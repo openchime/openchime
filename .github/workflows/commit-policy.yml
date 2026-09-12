@@ -1,0 +1,108 @@
+# Commit policy for pushes to staging and main.
+#
+# pr-policy checks the pull request TITLE, which is what a squash commits.
+# This checks the commits themselves, after the squash. Both are needed: the
+# title check cannot see a Co-authored-by trailer, because GitHub adds it
+# during the merge — and that trailer defeats an otherwise-empty squash body.
+name: commit-policy
+
+on:
+  push:
+    branches: [staging, main]
+
+jobs:
+  commits:
+    name: commit policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check the commits this push introduced
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          ZERO=0000000000000000000000000000000000000000
+
+          if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "$ZERO" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            RANGE="${BEFORE}..${GITHUB_SHA}"
+          elif [ -z "$(git log -1 --format=%P "$GITHUB_SHA")" ]; then
+            RANGE="$GITHUB_SHA"
+          else
+            RANGE="${GITHUB_SHA}~1..${GITHUB_SHA}"
+          fi
+          echo "checking $RANGE"
+
+          # Resolve the range ONCE, and fail if it cannot be resolved. The
+          # fail-open trap: `if [ -n "$(git rev-list ...)" ]` and `for c in
+          # $(git rev-list ...)` don't trip `set -e` on a failed command
+          # substitution, so an unresolvable range yields an empty list, zero
+          # loop iterations, and "commit policy ok" having checked nothing.
+          if ! MERGE_LIST=$(git rev-list --merges "$RANGE"); then
+            echo "::error::could not resolve $RANGE; refusing to report success"
+            exit 1
+          fi
+          if ! COMMIT_LIST=$(git rev-list --no-merges "$RANGE"); then
+            echo "::error::could not resolve $RANGE; refusing to report success"
+            exit 1
+          fi
+          MERGES=()
+          COMMITS=()
+          [ -n "$MERGE_LIST" ] && mapfile -t MERGES <<<"$MERGE_LIST"
+          [ -n "$COMMIT_LIST" ] && mapfile -t COMMITS <<<"$COMMIT_LIST"
+
+          # A merge produces a tree no single commit produced, and the policy
+          # below is keyed to one commit's subject. Reject them outright.
+          if [ "${#MERGES[@]}" -gt 0 ]; then
+            echo "::error::This push contains merge commits. Squash, or fast-forward."
+            printf '  %s\n' "${MERGES[@]}"
+            exit 1
+          fi
+
+          echo "checking ${#COMMITS[@]} commit(s)"
+
+          fail=0
+          for c in "${COMMITS[@]}"; do
+            subject=$(git log -1 --format=%s "$c")
+            author=$(git log -1 --format=%an "$c")
+
+            # A root commit predates any issue to scope it to.
+            [ -z "$(git log -1 --format=%P "$c")" ] && { echo "  ${c:0:8} root, exempt"; continue; }
+
+            # dependabot's own commits carry deps: and have no issue. The
+            # author pairing is what stops a human using the prefix to skip
+            # tracking.
+            if printf '%s' "$subject" | grep -q '^deps: '; then
+              if [ "$author" = 'dependabot[bot]' ]; then
+                echo "  ${c:0:8} dependency bump, exempt"
+              else
+                echo "::error::${c:0:8} uses 'deps:' but was written by '${author}'"
+                fail=1
+              fi
+              continue
+            fi
+
+            # GitHub appends " (#42)" on squash; strip it before matching so a
+            # trailing full stop before the suffix is still caught.
+            core=$(printf '%s' "$subject" | sed -E 's/ \(#[0-9]+\)$//')
+            printf '%s' "$core" \
+              | grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' \
+              || { echo "::error::${c:0:8} subject must read 'OC-<issue>: Capitalised description' — got: ${subject}"; fail=1; }
+
+            if [ "${#subject}" -gt 72 ]; then
+              echo "::error::${c:0:8} subject is ${#subject} chars, limit 72"
+              fail=1
+            fi
+
+            # THE REASON THIS WORKFLOW EXISTS.
+            if [ -n "$(git log -1 --format=%b "$c")" ]; then
+              echo "::error::${c:0:8} has a commit body; subjects here stand alone."
+              git log -1 --format=%b "$c" | head -2 | sed 's/^/    /'
+              fail=1
+            fi
+          done
+
+          [ "$fail" = 0 ] && echo "commit policy ok" || exit 1

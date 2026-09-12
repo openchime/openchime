@@ -1,0 +1,1496 @@
+# Publish a release of the daemon (ARCH-20).
+#
+# Until this existed the project shipped nothing: CI built the daemon on every
+# push and threw it away, the Dockerfile was never built by CI, and the image the
+# control plane provisions onto customer boxes was produced by hand. Four
+# channels come out of one run, all carrying the same release number:
+#
+#   apt      Debian/Ubuntu, GPG-signed repository in object storage
+#   dnf/yum  RHEL family, GPG-signed repository in object storage
+#   tarball  everyone else, and the offline case -- attached to the GitHub release
+#   image    GHCR, for the hosted model (Fly)
+#   windows  the client, not the daemon: a signed installer attached to the
+#            GitHub release, and an MSIX for the Store
+#
+# ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm and the tarball, so all
+# three ship a byte-identical artifact rather than three builds that merely came
+# from one source tree. It is built with `zig cc` targeting glibc 2.34, the
+# oldest supported target -- because the runner's own glibc is too new: a binary
+# linked against 2.35+ will not start on RHEL 9, and one linked here against the
+# runner's libc failed outright on Debian bookworm during development.
+#
+# NOTHING IN THIS WORKFLOW USES DOCKER. The 2.34 floor was previously held by
+# building inside a rockylinux:9 container; zig ships glibc stubs for every
+# version and pins the floor on a bare runner instead. The container image is
+# built with buildah, per-architecture on native runners, so the QEMU emulation
+# that a multi-arch buildx build required is gone too. Keeping the pipeline
+# daemon-free is a standing constraint, not an accident -- see docs/RELEASING.md.
+#
+# The image is the deliberate exception to the one-binary rule: it stays an
+# Alpine/musl build, so it carries a different binary from the same source.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and verify everything, publish nothing, tag nothing'
+        type: boolean
+        default: false
+      skip_repo_smoke:
+        description: 'Skip the published-repository smoke test (use only while the control plane is not yet serving DIST_BASE_URL)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The same jobs a branch push runs. Reused, not re-implemented.
+  test:
+    name: gate on CI
+    uses: ./.github/workflows/ci.yml
+
+  # attribution-guard.yml has carried `workflow_call:` specifically so a release
+  # could gate on it, and nothing did -- this was the only release path in the
+  # estate that skipped it. contents: write is declared here because a called
+  # workflow cannot exceed its caller's permissions and this workflow defaults to
+  # read; scoped to this job so the rest stays read-only.
+  guard:
+    name: attribution guard
+    uses: ./.github/workflows/attribution-guard.yml
+    permissions:
+      contents: write
+
+  # Assert the credentials EXIST before anything expensive runs.
+  #
+  # Every credential used to be read only at its point of use, and every step
+  # that reads one is skipped on a dry run -- so the first time a missing value
+  # could surface was a real release, after the CI gate, both package builds,
+  # the image and the Windows binaries had all run. Twenty-five minutes to learn
+  # a secret was unset. This job runs in parallel with the CI gate and takes
+  # seconds.
+  #
+  # It gates `version` deliberately, not just the publish. The release NUMBER is
+  # reserved before anything is built and only returned when nothing was
+  # published, so letting a run that cannot possibly publish reserve one burns a
+  # number for no reason.
+  preflight:
+    name: check release credentials
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    env:
+      # Mapped in rather than read inline: a secret cannot be tested in an `if:`
+      # at job level, and mapping makes the required set one readable list.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
+      WINGET_TOKEN:       ${{ secrets.WINGET_TOKEN }}
+      TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+      DRY: ${{ inputs.dry_run }}
+      # As in `publish`, which is where this value is defined and explained.
+      DIST_BASE_URL: https://openchime.io/dist
+    steps:
+      - name: required credentials
+        run: |
+          set -u
+          missing=""
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT \
+                   DIST_BUCKET REPO_SIGNING_KEY WINGET_TOKEN; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+
+          # Authenticode signing is OPTIONAL by design (RELEASING.md): without it
+          # the release ships an unsigned installer and says so. But the three
+          # values are all-or-nothing -- `SIGN` requires all three -- so a
+          # PARTIAL set is the dangerous state: it reads as configured and
+          # silently ships unsigned. Named separately for that reason.
+          ts_set=0
+          for v in TS_ENDPOINT TS_ACCOUNT TS_PROFILE; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] && ts_set=$((ts_set + 1))
+          done
+
+          {
+            echo "### Release credentials"
+            echo
+            if [ -n "$missing" ]; then
+              echo "**Missing (required):**"
+              for m in $missing; do echo "- \`$m\`"; done
+            else
+              echo "All required credentials are present."
+            fi
+            echo
+            case "$ts_set" in
+              3) echo "Authenticode signing: configured." ;;
+              0) echo "Authenticode signing: not configured — the installer ships unsigned, as designed." ;;
+              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 3)** — signing will be skipped and the installer will ship unsigned. Set all three or none." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ts_set" != 0 ] && [ "$ts_set" != 3 ]; then
+            echo "::warning::Authenticode signing is partially configured ($ts_set of 3); the installer will ship unsigned."
+          fi
+
+          if [ -z "$missing" ]; then
+            echo "all required release credentials present"
+            exit 0
+          fi
+
+          # A dry run REPORTS and continues: its job is to prove the build, and
+          # failing it would stop anyone verifying a build on a fork with no
+          # secrets. Reporting is still the fix -- surfacing the gap in a dry run
+          # is exactly what was impossible before.
+          if [ "$DRY" = "true" ]; then
+            echo "::warning::missing release credentials:$missing (dry run — not failing)"
+            exit 0
+          fi
+          echo "::error::missing release credentials:$missing"
+          exit 1
+
+      # The published base is a URL somebody else serves: the control plane
+      # reads the bucket and exposes it at DIST_BASE_URL. Nothing in this
+      # repository can make that true, and it has not been true for three
+      # releases -- so this REPORTS and never fails.
+      #
+      # It exists for the reason the credential check above does. That check was
+      # added because a missing value first surfaced during a real release,
+      # after the CI gate and every build had run; this one surfaced later still,
+      # after apt and dnf were already live. Knowing at minute one what you would
+      # otherwise learn at minute nine costs one HEAD request.
+      #
+      # Failing here was considered and rejected: it would make releases
+      # impossible until an external dependency lands, and the release is
+      # perfectly publishable without it -- only unreachable at the public URL.
+      - name: probe the published base URL
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -u
+          if curl -fsI --max-time 20 "$DIST_BASE_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
+            echo "published base URL serves: $DIST_BASE_URL"
+            echo "Published base URL (\`$DIST_BASE_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::$DIST_BASE_URL does not serve the archive keyring -- \
+          the repositories will publish, and the terminal smoke job will fail. \
+          The release itself still completes."
+            {
+              echo
+              echo "**Published base URL (\`$DIST_BASE_URL\`): NOT serving.**"
+              echo
+              echo "The repositories will publish and the release will complete;"
+              echo "the terminal \`smoke\` job will fail. Serving \`/dist\` is the"
+              echo "control plane's job, and it is not in this repository."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  version:
+    name: allocate the release number
+    needs: [test, guard, preflight]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write        # to reserve the tag; see the reserve step
+    outputs:
+      number: ${{ steps.n.outputs.number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: n
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          # Computed up front, unlike the control plane which tags after the
+          # fact: a package version is the artifact's identity and has to exist
+          # before anything is built.
+          N=$(scripts/version.sh next)
+          echo "number=$N" >> "$GITHUB_OUTPUT"
+          echo "this release is $N (previous: $(scripts/version.sh current))"
+
+      # Reserve the number NOW, not after publishing.
+      #
+      # The tag push used to be the last step of `publish`, by which point apt, dnf
+      # and GHCR had already been written. version.sh derives the next number purely
+      # from tags, so a refused push -- tag protection, a ruleset, a transient 500 --
+      # left release N live and untagged, and the next dispatch computed N again,
+      # built different content, and published it under the same version. version.sh
+      # says it itself: two .debs sharing a version is the one thing apt cannot
+      # recover from. It guards the branch-scoping route to that outcome and left
+      # this one open.
+      #
+      # Reserving instead means the failure mode is a burnt number, which costs
+      # nothing, rather than a duplicated one. The unreserve job at the bottom hands
+      # it back when publish did not succeed.
+      - name: Reserve the release number
+        if: ${{ !inputs.dry_run }}
+        env:
+          N: ${{ steps.n.outputs.number }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "release-${N}" "$GITHUB_SHA"
+          git push origin "release-${N}"
+          echo "reserved release-${N}"
+
+  packages:
+    name: ${{ matrix.arch }} packages
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            zig: x86_64
+            zig_sha: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+          - arch: arm64
+            # Native, not cross-compiled: cross-building would need a
+            # foreign-architecture libsqlite3-dev and would leave the result
+            # untested on the architecture it targets.
+            runner: ubuntu-22.04-arm
+            zig: aarch64
+            zig_sha: 041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # Every artifact this job produces lands under dist/<platform>/, which is
+      # also the artifact's name -- see the upload at the end of the job for why
+      # those two being the same string is what keeps the layout intact across
+      # the artifact round-trip.
+      PLATFORM: linux-${{ matrix.arch }}
+      DIST: dist/linux-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The toolchain that holds the glibc floor. `zig cc` ships glibc stub
+      # libraries for every version back to 2.17 and links against whichever one
+      # it is asked for, regardless of the host's own glibc -- so a 2.34 binary
+      # comes off a runner carrying 2.35 with no container in the picture.
+      #
+      # Pinned by checksum for the same reason scripts/build_mbedtls.sh pins
+      # mbedTLS: this is the compiler that produces the shipped binary, and an
+      # unverified fetch of a compiler is not a thing to shrug at.
+      - name: Install the zig toolchain
+        env:
+          ZIG_VERSION: '0.13.0'
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${{ matrix.zig }}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/zig.tar.xz "$url"
+          echo "${{ matrix.zig_sha }}  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          /opt/zig/zig version
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          # libsqlite3-dev for the daemon's only dynamic dependency; rpm supplies
+          # rpmbuild, which used to come from the Rocky container.
+          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev bzip2 rpm
+
+      # One binary, built against the oldest glibc we support, then stripped
+      # once. Everything downstream consumes this exact file.
+      #
+      # The wrapper exists to keep one rule: the ONLY host header this build may
+      # see is sqlite3.h. Adding -I/usr/include instead would pull the runner's
+      # glibc 2.39 headers, which redirect strtol to __isoc23_strtol -- a 2.38
+      # symbol that does not exist in the 2.34 stubs, so the link fails. libc
+      # headers come from zig; the sqlite header is copied out on its own.
+      - name: Build the daemon (glibc 2.34)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST" /tmp/sqinc
+          cp /usr/include/sqlite3.h /usr/include/sqlite3ext.h /tmp/sqinc/
+          cat > /tmp/zcc <<EOF
+          #!/bin/sh
+          exec /opt/zig/zig cc -target ${{ matrix.zig }}-linux-gnu.2.34 \
+            -I/tmp/sqinc -L/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH) "\$@"
+          EOF
+          chmod +x /tmp/zcc
+          make CC=/tmp/zcc OC_VERSION="$VERSION"
+          strip openchimed -o "$DIST/openchimed"
+          packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
+          "./$DIST/openchimed" --version
+
+      # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
+      # is invisible in a passing build -- a binary needing 2.38 links and runs
+      # perfectly here, then fails to start on the distro it was built for. The
+      # container used to enforce it structurally; with the container gone this
+      # assertion is what enforces it, so it is not optional.
+      - name: Assert the glibc floor
+        run: |
+          set -euo pipefail
+          max=$(objdump -T "$DIST/openchimed" \
+                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "highest glibc symbol required: $max"
+          [ "$max" = "GLIBC_2.34" ] || {
+            echo "::error::binary requires $max, above the supported floor GLIBC_2.34"
+            exit 1
+          }
+
+      # The build-*.sh scripts take an output directory and default to a bare
+      # dist/. They are deliberately left knowing nothing about the per-platform
+      # layout: the release pipeline owns where artifacts go, so one caller
+      # decides it rather than three scripts agreeing by coincidence.
+      - name: Build the .deb and the tarball
+        # No MBEDTLS_DIR override any more. It used to point at a licence tree
+        # copied out of the build container, because mbedTLS was fetched and
+        # built on the container's throwaway copy of the source and its LICENSE
+        # never existed on the runner. The build now happens in this very tree,
+        # so licenses.sh finds third_party/mbedtls-3.6.2/LICENSE where it
+        # defaults to looking.
+        run: |
+          set -euo pipefail
+          packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+
+      # Proves the three channels carry the same file. If this ever fails, the
+      # "one binary, packaged three ways" claim in the docs is false and should
+      # not be published.
+      - name: Verify all channels ship one identical binary
+        run: |
+          set -euo pipefail
+          want=$(sha256sum "$DIST/openchimed" | cut -d' ' -f1)
+          mkdir -p v/deb v/rpm v/tar
+          dpkg-deb -x "$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb" v/deb
+          ( cd v/rpm && rpm2cpio ../../"$DIST"/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
+          tar xzf "$DIST/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C v/tar
+          for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
+                   v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
+            got=$(sha256sum "$f" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "::error::$f differs from the built binary"; exit 1; }
+          done
+          echo "all three channels ship $want"
+
+      # Install the real .deb and run what it put on disk. This is a weaker check
+      # than the clean-room install it replaces: the runner is not pristine, it
+      # is Ubuntu rather than Debian, and there is no equivalent for the .rpm at
+      # all, because nothing on an Ubuntu runner can install one. What survives
+      # is the single most valuable assertion of the three -- that the package
+      # unpacks, its dependencies resolve, and the binary it lays down executes.
+      #
+      # Dropping the container was a deliberate trade (see docs/RELEASING.md).
+      # The .rpm is now covered only by the identical-binary check above and by
+      # the repository smoke test in `publish`; a package that builds but fails
+      # to install on the RHEL family will not be caught before it is published.
+      - name: Install the package and run it
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
+          /usr/bin/openchimed --version
+
+      # The install above does not touch the unit file: both maintainer scripts
+      # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60
+      # lines of ProtectSystem, DynamicUser and RestrictAddressFamilies that CI
+      # produces need something to actually parse them.
+      #
+      # This used to need a container precisely because `docker run` has no
+      # /run/systemd/system. The runner is the opposite case -- it boots systemd
+      # for real -- so the check runs directly, against a newer systemd than the
+      # bookworm container offered.
+      #
+      # Not a real boot: that would need the service to start. `verify` resolves
+      # every directive against the installed systemd, which is the failure class
+      # that would otherwise ship unchecked.
+      - name: Validate the unit file
+        run: |
+          set -euo pipefail
+          # systemd-analyze exits 0 even for a directive it does not recognise, so
+          # its status is worthless here -- measured, not assumed. Grep the output.
+          #
+          # The pattern is "Unknown key", NOT "Unknown key name": systemd words it
+          # "Unknown key 'ProtectSystm' in section [Service], ignoring." A first
+          # draft matching "Unknown key name" passed a unit with a typo'd
+          # ProtectSystem, which is the exact bug this step exists to catch.
+          out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
+          printf "%s\n" "$out"
+          # Scope to OUR unit before matching. `verify` walks the dependency
+          # graph and reports on everything it loads, which in a pristine
+          # container was only openchimed.service -- and on a runner is also
+          # whatever systemd units that runner ships. Both of these are real
+          # output from ubuntu-22.04 and both matched the patterns below:
+          #   /lib/systemd/system/snapd.service:23: Unknown key name 'RestartMode'
+          #   netplan-ovs-cleanup.service: Failed to open ...: Permission denied
+          # Neither says anything about openchimed. Every message that does is
+          # prefixed either with the unit name or with its path and line number,
+          # so filtering on the name first is what keeps this check about us.
+          if printf "%s\n" "$out" | grep "openchimed" | grep -v "is not executable" \
+               | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
+            echo "::error::openchimed.service has a directive this systemd rejects"
+            exit 1
+          fi
+          echo "unit parses clean"
+
+      # The artifact is NAMED for the platform, and the publish job downloads
+      # without merge-multiple. That combination is what rebuilds dist/<platform>/
+      # on the other side: upload-artifact strips the common path prefix, so the
+      # directory only survives the round-trip by being the artifact's name.
+      # The stripped binary is not uploaded -- it ships inside all three packages
+      # and the step above proves they are identical.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PLATFORM }}
+          path: |
+            ${{ env.DIST }}/*.deb
+            ${{ env.DIST }}/*.rpm
+            ${{ env.DIST }}/*.tar.gz
+            ${{ env.DIST }}/*.sha256
+          if-no-files-found: error
+
+  # Built with buildah, not docker. Two consequences beyond removing the daemon:
+  #
+  # 1. Each architecture builds on a runner of that architecture, so the QEMU
+  #    emulation this job used to need is gone. Native arm64 is both faster and
+  #    a truer build than emulating it on x86.
+  # 2. A multi-arch tag is no longer a side effect of one buildx invocation, so
+  #    the per-arch images and the manifest list that indexes them are two
+  #    separate jobs. The per-arch tags are an implementation detail; nothing is
+  #    documented as pullable until image-manifest publishes :VERSION.
+  image:
+    name: ${{ matrix.arch }} image
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install buildah
+        run: |
+          set -euo pipefail
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends buildah
+          buildah version
+      # The Dockerfile is unchanged and is read as-is; buildah speaks the same
+      # format. Only the tool that reads it changed.
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          buildah build \
+            --build-arg "OC_VERSION=${VERSION}" \
+            -f Dockerfile \
+            -t "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
+            .
+      - name: Push the per-architecture image
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          buildah push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+
+  # :VERSION only. `image` needs only `version`, so it runs alongside
+  # windows-package -- and if that fails, publish is skipped and nothing reaches
+  # apt, dnf or the releases page, yet :latest would already point at that build.
+  # Anyone pulling :latest would get a version that officially does not exist.
+  # :latest moves in `publish`.
+  image-manifest:
+    name: container image manifest
+    needs: [version, image]
+    # Nothing was pushed on a dry run, so there is nothing to index. The
+    # per-arch builds above still ran, which is the part worth proving.
+    if: ${{ inputs.dry_run == false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
+    steps:
+      - name: Install buildah
+        run: |
+          set -euo pipefail
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends buildah
+      - name: Publish the manifest list
+        run: |
+          set -euo pipefail
+          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          buildah manifest create "${IMAGE}:${VERSION}"
+          for a in amd64 arm64; do
+            buildah manifest add "${IMAGE}:${VERSION}" "docker://${IMAGE}:${VERSION}-${a}"
+          done
+          buildah manifest push --all "${IMAGE}:${VERSION}" "docker://${IMAGE}:${VERSION}"
+
+  # The Windows client (ARCH-80/81). It carries the same release number as the
+  # daemon even though it is a separate program, so a support question only ever
+  # needs one number.
+  #
+  # Split across two runners for one reason: the binaries cross-compile with
+  # mingw-w64 on Linux, exactly as `make windows-gui` does locally, but
+  # Authenticode signing and MSIX packaging (makeappx.exe) exist only on
+  # Windows. Compiling on windows-latest instead would mean maintaining a
+  # second, otherwise-unused toolchain for the same source.
+  windows-build:
+    name: windows binaries
+    needs: version
+    # 24.04, matching ci.yml's windows job and for the same reason: 22.04's
+    # mingw-w64 headers declare IRawElementProviderSimple but not the
+    # fragment/text interfaces, so the UIA provider (ARCH-99) compiles to its
+    # stub. On 22.04 this job SUCCEEDS and ships a client whose accessibility
+    # provider is a no-op -- a different binary from the one CI validates.
+    # The release must build what CI tested.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the mingw-w64 toolchain
+        run: |
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          # bzip2 and curl are for build_mbedtls_windows.sh below, which fetches
+          # and cross-builds the pinned tarball.
+          sudo apt-get install -y -qq mingw-w64 bzip2 curl
+
+      # Unlike the native build, the Makefile has no rule that produces the
+      # Windows mbedTLS archives, so nothing builds them implicitly: `make
+      # windows-gui` just fails with "No rule to make target". ci.yml runs this
+      # too -- the release omitted it, which is what this dry run found.
+      - name: Cross-build the vendored Windows mbedTLS
+        run: scripts/build_mbedtls_windows.sh
+
+      - name: Build the GUI and the TUI
+        run: |
+          set -euo pipefail
+          make OC_VERSION="$VERSION" windows-gui windows-tui
+          # Both are statically linked, so nothing downstream has to chain a
+          # redistributable. If that ever stops being true the installer will
+          # still build and the app will fail to start on a clean machine, so
+          # it is asserted here rather than discovered there.
+          for f in build/openchime.exe build/openchime-tui.exe; do
+            file "$f" | grep -q 'PE32+' || { echo "::error::$f is not a PE32+ binary"; exit 1; }
+          done
+
+      # Named for the toolchain, not the platform: these are the unpackaged
+      # compiler outputs handed to the next job, not a release artifact. The
+      # publish job collects dist/<platform>/ by matching `windows-*`, and this
+      # must not be caught by that.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mingw-binaries
+          path: |
+            build/openchime.exe
+            build/openchime-tui.exe
+            build/openchime.debug
+          if-no-files-found: error
+
+  windows-package:
+    name: windows installers
+    needs: [version, windows-build]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # Signing is gated on a real release AND on the credentials existing. A dry
+      # run produces the same artifacts unsigned and never reads them, which is
+      # what makes this job safe to run from a fork.
+      #
+      # The second half of that condition is what stops an absent certificate
+      # taking down the whole release. SIGN used to be `dry_run == false` alone,
+      # so a real release ran azure/trusted-signing-action against an empty
+      # endpoint, windows-package failed, and publish -- which needs it -- was
+      # skipped. The Linux packages were never the problem and never shipped
+      # either. Same shape the game repos use for absent Play signing secrets: an
+      # incomplete config degrades the artifact, it does not fail the release.
+      #
+      # Nothing needs editing when Artifact Signing is provisioned; setting the
+      # six secrets below turns signing back on by itself. All six are required:
+      # the first three name the signing profile, the last three are the service
+      # principal that proves the caller may use it -- the action authenticates
+      # via DefaultAzureCredential and has nothing to authenticate with otherwise.
+      SIGN: ${{ inputs.dry_run == false && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
+      # Same convention as the packages job: artifacts land in dist/<platform>/
+      # and the artifact is named for that platform. build/ stays the staging
+      # area -- the unpackaged binaries and the MSIX layout are inputs to a
+      # package, not outputs of one, and the .iss reads them from there.
+      PLATFORM: windows-x64
+      DIST: dist/windows-x64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: mingw-binaries
+          path: build
+
+      # Both binaries carry a VERSIONINFO resource (client/shared/res). It is
+      # asserted rather than assumed because the failure is silent: a missing
+      # or misbuilt resource still produces a working .exe, and the installer
+      # wrapping it carries its own version, so nothing downstream notices that
+      # the shipped files report none. Before that resource existed this step
+      # read back empty for both.
+      - name: Check the embedded version
+        shell: pwsh
+        run: |
+          $want = "1.0.$env:VERSION.0"
+          foreach ($f in 'build\openchime.exe','build\openchime-tui.exe') {
+            $got = (Get-Item $f).VersionInfo.FileVersion
+            if ($got -ne $want) { throw "$f reports FileVersion '$got', expected '$want'" }
+            Write-Host "$f $got"
+          }
+
+      # The SDK ships on the runner image but is not on PATH, and its versioned
+      # directory moves with each image update, so it is discovered rather than
+      # pinned to a build number that would silently rot.
+      - name: Locate the Windows SDK
+        shell: pwsh
+        run: |
+          $bin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdk = Get-ChildItem $bin -Directory -ErrorAction Stop |
+                 Where-Object Name -match '^10\.' | Sort-Object Name | Select-Object -Last 1
+          if (-not $sdk) { throw "no Windows 10 SDK under $bin" }
+          Write-Host "using SDK $($sdk.Name)"
+          "$($sdk.FullName)\x64" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Signed before packaging, not after: both the installer and the MSIX
+      # embed these files, so signing them afterwards would leave the copies
+      # inside the packages unsigned.
+      - name: Sign the binaries
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+          files-folder: build
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # DIST is written with forward slashes because upload-artifact's globs
+          # require them; ISCC is given the backslash form rather than trusting
+          # it to normalise a path handed to /O.
+          $out = $env:DIST -replace '/','\'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+              "/DVersion=$env:VERSION" "/O$out" packaging\windows\openchime.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      # An unsigned installer is a real cost, not a footnote: Windows SmartScreen
+      # will warn on it and some users will not click through. Said here so the
+      # run itself records why, rather than leaving it to be rediscovered.
+      - name: Note the missing signature
+        if: ${{ inputs.dry_run == false && env.SIGN != 'true' }}
+        shell: bash
+        run: |
+          echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign the installer
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+          files-folder: ${{ env.DIST }}
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      # Left unsigned on purpose: a Store submission is re-signed by Microsoft,
+      # and signing it here with our own certificate would be discarded. A
+      # sideloadable .msix is a different artifact and would need one.
+      - name: Build the MSIX
+        shell: pwsh
+        run: |
+          $stage = 'build\msix'
+          New-Item -ItemType Directory -Force "$stage\bin" | Out-Null
+          Copy-Item packaging\windows\msix\* $stage -Recurse -Force
+          Copy-Item build\*.exe "$stage\bin"
+
+          # version.sh hands out a bare integer; MSIX requires a.b.c.d with the
+          # fourth field reserved for the Store, so the release number lands in
+          # the third. Monotonic, which is all the Store checks.
+          $m = "$stage\AppxManifest.xml"
+          (Get-Content $m -Raw).Replace('Version="1.0.0.0"', "Version=`"1.0.$env:VERSION.0`"") |
+            Set-Content $m -Encoding utf8
+
+          # Without a resources.pri the scale-N asset variants are inert and
+          # the tile renders from the scale-100 file at every DPI.
+          makepri.exe createconfig /cf "$stage\priconfig.xml" /dq en-US /o
+          makepri.exe new /pr $stage /cf "$stage\priconfig.xml" /of "$stage\resources.pri" /o
+          Remove-Item "$stage\priconfig.xml"
+
+          $out = $env:DIST -replace '/','\'
+          makeappx.exe pack /d $stage /p "$out\openchime-$env:VERSION.msix" /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+
+      # The GUI's DWARF, split out by the Makefile and referenced by a
+      # .gnu_debuglink in the shipped .exe. It has to travel in THIS artifact:
+      # publish downloads linux-* and windows-* only, deliberately excluding the
+      # intermediate mingw-binaries, so anything left there never reaches the
+      # release.
+      - name: Stage the GUI debug symbols beside the installer
+        shell: pwsh
+        run: |
+          $out = $env:DIST -replace '/','\'
+          Copy-Item build\openchime.debug "$out\openchime.debug"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PLATFORM }}
+          path: ${{ env.DIST }}/*
+          if-no-files-found: error
+
+  publish:
+    name: publish repositories
+    needs: [version, packages, image-manifest, windows-package]
+    if: inputs.dry_run == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write        # to push the release tag and create the GitHub release
+      packages: write        # to move :latest once the release is real
+    outputs:
+      # Set the moment the apt index is in the bucket. From then on the number is
+      # SPENT whether or not the rest of the job succeeds, and unreserve must not
+      # hand it back -- see the note on that job.
+      published: ${{ steps.apt.outputs.published }}
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # Object storage is Tigris, provisioned through Fly (`fly storage create`)
+      # and billed on the Fly account, so it is not a separate vendor
+      # relationship. It speaks the S3 API; rclone is configured from these.
+      #
+      # Named for the role rather than the provider. Nothing outside this job
+      # knows where the bytes live -- the control plane serves DIST_BASE_URL and
+      # reads from the bucket -- so moving to another S3 endpoint is a change to
+      # these four values and nothing else. That indirection is the reason the
+      # public URL can be permanent while the storage behind it is not.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      # Endpoint and bucket are variables, not secrets: neither is confidential,
+      # and a masked bucket name turns every rclone log line into asterisks.
+      #
+      # The published base. Baked into every operator's sources.list, so it is
+      # permanent in a way nothing else here is (ARCH-20).
+      DIST_BASE_URL: https://openchime.io/dist
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # merge-multiple is deliberately absent: without it each artifact unpacks
+      # into a directory named after itself, and since every producing job names
+      # its artifact for its platform, that reconstitutes dist/<platform>/ here.
+      # Turning it on would flatten all three platforms into one directory,
+      # which is what put a Windows .exe within reach of the Debian pool glob
+      # below.
+      #
+      # Two patterns rather than a bare `*`, so the intermediate mingw-binaries
+      # artifact -- unpackaged compiler output, not a release artifact -- is not
+      # dragged in as a fourth platform.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: dist
+      # Named explicitly, not `pattern: windows-*`, and the path is spelled out.
+      # With a pattern, download-artifact nests each match in a directory named
+      # after it -- which is what rebuilds dist/<platform>/ for the two linux
+      # artifacts -- but the windows pattern matches exactly ONE artifact and it
+      # unpacked FLAT into dist/, so `dist/windows-x64/*-setup.exe` matched nothing
+      # and the release step failed after apt and dnf had already published.
+      # An explicit name and path does not depend on that behaviour either way, and
+      # it also makes the mingw-binaries exclusion structural rather than a glob.
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: dist/windows-x64
+
+      - name: Show what will be published
+        run: find dist -type f | sort
+
+      - name: Install repository tooling
+        run: |
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          # `rpm` is not optional and not implied: createrepo-c pulls librpm's
+          # shared libraries but not the rpm binary, and an Ubuntu runner has
+          # neither rpm nor rpmsign preinstalled. Without it the rpm repository
+          # step fails at `rpm --addsign` with command-not-found -- in a job the
+          # dry run skips, so it would only ever surface on a real release.
+          sudo apt-get install -y -qq apt-utils createrepo-c rclone gnupg rpm
+
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')" >> "$GITHUB_ENV"
+
+      - name: Configure rclone for object storage
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          # provider = Other rather than a named one: rclone has no Tigris
+          # profile, and the generic S3 path is what Tigris documents. region is
+          # required by the S3 signature even though Tigris routes globally.
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+          EOF
+
+      # Both repositories are regenerated from the FULL pool, not from this
+      # release's packages alone. An index built from the new package only would
+      # silently drop every previous release the moment it was published.
+      - name: Publish the apt repository
+        id: apt
+        run: |
+          set -euo pipefail
+          mkdir -p repo/apt
+          # `|| true` used to sit here, and it could not tell "the prefix does not
+          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
+          # fetch failure the pool stayed empty, the index below was built from this
+          # release alone, and the upload replaced Release/InRelease in the bucket --
+          # so every existing installation's `apt-get update` saw a repository
+          # containing one version. The old objects survive; the index naming them
+          # does not.
+          # COUNTED, not probed. `rclone lsjson` exits 0 on a prefix that does not
+          # exist -- it reports an empty listing rather than an error -- so testing
+          # its exit status called every bucket "existing" and the guard below then
+          # refused a genuinely first publish.
+          existing=$( { rclone ls "dist:${DIST_BUCKET}/apt" 2>/dev/null || true; } | wc -l )
+          if [ "$existing" -gt 0 ]; then
+            had_prefix=1
+            rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list
+          else
+            had_prefix=0
+            echo "::notice::no existing apt objects in ${DIST_BUCKET}; treating as first publish"
+          fi
+
+          # lsjson proves the prefix is reachable, not that the copy completed, so
+          # this is a second and independent witness: the tag count is what the pool
+          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
+          pool_count=$(find repo/apt -name '*.deb' | wc -l)
+          # PRIOR releases -- this one's tag is excluded, because `version` reserved
+          # it before anything was built (P3-OC-02). Counting it made the first ever
+          # release refuse itself: pool empty, prior=1, which is exactly the shape
+          # this guard treats as "an index that would delist history". The two fixes
+          # were correct separately and wrong together.
+          # `|| true` inside the braces, and it is not cosmetic. Once this release's
+          # own tag is filtered out, a FIRST release leaves grep with no match, so it
+          # exits 1; pipefail propagates that and set -e kills the assignment. The
+          # step died in under a second with no output at all -- the same shape as
+          # the dead error path in winget/render.sh, reintroduced here.
+          prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
+          # `had_prefix` is what separates the two ways to arrive at an empty pool,
+          # and only one of them is a fault. A prefix that EXISTS and yields no
+          # .deb means the copy above silently did not complete -- publishing then
+          # writes an index that delists every prior release, which is the case
+          # this guard was built for. No prefix at all means a bucket nothing has
+          # published into yet, which the branch above already recognises and
+          # announces as a first publish; refusing it made the guard contradict
+          # that notice and made moving to a new bucket impossible.
+          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+            echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
+            exit 1
+          fi
+
+          mkdir -p repo/apt/pool/main/o/openchimed
+          cp dist/linux-*/*.deb repo/apt/pool/main/o/openchimed/
+
+          cd repo/apt
+          for arch in amd64 arm64; do
+            mkdir -p "dists/stable/main/binary-${arch}"
+            apt-ftparchive --arch "$arch" packages pool \
+              > "dists/stable/main/binary-${arch}/Packages"
+            gzip -9kf "dists/stable/main/binary-${arch}/Packages"
+          done
+
+          cat > /tmp/apt-release.conf <<'EOF'
+          APT::FTPArchive::Release::Origin "OpenChime";
+          APT::FTPArchive::Release::Label "OpenChime";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "amd64 arm64";
+          APT::FTPArchive::Release::Components "main";
+          EOF
+          apt-ftparchive -c /tmp/apt-release.conf release dists/stable > dists/stable/Release
+
+          rm -f dists/stable/Release.gpg dists/stable/InRelease
+          gpg --batch --yes --local-user "$GPG_KEY_ID" -abs \
+              -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
+              -o dists/stable/InRelease dists/stable/Release
+
+          cd ../..
+          rclone copy repo/apt "dist:${DIST_BUCKET}/apt" --fast-list
+          # Past this line the number is spent: an apt client can see release N.
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the rpm repository
+        run: |
+          set -euo pipefail
+          mkdir -p repo/rpm
+          # `|| true` used to sit here, and it could not tell "the prefix does not
+          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
+          # fetch failure the pool stayed empty, the index below was built from this
+          # release alone, and the upload replaced Release/InRelease in the bucket --
+          # so every existing installation's `apt-get update` saw a repository
+          # containing one version. The old objects survive; the index naming them
+          # does not.
+          # COUNTED, not probed -- the same correction the apt step carries, and
+          # for the same reason: `rclone lsjson` exits 0 on a prefix that does
+          # not exist, reporting an empty listing rather than an error. Testing
+          # its exit status called every bucket "existing", so the guard below
+          # refused a genuinely first publish. Fixing one of the two copies and
+          # not the other is how the rpm half stayed broken after the apt half
+          # was proved working.
+          existing=$( { rclone ls "dist:${DIST_BUCKET}/rpm" 2>/dev/null || true; } | wc -l )
+          if [ "$existing" -gt 0 ]; then
+            had_prefix=1
+            rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list
+          else
+            had_prefix=0
+            echo "::notice::no existing rpm objects in ${DIST_BUCKET}; treating as first publish"
+          fi
+
+          # lsjson proves the prefix is reachable, not that the copy completed, so
+          # this is a second and independent witness: the tag count is what the pool
+          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
+          pool_count=$(find repo/rpm -name '*.rpm' | wc -l)
+          # PRIOR releases -- this one's tag is excluded, because `version` reserved
+          # it before anything was built (P3-OC-02). Counting it made the first ever
+          # release refuse itself: pool empty, prior=1, which is exactly the shape
+          # this guard treats as "an index that would delist history". The two fixes
+          # were correct separately and wrong together.
+          # `|| true` inside the braces, and it is not cosmetic. Once this release's
+          # own tag is filtered out, a FIRST release leaves grep with no match, so it
+          # exits 1; pipefail propagates that and set -e kills the assignment. The
+          # step died in under a second with no output at all -- the same shape as
+          # the dead error path in winget/render.sh, reintroduced here.
+          prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
+          # `had_prefix` separates the two ways to reach an empty pool. A prefix
+          # that EXISTS and yields no .rpm means the copy above did not complete,
+          # and an index published from it delists every prior release -- the case
+          # this guard was built for. No objects at all is a bucket nothing has
+          # published into, which the branch above already announces.
+          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+            echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
+            exit 1
+          fi
+          cp dist/linux-*/*.rpm repo/rpm/
+
+          # Each package is signed individually -- rpm verifies package
+          # signatures, unlike apt which verifies the index.
+          cat > /tmp/rpmmacros <<EOF
+          %_gpg_name ${GPG_KEY_ID}
+          %__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}
+          EOF
+          # rpm reads ~/.rpmmacros for the invoking user, so this must land in the
+          # home directory of whoever runs the next line -- not root's.
+          cp /tmp/rpmmacros ~/.rpmmacros
+          rpm --addsign repo/rpm/*.rpm
+
+          createrepo_c --update repo/rpm
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --detach-sign --armor \
+              -o repo/rpm/repodata/repomd.xml.asc repo/rpm/repodata/repomd.xml
+
+          rclone copy repo/rpm "dist:${DIST_BUCKET}/rpm" --fast-list
+
+      - name: Publish the public key and repo definitions
+        run: |
+          set -euo pipefail
+          mkdir -p repo/meta
+          gpg --export --armor "$GPG_KEY_ID" > repo/meta/openchime-archive-keyring.asc
+          gpg --export "$GPG_KEY_ID"         > repo/meta/openchime-archive-keyring.gpg
+          cat > repo/meta/openchime.repo <<EOF
+          [openchime]
+          name=OpenChime
+          baseurl=${DIST_BASE_URL}/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=${DIST_BASE_URL}/openchime-archive-keyring.asc
+          EOF
+          rclone copy repo/meta "dist:${DIST_BUCKET}/" --fast-list
+
+      - name: Tag the release and attach the tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tag already exists: `version` reserved it before anything was built
+          # (P3-OC-02). Assert rather than create, so a mismatch is loud instead of
+          # silently tagging a second commit with the same number.
+          git fetch --tags --force --quiet
+          git rev-parse -q --verify "refs/tags/release-${VERSION}" >/dev/null || {
+            echo "::error::release-${VERSION} was not reserved; refusing to publish"
+            exit 1
+          }
+          # The .msix is deliberately NOT attached. It is unsigned, because the
+          # Store re-signs on submission, so a downloaded copy will not install
+          # -- it is a build artifact for Partner Center, not a release asset.
+          #
+          # openchime.debug IS attached. The Makefile splits the GUI's DWARF into
+          # it and records a .gnu_debuglink in the shipped .exe, so without this
+          # the link points at a file that exists nowhere downloadable and
+          # crash_resolve.sh reports "built without -g?" for every released
+          # build. Build artifacts expire; a crash report does not.
+          # The note tells the truth about the installer's signing status, because
+          # the person who meets SmartScreen is the one who needs to know.
+          notes="Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached."
+          if [ -z "${{ secrets.TRUSTED_SIGNING_ENDPOINT }}" ]; then
+            unsigned="**The Windows installer in this release is not code-signed.** Windows SmartScreen will warn that the publisher is unrecognised; the download is still the artifact this workflow built, and its checksum is in the release assets."
+            notes="${notes}"$'\n\n'"${unsigned}"
+          fi
+          gh release create "release-${VERSION}" \
+            --title "release-${VERSION}" \
+            --notes "$notes" \
+            dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
+            dist/windows-x64/openchime.debug
+
+      # Only now does :latest move. `skopeo copy` re-points the tag registry-side
+      # without pulling or rebuilding, preserving the manifest digest exactly --
+      # the property the control plane's promote step relies on. It replaces
+      # `docker buildx imagetools create`, which did the same job with a daemon.
+      # --all copies the whole manifest list, not just the host architecture.
+      - name: Move :latest to the released version
+        run: |
+          set -euo pipefail
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends skopeo
+          skopeo copy --all \
+            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            --src-creds  "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            "docker://ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}" \
+            "docker://ghcr.io/${{ github.repository_owner }}/openchime:latest"
+          echo "latest -> ${VERSION}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Released \`${VERSION}\`"
+            echo
+            echo "| Channel | Where |"
+            echo "|---|---|"
+            echo "| apt | \`${DIST_BASE_URL}/apt stable main\` |"
+            echo "| dnf | \`${DIST_BASE_URL}/rpm\` |"
+            echo "| image | \`ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}\` |"
+            echo "| tarball | attached to \`release-${VERSION}\` |"
+            echo "| windows | installer attached to \`release-${VERSION}\`; \`.msix\` in the \`windows-x64\` artifact |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # WinGet. This is NOT the shape of the apt and dnf publishing above, despite
+  # sitting in the same position in the pipeline: there is no repository to
+  # host, no index to generate, and nothing to GPG-sign. Microsoft hosts the
+  # index and the GitHub release already serves the installer, so the entire
+  # channel is three YAML files submitted as a pull request.
+  #
+  # It runs AFTER publish rather than beside it, because the manifest points at
+  # a release asset URL. Submitting first would hand winget-pkgs' automated
+  # validation a 404.
+  #
+  # On Windows only because wingetcreate is a Windows executable. Nothing else
+  # in this job needs it -- render.sh runs under Git Bash exactly as it does on
+  # a developer's machine.
+  winget:
+    name: submit to winget
+    needs: [version, publish]
+    if: inputs.dry_run == false
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # A classic PAT with public_repo. The default GITHUB_TOKEN cannot be used:
+      # submission forks microsoft/winget-pkgs and opens a PR there, which is
+      # outside this repository's scope entirely.
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: dist/windows-x64
+
+      # Checked before any work: the release is already published at this point,
+      # so a missing token is a real failure to surface, not something to skip
+      # past quietly and leave the package silently a version behind.
+      - name: Check the submission token
+        shell: bash
+        run: |
+          [ -n "$WINGET_TOKEN" ] || {
+            echo "::error::WINGET_TOKEN is not set; release ${VERSION} is published but not submitted to WinGet"
+            exit 1
+          }
+
+      # The URL is derived from the file actually attached to the release rather
+      # than reconstructed from the version, so a change to the installer's
+      # OutputBaseFilename cannot leave the manifest pointing at a name that was
+      # never uploaded.
+      - name: Render the manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer=$(ls dist/windows-x64/*-setup.exe)
+          url="https://github.com/${{ github.repository }}/releases/download/release-${VERSION}/$(basename "$installer")"
+          echo "installer: $installer"
+          echo "url:       $url"
+          packaging/windows/winget/render.sh "$VERSION" "$installer" "$url" dist/winget
+          cat dist/winget/*.installer.yaml
+
+      # Pinned to a versioned asset with a checksum, not https://aka.ms/wingetcreate/
+      # latest. That is a mutable redirect, and whatever it served on the day ran
+      # nine lines later with WINGET_TOKEN in the environment. This repo already
+      # refuses to fetch mbedTLS without a known SHA-256 and explains why; the same
+      # rule applies to an executable handed a submission credential.
+      #
+      # Bump WINGETCREATE_VERSION and WINGETCREATE_SHA256 together. The hash is
+      # Microsoft's own, published beside the asset as wingetcreate.exe.txt, and
+      # confirmed by downloading and hashing the binary independently.
+      - name: Install wingetcreate
+        shell: pwsh
+        env:
+          WINGETCREATE_VERSION: v1.12.13.0
+          WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
+        run: |
+          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          Invoke-WebRequest $url -OutFile wingetcreate.exe
+          $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
+          if ($got -ne $env:WINGETCREATE_SHA256) {
+            Remove-Item wingetcreate.exe -Force
+            throw "wingetcreate.exe checksum mismatch: got $got, expected $env:WINGETCREATE_SHA256"
+          }
+          Write-Output "wingetcreate $env:WINGETCREATE_VERSION verified"
+
+      # Sync the fork before submitting, every time.
+      #
+      # wingetcreate pushes a branch to a fork of microsoft/winget-pkgs under the
+      # token's account, and refuses when GitHub will not fast-forward that fork:
+      # "The forked repository could not be synced with the upstream commits."
+      # Releases 6 and 7 both died here, at the last job, with everything else
+      # already published. Upstream takes hundreds of commits a day and ours is
+      # touched once per release, so the fork is behind by thousands of commits
+      # by the time anyone looks -- 10,650 when release 7 was measured.
+      #
+      # Unconditional, and safe to be: the fork carries NOTHING of ours. Every
+      # submission is a branch that lives only until its PR merges upstream, so
+      # the fork's default branch was 0 ahead as well as 10,650 behind. There is
+      # no state to preserve, which is why this is a sync and not a merge, and
+      # why it needs no judgement about what to keep.
+      #
+      # `|| true`, deliberately: a fork that is already current, or an API blip,
+      # must not fail a release that has already published everything else. If
+      # the sync genuinely did not work, the submit below fails with the message
+      # it always did, which is a better error than anything this step could
+      # invent.
+      - name: Sync the submission fork with upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          set -uo pipefail
+          owner=$(gh api user --jq .login)
+          echo "fork owner: $owner"
+          gh api "repos/microsoft/winget-pkgs/compare/microsoft:master...$owner:master" \
+            --jq '"before: \(.status), ahead \(.ahead_by), behind \(.behind_by)"' || true
+          gh repo sync "$owner/winget-pkgs" --source microsoft/winget-pkgs --branch master || true
+          gh api "repos/microsoft/winget-pkgs/compare/microsoft:master...$owner:master" \
+            --jq '"after:  \(.status), ahead \(.ahead_by), behind \(.behind_by)"' || true
+
+      # Forks winget-pkgs under the token's account, commits the three files to
+      # manifests/o/OpenChime/OpenChime/<version>/, and opens the PR. Merging is
+      # gated on Microsoft's automated validation plus moderation, so the
+      # package goes live some time after this job is green -- minutes to days.
+      - name: Submit the pull request
+        shell: pwsh
+        run: |
+          .\wingetcreate.exe submit --token $env:WINGET_TOKEN dist\winget
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed" }
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### WinGet"
+            echo
+            echo "Submitted \`OpenChime.OpenChime\` version \`${VERSION}\` to microsoft/winget-pkgs."
+            echo "It becomes installable once that PR passes validation and is merged."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Hands the reserved number back when the release did not happen.
+  #
+  # Safe precisely because publish did not succeed: no index, no GitHub release and
+  # no :latest names this number, so nothing downstream can be pointing at it. The
+  # `|| true` is deliberate -- the tag may never have been pushed (a dry run, or a
+  # failure before the reserve step), and failing here would only obscure the real
+  # error that is already red above.
+  #
+  # D-6: openchime has zero webhooks and nothing else consumes its tags, so a tag
+  # appearing and disappearing on a failed run has no external observer.
+  # VERIFICATION IS TERMINAL, and that is the whole point of this job.
+  #
+  # These steps used to sit inside `publish`, between writing the repositories
+  # and finishing the release. Being a postcondition in the middle of an
+  # irreversible sequence made a failure here truncate everything after it: the
+  # GitHub release, the tarballs, :latest and the winget submission were all
+  # skipped, while apt and dnf were already live. That is the worst reachable
+  # state -- packages published with nothing naming them -- and it cost a manual
+  # repair twice (release 2 in ea7201c, release 3).
+  #
+  # Once the apt index is written the release is irreversible, so completing it
+  # is strictly better than stopping half way. A red run saying "released, and
+  # the public URL does not serve it" is true, actionable, and leaves nothing to
+  # repair by hand.
+  smoke:
+    name: smoke the published repository
+    needs: [publish, winget]
+    # always(), so that winget being skipped -- it has conditions of its own --
+    # does not skip the smoke with it. Gated on publish having SUCCEEDED because
+    # there is nothing to smoke if nothing was published.
+    if: ${{ always() && inputs.dry_run == false && needs.publish.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      # The published base, as in `publish` -- which is where this value is
+      # defined and explained. Repeated rather than shared because a job cannot
+      # read another job's env.
+      DIST_BASE_URL: https://openchime.io/dist
+    steps:
+      - name: Smoke the published apt repository
+        # Skipped only when explicitly asked. The default stays a hard failure:
+        # this step existing to fail while DIST_BASE_URL is unserved is a
+        # recorded decision, not an oversight, and auto-detecting the outage
+        # would silently mask a genuinely broken repository later.
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
+            -o /usr/share/keyrings/openchime-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
+          openchimed --version
+
+      # The dnf half, and it is not decoration. The apt check above proved one of
+      # the two channels and the .rpm went out with nothing having attempted to
+      # install it -- the gap OC issue 142 records, left when the rockylinux:9
+      # container step went with the project's Docker usage.
+      #
+      # podman, not docker: this pipeline is daemon-free by standing constraint,
+      # which is why the image is built with buildah rather than a daemon. podman
+      # is that same family and needs no daemon either, so the rule is kept
+      # rather than bent. rockylinux:9 is the floor the glibc 2.34 target exists
+      # to support, so this also exercises the oldest supported RHEL.
+      #
+      # The whole point is to consume the repository the way an operator does:
+      # over HTTPS from DIST_BASE_URL, with the published key and the published
+      # .repo file, on a machine that has never seen this project.
+      - name: Smoke the published dnf repository
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends podman
+          podman run --rm rockylinux:9 bash -euo pipefail -c "
+            curl -fsSL '${DIST_BASE_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
+            rpm --import /tmp/oc.asc
+            curl -fsSL '${DIST_BASE_URL}/openchime.repo' -o /etc/yum.repos.d/openchime.repo
+            dnf install -y openchimed
+            openchimed --version
+          "
+
+      - name: Note the skipped smoke test
+        if: ${{ inputs.skip_repo_smoke }}
+        run: |
+          echo "::warning::published-repository smoke test SKIPPED by request -- "\
+            "nothing has verified that the apt or dnf repositories install"
+          echo '> :warning: The published-repository smoke test was skipped.' >> "$GITHUB_STEP_SUMMARY"
+
+
+  unreserve:
+    name: return the release number
+    needs: [version, publish]
+    # NOT on any publish failure -- only on one that published nothing.
+    #
+    # Learned by running it: the first successful publish failed at the very last
+    # step, `gh release create`, AFTER apt and dnf were written and smoked. This job
+    # then dutifully deleted the tag, leaving release 1 live in the apt index with
+    # no tag naming it -- which is precisely the state reserving the number early
+    # exists to prevent. Returning a number is only safe while nothing has been
+    # published under it.
+    if: ${{ always() && !inputs.dry_run && needs.version.result == 'success' && needs.publish.result != 'success' && needs.publish.outputs.published != 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - env:
+          N: ${{ needs.version.outputs.number }}
+        run: |
+          set -euo pipefail
+          git push origin ":refs/tags/release-${N}" || true
+          echo "::warning::release ${N} did not publish; the number has been returned"

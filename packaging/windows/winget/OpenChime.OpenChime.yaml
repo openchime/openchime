@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+#
+# The version manifest: the entry point that ties the installer and locale
+# manifests together. All three must carry the same PackageVersion or
+# validation rejects the submission.
+PackageIdentifier: OpenChime.OpenChime
+PackageVersion: "@VERSION@"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

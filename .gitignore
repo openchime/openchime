@@ -1,0 +1,23 @@
+openchimed
+build/
+# Release artefacts (.deb/.rpm/.tar.gz and the stripped binary they share),
+# produced by packaging/build-*.sh and by the release workflow. Built, never
+# committed — the published copies live in the repository on R2 (ARCH-20).
+dist/
+# Ignore vendored third_party contents (mbedTLS is fetched by scripts/build_*.sh)
+# — but keep the single-file libraries that have no fetch script and so must live
+# in the repo: jsmn (JSON), termbox2 + utf8proc (the TUI cell grid + Unicode
+# width, ARCH-75). (Ignore the *contents* with /* rather than the directory, so
+# re-inclusion below is possible.)
+/third_party/*
+!/third_party/jsmn/
+!/third_party/termbox2/
+!/third_party/utf8proc/
+!/third_party/lucide/
+*.o
+*.db
+*.db-shm
+*.db-wal
+.env
+.playwright-mcp/
+__pycache__/

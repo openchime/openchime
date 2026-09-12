@@ -1,0 +1,4215 @@
+/*
+ * OpenChime network event loop. See netloop.h, dbwriter.h, tls.h, framebuf.h.
+ */
+
+#include "netloop.h"
+#include "notify.h"
+#include "audio.h"
+#include "auth.h"
+#include "blobstore.h"
+#include "config.h"
+#include "push.h"
+#include "unfurl.h"
+#include "url.h"
+#include "xferpool.h"
+#include "storage.h"
+#include "framebuf.h"
+#include "http.h"
+#include "protocol.h"
+#include "ratelimit.h"
+
+#include <mbedtls/sha256.h>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define OC_NETLOOP_MAX_FD 4096
+/* Cap channels per CHANNEL_LIST frame so it never exceeds the wire limit; a
+ * client with more would page (not needed at current scale). */
+#define OC_CHANNEL_LIST_MAX 512
+#define OC_USER_LIST_MAX    512
+#define OC_WEBHOOK_LIST_MAX 256
+#define OC_REACTION_LIST_MAX 1024
+
+/* Per-connection pending-output cap. A client that stops reading while the
+ * daemon keeps fanning out broadcasts would otherwise grow its output buffer
+ * without bound (a single-client memory-exhaustion DoS). At the cap the
+ * connection is dropped; nothing is lost because delivery is recoverable via
+ * reconnect + backfill. Sized to the ~256MB lean profile (REQ-210/211): even a
+ * few hundred simultaneously-backlogged connections stay bounded, while a normal
+ * client's buffer is near-empty. */
+#define OC_MAX_OUT_BUFFER    (1u << 20)   /* 1 MiB */
+
+/* Per-connection message-send rate limit (REQ-190): a fixed window bounds how
+ * fast one authenticated client can create messages (SEND / SEND_REPLY), which
+ * the broadcast fan-out would otherwise amplify to every channel member. Excess
+ * sends get a non-fatal SEND_RATE_LIMITED and are dropped. Generous for a human
+ * (10/s sustained, 30 burst); a tight send loop trips it immediately. */
+#define OC_SEND_RATE_MAX       30u
+#define OC_SEND_RATE_WINDOW_MS 3000u
+
+typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
+
+/* Attachment transfer state (REQ-140/141, ARCH-69). A connection carries at most
+ * one transfer at a time. Uploads stream client->blob (net-thread writes to the
+ * a worker pool (ARCH-69, daemon/xferpool.c) rather than inline, so a slow S3
+ * endpoint cannot stall the event loop. At most one blob job per transfer is in
+ * flight; while one is, the connection stops being read, so a client cannot
+ * outrun the store and the frame buffer cannot grow unbounded. Downloads stream
+ * blob->client, paced by output-buffer occupancy so a large file never buffers
+ * in full. */
+typedef enum {
+    XFER_NONE = 0,
+    XFER_UP_AWAIT_CREATE,   /* sent ATTACH_CREATE; awaiting the id + storage key */
+    XFER_UP_AWAIT_OPEN,     /* asked the pool to open the blob sink */
+    XFER_UP_ACTIVE,         /* streaming UPLOAD_CHUNKs into the blob */
+    XFER_UP_AWAIT_COMMIT,   /* asked the pool to commit the blob */
+    XFER_UP_AWAIT_FINAL,    /* blob committed; awaiting ATTACH_FINALIZE */
+    XFER_DOWN_AWAIT_LOOKUP, /* sent ATTACH_LOOKUP; awaiting authz + metadata */
+    XFER_DOWN_AWAIT_OPEN,   /* asked the pool to open the blob source */
+    XFER_DOWN_ACTIVE        /* streaming DOWNLOAD_CHUNKs from the blob */
+} xfer_state;
+
+typedef struct {
+    xfer_state       state;
+    uint64_t         attachment_id;
+    uint64_t         declared_size;   /* upload: bytes promised by UPLOAD_BEGIN */
+    uint64_t         received;        /* upload: bytes streamed so far */
+    uint32_t         next_seq;        /* next expected (upload) / next sent (download) */
+    oc_blob_writer  *bw;              /* upload sink */
+    mbedtls_sha256_context sha;       /* upload: running digest */
+    int              sha_init;        /* sha context needs freeing */
+    uint8_t          digest[32];      /* upload: final digest, echoed in UPLOAD_OK */
+    oc_blob_reader  *br;              /* download source */
+    uint64_t         remaining;       /* download: bytes still to send */
+    /* A blob job is with a worker. While set, the handle above belongs to that
+     * job and must NOT be released here (xferpool.h), and the connection stops
+     * being read so the client cannot outrun the store (ARCH-69). */
+    int              in_flight;
+    /* DOWNLOAD_INFO fields, stashed from the DB result because it is freed
+     * before the blob finishes opening. */
+    char            *dl_filename;
+    char            *dl_mime;
+    uint8_t          dl_sha[32];
+    int              dl_have_sha;
+} conn_xfer;
+
+typedef struct {
+    int          fd;
+    uint64_t     conn_id;
+    oc_tls_conn  tls;
+    oc_framebuf  fb;
+    conn_state   state;
+    int          did_hello;
+    /* The version this session negotiated, from WELCOME. Every post-handshake
+     * frame must carry it (PROTOCOL.md §2.1): the field describes the layout the
+     * payload is in, so a frame that disagrees cannot be decoded correctly by
+     * definition, whatever it happens to parse as. */
+    uint16_t     version;
+    int          authed;
+    uint64_t     user_id;
+    uint64_t     session_id;   /* REQ-182: which sessions row this conn uses */
+    char         source[46]; /* peer IP string, for per-source rate limiting */
+    uint8_t     *out;       /* growable pending-output buffer (capped, see out_append) */
+    size_t       out_cap, out_len, out_sent;
+    uint32_t     events;    /* current epoll interest */
+    uint64_t     send_win_start; /* fixed-window start for the send rate limit */
+    uint32_t     send_count;     /* sends counted in the current window */
+    uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
+    /* The pause's end instant (REQ-278), seeded from AUTH_OK and refreshed when
+     * the user sets one. Held here rather than read from the database because
+     * this thread has none (ARCH-66/67), and presence — the thing it rides
+     * beside — already lives in exactly this memory. */
+    uint64_t     dnd_until_ms;
+    /* The recurring schedule (REQ-136), cached here for the same reason and
+     * refreshed from the same places. Other people's DND badge is computed from
+     * BOTH halves: without this one, a colleague inside their quiet hours showed
+     * as ordinarily interruptible, which is the case the badge exists for.
+     *
+     * `sc_tz_offset_min` is users.tz_offset_min (ARCH-103) — the same column the
+     * push query reads — so delivery and the badge cannot disagree about what
+     * time it is for someone. */
+    uint8_t         sc_mode;
+    int16_t         sc_tz_offset_min;
+    uint16_t        sc_start_min, sc_end_min;
+    oc_schedule_day sc_days[OC_SCHEDULE_DAYS];
+    uint8_t         sc_n_days;
+    /* The DND bit this user was last ANNOUNCED as. A schedule boundary passes
+     * with no event to hang a fan-out on, so the tick compares against this and
+     * sends only on a change — a quiet box stays quiet. */
+    uint8_t      dnd_announced;
+    conn_xfer    xfer;           /* in-flight attachment transfer, if any */
+    /* HTTP mode (ARCH-32/54): a connection that did not negotiate the oc/1 ALPN
+     * is a webhook/HTTP client, not a binary-protocol peer. `hin` accumulates the
+     * request; `http_pending` marks it as awaiting a webhook-post result. */
+    int          http;
+    uint8_t     *hin;
+    size_t       hlen, hcap;
+    int          http_pending;
+} conn;
+
+/* Scratch for encoding one outgoing frame; net thread only, so a single static
+ * buffer is safe and avoids per-send allocation (bodies can be ~64KB). */
+static uint8_t g_enc[OC_MAX_FRAME_SIZE];
+/* A SECOND such buffer, for the one frame that differs per recipient: a thread
+ * reply carries whether the peer being written to is in the thread (REQ-061), so
+ * the fan-out holds both encodings at once and sends whichever matches. Two
+ * buffers rather than an encode per member, because the field is a boolean. */
+static uint8_t g_enc_participant[OC_MAX_FRAME_SIZE];
+/* Scheduled-send sweep state (REQ-224, ARCH-102). `more` is set by the result
+ * path when a send arrives with no connection behind it — that is one the sweep
+ * fired, and there may be another right behind it. */
+static uint64_t g_last_sched_ms;
+static int      g_sched_more;
+static uint64_t g_next_conn_id = 1;
+
+/* Attachment blob store + the upload size cap (ARCH-70). Set once at the top of
+ * oc_netloop_run; the loop is single-threaded so file-scope state is safe, as
+ * with g_enc/g_next_conn_id. */
+static oc_blobstore *g_blobs;
+static oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
+/* Storage maintenance (ARCH-78): policy, the last free-space sample, and when
+ * the pass last ran. The sample is refreshed by the pass and read by the upload
+ * admission check, so a refusal never costs a statvfs on the hot path. */
+static oc_storage_policy g_spol;
+static oc_storage_stats  g_sstat;
+static uint64_t          g_last_maint_ms;
+static char              g_blob_dir[1024];
+static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+
+/* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
+ * fixed window keyed by the token, so one noisy integration can't flood a
+ * channel. Created in oc_netloop_run. */
+static oc_ratelimit *g_webhook_rl;
+#define OC_WEBHOOK_RATE_MAX     60u
+#define OC_WEBHOOK_RATE_WINDOW  60000u
+
+/* Release any transfer state on a connection and reset it. A still-open upload
+ * writer is aborted (its staged bytes discarded), so an interrupted upload never
+ * publishes a partial blob.
+ *
+ * Two rules make this safe now that blob I/O is asynchronous (ARCH-69):
+ *
+ *   1. If a job is in flight, the handle belongs to that job, not to us. The
+ *      completion path finds the connection gone and releases it there.
+ *      Aborting it here would be a double free — this is the sharp edge of the
+ *      whole change, and it is why `in_flight` exists.
+ *   2. Otherwise we own the handle, but must not release it inline: put_abort
+ *      and get_close can both block on an S3 round trip, which is exactly what
+ *      this work exists to keep off the net thread. So it goes to the pool as a
+ *      fire-and-forget job (conn_id 0), which runs it and frees it with no
+ *      result coming back. */
+static void xfer_reset(conn_xfer *x) {
+    if (!x->in_flight) {
+        if (x->bw) {
+            oc_xfer_job *j = oc_xfer_job_new(OC_XFER_ABORT, 0);
+            if (j) { j->bw = x->bw; oc_xferpool_submit(g_xfers, j); }
+        }
+        if (x->br) {
+            oc_xfer_job *j = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (j) { j->br = x->br; oc_xferpool_submit(g_xfers, j); }
+        }
+    }
+    x->bw = NULL;
+    x->br = NULL;
+    if (x->sha_init) { mbedtls_sha256_free(&x->sha); x->sha_init = 0; }
+    free(x->dl_filename);
+    free(x->dl_mime);
+
+    /* `in_flight` must SURVIVE the reset. It describes the connection, not the
+     * transfer: a job is still out with a worker, and the memset below would
+     * otherwise report the connection as idle. It would then un-pause, accept a
+     * new UPLOAD_BEGIN, and put a second operation in flight — breaking the
+     * one-op-per-transfer rule the whole design rests on, and ending in a
+     * double abort of the same handle. Keeping the flag set holds the
+     * connection paused until the outstanding completion lands, which then
+     * clears it. */
+    int outstanding = x->in_flight;
+    memset(x, 0, sizeof *x);
+    x->in_flight = outstanding;
+}
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    return (fl < 0) ? -1 : fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+/* A wire slice as a heap C string, empty rather than NULL for an absent value.
+ * An empty string is what the profile columns want: the caller cleared the
+ * field, which is a thing they did, and binding NULL would instead leave the
+ * old value in place on an UPDATE that names the column. */
+static char *slice_dup(oc_slice s) {
+    return s.len ? strndup((const char *)s.ptr, s.len) : strdup("");
+}
+
+/* Fixed-window send rate limit (REQ-190). Returns 1 if this send is within
+ * budget for the current window, 0 if the cap is exceeded. */
+static int send_rate_ok(conn *c) {
+    uint64_t now = now_ms();
+    if (now - c->send_win_start >= OC_SEND_RATE_WINDOW_MS) {
+        c->send_win_start = now;
+        c->send_count = 0;
+    }
+    c->send_count++;
+    return c->send_count <= OC_SEND_RATE_MAX;
+}
+
+/* --- Outgoing buffer ---------------------------------------------------- */
+
+static int out_append(conn *c, const uint8_t *buf, size_t len) {
+    if (c->out_sent > 0) {                       /* drop the already-sent prefix */
+        size_t rem = c->out_len - c->out_sent;
+        if (rem) memmove(c->out, c->out + c->out_sent, rem);
+        c->out_len = rem;
+        c->out_sent = 0;
+    }
+    /* Bound the backlog: a stuck/malicious reader can't grow this without limit.
+     * Over the cap, fail — send_bytes/flush_out then drop the connection. */
+    if (c->out_len + len > OC_MAX_OUT_BUFFER) return -1;
+    if (c->out_len + len > c->out_cap) {
+        size_t ncap = c->out_cap ? c->out_cap : 2048;
+        while (ncap < c->out_len + len) ncap *= 2;
+        uint8_t *g = realloc(c->out, ncap);
+        if (!g) return -1;
+        c->out = g;
+        c->out_cap = ncap;
+    }
+    memcpy(c->out + c->out_len, buf, len);
+    c->out_len += len;
+    return 0;
+}
+
+/* Returns 1 if fully flushed, 0 if it would block, -1 on error. */
+static int flush_out(conn *c) {
+    while (c->out_sent < c->out_len) {
+        size_t n = 0;
+        oc_tls_status st = oc_tls_write(&c->tls, c->out + c->out_sent,
+                                        c->out_len - c->out_sent, &n);
+        if (st == OC_TLS_OK)         { c->out_sent += n; continue; }
+        if (st == OC_TLS_WANT_WRITE || st == OC_TLS_WANT_READ) return 0;
+        return -1;
+    }
+    c->out_len = c->out_sent = 0;
+    return 1;
+}
+
+/* --- epoll interest ----------------------------------------------------- */
+
+static void conn_set_events(int ep, conn *c, uint32_t events) {
+    if (events == c->events) return;
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = events;
+    ev.data.fd = c->fd;
+    epoll_ctl(ep, EPOLL_CTL_MOD, c->fd, &ev);
+    c->events = events;
+}
+
+static void update_interest(int ep, conn *c) {
+    uint32_t ev = EPOLLIN;
+    /* Pending output, or an active download with bytes still to stream, both need
+     * writability. epoll here is level-triggered, so keeping EPOLLOUT set while a
+     * download has bytes left drives the pump each time the socket is writable and
+     * naturally stalls when its buffer fills (backpressure, ARCH-69). */
+    if (c->out_len > c->out_sent ||
+        (c->xfer.state == XFER_DOWN_ACTIVE && c->xfer.remaining > 0))
+        ev |= EPOLLOUT;
+    /* Blob job in flight: stop reading this connection so a client streaming
+     * faster than the store can absorb is throttled by TCP itself, and so no
+     * further push can overflow the frame buffer while the drain is paused
+     * (ARCH-69). */
+    if (c->xfer.in_flight) ev &= ~(uint32_t)EPOLLIN;
+    conn_set_events(ep, c, ev);
+}
+
+/* Broadcast that a user has gone offline if the just-closed connection was their
+ * last one (REQ-120). Defined below; declared here for conn_close. */
+static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id);
+/* Drop a closed connection from any audio call it was in (REQ-152). Defined
+ * below; declared here for conn_close. */
+static void call_conn_closed(int ep, conn **conns, uint64_t conn_id);
+/* Append + flush to a connection (closes it on error). Defined below; declared
+ * here for the call roster helpers. */
+static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len);
+
+static void conn_close(int ep, conn **conns, int fd) {
+    conn *c = conns[fd];
+    if (!c) return;
+    uint64_t uid = c->user_id;
+    uint64_t cid = c->conn_id;
+    int was_authed = c->authed;
+    epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+    xfer_reset(&c->xfer);
+    oc_tls_conn_free(&c->tls);
+    oc_framebuf_free(&c->fb);
+    free(c->out);
+    free(c->hin);
+    close(fd);
+    free(c);
+    conns[fd] = NULL;
+    if (was_authed) presence_offline_if_gone(ep, conns, uid);
+    call_conn_closed(ep, conns, cid);   /* leave any call; roster remaining (REQ-152) */
+}
+
+static conn *find_by_id(conn **conns, uint64_t id) {
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && conns[fd]->conn_id == id) return conns[fd];
+    return NULL;
+}
+
+/* Count live connections from a peer IP (for the accept throttle). */
+static int conns_from_ip(conn **conns, const char *src) {
+    if (!src[0]) return 0;
+    int n = 0;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && strcmp(conns[fd]->source, src) == 0) n++;
+    return n;
+}
+
+/* --- Presence (REQ-120, in-memory net-thread state, ARCH-67) ------------ */
+
+/* A user's aggregate presence across their connections: online if any is online,
+ * away if all connected are away, offline if none are connected. */
+static uint8_t presence_of(conn **conns, uint64_t uid) {
+    uint8_t st = OC_PRESENCE_OFFLINE;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (c && c->authed && c->user_id == uid) {
+            if (c->presence == OC_PRESENCE_ONLINE) return OC_PRESENCE_ONLINE;
+            st = OC_PRESENCE_AWAY;
+        }
+    }
+    return st;
+}
+
+/* Best-effort append+flush that never closes the connection — so presence fan-out
+ * can't recurse into conn_close (which itself broadcasts presence). A dead
+ * connection is reaped on its next epoll event. */
+static void presence_send(int ep, conn *c, const uint8_t *buf, size_t len) {
+    if (!c) return;
+    if (out_append(c, buf, len) == 0) { flush_out(c); update_interest(ep, c); }
+}
+
+/* Is this user not to be disturbed right now? BOTH halves of do-not-disturb
+ * answer, because a viewer deciding whether to write cares about the fact and
+ * not which mechanism produced it (REQ-122):
+ *
+ *   the PAUSE (REQ-278) — any of their connections carrying a stamp in the
+ *   future answers yes; a stamp that has passed answers no without anyone
+ *   having to clear it, which is the same rule the database applies on read;
+ *
+ *   the SCHEDULE (REQ-136) — through oc_notify_quiet, the SHARED evaluator the
+ *   push path already decides delivery with. Not re-implemented here: the
+ *   daemon decides whether to notify and the client decides whether to show
+ *   itself as quiet, and a third copy of the rule would disagree with both in
+ *   a way none of the three could see (shared/notify.h).
+ *
+ * The schedule is a per-user fact, so every connection holds the same copy and
+ * the first authenticated one answers for all of them. */
+static int dnd_of(conn **conns, uint64_t uid) {
+    uint64_t now = (uint64_t)time(NULL) * 1000ull;
+    int paused = 0, quiet = 0, seen = 0;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed || c->user_id != uid) continue;
+        if (c->dnd_until_ms > now) paused = 1;
+        if (seen) continue;
+        seen = 1;
+        /* The USER'S clock, never the server's (ARCH-103): a per-weekday window
+         * against a UTC day puts a large part of the world's Friday evening on
+         * Saturday. 1970-01-01 was a Thursday, hence the +4. */
+        long long lmin = (long long)(now / 60000) + c->sc_tz_offset_min;
+        int local_min  = (int)(((lmin % 1440) + 1440) % 1440);
+        int weekday    = (int)(((lmin / 1440) + 4) % 7);
+        if (weekday < 0) weekday += 7;
+        int day_present = 0, day_enabled = 0, day_start = 0, day_end = 0;
+        for (uint8_t i = 0; i < c->sc_n_days; i++)
+            if (c->sc_days[i].weekday == weekday) {
+                day_present = 1;
+                day_enabled = c->sc_days[i].enabled;
+                day_start   = c->sc_days[i].start_min;
+                day_end     = c->sc_days[i].end_min;
+                break;
+            }
+        quiet = oc_notify_quiet(c->sc_mode, c->sc_start_min, c->sc_end_min,
+                                day_present, day_enabled, day_start, day_end,
+                                local_min, weekday);
+    }
+    return (paused || quiet) ? 1 : 0;
+}
+
+/* Cache one user's schedule on every connection they hold. A schedule is a fact
+ * about a person, not about a device: leaving one connection on the old one
+ * would be two answers to "when am I quiet", which is what REQ-136 exists to
+ * prevent. */
+/* Something that can change a DND answer happened. The maintenance tick is
+ * otherwise gated to one pass a minute (see expire_snoozes), which is right for
+ * the clock but far too slow for a person: setting quiet hours on one device
+ * should reach everybody else's roster now, not on the next minute boundary. */
+static int g_dnd_dirty;
+
+static void cache_schedule(conn **conns, uint64_t uid, const oc_dbres *r) {
+    g_dnd_dirty = 1;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed || c->user_id != uid) continue;
+        c->sc_mode          = r->sc_mode;
+        c->sc_tz_offset_min = r->sc_tz_offset_min;
+        c->sc_start_min     = r->sc_start_min;
+        c->sc_end_min       = r->sc_end_min;
+        c->sc_n_days        = r->sc_n_days > OC_SCHEDULE_DAYS ? OC_SCHEDULE_DAYS : r->sc_n_days;
+        for (uint8_t i = 0; i < c->sc_n_days; i++) c->sc_days[i] = r->sc_days[i];
+    }
+}
+
+static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t uid,
+                            uint8_t status, int dnd) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    /* The FACT only, never the instant: a colleague needs to know whether to
+     * write, and when you are back is a movement report (REQ-122/278). */
+    oc_presence_update pu = { uid, status, (uint8_t)(dnd ? 1 : 0) };
+    oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &pu);
+    *outlen = w.len;
+}
+
+/* Tell every other authenticated connection that `uid` is now `status`
+ * (tenant-wide). The subject's own connections are skipped — a client tracks its
+ * own presence locally. */
+static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t status) {
+    uint8_t buf[32]; size_t len = 0;
+    uint8_t dnd = (uint8_t)dnd_of(conns, uid);
+    encode_presence(buf, sizeof buf, &len, uid, status, dnd);
+    /* Record what was said, on every connection this user holds, whatever
+     * prompted the announcement. The maintenance tick fires on a DIFFERENCE, so
+     * this is the one place that can honestly answer "what do other people
+     * currently believe" — updating it at the tick alone would make an ordinary
+     * presence change look like a DND change on the next turn. */
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && conns[fd]->authed && conns[fd]->user_id == uid)
+            conns[fd]->dnd_announced = dnd;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && conns[fd]->authed && conns[fd]->user_id != uid)
+            presence_send(ep, conns[fd], buf, len);
+}
+
+static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
+    if (presence_of(conns, user_id) == OC_PRESENCE_OFFLINE)
+        broadcast_presence(ep, conns, user_id, OC_PRESENCE_OFFLINE);
+}
+
+/* --- Audio calls (REQ-150, ephemeral net-thread state) ------------------ */
+
+/* One call per channel; call_id == channel_id. State is in-memory on the net
+ * thread (like presence, ARCH-67) — calls reset on restart. */
+#define OC_MAX_CALLS 64
+typedef struct { uint64_t user_id, conn_id; uint8_t token[OC_AUDIO_TOKEN_LEN]; } call_part;
+typedef struct { uint64_t channel_id; call_part parts[OC_MAX_CALL_PARTICIPANTS]; int n; } call_t;
+static call_t g_calls[OC_MAX_CALLS];   /* channel_id == 0 marks a free slot */
+
+/* Audio sidecar (ARCH-31): the IPC socket to it and the UDP port it listens on,
+ * set by oc_netloop_set_audio before the loop runs. ipc_fd < 0 => no sidecar
+ * (calls still form, but with no media endpoint). */
+static int      g_audio_ipc = -1;
+static uint16_t g_audio_udp_port;
+
+void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port) {
+    g_audio_ipc = ipc_fd;
+    g_audio_udp_port = udp_port;
+}
+
+/* Outbound push emitter (ARCH-85), NULL = push disabled. Set before the loop. */
+static oc_push *g_push;
+
+void oc_netloop_set_push(struct oc_push *push) {
+    g_push = push;
+}
+
+/* Link-unfurl worker (REQ-222, ARCH-105), NULL = unfurls disabled. */
+static oc_unfurler *g_unfurler;
+
+void oc_netloop_set_unfurler(struct oc_unfurler *u) {
+    g_unfurler = u;
+}
+
+/* Queue the URLs of a just-committed body for fetching — the first
+ * OC_UNFURL_MAX_URLS of them, extracted by the shared scanner so the daemon
+ * fetches exactly the addresses a client links. Fire-and-forget. */
+static void unfurl_enqueue(const uint8_t *body, size_t len,
+                           uint64_t channel_id, uint64_t message_id) {
+    if (!g_unfurler || !body || !len) return;
+    oc_url_span sp[OC_UNFURL_MAX_URLS];
+    size_t n = oc_url_extract((const char *)body, len, sp, OC_UNFURL_MAX_URLS);
+    for (size_t i = 0; i < n; i++)
+        oc_unfurler_fetch(g_unfurler, channel_id, message_id,
+                          (const char *)body + sp[i].start, sp[i].len);
+}
+
+/* Send one length-prefixed IPC message (type + payload) to the sidecar. */
+static void audio_ipc_send(uint8_t type, const uint8_t *payload, size_t plen) {
+    if (g_audio_ipc < 0) return;
+    uint8_t buf[64];
+    if (5 + plen > sizeof buf) return;
+    uint32_t mlen = (uint32_t)(1 + plen);
+    buf[0] = (uint8_t)(mlen >> 24); buf[1] = (uint8_t)(mlen >> 16);
+    buf[2] = (uint8_t)(mlen >> 8);  buf[3] = (uint8_t)mlen;
+    buf[4] = type;
+    memcpy(buf + 5, payload, plen);
+    ssize_t n = write(g_audio_ipc, buf, 5 + plen); (void)n;   /* best-effort */
+}
+
+static void audio_authorize(uint64_t call_id, uint64_t user_id, const uint8_t *token) {
+    uint8_t p[16 + OC_AUDIO_TOKEN_LEN];
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(call_id >> (56 - 8 * i));
+    for (int i = 0; i < 8; i++) p[8 + i] = (uint8_t)(user_id >> (56 - 8 * i));
+    memcpy(p + 16, token, OC_AUDIO_TOKEN_LEN);
+    audio_ipc_send(OC_AUDIO_IPC_AUTHORIZE, p, sizeof p);
+}
+
+static void audio_revoke(const uint8_t *token) {
+    audio_ipc_send(OC_AUDIO_IPC_REVOKE, token, OC_AUDIO_TOKEN_LEN);
+}
+
+static call_t *call_find(uint64_t channel_id) {
+    if (!channel_id) return NULL;
+    for (int i = 0; i < OC_MAX_CALLS; i++)
+        if (g_calls[i].channel_id == channel_id) return &g_calls[i];
+    return NULL;
+}
+
+static call_t *call_get_or_create(uint64_t channel_id) {
+    call_t *c = call_find(channel_id);
+    if (c) return c;
+    for (int i = 0; i < OC_MAX_CALLS; i++)
+        if (g_calls[i].channel_id == 0) { g_calls[i].channel_id = channel_id; g_calls[i].n = 0; return &g_calls[i]; }
+    return NULL;   /* all call slots busy */
+}
+
+/* Add a user (or refresh their connection) in a call with their media token.
+ * 1 ok, 0 if full. */
+static int call_add(call_t *c, uint64_t user_id, uint64_t conn_id, const uint8_t *token) {
+    for (int i = 0; i < c->n; i++)
+        if (c->parts[i].user_id == user_id) {
+            c->parts[i].conn_id = conn_id;
+            memcpy(c->parts[i].token, token, OC_AUDIO_TOKEN_LEN);
+            return 1;
+        }
+    if (c->n >= (int)OC_MAX_CALL_PARTICIPANTS) return 0;
+    c->parts[c->n].user_id = user_id; c->parts[c->n].conn_id = conn_id;
+    memcpy(c->parts[c->n].token, token, OC_AUDIO_TOKEN_LEN);
+    c->n++;
+    return 1;
+}
+
+/* Remove the participant on `conn_id` from whatever call it is in; returns that
+ * call's channel_id (for a roster push) or 0, and copies the removed token to
+ * `out_token` (for a sidecar revoke). Frees the call if it empties. */
+static uint64_t call_remove_conn(uint64_t conn_id, uint8_t *out_token) {
+    for (int i = 0; i < OC_MAX_CALLS; i++) {
+        call_t *c = &g_calls[i];
+        if (!c->channel_id) continue;
+        for (int j = 0; j < c->n; j++)
+            if (c->parts[j].conn_id == conn_id) {
+                uint64_t ch = c->channel_id;
+                if (out_token) memcpy(out_token, c->parts[j].token, OC_AUDIO_TOKEN_LEN);
+                c->parts[j] = c->parts[--c->n];
+                if (c->n == 0) c->channel_id = 0;
+                return ch;
+            }
+    }
+    return 0;
+}
+
+/* Send a CALL_ROSTER for `c` to every participant except `except_conn` (0 = all).
+ * Snapshots the recipient set first so a send that drops a connection (and thus
+ * mutates the call) can't corrupt the iteration. */
+static void call_send_roster(int ep, conn **conns, call_t *c, uint64_t except_conn) {
+    uint64_t parts[OC_MAX_CALL_PARTICIPANTS], cids[OC_MAX_CALL_PARTICIPANTS];
+    int n = c->n;
+    for (int i = 0; i < n; i++) { parts[i] = c->parts[i].user_id; cids[i] = c->parts[i].conn_id; }
+    oc_call_roster ro = { c->channel_id, c->channel_id, (uint16_t)n, parts };
+    oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+    oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &ro);
+    size_t len = w.len;
+    for (int i = 0; i < n; i++) {
+        if (cids[i] == except_conn) continue;
+        conn *pc = find_by_id(conns, cids[i]);
+        if (pc) send_bytes(ep, conns, pc->fd, g_enc, len);
+    }
+}
+
+static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
+    uint8_t token[OC_AUDIO_TOKEN_LEN];
+    uint64_t ch = call_remove_conn(conn_id, token);
+    if (ch) {
+        audio_revoke(token);
+        call_t *c = call_find(ch);
+        if (c) call_send_roster(ep, conns, c, 0);
+    }
+}
+
+static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
+    for (size_t i = 0; i < n; i++) if (m[i] == uid) return 1;
+    return 0;
+}
+
+/* in_members, but reporting WHERE — a thread reply carries a per-recipient byte
+ * (ARCH-104) held in an array parallel to the audience, so the fan-out needs the
+ * index and not merely the membership. */
+static int member_index(uint64_t uid, const uint64_t *m, size_t n, size_t *out) {
+    for (size_t i = 0; i < n; i++) if (m[i] == uid) { *out = i; return 1; }
+    return 0;
+}
+
+/* Fill an on-wire attachment-entry array from the DB's attachment metadata
+ * (REQ-140). Returns the count written (capped at OC_MAX_ATTACH). Shared by the
+ * BROADCAST and THREAD_REPLY encoders so every recipient — live or via backfill/
+ * thread listing — sees the attachments inline. */
+static uint16_t fill_attach_entries(oc_attach_entry *out, const oc_attach_meta *att, size_t n) {
+    if (n > OC_MAX_ATTACH) n = OC_MAX_ATTACH;
+    for (size_t i = 0; i < n; i++) {
+        out[i].id = att[i].id;
+        out[i].filename = oc_slice_str(att[i].filename ? att[i].filename : "");
+        out[i].mime = oc_slice_str(att[i].mime ? att[i].mime : "");
+        out[i].size = att[i].size;
+        out[i].reclaimed = att[i].reclaimed;
+    }
+    return (uint16_t)n;
+}
+
+static void broadcast_set_attach(oc_broadcast *b, const oc_attach_meta *att, size_t n) {
+    b->n_attach = fill_attach_entries(b->attach, att, n);
+}
+
+/* Append encoded bytes to a connection and try to flush; close it on error. */
+static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len) {
+    conn *c = conns[fd];
+    if (!c) return;
+    if (out_append(c, buf, len) != 0 || flush_out(c) < 0) {
+        conn_close(ep, conns, fd);
+        return;
+    }
+    update_interest(ep, c);
+}
+
+/* --- Handshake response ------------------------------------------------- */
+
+/* Build WELCOME/REJECT for a HELLO into the connection's out buffer.
+ * Returns 0 to keep the connection, -1 to close it (fatal REJECT/malformed). */
+static int handle_hello(conn *c, oc_rbuf *payload, oc_dbwriter *dbw) {
+    oc_hello h;
+    oc_wbuf w;
+    uint8_t tmp[128];
+    if (oc_decode_hello(payload, &h) != OC_OK) {
+        oc_wbuf_init(&w, tmp, sizeof tmp);
+        oc_reject rej = { OC_ERR_MALFORMED_FRAME, oc_slice_str("bad HELLO") };
+        oc_encode_reject(&w, &rej);
+        out_append(c, tmp, w.len);
+        return -1;
+    }
+    uint16_t chosen = 0, code = 0;
+    if (oc_negotiate_version(h.min_version, h.max_version,
+                             OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION,
+                             &chosen, &code) != OC_OK) {
+        oc_wbuf_init(&w, tmp, sizeof tmp);
+        oc_reject rej = { code, oc_slice_str("unsupported protocol version") };
+        oc_encode_reject(&w, &rej);
+        out_append(c, tmp, w.len);
+        return -1;
+    }
+    oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_welcome wel = { chosen, now_ms() };
+    oc_encode_welcome(&w, &wel);
+    out_append(c, tmp, w.len);
+    c->version = chosen;   /* what every later frame on this connection must carry */
+
+    /* Immediately advertise the auth methods this deployment accepts (AUTH.md
+     * §5) — local+session, or oidc+session in OIDC mode — plus the OIDC params
+     * blob (empty in local mode). Sized for an authorize URL in oidc_params. */
+    {
+        uint8_t cbuf[1024]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        oc_auth_challenge ch = { oc_dbwriter_auth_methods(dbw),
+                                 oc_slice_str(oc_dbwriter_oidc_params(dbw)) };
+        oc_encode_auth_challenge(&cw, OC_PROTOCOL_VERSION, &ch);
+        out_append(c, cbuf, cw.len);
+    }
+    return 0;
+}
+
+/* --- Frame dispatch ----------------------------------------------------- */
+
+/* Queue a non-fatal SEND_RATE_LIMITED error echoing the offending idempotency
+ * token (so the client can correlate the dropped send). Returns out_append's
+ * result: 0 keep the connection, -1 (buffer full) -> caller closes. */
+static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_slice ctx = { idem, OC_IDEM_LEN };
+    oc_error e = { OC_ERR_SEND_RATE_LIMITED, 0, ctx, oc_slice_str("send rate exceeded") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
+/* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
+
+/* Soft pending-output target while streaming a download: the pump tops the
+ * output buffer up to here and lets the rest follow on the next writable
+ * wakeup, so a 100 MiB download never buffers in full. Well under the 1 MiB
+ * hard output cap. Also the upload receive window advertised to the client. */
+#define OC_DOWNLOAD_SOFT_CAP  (256u * 1024u)
+#define OC_UPLOAD_WINDOW      (OC_ATTACH_CHUNK_SIZE * 8u)
+
+/* Non-fatal transfer error carrying the attachment id in `context` (8 bytes,
+ * big-endian) so the client can correlate, then reset the transfer. Returns
+ * out_append's result (0 keep, -1 buffer full -> caller closes). */
+static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
+    uint8_t ctxb[8];
+    for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(aid >> (56 - 8 * i));
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_slice ctx = { ctxb, 8 };
+    oc_error e = { code, 0, ctx, oc_slice_str("transfer error") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    int rc = out_append(c, tmp, w.len);
+    xfer_reset(&c->xfer);
+    return rc;
+}
+
+/* Ask the pool for the next slice of the blob, if the output buffer has room.
+ * The read completes asynchronously; xfer_read_done appends the chunk and calls
+ * back in here, so the loop is driven by completions rather than by a blocking
+ * read on the net thread (ARCH-69). Backpressure is unchanged in spirit: while
+ * the output buffer is above the soft cap we simply don't ask for more, and the
+ * EPOLLOUT drain calls us again once it empties. */
+static void download_pump(conn *c) {
+    conn_xfer *x = &c->xfer;
+    if (x->state != XFER_DOWN_ACTIVE || x->in_flight) return;
+    if (x->remaining == 0) {
+        oc_download_end de = { x->attachment_id };
+        oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
+        out_append(c, g_enc, w.len);
+        /* Closing can block on S3, so hand it to the pool and forget it. */
+        if (x->br) {
+            oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (cl) { cl->br = x->br; oc_xferpool_submit(g_xfers, cl); }
+            x->br = NULL;
+        }
+        x->state = XFER_NONE;
+        return;
+    }
+    if ((c->out_len - c->out_sent) >= OC_DOWNLOAD_SOFT_CAP) return;  /* resume on drain */
+    size_t want = x->remaining < OC_ATTACH_CHUNK_SIZE ? (size_t)x->remaining : OC_ATTACH_CHUNK_SIZE;
+    oc_xfer_job *j = oc_xfer_job_new(OC_XFER_READ, c->conn_id);
+    if (!j) return;
+    j->br = x->br;
+    j->attachment_id = x->attachment_id;
+    j->len = want;
+    j->data = malloc(want);
+    if (!j->data) { oc_xfer_job_free(j); return; }
+    x->in_flight = 1;
+    oc_xferpool_submit(g_xfers, j);
+}
+
+/* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
+ * AUTH/SEND become jobs for the DB writer; their replies arrive asynchronously
+ * via deliver_result. */
+/* Defined below with the HTTP webhook path; declared here for the redeem path. */
+static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap);
+
+static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
+    const uint8_t *frame; size_t flen;
+    for (;;) {
+        /* A blob job is with a worker: leave the remaining frames buffered and
+         * stop reading (update_interest drops EPOLLIN). The completion handler
+         * calls back in here. */
+        if (c->xfer.in_flight) return 0;
+        int r = oc_framebuf_next(&c->fb, &frame, &flen);
+        if (r == 0) return 0;
+        if (r < 0)  return -1;
+
+        oc_header hdr; oc_rbuf p;
+        if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
+
+        if (!c->did_hello) {
+            if (hdr.msg_type != OC_MSG_HELLO) {
+                /* The specification reserves a reason for this and the daemon
+                 * used to close the socket with nothing written, which tells a
+                 * third-party implementer only that something went wrong. It is
+                 * a REJECT rather than an ERROR because no version has been
+                 * negotiated yet: REJECT is frozen at version 1 (§3), so it is
+                 * the only frame we can be sure this peer can read. */
+                uint8_t rbuf[128]; oc_wbuf rw; oc_wbuf_init(&rw, rbuf, sizeof rbuf);
+                oc_reject rej = { OC_ERR_UNEXPECTED_MSG_TYPE,
+                                  oc_slice_str("first frame must be HELLO") };
+                oc_encode_reject(&rw, &rej);
+                out_append(c, rbuf, rw.len);
+                return -1;
+            }
+            c->did_hello = 1;
+            if (handle_hello(c, &p, dbw) < 0) return -1;
+            continue;
+        }
+
+        /* Every frame after the handshake must carry the negotiated version.
+         * Until this check existed the field was decorative — two bytes on every
+         * frame that nothing read — so a peer that disagreed about a layout
+         * misparsed the payload instead of being told, which surfaces as a
+         * decode failure somewhere downstream and reads as "connection lost".
+         * Fatal, and answered before dispatch: a frame whose layout we do not
+         * share is not one to act on. */
+        if (hdr.version != c->version) {
+            uint8_t ebuf[128]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+            oc_error err = { OC_ERR_VERSION_MISMATCH, 1, oc_slice_str("frame"),
+                             oc_slice_str("frame version is not the negotiated one") };
+            oc_encode_error(&ew, c->version, &err);
+            out_append(c, ebuf, ew.len);
+            return -1;
+        }
+
+        if (!c->authed) {
+            if (hdr.msg_type == OC_MSG_AUTH) {
+                oc_auth a;
+                if (oc_decode_auth(&p, &a) != OC_OK) return -1;
+                oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
+                if (!j) return -1;
+                j->method = a.method;
+                memcpy(j->source, c->source, sizeof j->source);
+                if (oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
+                oc_dbwriter_submit(dbw, j);
+                continue;
+            }
+            if (hdr.msg_type == OC_MSG_REDEEM_INVITE) {
+                /* Pre-auth account creation: redeem an invite, which both creates
+                 * the account and authenticates (reply is AUTH_OK). */
+                oc_redeem_invite ri;
+                if (oc_decode_redeem_invite(&p, &ri) != OC_OK) return -1;
+                oc_job *j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
+                if (!j) return -1;
+                char *u = strndup((const char *)ri.username.ptr, ri.username.len);
+                char *pw = strndup((const char *)ri.password.ptr, ri.password.len);
+                /* The client holds the hex form (see hex_encode above); accept
+                 * the raw bytes too, so a token captured before this change, or
+                 * pasted from the daemon's own bootstrap log, still redeems. */
+                uint8_t raw[OC_INVITE_TOKEN_LEN];
+                const uint8_t *tokp = ri.token.ptr;
+                size_t toklen = ri.token.len;
+                if (hex_decode((const char *)ri.token.ptr, ri.token.len,
+                               raw, sizeof raw) == (int)sizeof raw) {
+                    tokp = raw; toklen = sizeof raw;
+                }
+                int ok = u && pw &&
+                         oc_job_set_register(j, u, pw, 0, 0) == 0 &&
+                         oc_job_set_token(j, tokp, toklen) == 0;
+                free(u); free(pw);
+                if (!ok) return -1;
+                oc_dbwriter_submit(dbw, j);
+                continue;
+            }
+            /* A messaging frame before AUTH is a fatal protocol error. */
+            oc_wbuf w; uint8_t tmp[64];
+            oc_wbuf_init(&w, tmp, sizeof tmp);
+            oc_error e = { OC_ERR_AUTH_REQUIRED, 1, { NULL, 0 }, oc_slice_str("auth required") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            out_append(c, tmp, w.len);
+            return -1;
+        }
+
+        if (hdr.msg_type == OC_MSG_SEND) {
+            oc_send s = {0};
+            if (oc_decode_send(&p, &s) != OC_OK) return -1;
+            if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
+            oc_job *j = oc_job_new(OC_JOB_SEND, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = s.channel_id;
+            memcpy(j->idem, s.idem, OC_IDEM_LEN);
+            if (oc_job_set_body(j, s.body.ptr, s.body.len) != 0) return -1;
+            /* Attachments to link to this message (REQ-140). */
+            uint16_t na = s.n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : s.n_attach;
+            for (uint16_t i = 0; i < na; i++) j->attach_ids[i] = s.attach_ids[i];
+            j->n_attach = na;
+            /* The forward source (REQ-057). Passed through unchecked on
+             * purpose: the writer holds the row and does both the read-access
+             * gate and the resolution, so nothing here can be talked into
+             * quoting a channel the sender cannot read. */
+            j->src_channel = s.src_channel;
+            j->src_message = s.src_message;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_EDIT) {
+            oc_edit e;
+            if (oc_decode_edit(&p, &e) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_EDIT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = e.channel_id;
+            j->message_id = e.message_id;
+            if (oc_job_set_body(j, e.body.ptr, e.body.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE) {
+            oc_delete d;
+            if (oc_decode_delete(&p, &d) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = d.channel_id;
+            j->message_id = d.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CREATE_CHANNEL) {
+            oc_create_channel cc;
+            if (oc_decode_create_channel(&p, &cc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CREATE_CHANNEL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ch_is_public = cc.is_public;
+            j->ch_name = malloc(cc.name.len + 1);
+            if (!j->ch_name) return -1;
+            if (cc.name.len) memcpy(j->ch_name, cc.name.ptr, cc.name.len);
+            j->ch_name[cc.name.len] = '\0';
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_CHANNELS) {
+            if (oc_decode_list_channels(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_CHANNELS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_JOIN_CHANNEL || hdr.msg_type == OC_MSG_LEAVE_CHANNEL) {
+            oc_channel_ref cr;
+            if (oc_decode_join_channel(&p, &cr) != OC_OK) return -1;
+            int jt = (hdr.msg_type == OC_MSG_JOIN_CHANNEL) ? OC_JOB_JOIN_CHANNEL : OC_JOB_LEAVE_CHANNEL;
+            oc_job *j = oc_job_new(jt, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = cr.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_INVITE_TO_CHANNEL || hdr.msg_type == OC_MSG_REMOVE_FROM_CHANNEL) {
+            oc_channel_member_op op;
+            if (oc_decode_invite_to_channel(&p, &op) != OC_OK) return -1;
+            int jt = (hdr.msg_type == OC_MSG_INVITE_TO_CHANNEL) ? OC_JOB_INVITE_CHANNEL : OC_JOB_REMOVE_CHANNEL;
+            oc_job *j = oc_job_new(jt, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = op.channel_id;
+            j->target_user_id = op.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_OPEN_DM) {
+            oc_open_dm od;
+            if (oc_decode_open_dm(&p, &od) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_OPEN_DM, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = od.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_USERS) {
+            if (oc_decode_list_users(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_USERS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_ROLE) {
+            oc_set_role sr;
+            if (oc_decode_set_role(&p, &sr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_ROLE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = sr.user_id;
+            j->role = sr.role;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_INVITE_USER) {
+            oc_invite_user iu;
+            if (oc_decode_invite_user(&p, &iu) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_INVITE_USER, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->role = iu.role;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REMOVE_USER) {
+            oc_remove_user ru;
+            if (oc_decode_remove_user(&p, &ru) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REMOVE_USER, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = ru.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REACT) {
+            oc_react rc;
+            if (oc_decode_react(&p, &rc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REACT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = rc.channel_id;
+            j->message_id = rc.message_id;
+            j->react_op = rc.op;
+            j->emoji = malloc(rc.emoji.len + 1);
+            if (!j->emoji) return -1;
+            if (rc.emoji.len) memcpy(j->emoji, rc.emoji.ptr, rc.emoji.len);
+            j->emoji[rc.emoji.len] = '\0';
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_REACTIONS) {
+            oc_list_reactions lr;
+            if (oc_decode_list_reactions(&p, &lr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_REACTIONS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lr.channel_id;
+            j->message_id = lr.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_PIN) {
+            oc_pin pn;
+            if (oc_decode_pin(&p, &pn) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_PIN, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = pn.channel_id;
+            j->message_id = pn.message_id;
+            j->pin_op = pn.op;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_PINS) {
+            oc_list_pins lp;
+            if (oc_decode_list_pins(&p, &lp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_PINS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lp.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPDATE_CHANNEL) {
+            oc_update_channel uc;
+            if (oc_decode_update_channel(&p, &uc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_UPDATE_CHANNEL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = uc.channel_id;
+            j->chup_op = uc.op;
+            j->ch_name = malloc(uc.value.len + 1);
+            if (!j->ch_name) return -1;
+            if (uc.value.len) memcpy(j->ch_name, uc.value.ptr, uc.value.len);
+            j->ch_name[uc.value.len] = '\0';
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SAVE_ITEM) {
+            oc_save_item si;
+            if (oc_decode_save_item(&p, &si) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = si.message_id; j->save_op = si.op;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_SAVED) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_SAVED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_ACTIVITY) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_ACTIVITY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            { uint8_t f = OC_ACTF_INVOLVED; oc_decode_list_activity(&p, &f); j->act_filter = f; }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_MEMBERS) {
+            oc_list_members lm;
+            if (oc_decode_list_members(&p, &lm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_MEMBERS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lm.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_FILES) {
+            oc_list_files lf;
+            if (oc_decode_list_files(&p, &lf) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_FILES, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lf.channel_id;   /* 0 = every channel I can read */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SEND_REPLY) {
+            oc_send_reply sr = {0};
+            if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
+            if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
+            oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = sr.channel_id;
+            j->parent_id = sr.parent_id;
+            memcpy(j->idem, sr.idem, OC_IDEM_LEN);
+            if (oc_job_set_body(j, sr.body.ptr, sr.body.len) != 0) return -1;
+            uint16_t na = sr.n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : sr.n_attach;
+            for (uint16_t i = 0; i < na; i++) j->attach_ids[i] = sr.attach_ids[i];
+            j->n_attach = na;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_THREAD) {
+            oc_list_thread lt;
+            if (oc_decode_list_thread(&p, &lt) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_THREAD, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lt.channel_id;
+            j->parent_id = lt.parent_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SEARCH) {
+            oc_search sq;
+            if (oc_decode_search(&p, &sq) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SEARCH, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->search_limit = sq.limit;
+            if (oc_job_set_body(j, sq.query.ptr, sq.query.len) != 0) return -1;
+            /* 39: the cursor and the filters. */
+            j->message_id = sq.before_id;
+            j->sq_from   = sq.from_name.len  ? strndup((const char *)sq.from_name.ptr, sq.from_name.len)   : NULL;
+            j->sq_in     = sq.in_channel.len ? strndup((const char *)sq.in_channel.ptr, sq.in_channel.len) : NULL;
+            j->sq_has    = sq.has_mask;
+            j->sq_after  = sq.after_ms;
+            j->sq_before = sq.before_ms;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_PRESENCE) {
+            oc_set_presence sp;
+            if (oc_decode_set_presence(&p, &sp) != OC_OK) return -1;
+            /* Only online/away are settable while connected (REQ-120). */
+            c->presence = (sp.status == OC_PRESENCE_AWAY) ? OC_PRESENCE_AWAY : OC_PRESENCE_ONLINE;
+            broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_TYPING) {
+            oc_typing t;
+            if (oc_decode_typing(&p, &t) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_TYPING, c->conn_id);   /* read job -> members */
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = t.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
+            oc_client_ack ca;
+            if (oc_decode_client_ack(&p, &ca) != OC_OK) return -1;
+            /* Record the delivery cursor (REQ-090); no reply. */
+            oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = ca.channel_id;
+            j->message_id = ca.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LOGOUT) {
+            oc_logout lo;
+            if (oc_decode_logout(&p, &lo) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LOGOUT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->scope = lo.scope;
+            if (oc_job_set_token(j, lo.session_token.ptr, lo.session_token.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_HISTORY_AROUND) {
+            oc_history_around ha;
+            if (oc_decode_history_around(&p, &ha) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_HISTORY, c->conn_id);
+            if (!j) return -1;
+            j->user_id      = c->user_id;
+            j->channel_id   = ha.channel_id;
+            j->message_id   = ha.message_id;
+            j->search_limit = ha.limit;
+            j->hist_around  = 1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_HISTORY_REQUEST) {
+            oc_history_request hr;
+            if (oc_decode_history_request(&p, &hr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_HISTORY, c->conn_id);
+            if (!j) return -1;
+            j->user_id      = c->user_id;
+            j->channel_id   = hr.channel_id;
+            j->message_id   = hr.before_message_id;
+            j->search_limit = hr.limit;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_BACKFILL_REQUEST) {
+            oc_cursor cursors[256];
+            uint16_t count = 0;
+            if (oc_decode_backfill_request(&p, cursors, 256, &count) != OC_OK) return -1;
+            if (count > 256) count = 256; /* wire count may exceed our capacity */
+            oc_job *j = oc_job_new(OC_JOB_BACKFILL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            if (count > 0) {
+                j->cursors = malloc((size_t)count * sizeof *j->cursors);
+                if (j->cursors) {
+                    for (uint16_t i = 0; i < count; i++) {
+                        j->cursors[i].channel_id = cursors[i].channel_id;
+                        j->cursors[i].after_message_id = cursors[i].after_message_id;
+                    }
+                    j->n_cursors = count;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CREATE_WEBHOOK) {
+            oc_create_webhook cw;
+            if (oc_decode_create_webhook(&p, &cw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CREATE_WEBHOOK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = cw.channel_id;
+            j->ch_name = cw.label.len ? strndup((const char *)cw.label.ptr, cw.label.len) : strdup("");
+            if (!j->ch_name) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        /* Invite management (REQ-026) + webhook lifecycle. */
+        if (hdr.msg_type == OC_MSG_LIST_INVITES) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_INVITES, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REVOKE_INVITE) {
+            oc_revoke_invite ri;
+            if (oc_decode_revoke_invite(&p, &ri) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REVOKE_INVITE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = ri.invite_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_EMOJI) {
+            if (oc_decode_list_emoji(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_ADD_EMOJI) {
+            oc_add_emoji ae;
+            if (oc_decode_add_emoji(&p, &ae) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_ADD_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = ae.attachment_id;
+            j->ch_name = ae.name.len ? strndup((const char *)ae.name.ptr, ae.name.len) : strdup("");
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE_EMOJI) {
+            oc_delete_emoji de;
+            if (oc_decode_delete_emoji(&p, &de) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ch_name = de.name.len ? strndup((const char *)de.name.ptr, de.name.len) : strdup("");
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_OPEN_GROUP_DM) {
+            oc_open_group_dm gd;
+            if (oc_decode_open_group_dm(&p, &gd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->n_group_uids = gd.count;
+            for (uint16_t i = 0; i < gd.count && i < OC_MAX_GROUP_DM; i++)
+                j->group_uids[i] = gd.user_ids[i];
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_AVATAR) {
+            oc_set_avatar sa;
+            if (oc_decode_set_avatar(&p, &sa) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_AVATAR, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = sa.attachment_id;      /* 0 clears */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_NOTIFY_DEFAULT) {
+            oc_set_notify_default nd;
+            if (oc_decode_set_notify_default(&p, &nd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_NOTIFY_DEFAULT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->notify_level = nd.level;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_SESSIONS) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_SESSIONS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = c->session_id;      /* so the list can mark "this device" */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_FILE_CHANNELS) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_FILE_CHANNELS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_STATUS) {
+            oc_set_status ss;
+            if (oc_decode_set_status(&p, &ss) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_STATUS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            /* body = emoji, ch_name = text, message_id = expiry: the job struct's
+             * generic slots, named at the point of use rather than grown per feature. */
+            oc_job_set_body(j, ss.emoji.ptr, ss.emoji.len);
+            j->ch_name = ss.text.len ? strndup((const char *)ss.text.ptr, ss.text.len)
+                                     : strdup("");
+            j->message_id = ss.expires_at;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_PROFILE) {
+            oc_set_profile sp;
+            if (oc_decode_set_profile(&p, &sp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_PROFILE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->pf_full_name = slice_dup(sp.full_name);
+            j->pf_title     = slice_dup(sp.title);
+            j->pf_pronouns  = slice_dup(sp.pronouns);
+            j->pf_phone     = slice_dup(sp.phone);
+            j->pf_timezone  = slice_dup(sp.timezone);
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_MUTE) {
+            oc_set_mute sm;
+            if (oc_decode_set_mute(&p, &sm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_MUTE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sm.channel_id;
+            j->hook_disabled = sm.muted;      /* the flag field, reused */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_READ_CURSOR) {
+            oc_set_read_cursor sc;
+            if (oc_decode_set_read_cursor(&p, &sc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sc.channel_id;
+            j->message_id = sc.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_WEBHOOK_STATE) {
+            oc_set_webhook_state sw;
+            if (oc_decode_set_webhook_state(&p, &sw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_WEBHOOK_STATE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = sw.webhook_id;
+            j->hook_disabled = sw.disabled;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_ROTATE_WEBHOOK) {
+            oc_rotate_webhook rw;
+            if (oc_decode_rotate_webhook(&p, &rw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_ROTATE_WEBHOOK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = rw.webhook_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_WEBHOOKS) {
+            oc_list_webhooks lw;
+            if (oc_decode_list_webhooks(&p, &lw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_WEBHOOKS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = lw.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE_WEBHOOK) {
+            oc_delete_webhook dw;
+            if (oc_decode_delete_webhook(&p, &dw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE_WEBHOOK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = dw.webhook_id;   /* id carried in message_id */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_NOTIFY_PREF) {
+            oc_set_notify_pref sp;
+            if (oc_decode_set_notify_pref(&p, &sp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sp.channel_id; j->notify_level = sp.level;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_SCHEDULE) {
+            oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+            if (oc_decode_schedule(&p, &sc, days) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_SCHEDULE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->sched_mode = sc.mode;
+            j->sched_tz_offset_min = sc.tz_offset_min;
+            j->sched_start_min = sc.start_min;
+            j->sched_end_min = sc.end_min;
+            if (sc.count) {
+                j->sched_days = calloc(sc.count, sizeof *j->sched_days);
+                if (j->sched_days) {
+                    memcpy(j->sched_days, days, sc.count * sizeof *j->sched_days);
+                    j->n_sched_days = sc.count;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_THREADS) {
+            oc_list_threads lt;
+            if (oc_decode_list_threads(&p, &lt) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_THREADS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->thread_filter = lt.filter;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_THREAD_FOLLOW) {
+            oc_set_thread_follow tf;
+            if (oc_decode_set_thread_follow(&p, &tf) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_THREAD_FOLLOW, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->parent_id = tf.root_id;
+            j->channel_id = tf.channel_id; j->follow_on = tf.on;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_MARK_THREAD_READ) {
+            oc_mark_thread_read mr;
+            if (oc_decode_mark_thread_read(&p, &mr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_MARK_THREAD_READ, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->parent_id = mr.root_id; j->message_id = mr.up_to;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_KEYWORDS) {
+            oc_slice terms[OC_MAX_KEYWORDS]; uint8_t n = 0;
+            if (oc_decode_set_keywords(&p, terms, OC_MAX_KEYWORDS, &n) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_KEYWORDS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            if (n) {
+                j->kw_terms = calloc(n, sizeof *j->kw_terms);
+                for (uint8_t i = 0; j->kw_terms && i < n; i++) {
+                    size_t len = terms[i].len < OC_KEYWORD_MAX - 1 ? terms[i].len : OC_KEYWORD_MAX - 1;
+                    char *t = malloc(len + 1);
+                    if (!t) break;
+                    if (len) memcpy(t, terms[i].ptr, len);
+                    t[len] = '\0';
+                    j->kw_terms[j->n_kw_terms++] = t;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_PRIORITY) {
+            uint64_t people[OC_MAX_PRIORITY]; uint8_t n = 0;
+            if (oc_decode_set_priority(&p, people, OC_MAX_PRIORITY, &n) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_PRIORITY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            if (n) {
+                j->pri_people = calloc(n, sizeof *j->pri_people);
+                if (j->pri_people) {
+                    memcpy(j->pri_people, people, n * sizeof *j->pri_people);
+                    j->n_pri_people = n;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_TZ_OFFSET) {
+            oc_set_tz_offset tz;
+            if (oc_decode_set_tz_offset(&p, &tz) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_TZ_OFFSET, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->tz_offset_min = tz.tz_offset_min;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_SNOOZE) {
+            oc_set_snooze ss;
+            if (oc_decode_set_snooze(&p, &ss) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_SNOOZE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->snooze_minutes = ss.minutes;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REGISTER_DEVICE_TOKEN) {
+            oc_register_device_token rd;
+            if (oc_decode_register_device_token(&p, &rd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REGISTER_DEVICE_TOKEN, c->conn_id);
+            if (!j) return -1;
+            size_t tl = rd.token.len < OC_DEVICE_TOKEN_MAX - 1 ? rd.token.len : OC_DEVICE_TOKEN_MAX - 1;
+            j->user_id = c->user_id;
+            j->device_platform = rd.platform;
+            j->device_token = strndup((const char *)rd.token.ptr, tl);
+            if (!j->device_token) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UNREGISTER_DEVICE_TOKEN) {
+            oc_slice tok;
+            if (oc_decode_unregister_device_token(&p, &tok) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_UNREGISTER_DEVICE_TOKEN, c->conn_id);
+            if (!j) return -1;
+            size_t tl = tok.len < OC_DEVICE_TOKEN_MAX - 1 ? tok.len : OC_DEVICE_TOKEN_MAX - 1;
+            j->user_id = c->user_id;
+            j->device_token = strndup((const char *)tok.ptr, tl);
+            if (!j->device_token) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_NOTIFY_PREFS) {
+            if (oc_decode_list_notify_prefs(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SCHEDULE_MESSAGE) {
+            oc_schedule_message sm;
+            if (oc_decode_schedule_message(&p, &sm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SCHEDULE, c->conn_id);
+            if (!j) return -1;
+            size_t bl = sm.body.len < OC_MAX_BODY_SIZE ? sm.body.len : OC_MAX_BODY_SIZE;
+            j->user_id = c->user_id; j->channel_id = sm.channel_id;
+            j->parent_id = sm.thread_root; j->sched_at_ms = sm.send_at_ms;
+            if (bl) { j->body = malloc(bl); if (!j->body) return -1;
+                      memcpy(j->body, sm.body.ptr, bl); }
+            j->body_len = bl;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_SCHEDULED) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_SCHEDULED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CANCEL_SCHEDULED) {
+            oc_cancel_scheduled cs;
+            if (oc_decode_cancel_scheduled(&p, &cs) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CANCEL_SCHEDULED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = cs.id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPDATE_SCHEDULED) {
+            oc_update_scheduled us;
+            if (oc_decode_update_scheduled(&p, &us) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_UPDATE_SCHEDULED, c->conn_id);
+            if (!j) return -1;
+            size_t bl = us.body.len < OC_MAX_BODY_SIZE ? us.body.len : OC_MAX_BODY_SIZE;
+            j->user_id = c->user_id; j->message_id = us.id; j->sched_at_ms = us.send_at_ms;
+            if (bl) { j->body = malloc(bl); if (!j->body) return -1;
+                      memcpy(j->body, us.body.ptr, bl); }
+            j->body_len = bl;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_DRAFT) {
+            oc_set_draft sd;
+            if (oc_decode_set_draft(&p, &sd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_DRAFT, c->conn_id);
+            if (!j) return -1;
+            size_t bl = sd.body.len < OC_DRAFT_BODY_MAX ? sd.body.len : OC_DRAFT_BODY_MAX;
+            j->user_id    = c->user_id;
+            j->channel_id = sd.channel_id;
+            j->parent_id  = sd.thread_root;
+            if (bl) {
+                j->body = malloc(bl);
+                if (!j->body) return -1;
+                memcpy(j->body, sd.body.ptr, bl);
+            }
+            j->body_len = bl;          /* 0 is the DELETE form, not a decode failure */
+            {   /* Who it is for, when it is not for a channel yet (REQ-229). */
+                size_t rl = sd.recipients.len < 160 ? sd.recipients.len : 160;
+                j->recipients = strndup((const char *)sd.recipients.ptr, rl);
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_DRAFTS) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_DRAFTS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_CLIENT_SETTING) {
+            oc_set_client_setting cs;
+            if (oc_decode_set_client_setting(&p, &cs) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_CLIENT_SETTING, c->conn_id);
+            if (!j) return -1;
+            size_t ctl = cs.client_type.len < OC_CLIENT_TYPE_MAX ? cs.client_type.len : OC_CLIENT_TYPE_MAX;
+            size_t kl  = cs.key.len   < OC_SETTING_KEY_MAX   ? cs.key.len   : OC_SETTING_KEY_MAX;
+            size_t vl  = cs.value.len < OC_SETTING_VALUE_MAX ? cs.value.len : OC_SETTING_VALUE_MAX;
+            j->user_id = c->user_id;
+            j->cs_client_type = strndup((const char *)cs.client_type.ptr, ctl);
+            j->cs_key   = strndup((const char *)cs.key.ptr, kl);
+            j->cs_value = strndup((const char *)cs.value.ptr, vl);
+            if (!j->cs_client_type || !j->cs_key || !j->cs_value) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_CLIENT_SETTINGS) {
+            oc_list_client_settings ls;
+            if (oc_decode_list_client_settings(&p, &ls) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_CLIENT_SETTINGS, c->conn_id);
+            if (!j) return -1;
+            size_t ctl = ls.client_type.len < OC_CLIENT_TYPE_MAX ? ls.client_type.len : OC_CLIENT_TYPE_MAX;
+            j->user_id = c->user_id;
+            j->cs_client_type = strndup((const char *)ls.client_type.ptr, ctl);
+            if (!j->cs_client_type) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_DISPLAY_NAME) {
+            oc_set_display_name sn;
+            if (oc_decode_set_display_name(&p, &sn) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_DISPLAY_NAME, c->conn_id);
+            if (!j) return -1;
+            size_t nl = sn.name.len < OC_MAX_DISPLAY_NAME ? sn.name.len : OC_MAX_DISPLAY_NAME;
+            j->user_id = c->user_id;
+            j->pf_name = strndup((const char *)sn.name.ptr, nl);
+            if (!j->pf_name) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CHANGE_PASSWORD) {
+            oc_change_password cp;
+            if (oc_decode_change_password(&p, &cp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->pf_old_pw = strndup((const char *)cp.old_password.ptr, cp.old_password.len);
+            j->pf_new_pw = strndup((const char *)cp.new_password.ptr, cp.new_password.len);
+            if (!j->pf_old_pw || !j->pf_new_pw) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_JOIN) {
+            oc_call_join cj;
+            if (oc_decode_call_join(&p, &cj) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id);   /* read job: access gate */
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = cj.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_LEAVE) {
+            oc_call_leave cl;
+            if (oc_decode_call_leave(&p, &cl) != OC_OK) return -1;
+            uint8_t token[OC_AUDIO_TOKEN_LEN];
+            uint64_t ch = call_remove_conn(c->conn_id, token);
+            if (ch) {
+                audio_revoke(token);
+                call_t *cc = call_find(ch);
+                if (cc) call_send_roster(ep, conns, cc, 0);
+            }
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_AUDIT_QUERY) {
+            oc_audit_query aq;
+            if (oc_decode_audit_query(&p, &aq) != OC_OK) return -1;
+            /* Owner/admin only; checked in the writer against the current role. */
+            oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->audit_limit = aq.limit ? aq.limit : 50;
+            j->audit_before_ms = aq.before_ms;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_STORAGE_STATUS_REQ) {
+            /* Owner/admin only (REQ-214). The check lives in the writer, which
+             * reads the user's CURRENT role, rather than here — the same shape
+             * as SET_ROLE and the other admin operations. A role revoked
+             * mid-session therefore takes effect immediately. */
+            oc_job *j = oc_job_new(OC_JOB_STORAGE_STATUS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
+            oc_upload_begin ub;
+            if (oc_decode_upload_begin(&p, &ub) != OC_OK) return -1;
+            if (c->xfer.state != XFER_NONE) {
+                if (send_transfer_error(c, 0, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            if (ub.total_size > g_max_attach) {
+                if (send_transfer_error(c, 0, OC_ERR_ATTACHMENT_TOO_LARGE) != 0) return -1;
+                continue;
+            }
+            /* Admission control (REQ-216): refuse at declaration, before a byte
+             * moves, rather than failing a half-finished transfer. The reserve
+             * below this point belongs to SQLite — spending it on attachments is
+             * what would turn "attachments unavailable" into "chat down"
+             * (REQ-212). Uses the cached sample, so this costs no syscall. */
+            if (oc_storage_must_refuse(&g_sstat, &g_spol)) {
+                if (send_transfer_error(c, 0, OC_ERR_STORAGE_FULL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_ATTACH_CREATE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = ub.channel_id;
+            memcpy(j->idem, ub.idem, OC_IDEM_LEN);
+            j->att_size = ub.total_size;
+            j->filename = ub.filename.len ? strndup((const char *)ub.filename.ptr, ub.filename.len) : strdup("");
+            j->mime     = ub.mime.len     ? strndup((const char *)ub.mime.ptr, ub.mime.len)         : strdup("");
+            if (!j->filename || !j->mime) { return -1; }
+            oc_dbwriter_submit(dbw, j);
+            c->xfer.state = XFER_UP_AWAIT_CREATE;
+            c->xfer.declared_size = ub.total_size;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPLOAD_CHUNK) {
+            oc_upload_chunk uc;
+            if (oc_decode_upload_chunk(&p, &uc) != OC_OK) return -1;
+            conn_xfer *x = &c->xfer;
+            if (x->state != XFER_UP_ACTIVE || uc.attachment_id != x->attachment_id ||
+                uc.seq != x->next_seq || uc.data.len > OC_ATTACH_CHUNK_SIZE ||
+                x->received + uc.data.len > x->declared_size) {
+                if (send_transfer_error(c, uc.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            /* Hand the bytes to a worker. The job owns a copy because the frame
+             * buffer is reused, and because the write may outlive this frame.
+             * UPLOAD_ACK is sent on completion, so an ack now means "durably
+             * written" rather than merely "received". */
+            oc_xfer_job *wj = oc_xfer_job_new(OC_XFER_WRITE, c->conn_id);
+            if (!wj) return -1;
+            wj->bw = x->bw;
+            wj->attachment_id = x->attachment_id;
+            wj->len = uc.data.len;
+            if (uc.data.len) {
+                wj->data = malloc(uc.data.len);
+                if (!wj->data) { oc_xfer_job_free(wj); return -1; }
+                memcpy(wj->data, uc.data.ptr, uc.data.len);
+            }
+            x->in_flight = 1;
+            oc_xferpool_submit(g_xfers, wj);
+            /* Stop draining here. Frames already buffered stay buffered, and
+             * update_interest drops EPOLLIN, so no further push can overflow the
+             * frame buffer while we are paused (framebuf.h). Draining resumes
+             * from the completion handler. */
+            return 0;
+        }
+        if (hdr.msg_type == OC_MSG_UPLOAD_END) {
+            oc_upload_end ue;
+            if (oc_decode_upload_end(&p, &ue) != OC_OK) return -1;
+            conn_xfer *x = &c->xfer;
+            if (x->state != XFER_UP_ACTIVE || ue.attachment_id != x->attachment_id ||
+                x->received != x->declared_size) {
+                if (send_transfer_error(c, ue.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            mbedtls_sha256_finish(&x->sha, x->digest);
+            mbedtls_sha256_free(&x->sha); x->sha_init = 0;
+            /* Committing can be a full request/response against S3, so it goes
+             * to the pool; the ATTACH_FINALIZE job is submitted when it lands.
+             * Reaching here means no write is in flight: the read pause above
+             * guarantees UPLOAD_END is only dispatched once the previous chunk
+             * has completed. */
+            oc_xfer_job *cj = oc_xfer_job_new(OC_XFER_COMMIT, c->conn_id);
+            if (!cj) return -1;
+            cj->bw = x->bw;
+            /* COMMIT *consumes* the writer (oc_blob_put_commit frees it), so
+             * ownership moves to the job here. Leaving x->bw set would let a
+             * later xfer_reset abort an already-freed writer — the handle must
+             * be reachable from exactly one place at a time. */
+            x->bw = NULL;
+            cj->attachment_id = x->attachment_id;
+            x->state = XFER_UP_AWAIT_COMMIT;
+            x->in_flight = 1;
+            oc_xferpool_submit(g_xfers, cj);
+            return 0;
+        }
+        if (hdr.msg_type == OC_MSG_DOWNLOAD_BEGIN) {
+            oc_download_begin db;
+            if (oc_decode_download_begin(&p, &db) != OC_OK) return -1;
+            if (c->xfer.state != XFER_NONE) {
+                if (send_transfer_error(c, db.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_ATTACH_LOOKUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->attachment_id = db.attachment_id;
+            oc_dbwriter_submit(dbw, j);
+            c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            c->xfer.attachment_id = db.attachment_id;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_TRANSFER_CANCEL) {
+            oc_transfer_cancel tc;
+            if (oc_decode_transfer_cancel(&p, &tc) != OC_OK) return -1;
+            xfer_reset(&c->xfer);   /* aborts an open upload blob; drops a download */
+            continue;
+        }
+        /* No branch claimed this type. Silently ignoring it was indistinguishable
+         * from handling it and choosing to say nothing, which is the worst thing
+         * to do to an implementer: their frame vanishes and the connection stays
+         * up. Every type our own client sends is dispatched above, so reaching
+         * here means the peer sent something this version does not define. */
+        {
+            uint8_t ebuf[128]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+            oc_error err = { OC_ERR_UNEXPECTED_MSG_TYPE, 1, oc_slice_str("frame"),
+                             oc_slice_str("message type not valid in this state") };
+            oc_encode_error(&ew, c->version, &err);
+            out_append(c, ebuf, ew.len);
+            return -1;
+        }
+    }
+}
+
+/* --- HTTP / incoming webhooks (ARCH-32, REQ-170) ------------------------ */
+
+/* Total request bytes we'll buffer for an HTTP connection: a full body plus
+ * generous header headroom. Beyond this the request is refused (413). */
+#define OC_HTTP_MAX_REQUEST (OC_MAX_BODY_SIZE + 16384u)
+
+static int hexval(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* Tokens are random BYTES on the daemon side but must reach a human as text:
+ * an invite gets shared in a message, and a webhook token goes into a URL —
+ * /webhook/<hex-token> already assumed hex at the HTTP end. Both were being sent
+ * to clients verbatim, so what the UI displayed was unreadable and, for
+ * webhooks, would never have matched the endpoint. Encode on the way out and
+ * decode on the way back in. */
+static void hex_encode(const uint8_t *in, size_t n, char *out) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[2 * i] = H[in[i] >> 4]; out[2 * i + 1] = H[in[i] & 15]; }
+    out[2 * n] = '\0';
+}
+
+static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap) {
+    if (hexlen % 2 != 0 || hexlen / 2 > outcap) return -1;
+    for (size_t i = 0; i < hexlen; i += 2) {
+        int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    return (int)(hexlen / 2);
+}
+
+/* Queue an HTTP/1.1 response (Connection: close) into the output buffer. */
+static void http_reply(conn *c, int status, const char *reason,
+                       const char *ctype, const char *body, size_t blen) {
+    char hdr[256];
+    int n = snprintf(hdr, sizeof hdr,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        status, reason, ctype, blen);
+    if (n < 0 || n >= (int)sizeof hdr) return;
+    out_append(c, (const uint8_t *)hdr, (size_t)n);
+    if (body && blen) out_append(c, (const uint8_t *)body, blen);
+}
+
+/* Dispatch one fully-parsed HTTP request. The only route is
+ * POST /webhook/<hex-token>; everything else gets a terminal status. Returns 0
+ * to keep the connection (a webhook post is awaiting its result) or -1 to close
+ * (a response has been queued). */
+static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
+    if (req->method_len != 4 || memcmp(req->method, "POST", 4) != 0) {
+        http_reply(c, 405, "Method Not Allowed", "text/plain", "method not allowed\n", 19);
+        return -1;
+    }
+    static const char PFX[] = "/webhook/";
+    size_t pfx = sizeof PFX - 1;
+    if (req->path_len <= pfx || memcmp(req->path, PFX, pfx) != 0) {
+        http_reply(c, 404, "Not Found", "text/plain", "not found\n", 10);
+        return -1;
+    }
+    const char *tokhex = req->path + pfx;
+    size_t tokhexlen = req->path_len - pfx;
+    const char *q = memchr(tokhex, '?', tokhexlen);      /* drop any query string */
+    if (q) tokhexlen = (size_t)(q - tokhex);
+
+    uint8_t token[OC_SESSION_TOKEN_LEN];
+    if (hex_decode(tokhex, tokhexlen, token, sizeof token) != (int)sizeof token) {
+        http_reply(c, 404, "Not Found", "text/plain", "not found\n", 10);
+        return -1;
+    }
+    const char *text = NULL; size_t tlen = 0;
+    if (!oc_http_webhook_text(req, &text, &tlen) || tlen == 0) {
+        http_reply(c, 400, "Bad Request", "text/plain", "empty message\n", 14);
+        return -1;
+    }
+    if (tlen > OC_MAX_BODY_SIZE) tlen = OC_MAX_BODY_SIZE;
+
+    char key[2 * OC_SESSION_TOKEN_LEN + 1];
+    size_t klen = tokhexlen < sizeof key - 1 ? tokhexlen : sizeof key - 1;
+    memcpy(key, tokhex, klen); key[klen] = '\0';
+    uint64_t now = now_ms();
+    if (g_webhook_rl && oc_ratelimit_blocked(g_webhook_rl, key, now)) {
+        http_reply(c, 429, "Too Many Requests", "text/plain", "rate limited\n", 13);
+        return -1;
+    }
+    if (g_webhook_rl) oc_ratelimit_record(g_webhook_rl, key, now);
+
+    oc_job *j = oc_job_new(OC_JOB_WEBHOOK_POST, c->conn_id);
+    if (!j || oc_job_set_token(j, token, sizeof token) != 0 ||
+        oc_job_set_body(j, text, tlen) != 0) {
+        http_reply(c, 500, "Internal Server Error", "text/plain", "error\n", 6);
+        return -1;
+    }
+    oc_dbwriter_submit(dbw, j);
+    c->http_pending = 1;       /* response written when the post result returns */
+    return 0;
+}
+
+/* Read for an HTTP (non-oc/1) connection: accumulate the request, parse, dispatch.
+ * Returns 0 to keep, -1 to close. */
+static int on_http_readable(conn *c, oc_dbwriter *dbw) {
+    for (;;) {
+        uint8_t chunk[OC_READ_CHUNK];
+        size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
+        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
+        if (c->http_pending) continue;              /* already dispatched; drain quietly */
+        if (c->hlen + n > OC_HTTP_MAX_REQUEST) {
+            http_reply(c, 413, "Payload Too Large", "text/plain", "too large\n", 10);
+            return -1;
+        }
+        if (c->hlen + n > c->hcap) {
+            size_t nc = c->hcap ? c->hcap : 4096;
+            while (nc < c->hlen + n) nc *= 2;
+            uint8_t *g = realloc(c->hin, nc);
+            if (!g) return -1;
+            c->hin = g; c->hcap = nc;
+        }
+        memcpy(c->hin + c->hlen, chunk, n);
+        c->hlen += n;
+
+        oc_http_req req;
+        int pr = oc_http_parse((const char *)c->hin, c->hlen, OC_MAX_BODY_SIZE, &req);
+        if (pr < 0) { http_reply(c, 400, "Bad Request", "text/plain", "bad request\n", 12); return -1; }
+        if (pr == 0) continue;                      /* need more bytes */
+        return on_http_request(c, &req, dbw);       /* complete request */
+    }
+}
+
+/* Read, reassemble, and dispatch. Returns 0 to keep, -1 to close. */
+static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
+    if (c->http) return on_http_readable(c, dbw);
+    for (;;) {
+        uint8_t chunk[OC_READ_CHUNK];
+        size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
+        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
+        if (oc_framebuf_push(&c->fb, chunk, n) != 0) return -1;
+        if (drain_frames(ep, conns, c, dbw) < 0) return -1;
+        /* A blob job went in flight, so the drain is paused. Stop reading here
+         * too: dropping EPOLLIN only governs the next epoll wakeup, and this
+         * loop would otherwise keep pushing frames nobody is draining until the
+         * frame buffer overflows (framebuf.h sizes it for drain-after-push).
+         * The completion handler resumes both. */
+        if (c->xfer.in_flight) return 0;
+    }
+}
+
+/* --- Result delivery (from the DB-writer thread) ------------------------ */
+
+static void deliver_result(int ep, conn **conns, oc_dbres *r) {
+    oc_wbuf w;
+    switch (r->type) {
+    case OC_RES_AUTH_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        c->authed = 1;
+        c->user_id = r->user_id;
+        c->session_id = r->session_id;   /* REQ-182 */
+        c->presence = OC_PRESENCE_ONLINE;
+        c->dnd_until_ms = r->snooze_until_ms;   /* REQ-278, already expiry-checked */
+        cache_schedule(conns, r->user_id, r);   /* REQ-136, the other DND half */
+        int fd = c->fd;
+        uint64_t uid = r->user_id;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        /* Fresh auth carries the session token; a session re-auth omits it
+         * (PROTOCOL.md §4.3). */
+        oc_slice tok = r->has_session_token
+                     ? (oc_slice){ r->session_token, OC_SESSION_TOKEN_LEN }
+                     : (oc_slice){ NULL, 0 };
+        oc_auth_ok m = { r->user_id, r->role, r->session_expiry, tok };
+        oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &m);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        if (!conns[fd]) break;   /* dropped on the AUTH_OK write */
+
+        /* Workspace facts from static config (deployment mode / user cap / name),
+         * so the client can render a branded header instead of a bare host. */
+        {
+            const oc_config *cfg = oc_config_get();
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_workspace_info wi = { (uint8_t)cfg->deployment_mode,
+                                     (uint32_t)(cfg->max_users > 0 ? cfg->max_users : 0),
+                                     oc_slice_str(cfg->workspace_name ? cfg->workspace_name : "") };
+            oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
+        }
+
+        /* A pause outlives the session that set it (REQ-278), so the client is
+         * told at auth rather than only when it opens its notification
+         * settings — otherwise a restart shows "not paused" to somebody who is. */
+        {
+            uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+            oc_snooze sn = { r->snooze_until_ms };
+            oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
+            send_bytes(ep, conns, fd, sbuf, sw.len);
+            if (!conns[fd]) break;
+        }
+
+        /* Presence (REQ-120): send the new client a snapshot of who is currently
+         * online/away, then — if this is the user's first connection — announce
+         * them online to everyone. */
+        for (int f = 0; f < OC_NETLOOP_MAX_FD; f++) {
+            conn *v = conns[f];
+            if (!v || !v->authed || v->user_id == uid) continue;
+            int first = 1;
+            for (int g = 0; g < f; g++)
+                if (conns[g] && conns[g]->authed && conns[g]->user_id == v->user_id) { first = 0; break; }
+            if (!first) continue;
+            uint8_t pbuf[32]; size_t plen = 0;
+            encode_presence(pbuf, sizeof pbuf, &plen, v->user_id, presence_of(conns, v->user_id),
+                            dnd_of(conns, v->user_id));
+            presence_send(ep, conns[fd], pbuf, plen);
+        }
+        int others = 0;
+        for (int f = 0; f < OC_NETLOOP_MAX_FD; f++)
+            if (conns[f] && conns[f]->authed && conns[f]->user_id == uid && conns[f] != conns[fd]) { others = 1; break; }
+        if (!others) broadcast_presence(ep, conns, uid, OC_PRESENCE_ONLINE);
+        break;
+    }
+    case OC_RES_AUTH_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 1, { NULL, 0 }, oc_slice_str("auth failed") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_LOGOUT_OK: {
+        /* The session is revoked; drop the connection (the client re-auths to
+         * continue). Any queued output is discarded with the conn. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (c) conn_close(ep, conns, c->fd);
+        break;
+    }
+    case OC_RES_SEND_OK: {
+        /* A send nobody asked for is one the scheduled sweep fired (ARCH-102):
+         * ask for the next straight away, so a backlog drains at queue speed
+         * instead of one per fifteen seconds. */
+        if (r->conn_id == 0) g_sched_more = 1;
+        conn *sender = find_by_id(conns, r->conn_id);
+        if (sender) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_send_ack ack;
+            memcpy(ack.idem, r->idem, OC_IDEM_LEN);
+            ack.channel_id = r->channel_id;
+            ack.message_id = r->message_id;
+            ack.server_time = r->server_time;
+            oc_encode_send_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            send_bytes(ep, conns, sender->fd, g_enc, w.len);
+            /* And, to the SENDER ONLY, anyone they named who is not in this
+             * channel (REQ-287). After the ack, because the message was accepted
+             * — this is a consequence, not a failure — and to nobody else,
+             * because it is about their action rather than the conversation. */
+            if (r->unres.count && !r->duplicate) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                if (oc_encode_mention_unresolved(&w, OC_PROTOCOL_VERSION, &r->unres) == OC_OK)
+                    send_bytes(ep, conns, sender->fd, g_enc, w.len);
+            }
+        }
+        if (!r->duplicate) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { r->body, r->body_len };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}}, {0} };
+            broadcast_set_attach(&b, r->attach, r->n_attach);
+            b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
+            oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+            size_t blen = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                    send_bytes(ep, conns, fd, g_enc, blen);
+            }
+            /* Offline mobile delivery (ARCH-85): hand the notify decision to the
+             * push emitter — members minus author, level/DND-gated, off this
+             * thread. Fire-and-forget; a no-op when push is unconfigured. */
+            /* The forward reference, to the same members and right behind the
+             * BROADCAST it describes (REQ-057). One entry at most here; the
+             * array is shared with the replay so both read the same rows. */
+            for (size_t i = 0; i < r->n_rfwd; i++) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
+                                  r->rfwd[i].src_channel, r->rfwd[i].src_message,
+                                  r->rfwd[i].src_author,
+                                  oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
+                                  r->rfwd[i].n_attach,
+                                  oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+                if (oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) != OC_OK) break;
+                size_t flen = w.len;
+                for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                    conn *c = conns[fd];
+                    if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                        send_bytes(ep, conns, fd, g_enc, flen);
+                }
+            }
+            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id, 0);
+            /* Link previews (REQ-222): queue this body's URLs for fetching.
+             * Off the hot path — the fetch completes as an UNFURL_STORED
+             * result later, or never. */
+            unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
+        }
+        break;
+    }
+    case OC_RES_SEND_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice ctx = { r->idem, OC_IDEM_LEN };
+        oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_DEVICE_TOKEN_OK:
+    case OC_RES_DEVICE_TOKEN_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_device_token_ack ack = { (uint8_t)(r->type == OC_RES_DEVICE_TOKEN_OK ? 1 : 0), r->err_code };
+        oc_encode_device_token_ack(&w, OC_PROTOCOL_VERSION, &ack);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_EDIT_OK: {
+        /* Fan the edit out to every connected member (including the editor, whose
+         * frame doubles as the confirmation) — same shape as a BROADCAST. */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice body = { r->body, r->body_len };
+        oc_msg_edited m = { r->message_id, r->channel_id, r->author_id, r->server_time, body };
+        oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &m);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        /* The writer dropped the old body's unfurls; re-fetch for the new one
+         * (REQ-222). The store step re-validates presence, so a URL the edit
+         * removed cannot come back. */
+        unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
+        break;
+    }
+    case OC_RES_DELETE_OK: {
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_msg_deleted m = { r->message_id, r->channel_id, r->author_id, r->user_id, r->server_time };
+        oc_encode_msg_deleted(&w, OC_PROTOCOL_VERSION, &m);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        break;
+    }
+    case OC_RES_EDIT_ERR:
+    case OC_RES_DELETE_ERR: {
+        /* Non-fatal: report to the requester with the offending message_id in
+         * `context` (8 bytes, big-endian) so the client can correlate. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("edit/delete rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CHANNEL_INFO: {
+        /* One filler for all three sends below. Designated, not positional: adding
+         * `n_peers`/`peers` for group DMs (REQ-056) to the middle of a positional
+         * initializer is how the notify-prefs frame silently sent its entry count as
+         * the new field earlier today. */
+        #define CHINFO(dst, peer, joined_flag) do {                                  \
+            memset(&(dst), 0, sizeof (dst));                                         \
+            (dst).channel_id = r->channel_id;                                        \
+            (dst).kind       = r->ch_kind;                                           \
+            (dst).name       = oc_slice_str(r->ch_name ? r->ch_name : "");           \
+            (dst).is_public  = r->ch_is_public;                                      \
+            (dst).joined     = (joined_flag);                                        \
+            (dst).created_at = r->ch_created_at;                                     \
+            (dst).peer_id    = (peer);                                               \
+            (dst).topic      = oc_slice_str(r->ch_topic ? r->ch_topic : "");         \
+            (dst).archived   = r->ch_archived;                                       \
+            (dst).n_peers    = r->n_ch_peers;                                        \
+            for (uint16_t pi = 0; pi < r->n_ch_peers; pi++)                          \
+                (dst).peers[pi] = r->ch_peers[pi];                                   \
+        } while (0)
+        /* Ack the actor with the channel's state. For a DM, peer_id is the other
+         * participant (from the actor's view). */
+        conn *c = find_by_id(conns, r->conn_id);
+        uint64_t actor = c ? c->user_id : 0;
+        if (c) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_channel_info ci; CHINFO(ci, r->ch_peer, r->ch_joined);
+            oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        /* An UPDATE_CHANNEL (ARCH-93) changes what EVERY member's sidebar should
+         * say, so its CHANNEL_INFO fans out rather than only acking the actor. */
+        if (r->ch_fanout) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_channel_info ci; CHINFO(ci, 0, 1);
+            oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
+            size_t len = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed && t->user_id != actor &&
+                    in_members(t->user_id, r->members, r->n_members))
+                    send_bytes(ep, conns, fd, g_enc, len);
+            }
+        }
+        /* Push the (now-member) channel to the target: an INVITE (regular channel)
+         * or the peer of a new DM. For a DM the peer, from the target's view, is
+         * the actor. */
+        if (r->push_user_id) {
+            uint64_t push_peer = (r->ch_kind == OC_CHANNEL_KIND_DM) ? actor : 0;
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_channel_info ci; CHINFO(ci, push_peer, 1);
+            oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
+            size_t len = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed && t->user_id == r->push_user_id)
+                    send_bytes(ep, conns, fd, g_enc, len);
+            }
+        }
+        break;
+    }
+    case OC_RES_CHANNEL_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->channel_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        /* Name the actual problem. "channel op rejected" told a user nothing
+         * they could act on, and REQ-263 is about failures being legible. */
+        const char *why =
+            r->err_code == OC_ERR_CHANNEL_EXISTS   ? "a channel with that name already exists"
+          : r->err_code == OC_ERR_INVALID_CHANNEL  ? "that channel name is not valid"
+          : r->err_code == OC_ERR_UNKNOWN_CHANNEL  ? "no such channel"
+          : r->err_code == OC_ERR_NOT_A_MEMBER     ? "you are not a member of that channel"
+          : r->err_code == OC_ERR_FORBIDDEN        ? "you do not have permission to do that"
+          :                                          "channel op rejected";
+        oc_error e = { r->err_code, 0, cs, oc_slice_str(why) };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CHANNEL_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_chlist > OC_CHANNEL_LIST_MAX ? OC_CHANNEL_LIST_MAX : r->n_chlist;
+        oc_channel_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].channel_id = r->chlist[i].channel_id;
+            ents[i].name = oc_slice_str(r->chlist[i].name ? r->chlist[i].name : "");
+            ents[i].is_public = r->chlist[i].is_public;
+            ents[i].joined = r->chlist[i].joined;
+            ents[i].kind = r->chlist[i].kind;
+            ents[i].last_message_at = r->chlist[i].last_message_at;
+            ents[i].unread = r->chlist[i].unread;
+            ents[i].peer_id = r->chlist[i].peer_id;
+            ents[i].topic = oc_slice_str(r->chlist[i].topic ? r->chlist[i].topic : "");
+            ents[i].archived = r->chlist[i].archived;
+            ents[i].created_at = r->chlist[i].created_at;
+            ents[i].preview = oc_slice_str(r->chlist[i].preview ? r->chlist[i].preview : "");
+            ents[i].preview_author = r->chlist[i].preview_author;
+            ents[i].n_peers = r->chlist[i].n_peers;               /* REQ-056 */
+            for (uint16_t k = 0; k < r->chlist[i].n_peers; k++)
+                ents[i].peers[k] = r->chlist[i].peers[k];
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_channel_list cl = { (uint16_t)n, ents };
+        oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &cl);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_USER_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_ulist > OC_USER_LIST_MAX ? OC_USER_LIST_MAX : r->n_ulist;
+        oc_user_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].user_id = r->ulist[i].user_id;
+            ents[i].role = r->ulist[i].role;
+            ents[i].disabled = r->ulist[i].disabled;
+            ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
+            ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
+            ents[i].avatar_id = r->ulist[i].avatar_id;      /* */
+            ents[i].title = oc_slice_str(r->ulist[i].title ? r->ulist[i].title : "");
+            ents[i].timezone = oc_slice_str(r->ulist[i].timezone ? r->ulist[i].timezone : "");
+            ents[i].status_emoji = oc_slice_str(r->ulist[i].status_emoji ? r->ulist[i].status_emoji : "");
+            ents[i].status_text = oc_slice_str(r->ulist[i].status_text ? r->ulist[i].status_text : "");
+            ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
+            ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_user_list ul = { (uint16_t)n, ents };
+        oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &ul);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_INVITE_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        char tokhex[2 * OC_INVITE_TOKEN_LEN + 1];
+        hex_encode(r->session_token, OC_INVITE_TOKEN_LEN, tokhex);
+        oc_slice tok = { (const uint8_t *)tokhex, strlen(tokhex) };
+        oc_invite_created ic = { tok, r->role, r->session_expiry };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &ic);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_INVITE_ERR:
+    case OC_RES_SETROLE_ERR:
+    case OC_RES_USER_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("admin op rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SETROLE_OK: {
+        /* Ack the actor and push the new role to the affected user's live conns
+         * (so their client updates its capabilities immediately). */
+        oc_user_updated m = { r->user_id, r->role, 0 };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        conn *actor = find_by_id(conns, r->conn_id);
+        if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *t = conns[fd];
+            if (t && t->authed && t->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_USER_UPDATED: {
+        /* Removal (disabled=1): ack the actor, notify the removed user's live
+         * connections, then drop them (they cannot re-authenticate). */
+        oc_user_updated m = { r->user_id, r->role, r->disabled };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        conn *actor = find_by_id(conns, r->conn_id);
+        if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *t = conns[fd];
+            if (t && t->authed && t->user_id == r->user_id) {
+                send_bytes(ep, conns, fd, g_enc, len);
+                if (r->disabled && conns[fd]) conn_close(ep, conns, fd);
+            }
+        }
+        break;
+    }
+    case OC_RES_REACTION_OK: {
+        /* Fan the reaction change out to every connected member (REQ-070/071). */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_reaction_updated m = { r->message_id, r->channel_id, r->user_id,
+                                  oc_slice_str(r->emoji ? r->emoji : ""),
+                                  r->react_op, r->react_count };
+        oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_REACTION_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("reaction rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_REACTIONS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_rlist > OC_REACTION_LIST_MAX ? OC_REACTION_LIST_MAX : r->n_rlist;
+        oc_reaction_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].emoji = oc_slice_str(r->rlist[i].emoji ? r->rlist[i].emoji : "");
+            ents[i].user_id = r->rlist[i].user_id;
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_reactions rr = { r->message_id, (uint16_t)n, ents };
+        oc_encode_reactions(&w, OC_PROTOCOL_VERSION, &rr);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_PIN_OK: {
+        /* A pin is channel state, so every connected member learns of it —
+         * the same fan-out shape as a reaction (REQ-230). */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_pin_updated m = { r->message_id, r->channel_id, r->user_id,
+                             r->pin_op, r->pinned_at };
+        oc_encode_pin_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_PIN_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("pin rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_PINS: {
+        /* Stream each pinned message, then the terminator — the LIST_THREAD
+         * shape, chosen because each body needs its own frame. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_plist && conns[c->fd]; i++) {
+            const oc_pin_row *pr = &r->plist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_pinned_msg pm = { pr->message_id, r->channel_id, pr->author_id,
+                                 pr->created_at_ms, pr->pinned_by, pr->pinned_at,
+                                 oc_slice_str(pr->body ? pr->body : ""),
+                                 oc_slice_str(pr->attach_name ? pr->attach_name : "") };
+            oc_encode_pinned_msg(&w, OC_PROTOCOL_VERSION, &pm);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_pins term = { r->channel_id, (uint32_t)r->n_plist };
+        oc_encode_pins(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SAVED_OK: {
+        /* Private: the ack goes to the actor and stops. There is no one to fan
+         * a personal bookmark to. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_saved_updated su = { r->message_id, r->save_op, r->saved_at };
+        oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SAVED_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_slist && conns[c->fd]; i++) {
+            const oc_saved_row *sr = &r->slist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_saved_msg sm = { sr->message_id, sr->channel_id, sr->author_id,
+                                sr->created_at, sr->saved_at,
+                                oc_slice_str(sr->body ? sr->body : ""),
+                                oc_slice_str(sr->attach_name ? sr->attach_name : "") };
+            oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &sm);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_saved term = { (uint32_t)r->n_slist };
+        oc_encode_saved(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ACTIVITY: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_alist && conns[c->fd]; i++) {
+            const oc_activity_row *ar = &r->alist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_activity_entry ae = { ar->kind, ar->message_id, ar->channel_id,
+                                     ar->actor_id, ar->at,
+                                     oc_slice_str(ar->text ? ar->text : "") };
+            oc_encode_activity_entry(&w, OC_PROTOCOL_VERSION, &ae);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_activity term = { (uint32_t)r->n_alist, r->activity_seen };
+        oc_encode_activity(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_MEMBER_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_cmlist && conns[c->fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_member_entry me = { r->channel_id, r->cmlist[i].user_id,
+                                   r->cmlist[i].role, r->cmlist[i].joined_at };
+            oc_encode_member_entry(&w, OC_PROTOCOL_VERSION, &me);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_members term = { r->channel_id, (uint32_t)r->n_cmlist };
+        oc_encode_members(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_FILE_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_flist && conns[c->fd]; i++) {
+            const oc_file_row *fr = &r->flist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_file_entry fe = { fr->id, fr->channel_id, fr->message_id, fr->uploader_id,
+                                 fr->size, fr->created_at, fr->reclaimed,
+                                 oc_slice_str(fr->filename ? fr->filename : ""),
+                                 oc_slice_str(fr->mime ? fr->mime : "") };
+            oc_encode_file_entry(&w, OC_PROTOCOL_VERSION, &fe);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_files term = { r->channel_id, (uint32_t)r->n_flist };
+        oc_encode_files(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_LIST_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice none = { NULL, 0 };
+        oc_error e = { r->err_code, 0, none, oc_slice_str("listing refused") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_REPLY_OK: {
+        /* Ack the sender; then, unless it was an idempotent replay, fan the reply
+         * out as a THREAD_REPLY (never to the main scroll, REQ-060). */
+        conn *sender = find_by_id(conns, r->conn_id);
+        if (sender) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_send_ack ack;
+            memcpy(ack.idem, r->idem, OC_IDEM_LEN);
+            ack.channel_id = r->channel_id;
+            ack.message_id = r->message_id;
+            ack.server_time = r->server_time;
+            oc_encode_send_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            send_bytes(ep, conns, sender->fd, g_enc, w.len);
+        }
+        if (!r->duplicate) {
+            /* `participant` is per-RECIPIENT (REQ-061, ARCH-104) — the only
+             * field on a fan-out frame that is. It is a boolean, so the frame
+             * is encoded twice rather than once per member: two encodes for a
+             * channel of any size, and the loop below picks the one that
+             * matches. Designated initialisers, because a positional list over
+             * a struct that just grew a field shifts every later value with no
+             * compiler error at all. */
+            oc_slice body = { r->body, r->body_len };
+            oc_thread_reply tr = { .message_id  = r->message_id,
+                                   .channel_id  = r->channel_id,
+                                   .parent_id   = r->parent_id,
+                                   .author_id   = r->author_id,
+                                   .server_time = r->server_time,
+                                   .reply_count = r->reply_count,
+                                   .participant = 0,
+                                   .body        = body };
+            tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
+
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
+            size_t out_len = w.len;
+
+            oc_wbuf pw;
+            oc_wbuf_init(&pw, g_enc_participant, sizeof g_enc_participant);
+            tr.participant = 1;
+            oc_encode_thread_reply(&pw, OC_PROTOCOL_VERSION, &tr);
+            size_t in_len = pw.len;
+
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (!c || !c->authed) continue;
+                size_t idx = 0;
+                if (!member_index(c->user_id, r->members, r->n_members, &idx)) continue;
+                /* No flags means the participation lookup could not allocate:
+                 * treat everyone as outside the thread, so the failure costs a
+                 * toast rather than inventing one. */
+                int in_thread = r->member_participant && r->member_participant[idx];
+                if (in_thread) send_bytes(ep, conns, fd, g_enc_participant, in_len);
+                else           send_bytes(ep, conns, fd, g_enc,   out_len);
+            }
+            /* And the notify decision, which a reply never produced at all
+             * (REQ-061): the root goes with it, so the emitter can notify the
+             * thread's PARTICIPANTS and not merely whoever the channel level
+             * would have caught. Fire-and-forget beside the send path's own
+             * call, and a no-op when push is unconfigured. */
+            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id,
+                           r->parent_id);
+            /* A reply's URLs unfurl like any other body's (REQ-222). */
+            unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
+        }
+        break;
+    }
+    case OC_RES_REPLY_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice ctx = { r->idem, OC_IDEM_LEN };
+        oc_error e = { r->err_code, 0, ctx, oc_slice_str("reply rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_THREAD: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        if (r->err_code) {
+            uint8_t ctx[8];
+            for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->parent_id >> (56 - 8 * i));
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice cs = { ctx, sizeof ctx };
+            oc_error e = { r->err_code, 0, cs, oc_slice_str("thread unavailable") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+            break;
+        }
+        /* Stream each reply as a self-framed THREAD_REPLY (a 64KB body is fine),
+         * then close with the THREAD terminator (like BACKFILL_DONE). */
+        int fd = c->fd;
+        /* One recipient — the caller — so participation is asked once. It is
+         * the TRUE answer: a replay reports who is in the thread just as the
+         * live fan-out does, and the client suppresses its own toasts for
+         * history it asked for. Reporting 0 here to stop the toasts would make
+         * the byte mean something different depending on the path, which is
+         * how the two copies of the rule drifted the first time. */
+        int in_thread = r->list_participant;
+        for (size_t i = 0; i < r->n_thread && conns[fd]; i++) {
+            oc_replay_msg *m = &r->thread[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { m->body, m->body_len };
+            oc_thread_reply tr = { .message_id  = m->message_id,
+                                   .channel_id  = m->channel_id,
+                                   .parent_id   = r->parent_id,
+                                   .author_id   = m->author_id,
+                                   .server_time = m->server_time,
+                                   .reply_count = (uint32_t)r->n_thread,
+                                   .participant = (uint8_t)(in_thread != 0),
+                                   .body        = body };
+            tr.n_attach = fill_attach_entries(tr.attach, m->attach, m->n_attach);
+            oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        if (!conns[fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_thread th = { r->parent_id, (uint32_t)r->n_thread, r->truncated };
+        oc_encode_thread(&w, OC_PROTOCOL_VERSION, &th);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SEARCH: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_search;   /* already bounded by OC_SEARCH_MAX */
+        oc_search_result_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].message_id = r->search[i].message_id;
+            ents[i].channel_id = r->search[i].channel_id;
+            ents[i].author_id = r->search[i].author_id;
+            ents[i].server_time = r->search[i].server_time;
+            ents[i].snippet.ptr = r->search[i].body;
+            ents[i].snippet.len = r->search[i].body_len;
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_search_results sr = { (uint16_t)n, ents, r->truncated };
+        oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &sr);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_TYPING: {
+        /* Relay to every connected member except the typer (REQ-121). Members is
+         * empty if the typer couldn't read the channel, so nothing leaks. */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_typing_update tu = { r->channel_id, r->author_id };
+        oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &tu);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id != r->author_id &&
+                in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_ATTACH_CREATED: {
+        /* UPLOAD_BEGIN accepted: open the blob sink and tell the client to stream
+         * (REQ-140, ARCH-69). The blob bytes never came near the writer thread. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_UP_AWAIT_CREATE) break;   /* client canceled/closed */
+        /* Opening an S3 object is a connect + TLS handshake, so it goes to the
+         * pool; UPLOAD_READY is sent when it completes. */
+        oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_W, c->conn_id);
+        if (!j || !(j->key = strdup(r->storage_key ? r->storage_key : ""))) {
+            oc_xfer_job_free(j);
+            int fd = c->fd;
+            send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+            break;
+        }
+        j->size_hint = r->att_size;
+        j->attachment_id = r->attachment_id;
+        x->attachment_id = r->attachment_id;
+        x->declared_size = r->att_size;
+        x->received = 0;
+        x->next_seq = 0;
+        x->state = XFER_UP_AWAIT_OPEN;
+        x->in_flight = 1;
+        oc_xferpool_submit(g_xfers, j);
+        update_interest(ep, c);
+        break;
+    }
+    case OC_RES_ATTACH_OK: {
+        /* UPLOAD_END finalized: confirm with the digest computed while streaming. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_UP_AWAIT_FINAL) break;
+        int fd = c->fd;
+        oc_upload_ok ok = { x->attachment_id, r->att_size, { x->digest, 32 } };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_upload_ok(&w, OC_PROTOCOL_VERSION, &ok);
+        xfer_reset(x);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ATTACH_META: {
+        /* DOWNLOAD_BEGIN authorized: open the blob and stream it (REQ-141). */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_DOWN_AWAIT_LOOKUP) break;
+        /* Stash what DOWNLOAD_INFO needs: this DB result is freed before the
+         * blob finishes opening on the worker. */
+        free(x->dl_filename); free(x->dl_mime);
+        x->dl_filename = strdup(r->filename ? r->filename : "");
+        x->dl_mime = strdup(r->mime ? r->mime : "");
+        memcpy(x->dl_sha, r->att_sha256, 32);
+        x->dl_have_sha = 1;
+        oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_R, c->conn_id);
+        if (!j || !(j->key = strdup(r->storage_key ? r->storage_key : ""))) {
+            oc_xfer_job_free(j);
+            int fd = c->fd;
+            send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+            break;
+        }
+        j->attachment_id = r->attachment_id;
+        x->attachment_id = r->attachment_id;
+        x->remaining = r->att_size;
+        x->next_seq = 0;
+        x->state = XFER_DOWN_AWAIT_OPEN;
+        x->in_flight = 1;
+        oc_xferpool_submit(g_xfers, j);
+        update_interest(ep, c);
+        break;
+    }
+    case OC_RES_STORAGE_STATUS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        /* The writer knows the database half; free space comes from the net
+         * thread's cached statvfs sample, so the two halves meet here. */
+        oc_storage_status ss;
+        memset(&ss, 0, sizeof ss);
+        ss.total_bytes  = g_sstat.total_bytes;
+        ss.avail_bytes  = g_sstat.avail_bytes;
+        ss.attach_bytes = r->st_attach_bytes;
+        ss.attach_count = r->st_attach_count;
+        ss.reclaimed_orphan  = r->st_rec_orphan;
+        ss.reclaimed_expired = r->st_rec_expired;
+        ss.reclaimed_evicted = r->st_rec_evicted;
+        ss.last_reclaim_ms   = r->st_last_reclaim_ms;
+        ss.max_age_days   = g_spol.max_age_ms / (24ull * 3600 * 1000);
+        ss.reserve_bytes  = g_spol.reserve_bytes;
+        ss.evict_enabled  = (uint8_t)g_spol.evict_enabled;
+        ss.under_pressure = (uint8_t)oc_storage_under_pressure(&g_sstat, &g_spol);
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_storage_status(&w, OC_PROTOCOL_VERSION, &ss);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_AUDIT_PAGE: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_audit_entry ents[OC_AUDIT_PAGE_MAX];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_audit && n < OC_AUDIT_PAGE_MAX; i++, n++) {
+            const oc_audit_row *a = &r->audit[i];
+            ents[n].at_ms     = a->at_ms;
+            ents[n].actor_id  = a->actor_id;
+            ents[n].target_id = a->target_id;
+            ents[n].family    = a->family;
+            ents[n].outcome   = a->outcome;
+            ents[n].actor_name = oc_slice_str(a->actor_name ? a->actor_name : "");
+            ents[n].action     = oc_slice_str(a->action ? a->action : "");
+            ents[n].target     = oc_slice_str(a->target ? a->target : "");
+            ents[n].detail     = oc_slice_str(a->detail ? a->detail : "");
+        }
+        oc_audit_page pg = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_audit_page(&w, OC_PROTOCOL_VERSION, &pg);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_AUDIT_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("audit query denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_STORAGE_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("storage status denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_STORAGE_MAINT: {
+        /* The rows are already tombstoned; delete the bytes off-thread. These
+         * are fire-and-forget (conn_id 0) — no connection is waiting, and a
+         * failed delete simply leaves a blob the next orphan sweep will retry. */
+        for (size_t i = 0; i < r->n_reclaim; i++) {
+            oc_xfer_job *dj = oc_xfer_job_new(OC_XFER_DELETE, 0);
+            if (!dj) break;
+            dj->key = strdup(r->reclaim[i].storage_key ? r->reclaim[i].storage_key : "");
+            dj->attachment_id = r->reclaim[i].attachment_id;
+            if (!dj->key) { oc_xfer_job_free(dj); break; }
+            oc_xferpool_submit(g_xfers, dj);
+        }
+        if (r->n_reclaim)
+            fprintf(stderr, "openchimed: storage maintenance reclaimed %zu blob(s) "
+                            "(%llu orphaned, %llu expired, %llu evicted); %llu MB free\n",
+                    r->n_reclaim,
+                    (unsigned long long)r->maint_orphans,
+                    (unsigned long long)r->maint_expired,
+                    (unsigned long long)r->maint_evicted,
+                    (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
+        break;
+    }
+    case OC_RES_ATTACH_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        int fd = c->fd;
+        send_transfer_error(c, r->attachment_id, r->err_code);   /* resets the xfer */
+        if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        break;
+    }
+    case OC_RES_WEBHOOK_CREATED: {
+        /* Hand the minted token back to the client that asked (shown once). */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        char whhex[2 * OC_SESSION_TOKEN_LEN + 1];
+        hex_encode(r->session_token, OC_SESSION_TOKEN_LEN, whhex);
+        oc_webhook_info wi = { r->message_id, r->channel_id,
+                               { (const uint8_t *)whhex, strlen(whhex) } };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_webhook_info(&w, OC_PROTOCOL_VERSION, &wi);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_WEBHOOK_POSTED: {
+        /* Fan the posted message out to connected members (like SEND_OK)... */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice body = { r->body, r->body_len };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}}, {0} };
+        b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
+        oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *m = conns[fd];
+            if (m && m->authed && in_members(m->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        /* ...then 200 the webhook sender and close its HTTP connection. */
+        conn *hc = find_by_id(conns, r->conn_id);
+        if (hc) {
+            char jb[64];
+            int jn = snprintf(jb, sizeof jb, "{\"ok\":true,\"message_id\":%llu}\n",
+                              (unsigned long long)r->message_id);
+            http_reply(hc, 200, "OK", "application/json", jb, jn > 0 ? (size_t)jn : 0);
+            flush_out(hc);
+            conn_close(ep, conns, hc->fd);
+        }
+        break;
+    }
+    case OC_RES_WEBHOOK_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        if (c->http) {
+            int status = 404; const char *reason = "Not Found"; const char *msg = "unknown webhook\n";
+            if (r->err_code == OC_ERR_INTERNAL) { status = 500; reason = "Internal Server Error"; msg = "error\n"; }
+            /* 403, not 404: the token is real and the sender is entitled to use
+             * it — the CHANNEL is read-only (REQ-035). Answering "not found"
+             * would tell an integration its token had been revoked, which is a
+             * different problem with a different fix. */
+            else if (r->err_code == OC_ERR_CHANNEL_ARCHIVED) {
+                status = 403; reason = "Forbidden"; msg = "channel is archived\n";
+            }
+            http_reply(c, status, reason, "text/plain", msg, strlen(msg));
+            flush_out(c);
+            conn_close(ep, conns, c->fd);
+        } else {
+            /* CREATE_WEBHOOK failure on a binary client -> ERROR frame. */
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("webhook error") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_EMOJI_LIST: {
+        /* To the asker, and — when the catalogue CHANGED (ch_fanout) — to everyone
+         * else too: an emoji nobody else's picker knows about is one they cannot use,
+         * and a deleted one they would render as a broken image. */
+        oc_emoji_entry ents[OC_MAX_CUSTOM_EMOJI];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_elist && n < OC_MAX_CUSTOM_EMOJI; i++) {
+            ents[n].name = oc_slice_str(r->elist[i].name ? r->elist[i].name : "");
+            ents[n].attachment_id = r->elist[i].attachment_id;
+            ents[n].created_by = r->elist[i].created_by;
+            n++;
+        }
+        oc_emoji_list el = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_emoji_list(&w, OC_PROTOCOL_VERSION, &el);
+        size_t len = w.len;
+        if (r->ch_fanout) {
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed) send_bytes(ep, conns, fd, g_enc, len);
+            }
+        } else {
+            conn *c = find_by_id(conns, r->conn_id);
+            if (c) send_bytes(ep, conns, c->fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_SESSION_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_session_entry ents[OC_MAX_SESSIONS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_sessions && n < OC_MAX_SESSIONS; i++) ents[n++] = r->sessions[i];
+        oc_session_list sl = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_session_list(&w, OC_PROTOCOL_VERSION, &sl);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_FILE_CHANNELS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_file_channel_entry ents[OC_MAX_FILE_CHANNELS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_fchans && n < OC_MAX_FILE_CHANNELS; i++) ents[n++] = r->fchans[i];
+        oc_file_channels fc = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_file_channels(&w, OC_PROTOCOL_VERSION, &fc);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_PROFILE_INFO: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_profile_info pi;
+        memset(&pi, 0, sizeof pi);
+        pi.user_id        = r->user_id;
+        pi.display_name   = oc_slice_str(r->author_name ? r->author_name : "");
+        pi.email          = oc_slice_str(r->body ? (const char *)r->body : "");
+        pi.status_emoji   = oc_slice_str(r->st_emoji ? r->st_emoji : "");
+        pi.status_text    = oc_slice_str(r->st_text ? r->st_text : "");
+        pi.status_expires = r->st_expires;
+        pi.title          = oc_slice_str(r->pf_title ? r->pf_title : "");
+        pi.timezone       = oc_slice_str(r->pf_tz ? r->pf_tz : "");
+        pi.avatar_id      = r->pf_avatar;
+        pi.role           = r->role;
+        pi.full_name      = oc_slice_str(r->pf_full_name ? r->pf_full_name : "");
+        pi.pronouns       = oc_slice_str(r->pf_pronouns ? r->pf_pronouns : "");
+        pi.phone          = oc_slice_str(r->pf_phone ? r->pf_phone : "");
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_INVITE_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_invite_entry ents[OC_MAX_INVITES];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_invites && n < OC_MAX_INVITES; i++) ents[n++] = r->invites[i];
+        oc_invite_list il = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_invite_list(&w, OC_PROTOCOL_VERSION, &il);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_INVITE_REVOKED: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        /* The ack carries the id so a client can drop that row without re-listing. */
+        oc_revoke_invite rv = { r->message_id };
+        oc_encode_invite_revoked(&w, OC_PROTOCOL_VERSION, &rv);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_WEBHOOK_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_webhook_list_entry ents[OC_WEBHOOK_LIST_MAX];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_whlist && n < OC_WEBHOOK_LIST_MAX; i++) {
+            ents[n].webhook_id = r->whlist[i].id;
+            ents[n].channel_id = r->whlist[i].channel_id;
+            ents[n].label = oc_slice_str(r->whlist[i].label ? r->whlist[i].label : "");
+            ents[n].disabled = r->whlist[i].disabled;
+            n++;
+        }
+        oc_webhook_list wl = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_webhook_list(&w, OC_PROTOCOL_VERSION, &wl);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_WEBHOOK_DELETED: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_webhook_deleted wd = { r->message_id };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_webhook_deleted(&w, OC_PROTOCOL_VERSION, &wd);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_NOTIFY_PREFS: {
+        /* Sync the settings snapshot to *all* of the user's connections, so a
+         * change on one device updates the others (REQ-130/131). */
+        static oc_notify_pref_entry ents[OC_MAX_NOTIFY_PREFS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_nprefs && n < OC_MAX_NOTIFY_PREFS; i++) {
+            ents[n].channel_id = r->nprefs[i].channel_id;
+            ents[n].level = r->nprefs[i].level;
+            ents[n].muted = r->nprefs[i].muted;      /* */
+            n++;
+        }
+        /* Designated, not positional: adding `notify_default` before `count` silently
+         * assigned the count to the new field. A positional initializer turns "one new
+         * struct field" into a data corruption with no compiler error worth the name. */
+        oc_notify_prefs np;
+        np.notify_default = r->np_default;        /* REQ-134 */
+        np.count          = n;
+        np.entries        = ents;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &np);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        /* The rest of the user's notification state travels with it, each in its
+         * own frame — NOTIFY_PREFS ends in a repeated list, so a field added to
+         * its fixed part would shift every entry after the first. One request
+         * answers with all of it, in a fixed order: pause, schedule, alerts. */
+        {
+            uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+            oc_snooze sn = { r->snooze_until_ms };
+            oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && c->user_id == r->user_id) {
+                    c->dnd_until_ms = r->snooze_until_ms;
+                    send_bytes(ep, conns, fd, sbuf, sw.len);
+                }
+            }
+        }
+        {
+            /* The schedule rides the same answer, and into the net thread's own
+             * copy: other people's DND badge is computed from it. */
+            cache_schedule(conns, r->user_id, r);
+            oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min,
+                               r->sc_end_min, r->sc_n_days, r->sc_days };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &sc);
+            size_t sl = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && c->user_id == r->user_id)
+                    send_bytes(ep, conns, fd, g_enc, sl);
+            }
+        }
+        {
+            oc_slice terms[OC_MAX_KEYWORDS];
+            for (uint8_t i = 0; i < r->al_n_terms; i++) terms[i] = oc_slice_str(r->al_terms[i]);
+            oc_alert_prefs ap = { r->al_n_terms, terms, r->al_n_people, r->al_people };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &ap);
+            size_t al = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && c->user_id == r->user_id)
+                    send_bytes(ep, conns, fd, g_enc, al);
+            }
+        }
+        break;
+    }
+    case OC_RES_THREAD_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_threads && conns[c->fd]; i++) {
+            const oc_thread_row *t = &r->threads[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
+                                     t->root_at, t->last_reply_at, t->reply_count,
+                                     t->unread, t->following,
+                                     oc_slice_str(t->preview ? t->preview : "") };
+            oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_threads term = { (uint32_t)r->n_threads };
+        oc_encode_threads(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_THREAD_ONE: {
+        /* The one row that changed, to every one of the user's connections: a
+         * follow or a read mark is a fact about them, not about this device. */
+        if (!r->n_threads) break;
+        const oc_thread_row *t = &r->threads[0];
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
+                                 t->root_at, t->last_reply_at, t->reply_count,
+                                 t->unread, t->following,
+                                 oc_slice_str(t->preview ? t->preview : "") };
+        oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_SCHEDULE: {
+        /* Self-only, and to EVERY connection the user holds: a schedule set on
+         * one device that left another showing the old one would be two answers
+         * to "when am I quiet", which is the thing REQ-136 exists to prevent. */
+        oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min, r->sc_end_min,
+                           r->sc_n_days, r->sc_days };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &sc);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        /* And into the net thread's own copy, which is what other people's DND
+         * badge is computed from. The tick below announces the change. */
+        cache_schedule(conns, r->user_id, r);
+        break;
+    }
+    case OC_RES_ALERT_PREFS: {
+        oc_slice terms[OC_MAX_KEYWORDS];
+        for (uint8_t i = 0; i < r->al_n_terms; i++) terms[i] = oc_slice_str(r->al_terms[i]);
+        oc_alert_prefs ap = { r->al_n_terms, terms, r->al_n_people, r->al_people };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &ap);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_SNOOZE: {
+        /* To the user's own connections: when it ends, which only they may know.
+         * Then re-announce their presence to everyone else, because the FACT is
+         * public — a sender should learn it before writing, not after being
+         * ignored (REQ-122). */
+        uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+        oc_snooze sn = { r->snooze_until_ms };
+        oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id) {
+                c->dnd_until_ms = r->snooze_until_ms;
+                send_bytes(ep, conns, fd, sbuf, sw.len);
+            }
+        }
+        broadcast_presence(ep, conns, r->user_id, presence_of(conns, r->user_id));
+        break;
+    }
+    case OC_RES_NOTIFY_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("notify pref error") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SCHEDULED: {
+        /* To every connection of the author, INCLUDING the one that asked: this
+         * is an acknowledgement as much as a sync, and unlike a draft it cannot
+         * overwrite anything being typed. */
+        oc_scheduled sc = { r->sched.id, r->sched.channel_id, r->sched.thread_root,
+                            r->sched.send_at_ms, r->sched.created_ms, r->sched.state,
+                            oc_slice_str(r->sched.fail_reason ? r->sched.fail_reason : ""),
+                            oc_slice_str(r->sched.body ? r->sched.body : "") };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_scheduled(&w, OC_PROTOCOL_VERSION, &sc);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_SCHEDULED_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_scheds && conns[c->fd]; i++) {
+            oc_scheduled sc = { r->scheds[i].id, r->scheds[i].channel_id,
+                                r->scheds[i].thread_root, r->scheds[i].send_at_ms,
+                                r->scheds[i].created_ms, r->scheds[i].state,
+                                oc_slice_str(r->scheds[i].fail_reason ? r->scheds[i].fail_reason : ""),
+                                oc_slice_str(r->scheds[i].body ? r->scheds[i].body : "") };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            if (oc_encode_scheduled(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (conns[c->fd]) {
+            oc_scheduled_list term = { (uint16_t)r->n_scheds };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_scheduled_list(&w, OC_PROTOCOL_VERSION, &term);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_SCHED_FIRED:
+        /* Nothing was due, or the one that was could not be delivered and has
+         * been marked for its author. A delivered one comes back as SEND_OK and
+         * is broadcast by that case, which is the point of ARCH-102. */
+        break;
+    case OC_RES_DRAFT: {
+        /* To the user's OTHER connections only (ARCH-101). The device that wrote
+         * it already has the text, and echoing it back is how a client ends up
+         * overwriting the composer somebody is still typing in. */
+        oc_draft d = { r->draft.id, r->draft.channel_id, r->draft.thread_root,
+                       r->draft.updated_ms,
+                       oc_slice_str(r->draft.recipients ? r->draft.recipients : ""),
+                       oc_slice_str(r->draft.body ? r->draft.body : "") };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id && c->conn_id != r->conn_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_DRAFTS: {
+        /* The list, to the connection that asked: N drafts then the terminator,
+         * the same shape the saved-items listing uses. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_drafts && conns[c->fd]; i++) {
+            oc_draft d = { r->drafts[i].id, r->drafts[i].channel_id,
+                           r->drafts[i].thread_root, r->drafts[i].updated_ms,
+                           oc_slice_str(r->drafts[i].recipients ? r->drafts[i].recipients : ""),
+                           oc_slice_str(r->drafts[i].body ? r->drafts[i].body : "") };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            if (oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d) == OC_OK)
+                send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (conns[c->fd]) {
+            oc_drafts term = { (uint16_t)r->n_drafts };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_drafts(&w, OC_PROTOCOL_VERSION, &term);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_CLIENT_SETTINGS: {
+        /* Sync the bucket snapshot to *all* of the user's connections, so a change
+         * on one device reaches the others; each client folds it only if the
+         * client_type matches its own (per-frontend buckets). */
+        static oc_client_setting_entry ents[OC_MAX_CLIENT_SETTINGS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_cslist && n < OC_MAX_CLIENT_SETTINGS; i++) {
+            ents[n].key = oc_slice_str(r->cslist[i].key ? r->cslist[i].key : "");
+            ents[n].value = oc_slice_str(r->cslist[i].value ? r->cslist[i].value : "");
+            n++;
+        }
+        oc_client_settings cst = { oc_slice_str(r->cs_client_type ? r->cs_client_type : ""), n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_client_settings(&w, OC_PROTOCOL_VERSION, &cst);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_PROFILE_UPDATED: {
+        /* A display-name change (REQ-020): fan it to every authed connection so all
+         * rosters update; the originator reads it as its own ack (a password change
+         * echoes the unchanged name, which is a harmless roster no-op). */
+        oc_profile_updated pu = { r->user_id, oc_slice_str(r->profile_name ? r->profile_name : "") };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_profile_updated(&w, OC_PROTOCOL_VERSION, &pu);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed) send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_PROFILE_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("profile update rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_READ_CURSOR: {
+        /* Seen-by (REQ-090): tell the channel's other members that this member
+         * advanced their read cursor, and backfill the acker with the others'
+         * current cursors so opening a channel shows who has already read it. */
+        oc_read_cursor rc = { r->channel_id, r->user_id, r->message_id };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rc);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id != r->user_id &&
+                in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        conn *ac = find_by_id(conns, r->conn_id);
+        if (ac) {
+            for (size_t i = 0; i < r->n_rcur; i++) {
+                oc_read_cursor rb = { r->channel_id, r->rcur[i].user_id, r->rcur[i].message_id };
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rb);
+                send_bytes(ep, conns, ac->fd, g_enc, w.len);
+            }
+        }
+        break;
+    }
+    case OC_RES_CALL_AUTH: {
+        /* Authorized: add to the channel's ephemeral call, tell the joiner (with
+         * the roster), and push a roster update to the other participants. */
+        conn *jc = find_by_id(conns, r->conn_id);
+        if (!jc) break;
+        int jfd = jc->fd;
+        call_t *c = call_get_or_create(r->channel_id);
+        uint8_t token[OC_AUDIO_TOKEN_LEN];
+        if (!c || oc_rand_bytes(token, sizeof token) != 0 ||
+            !call_add(c, r->user_id, r->conn_id, token)) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_error e = { OC_ERR_INTERNAL, 0, { NULL, 0 }, oc_slice_str("call full") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, jfd, g_enc, w.len);
+            break;
+        }
+        /* Register the participant + token with the media sidecar (ARCH-31). */
+        audio_authorize(r->channel_id, r->user_id, token);
+        uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
+        for (int i = 0; i < c->n; i++) parts[i] = c->parts[i].user_id;
+        /* The joiner's private media endpoint: the sidecar's UDP port + its token. */
+        oc_call_joined jd = { c->channel_id, c->channel_id, g_audio_udp_port,
+                              { token, OC_AUDIO_TOKEN_LEN }, (uint16_t)c->n, parts };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &jd);
+        send_bytes(ep, conns, jfd, g_enc, w.len);
+        if (conns[jfd]) {   /* joiner still up */
+            call_t *cc = call_find(r->channel_id);
+            if (cc) call_send_roster(ep, conns, cc, r->conn_id);
+        }
+        break;
+    }
+    case OC_RES_CALL_ERR: {
+        conn *jc = find_by_id(conns, r->conn_id);
+        if (!jc) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("call join denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, jc->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_UNFURL_STORED: {
+        /* Fan the stored preview to every connected member (REQ-222). The same
+         * shape as an edit fan-out; there is no requester to ack — the job was
+         * the unfurl worker's. */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_unfurl uf = { r->message_id, r->channel_id,
+                         oc_slice_str(r->unf_url ? r->unf_url : ""),
+                         oc_slice_str(r->unf_title ? r->unf_title : ""),
+                         oc_slice_str(r->unf_descr ? r->unf_descr : "") };
+        oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        break;
+    }
+    case OC_RES_BACKFILL_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        int fd = c->fd;
+        /* Replay each missed top-level message as a BROADCAST, ascending id.
+         * A message with thread replies is followed by a THREAD_META so the
+         * client can show its reply count without opening the thread (REQ-060). */
+        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+            oc_replay_msg *m = &r->replay[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { m->body, m->body_len };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body, 0, {{0}}, {0} };
+            broadcast_set_attach(&b, m->attach, m->n_attach);
+            b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
+            oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (m->reply_count > 0 && conns[fd]) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_thread_meta tm = { m->message_id, m->reply_count, m->last_reply_at };
+                oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm);
+                send_bytes(ep, conns, fd, g_enc, w.len);
+            }
+        }
+        /* Pin state for what we just replayed, for the same reason as the
+         * reactions below: a BROADCAST has no field for it, so without this a
+         * reload silently loses every pin (REQ-230). */
+        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+            if (!r->replay[i].pinned_by && !r->replay[i].pinned_at) continue;
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_pin_updated pu = { r->replay[i].message_id, r->replay[i].channel_id,
+                                  r->replay[i].pinned_by, OC_PIN_ADD,
+                                  r->replay[i].pinned_at };
+            oc_encode_pin_updated(&w, OC_PROTOCOL_VERSION, &pu);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
+        /* And this user's saved-for-later marks, for the same reason again — but
+         * note the difference: a pin is a channel-wide fact and this is private,
+         * so it goes only down THIS connection and is keyed to the requester
+         * (REQ-231). Without it, a reload showed nothing bookmarked until the
+         * Later view was opened. */
+        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+            if (!r->replay[i].saved) continue;
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_saved_updated su = { r->replay[i].message_id, OC_SAVE_ADD,
+                                    r->replay[i].saved_at };
+            oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
+        /* Then the reaction state for those messages. A BROADCAST carries none,
+         * so without this every reaction vanished on reload. op=ADD with the
+         * aggregate count reconstructs the chip; user_id is the requester when
+         * they reacted, which is what marks the chip as theirs. */
+        for (size_t i = 0; i < r->n_rreact && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_reaction_updated ru = { r->rreact[i].message_id, r->rreact[i].channel_id,
+                                       r->rreact[i].user_id,
+                                       oc_slice_str(r->rreact[i].emoji ? r->rreact[i].emoji : ""),
+                                       OC_REACT_ADD, r->rreact[i].count };
+            oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &ru);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
+        /* And the link previews (REQ-222), for the same reason once more: an
+         * unfurl travels on its own frame, so a replay that omitted it would
+         * silently lose every preview on reload. */
+        for (size_t i = 0; i < r->n_runfurl && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_unfurl uf = { r->runfurl[i].message_id, r->runfurl[i].channel_id,
+                             oc_slice_str(r->runfurl[i].url ? r->runfurl[i].url : ""),
+                             oc_slice_str(r->runfurl[i].title ? r->runfurl[i].title : ""),
+                             oc_slice_str(r->runfurl[i].descr ? r->runfurl[i].descr : "") };
+            oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
+        /* And what each replayed forward points at (REQ-057) — the reference
+         * rides its own frame, so a replay without this loses the attribution
+         * the moment the client reloads, which is exactly what the reaction,
+         * pin and unfurl replays above each exist to prevent. */
+        for (size_t i = 0; i < r->n_rfwd && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
+                              r->rfwd[i].src_channel, r->rfwd[i].src_message,
+                              r->rfwd[i].src_author,
+                              oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
+                              r->rfwd[i].n_attach,
+                              oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+            oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        if (!conns[fd]) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_backfill_done done = { r->high_water, r->truncated };
+        oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &done);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* --- Main loop ---------------------------------------------------------- */
+
+
+/* Collect one finished blob job (ARCH-69) and advance that transfer.
+ *
+ * The connection may have closed while the job was with a worker, which is the
+ * case this whole design exists to make safe: the handle travels with the job,
+ * so if the connection is gone we still own something valid and release it here
+ * rather than leaking it. Nothing dereferences a stale `conn *` — the job
+ * carries a conn_id and connection ids are never reused. */
+/* Run the storage maintenance pass if its interval has elapsed (ARCH-78).
+ *
+ * Driven by the net loop's regular tick rather than by incoming writes: an idle
+ * tenant is exactly the one whose disk fills with nothing prompting a cleanup,
+ * so piggybacking on traffic (the way ARCH-44's idempotency prune does) would
+ * stop precisely when it matters most. The pass itself is a DB job — finding
+ * what to reclaim is a query — and the bytes are deleted by the transfer pool
+ * when the result comes back. */
+/* Scheduled messages (REQ-224, ARCH-102), on their OWN interval. Storage
+ * maintenance's five minutes is not a send time: a message scheduled for 09:00
+ * arriving at 09:04 is a different product. Fifteen seconds is close enough that
+ * nobody notices, and far enough apart that an idle workspace is not paying for
+ * a query it never needs.
+ *
+ * Raised again immediately whenever one fires, so a backlog drains at queue
+ * speed rather than one per tick — the flag is set by the result path below. */
+static uint64_t g_last_sched_ms;
+static int      g_sched_more;
+/* Overridable for tests, exactly as OPENCHIME_MAINT_INTERVAL_MS is: a suite
+ * that has to wait fifteen real seconds to see a scheduled message fire is one
+ * nobody runs. Floored so a bad value cannot busy-loop the writer. */
+static uint64_t sched_tick_ms(void) {
+    const char *e = getenv("OPENCHIME_SCHED_TICK_MS");
+    if (e && *e) {
+        unsigned long long v = strtoull(e, NULL, 10);
+        if (v >= 50) return (uint64_t)v;
+    }
+    return 15000u;
+}
+
+static void maybe_fire_scheduled(oc_dbwriter *dbw) {
+    uint64_t now = now_ms();
+    if (!g_sched_more && g_last_sched_ms && now - g_last_sched_ms < sched_tick_ms()) return;
+    g_last_sched_ms = now;
+    g_sched_more = 0;
+    oc_job *j = oc_job_new(OC_JOB_FIRE_SCHEDULED, 0);   /* no connection owns this */
+    if (j) oc_dbwriter_submit(dbw, j);
+}
+
+/* Do-not-disturb changing with no frame to hang it on.
+ *
+ * Both halves end by the CLOCK rather than by anyone doing something. A pause
+ * runs out (REQ-278); quiet hours begin at 18:00 and end at 09:00 (REQ-136).
+ * Nothing needs to clear a passed pause stamp — every reader treats one as
+ * absent — but other people were told the fact, and only a frame can untell
+ * them. Without this the badge would be right only for whoever happened to
+ * reconnect after the boundary.
+ *
+ * So: clear lapsed stamps, then re-announce any user whose DND answer differs
+ * from what they were last announced as. Comparing rather than announcing every
+ * tick is what keeps a quiet box quiet — this runs on every epoll turn. */
+static void expire_snoozes(int ep, conn **conns) {
+    uint64_t now = (uint64_t)time(NULL) * 1000ull;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed || !c->dnd_until_ms || c->dnd_until_ms > now) continue;
+        uint64_t uid = c->user_id;
+        for (int g = 0; g < OC_NETLOOP_MAX_FD; g++)      /* every connection they hold */
+            if (conns[g] && conns[g]->authed && conns[g]->user_id == uid)
+                conns[g]->dnd_until_ms = 0;
+        g_dnd_dirty = 1;
+    }
+
+    /* The re-announce sweep is O(connections squared) — dnd_of rescans the
+     * table for each connection — and this function runs on EVERY epoll turn,
+     * which under a busy transfer is many times a second. Paying that per turn
+     * put real work on the hot path for an answer that had not changed.
+     *
+     * Two things can change it, and neither needs the hot path:
+     *
+     *   the CLOCK, at minute granularity, because that is the resolution quiet
+     *   hours are expressed in — so once a minute is not an approximation, it
+     *   is exactly often enough;
+     *
+     *   a PERSON, which sets the dirty flag, because waiting up to a minute to
+     *   tell everyone you just turned quiet hours on would be a visible lag.
+     */
+    static uint64_t last_min;
+    uint64_t this_min = now / 60000ull;
+    if (!g_dnd_dirty && this_min == last_min) return;
+    last_min = this_min;
+    g_dnd_dirty = 0;
+
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed) continue;
+        if ((uint8_t)dnd_of(conns, c->user_id) == c->dnd_announced) continue;
+        /* broadcast_presence stamps every connection this user holds, so they
+         * are announced once however many devices they are on. */
+        broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
+    }
+}
+
+static void maybe_run_maintenance(oc_dbwriter *dbw) {
+    uint64_t now = now_ms();
+    if (g_last_maint_ms && now - g_last_maint_ms < g_spol.interval_ms) return;
+    g_last_maint_ms = now;
+
+    oc_storage_sample(g_blob_dir, now, &g_sstat);
+
+    /* Eviction is the destructive tier, so it is requested only when free space
+     * is genuinely below the watermark AND the operator left it enabled. The
+     * orphan sweep runs every pass regardless: it frees bytes nobody was ever
+     * promised, so there is no reason to wait for pressure. */
+    int pressure = oc_storage_under_pressure(&g_sstat, &g_spol);
+
+    oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);   /* no connection owns this */
+    if (!j) return;
+    j->maint_max_age_ms = g_spol.max_age_ms;
+    j->maint_grace_ms   = g_spol.grace_ms;
+    j->maint_batch      = g_spol.batch;
+    j->maint_evict      = (pressure && g_spol.evict_enabled);
+    j->audit_max_age_ms = g_spol.audit_max_age_ms;
+    oc_dbwriter_submit(dbw, j);
+}
+
+static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_job *j) {
+    conn *c = find_by_id(conns, j->conn_id);
+    if (!c) {
+        /* Orphaned: release whatever the job is still holding, off-thread. */
+        if (j->bw) {
+            oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
+            if (ab) { ab->bw = j->bw; oc_xferpool_submit(g_xfers, ab); }
+        }
+        if (j->br) {
+            oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
+        }
+        return;
+    }
+
+    conn_xfer *x = &c->xfer;
+    int fd = c->fd;
+    oc_wbuf w;
+
+    /* The job is done, so the connection owns its transfer state again. Clear
+     * this before anything below, since xfer_reset consults it to decide
+     * whether a handle is ours to release. */
+    x->in_flight = 0;
+
+    /* A stale completion for a transfer the client already abandoned (it sent
+     * TRANSFER_CANCEL, or started a new one). Release the handle and stop. */
+    if (j->attachment_id && x->attachment_id != j->attachment_id) {
+        if (j->bw) {
+            oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
+            if (ab) { ab->bw = j->bw; oc_xferpool_submit(g_xfers, ab); }
+        }
+        if (j->br) {
+            oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
+        }
+        update_interest(ep, c);
+        return;
+    }
+
+    switch (j->op) {
+    case OC_XFER_OPEN_W:
+        if (j->rc != 0 || !j->bw || x->state != XFER_UP_AWAIT_OPEN) {
+            if (j->bw) {   /* opened, but the client moved on */
+                oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
+                if (ab) { ab->bw = j->bw; oc_xferpool_submit(g_xfers, ab); }
+            }
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        x->bw = j->bw;
+        mbedtls_sha256_init(&x->sha);
+        mbedtls_sha256_starts(&x->sha, 0);
+        x->sha_init = 1;
+        x->state = XFER_UP_ACTIVE;
+        {
+            oc_upload_ready rd = { x->attachment_id, OC_ATTACH_CHUNK_SIZE, OC_UPLOAD_WINDOW };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &rd);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        break;
+
+    case OC_XFER_WRITE:
+        if (j->rc != 0 || x->state != XFER_UP_ACTIVE) {
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        /* Hash here, not at submit time: completions arrive in submission order
+         * (one job per transfer in flight), so this matches what was stored. */
+        if (j->len) mbedtls_sha256_update(&x->sha, j->data, j->len);
+        x->received += j->len;
+        x->next_seq++;
+        {
+            oc_upload_ack ack = { x->attachment_id, x->next_seq };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        break;
+
+    case OC_XFER_COMMIT:
+        if (j->rc != 0 || x->state != XFER_UP_AWAIT_COMMIT) {
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        {
+            oc_job *fj = oc_job_new(OC_JOB_ATTACH_FINALIZE, c->conn_id);
+            if (!fj) { send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL); break; }
+            fj->user_id = c->user_id;
+            fj->attachment_id = x->attachment_id;
+            fj->att_size = x->received;
+            memcpy(fj->att_sha256, x->digest, 32);
+            oc_dbwriter_submit(dbw, fj);
+            x->state = XFER_UP_AWAIT_FINAL;
+        }
+        break;
+
+    case OC_XFER_OPEN_R:
+        if (j->rc != 0 || !j->br || x->state != XFER_DOWN_AWAIT_OPEN) {
+            if (j->br) {
+                oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+                if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
+            }
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        x->br = j->br;
+        x->state = XFER_DOWN_ACTIVE;
+        {
+            oc_download_info di = { x->attachment_id,
+                                    oc_slice_str(x->dl_filename ? x->dl_filename : ""),
+                                    oc_slice_str(x->dl_mime ? x->dl_mime : ""),
+                                    x->remaining, { x->dl_sha, 32 } };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &di);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        download_pump(c);
+        break;
+
+    case OC_XFER_READ:
+        if (j->rc != 0 || j->len == 0 || x->state != XFER_DOWN_ACTIVE) {
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        {
+            oc_download_chunk ch = { x->attachment_id, x->next_seq, { j->data, j->len } };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        x->next_seq++;
+        x->remaining -= (uint64_t)j->len;
+        download_pump(c);                      /* ask for the next slice */
+        break;
+
+    case OC_XFER_ABORT:
+    case OC_XFER_CLOSE:
+    case OC_XFER_DELETE:
+        break;                                  /* submitted fire-and-forget */
+    }
+
+    if (!conns[fd]) return;                     /* closed above */
+    /* An upload write just finished: resume draining the frames that arrived
+     * while we were paused, then re-arm EPOLLIN via update_interest. */
+    if (j->op == OC_XFER_WRITE && !x->in_flight) {
+        if (drain_frames(ep, conns, c, dbw) < 0) { conn_close(ep, conns, fd); return; }
+        if (!conns[fd]) return;
+    }
+    if (flush_out(c) < 0) { conn_close(ep, conns, fd); return; }
+    if (conns[fd]) update_interest(ep, c);
+}
+
+/* Every startup failure says what failed and why, on stderr (ARCH-53), before
+ * returning. A daemon that cannot serve used to be indistinguishable from one
+ * that was asked to stop: six bare `return -1`s, and the last thing in the
+ * journal was `healthz listening`. That cost about forty minutes of diagnosing
+ * a daemon that logged nothing wrong. `errno` is read immediately, because
+ * anything between the call and the message can overwrite it. */
+#define NETLOOP_FAIL(op) \
+    fprintf(stderr, "openchimed: cannot start: %s: %s\n", (op), strerror(errno))
+
+int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
+                   volatile sig_atomic_t *stop) {
+    conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
+    if (!conns) { NETLOOP_FAIL("allocating the connection table"); return -1; }
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { NETLOOP_FAIL("socket"); free(conns); return -1; }
+    int yes = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    /* Named separately: "bind" on the proto port is the one an operator can act
+     * on — the port is taken, or is privileged and the unit lacks
+     * CAP_NET_BIND_SERVICE (ARCH-54) — and lumping three calls under one
+     * message would hide which. */
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        fprintf(stderr, "openchimed: cannot start: bind port %d: %s\n",
+                port, strerror(errno));
+        close(lfd); free(conns); return -1;
+    }
+    if (listen(lfd, 128) < 0) {
+        NETLOOP_FAIL("listen"); close(lfd); free(conns); return -1;
+    }
+    if (set_nonblock(lfd) < 0) {
+        NETLOOP_FAIL("setting the listening socket non-blocking");
+        close(lfd); free(conns); return -1;
+    }
+
+    int ep = epoll_create1(0);
+    if (ep < 0) { NETLOOP_FAIL("epoll_create1"); close(lfd); free(conns); return -1; }
+    int evfd = oc_dbwriter_eventfd(dbw);
+
+    /* Attachment blob store (ARCH-70) + upload size cap (REQ-140). Bytes are
+     * proxied through this loop to/from the store; keep it beside the daemon. */
+    {
+        const oc_config *cfg = oc_config_get();
+        const char *bd = cfg->blob_dir;
+        g_blobs = oc_blobstore_open(bd);
+        if (!g_blobs) {
+            /* The path is in the message because this is the failure that
+             * actually happens: every path default points into `/data`, which
+             * exists in the image and nowhere else, so it fires the moment the
+             * daemon runs outside a container (CONFIG.md). */
+            fprintf(stderr, "openchimed: cannot start: opening the blob store "
+                            "at \"%s\": %s\n", bd ? bd : "(unset)", strerror(errno));
+            close(ep); close(lfd); free(conns); return -1;
+        }
+        g_max_attach = cfg->max_attach_size;
+
+        /* Blob I/O runs here, off the net thread (ARCH-69). Worker count from
+         * config (default 2, clamped 1..16): each in-flight transfer holds a TLS
+         * session plus a chunk buffer, which has to stay modest against the 256MB
+         * lean profile (REQ-210). */
+        int nw = cfg->xfer_workers;
+        snprintf(g_blob_dir, sizeof g_blob_dir, "%s", bd);
+        g_spol = cfg->storage;
+        oc_storage_sample(g_blob_dir, now_ms(), &g_sstat);
+        fprintf(stderr, "openchimed: storage maintenance every %llus, "
+                        "max attachment age %llud, eviction %s, %llu MB free\n",
+                (unsigned long long)(g_spol.interval_ms / 1000),
+                (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)),
+                g_spol.evict_enabled ? "on" : "off",
+                (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
+
+        g_xfers = oc_xferpool_start(g_blobs, nw);
+        if (!g_xfers) {
+            fprintf(stderr, "openchimed: cannot start: starting %d transfer "
+                            "worker(s): %s\n", nw, strerror(errno));
+            oc_blobstore_close(g_blobs); g_blobs = NULL;
+            close(ep); close(lfd); free(conns); return -1;
+        }
+    }
+
+    /* Per-webhook rate limit (REQ-170); best-effort — if allocation fails the
+     * endpoint still works, just unthrottled. */
+    g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
+
+    /* Per-source-IP concurrent-connection cap (0 disables). Blunts a
+     * connection-exhaustion flood from one host while staying generous enough
+     * for a large office behind one NAT; operators tune it. The global cap is
+     * OC_NETLOOP_MAX_FD. */
+    int max_per_ip = oc_config_get()->max_conns_per_ip;
+
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN; ev.data.fd = lfd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN; ev.data.fd = evfd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, evfd, &ev);
+
+    int xfd = oc_xferpool_eventfd(g_xfers);
+    ev.events = EPOLLIN; ev.data.fd = xfd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, xfd, &ev);
+
+    fprintf(stderr, "netloop: listening on :%d\n", port);
+
+    struct epoll_event events[64];
+    while (!*stop) {
+        int nfds = epoll_wait(ep, events, 64, 500);
+        /* Every tick, timeout included — a quiet box must still be maintained. */
+        maybe_run_maintenance(dbw);
+        maybe_fire_scheduled(dbw);
+        expire_snoozes(ep, conns);
+        if (nfds < 0) { if (errno == EINTR) continue; break; }
+
+        for (int i = 0; i < nfds; i++) {
+            int fd = events[i].data.fd;
+
+            if (fd == lfd) {
+                for (;;) {
+                    struct sockaddr_storage ss;
+                    socklen_t sl = sizeof ss;
+                    int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
+                    if (cfd < 0) break;
+                    if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
+                    /* Peer IP (for the accept throttle + per-source auth limit). */
+                    char src[46] = {0};
+                    if (ss.ss_family == AF_INET) {
+                        inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, src, sizeof src);
+                    } else if (ss.ss_family == AF_INET6) {
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, src, sizeof src);
+                    }
+                    /* Throttle a single IP before spending a conn/TLS context on it. */
+                    if (max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
+                        close(cfd);
+                        continue;
+                    }
+                    conn *c = calloc(1, sizeof *c);
+                    if (!c || oc_framebuf_init(&c->fb) != 0 ||
+                        oc_tls_conn_init(&c->tls, &tls->conf, cfd) != 0) {
+                        if (c) { oc_framebuf_free(&c->fb); free(c); }
+                        close(cfd);
+                        continue;
+                    }
+                    c->fd = cfd;
+                    memcpy(c->source, src, sizeof c->source);
+                    c->conn_id = g_next_conn_id++;
+                    c->state = CONN_HANDSHAKE;
+                    conns[cfd] = c;
+                    struct epoll_event cev;
+                    memset(&cev, 0, sizeof cev);
+                    cev.events = EPOLLIN; cev.data.fd = cfd;
+                    epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &cev);
+                    c->events = EPOLLIN;
+                }
+                continue;
+            }
+
+            if (fd == evfd) {
+                uint64_t cnt;
+                while (read(evfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                oc_dbres *r;
+                while ((r = oc_dbwriter_next_result(dbw)) != NULL) {
+                    deliver_result(ep, conns, r);
+                    oc_dbres_free(r);
+                }
+                continue;
+            }
+
+            if (fd == xfd) {
+                uint64_t cnt;
+                while (read(xfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                oc_xfer_job *xj;
+                while ((xj = oc_xferpool_next_result(g_xfers)) != NULL) {
+                    deliver_xfer_result(ep, conns, dbw, xj);
+                    oc_xfer_job_free(xj);
+                }
+                continue;
+            }
+
+            conn *c = conns[fd];
+            if (!c) continue;
+
+            if (c->state == CONN_HANDSHAKE) {
+                oc_tls_status st = oc_tls_handshake(&c->tls);
+                if (st == OC_TLS_OK) {
+                    c->state = CONN_ESTABLISHED;
+                    /* ALPN demux (ARCH-54): a peer that didn't negotiate oc/1 is an
+                     * HTTP/webhook client, routed to the HTTP handler (ARCH-32). */
+                    const char *alpn = oc_tls_alpn_selected(&c->tls);
+                    c->http = (!alpn || strcmp(alpn, OC_ALPN_PROTO) != 0);
+                }
+                else if (st == OC_TLS_WANT_READ)  { conn_set_events(ep, c, EPOLLIN);  continue; }
+                else if (st == OC_TLS_WANT_WRITE) { conn_set_events(ep, c, EPOLLOUT); continue; }
+                else { conn_close(ep, conns, fd); continue; }
+                /* fall through: drain any app data mbedTLS already buffered */
+            }
+
+            if (c->state == CONN_ESTABLISHED) {
+                if (on_readable(ep, conns, c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); continue; }
+            }
+            download_pump(c);   /* refill an active download as the socket drains */
+            if (flush_out(c) < 0) { conn_close(ep, conns, fd); continue; }
+            update_interest(ep, c);
+        }
+    }
+
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd]) conn_close(ep, conns, fd);
+    /* Stop the workers before the store they borrow; this also drains any
+     * fire-and-forget cleanup the closes above just queued. */
+    oc_xferpool_stop(g_xfers);
+    g_xfers = NULL;
+    oc_blobstore_close(g_blobs);
+    g_blobs = NULL;
+    oc_ratelimit_free(g_webhook_rl);
+    g_webhook_rl = NULL;
+    close(ep);
+    close(lfd);
+    free(conns);
+    fprintf(stderr, "netloop: stopped\n");
+    return 0;
+}

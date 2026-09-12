@@ -1,0 +1,1452 @@
+/*
+ * OpenChime wire protocol v1 — frame codec.
+ *
+ * Pure encode/decode of the core-messaging-path frames defined in
+ * docs/PROTOCOL.md. No sockets, no threads, no SQLite: this is the leaf the
+ * event loop and DB writer are built on top of, and it is the first thing to
+ * be exhaustively unit-tested (docs/TESTING.md §2.2).
+ *
+ * Encoding is explicit and field-by-field (ARCH-7); nothing is memcpy'd over a
+ * struct. All integers are big-endian on the wire, converted at the edges
+ * (ARCH-9). Decoders return zero-copy views (oc_slice) into the caller's frame
+ * buffer, so that buffer must outlive any use of the decoded strings.
+ */
+
+#ifndef OPENCHIME_PROTOCOL_H
+#define OPENCHIME_PROTOCOL_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* --- Constants (PROTOCOL.md §2.1, §7) ----------------------------------- */
+
+/* The only version this codec speaks. Both sides send it as min AND max, so a
+ * mismatched pair is rejected at the handshake with VERSION_TOO_OLD/TOO_NEW
+ * rather than discovering the disagreement halfway through a frame.
+ *
+ * **Bump this whenever a frame's LAYOUT changes** — a new field, a reordering, a
+ * field that stops being optional — not only when a frame is added. Adding a
+ * frame is safe (an old peer never sends or expects it); changing a layout is
+ * not, because both sides still claim the same number while disagreeing about
+ * what it means. That is not hypothetical: version 1 was left alone while
+ * CHANNEL_INFO and CHANNEL_LIST both grew fields, and the result was a client
+ * and daemon that connected happily and then dropped the link on a decode
+ * failure, reported as "connection lost — reconnecting" with nothing pointing at
+ * the real cause.
+ *
+ * v2 (2026-07-29): CHANNEL_INFO gained topic/archived and made peer_id
+ * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
+ * preview_author. Shipping client and daemon together (ARCH-61) means there is
+ * no compatibility window to preserve — only a mismatch to detect loudly. */
+/* 11: THREAD_REPLY carries whether the recipient is a PARTICIPANT in the thread
+ * (REQ-061, ARCH-104). Participation is derived from message rows the client
+ * does not hold — it keeps at most one thread's replies, and only while that
+ * thread is open — so the client cannot compute its own, and without being told
+ * it passed 0 for the evaluator's thread_reply input and never raised a toast
+ * for a reply the daemon had already decided was worth one. The byte rides the
+ * fixed part rather than the tail, which already holds the optional attachment
+ * list. It carries the INPUT, not the verdict: the recipient still asks
+ * oc_notify_decide with its own mute, level, priority people, schedule and
+ * pause, because a second thing deciding is what ARCH-103 exists to prevent.
+ *
+ * 10: SEND carries an optional forward SOURCE (channel + message), and FORWARD
+ * (0x00D9) carries the reference the daemon resolves from it (REQ-057). The
+ * source rides SEND's fixed part rather than its tail: that tail already holds
+ * an optional attachment list, BROADCAST's holds two optional fields, and a
+ * third sharing one is how a decoder loses its place.
+ *
+ * 9: SET_PROFILE moves to 0x00D8, off the opcode it shared with SET_PRESENCE,
+ * and the profile frames grow. Both halves are wire changes the version exists
+ * to make loud: the two types were both C->S, so the dispatch chain reached
+ * presence first and a profile payload was decoded as a presence one; and
+ * SET_PROFILE, PROFILE_INFO and USER_LIST all gain fields, USER_LIST being a
+ * repeated list where one added field shifts every entry after the first.
+ *
+ * 8: TYPING and TYPING_UPDATE move to 0x007E/0x007F, off the two opcodes they
+ * shared with PROFILE_INFO and LIST_FILE_CHANNELS. No frame's layout changed, so
+ * this is the one case the rule above does not cover — but it is a wire change
+ * of exactly the kind the version exists to make loud: a v7 peer's TYPING is a
+ * v8 peer's PROFILE_INFO, decoded as a different struct rather than rejected.
+ *
+ * 7: USER_LIST carries title, timezone and custom status (REQ-289) — a repeated
+ * list, so an added field shifts every entry after the first.
+ *
+ * 6: NOTIFY_PREFS drops the three DND-window fields — the recurring schedule is
+ * its own frame (REQ-136), and SET_DND is retired with them.
+ *
+ * 5: PRESENCE_UPDATE carries the do-not-disturb FACT beside the status byte
+ * (REQ-122/278). One byte appended to a fixed frame is still a layout change,
+ * and the rule above has no exception for small ones.
+ *
+ * 4: USER_LIST carries each user's avatar attachment id. A frame LAYOUT
+ * change, not merely a new frame, so the version must move — a v3 client decoding a
+ * v4 user list reads the next entry's fields shifted by eight bytes and reports only
+ * "connection lost" (ARCH-61 ships the two together). */
+#define OC_PROTOCOL_VERSION 11u
+
+/* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
+ * be allowed to depend on its own outcome: if the handshake frames carried the
+ * current version, then the frames that exist to *discover* a version mismatch
+ * would themselves be a version mismatch. Freezing them at 1 is what makes
+ * "your peer is too old" expressible rather than undecodable — so their layout
+ * can never change either, and a new handshake field means a new frame. */
+#define OC_HANDSHAKE_VERSION 1u
+
+/* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
+ * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
+ * client offers OC_ALPN_PROTO, and the daemon routes that to the binary
+ * handler (anything else is HTTP). Clients dial OC_DEFAULT_PORT unless a SRV
+ * record or .well-known metadata overrides the port. */
+#define OC_ALPN_PROTO   "oc/1"     /* ALPN id for the binary protocol */
+/* The daemon also advertises HTTP/1.1, because a webhook sender is an ordinary
+ * HTTPS client that always offers an ALPN list: advertising oc/1 alone makes the
+ * server abort every such handshake with `no_application_protocol` before the
+ * HTTP handler is reached. Second in the server's preference order, so a peer
+ * offering both still lands on the binary protocol. */
+#define OC_ALPN_HTTP11  "http/1.1" /* ALPN id for the HTTP/webhook surface */
+#define OC_DEFAULT_PORT 443        /* default client connect port */
+#define OC_HEADER_SIZE      8u     /* length(4) + version(2) + msg_type(2) */
+#define OC_LENGTH_MIN       4u     /* version(2) + msg_type(2), empty payload */
+#define OC_MAX_FRAME_SIZE   66560u /* 65 KiB, total on wire (4 + length) */
+#define OC_MAX_BODY_SIZE    65536u /* 64 KiB, message body cap (REQ-054) */
+#define OC_IDEM_SIZE        16u    /* 128-bit idempotency token, fixed width */
+/* Attachment transfer (REQ-140, ARCH-69). A chunk's data must leave room for the
+ * frame header + the chunk's fixed fields under OC_MAX_FRAME_SIZE. */
+#define OC_ATTACH_CHUNK_SIZE   65024u /* 63.5 KiB data per UPLOAD/DOWNLOAD chunk  */
+#define OC_MAX_ATTACHMENT_SIZE (100ull * 1024 * 1024) /* 100 MiB default cap      */
+
+/* --- Message types (PROTOCOL.md §9) ------------------------------------- */
+
+typedef enum {
+    OC_MSG_HELLO            = 0x0001, /* C->S, frozen@v1 */
+    OC_MSG_WELCOME          = 0x0002, /* S->C, frozen@v1 */
+    OC_MSG_REJECT           = 0x0003, /* S->C, frozen@v1, fatal */
+    OC_MSG_AUTH             = 0x0010, /* C->S */
+    OC_MSG_AUTH_OK          = 0x0011, /* S->C */
+    OC_MSG_AUTH_CHALLENGE   = 0x0012, /* S->C */
+    OC_MSG_LOGOUT           = 0x0013, /* C->S */
+    OC_MSG_WORKSPACE_INFO   = 0x0014, /* S->C, pushed after AUTH_OK */
+    OC_MSG_SEND             = 0x0020, /* C->S */
+    OC_MSG_SEND_ACK         = 0x0021, /* S->C */
+    OC_MSG_BROADCAST        = 0x0022, /* S->C */
+    OC_MSG_CLIENT_ACK       = 0x0023, /* C->S */
+    OC_MSG_EDIT             = 0x0024, /* C->S (REQ-051) */
+    OC_MSG_DELETE           = 0x0025, /* C->S (REQ-052) */
+    OC_MSG_MSG_EDITED       = 0x0026, /* S->C, edit fan-out */
+    OC_MSG_MSG_DELETED      = 0x0027, /* S->C, tombstone fan-out */
+    OC_MSG_REACT            = 0x0028, /* C->S (REQ-070) */
+    OC_MSG_REACTION_UPDATED = 0x0029, /* S->C, reaction fan-out */
+    OC_MSG_LIST_REACTIONS   = 0x002A, /* C->S (REQ-071) */
+    OC_MSG_REACTIONS        = 0x002B, /* S->C */
+    OC_MSG_SEND_REPLY       = 0x002C, /* C->S (REQ-060), a threaded reply */
+    OC_MSG_THREAD_REPLY     = 0x002D, /* S->C, reply fan-out (not in main scroll) */
+    OC_MSG_LIST_THREAD      = 0x002E, /* C->S, open a thread */
+    OC_MSG_THREAD           = 0x002F, /* S->C, a thread's replies */
+    OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count (backfill) */
+    OC_MSG_READ_CURSOR      = 0x0033, /* S->C, a member's read cursor advanced (REQ-090 seen-by) */
+    OC_MSG_HISTORY_REQUEST  = 0x0034, /* C->S, page BACKWARDS through a channel (§6.3) */
+    OC_MSG_HISTORY_AROUND   = 0x006A, /* C->S (REQ-232), the messages AROUND an id */
+    OC_MSG_PIN              = 0x0035, /* C->S (REQ-230), pin/unpin a message */
+    OC_MSG_PIN_UPDATED      = 0x0036, /* S->C, pin fan-out to every channel member */
+    OC_MSG_LIST_PINS        = 0x0037, /* C->S, a channel's pinned messages */
+    OC_MSG_PINNED_MSG       = 0x0038, /* S->C, one pinned message (streamed, body included) */
+    OC_MSG_PINS             = 0x0039, /* S->C, terminator of a LIST_PINS response */
+    OC_MSG_LIST_MEMBERS     = 0x003A, /* C->S (REQ-031), a channel's members */
+    OC_MSG_MEMBER_ENTRY     = 0x003B, /* S->C, one channel member (streamed) */
+    OC_MSG_MEMBERS          = 0x003C, /* S->C, terminator of a LIST_MEMBERS response */
+    OC_MSG_LIST_FILES       = 0x003D, /* C->S (REQ-143), files in a channel (0 = everywhere) */
+    OC_MSG_FILE_ENTRY       = 0x003E, /* S->C, one shared file (streamed) */
+    OC_MSG_FILES            = 0x003F, /* S->C, terminator of a LIST_FILES response */
+    OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
+    OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
+    OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
+    OC_MSG_CHANNEL_LIST       = 0x0053, /* S->C */
+    OC_MSG_JOIN_CHANNEL       = 0x0054, /* C->S */
+    OC_MSG_LEAVE_CHANNEL      = 0x0055, /* C->S */
+    OC_MSG_INVITE_TO_CHANNEL  = 0x0056, /* C->S (REQ-033, channel-level) */
+    OC_MSG_REMOVE_FROM_CHANNEL= 0x0057, /* C->S (REQ-033, channel-level) */
+    OC_MSG_OPEN_DM            = 0x0058, /* C->S, open/get a 1:1 DM (REQ-050) */
+    OC_MSG_CREATE_WEBHOOK     = 0x0059, /* C->S, mint an incoming-webhook token (REQ-170) */
+    OC_MSG_WEBHOOK_INFO       = 0x005A, /* S->C, the minted webhook id + token (shown once) */
+    OC_MSG_LIST_WEBHOOKS      = 0x005B, /* C->S, list a channel's webhooks (REQ-170) */
+    OC_MSG_WEBHOOK_LIST       = 0x005C, /* S->C, the webhook list (no tokens) */
+    OC_MSG_DELETE_WEBHOOK     = 0x005D, /* C->S, remove a webhook */
+    OC_MSG_WEBHOOK_DELETED    = 0x005E, /* S->C, ack for DELETE_WEBHOOK */
+    OC_MSG_UPDATE_CHANNEL     = 0x005F, /* C->S (REQ-034/035/036), mutate a channel */
+    /* Webhook lifecycle. `webhooks.disabled` already existed and nothing
+     * could set it. **Reveal is impossible and deliberately absent**: only the
+     * token's SHA-256 is stored, so a lost token can be rotated but never shown
+     * again — the UI has to say so rather than offer a button that cannot work. */
+    /* Mute (REQ-137) and mark-unread (REQ-235). SET_READ_CURSOR is
+     * deliberately NOT the ack path: CLIENT_ACK only ever advances (the daemon takes
+     * MAX), because a replayed ack must not rewind anyone's cursor. Marking unread is
+     * an explicit act and gets an explicit op. */
+    /* Custom status (REQ-241/122) and profile fields (REQ-240).
+     * PROFILE carries everything a client shows about a person, so a roster needs one
+     * frame per user rather than one per field. */
+    /* which channels hold files, and how many. The Files view's left column
+     * was built from the 200-row page, so a channel whose last upload was older than
+     * that simply did not appear. One aggregate query answers it exactly. */
+    /* REQ-182: the caller's own active sessions. `sessions` has carried device_label
+     * and last_seen_ms since migration 0001 and only REVOKE could reach them, so you
+     * could sign out everywhere without ever seeing what "everywhere" was. */
+    /* REQ-134: the level for channels with no per-channel override. Rides the
+     * NOTIFY_PREFS frame back, so a client learns it with the rest. */
+    OC_MSG_SET_NOTIFY_DEFAULT = 0x0077,
+    OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id */
+    OC_MSG_OPEN_GROUP_DM      = 0x0079, /* C->S, open/create a group DM (REQ-056) */
+    OC_MSG_ADD_EMOJI          = 0x007A, /* C->S, name + attachment id (REQ-072) */
+    OC_MSG_DELETE_EMOJI       = 0x007B, /* C->S, name */
+    OC_MSG_LIST_EMOJI         = 0x007C, /* C->S, ask for the catalogue */
+    OC_MSG_EMOJI_LIST         = 0x007D, /* S->C, the catalogue (also a push) */ /* C->S */
+    OC_MSG_LIST_SESSIONS      = 0x0075, /* C->S */
+    OC_MSG_SESSION_LIST       = 0x0076, /* S->C, never the tokens */
+    OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
+    OC_MSG_FILE_CHANNELS      = 0x0074, /* S->C, (channel_id, count) pairs */
+    OC_MSG_SET_STATUS         = 0x006F, /* C->S, my custom status (empty text clears) */
+    OC_MSG_SET_PROFILE        = 0x00D8, /* C->S, my profile fields (REQ-240) */
+    OC_MSG_PROFILE_INFO       = 0x0072, /* S->C, a user's full profile (also a push) */
+    OC_MSG_SET_MUTE           = 0x006D, /* C->S, mute/unmute a conversation */
+    OC_MSG_SET_READ_CURSOR    = 0x006E, /* C->S, set the cursor (may move BACK) */
+    OC_MSG_SET_WEBHOOK_STATE  = 0x006B, /* C->S, enable/disable one */
+    OC_MSG_ROTATE_WEBHOOK     = 0x006C, /* C->S, mint a new token for it */
+    /* Saved items + activity feed (REQ-231/139, ARCH-95). 0x0060-0x0061 are
+     * taken; this family starts at the next free run. */
+    OC_MSG_SAVE_ITEM        = 0x0062, /* C->S, save/unsave a message (private) */
+    OC_MSG_SAVED_UPDATED    = 0x0063, /* S->C, ack to the actor only */
+    OC_MSG_LIST_SAVED       = 0x0064, /* C->S, my saved items */
+    OC_MSG_SAVED_MSG        = 0x0065, /* S->C, one saved message (streamed) */
+    OC_MSG_SAVED            = 0x0066, /* S->C, terminator */
+    OC_MSG_LIST_ACTIVITY    = 0x0067, /* C->S (REQ-139), what involved me — or what I have not read */
+    OC_MSG_ACTIVITY_ENTRY   = 0x0068, /* S->C, one activity item (streamed) */
+    OC_MSG_ACTIVITY         = 0x0069, /* S->C, terminator + the seen watermark */
+    OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
+    OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
+    /* Moved off 0x0072/0x0073 in v8: those two values were each carried by a
+     * second message type (PROFILE_INFO, LIST_FILE_CHANNELS). Each pair was
+     * direction-disjoint, so nothing misdecoded — but the safety came from the
+     * dispatch chains happening to hold one branch per value, which is a
+     * property the next inbound branch silently removes. Typing moves rather
+     * than the other two because it is the only contiguous pair among them, so
+     * two values buy back both collisions. Every opcode now carries exactly one
+     * message type, which is what scripts/check_opcodes.sh enforces with no
+     * exceptions. */
+    OC_MSG_TYPING           = 0x007E, /* C->S, "I am typing" in a channel (REQ-121) */
+    OC_MSG_TYPING_UPDATE    = 0x007F, /* S->C, relay of a typing signal */
+    OC_MSG_UPLOAD_BEGIN     = 0x0080, /* C->S, declare an attachment upload (REQ-140) */
+    OC_MSG_UPLOAD_READY     = 0x0081, /* S->C, id + chunk size + in-flight window */
+    OC_MSG_UPLOAD_CHUNK     = 0x0082, /* C->S, one upload chunk */
+    OC_MSG_UPLOAD_ACK       = 0x0083, /* S->C, window advance */
+    OC_MSG_UPLOAD_END       = 0x0084, /* C->S, finish the upload */
+    OC_MSG_UPLOAD_OK        = 0x0085, /* S->C, upload finalized (id + size + sha256) */
+    OC_MSG_DOWNLOAD_BEGIN   = 0x0086, /* C->S, request an attachment (REQ-141) */
+    OC_MSG_DOWNLOAD_INFO    = 0x0087, /* S->C, metadata preceding the bytes */
+    OC_MSG_DOWNLOAD_CHUNK   = 0x0088, /* S->C, one download chunk */
+    OC_MSG_DOWNLOAD_END     = 0x0089, /* S->C, all bytes sent */
+    OC_MSG_TRANSFER_CANCEL  = 0x008A, /* C->S, abort an in-progress transfer */
+    OC_MSG_SET_NOTIFY_PREF  = 0x0090, /* C->S, set a channel's notification level (REQ-130) */
+    /* 0x0091 was SET_DND, REQ-131's single quiet window. REQ-136 replaced it
+     * with a schedule (0x00CC) that states ALLOWED hours, so the op is retired
+     * rather than redefined: the same number meaning the opposite thing is how a
+     * client and a daemon agree loudly and behave differently. */
+    OC_MSG_LIST_NOTIFY_PREFS= 0x0092, /* C->S, request all notification settings */
+    OC_MSG_NOTIFY_PREFS     = 0x0093, /* S->C, DND + per-channel levels (also a sync push) */
+    OC_MSG_SET_CLIENT_SETTING  = 0x0094, /* C->S, upsert a synced client setting (empty value = delete) */
+    OC_MSG_LIST_CLIENT_SETTINGS= 0x0095, /* C->S, request a client_type bucket's settings */
+    OC_MSG_CLIENT_SETTINGS     = 0x0096, /* S->C, a bucket snapshot (also a device-sync push) */
+    OC_MSG_STORAGE_STATUS_REQ  = 0x0097, /* C->S, owner/admin: ask for storage usage (REQ-214) */
+    OC_MSG_STORAGE_STATUS      = 0x0098, /* S->C, usage + policy + what maintenance reclaimed */
+    OC_MSG_AUDIT_QUERY         = 0x0099, /* C->S, owner/admin: page the audit log (REQ-251) */
+    OC_MSG_AUDIT_PAGE          = 0x009A, /* S->C, a page of entries, newest first */
+    OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a channel's audio call (REQ-150) */
+    OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
+    OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
+    OC_MSG_CALL_ROSTER      = 0x00A3, /* S->C, to participants: roster changed */
+    OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
+    OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
+    OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
+    /* S->C, to the SENDER ONLY: names in the message that are people here but
+     * are not in this channel, so the mention notified nobody (REQ-287). Not an
+     * ERROR frame: nothing failed, the message was accepted and stored — it is a
+     * notice about a consequence the sender cannot otherwise see, because the
+     * highlight is syntactic and renders the same either way. */
+    OC_MSG_MENTION_UNRESOLVED      = 0x00B3,
+    /* Drafts (REQ-223, ARCH-101). DRAFT is deliberately BOTH the streamed list
+     * entry and the device-sync push, exactly as CLIENT_SETTINGS doubles as
+     * snapshot and push: one frame the client folds the same way whatever
+     * prompted it, rather than two that can disagree. */
+    OC_MSG_SET_DRAFT        = 0x00C0, /* C->S, upsert a draft (empty body = delete) */
+    OC_MSG_LIST_DRAFTS      = 0x00C1, /* C->S, all of my drafts */
+    OC_MSG_DRAFT            = 0x00C2, /* S->C, one draft: a list entry AND the sync push */
+    OC_MSG_DRAFTS           = 0x00C3, /* S->C, terminator */
+    /* Scheduled messages (REQ-224, ARCH-102). SCHEDULED is the list entry AND
+     * the push, as DRAFT is — same reasoning, one frame the client folds one
+     * way. `state` carries the outcome, including a failure the author must be
+     * told about rather than a row that quietly disappears. */
+    OC_MSG_SCHEDULE_MESSAGE = 0x00C4, /* C->S, hold this until send_at_ms */
+    OC_MSG_LIST_SCHEDULED   = 0x00C5, /* C->S, everything I have waiting */
+    OC_MSG_CANCEL_SCHEDULED = 0x00C6, /* C->S, drop one before it fires */
+    OC_MSG_UPDATE_SCHEDULED = 0x00C7, /* C->S, change its time or its text */
+    OC_MSG_SCHEDULED        = 0x00C8, /* S->C, one row: list entry AND push */
+    OC_MSG_SCHEDULED_LIST   = 0x00C9, /* S->C, terminator */
+    /* Pausing notifications (REQ-278). Slack's `dnd.setSnooze` — the MANUAL,
+     * one-shot half — deliberately named apart from the recurring schedule at
+     * 0x0091: two mechanisms, two ways to cancel, and cancelling one has never
+     * cancelled the other. A separate frame rather than a field on NOTIFY_PREFS
+     * because that frame ends in a repeated list, so anything added to its fixed
+     * part shifts every entry. */
+    OC_MSG_SET_SNOOZE       = 0x00CA, /* C->S, pause for N minutes from now (0 = end it) */
+    OC_MSG_SNOOZE           = 0x00CB, /* S->C, to that user's own connections: when it ends */
+    /* The recurring SCHEDULE (REQ-136), the pause's opposite number: planned
+     * rather than manual, and stating when notifications are ALLOWED. */
+    OC_MSG_SET_SCHEDULE     = 0x00CC, /* C->S, mode + base window + per-weekday rows */
+    OC_MSG_SCHEDULE         = 0x00CD, /* S->C, self only: the same, as stored */
+    /* Keywords and priority people (REQ-135) — the recipient's own lists. */
+    OC_MSG_SET_KEYWORDS     = 0x00CE, /* C->S, replace my keyword list wholesale */
+    OC_MSG_SET_PRIORITY     = 0x00CF, /* C->S, replace my priority-people list */
+    OC_MSG_ALERT_PREFS      = 0x00D0, /* S->C, self only: both lists, as stored */
+    /* Threads I am in, across channels (REQ-062, ARCH-104). Every existing thread
+     * op is scoped to ONE parent; this is the aggregate Slack's Threads view
+     * needs, and the only one that can answer "what have I missed" without
+     * visiting every channel. */
+    OC_MSG_LIST_THREADS     = 0x00D1, /* C->S, {filter} 0 all / 1 unread only */
+    OC_MSG_THREAD_SUMMARY   = 0x00D2, /* S->C, one thread (streamed) */
+    OC_MSG_THREADS          = 0x00D3, /* S->C, terminator */
+    OC_MSG_SET_THREAD_FOLLOW= 0x00D4, /* C->S, follow/unfollow one thread */
+    OC_MSG_MARK_THREAD_READ = 0x00D5, /* C->S, its replies are read up to here */
+    /* The client's current UTC offset, sent on every connect (ARCH-103). A
+     * per-weekday quiet-hours schedule is evaluated on the user's local calendar
+     * day, and only the client knows the zone — but the offset it implies moves
+     * with travel and with daylight saving, so it cannot be captured once when
+     * the schedule is edited and then trusted. Its own frame rather than a field
+     * on SET_SCHEDULE because refreshing the offset must not require, or rewrite,
+     * a schedule. */
+    OC_MSG_SET_TZ_OFFSET    = 0x00D6, /* C->S, minutes east of UTC, right now */
+    /* A link unfurl (REQ-222, ARCH-105): the fetched title + description of a
+     * URL in a message. Arrives asynchronously after the BROADCAST — when the
+     * fetch completes, or never — and is REPLAYED on backfill, because state
+     * that only travels on a live fan-out disappears on reload (the defect
+     * class the reaction and pin replays exist to prevent). Adding a frame
+     * needs no protocol-version bump: a peer that does not know it never
+     * sends or expects it. */
+    OC_MSG_UNFURL           = 0x00D7, /* S->C, a URL's fetched preview */
+    OC_MSG_FORWARD          = 0x00D9, /* S->C, a forwarded message's source (REQ-057) */
+    OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
+    OC_MSG_USER_LIST        = 0x0041, /* S->C */
+    OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
+    OC_MSG_INVITE_USER      = 0x0043, /* C->S (REQ-033, tenant-level; owner/admin) */
+    OC_MSG_REMOVE_USER      = 0x0044, /* C->S (REQ-033, tenant-level; owner/admin) */
+    OC_MSG_USER_UPDATED     = 0x0045, /* S->C, ack/push for SET_ROLE + REMOVE_USER */
+    OC_MSG_INVITE_CREATED   = 0x0046, /* S->C, the minted invite token */
+    OC_MSG_REDEEM_INVITE    = 0x0047, /* C->S, pre-auth account creation */
+    OC_MSG_SET_DISPLAY_NAME = 0x0048, /* C->S, change your own display name (REQ-020) */
+    OC_MSG_CHANGE_PASSWORD  = 0x0049, /* C->S, change your own local password (verify old) */
+    OC_MSG_PROFILE_UPDATED  = 0x004A, /* S->C, a user's display name changed (also the self ack) */
+    /* Invite management (REQ-026). The `invites` table has always carried
+     * role, expires_at_ms and consumed_at_ms — nothing could READ them, so a minted
+     * invite was write-only: no way to see what was outstanding or to revoke one.
+     * No migration; two ops and a list frame. */
+    OC_MSG_LIST_INVITES     = 0x004B, /* C->S, outstanding invites (owner/admin) */
+    OC_MSG_INVITE_LIST      = 0x004C, /* S->C, the list (token HASHES only, never tokens) */
+    OC_MSG_REVOKE_INVITE    = 0x004D, /* C->S, revoke one by id */
+    OC_MSG_INVITE_REVOKED   = 0x004E, /* S->C, ack */
+    OC_MSG_SEARCH           = 0x0060, /* C->S (REQ-080) */
+    OC_MSG_SEARCH_RESULTS   = 0x0061, /* S->C */
+    OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
+    OC_MSG_BACKFILL_DONE    = 0x0031, /* S->C */
+    OC_MSG_ERROR            = 0x00FF  /* S->C */
+} oc_msg_type;
+
+/* --- Reason codes (PROTOCOL.md §8.2) ------------------------------------ */
+
+typedef enum {
+    OC_ERR_VERSION_TOO_OLD     = 1001,
+    OC_ERR_VERSION_TOO_NEW     = 1002,
+    OC_ERR_MALFORMED_FRAME     = 1003,
+    OC_ERR_FRAME_TOO_LARGE     = 1004,
+    OC_ERR_UNEXPECTED_MSG_TYPE = 1005,
+    /* A post-handshake frame stamped with a version other than the one this
+     * session negotiated. Distinct from VERSION_TOO_OLD/TOO_NEW, which answer a
+     * HELLO and precede a session: this one says the peer already agreed and
+     * then sent something else, so the disagreement is about a frame rather
+     * than about the connection. Fatal — the negotiated layout is the only
+     * basis on which the payload could be read at all. */
+    OC_ERR_VERSION_MISMATCH    = 1006,
+    OC_ERR_AUTH_REQUIRED       = 2001,
+    OC_ERR_AUTH_INVALID_TOKEN  = 2002,
+    OC_ERR_AUTH_RATE_LIMITED   = 2003,
+    OC_ERR_USER_LIMIT          = 2004, /* workspace at its registered-user cap (OPENCHIME_MAX_USERS) */
+    OC_ERR_BODY_TOO_LARGE      = 3001,
+    OC_ERR_NOT_A_MEMBER        = 3002,
+    OC_ERR_UNKNOWN_CHANNEL     = 3003,
+    OC_ERR_SEND_RATE_LIMITED   = 3004,
+    OC_ERR_FORBIDDEN           = 3005, /* actor may not perform the action (role, or not the author) */
+    OC_ERR_LAST_OWNER          = 3006, /* would remove/demote the last owner (REQ-030) */
+    OC_ERR_UNKNOWN_MESSAGE     = 3007, /* no such message in the channel (edit/delete) */
+    OC_ERR_INVALID_CHANNEL     = 3008, /* bad channel name on CREATE_CHANNEL (empty/too long) */
+    OC_ERR_INVALID_REACTION    = 3009, /* empty/oversized emoji on REACT */
+    OC_ERR_ATTACHMENT_TOO_LARGE = 3010, /* upload exceeds MAX_ATTACHMENT_SIZE (REQ-140) */
+    OC_ERR_UNKNOWN_ATTACHMENT  = 3011, /* no such attachment, or not finalized (REQ-141) */
+    OC_ERR_STORAGE_FULL        = 3012, /* upload refused: below the DB reserve (REQ-216) */
+    OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217) */
+    OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
+    OC_ERR_TRANSFER_PROTOCOL   = 3015, /* out-of-order/oversized chunk or bad transfer state */
+    OC_ERR_UNKNOWN_WEBHOOK     = 3016, /* no such (or disabled) incoming webhook token (REQ-170) */
+    OC_ERR_CHANNEL_EXISTS      = 3017, /* a channel of that name already exists (names are unique, case-insensitively) */
+    OC_ERR_TOO_MANY_PINS       = 3018, /* channel already holds OC_MAX_PINS pins (REQ-230) */
+    OC_ERR_CHANNEL_ARCHIVED    = 3019, /* channel is archived: read-only (REQ-035) */
+    OC_ERR_INVALID_MESSAGE     = 3020, /* nothing to send: an empty body (REQ-224) */
+    OC_ERR_INTERNAL            = 9001
+} oc_reason_code;
+
+/* --- Codec result codes ------------------------------------------------- */
+
+typedef enum {
+    OC_OK               =  0,
+    OC_E_OVERFLOW       = -1, /* writer ran out of buffer space */
+    OC_E_MALFORMED      = -2, /* reader underflow / bad length / short frame */
+    OC_E_TOO_LARGE      = -3, /* frame exceeds OC_MAX_FRAME_SIZE */
+    OC_E_BODY_TOO_LARGE = -4  /* body exceeds OC_MAX_BODY_SIZE */
+} oc_result;
+
+/* --- Buffers and primitive encodings (PROTOCOL.md §7) ------------------- */
+
+/* A zero-copy view into a frame buffer, returned by string/bytes decoders. */
+typedef struct {
+    const uint8_t *ptr;
+    size_t         len;
+} oc_slice;
+
+/* Write cursor over a caller-provided buffer. Once `overflow` is set, further
+ * writes are no-ops and the frame is unusable. */
+typedef struct {
+    uint8_t *data;
+    size_t   cap;
+    size_t   len;
+    int      overflow;
+} oc_wbuf;
+
+/* Read cursor over a caller-provided buffer. Once `underflow` is set, further
+ * reads are no-ops and yield zeroed values. */
+typedef struct {
+    const uint8_t *data;
+    size_t         len;
+    size_t         pos;
+    int            underflow;
+} oc_rbuf;
+
+void oc_wbuf_init(oc_wbuf *w, uint8_t *data, size_t cap);
+void oc_rbuf_init(oc_rbuf *r, const uint8_t *data, size_t len);
+
+/* Convenience: view a NUL-terminated C string as a slice (length = strlen). */
+oc_slice oc_slice_str(const char *s);
+
+/* Primitive writers. Each is a no-op once the buffer has overflowed. */
+void oc_w_u8(oc_wbuf *w, uint8_t v);
+void oc_w_u16(oc_wbuf *w, uint16_t v);
+void oc_w_u32(oc_wbuf *w, uint32_t v);
+void oc_w_u64(oc_wbuf *w, uint64_t v);
+void oc_w_str(oc_wbuf *w, oc_slice s);   /* u16 length + bytes; >65535 overflows */
+void oc_w_lstr(oc_wbuf *w, oc_slice s);  /* u32 length + bytes */
+void oc_w_bytes(oc_wbuf *w, oc_slice s); /* u32 length + bytes */
+void oc_w_idem(oc_wbuf *w, const uint8_t idem[OC_IDEM_SIZE]);
+
+/* Primitive readers. Each is a no-op once the buffer has underflowed. */
+uint8_t  oc_r_u8(oc_rbuf *r);
+uint16_t oc_r_u16(oc_rbuf *r);
+uint32_t oc_r_u32(oc_rbuf *r);
+uint64_t oc_r_u64(oc_rbuf *r);
+oc_slice oc_r_str(oc_rbuf *r);
+oc_slice oc_r_lstr(oc_rbuf *r);
+oc_slice oc_r_bytes(oc_rbuf *r);
+void     oc_r_idem(oc_rbuf *r, uint8_t idem[OC_IDEM_SIZE]);
+
+/* --- Frame header (PROTOCOL.md §2) -------------------------------------- */
+
+typedef struct {
+    uint32_t length;
+    uint16_t version;
+    uint16_t msg_type;
+} oc_header;
+
+/* Parse and validate a complete frame. `data`/`len` must span at least one
+ * full frame (4 + length bytes). On OC_OK, `hdr` is filled and `payload` is a
+ * reader positioned at the first payload byte, bounded to the payload length.
+ * Returns OC_E_MALFORMED (short frame / length below minimum) or
+ * OC_E_TOO_LARGE (length beyond OC_MAX_FRAME_SIZE). */
+oc_result oc_parse_frame(const uint8_t *data, size_t len,
+                         oc_header *hdr, oc_rbuf *payload);
+
+/* --- Version negotiation (PROTOCOL.md §3.2) ----------------------------- */
+
+/* Given the client's advertised [min,max] and the server's supported [min,max],
+ * compute the chosen version (OC_OK, *chosen set) or the REJECT reason
+ * (OC_E_MALFORMED, *reject_code set to OC_ERR_VERSION_TOO_OLD/TOO_NEW). */
+oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
+                               uint16_t server_min, uint16_t server_max,
+                               uint16_t *chosen, uint16_t *reject_code);
+
+/* --- Auth methods and roles (PROTOCOL.md §4, AUTH.md) ------------------- */
+
+/* AUTH `method` discriminator; also the bitset in AUTH_CHALLENGE.methods. */
+#define OC_AUTH_LOCAL   0x01u   /* username + password (ARCH-59) */
+#define OC_AUTH_OIDC    0x02u   /* central-issued ES256 JWT (ARCH-56/57) */
+#define OC_AUTH_SESSION 0x04u   /* a prior session token (reconnect, ARCH-58) */
+
+/* AUTH_OK.role (ARCH-60). */
+#define OC_ROLE_MEMBER  0u
+#define OC_ROLE_ADMIN   1u
+#define OC_ROLE_OWNER   2u
+
+#define OC_SESSION_TOKEN_LEN 32u  /* random session token; only its hash is stored */
+
+/* Presence status (REQ-120). offline is implicit (no connection); a client sets
+ * online/away. */
+#define OC_PRESENCE_OFFLINE 0u
+#define OC_PRESENCE_ONLINE  1u
+#define OC_PRESENCE_AWAY    2u
+
+/* Audio calls (REQ-150-152): one call per channel, small participant sets. */
+#define OC_MAX_CALL_PARTICIPANTS 32u
+
+/* Per-channel notification level (REQ-130). */
+#define OC_NOTIFY_ALL      0u
+#define OC_NOTIFY_MENTIONS 1u
+#define OC_NOTIFY_NONE     2u
+#define OC_MAX_NOTIFY_PREFS 1024u   /* cap on a NOTIFY_PREFS list */
+
+/* Synced client settings (the daemon-side settings bucket). */
+#define OC_MAX_CLIENT_SETTINGS 128u /* cap on a CLIENT_SETTINGS snapshot */
+#define OC_MAX_INVITES     64u  /* cap on an INVITE_LIST */
+#define OC_MAX_FILE_CHANNELS 128u /* cap on a FILE_CHANNELS list */
+#define OC_MAX_SESSIONS      32u  /* cap on a SESSION_LIST (REQ-182) */
+#define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
+#define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
+#define OC_SETTING_VALUE_MAX   512u /* setting value string cap (bytes) */
+/* A draft is bounded by the COMPOSER, not by an invented number (ARCH-101): the
+ * field holds ED_MAX = 4000 UTF-16 units, which is at most 12000 bytes of UTF-8
+ * (surrogate pairs are cheaper still, 4 bytes per 2 units). 16 KB clears that
+ * with room and stays far under REQ-054's 64 KB body cap. */
+#define OC_DRAFT_BODY_MAX    16384u
+/* Which question LIST_ACTIVITY is asking (REQ-139). The first is the original
+ * feed — mentions, reactions, thread replies. The other three are "what have I
+ * not read", which share one shape: messages past my read cursor in a
+ * conversation I belong to, narrowed by the channel's kind or its notify level. */
+#define OC_ACTF_INVOLVED   0u
+#define OC_ACTF_UNREADS    1u
+#define OC_ACTF_DMS        2u
+#define OC_ACTF_CHANNELS   3u
+/* A row that is simply an unread message rather than something aimed at you. */
+#define OC_ACT_UNREAD      3u
+#define OC_MAX_DRAFTS          256u /* cap on a LIST_DRAFTS reply */
+#define OC_MAX_SCHEDULED       256u /* cap on a LIST_SCHEDULED reply */
+
+/* Channel kind (SCHEMA.md channels.kind) and the name cap for CREATE_CHANNEL. */
+#define OC_CHANNEL_KIND    0u   /* a named channel */
+#define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
+#define OC_MAX_CHANNEL_NAME 64u /* channel-name length cap (bytes) */
+#define OC_MAX_DISPLAY_NAME 48u /* display-name length cap (bytes), self-service rename */
+
+/* Account-creation invite token (AUTH.md §2); like a session token, only its
+ * SHA-256 is stored. Presented in REDEEM_INVITE to set a password. */
+#define OC_INVITE_TOKEN_LEN 32u
+
+/* Emoji reaction op (REQ-070) and the emoji length cap (bytes; fits multi-
+ * codepoint sequences like flags/ZWJ). */
+#define OC_REACT_REMOVE 0u
+#define OC_REACT_ADD    1u
+#define OC_MAX_EMOJI    32u
+
+/* Saved-item op (REQ-231) and activity kinds (REQ-139), ARCH-95. */
+#define OC_SAVE_REMOVE 0u
+#define OC_SAVE_ADD    1u
+#define OC_ACT_MENTION  0u   /* someone named me */
+#define OC_ACT_REACTION 1u   /* someone reacted to something I wrote */
+#define OC_ACT_REPLY    2u   /* someone replied in a thread I started */
+#define OC_MAX_SAVED    200u
+#define OC_MAX_ACTIVITY 200u
+
+/* Channel mutation ops (REQ-034/035/036, ARCH-93). One frame carries all four
+ * because they all mutate one row and all fan out the same CHANNEL_INFO — the
+ * op IS the difference. `value` is the new topic or name; unused for archive. */
+#define OC_CHUP_TOPIC     0u   /* any member */
+#define OC_CHUP_RENAME    1u   /* owner/admin */
+#define OC_CHUP_ARCHIVE   2u   /* owner/admin */
+#define OC_CHUP_UNARCHIVE 3u   /* owner/admin */
+/* Visibility (REQ-031). TWO ops, not one toggle, for the same reason ARCHIVE and
+ * UNARCHIVE are two: a toggle means "flip whatever it is now", so two admins acting
+ * at once flip it twice and land where neither intended. A target state is
+ * idempotent — the second one is a no-op.
+ *
+ * The directions are NOT symmetric, and that asymmetry is the whole design:
+ * PRIVATE only narrows the audience (non-member readers lose access, members keep
+ * it), while PUBLIC retroactively exposes the ENTIRE history of a private channel
+ * to everyone in the workspace. The second is a disclosure you cannot take back by
+ * flipping it again, so the client confirms it in those words and the daemon audits
+ * it as its own action. */
+#define OC_CHUP_PRIVATE   4u   /* owner/admin */
+#define OC_CHUP_PUBLIC    5u   /* owner/admin — see the asymmetry above */
+#define OC_MAX_TOPIC      250u /* bytes; Slack's cap, and a topic is one header line */
+#define OC_MAX_PREVIEW    120u /* bytes of last-message preview in CHANNEL_LIST */
+
+/* Pin op (REQ-230, ARCH-90) and the per-channel cap. A pin belongs to the
+ * channel, not to the pinner: pinning an already-pinned message is a no-op
+ * rather than a second pin. The cap bounds both the list frame and the work of
+ * opening the pins view; Slack's is the same number. */
+#define OC_PIN_REMOVE 0u
+#define OC_PIN_ADD    1u
+#define OC_MAX_PINS   100u
+
+/* Response caps for the two channel-details listings (REQ-031, REQ-143). Both
+ * are "show me this channel" views, not paged datasets: a bound keeps one frame
+ * burst bounded, and a client that wants an older file has search. */
+#define OC_MAX_MEMBER_LIST 500u
+#define OC_MAX_FILE_LIST   200u
+
+/* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
+#define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
+#define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
+
+/* --- Frame payload structs ---------------------------------------------- */
+
+/* Attachment linkage (REQ-140, ARCH-69). A message may reference up to
+ * OC_MAX_ATTACH uploaded attachments. On the wire the list is an *optional
+ * trailing field* on SEND/BROADCAST: it is written only when non-empty, and the
+ * decoder reads it only if bytes remain after the base fields — so a message
+ * with no attachments is byte-identical to the pre-attachment format and no
+ * protocol-version bump is needed (client and daemon share this codec). SEND
+ * carries just the ids to link; BROADCAST carries each linked attachment's
+ * metadata so every reader can render/fetch it. */
+#define OC_MAX_ATTACH 16u
+/* One attachment's metadata as carried on a message (REQ-140). `reclaimed` is
+ * set when the bytes have been removed by age or storage pressure (REQ-215/217)
+ * while the row survives as a tombstone — so a client can render "no longer
+ * available" in place, instead of offering a download that will fail. */
+typedef struct {
+    uint64_t id;
+    oc_slice filename;
+    oc_slice mime;
+    uint64_t size;
+    uint8_t  reclaimed;
+} oc_attach_entry;
+
+typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
+typedef struct { uint16_t chosen_version; uint64_t server_time; } oc_welcome;
+typedef struct { uint16_t code; oc_slice message; } oc_reject;
+typedef struct { uint8_t methods; oc_slice oidc_params; } oc_auth_challenge;
+typedef struct { uint8_t method; oc_slice credential; } oc_auth;
+typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
+typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
+/* Pushed after AUTH_OK: infra facts about this workspace, from the daemon's
+ * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
+ * workspace_name may be empty (client falls back to the host subdomain). */
+typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name; } oc_workspace_info;
+/* src_channel/src_message are the forward source (REQ-057), zero when the
+ * message is not a forward. The client asserts nothing but the two ids: the
+ * daemon resolves the author, the excerpt and the attachment count from the
+ * row it already holds, so a client cannot claim someone said something they
+ * did not. They sit in the fixed part, ahead of the optional attachment tail. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body;
+                 uint64_t src_channel; uint64_t src_message;
+                 uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send;
+typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body;
+                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
+                 oc_slice author_name; } oc_broadcast;  /* override name (webhooks); empty = use author_id */
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
+/* A member's read cursor in a channel advanced (REQ-090 seen-by). */
+typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice body; } oc_edit;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_delete;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t edited_at; oc_slice body; } oc_msg_edited;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t deleted_by; uint64_t deleted_at; } oc_msg_deleted;
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice emoji; uint8_t op; } oc_react;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; oc_slice emoji; uint8_t op; uint64_t count; } oc_reaction_updated;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_list_reactions;
+typedef struct { oc_slice emoji; uint64_t user_id; } oc_reaction_entry;
+typedef struct { uint64_t message_id; uint16_t count; const oc_reaction_entry *entries; } oc_reactions;
+/* Pins (REQ-230). PIN carries the op; PIN_UPDATED is the fan-out every member
+ * receives. LIST_PINS streams PINNED_MSG frames — each self-framed, so a full
+ * body is fine — terminated by PINS, exactly as LIST_THREAD does, because a
+ * pinned message is often scrolled out of a client's loaded history. */
+typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t op; } oc_pin;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; uint8_t op; uint64_t pinned_at; } oc_pin_updated;
+typedef struct { uint64_t channel_id; } oc_list_pins;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
+                 uint64_t pinned_by; uint64_t pinned_at; oc_slice body;
+                 /* The first attachment's filename, or empty. An attachment-only
+                  * message has no body at all, so without this a pinned file
+                  * rendered as a blank row in the pins list. */
+                 oc_slice attach_name; } oc_pinned_msg;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
+/* A link unfurl (REQ-222, ARCH-105): fan-out on fetch completion, and the
+ * backfill replay entry. `title`/`descr` are what the daemon's fetcher
+ * extracted; a client renders them under the message's link. */
+typedef struct { uint64_t message_id; uint64_t channel_id;
+                 oc_slice url; oc_slice title; oc_slice descr; } oc_unfurl;
+/* The resolved reference a forward carries (REQ-057). src_author/excerpt/
+ * n_attach are a SNAPSHOT taken when the forward was sent: editing the
+ * original afterwards does not rewrite what was forwarded. The files stay with
+ * the source message, so n_attach counts them and src_attach_name is the FIRST
+ * one's name — enough for the card to say what it is naming rather than offer a
+ * download the recipient may not be allowed to make (ARCH-77/78). */
+typedef struct { uint64_t message_id; uint64_t channel_id;
+                 uint64_t src_channel; uint64_t src_message; uint64_t src_author;
+                 oc_slice src_excerpt; uint16_t n_attach;
+                 oc_slice src_attach_name; } oc_forward;
+
+/* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
+ * follow the LIST_PINS shape — stream the entries, then a terminator — because
+ * both carry variable-length text and both are lists a client holds nothing on
+ * disk to reconstruct (ARCH-88). */
+typedef struct { uint64_t channel_id; } oc_list_members;
+typedef struct { uint64_t channel_id; uint64_t user_id; uint8_t role; uint64_t joined_at; } oc_member_entry;
+
+/* REQ-287. One frame per SEND, listing every mention that resolved to a real
+ * person who is not in this channel. `can_add` is the daemon's answer to "may
+ * the sender fix this here" — a DM has nobody to add, an archived channel takes
+ * no writes — so the client offers an action only when there is one, rather than
+ * discovering that by failing. `is_private` travels because the remedy differs:
+ * adding to a private channel discloses its history (cf. REQ-036a), and the
+ * client has to say so before doing it. */
+enum { OC_UNRESOLVED_MAX = 8 };
+typedef struct {
+    uint64_t user_id;
+    char     name[OC_MAX_DISPLAY_NAME + 1];
+} oc_unresolved_mention;
+typedef struct {
+    uint64_t channel_id;
+    uint64_t message_id;
+    uint8_t  can_add;      /* the sender may add people to this channel */
+    uint8_t  is_private;   /* adding discloses history */
+    uint16_t count;
+    oc_unresolved_mention who[OC_UNRESOLVED_MAX];
+} oc_mention_unresolved;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_members;
+
+/* channel_id 0 means "every channel I can read" — the same query with a wider
+ * WHERE, which is what makes a workspace-wide files view free. */
+typedef struct { uint64_t channel_id; } oc_list_files;
+typedef struct {
+    uint64_t attachment_id, channel_id, message_id, uploader_id;
+    uint64_t size, created_at;
+    uint8_t  reclaimed;          /* bytes gone (REQ-215/217); row kept, no download */
+    oc_slice filename, mime;
+} oc_file_entry;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_files;
+
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
+                 uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;
+/* `participant` is per-RECIPIENT, which no other field on a fan-out frame is:
+ * it answers "are you in this thread" (REQ-061, ARCH-104) for the peer being
+ * written to, so the daemon encodes the frame twice — once each way — and sends
+ * whichever matches. It is the evaluator's thread_reply INPUT and not a verdict;
+ * the recipient still decides with its own mute, level and schedule. */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
+                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH]; } oc_thread_reply;
+typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
+/* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
+ * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
+ * then this frame closes the stream — mirroring BACKFILL_DONE (§6.2). */
+typedef struct { uint64_t parent_id; uint32_t count; uint8_t truncated; } oc_thread;
+typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
+typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
+typedef struct { uint64_t channel_id; uint8_t op; oc_slice value; } oc_update_channel;
+
+/* Saved items (REQ-231) — private, so SAVED_UPDATED goes to the actor only. */
+typedef struct { uint64_t message_id; uint8_t op; } oc_save_item;
+typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; } oc_saved_updated;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
+                 uint64_t server_time; uint64_t saved_at; oc_slice body;
+                 oc_slice attach_name; } oc_saved_msg;
+typedef struct { uint32_t count; } oc_saved;
+
+/* Activity (REQ-139). `actor_id` is who did the thing; `text` is the message
+ * body for a mention or reply, and the emoji for a reaction. */
+typedef struct { uint8_t kind; uint64_t message_id; uint64_t channel_id;
+                 uint64_t actor_id; uint64_t at; oc_slice text; } oc_activity_entry;
+typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
+/* CHANNEL_INFO is the channel-state frame: the ack for create/join/leave/
+ * invite/remove, and (ARCH-93) the fan-out when a topic/name/archive changes.
+ * `peer_id` used to be an "optional trailing" field written only for DMs; that
+ * trick does not survive a SECOND optional field, so as of REQ-034/035/036 the
+ * layout is fixed and peer_id is always written (0 when not a DM). */
+/* A group DM (REQ-056). The ids are the OTHER participants; the daemon adds the
+ * caller. Capped because a group DM with fifty people in it is a channel, and
+ * pretending otherwise gives you a conversation nobody can name or leave. */
+#define OC_MAX_GROUP_DM 8u
+
+/* `peers` carries a GROUP DM's participants (REQ-056), so a client can title the
+ * conversation on first paint instead of fetching a roster per group. Empty for a
+ * channel and for a 1:1 DM, whose single other participant is `peer_id`. */
+typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
+                 uint64_t peer_id; oc_slice topic; uint8_t archived;
+                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_info;
+typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
+typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
+/* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
+ * client that keeps no local cache (ARCH-88) can order and badge the sidebar on
+ * first paint rather than only after backfill. This amends the v1 layout in
+ * place rather than riding a trailing block, because the entries are packed
+ * sequentially and r_done() rejects leftover bytes — and client and daemon ship
+ * from this one file (ARCH-61), so they change together. */
+typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind;
+                 uint64_t last_message_at; uint32_t unread; uint64_t peer_id;
+                 oc_slice topic; uint8_t archived; uint64_t created_at;
+                 /* The newest top-level message, for a scannable list: a client
+                  * that caches nothing (ARCH-88) has no other way to show one. */
+                 oc_slice preview; uint64_t preview_author;
+                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_list_entry;
+typedef struct { uint64_t user_id; } oc_open_dm;
+/* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
+ * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,
+ * the client hex-encodes it into the POST URL). */
+typedef struct { uint64_t channel_id; oc_slice label; } oc_create_webhook;
+typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice token; } oc_webhook_info;
+typedef struct { uint64_t channel_id; } oc_list_webhooks;
+typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice label; uint8_t disabled; } oc_webhook_list_entry;
+typedef struct { uint16_t count; const oc_webhook_list_entry *entries; } oc_webhook_list;  /* tokens never listed */
+/* ROTATE replies with a WEBHOOK_INFO carrying the new token — the same
+ * shown-once frame CREATE uses, because it is the same situation. */
+typedef struct { uint64_t webhook_id; uint8_t disabled; } oc_set_webhook_state;
+typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
+/* / `message_id` 0 in SET_READ_CURSOR means "everything unread". */
+/* / `expires_at` 0 means "until I change it"; the DAEMON enforces the
+ * expiry, because a client that is not running cannot clear its own status. */
+typedef struct { oc_slice emoji; oc_slice text; uint64_t expires_at; } oc_set_status;
+/* The whole profile in one frame, because it is edited on one screen (REQ-240)
+ * and a field-at-a-time wire would make Cancel mean "some of it stuck". */
+typedef struct { oc_slice full_name; oc_slice title; oc_slice pronouns;
+                 oc_slice phone; oc_slice timezone; } oc_set_profile;
+/* An id, not bytes: the image goes up through the ordinary attachment
+ * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
+ * store all keep working. 0 clears the avatar. */
+typedef struct { uint64_t attachment_id; } oc_set_avatar;
+typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_group_dm;
+/* Custom emoji (REQ-072). The image is an attachment id for the same reason an
+ * avatar is: the store already handles upload, caps, dedup and reclamation. The
+ * NAME is the identity — `:shipit:` must mean one image workspace-wide, or every
+ * message containing it is ambiguous. */
+#define OC_EMOJI_NAME_MAX 48u
+#define OC_MAX_CUSTOM_EMOJI 512u
+typedef struct { oc_slice name; uint64_t attachment_id; } oc_add_emoji;
+typedef struct { oc_slice name; } oc_delete_emoji;
+typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by; } oc_emoji_entry;
+typedef struct { uint16_t count; const oc_emoji_entry *entries; } oc_emoji_list;
+/* Everything a card shows about one person. `phone` is here and NOT on
+ * USER_LIST: this frame goes to the one person who asked for the card, where a
+ * roster fan-out would hand every member's number to everybody. */
+typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
+                 oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
+                 oc_slice title; oc_slice timezone; uint64_t avatar_id;
+                 uint8_t role; oc_slice full_name; oc_slice pronouns;
+                 oc_slice phone; } oc_profile_info;
+/* Counts, not rows: the column shows "#design 12", so the wire carries
+ * exactly that and nothing more. */
+/* REQ-182. `current` marks the connection asking — you should be able to tell which
+ * row is the machine in front of you before revoking one. No token, ever: only its
+ * hash is stored. */
+typedef struct { uint64_t session_id; uint64_t created_at; uint64_t last_seen;
+                 uint64_t expires_at; uint8_t current; oc_slice device_label; } oc_session_entry;
+typedef struct { uint16_t count; const oc_session_entry *entries; } oc_session_list;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_file_channel_entry;
+typedef struct { uint16_t count; const oc_file_channel_entry *entries; } oc_file_channels;
+typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
+typedef struct { uint64_t webhook_id; } oc_delete_webhook;
+typedef struct { uint64_t webhook_id; } oc_webhook_deleted;
+typedef struct { uint8_t status; } oc_set_presence;
+/* `dnd` is the pause/schedule FACT for other people (REQ-122/278) — one bit,
+ * never the end time. Appended after `status`, and decoded tolerantly, so a peer
+ * built before it existed still reads the frame it always read. */
+typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_update;
+typedef struct { uint64_t channel_id; } oc_typing;
+typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
+/* Notification preferences (REQ-130/131). */
+typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
+/* The notification schedule (REQ-136, ARCH-103). `mode`: 0 off, 1 every day,
+ * 2 weekdays, 3 custom. `start_min`/`end_min` are the ALLOWED window for modes 1
+ * and 2; mode 3 reads the per-weekday rows instead, weekday 0 = Sunday.
+ *
+ * `tz_offset_min` rides along because the window is meaningless without it: the
+ * day boundaries are the user's local ones, and only the client knows the zone
+ * (the same reason SET_SNOOZE carries minutes rather than an instant). */
+#define OC_SCHEDULE_DAYS 7u
+enum { OC_DND_OFF = 0, OC_DND_EVERY_DAY = 1, OC_DND_WEEKDAYS = 2, OC_DND_CUSTOM = 3 };
+typedef struct { uint8_t weekday; uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_schedule_day;
+typedef struct { uint8_t mode; int16_t tz_offset_min;
+                 uint16_t start_min, end_min;
+                 uint8_t count; const oc_schedule_day *days; } oc_schedule;
+/* Keyword alerts and priority people (REQ-135). Both are REPLACE-the-whole-list
+ * ops: the lists are short, and a client that edits one has the whole thing in
+ * front of it — an add/remove pair would need ids for terms that are their own
+ * identity. */
+#define OC_MAX_KEYWORDS 64u
+#define OC_MAX_PRIORITY 64u
+#define OC_KEYWORD_MAX  64u
+typedef struct { uint8_t count; const oc_slice *terms; } oc_set_keywords;
+typedef struct { uint8_t count; const uint64_t *people; } oc_set_priority;
+typedef struct { uint8_t n_terms; const oc_slice *terms;
+                 uint8_t n_people; const uint64_t *people; } oc_alert_prefs;
+
+/* One thread in the aggregated view (REQ-062). `unread` counts replies by other
+ * people past my per-thread cursor — a channel cursor cannot answer this, since
+ * reading a channel says nothing about whether I read its threads.
+ *
+ * `following` is whether I would be notified: participation is derived (I wrote
+ * the root or a reply), so the flag reports the resolved answer rather than the
+ * presence of a row (ARCH-104). */
+#define OC_MAX_THREADS 100u
+enum { OC_THREADF_ALL = 0, OC_THREADF_UNREAD = 1 };
+typedef struct {
+    uint64_t root_id, channel_id, root_author;
+    uint64_t root_at, last_reply_at;
+    uint32_t reply_count, unread;
+    uint8_t  following;
+    oc_slice preview;
+} oc_thread_summary;
+typedef struct { uint8_t filter; } oc_list_threads;
+typedef struct { uint32_t count; } oc_threads;
+typedef struct { uint64_t root_id, channel_id; uint8_t on; } oc_set_thread_follow;
+/* `up_to` 0 means "everything in it", which is what opening a thread means. */
+typedef struct { uint64_t root_id, up_to; } oc_mark_thread_read;
+
+/* Minutes east of UTC at the moment of sending (ARCH-103). Signed: west of
+ * Greenwich is negative, and the range spans -720..+840 including the offsets
+ * that are not whole hours. */
+typedef struct { int16_t tz_offset_min; } oc_set_tz_offset;
+
+/* REQ-278. Minutes FROM NOW, as Slack's API takes them: the presets are all
+ * durations, and only the client knows the timezone that turns "until tomorrow"
+ * into an instant. 0 ends the pause — there is no second op. */
+typedef struct { uint32_t minutes; } oc_set_snooze;
+/* The absolute instant it ends, 0 for "not paused". Self-only: other people
+ * learn THAT you are not to be disturbed, never when you are back (REQ-122). */
+typedef struct { uint64_t until_ms; } oc_snooze;
+
+/* Push device-token registration (REQ-132). platform: OC_PUSH_APNS / OC_PUSH_FCM. */
+#define OC_PUSH_APNS        0u
+#define OC_PUSH_FCM         1u
+#define OC_DEVICE_TOKEN_MAX 512u
+typedef struct { uint8_t platform; oc_slice token; } oc_register_device_token;
+typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
+/* `muted` appended per entry — which IS a layout change, not a compatible one: this
+ * is a repeated list, so an extra byte per entry shifts every entry after the first.
+ * My first note here claimed otherwise. Hence the bump to protocol 3, which the
+ * search cursor needs regardless. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_entry;
+typedef struct { uint8_t level; } oc_set_notify_default;
+/* `notify_default` (REQ-134) rides here so a client learns the fallback with the rest
+ * of its notification state, rather than needing a second round trip. Appended at the
+ * END of the fixed fields, before the repeated list, which is a layout change — and
+ * the reason it lands in the same release as protocol 3. */
+/* The DND window's three fields left with REQ-136: the schedule is its own frame
+ * now, and three stale fields describing the opposite sense would have read
+ * correctly while being wrong. */
+typedef struct { uint8_t notify_default;
+                 uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
+/* Synced client settings bucket (the daemon-side layer of the client config). */
+/* `recipients` is a comma-separated user-id list, used only when channel_id is 0
+ * — a draft written before it was addressed (REQ-229, ARCH-101 as amended). */
+typedef struct { uint64_t channel_id; uint64_t thread_root;
+                 oc_slice recipients; oc_slice body; } oc_set_draft;
+/* `id` distinguishes UNADDRESSED drafts from each other: they all have
+ * channel_id 0, so the conversation key cannot tell them apart. */
+typedef struct { uint64_t id; uint64_t channel_id; uint64_t thread_root;
+                 uint64_t updated_ms; oc_slice recipients; oc_slice body; } oc_draft;
+
+enum { OC_SCHED_PENDING = 0, OC_SCHED_SENT = 1, OC_SCHED_FAILED = 2, OC_SCHED_GONE = 3 };
+typedef struct { uint64_t channel_id; uint64_t thread_root;
+                 uint64_t send_at_ms; oc_slice body; } oc_schedule_message;
+typedef struct { uint64_t id; } oc_cancel_scheduled;
+typedef struct { uint64_t id; uint64_t send_at_ms; oc_slice body; } oc_update_scheduled;
+typedef struct { uint64_t id; uint64_t channel_id; uint64_t thread_root;
+                 uint64_t send_at_ms; uint64_t created_ms; uint8_t state;
+                 oc_slice fail_reason; oc_slice body; } oc_scheduled;
+typedef struct { uint16_t count; } oc_scheduled_list;
+typedef struct { uint16_t count; } oc_drafts;
+typedef struct { oc_slice client_type; oc_slice key; oc_slice value; } oc_set_client_setting;
+typedef struct { oc_slice client_type; } oc_list_client_settings;
+typedef struct { oc_slice key; oc_slice value; } oc_client_setting_entry;
+/* Storage usage + policy + reclamation history (REQ-214/215). Sent only to an
+ * owner/admin. `attach_bytes`/`attach_count` cover live attachments; the
+ * reclaimed_* counts are cumulative and come from the attachments table's
+ * reclaim_reason, which is what makes eviction auditable after the fact. */
+typedef struct {
+    uint64_t total_bytes;
+    uint64_t avail_bytes;
+    uint64_t attach_bytes;
+    uint64_t attach_count;
+    uint64_t reclaimed_orphan;
+    uint64_t reclaimed_expired;
+    uint64_t reclaimed_evicted;
+    uint64_t last_reclaim_ms;   /* 0 if nothing has ever been reclaimed */
+    uint64_t max_age_days;      /* 0 = keep forever */
+    uint64_t reserve_bytes;
+    uint8_t  evict_enabled;
+    uint8_t  under_pressure;
+} oc_storage_status;
+
+/* Audit log paging (REQ-251). `before_ms` pages backwards from a timestamp
+ * rather than by offset, so a boundary stays stable as new entries arrive;
+ * 0 asks for the newest page. */
+#define OC_AUDIT_PAGE_MAX 200u
+typedef struct { uint64_t before_ms; uint16_t limit; } oc_audit_query;
+
+typedef struct {
+    uint64_t at_ms;
+    uint64_t actor_id;
+    uint64_t target_id;
+    oc_slice actor_name;
+    oc_slice action;
+    oc_slice target;
+    oc_slice detail;      /* never the secret involved (ARCH-79) */
+    uint8_t  family;      /* 1 admin, 2 account, 3 security, 4 moderation */
+    uint8_t  outcome;     /* 1 ok, 0 denied/failed */
+} oc_audit_entry;
+
+typedef struct {
+    uint16_t count;
+    const oc_audit_entry *entries;
+} oc_audit_page;
+
+typedef struct { oc_slice client_type; uint16_t count;
+                 const oc_client_setting_entry *entries; } oc_client_settings;
+/* Audio call signaling (REQ-150). CALL_JOINED carries the joiner's private UDP
+ * endpoint + bearer token (empty until the sidecar milestone) plus the roster;
+ * CALL_ROSTER carries just the participant list, pushed on any change. */
+typedef struct { uint64_t channel_id; } oc_call_join;
+typedef struct { uint64_t channel_id; } oc_call_leave;
+typedef struct { uint64_t channel_id; uint64_t call_id; uint16_t udp_port; oc_slice token;
+                 uint16_t count; const uint64_t *participants; } oc_call_joined;
+typedef struct { uint64_t channel_id; uint64_t call_id;
+                 uint16_t count; const uint64_t *participants; } oc_call_roster;
+/* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
+ * sha256 is a 32-byte digest carried as `bytes`. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
+typedef struct { uint64_t attachment_id; uint32_t chunk_size; uint32_t window_bytes; } oc_upload_ready;
+typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_upload_chunk;
+typedef struct { uint64_t attachment_id; uint32_t acked_through; } oc_upload_ack;
+typedef struct { uint64_t attachment_id; } oc_upload_end;
+typedef struct { uint64_t attachment_id; uint64_t size; oc_slice sha256; } oc_upload_ok;
+typedef struct { uint64_t attachment_id; } oc_download_begin;
+typedef struct { uint64_t attachment_id; oc_slice filename; oc_slice mime; uint64_t total_size; oc_slice sha256; } oc_download_info;
+typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_download_chunk;
+typedef struct { uint64_t attachment_id; } oc_download_end;
+typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
+typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
+/* `title`, `timezone` and the custom status ride here as of protocol 7 (REQ-289).
+ * They were on PROFILE_INFO alone, which the daemon sends ONLY to the user who
+ * edited them — so no client ever learned anyone else's, and the profile card had
+ * to say the fields were not built although REQ-240 shipped them. A directory
+ * cannot exist without them, and neither could the card. */
+typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email;
+                 oc_slice display_name; uint64_t avatar_id;
+                 oc_slice title; oc_slice timezone;
+                 oc_slice status_emoji; oc_slice status_text;
+                 /* Both are drawn BESIDE a name, so the directory (REQ-289) and
+                  * every roster need them from here — PROFILE_INFO reaches only
+                  * the person who edited it. `phone` is deliberately absent. */
+                 oc_slice full_name; oc_slice pronouns; } oc_user_list_entry;
+typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
+typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
+typedef struct { uint8_t role; } oc_invite_user;
+typedef struct { uint64_t user_id; } oc_remove_user;
+typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
+typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
+/* An outstanding invite, identified by a server-side id rather than its
+ * token: the token is not recoverable (only its hash is stored) and putting one on
+ * the wire again would hand it to anyone who could read a list. */
+typedef struct { uint64_t invite_id; uint8_t role; uint64_t created_at; uint64_t expires_at;
+                 uint64_t created_by; } oc_invite_entry;
+typedef struct { uint16_t count; const oc_invite_entry *entries; } oc_invite_list;
+typedef struct { uint64_t invite_id; } oc_revoke_invite;
+typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
+/* Self-service profile (REQ-020). */
+typedef struct { oc_slice name; } oc_set_display_name;
+typedef struct { oc_slice old_password; oc_slice new_password; } oc_change_password;
+typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
+/* SEARCH carries the parsed FILTERS as fields and the leftover text as the FTS
+ * query (REQ-081): `from:`/`in:`/`has:`/dates are predicates on columns, and
+ * MATCHing them as literal text would find messages that merely mention them.
+ * Parsing lives in shared/searchq.c so both frontends mean the same thing.
+ *
+ * `before_id` is the paging cursor: results come back newest-first ordered by
+ * id, so "give me the page before this id" is a keyset cursor — stable under
+ * concurrent posting, unlike an offset. 0 = the first page. */
+typedef struct {
+    oc_slice query;          /* free text for FTS; may be empty when filters carry it */
+    uint16_t limit;
+    uint64_t before_id;      /* */
+    oc_slice from_name;      /* author, as typed; "" = any */
+    oc_slice in_channel;     /* channel name, as typed; "" = any */
+    uint8_t  has_mask;       /* OC_SQ_HAS_* */
+    uint64_t after_ms, before_ms;   /* 0 = unbounded; resolved by the CLIENT, which
+                                     * knows the user's timezone */
+} oc_search;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet; } oc_search_result_entry;
+typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
+typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
+typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
+/* Page backwards: the newest `limit` messages STRICTLY OLDER than
+ * `before_message_id`. BACKFILL_REQUEST's cursor only points forward, so
+ * scrolling into older history needed its own request rather than a new field
+ * on an existing frame. `before_message_id` of 0 means "from the newest". */
+typedef struct { uint64_t channel_id; uint64_t before_message_id; uint16_t limit; } oc_history_request;
+/* Fetch-around (REQ-232, ARCH-96): `limit` total, split either side of the id.
+ * Replies as a BACKFILL replay — same rows, same encoding, only the WHERE
+ * differs, so nothing downstream needs a second code path. */
+typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t limit; } oc_history_around;
+typedef struct { uint64_t high_water; uint8_t more; } oc_backfill_done;
+typedef struct { uint16_t code; uint8_t fatal; oc_slice context; oc_slice message; } oc_error;
+
+/* --- Frame encoders ----------------------------------------------------- */
+/*
+ * Each writes a complete frame (header + payload) into `w`. Frozen handshake
+ * frames force version 1; the rest take the negotiated `version`. Returns
+ * OC_OK, OC_E_OVERFLOW (buffer too small), OC_E_TOO_LARGE (frame over the
+ * limit), or OC_E_BODY_TOO_LARGE (body over OC_MAX_BODY_SIZE).
+ */
+oc_result oc_encode_hello(oc_wbuf *w, const oc_hello *m);
+oc_result oc_encode_welcome(oc_wbuf *w, const oc_welcome *m);
+oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m);
+oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m);
+oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
+oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
+oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_workspace_info *m);
+oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m);
+oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
+oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m);
+oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *m);
+oc_result oc_encode_client_ack(oc_wbuf *w, uint16_t version, const oc_client_ack *m);
+oc_result oc_encode_read_cursor(oc_wbuf *w, uint16_t version, const oc_read_cursor *m);
+oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m);
+oc_result oc_encode_delete(oc_wbuf *w, uint16_t version, const oc_delete *m);
+oc_result oc_encode_msg_edited(oc_wbuf *w, uint16_t version, const oc_msg_edited *m);
+oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_deleted *m);
+oc_result oc_encode_react(oc_wbuf *w, uint16_t version, const oc_react *m);
+oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reaction_updated *m);
+oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m);
+oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m);
+oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m);
+oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m);
+oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m);
+oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
+oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m);
+oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m);
+oc_result oc_encode_list_members(oc_wbuf *w, uint16_t version, const oc_list_members *m);
+oc_result oc_encode_member_entry(oc_wbuf *w, uint16_t version, const oc_member_entry *m);
+oc_result oc_encode_members(oc_wbuf *w, uint16_t version, const oc_members *m);
+oc_result oc_encode_list_files(oc_wbuf *w, uint16_t version, const oc_list_files *m);
+oc_result oc_encode_file_entry(oc_wbuf *w, uint16_t version, const oc_file_entry *m);
+oc_result oc_encode_files(oc_wbuf *w, uint16_t version, const oc_files *m);
+oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *m);
+oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply *m);
+oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_reply *m);
+oc_result oc_encode_list_thread(oc_wbuf *w, uint16_t version, const oc_list_thread *m);
+oc_result oc_encode_thread(oc_wbuf *w, uint16_t version, const oc_thread *m);
+oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_meta *m);
+oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
+oc_result oc_encode_update_channel(oc_wbuf *w, uint16_t version, const oc_update_channel *m);
+oc_result oc_encode_save_item(oc_wbuf *w, uint16_t version, const oc_save_item *m);
+oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_updated *m);
+oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
+oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
+oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
+oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);
+oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
+oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m);
+oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
+oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_mention_unresolved *m);
+oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
+/* Bodyless request for the storage report (REQ-214); owner/admin only. */
+oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m);
+oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
+oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
+oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m);
+oc_result oc_encode_create_webhook(oc_wbuf *w, uint16_t version, const oc_create_webhook *m);
+oc_result oc_encode_webhook_info(oc_wbuf *w, uint16_t version, const oc_webhook_info *m);
+oc_result oc_encode_list_webhooks(oc_wbuf *w, uint16_t version, const oc_list_webhooks *m);
+oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_list *m);
+oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
+oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
+oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m);
+oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m);
+oc_result oc_encode_open_group_dm(oc_wbuf *w, uint16_t version, const oc_open_group_dm *m);
+oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m);
+oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m);
+oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list *m);
+oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
+oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m);
+oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m);
+oc_result oc_decode_add_emoji(oc_rbuf *p, oc_add_emoji *m);
+oc_result oc_decode_delete_emoji(oc_rbuf *p, oc_delete_emoji *m);
+oc_result oc_decode_list_emoji(oc_rbuf *p);
+oc_result oc_decode_emoji_list(oc_rbuf *p, oc_emoji_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
+oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,
+                                 uint16_t *out_count);
+oc_result oc_encode_list_file_channels(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_file_channels(oc_wbuf *w, uint16_t version, const oc_file_channels *m);
+oc_result oc_decode_file_channels(oc_rbuf *p, oc_file_channel_entry *entries, uint16_t cap,
+                                  uint16_t *out_count);
+oc_result oc_encode_set_status(oc_wbuf *w, uint16_t version, const oc_set_status *m);
+oc_result oc_encode_set_profile(oc_wbuf *w, uint16_t version, const oc_set_profile *m);
+oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_info *m);
+oc_result oc_encode_set_mute(oc_wbuf *w, uint16_t version, const oc_set_mute *m);
+oc_result oc_encode_set_read_cursor(oc_wbuf *w, uint16_t version, const oc_set_read_cursor *m);
+oc_result oc_encode_list_invites(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_invite_list(oc_wbuf *w, uint16_t version, const oc_invite_list *m);
+oc_result oc_encode_revoke_invite(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m);
+oc_result oc_encode_invite_revoked(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m);
+oc_result oc_encode_webhook_deleted(oc_wbuf *w, uint16_t version, const oc_webhook_deleted *m);
+oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_presence *m);
+oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m);
+oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
+oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
+oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m);
+oc_result oc_encode_set_tz_offset(oc_wbuf *w, uint16_t version, const oc_set_tz_offset *m);
+oc_result oc_encode_set_snooze(oc_wbuf *w, uint16_t version, const oc_set_snooze *m);
+oc_result oc_encode_snooze(oc_wbuf *w, uint16_t version, const oc_snooze *m);
+oc_result oc_encode_set_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
+oc_result oc_encode_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
+oc_result oc_encode_set_keywords(oc_wbuf *w, uint16_t version, const oc_set_keywords *m);
+oc_result oc_encode_set_priority(oc_wbuf *w, uint16_t version, const oc_set_priority *m);
+oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m);
+oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_threads *m);
+oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m);
+oc_result oc_encode_threads(oc_wbuf *w, uint16_t version, const oc_threads *m);
+oc_result oc_encode_set_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_thread_follow *m);
+oc_result oc_encode_mark_thread_read(oc_wbuf *w, uint16_t version, const oc_mark_thread_read *m);
+oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
+oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
+oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m);
+oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
+oc_result oc_encode_schedule_message(oc_wbuf *w, uint16_t version, const oc_schedule_message *m);
+oc_result oc_encode_list_scheduled(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_cancel_scheduled(oc_wbuf *w, uint16_t version, const oc_cancel_scheduled *m);
+oc_result oc_encode_update_scheduled(oc_wbuf *w, uint16_t version, const oc_update_scheduled *m);
+oc_result oc_encode_scheduled(oc_wbuf *w, uint16_t version, const oc_scheduled *m);
+oc_result oc_encode_scheduled_list(oc_wbuf *w, uint16_t version, const oc_scheduled_list *m);
+oc_result oc_encode_set_draft(oc_wbuf *w, uint16_t version, const oc_set_draft *m);
+oc_result oc_encode_list_drafts(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_draft(oc_wbuf *w, uint16_t version, const oc_draft *m);
+oc_result oc_encode_drafts(oc_wbuf *w, uint16_t version, const oc_drafts *m);
+oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m);
+oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_list_client_settings *m);
+oc_result oc_encode_audit_query(oc_wbuf *w, uint16_t ver, const oc_audit_query *m);
+oc_result oc_decode_audit_query(oc_rbuf *r, oc_audit_query *m);
+oc_result oc_encode_audit_page(oc_wbuf *w, uint16_t ver, const oc_audit_page *m);
+/* Decodes into `out` (caller-provided, `cap` entries); slices point into `r`. */
+oc_result oc_decode_audit_page(oc_rbuf *r, oc_audit_entry *out, uint16_t cap, uint16_t *n);
+
+oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t ver, const oc_storage_status *m);
+oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m);
+
+oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m);
+oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);
+oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m);
+oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m);
+oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m);
+oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
+oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
+oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
+oc_result oc_encode_upload_ack(oc_wbuf *w, uint16_t version, const oc_upload_ack *m);
+oc_result oc_encode_upload_end(oc_wbuf *w, uint16_t version, const oc_upload_end *m);
+oc_result oc_encode_upload_ok(oc_wbuf *w, uint16_t version, const oc_upload_ok *m);
+oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m);
+oc_result oc_encode_download_info(oc_wbuf *w, uint16_t version, const oc_download_info *m);
+oc_result oc_encode_download_chunk(oc_wbuf *w, uint16_t version, const oc_download_chunk *m);
+oc_result oc_encode_download_end(oc_wbuf *w, uint16_t version, const oc_download_end *m);
+oc_result oc_encode_transfer_cancel(oc_wbuf *w, uint16_t version, const oc_transfer_cancel *m);
+oc_result oc_encode_list_users(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *m);
+oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m);
+oc_result oc_encode_invite_user(oc_wbuf *w, uint16_t version, const oc_invite_user *m);
+oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_user *m);
+oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
+oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
+oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
+oc_result oc_encode_set_display_name(oc_wbuf *w, uint16_t version, const oc_set_display_name *m);
+oc_result oc_encode_change_password(oc_wbuf *w, uint16_t version, const oc_change_password *m);
+oc_result oc_encode_profile_updated(oc_wbuf *w, uint16_t version, const oc_profile_updated *m);
+oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m);
+oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search_results *m);
+oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
+oc_result oc_encode_history_request(oc_wbuf *w, uint16_t version, const oc_history_request *m);
+oc_result oc_encode_history_around(oc_wbuf *w, uint16_t version, const oc_history_around *m);
+oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
+oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
+
+/* --- Frame decoders ----------------------------------------------------- */
+/*
+ * Each reads a payload (positioned by oc_parse_frame) into the out struct.
+ * Returns OC_OK or OC_E_MALFORMED (payload underflow / trailing-length
+ * mismatch). Backfill-request decode copies up to `cap` cursors into `cursors`
+ * and reports the wire count in `*out_count` (which may exceed `cap`, meaning
+ * the caller's array was too small).
+ */
+oc_result oc_decode_hello(oc_rbuf *p, oc_hello *m);
+oc_result oc_decode_welcome(oc_rbuf *p, oc_welcome *m);
+oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m);
+oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m);
+oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
+oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);
+oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m);
+oc_result oc_decode_logout(oc_rbuf *p, oc_logout *m);
+oc_result oc_decode_send(oc_rbuf *p, oc_send *m);
+oc_result oc_decode_send_ack(oc_rbuf *p, oc_send_ack *m);
+oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m);
+oc_result oc_decode_client_ack(oc_rbuf *p, oc_client_ack *m);
+oc_result oc_decode_read_cursor(oc_rbuf *p, oc_read_cursor *m);
+oc_result oc_decode_edit(oc_rbuf *p, oc_edit *m);
+oc_result oc_decode_delete(oc_rbuf *p, oc_delete *m);
+oc_result oc_decode_msg_edited(oc_rbuf *p, oc_msg_edited *m);
+oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m);
+oc_result oc_decode_react(oc_rbuf *p, oc_react *m);
+oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
+oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
+oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
+oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
+oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
+oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
+oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);
+oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m);
+oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m);
+oc_result oc_decode_list_members(oc_rbuf *p, oc_list_members *m);
+oc_result oc_decode_member_entry(oc_rbuf *p, oc_member_entry *m);
+oc_result oc_decode_members(oc_rbuf *p, oc_members *m);
+oc_result oc_decode_list_files(oc_rbuf *p, oc_list_files *m);
+oc_result oc_decode_file_entry(oc_rbuf *p, oc_file_entry *m);
+oc_result oc_decode_files(oc_rbuf *p, oc_files *m);
+oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t cap, uint16_t *out_count, uint64_t *out_message_id);
+oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m);
+oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m);
+oc_result oc_decode_list_thread(oc_rbuf *p, oc_list_thread *m);
+oc_result oc_decode_thread(oc_rbuf *p, oc_thread *m);
+oc_result oc_decode_thread_meta(oc_rbuf *p, oc_thread_meta *m);
+oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m);
+oc_result oc_decode_update_channel(oc_rbuf *p, oc_update_channel *m);
+oc_result oc_decode_save_item(oc_rbuf *p, oc_save_item *m);
+oc_result oc_decode_saved_updated(oc_rbuf *p, oc_saved_updated *m);
+oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m);
+oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m);
+oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m);
+oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m);
+oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
+oc_result oc_decode_mention_unresolved(oc_rbuf *p, oc_mention_unresolved *m);
+oc_result oc_decode_list_channels(oc_rbuf *p);
+oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_join_channel(oc_rbuf *p, oc_channel_ref *m);
+oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m);
+oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m);
+oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
+oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m);
+oc_result oc_decode_create_webhook(oc_rbuf *p, oc_create_webhook *m);
+oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m);
+oc_result oc_decode_set_webhook_state(oc_rbuf *p, oc_set_webhook_state *m);
+oc_result oc_decode_rotate_webhook(oc_rbuf *p, oc_rotate_webhook *m);
+oc_result oc_decode_set_status(oc_rbuf *p, oc_set_status *m);
+oc_result oc_decode_set_profile(oc_rbuf *p, oc_set_profile *m);
+oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m);
+oc_result oc_decode_set_mute(oc_rbuf *p, oc_set_mute *m);
+oc_result oc_decode_set_read_cursor(oc_rbuf *p, oc_set_read_cursor *m);
+oc_result oc_decode_invite_list(oc_rbuf *p, oc_invite_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_revoke_invite(oc_rbuf *p, oc_revoke_invite *m);
+oc_result oc_decode_invite_revoked(oc_rbuf *p, oc_revoke_invite *m);
+oc_result oc_decode_list_webhooks(oc_rbuf *p, oc_list_webhooks *m);
+oc_result oc_decode_webhook_list(oc_rbuf *p, oc_webhook_list_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_delete_webhook(oc_rbuf *p, oc_delete_webhook *m);
+oc_result oc_decode_webhook_deleted(oc_rbuf *p, oc_webhook_deleted *m);
+oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m);
+oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
+oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
+oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
+oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m);
+oc_result oc_decode_set_tz_offset(oc_rbuf *p, oc_set_tz_offset *m);
+oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m);
+oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m);
+/* `days` must have room for OC_SCHEDULE_DAYS entries; `m->days` points at it. */
+oc_result oc_decode_schedule(oc_rbuf *p, oc_schedule *m, oc_schedule_day *days);
+oc_result oc_decode_set_keywords(oc_rbuf *p, oc_slice *terms, uint8_t cap, uint8_t *out_n);
+oc_result oc_decode_set_priority(oc_rbuf *p, uint64_t *people, uint8_t cap, uint8_t *out_n);
+oc_result oc_decode_alert_prefs(oc_rbuf *p, oc_slice *terms, uint8_t tcap, uint8_t *out_nt,
+                                uint64_t *people, uint8_t pcap, uint8_t *out_np);
+oc_result oc_decode_list_threads(oc_rbuf *p, oc_list_threads *m);
+oc_result oc_decode_thread_summary(oc_rbuf *p, oc_thread_summary *m);
+oc_result oc_decode_threads(oc_rbuf *p, oc_threads *m);
+oc_result oc_decode_set_thread_follow(oc_rbuf *p, oc_set_thread_follow *m);
+oc_result oc_decode_mark_thread_read(oc_rbuf *p, oc_mark_thread_read *m);
+oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
+oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
+oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m);
+oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
+oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
+                                 uint16_t *out_count, uint8_t *out_default);
+oc_result oc_decode_schedule_message(oc_rbuf *p, oc_schedule_message *m);
+oc_result oc_decode_cancel_scheduled(oc_rbuf *p, oc_cancel_scheduled *m);
+oc_result oc_decode_update_scheduled(oc_rbuf *p, oc_update_scheduled *m);
+oc_result oc_decode_scheduled(oc_rbuf *p, oc_scheduled *m);
+oc_result oc_decode_scheduled_list(oc_rbuf *p, oc_scheduled_list *m);
+oc_result oc_decode_set_draft(oc_rbuf *p, oc_set_draft *m);
+oc_result oc_decode_draft(oc_rbuf *p, oc_draft *m);
+oc_result oc_decode_drafts(oc_rbuf *p, oc_drafts *m);
+oc_result oc_decode_set_client_setting(oc_rbuf *p, oc_set_client_setting *m);
+oc_result oc_decode_list_client_settings(oc_rbuf *p, oc_list_client_settings *m);
+/* CLIENT_SETTINGS decodes the entries into a caller buffer; client_type stays a
+ * view into the frame. */
+oc_result oc_decode_client_settings(oc_rbuf *p, oc_client_settings *m,
+                                    oc_client_setting_entry *entries, uint16_t cap);
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m);
+oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m);
+/* CALL_JOINED/CALL_ROSTER decode the participant ids into a caller buffer. */
+oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, uint64_t *parts, uint16_t cap);
+oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, uint64_t *parts, uint16_t cap);
+oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
+oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
+oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);
+oc_result oc_decode_upload_ack(oc_rbuf *p, oc_upload_ack *m);
+oc_result oc_decode_upload_end(oc_rbuf *p, oc_upload_end *m);
+oc_result oc_decode_upload_ok(oc_rbuf *p, oc_upload_ok *m);
+oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m);
+oc_result oc_decode_download_info(oc_rbuf *p, oc_download_info *m);
+oc_result oc_decode_download_chunk(oc_rbuf *p, oc_download_chunk *m);
+oc_result oc_decode_download_end(oc_rbuf *p, oc_download_end *m);
+oc_result oc_decode_transfer_cancel(oc_rbuf *p, oc_transfer_cancel *m);
+oc_result oc_decode_list_users(oc_rbuf *p);
+oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m);
+oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m);
+oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
+oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
+oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
+oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);
+oc_result oc_decode_set_display_name(oc_rbuf *p, oc_set_display_name *m);
+oc_result oc_decode_change_password(oc_rbuf *p, oc_change_password *m);
+oc_result oc_decode_profile_updated(oc_rbuf *p, oc_profile_updated *m);
+oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
+oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);
+oc_result oc_decode_history_request(oc_rbuf *p, oc_history_request *m);
+oc_result oc_decode_history_around(oc_rbuf *p, oc_history_around *m);
+oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
+oc_result oc_decode_error(oc_rbuf *p, oc_error *m);
+
+/* --- Inner credential codec (AUTH.md §2; PROTOCOL.md §4.2) --------------- */
+/* For method=local the AUTH `credential` payload is itself `str username`
+ * followed by `str password`. These pack/parse that inner payload, kept here
+ * so the client and daemon share one definition of the format. Encode writes
+ * into `w` (whose bytes then become the credential slice); parse reads a
+ * credential slice, rejecting trailing garbage with OC_E_MALFORMED. */
+oc_result oc_encode_local_credential(oc_wbuf *w, oc_slice username, oc_slice password);
+oc_result oc_parse_local_credential(oc_slice credential, oc_slice *username, oc_slice *password);
+
+#endif /* OPENCHIME_PROTOCOL_H */

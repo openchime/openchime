@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+#
+# The installer manifest -- the one that has to be right, because the two
+# fields that make `winget upgrade` work fail SILENTLY when they are wrong.
+#
+# WinGet does not remember what it installed. It reads Add/Remove Programs and
+# tries to correlate each entry with a package in its index. A package it
+# cannot correlate never appears in `winget upgrade` at all: no error, no
+# warning, it is simply absent, and every install of it is stranded on the
+# version it shipped with.
+#
+# Correlation here is by ProductCode. Inno Setup registers under the AppId with
+# an `_is1` suffix, so this GUID must stay identical to AppId in
+# ../openchime.iss forever. Changing it there orphans every existing install.
+#
+# Rendered by render.sh, which fills in @VERSION@, @URL@ and @SHA256@.
+PackageIdentifier: OpenChime.OpenChime
+PackageVersion: "@VERSION@"
+
+InstallerType: inno
+# The installer is PrivilegesRequired=lowest and lands under
+# %LOCALAPPDATA%\Programs, so its ARP entry is in HKCU. Declaring user scope is
+# what points WinGet's correlation at the per-user hive instead of the machine
+# one.
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+
+# WinGet knows Inno's defaults; they are spelled out because an unattended
+# upgrade depends on them and a silent default is a bad thing to inherit
+# implicitly. SUPPRESSMSGBOXES matters most: without it an upgrade that hits a
+# prompt hangs invisibly with no console attached.
+InstallerSwitches:
+  Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
+
+# `install` rather than `uninstallPrevious`: Inno upgrades in place, keyed on
+# AppId, and uninstalling first would be slower and would briefly leave the
+# machine with no client for no benefit.
+UpgradeBehavior: install
+
+AppsAndFeaturesEntries:
+  - DisplayName: OpenChime
+    Publisher: OpenChime
+    ProductCode: "{8C4E1F2A-6D3B-4A57-9E80-2F1B7C5D9A43}_is1"
+    UpgradeBehavior: install
+
+Installers:
+  - Architecture: x64
+    InstallerUrl: "@URL@"
+    InstallerSha256: "@SHA256@"
+
+ManifestType: installer
+ManifestVersion: 1.6.0

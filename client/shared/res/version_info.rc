@@ -1,0 +1,72 @@
+/* The VERSIONINFO resource both Windows binaries carry.
+ *
+ * Shared rather than duplicated because the two differ in exactly two strings.
+ * An includer defines those and then includes this file:
+ *
+ *     #define OC_RES_DESC "Chat client for an OpenChime server."
+ *     #define OC_RES_ORIG "openchime.exe"
+ *     #include "version_info.rc"
+ *
+ * This is the block Explorer reads under Properties > Details, and the one a
+ * bug report quotes. Without it a shipped .exe reports no version at all --
+ * which was true of both binaries until this file existed, even though the
+ * installer wrapping them carried one (packaging/windows/openchime.iss).
+ *
+ * The Makefile passes OC_VERSION_NUM to windres as bare digits, from the same
+ * OC_VERSION that scripts/version.sh allocates and the daemon reports. A
+ * source build leaves it unset and gets 0, matching the daemon's "dev".
+ *
+ * Only the number crosses the command line, and the display string is built
+ * here. That is deliberate: windres hands its arguments to the preprocessor
+ * through a second shell, so a --define carrying quotes loses them on the way
+ * and the string literal arrives as bare tokens. Digits have no such problem.
+ *
+ * Why 1.0.<release>.0: version.sh hands out a bare integer, and Windows wants
+ * four fields. Third field, so the number increases monotonically -- the only
+ * property Windows actually enforces. Same placement as the MSIX manifest and
+ * the Inno script, so all three agree.
+ */
+#include <windows.h>
+
+#ifndef OC_VERSION_NUM
+#define OC_VERSION_NUM 0
+#endif
+
+/* Two levels, because # does not expand its argument: the outer macro expands
+   OC_VERSION_NUM and the inner one stringifies the result. */
+#define OC_RES_STR_(x) #x
+#define OC_RES_STR(x)  OC_RES_STR_(x)
+#define OC_VERSION_STR "1.0." OC_RES_STR(OC_VERSION_NUM) ".0"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    1,0,OC_VERSION_NUM,0
+PRODUCTVERSION 1,0,OC_VERSION_NUM,0
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        /* 0409 is en-US, 04B0 is codepage 1200 (Unicode). The VarFileInfo
+           translation below must name the same pair. */
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "OpenChime"
+            VALUE "FileDescription",  OC_RES_DESC
+            VALUE "FileVersion",      OC_VERSION_STR
+            VALUE "InternalName",     OC_RES_ORIG
+            VALUE "OriginalFilename", OC_RES_ORIG
+            VALUE "ProductName",      "OpenChime"
+            VALUE "ProductVersion",   OC_VERSION_STR
+            /* No LegalCopyright: the licence is an open decision and this is
+               not the place to assert one. Add it when the tree gets a
+               LICENSE file. */
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
