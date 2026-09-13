@@ -27,14 +27,21 @@ has more, squash them:
 
 ```
 git reset --soft $(git merge-base origin/staging HEAD)
-git commit -s -m "<area>: <imperative summary>"
+git commit -s -m "OC-<number>: <Capitalised imperative summary>"
 ```
 
-The single commit's message follows the house format — `area: imperative
-summary`, sentence case, no trailing period, sign-off, the issue cited as
-`Closes #<number>` — and must contain nothing that trips the attribution
-guard (no attribution trailers, never the name of the directory these
-commands live in).
+The single commit's message is exactly what `commit-policy` enforces once it
+lands:
+
+- **Subject:** `OC-<number>: Capitalised imperative summary`, no trailing
+  punctuation. GitHub appends ` (#<pr>)` on squash, and the whole subject must
+  still fit in 72 characters, so keep your part to about 64.
+- **Body:** the `Signed-off-by:` trailer from `-s`, and **nothing else** — no
+  description, no `Closes #<number>`, no other trailers. The squash drops any
+  body text except the sign-off, so a `Closes` line never reaches `staging` or
+  `main` and closes nothing.
+- Nothing that trips the attribution guard (no attribution trailers, never the
+  name of the directory these commands live in).
 
 ## 4. Clean and pushed
 

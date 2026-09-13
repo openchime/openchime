@@ -98,10 +98,16 @@ jobs:
               fail=1
             fi
 
-            # THE REASON THIS WORKFLOW EXISTS.
-            if [ -n "$(git log -1 --format=%b "$c")" ]; then
+            # THE REASON THIS WORKFLOW EXISTS. The one line a body may hold is
+            # a DCO sign-off: every commit must carry one (CONTRIBUTING.md), and
+            # GitHub copies it into the squash even with a BLANK message. Anything
+            # else, a Co-authored-by trailer included, still fails.
+            body=$(git log -1 --format=%b "$c" \
+                   | grep -vE '^Signed-off-by: [^<]+ <[^>]+>$' \
+                   | sed '/^[[:space:]]*$/d')
+            if [ -n "$body" ]; then
               echo "::error::${c:0:8} has a commit body; subjects here stand alone."
-              git log -1 --format=%b "$c" | head -2 | sed 's/^/    /'
+              printf '%s\n' "$body" | head -2 | sed 's/^/    /'
               fail=1
             fi
           done
