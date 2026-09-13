@@ -101,9 +101,12 @@ jobs:
             # THE REASON THIS WORKFLOW EXISTS. The one line a body may hold is
             # a DCO sign-off: every commit must carry one (CONTRIBUTING.md), and
             # GitHub copies it into the squash even with a BLANK message. Anything
-            # else, a Co-authored-by trailer included, still fails.
+            # else, a Co-authored-by trailer included, still fails. The `|| true`
+            # is load-bearing: a body that is ONLY the sign-off leaves grep with no
+            # output, grep exits 1, and under the runner's `bash -e` plus pipefail
+            # that kills the step silently -- a failure with no error printed.
             body=$(git log -1 --format=%b "$c" \
-                   | grep -vE '^Signed-off-by: [^<]+ <[^>]+>$' \
+                   | { grep -vE '^Signed-off-by: [^<]+ <[^>]+>$' || true; } \
                    | sed '/^[[:space:]]*$/d')
             if [ -n "$body" ]; then
               echo "::error::${c:0:8} has a commit body; subjects here stand alone."
