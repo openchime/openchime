@@ -581,15 +581,23 @@ that actually changed.
 `form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
 `FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`, `FF_SELECT`) behind every typed form in
 the client —
-topics, renames, webhooks, invites, quick reactions, sign-up, keywords, priority
-people, the custom pause time, profile fields, sections and more. It splits the
-work deliberately:
+topics, renames, webhooks, invites, sign-up, keywords, priority people, the
+custom pause time, profile fields, sections and more. It splits the work
+deliberately:
 
 - the **text fields are native `EDIT`s** and always will be, so caret, selection,
   IME, clipboard and undo remain the platform's problem, not ours;
 - the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
   themed app were never worth it — and none of them was dismissible the way every
   other sheet is, screenshot-comparable, or reachable by the harness.
+
+**A choice of emoji is never typed.** The quick reactions are six slots in
+Preferences → Messages, each opening the emoji picker for that slot: the same
+picker the status dialog uses, floating over the card that owns it
+(`picker_floats()`). A pick already in another slot swaps with it, so the set
+never offers one reaction twice, and the last emoji left cannot be cleared.
+The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
+its base, and the workspace's own emoji are not offered.
 
 **`FF_CHOICE` and `FF_SELECT` are the same question at two sizes.** Choice is a
 chip row — right for a handful of options you want to see at once. Select is a

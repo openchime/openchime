@@ -660,6 +660,69 @@ static void quick_rebuild(void) {
     }
 }
 
+/* The six SLOTS of the set, positionally: slot i is the i-th comma-separated
+ * entry of g_quick_names, and an empty entry is an empty slot. Read straight from
+ * the one string every path already writes — load, snapshot restore, Reset — so
+ * the slots the Preferences row draws cannot drift from the set the menu offers. */
+#define QUICK_SLOTS 6
+static void quick_slot_get(int slot, char *out, size_t cap) {
+    out[0] = '\0';
+    const char *p = g_quick_names;
+    for (int i = 0; i < slot && p; i++) { p = strchr(p, ','); if (p) p++; }
+    if (!p) return;
+    while (*p == ' ') p++;
+    size_t n = 0;
+    while (*p && *p != ',' && n + 1 < cap) out[n++] = *p++;
+    out[n] = '\0';
+    while (n && out[n - 1] == ' ') out[--n] = '\0';
+}
+
+static int quick_slots_filled(void) {
+    int n = 0;
+    for (int i = 0; i < QUICK_SLOTS; i++) {
+        char nm[40]; quick_slot_get(i, nm, sizeof nm);
+        if (nm[0] && oc_emoji_by_name(nm)) n++;
+    }
+    return n;
+}
+
+/* Put `name` ("" clears) in `slot`. A name already in another slot MOVES here and
+ * that slot takes this one's old emoji — a swap, so the set never offers the same
+ * reaction twice. */
+static void quick_slot_set(int slot, const char *name) {
+    if (slot < 0 || slot >= QUICK_SLOTS) return;
+    char s[QUICK_SLOTS][40];
+    for (int i = 0; i < QUICK_SLOTS; i++) quick_slot_get(i, s[i], sizeof s[i]);
+    if (name[0])
+        for (int i = 0; i < QUICK_SLOTS; i++)
+            if (i != slot && !strcmp(s[i], name)) snprintf(s[i], sizeof s[i], "%s", s[slot]);
+    snprintf(s[slot], sizeof s[slot], "%s", name);
+    char out[sizeof g_quick_names]; out[0] = '\0';
+    for (int i = 0; i < QUICK_SLOTS; i++)
+        snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", i ? "," : "", s[i]);
+    snprintf(g_quick_names, sizeof g_quick_names, "%s", out);
+    quick_rebuild();
+}
+
+/* The catalogue shortcode for a glyph the picker returned, or NULL. The picker
+ * draws with the user's skin tone applied, but a quick reaction is stored — and
+ * always has been — as the base shortcode, so a toned pick resolves to its base. */
+static const char *quick_name_for(const char *glyph) {
+    size_t n = 0;
+    const oc_emoji *all = oc_emoji_all(&n);
+    for (size_t i = 0; i < n; i++)
+        if (!strcmp(all[i].emoji, glyph)) return all[i].name;
+    for (size_t i = 0; i < n; i++) {
+        if (!all[i].tonable) continue;
+        for (uint8_t t = 0; t < OC_SKIN_COUNT; t++) {
+            char buf[32];
+            if (oc_emoji_with_tone(&all[i], t, buf, sizeof buf) && !strcmp(buf, glyph))
+                return all[i].name;
+        }
+    }
+    return NULL;
+}
+
 /* ---- app state ----------------------------------------------------------- */
 
 static oc_client *g_client;
@@ -877,6 +940,9 @@ static int geom_capture(HWND hwnd) {
  * silently stops recording makes the last control on a pane simply not respond. */
 static struct { rectf r; int row, val; } g_pref_hits[24];
 static int g_n_pref_hits;
+/* The quick-reaction slots in Preferences: the tile that opens the picker for a
+ * slot, and the small clear badge on it (empty when it is not offered). */
+static rectf g_quick_tile[6], g_quick_clear[6];
 static int g_n_rows;
 
 /* Transcript message hit-boxes (context menu + text selection). bx/by = the body
@@ -1763,9 +1829,18 @@ static uint64_t g_pick_mid;
 /* Who the picked emoji is FOR. The mid alone could not say "the status
  * dialog's emoji slot", and the target also decides where the panel anchors
  * and whether it may float over a modal. */
-enum { PICK_COMPOSER = 0, PICK_REACT, PICK_STATUS };
+enum { PICK_COMPOSER = 0, PICK_REACT, PICK_STATUS, PICK_QUICK };
 static int      g_pick_target = PICK_COMPOSER;
-static rectf    g_pick_anchor;          /* PICK_STATUS: the emoji button */
+static rectf    g_pick_anchor;          /* PICK_STATUS / PICK_QUICK: what opened it */
+static int      g_pick_quick_slot = -1; /* PICK_QUICK: the slot being chosen for */
+/* The picker FLOATS over a modal card, anchored to the control that opened it,
+ * when a modal owns it: the status dialog's emoji button, or a quick-reaction
+ * slot in Preferences. Every place that treats the picker as the card's
+ * companion rather than the composer's asks this, so a new modal owner is one
+ * line here rather than a hunt for every comparison. */
+static int picker_floats(void) {
+    return g_pick_target == PICK_STATUS || g_pick_target == PICK_QUICK;
+}
 static HWND     g_pick_edit;        /* native search box */
 static float    g_pick_scroll;
 static rectf g_pick_panel, g_pick_box;
@@ -6989,6 +7064,7 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
 
 static void draw_prefs(gfx *rt, rectf reg) {
     g_n_pref_hits = 0;
+    for (int i = 0; i < 6; i++) g_quick_tile[i] = g_quick_clear[i] = rf(0, 0, 0, 0);
 
     /* The category column. Inside the frame's content rect, with its own right
      * edge — the same treatment every other second column in the app gets.
@@ -7099,21 +7175,57 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      "Rich text formats as you type. Plain text shows the markup "
                      "and never restyles it.",
                      EDITORS, 2, g_pref_richtext);
-        /* the quick reactions were six literals in the source. */
+        /* The quick reactions: six slots you click, each opening the emoji
+         * picker for that slot. A typed list of shortcodes asked people to
+         * remember names and separators and showed them nothing until the menu
+         * next opened. Changes apply at once and, like every row here, persist
+         * on Save and revert on Cancel (the set is part of the snapshot). */
         {
-            static const char *EDIT1[1] = { "Change" };
-            char cur[128] = "";
-            for (int i = 0; i < g_n_quick; i++)
-                snprintf(cur + strlen(cur), sizeof cur - strlen(cur), "%s ", REACT_EMO[i]);
-            draw_text(rt, "Quick reactions", g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
-            draw_emoji_fmt(rt, "", rf(0, 0, 0, 0), g_emoji_s);      /* keep the format warm */
-            /* Where pref_row puts a HINT, so this row lines up with every other
-             * one. It draws its own label and glyphs rather than going through
-             * pref_row because colour emoji need the emoji format -- but that is
-             * a reason to match pref_row's geometry, not to ignore it. The hint
-             * moved down when hints started wrapping and this did not follow. */
-            draw_text(rt, cur, g_emoji_s, rf(body.left + 24, y + 30, body.left + 340, y + 52), OC_COL_TEXT);
-            y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
+            const char *hint = "The reactions offered on every message. Click a slot "
+                               "to choose its emoji.";
+            draw_text(rt, "Quick reactions", g_ui_b,
+                      rf(body.left + 24, y, body.right - 24, y + 22), OC_COL_TEXT);
+            float hw = (body.right - 24) - (body.left + 24);
+            float hint_h = text_height(hint, g_meta_w, hw);
+            draw_text(rt, hint, g_meta_w,
+                      rf(body.left + 24, y + 30, body.right - 24, y + 30 + hint_h),
+                      OC_COL_FAINT);
+            float ty = y + 30 + hint_h + 10, tile = UIS(44.0f), gap = UIS(10.0f);
+            /* The last emoji left cannot be cleared: an empty set falls back to
+             * the defaults, so offering to clear it would really offer a reset. */
+            int filled = quick_slots_filled();
+            for (int i = 0; i < QUICK_SLOTS; i++) {
+                float tx = body.left + 24 + i * (tile + gap);
+                rectf t = rf(tx, ty, tx + tile, ty + tile);
+                char nm[40]; quick_slot_get(i, nm, sizeof nm);
+                const char *glyph = nm[0] ? oc_emoji_by_name(nm) : NULL;
+                int hov = in_rect(t, g_mouse_x, g_mouse_y);
+                int picking = g_pick_open && g_pick_target == PICK_QUICK && g_pick_quick_slot == i;
+                fill_round(rt, t, OC_R_CONTROL, hov ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, t, OC_R_CONTROL, picking || hov ? OC_COL_ACCENT : OC_COL_BORDER,
+                             picking ? 2.0f : 1.0f);
+                rectf gi = rf(t.left + 7, t.top + 7, t.right - 7, t.bottom - 7);
+                if (glyph) draw_emoji_glyph(rt, glyph, gi);
+                else       draw_lucide(rt, OC_ICON_PLUS, rf(t.left + 13, t.top + 13, t.right - 13, t.bottom - 13),
+                                       OC_COL_FAINT);
+                g_quick_tile[i] = t;
+                if (glyph && filled > 1) {
+                    /* The target exists whenever clearing is allowed, so the
+                     * keyboard-free routes (automation, a click with no hover
+                     * first) reach it; the badge is DRAWN only on hover. */
+                    rectf x = rf(t.right - 12, t.top - 6, t.right + 6, t.top + 12);
+                    g_quick_clear[i] = x;
+                    if (hov || in_rect(x, g_mouse_x, g_mouse_y)) {
+                        fill_round(rt, x, OC_R_PILL, OC_COL_TEXT);
+                        g_meta->align = ST_ALIGN_CENTER;
+                        draw_text(rt, "\xC3\x97", g_meta, rf(x.left, x.top - 1, x.right, x.bottom - 1), OC_COL_BASE);
+                        g_meta->align = ST_ALIGN_LEFT;
+                    }
+                }
+            }
+            float rule = ty + tile + 12;
+            fill(rt, rf(body.left + 24, rule, body.right - 24, rule + 1), OC_COL_BORDER);
+            y = rule + 15;
         }
     } else if (g_pref_cat == PC_NOTIFICATIONS) {
         /* WHERE, then how much. Two questions, because they are two questions:
@@ -7173,6 +7285,10 @@ static void draw_prefs(gfx *rt, rectf reg) {
      * bare in_rect. The category chips are outside the scroller and keep theirs. */
     for (int i = 0; i < g_n_pref_hits; i++)
         g_pref_hits[i].r = hit_visible(g_pref_hits[i].r, rows);
+    for (int i = 0; i < QUICK_SLOTS; i++) {
+        g_quick_tile[i]  = hit_visible(g_quick_tile[i], rows);
+        g_quick_clear[i] = hit_visible(g_quick_clear[i], rows);
+    }
 }
 
 /* A person's card, in the context pane (right). Laid out VERTICALLY: the old
@@ -8686,8 +8802,8 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     float pw = 360; if (pw > w - 40) pw = w - 40;
     float ph = 300; if (ph > h - HEADER_H - g_composer_h - 20) ph = h - HEADER_H - g_composer_h - 20;
     float px, py;
-    if (g_pick_target == PICK_STATUS) {
-        /* Anchored to the status dialog's emoji button, like the time picker
+    if (picker_floats()) {
+        /* Anchored to the control that opened it, like the time picker
          * to its field: below the button, flipped above when the window's
          * bottom edge would clip it, clamped inside the window either way. */
         px = g_pick_anchor.left;
@@ -8738,6 +8854,7 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
      * ink and let the ink run out of the rect and under the swatches, which is
      * the same collision arriving through the fix for it. */
     const char *ptitle = g_pick_target == PICK_STATUS ? "Status emoji"
+                       : g_pick_target == PICK_QUICK ? "Quick reaction"
                        : g_pick_mid ? "Add reaction" : "Emoji";
     if (title_r - (px + 14) >= text_width(ptitle, g_title))
         draw_text(rt, ptitle, g_title,
@@ -8817,7 +8934,8 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
         static char pool[64][52];
         const oc_model *pm = model();
         int np = 0;
-        if (pm) for (size_t i = 0; i < pm->n_cemoji && np < 64; i++) {
+        /* Not for a quick reaction: that set is catalogue shortcodes only. */
+        if (pm && g_pick_target != PICK_QUICK) for (size_t i = 0; i < pm->n_cemoji && np < 64; i++) {
             if (q[0] && !strstr(pm->cemoji[i].name, q)) continue;
             snprintf(pool[np], sizeof pool[np], ":%s:", pm->cemoji[i].name);
             np++;
@@ -8919,15 +9037,26 @@ static void picker_open_status(HWND hwnd, rectf anchor) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* A quick-reaction slot's variant: the same floating picker, over Preferences. */
+static void picker_open_quick(HWND hwnd, int slot, rectf anchor) {
+    picker_open_status(hwnd, anchor);
+    g_pick_target = PICK_QUICK;
+    g_pick_quick_slot = slot;
+}
+
 static HWND g_status_edit;                /* fwd-declared here: picker_close
                                            * hands focus back to it */
 static void picker_close(HWND hwnd) {
-    int was_status = g_pick_target == PICK_STATUS;
+    int was = g_pick_target;
     g_pick_open = 0; g_pick_mid = 0;
     g_pick_target = PICK_COMPOSER;
+    g_pick_quick_slot = -1;
     if (g_pick_edit) ShowWindow(g_pick_edit, SW_HIDE);
-    /* Focus goes back to whoever the picker was working for. */
-    if (was_status) { if (g_status_edit) SetFocus(g_status_edit); }
+    /* Focus goes back to whoever the picker was working for. Preferences has
+     * no field of its own, so it gets the window: never the composer under
+     * the card. */
+    if (was == PICK_STATUS) { if (g_status_edit) SetFocus(g_status_edit); }
+    else if (was == PICK_QUICK) { if (hwnd) SetFocus(hwnd); }
     else ed_focus(hwnd);
     if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -8936,6 +9065,14 @@ static void picker_close(HWND hwnd) {
 static char g_status_emoji[24];           /* fwd-declared: the picker fills it */
 static void picker_choose(HWND hwnd, const char *emoji) {
     if (!emoji || !g_client) { picker_close(hwnd); return; }
+    if (g_pick_target == PICK_QUICK) {
+        /* Only the catalogue can be a quick reaction (the set is stored as
+         * shortcodes), which is why this picker offers no workspace emoji. */
+        const char *nm = quick_name_for(emoji);
+        if (nm) quick_slot_set(g_pick_quick_slot, nm);
+        picker_close(hwnd);
+        return;
+    }
     if (g_pick_target == PICK_STATUS) {
         snprintf(g_status_emoji, sizeof g_status_emoji, "%s", emoji);
         picker_close(hwnd);
@@ -10470,7 +10607,7 @@ static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
 static void modal_finish(int save) {
     g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
-    if (g_pick_open && g_pick_target == PICK_STATUS) picker_close(NULL);
+    if (g_pick_open && picker_floats()) picker_close(NULL);
     if (g_status_edit) ShowWindow(g_status_edit, SW_HIDE);
     const oc_modal_spec *s = modal_current();
     /* A confirmation's "commit" is its action. Handled here rather than through
@@ -10535,8 +10672,8 @@ static int modal_key(HWND hwnd, WPARAM vk) {
     /* And for a form's open FF_SELECT list: Escape closes the list, not the card
      * it is standing on. */
     if (vk == VK_ESCAPE && g_form_sel_field >= 0) { g_form_sel_field = -1; return 1; }
-    /* Same rule for the status dialog's emoji picker. */
-    if (vk == VK_ESCAPE && g_pick_open && g_pick_target == PICK_STATUS) {
+    /* Same rule for an emoji picker floating over the card. */
+    if (vk == VK_ESCAPE && g_pick_open && picker_floats()) {
         picker_close(hwnd);
         return 1;
     }
@@ -10624,9 +10761,9 @@ static void layout_natives(HWND hwnd) {
                    PX(b.right - b.left - 18), PX(b.bottom - b.top - 10), TRUE);
     }
     if (g_pick_edit) {
-        /* Over a modal only when the STATUS dialog owns the picker — the one
-         * companion allowed to float above a card (the time-picker rule). */
-        if (g_pick_open && (!covered || g_pick_target == PICK_STATUS)) {
+        /* Over a modal only when a modal owns the picker — the one companion
+         * allowed to float above a card (the time-picker rule). */
+        if (g_pick_open && (!covered || picker_floats())) {
             ShowWindow(g_pick_edit, SW_SHOW);
             MoveWindow(g_pick_edit, PX(g_pick_box.left + 30), PX(g_pick_box.top + 6),
                        PX(g_pick_box.right - g_pick_box.left - 40), PX(18), TRUE);
@@ -12513,15 +12650,15 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
          * prevent. One predicate now decides both. */
         if (main_is_conversation()) draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
-        if (g_pick_target != PICK_STATUS)
+        if (!picker_floats())
             draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else g_n_memrows = 0;
     } else {
         g_n_ac = 0;
-        /* The STATUS dialog's picker belongs to the modal, not the composer,
-         * and the modal opens from any view — it must survive this branch. */
-        if (g_pick_target != PICK_STATUS) g_pick_open = 0;
+        /* A modal's picker belongs to the modal, not the composer, and the
+         * modal opens from any view — it must survive this branch. */
+        if (!picker_floats()) g_pick_open = 0;
         g_banner_on = 0;
         rectf reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
@@ -12570,9 +12707,9 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     draw_menu(rt);          /* dropdown menus float on top of everything */
     draw_submenu(rt, W, H); /* ...and the pause flyout above its menu */
     draw_time_picker(rt, W, H);   /* ...and the time dropdown above the overlay it belongs to */
-    if (g_pick_target == PICK_STATUS)   /* the status dialog's emoji picker floats
-                                         * over its card, exactly like the time
-                                         * dropdown over the notifications sheet */
+    if (picker_floats())    /* a modal's emoji picker floats over its card,
+                             * exactly like the time dropdown over the
+                             * notifications sheet */
         draw_emoji_picker(rt, 0, W, H);
     if (si_over) {          /* the sign-in card, over a dimmed live shell */
         rectf all = rf(0, 0, W, H);
@@ -14256,6 +14393,7 @@ enum {
     AT_STATUSSUGG,    /* payload: status suggestion row index */
     AT_STATUSCHIP,    /* payload: status clear-after chip index */
     AT_FORMSIDE,      /* payload: 0 = the form's upload photo, 1 = remove photo */
+    AT_QUICKSLOT,     /* payload: slot index; +100 = that slot's clear */
     AT_FSCOPE,        /* payload: Files ownership-scope index */
     AT_FSORT,         /* the Files sort dropdown */
     AT_FTYPE,         /* the Files type dropdown */
@@ -14594,6 +14732,22 @@ modal_items:
                 snprintf(aid, sizeof aid, "status.clear.%d", k);
                 acc_push(items, &n, OC_ACC_TAB, aid, STATUS_CLEARS[k],
                          g_status_chip_hits[k], ATOK(AT_STATUSCHIP, k));
+            }
+        }
+        if (g_prefs_open) {
+            for (int i = 0; i < QUICK_SLOTS && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[40], label[64];
+                quick_slot_get(i, nm, sizeof nm);
+                if (g_quick_tile[i].right > g_quick_tile[i].left) {
+                    snprintf(aid, sizeof aid, "prefs.quick.%d", i);
+                    snprintf(label, sizeof label, "Quick reaction %d: %s", i + 1, nm[0] ? nm : "empty");
+                    acc_push(items, &n, OC_ACC_BUTTON, aid, label, g_quick_tile[i], ATOK(AT_QUICKSLOT, i));
+                }
+                if (g_quick_clear[i].right > g_quick_clear[i].left && n < OC_ACC_MAX) {
+                    snprintf(aid, sizeof aid, "prefs.quick.%d.clear", i);
+                    snprintf(label, sizeof label, "Clear quick reaction %d", i + 1);
+                    acc_push(items, &n, OC_ACC_BUTTON, aid, label, g_quick_clear[i], ATOK(AT_QUICKSLOT, 100 + i));
+                }
             }
         }
         if (g_form_open && g_form_side.on) {
@@ -16003,7 +16157,7 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The emoji picker first WHEN IT FLOATS OVER A MODAL: the frame's
      * outside-the-card rule would read a click on the panel as scrim-cancel.
      * An outside click closes the picker and is consumed — never the card. */
-    if (g_pick_open && g_pick_target == PICK_STATUS) {
+    if (g_pick_open && picker_floats()) {
         picker_click(hwnd, x, y);
         return 1;
     }
@@ -16434,6 +16588,18 @@ static int on_click(HWND hwnd, int x, int y) {
         if (in_rect(g_modal_card, x, y)) return 1;
     }
     if (g_prefs_open) {
+        /* A slot's clear badge overlaps its tile's corner, so it is tested first. */
+        for (int i = 0; i < QUICK_SLOTS; i++) {
+            if (in_rect(g_quick_clear[i], x, y)) {
+                if (quick_slots_filled() > 1) quick_slot_set(i, "");
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+            if (in_rect(g_quick_tile[i], x, y)) {
+                picker_open_quick(hwnd, i, g_quick_tile[i]);
+                return 1;
+            }
+        }
         for (int i = 0; i < PC_COUNT; i++)
             if (in_rect(g_pref_cats[i], x, y)) { g_pref_cat = i; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         for (int i = 0; i < g_n_pref_hits; i++) {
@@ -16488,15 +16654,6 @@ static int on_click(HWND hwnd, int x, int y) {
                 modal_finish(1);
                 modal_enter(hwnd, &g_notify_open);
                 return 1;
-            case PREF_ROW_QUICK: {
-                oc_field f[1] = { { FF_TEXT, "Quick reactions",
-                                    "Up to six emoji shortcodes, comma separated (e.g. +1, fire, tada).", "" } };
-                snprintf(f[0].value, sizeof f[0].value, "%s", g_quick_names);
-                if (!form_dialog(hwnd, "Quick reactions", f, 1)) return 1;
-                snprintf(g_quick_names, sizeof g_quick_names, "%s", f[0].value);
-                quick_rebuild();
-                break;
-            }
             }
             /* No prefs_save() here. The footer's Save commits (modal_finish ->
              * spec->commit) and Cancel restores the snapshot; persisting on every
@@ -19440,10 +19597,24 @@ static void test_dump(const char *path) {
             fprintf(f, "  statuschip %d r=%.0f,%.0f,%.0f,%.0f\n", k,
                     g_status_chip_hits[k].left, g_status_chip_hits[k].top,
                     g_status_chip_hits[k].right, g_status_chip_hits[k].bottom);
-        fprintf(f, "pickstate open=%d target=%d panel=%.0f,%.0f,%.0f,%.0f\n",
-                g_pick_open, g_pick_target,
+        fprintf(f, "pickstate open=%d target=%d slot=%d panel=%.0f,%.0f,%.0f,%.0f\n",
+                g_pick_open, g_pick_target, g_pick_quick_slot,
                 g_pick_panel.left, g_pick_panel.top,
                 g_pick_panel.right, g_pick_panel.bottom);
+        /* The first cells, so a driven pick can click a real one and a
+         * test can check what the picker offered (no workspace emoji for a
+         * quick-reaction slot). */
+        for (int i = 0; i < g_n_pick_cells && i < 48 && g_pick_open; i++)
+            fprintf(f, "  pickcell %d emoji=\"%s\" r=%.0f,%.0f,%.0f,%.0f\n", i,
+                    g_pick_cells[i].emoji, g_pick_cells[i].r.left, g_pick_cells[i].r.top,
+                    g_pick_cells[i].r.right, g_pick_cells[i].r.bottom);
+        fprintf(f, "quickset names=\"%s\" filled=%d\n", g_quick_names, quick_slots_filled());
+        for (int i = 0; i < QUICK_SLOTS; i++) {
+            char nm[40]; quick_slot_get(i, nm, sizeof nm);
+            fprintf(f, "  quickslot %d name=\"%s\" tile=%.0f,%.0f,%.0f,%.0f clear=%d\n", i, nm,
+                    g_quick_tile[i].left, g_quick_tile[i].top, g_quick_tile[i].right,
+                    g_quick_tile[i].bottom, g_quick_clear[i].right > g_quick_clear[i].left);
+        }
     }
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
@@ -21984,6 +22155,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case AT_STATUSCHIP:
             if (g_status_open && (int)arg < 5) {
                 g_status_clear = (int)arg;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        case AT_QUICKSLOT:
+            if (g_prefs_open) {
+                if (arg >= 100 && arg < 100 + QUICK_SLOTS) {
+                    if (quick_slots_filled() > 1) quick_slot_set((int)arg - 100, "");
+                } else if (arg < QUICK_SLOTS) {
+                    picker_open_quick(hwnd, (int)arg, g_quick_tile[arg]);
+                }
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             break;
