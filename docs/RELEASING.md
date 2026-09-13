@@ -3,18 +3,49 @@
 How `release.yml` publishes a version, and the things about it that are not
 obvious from reading the file.
 
+## Starting a release
+
+A release is a **promotion**. Run
+
+    gh workflow run promote.yml --ref staging
+
+and `promote.yml` does, in order:
+
+1. refuses unless it was started on `staging`;
+2. runs the full CI suite on that exact staging commit;
+3. confirms the attribution guard and commit policy passed on the push that put
+   the commit on `staging`, that `staging` has not moved on since, and that
+   `main` is its ancestor;
+4. fast-forwards `main` to it with the repository's deploy key (`RELEASE_SSH_KEY`
+   in the `release` environment).
+
+That push to `main` **is** the trigger: `release.yml` runs on it and publishes.
+A ruleset on `main` refuses every update except from that deploy key, so every
+push to `main` is a promotion, and `main` always names what was released. A
+deploy-key push starts workflows natively; no personal token is involved.
+
+`promote.yml` takes `dry_run`, which does everything except move `main`. A dry
+run of the release itself is `gh workflow run release.yml --ref main -f
+dry_run=true`. `release.yml` runs on `main` only, whether pushed or dispatched —
+its first job, `branch`, refuses anything else.
+
 ## Shape
 
-    guard ────┐
-    test ─────┼─▶ version ─┬─▶ packages (amd64, arm64) ─┐
-    preflight ┘            │                            │
-                           ├─▶ image                    ├─▶ publish ─┬─▶ winget ─▶ smoke
-                           └─▶ windows-build ─▶ windows-package      │
-                                                        └─▶ unreserve (on failure)
+    branch ─▶ guard ─────┐
+          ├─▶ test ──────┼─▶ version ─┬─▶ packages (amd64, arm64) ──────────────┐
+          └─▶ preflight ─┘            ├─▶ image ─▶ image-manifest ───────────────┤
+                                      └─▶ windows-build ─▶ windows-package ──────┴─▶ publish ─┬─▶ winget ─▶ smoke
+                                                                                              ├─▶ close-issues
+                                                                                              └─▶ unreserve (on failure)
 
 `test` is `ci.yml` reused, not re-implemented: a release that ran a weaker suite
 than CI would be worse than no gate, because it would look like one. `guard` is
 the attribution guard, gated via `workflow_call`.
+
+`close-issues` closes the issues the release shipped: every commit on `main`
+names its issue in the subject, and `scripts/close_shipped_issues.sh` reads the
+commits between the previous `release-N` and this one. An issue closes when it
+ships, not when it merges. The job only ever warns — the release is already live.
 
 ## Verification is terminal, and publishing is not interrupted by it
 
@@ -321,8 +352,13 @@ to `buildah login` and `skopeo --creds`.
 
 ## Dry runs
 
-`dry_run: true` builds and verifies everything and withholds exactly two things:
-the tag and the GitHub release. Note what that means for testing — a dry run
-**cannot** exercise the version reservation, the `:latest` move or the WinGet
-submission, because those are the parts it skips. The first real release is the
-first test of them.
+`dry_run: true` builds and verifies everything and publishes nothing. It skips
+the version reservation, the per-architecture image push and `image-manifest`,
+Authenticode signing, `publish` (apt, dnf, the GitHub release and `:latest`),
+`winget`, `smoke`, `unreserve` and `close-issues`. Note what that means for
+testing — a dry run **cannot** exercise any of those, because they are the parts
+it skips. The first real release is the first test of them.
+
+A push is never a dry run: `inputs.*` is empty on a push, so every dry-run
+condition tests `github.event_name == 'workflow_dispatch' && inputs.dry_run`
+rather than the input alone.
