@@ -104,14 +104,14 @@ const char *oc_theme_mode_name(int mode);
  * literals it replaces were doing by hand, and getting wrong whenever the
  * height moved.
  *
- * OC_R_AVATAR_* are the rounded squares standing in for a person or a
- * workspace. They stay proportional to the tile rather than fixed: a 36px tile
- * and an 18px one with the same radius do not read as the same shape. */
+ * OC_R_AVATAR_LG is the rounded square standing in for a workspace. A PERSON's
+ * tile has no token: its corner is a fraction of the tile (avatar_corner() in
+ * winmain.c), because a 36px tile and an 18px one with the same radius do not
+ * read as the same shape. */
 #define OC_R_OVERLAY     8.0f
 #define OC_R_CONTROL     4.0f
 #define OC_R_PILL      999.0f
-#define OC_R_AVATAR_LG  12.0f   /* the 36px tile: rail, menu header, sign-in mark */
-#define OC_R_AVATAR_SM   5.0f   /* 18-20px, in a row or a chip */
+#define OC_R_AVATAR_LG  12.0f   /* the 36px workspace tile: rail, menu header, sign-in mark */
 
 #define OC_COL_ACCENT      oc_theme[TH_ACCENT]
 #define OC_COL_ACCENT_DIM  oc_theme[TH_ACCENT_DIM]

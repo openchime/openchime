@@ -419,11 +419,21 @@ static void draw_presence_dot_dnd(gfx *rt, float cx, float cy, float r,
  * call site cannot pass an inset, so no call site can get one wrong, and a new
  * avatar size is right on the day it is added rather than on the day somebody
  * notices. */
-static void draw_avatar_presence(gfx *rt, rectf tile, float corner,
+/* The one avatar shape: a rounded square, as the reference product draws every
+ * person, with the corner a fixed fraction of the tile so an 18 DIP row avatar
+ * and a 128 DIP profile photo read as the same shape. Every person tile and the
+ * presence seat on it derive from this; no call site chooses a shape. */
+static float avatar_corner(rectf tile) {
+    float w = tile.right - tile.left, h = tile.bottom - tile.top;
+    return (w < h ? w : h) * 0.25f;
+}
+
+static void draw_avatar_presence(gfx *rt, rectf tile,
                                  uint8_t presence, uint32_t surface, int dnd) {
     float w = tile.right - tile.left, h = tile.bottom - tile.top;
     float side = w < h ? w : h;
     if (side < 8.0f) return;          /* nothing this small can say anything */
+    float corner = avatar_corner(tile);
 
     float r = side * 0.15f;
     if (r < 2.5f) r = 2.5f;
@@ -431,12 +441,8 @@ static void draw_avatar_presence(gfx *rt, rectf tile, float corner,
     float ring = r * 0.45f;
     if (ring < 1.0f) ring = 1.0f;
 
-    /* Where the bottom-right diagonal leaves the tile. A circle (corner >= half
-     * the side) crosses it at 1/sqrt(2) of the radius on each axis; a rounded
-     * square crosses on its corner arc, whose centre is inset by the corner
-     * radius. Both reduce to the same expression with the right centre. */
-    float half = side / 2.0f;
-    if (corner > half) corner = half;
+    /* Where the bottom-right diagonal leaves the tile: on the corner arc, whose
+     * centre is inset by the corner radius. */
     float cx0 = tile.right - corner, cy0 = tile.bottom - corner;
     const float DIAG = 0.70710678f;
     float cx = cx0 + corner * DIAG, cy = cy0 + corner * DIAG;
@@ -494,6 +500,12 @@ static HWND       g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD o
 static rectf g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
 /* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
 static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
+/* An optional photo column beside the fields (REQ-240: identity includes the
+ * picture). Armed by the caller immediately before form_dialog, and disarmed by
+ * form_dialog on every way out, so it can never outlive the one form it was set
+ * for. Its buttons dispatch ordinary commands and take effect at once — a photo
+ * is uploaded and claimed as it is chosen, not held until OK. */
+static struct { int on; uint64_t uid; int upload_cmd, remove_cmd; rectf up_btn, rm_btn; } g_form_side;
 /* FF_SELECT. `g_form_sel_box` is where each closed field was drawn (its click
  * target); the rest is the open list, and only one is ever open.
  *
@@ -721,7 +733,7 @@ static fmtw *g_ui_b;     /* 14/600 — the same, emphasised */
 static fmtw *g_meta;     /* 12.5/400 — timestamps, sublabels, chips */
 static fmtw *g_meta_w;   /* the same, wrapping — paragraphs of explanation */
 static fmtw *g_meta_r;   /* the same, trailing-aligned — timestamps */
-static fmtw *g_avatar;   /* title weight, centred in the disc */
+static fmtw *g_avatar;   /* title weight, centred in the avatar tile */
 static fmtw *g_micro;    /* 10/600 — rail labels */
 static fmtw *g_meta_i;   /* meta, ITALIC — placeholder text only */
 /* The formatting toolbar's two letterforms. A "B" that is not bold and
@@ -2767,7 +2779,7 @@ static void fonts_build(void) {
     g_meta    = mk_fmt(UI, FONT_META    * k, REG, L, MID, 0);
     g_meta_w  = mk_fmt(UI, FONT_META    * k, REG, L, TOP, 1);
     g_meta_r  = mk_fmt(UI, FONT_META    * k, REG, R, MID, 0);
-    /* The avatar initial is title-sized and centred in its disc, both axes. */
+    /* The avatar initial is title-sized and centred in its tile, both axes. */
     g_avatar  = mk_fmt(UI, FONT_TITLE   * k, SEM, C, MID, 0);
     g_micro   = mk_fmt(UI, FONT_MICRO   * k, SEM, C, MID, 0);
     /* The ONE italic in the app (ARCH-97 names weights, not styles). It marks text
@@ -3124,7 +3136,7 @@ static void avatar_want(uint64_t aid) {
     oc_client_fetch_attachment(g_client, aid);
 }
 
-/* The disc colour for a user's initial. Derived from the id, so one person is one
+/* The tile colour for a user's initial. Derived from the id, so one person is one
  * colour everywhere they appear — it is an identity cue, not decoration.
  *
  * This was a `tint` PARAMETER until 2026-07-31, which meant every caller
@@ -3132,7 +3144,7 @@ static void avatar_want(uint64_t aid) {
  * theme's accent while the transcript, sidebar and profile pane all passed
  * AVPAL[uid % 6], so the signed-in user was one colour in the rail and another
  * everywhere else. Invisible to anyone with a photo, since the photo path returns
- * before the disc is drawn — and wrong for everybody else, which is the default
+ * before the tile is drawn — and wrong for everybody else, which is the default
  * state. A value that must agree across call sites should not be an argument. */
 static uint32_t avatar_tint(uint64_t uid) {
     return AVPAL[uid % (sizeof AVPAL / sizeof AVPAL[0])];
@@ -3143,12 +3155,12 @@ static uint32_t avatar_tint(uint64_t uid) {
  * drawn in. Every avatar in the app goes through here — see the avatar cache note on what happens
  * when some of them do not. */
 static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
-                             const char *name, rectf box,
-                             fmtw *fmt, int square, float radius) {
+                             const char *name, rectf box, fmtw *fmt) {
     uint32_t tint = avatar_tint(uid);
     uint64_t aid = avatar_of(m, uid);
+    float radius = avatar_corner(box);
     if (aid) {
-        if (draw_avatar_image(rt, aid, box, radius, square)) return;
+        if (draw_avatar_image(rt, aid, box, radius, 1)) return;
         avatar_want(aid);        /* not here yet: fall through to the initial */
     }
     /* Tagged for the audit: an avatar's colour is derived from the user id, so
@@ -3157,11 +3169,7 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
      * unthemed colour, and a check that fires on correct code is one people
      * learn to skip. */
     gfx_tag(rt, "content:avatar");
-    if (square) {
-        fill_round(rt, box, radius, tint);
-    } else {
-                gfx_ellipse(rt, (box.left + box.right) / 2, (box.top + box.bottom) / 2, (box.right - box.left) / 2, (box.bottom - box.top) / 2, tint, 1.0f);
-    }
+    fill_round(rt, box, radius, tint);
     const char *nm = (name && name[0]) ? name : "user";
     char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
     int prev = fmt->align;
@@ -3180,8 +3188,8 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
 static void draw_group_avatar(gfx *rt, const oc_model *m,
                               const oc_channel *c, rectf box) {
     (void)m;
-    fill_round(rt, box, OC_R_AVATAR_SM, OC_COL_INPUT);
-    stroke_round(rt, box, OC_R_AVATAR_SM, OC_COL_BORDER, 1.0f);
+    fill_round(rt, box, avatar_corner(box), OC_COL_INPUT);
+    stroke_round(rt, box, avatar_corner(box), OC_COL_BORDER, 1.0f);
     char cnt[8];
     snprintf(cnt, sizeof cnt, "%u", (unsigned)c->n_peers);
     g_micro->align = ST_ALIGN_CENTER;
@@ -3341,11 +3349,11 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
          * above is one already) — the circle read as a different product. */
         rectf av2 = rf(cx - 15, base + 12, cx + 15, base + 42);
         draw_user_avatar(rt, m, m ? m->user_id : 0, (nm && nm[0]) ? nm : "U",
-                         av2, g_avatar, 1, 8.0f);
+                         av2, g_avatar);
         /* Your own presence, notched into the bottom-right corner — the same
          * dot, from the same helper, that every person in the DM list and the
          * member pane carries. */
-        draw_avatar_presence(rt, av2, 8.0f,
+        draw_avatar_presence(rt, av2,
                              m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
                              OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
         {
@@ -3505,10 +3513,10 @@ static void draw_menu(gfx *rt) {
             rectf av = rf(x + 14, cy + 10, x + 54, cy + 50);
             const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
             draw_user_avatar(rt, m, m ? m->user_id : 0,
-                             (nm && nm[0]) ? nm : "U", av, g_avatar, 0, 0);
+                             (nm && nm[0]) ? nm : "U", av, g_avatar);
             uint8_t pres = m ? oc_model_presence_of(m, m->user_id) : 0;
             int snoozed = m ? oc_model_snoozed(m) : 0;
-            draw_avatar_presence(rt, av, (av.bottom - av.top) / 2.0f,
+            draw_avatar_presence(rt, av,
                                  pres, OC_COL_INPUT, snoozed);
             draw_text(rt, (nm && nm[0]) ? nm : "you", g_ui_b,
                       rf(x + 62, cy + 12, panel.right - 12, cy + 32), OC_COL_TEXT);
@@ -3901,8 +3909,8 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                  * rather than one participant's avatar and one participant's presence
                  * dot — both of which would be a claim about the wrong person. */
                 if (rc && rc->n_peers > 2) {
-                    fill_round(rt, av, OC_R_AVATAR_SM, OC_COL_INPUT);
-                    stroke_round(rt, av, OC_R_AVATAR_SM, OC_COL_BORDER, 1.0f);
+                    fill_round(rt, av, avatar_corner(av), OC_COL_INPUT);
+                    stroke_round(rt, av, avatar_corner(av), OC_COL_BORDER, 1.0f);
                     char cnt[8];
                     snprintf(cnt, sizeof cnt, "%u", (unsigned)rc->n_peers);
                     /* Save/restore, never a literal (ARCH-108 hygiene):
@@ -3913,8 +3921,8 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                       draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
                       g_micro->align = oa; }
                 } else {
-                draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
-                draw_avatar_presence(rt, av, OC_R_AVATAR_SM,
+                draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta);
+                draw_avatar_presence(rt, av,
                                      oc_model_presence_of(m, r->peer_id),
                                      oc_theme[row_surface],
                                      oc_model_dnd_of(m, r->peer_id));
@@ -4391,11 +4399,11 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
 
     if (!grouped) {
         float ty = y + MSG_TOP(grouped);        /* content sits below the top margin */
-        /* Avatar: colored circle with the author's initial. */
+        /* Avatar: the author's photo, or a coloured tile with their initial. */
         const char *nm = msg->author_name[0] ? msg->author_name : oc_model_user_name(m, msg->author_id);
         if (!nm || !nm[0]) nm = "user";
         draw_user_avatar(rt, m, msg->author_id, nm, rf(ax, ty, ax + AVA, ty + AVA),
-                         g_avatar, 0, 0);
+                         g_avatar);
 
         /* Author, then the time INLINE beside it — Slack's shape, and the one
          * that reads as "alice said this at 10:25" rather than as a mail client's
@@ -7177,7 +7185,7 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
     float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
 
     draw_user_avatar(rt, m, g_profile_uid, nm, rf(cx - 36, y, cx + 36, y + 72),
-                     g_display, 0, 0);
+                     g_display);
     y += 84;
 
     draw_text(rt, nm, g_display, rf(reg.left + 12, y, reg.right - 12, y + 28), OC_COL_TEXT);
@@ -7213,14 +7221,14 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
          * points here with "Profile", and photo/name/password/sessions moved
          * off its top level. Two labelled groups of stacked bordered buttons,
          * the About-tab admin idiom. */
-        /* "Change display name" is NOT here: it is a field on the Edit profile
-         * screen (cmd 53), which is the whole point of consolidating it. Two
-         * buttons opening two sheets both titled "Edit profile" is what this
-         * replaced. */
+        /* Neither the display name nor the photo has a button here: both are on
+         * the Edit profile screen (cmd 53), which is the whole point of
+         * consolidating identity onto one card. Three slots per group; an
+         * unshown slot is skipped. */
         struct { const char *label; int cmd; int show; } B[6] = {
             { "Edit profile",        53, 1 },
-            { "Change photo",        55, 1 },
-            { "Remove photo",        56, avatar_of(m, m->user_id) != 0 },
+            { NULL,                   0, 0 },
+            { NULL,                   0, 0 },
             { "Change password",     31, 1 },
             { "Active sessions",     54, 1 },
             { NULL,                   0, 0 },
@@ -10148,6 +10156,45 @@ static void form_collect(int save) {
 static void draw_browse(gfx *rt, const oc_model *m, rectf body);   /* fwd */
 static void draw_sessions(gfx *rt, const oc_model *m, rectf body); /* fwd */
 
+/* The form's photo column: the avatar as everyone sees it, and the two actions on
+ * it. draw_user_avatar fetches a photo it does not have yet, and the frame repaints
+ * on every tick — including inside the form's nested loop — so an upload that
+ * lands while the card is open replaces the initial in place. */
+#define FORM_SIDE_W   UIS(168.0f)
+#define FORM_SIDE_GAP UIS(24.0f)
+static float form_side_h(void) {
+    return UIS(4.0f) + UIS(22.0f) + UIS(128.0f) + UIS(16.0f) + 2 * UIS(34.0f);
+}
+
+static void draw_form_side(gfx *rt, const oc_model *m, rectf col) {
+    g_form_side.up_btn = rf(0, 0, 0, 0);
+    g_form_side.rm_btn = rf(0, 0, 0, 0);
+    if (!m) return;
+    const char *nm = oc_model_user_name(m, g_form_side.uid);
+    if (!nm || !nm[0]) nm = "user";
+    float y = col.top + UIS(4.0f);
+    draw_text(rt, "Profile photo", g_ui_b, rf(col.left, y, col.right, y + UIS(20.0f)), OC_COL_TEXT);
+    y += UIS(22.0f);
+    float cx = (col.left + col.right) / 2, d = UIS(128.0f);
+    draw_user_avatar(rt, m, g_form_side.uid, nm, rf(cx - d / 2, y, cx + d / 2, y + d),
+                     g_display);
+    y += d + UIS(16.0f);
+    /* Remove only when there is something to remove, as the self card had it. */
+    int has = avatar_of(m, g_form_side.uid) != 0;
+    for (int k = 0; k < 1 + has; k++) {
+        rectf b = rf(col.left, y, col.right, y + UIS(28.0f));
+        int hov = in_rect(b, g_mouse_x, g_mouse_y);
+        if (hov) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+        stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, k ? "Remove photo" : "Upload photo", g_meta, b,
+                  hov ? OC_COL_TEXT : OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        if (k) g_form_side.rm_btn = b; else g_form_side.up_btn = b;
+        y += UIS(34.0f);
+    }
+}
+
 static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     if (!modal_open()) {
         g_modal_card = rf(0, 0, 0, 0);
@@ -10182,6 +10229,14 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_confirm_open) draw_confirm(rt, body);
     else if (g_sessions_open) draw_sessions(rt, m, body);
     else if (g_status_open) draw_status_body(rt, body);
+    else if (g_form_open && g_form_side.on) {
+        /* Two columns: the fields get everything left of the photo column. The
+         * column is drawn first, though an open select list is bounded by the
+         * field rect it is given and cannot reach it. */
+        float split = body.right - FORM_SIDE_W - FORM_SIDE_GAP;
+        draw_form_side(rt, m, rf(split + FORM_SIDE_GAP, body.top, body.right, body.bottom));
+        draw_form(rt, rf(body.left, body.top, split, body.bottom));
+    }
     else if (g_form_open)   draw_form(rt, body);
     gfx_clip_pop(rt);
 }
@@ -10298,14 +10353,17 @@ static const oc_modal_spec *modal_current(void) {
         /* A form is the one modal whose height depends on its content, so the
          * height is MEASURED from its rows — the field-count heuristic gave a
          * three-field card 300px whatever the rows added up to, and the status
-         * form's chips clipped at the bottom edge. Width stays the small
-         * class; every current form fits 460. */
+         * form's chips clipped at the bottom edge. Width is the small class
+         * unless the form carries the photo column, which takes the large one
+         * and measures its rows at the narrower field width they get. */
         sp.title = g_form_title;
-        sp.size = MODAL_SM;
+        sp.size = g_form_side.on ? MODAL_LG : MODAL_SM;
         {
-            float bw = UIS(460.0f) - 2 * MODAL_PAD;
+            float bw = UIS(g_form_side.on ? 720.0f : 460.0f) - 2 * MODAL_PAD;
+            if (g_form_side.on) bw -= FORM_SIDE_W + FORM_SIDE_GAP;
             float rows = 4;
             for (int i = 0; i < g_form_n; i++) rows += form_rowh(&g_form_f[i], bw);
+            if (g_form_side.on && rows < form_side_h()) rows = form_side_h();
             /* want_h is in unscaled DIPs (modal_frame applies UIS); the sums
              * above are already scaled, so divide the scale back out. */
             sp.want_h = (MODAL_TITLE_H + rows + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
@@ -10946,8 +11004,8 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
             draw_group_avatar(rt, m, best, rf(row.left + 9, y + 11, row.left + 39, y + 41));
         } else {
             rectf dav = rf(row.left + 9, y + 11, row.left + 39, y + 41);
-            draw_user_avatar(rt, m, best->peer_id, nm, dav, g_ui, 0, 0);
-            draw_avatar_presence(rt, dav, (dav.bottom - dav.top) / 2.0f,
+            draw_user_avatar(rt, m, best->peer_id, nm, dav, g_ui);
+            draw_avatar_presence(rt, dav,
                                  oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
                                  oc_model_dnd_of(m, best->peer_id));
         }
@@ -11066,7 +11124,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
         rectf row = rf(body.left + 12, y, body.right - 12, y + 44);
         if (g_dm_hover == u->user_id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "user",
-                         rf(row.left + 12, y + 6, row.left + 44, y + 38), g_ui, 0, 0);
+                         rf(row.left + 12, y + 6, row.left + 44, y + 38), g_ui);
         char nm[96];
         snprintf(nm, sizeof nm, "%s%s", u->name[0] ? u->name : "user",
                  u->user_id == m->user_id ? " (you)" : "");
@@ -11207,7 +11265,7 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
 
         const char *who = oc_model_user_name((oc_model *)m, a->actor_id);
         draw_user_avatar(rt, m, a->actor_id, (who && who[0]) ? who : "?",
-                         rf(row.left + 13, y + 8, row.left + 39, y + 34), g_meta, 0, 0);
+                         rf(row.left + 13, y + 8, row.left + 39, y + 34), g_meta);
 
         char when[24]; rel_time(a->at, when, sizeof when);
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
@@ -11553,7 +11611,7 @@ static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused,
         } else {
             draw_user_avatar(rt, m, g_tgt[i].id, g_tgt[i].name,
                              rf(row.left + 8, row.top + 5, row.left + 32, row.top + 29),
-                             g_meta, 1, 5.0f);
+                             g_meta);
         }
         draw_text(rt, g_tgt[i].name, g_ui, rf(row.left + 40, row.top + 7, row.right - 140, row.bottom),
                   OC_COL_TEXT);
@@ -11893,8 +11951,8 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
         if (g_listrow_hover == u->user_id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
 
         rectf uav = rf(row.left + 12, y + 10, row.left + 44, y + 42);
-        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?", uav, g_ui, 0, 0);
-        draw_avatar_presence(rt, uav, (uav.bottom - uav.top) / 2.0f,
+        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?", uav, g_ui);
+        draw_avatar_presence(rt, uav,
                              oc_model_presence_of(m, u->user_id), OC_COL_BASE,
                              oc_model_dnd_of(m, u->user_id));
         /* Title, or the custom status when there is one — Slack shows the status
@@ -12018,7 +12076,7 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
         const char *who = oc_model_user_name((oc_model *)m, t->root_author);
         draw_user_avatar(rt, m, t->root_author, (who && who[0]) ? who : "?",
                          rf(card.left + 16, card.top + 30, card.left + 44, card.top + 58),
-                         g_meta, 0, 0);
+                         g_meta);
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
                   rf(card.left + 52, card.top + 28, card.right - UIS(140), card.top + 48),
                   OC_COL_TEXT);
@@ -14197,6 +14255,7 @@ enum {
     AT_STATUSEMOJI,   /* the status dialog's emoji button */
     AT_STATUSSUGG,    /* payload: status suggestion row index */
     AT_STATUSCHIP,    /* payload: status clear-after chip index */
+    AT_FORMSIDE,      /* payload: 0 = the form's upload photo, 1 = remove photo */
     AT_FSCOPE,        /* payload: Files ownership-scope index */
     AT_FSORT,         /* the Files sort dropdown */
     AT_FTYPE,         /* the Files type dropdown */
@@ -14536,6 +14595,14 @@ modal_items:
                 acc_push(items, &n, OC_ACC_TAB, aid, STATUS_CLEARS[k],
                          g_status_chip_hits[k], ATOK(AT_STATUSCHIP, k));
             }
+        }
+        if (g_form_open && g_form_side.on) {
+            if (g_form_side.up_btn.right > g_form_side.up_btn.left && n < OC_ACC_MAX)
+                acc_push(items, &n, OC_ACC_BUTTON, "form.avatar.upload", "Upload photo",
+                         g_form_side.up_btn, ATOK(AT_FORMSIDE, 0));
+            if (g_form_side.rm_btn.right > g_form_side.rm_btn.left && n < OC_ACC_MAX)
+                acc_push(items, &n, OC_ACC_BUTTON, "form.avatar.remove", "Remove photo",
+                         g_form_side.rm_btn, ATOK(AT_FORMSIDE, 1));
         }
     }
 
@@ -16359,6 +16426,11 @@ static int on_click(HWND hwnd, int x, int y) {
                 SetFocus(g_form_edit[i]);
                 return 1;
             }
+        if (g_form_side.on) {
+            int cmd = in_rect(g_form_side.up_btn, x, y) ? g_form_side.upload_cmd
+                    : in_rect(g_form_side.rm_btn, x, y) ? g_form_side.remove_cmd : 0;
+            if (cmd) { menu_dispatch(hwnd, cmd); return 1; }
+        }
         if (in_rect(g_modal_card, x, y)) return 1;
     }
     if (g_prefs_open) {
@@ -18001,6 +18073,7 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
     if (g_form_seeded) {
         int seeded = g_form_seeded, cancel = g_form_seed_cancel;
         g_form_seeded = 0; g_form_seed_cancel = 0;
+        g_form_side.on = 0;
         if (cancel) return 0;
         for (int i = 0; i < n && i < seeded; i++)
             snprintf(f[i].value, sizeof f[i].value, "%s", g_form_seed[i]);
@@ -18060,6 +18133,8 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
         if (g_form_edit[i]) { DestroyWindow(g_form_edit[i]); g_form_edit[i] = NULL; }
     g_form_sel_field = -1;
     g_form_f = NULL; g_form_n = 0;
+    g_form_side.on = 0;
+    g_form_side.up_btn = g_form_side.rm_btn = rf(0, 0, 0, 0);
     SetFocus(owner);
     layout_natives(owner);
     InvalidateRect(owner, NULL, FALSE);
@@ -18639,6 +18714,15 @@ static void menu_dispatch(HWND hwnd, int cmd) {
                 had_name = pm2->users[i].name;
                 break;
             }
+        /* The photo sits beside the fields rather than behind a separate action:
+         * one screen owns identity, and identity includes the picture. Not armed
+         * over a form that is already open — that one would inherit the column. */
+        if (!g_form_open && pm2) {
+            g_form_side.on = 1;
+            g_form_side.uid = pm2->user_id;
+            g_form_side.upload_cmd = 55;
+            g_form_side.remove_cmd = 56;
+        }
         if (!form_dialog(hwnd, "Edit profile", f, 6)) break;
         char tz[64]; sel_opt(f[5].hint, atoi(f[5].value), tz, sizeof tz);
         if (!strcmp(tz, OC_TZ_UNSET)) tz[0] = '\0';
@@ -18680,14 +18764,6 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 56:                                   /* */
         oc_client_set_avatar(g_client, 0);
         break;
-    case 30: {
-        const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
-        oc_field f[1] = { { FF_TEXT, "Display name",
-                            "How you appear to everyone in this workspace.", "" } };
-        snprintf(f[0].value, sizeof f[0].value, "%s", cur ? cur : "");
-        if (form_dialog(hwnd, "Edit profile", f, 1) && f[0].value[0])
-            oc_client_set_display_name(g_client, f[0].value);
-        break; }
     case 31: {   /* a confirm field, which the chained prompts had none of. */
         oc_field f[3] = {
             { FF_PASSWORD, "Current password", "", "" },
@@ -19309,6 +19385,15 @@ static void test_dump(const char *path) {
             g_pane_close.right, g_pane_close.bottom);
     fprintf(f, "form=%d nfields=%d title=\"%s\" last=%s\n",
             g_form_open, g_form_n, g_form_title, g_form_last[0] ? g_form_last : "none");
+    {
+        const oc_model *sm = model();
+        fprintf(f, "formside on=%d avatar=%llu upload=%.0f,%.0f,%.0f,%.0f remove=%d\n",
+                g_form_side.on,
+                (unsigned long long)(g_form_side.on && sm ? avatar_of(sm, g_form_side.uid) : 0),
+                g_form_side.up_btn.left, g_form_side.up_btn.top,
+                g_form_side.up_btn.right, g_form_side.up_btn.bottom,
+                g_form_side.rm_btn.right > g_form_side.rm_btn.left);
+    }
     for (int i = 0; i < g_form_n && g_form_f; i++) {
         char cur[256]; snprintf(cur, sizeof cur, "%s", g_form_f[i].value);
         if (g_form_edit[i]) {
@@ -21901,6 +21986,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_status_clear = (int)arg;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            break;
+        case AT_FORMSIDE:
+            if (g_form_open && g_form_side.on)
+                menu_dispatch(hwnd, arg ? g_form_side.remove_cmd : g_form_side.upload_cmd);
             break;
         case AT_MENTION:   ed_focus(hwnd); ed_insert(L"@"); ac_rebuild(); break;
         case AT_SCHEDMENU:
