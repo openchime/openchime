@@ -30,7 +30,17 @@
 # Alpine/musl build, so it carries a different binary from the same source.
 name: release
 
+# A release runs on the promotion: promote.yml fast-forwards main to a verified
+# staging commit with the deploy key, and that push is the trigger. main takes no
+# other updates (a ruleset), so every push to main is a promotion. The dispatch
+# stays for dry runs, and like the push it runs on main only (the `branch` job).
+#
+# `inputs.*` is EMPTY on a push, so every dry-run test below is written
+# `(github.event_name == 'workflow_dispatch' && inputs.dry_run)`: a push is never
+# a dry run, and no condition depends on how an absent input happens to compare.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -50,9 +60,26 @@ permissions:
   contents: read
 
 jobs:
+  # Only main is released. release-N is a fact about what main shipped, and the
+  # workflow used to publish from whatever ref it was dispatched on.
+  branch:
+    name: running on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuse any other ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::release runs on main only (this run is on $REF). A release starts with promote.yml on staging; a dry run is dispatched on main."
+            exit 1
+          fi
+
   # The same jobs a branch push runs. Reused, not re-implemented.
   test:
     name: gate on CI
+    needs: branch
     uses: ./.github/workflows/ci.yml
 
   # attribution-guard.yml has carried `workflow_call:` specifically so a release
@@ -62,6 +89,7 @@ jobs:
   # read; scoped to this job so the rest stays read-only.
   guard:
     name: attribution guard
+    needs: branch
     uses: ./.github/workflows/attribution-guard.yml
     permissions:
       contents: write
@@ -81,6 +109,7 @@ jobs:
   # number for no reason.
   preflight:
     name: check release credentials
+    needs: branch
     runs-on: ubuntu-22.04
     timeout-minutes: 2
     env:
@@ -95,7 +124,7 @@ jobs:
       TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
       TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
       TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
-      DRY: ${{ inputs.dry_run }}
+      DRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
       # As in `publish`, which is where this value is defined and explained.
       DIST_BASE_URL: https://openchime.io/dist
     steps:
@@ -231,7 +260,7 @@ jobs:
       # nothing, rather than a duplicated one. The unreserve job at the bottom hands
       # it back when publish did not succeed.
       - name: Reserve the release number
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
           N: ${{ steps.n.outputs.number }}
         run: |
@@ -527,7 +556,7 @@ jobs:
             -t "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
             .
       - name: Push the per-architecture image
-        if: ${{ inputs.dry_run == false }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
           set -euo pipefail
           buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
@@ -543,7 +572,7 @@ jobs:
     needs: [version, image]
     # Nothing was pushed on a dry run, so there is nothing to index. The
     # per-arch builds above still ran, which is the part worth proving.
-    if: ${{ inputs.dry_run == false }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -686,7 +715,7 @@ jobs:
       # the first three name the signing profile, the last three are the service
       # principal that proves the caller may use it -- the action authenticates
       # via DefaultAzureCredential and has nothing to authenticate with otherwise.
-      SIGN: ${{ inputs.dry_run == false && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
+      SIGN: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
       # Same convention as the packages job: artifacts land in dist/<platform>/
       # and the artifact is named for that platform. build/ stays the staging
       # area -- the unpackaged binaries and the MSIX layout are inputs to a
@@ -770,7 +799,7 @@ jobs:
       # will warn on it and some users will not click through. Said here so the
       # run itself records why, rather than leaving it to be rediscovered.
       - name: Note the missing signature
-        if: ${{ inputs.dry_run == false && env.SIGN != 'true' }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && env.SIGN != 'true' }}
         shell: bash
         run: |
           echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
@@ -848,7 +877,7 @@ jobs:
   publish:
     name: publish repositories
     needs: [version, packages, image-manifest, windows-package]
-    if: inputs.dry_run == false
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -1242,7 +1271,7 @@ jobs:
   winget:
     name: submit to winget
     needs: [version, publish]
-    if: inputs.dry_run == false
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     runs-on: windows-latest
     timeout-minutes: 15
     env:
@@ -1394,7 +1423,7 @@ jobs:
     # always(), so that winget being skipped -- it has conditions of its own --
     # does not skip the smoke with it. Gated on publish having SUCCEEDED because
     # there is nothing to smoke if nothing was published.
-    if: ${{ always() && inputs.dry_run == false && needs.publish.result == 'success' }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && needs.publish.result == 'success' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     env:
@@ -1481,7 +1510,7 @@ jobs:
     # no tag naming it -- which is precisely the state reserving the number early
     # exists to prevent. Returning a number is only safe while nothing has been
     # published under it.
-    if: ${{ always() && !inputs.dry_run && needs.version.result == 'success' && needs.publish.result != 'success' && needs.publish.outputs.published != 'true' }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && needs.version.result == 'success' && needs.publish.result != 'success' && needs.publish.outputs.published != 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
@@ -1494,3 +1523,29 @@ jobs:
           set -euo pipefail
           git push origin ":refs/tags/release-${N}" || true
           echo "::warning::release ${N} did not publish; the number has been returned"
+
+  # Close the issues this release shipped. Here, not on merge: a merge lands on
+  # staging, and merged is not shipped. The squash also carries no body, so a
+  # `Closes` line never reaches main -- the commit SUBJECT names the issue instead
+  # (commit-policy enforces it), and scripts/close_shipped_issues.sh reads the
+  # subjects between the previous release-N and this one. It never fails: by now
+  # the packages are live, and a failed close must not brand a good release failed.
+  close-issues:
+    name: close shipped issues
+    needs: [version, publish]
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && needs.publish.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - env:
+          N: ${{ needs.version.outputs.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --tags --force --quiet || true
+          scripts/close_shipped_issues.sh "release-${N}"

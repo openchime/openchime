@@ -6,41 +6,48 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 ## Branches & merging
 
 - **`staging` is the integration branch.** All feature work lands on `staging`
-  through a pull request; `main` receives staging's history when it is
-  promoted. Promotion of `staging` to `main` is not yet mechanised; until it is,
-  nothing lands on `main` directly except docs-only changes.
+  through a pull request.
+- **`main` is what was released, and nothing else.** It moves only when
+  `staging` is **promoted**: `gh workflow run promote.yml --ref staging` runs CI
+  on the staging tip, confirms its attribution guard and commit policy passed,
+  and fast-forwards `main` to that exact commit with the repository's deploy key.
+  That push is the release (`release.yml`; see [RELEASING.md](./RELEASING.md)).
+  A ruleset refuses every other update to `main`, from anyone — so `main` is
+  always an ancestor of `staging`, and never takes a direct push or a pull
+  request.
 - **Every feature has exactly one GitHub issue**, and its branch is named for
   it: `feature/oc-<issue number>-<short-kebab-description>`, cut from a clean,
   current `staging`. The repo's `/oc-feature-start` command runs the preflight
   (clean tree, `staging` in sync with origin, no branch already carrying the
   issue) and refuses rather than repairs.
 - **Land by pull request to `staging`,** squashed to a **single** house-format
-  commit whose message cites the issue — `Closes` plus its number when the
-  merge should close it. Note GitHub auto-closes only from the default branch,
-  so closing the issue on a merge to `staging` is a deliberate act, done with a
-  short comment saying what landed. The PR body stays **empty**: the issue and
-  the commit already say everything. `/oc-feature-pr` runs the sequence: tests
+  commit whose subject names the issue. The issue **closes when its release
+  ships**: the release reads the issue from each shipped commit's subject and
+  closes it with a comment naming the release. A merge does not close it — merged
+  is not shipped. The PR body stays **empty**: the issue and the commit already
+  say everything. `/oc-feature-pr` runs the sequence: tests
   clean with zero warnings, squash, push (`--force-with-lease` after a squash
   is the one acceptable force-push, and only ever on a `feature/*` branch),
   raise the PR.
 - **Gate merges on CI.** Merge only when every check on the pull request is
   green, with a **rebase merge** — no merge commits, history stays linear.
   Delete the branch, local and remote, after.
-- **Docs-only changes still go straight to `main`** (they skip the build jobs
-  via `paths-ignore`; the attribution guard runs on every push regardless).
+- **Docs-only changes go straight to `staging`**, without a pull request, and
+  reach `main` with the next promotion (they skip the build jobs via
+  `paths-ignore`; the attribution guard runs on every push regardless).
 - **Sign off every commit** (`git commit -s`) — the DCO applies to every path
   into the tree, including a cherry-pick.
 - **One logical change per branch.**
 
 ## Commits
 
-- `area: imperative summary` — sentence case, **no trailing period**. The prefix
-  names the area/subsystem (`TUI:`, `GUI:`, `docs:`, `daemon:`, …), not a fixed
-  type set.
+- `OC-<issue>: Capitalised imperative summary` — **no trailing punctuation**, at
+  most 72 characters once GitHub appends the pull request suffix on squash, and
+  **no body** beyond the sign-off. `commit-policy` enforces all of it on every
+  push to `staging` and `main`.
 - Cite decision ids inline where relevant: `ARCH-N`, `REQ-N`.
-- **A commit that resolves an issue cites it** — its number, or `Closes` plus
-  its number when the merge should close it. GitHub Issues is the project's only
-  issue list, and its numbers are stable identifiers.
+- **Every commit cites its issue**, in the subject prefix. GitHub Issues is the
+  project's only issue list, and its numbers are stable identifiers.
 - **No file cites an issue number — a commit message is the only place one
   belongs.** Not source, not scripts, not the workflows, not the documents.
   Comments explain themselves, or cite a `REQ-N` / `ARCH-N`: REQUIREMENTS.md and
@@ -78,9 +85,8 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 - **`guard`** — the job in the separate [`attribution-guard`](../.github/workflows/attribution-guard.yml)
   workflow. Unlike the four above it has **no `paths-ignore`**, so it runs on
   every push including docs-only ones — which is the point, since the thing it
-  rejects lives in commit messages and author lines. It is also the **required
-  status check** on `main`, so a direct docs push to `main` reports a bypass
-  until it reports green.
+  rejects lives in commit messages and author lines. A promotion refuses a
+  staging commit it has not passed on.
 - Docs-only pushes skip the build jobs (`paths-ignore: ['**.md', ...]`).
 
 See [TESTING.md](./TESTING.md) for the full test strategy.

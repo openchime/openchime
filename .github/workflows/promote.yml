@@ -1,0 +1,136 @@
+# Promote staging to main -- which IS the release.
+#
+# main is release-only: a ruleset refuses every update to it, and the one bypass
+# actor is the repository's deploy key, held as RELEASE_SSH_KEY in the `release`
+# environment this job reads. So main moves only here, only forward, and only to a
+# staging commit that was verified. The push then runs release.yml on main, which
+# publishes, tags release-N and closes the issues it shipped. A deploy-key push
+# triggers workflows natively; no personal token is needed anywhere.
+#
+# Start it on staging:  gh workflow run promote.yml --ref staging
+# The same model as the control plane's (bronzeventure/.github release.yml).
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Verify everything and show the fast-forward, but do not move main'
+        type: boolean
+        default: false
+
+# Shared with release.yml: a promotion must not start while a release is running,
+# and neither ever cancels the other.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Dispatched on anything but staging, the SHA below is not a staging commit, and
+  # "fast-forward main to what I was run on" would release a feature branch.
+  branch:
+    name: dispatched on staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuse any other ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/staging" ]; then
+            echo "::error::promote runs on staging only (dispatched on $REF). Use: gh workflow run promote.yml --ref staging"
+            exit 1
+          fi
+          echo "promoting staging at ${GITHUB_SHA:0:8}"
+
+  # The full suite on the EXACT commit being promoted. The staging push ran CI
+  # already, unless the tip is docs-only (ci.yml's paths-ignore); running it here
+  # means a docs tip is verified too, and the answer cannot be stale. Note ci.yml's
+  # concurrency group is per ref: a new push to staging mid-promotion cancels this
+  # run, which fails the promotion -- the safe direction.
+  test:
+    name: gate on CI
+    needs: branch
+    uses: ./.github/workflows/ci.yml
+
+  fast-forward:
+    name: fast-forward main
+    needs: [branch, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+      actions: read          # to confirm the staging push's policy runs passed
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward main to the verified commit
+        env:
+          KEY: ${{ secrets.RELEASE_SSH_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin main staging
+          SHA="$GITHUB_SHA"
+
+          # The attribution guard and commit-policy judge a PUSHED RANGE, so they
+          # cannot be re-run from a dispatch (the guard exits early with nothing to
+          # scan). What can be checked is that both passed on the push that put
+          # this commit on staging. Anything else -- still running, failed, never
+          # ran -- refuses.
+          for wf in attribution-guard commit-policy; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${SHA}&event=push&branch=staging" \
+                      --jq "[.workflow_runs[] | select(.name == \"${wf}\") | .conclusion] | first // \"none\"")
+            if [ "$state" != "success" ]; then
+              echo "::error::${wf} has not passed on staging ${SHA:0:8} (state: ${state}). Wait for its run, then promote again."
+              exit 1
+            fi
+            echo "${wf}: success on ${SHA:0:8}"
+          done
+
+          # Only the commit that was verified ever reaches main. A newer staging tip
+          # was not tested by this run.
+          if [ "$(git rev-parse origin/staging)" != "$SHA" ]; then
+            echo "::error::staging moved past ${SHA:0:8} during the promotion; promote again to release the new tip."
+            exit 1
+          fi
+
+          if [ "$(git rev-parse origin/main)" = "$SHA" ]; then
+            echo "::notice::main already is staging ${SHA:0:8}; nothing to release."
+            exit 0
+          fi
+
+          # A fast-forward exists only from an ancestor. Anything else means main
+          # moved outside a promotion; look before repairing.
+          if ! git merge-base --is-ancestor origin/main "$SHA"; then
+            echo "::error::main is not an ancestor of staging; reconcile by hand."
+            exit 1
+          fi
+
+          echo "releasing $(git rev-list --count origin/main.."$SHA") commit(s):"
+          git log --format='  %h %s' origin/main.."$SHA"
+
+          if [ "$DRY" = "true" ]; then
+            echo "::notice::dry run: would fast-forward main $(git rev-parse --short origin/main) -> ${SHA:0:8}"
+            exit 0
+          fi
+
+          if [ -z "$KEY" ]; then
+            echo "::error::RELEASE_SSH_KEY is not set in the release environment."
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/release_key
+          chmod 600 ~/.ssh/release_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/release_key -o IdentitiesOnly=yes" \
+            git push "git@github.com:${GITHUB_REPOSITORY}.git" "${SHA}:refs/heads/main"
+          echo "main fast-forwarded to ${SHA:0:8}; release.yml now runs on main"
