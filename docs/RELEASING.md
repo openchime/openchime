@@ -336,13 +336,23 @@ upstream, so the default branch is always 0 ahead. The step logs the drift
 before and after, and cannot fail the release — if the sync really did not work,
 `wingetcreate` fails with the message it always did.
 
+The sync needs the token's **`workflow` scope**. Upstream's commits include
+changes to its own workflow files, and GitHub refuses to sync those into a fork
+without that scope ("Upstream commits contain workflow changes, which require the
+`workflow` scope"). Release 11 hit exactly this: the sync reported the refusal,
+the fork stayed 4,083 commits behind, and `wingetcreate` failed as described
+above. A one-off repair is `gh repo sync <owner>/winget-pkgs --source
+microsoft/winget-pkgs --branch master` from a login that has the scope, then
+re-running only the failed job; the permanent fix is the scope on `WINGET_TOKEN`.
+
 ## Secrets and variables
 
 | name | kind | required for |
 |---|---|---|
 | `DIST_S3_ACCESS_KEY` / `DIST_S3_SECRET_KEY` | secret | apt + dnf publish |
 | `REPO_SIGNING_KEY` | secret | signing the indexes and packages |
-| `WINGET_TOKEN` | secret | the WinGet submission PR |
+| `WINGET_TOKEN` | secret | the WinGet submission PR; a classic token with the `public_repo` **and `workflow`** scopes |
+| `RELEASE_SSH_KEY` | secret, `release` environment | `promote.yml`'s fast-forward of `main`; the private half of the repository's write deploy key, the ruleset's one bypass actor |
 | `TRUSTED_SIGNING_ACCOUNT` / `_ENDPOINT` / `_PROFILE` | secret | Authenticode; **optional** |
 | `AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | secret | Authenticode signing auth; **optional** |
 | `DIST_S3_ENDPOINT` / `DIST_BUCKET` | variable | rclone configuration |
