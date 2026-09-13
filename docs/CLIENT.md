@@ -709,6 +709,14 @@ dot, and the seat is where the bottom-right diagonal crosses the edge. A call
 site cannot pass an inset, so no call site can get one wrong, and a new avatar
 size is right on the day it is added.
 
+**A person is a rounded square, everywhere.** The reference product draws every
+person that way — message authors, DM rows, the profile pane, the popover and the
+rail's You button alone — and a circle in one place beside a square in another
+reads as two products. `draw_user_avatar()` takes no shape: the corner is a fixed
+fraction of the tile (`avatar_corner()`), so a 20 DIP row avatar and a 128 DIP
+profile photo are the same shape, and the presence seat derives from the same
+corner.
+
 **An expanded section that is empty says so**, in italics — the app's only italic
 (ARCH-97 names weights, not styles) precisely so it cannot be read as a conversation
 called "Empty". It says "No matches" instead when a find filter is what emptied it,
