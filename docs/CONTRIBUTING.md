@@ -30,7 +30,7 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   is the one acceptable force-push, and only ever on a `feature/*` branch),
   raise the PR.
 - **Gate merges on CI.** Merge only when every check on the pull request is
-  green, with a **rebase merge** — no merge commits, history stays linear.
+  green, with a **squash merge** — no merge commits, history stays linear.
   Delete the branch, local and remote, after.
 - **Docs-only changes go straight to `staging`**, without a pull request, and
   reach `main` with the next promotion (they skip the build jobs via
@@ -68,7 +68,9 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 - **Never** add a `Co-Authored-By:` or any attribution trailer naming Claude /
   Anthropic. The [`attribution-guard`](../.github/workflows/attribution-guard.yml)
   workflow scans author, committer, and message on every push and **rejects**
-  matches (it force-resets `main` / deletes the offending branch).
+  matches (it deletes an offending branch or tag; a violation can only reach
+  `main` through a promotion, and promotion refuses a commit the guard did not
+  pass).
 
 ## CI
 
@@ -81,9 +83,10 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   of this job, and the published image is tested by nothing
   (docs/TESTING.md §3.2).
 - **`core`** — standalone compile check of the client app-core (ARCH-74).
+- **`second-compiler`** — `make CC=clang test`, so a gcc-only assumption fails here.
 - **`windows`** — cross-compiles the Windows TUI + GUI (`make windows-tui windows-gui`).
 - **`guard`** — the job in the separate [`attribution-guard`](../.github/workflows/attribution-guard.yml)
-  workflow. Unlike the four above it has **no `paths-ignore`**, so it runs on
+  workflow. Unlike the five above it has **no `paths-ignore`**, so it runs on
   every push including docs-only ones — which is the point, since the thing it
   rejects lives in commit messages and author lines. A promotion refuses a
   staging commit it has not passed on.

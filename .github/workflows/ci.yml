@@ -1,7 +1,7 @@
 name: ci
 
-# Runs on every branch push (so the branch gate is real — see CONTRIBUTING.md)
-# and on PRs targeting main. Five jobs:
+# Runs on every branch push except main (so the branch gate is real — see
+# CONTRIBUTING.md), and is called by promote.yml and release.yml. Five jobs:
 #   - build:       native gcc build of the daemon, plus unit tests (make test),
 #                  which include the headless client app-core test.
 #   - integration: the daemon end-to-end, run natively on the runner — health
@@ -10,7 +10,7 @@ name: ci
 #                  longer uses Docker anywhere, in CI or locally, so the same two
 #                  assertions run against the binary the job builds.
 #   - core:        standalone compile check of the client app-core (ARCH-74).
-#   - second-compiler: clang build and tests, so a gcc-only assumption fails.
+#   - second-compiler: `make CC=clang test`, so a gcc-only assumption fails.
 #   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
 #                  SDL3/sdltext GUI, ARCH-80/106/107). Build breaks only.
 #
@@ -31,14 +31,9 @@ on:
     paths-ignore:
       - '**.md'
       - '.gitignore'
-  # No paths-ignore here, deliberately, unlike the push trigger above. These five
-  # jobs are required status checks on main, and a job that never triggers never
-  # reports -- so a docs-only pull request waits forever for a check that will not
-  # run. Found by opening one: the release runbook PR was unmergeable, with only
-  # `guard` reporting. The suite costs a couple of minutes; an unmergeable PR costs
-  # more. Same reasoning the control-plane repo records on its own trigger.
-  pull_request:
-    branches: [main]
+  # No pull_request trigger. It existed for pull requests into main, and main takes
+  # none: it moves only by promotion. A pull request into staging is checked by the
+  # push to its feature branch above, which is the same commit.
   # Lets the release workflow gate on these exact jobs rather than re-implement
   # them. A release that ran a weaker suite than CI would be worse than no gate,
   # because it would look like one. Same arrangement the control-plane repo's
