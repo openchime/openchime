@@ -115,16 +115,16 @@ jobs:
 
       # The default branch is remediated by a HUMAN, not by this step.
       #
-      # main is protected with allow_force_pushes disabled, and the Actions bot holds write
-      # (not admin) permission, so the force-reset this step used to attempt
+      # main takes no update but a promotion: a ruleset refuses every push, force or not,
+      # except from the release deploy key, so the force-reset this step used to attempt
       # (PATCH .../git/refs/heads/main with force=true) is refused. It never worked, while
       # the header comment promised the branch was reset "within seconds".
       #
-      # What actually protects main now is that this job is a REQUIRED status check: a red
-      # guard blocks the pull request, so a violating commit cannot merge in the first place.
-      # If one reaches main anyway (direct push before protection, or an admin override) it
-      # STAYS there until removed by hand -- that is the real behaviour, and it is now the
-      # documented one.
+      # What actually protects main is upstream of it. This job is a REQUIRED status check
+      # on pull requests into staging, so a violating commit cannot merge; and promote.yml
+      # refuses to fast-forward main to a staging commit this guard did not pass on. If one
+      # reaches main anyway (an admin override on the ruleset) it STAYS there until removed
+      # by hand -- that is the real behaviour, and it is the documented one.
       #
       # Non-default branches and tags are a different matter: nothing protects those, so
       # deleting them still works and is still done here.

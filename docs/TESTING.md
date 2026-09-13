@@ -255,13 +255,14 @@ works. Nothing proves the shipped *image* works (§3.2).
 ## 4. Continuous integration
 
 CI is GitHub Actions (`.github/workflows/ci.yml`), mirroring openblocks'
-conventions. The `push` trigger runs on **every branch except `main`** — main is
-covered by the required checks on pull requests and by the release workflow's
-`workflow_call`, so a standalone push run would only cancel its twin in the same
-`concurrency` group — and skips doc-only changes via `paths-ignore`. The
-`pull_request` trigger targets `main` and deliberately has **no** `paths-ignore`:
-the jobs are required status checks, and a job that never triggers never
-reports, so a docs-only PR would wait forever on a check that will not run.
+conventions. The `push` trigger runs on **every branch except `main`** — `main`
+moves only by promotion, and both `promote.yml` (on the staging commit being
+promoted) and `release.yml` (on `main`) run the suite through `workflow_call`, so
+a standalone push run would only cancel its twin in the same `concurrency` group
+— and skips doc-only changes via `paths-ignore`. Because `promote.yml` runs the
+suite itself, a docs-only staging tip is still tested before it is released.
+There is no `pull_request` trigger: a pull request into `staging` is the same
+commit its feature-branch push already ran.
 
 Jobs:
 
@@ -272,6 +273,8 @@ Jobs:
   protocol vertical over TLS with the e2e client (§3.2 — the published image is
   tested by nothing).
 - **`core`** — a standalone compile-check of the client app-core (ARCH-74).
+- **`second-compiler`** — `make CC=clang test`, so an assumption only gcc
+  accepts fails in CI rather than on someone's machine.
 - **`windows`** — the Windows cross-compile of the TUI and GUI
   (`make windows-tui windows-gui`), so the ported client stays building.
 
