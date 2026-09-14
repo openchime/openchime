@@ -2019,7 +2019,10 @@ REQ-269, whose accessibility half is a real open decision.*
   the reference clients — a dedicated **direct-message section**, collapsible
   Public/Private/DM groups, per-user custom sections and starred/favorite
   conversations (whose storage is REQ-234), and a **sidebar search/filter** —
-  rather than a flat, unsearchable list. (ARCH-92: per-frontend.)
+  rather than a flat, unsearchable list. An **unreads-only mode** has collapsed the
+  whole sidebar to the conversations with something unread, while always keeping
+  the one open so reading it does not make it vanish; it persists with the rest of
+  the sidebar state. (ARCH-92: per-frontend.)
 - **REQ-268.** A client has provided **first-run onboarding** — a signup /
   first-owner setup UI that redeems the one-time owner setup token or an invite
   (REQ-024/026) into a working account — so bringing up a new tenant, or joining

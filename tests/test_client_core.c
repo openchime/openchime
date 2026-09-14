@@ -612,6 +612,35 @@ static void test_sidebar(void) {
     CHECK(n == 5 && rows[0].section == OC_SB_CHANNELS);
     CHECK(strcmp(rows[1].label, "alpha") == 0);
 
+    /* Unreads only (REQ-234's sidebar): every section keeps just what has something
+     * unread — here only the DM (3 unread) — and the open conversation stays even
+     * though it is read, so reading it cannot pull it out from under you. */
+    o.unreads_only = 1;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CHANNELS && rows[0].section_total == 2);
+    CHECK(rows[1].is_header && rows[1].section == OC_SB_DMS);
+    CHECK(strcmp(rows[2].label, "bob") == 0);
+    o.keep_id = 10;                                  /* zulu is open */
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 4 && strcmp(rows[1].label, "zulu") == 0);
+    {   /* It persists, and an older setting without it reads as off. */
+        char enc[512]; oc_sidebar_opts_encode(&o, enc, sizeof enc);
+        CHECK(strstr(enc, ";ro:1") != NULL);
+        oc_sidebar_opts back; oc_sidebar_opts_defaults(&back);
+        oc_sidebar_opts_parse(&back, enc);
+        CHECK(back.unreads_only == 1 && back.keep_id == 0);
+        oc_sidebar_opts old; oc_sidebar_opts_defaults(&old);
+        old.unreads_only = 1;
+        oc_sidebar_opts_parse(&old, "c:0,0,0;d:0,0,0");
+        CHECK(old.unreads_only == 0);
+        /* A custom section NAMED with the key must not switch it on. */
+        oc_sidebar_opts named; oc_sidebar_opts_defaults(&named);
+        oc_sidebar_opts_parse(&named, "c:0,0,0;d:0,0,0;sc:0;u:x;ro:1|0,0,0|");
+        CHECK(named.unreads_only == 0);
+    }
+    o.unreads_only = 0; o.keep_id = 0;
+
     /* Recency uses the server-reported last_message_at: alpha(300) before zulu(100). */
     o.sort[OC_SB_CHANNELS] = OC_SB_SORT_RECENT;
     n = oc_model_sidebar(&m, &o, rows, 16);

@@ -561,6 +561,14 @@ typedef struct {
         uint8_t  sort, filter, collapsed;
     } custom[OC_SB_CUSTOM_MAX];
     uint8_t  n_custom;
+    /* Unreads only: EVERY section shows just the conversations with something
+     * unread, on top of its own filter — the sidebar collapsed to what wants
+     * attention. Persisted with the rest. */
+    uint8_t  unreads_only;
+    /* The conversation open right now, which unreads-only KEEPS even once it is
+     * read: reading the channel you are in must not make it vanish from under
+     * you. View state set by the frontend on each build; never persisted. */
+    uint64_t keep_id;
 } oc_sidebar_opts;
 
 /* Per-section sort / filter / collapse, for BOTH kinds of section. A frontend must
