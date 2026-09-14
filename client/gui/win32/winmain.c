@@ -17802,9 +17802,18 @@ static void ws_forget(const char *ws) {
     oc_store_close(st);
 }
 
-/* Park the active globals in their slot. */
+/* Park the active globals in their slot.
+ *
+ * The composer is one control shared by every workspace, so its text belongs to
+ * the workspace on screen and has to be written THERE before anything else
+ * changes. Left to the draft debounce, it fired after the switch with the new
+ * workspace's client and channel id — and channel ids collide across workspaces,
+ * so one workspace's half-typed message was saved as a draft in another's channel,
+ * and never reached its own. Every switch parks through here, so flushing here is
+ * the one place that covers them all. */
 static void ws_save_active(void) {
     if (g_ws_active < 0 || g_ws_active >= g_n_wss) return;
+    if (g_sel && g_client) draft_flush(g_sel);
     oc_ws_slot *w = &g_wss[g_ws_active];
     w->client = g_client;
     w->sel = g_sel; w->scroll = g_scroll; w->post_auth = g_post_auth;
@@ -17831,6 +17840,12 @@ static void ws_load(int i) {
      * workspace means nothing here. */
     g_has_sel = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
     g_menu = MENU_NONE; g_more_open = 0; submenu_close();
+    /* And the composer shows THIS workspace's draft for its conversation, or
+     * nothing — never the text left over from the one parked above. Restoring also
+     * resets what the debounce last wrote, so it cannot re-send the old text
+     * under this workspace's channel id. */
+    if (g_sel && g_client) draft_restore(g_sel);
+    else { ed_clear(); g_draft_sent_cid = 0; g_draft_sent[0] = 0; g_draft_dirty = 0; }
 }
 
 /* Collect the remembered workspaces, so boot can connect them all. */

@@ -132,9 +132,14 @@ the requirement says so explicitly rather than implying one.
   unread state rather than state as of the last visit. Each workspace's
   connection, credentials, model, and cached history have stayed isolated from
   every other's; nothing has crossed between them (REQ-040).
-- **REQ-015.** *(Partly built)* Per-workspace view state — the focused channel, scroll position,
+- **REQ-015.** Per-workspace view state — the focused channel, scroll position,
   and a partly-typed message — has survived switching away and back, so that a
-  switch has not discarded work in progress.
+  switch has not discarded work in progress. The partly-typed message belongs to
+  the workspace it was typed in: a client writes it as that workspace's draft (or
+  keeps it with that workspace's state) before the switch takes effect, and shows
+  the arriving workspace's own draft, never the text left in the box. Channel ids
+  are per-workspace and collide across workspaces, so text carried over would be
+  saved into an unrelated workspace's channel (REQ-014).
 
 ### 1.2 Authentication
 
