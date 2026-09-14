@@ -605,8 +605,10 @@ never offers one reaction twice, and the last emoji left cannot be cleared.
 The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
 its base, and the workspace's own emoji are not offered.
 
-**A send time is never typed either.** The composer's send-later menu — in a
-channel, or in a thread, where what it schedules is a reply — offers
+**A time is never typed either.** Pause notifications' custom end time is a
+select of the day's half-hour slots, in the user's 12- or 24-hour format. The
+composer's send-later menu — in a channel, or in a thread, where what it
+schedules is a reply — offers
 three presets (*In 30 minutes*, *In 1 hour*, *Tomorrow, 9:00*) and **Custom date and
 time**, which opens the *Schedule message* card: a month calendar and the chosen
 day's half-hour slots, both drawn inside the card, with a line saying exactly when
@@ -621,6 +623,12 @@ chip row — right for a handful of options you want to see at once. Select is a
 closed field opening a scrolling list, for a set you scan rather than survey
 (the timezone list, REQ-240). Both carry their options in `hint` as `"a|b|c"`
 and both write the chosen **index** into `value`, so a caller reads them alike.
+
+**A form with a select is measured with the list open.** The card reserves the
+list's full eight rows below its fields, because the list is sized to the space
+the body has: measured only to its closed fields, a one-field time picker opened
+a two-row list. (And a card that wants little height stays that size: the frame's
+"window too small to inset" rule is asked of the window, not of the card.)
 
 The list is drawn **inside the card body**, flipping above the field when there
 is no room below, rather than floating over the card the way the emoji picker
