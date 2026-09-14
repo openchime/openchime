@@ -598,7 +598,7 @@ Full design and rationale in [AUTH.md](./AUTH.md).
   **Signing-key custody, recorded rather than assumed.** The repository signing key's private half is a GitHub Actions secret, so any workflow able to publish is able to sign, and a leak lets an attacker serve packages to every self-hoster who trusts the key. This is the same class of trade the control-plane repo records for `Fly__ApiToken` (its SECURITY.md §2). Offline custody with a publishing subkey is the improvement, deferred rather than done.
 
   **Distributing binaries carries attribution obligations that building from source did not.** `openchimed` links mbedTLS (Apache-2.0) and jsmn (MIT); both require their notice to accompany the binary. Every channel ships the full texts, assembled by `packaging/licenses.sh` from the trees the build actually used so they cannot drift from what was linked.
-- **ARCH-21 (Windows distribution):** A Windows installer (`-setup.exe`) published on the GitHub release and submitted to **WinGet**, Authenticode-signed when the Trusted Signing secrets are configured and shipped unsigned (with the release notes saying so) when they are not. Mechanics in [RELEASING.md](./RELEASING.md).
+- **ARCH-21 (Windows distribution):** A Windows installer (`-setup.exe`) published on the GitHub release — not submitted to WinGet while the client and the release cadence are still settling; it returns as one deliberate submission once they have — Authenticode-signed when the Trusted Signing secrets are configured and shipped unsigned (with the release notes saying so) when they are not. Mechanics in [RELEASING.md](./RELEASING.md).
 
 ## Local Development and Build
 

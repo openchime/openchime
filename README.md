@@ -54,7 +54,7 @@ today is not a document — it is the
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
-| [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and WinGet — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
+| [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and the GitHub release — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
 
 The daemon is a **feature-complete v1 chat core**. On the foundations — the
 wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
