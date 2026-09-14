@@ -14613,7 +14613,13 @@ static void sched_menu_open(float x, float y) {
     mi_item(302, "Tomorrow, 9:00");
     mi_item(303, "Custom date and time");
     g_menu = MENU_SCHED; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
-    g_menu_x = x - 40; g_menu_y = y - 120;
+    g_menu_x = x - 40;
+    /* MEASURED, and grown upward from a fixed bottom edge. This was a literal
+     * `y - 120`, which fit three presets; the fourth row pushed the panel past the
+     * window's bottom edge and cut "Custom date and time" in half. */
+    float total = 12.0f;
+    for (int i = 0; i < g_n_mi; i++) total += menu_item_h(g_mi[i].kind);
+    g_menu_y = y + 24.0f - total;
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
