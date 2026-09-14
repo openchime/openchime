@@ -1813,7 +1813,7 @@ static struct { rectf row, unpin; uint64_t mid; } g_pinrows[64];
 static int g_n_pinrows;
 static uint64_t g_hover_pinrow;
 static rectf g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
-static rectf g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
+static rectf g_hdr_compose;               /* channel-column header compose button */
 static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
 static HWND     g_ffind;                /* "Search files" box, Files view only (native EDIT) */
 static HWND     g_srch;                 /* search-overlay query box (native EDIT) */
@@ -3732,44 +3732,41 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
     sidebar_surface(rt, h);
 
     float x1 = RAIL_W + SIDEBAR_W - 12;
-    /* Header: workspace name + chevron (opens ws menu), with settings + compose
-     * icon buttons on the right (Slack channel-column header). */
-    /* Hit-boxes stay 24px for a comfortable click target, but the GLYPH is drawn
+    /* Header: workspace name + chevron (opens the workspace menu), and ONE icon
+     * button on the right — compose, which starts a new message, as the reference
+     * product's does. There used to be a gear beside it that opened the very menu
+     * the name opens, and compose opened the same New menu as the rail's (+):
+     * two icons that looked distinct and did nothing distinct. Each destination
+     * has one door in the visible chrome now. */
+    /* Hit-box stays 24px for a comfortable click target, but the GLYPH is drawn
      * at 20px to match the rail — mixed icon sizes in one chrome read as a bug. */
     g_hdr_compose = rf(x1 - 24, 16, x1, 40);
-    g_hdr_gear    = rf(x1 - 54, 16, x1 - 30, 40);
     rectf ci = rf(g_hdr_compose.left + 2, g_hdr_compose.top + 2,
                         g_hdr_compose.right - 2, g_hdr_compose.bottom - 2);
-    rectf gi = rf(g_hdr_gear.left + 2, g_hdr_gear.top + 2,
-                        g_hdr_gear.right - 2, g_hdr_gear.bottom - 2);
-    /* Hover feedback on the two icon buttons — they were click targets with no
-     * cue at all, next to shelf rows that light up. */
     if (g_chrome_hover == 2) fill_round(rt, g_hdr_compose, OC_R_CONTROL, OC_COL_HOVER);
-    if (g_chrome_hover == 1) fill_round(rt, g_hdr_gear, OC_R_CONTROL, OC_COL_HOVER);
     draw_lucide(rt, OC_ICON_SQUARE_PEN, ci,
                 g_chrome_hover == 2 ? OC_COL_TEXT : OC_COL_MUTED);
-    draw_lucide(rt, OC_ICON_SETTINGS,   gi,
-                g_chrome_hover == 1 ? OC_COL_TEXT : OC_COL_MUTED);
-    g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
+    float hdr_lim = g_hdr_compose.left;     /* the name and its chrome stop here */
+    g_ws_hdr_btn = rf(RAIL_W, 0, hdr_lim - 4, HEADER_H);
     if (g_chrome_hover == 3)
         fill_round(rt, rf(g_ws_hdr_btn.left + 8, 10, g_ws_hdr_btn.right, HEADER_H - 10), OC_R_CONTROL, OC_COL_HOVER);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
-    draw_text(rt, wsname, g_display, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
+    draw_text(rt, wsname, g_display, rf(RAIL_W + 16, 0, hdr_lim - 22, HEADER_H), OC_COL_TEXT);
     /* Chevron and connection dot both hug the NAME, in that order — the chevron
      * belongs to the name (it opens the workspace menu), and the dot is a status
      * on the workspace, so both travel with the text rather than sitting at the
      * far edge where they read as unrelated chrome. */
     {
         float nx  = RAIL_W + 16 + text_width(wsname, g_display);
-        float lim = g_hdr_gear.left - 30;              /* never crowd the gear */
+        float lim = hdr_lim - 30;                      /* never crowd the compose button */
         if (nx > lim) nx = lim;
         draw_text(rt, "\xE2\x96\xBE", g_meta,
-                  baseline_align(rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H),
+                  baseline_align(rf(RAIL_W + 16, 0, hdr_lim - 22, HEADER_H),
                                  g_display, g_meta, nx + 6, nx + 22),
                   OC_COL_MUTED);
 
         float dx = nx + 22;
-        if (dx > g_hdr_gear.left - 20) dx = g_hdr_gear.left - 20;
+        if (dx > hdr_lim - 20) dx = hdr_lim - 20;
         int live = m->authed ? 1 : 0;
         draw_conn_dot(rt, dx + 5, HEADER_H / 2, 4.5f, live);
         /* Only a hit-box when it would DO something: a control that silently
@@ -11872,6 +11869,15 @@ static void newmsg_restore(void) {
     } else ed_clear();
 }
 
+/* Start a new message: the New message view, with its To field taking the keys.
+ * One function for every door to it (the channel header's compose button, the DM
+ * list's pencil, the Drafts pane's New) so they cannot come to mean different
+ * things. */
+static void open_new_message(HWND hwnd) {
+    g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
+    newmsg_restore(); layout_composer(hwnd);
+}
+
 /* Resolve the chips into a conversation and post. A channel goes straight
  * there; people need a DM opened first, which is asynchronous — so the body is
  * held and sent when the channel arrives (the tick watches for it). */
@@ -15953,6 +15959,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
 static void open_ws_menu(HWND hwnd);
 static void open_profile_menu(HWND hwnd);
 static void open_new_menu(HWND hwnd);
+static void open_new_message(HWND hwnd);   /* fwd */
 static void open_switcher(HWND hwnd);
 static void menu_dispatch(HWND hwnd, int cmd);
 
@@ -16219,10 +16226,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
                 return 1;
             }
-        if (in_rect(g_dnew_btn, x, y)) {
-            g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
-            newmsg_restore(); layout_composer(hwnd); return 1;
-        }
+        if (in_rect(g_dnew_btn, x, y)) { open_new_message(hwnd); return 1; }
         for (int i = 0; i < g_n_listrows; i++) {
             if (g_dtab == DTAB_SCHEDULED && in_rect(g_listrows[i].act, x, y)) {
                 oc_client_cancel_scheduled(g_client, g_listrows[i].mid);
@@ -16943,11 +16947,8 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         }
     if (g_view == VIEW_DMS) {
-        if (in_rect(g_dm_compose_btn, x, y)) {
-            /* The pencil opens the PANE now (REQ-229), not the old card. */
-            g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
-            newmsg_restore(); layout_composer(hwnd); return 1;
-        }
+        /* The pencil opens the PANE now (REQ-229), not the old card. */
+        if (in_rect(g_dm_compose_btn, x, y)) { open_new_message(hwnd); return 1; }
         for (int i = 0; i < g_n_dmrows; i++)
             if (in_rect(g_dmrows[i].r, x, y)) {
                 g_dm_compose = 0; pick_clear();
@@ -17003,8 +17004,7 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
 
     /* Header buttons + workspace header. */
-    if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
-    if (in_rect(g_hdr_compose, x, y)) { open_new_menu(hwnd); return 1; }
+    if (in_rect(g_hdr_compose, x, y)) { open_new_message(hwnd); return 1; }
     /* The dot sits inside the workspace-header button, so it must be tested
      * first or the menu swallows it. It only exists while retrying is
      * meaningful — see draw_sidebar. */
@@ -18391,14 +18391,17 @@ static void open_ws_menu(HWND hwnd) {
     int admin = m && self_role(m) >= OC_ROLE_ADMIN;
     g_n_mi = 0;
     if (admin) { mi_item(40, "Invite people as member"); mi_item(41, "Invite people as admin"); mi_sep(); }
-    mi_item(70, "Preferences");
+    /* No "Preferences" here: they are a person's, so they live on the profile menu
+     * (with Ctrl+, and the palette as the keyboard routes). Listing them in both
+     * menus was two doors a click apart to one sheet. */
     mi_item(71, "Notifications");
     mi_item(73, "Mark all as read");
     mi_item(72, "Keyboard shortcuts");
     if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log"); }
     mi_sep();
     mi_item(2, "Reconnect now");
-    mi_item_d(3, "Sign out");
+    /* Plain "Sign out" is the profile menu's, like Preferences above; this menu
+     * keeps only the workspace-wide variant, which nothing else offers. */
     mi_item_d(5, "Sign out everywhere");
     g_menu = MENU_WS; g_menu_headerblock = 1; g_menu_hover = -1;
     g_menu_x = RAIL_W + 8; g_menu_y = HEADER_H - 6; g_menu_w = 268;
@@ -21794,15 +21797,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     : in_rect(g_sched_btn, (float)mx, (float)my) ? 2 : 0;
             if (sh2 != g_send_hover) { g_send_hover = sh2; InvalidateRect(hwnd, NULL, FALSE); }
         }
-        {   /* Small chrome buttons (sidebar gear/compose, workspace header, the
+        {   /* Small chrome buttons (sidebar compose, workspace header, the
              * context pane's back/close, the DM-list compose): one tracked id so
              * entering or leaving any of them repaints; the painters test the
              * recorded pointer against their own rect. */
             int ch = 0;
             if (!pointer_blocked()) {
                 float fx2 = (float)mx, fy2 = (float)my;
-                if      (in_rect(g_hdr_gear, fx2, fy2))       ch = 1;
-                else if (in_rect(g_hdr_compose, fx2, fy2))    ch = 2;
+                if      (in_rect(g_hdr_compose, fx2, fy2))    ch = 2;
                 else if (in_rect(g_ws_hdr_btn, fx2, fy2))     ch = 3;
                 else if (in_rect(g_rp_close, fx2, fy2))       ch = 4;
                 else if (in_rect(g_rp_back, fx2, fy2))        ch = 5;
