@@ -301,12 +301,16 @@ model; translate input to intents }, stop.
   by oc_gfx) holds the workspace avatar → switcher, six primary views (Home, DMs,
   Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
   overflow flyout), and a bottom cluster of New (+) / profile avatar.
-  Three custom D2D dropdowns hang off the rail — **workspace**
-  (invite, preferences, storage/audit, reconnect, sign out / sign out
-  everywhere), **profile** (presence, DND, display name, password), and **New**
-  (channel, DM, upload, search). Right of the rail sits the channel column
-  (header with settings + compose buttons, a "Find a conversation" filter, then
-  the channel list), the transcript, the self-drawn composer, and an optional
+  Three custom D2D dropdowns hang off the rail and the channel header —
+  **workspace** (invites, notifications, mark all read, shortcuts, storage/audit,
+  reconnect, sign out everywhere), **profile** (status, away, pause
+  notifications, Profile, Preferences, sign out), and **New** (channel, DM,
+  group message, upload, search, jump to, browse, section, custom emoji). **Each
+  destination has one door in the visible chrome**: an item is not repeated in a
+  second menu a click away, and an icon does not open a menu something beside it
+  already opens. Right of the rail sits the channel column (header with the
+  workspace name, which opens the workspace menu, and a compose button, which
+  starts a new message; a "Find a conversation" filter; then the channel list), the transcript, the self-drawn composer, and an optional
   members pane. **Home, DMs and Activity** render that chat shell
   (`shell_visible()`), and Home and DMs are not the same: the second column holds
   channels in one and conversations in the other (`sidebar_kind()`), and DMs shows
