@@ -599,6 +599,16 @@ never offers one reaction twice, and the last emoji left cannot be cleared.
 The set is still stored as catalogue shortcodes. A skin-toned pick resolves to
 its base, and the workspace's own emoji are not offered.
 
+**A send time is never typed either.** The composer's send-later menu offers
+three presets (*In 30 minutes*, *In 1 hour*, *Tomorrow, 9:00*) and **Custom date and
+time**, which opens the *Schedule message* card: a month calendar and the chosen
+day's half-hour slots, both drawn inside the card, with a line saying exactly when
+the message will go (REQ-224). Past days and slots are faint and take no click,
+and Schedule checks the time again when pressed, so a slot that passed while the
+card was open is refused with the reason rather than sent at once. A menu row runs
+by its menu's own dispatcher (`menu_run_kind()`) whether it was clicked or invoked
+through automation, because a context menu's command numbers are its own.
+
 **`FF_CHOICE` and `FF_SELECT` are the same question at two sizes.** Choice is a
 chip row — right for a handful of options you want to see at once. Select is a
 closed field opening a scrolling list, for a set you scan rather than survey

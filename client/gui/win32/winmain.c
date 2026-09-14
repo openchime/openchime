@@ -1729,6 +1729,7 @@ static int g_notify_open, g_keys_open;
  * expiry. g_status_emoji and g_status_edit are declared beside the picker,
  * which fills the one and refocuses the other. */
 static int   g_status_open;
+static int   g_sch_open;              /* the send-later date and time card */
 static int   g_status_clear;                 /* chip index 0..4 */
 static rectf g_status_emoji_btn, g_status_erect;
 static rectf g_status_chip_hits[5];
@@ -9743,7 +9744,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
-           g_status_open;
+           g_status_open || g_sch_open;
 }
 
 static rectf g_modal_card;
@@ -10291,6 +10292,7 @@ static void form_collect(int save) {
 }
 
 static void draw_browse(gfx *rt, const oc_model *m, rectf body);   /* fwd */
+static void draw_sched_custom(gfx *rt, rectf body);                /* fwd */
 static void draw_sessions(gfx *rt, const oc_model *m, rectf body); /* fwd */
 
 /* The form's photo column: the avatar as everyone sees it, and the two actions on
@@ -10366,6 +10368,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_confirm_open) draw_confirm(rt, body);
     else if (g_sessions_open) draw_sessions(rt, m, body);
     else if (g_status_open) draw_status_body(rt, body);
+    else if (g_sch_open)    draw_sched_custom(rt, body);
     else if (g_form_open && g_form_side.on) {
         /* Two columns: the fields get everything left of the photo column. The
          * column is drawn first, though an open select list is bounded by the
@@ -10456,6 +10459,239 @@ static void prefs_restore(void) {
  * rows that differ — silence for the untouched ones. */
 
 /* Content-measured card height for the status body, in unscaled DIPs. */
+/* ---- send later, at a date and time you pick (REQ-224) -----------------------
+ *
+ * The send-later menu's presets are durations from now and one fixed morning; a
+ * message meant for Friday afternoon could not be scheduled at all. This is the
+ * fourth choice: a month calendar and the day's half-hour slots, both INSIDE the
+ * card. A floating time dropdown was the obvious reuse and the wrong one here —
+ * the frame reads a click outside the card as cancel, and this card is small
+ * enough that a dropdown would hang off it.
+ *
+ * Nothing in the past is offered: past days and slots are drawn faint and take no
+ * click, and Schedule re-checks at the moment it is pressed, because a slot that
+ * was a minute away when the card opened may not be when the button is. */
+static int   g_sch_vy, g_sch_vm;            /* the month on view: year, 0-11 */
+static int   g_sch_y, g_sch_m, g_sch_d;     /* the chosen day */
+static int   g_sch_min;                     /* the chosen minute of that day, in 30s */
+static int   g_sch_err;                     /* Schedule was refused: the time had passed */
+static float g_sch_tscroll;                 /* the slot list's scroll, in DIPs */
+static rectf g_sch_prev, g_sch_next, g_sch_tlist;
+static struct { rectf r; int y, m, d, on; } g_sch_days[42];
+static int   g_n_sch_days;
+static struct { rectf r; int min, on; } g_sch_times[48];
+static int   g_n_sch_times;
+static const char *const SCH_MONTHS[12] = { "January", "February", "March", "April", "May",
+    "June", "July", "August", "September", "October", "November", "December" };
+static const char *const SCH_WDAYS[7] = { "Sunday", "Monday", "Tuesday", "Wednesday",
+    "Thursday", "Friday", "Saturday" };
+#define SCH_CELL_W  UIS(40.0f)
+#define SCH_CELL_H  UIS(34.0f)
+#define SCH_ROW_H   UIS(28.0f)
+#define SCH_LIST_W  UIS(112.0f)
+
+/* Local wall-clock time to an instant. tm_isdst = -1 lets the C library decide
+ * whether that local time falls in daylight saving, which is the question a
+ * person picking "9:00 on the 3rd of November" is actually asking. */
+static uint64_t sch_ms(int y, int m, int d, int min) {
+    struct tm tv; memset(&tv, 0, sizeof tv);
+    tv.tm_year = y - 1900; tv.tm_mon = m; tv.tm_mday = d;
+    tv.tm_hour = min / 60; tv.tm_min = min % 60; tv.tm_isdst = -1;
+    time_t t = mktime(&tv);
+    return t > 0 ? (uint64_t)t * 1000ULL : 0;
+}
+
+/* Far enough ahead to be a schedule rather than a send: the daemon's sweep runs
+ * every few seconds, so anything nearer would effectively go out at once. */
+static int sch_future(uint64_t at) {
+    return at > (uint64_t)time(NULL) * 1000ULL + 60000ULL;
+}
+
+static int sch_days_in(int y, int m) {
+    static const int D[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    return D[m] + (m == 1 && leap);
+}
+
+/* "Tuesday, September 15 at 9:00 AM" — in the user's own time format. */
+static void sch_describe(uint64_t at, char *out, size_t cap) {
+    time_t t = (time_t)(at / 1000); struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) { snprintf(out, cap, "%s", ""); return; }
+    char tl[16]; sched_time_label((uint16_t)(tv.tm_hour * 60 + tv.tm_min), tl, sizeof tl);
+    snprintf(out, cap, "%s, %s %d at %s", SCH_WDAYS[tv.tm_wday], SCH_MONTHS[tv.tm_mon],
+             tv.tm_mday, tl);
+}
+
+/* The first slot on the chosen day that is still ahead, or -1 if none is. */
+static int sch_first_future_slot(void) {
+    for (int k = 0; k < 48; k++)
+        if (sch_future(sch_ms(g_sch_y, g_sch_m, g_sch_d, k * 30))) return k * 30;
+    return -1;
+}
+
+/* Open on a sensible slot: the first half-hour at least thirty minutes away,
+ * which rolls to tomorrow's midnight slot late at night. */
+static void sched_custom_open(HWND hwnd) {
+    time_t t = time(NULL) + 30 * 60; struct tm tv;
+    if (!oc_localtime_r(&t, &tv)) return;
+    int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
+    if (min >= 1440) {
+        t += 24 * 60 * 60;
+        if (!oc_localtime_r(&t, &tv)) return;
+        min = 0;
+    }
+    g_sch_y = tv.tm_year + 1900; g_sch_m = tv.tm_mon; g_sch_d = tv.tm_mday;
+    g_sch_min = min; g_sch_err = 0;
+    g_sch_vy = g_sch_y; g_sch_vm = g_sch_m;
+    g_sch_tscroll = (float)(min / 30) * SCH_ROW_H - 3 * SCH_ROW_H;
+    if (g_sch_tscroll < 0) g_sch_tscroll = 0;
+    modal_enter(hwnd, &g_sch_open);
+}
+
+static float sched_custom_body_h(void) {
+    return UIS(30.0f) + UIS(22.0f) + 6 * SCH_CELL_H + UIS(14.0f) + UIS(44.0f);
+}
+
+static void draw_sched_custom(gfx *rt, rectf body) {
+    g_n_sch_days = 0; g_n_sch_times = 0;
+    time_t nowt = time(NULL); struct tm nv; int ty = 0, tm_ = 0, td = 0;
+    if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tm_ = nv.tm_mon; td = nv.tm_mday; }
+
+    /* The calendar: month title with previous/next, weekday initials, six rows. */
+    float cx = body.left, y = body.top + UIS(2.0f);
+    float cw = 7 * SCH_CELL_W;
+    char title[40]; snprintf(title, sizeof title, "%s %d", SCH_MONTHS[g_sch_vm], g_sch_vy);
+    draw_text(rt, title, g_ui_b, rf(cx + UIS(4.0f), y, cx + cw - UIS(60.0f), y + UIS(26.0f)), OC_COL_TEXT);
+    /* No earlier than this month: every day before it has passed. */
+    int can_prev = g_sch_vy > ty || (g_sch_vy == ty && g_sch_vm > tm_);
+    g_sch_prev = can_prev ? rf(cx + cw - UIS(56.0f), y, cx + cw - UIS(30.0f), y + UIS(26.0f)) : rf(0, 0, 0, 0);
+    g_sch_next = rf(cx + cw - UIS(26.0f), y, cx + cw, y + UIS(26.0f));
+    for (int k = 0; k < 2; k++) {
+        rectf b = k ? g_sch_next : rf(cx + cw - UIS(56.0f), y, cx + cw - UIS(30.0f), y + UIS(26.0f));
+        int live = k ? 1 : can_prev;
+        if (live && in_rect(b, g_mouse_x, g_mouse_y)) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+        int oa = g_ui_b->align;
+        g_ui_b->align = ST_ALIGN_CENTER;
+        draw_text(rt, k ? "\xE2\x80\xBA" : "\xE2\x80\xB9", g_ui_b, b, live ? OC_COL_TEXT : OC_COL_FAINT);
+        g_ui_b->align = oa;
+    }
+    y += UIS(30.0f);
+    static const char *const INI[7] = { "S", "M", "T", "W", "T", "F", "S" };
+    g_meta->align = ST_ALIGN_CENTER;
+    for (int i = 0; i < 7; i++)
+        draw_text(rt, INI[i], g_meta, rf(cx + i * SCH_CELL_W, y, cx + (i + 1) * SCH_CELL_W, y + UIS(20.0f)),
+                  OC_COL_FAINT);
+    y += UIS(22.0f);
+    struct tm first; memset(&first, 0, sizeof first);
+    first.tm_year = g_sch_vy - 1900; first.tm_mon = g_sch_vm; first.tm_mday = 1;
+    first.tm_hour = 12; first.tm_isdst = -1;
+    mktime(&first);
+    int lead = first.tm_wday, n = sch_days_in(g_sch_vy, g_sch_vm);
+    for (int d = 1; d <= n; d++) {
+        int slot = lead + d - 1, row = slot / 7, col = slot % 7;
+        rectf c = rf(cx + col * SCH_CELL_W + UIS(2.0f), y + row * SCH_CELL_H + UIS(2.0f),
+                     cx + (col + 1) * SCH_CELL_W - UIS(2.0f), y + (row + 1) * SCH_CELL_H - UIS(2.0f));
+        /* A day is open while its last slot is still ahead. */
+        int on = sch_future(sch_ms(g_sch_vy, g_sch_vm, d, 23 * 60 + 30));
+        int sel = g_sch_vy == g_sch_y && g_sch_vm == g_sch_m && d == g_sch_d;
+        int today = g_sch_vy == ty && g_sch_vm == tm_ && d == td;
+        if (sel)       fill_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT);
+        else if (on && in_rect(c, g_mouse_x, g_mouse_y)) fill_round(rt, c, OC_R_CONTROL, OC_COL_HOVER);
+        if (today && !sel) stroke_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT, 1.0f);
+        char num[4]; snprintf(num, sizeof num, "%d", d);
+        draw_text(rt, num, g_meta, c, sel ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+        if (g_n_sch_days < 42) {
+            g_sch_days[g_n_sch_days].r = c; g_sch_days[g_n_sch_days].y = g_sch_vy;
+            g_sch_days[g_n_sch_days].m = g_sch_vm; g_sch_days[g_n_sch_days].d = d;
+            g_sch_days[g_n_sch_days].on = on;
+            g_n_sch_days++;
+        }
+    }
+    g_meta->align = ST_ALIGN_LEFT;
+
+    /* The slots of the chosen day, scrolling inside their own box. */
+    /* Inset from the body's right edge: the body is clipped to itself, and a
+     * border drawn ON that edge loses its right side. */
+    float rx = body.right - UIS(2.0f);
+    float lx = rx - SCH_LIST_W, ly = body.top + UIS(2.0f);
+    draw_text(rt, "Time", g_ui_b, rf(lx, ly, rx, ly + UIS(26.0f)), OC_COL_TEXT);
+    rectf list = rf(lx, ly + UIS(30.0f), rx, body.top + UIS(30.0f) + UIS(22.0f) + 6 * SCH_CELL_H);
+    g_sch_tlist = list;
+    stroke_round(rt, list, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    float full = 48 * SCH_ROW_H, view = (list.bottom - list.top) - UIS(8.0f);
+    if (g_sch_tscroll > full - view) g_sch_tscroll = full - view;
+    if (g_sch_tscroll < 0) g_sch_tscroll = 0;
+    rectf inner = rf(list.left + 1, list.top + UIS(4.0f), list.right - 1, list.bottom - UIS(4.0f));
+    gfx_clip_push(rt, gr(inner));
+    for (int k = 0; k < 48; k++) {
+        float ry = inner.top + k * SCH_ROW_H - g_sch_tscroll;
+        if (ry + SCH_ROW_H < inner.top || ry > inner.bottom) continue;
+        rectf r = rf(inner.left + UIS(3.0f), ry, inner.right - UIS(3.0f), ry + SCH_ROW_H);
+        int on = sch_future(sch_ms(g_sch_y, g_sch_m, g_sch_d, k * 30));
+        int sel = g_sch_min == k * 30;
+        if (sel)     fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
+        else if (on && in_rect(r, g_mouse_x, g_mouse_y)) fill_round(rt, r, OC_R_CONTROL, OC_COL_HOVER);
+        char tl[16]; sched_time_label((uint16_t)(k * 30), tl, sizeof tl);
+        draw_text(rt, tl, g_meta, rf(r.left + UIS(10.0f), r.top, r.right, r.bottom),
+                  sel ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+        /* Recorded clipped to the box, so a half-visible row cannot be clicked
+         * outside it. */
+        rectf hit = rf(r.left, r.top > inner.top ? r.top : inner.top,
+                       r.right, r.bottom < inner.bottom ? r.bottom : inner.bottom);
+        if (g_n_sch_times < 48 && hit.bottom > hit.top) {
+            g_sch_times[g_n_sch_times].r = hit; g_sch_times[g_n_sch_times].min = k * 30;
+            g_sch_times[g_n_sch_times].on = on;
+            g_n_sch_times++;
+        }
+    }
+    gfx_clip_pop(rt);
+
+    /* What will happen, in words — or why it will not. */
+    float sy = list.bottom + UIS(14.0f);
+    uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
+    char line[128];
+    if (!sch_future(at)) {
+        snprintf(line, sizeof line, "That time has already passed. Pick a later one.");
+        draw_text(rt, line, g_ui, rf(body.left, sy, body.right, sy + UIS(24.0f)), OC_COL_DANGER);
+    } else {
+        char when[96]; sch_describe(at, when, sizeof when);
+        snprintf(line, sizeof line, "Sends %s", when);
+        draw_text(rt, line, g_ui, rf(body.left, sy, body.right, sy + UIS(24.0f)),
+                  g_sch_err ? OC_COL_DANGER : OC_COL_TEXT);
+    }
+}
+
+/* A click on the card. Returns 1 for any click inside it. */
+static int sched_custom_click(HWND hwnd, int x, int y) {
+    if (in_rect(g_sch_prev, x, y)) {
+        if (--g_sch_vm < 0) { g_sch_vm = 11; g_sch_vy--; }
+        InvalidateRect(hwnd, NULL, FALSE); return 1;
+    }
+    if (in_rect(g_sch_next, x, y)) {
+        if (++g_sch_vm > 11) { g_sch_vm = 0; g_sch_vy++; }
+        InvalidateRect(hwnd, NULL, FALSE); return 1;
+    }
+    for (int i = 0; i < g_n_sch_days; i++)
+        if (g_sch_days[i].on && in_rect(g_sch_days[i].r, x, y)) {
+            g_sch_y = g_sch_days[i].y; g_sch_m = g_sch_days[i].m; g_sch_d = g_sch_days[i].d;
+            /* Keep the time if it is still ahead on the new day; otherwise move to
+             * the first slot that is, rather than leave a choice that cannot be
+             * scheduled selected. */
+            if (!sch_future(sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min))) {
+                int f = sch_first_future_slot();
+                if (f >= 0) { g_sch_min = f; g_sch_tscroll = (float)(f / 30) * SCH_ROW_H - 3 * SCH_ROW_H; }
+            }
+            g_sch_err = 0;
+            InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+    for (int i = 0; i < g_n_sch_times; i++)
+        if (g_sch_times[i].on && in_rect(g_sch_times[i].r, x, y)) {
+            g_sch_min = g_sch_times[i].min; g_sch_err = 0;
+            InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+    return in_rect(g_modal_card, x, y);
+}
+
 static float status_want_h(void) {
     float rows = UIS(4.0f) + UIS(46.0f) + UIS(24.0f)
                + (float)g_n_status_suggs * UIS(32.0f)
@@ -10466,7 +10702,17 @@ static float status_want_h(void) {
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
     memset(&sp, 0, sizeof sp);
-    if (g_status_open) {
+    if (g_sch_open) {
+        /* Schedule is a COMMAND, not MODAL_OK: it validates first, and a time
+         * that has passed keeps the card open with the reason, which a plain OK
+         * (close, then commit) cannot do. Enter reaches it the same way. */
+        sp.title = "Schedule message";
+        sp.size = MODAL_SM;
+        sp.want_h = (MODAL_TITLE_H + sched_custom_body_h() + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
+        sp.buttons[0] = (oc_mbtn){ "Cancel",   MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Schedule", MB_PRIMARY, 304 };
+        sp.n_buttons = 2;
+    } else if (g_status_open) {
         sp.title = "Set a status";
         sp.size = MODAL_SM;
         sp.want_h = status_want_h();
@@ -10571,7 +10817,8 @@ static void modal_enter(HWND hwnd, int *flag) {
      * at, and answering "Revoke" in Admin > Invites dumped you on Home, losing the
      * list you were working in. The your-account modals below do set VIEW_HOME,
      * because they are not about the current view at all. */
-    int keep_view = (flag == &g_confirm_open);
+    /* Scheduling is about the conversation you are in, so it keeps you there too. */
+    int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open);
     int prev_view = g_view;
     close_overlays();
     /* The transient overlays too, and this was a real bug rather than tidiness:
@@ -10617,7 +10864,7 @@ static void modal_finish(int save) {
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
-    g_confirm_open = g_sessions_open = g_status_open = 0;
+    g_confirm_open = g_sessions_open = g_status_open = g_sch_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
 }
 
@@ -14358,6 +14605,7 @@ static void sched_menu_open(float x, float y) {
     mi_item(300, "In 30 minutes");
     mi_item(301, "In 1 hour");
     mi_item(302, "Tomorrow, 9:00");
+    mi_item(303, "Custom date and time");
     g_menu = MENU_SCHED; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
     g_menu_x = x - 40; g_menu_y = y - 120;
     if (g_menu_y < 8) g_menu_y = 8;
@@ -14394,6 +14642,7 @@ enum {
     AT_STATUSCHIP,    /* payload: status clear-after chip index */
     AT_FORMSIDE,      /* payload: 0 = the form's upload photo, 1 = remove photo */
     AT_QUICKSLOT,     /* payload: slot index; +100 = that slot's clear */
+    AT_SCHED,         /* payload: 1 prev month, 2 next, yyyymmdd a day, 10000+min a slot */
     AT_FSCOPE,        /* payload: Files ownership-scope index */
     AT_FSORT,         /* the Files sort dropdown */
     AT_FTYPE,         /* the Files type dropdown */
@@ -14734,6 +14983,29 @@ modal_items:
                          g_status_chip_hits[k], ATOK(AT_STATUSCHIP, k));
             }
         }
+        /* The schedule card: ids from the DATE and the TIME, never the cell's
+         * position, so `sched.day.20260918` survives the month changing layout. */
+        if (g_sch_open) {
+            if (g_sch_prev.right > g_sch_prev.left)
+                acc_push(items, &n, OC_ACC_BUTTON, "sched.prev", "Previous month", g_sch_prev, ATOK(AT_SCHED, 1));
+            acc_push(items, &n, OC_ACC_BUTTON, "sched.next", "Next month", g_sch_next, ATOK(AT_SCHED, 2));
+            for (int i = 0; i < g_n_sch_days && n < OC_ACC_MAX; i++) {
+                if (!g_sch_days[i].on) continue;
+                char aid[OC_ACC_AID_MAX], nm[48];
+                int ymd = g_sch_days[i].y * 10000 + (g_sch_days[i].m + 1) * 100 + g_sch_days[i].d;
+                snprintf(aid, sizeof aid, "sched.day.%d", ymd);
+                snprintf(nm, sizeof nm, "%s %d", SCH_MONTHS[g_sch_days[i].m], g_sch_days[i].d);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sch_days[i].r, ATOK(AT_SCHED, (uint64_t)ymd));
+            }
+            for (int i = 0; i < g_n_sch_times && n < OC_ACC_MAX; i++) {
+                if (!g_sch_times[i].on) continue;
+                char aid[OC_ACC_AID_MAX], nm[16];
+                snprintf(aid, sizeof aid, "sched.time.%02d%02d", g_sch_times[i].min / 60, g_sch_times[i].min % 60);
+                sched_time_label((uint16_t)g_sch_times[i].min, nm, sizeof nm);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sch_times[i].r,
+                         ATOK(AT_SCHED, (uint64_t)(10000 + g_sch_times[i].min)));
+            }
+        }
         if (g_prefs_open) {
             for (int i = 0; i < QUICK_SLOTS && n < OC_ACC_MAX; i++) {
                 char aid[OC_ACC_AID_MAX], nm[40], label[64];
@@ -14826,8 +15098,10 @@ static void ac_accept(void) {
 /* Hand the composer's text to the daemon's queue instead of sending it now
  * (REQ-224, ARCH-102). The body leaves the field exactly as a send would take
  * it, so what arrives later is what you wrote. */
+static void sched_at(HWND hwnd, uint64_t at);   /* fwd */
 static void sched_menu_run(HWND hwnd, int cmd) {
     if (!g_client || !g_sel || ed_len() <= 0) return;
+    if (cmd == 303) { sched_custom_open(hwnd); return; }
     uint64_t now = (uint64_t)time(NULL) * 1000ULL, at = now;
     if (cmd == 300) at = now + 30ULL * 60 * 1000;
     else if (cmd == 301) at = now + 60ULL * 60 * 1000;
@@ -14839,7 +15113,14 @@ static void sched_menu_run(HWND hwnd, int cmd) {
             if (when > 0) at = (uint64_t)when * 1000ULL;
         }
     } else return;
+    sched_at(hwnd, at);
+}
 
+/* Hand the composer's text to the schedule at `at`. Shared by the presets and the
+ * custom card, so a message scheduled either way leaves the composer, its draft
+ * and the toast in the same state. */
+static void sched_at(HWND hwnd, uint64_t at) {
+    if (!g_client || !g_sel || ed_len() <= 0) return;
     WCHAR w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n <= 0) return;
@@ -14852,7 +15133,10 @@ static void sched_menu_run(HWND hwnd, int cmd) {
     ed_clear();
     /* The draft it came from goes with it, as it would on a send. */
     draft_flush(g_sel);
-    toast_push("Scheduled \u2014 see Drafts, scheduled & sent.", 0);
+    char when[96], msg[160];
+    sch_describe(at, when, sizeof when);
+    snprintf(msg, sizeof msg, "Scheduled for %s \u2014 see Drafts, scheduled & sent.", when);
+    toast_push(msg, 0);
     ed_changed(hwnd);
 }
 
@@ -16147,6 +16431,20 @@ static int permalink_follow(HWND hwnd, const char *text) {
     return 1;
 }
 
+/* Run a command from a menu row by the menu's KIND. A context menu's numbers are
+ * its own, so 21 means Edit on a message and a notification level in a dropdown;
+ * the click and the automation invoke both come through here so they cannot mean
+ * different things. */
+static void menu_run_kind(HWND hwnd, int kind, int cmd) {
+    if (kind == MENU_THREAD)       thread_menu_run(hwnd, cmd);
+    else if (kind == MENU_SCHED)   sched_menu_run(hwnd, cmd);
+    else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
+    else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
+    else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
+    else if (kind == MENU_THUMB)   thumb_menu_run(hwnd, cmd);
+    else                           menu_dispatch(hwnd, cmd);
+}
+
 static int on_click(HWND hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* A modal owns the window while it is up: a click outside the card dismisses
@@ -16281,6 +16579,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
             return 1;   /* the card swallows what nothing above claimed */
         }
+        if (g_sch_open && sched_custom_click(hwnd, x, y)) return 1;
         if (g_notify_open) {
             /* The time dropdown is above everything else in this overlay, so it
              * gets the click first — otherwise a row underneath it takes one that
@@ -16755,15 +17054,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 int cmd = g_mirows[i].cmd, kind = g_menu;
                 submenu_close();
                 g_menu = MENU_NONE; g_menu_hover = -1;
-                /* Per-kind dispatch: a context menu's numbers are its own, so 21
-                 * means Edit on a message and a notification level in a dropdown. */
-                if (kind == MENU_THREAD)       thread_menu_run(hwnd, cmd);
-                else if (kind == MENU_SCHED)   sched_menu_run(hwnd, cmd);
-                else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
-                else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
-                else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
-                else if (kind == MENU_THUMB)   thumb_menu_run(hwnd, cmd);
-                else                           menu_dispatch(hwnd, cmd);
+                menu_run_kind(hwnd, kind, cmd);
                 return 1;
             }
         /* The quick-reaction row is not a command row, so it is tested separately. */
@@ -18833,6 +19124,16 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         const oc_model *m65 = model();
         if (m65) { g_view = VIEW_HOME; profile_open(m65->user_id); }
         break; }
+    case 304:   /* the custom send-later card's Schedule */
+        if (!g_sch_open) break;
+        {
+            uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
+            if (!sch_future(at)) { g_sch_err = 1; InvalidateRect(hwnd, NULL, FALSE); break; }
+            modal_finish(0);
+            g_modal_closed_by = "save";
+            sched_at(hwnd, at);
+        }
+        break;
     case 52:     /* clear — and when invoked from the status dialog's own
                   * footer, close the card: the clear IS the outcome. */
         oc_client_set_status(g_client, "", "", 0);
@@ -19609,6 +19910,24 @@ static void test_dump(const char *path) {
                     g_pick_cells[i].emoji, g_pick_cells[i].r.left, g_pick_cells[i].r.top,
                     g_pick_cells[i].r.right, g_pick_cells[i].r.bottom);
         fprintf(f, "quickset names=\"%s\" filled=%d\n", g_quick_names, quick_slots_filled());
+        {
+            uint64_t sat = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
+            int on_days = 0, on_times = 0;
+            for (int i = 0; i < g_n_sch_days; i++) on_days += g_sch_days[i].on;
+            for (int i = 0; i < g_n_sch_times; i++) on_times += g_sch_times[i].on;
+            fprintf(f, "schedcard open=%d view=%04d-%02d sel=%04d-%02d-%02d %02d:%02d at=%llu future=%d err=%d days_on=%d times_on=%d\n",
+                    g_sch_open, g_sch_vy, g_sch_vm + 1, g_sch_y, g_sch_m + 1, g_sch_d,
+                    g_sch_min / 60, g_sch_min % 60, (unsigned long long)sat,
+                    g_sch_open ? sch_future(sat) : 0, g_sch_err, on_days, on_times);
+            for (int i = 0; i < g_n_sch_days && g_sch_open; i++)
+                fprintf(f, "  schedday %04d%02d%02d on=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                        g_sch_days[i].y, g_sch_days[i].m + 1, g_sch_days[i].d, g_sch_days[i].on,
+                        g_sch_days[i].r.left, g_sch_days[i].r.top, g_sch_days[i].r.right, g_sch_days[i].r.bottom);
+            for (int i = 0; i < g_n_sch_times && g_sch_open; i++)
+                fprintf(f, "  schedtime %02d%02d on=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                        g_sch_times[i].min / 60, g_sch_times[i].min % 60, g_sch_times[i].on,
+                        g_sch_times[i].r.left, g_sch_times[i].r.top, g_sch_times[i].r.right, g_sch_times[i].r.bottom);
+        }
         for (int i = 0; i < QUICK_SLOTS; i++) {
             char nm[40]; quick_slot_get(i, nm, sizeof nm);
             fprintf(f, "  quickslot %d name=\"%s\" tile=%.0f,%.0f,%.0f,%.0f clear=%d\n", i, nm,
@@ -21607,6 +21926,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         wpt.x = (LONG)DIPF(wpt.x); wpt.y = (LONG)DIPF(wpt.y);
         float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         const oc_model *wm = model();
+        if (g_sch_open && in_rect(g_sch_tlist, (float)wpt.x, (float)wpt.y)) {
+            g_sch_tscroll -= dy;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_tp_open) {   /* the open dropdown owns the wheel, as a dropdown does */
             g_tp_scroll -= dy;
             InvalidateRect(hwnd, NULL, FALSE);
@@ -22101,8 +22425,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* An a11y invoke of a menu row acts like the click: the menu (and
              * its flyout) close BEFORE the command runs, or the command's own
              * surface opens underneath a stale panel. */
-            if (g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; submenu_close(); }
-            menu_dispatch(hwnd, (int)arg);
+            {
+                /* Through the menu's OWN dispatcher, as the click is. Sending every
+                 * row to menu_dispatch ran a context menu's number as a global
+                 * command: its numbers are its own, so an automation "Edit" on a
+                 * message was not Edit at all, and send-later's custom time did
+                 * nothing. */
+                int kind = g_menu;
+                if (g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; submenu_close(); }
+                menu_run_kind(hwnd, kind, (int)arg);
+            }
             break;
         case AT_SEND:      composer_send(); break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
@@ -22156,6 +22488,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_status_open && (int)arg < 5) {
                 g_status_clear = (int)arg;
                 InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        case AT_SCHED:
+            /* The same path a click takes, at the control's recorded centre. */
+            if (g_sch_open) {
+                rectf r = rf(0, 0, 0, 0);
+                if (arg == 1) r = g_sch_prev;
+                else if (arg == 2) r = g_sch_next;
+                else if (arg >= 10000 && arg < 10000 + 1440) {
+                    for (int i = 0; i < g_n_sch_times; i++)
+                        if ((uint64_t)(10000 + g_sch_times[i].min) == arg) r = g_sch_times[i].r;
+                } else {
+                    for (int i = 0; i < g_n_sch_days; i++)
+                        if ((uint64_t)(g_sch_days[i].y * 10000 + (g_sch_days[i].m + 1) * 100 + g_sch_days[i].d) == arg)
+                            r = g_sch_days[i].r;
+                }
+                if (r.right > r.left)
+                    sched_custom_click(hwnd, (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
             }
             break;
         case AT_QUICKSLOT:
