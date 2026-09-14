@@ -15140,14 +15140,22 @@ static void sched_at(HWND hwnd, uint64_t at) {
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
     WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
-    oc_client_schedule(g_client, g_sel, 0, at, b);
+    /* Into the thread when the composer is replying in one, exactly as a send
+     * would be (composer_send): the root rides the schedule, and the daemon posts
+     * it as a reply when it fires. */
+    const oc_model *tm = model();
+    int reply = tm && tm->thread_open;
+    uint64_t cid  = reply ? tm->thread_channel : g_sel;
+    uint64_t root = reply ? tm->thread_parent  : 0;
+    oc_client_schedule(g_client, cid, root, at, b);
     free(b);
     ed_clear();
     /* The draft it came from goes with it, as it would on a send. */
     draft_flush(g_sel);
     char when[96], msg[160];
     sch_describe(at, when, sizeof when);
-    snprintf(msg, sizeof msg, "Scheduled for %s \u2014 see Drafts, scheduled & sent.", when);
+    snprintf(msg, sizeof msg, "%s for %s \u2014 see Drafts, scheduled & sent.",
+             reply ? "Reply scheduled" : "Scheduled", when);
     toast_push(msg, 0);
     ed_changed(hwnd);
 }

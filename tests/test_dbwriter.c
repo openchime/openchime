@@ -1682,6 +1682,14 @@ static void test_drafts(void) {
 
 /* --- Scheduled messages (REQ-224, ARCH-102) ------------------------------ */
 
+static oc_dbres *sched_new_in(oc_dbwriter *w, uint64_t uid, uint64_t cid, uint64_t root,
+                              uint64_t at, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SCHEDULE, 910);
+    j->user_id = uid; j->channel_id = cid; j->parent_id = root; j->sched_at_ms = at;
+    if (body && *body) oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
 static oc_dbres *sched_new(oc_dbwriter *w, uint64_t uid, uint64_t cid,
                            uint64_t at, const char *body) {
     oc_job *j = oc_job_new(OC_JOB_SCHEDULE, 910);
@@ -1762,7 +1770,43 @@ static void test_scheduled(void) {
     r = sched_fire(w);
     CHECK(r && r->type == OC_RES_SEND_OK && r->message_id != 0);
     CHECK(r->body_len == 17 && memcmp(r->body, "sent by the clock", 17) == 0);
+    uint64_t root_msg = r ? r->message_id : 0;
+    CHECK(r && r->parent_id == 0);                 /* a channel message, not a reply */
     oc_dbres_free(r);
+
+    /* A scheduled REPLY: the thread root rides the schedule and the sweep posts
+     * it into that thread, not the channel — the same send path, with a parent. */
+    r = sched_new_in(w, alice, OC_DEFAULT_CHANNEL, root_msg, 1, "reply by the clock");
+    CHECK(r && r->type == OC_RES_SCHEDULED && r->sched.thread_root == root_msg);
+    oc_dbres_free(r);
+    r = sched_list(w, alice);
+    CHECK(r && r->n_scheds == 1 && r->scheds[0].thread_root == root_msg);
+    oc_dbres_free(r);
+    r = sched_fire(w);
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->message_id != 0);   /* fanned into the thread */
+    CHECK(r && r->parent_id == root_msg);
+    CHECK(r && r->body_len == 18 && memcmp(r->body, "reply by the clock", 18) == 0);
+    oc_dbres_free(r);
+    r = sched_list(w, alice); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);
+
+    /* A reply to a message that is gone cannot be kept: FAILED, with the reason. */
+    r = sched_new_in(w, alice, OC_DEFAULT_CHANNEL, 999999, 1, "reply to nothing");
+    CHECK(r && r->type == OC_RES_SCHEDULED);
+    oc_dbres_free(r);
+    r = sched_fire(w);
+    CHECK(r && r->type == OC_RES_REPLY_ERR);
+    oc_dbres_free(r);
+    r = sched_list(w, alice);
+    CHECK(r && r->n_scheds == 1 && r->scheds[0].state == OC_SCHED_FAILED);
+    CHECK(r && r->scheds[0].fail_reason && strstr(r->scheds[0].fail_reason, "deleted") != NULL);
+    uint64_t dead = (r && r->n_scheds) ? r->scheds[0].id : 0;
+    oc_dbres_free(r);
+    {   /* out of the way of the archive case below, which counts the list */
+        oc_job *j = oc_job_new(OC_JOB_CANCEL_SCHEDULED, 912);
+        j->user_id = alice; j->message_id = dead;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
     /* Delivered ones leave the list: they are messages now. */
     r = sched_list(w, alice); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);
     /* And firing again does nothing — the row is no longer pending, which is
