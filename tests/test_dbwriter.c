@@ -1118,6 +1118,26 @@ static oc_dbres *chan_member(oc_dbwriter *w, int type, uint64_t actor, uint64_t 
     return wait_result(w);
 }
 
+/* How many rows in the audit log, read as `actor` (must be admin/owner), carry
+ * `action`? */
+static int audit_count(oc_dbwriter *w, uint64_t actor, const char *action) {
+    oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, 901);
+    j->user_id = actor; j->audit_limit = 100;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    int n = 0;
+    if (r && r->type == OC_RES_AUDIT_PAGE) {
+        for (size_t i = 0; i < r->n_audit; i++) {
+            if (r->audit[i].action && !strcmp(r->audit[i].action, action)) n++;
+        }
+    }
+    oc_dbres_free(r);
+    return n;
+}
+static int audit_saw(oc_dbwriter *w, uint64_t actor, const char *action) {
+    return audit_count(w, actor, action) > 0;
+}
+
 /* A channel's member roster (REQ-031) and its shared files (REQ-143, ARCH-91).
  * Both are new READ ops over storage that already existed; what matters is that
  * they are scoped to what the caller may see. */
@@ -2436,8 +2456,20 @@ static void test_admin_ops(void) {
     uint64_t newbie = r->user_id;
     CHECK(newbie != 0);
     oc_dbres_free(r);
+    /* Redemption is audited under the redeemer, not the inviting admin (REQ-251):
+     * the account that now exists is the one that acted. */
+    CHECK(audit_saw(w, owner, "invite.redeem"));
+
     /* The new account can now log in with its password. */
-    CHECK(auth_local(w, 100, "newbie", "newpw", NULL, NULL) == newbie);
+    uint8_t newbie_tok[OC_SESSION_TOKEN_LEN];
+    CHECK(auth_local(w, 100, "newbie", "newpw", newbie_tok, NULL) == newbie);
+    /* A fresh local login is audited... */
+    int fresh_logins = audit_count(w, owner, "auth.success");
+    CHECK(fresh_logins > 0);
+    /* ...but resuming that same session on reconnect is not a new sign-in and
+     * adds no entry (REQ-251: "who signed in, when", not every reconnect). */
+    CHECK(auth_session(w, 101, newbie_tok) == newbie);
+    CHECK(audit_count(w, owner, "auth.success") == fresh_logins);
 
     /* The token is single-use: a second redemption is refused. */
     r = redeem_invite(w, tok_member, "newbie2", "x");
@@ -2496,6 +2528,16 @@ static void test_admin_ops(void) {
     CHECK(remove_user(w, owner, member) == 0);
     CHECK(auth_session(w, 103, mtok) == 0);                      /* session revoked */
     CHECK(auth_local(w, 104, "ad-member", "pw", NULL, NULL) == 0); /* login refused */
+
+    /* Removing another member FROM A CHANNEL (moderation, REQ-251) is a
+     * distinct, audited action from removing them from the tenant above. */
+    r = create_channel(w, owner, "admin-only", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t adminonly = r->channel_id;
+    oc_dbres_free(r);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, owner, adminonly, admin));
+    oc_dbres_free(chan_member(w, OC_JOB_REMOVE_CHANNEL, owner, adminonly, admin));
+    CHECK(audit_saw(w, owner, "channel.member.remove"));
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -3359,7 +3401,13 @@ static void test_setup_invite(void) {
     /* Redeeming it creates the first owner. */
     oc_dbres *r = redeem_invite(w, tok, "founder", "founder-pw");
     CHECK(r && r->type == OC_RES_AUTH_OK && r->role == OC_ROLE_OWNER);
+    uint64_t founder = r ? r->user_id : 0;
     oc_dbres_free(r);
+
+    /* Bootstrap is audited distinctly from an ordinary invite redemption
+     * (REQ-251): there is no inviting actor to name. */
+    CHECK(audit_saw(w, founder, "user.bootstrap"));
+    CHECK(!audit_saw(w, founder, "invite.redeem"));
 
     /* An owner now exists -> nothing is minted. */
     CHECK(oc_dbwriter_setup_invite(w, tok) == 0);
