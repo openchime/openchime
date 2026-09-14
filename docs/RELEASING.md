@@ -34,7 +34,7 @@ its first job, `branch`, refuses anything else.
     branch ─▶ guard ─────┐
           ├─▶ test ──────┼─▶ version ─┬─▶ packages (amd64, arm64) ──────────────┐
           └─▶ preflight ─┘            ├─▶ image ─▶ image-manifest ───────────────┤
-                                      └─▶ windows-build ─▶ windows-package ──────┴─▶ publish ─┬─▶ winget ─▶ smoke
+                                      └─▶ windows-build ─▶ windows-package ──────┴─▶ publish ─┬─▶ smoke
                                                                                               ├─▶ close-issues
                                                                                               └─▶ unreserve (on failure)
 
@@ -54,8 +54,8 @@ the last job, not a step in the middle of `publish`.
 
 It used to be a step, sitting between writing the repositories and finishing the
 release. That made a postcondition abort the steps after it: a failed smoke
-skipped the GitHub release, the tarballs, `:latest` and the `winget`
-submission, while apt and dnf were already live. Packages published with nothing
+skipped the GitHub release, the tarballs and `:latest`, while apt and dnf were
+already live. Packages published with nothing
 naming them is the worst reachable state, and it needed a manual repair twice.
 
 Once the apt index is written the release is irreversible, so **completing it is
@@ -312,38 +312,9 @@ with no edit.
 
 ## Downloads are pinned
 
-`wingetcreate` is pinned to a versioned asset with a `Get-FileHash` check —
-`https://aka.ms/wingetcreate/latest` is a mutable redirect, and the tool runs
-with `WINGET_TOKEN` in scope. Bump `WINGETCREATE_VERSION` and
-`WINGETCREATE_SHA256` together; the hash is Microsoft's own, published beside the
-asset as `wingetcreate.exe.txt`.
-
-Same rule as `build_mbedtls.sh`, which refuses to fetch without a known SHA-256.
-
-## The WinGet fork syncs itself
-
-`wingetcreate` pushes a branch to a fork of `microsoft/winget-pkgs` under the
-token's account, and refuses outright when GitHub will not fast-forward that
-fork. Upstream takes hundreds of commits a day and ours is touched once per
-release, so the fork falls thousands of commits behind between releases — 10,650
-when release 7 measured it. Releases 6 and 7 both died at this one job, with
-every other channel already published.
-
-The `winget` job now runs `gh repo sync` against the fork immediately before
-submitting. It is unconditional and needs no judgement, because the fork carries
-nothing of ours: each submission is a branch that lives only until its PR merges
-upstream, so the default branch is always 0 ahead. The step logs the drift
-before and after, and cannot fail the release — if the sync really did not work,
-`wingetcreate` fails with the message it always did.
-
-The sync needs the token's **`workflow` scope**. Upstream's commits include
-changes to its own workflow files, and GitHub refuses to sync those into a fork
-without that scope ("Upstream commits contain workflow changes, which require the
-`workflow` scope"). Release 11 hit exactly this: the sync reported the refusal,
-the fork stayed 4,083 commits behind, and `wingetcreate` failed as described
-above. A one-off repair is `gh repo sync <owner>/winget-pkgs --source
-microsoft/winget-pkgs --branch master` from a login that has the scope, then
-re-running only the failed job; the permanent fix is the scope on `WINGET_TOKEN`.
+A tool the release downloads is pinned to a versioned asset with a known SHA-256,
+never fetched from a mutable "latest" redirect — the same rule as
+`build_mbedtls.sh`, which refuses to fetch without one.
 
 ## Secrets and variables
 
@@ -351,7 +322,6 @@ re-running only the failed job; the permanent fix is the scope on `WINGET_TOKEN`
 |---|---|---|
 | `DIST_S3_ACCESS_KEY` / `DIST_S3_SECRET_KEY` | secret | apt + dnf publish |
 | `REPO_SIGNING_KEY` | secret | signing the indexes and packages |
-| `WINGET_TOKEN` | secret | the WinGet submission PR; a classic token with the `public_repo` **and `workflow`** scopes |
 | `RELEASE_SSH_KEY` | secret, `release` environment | `promote.yml`'s fast-forward of `main`; the private half of the repository's write deploy key, the ruleset's one bypass actor |
 | `TRUSTED_SIGNING_ACCOUNT` / `_ENDPOINT` / `_PROFILE` | secret | Authenticode; **optional** |
 | `AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | secret | Authenticode signing auth; **optional** |
@@ -365,7 +335,7 @@ to `buildah login` and `skopeo --creds`.
 `dry_run: true` builds and verifies everything and publishes nothing. It skips
 the version reservation, the per-architecture image push and `image-manifest`,
 Authenticode signing, `publish` (apt, dnf, the GitHub release and `:latest`),
-`winget`, `smoke`, `unreserve` and `close-issues`. Note what that means for
+`smoke`, `unreserve` and `close-issues`. Note what that means for
 testing — a dry run **cannot** exercise any of those, because they are the parts
 it skips. The first real release is the first test of them.
 

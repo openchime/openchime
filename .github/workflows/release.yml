@@ -2,7 +2,7 @@
 #
 # Until this existed the project shipped nothing: CI built the daemon on every
 # push and threw it away, the Dockerfile was never built by CI, and the image the
-# control plane provisions onto customer boxes was produced by hand. Four
+# control plane provisions onto customer boxes was produced by hand. Five
 # channels come out of one run, all carrying the same release number:
 #
 #   apt      Debian/Ubuntu, GPG-signed repository in object storage
@@ -120,7 +120,6 @@ jobs:
       DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
       DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
       REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
-      WINGET_TOKEN:       ${{ secrets.WINGET_TOKEN }}
       TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
       TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
       TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
@@ -133,7 +132,7 @@ jobs:
           set -u
           missing=""
           for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT \
-                   DIST_BUCKET REPO_SIGNING_KEY WINGET_TOKEN; do
+                   DIST_BUCKET REPO_SIGNING_KEY; do
             eval "val=\${$v:-}"
             [ -n "$val" ] || missing="$missing $v"
           done
@@ -1039,7 +1038,7 @@ jobs:
           # own tag is filtered out, a FIRST release leaves grep with no match, so it
           # exits 1; pipefail propagates that and set -e kills the assignment. The
           # step died in under a second with no output at all -- the same shape as
-          # the dead error path in winget/render.sh, reintroduced here.
+          # a dead error path in an earlier packaging script, reintroduced here.
           prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
           # `had_prefix` is what separates the two ways to arrive at an empty pool,
           # and only one of them is a fault. A prefix that EXISTS and yields no
@@ -1126,7 +1125,7 @@ jobs:
           # own tag is filtered out, a FIRST release leaves grep with no match, so it
           # exits 1; pipefail propagates that and set -e kills the assignment. The
           # step died in under a second with no output at all -- the same shape as
-          # the dead error path in winget/render.sh, reintroduced here.
+          # a dead error path in an earlier packaging script, reintroduced here.
           prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
           # `had_prefix` separates the two ways to reach an empty pool. A prefix
           # that EXISTS and yields no .rpm means the copy above did not complete,
@@ -1255,160 +1254,12 @@ jobs:
             echo "| windows | installer attached to \`release-${VERSION}\`; \`.msix\` in the \`windows-x64\` artifact |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # WinGet. This is NOT the shape of the apt and dnf publishing above, despite
-  # sitting in the same position in the pipeline: there is no repository to
-  # host, no index to generate, and nothing to GPG-sign. Microsoft hosts the
-  # index and the GitHub release already serves the installer, so the entire
-  # channel is three YAML files submitted as a pull request.
-  #
-  # It runs AFTER publish rather than beside it, because the manifest points at
-  # a release asset URL. Submitting first would hand winget-pkgs' automated
-  # validation a 404.
-  #
-  # On Windows only because wingetcreate is a Windows executable. Nothing else
-  # in this job needs it -- render.sh runs under Git Bash exactly as it does on
-  # a developer's machine.
-  winget:
-    name: submit to winget
-    needs: [version, publish]
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-    runs-on: windows-latest
-    timeout-minutes: 15
-    env:
-      VERSION: ${{ needs.version.outputs.number }}
-      # A classic PAT with public_repo. The default GITHUB_TOKEN cannot be used:
-      # submission forks microsoft/winget-pkgs and opens a PR there, which is
-      # outside this repository's scope entirely.
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: windows-x64
-          path: dist/windows-x64
-
-      # Checked before any work: the release is already published at this point,
-      # so a missing token is a real failure to surface, not something to skip
-      # past quietly and leave the package silently a version behind.
-      - name: Check the submission token
-        shell: bash
-        run: |
-          [ -n "$WINGET_TOKEN" ] || {
-            echo "::error::WINGET_TOKEN is not set; release ${VERSION} is published but not submitted to WinGet"
-            exit 1
-          }
-
-      # The URL is derived from the file actually attached to the release rather
-      # than reconstructed from the version, so a change to the installer's
-      # OutputBaseFilename cannot leave the manifest pointing at a name that was
-      # never uploaded.
-      - name: Render the manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          installer=$(ls dist/windows-x64/*-setup.exe)
-          url="https://github.com/${{ github.repository }}/releases/download/release-${VERSION}/$(basename "$installer")"
-          echo "installer: $installer"
-          echo "url:       $url"
-          packaging/windows/winget/render.sh "$VERSION" "$installer" "$url" dist/winget
-          cat dist/winget/*.installer.yaml
-
-      # Pinned to a versioned asset with a checksum, not https://aka.ms/wingetcreate/
-      # latest. That is a mutable redirect, and whatever it served on the day ran
-      # nine lines later with WINGET_TOKEN in the environment. This repo already
-      # refuses to fetch mbedTLS without a known SHA-256 and explains why; the same
-      # rule applies to an executable handed a submission credential.
-      #
-      # Bump WINGETCREATE_VERSION and WINGETCREATE_SHA256 together. The hash is
-      # Microsoft's own, published beside the asset as wingetcreate.exe.txt, and
-      # confirmed by downloading and hashing the binary independently.
-      - name: Install wingetcreate
-        shell: pwsh
-        env:
-          WINGETCREATE_VERSION: v1.12.13.0
-          WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
-        run: |
-          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
-          Invoke-WebRequest $url -OutFile wingetcreate.exe
-          $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
-          if ($got -ne $env:WINGETCREATE_SHA256) {
-            Remove-Item wingetcreate.exe -Force
-            throw "wingetcreate.exe checksum mismatch: got $got, expected $env:WINGETCREATE_SHA256"
-          }
-          Write-Output "wingetcreate $env:WINGETCREATE_VERSION verified"
-
-      # Sync the fork before submitting, every time.
-      #
-      # wingetcreate pushes a branch to a fork of microsoft/winget-pkgs under the
-      # token's account, and refuses when GitHub will not fast-forward that fork:
-      # "The forked repository could not be synced with the upstream commits."
-      # Releases 6 and 7 both died here, at the last job, with everything else
-      # already published. Upstream takes hundreds of commits a day and ours is
-      # touched once per release, so the fork is behind by thousands of commits
-      # by the time anyone looks -- 10,650 when release 7 was measured.
-      #
-      # Unconditional, and safe to be: the fork carries NOTHING of ours. Every
-      # submission is a branch that lives only until its PR merges upstream, so
-      # the fork's default branch was 0 ahead as well as 10,650 behind. There is
-      # no state to preserve, which is why this is a sync and not a merge, and
-      # why it needs no judgement about what to keep.
-      #
-      # `|| true`, deliberately: a fork that is already current, or an API blip,
-      # must not fail a release that has already published everything else. If
-      # the sync genuinely did not work, the submit below fails with the message
-      # it always did, which is a better error than anything this step could
-      # invent.
-      - name: Sync the submission fork with upstream
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
-        run: |
-          set -uo pipefail
-          owner=$(gh api user --jq .login)
-          echo "fork owner: $owner"
-          gh api "repos/microsoft/winget-pkgs/compare/microsoft:master...$owner:master" \
-            --jq '"before: \(.status), ahead \(.ahead_by), behind \(.behind_by)"' || true
-          gh repo sync "$owner/winget-pkgs" --source microsoft/winget-pkgs --branch master || true
-          gh api "repos/microsoft/winget-pkgs/compare/microsoft:master...$owner:master" \
-            --jq '"after:  \(.status), ahead \(.ahead_by), behind \(.behind_by)"' || true
-
-      # Forks winget-pkgs under the token's account, commits the three files to
-      # manifests/o/OpenChime/OpenChime/<version>/, and opens the PR. Merging is
-      # gated on Microsoft's automated validation plus moderation, so the
-      # package goes live some time after this job is green -- minutes to days.
-      - name: Submit the pull request
-        shell: pwsh
-        run: |
-          .\wingetcreate.exe submit --token $env:WINGET_TOKEN dist\winget
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed" }
-
-      - name: Summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "### WinGet"
-            echo
-            echo "Submitted \`OpenChime.OpenChime\` version \`${VERSION}\` to microsoft/winget-pkgs."
-            echo "It becomes installable once that PR passes validation and is merged."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # Hands the reserved number back when the release did not happen.
-  #
-  # Safe precisely because publish did not succeed: no index, no GitHub release and
-  # no :latest names this number, so nothing downstream can be pointing at it. The
-  # `|| true` is deliberate -- the tag may never have been pushed (a dry run, or a
-  # failure before the reserve step), and failing here would only obscure the real
-  # error that is already red above.
-  #
-  # D-6: openchime has zero webhooks and nothing else consumes its tags, so a tag
-  # appearing and disappearing on a failed run has no external observer.
   # VERIFICATION IS TERMINAL, and that is the whole point of this job.
   #
   # These steps used to sit inside `publish`, between writing the repositories
   # and finishing the release. Being a postcondition in the middle of an
   # irreversible sequence made a failure here truncate everything after it: the
-  # GitHub release, the tarballs, :latest and the winget submission were all
+  # GitHub release, the tarballs and :latest were all
   # skipped, while apt and dnf were already live. That is the worst reachable
   # state -- packages published with nothing naming them -- and it cost a manual
   # repair twice (release 2 in ea7201c, release 3).
@@ -1419,10 +1270,10 @@ jobs:
   # repair by hand.
   smoke:
     name: smoke the published repository
-    needs: [publish, winget]
-    # always(), so that winget being skipped -- it has conditions of its own --
-    # does not skip the smoke with it. Gated on publish having SUCCEEDED because
-    # there is nothing to smoke if nothing was published.
+    needs: [publish]
+    # Gated on publish having SUCCEEDED because there is nothing to smoke if
+    # nothing was published. always() so a skipped or failed sibling job cannot
+    # skip the verification with it.
     if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && needs.publish.result == 'success' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
