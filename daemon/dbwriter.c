@@ -5931,7 +5931,11 @@ static oc_dbres *process_fire_scheduled(sqlite3 *db, const oc_job *j) {
 
     oc_job sj;
     memset(&sj, 0, sizeof sj);
-    sj.type = OC_JOB_SEND;
+    /* A reply is a different send: process_send does not read parent_id, so a
+     * scheduled thread reply went out as a channel message. It takes the reply
+     * path, which also fans it out as a THREAD_REPLY rather than to the main
+     * scroll (REQ-060). */
+    sj.type = root ? OC_JOB_SEND_REPLY : OC_JOB_SEND;
     sj.conn_id = 0;                    /* nobody is waiting for an ack */
     sj.user_id = uid;
     sj.channel_id = cid;
@@ -5944,14 +5948,21 @@ static oc_dbres *process_fire_scheduled(sqlite3 *db, const oc_job *j) {
      * posting — which is exactly what idempotency is for. */
     memcpy(sj.idem, "sched", 5);
     memcpy(sj.idem + 5, &id, sizeof id);
-    oc_dbres *sent = process_send(db, &sj);
-    int ok = sent && sent->type == OC_RES_SEND_OK;
+    oc_dbres *sent = root ? process_send_reply(db, &sj) : process_send(db, &sj);
+    int ok = sent && (sent->type == OC_RES_SEND_OK || sent->type == OC_RES_REPLY_OK);
+    /* The one failure a reply adds: the message it answers is gone. Named, like
+     * the two above, because a promise not kept is owed a reason. */
+    const char *why = (sent && sent->type == OC_RES_REPLY_ERR && sent->err_code == OC_ERR_UNKNOWN_MESSAGE)
+                    ? "the message it replies to was deleted"
+                    : "the server could not deliver it";
     sqlite3_prepare_v2(db, ok
         ? "UPDATE scheduled_messages SET state='sent', message_id=? WHERE id=?;"
         : "UPDATE scheduled_messages SET state='failed', message_id=?, "
-          "  fail_reason='the server could not deliver it' WHERE id=?;", -1, &st, NULL);
+          "  fail_reason=? WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)(ok ? sent->message_id : 0));
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+    if (ok) sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+    else  { sqlite3_bind_text(st, 2, why, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)id); }
     sqlite3_step(st); sqlite3_finalize(st);
     free(body);
     if (sent) return sent;             /* handed back UNCHANGED — see the note above */

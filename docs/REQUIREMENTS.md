@@ -1615,7 +1615,9 @@ None are yet backed by an architecture decision.*
   it is your own text and must not make a channel look like it wants attention.
   A "Drafts" hub is out of scope here and pairs with scheduled send (REQ-224).
 - **REQ-224.** A user has been able to **schedule a message** for future delivery
-  to a channel or DM; the message has been held until its send time, then
+  to a channel or DM, or as a **reply in a thread** (it fires into that thread, not
+  the channel, and fails with a reason if the message it answers was deleted); the
+  message has been held until its send time, then
   delivered through the ordinary path (REQ-090), and cancelable before it fired.
   **Settled by ARCH-102:** held in its own `scheduled_messages`
   table rather than in `messages` — it is not a message yet, and a "pending" flag

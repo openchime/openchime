@@ -2712,6 +2712,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
     case OC_RES_REPLY_OK: {
         /* Ack the sender; then, unless it was an idempotent replay, fan the reply
          * out as a THREAD_REPLY (never to the main scroll, REQ-060). */
+        /* A reply nobody asked for is a scheduled one: drain the backlog, as
+         * SEND_OK does. */
+        if (r->conn_id == 0) g_sched_more = 1;
         conn *sender = find_by_id(conns, r->conn_id);
         if (sender) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
