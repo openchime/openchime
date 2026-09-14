@@ -170,6 +170,8 @@ static float g_text_scale = 1.0f;
 static float g_shell_scale = 1.0f;
 #define UISW(x) ((x) * g_shell_scale)
 static rectf find_box(void);   /* fwd — the painter and layout_find share it */
+static rectf unread_chip_box(void);   /* fwd — the Unreads toggle beside it */
+static rectf g_sb_unread_chip;        /* where it was drawn this frame; empty when not */
 static void shell_scale_update(float client_w_dip, float client_h_dip) {
     float s = g_text_scale;
     /* Width: the rail and sidebar together may not take more than half the
@@ -3786,12 +3788,17 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
     stroke_round(rt, fb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     draw_lucide(rt, OC_ICON_SEARCH, rf(fb.left + UIS(8), fb.top + UIS(7),
                                        fb.left + UIS(24), fb.top + UIS(23)), OC_COL_MUTED);
+    /* Unreads only: one chip, lit while on. Beside the find box because both
+     * answer the same question — which conversations should this list show. */
+    g_sb_unread_chip = unread_chip_box();
+    draw_chip_r(rt, g_sb_unread_chip, "Unreads", g_sb.unreads_only);
 
     /* Rows come from the core (oc_model_sidebar): grouping, filtering, sorting
      * and collapse are decided there so both frontends agree. The DMs rail view
      * shows only that section; Home shows both. */
     oc_sidebar_opts o = g_sb;
     snprintf(o.find, sizeof o.find, "%s", g_find_filter);
+    o.keep_id = g_sel;   /* unreads-only never hides the conversation you are in */
     if (g_view == VIEW_DMS) {
         o.collapsed[OC_SB_CHANNELS] = 1;
         /* Starred holds channels as well as DMs, and the DMs view is only
@@ -3937,7 +3944,8 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 (ri + 1 >= nrows || rows[ri + 1].is_header)) {
                 float ey = y; y += ROW_H;         /* the placeholder occupies a row */
                 if (!(ey + ROW_H < top || ey > bot))
-                    draw_text(rt, g_sb.find[0] ? "No matches" : "Empty", g_meta_i,
+                    draw_text(rt, g_sb.find[0] ? "No matches"
+                                  : g_sb.unreads_only ? "All caught up" : "Empty", g_meta_i,
                               rf(sx0 + 34, ey, sx1 - 12, ey + ROW_H), OC_COL_FAINT);
             }
         } else {
@@ -7806,6 +7814,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Invite people as admin",  41 },
     { "Storage usage",           60 },
     { "Audit log",               61 },
+    { "Toggle unreads only in the sidebar", 85 },
     { "Reconnect now",           2  },
     { "Add a workspace",         80 },
     { "Sign out",                3  },
@@ -12855,6 +12864,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     g_n_msgrows = 0;
     g_n_shelf = 0;
     g_n_rows = 0;
+    g_sb_unread_chip = rf(0, 0, 0, 0);
     /* The caller cleared to OC_COL_BASE via gfx_begin; grayscale text AA and
      * the DIP scale live inside the gfx/sdltext layers (ARCH-106/107). */
     /* Sign-in owns the whole window only when there is nothing behind it. With a
@@ -14824,6 +14834,10 @@ static void a11y_publish_scene(const oc_model *m) {
                  ATOK(AT_VIEW, (uint64_t)(g_navrows[i].act + 1000)));
     }
 
+    if (g_sb_unread_chip.right > g_sb_unread_chip.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_TAB, "sidebar.unreads",
+                 g_sb.unreads_only ? "Unreads only: on" : "Unreads only: off",
+                 g_sb_unread_chip, ATOK(AT_MENU, 85));
     /* The Home sidebar's destinations shelf. */
     for (int i = 0; i < g_n_shelf && n < OC_ACC_MAX; i++) {
         const char *a = view_aid(g_shelf_rows[i].view);
@@ -15391,8 +15405,15 @@ static void layout_composer(HWND hwnd) {
 /* Where the sidebar's filter box is, in DIP. The painter draws its container
  * here and layout_find places the EDIT inside it — one source, so they cannot
  * disagree at a scale nobody tested. */
+/* The find box gives up its right end to the Unreads toggle, and both derive
+ * from here so the chip and the native EDIT inside the box cannot overlap. */
+#define UNREAD_CHIP_W UIS(70)
 static rectf find_box(void) {
     return rf(RAIL_W + UIS(10), HEADER_H + UIS(6),
+              RAIL_W + SIDEBAR_W - UIS(10) - UNREAD_CHIP_W - UIS(6), HEADER_H + UIS(36));
+}
+static rectf unread_chip_box(void) {
+    return rf(RAIL_W + SIDEBAR_W - UIS(10) - UNREAD_CHIP_W, HEADER_H + UIS(6),
               RAIL_W + SIDEBAR_W - UIS(10), HEADER_H + UIS(36));
 }
 
@@ -17617,6 +17638,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     }
         }
     }
+    if (in_rect(g_sb_unread_chip, x, y)) { menu_dispatch(hwnd, 85); return 1; }
     /* Sidebar channel rows. */
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_rows; i++)
@@ -19311,6 +19333,12 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     /* Adding a workspace must not sign you out of the one you are in — which is
      * exactly what reset_session() here used to do. Park the current one and
      * sign in alongside it. */
+    case 85:     /* the sidebar's Unreads-only toggle, from its chip or the palette */
+        g_sb.unreads_only = !g_sb.unreads_only;
+        g_sb_scroll = 0;              /* the list just changed length under the scroll */
+        sidebar_opts_save();
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
     case 84: {   /* REQ-072: upload an image and register it as :name: */
         if (!g_client) break;
         oc_field f[1] = { { FF_TEXT, "Shortcode",
@@ -20290,6 +20318,8 @@ static void test_dump(const char *path) {
         }
     }
     fprintf(f, "sbsel=%d\n", g_n_sbsel);
+    fprintf(f, "sbunreads on=%d chip=%.0f,%.0f,%.0f,%.0f\n", g_sb.unreads_only,
+            g_sb_unread_chip.left, g_sb_unread_chip.top, g_sb_unread_chip.right, g_sb_unread_chip.bottom);
     fprintf(f, "shelf n=%d", g_n_shelf);
     for (int i = 0; i < g_n_shelf; i++)
         fprintf(f, " %d:%.0f-%.0f", g_shelf_rows[i].view, g_shelf_rows[i].top, g_shelf_rows[i].bot);

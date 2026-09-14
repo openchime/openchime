@@ -310,8 +310,10 @@ model; translate input to intents }, stop.
   second menu a click away, and an icon does not open a menu something beside it
   already opens. Right of the rail sits the channel column (header with the
   workspace name, which opens the workspace menu, and a compose button, which
-  starts a new message; a "Find a conversation" filter; then the channel list), the transcript, the self-drawn composer, and an optional
-  members pane. **Home, DMs and Activity** render that chat shell
+  starts a new message; a "Find a conversation" filter with an **Unreads** chip
+  beside it, which narrows every section to what has something unread and always
+  keeps the open conversation; then the channel list), the transcript, the
+  self-drawn composer, and an optional members pane. **Home, DMs and Activity** render that chat shell
   (`shell_visible()`), and Home and DMs are not the same: the second column holds
   channels in one and conversations in the other (`sidebar_kind()`), and DMs shows
   an index until a conversation is picked. **Activity, Files, Later, Drafts,

@@ -1786,6 +1786,13 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
         size_t at2 = strlen(out);
         if (at2 + 8 < cap) snprintf(out + at2, cap - at2, ";sc:%u", o->collapsed[OC_SB_STARRED]);
     }
+    /* Before the custom-section runs, whose names are free text: a ";ro:" inside a
+     * name must not be mistaken for this key, so the parser reads it from the part
+     * of the string ahead of the first ";u:". */
+    if (o->unreads_only) {
+        size_t at3 = strlen(out);
+        if (at3 + 8 < cap) snprintf(out + at3, cap - at3, ";ro:1");
+    }
     /* Custom sections, one ";u:" run each: name|sort,filter,collapsed|ids.
      * Appended for the same reason as everything above — an older client parses the
      * prefix it knows and ignores this. */
@@ -1821,6 +1828,10 @@ void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
     }
     const char *cp = strstr(s, ";sc:");
     if (cp) o->collapsed[OC_SB_STARRED] = (uint8_t)(atoi(cp + 4) ? 1 : 0);
+    {   /* Unreads only, looked for only AHEAD of the custom sections (see encode). */
+        const char *ro = strstr(s, ";ro:"), *u0 = strstr(s, ";u:");
+        o->unreads_only = (uint8_t)(ro && (!u0 || ro < u0) && atoi(ro + 4) ? 1 : 0);
+    }
     /* Custom sections. Parsed positionally within each ";u:" run; a malformed run is
      * skipped rather than aborting the whole setting, so one bad section cannot cost
      * the user their sort and filter choices as well. */
@@ -2132,6 +2143,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
                 if (!strstr(low, o->find)) continue;
             }
             if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_UNREAD && c->unread <= 0) continue;
+            if (o->unreads_only && c->unread <= 0 && c->channel_id != o->keep_id) continue;
             if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_ACTIVE) {
                 /* Channels: joined ones. DMs: a peer who is not offline.
                  *
