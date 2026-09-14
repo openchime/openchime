@@ -9927,10 +9927,16 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
     float want_h = s->want_h > 0 ? UIS(s->want_h)
                                  : UIS((s->size == MODAL_LG) ? 620.0f : 300.0f);
     float cw = W - 96, ch = H - 96;
+    /* "Too small to inset" is a question about the WINDOW, so it is asked of the
+     * space the window offers, before the card is clamped to what it wants. Asked
+     * after, a short card counted as a small window: a one-field form wants about
+     * 206 DIPs, which is under 220, so at 100% scaling every short dialog was
+     * stretched to the full height of the window. */
+    int tiny_w = cw < 300, tiny_h = ch < 220;
     if (cw > want_w) cw = want_w;
     if (ch > want_h) ch = want_h;
-    if (cw < 300) cw = W;                    /* a window too small to inset */
-    if (ch < 220) ch = H;
+    if (tiny_w) cw = W;
+    if (tiny_h) ch = H;
     rectf card = rf((W - cw) / 2, (H - ch) / 2, (W + cw) / 2, (H + ch) / 2);
     g_modal_card = card;
     fill_round(rt, card, OC_R_OVERLAY, OC_COL_BASE);
@@ -10751,7 +10757,16 @@ static const oc_modal_spec *modal_current(void) {
             float bw = UIS(g_form_side.on ? 720.0f : 460.0f) - 2 * MODAL_PAD;
             if (g_form_side.on) bw -= FORM_SIDE_W + FORM_SIDE_GAP;
             float rows = 4;
-            for (int i = 0; i < g_form_n; i++) rows += form_rowh(&g_form_f[i], bw);
+            int has_select = 0;
+            for (int i = 0; i < g_form_n; i++) {
+                rows += form_rowh(&g_form_f[i], bw);
+                if (g_form_f[i].kind == FF_SELECT) has_select = 1;
+            }
+            /* A select's list opens INSIDE the card and shows as many rows as fit,
+             * so a card measured only to its closed fields gave a one-field time
+             * picker a two-row list. Reserve the list's full height below the
+             * fields whenever there is a select to open. */
+            if (has_select) rows += FORM_SEL_VISIBLE * UIS(26.0f) + UIS(12.0f);
             if (g_form_side.on && rows < form_side_h()) rows = form_side_h();
             /* want_h is in unscaled DIPs (modal_frame applies UIS); the sums
              * above are already scaled, so divide the scale back out. */
@@ -19137,17 +19152,42 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 63: oc_client_set_snooze(g_client, minutes_until_local(9, 0, 1)); break;
     case 64: {   /* Custom: an end TIME, because that is how the thought arrives
                   * ("until 5") — the duration is arithmetic, not the decision. */
-        oc_field f[1] = { { FF_TEXT, "Pause until (HH:MM)",
-                            "Today, or tomorrow if that time has passed.", "17:00" } };
-        if (!form_dialog(hwnd, "Pause notifications", f, 1)) break;
-        int hh = -1, mm = -1;
-        if (sscanf(f[0].value, "%d:%d", &hh, &mm) != 2 ||
-            hh < 0 || hh > 23 || mm < 0 || mm > 59) {
-            toast_push("Enter a time as HH:MM.", 1); break;
+        /* Picked, not typed: the half-hour slots every other time in the app
+         * offers (the quiet-hours schedule, send later), in the user's own 12- or
+         * 24-hour format. A typed HH:MM asked people to know the format, and
+         * rejected "5pm" with a toast after the fact. */
+        static char opts[48 * 12];
+        opts[0] = '\0';
+        for (int k = 0; k < 48; k++) {
+            char lbl[16]; sched_time_label((uint16_t)(k * 30), lbl, sizeof lbl);
+            size_t at = strlen(opts);
+            snprintf(opts + at, sizeof opts - at, "%s%s", k ? "|" : "", lbl);
         }
+        /* Open on the next slot after now, which is the likeliest answer. */
+        int first = 0;
+        {
+            time_t now = time(NULL); struct tm tv;
+            if (oc_localtime_r(&now, &tv)) first = ((tv.tm_hour * 60 + tv.tm_min) / 30 + 1) % 48;
+        }
+        oc_field f[1] = { { FF_SELECT, "Pause until", opts, "" } };
+        snprintf(f[0].value, sizeof f[0].value, "%d", first);
+        if (!form_dialog(hwnd, "Pause notifications", f, 1)) break;
+        int slot = atoi(f[0].value);
+        if (slot < 0 || slot > 47) break;
+        int hh = slot / 2, mm = slot % 2 ? 30 : 0;
+        /* Today, or tomorrow if that time has passed — said back, since the list
+         * itself does not say which day it means. */
         uint32_t mins = minutes_until_local(hh, mm, 0);
-        if (!mins) { toast_push("That time is now.", 1); break; }
+        if (!mins) break;
         oc_client_set_snooze(g_client, mins);
+        {
+            char lbl[16], msg[96];
+            sched_time_label((uint16_t)(slot * 30), lbl, sizeof lbl);
+            time_t now = time(NULL); struct tm tv;
+            int tomorrow = oc_localtime_r(&now, &tv) && (hh * 60 + mm) <= (tv.tm_hour * 60 + tv.tm_min);
+            snprintf(msg, sizeof msg, "Notifications paused until %s%s.", lbl, tomorrow ? " tomorrow" : "");
+            toast_push(msg, 0);
+        }
         break;
     }
     case 2:  oc_client_reconnect(g_client); break;

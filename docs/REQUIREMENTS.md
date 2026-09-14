@@ -781,7 +781,9 @@ the requirement says so explicitly rather than implying one.
 - **REQ-278.** A user has been able to **pause notifications until a chosen
   instant** — "do not disturb until 17:00" — as a **one-shot** act distinct from
   any recurring window (REQ-131/136). The client has offered **durations**
-  (30 minutes, 1 hour, 2 hours, until tomorrow) and a **custom** end time; the
+  (30 minutes, 1 hour, 2 hours, until tomorrow) and a **custom** end time, picked
+  from the day's half-hour times rather than typed (today, or tomorrow if the time
+  has passed, and said back when it is set); the
   pause has expired on its own; and the user has been able to **resume
   immediately** without waiting for it. While paused, the **fact** that the user
   is not to be disturbed has been visible to other people beside their presence
