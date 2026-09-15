@@ -28,6 +28,19 @@
 #include <string.h>
 #include <time.h>
 
+/* Transfers waiting their turn (REQ-140/162). A connection runs one transfer at a
+ * time — the daemon's rule — so the rest wait here instead of being refused as
+ * busy. It belongs to the net thread and outlives a connection: a job running
+ * when the link drops goes back to the front and starts over on the next one. */
+typedef struct {
+    oc_cmd  **q;
+    size_t    n, cap;
+    oc_cmd   *active;          /* the job running now, or NULL */
+    uint8_t   vstage;          /* POST_VIDEO: 0 poster, 1 video, 2 ATTACH_MEDIA_SET sent */
+    uint64_t  vposter, vvideo; /* POST_VIDEO: the two finished uploads */
+    uint64_t  progress_ms;     /* when the last progress tick went out */
+} oc_xqueue;
+
 struct oc_net {
     oc_thread_t   thread;
     volatile int  stop;
@@ -41,6 +54,7 @@ struct oc_net {
     char          client_type[32]; /* synced-settings bucket id (default "tui") */
     oc_queue     *to_ui;
     oc_queue     *from_ui;
+    oc_xqueue     xq;
 };
 
 /* ---- the offline outbox, in memory (REQ-102, ARCH-88) ----------------------
@@ -234,7 +248,7 @@ static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
  * state lives on the net thread and is driven by the serve loop (commands) and
  * dispatch (server frames). */
 typedef struct {
-    int      mode;        /* 0 idle, 1 upload, 2 download */
+    int      mode;        /* 0 idle, 1 upload, 2 download, 3 waiting for ATTACH_MEDIA_OK */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
     /* An in-memory download: `fp` is NULL and chunks accumulate here
@@ -243,6 +257,8 @@ typedef struct {
      * the cache that decision removed. */
     uint8_t *buf;
     size_t   buf_len, buf_cap;
+    size_t   buf_max;     /* in-memory download ceiling: OC_INLINE_MAX, or a video's */
+    const uint8_t *src;   /* an in-memory upload (a recording): read here, not from fp */
     uint64_t total;       /* declared/expected byte size */
     uint64_t done;        /* upload: bytes handed to chunks; download: bytes written */
     uint32_t chunk;       /* max data bytes per chunk (from UPLOAD_READY) */
@@ -300,12 +316,28 @@ typedef struct {
     const char  *workspace;
     const char  *client_type; /* which settings bucket this frontend syncs */
     uint16_t     version;     /* negotiated at WELCOME; every frame must carry it */
+    oc_xqueue   *xq;
 } disp_ctx;
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
 static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
     oc_ev *e = oc_ev_new(OC_EV_XFER);
-    if (e) { e->op = phase; e->body = strdup(msg); oc_queue_push(ctx->to_ui, e); }
+    if (!e) return;
+    e->op = phase;
+    e->body = msg ? strdup(msg) : NULL;
+    if (ctx->xq && ctx->xq->active) e->xfer_tag = ctx->xq->active->xfer_tag;
+    e->xfer_done = ctx->xfer->done;
+    e->xfer_total = ctx->xfer->total;
+    oc_queue_push(ctx->to_ui, e);
+}
+
+/* A bare progress tick, at most ten a second: enough for a bar or a ring to move
+ * smoothly, few enough that a fast link does not flood the UI queue. */
+static void xfer_progress(disp_ctx *ctx) {
+    uint64_t now = oc_model_now_ms();
+    if (ctx->xq && now - ctx->xq->progress_ms < 100 && ctx->xfer->done < ctx->xfer->total) return;
+    if (ctx->xq) ctx->xq->progress_ms = now;
+    xfer_notice(ctx, 0, NULL);
 }
 
 /* Tear down the active transfer (closing the file), leaving it idle. */
@@ -370,6 +402,11 @@ static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t mess
         e->parent_id  = att[i].id;        /* attachment id (used to download) */
         e->server_time = att[i].size;
         e->status = att[i].reclaimed;   /* bytes gone; row is a tombstone */
+        e->media_kind  = att[i].media_kind;
+        e->duration_ms = att[i].duration_ms;
+        e->media_w     = att[i].width;
+        e->media_h     = att[i].height;
+        e->poster_id   = att[i].poster_id;
         size_t fn = att[i].filename.len < sizeof e->author_name - 1 ? att[i].filename.len : 0;
         /* filename in body (heap, may be long), mime in author_name (bounded). */
         e->body = malloc(att[i].filename.len + 1);
@@ -390,7 +427,9 @@ static void upload_pump(disp_ctx *ctx) {
     uint8_t data[OC_ATTACH_CHUNK_SIZE];
     while (x->done < x->total && (x->next_seq - x->acked_seq) < x->win_chunks) {
         size_t want = (x->total - x->done) < x->chunk ? (size_t)(x->total - x->done) : x->chunk;
-        size_t got = fread(data, 1, want, x->fp);
+        size_t got = want;
+        if (x->src) memcpy(data, x->src + x->done, want);
+        else got = fread(data, 1, want, x->fp);
         if (got != want) { xfer_notice(ctx, 2, "upload: read error"); xfer_reset(x); return; }
         oc_upload_chunk uc = { x->id, x->next_seq, { data, got } };
         oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
@@ -400,6 +439,7 @@ static void upload_pump(disp_ctx *ctx) {
         }
         x->next_seq++; x->done += got;
     }
+    if (x->done) xfer_progress(ctx);
     if (x->done == x->total && !x->ended) {
         oc_upload_end ue = { x->id };
         oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
@@ -407,6 +447,140 @@ static void upload_pump(disp_ctx *ctx) {
             (void)write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop);
         x->ended = 1;
     }
+}
+
+/* Declare an upload, from a file (`fp`) or from memory (`src`). On failure the
+ * transfer is left idle with an error notice. */
+static void begin_upload(disp_ctx *ctx, uint64_t channel, const char *name, const char *mime,
+                         const uint8_t *src, uint64_t total, uint8_t purpose) {
+    oc_xfer *x = ctx->xfer;
+    FILE *fp = x->fp;                      /* a file upload opened it already */
+    memset(x, 0, sizeof *x);
+    x->mode = 1; x->fp = fp; x->src = src; x->total = total;
+    x->chunk = OC_ATTACH_CHUNK_SIZE; x->win_chunks = 8;
+    x->channel = channel;
+    x->purpose = purpose;
+    snprintf(x->name, sizeof x->name, "%s", name);
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_upload_begin ub; memset(&ub, 0, sizeof ub);
+    ub.channel_id = channel;
+    gen_idem(ub.idem);
+    ub.filename = oc_slice_str(x->name);
+    ub.mime = oc_slice_str(mime);
+    ub.total_size = total;
+    if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
+        char msg[200]; snprintf(msg, sizeof msg, "uploading %s…", x->name);
+        xfer_notice(ctx, 0, msg);
+    } else {
+        xfer_notice(ctx, 2, "upload: begin failed");
+        xfer_reset(x);
+    }
+}
+
+static void begin_download(disp_ctx *ctx, uint64_t aid, FILE *fp, size_t buf_max, const char *label) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 2; x->fp = fp; x->id = aid; x->buf_max = buf_max;
+    if (label) snprintf(x->name, sizeof x->name, "%s", label);
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_download_begin db = { aid };
+    if (oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK &&
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) == 0) {
+        if (label) { char msg[200]; snprintf(msg, sizeof msg, "downloading to %s…", x->name); xfer_notice(ctx, 0, msg); }
+    } else {
+        if (label) xfer_notice(ctx, 2, "download: begin failed");
+        xfer_reset(x);
+    }
+}
+
+/* Start the active job. Whatever leaves the transfer idle has already finished,
+ * with its notice sent; xq_pump then retires it. */
+static void xq_start(disp_ctx *ctx) {
+    oc_cmd *c = ctx->xq->active;
+    oc_xfer *x = ctx->xfer;
+    if (c->type == OC_CMD_UPLOAD) {
+        FILE *fp = fopen(c->body, "rb");
+        if (!fp) { xfer_notice(ctx, 2, "upload: cannot open file"); return; }
+        if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); xfer_notice(ctx, 2, "upload: not a regular file"); return; }
+        long sz = ftell(fp);
+        if (sz < 0 || (unsigned long long)sz > OC_MAX_ATTACHMENT_SIZE) {
+            fclose(fp); xfer_notice(ctx, 2, "upload: file too large"); return;
+        }
+        rewind(fp);
+        const char *name = path_basename(c->body);
+        x->fp = fp;
+        begin_upload(ctx, c->channel_id, name, mime_for(name), NULL, (uint64_t)sz,
+                     (uint8_t)(c->op == 1 ? 1 : c->op == 2 ? 2 : 0));
+        if (x->mode && x->purpose == 2 && c->body2) snprintf(x->ename, sizeof x->ename, "%s", c->body2);
+    } else if (c->type == OC_CMD_FETCH) {
+        /* op 1: a video message, fetched whole into memory under the attachment
+         * ceiling rather than the thumbnail one (ARCH-88: nothing on disk). */
+        begin_download(ctx, c->message_id, NULL, c->op == 1 ? (size_t)OC_MAX_ATTACHMENT_SIZE : OC_INLINE_MAX, NULL);
+    } else if (c->type == OC_CMD_DOWNLOAD) {
+        FILE *fp = fopen(c->body, "wb");
+        if (!fp) { xfer_notice(ctx, 2, "download: cannot create file"); return; }
+        const char *slash = strrchr(c->body, '/');
+        begin_download(ctx, c->message_id, fp, 0, slash ? slash + 1 : c->body);
+    } else if (c->type == OC_CMD_POST_VIDEO) {
+        ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
+        char pname[128];
+        snprintf(pname, sizeof pname, "%s.jpg", c->body2 ? c->body2 : "video-message");
+        begin_upload(ctx, c->channel_id, pname, "image/jpeg", c->blob2, c->blob2_len, 3);
+    }
+}
+
+/* Retire a finished job and start the next. Called whenever the transfer may
+ * have gone idle: after the command queue drains and after server frames. */
+static void xq_pump(disp_ctx *ctx) {
+    oc_xqueue *q = ctx->xq;
+    while (ctx->xfer->mode == 0) {
+        if (q->active) { oc_cmd_free(q->active); q->active = NULL; }
+        if (q->n == 0) return;
+        q->active = q->q[0];
+        memmove(q->q, q->q + 1, (q->n - 1) * sizeof *q->q);
+        q->n--;
+        xq_start(ctx);
+    }
+}
+
+/* Queue a transfer command, taking ownership. A fetch already waiting or
+ * running for the same attachment is not queued twice: frontends ask again on
+ * every frame until the bytes arrive. */
+static void xq_add(oc_xqueue *q, oc_cmd *c) {
+    if (c->type == OC_CMD_FETCH) {
+        if (q->active && q->active->type == OC_CMD_FETCH && q->active->message_id == c->message_id &&
+            q->active->op >= c->op) { oc_cmd_free(c); return; }
+        for (size_t i = 0; i < q->n; i++)
+            if (q->q[i]->type == OC_CMD_FETCH && q->q[i]->message_id == c->message_id) {
+                if (c->op > q->q[i]->op) q->q[i]->op = c->op;
+                oc_cmd_free(c);
+                return;
+            }
+    }
+    if (q->n == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 16;
+        oc_cmd **nq = realloc(q->q, cap * sizeof *nq);
+        if (!nq) { oc_cmd_free(c); return; }
+        q->q = nq; q->cap = cap;
+    }
+    q->q[q->n++] = c;
+}
+
+/* Put the running job back at the front: its connection is gone, so it starts
+ * over on the next one. */
+static void xq_requeue_active(oc_xqueue *q) {
+    if (!q->active) return;
+    if (q->n == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 16;
+        oc_cmd **nq = realloc(q->q, cap * sizeof *nq);
+        if (!nq) { oc_cmd_free(q->active); q->active = NULL; return; }
+        q->q = nq; q->cap = cap;
+    }
+    memmove(q->q + 1, q->q, q->n * sizeof *q->q);
+    q->q[0] = q->active;
+    q->n++;
+    q->active = NULL;
 }
 
 /* Dispatch every buffered server frame into UI events. Returns 0 to keep the
@@ -640,6 +814,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->size        = fe.size;
                     e->server_time = fe.created_at;
                     e->reclaimed   = fe.reclaimed;
+                    e->media_kind  = fe.media_kind;
+                    e->duration_ms = fe.duration_ms;
                     size_t mn = fe.mime.len < sizeof e->emoji - 1 ? fe.mime.len : sizeof e->emoji - 1;
                     memcpy(e->emoji, fe.mime.ptr, mn);
                     e->emoji[mn] = '\0';
@@ -1158,6 +1334,37 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_upload_ok(&p, &ok) == OC_OK && ctx && ctx->xfer->mode == 1 &&
                 ok.attachment_id == ctx->xfer->id) {
                 oc_xfer *x = ctx->xfer;
+                if (x->purpose == 3) {
+                    /* A video message (REQ-162): poster, then video, then its media
+                     * facts. The job stays busy across the steps, so nothing else
+                     * starts between them. */
+                    oc_xqueue *q = ctx->xq;
+                    oc_cmd *job = q->active;
+                    if (q->vstage == 0) {
+                        q->vposter = x->id;
+                        xfer_reset(x);
+                        q->vstage = 1;
+                        char vname[128];
+                        snprintf(vname, sizeof vname, "%s.mp4", job->body2 ? job->body2 : "video-message");
+                        begin_upload(ctx, job->channel_id, vname, "video/mp4",
+                                     job->blob, job->blob_len, 3);
+                    } else {
+                        q->vvideo = x->id;
+                        xfer_reset(x);
+                        uint8_t mf[64]; oc_wbuf mw; oc_wbuf_init(&mw, mf, sizeof mf);
+                        oc_attach_media_set ms = { q->vvideo, OC_MEDIA_VIDEO_MESSAGE, job->duration_ms,
+                                                   job->media_w, job->media_h, q->vposter };
+                        if (oc_encode_attach_media_set(&mw, OC_PROTOCOL_VERSION, &ms) == OC_OK &&
+                            write_all(ctx->conn, ctx->fd, mf, mw.len, ctx->stop) == 0) {
+                            x->mode = 3;
+                            x->id = q->vvideo;
+                            q->vstage = 2;
+                        } else {
+                            xfer_notice(ctx, 2, "video message: could not send");
+                        }
+                    }
+                    continue;
+                }
                 if (x->purpose == 2) {
                     /* A custom emoji (REQ-072): claim the finished upload by name,
                      * and post nothing — the same shape as an avatar. */
@@ -1196,6 +1403,44 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 xfer_notice(ctx, 1, msg);
                 xfer_reset(x);
             }
+        } else if (hdr.msg_type == OC_MSG_ATTACH_MEDIA_OK) {
+            oc_attach_media_ok mo;
+            if (oc_decode_attach_media_ok(&p, &mo) == OC_OK && ctx && ctx->xfer->mode == 3 &&
+                ctx->xq->active && mo.attachment_id == ctx->xq->vvideo) {
+                oc_cmd *job = ctx->xq->active;
+                static uint8_t frame[OC_MAX_FRAME_SIZE];
+                oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+                oc_result er;
+                if (job->message_id) {
+                    oc_send_reply sr; memset(&sr, 0, sizeof sr);
+                    sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                    gen_idem(sr.idem);
+                    sr.body = oc_slice_str(job->body ? job->body : "");
+                    sr.n_attach = 1; sr.attach_ids[0] = mo.attachment_id;
+                    er = oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr);
+                } else {
+                    oc_send sd; memset(&sd, 0, sizeof sd);
+                    sd.channel_id = job->channel_id;
+                    gen_idem(sd.idem);
+                    sd.body = oc_slice_str(job->body ? job->body : "");
+                    sd.n_attach = 1; sd.attach_ids[0] = mo.attachment_id;
+                    er = oc_encode_send(&w, OC_PROTOCOL_VERSION, &sd);
+                }
+                if (er == OC_OK && write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop) == 0) {
+                    oc_ev *e = oc_ev_new(OC_EV_MEDIA_POSTED);
+                    if (e) {
+                        e->xfer_tag = job->xfer_tag;
+                        e->attach_id = mo.attachment_id;
+                        e->channel_id = job->channel_id;
+                        e->parent_id = job->message_id;
+                        oc_queue_push(ctx->to_ui, e);
+                    }
+                    xfer_notice(ctx, 1, "video message sent");
+                } else {
+                    xfer_notice(ctx, 2, "video message: could not send");
+                }
+                xfer_reset(ctx->xfer);
+            }
         } else if (hdr.msg_type == OC_MSG_DOWNLOAD_INFO) {
             oc_download_info di;
             if (oc_decode_download_info(&p, &di) == OC_OK && ctx && ctx->xfer->mode == 2 &&
@@ -1213,7 +1458,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         failed = fwrite(dc.data.ptr, 1, dc.data.len, x->fp) != dc.data.len;
                     } else {
                         /* Bounded: an image we are about to decode, not a file. */
-                        if (x->buf_len + dc.data.len > OC_INLINE_MAX) failed = 1;
+                        if (x->buf_len + dc.data.len > (x->buf_max ? x->buf_max : OC_INLINE_MAX)) failed = 1;
                         else {
                             if (x->buf_len + dc.data.len > x->buf_cap) {
                                 size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
@@ -1229,7 +1474,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     }
                 }
                 if (failed) { xfer_notice(ctx, 2, "download: write error"); xfer_reset(x); }
-                else { x->done += dc.data.len; x->next_seq++; }
+                else { x->done += dc.data.len; x->next_seq++; xfer_progress(ctx); }
             }
         } else if (hdr.msg_type == OC_MSG_DOWNLOAD_END) {
             oc_download_end de;
@@ -1427,7 +1672,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     err.code == OC_ERR_ATTACHMENT_TOO_LARGE ||
                     err.code == OC_ERR_ATTACHMENT_GONE      ||
                     err.code == OC_ERR_UNKNOWN_ATTACHMENT   ||
-                    err.code == OC_ERR_STORAGE_FULL;
+                    err.code == OC_ERR_STORAGE_FULL         ||
+                    /* A video message refused at ATTACH_MEDIA_SET (REQ-164). */
+                    (ctx && ctx->xfer->mode == 3 &&
+                     (err.code == OC_ERR_MEDIA_INVALID || err.code == OC_ERR_MEDIA_TOO_LARGE));
+                if (ctx && ctx->xfer->mode == 3 && about_transfer)
+                    xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
+                                        ? "video message: larger than this server accepts"
+                                        : "video message refused by the server");
                 if (ctx && ctx->xfer->mode != 0 && about_transfer) xfer_reset(ctx->xfer);
                 if (err.fatal) return -1;
             }
@@ -1669,7 +1921,7 @@ static int run_connection(oc_net *n, int reconnecting,
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
-                     cs ? cs->workspace : NULL, n->client_type, negotiated };
+                     cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
@@ -2151,75 +2403,30 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_read_cursor(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
-            if (c->type == OC_CMD_UPLOAD && c->body) {
-                if (xfer.mode != 0) { xfer_notice(&ctx, 2, "busy: another transfer is in progress"); }
-                else {
-                    FILE *fp = fopen(c->body, "rb");
-                    if (!fp) { xfer_notice(&ctx, 2, "upload: cannot open file"); }
-                    else if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); xfer_notice(&ctx, 2, "upload: not a regular file"); }
-                    else {
-                        long sz = ftell(fp);
-                        if (sz < 0 || (unsigned long long)sz > OC_MAX_ATTACHMENT_SIZE) {
-                            fclose(fp); xfer_notice(&ctx, 2, "upload: file too large");
-                        } else {
-                            rewind(fp);
-                            memset(&xfer, 0, sizeof xfer);
-                            xfer.mode = 1; xfer.fp = fp; xfer.total = (uint64_t)sz;
-                            xfer.chunk = OC_ATTACH_CHUNK_SIZE; xfer.win_chunks = 8;
-                            xfer.channel = c->channel_id;
-                            xfer.purpose = (uint8_t)(c->op == 1 ? 1 : c->op == 2 ? 2 : 0);
-                            if (xfer.purpose == 2 && c->body2)
-                                snprintf(xfer.ename, sizeof xfer.ename, "%s", c->body2);
-                            snprintf(xfer.name, sizeof xfer.name, "%s", path_basename(c->body));
-                            uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                            oc_upload_begin ub; memset(&ub, 0, sizeof ub);
-                            ub.channel_id = c->channel_id;
-                            gen_idem(ub.idem);
-                            ub.filename = oc_slice_str(xfer.name);
-                            ub.mime = oc_slice_str(mime_for(xfer.name));
-                            ub.total_size = (uint64_t)sz;
-                            if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
-                                write_all(&conn, fd, buf, w.len, &n->stop) == 0) {
-                                char msg[200]; snprintf(msg, sizeof msg, "uploading %s…", xfer.name);
-                                xfer_notice(&ctx, 0, msg);
-                            } else { xfer_notice(&ctx, 2, "upload: begin failed"); xfer_reset(&xfer); }
-                        }
-                    }
-                }
+            if ((c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
+                (c->type == OC_CMD_DOWNLOAD && c->body) ||
+                (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {
+                xq_add(&n->xq, c);             /* owned by the queue now */
+                continue;
             }
-            if (c->type == OC_CMD_FETCH) {
-                /* Same DOWNLOAD_BEGIN, no file: the bytes come back as an event
-                 *. Silently skipped while another transfer is running —
-                 * a thumbnail must never interrupt a real download, and the
-                 * frontend simply re-requests on a later frame. */
-                if (xfer.mode == 0) {
-                    memset(&xfer, 0, sizeof xfer);
-                    xfer.mode = 2; xfer.fp = NULL; xfer.id = c->message_id;
-                    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                    oc_download_begin db = { c->message_id };
-                    if (!(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK &&
-                          write_all(&conn, fd, buf, w.len, &n->stop) == 0))
-                        xfer_reset(&xfer);
+            if (c->type == OC_CMD_CANCEL_TRANSFER) {
+                oc_xqueue *q = &n->xq;
+                for (size_t i = 0; i < q->n;) {
+                    if (q->q[i]->xfer_tag == c->xfer_tag) {
+                        oc_cmd_free(q->q[i]);
+                        memmove(q->q + i, q->q + i + 1, (q->n - i - 1) * sizeof *q->q);
+                        q->n--;
+                    } else i++;
                 }
-            }
-            if (c->type == OC_CMD_DOWNLOAD && c->body) {
-                if (xfer.mode != 0) { xfer_notice(&ctx, 2, "busy: another transfer is in progress"); }
-                else {
-                    FILE *fp = fopen(c->body, "wb");
-                    if (!fp) { xfer_notice(&ctx, 2, "download: cannot create file"); }
-                    else {
-                        memset(&xfer, 0, sizeof xfer);
-                        xfer.mode = 2; xfer.fp = fp; xfer.id = c->message_id;
-                        const char *slash = strrchr(c->body, '/');
-                        snprintf(xfer.name, sizeof xfer.name, "%s", slash ? slash + 1 : c->body);
+                if (q->active && q->active->xfer_tag == c->xfer_tag && xfer.mode != 0) {
+                    if ((xfer.mode == 1 || xfer.mode == 2) && xfer.id) {
                         uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                        oc_download_begin db = { c->message_id };
-                        if (oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK &&
-                            write_all(&conn, fd, buf, w.len, &n->stop) == 0) {
-                            char msg[200]; snprintf(msg, sizeof msg, "downloading to %s…", xfer.name);
-                            xfer_notice(&ctx, 0, msg);
-                        } else { xfer_notice(&ctx, 2, "download: begin failed"); xfer_reset(&xfer); }
+                        oc_transfer_cancel tc = { xfer.id };
+                        if (oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &tc) == OC_OK)
+                            (void)write_all(&conn, fd, buf, w.len, &n->stop);
                     }
+                    xfer_notice(&ctx, 2, "cancelled");
+                    xfer_reset(&xfer);
                 }
             }
             if (c->type == OC_CMD_OPEN_DM) {
@@ -2243,12 +2450,18 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             oc_cmd_free(c);
         }
+        xq_pump(&ctx);
 
-        if (oc_poll(fd, 0, 50) > 0) {
+        /* Pending first: a TLS record holds up to 16 KiB and one read takes 4,
+         * so after the first read the rest sits decrypted inside TLS, where the
+         * socket poll cannot see it. Polling alone waited 50 ms per read on data
+         * already here — invisible for a message, minutes for a video. */
+        if (oc_tls_pending(&conn) > 0 || oc_poll(fd, 0, 50) > 0) {
             uint8_t buf[4096]; size_t rn = 0;
             oc_tls_status st = oc_tls_read(&conn, buf, sizeof buf, &rn);
             if (st == OC_TLS_OK) {
                 if (oc_framebuf_push(&fb, buf, rn) != 0 || dispatch(&fb, n->to_ui, &ctx) < 0) break;
+                xq_pump(&ctx);
             } else if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) {
                 break;
             }
@@ -2257,6 +2470,7 @@ static int run_connection(oc_net *n, int reconnecting,
 
 drop:
     xfer_reset(&xfer);   /* close any half-done transfer file */
+    xq_requeue_active(&n->xq);
     oc_framebuf_free(&fb);
     oc_tls_conn_free(&conn);
     oc_tls_client_free(&cli);
@@ -2408,6 +2622,9 @@ void oc_net_stop(oc_net *n) {
     n->stop = 1;
     oc_queue_push(n->from_ui, oc_cmd_new(OC_CMD_QUIT)); /* wake it promptly */
     oc_thread_join(n->thread);
+    if (n->xq.active) oc_cmd_free(n->xq.active);
+    for (size_t i = 0; i < n->xq.n; i++) oc_cmd_free(n->xq.q[i]);
+    free(n->xq.q);
     free(n->token);
     free(n->store_path);
     free(n);

@@ -39,6 +39,12 @@ typedef struct {
     char     mime[64];
     uint64_t size;
     uint8_t  reclaimed;
+    /* A video message (REQ-165): media_kind OC_MEDIA_VIDEO_MESSAGE with its
+     * length, size and poster attachment; 0 for an ordinary file. */
+    uint8_t  media_kind;
+    uint32_t duration_ms;
+    uint16_t width, height;
+    uint64_t poster_id;
 } oc_attachment;
 
 /* One link preview under a message (REQ-222, ARCH-105): the daemon's fetched
@@ -226,6 +232,8 @@ typedef struct {
     uint64_t id, channel_id, message_id, uploader_id, size, created_at;
     uint8_t  reclaimed;
     char     filename[128], mime[64];
+    uint8_t  media_kind;         /* a video message lists as video (REQ-165) */
+    uint32_t duration_ms;
 } oc_file_view;
 
 /* One outstanding invite (REQ-026). No token: only its SHA-256 is stored
@@ -465,9 +473,15 @@ typedef struct {
     /* The most recent in-memory attachment fetch. The model holds the
      * bytes until a frontend takes them; taking transfers ownership, so nothing
      * accumulates if nobody asks. */
-    uint64_t fetched_attachment;
-    uint8_t *fetched_data;
-    size_t   fetched_len;
+    /* A few, not one: transfers queue now, so a thumbnail and a video can both
+     * land between two frames, and the second must not free the first. */
+    struct { uint64_t id; uint8_t *data; size_t len; } fetched[8];
+    uint8_t  n_fetched;
+    /* The transfer running now (0 tag = none), for a progress bar or ring. */
+    uint64_t xfer_tag, xfer_done, xfer_total;
+    uint8_t  xfer_phase;             /* the last notice: 0 running, 1 done, 2 failed */
+    /* The last video message this client sent (REQ-162): its queue tag. */
+    uint64_t media_posted_tag;
 
     /* When the net thread will next attempt a reconnect, as a monotonic
      * millisecond stamp (0 = not backing off). The error text carries the delay
@@ -723,6 +737,13 @@ uint64_t oc_model_now_ms(void);
 /* Take the last fetched attachment's bytes, transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);
+
+/* What a message says in a one-line summary — a sidebar row, a toast, the
+ * activity feed: its text, or for a message that is only a file, what the file
+ * is ("🎥 Video message (1:05)" for a video message, REQ-165). */
+void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap);
+/* "m:ss" for a duration in milliseconds (h:mm:ss past an hour). */
+void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);

@@ -655,8 +655,8 @@ jobs:
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update -qq
           # bzip2 and curl are for build_mbedtls_windows.sh below, which fetches
-          # and cross-builds the pinned tarball.
-          sudo apt-get install -y -qq mingw-w64 bzip2 curl
+          # and cross-builds the pinned tarball; nasm for libvpx's assembly.
+          sudo apt-get install -y -qq mingw-w64 bzip2 curl nasm
 
       # Unlike the native build, the Makefile has no rule that produces the
       # Windows mbedTLS archives, so nothing builds them implicitly: `make
@@ -664,6 +664,9 @@ jobs:
       # too -- the release omitted it, which is what this dry run found.
       - name: Cross-build the vendored Windows mbedTLS
         run: scripts/build_mbedtls_windows.sh
+
+      - name: Cross-build the vendored Windows libvpx and libopus
+        run: scripts/build_libvpx.sh windows && scripts/build_opus.sh windows
 
       - name: Build the GUI and the TUI
         run: |

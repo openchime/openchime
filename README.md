@@ -51,6 +51,7 @@ today is not a document — it is the
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
 | [AUDIO.md](docs/AUDIO.md) | The design for server-relayed audio calls: the huddle model, client-side mixing, and echo cancellation. The server half is built; the client half is not. |
 | [VIDEO.md](docs/VIDEO.md) | The screenshare design: why the codec is a wire contract rather than a per-platform choice, and why it is sequenced behind the audio client. Not started. |
+| [VIDEO-MESSAGES.md](docs/VIDEO-MESSAGES.md) | Recorded video messages: the capture interface and its six platform backends, VP9 and Opus in a restricted MP4, the recorder and player, how a message travels as an attachment, consent, and the tests that prove it. |
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |

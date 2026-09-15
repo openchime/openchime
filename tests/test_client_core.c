@@ -180,6 +180,40 @@ static int channel_has_named(const oc_model *m, uint64_t cid, const char *body, 
 
 /* The id of the first attachment on any message in channel `cid` (0 if none),
  * filling `fn_out`/`size_out` with its filename + byte size. */
+/* The newest video message in channel `cid` (REQ-165), or NULL. */
+static const oc_msg *channel_video(const oc_model *m, uint64_t cid) {
+    const oc_msg *found = NULL;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->n_attach && msg->attach[0].media_kind == OC_MEDIA_VIDEO_MESSAGE) found = msg;
+        }
+    }
+    return found;
+}
+
+static int channel_video_count(const oc_model *m, uint64_t cid) {
+    int n = 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].n_attach &&
+                m->channels[i].msgs[j].attach[0].media_kind == OC_MEDIA_VIDEO_MESSAGE) n++;
+    }
+    return n;
+}
+
+/* Take fetched bytes for `aid` if they have arrived; others are dropped. */
+static uint8_t *take_fetched(oc_client *cl, uint64_t aid, size_t *len) {
+    uint64_t id; size_t n; uint8_t *d;
+    while ((d = oc_model_take_attachment((oc_model *)oc_client_model(cl), &id, &n)) != NULL) {
+        if (id == aid) { *len = n; return d; }
+        free(d);
+    }
+    return NULL;
+}
+
 static uint64_t channel_attach(const oc_model *m, uint64_t cid, char *fn_out,
                                size_t fncap, uint64_t *size_out) {
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -1595,6 +1629,94 @@ int run_client_core_tests(void) {
 
             free(blob);
             unlink(src); unlink(dst);
+        }
+
+        /* video messages (REQ-162/165): dana asks for an earlier file's bytes and
+         * posts a video message straight after, so the post has to wait its turn in
+         * the transfer queue rather than be refused as busy; both complete. erik
+         * sees the media facts and the summary line, fetches the 9 MiB video — past
+         * the 8 MiB inline ceiling — with progress, and fetches the poster. A post
+         * cancelled while queued never goes out. */
+        {
+            uint64_t earlier = channel_attach(oc_client_model(b), 1, (char[128]){0}, 128, NULL);
+            CHECK(earlier != 0);
+            const size_t VN = 9u * 1024u * 1024u, PN = 3000;
+            uint8_t *video = malloc(VN), *poster = malloc(PN);
+            uint8_t *vcopy = malloc(VN), *pcopy = malloc(PN);
+            CHECK(video && poster && vcopy && pcopy);
+            if (video && poster && vcopy && pcopy) {
+                for (size_t k = 0; k < VN; k++) video[k] = (uint8_t)(k * 13u + (k >> 16));
+                for (size_t k = 0; k < PN; k++) poster[k] = (uint8_t)(k * 5u + 1u);
+                memcpy(vcopy, video, VN); memcpy(pcopy, poster, PN);
+
+                oc_client_fetch_attachment(a, earlier);
+                uint64_t tag = oc_client_post_video(a, 1, 0, video, VN, poster, PN,
+                                                    65000, 1280, 720, "");
+                video = poster = NULL;                          /* the core owns them */
+                CHECK(tag != 0);
+                int posted = 0;
+                for (int t = 0; t < 6 && !posted; t++) posted = WAIT_FOR(a, m->media_posted_tag == tag);
+                CHECK(posted);
+                size_t elen = 0;
+                uint8_t *ebytes = NULL;
+                CHECK(WAIT_FOR(a, (ebytes = take_fetched(a, earlier, &elen)) != NULL));
+                CHECK(elen == 150000);
+                free(ebytes);
+
+                const oc_msg *vm = NULL;
+                CHECK(WAIT_FOR(b, (vm = channel_video(m, 1)) != NULL));
+                vm = channel_video(oc_client_model(b), 1);
+                if (vm) {
+                    const oc_attachment *va = &vm->attach[0];
+                    CHECK(va->duration_ms == 65000 && va->width == 1280 && va->height == 720);
+                    CHECK(va->poster_id != 0 && va->size == VN);
+                    CHECK(strcmp(va->mime, "video/mp4") == 0);
+                    /* Named for whose and when: "dana-video-YYYYMMDDHHMMSS.mp4". */
+                    CHECK(strncmp(va->filename, "dana-video-", 11) == 0 && strlen(va->filename) == 11 + 14 + 4 &&
+                          strcmp(va->filename + 25, ".mp4") == 0);
+                    char prev[96];
+                    oc_model_msg_preview(vm, prev, sizeof prev);
+                    CHECK(strcmp(prev, "\xF0\x9F\x8E\xA5 Video message (1:05)") == 0);
+
+                    uint64_t vid = va->id, pid = va->poster_id;
+                    CHECK(oc_client_fetch_media(b, vid) == vid);
+                    size_t vlen = 0;
+                    uint8_t *vbytes = NULL;
+                    for (int t = 0; t < 6 && !vbytes; t++)
+                        WAIT_FOR(b, (vbytes = take_fetched(b, vid, &vlen)) != NULL);
+                    CHECK(vbytes && vlen == VN && memcmp(vbytes, vcopy, VN) == 0);
+                    free(vbytes);
+                    CHECK(oc_client_model(b)->xfer_tag == vid &&
+                          oc_client_model(b)->xfer_done == VN && oc_client_model(b)->xfer_total == VN);
+
+                    oc_client_fetch_attachment(b, pid);
+                    size_t plen = 0;
+                    uint8_t *pbytes = NULL;
+                    CHECK(WAIT_FOR(b, (pbytes = take_fetched(b, pid, &plen)) != NULL));
+                    CHECK(pbytes && plen == PN && memcmp(pbytes, pcopy, PN) == 0);
+                    free(pbytes);
+                }
+
+                /* Cancelled while queued behind another post: only the other lands. */
+                uint8_t *v2 = malloc(2 * 1024 * 1024), *p2 = malloc(100);
+                uint8_t *v3 = malloc(1000), *p3 = malloc(100);
+                if (v2 && p2 && v3 && p3) {
+                    memset(v2, 2, 2 * 1024 * 1024); memset(p2, 2, 100);
+                    memset(v3, 3, 1000); memset(p3, 3, 100);
+                    uint64_t t2 = oc_client_post_video(a, 1, 0, v2, 2 * 1024 * 1024, p2, 100, 1000, 640, 360, "first");
+                    uint64_t t3 = oc_client_post_video(a, 1, 0, v3, 1000, p3, 100, 1000, 640, 360, "second");
+                    oc_client_cancel_transfer(a, t2);
+                    int second = 0;
+                    for (int t = 0; t < 6 && !second; t++) second = WAIT_FOR(a, m->media_posted_tag == t3);
+                    CHECK(second);
+                    CHECK(WAIT_FOR(b, channel_has_body(m, 1, "second")));
+                    CHECK(!channel_has_body(oc_client_model(b), 1, "first"));
+                    CHECK(channel_video_count(oc_client_model(b), 1) == 2);
+                } else {
+                    free(v2); free(p2); free(v3); free(p3);
+                }
+            }
+            free(video); free(poster); free(vcopy); free(pcopy);
         }
 
         /* incoming webhooks (REQ-170): dana mints a webhook on channel 1 — the

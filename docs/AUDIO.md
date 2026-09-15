@@ -181,6 +181,18 @@ PulseAudio, PipeWire, CoreAudio, and WASAPI behind one API, and — critically �
 supports the duplex mode §2 requires, with resampling so the engine can request
 16 kHz regardless of what the hardware prefers.
 
+**The device layer is built**, by video messages (ARCH-110):
+`client/core/media/audio_dev.{c,h}` enumerates capture and playback devices,
+opens either at a requested rate and channel count, and joins each device
+callback to its media thread with a lock-free single-producer ring. The callback
+never allocates, locks or does I/O; captured samples are stamped from the media
+clock video frames use; playback reports the samples the device has consumed,
+which is the clock a player — or a call's jitter buffer — runs on. Video messages
+record at 48 kHz mono; calls will open it at 16 kHz. `OPENCHIME_TEST_AUDIO=synthetic`
+swaps the devices for a tone source and a real-time sink, so both run in
+`make test` on a machine with no sound hardware. Duplex operation and drift
+detection (build step 1 below) remain to be added for calls.
+
 ### 3.3 The processor seam
 
 Between capture and encode sits an **optional processor**, a vtable in the shape

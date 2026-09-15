@@ -29,6 +29,7 @@
 #define OC_SQ_HAS_FILE  0x01u
 #define OC_SQ_HAS_LINK  0x02u
 #define OC_SQ_HAS_IMAGE 0x04u
+#define OC_SQ_HAS_VIDEO 0x08u   /* any video attachment, a video message among them (REQ-165) */
 
 typedef struct {
     char     text[OC_SQ_TEXT_MAX];      /* what is left for FTS; may be empty */

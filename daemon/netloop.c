@@ -186,6 +186,7 @@ static oc_storage_stats  g_sstat;
 static uint64_t          g_last_maint_ms;
 static char              g_blob_dir[1024];
 static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+static uint64_t      g_max_video  = OC_MAX_VIDEO_MESSAGE_SIZE;   /* REQ-164 */
 
 /* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
  * fixed window keyed by the token, so one noisy integration can't flood a
@@ -688,6 +689,11 @@ static uint16_t fill_attach_entries(oc_attach_entry *out, const oc_attach_meta *
         out[i].mime = oc_slice_str(att[i].mime ? att[i].mime : "");
         out[i].size = att[i].size;
         out[i].reclaimed = att[i].reclaimed;
+        out[i].media_kind = att[i].media_kind;
+        out[i].duration_ms = att[i].duration_ms;
+        out[i].width = att[i].width;
+        out[i].height = att[i].height;
+        out[i].poster_id = att[i].poster_id;
     }
     return (uint16_t)n;
 }
@@ -1138,6 +1144,22 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id; j->message_id = si.message_id; j->save_op = si.op;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_ATTACH_MEDIA_SET) {
+            oc_attach_media_set ms;
+            if (oc_decode_attach_media_set(&p, &ms) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_ATTACH_MEDIA_SET, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->attachment_id = ms.attachment_id;
+            j->att_size = g_max_video;
+            j->media_kind = ms.media_kind;
+            j->media_duration_ms = ms.duration_ms;
+            j->media_width = ms.width;
+            j->media_height = ms.height;
+            j->media_poster_id = ms.poster_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -2612,6 +2634,27 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_MEDIA_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_attach_media_ok mo = { r->attachment_id };
+        oc_encode_attach_media_ok(&w, OC_PROTOCOL_VERSION, &mo);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_MEDIA_ERR: {
+        /* An ordinary ERROR, not a transfer error: both uploads have finished,
+         * and nothing about this refusal touches the connection's transfer. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice none = { NULL, 0 };
+        oc_error e = { r->err_code, 0, none, oc_slice_str("video message refused") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_SAVED_OK: {
         /* Private: the ack goes to the actor and stops. There is no one to fan
          * a personal bookmark to. */
@@ -2688,7 +2731,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_file_entry fe = { fr->id, fr->channel_id, fr->message_id, fr->uploader_id,
                                  fr->size, fr->created_at, fr->reclaimed,
                                  oc_slice_str(fr->filename ? fr->filename : ""),
-                                 oc_slice_str(fr->mime ? fr->mime : "") };
+                                 oc_slice_str(fr->mime ? fr->mime : ""),
+                                 fr->media_kind, fr->duration_ms };
             oc_encode_file_entry(&w, OC_PROTOCOL_VERSION, &fe);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -4050,6 +4094,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             close(ep); close(lfd); free(conns); return -1;
         }
         g_max_attach = cfg->max_attach_size;
+        g_max_video  = cfg->max_video_size;
 
         /* Blob I/O runs here, off the net thread (ARCH-69). Worker count from
          * config (default 2, clamped 1..16): each in-flight transfer holds a TLS

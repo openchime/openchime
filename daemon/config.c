@@ -93,6 +93,12 @@ int oc_config_load(char *err, size_t errcap) {
     c->max_users       = env_int("OPENCHIME_MAX_USERS", NULL, 0);
     c->max_attach_size = env_u64("OPENCHIME_MAX_ATTACHMENT_SIZE", NULL, OC_MAX_ATTACHMENT_SIZE);
     if (c->max_attach_size == 0) c->max_attach_size = OC_MAX_ATTACHMENT_SIZE;
+    /* A video message is an attachment first, so it can never be allowed more
+     * than any attachment is: the upload would be refused before the cap was
+     * consulted, and a larger setting would only be a number that lies. */
+    c->max_video_size  = env_u64("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE", NULL, OC_MAX_VIDEO_MESSAGE_SIZE);
+    if (c->max_video_size == 0) c->max_video_size = OC_MAX_VIDEO_MESSAGE_SIZE;
+    if (c->max_video_size > c->max_attach_size) c->max_video_size = c->max_attach_size;
     c->xfer_workers    = env_int("OPENCHIME_XFER_WORKERS", NULL, 2);
     if (c->xfer_workers < 1)  c->xfer_workers = 1;
     if (c->xfer_workers > 16) c->xfer_workers = 16;
