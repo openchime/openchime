@@ -874,6 +874,32 @@ static const char MIGRATION_0040[] =
     "  attach_name TEXT    NOT NULL DEFAULT ''"
     ");";
 
+static const char MIGRATION_0041[] =
+    /* A video message's media facts (REQ-162/164, ARCH-110). A side table keyed
+     * on the attachment, as `forwards` is on the message: almost no attachment
+     * is a video message, and columns on `attachments` would be paid for on
+     * every row to serve a rare one.
+     *
+     * `duration_ms`, `width` and `height` are what the client measured. The
+     * daemon links no codec, so it cannot check them; they are display facts,
+     * and the byte cap on the attachment is the bound it enforces.
+     *
+     * `poster_id` is the still shown before the video plays — an attachment of
+     * its own, uploaded to the same channel by the same person. Nothing in
+     * `messages` references it, so the storage sweep would take it for an
+     * orphan; the sweep consults this column to keep a poster exactly as long as
+     * its video is live. Indexed for that lookup. */
+    "CREATE TABLE attachment_media ("
+    "  attachment_id INTEGER PRIMARY KEY REFERENCES attachments(id),"
+    "  kind          INTEGER NOT NULL,"
+    "  duration_ms   INTEGER NOT NULL,"
+    "  width         INTEGER NOT NULL,"
+    "  height        INTEGER NOT NULL,"
+    "  poster_id     INTEGER REFERENCES attachments(id),"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX attachment_media_poster ON attachment_media(poster_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -915,6 +941,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 38, MIGRATION_0038 },
     { 39, MIGRATION_0039 },
     { 40, MIGRATION_0040 },
+    { 41, MIGRATION_0041 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

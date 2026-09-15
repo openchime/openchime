@@ -1211,9 +1211,10 @@ the requirement says so explicitly rather than implying one.
   silence timeout in the sidecar. **Signaling built (PROTOCOL.md §5.17); the UDP
   relay + timeout land in the sidecar milestone.**
 
-### 6.3 Video — camera video excluded, screenshare admitted
+### 6.3 Video — camera video excluded; screenshare and video messages admitted
 
-*Design: [VIDEO.md](./VIDEO.md).*
+*Design: [VIDEO.md](./VIDEO.md) (screenshare), [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md)
+(video messages).*
 
 - **REQ-160.** *(Excluded by decision)* **Camera video** calling, and video streaming or playback beyond
   generic file-attachment handling (REQ-140), have not been supported. This is a
@@ -1221,8 +1222,11 @@ the requirement says so explicitly rather than implying one.
   decision. **Scoped by ARCH-86:** the exclusion covers *camera* video
   and general playback; **screenshare** is admitted separately as REQ-161, whose
   content profile (mostly static, low frame rate, a single sender) is
-  fundamentally cheaper and whose use case is concrete. The exclusion is narrowed,
-  not repealed.
+  fundamentally cheaper and whose use case is concrete. **Scoped again by
+  ARCH-110:** a **recorded video message** — made, posted and played back in the
+  client (REQ-162–166) — is admitted too, because it needs no real-time path at
+  all: it is a file, an attachment and a message. Camera video *calling* stays
+  excluded. The exclusion is narrowed, not repealed.
 - **REQ-161.** *(Not built)* A participant in a call has been able to **share a screen or
   window** to the other participants, view-only. Screenshare has ridden the
   existing server-relay media path unchanged (ARCH-73/86): the sidecar forwards
@@ -1237,6 +1241,40 @@ the requirement says so explicitly rather than implying one.
   been permanently exempt** (ARCH-75 — the TUI renders no graphics), showing only
   that a share is in progress and by whom. **Not started; sequenced behind the
   audio client** (REQ-150–152), whose media transport it builds on.
+- **REQ-162.** A user has been able to **record a video message and
+  post it** into a channel, a DM or a thread, with the composer's text as its
+  caption. Recording only — no trimming or editing — and **capped at five
+  minutes**, where recording stops on its own. The recording is reviewed before it
+  is sent (play it back, retake, discard or send) and **nothing leaves the machine
+  until Send** (ARCH-110).
+- **REQ-163.** Every graphical client has captured through **one
+  capture interface** whose frame format is fixed at the boundary — planar I420,
+  BT.709 limited range — so the encoder and the preview see one thing whatever the
+  camera delivers. Six backends have been designed: Media Foundation (Windows),
+  V4L2 (Linux), AVFoundation (macOS), AVCaptureSession (iOS), Camera2 through the
+  NDK (Android) and `getUserMedia` (web). A backend is built together with the
+  client for its platform; the Win32 client's is the first. Microphone and
+  speaker have gone through the audio device layer the call client uses (REQ-151,
+  AUDIO.md §3.2).
+- **REQ-164.** A video message has been stored as **VP9 video and
+  Opus audio in MP4**, encoded in the client (ARCH-110). The daemon has linked no
+  codec and treats the file as an ordinary attachment (REQ-140) with media
+  metadata beside it — duration, dimensions and a poster image. Because the daemon
+  cannot measure a duration, the reported one is advisory and the enforced bound
+  is a **byte cap** for video messages (`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`).
+- **REQ-165.** A video message has **played back in the client**: a
+  card in the conversation with its poster, a play mark and its duration, opening
+  a player with play and pause, seeking, volume and download. Previews name it
+  ("Video message", with its length) wherever a message is summarised, the Files
+  view lists it as video, and search finds it with `has:video`. A text-only
+  frontend has shown that a video message is there and offered the download
+  (ARCH-75).
+- **REQ-166.** Recording has been **consented to and visible**. A
+  camera or microphone the operating system blocks has been reported as that, with
+  a way to the system setting, never as a generic failure; a recording in progress
+  has been visibly marked; the camera has been released as soon as the recording
+  surface closes; and a recording has never been written to disk, so one that was
+  discarded or interrupted by a crash has left nothing behind (ARCH-88).
 
 ---
 
@@ -2116,11 +2154,12 @@ feature.*
 - **REQ-272.** *(Excluded by decision)* **Lists / tables / project boards** (structured task/records
   surfaces) have not been supported — project-management territory (the space
   Pumble's sibling product Plaky occupies), out of scope.
-- **REQ-273.** *(Excluded by decision)* **Clips / asynchronous voice and video messages** (recording a
-  short audio or video clip posted into a conversation) have not been supported.
-  Live audio is REQ-150–152 and screenshare REQ-161; *recorded* async media is a
-  separate capability and is excluded, consistent with the camera-video exclusion
-  (REQ-160).
+- **REQ-273.** *(Excluded by decision)* **Clips / asynchronous voice messages** (recording a short
+  audio-only clip posted into a conversation) have not been supported. Live audio
+  is REQ-150–152 and screenshare REQ-161. **Scoped by ARCH-110:** a recorded
+  *video* message is admitted (REQ-162–166); an audio-only clip stays excluded, so
+  there is one kind of recorded message and no second class of audio playback in a
+  channel. The exclusion is narrowed, not repealed.
 - **REQ-274.** *(Excluded by decision)* **Slack-Connect-style cross-organization shared channels and
   external DMs** have not been supported. Cross-tenant messaging is precluded by
   the island model (ARCH-4/REQ-040); federation between tenants is a separate

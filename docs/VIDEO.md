@@ -12,7 +12,8 @@ work begins, not to signal that it is scheduled — it is explicitly **sequenced
 behind the audio client** (§8), which itself is at phase 0.
 
 **This document is screenshare only.** Camera video calling remains excluded by
-REQ-160 and nothing here reverses that (§2).
+REQ-160 and nothing here reverses that (§2). Recorded **video messages** are a
+separate design with no real-time path: [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
 
 ---
 
@@ -38,10 +39,12 @@ legitimate.
 | Screen audio is **not** captured; voice rides the existing audio path | Recording the share |
 | One sharer at a time per call | Simultaneous shares / picture-in-picture grids |
 
-**REQ-160 stands.** Camera video calling and general video
-playback remain a deliberate exclusion. Screenshare is admitted as REQ-161
-because its content profile (mostly static, low frame rate, one sender) is
-fundamentally cheaper than camera video and its use case is concrete.
+**Camera video calling stays excluded (REQ-160).** Screenshare is admitted as
+REQ-161 because its content profile (mostly static, low frame rate, one sender) is
+fundamentally cheaper than camera video and its use case is concrete. A recorded
+video message (REQ-162–166) is admitted as well, and is not part of this document:
+it is a file posted as an attachment and played back in the client, with no call,
+relay or stream involved ([VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md), ARCH-110).
 
 ## 3. It rides the existing relay unchanged
 

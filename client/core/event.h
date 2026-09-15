@@ -86,7 +86,9 @@ enum {
     OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
     OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
     OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string) */
-    OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
+    OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text
+                            * (NULL on a bare progress tick), xfer_tag/xfer_done/xfer_total */
+    OC_EV_MEDIA_POSTED,    /* a video message went out: xfer_tag, attach_id = the video, channel_id */
     OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
     /* Custom emoji (REQ-072): BEGIN clears the catalogue, then one per entry —
      * the same shape as the settings snapshot below, and for the same reason: the
@@ -211,6 +213,15 @@ typedef struct {
     uint8_t  n_kw_terms;
     uint64_t pri_people[OC_MAX_PRIORITY];
     uint8_t  n_pri_people;
+    /* ATTACHMENT / FILE: a video message's media row (REQ-165); media_kind 0 for
+     * an ordinary file. */
+    uint8_t  media_kind;
+    uint32_t duration_ms;
+    uint16_t media_w, media_h;
+    uint64_t poster_id;
+    /* XFER / MEDIA_POSTED: which queued transfer (the tag its command carried),
+     * and bytes moved of the total. */
+    uint64_t xfer_tag, xfer_done, xfer_total;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -310,6 +321,12 @@ enum {
     OC_CMD_REDEEM_INVITE,   /* pre-auth: body = token, body2 = "user:pass" */
     OC_CMD_FETCH,           /* download an attachment INTO MEMORY: message_id = attachment_id */
     OC_CMD_HISTORY,         /* page backwards: channel_id, message_id = before-id (0 = newest) */
+    /* Post a video message (REQ-162): channel_id, message_id = thread root (0 = the
+     * channel), body = caption, body2 = the file name without extension, blob = the
+     * MP4, blob2 = the poster JPEG, media_*.
+     * Uploads both, sends ATTACH_MEDIA_SET, then SEND or SEND_REPLY. */
+    OC_CMD_POST_VIDEO,
+    OC_CMD_CANCEL_TRANSFER, /* xfer_tag: drop it from the queue, or abort it if running */
     OC_CMD_QUIT
 };
 
@@ -339,6 +356,14 @@ typedef struct {
     uint8_t  n_kw_terms;
     uint64_t pri_people[OC_MAX_PRIORITY];
     uint8_t  n_pri_people;
+    /* UPLOAD / DOWNLOAD / FETCH / POST_VIDEO: the tag progress and completion
+     * events carry, so a frontend can tell its transfers apart. */
+    uint64_t xfer_tag;
+    /* POST_VIDEO: owned buffers, and the facts ATTACH_MEDIA_SET reports. */
+    uint8_t *blob, *blob2;
+    size_t   blob_len, blob2_len;
+    uint32_t duration_ms;
+    uint16_t media_w, media_h;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

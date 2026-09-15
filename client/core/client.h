@@ -308,6 +308,27 @@ void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_p
  * rather than buffered, so a caller should fall back to a real download. */
 void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id);
 
+/* Transfers wait their turn in a queue rather than being refused while another
+ * runs; each carries a tag that its OC_EV_XFER progress and completion events
+ * repeat. A download's or fetch's tag is the attachment id. */
+
+/* Post a video message (REQ-162): the recorder's MP4 and poster JPEG, which the
+ * core takes ownership of (both are freed whatever happens), its measured length
+ * and size, and a caption (may be empty). `thread_root` 0 posts to the channel,
+ * otherwise into that thread. The core uploads the poster and the video,
+ * reports the media facts and sends the message; OC_EV_MEDIA_POSTED says it
+ * went. Returns the job's tag, or 0 if nothing was queued. */
+uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
+                              uint32_t duration_ms, uint16_t width, uint16_t height,
+                              const char *caption);
+/* Fetch a video message into memory for playing (REQ-165): like
+ * oc_client_fetch_attachment, under the attachment ceiling rather than the
+ * inline one, with progress. Returns the tag (the attachment id). */
+uint64_t oc_client_fetch_media(oc_client *c, uint64_t attachment_id);
+/* Drop a queued transfer, or abort it if it is running. */
+void oc_client_cancel_transfer(oc_client *c, uint64_t tag);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);

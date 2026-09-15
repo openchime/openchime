@@ -136,6 +136,12 @@ framework, and OpenChime follows suit.
 - **Idempotency + dedup** (ARCH-44/45) — a repeated `(channel, token)` returns
   the original id without a second insert; the client high-water mark
   suppresses a `message_id` at or below the mark.
+- **Video message media** (`tests/test_media.c`, ARCH-110) — the MP4 writer
+  and reader round-trip and the reader survives a mutation fuzz; VP9 and Opus
+  round-trip against quality floors; the recorder runs against the synthetic
+  camera and tone, and `ffprobe` (installed in CI as a validator, never linked)
+  checks the file it writes; the player plays, seeks and copes with a slow
+  decoder. `tests/test_video_media.c` covers the protocol and daemon side.
 - **Rate limiter** (REQ-190/191) and the **connection state machine**
   ([PROTOCOL.md](./PROTOCOL.md) §10) — legal transitions accepted, illegal
   frames rejected with the expected reason code.
@@ -608,6 +614,22 @@ real time three times in a single day before the guard existed.
 `make` is incremental, so it is free when nothing changed. `OC_DRIVE_NO_BUILD=1`
 skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
+
+**Video messages drive on a synthetic camera.** Launch with
+`WSLENV=OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_AUDIO OPENCHIME_TEST_CAPTURE=synthetic
+OPENCHIME_TEST_AUDIO=synthetic scripts/gui_drive.sh launch` (add
+`OPENCHIME_TEST_VIDEO_CAP_MS` to shorten the five-minute cap, or
+`OPENCHIME_TEST_CAPTURE=denied` for the blocked-camera path). The `vm` verb opens,
+records, stops, sends, plays and closes by name, and `dump` reports the overlay on
+its `vm=` line. The synthetic source never opens a real camera, so a run cannot
+turn on the camera of the machine it happens to be on.
+
+**A real camera needs the client on a local disk.** Windows refuses camera
+activation to an executable started from the WSL share (`\\wsl.localhost\…`):
+`ActivateObject` fails with `0x80070490`, element not found, and the card says
+the recording could not start, with that step in brackets. `gui_drive.sh launch`
+runs `build/openchime.exe` from the share, which is fine for everything else;
+for a camera test, copy it to a Windows directory and start it from there.
 
 **Two verbs put text in the composer, and they are not interchangeable.**
 `type` sets the buffer directly (`ed_set`), bypassing the editor's own rules;

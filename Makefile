@@ -76,6 +76,21 @@ TEST_BIN  := build/tests
 CORE_SRC := $(wildcard client/core/*.c)
 CORE_INC := -Iclient/core
 
+# --- Video message media (ARCH-110) -------------------------------------------
+# Capture, the audio device layer, the codec wrappers, the MP4 muxer/demuxer, the
+# recorder and the player. Kept out of CORE_SRC so a client that does not record
+# or play video (the TUI) links no codec. libvpx and libopus are fetched and built
+# pinned (scripts/build_libvpx.sh, scripts/build_opus.sh), natively for `make
+# test` and cross-built for the Win32 client.
+MEDIA_SRC  := $(wildcard client/core/media/*.c)
+MEDIA_HDRS := $(wildcard client/core/media/*.h)
+LIBVPX_DIR := third_party/libvpx-1.17.0
+OPUS_DIR   := third_party/opus-1.6.1
+LIBVPX_A   := $(LIBVPX_DIR)/lib/libvpx.a
+OPUS_A     := $(OPUS_DIR)/lib/libopus.a
+MEDIA_INC  := -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include
+MEDIA_LIBS := $(LIBVPX_A) $(OPUS_A) -ldl -lm
+
 # --- sdltext (portable text layer) --------------------------------------------
 # One text API for every graphical client: layout, measurement, hit-testing,
 # byte-offset range styling. The portable core (the byte<->UTF-16 offset map)
@@ -135,6 +150,10 @@ $(BIN): $(SRC) $(MBEDTLS_A) $(HDRS)
 
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
+$(LIBVPX_A):
+	scripts/build_libvpx.sh native
+$(OPUS_A):
+	scripts/build_opus.sh native
 
 # The wire contract's one static invariant: no two message types share an opcode.
 # A source check rather than a C test, because a C test cannot enumerate an enum.
@@ -160,9 +179,9 @@ test: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h client/gui/win32/theme.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests -Iclient/gui/win32 \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) $(MEDIA_INC) -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lsqlite3 -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
@@ -283,6 +302,20 @@ $(SDL3_WIN_LIB):
 	scripts/build_sdl3_windows.sh
 
 WIN_GUI_BIN := build/openchime.exe
+# Video messages (ARCH-110): the cross-built codecs, and Media Foundation for the
+# camera. The native rules above build Linux archives only, so like mbedTLS these
+# have a rule of their own here.
+WIN_LIBVPX_A := third_party/libvpx-1.17.0-win/lib/libvpx.a
+WIN_OPUS_A   := third_party/opus-1.6.1-win/lib/libopus.a
+WIN_MEDIA_A  := $(WIN_LIBVPX_A) $(WIN_OPUS_A)
+WIN_MEDIA_INC := -Iclient/core/media -Ithird_party/libvpx-1.17.0-win/include -Ithird_party/opus-1.6.1-win/include
+# -lpthread: libvpx's mingw build threads through winpthreads (statically linked
+# here, like everything else, so no DLL ships beside the .exe).
+WIN_MEDIA_SYSLIBS := -lmfplat -lmfreadwrite -lmf -lmfuuid -lole32 -luuid -lpthread
+$(WIN_LIBVPX_A):
+	scripts/build_libvpx.sh windows
+$(WIN_OPUS_A):
+	scripts/build_opus.sh windows
 # Debug symbols, split out of the shipped binary (see the strip step below).
 WIN_GUI_SYMS := build/openchime.debug
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
@@ -299,13 +332,13 @@ $(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime
 	$(WINDRES) -I client/gui/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 
 windows-gui: $(WIN_GUI_BIN)
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) \
-                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) | build
-	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) -Iclient/gui/win32/res \
-	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-	    $(WIN_MBEDLIBS) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcomdlg32 \
-	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_SDL_SYSLIBS) -static -o $@
+$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) \
+                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
+	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/win32/res \
+	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcomdlg32 \
+	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
 # Split the debug info out rather than discarding it. The client writes real
 # minidumps on a crash (crash_filter, winmain.c), and symbolicating a mingw
 # build needs its DWARF -- a plain strip would shrink the download by trading

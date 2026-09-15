@@ -38,7 +38,13 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 11: THREAD_REPLY carries whether the recipient is a PARTICIPANT in the thread
+/* 12: every attachment entry — on BROADCAST, THREAD_REPLY, and everything that
+ * replays them — carries a media kind, and for a video message its duration,
+ * size and poster (REQ-162/165, ARCH-110); FILE_ENTRY carries the kind and
+ * duration. An entry sits inside a repeated list, so one added byte shifts every
+ * entry after the first. ATTACH_MEDIA_SET/OK (0x00DA/0x00DB) are new.
+ *
+ * 11: THREAD_REPLY carries whether the recipient is a PARTICIPANT in the thread
  * (REQ-061, ARCH-104). Participation is derived from message rows the client
  * does not hold — it keeps at most one thread's replies, and only while that
  * thread is open — so the client cannot compute its own, and without being told
@@ -82,7 +88,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 11u
+#define OC_PROTOCOL_VERSION 12u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -113,7 +119,7 @@
 /* Attachment transfer (REQ-140, ARCH-69). A chunk's data must leave room for the
  * frame header + the chunk's fixed fields under OC_MAX_FRAME_SIZE. */
 #define OC_ATTACH_CHUNK_SIZE   65024u /* 63.5 KiB data per UPLOAD/DOWNLOAD chunk  */
-#define OC_MAX_ATTACHMENT_SIZE (100ull * 1024 * 1024) /* 100 MiB default cap      */
+#define OC_MAX_ATTACHMENT_SIZE (200ull * 1024 * 1024) /* 200 MiB default cap      */
 
 /* --- Message types (PROTOCOL.md §9) ------------------------------------- */
 
@@ -331,6 +337,12 @@ typedef enum {
      * sends or expects it. */
     OC_MSG_UNFURL           = 0x00D7, /* S->C, a URL's fetched preview */
     OC_MSG_FORWARD          = 0x00D9, /* S->C, a forwarded message's source (REQ-057) */
+    /* A video message's media facts (REQ-162, ARCH-110): after both uploads and
+     * before the SEND that links the video, the client names the poster and
+     * reports the duration and size. The daemon checks what it can — owner,
+     * type, byte cap, bounds — and stores the rest as display facts. */
+    OC_MSG_ATTACH_MEDIA_SET = 0x00DA, /* C->S, mark an upload as a video message */
+    OC_MSG_ATTACH_MEDIA_OK  = 0x00DB, /* S->C, accepted */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -396,6 +408,8 @@ typedef enum {
     OC_ERR_TOO_MANY_PINS       = 3018, /* channel already holds OC_MAX_PINS pins (REQ-230) */
     OC_ERR_CHANNEL_ARCHIVED    = 3019, /* channel is archived: read-only (REQ-035) */
     OC_ERR_INVALID_MESSAGE     = 3020, /* nothing to send: an empty body (REQ-224) */
+    OC_ERR_MEDIA_INVALID       = 3021, /* ATTACH_MEDIA_SET refused: kind, bounds, type or poster (REQ-164) */
+    OC_ERR_MEDIA_TOO_LARGE     = 3022, /* the video exceeds MAX_VIDEO_MESSAGE_SIZE (REQ-164) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -622,13 +636,33 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * set when the bytes have been removed by age or storage pressure (REQ-215/217)
  * while the row survives as a tombstone — so a client can render "no longer
  * available" in place, instead of offering a download that will fail. */
+/* `media_kind` is OC_MEDIA_NONE for an ordinary file. For OC_MEDIA_VIDEO_MESSAGE
+ * the four fields after it are on the wire too (REQ-165, ARCH-110); otherwise
+ * they are absent and read as zero. */
 typedef struct {
     uint64_t id;
     oc_slice filename;
     oc_slice mime;
     uint64_t size;
     uint8_t  reclaimed;
+    uint8_t  media_kind;
+    uint32_t duration_ms;
+    uint16_t width, height;
+    uint64_t poster_id;
 } oc_attach_entry;
+
+/* Media kinds and the bounds ATTACH_MEDIA_SET enforces (REQ-162/164). */
+#define OC_MEDIA_NONE             0u
+#define OC_MEDIA_VIDEO_MESSAGE    1u
+#define OC_MEDIA_MAX_DURATION_MS  300000u      /* five minutes, the recording cap */
+#define OC_MEDIA_MAX_WIDTH        1920u
+#define OC_MEDIA_MAX_HEIGHT       1080u
+#define OC_MEDIA_MAX_POSTER_SIZE  (1024u * 1024u)
+#define OC_MAX_VIDEO_MESSAGE_SIZE (160ull * 1024 * 1024) /* default byte cap: five minutes at 1080p */
+
+typedef struct { uint64_t attachment_id; uint8_t media_kind; uint32_t duration_ms;
+                 uint16_t width, height; uint64_t poster_id; } oc_attach_media_set;
+typedef struct { uint64_t attachment_id; } oc_attach_media_ok;
 
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
 typedef struct { uint16_t chosen_version; uint64_t server_time; } oc_welcome;
@@ -732,6 +766,8 @@ typedef struct {
     uint64_t size, created_at;
     uint8_t  reclaimed;          /* bytes gone (REQ-215/217); row kept, no download */
     oc_slice filename, mime;
+    uint8_t  media_kind;         /* OC_MEDIA_*; a video message is listed as video (REQ-165) */
+    uint32_t duration_ms;
 } oc_file_entry;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_files;
 
@@ -1131,6 +1167,8 @@ oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m);
 oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m);
 oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m);
 oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m);
+oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_attach_media_set *m);
+oc_result oc_encode_attach_media_ok(oc_wbuf *w, uint16_t version, const oc_attach_media_ok *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
 oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m);
 oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m);
@@ -1318,6 +1356,8 @@ oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
 oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
 oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
+oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m);
+oc_result oc_decode_attach_media_ok(oc_rbuf *p, oc_attach_media_ok *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);
 oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m);
 oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m);

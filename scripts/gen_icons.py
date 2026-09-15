@@ -33,6 +33,11 @@ ICONS = [
     ("PIN",      "pin"),
     ("CROWN",    "crown"),
     ("SHIELD",   "shield"),
+    ("VIDEO",    "video"),
+    ("PLAY",     "play"),
+    ("PAUSE",    "pause"),
+    ("VOLUME",   "volume-2"),
+    ("MUTE",     "volume-x"),
 ]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SVGDIR = os.path.join(ROOT, "third_party", "lucide", "icons")

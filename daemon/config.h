@@ -52,6 +52,7 @@ typedef struct {
     int      xfer_workers;          /* clamped 1..16 */
     int      max_conns_per_ip;      /* 0 disables */
     uint64_t max_attach_size;
+    uint64_t max_video_size;        /* video message byte cap (REQ-164); <= max_attach_size */
     const char *blob_dir;
 
     /* Storage-pressure policy (populated via oc_storage_policy_load). */

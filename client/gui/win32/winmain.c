@@ -58,6 +58,10 @@
 #include "wintoast.h"    /* the real Windows notification (REQ-138) */
 #include <mmsystem.h>       /* PlaySoundW, the notification sound (REQ-138) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
+#include "oc_capture.h"       /* video messages: the camera list (REQ-163) */
+#include "oc_recorder.h"      /* ...recording (REQ-162) */
+#include "oc_player.h"        /* ...and playback (REQ-165) */
+#include "audio_dev.h"        /* ...and the microphone list */
 
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
@@ -930,6 +934,9 @@ static int geom_capture(HWND hwnd) {
     WINDOWPLACEMENT wp; wp.length = sizeof wp;
     if (!GetWindowPlacement(hwnd, &wp)) return 0;
     if (wp.showCmd == SW_SHOWMINIMIZED) return 0;   /* never persist minimised */
+    /* Nor a place no monitor shows: a window parked off-screen (by a test harness,
+     * or on a display since unplugged) saved there comes back invisible. */
+    if (!MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONULL)) return 0;
     int mx = (wp.showCmd == SW_SHOWMAXIMIZED);
     RECT *n = &wp.rcNormalPosition;
     int w = n->right - n->left, h = n->bottom - n->top;
@@ -1529,7 +1536,7 @@ static uint64_t g_thumb_pending;                /* one fetch in flight */
  * size. The bitmap is already decoded at native resolution — the transcript
  * merely draws it small — so expanding costs nothing but a bigger destination
  * rect. */
-static struct { rectf r; uint64_t id; } g_thumb_hits[32];
+static struct { rectf r; uint64_t id; uint64_t mid; int ix; } g_thumb_hits[32];
 static int      g_n_thumb_hits;
 /* Forward quote cards (REQ-057): clicking one goes to the original, which is
  * the whole point of a reference — the card names the source's files, and this
@@ -1538,6 +1545,35 @@ static int      g_n_thumb_hits;
 static struct { rectf r; uint64_t chan, mid; } g_fwd_hits[32];
 static int      g_n_fwd_hits;
 static uint64_t g_lightbox;
+/* The video message overlay (recording card or player) is up; see draw_video_overlay. */
+static int g_vm;
+/* The recording quality, as a height: 360, 720 or 1080. Synced with the prefs. */
+static int g_vm_quality = 720;
+enum { VMC_OPEN = 1, VMC_RECORD, VMC_STOP, VMC_DISCARD, VMC_RETAKE, VMC_SEND,
+       VMC_PRIVACY, VMC_PLAYPAUSE, VMC_MUTE, VMC_DOWNLOAD, VMC_CLOSE, VMC_CAMERA, VMC_MIC,
+       VMC_QUALITY };
+static rectf g_video_btn;                 /* composer: record a video message */
+#define VM_MAX_BTNS    8
+static rectf        g_vm_card, g_vm_seek, g_vm_close;
+static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
+static int          g_n_vm_btns;
+static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H);   /* fwd */
+static void vm_command(HWND hwnd, int cmd);                                     /* fwd */
+static void vm_pick_device(HWND hwnd, int camera, int ix);                      /* fwd */
+static int  vm_click(HWND hwnd, int x, int y);                                  /* fwd */
+static void vm_open_player(HWND hwnd, const oc_attachment *at);                 /* fwd */
+static int  vm_take_bytes(uint64_t id, uint8_t *d, size_t n);                   /* fwd */
+static void vm_tick(HWND hwnd, const oc_model *m);                              /* fwd */
+/* Whether this machine has a camera, asked once: enumerating capture devices is
+ * not something to do per frame. */
+static int g_have_camera = -1;
+static int have_camera(void) {
+    if (g_have_camera < 0) { oc_capture_device d[1]; g_have_camera = oc_capture_list(d, 1) > 0; }
+    return g_have_camera;
+}
+static int is_video_msg(const oc_attachment *a) {
+    return a && !a->reclaimed && a->media_kind == OC_MEDIA_VIDEO_MESSAGE;
+}
 /* Slack's pattern: the image itself is the click target for a bigger view, and
  * saving it is a button that appears on hover — so the affordance is there when
  * you look for it and out of the way when you are reading. */
@@ -2984,7 +3020,7 @@ static int  modal_open(void);          /* fwd — pointer_blocked() asks */
  * it lives later in the file and gates native children rather than hover. */
 static int pointer_blocked(void) {
     return g_menu != MENU_NONE || g_pick_open || g_pal_open || g_more_open ||
-           g_tp_open || g_lightbox || modal_open() || g_view == VIEW_SIGNIN;
+           g_tp_open || g_lightbox || g_vm || modal_open() || g_view == VIEW_SIGNIN;
 }
 
 static int in_rect(rectf r, int x, int y);   /* fwd */
@@ -4444,7 +4480,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         /* An image gets a thumbnail box instead of a text line — and the space
          * must be reserved whether or not the bitmap has arrived, or the
          * transcript jumps under the reader the moment one decodes. */
-        if (!msg->attach[i].reclaimed && mime_is_image(msg->attach[i].mime))
+        if (!msg->attach[i].reclaimed && (mime_is_image(msg->attach[i].mime) || is_video_msg(&msg->attach[i])))
             thumbs += THUMB_H + 6.0f + LINE_H;   /* + the filename line above it */
         else
             extra++;
@@ -4580,6 +4616,60 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
     /* Meta lines: attachments, thread, then reactions LAST — see below. */
     for (int i = 0; i < msg->n_attach; i++) {
         const oc_attachment *at = &msg->attach[i];
+        if (is_video_msg(at)) {
+            /* A video message (REQ-165): its poster in the thumbnail's place, a
+             * play mark, and the length. Clicking plays it. */
+            char dur[16], cap[64];
+            oc_model_format_duration(at->duration_ms, dur, sizeof dur);
+            snprintf(cap, sizeof cap, "Video message \xC2\xB7 %s", dur);
+            draw_text(rt, cap, g_meta, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_MUTED);
+            by += LINE_H;
+            float bw = THUMB_W, bh = THUMB_H;
+            if (at->width && at->height) {
+                float sc = THUMB_W / (float)at->width;
+                if (THUMB_H / (float)at->height < sc) sc = THUMB_H / (float)at->height;
+                bw = (float)at->width * sc; bh = (float)at->height * sc;
+            }
+            rectf area = rf(tx, by + 3, tx + bw, by + 3 + bh);
+            UINT iw = 0, ih = 0;
+            gfx_tex *pbmp = at->poster_id ? thumb_get(rt, at->poster_id, &iw, &ih) : NULL;
+            fill_round(rt, area, OC_R_CONTROL, 0x101010);
+            if (pbmp) gfx_tex_draw(rt, pbmp, gr(area), OC_R_CONTROL, 1.0f);
+            else if (at->poster_id && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
+                g_thumb_pending = at->poster_id;
+                g_thumb_deadline = GetTickCount64() + 8000;
+                oc_client_fetch_attachment(g_client, at->poster_id);
+            }
+            stroke_round(rt, area, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            float pcx = (area.left + area.right) / 2, pcy = (area.top + area.bottom) / 2, pr = UIS(22);
+            gfx_ellipse(rt, pcx, pcy, pr, pr, 0x000000, 0.55f);
+            draw_lucide(rt, OC_ICON_PLAY, rf(pcx - pr * 0.5f + 2, pcy - pr * 0.5f, pcx + pr * 0.5f + 2, pcy + pr * 0.5f), 0xFFFFFF);
+            float dw = UIS(44);
+            rectf badge = rf(area.right - dw - 6, area.bottom - UIS(22), area.right - 6, area.bottom - 6);
+            fill_round_a(rt, badge, OC_R_CONTROL, 0x000000, 0.62f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, dur, g_meta, badge, 0xFFFFFF);
+            g_meta->align = ST_ALIGN_LEFT;
+            if (g_n_thumb_hits < 32) {
+                g_thumb_hits[g_n_thumb_hits].r = area;
+                g_thumb_hits[g_n_thumb_hits].id = at->id;
+                g_thumb_hits[g_n_thumb_hits].mid = msg->message_id;
+                g_thumb_hits[g_n_thumb_hits].ix = i;
+                g_n_thumb_hits++;
+            }
+            if (g_thumb_hover == at->id && g_n_thumb_dl < 32) {
+                float bs = 26;
+                rectf db = rf(area.right - 6 - bs, area.top + 6, area.right - 6, area.top + 6 + bs);
+                fill_round_a(rt, db, OC_R_CONTROL, 0x000000, 0.62f);
+                draw_lucide(rt, OC_ICON_DOWNLOAD, rf(db.left + 5, db.top + 5, db.right - 5, db.bottom - 5), 0xFFFFFF);
+                g_thumb_dl[g_n_thumb_dl].r = db;
+                g_thumb_dl[g_n_thumb_dl].attach_ix = i;
+                g_thumb_dl[g_n_thumb_dl].mid = msg->message_id;
+                g_n_thumb_dl++;
+            }
+            by += THUMB_H + 6.0f;
+            continue;
+        }
         if (!at->reclaimed && mime_is_image(at->mime)) {
             /* Filename above the image, as Slack does: the thumbnail alone does
              * not tell you what the file is called or whether it is the one you
@@ -4628,6 +4718,8 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             if (g_n_thumb_hits < 32) {
                 g_thumb_hits[g_n_thumb_hits].r = rf(tx, by + 3, tx + bw, by + 3 + bh);
                 g_thumb_hits[g_n_thumb_hits].id = at->id;
+                g_thumb_hits[g_n_thumb_hits].mid = msg->message_id;
+                g_thumb_hits[g_n_thumb_hits].ix = -1;
                 g_n_thumb_hits++;
             }
             /* Hover toolbar, top-right of the image: save, and a kebab for the
@@ -6110,8 +6202,10 @@ static int mod_down(int vk) {
     return (GetKeyState(vk) & 0x8000) != 0;
 }
 
+static int vm_key(HWND hwnd, WPARAM wp);   /* fwd: the video overlay owns the keyboard while up */
 static int accel_dispatch(HWND hwnd, const MSG *m) {
     if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) return 0;
+    if (g_vm && m->message == WM_KEYDOWN && vm_key(hwnd, m->wParam)) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
      * modal_key in the window proc. */
@@ -6427,7 +6521,7 @@ static void draw_pinlist(gfx *rt, const oc_model *m, rectf reg) {
 /* File-type filter (REQ-143). Client-side over the `mime` the wire already
  * carries — the server returns the newest 200 and the user narrows what they are
  * looking at, which is honest: it filters the page, it does not re-query. */
-enum { FF_ALL = 0, FF_IMAGES, FF_DOCS, FF_OTHER, FF_KINDS };
+enum { FF_ALL = 0, FF_IMAGES, FF_VIDEO, FF_DOCS, FF_OTHER, FF_KINDS };
 static int g_file_filter;
 static rectf g_file_filters[FF_KINDS];
 /* Scope is a separate axis from type — Slack splits them the same way, because
@@ -6485,6 +6579,7 @@ static int g_n_fchan_rows;
 static int file_kind(const char *mime) {
     if (mime_is_image(mime)) return FF_IMAGES;
     if (!mime) return FF_OTHER;
+    if (!strncmp(mime, "video/", 6)) return FF_VIDEO;     /* video messages among them (REQ-165) */
     if (!strncmp(mime, "text/", 5) || strstr(mime, "pdf") || strstr(mime, "word") ||
         strstr(mime, "sheet") || strstr(mime, "presentation") || strstr(mime, "document"))
         return FF_DOCS;
@@ -6498,7 +6593,9 @@ static void file_badge(gfx *rt, const oc_file_view *f, rectf r) {
     const char *ext = strrchr(f->filename, '.');
     char tag[6] = "FILE";
     uint32_t col = 0x5B6270;                       /* generic */
-    if (mime_is_image(f->mime))                     { col = 0x8B5CF6; snprintf(tag, sizeof tag, "IMG"); }
+    if (f->media_kind == OC_MEDIA_VIDEO_MESSAGE ||
+        strncmp(f->mime, "video/", 6) == 0)          { col = 0xE0701A; snprintf(tag, sizeof tag, "VID"); }
+    else if (mime_is_image(f->mime))                { col = 0x8B5CF6; snprintf(tag, sizeof tag, "IMG"); }
     else if (ext && !_stricmp(ext, ".pdf"))       { col = 0xD64545; snprintf(tag, sizeof tag, "PDF"); }
     else if (ext && (!_stricmp(ext, ".doc") || !_stricmp(ext, ".docx")))
                                                     { col = 0x2B5CE6; snprintf(tag, sizeof tag, "DOC"); }
@@ -6622,7 +6719,7 @@ static rectf drop_btn(gfx *rt, float right, float y, const char *label,
     return b;
 }
 
-static const char *FF_LABEL[FF_KINDS] = { "All", "Images", "Documents", "Other" };
+static const char *FF_LABEL[FF_KINDS] = { "All", "Images", "Video", "Documents", "Other" };
 /* Slack's wording, because these say exactly what they mean and we had a vaguer
  * set ("Everyone") saying the same thing. */
 static const char *FS_LABEL[FS_SCOPES] = { "All", "Shared by you", "Shared with you" };
@@ -9610,7 +9707,13 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * next to a grey "+" and a grey paper plane as the only coloured control in
      * the whole shell. Colour is for content — messages, reactions, and the
      * glyphs you pick in the picker. */
-    g_emoji_btn = rf(bx0 + COMPOSER_GUTTER + sq, cy, bx0 + COMPOSER_GUTTER + sq * 2, cy + sq);
+    /* Record a video message (REQ-162), beside attach: shown only where there is
+     * a camera, since a button that can only fail is worse than none. */
+    int vcam = have_camera();
+    g_video_btn = vcam ? rf(bx0 + COMPOSER_GUTTER + sq, cy, bx0 + COMPOSER_GUTTER + sq * 2, cy + sq)
+                       : rf(0, 0, 0, 0);
+    float vsh = vcam ? sq : 0;
+    g_emoji_btn = rf(bx0 + COMPOSER_GUTTER + sq + vsh, cy, bx0 + COMPOSER_GUTTER + sq * 2 + vsh, cy + sq);
 
     /* Mention. The '@' trigger already worked when typed; ARCH-82 says the GUI
      * is affordance-driven, so it needs to be visible too.
@@ -9621,10 +9724,22 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * composer.mention+composer.send. Send is the one that must always
      * be there, so the optional icons drop off from the right. */
     float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
-    g_at_btn = rf(bx0 + COMPOSER_GUTTER + sq * 2, cy, bx0 + COMPOSER_GUTTER + sq * 3, cy + sq);
+    g_at_btn = rf(bx0 + COMPOSER_GUTTER + sq * 2 + vsh, cy, bx0 + COMPOSER_GUTTER + sq * 3 + vsh, cy + sq);
     if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
-    if (g_emoji_btn.right > left_limit) g_emoji_btn = rf(0, 0, 0, 0);
+    if (g_video_btn.right > left_limit) g_video_btn = rf(0, 0, 0, 0);
     if (g_attach_btn.right > left_limit) g_attach_btn = rf(0, 0, 0, 0);
+    if (g_emoji_btn.right > left_limit) g_emoji_btn = rf(0, 0, 0, 0);
+    /* Hover, as every other button in the shell has: the plate under the icon
+     * the pointer is on, before the icons are drawn over it. */
+    if (!pointer_blocked()) {
+        const rectf *cb[] = { &g_attach_btn, &g_video_btn, &g_emoji_btn, &g_at_btn };
+        for (int i = 0; i < 4; i++)
+            if (cb[i]->right > cb[i]->left && in_rect(*cb[i], (float)g_mouse_x, (float)g_mouse_y))
+                fill_round(rt, *cb[i], OC_R_CONTROL, OC_COL_HOVER);
+    }
+    if (g_video_btn.right > g_video_btn.left)
+        draw_lucide(rt, OC_ICON_VIDEO, rf(g_video_btn.left + 8, g_video_btn.top + 8,
+                                          g_video_btn.right - 8, g_video_btn.bottom - 8), OC_COL_MUTED);
     if (g_attach_btn.right > g_attach_btn.left)
         draw_lucide(rt, OC_ICON_PLUS, rf(g_attach_btn.left + 8, g_attach_btn.top + 8,
                                          g_attach_btn.right - 8, g_attach_btn.bottom - 8),
@@ -12980,6 +13095,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         g_n_memrows = 0;
     }
     draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
+    draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
@@ -14663,6 +14779,7 @@ enum {
     AT_VIEW = 1,      /* payload: a VIEW_* / NAV_* rail act */
     AT_CONV,          /* payload: channel id */
     AT_MENU,          /* payload: a menu_dispatch command */
+    AT_VIDEO,         /* payload: a video overlay command (VMC_*) */
     AT_SEND,          /* the composer's send */
     AT_DTAB,          /* payload: drafts tab index */
     AT_ACTFILTER,     /* payload: activity filter index */
@@ -14866,9 +14983,25 @@ static void a11y_publish_scene(const oc_model *m) {
     /* The composer's controls. Send carries the state a test needs to assert on
      * in its NAME, since an element that is present but refuses is the case a
      * locator alone cannot distinguish. */
+    /* The video overlay's buttons, named for what they do (REQ-290). */
+    if (g_vm) {
+        static const char *VMID[] = { "", "composer.video", "rec.record", "rec.stop", "rec.discard",
+                                      "rec.retake", "rec.send", "rec.privacy", "player.play",
+                                      "player.mute", "player.download", "vm.close", "rec.camera", "rec.mic",
+                                      "rec.quality" };
+        for (int i = 0; i < g_n_vm_btns; i++) {
+            int cmd = g_vm_btns[i].cmd;
+            const char *aid = (cmd > 0 && cmd < (int)(sizeof VMID / sizeof VMID[0])) ? VMID[cmd] : "vm.button";
+            acc_push(items, &n, OC_ACC_BUTTON, aid, g_vm_btns[i].label, g_vm_btns[i].r, ATOK(AT_VIDEO, cmd));
+        }
+        acc_push(items, &n, OC_ACC_BUTTON, "vm.dismiss", "Close", g_vm_close, ATOK(AT_VIDEO, VMC_CLOSE));
+    }
     if (main_is_conversation()) {
         acc_push(items, &n, OC_ACC_BUTTON, "composer.attach", "Attach a file",
                  g_attach_btn, ATOK(AT_MENU, 7));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.video", "Record a video message",
+                 g_video_btn, ATOK(AT_VIDEO, VMC_OPEN));
+
         acc_push(items, &n, OC_ACC_BUTTON, "composer.emoji", "Emoji", g_emoji_btn,
                  ATOK(AT_EMOJI, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.mention", "Mention someone", g_at_btn,
@@ -15363,7 +15496,7 @@ static int main_is_conversation(void) {
 /* Does something own the whole window right now? A native child underneath it
  * must be hidden, because there is no z-order to lose — see layout_natives. */
 static int window_is_covered(void) {
-    return modal_open() || g_pal_open || g_lightbox || g_menu || g_more_open ||
+    return modal_open() || g_pal_open || g_lightbox || g_vm || g_menu || g_more_open ||
            g_view == VIEW_SIGNIN;
 }
 
@@ -15663,6 +15796,679 @@ static void palette_accept(HWND hwnd) {
 
 static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static WNDPROC g_pal_prev;
+
+static void download_attachment(HWND hwnd, const oc_attachment *a);   /* fwd */
+
+/* ---- video messages (REQ-162–166, ARCH-110, docs/VIDEO-MESSAGES.md §9) -------
+ *
+ * One overlay, two uses. The RECORDING CARD opens from the composer: a live
+ * preview, a 3-2-1 countdown, the timer against the five-minute cap, and a review
+ * step that plays the take back before anything leaves the machine. The PLAYER
+ * opens from a video message in the transcript: the video fitted to the window,
+ * with play, seek, time, mute, download and close. Both draw a frame the core
+ * hands over as BGRA, uploaded as one texture per new frame.
+ *
+ * Nothing is written to disk (ARCH-88): a take lives in memory until it is sent
+ * or discarded, and fetched videos are kept in a small in-memory cache. */
+
+enum { VM_CLOSED, VM_REC, VM_PLAY };
+enum { REC_PREVIEW, REC_COUNTDOWN, REC_RECORDING, REC_FINISHING, REC_REVIEW, REC_ERROR };
+
+#define VM_CACHE_N     8
+#define VM_CACHE_BYTES (256u * 1024u * 1024u)
+
+static oc_recorder *g_rec;
+static int          g_rec_phase, g_rec_err;
+static char         g_rec_detail[200];
+static ULONGLONG    g_rec_count_at;           /* when the countdown started */
+static oc_rec_result g_rec_res;               /* the take under review */
+static oc_player   *g_vplayer;
+static uint64_t     g_vplay_aid;              /* the video message being played (0 = a review) */
+static char         g_vplay_name[128];
+static int          g_vplay_loading;
+static int          g_vm_muted;
+/* The chosen devices, by list index (0 = the first, which is the default). */
+static oc_capture_device g_vm_cams[8];
+static oc_audio_device   g_vm_mics[8];
+static int          g_vm_ncams, g_vm_nmics, g_vm_cam, g_vm_mic;
+static float        g_vm_volume = 1.0f;      /* 0..1, Up and Down in the player */
+static uint64_t     g_vm_post_tag;            /* the last send, for its outcome toast */
+static gfx_tex     *g_vm_tex;
+static int          g_vm_tw, g_vm_th;
+static uint8_t     *g_vm_px;
+static size_t       g_vm_pxcap;
+static uint64_t     g_vm_seq;
+static struct { uint64_t id; uint8_t *d; size_t n; ULONGLONG used; } g_vcache[VM_CACHE_N];
+
+static const uint8_t *vcache_get(uint64_t id, size_t *n) {
+    for (int i = 0; i < VM_CACHE_N; i++)
+        if (g_vcache[i].id == id && g_vcache[i].d) {
+            g_vcache[i].used = GetTickCount64();
+            *n = g_vcache[i].n;
+            return g_vcache[i].d;
+        }
+    return NULL;
+}
+
+/* Keep the newest videos up to the byte budget; the one playing is never the
+ * one evicted, since the player borrows its bytes. */
+static void vcache_put(uint64_t id, uint8_t *d, size_t n) {
+    for (;;) {
+        size_t total = n; int slot = -1, oldest = -1;
+        for (int i = 0; i < VM_CACHE_N; i++) {
+            if (!g_vcache[i].d) { if (slot < 0) slot = i; continue; }
+            total += g_vcache[i].n;
+            if (g_vcache[i].id == g_vplay_aid) continue;
+            if (oldest < 0 || g_vcache[i].used < g_vcache[oldest].used) oldest = i;
+        }
+        if (slot >= 0 && total <= VM_CACHE_BYTES) {
+            g_vcache[slot].id = id; g_vcache[slot].d = d; g_vcache[slot].n = n;
+            g_vcache[slot].used = GetTickCount64();
+            return;
+        }
+        if (oldest < 0) { free(d); return; }
+        free(g_vcache[oldest].d);
+        memset(&g_vcache[oldest], 0, sizeof g_vcache[oldest]);
+    }
+}
+
+static void vm_tex_drop(void) {
+    if (g_vm_tex) gfx_tex_destroy(g_vm_tex);
+    g_vm_tex = NULL; g_vm_tw = g_vm_th = 0; g_vm_seq = 0;
+}
+
+/* Pull the newest frame from whichever source is live and upload it. */
+static void vm_frame_update(void) {
+    if (!g_gfx) return;
+    size_t want = 1920u * 1080u * 4u;
+    if (g_vm_pxcap < want) {
+        uint8_t *p = realloc(g_vm_px, want);
+        if (!p) return;
+        g_vm_px = p; g_vm_pxcap = want;
+    }
+    int w = 0, h = 0, rc = 0;
+    uint64_t seq = g_vm_seq;
+    if (g_rec)          rc = oc_recorder_preview(g_rec, g_vm_px, g_vm_pxcap, &w, &h, &seq);
+    else if (g_vplayer) rc = oc_player_frame(g_vplayer, g_vm_px, g_vm_pxcap, &w, &h, &seq);
+    if (rc != 1 || w <= 0 || h <= 0) return;
+    g_vm_seq = seq;
+    if (g_vm_tex) gfx_tex_destroy(g_vm_tex);
+    g_vm_tex = gfx_tex_create_text(g_gfx, g_vm_px, w * 4, w, h);
+    g_vm_tw = w; g_vm_th = h;
+}
+
+static void vm_set_title(HWND hwnd, int recording) {
+    SetWindowTextW(hwnd, recording ? L"● Recording - OpenChime" : L"OpenChime");
+    if (g_win) SDL_SetWindowTitle(g_win, recording ? "\xE2\x97\x8F Recording - OpenChime" : "OpenChime");
+}
+
+static void vm_player_close(void) {
+    if (g_vplayer) oc_player_close(g_vplayer);
+    g_vplayer = NULL;
+    vm_tex_drop();
+}
+
+/* Close everything: the camera and microphone are released here, at once
+ * (REQ-166), and an unsent take is freed. */
+static void vm_close(HWND hwnd) {
+    vm_player_close();
+    if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
+    oc_rec_result_free(&g_rec_res);
+    g_vm = VM_CLOSED; g_rec_phase = REC_PREVIEW; g_rec_err = 0;
+    g_vplay_aid = 0; g_vplay_loading = 0;
+    vm_set_title(hwnd, 0);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void rec_open_devices(HWND hwnd) {
+    oc_recorder_opts o = {0};
+    g_vm_ncams = oc_capture_list(g_vm_cams, 8);
+    if (g_vm_ncams < 0) g_vm_ncams = 0;
+    g_vm_nmics = oc_audio_list(1, g_vm_mics, 8);
+    if (g_vm_nmics < 0) g_vm_nmics = 0;
+    if (g_vm_cam >= g_vm_ncams) g_vm_cam = 0;
+    if (g_vm_mic >= g_vm_nmics) g_vm_mic = 0;
+    if (g_vm_ncams) o.camera_id = g_vm_cams[g_vm_cam].id;
+    if (g_vm_nmics) o.mic_id = g_vm_mics[g_vm_mic].id;
+    o.height = g_vm_quality;
+    int err = 0;
+    g_rec = oc_recorder_open(&o, &err);
+    g_rec_err = err;
+    /* The step that failed, kept for the card and the crash crumbs: "could not
+     * start" alone cannot be diagnosed from a report. */
+    snprintf(g_rec_detail, sizeof g_rec_detail, "%s", g_rec ? "" : oc_capture_detail());
+    g_rec_phase = g_rec ? REC_PREVIEW : REC_ERROR;
+    crumb("rec_open err=%d cam=%d/%d mic=%d/%d detail=%s", err, g_vm_cam, g_vm_ncams, g_vm_mic, g_vm_nmics, g_rec_detail);
+    (void)hwnd;
+}
+
+static void vm_open_recorder(HWND hwnd) {
+    if (!g_client || !g_sel || g_vm) return;
+    g_vm = VM_REC;
+    SetFocus(hwnd);
+    rec_open_devices(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void vm_open_player(HWND hwnd, const oc_attachment *at) {
+    if (!g_client || !at || at->reclaimed || g_vm) return;
+    g_vm = VM_PLAY;
+    g_vplay_aid = at->id;
+    snprintf(g_vplay_name, sizeof g_vplay_name, "%s", at->filename);
+    SetFocus(hwnd);
+    size_t n = 0;
+    const uint8_t *d = vcache_get(at->id, &n);
+    if (d) {
+        g_vplayer = oc_player_open(d, n);
+        if (g_vplayer) { oc_player_volume(g_vplayer, g_vm_muted ? 0.0f : g_vm_volume); oc_player_play(g_vplayer); }
+        else toast_push("This video could not be played", 1);
+        g_vplay_loading = 0;
+    } else {
+        g_vplay_loading = 1;
+        oc_client_fetch_media(g_client, at->id);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* A fetched attachment arrived. Returns 1 if it was the video being opened. */
+static int vm_take_bytes(uint64_t id, uint8_t *d, size_t n) {
+    if (g_vm != VM_PLAY || !g_vplay_loading || id != g_vplay_aid) return 0;
+    vcache_put(id, d, n);
+    size_t cn = 0;
+    const uint8_t *cd = vcache_get(id, &cn);
+    g_vplay_loading = 0;
+    g_vplayer = cd ? oc_player_open(cd, cn) : NULL;
+    if (g_vplayer) { oc_player_volume(g_vplayer, g_vm_muted ? 0.0f : g_vm_volume); oc_player_play(g_vplayer); }
+    else toast_push("This video could not be played", 1);
+    return 1;
+}
+
+static void vm_send(HWND hwnd) {
+    if (!g_rec_res.video || !g_client || !g_sel) return;
+    vm_player_close();                                /* it borrows the bytes being handed over */
+    WCHAR wcap[4096]; char cap[8192] = "";
+    if (ed_get(wcap, 4096) > 0) WideCharToMultiByte(CP_UTF8, 0, wcap, -1, cap, sizeof cap, NULL, NULL);
+    /* Into the open thread when the composer is replying there, as a typed
+     * message would go (composer_send). */
+    const oc_model *pm = model();
+    uint64_t pch = (pm && pm->thread_open) ? pm->thread_channel : g_sel;
+    uint64_t proot = (pm && pm->thread_open) ? pm->thread_parent : 0;
+    g_vm_post_tag = oc_client_post_video(g_client, pch, proot,
+                                         g_rec_res.video, g_rec_res.video_len,
+                                         g_rec_res.poster, g_rec_res.poster_len,
+                                         g_rec_res.duration_ms, (uint16_t)g_rec_res.width,
+                                         (uint16_t)g_rec_res.height, cap);
+    g_rec_res.video = g_rec_res.poster = NULL;        /* the core owns them now */
+    if (cap[0]) ed_clear();
+    toast_push("Sending video message\xE2\x80\xA6", 0);
+    vm_close(hwnd);
+}
+
+/* A device chosen from a dropdown: reopen the recorder on it. */
+static void vm_pick_device(HWND hwnd, int camera, int ix) {
+    if (g_vm != VM_REC || (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR)) return;
+    if (camera) { if (ix >= g_vm_ncams || ix == g_vm_cam) return; g_vm_cam = ix; }
+    else        { if (ix >= g_vm_nmics || ix == g_vm_mic) return; g_vm_mic = ix; }
+    if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
+    vm_tex_drop();
+    rec_open_devices(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void vm_command(HWND hwnd, int cmd) {
+    crumb("vm_command %d", cmd);
+    switch (cmd) {
+    case VMC_OPEN:     vm_open_recorder(hwnd); break;
+    case VMC_RECORD:
+        if (g_vm == VM_REC && g_rec && g_rec_phase == REC_PREVIEW) {
+            g_rec_phase = REC_COUNTDOWN; g_rec_count_at = GetTickCount64();
+        }
+        break;
+    case VMC_STOP:
+        if (g_rec && g_rec_phase == REC_RECORDING) { oc_recorder_stop(g_rec); g_rec_phase = REC_FINISHING; }
+        else if (g_rec_phase == REC_COUNTDOWN) g_rec_phase = REC_PREVIEW;
+        break;
+    case VMC_DISCARD:
+    case VMC_CLOSE:    vm_close(hwnd); break;
+    case VMC_RETAKE:
+        vm_player_close();
+        oc_rec_result_free(&g_rec_res);
+        rec_open_devices(hwnd);
+        break;
+    case VMC_SEND:     vm_send(hwnd); break;
+    case VMC_QUALITY: {
+        if (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR) break;
+        rectf field = rf(0, 0, 0, 0);
+        for (int i = 0; i < g_n_vm_btns; i++) if (g_vm_btns[i].cmd == cmd) field = g_vm_btns[i].r;
+        static const struct { int h; const char *label; } Q[] = {
+            { 360, "360p (smallest file)" }, { 720, "720p (standard)" },
+            { 1080, "1080p (best quality)" },
+        };
+        g_n_mi = 0;
+        mi_section("QUALITY");
+        char lbl[64];
+        for (int i = 0; i < 3; i++) {
+            snprintf(lbl, sizeof lbl, "%s%s", g_vm_quality == Q[i].h ? "\xE2\x9C\x93 " : "    ", Q[i].label);
+            mi_item(990 + i, lbl);
+        }
+        g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
+        g_menu_w = UIS(220);
+        float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+        RECT rc; GetClientRect(hwnd, &rc);
+        g_menu_x = field.left;
+        g_menu_y = field.bottom + 4;
+        if (g_menu_y + h > DIPF(rc.bottom) - 8) g_menu_y = field.top - 4 - h;
+        if (g_menu_y < 8) g_menu_y = 8;
+        break;
+    }
+    case VMC_CAMERA:
+    case VMC_MIC: {
+        /* An ordinary dropdown: the devices, the one in use ticked. Commands
+         * 950+ (cameras) and 970+ (microphones) come back through menu_dispatch. */
+        if (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR) break;
+        int cam = cmd == VMC_CAMERA;
+        rectf field = rf(0, 0, 0, 0);
+        for (int i = 0; i < g_n_vm_btns; i++) if (g_vm_btns[i].cmd == cmd) field = g_vm_btns[i].r;
+        g_n_mi = 0;
+        char lbl[300];
+        int n = cam ? g_vm_ncams : g_vm_nmics, cur = cam ? g_vm_cam : g_vm_mic;
+        mi_section(cam ? "CAMERA" : "MICROPHONE");
+        for (int i = 0; i < n; i++) {
+            snprintf(lbl, sizeof lbl, "%s%s", i == cur ? "\xE2\x9C\x93 " : "    ",
+                     cam ? g_vm_cams[i].name : g_vm_mics[i].name);
+            mi_item((cam ? 950 : 970) + i, lbl);
+        }
+        g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
+        g_menu_w = field.right - field.left > UIS(240) ? field.right - field.left : UIS(240);
+        float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+        RECT rc; GetClientRect(hwnd, &rc);
+        float WH = DIPF(rc.bottom);
+        g_menu_x = field.left;
+        g_menu_y = field.bottom + 4;
+        if (g_menu_y + h > WH - 8) g_menu_y = field.top - 4 - h;   /* above, when below would not fit */
+        if (g_menu_y < 8) g_menu_y = 8;
+        break;
+    }
+    case VMC_PRIVACY: {
+        const WCHAR *uri = (g_rec_err == OC_REC_MIC_DENIED) ? L"ms-settings:privacy-microphone"
+                                                           : L"ms-settings:privacy-webcam";
+        ShellExecuteW(NULL, L"open", uri, NULL, NULL, SW_SHOWNORMAL);
+        break;
+    }
+    case VMC_PLAYPAUSE:
+        if (g_vplayer) {
+            oc_player_status st; oc_player_status_get(g_vplayer, &st);
+            if (st.state == OC_PLAYER_PLAYING) oc_player_pause(g_vplayer); else oc_player_play(g_vplayer);
+        }
+        break;
+    case VMC_MUTE:
+        g_vm_muted = !g_vm_muted;
+        if (g_vplayer) oc_player_volume(g_vplayer, g_vm_muted ? 0.0f : g_vm_volume);
+        break;
+    case VMC_DOWNLOAD:
+        if (g_vplay_aid) {
+            oc_attachment at; memset(&at, 0, sizeof at);
+            at.id = g_vplay_aid;
+            snprintf(at.filename, sizeof at.filename, "%s", g_vplay_name[0] ? g_vplay_name : "video.mp4");
+            download_attachment(hwnd, &at);
+        }
+        break;
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Per tick: advance the recording card, and report how a send went. */
+static void vm_tick(HWND hwnd, const oc_model *m) {
+    if (m && g_vm_post_tag) {
+        if (m->media_posted_tag == g_vm_post_tag) {
+            toast_push("Video message sent", 0);
+            g_vm_post_tag = 0;
+        } else if (m->xfer_tag == g_vm_post_tag && m->xfer_phase == 2) {
+            toast_push(m->status[0] ? m->status : "The video message could not be sent", 1);
+            g_vm_post_tag = 0;
+        }
+    }
+    if (g_vm != VM_REC) return;
+    if (g_rec_phase == REC_COUNTDOWN && GetTickCount64() - g_rec_count_at >= 3000) {
+        if (g_rec && oc_recorder_start(g_rec) == 0) { g_rec_phase = REC_RECORDING; vm_set_title(hwnd, 1); }
+        else g_rec_phase = REC_PREVIEW;
+    }
+    if (g_rec && (g_rec_phase == REC_RECORDING || g_rec_phase == REC_FINISHING)) {
+        oc_rec_status st; oc_recorder_status(g_rec, &st);
+        if (st.state == OC_REC_FINISHING) g_rec_phase = REC_FINISHING;
+        if (st.state == OC_REC_DONE && oc_recorder_take(g_rec, &g_rec_res) == 0) {
+            /* The camera goes as soon as the take exists: review plays the
+             * recording, not the camera (REQ-166). */
+            oc_recorder_close(g_rec); g_rec = NULL;
+            vm_tex_drop();
+            g_vplayer = oc_player_open(g_rec_res.video, g_rec_res.video_len);
+            g_rec_phase = REC_REVIEW;
+            vm_set_title(hwnd, 0);
+        } else if (st.state == OC_REC_ERROR) {
+            g_rec_phase = REC_ERROR; g_rec_err = OC_REC_FAILED;
+            vm_set_title(hwnd, 0);
+        }
+    }
+}
+
+static void vm_btn(gfx *rt, rectf r, const char *label, int cmd, int primary, int danger) {
+    int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
+    if (primary)     fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
+    else if (danger) { fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+                       stroke_round(rt, r, OC_R_CONTROL, OC_COL_DANGER, 1.0f); }
+    else             { fill_round(rt, r, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+                       stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f); }
+    g_ui->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
+              primary ? 0xFFFFFF : danger ? OC_COL_DANGER : OC_COL_TEXT);
+    g_ui->align = ST_ALIGN_LEFT;
+    if (g_n_vm_btns < VM_MAX_BTNS) {
+        g_vm_btns[g_n_vm_btns].r = r;
+        g_vm_btns[g_n_vm_btns].cmd = cmd;
+        snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[g_n_vm_btns].label, "%s", label);
+        g_n_vm_btns++;
+    }
+}
+
+/* The video fitted inside `box` (letterboxed), or a placeholder line. */
+static void vm_draw_video(gfx *rt, rectf box, const char *placeholder) {
+    fill(rt, box, 0x000000);
+    if (g_vm_tex && g_vm_tw > 0 && g_vm_th > 0) {
+        float bw = box.right - box.left, bh = box.bottom - box.top;
+        float sc = bw / (float)g_vm_tw;
+        if (bh / (float)g_vm_th < sc) sc = bh / (float)g_vm_th;
+        float dw = (float)g_vm_tw * sc, dh = (float)g_vm_th * sc;
+        float cx = (box.left + box.right) / 2, cy = (box.top + box.bottom) / 2;
+        gfx_tex_draw(rt, g_vm_tex, gr(rf(cx - dw / 2, cy - dh / 2, cx + dw / 2, cy + dh / 2)), 0.0f, 1.0f);
+    } else if (placeholder) {
+        g_ui->align = ST_ALIGN_CENTER;
+        float cy = (box.top + box.bottom) / 2;
+        draw_text(rt, placeholder, g_ui, rf(box.left + 16, cy - 10, box.right - 16, cy + 12), 0xC8C8C8);
+        g_ui->align = ST_ALIGN_LEFT;
+    }
+}
+
+static const char *rec_error_text(int err) {
+    switch (err) {
+    case OC_REC_CAMERA_DENIED:   return "Windows is blocking camera access for OpenChime.";
+    case OC_REC_MIC_DENIED:      return "Windows is blocking microphone access for OpenChime.";
+    case OC_REC_CAMERA_NODEVICE: return "No camera was found.";
+    case OC_REC_CAMERA_BUSY:     return "The camera is in use by another app.";
+    default:                     return "The recording could not start.";
+    }
+}
+
+static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
+    g_n_vm_btns = 0;
+    g_vm_seek = g_vm_close = rf(0, 0, 0, 0);
+    if (!g_vm) return;
+    vm_frame_update();
+    gfx_fill(rt, gr(rf(0, 0, W, H)), 0x000000, g_vm == VM_PLAY ? 0.95f : 0.55f);
+    float bh = UIS(34);
+
+    if (g_vm == VM_REC) {
+        float cw = UIS(640); if (cw > W - 40) cw = W - 40;
+        float vh = cw * 9.0f / 16.0f;
+        float ch = UIS(56) + vh + UIS(52) + UIS(60);
+        if (ch > H - 40) { vh -= ch - (H - 40); ch = H - 40; }
+        rectf card = rf((W - cw) / 2, (H - ch) / 2, (W + cw) / 2, (H + ch) / 2);
+        g_vm_card = card;
+        fill_round(rt, card, OC_R_OVERLAY, OC_COL_BASE);
+        stroke_round(rt, card, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
+        draw_text(rt, g_rec_phase == REC_REVIEW ? "Review your video message" : "Record a video message",
+                  g_display, rf(card.left + UIS(20), card.top + UIS(16), card.right - UIS(60), card.top + UIS(44)),
+                  OC_COL_TEXT);
+        g_vm_close = rf(card.right - UIS(44), card.top + UIS(12), card.right - UIS(16), card.top + UIS(40));
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, "\xC3\x97", g_ui, g_vm_close, OC_COL_MUTED);
+        g_ui->align = ST_ALIGN_LEFT;
+        rectf vbox = rf(card.left + UIS(20), card.top + UIS(56), card.right - UIS(20), card.top + UIS(56) + vh);
+        char errline[320];
+        snprintf(errline, sizeof errline, "%s%s%s", rec_error_text(g_rec_err),
+                 g_rec_detail[0] && g_rec_err == OC_REC_FAILED ? "  (" : "",
+                 g_rec_detail[0] && g_rec_err == OC_REC_FAILED ? g_rec_detail : "");
+        if (g_rec_detail[0] && g_rec_err == OC_REC_FAILED) strncat(errline, ")", sizeof errline - strlen(errline) - 1);
+        const char *ph = g_rec_phase == REC_ERROR ? errline
+                       : g_rec_phase == REC_FINISHING ? "Finishing\xE2\x80\xA6" : "Starting the camera\xE2\x80\xA6";
+        vm_draw_video(rt, vbox, ph);
+
+        /* Status line: countdown, the red recording mark and timer, the level. */
+        float sy = vbox.bottom + UIS(10);
+        char line[96] = "";
+        oc_rec_status st; memset(&st, 0, sizeof st);
+        if (g_rec) oc_recorder_status(g_rec, &st);
+        if (g_rec_phase == REC_COUNTDOWN) {
+            int left = 3 - (int)((GetTickCount64() - g_rec_count_at) / 1000);
+            snprintf(line, sizeof line, "Recording in %d\xE2\x80\xA6", left < 1 ? 1 : left);
+            char big[4]; snprintf(big, sizeof big, "%d", left < 1 ? 1 : left);
+            g_display->align = ST_ALIGN_CENTER;
+            float cy = (vbox.top + vbox.bottom) / 2;
+            gfx_ellipse(rt, (vbox.left + vbox.right) / 2, cy, UIS(40), UIS(40), 0x000000, 0.5f);
+            draw_text(rt, big, g_display, rf(vbox.left, cy - UIS(12), vbox.right, cy + UIS(14)), 0xFFFFFF);
+            g_display->align = ST_ALIGN_LEFT;
+        } else if (g_rec_phase == REC_RECORDING) {
+            char e[16], c[16];
+            oc_model_format_duration(st.elapsed_ms, e, sizeof e);
+            oc_model_format_duration(st.cap_ms, c, sizeof c);
+            snprintf(line, sizeof line, "Recording  %s / %s", e, c);
+            gfx_ellipse(rt, vbox.left + UIS(18), vbox.top + UIS(18), UIS(6), UIS(6), OC_COL_DANGER, 1.0f);
+            gfx_ellipse(rt, card.left + UIS(26), sy + UIS(9), UIS(5), UIS(5), OC_COL_DANGER, 1.0f);
+        } else if (g_rec_phase == REC_REVIEW) {
+            char d[16]; oc_model_format_duration(g_rec_res.duration_ms, d, sizeof d);
+            oc_player_status ps; memset(&ps, 0, sizeof ps);
+            if (g_vplayer) oc_player_status_get(g_vplayer, &ps);
+            char p[16]; oc_model_format_duration(ps.position_ms, p, sizeof p);
+            snprintf(line, sizeof line, "%s / %s", p, d);
+        } else if (g_rec_phase == REC_PREVIEW) {
+            snprintf(line, sizeof line, g_rec && !st.has_audio ? "No microphone: the video will be silent"
+                                                               : "Up to 5 minutes");
+        }
+        if (line[0])
+            draw_text(rt, line, g_meta, rf(card.left + UIS(40), sy, card.right - UIS(140), sy + UIS(20)), OC_COL_MUTED);
+        if (g_rec && st.has_audio && (g_rec_phase == REC_PREVIEW || g_rec_phase == REC_RECORDING)) {
+            rectf meter = rf(card.right - UIS(120), sy + UIS(5), card.right - UIS(20), sy + UIS(13));
+            fill_round(rt, meter, UIS(4), OC_COL_INPUT);
+            float lv = (float)st.level / 32767.0f; if (lv > 1) lv = 1;
+            if (lv > 0.01f)
+                fill_round(rt, rf(meter.left, meter.top, meter.left + (meter.right - meter.left) * lv, meter.bottom),
+                           UIS(4), OC_COL_ONLINE);
+        }
+
+        /* Buttons, right to left, primary rightmost. */
+        float by = card.bottom - UIS(16) - bh, bx = card.right - UIS(20);
+        #define VM_RBTN(label, cmd, primary, danger) do { \
+            float w_ = btn_width(label); rectf r_ = rf(bx - w_, by, bx, by + bh); \
+            vm_btn(rt, r_, label, cmd, primary, danger); bx = r_.left - 10; } while (0)
+        switch (g_rec_phase) {
+        case REC_PREVIEW:   VM_RBTN("Record", VMC_RECORD, 1, 0); VM_RBTN("Cancel", VMC_CLOSE, 0, 0); break;
+        case REC_COUNTDOWN: VM_RBTN("Cancel countdown", VMC_STOP, 0, 0); break;
+        case REC_RECORDING: VM_RBTN("Stop", VMC_STOP, 1, 0); break;
+        case REC_FINISHING: break;
+        case REC_REVIEW:
+            VM_RBTN("Send", VMC_SEND, 1, 0);
+            VM_RBTN("Retake", VMC_RETAKE, 0, 0);
+            {
+                oc_player_status rps; memset(&rps, 0, sizeof rps);
+                if (g_vplayer) oc_player_status_get(g_vplayer, &rps);
+                VM_RBTN(rps.state == OC_PLAYER_PLAYING ? "Pause" : "Play", VMC_PLAYPAUSE, 0, 0);
+            }
+            VM_RBTN("Discard", VMC_DISCARD, 0, 1);
+            break;
+        case REC_ERROR:
+            if (g_rec_err == OC_REC_CAMERA_DENIED || g_rec_err == OC_REC_MIC_DENIED)
+                VM_RBTN("Open privacy settings", VMC_PRIVACY, 1, 0);
+            VM_RBTN("Close", VMC_CLOSE, 0, 0);
+            break;
+        }
+        #undef VM_RBTN
+        if (g_rec_phase == REC_PREVIEW || g_rec_phase == REC_ERROR) {
+            /* Device dropdowns, left: the device in use, and a chevron. */
+            float lx = card.left + UIS(20);
+            {
+                float qw = UIS(84);
+                rectf f = rf(lx, by, lx + qw, by + bh);
+                int hot = in_rect(f, (float)g_mouse_x, (float)g_mouse_y);
+                int open = g_menu == MENU_SECTION && g_menu_x == f.left;
+                fill_round(rt, f, OC_R_CONTROL, hot || open ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, f, OC_R_CONTROL, open ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+                char ql[16]; snprintf(ql, sizeof ql, "%dp", g_vm_quality);
+                draw_text(rt, ql, g_ui, rf(f.left + UIS(10), f.top + (bh - UIS(20)) / 2,
+                                           f.right - UIS(24), f.top + (bh + UIS(20)) / 2), OC_COL_TEXT);
+                draw_text(rt, "\xE2\x96\xBE", g_ui, rf(f.right - UIS(22), f.top + (bh - UIS(20)) / 2,
+                                                         f.right - UIS(6), f.top + (bh + UIS(20)) / 2), OC_COL_MUTED);
+                if (g_n_vm_btns < VM_MAX_BTNS) {
+                    g_vm_btns[g_n_vm_btns].r = f;
+                    g_vm_btns[g_n_vm_btns].cmd = VMC_QUALITY;
+                    snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "Quality: %s", ql);
+                    g_n_vm_btns++;
+                }
+                lx += qw + 10;
+            }
+            float room = (bx - lx) / 2 - 10;
+            for (int k = 0; k < 2; k++) {
+                int cam = k == 0, n = cam ? g_vm_ncams : g_vm_nmics;
+                if (n <= 0 || room <= UIS(80)) continue;
+                rectf f = rf(lx, by, lx + room, by + bh);
+                int hot = in_rect(f, (float)g_mouse_x, (float)g_mouse_y);
+                int open = g_menu == MENU_SECTION && g_menu_x == f.left;
+                fill_round(rt, f, OC_R_CONTROL, hot || open ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, f, OC_R_CONTROL, open ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+                const char *name = cam ? g_vm_cams[g_vm_cam].name : g_vm_mics[g_vm_mic].name;
+                draw_text(rt, name, g_ui, rf(f.left + UIS(10), f.top + (bh - UIS(20)) / 2,
+                                             f.right - UIS(30), f.top + (bh + UIS(20)) / 2), OC_COL_TEXT);
+                draw_text(rt, "\xE2\x96\xBE", g_ui, rf(f.right - UIS(22), f.top + (bh - UIS(20)) / 2,
+                                                         f.right - UIS(6), f.top + (bh + UIS(20)) / 2), OC_COL_MUTED);
+                if (g_n_vm_btns < VM_MAX_BTNS) {
+                    g_vm_btns[g_n_vm_btns].r = f;
+                    g_vm_btns[g_n_vm_btns].cmd = cam ? VMC_CAMERA : VMC_MIC;
+                    snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "%s: %s",
+                             cam ? "Camera" : "Microphone", name);
+                    g_n_vm_btns++;
+                }
+                lx += room + 10;
+            }
+        }
+        return;
+    }
+
+    /* The player. */
+    g_vm_card = rf(0, 0, W, H);
+    float bar = UIS(52);
+    rectf vbox = rf(UIS(40), UIS(48), W - UIS(40), H - bar - UIS(16));
+    g_vm_close = rf(W - UIS(48), UIS(10), W - UIS(16), UIS(40));
+    g_ui->align = ST_ALIGN_CENTER;
+    draw_text(rt, "\xC3\x97", g_display, g_vm_close, 0xFFFFFF);
+    g_ui->align = ST_ALIGN_LEFT;
+    if (g_vplay_loading) {
+        uint64_t done = 0, total = 0;
+        if (m && m->xfer_tag == g_vplay_aid) { done = m->xfer_done; total = m->xfer_total; }
+        char msg[64];
+        if (total) snprintf(msg, sizeof msg, "Loading video\xE2\x80\xA6 %u%%", (unsigned)(done * 100 / total));
+        else       snprintf(msg, sizeof msg, "Loading video\xE2\x80\xA6");
+        vm_draw_video(rt, vbox, msg);
+        if (total) {
+            float cx = (vbox.left + vbox.right) / 2, cy = (vbox.top + vbox.bottom) / 2 + UIS(30);
+            rectf track = rf(cx - UIS(120), cy, cx + UIS(120), cy + UIS(6));
+            fill_round(rt, track, UIS(3), 0x404040);
+            fill_round(rt, rf(track.left, track.top, track.left + (track.right - track.left) * (float)done / (float)total,
+                              track.bottom), UIS(3), OC_COL_ACCENT);
+        }
+        return;
+    }
+    vm_draw_video(rt, vbox, g_vplayer ? NULL : "This video could not be played");
+    if (!g_vplayer) return;
+    oc_player_status ps; oc_player_status_get(g_vplayer, &ps);
+    rectf bb = rf(vbox.left, H - bar - UIS(8), vbox.right, H - UIS(8));
+    float ix = bb.left, icy = (bb.top + bb.bottom) / 2, isz = UIS(28);
+    rectf playr = rf(ix, icy - isz / 2, ix + isz, icy + isz / 2);
+    draw_lucide(rt, ps.state == OC_PLAYER_PLAYING ? OC_ICON_PAUSE : OC_ICON_PLAY,
+                rf(playr.left + 4, playr.top + 4, playr.right - 4, playr.bottom - 4), 0xFFFFFF);
+    if (g_n_vm_btns < VM_MAX_BTNS) { g_vm_btns[g_n_vm_btns].r = playr; g_vm_btns[g_n_vm_btns].cmd = VMC_PLAYPAUSE;
+        snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "%s", ps.state == OC_PLAYER_PLAYING ? "Pause" : "Play");
+        g_n_vm_btns++; }
+    rectf dlr = rf(bb.right - isz, icy - isz / 2, bb.right, icy + isz / 2);
+    rectf mur = rf(dlr.left - UIS(8) - isz, dlr.top, dlr.left - UIS(8), dlr.bottom);
+    draw_lucide(rt, OC_ICON_DOWNLOAD, rf(dlr.left + 4, dlr.top + 4, dlr.right - 4, dlr.bottom - 4), 0xFFFFFF);
+    draw_lucide(rt, g_vm_muted ? OC_ICON_MUTE : OC_ICON_VOLUME, rf(mur.left + 4, mur.top + 4, mur.right - 4, mur.bottom - 4), 0xFFFFFF);
+    if (g_n_vm_btns + 1 < VM_MAX_BTNS) {
+        g_vm_btns[g_n_vm_btns].r = mur; g_vm_btns[g_n_vm_btns].cmd = VMC_MUTE;
+        snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "%s", g_vm_muted ? "Unmute" : "Mute");
+        g_n_vm_btns++;
+        g_vm_btns[g_n_vm_btns].r = dlr; g_vm_btns[g_n_vm_btns].cmd = VMC_DOWNLOAD;
+        snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "Download");
+        g_n_vm_btns++;
+    }
+    char p[16], d[16], t[40];
+    oc_model_format_duration(ps.position_ms, p, sizeof p);
+    oc_model_format_duration(ps.duration_ms, d, sizeof d);
+    if (g_vm_muted) snprintf(t, sizeof t, "%s / %s", p, d);
+    else snprintf(t, sizeof t, "%s / %s  \xC2\xB7 %d%%", p, d, (int)(g_vm_volume * 100 + 0.5f));
+    float tw = UIS(150);
+    draw_text(rt, t, g_meta, rf(mur.left - UIS(8) - tw, icy - UIS(9), mur.left - UIS(8), icy + UIS(11)), 0xE0E0E0);
+    g_vm_seek = rf(playr.right + UIS(12), icy - UIS(8), mur.left - UIS(16) - tw, icy + UIS(8));
+    rectf track = rf(g_vm_seek.left, icy - UIS(2), g_vm_seek.right, icy + UIS(2));
+    fill_round(rt, track, UIS(2), 0x505050);
+    float frac = ps.duration_ms ? (float)ps.position_ms / (float)ps.duration_ms : 0.0f;
+    if (frac > 1) frac = 1;
+    float kx = track.left + (track.right - track.left) * frac;
+    fill_round(rt, rf(track.left, track.top, kx, track.bottom), UIS(2), OC_COL_ACCENT);
+    gfx_ellipse(rt, kx, icy, UIS(6), UIS(6), 0xFFFFFF, 1.0f);
+}
+
+/* Clicks while the overlay is up: always consumed. */
+static int vm_click(HWND hwnd, int x, int y) {
+    if (!g_vm) return 0;
+    if (g_menu) {                       /* a device dropdown is open over the card */
+        for (int i = 0; i < g_n_mirows; i++)
+            if ((float)y >= g_mirows[i].top && (float)y < g_mirows[i].bot &&
+                (float)x >= g_menu_x && (float)x < g_menu_x + g_menu_w) {
+                int cmd = g_mirows[i].cmd;
+                g_menu = MENU_NONE; g_menu_hover = -1;
+                if (cmd > 0) menu_dispatch(hwnd, cmd);
+                return 1;
+            }
+        g_menu = MENU_NONE; g_menu_hover = -1;
+        return 1;
+    }
+    if (in_rect(g_vm_close, x, y)) { vm_command(hwnd, VMC_CLOSE); return 1; }
+    for (int i = 0; i < g_n_vm_btns; i++)
+        if (in_rect(g_vm_btns[i].r, x, y)) { vm_command(hwnd, g_vm_btns[i].cmd); return 1; }
+    if (g_vplayer && in_rect(g_vm_seek, x, y) && g_vm_seek.right > g_vm_seek.left) {
+        oc_player_status ps; oc_player_status_get(g_vplayer, &ps);
+        float frac = ((float)x - g_vm_seek.left) / (g_vm_seek.right - g_vm_seek.left);
+        oc_player_seek(g_vplayer, (uint32_t)(frac * (float)ps.duration_ms));
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    return 1;
+}
+
+static int vm_key(HWND hwnd, WPARAM wp) {
+    if (!g_vm) return 0;
+    if (g_menu) { if (wp == VK_ESCAPE) { g_menu = MENU_NONE; g_menu_hover = -1; } return 1; }
+    if (wp == VK_ESCAPE) { vm_command(hwnd, g_rec_phase == REC_RECORDING ? VMC_STOP : VMC_CLOSE); return 1; }
+    if (g_vplayer) {
+        oc_player_status ps; oc_player_status_get(g_vplayer, &ps);
+        if (wp == VK_SPACE) { vm_command(hwnd, VMC_PLAYPAUSE); return 1; }
+        if (wp == 'M')      { vm_command(hwnd, VMC_MUTE); return 1; }
+        if (wp == VK_LEFT)  { oc_player_seek(g_vplayer, ps.position_ms > 5000 ? ps.position_ms - 5000 : 0); return 1; }
+        if (wp == VK_RIGHT) { oc_player_seek(g_vplayer, ps.position_ms + 5000); return 1; }
+        if (wp == VK_UP || wp == VK_DOWN) {
+            g_vm_volume += wp == VK_UP ? 0.1f : -0.1f;
+            if (g_vm_volume < 0) g_vm_volume = 0;
+            if (g_vm_volume > 1) g_vm_volume = 1;
+            g_vm_muted = 0;
+            oc_player_volume(g_vplayer, g_vm_volume);
+            return 1;
+        }
+    }
+    if (g_vm == VM_REC && wp == VK_RETURN) {
+        if (g_rec_phase == REC_PREVIEW)   { vm_command(hwnd, VMC_RECORD); return 1; }
+        if (g_rec_phase == REC_RECORDING) { vm_command(hwnd, VMC_STOP); return 1; }
+        if (g_rec_phase == REC_REVIEW)    { vm_command(hwnd, VMC_SEND); return 1; }
+    }
+    return 1;                                  /* nothing behind the overlay takes keys */
+}
 
 /* The expanded image: the full bitmap fitted to the window over a dimmed
  * backdrop. Drawn last so nothing overlaps it. */
@@ -16348,7 +17154,7 @@ static int files_click(HWND hwnd, int x, int y) {
         if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
         const oc_file_view *f = &fm->files[g_filerows[i].ix];
         if (in_rect(g_filerows[i].dl, (float)x, (float)y)) {
-            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed };
+            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed, f->media_kind, f->duration_ms, 0, 0, 0 };
             snprintf(at.filename, sizeof at.filename, "%s", f->filename);
             snprintf(at.mime, sizeof at.mime, "%s", f->mime);
             download_attachment(hwnd, &at);
@@ -16516,6 +17322,7 @@ static int on_click(HWND hwnd, int x, int y) {
         picker_click(hwnd, x, y);
         return 1;
     }
+    if (vm_click(hwnd, x, y)) return 1;
     if (modal_frame_click(hwnd, x, y)) return 1;
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
     /* A pane's ✕. One test for every pane, because there is one header:
@@ -17512,7 +18319,18 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     for (int i = 0; i < g_n_thumb_hits; i++)
-        if (in_rect(g_thumb_hits[i].r, x, y)) { g_lightbox = g_thumb_hits[i].id; return 1; }
+        if (in_rect(g_thumb_hits[i].r, x, y)) {
+            if (g_thumb_hits[i].ix >= 0) {                /* a video message: play it */
+                const oc_model *vmm = model();
+                const oc_channel *vc = vmm ? oc_model_channel((oc_model *)vmm, g_sel) : NULL;
+                const oc_msg *vmsg = find_msg(vc, g_thumb_hits[i].mid);
+                if (vmsg && g_thumb_hits[i].ix < vmsg->n_attach)
+                    vm_open_player(hwnd, &vmsg->attach[g_thumb_hits[i].ix]);
+                return 1;
+            }
+            g_lightbox = g_thumb_hits[i].id;
+            return 1;
+        }
     /* A forward card goes to the message it quotes (REQ-057), through the same
      * arming a permalink uses: if the original is outside the loaded window the
      * tick fetches around it (ARCH-96) and the flash lands when it arrives. */
@@ -17547,6 +18365,7 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
+    if (in_rect(g_video_btn, x, y)) { vm_command(hwnd, VMC_OPEN); return 1; }
     /* The Home sidebar's destinations shelf (REQ-228) — before the conversation
      * rows below it, which start where the shelf ends. */
     /* sidebar_kind(), not transcript_shell(): the shelf is drawn in the Drafts
@@ -18902,9 +19721,9 @@ static void prefs_save(void) {
      * build, which stops at `q:`, still reads everything it understands. */
     {
         size_t at = strlen(enc);
-        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d;v:%d;u:%d;g:%d;i:%d",
+        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d;v:%d;u:%d;g:%d;i:%d;x:%d",
                  g_skin_tone, g_pref_flash, g_close_to_tray_told,
-                 g_pref_deliver, g_snd_muted, g_pref_close, g_pref_min_tray);
+                 g_pref_deliver, g_snd_muted, g_pref_close, g_pref_min_tray, g_vm_quality);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -18942,6 +19761,7 @@ static void prefs_load(const oc_model *m) {
              * say -- which is `n:` above. */
             else if (k == 'v') g_pref_deliver = (val < 0 || val > 2) ? DELIVER_OS : val;
             else if (k == 'u') g_snd_muted = val ? 1 : 0;
+            else if (k == 'x') g_vm_quality = (val == 360 || val == 1080) ? val : 720;   /* video messages */
             else if (k == 'g') g_pref_close = (val == CLOSE_HIDES) ? CLOSE_HIDES : CLOSE_QUITS;
             else if (k == 'i') g_pref_min_tray = val ? 1 : 0;
             else if (k == 'q') {
@@ -19133,7 +19953,24 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (form_dialog(hwnd, "Create a channel", f, 2) && f[0].value[0])
             oc_client_create_channel_ex(g_client, f[0].value, atoi(f[1].value) == 0);
         break; }
-    case 900: case 901: case 902: case 903: g_file_filter = cmd - 900; break;
+    case 900: case 901: case 902: case 903: case 904: g_file_filter = cmd - 900; break;
+    case 950: case 951: case 952: case 953: case 954: case 955: case 956: case 957:
+    case 970: case 971: case 972: case 973: case 974: case 975: case 976: case 977:
+        vm_pick_device(hwnd, cmd < 970, cmd < 970 ? cmd - 950 : cmd - 970);
+        break;
+    case 990: case 991: case 992: {
+        int q = cmd == 990 ? 360 : cmd == 991 ? 720 : 1080;
+        if (q != g_vm_quality) {
+            g_vm_quality = q;
+            prefs_save();
+            if (g_vm == VM_REC && (g_rec_phase == REC_PREVIEW || g_rec_phase == REC_ERROR)) {
+                if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
+                vm_tex_drop();
+                rec_open_devices(hwnd);
+            }
+        }
+        break;
+    }
     case 910: case 911: case 912:           g_file_sort   = cmd - 910; break;
     case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
     case 1000: show_and_focus(hwnd); break;
@@ -20427,6 +21264,25 @@ static void test_dump(const char *path) {
             g_badge_shown < 0 ? 0 : g_badge_shown, g_pref_flash, g_flashes_raised,
             g_taskbar_dead ? -1 : (g_taskbar ? 1 : 0), (unsigned long)g_taskbar_hr);
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
+    /* The video overlay (REQ-162/165): which card, its phase, and its buttons. */
+    {
+        oc_rec_status rs; memset(&rs, 0, sizeof rs);
+        if (g_rec) oc_recorder_status(g_rec, &rs);
+        oc_player_status ps; memset(&ps, 0, sizeof ps);
+        if (g_vplayer) oc_player_status_get(g_vplayer, &ps);
+        fprintf(f, "vm=%d recphase=%d recerr=%d rec_elapsed=%u rec_audio=%d take_ms=%u take_bytes=%zu "
+                   "play_aid=%llu play_loading=%d play_state=%d play_pos=%u play_dur=%u presented=%llu "
+                   "frame=%dx%d camera=%d post_tag=%llu detail=\"%s\"\n",
+                g_vm, g_rec_phase, g_rec_err, rs.elapsed_ms, rs.has_audio, g_rec_res.duration_ms,
+                g_rec_res.video_len, (unsigned long long)g_vplay_aid, g_vplay_loading, (int)ps.state,
+                ps.position_ms, ps.duration_ms, (unsigned long long)ps.presented, g_vm_tw, g_vm_th,
+                g_have_camera, (unsigned long long)g_vm_post_tag, g_rec_detail);
+        for (int i = 0; i < g_n_vm_btns; i++)
+            fprintf(f, "vmbtn[%d] cmd=%d \"%s\" %.0f %.0f %.0f %.0f\n", i, g_vm_btns[i].cmd, g_vm_btns[i].label,
+                    g_vm_btns[i].r.left, g_vm_btns[i].r.top, g_vm_btns[i].r.right, g_vm_btns[i].r.bottom);
+        fprintf(f, "video_btn %.0f %.0f %.0f %.0f\n", g_video_btn.left, g_video_btn.top,
+                g_video_btn.right, g_video_btn.bottom);
+    }
     fprintf(f, "thumb_hover=%llu thumb_tools=%d\n", (unsigned long long)g_thumb_hover, g_n_thumb_dl);
     for (int i = 0; i < g_n_thumb_dl; i++)
         fprintf(f, "  tool[%d] %s %.0f,%.0f %.0fx%.0f\n", i,
@@ -21168,6 +22024,19 @@ static void test_poll(HWND hwnd) {
         if (pm && pm->pinlist_open) oc_client_close_pins(g_client);
         else if (g_sel)             oc_client_list_pins(g_client, g_sel);
         test_ack("ok");
+    } else if (!strcmp(verb, "vm")) {
+        /* Drive the video overlay by name: open, record, stop, discard, retake,
+         * send, play (play/pause), mute, close, seek <ms>. */
+        static const struct { const char *name; int cmd; } VMV[] = {
+            { "open", VMC_OPEN }, { "record", VMC_RECORD }, { "stop", VMC_STOP },
+            { "discard", VMC_DISCARD }, { "retake", VMC_RETAKE }, { "send", VMC_SEND },
+            { "play", VMC_PLAYPAUSE }, { "mute", VMC_MUTE }, { "close", VMC_CLOSE },
+        };
+        int done = 0;
+        if (!strncmp(arg, "seek ", 5) && g_vplayer) { oc_player_seek(g_vplayer, (uint32_t)atol(arg + 5)); done = 1; }
+        for (size_t i = 0; !done && i < sizeof VMV / sizeof VMV[0]; i++)
+            if (!strcmp(arg, VMV[i].name)) { vm_command(hwnd, VMV[i].cmd); done = 1; }
+        test_ack(done ? "ok" : "err");
     } else if (!strcmp(verb, "dump")) {
         test_dump(arg); test_ack("ok");
     /* Sign-in drivers. Setting the EDIT text directly is deterministic, where
@@ -21639,8 +22508,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
                         snprintf(title, sizeof title, "%s",
                                  (who && who[0]) ? who : (one_to_one ? "Direct message" : label));
-                        if (g_pref_notify == NOTIFY_FULL && last && last->body)
-                            snprintf(body, sizeof body, "%s", last->body);
+                        char lprev[160] = "";
+                        if (last) oc_model_msg_preview(last, lprev, sizeof lprev);
+                        if (g_pref_notify == NOTIFY_FULL && lprev[0])
+                            snprintf(body, sizeof body, "%s", lprev);
                         else
                             snprintf(body, sizeof body, "%d new message%s",
                                      c->unread, c->unread == 1 ? "" : "s");
@@ -21757,7 +22628,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             {
                 uint64_t fid = 0; size_t flen = 0;
                 uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
-                if (fd) {
+                if (fd && vm_take_bytes(fid, fd, flen)) {
+                    InvalidateRect(hwnd, NULL, FALSE);   /* a video, now owned by the cache */
+                } else if (fd) {
                     thumb_decode(fid, fd, flen);
                     free(fd);
                     if (g_thumb_pending == fid) g_thumb_pending = 0;
@@ -21766,6 +22639,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             /* A fetch that never came back — a reclaimed or oversized image.
              * Mark it so the transcript stops asking on every frame. */
+            vm_tick(hwnd, m);
+            /* Transfers queue in the core, so a thumbnail waiting behind a video
+             * download is late, not lost: the clock only runs while nothing
+             * else is moving. */
+            if (g_thumb_pending && m->xfer_phase == 0 && m->xfer_tag && m->xfer_tag != g_thumb_pending &&
+                m->xfer_done < m->xfer_total)
+                g_thumb_deadline = GetTickCount64() + 8000;
             if (g_thumb_pending && GetTickCount64() > g_thumb_deadline) {
                 if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = g_thumb_pending;
                 g_thumb_pending = 0;
@@ -21824,7 +22704,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                  * a visible window would flash it at the default size first. */
                 if (!g_geom_applied) {
                     g_geom_applied = 1;
-                    if (g_win_x != -1) {
+                    RECT saved = { g_win_x, g_win_y, g_win_x + g_win_w, g_win_y + g_win_h };
+                    /* A saved place no monitor shows any more is not restored: the
+                     * default placement is visible, and an invisible window reads
+                     * as an app that did not start. */
+                    if (g_win_x != -1 && MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
                         WINDOWPLACEMENT wp2; wp2.length = sizeof wp2;
                         wp2.flags = 0;
                         wp2.showCmd = g_win_max ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
@@ -22451,6 +23335,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 'C' && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) && g_has_sel) {
             copy_selection(hwnd); return 0;
         }
+        if (g_vm && vm_key(hwnd, wp)) { InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
@@ -22538,6 +23423,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case AT_SEND:      composer_send(); break;
+        case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
         case AT_ACTFILTER: {
             uint8_t was = act_wire_filter();
