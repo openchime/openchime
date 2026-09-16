@@ -16,7 +16,10 @@ COPY third_party/jsmn ./third_party/jsmn
 # Stamped by the release so a running container reports the release it came from
 # (`openchimed --version`). Unset for a local build, which reports "dev".
 ARG OC_VERSION=
-RUN make OC_VERSION="$OC_VERSION"
+# Without read-aloud (TTS=0): its engine is built for the glibc toolchain the
+# release packages use, not for musl. The image gains it by carrying the release
+# binary on a glibc base instead of compiling its own.
+RUN make TTS=0 OC_VERSION="$OC_VERSION"
 
 FROM alpine:3.20
 

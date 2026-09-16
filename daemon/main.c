@@ -19,6 +19,10 @@
 #include "push.h"
 #include "unfurl.h"
 #include "tls.h"
+#ifdef OC_TTS
+#include "tts.h"
+#include "tts_render.h"
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -210,6 +214,12 @@ int main(int argc, char **argv) {
     /* The only argument the daemon takes. Everything else is configuration, and
      * configuration comes from the environment (ARCH-26) — so this is a version
      * probe, not the beginning of a command-line interface. */
+#ifdef OC_TTS
+    /* Read-aloud's check by ear (tts.h): not configuration, a diagnostic that
+     * renders one text with the voice model built into this binary. */
+    if (argc == 5 && strcmp(argv[1], "--tts-say") == 0)
+        return oc_tts_say(argv[2], argv[3], argv[4]);
+#endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("openchimed %s (protocol %u)\n", OC_VERSION,
@@ -221,6 +231,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "configuration is read from the environment; see CONFIG.md\n");
         return 2;
     }
+
+#ifdef OC_TTS
+    /* Read-aloud's engine: the voice model built into this binary (ARCH-111).
+     * Whether it is used at all is the operator's, through OPENCHIME_TTS. */
+    oc_netloop_set_tts(oc_tts_kitten_engine());
+#endif
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

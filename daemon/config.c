@@ -136,5 +136,22 @@ int oc_config_load(char *err, size_t errcap) {
     c->unfurl.ca_bundle     = env_or2("OPENCHIME_UNFURL_CA_BUNDLE", NULL, NULL);
     c->unfurl.allow_private = env_int("OPENCHIME_UNFURL_ALLOW_PRIVATE", NULL, 0);
 
+    /* Read-aloud (ARCH-111). The model is in the binary, so the only reason to
+     * turn this off is not wanting the feature or the memory a render takes. */
+    c->tts.enabled   = env_int("OPENCHIME_TTS", NULL, 1) != 0;
+    c->tts.queue     = env_int("OPENCHIME_TTS_QUEUE", NULL, 256);
+    if (c->tts.queue < 1)    c->tts.queue = 1;
+    if (c->tts.queue > 4096) c->tts.queue = 4096;
+    /* Long enough that a listener working through a channel keeps the model
+     * loaded, short enough that an idle tenant gives its memory back. */
+    c->tts.idle_secs = env_int("OPENCHIME_TTS_IDLE_SECS", NULL, 300);
+    if (c->tts.idle_secs < 5)     c->tts.idle_secs = 5;
+    if (c->tts.idle_secs > 86400) c->tts.idle_secs = 86400;
+    /* A listener plays messages one after another, so this bounds a client
+     * asking for a whole history at once, not ordinary listening. */
+    c->tts.rate      = env_int("OPENCHIME_TTS_RATE", NULL, 60);
+    if (c->tts.rate < 1)    c->tts.rate = 1;
+    if (c->tts.rate > 6000) c->tts.rate = 6000;
+
     return 0;
 }

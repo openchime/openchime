@@ -52,6 +52,8 @@ today is not a document — it is the
 | [AUDIO.md](docs/AUDIO.md) | The design for server-relayed audio calls: the huddle model, client-side mixing, and echo cancellation. The server half is built; the client half is not. |
 | [VIDEO.md](docs/VIDEO.md) | The screenshare design: why the codec is a wire contract rather than a per-platform choice, and why it is sequenced behind the audio client. Not started. |
 | [VIDEO-MESSAGES.md](docs/VIDEO-MESSAGES.md) | Recorded video messages: the capture interface and its six platform backends, VP9 and Opus in a restricted MP4, the recorder and player, how a message travels as an attachment, consent, and the tests that prove it. |
+| [READ-ALOUD.md](docs/READ-ALOUD.md) | Read-aloud: a channel spoken in each author's voice — rendered once by the daemon from a voice model built into it, cached, and played by the clients. |
+| [TTSKIT.md](docs/TTSKIT.md) | ttskit, the GPL-free pronunciation library: text to the phonemes a voice model reads, its data files, and how to rebuild them from CMUdict. |
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |

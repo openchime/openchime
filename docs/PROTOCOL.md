@@ -686,12 +686,14 @@ Each entry, in wire order:
 `user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
 `status_emoji` (str) · `status_text` (str) · `full_name` (str) ·
-`pronouns` (str).
+`pronouns` (str) · `voice_id` (str).
 
 A **phone number is deliberately absent**: it is contact detail rather than
 something drawn beside a name, and every member's number in every roster
 fan-out is a size and privacy cost with nothing asking for it. `PROFILE_INFO`
-carries it to whoever opened the card.
+carries it to whoever opened the card. `voice_id` **is** here: everyone hears the
+same voice for the same author (REQ-292), so it is a name decoration like the
+pronouns beside it, and empty means the daemon has not chosen one yet.
 
 Because this is a repeated list, an added field shifts **every** entry after the
 first — which is why adding one always raises the protocol version rather than
@@ -1390,6 +1392,51 @@ therefore read-only, REQ-035), `404` (unknown or disabled token), `405`
 One gap, tracked: REQ-171's CA-signed certificate for this
 endpoint is not implemented, so it answers on the daemon's TOFU cert.
 
+
+### 5.14b Read-aloud (REQ-291–295, ARCH-111)
+
+Speech is **not** an attachment: nothing was uploaded, and the daemon makes the
+file itself from the message's text. What the wire carries is therefore the
+download shape without the upload half, keyed by the **message** id the client
+already has.
+
+**`TTS_INFO` (S → C), `0x00DC`** `{ available: u8, model_version: str,
+count: u8, count × { id: str, label: str }, preview: str }` — sent once to every
+client just after `WORKSPACE_INFO`, whatever the answer. `available` 0 (with no
+voices) means this daemon does not read messages aloud, and a client showing
+nothing of the feature is the correct result (REQ-295). `model_version` names the
+model, the pronunciation data and the speaking rate together; `preview` is the
+sentence a client plays to audition a voice. At most 16 voices: a longer list is
+a malformed frame, not a truncated one.
+
+**`AUDIO_GET` (C → S), `0x00DD`** `{ message_id: u64 }` — "read this message to
+me". The gate is the one that guards reading the message itself
+(`channel_read_access`), because the speech IS the message. Then, in order:
+
+1. **`AUDIO_INFO` (S → C), `0x00DE`** `{ message_id: u64, duration_ms: u32,
+   total_size: u64 }` — once, before the bytes.
+2. **`AUDIO_CHUNK` (S → C), `0x00DF`** `{ message_id: u64, seq: u32, data: bytes }`
+   — sequential chunks, with the download path's backpressure: the daemon stops
+   reading from storage while this connection's output is above the soft cap and
+   resumes on drain.
+3. **`AUDIO_END` (S → C), `0x00E0`** `{ message_id: u64 }` — everything sent.
+
+The payload is an **audio-only MP4** holding one Opus track (the video message
+profile with the video track left out, docs/VIDEO-MESSAGES.md §5), 24 kHz mono at
+24 kbit/s.
+
+A first request **renders**, which takes about six tenths of the spoken duration,
+and the answer arrives when it is done; later requests for the same text in the
+same voice are served from the cache. Two listeners asking at once cost one
+render. One transfer at a time per connection, as for an attachment: a second
+`AUDIO_GET` mid-stream is `TRANSFER_PROTOCOL`.
+
+Refusals are `ERROR` frames carrying the message id in `context`:
+`NOT_RENDERABLE` 3023 when the message has nothing to say — a bare attachment,
+only emoji (REQ-294) — `TTS_UNAVAILABLE` 3024 when read-aloud is off or its queue
+is full, `FORBIDDEN` when the caller cannot read the channel, and
+`UNKNOWN_MESSAGE` for an id that is not there.
+
 ---
 
 ### 5.16 Notification preferences (REQ-130, REQ-131)
@@ -1635,9 +1682,9 @@ notified on. Priority people pierce a level and a pause but never a mute
 
     emoji (str), text (str), expires_at (u64)
 
-**`SET_PROFILE` (C → S), `0x00D8`** — Set my profile: full name, title, pronouns, phone and timezone. (REQ-240)
+**`SET_PROFILE` (C → S), `0x00D8`** — Set my profile: full name, title, pronouns, phone, timezone and the voice I am read aloud in. (REQ-240, REQ-292)
 
-    full_name (str), title (str), pronouns (str), phone (str), timezone (str)
+    full_name (str), title (str), pronouns (str), phone (str), timezone (str), voice_id (str)
 
 The whole profile in one frame, because it is edited on one screen and
 committed by one button — a field-at-a-time wire would let Cancel mean "some of
@@ -1650,7 +1697,7 @@ thing they did, and is a different fact from never having set it.
 
 **`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. (REQ-240, REQ-241)
 
-    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str)
+    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str), voice_id (str)
 
 An **empty `text` on `SET_STATUS` clears all three fields together** — emoji,
 text and expiry — because "no status" is one state rather than two, and a client
@@ -2141,6 +2188,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3020` | `INVALID_MESSAGE`     | messaging  | no    | Nothing to send — an empty body on a scheduled message (REQ-224). |
 | `3021` | `MEDIA_INVALID`       | attachment | no    | `ATTACH_MEDIA_SET` refused: kind, bounds, type, already sent, or poster (§5.14a). |
 | `3022` | `MEDIA_TOO_LARGE`     | attachment | no    | The video exceeds `MAX_VIDEO_MESSAGE_SIZE` (§5.14a). |
+| `3023` | `NOT_RENDERABLE`      | read-aloud | no    | The message has nothing to say aloud (§5.14b, REQ-294). |
+| `3024` | `TTS_UNAVAILABLE`     | read-aloud | no    | Read-aloud is off, its queue is full, or the render failed (§5.14b). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -2151,7 +2200,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 ## 9. Message type registry
 
 **Generated from `shared/protocol.h`** — every `OC_MSG_*` the codec defines, in
-opcode order, 158 of them. The sections above specify the payload layouts; this
+opcode order, 165 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
 **Every opcode carries exactly one message type.** `scripts/check_opcodes.sh`
@@ -2320,6 +2369,11 @@ this table cannot silently gain a shared value.
 | `0x00D9` | `FORWARD` | S → C | what a forwarded message points at (REQ-057); also replayed on backfill |
 | `0x00DA` | `ATTACH_MEDIA_SET` | C → S | mark an upload as a video message, with its poster (REQ-162) |
 | `0x00DB` | `ATTACH_MEDIA_OK` | S → C | accepted |
+| `0x00DC` | `TTS_INFO` | S → C | read-aloud availability and voices (REQ-291/295) |
+| `0x00DD` | `AUDIO_GET` | C → S | the speech of one message (REQ-291) |
+| `0x00DE` | `AUDIO_INFO` | S → C | its duration and size |
+| `0x00DF` | `AUDIO_CHUNK` | S → C | a slice of the rendering |
+| `0x00E0` | `AUDIO_END` | S → C | the whole rendering is sent |
 
 ## 10. Connection state machine
 

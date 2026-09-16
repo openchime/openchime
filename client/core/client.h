@@ -293,8 +293,22 @@ void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
                           uint64_t expires_at);
 void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
                            const char *pronouns, const char *phone,
-                           const char *timezone);
+                           const char *timezone, const char *voice_id);
 void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id);
+
+/* Talking mode (REQ-291, ARCH-111): read this conversation aloud from now on.
+ * `on` 0 stops. Every message that arrives while it is on is queued and spoken
+ * in order, in its author's voice; the backlog is not read, and the queue
+ * running dry simply waits for the next message. Turning it on for another
+ * conversation replaces it, and a frontend turns it off when the user leaves the
+ * conversation -- nothing plays from a conversation that is not on screen.
+ *
+ * The core fetches; the FRONTEND plays: take the bytes with
+ * oc_model_listen_take_audio, play them (oc_player over an audio-only MP4), and
+ * call oc_client_listen_done when they finish or the user skips, which is what
+ * moves the queue on. */
+void oc_client_listen(oc_client *c, uint64_t channel_id, int on);
+void oc_client_listen_done(oc_client *c);
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by

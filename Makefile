@@ -43,7 +43,8 @@ BIN := openchimed
 # The tree is split into three concerns: shared/ is the wire contract (linked by
 # both the daemon and the client), daemon/ is the server, client/ is the app.
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c \
-              shared/searchq.c shared/notify.c shared/url.c
+              shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c \
+              shared/oc_mp4.c
 DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/audio_sidecar.c daemon/enroll.c daemon/push.c daemon/unfurl.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
@@ -91,6 +92,15 @@ OPUS_A     := $(OPUS_DIR)/lib/libopus.a
 MEDIA_INC  := -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include
 MEDIA_LIBS := $(LIBVPX_A) $(OPUS_A) -ldl -lm
 
+# --- ttskit (read-aloud pronunciation, ARCH-111) -----------------------------
+# English text to the IPA a voice model reads: a CMUdict-derived dictionary and a
+# trained guesser, both committed as memory-mapped data in ttskit/data. Pure C, no
+# dependencies; linked into the daemon and covered by `make test`. tts_pack
+# builds the data files (scripts/build_ttskit_data.sh) and says words with them.
+# See docs/TTSKIT.md.
+TTSKIT_SRC := $(filter-out ttskit/tts_pack.c,$(wildcard ttskit/*.c))
+TTSKIT_INC := -Ittskit
+
 # --- sdltext (portable text layer) --------------------------------------------
 # One text API for every graphical client: layout, measurement, hit-testing,
 # byte-offset range styling. The portable core (the byte<->UTF-16 offset map)
@@ -129,7 +139,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test check-opcodes check-refs core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
+.PHONY: all run test check-opcodes check-refs core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
 
 all: $(BIN)
 
@@ -145,8 +155,41 @@ run: $(BIN) $(TUI_BIN)
 	 OPENCHIME_PROTO_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
 	 OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
 
-$(BIN): $(SRC) $(MBEDTLS_A) $(HDRS)
-	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) -o $@ $(SRC) $(MBEDTLS_LIBS) $(LDFLAGS)
+# --- Read-aloud in the daemon (ARCH-111) ---------------------------------------
+# On by default: the daemon carries its own speech synthesis. ttskit, the Kitten
+# voice model through a minimal ONNX Runtime built from source as one static
+# archive, and the model and pronunciation data embedded in the binary -- so
+# openchimed stays one file whose only dynamic dependencies are glibc and SQLite.
+# The first build compiles ONNX Runtime (about 20 minutes) and fetches the model;
+# both are kept under third_party/ and build/. `make TTS=0` builds without.
+TTS ?= 1
+# What `make test` links of read-aloud whatever TTS is: the render path and worker
+# (driven by a stub engine) and the tokenizer -- everything but the model.
+TTS_TEST_SRC := daemon/tts_render.c daemon/tts_worker.c daemon/tts_kitten_tokens.c
+ORT_DIR   := third_party/onnxruntime-1.30.0
+ORT_A     := $(ORT_DIR)/lib/libonnxruntime.a
+KITTEN    := build/kitten/kitten.ort
+ifeq ($(TTS),1)
+TTS_SRC   := daemon/tts.c daemon/tts_render.c daemon/tts_worker.c daemon/tts_kitten.c daemon/tts_kitten_tokens.c daemon/tts_embed.S $(TTSKIT_SRC)
+TTS_DEPS  := $(ORT_A) $(OPUS_A) $(KITTEN) build/kitten/voices.npz ttskit/data/lexicon.bin ttskit/data/guesses.bin $(wildcard ttskit/*.h)
+TTS_FLAGS := -DOC_TTS $(TTSKIT_INC) -I$(ORT_DIR)/include -I$(OPUS_DIR)/include
+# ONNX Runtime is C++: its standard library and runtime support are linked in
+# statically, not required of the host. That is GCC's libstdc++ by default; the
+# release, which compiles everything with zig, passes TTS_CXXLIB=-lc++ for zig's
+# bundled libc++ (the library ONNX Runtime was compiled against there).
+# One of its assembly kernels lacks the GNU-stack note, which would otherwise mark
+# the whole daemon's stack executable; the stack stays non-executable.
+TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl
+TTS_LIBS  := $(ORT_A) $(OPUS_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
+endif
+
+$(BIN): $(SRC) $(TTS_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS)
+	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(TTS_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
+
+$(ORT_A): daemon/tts_kitten.ops.config
+	scripts/build_onnxruntime.sh
+$(KITTEN) build/kitten/voices.npz: scripts/build_kitten.sh scripts/tts_convert.c
+	scripts/build_kitten.sh
 
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
@@ -179,9 +222,9 @@ test: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) $(MEDIA_INC) -Itests -Iclient/gui/win32 \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lsqlite3 -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) $(MEDIA_INC) $(TTSKIT_INC) -DOC_TTS -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lsqlite3 -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
@@ -384,6 +427,11 @@ tuikit-demo: build/tuikit-demo
 build/tuikit-demo: $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) $(wildcard tuikit/*.h) | build
 	$(CC) $(CFLAGS) -Wno-unused-result $(TUIKIT_INC) -Ithird_party/termbox2 -Ithird_party/utf8proc \
 	    $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) -o $@
+
+# --- tts_pack (ttskit's data tool) --------------------------------------------
+tts_pack: build/tts_pack
+build/tts_pack: $(TTSKIT_SRC) ttskit/tts_pack.c $(wildcard ttskit/*.h) | build
+	$(CC) $(CFLAGS) $(TTSKIT_INC) $(TTSKIT_SRC) ttskit/tts_pack.c -lm -o $@
 
 build:
 	mkdir -p build

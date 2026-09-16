@@ -93,10 +93,26 @@ struct oc_audio_dev {
     atomic_int    level;
     _Atomic float gain;
     atomic_int    flush;              /* playback: drop the ring on the next consume */
+    atomic_size_t flush_to;           /* ... but only what was written before it was asked for */
     /* Synthetic: when the tone source / real-time sink last caught up. */
     int64_t       syn_start_us;
     uint64_t      syn_frames;
 };
+
+/* Carry out a flush the producer asked for, on the consumer's side, where the
+ * tail belongs. It drops what was in the ring WHEN IT WAS ASKED FOR and nothing
+ * after: the producer writes again the moment it has asked (a seek refills
+ * immediately), and this runs a device period later, so a flush that simply
+ * emptied the ring would eat that fresh audio — silently, since dropped frames
+ * are never counted as played. That cost the first 213 ms of every read-aloud
+ * message, and left the audio clock permanently short of the file's duration,
+ * so a player that had reached the end never said so (REQ-291, ARCH-111). */
+static void take_flush(oc_audio_dev *d) {
+    if (!atomic_exchange(&d->flush, 0)) return;
+    size_t to = atomic_load(&d->flush_to), tail = atomic_load(&d->ring.tail);
+    /* The consumer may already be past the mark; the tail never goes backwards. */
+    if ((ptrdiff_t)(to - tail) > 0) atomic_store(&d->ring.tail, to);
+}
 
 static int use_synthetic(void) {
     const char *t = getenv("OPENCHIME_TEST_AUDIO");
@@ -128,7 +144,7 @@ static void playback_cb(ma_device *dev, void *out, const void *in, ma_uint32 fra
     oc_audio_dev *d = dev->pUserData;
     int16_t *o = out;
     size_t n = (size_t)frames * (size_t)d->channels;
-    if (atomic_exchange(&d->flush, 0)) atomic_store(&d->ring.tail, atomic_load(&d->ring.head));
+    take_flush(d);
     size_t got = ring_pop(&d->ring, o, n);
     float g = atomic_load(&d->gain);
     if (g < 0.999f)
@@ -248,8 +264,7 @@ oc_audio_dev *oc_audio_playback_open(const char *id, int rate, int channels, int
 /* The synthetic devices run their "callback" lazily, from the reader's or
  * writer's thread, for however many frames real time says are due. */
 static void synthetic_catch_up(oc_audio_dev *d) {
-    if (!d->capture && atomic_exchange(&d->flush, 0))
-        atomic_store(&d->ring.tail, atomic_load(&d->ring.head));
+    if (!d->capture) take_flush(d);
     int64_t now = oc_media_clock_us();
     uint64_t due = (uint64_t)((now - d->syn_start_us) * d->rate / 1000000);
     if (due <= d->syn_frames) return;
@@ -309,7 +324,9 @@ uint64_t oc_audio_playback_position(oc_audio_dev *d) {
 
 void oc_audio_playback_flush(oc_audio_dev *d) {
     /* Only the consumer moves the tail, so the flush is a request the consumer
-     * (the device callback, or the synthetic catch-up) carries out. */
+     * (the device callback, or the synthetic catch-up) carries out -- against the
+     * mark set here, not against whatever the ring holds by then (take_flush). */
+    atomic_store(&d->flush_to, atomic_load(&d->ring.head));
     atomic_store(&d->flush, 1);
     if (d->synthetic) synthetic_catch_up(d);
 }

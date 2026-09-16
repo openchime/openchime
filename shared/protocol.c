@@ -1593,6 +1593,50 @@ oc_result oc_encode_upload_ok(oc_wbuf *w, uint16_t version, const oc_upload_ok *
     return oc_frame_end(w, off);
 }
 
+/* Read-aloud (ARCH-111). The voices are a short fixed list, so they ride as a
+ * count and that many id/label pairs rather than a repeated-entry frame. */
+oc_result oc_encode_tts_info(oc_wbuf *w, uint16_t version, const oc_tts_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TTS_INFO);
+    oc_w_u8(w, m->available);
+    oc_w_str(w, m->model_version);
+    uint8_t n = m->count > OC_TTS_VOICE_MAX ? OC_TTS_VOICE_MAX : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) {
+        oc_w_str(w, m->voices[i].id);
+        oc_w_str(w, m->voices[i].label);
+    }
+    oc_w_str(w, m->preview);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_GET);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_INFO);
+    oc_w_u64(w, m->message_id);
+    oc_w_u32(w, m->duration_ms);
+    oc_w_u64(w, m->total_size);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_CHUNK);
+    oc_w_u64(w, m->message_id);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_END);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_DOWNLOAD_BEGIN);
     oc_w_u64(w, m->attachment_id);
@@ -1676,6 +1720,7 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_str(w, m->entries[i].status_text);
         oc_w_str(w, m->entries[i].full_name);      /* REQ-240/289 */
         oc_w_str(w, m->entries[i].pronouns);
+        oc_w_str(w, m->entries[i].voice_id);       /* REQ-292 */
     }
     return oc_frame_end(w, off);
 }
@@ -2418,6 +2463,45 @@ oc_result oc_decode_upload_ok(oc_rbuf *p, oc_upload_ok *m) {
     return r_done(p);
 }
 
+oc_result oc_decode_tts_info(oc_rbuf *p, oc_tts_info *m) {
+    memset(m, 0, sizeof *m);
+    m->available = oc_r_u8(p);
+    m->model_version = oc_r_str(p);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_TTS_VOICE_MAX) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint8_t i = 0; i < n; i++) {
+        m->voices[i].id = oc_r_str(p);
+        m->voices[i].label = oc_r_str(p);
+    }
+    m->preview = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_audio_get(oc_rbuf *p, oc_audio_get *m) {
+    m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m) {
+    m->message_id = oc_r_u64(p);
+    m->duration_ms = oc_r_u32(p);
+    m->total_size = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m) {
+    m->message_id = oc_r_u64(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m) {
+    m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m) {
     m->attachment_id = oc_r_u64(p);
     return r_done(p);
@@ -2495,6 +2579,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
          * the rest of the list. */
         oc_slice fname = oc_r_str(p);
         oc_slice prn = oc_r_str(p);
+        oc_slice voice = oc_r_str(p);
         if (i < cap) {
             entries[i].user_id = uid;
             entries[i].role = role;
@@ -2508,6 +2593,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
             entries[i].status_text = stext;
             entries[i].full_name = fname;
             entries[i].pronouns = prn;
+            entries[i].voice_id = voice;
         }
     }
     return r_done(p);
@@ -2787,6 +2873,7 @@ oc_result oc_encode_set_profile(oc_wbuf *w, uint16_t version, const oc_set_profi
     oc_w_str(w, m->pronouns);
     oc_w_str(w, m->phone);
     oc_w_str(w, m->timezone);
+    oc_w_str(w, m->voice_id);
     return oc_frame_end(w, off);
 }
 
@@ -2796,6 +2883,7 @@ oc_result oc_decode_set_profile(oc_rbuf *p, oc_set_profile *m) {
     m->pronouns  = oc_r_str(p);
     m->phone     = oc_r_str(p);
     m->timezone  = oc_r_str(p);
+    m->voice_id  = oc_r_str(p);
     return r_done(p);
 }
 
@@ -2816,6 +2904,7 @@ oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_
     oc_w_str(w, m->full_name);
     oc_w_str(w, m->pronouns);
     oc_w_str(w, m->phone);
+    oc_w_str(w, m->voice_id);
     return oc_frame_end(w, off);
 }
 
@@ -2833,6 +2922,7 @@ oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
     m->full_name      = oc_r_str(p);
     m->pronouns       = oc_r_str(p);
     m->phone          = oc_r_str(p);
+    m->voice_id       = oc_r_str(p);
     return r_done(p);
 }
 

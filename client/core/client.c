@@ -59,6 +59,23 @@ oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
     return c;
 }
 
+/* Keep talking mode fed (ARCH-111): with nothing in hand and nothing on its way,
+ * ask for the next queued message's speech. One at a time, so the rendering the
+ * listener is about to hear is the one the daemon is working on. */
+static void listen_pump(oc_client *c) {
+    oc_model *m = &c->model;
+    if (!m->listen_channel || m->listen_fetching || m->listen_ready || m->listen_playing) return;
+    if (m->n_listen_queue == 0) return;
+    uint64_t id = m->listen_queue[0];
+    memmove(m->listen_queue, m->listen_queue + 1, (m->n_listen_queue - 1) * sizeof *m->listen_queue);
+    m->n_listen_queue--;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LISTEN_FETCH);
+    if (!cmd) return;
+    cmd->message_id = id;
+    m->listen_fetching = id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_tick(oc_client *c) {
     if (!c) return;
     oc_ev *e;
@@ -66,6 +83,29 @@ void oc_client_tick(oc_client *c) {
         oc_model_apply(&c->model, e);
         oc_ev_free(e);
     }
+    listen_pump(c);
+}
+
+void oc_client_listen(oc_client *c, uint64_t channel_id, int on) {
+    if (!c) return;
+    oc_model *m = &c->model;
+    /* Starting, stopping and moving to another conversation all begin from
+     * silence: whatever was fetched or queued belonged to the old one. */
+    free(m->listen_ready);
+    m->listen_ready = NULL;
+    m->listen_ready_len = 0;
+    m->listen_ready_id = 0;
+    m->listen_fetching = 0;
+    m->listen_playing = 0;
+    m->n_listen_queue = 0;
+    m->listen_skipped = 0;
+    m->listen_channel = (on && channel_id) ? channel_id : 0;
+}
+
+void oc_client_listen_done(oc_client *c) {
+    if (!c) return;
+    c->model.listen_playing = 0;
+    listen_pump(c);
 }
 
 const oc_model *oc_client_model(oc_client *c) {
@@ -889,15 +929,18 @@ void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
  * is encoded, so the two halves are read together. */
 void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
                            const char *pronouns, const char *phone,
-                           const char *timezone) {
+                           const char *timezone, const char *voice_id) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE);
     if (!cmd) return;
     char packed[512];
-    snprintf(packed, sizeof packed, "%s\x1f%s\x1f%s\x1f%s\x1f%s",
+    /* An empty voice keeps the one in place (REQ-292), which is what a frontend
+     * without a voice picker sends -- unlike the other fields, where empty is
+     * the user clearing them. */
+    snprintf(packed, sizeof packed, "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s",
              full_name ? full_name : "", title ? title : "",
              pronouns ? pronouns : "", phone ? phone : "",
-             timezone ? timezone : "");
+             timezone ? timezone : "", voice_id ? voice_id : "");
     cmd->body = strdup(packed);
     oc_queue_push(&c->cmds, cmd);
 }

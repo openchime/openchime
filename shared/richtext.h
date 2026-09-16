@@ -1,15 +1,15 @@
 /*
- * OpenChime client core — message formatting (REQ-220, ARCH-100).
+ * OpenChime — message formatting (REQ-220, ARCH-100).
  *
- * The parser for the dialect [MARKDOWN.md](../../docs/MARKDOWN.md) specifies:
+ * The parser for the dialect [MARKDOWN.md](../docs/MARKDOWN.md) specifies:
  * a Slack-compatible subset of inline emphasis extended with real lists.
  *
- * Client-side and nowhere else. Formatting needs no server knowledge, which is
- * exactly where it differs from @mentions (ARCH-89) — those had to resolve in
- * `shared/` because only the daemon holds the roster. It lives in `client/core/`
- * rather than `shared/` because it is shared between *frontends*, not with the
- * daemon, and one implementation is what stops the TUI and the GUI drifting
- * about what counts as bold.
+ * Shared by every frontend and by the daemon. Rendering formatting needs no
+ * server knowledge, but reading a message aloud does: the daemon turns a body
+ * into speakable text before it is synthesized (ARCH-111, shared/speakable.c),
+ * and it must agree with the frontends about what is a code block and what is a
+ * delimiter. One implementation is what stops the TUI, the GUI and the spoken
+ * version drifting about what counts as bold.
  *
  * It returns SPANS OVER THE ORIGINAL BYTES and never a rewritten string. The
  * body a client renders is byte-identical to the body the daemon stored, which

@@ -12,6 +12,9 @@
 #include "unfurl.h"
 #include "url.h"
 #include "xferpool.h"
+#ifdef OC_TTS
+#include "tts_worker.h"
+#endif
 #include "storage.h"
 #include "framebuf.h"
 #include "http.h"
@@ -77,7 +80,12 @@ typedef enum {
     XFER_UP_AWAIT_FINAL,    /* blob committed; awaiting ATTACH_FINALIZE */
     XFER_DOWN_AWAIT_LOOKUP, /* sent ATTACH_LOOKUP; awaiting authz + metadata */
     XFER_DOWN_AWAIT_OPEN,   /* asked the pool to open the blob source */
-    XFER_DOWN_ACTIVE        /* streaming DOWNLOAD_CHUNKs from the blob */
+    XFER_DOWN_ACTIVE,       /* streaming DOWNLOAD_CHUNKs from the blob */
+    /* Read-aloud (ARCH-111) reuses this machine: the same lookup, open, pump and
+     * backpressure, over a rendering the daemon made rather than a file someone
+     * uploaded. `audio` on the transfer says which frames the pump writes.
+     * AWAIT_RENDER is the state with no blob yet: the worker is synthesizing. */
+    XFER_AUDIO_AWAIT_RENDER
 } xfer_state;
 
 typedef struct {
@@ -102,6 +110,10 @@ typedef struct {
     char            *dl_mime;
     uint8_t          dl_sha[32];
     int              dl_have_sha;
+    /* Read-aloud: this transfer is a message's speech, not an attachment. */
+    int              audio;
+    uint64_t         audio_message_id;
+    uint32_t         audio_duration_ms;
 } conn_xfer;
 
 typedef struct {
@@ -125,6 +137,8 @@ typedef struct {
     uint32_t     events;    /* current epoll interest */
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
+    uint64_t     audio_win_start;/* the same, for read-aloud requests (ARCH-111) */
+    uint32_t     audio_count;
     uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
     /* The pause's end instant (REQ-278), seeded from AUTH_OK and refreshed when
      * the user sets one. Held here rather than read from the database because
@@ -178,6 +192,24 @@ static uint64_t g_next_conn_id = 1;
  * with g_enc/g_next_conn_id. */
 static oc_blobstore *g_blobs;
 static oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
+#ifdef OC_TTS
+/* Read-aloud (ARCH-111): the render worker and the engine it runs. The engine is
+ * injected before the loop starts (a daemon built with read-aloud passes the
+ * voice model; a test passes a stub), and the worker exists only when the
+ * operator left the feature on. */
+static const oc_tts_engine *g_tts_engine;
+static oc_tts_worker       *g_tts;
+/* Renders in flight, so two listeners asking for the same message at the same
+ * moment cost one render: the first submits, the rest wait on the same handle. */
+typedef struct tts_wait {
+    uint8_t          handle[32];
+    uint64_t         conn_id, message_id;
+    struct tts_wait *next;
+} tts_wait;
+static tts_wait *g_tts_waits;
+static uint64_t  g_tts_req_seq;
+static void tts_drop_waiters(uint64_t conn_id);
+#endif
 /* Storage maintenance (ARCH-78): policy, the last free-space sample, and when
  * the pass last ran. The sample is refreshed by the pass and read by the upload
  * admission check, so a refusal never costs a statvfs on the hot path. */
@@ -357,6 +389,9 @@ static void conn_close(int ep, conn **conns, int fd) {
     int was_authed = c->authed;
     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
     xfer_reset(&c->xfer);
+#ifdef OC_TTS
+    tts_drop_waiters(cid);
+#endif
     oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
     free(c->out);
@@ -543,6 +578,14 @@ void oc_netloop_set_push(struct oc_push *push) {
 
 /* Link-unfurl worker (REQ-222, ARCH-105), NULL = unfurls disabled. */
 static oc_unfurler *g_unfurler;
+
+void oc_netloop_set_tts(const struct oc_tts_engine *engine) {
+#ifdef OC_TTS
+    g_tts_engine = engine;
+#else
+    (void)engine;
+#endif
+}
 
 void oc_netloop_set_unfurler(struct oc_unfurler *u) {
     g_unfurler = u;
@@ -772,6 +815,58 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
 
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
+#ifdef OC_TTS
+static int send_transfer_error(conn *c, uint64_t aid, uint16_t code);
+
+/* Start streaming a stored rendering: open the blob, then AUDIO_INFO and the
+ * pump, exactly as an attachment download does (ARCH-69). Returns -1 if the
+ * connection was told about a failure instead. */
+static int audio_open_blob(int ep, conn **conns, conn *c, const char *key, uint64_t bytes) {
+    conn_xfer *x = &c->xfer;
+    oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_R, c->conn_id);
+    if (!j || !key || !(j->key = strdup(key))) {
+        oc_xfer_job_free(j);
+        int fd = c->fd;
+        send_transfer_error(c, x->audio_message_id, OC_ERR_INTERNAL);
+        if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        return -1;
+    }
+    x->remaining = bytes;
+    x->next_seq = 0;
+    x->state = XFER_DOWN_AWAIT_OPEN;
+    x->in_flight = 1;
+    oc_xferpool_submit(g_xfers, j);
+    update_interest(ep, c);
+    return 0;
+}
+
+/* Read-aloud's per-connection limit, the shape of send_rate_ok: a fixed window,
+ * counted on the connection, so one client cannot occupy the render worker. */
+static int audio_rate_ok(conn *c) {
+    const oc_config *cfg = oc_config_get();
+    uint64_t now = now_ms();
+    if (now - c->audio_win_start >= 60000u) { c->audio_win_start = now; c->audio_count = 0; }
+    if (c->audio_count >= (unsigned)cfg->tts.rate) return 0;
+    c->audio_count++;
+    return 1;
+}
+
+/* The engine's voices as one comma-separated string, which is how the dbwriter
+ * is told what it may choose from without knowing anything about the model. */
+static char *tts_voice_list(void) {
+    char buf[512];
+    size_t n = 0;
+    for (int i = 0; g_tts_engine && i < g_tts_engine->voices; i++) {
+        const char *id = g_tts_engine->voice_id ? g_tts_engine->voice_id(i) : NULL;
+        if (!id) break;
+        n += (size_t)snprintf(buf + n, sizeof buf - n, "%s%s", n ? "," : "", id);
+        if (n >= sizeof buf) { n = sizeof buf - 1; break; }
+    }
+    buf[n] = '\0';
+    return strdup(buf);
+}
+#endif
+
 /* Soft pending-output target while streaming a download: the pump tops the
  * output buffer up to here and lets the rest follow on the next writable
  * wakeup, so a 100 MiB download never buffers in full. Well under the 1 MiB
@@ -783,6 +878,9 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
  * big-endian) so the client can correlate, then reset the transfer. Returns
  * out_append's result (0 keep, -1 buffer full -> caller closes). */
 static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
+    /* For a rendering the id in `context` is the message's, which is what the
+     * client asked by and the only id it knows. */
+    if (c->xfer.audio && c->xfer.audio_message_id) aid = c->xfer.audio_message_id;
     uint8_t ctxb[8];
     for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(aid >> (56 - 8 * i));
     uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
@@ -804,9 +902,14 @@ static void download_pump(conn *c) {
     conn_xfer *x = &c->xfer;
     if (x->state != XFER_DOWN_ACTIVE || x->in_flight) return;
     if (x->remaining == 0) {
-        oc_download_end de = { x->attachment_id };
         oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
+        if (x->audio) {
+            oc_audio_end ae = { x->audio_message_id };
+            oc_encode_audio_end(&w, OC_PROTOCOL_VERSION, &ae);
+        } else {
+            oc_download_end de = { x->attachment_id };
+            oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
+        }
         out_append(c, g_enc, w.len);
         /* Closing can block on S3, so hand it to the pool and forget it. */
         if (x->br) {
@@ -1459,6 +1562,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->pf_full_name = slice_dup(sp.full_name);
             j->pf_title     = slice_dup(sp.title);
             j->pf_pronouns  = slice_dup(sp.pronouns);
+            j->pf_voice_id  = slice_dup(sp.voice_id);
             j->pf_phone     = slice_dup(sp.phone);
             j->pf_timezone  = slice_dup(sp.timezone);
             oc_dbwriter_submit(dbw, j);
@@ -1945,6 +2049,47 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             c->xfer.attachment_id = db.attachment_id;
             continue;
         }
+#ifdef OC_TTS
+        if (hdr.msg_type == OC_MSG_AUDIO_GET) {
+            oc_audio_get ag;
+            if (oc_decode_audio_get(&p, &ag) != OC_OK) return -1;
+            c->xfer.audio_message_id = ag.message_id;
+            if (!g_tts) {
+                c->xfer.audio = 1;                       /* so the error names the message */
+                int rc = send_transfer_error(c, ag.message_id, OC_ERR_TTS_UNAVAILABLE);
+                c->xfer.audio = 0;
+                if (rc != 0) return -1;
+                continue;
+            }
+            /* One transfer at a time on a connection, as for an attachment: the
+             * pump and its backpressure are per connection, not per request. */
+            if (c->xfer.state != XFER_NONE) {
+                c->xfer.audio = 1;
+                int rc = send_transfer_error(c, ag.message_id, OC_ERR_TRANSFER_PROTOCOL);
+                if (rc != 0) return -1;
+                continue;
+            }
+            /* A listener plays messages one at a time; this bounds a client that
+             * asks for a whole history at once and would occupy the worker. */
+            if (!audio_rate_ok(c)) {
+                c->xfer.audio = 1;
+                int rc = send_transfer_error(c, ag.message_id, OC_ERR_TTS_UNAVAILABLE);
+                c->xfer.audio = 0;
+                if (rc != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_TTS_LOOKUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = ag.message_id;
+            j->tts_model_version = strdup(g_tts_engine->version);
+            j->tts_voices = tts_voice_list();
+            oc_dbwriter_submit(dbw, j);
+            c->xfer.audio = 1;
+            c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            continue;
+        }
+#endif
         if (hdr.msg_type == OC_MSG_TRANSFER_CANCEL) {
             oc_transfer_cancel tc;
             if (oc_decode_transfer_cancel(&p, &tc) != OC_OK) return -1;
@@ -2124,7 +2269,10 @@ static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
 
 /* --- Result delivery (from the DB-writer thread) ------------------------ */
 
-static void deliver_result(int ep, conn **conns, oc_dbres *r) {
+/* `dbw` because a result can beget a job: read-aloud writes back the voice it
+ * chose and marks a served rendering used (ARCH-111). */
+static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
+    (void)dbw;
     oc_wbuf w;
     switch (r->type) {
     case OC_RES_AUTH_OK: {
@@ -2160,6 +2308,37 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
+        }
+
+        /* Whether this daemon reads messages aloud, and in which voices
+         * (REQ-291/295). Always sent: a client that hears "no" hides the feature
+         * rather than offering something that would fail. */
+        {
+            oc_tts_info ti;
+            memset(&ti, 0, sizeof ti);
+            ti.model_version = oc_slice_str("");
+            ti.preview = oc_slice_str("");
+#ifdef OC_TTS
+            if (g_tts && g_tts_engine) {
+                ti.available = 1;
+                ti.model_version = oc_slice_str(g_tts_engine->version);
+                ti.preview = oc_slice_str(g_tts_engine->preview ? g_tts_engine->preview : "");
+                int n = g_tts_engine->voices;
+                if (n > OC_TTS_VOICE_MAX) n = OC_TTS_VOICE_MAX;
+                for (int i = 0; i < n; i++) {
+                    const char *id = g_tts_engine->voice_id ? g_tts_engine->voice_id(i) : NULL;
+                    const char *lb = g_tts_engine->voice_label ? g_tts_engine->voice_label(i) : NULL;
+                    if (!id) break;
+                    ti.voices[ti.count].id = oc_slice_str(id);
+                    ti.voices[ti.count].label = oc_slice_str(lb ? lb : id);
+                    ti.count++;
+                }
+            }
+#endif
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &ti);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;   /* dropped on the TTS_INFO write */
         }
 
         /* A pause outlives the session that set it (REQ-278), so the client is
@@ -2476,6 +2655,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].status_text = oc_slice_str(r->ulist[i].status_text ? r->ulist[i].status_text : "");
             ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
             ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
+            ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_user_list ul = { (uint16_t)n, ents };
@@ -2958,6 +3138,69 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, fd, g_enc, w.len);
         break;
     }
+#ifdef OC_TTS
+    case OC_RES_TTS_META: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_DOWN_AWAIT_LOOKUP || !x->audio) break;
+        /* The voice the daemon picked for this author becomes a fact on their
+         * profile, written once (REQ-292). */
+        if (r->tts_persist && g_tts_engine && g_tts_engine->voice_id) {
+            const char *vid = g_tts_engine->voice_id(r->tts_voice);
+            oc_job *vj = vid ? oc_job_new(OC_JOB_TTS_VOICE_SET, 0) : NULL;
+            if (vj) {
+                vj->user_id = r->tts_author_id;
+                vj->pf_voice_id = strdup(vid);
+                oc_dbwriter_submit(dbw, vj);
+            }
+        }
+        if (r->tts_cached) {
+            /* Already rendered: serve it, and mark it used so the storage sweep
+             * evicts the renderings nobody listens to first. */
+            oc_job *tj = oc_job_new(OC_JOB_TTS_TOUCH, 0);
+            if (tj) {
+                memcpy(tj->tts_handle, r->tts_handle, 32);
+                tj->tts_model_version = strdup(g_tts_engine->version);
+                oc_dbwriter_submit(dbw, tj);
+            }
+            x->audio_duration_ms = r->tts_duration_ms;
+            if (audio_open_blob(ep, conns, c, r->tts_blob_key, r->tts_bytes) != 0) break;
+            break;
+        }
+        if (!g_tts) { send_transfer_error(c, r->message_id, OC_ERR_TTS_UNAVAILABLE); break; }
+        /* Not rendered yet. If the same handle is already being rendered for
+         * somebody else, wait on it rather than paying for it twice. */
+        int in_flight = 0;
+        for (tts_wait *wt = g_tts_waits; wt; wt = wt->next)
+            if (memcmp(wt->handle, r->tts_handle, 32) == 0) { in_flight = 1; break; }
+        tts_wait *wait = calloc(1, sizeof *wait);
+        if (!wait) { send_transfer_error(c, r->message_id, OC_ERR_INTERNAL); break; }
+        memcpy(wait->handle, r->tts_handle, 32);
+        wait->conn_id = c->conn_id;
+        wait->message_id = r->message_id;
+        if (!in_flight &&
+            oc_tts_worker_submit(g_tts, ++g_tts_req_seq, r->tts_handle, r->tts_voice, r->tts_text) != 0) {
+            free(wait);
+            send_transfer_error(c, r->message_id, OC_ERR_TTS_UNAVAILABLE);   /* the queue is full */
+            break;
+        }
+        wait->next = g_tts_waits;
+        g_tts_waits = wait;
+        x->state = XFER_AUDIO_AWAIT_RENDER;
+        break;
+    }
+    case OC_RES_TTS_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        if (c->xfer.state == XFER_DOWN_AWAIT_LOOKUP && c->xfer.audio) {
+            int fd = c->fd;
+            send_transfer_error(c, r->message_id, r->err_code);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        }
+        break;
+    }
+#endif
     case OC_RES_ATTACH_META: {
         /* DOWNLOAD_BEGIN authorized: open the blob and stream it (REQ-141). */
         conn *c = find_by_id(conns, r->conn_id);
@@ -3068,8 +3311,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         }
         if (r->n_reclaim)
             fprintf(stderr, "openchimed: storage maintenance reclaimed %zu blob(s) "
-                            "(%llu orphaned, %llu expired, %llu evicted); %llu MB free\n",
+                            "(%llu read-aloud, %llu orphaned, %llu expired, %llu evicted); %llu MB free\n",
                     r->n_reclaim,
+                    (unsigned long long)r->maint_renders,
                     (unsigned long long)r->maint_orphans,
                     (unsigned long long)r->maint_expired,
                     (unsigned long long)r->maint_evicted,
@@ -3215,6 +3459,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         pi.role           = r->role;
         pi.full_name      = oc_slice_str(r->pf_full_name ? r->pf_full_name : "");
         pi.pronouns       = oc_slice_str(r->pf_pronouns ? r->pf_pronouns : "");
+        pi.voice_id       = oc_slice_str(r->pf_voice_id ? r->pf_voice_id : "");
         pi.phone          = oc_slice_str(r->pf_phone ? r->pf_phone : "");
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
@@ -3881,6 +4126,62 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     oc_dbwriter_submit(dbw, j);
 }
 
+#ifdef OC_TTS
+/* A render the worker finished: record it, then start every connection that was
+ * waiting for that handle. A waiter whose connection has gone, or which moved on
+ * to something else, is simply dropped. */
+static void deliver_tts_results(int ep, conn **conns, oc_dbwriter *dbw) {
+    oc_tts_result res;
+    while (g_tts && oc_tts_worker_next_result(g_tts, &res)) {
+        if (res.status == OC_TTS_OK) {
+            oc_job *sj = oc_job_new(OC_JOB_TTS_STORE, 0);
+            if (sj) {
+                memcpy(sj->tts_handle, res.handle, 32);
+                sj->tts_model_version = strdup(g_tts_engine->version);
+                sj->tts_blob_key = strdup(res.key);
+                sj->tts_bytes = res.bytes;
+                sj->tts_duration_ms = res.duration_ms;
+                oc_dbwriter_submit(dbw, sj);
+            }
+        } else if (res.status == OC_TTS_FAILED) {
+            fprintf(stderr, "tts: render failed: %s\n", res.reason);
+        }
+        tts_wait **link = &g_tts_waits;
+        while (*link) {
+            tts_wait *wt = *link;
+            if (memcmp(wt->handle, res.handle, 32) != 0) { link = &wt->next; continue; }
+            *link = wt->next;
+            conn *c = find_by_id(conns, wt->conn_id);
+            if (c && c->xfer.state == XFER_AUDIO_AWAIT_RENDER && c->xfer.audio) {
+                int fd = c->fd;
+                if (res.status == OC_TTS_OK) {
+                    c->xfer.audio_duration_ms = res.duration_ms;
+                    c->xfer.state = XFER_NONE;              /* audio_open_blob sets the next one */
+                    audio_open_blob(ep, conns, c, res.key, res.bytes);
+                } else {
+                    send_transfer_error(c, wt->message_id,
+                                        res.status == OC_TTS_NOTHING ? OC_ERR_NOT_RENDERABLE
+                                                                     : OC_ERR_TTS_UNAVAILABLE);
+                    if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+                }
+            }
+            free(wt);
+        }
+    }
+}
+
+/* A connection that goes away while its render is in flight leaves no waiter
+ * behind: the render still finishes and is cached, it simply has no listener. */
+static void tts_drop_waiters(uint64_t conn_id) {
+    tts_wait **link = &g_tts_waits;
+    while (*link) {
+        tts_wait *wt = *link;
+        if (wt->conn_id == conn_id) { *link = wt->next; free(wt); continue; }
+        link = &wt->next;
+    }
+}
+#endif
+
 static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_job *j) {
     conn *c = find_by_id(conns, j->conn_id);
     if (!c) {
@@ -3989,6 +4290,14 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
         }
         x->br = j->br;
         x->state = XFER_DOWN_ACTIVE;
+        if (x->audio) {
+            oc_audio_info ai = { x->audio_message_id, x->audio_duration_ms, x->remaining };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_audio_info(&w, OC_PROTOCOL_VERSION, &ai);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+            download_pump(c);
+            break;
+        }
         {
             oc_download_info di = { x->attachment_id,
                                     oc_slice_str(x->dl_filename ? x->dl_filename : ""),
@@ -4007,9 +4316,14 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             break;
         }
         {
-            oc_download_chunk ch = { x->attachment_id, x->next_seq, { j->data, j->len } };
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
-            oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
+            if (x->audio) {
+                oc_audio_chunk ac = { x->audio_message_id, x->next_seq, { j->data, j->len } };
+                oc_encode_audio_chunk(&w, OC_PROTOCOL_VERSION, &ac);
+            } else {
+                oc_download_chunk ch = { x->attachment_id, x->next_seq, { j->data, j->len } };
+                oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
+            }
             if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
         }
         x->next_seq++;
@@ -4120,6 +4434,33 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         }
     }
 
+#ifdef OC_TTS
+    /* Read-aloud's render worker (ARCH-111), beside the transfer pool because it
+     * writes to the same store. No engine (a daemon built without read-aloud) or
+     * an operator who turned it off means no worker, and TTS_INFO then says the
+     * feature is absent (REQ-295). The model itself loads on the first render. */
+    int tts_eventfd = -1;
+    {
+        const oc_config *cfg = oc_config_get();
+        if (g_tts_engine && cfg->tts.enabled) {
+            g_tts = oc_tts_worker_start(g_tts_engine, g_blobs, (size_t)cfg->tts.queue,
+                                        (unsigned)cfg->tts.idle_secs * 1000u);
+            if (!g_tts) {
+                fprintf(stderr, "tts: cannot start the render worker; read-aloud is off\n");
+            } else {
+                tts_eventfd = oc_tts_worker_eventfd(g_tts);
+                struct epoll_event tev;
+                tev.events = EPOLLIN; tev.data.fd = tts_eventfd;
+                epoll_ctl(ep, EPOLL_CTL_ADD, tts_eventfd, &tev);
+                fprintf(stderr, "tts: read-aloud on, %d voices, queue %d, model idle %ds\n",
+                        g_tts_engine->voices, cfg->tts.queue, cfg->tts.idle_secs);
+            }
+        } else {
+            fprintf(stderr, "tts: read-aloud off\n");
+        }
+    }
+#endif
+
     /* Per-webhook rate limit (REQ-170); best-effort — if allocation fails the
      * endpoint still works, just unthrottled. */
     g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
@@ -4201,12 +4542,20 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 while (read(evfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
                 oc_dbres *r;
                 while ((r = oc_dbwriter_next_result(dbw)) != NULL) {
-                    deliver_result(ep, conns, r);
+                    deliver_result(ep, conns, dbw, r);
                     oc_dbres_free(r);
                 }
                 continue;
             }
 
+#ifdef OC_TTS
+            if (fd == tts_eventfd) {
+                uint64_t cnt;
+                while (read(tts_eventfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                deliver_tts_results(ep, conns, dbw);
+                continue;
+            }
+#endif
             if (fd == xfd) {
                 uint64_t cnt;
                 while (read(xfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
@@ -4249,6 +4598,13 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         if (conns[fd]) conn_close(ep, conns, fd);
     /* Stop the workers before the store they borrow; this also drains any
      * fire-and-forget cleanup the closes above just queued. */
+#ifdef OC_TTS
+    /* Before the store it writes to, like the transfer pool. */
+    oc_tts_worker_stop(g_tts);
+    g_tts = NULL;
+    for (tts_wait *wt = g_tts_waits, *next; wt; wt = next) { next = wt->next; free(wt); }
+    g_tts_waits = NULL;
+#endif
     oc_xferpool_stop(g_xfers);
     g_xfers = NULL;
     oc_blobstore_close(g_blobs);

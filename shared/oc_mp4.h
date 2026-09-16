@@ -1,8 +1,11 @@
 /* The restricted MP4 a video message is stored in (ARCH-110,
  * docs/VIDEO-MESSAGES.md §5): one VP9 track and one Opus track, progressive,
- * `moov` before `mdat`. The writer produces exactly that layout and the reader
- * accepts exactly that layout — which is what makes an in-tree implementation
- * reasonable, and what lets the reader reject everything else cleanly. */
+ * `moov` before `mdat` — or, for read-aloud (ARCH-111, docs/READ-ALOUD.md §4),
+ * the same file with the Opus track alone. The writer produces exactly those
+ * layouts and the reader accepts exactly those — which is what makes an in-tree
+ * implementation reasonable, and what lets the reader reject everything else
+ * cleanly. Shared: clients write and play video messages, the daemon writes
+ * read-aloud renders. */
 #ifndef OC_MP4_H
 #define OC_MP4_H
 
@@ -25,19 +28,24 @@ typedef struct oc_mp4_writer oc_mp4_writer;
  * a client writes no files (ARCH-88) — and OC_MP4_MAX_FILE bounds it. NULL on
  * failure. */
 oc_mp4_writer *oc_mp4_writer_open(int width, int height);
+/* Start an audio-only file: an Opus track and no video. `input_rate` is the
+ * sample rate the audio was produced at (recorded in the file for information;
+ * Opus itself always decodes at 48 kHz). */
+oc_mp4_writer *oc_mp4_writer_open_audio(unsigned input_rate);
 
 /* Sample bytes written so far: roughly the file's size, less a small moov. */
 uint64_t oc_mp4_writer_bytes(const oc_mp4_writer *w);
 
 /* Append one encoded VP9 frame. `pts_us` must not go backwards, and the first
- * frame must be a keyframe. */
+ * frame must be a keyframe. Refused by an audio-only writer. */
 int oc_mp4_write_video(oc_mp4_writer *w, const uint8_t *data, size_t len,
                        int64_t pts_us, int keyframe);
 /* Append one Opus packet of `samples` samples at 48 kHz (960 for 20 ms). */
 int oc_mp4_write_audio(oc_mp4_writer *w, const uint8_t *data, size_t len, unsigned samples);
 
 /* Assemble the file (ftyp, moov, mdat) into `*out` (malloc'd; the caller frees
- * it) and free `w`. `*duration_ms` receives the longer track's duration.
+ * it) and free `w`. `*duration_ms` receives the longer track's duration. A video
+ * writer needs at least one video frame, an audio-only one at least one packet.
  * Returns 0, or -1 with `w` freed and nothing allocated. */
 int  oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t *duration_ms);
 /* Stop without a file. */
@@ -72,7 +80,8 @@ typedef struct oc_mp4_info {
 
 /* Parse a whole file held in memory. Returns 0 and fills `info` (free with
  * oc_mp4_info_free), or a negative value for anything that is not exactly this
- * profile. Never reads outside `data[0..len)`. */
+ * profile. A file with no video track is accepted when it has an audio track
+ * (`info->video.present` is 0). Never reads outside `data[0..len)`. */
 int  oc_mp4_parse(const uint8_t *data, size_t len, oc_mp4_info *info);
 void oc_mp4_info_free(oc_mp4_info *info);
 

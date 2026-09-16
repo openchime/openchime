@@ -900,6 +900,42 @@ static const char MIGRATION_0041[] =
     ");"
     "CREATE INDEX attachment_media_poster ON attachment_media(poster_id);";
 
+static const char MIGRATION_0042[] =
+    /* Read-aloud (REQ-292/293, ARCH-111): the voice a person is read in, and the
+     * renderings the daemon has already made.
+     *
+     * `users.voice_id` is the author's voice, not a listener's preference — one
+     * rendering serves every listener, so the voice belongs to the person being
+     * read. Nullable: an absent value means the daemon picks one and writes it
+     * back on first use, which is what makes it visible and correctable rather
+     * than recomputed differently by a later version.
+     *
+     * `rendered_audio` is a CACHE keyed on what was said and how. `handle` is
+     * SHA-256 over the speakable text and the voice, so identical text in the
+     * same voice is rendered once and an edit simply mints another handle;
+     * `model_version` names the model, the pronunciation data and the speaking
+     * rate together, so a changed version renders again rather than serving
+     * speech in a voice the daemon no longer has. The pair is the primary key.
+     *
+     * A row points at a blob (`blob_key`), as `attachments` does, and holds only
+     * the facts the AUDIO_INFO frame needs. Nothing references it: it is
+     * reclaimable storage, evicted before any attachment tier and with no
+     * tombstone (ARCH-77 applies to what a user uploaded, not to what the daemon
+     * can make again), so the sweep takes the least recently used first --
+     * hence the index on `last_used_ms`. Losing a row costs a re-render. */
+    "ALTER TABLE users ADD COLUMN voice_id TEXT;"
+    "CREATE TABLE rendered_audio ("
+    "  handle        BLOB NOT NULL,"
+    "  model_version TEXT NOT NULL,"
+    "  blob_key      TEXT NOT NULL,"
+    "  bytes         INTEGER NOT NULL,"
+    "  duration_ms   INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  last_used_ms  INTEGER NOT NULL,"
+    "  PRIMARY KEY (handle, model_version)"
+    ") WITHOUT ROWID;"
+    "CREATE INDEX rendered_audio_lru ON rendered_audio(last_used_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -942,6 +978,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 39, MIGRATION_0039 },
     { 40, MIGRATION_0040 },
     { 41, MIGRATION_0041 },
+    { 42, MIGRATION_0042 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

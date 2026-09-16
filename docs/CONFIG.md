@@ -123,6 +123,27 @@ fail, bounded and silent.
 |---|---|---|
 | `OPENCHIME_AUDIO_PORT` | `0` (ephemeral) | UDP port for the forked audio-relay sidecar (ARCH-28/73). **`0` means the kernel picks a free port, not that audio is off** — the daemon binds the socket, reads the assigned port back with `getsockname`, forks the sidecar unconditionally, and advertises that port in `CALL_JOINED`. Setting a value pins the port. The relay forwards opaque payloads; the daemon never decodes a codec. |
 
+## Read-aloud
+
+Speech is built into the daemon (ARCH-111): the voice model and the pronunciation
+data are inside the binary, so there is nothing to install and the feature is on
+unless it is turned off. A daemon built with `make TTS=0` has no read-aloud
+whatever these say, and tells its clients so.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCHIME_TTS` | `1` | Read messages aloud. `0` turns it off: no renderings are made or served, and clients are told the feature is absent (REQ-295). |
+| `OPENCHIME_TTS_QUEUE` | `256` | Renderings that may wait for the worker. A full queue answers `TTS_UNAVAILABLE` rather than growing; clamped to 1–4096. |
+| `OPENCHIME_TTS_IDLE_SECS` | `300` | How long the model stays loaded with nothing to render. It loads on the first request (about a quarter of a second) and is released after this, so an idle tenant holds none of its working memory; clamped to 5–86400. |
+| `OPENCHIME_TTS_RATE` | `60` | `AUDIO_GET`s one connection may make a minute. A listener plays messages one at a time, so this bounds a client asking for a whole history at once; clamped to 1–6000. |
+
+**What it costs.** Nothing while nobody is listening: measured on one core, an
+idle daemon with read-aloud built in holds 1.7 MB against 1.6 MB without it, and
+the ~110 MB of model and pronunciation data stays on disk. While rendering, peak
+memory is about 210 MB for a typical sentence and up to 315 MB for a long one, and
+a rendering takes about six tenths of the time it takes to speak. A rendering is
+about 3 KB a second of speech, stored until the disk needs the room.
+
 ---
 
 ## Client-side

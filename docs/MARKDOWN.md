@@ -64,17 +64,16 @@ Rendering is never allowed to lose characters the author typed.
 
 ## 3. Where it is parsed
 
-**`client/core/richtext.[ch]`, and nowhere else.**
+**`shared/richtext.[ch]`, and nowhere else.**
 
-- **Not the daemon.** Formatting needs no server knowledge. This is the point
-  where it differs from @mentions (ARCH-89), which *had* to resolve server-side
-  because only the daemon holds the roster. Parsing markup server-side would buy
-  nothing and add a wire contract to version forever.
-- **Not `shared/`.** That directory is the **wire contract shared with the
-  daemon** — `protocol.c`, `mention.c`, `searchq.c` are all there because the
-  daemon links them too. Formatting is shared between *frontends only*, which is
-  exactly what `client/core/` is (see `complete.c`, the shared completion and
-  emoji catalogue).
+- **Rendering stays in the clients.** Formatting needs no server knowledge to
+  display, which is where it differs from @mentions (ARCH-89), which *had* to
+  resolve server-side because only the daemon holds the roster. The wire carries
+  the author's bytes, never markup, and no frame describes formatting.
+- **In `shared/` because the daemon reads messages aloud** (ARCH-111). Turning a
+  body into speakable text (`shared/speakable.c`) has to skip code blocks and drop
+  delimiters by exactly the rules a reader sees applied, so the daemon links the
+  same parser the frontends do.
 - **One parser, both frontends.** The TUI and the GUI call the same function and
   receive the same spans, for the reason ARCH-89 gives for the mention scanner:
   two implementations of "is this bold" will drift, and nobody can tell which is

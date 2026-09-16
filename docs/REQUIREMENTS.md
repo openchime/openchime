@@ -1276,6 +1276,38 @@ the requirement says so explicitly rather than implying one.
   surface closes; and a recording has never been written to disk, so one that was
   discarded or interrupted by a crash has left nothing behind (ARCH-88).
 
+### 6.4 Read-aloud
+
+*Design: [READ-ALOUD.md](./READ-ALOUD.md) (the feature), [TTSKIT.md](./TTSKIT.md)
+(pronunciation).*
+
+- **REQ-291.** *(Not built)* A user has been able to **listen to a channel** instead
+  of reading it: from a message onward, each message that has something to say is
+  spoken in order, with play, pause, skip and stop. Playback runs at one fixed speaking
+  rate; there is no listener speed setting. What is spoken is the message text made
+  speakable — code blocks announced and skipped, links reduced to their site, mentions
+  said as names, formatting and emoji dropped, numbers and times read as words.
+- **REQ-292.** *(Not built)* Each author has been **read in a voice of their own** —
+  a synthetic voice chosen from a fixed set and held on their profile (REQ-240), the
+  same for every listener on every device. A listener has not overridden it. A new
+  user's voice has defaulted from their declared pronouns, else from a stable choice
+  keyed on their account, and the user has been able to change it with a preview. A
+  change has applied to messages rendered afterwards, not retroactively.
+- **REQ-293.** *(Not built)* Speech has been **synthesized on the server, once per
+  message text and voice**, by the daemon itself from a voice model built into it (ARCH-111), and
+  kept so every later listener and every re-listen reuses it. Identical text in the same
+  voice has been synthesized once. A rendering has been reclaimable storage: reclaimed
+  first under pressure, with nothing shown in its place, and synthesized again on the
+  next request.
+- **REQ-294.** *(Not built)* A message with **nothing to say** — a bare attachment, only
+  emoji — has been marked not renderable and skipped by a listener, rather than played
+  as silence or refused as an error.
+- **REQ-295.** *(Not built)* Read-aloud has been **absent where it is turned off**:
+  a server whose operator has disabled it has offered nothing and no client has shown it,
+  and a server with it on has needed nothing installed or fetched to provide it. No
+  message text has left the tenant's own box to be spoken, and no part of the speech
+  chain has been under a copyleft licence (ARCH-111).
+
 ---
 
 ## 7. Integrations
@@ -1781,8 +1813,8 @@ architecture decision.*
 messages (author name, ARCH-74). Not yet backed by an architecture decision.*
 
 - **REQ-240.** Each user has had a **profile** — full name, display name, avatar
-  image, title/role text, pronouns, phone, and timezone — set by the user and
-  shown wherever the user appears. Avatars have been stored as image assets in
+  image, title/role text, pronouns, phone, timezone, and the voice their messages are
+  read aloud in (REQ-292) — set by the user and shown wherever the user appears. Avatars have been stored as image assets in
   object storage (ARCH-17), not SQLite.
 
   **One screen owns it.** The fields are edited together on a single Edit
@@ -2159,7 +2191,9 @@ feature.*
   is REQ-150–152 and screenshare REQ-161. **Scoped by ARCH-110:** a recorded
   *video* message is admitted (REQ-162–166); an audio-only clip stays excluded, so
   there is one kind of recorded message and no second class of audio playback in a
-  channel. The exclusion is narrowed, not repealed.
+  channel. The exclusion is narrowed, not repealed. Reading a *text* message aloud
+  (REQ-291–295) is not a clip: nothing is recorded or posted, and the message is still
+  its text.
 - **REQ-274.** *(Excluded by decision)* **Slack-Connect-style cross-organization shared channels and
   external DMs** have not been supported. Cross-tenant messaging is precluded by
   the island model (ARCH-4/REQ-040); federation between tenants is a separate

@@ -97,6 +97,20 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
     }
 }
 
+/* Read until `want` arrives, ignoring anything the daemon pushes of its own
+ * accord along the way. A server may send an unsolicited frame at any moment --
+ * read-aloud announces its voices with TTS_INFO the moment a session opens
+ * (ARCH-111) -- and a client that treats "not the frame I asked for" as a
+ * protocol error is not a client worth modelling here. Bounded, so a daemon
+ * that never sends `want` still fails rather than reading for ever. */
+static int read_until(client *c, uint16_t want, oc_header *hdr, oc_rbuf *p) {
+    for (int i = 0; i < 16; i++) {
+        if (read_frame(c, hdr, p) != 0) return -1;
+        if (hdr->msg_type == want) return 0;
+    }
+    return -1;
+}
+
 static int do_handshake(client *c) {
     uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     /* min = max = OC_PROTOCOL_VERSION, the same rule both real peers follow
@@ -107,11 +121,11 @@ static int do_handshake(client *c) {
     oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("e2e") };
     if (oc_encode_hello(&w, &h) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
-    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;
+    if (read_until(c, OC_MSG_WELCOME, &hdr, &p) != 0) return -1;
     oc_welcome wel;
     if (oc_decode_welcome(&p, &wel) != OC_OK) return -1;
     /* The daemon follows WELCOME with AUTH_CHALLENGE (PROTOCOL.md §4.1). */
-    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_CHALLENGE) return -1;
+    if (read_until(c, OC_MSG_AUTH_CHALLENGE, &hdr, &p) != 0) return -1;
     oc_auth_challenge ch;
     return oc_decode_auth_challenge(&p, &ch) == OC_OK ? 0 : -1;
 }
@@ -123,7 +137,7 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *uid)
     oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0 || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
-    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;
+    if (read_until(c, OC_MSG_AUTH_OK, &hdr, &p) != 0) return -1;
     oc_auth_ok ok;
     if (oc_decode_auth_ok(&p, &ok) != OC_OK) return -1;
     *uid = ok.user_id;
@@ -151,9 +165,10 @@ static int run(const char *host, int port) {
     if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK || write_all(&a.conn, buf, w.len) != 0)
         FAIL("send");
 
-    /* A gets SEND_ACK + BROADCAST (either order). */
+    /* A gets SEND_ACK + BROADCAST (either order), with anything the daemon sends
+     * of its own accord allowed in between -- see read_until. */
     uint64_t acked = 0, bcast_a = 0;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 16 && !(acked && bcast_a); i++) {
         oc_header hdr; oc_rbuf p;
         if (read_frame(&a, &hdr, &p) != 0) FAIL("read A");
         if (hdr.msg_type == OC_MSG_SEND_ACK) {
@@ -164,13 +179,14 @@ static int run(const char *host, int port) {
             oc_broadcast bc;
             if (oc_decode_broadcast(&p, &bc) != OC_OK) FAIL("decode bcast A");
             bcast_a = bc.message_id;
-        } else FAIL("unexpected frame to A");
+        }
     }
+    if (!acked || !bcast_a) FAIL("no ack/broadcast to A");
     if (acked == 0 || acked != bcast_a) FAIL("ack/broadcast mismatch");
 
     /* B gets the same BROADCAST. */
     oc_header hdr; oc_rbuf p;
-    if (read_frame(&b, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_BROADCAST) FAIL("read B broadcast");
+    if (read_until(&b, OC_MSG_BROADCAST, &hdr, &p) != 0) FAIL("read B broadcast");
     oc_broadcast bcb;
     if (oc_decode_broadcast(&p, &bcb) != OC_OK) FAIL("decode bcast B");
     if (bcb.message_id != acked || bcb.author_id != ua) FAIL("B broadcast content");

@@ -150,6 +150,15 @@ static void insert_attachment(sqlite3 *db, uint64_t id, uint64_t age_ms,
     sqlite3_finalize(st);
 }
 
+/* One number out of the database, for the rows that have no helper of their own. */
+static int scalar(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    int v = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return v;
+}
+
 static int reclaimed(sqlite3 *db, uint64_t id) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db, "SELECT reclaimed_at_ms FROM attachments WHERE id=?;", -1, &st, NULL);
@@ -397,6 +406,59 @@ int run_storage_tests(void) {
         CHECK(reclaimed(db, 11) == 0);
     }
 
+    /* Read-aloud renderings go before anything a user uploaded (ARCH-111): the
+     * daemon can make one again from the message it speaks, where an attachment
+     * exists only here. Least recently listened to first, and the row goes with
+     * the blob — no tombstone, because nothing is shown in its place. */
+    {
+        CHECK(sqlite3_exec(db,
+            "INSERT INTO rendered_audio(handle,model_version,blob_key,bytes,duration_ms,created_at_ms,last_used_ms)"
+            " VALUES(x'AA','v1','render-old',100,1000,1,1000),"
+            "       (x'BB','v1','render-mid',100,1000,1,2000),"
+            "       (x'CC','v1','render-new',100,1000,1,3000);", NULL, NULL, NULL) == SQLITE_OK);
+        insert_attachment(db, 300, 90 * DAY, 1, now);      /* old, linked: tier 2b food */
+
+        oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        CHECK(j != NULL);
+        j->maint_grace_ms = 1 * HOUR;
+        j->maint_batch = 2;                 /* room for two, and renders come first */
+        j->maint_max_age_ms = 0;
+        j->maint_evict = 1;                 /* under pressure */
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) {
+            CHECK(r->maint_renders == 2 && r->n_reclaim == 2);
+            /* The two least recently used, and their blobs are what the net
+             * thread is told to delete. */
+            CHECK(strcmp(r->reclaim[0].storage_key, "render-old") == 0);
+            CHECK(strcmp(r->reclaim[1].storage_key, "render-mid") == 0);
+            CHECK(r->reclaim[0].attachment_id == 0);       /* not an attachment */
+            CHECK(r->maint_evicted == 0);                  /* the batch was full */
+            oc_dbres_free(r);
+        }
+        CHECK(scalar(db, "SELECT COUNT(*) FROM rendered_audio;") == 1);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM rendered_audio WHERE blob_key='render-new';") == 1);
+        CHECK(reclaimed(db, 300) == 0);                    /* the attachment was not touched */
+
+        /* The next pass takes the last rendering, and only then the attachment. */
+        j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        j->maint_grace_ms = 1 * HOUR;
+        j->maint_batch = 64;
+        j->maint_max_age_ms = 0;
+        j->maint_evict = 1;
+        oc_dbwriter_submit(w, j);
+        r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) {
+            CHECK(r->maint_renders == 1);
+            oc_dbres_free(r);
+        }
+        CHECK(scalar(db, "SELECT COUNT(*) FROM rendered_audio;") == 0);
+    }
+
     /* An AVATAR is an attachment no message references, so it looks exactly
      * like an orphan to tier 1 and like any other old file to tiers 2a and 2b. It
      * must survive all three, or every profile picture in the workspace goes blank an
@@ -508,10 +570,13 @@ int run_storage_tests(void) {
              * of each kind. */
             /* 7 orphans: one from the first pass, the 5 the batch-cap step
              * reclaimed, and the ex-avatar collected once it stopped being one.
-             * One expired and one evicted from their passes. */
+             * One expired; two evicted — the pressure pass and the attachment the
+             * read-aloud step left behind once the renderings were gone.
+             * Renderings are not counted here: they are not attachments, and the
+             * reasons this report breaks down are attachments' (ARCH-111). */
             CHECK(r->st_rec_orphan == 7);
             CHECK(r->st_rec_expired == 1);
-            CHECK(r->st_rec_evicted == 1);
+            CHECK(r->st_rec_evicted == 2);
             CHECK(r->st_last_reclaim_ms > 0);
             oc_dbres_free(r);
         }

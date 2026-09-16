@@ -486,7 +486,10 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
  * same arrangement the sign-in card already uses successfully — the platform keeps
  * caret, selection, IME and clipboard, and we stop shipping a grey GDI popup with
  * a different font, different colours and a Windows 95 title bar. */
-#define FORM_MAX_FIELDS 6
+/* Seven since Edit profile gained the voice a person is read aloud in
+ * (REQ-292): the identity screen owns every field that is one screen's worth of
+ * a person, and the voice is one of them. */
+#define FORM_MAX_FIELDS 7
 static int        g_form_open;                       /* a form is on the frame */
 /* What the last form returned, for the harness: a form's answer is consumed by its
  * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
@@ -611,6 +614,35 @@ static const char *tz_options_for(const char *tz) {
         snprintf(g_tz_opts + n, sizeof g_tz_opts - n, "|%s", tz);
     }
     return g_tz_opts;
+}
+
+/* The voices this daemon offers, as a select's "a|b|c" (REQ-292, ARCH-111).
+ * Index 0 is "Automatic", which is the daemon choosing one and is what an empty
+ * voice means; the rest are the labels people pick from. */
+static char g_voice_opts[512];
+#define OC_VOICE_AUTO "Automatic"
+
+static const char *voice_options(const oc_model *m) {
+    snprintf(g_voice_opts, sizeof g_voice_opts, "%s", OC_VOICE_AUTO);
+    for (uint8_t i = 0; m && i < oc_model_tts_voice_count(m); i++) {
+        const oc_voice *v = oc_model_tts_voice(m, i);
+        size_t n = strlen(g_voice_opts);
+        snprintf(g_voice_opts + n, sizeof g_voice_opts - n, "|%s", v->label[0] ? v->label : v->id);
+    }
+    return g_voice_opts;
+}
+
+/* Which option a stored voice id is (0 = automatic, or unknown to this daemon). */
+static int voice_index_of(const oc_model *m, const char *voice_id) {
+    for (uint8_t i = 0; m && voice_id && voice_id[0] && i < oc_model_tts_voice_count(m); i++)
+        if (strcmp(oc_model_tts_voice(m, i)->id, voice_id) == 0) return i + 1;
+    return 0;
+}
+
+/* ...and back: the id to send for option `idx` ("" for automatic). */
+static const char *voice_id_at(const oc_model *m, int idx) {
+    if (!m || idx <= 0 || idx > (int)oc_model_tts_voice_count(m)) return "";
+    return oc_model_tts_voice(m, (uint8_t)(idx - 1))->id;
 }
 
 static int sel_count(const char *hint) {
@@ -1563,6 +1595,8 @@ static void vm_pick_device(HWND hwnd, int camera, int ix);                      
 static int  vm_click(HWND hwnd, int x, int y);                                  /* fwd */
 static void vm_open_player(HWND hwnd, const oc_attachment *at);                 /* fwd */
 static int  vm_take_bytes(uint64_t id, uint8_t *d, size_t n);                   /* fwd */
+static void listen_set(HWND hwnd, int on);                                     /* fwd */
+static void listen_drop_player(void);                                           /* fwd */
 static void vm_tick(HWND hwnd, const oc_model *m);                              /* fwd */
 /* Whether this machine has a camera, asked once: enumerating capture devices is
  * not something to do per frame. */
@@ -1836,6 +1870,14 @@ static int tab_applies(const oc_channel *c, int tab) {
 static int g_tab;                       /* the selected channel tab */
 static rectf g_tab_r[TAB_COUNT];  /* tab hit-boxes */
 static rectf g_memchip;           /* header member-count chip */
+/* Talking mode (REQ-291, ARCH-111): the header toggle, and what is being read
+ * aloud right now. The player BORROWS the bytes, so they are held here for as
+ * long as it runs and freed with it. */
+static rectf      g_listen_btn;
+static oc_player *g_listen_player;
+static uint8_t   *g_listen_bytes;
+static size_t     g_listen_len;
+static uint64_t   g_listen_msg;
 static rectf g_ws_dot;            /* workspace connection dot */
 static int g_tab_hover = -1;
 /* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
@@ -5038,6 +5080,14 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                             rf(reg.right - 27, by + 1, reg.right - 11, by + 17),
                             OC_COL_ACCENT);
             }
+            /* Being read aloud right now (REQ-291): a band on the row the voice is
+             * speaking, so the transcript and what you hear agree. It is state
+             * rather than an event, so it does not fade like the jump flash. */
+            if (capture && g_listen_msg && msgs[first + i].message_id == g_listen_msg) {
+                rectf lr = rf(reg.left, y, reg.right, y + heights[i]);
+                gfx_fill(rt, gr(lr), OC_COL_ACCENT, 0.14f);
+                fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
+            }
             /* Jump flash — fades out so it reads as "here it is", not as state. */
             if (capture && g_flash_mid == msgs[first + i].message_id) {
                 ULONGLONG now = GetTickCount64();
@@ -6107,7 +6157,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS, ACC_PREFS, ACC_QUIT };
+       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_QUIT };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -6139,6 +6189,7 @@ static const struct {
     { AM_CTRL,            VK_OEM_COMMA, ACC_PREFS,  "Ctrl+,",           "Preferences" },
     /* The numeric keypad's +/- are different virtual keys and a user with a full
      * keyboard will reach for them. */
+    { AM_CTRL | AM_SHIFT, 'L',        ACC_LISTEN,  "Ctrl+Shift+L",     "Read this conversation aloud, from now on" },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
@@ -6160,6 +6211,11 @@ static void accel_run(HWND hwnd, int action) {
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
+    case ACC_LISTEN: {
+        const oc_model *lm = model();
+        if (lm && oc_model_tts_available(lm) && g_sel)
+            listen_set(hwnd, oc_model_listening_channel(lm) != g_sel);
+        break; }
     case ACC_NAV_PREV:        nav_conversation(hwnd, -1, 0); break;
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
     case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
@@ -7710,9 +7766,31 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
                                       g_memchip.right, g_memchip.bottom), mcol);
     g_members_btn = rf(0, 0, 0, 0);   /* superseded by the chip */
 
-    /* Jump-to-unread: only while this channel actually has a divider to
-     * jump to, so it is never a dead control. */
+    /* Talking mode (REQ-291): one button, and it means "read this conversation to
+     * me from now on". Shown only where the daemon speaks (REQ-295), so a client
+     * against a daemon without read-aloud has no dead control. Lit while it is
+     * on, with what is still waiting to be read. */
     float statr = g_memchip.left - 12;
+    if (m && oc_model_tts_available(m) && c) {
+        int on = oc_model_listening_channel(m) == g_sel;
+        char lq[8] = "";
+        if (on && oc_model_listen_queued(m)) snprintf(lq, sizeof lq, "%u", (unsigned)oc_model_listen_queued(m));
+        float lw = UIS(30) + (lq[0] ? text_width(lq, g_meta) + UIS(4) : 0);
+        g_listen_btn = rf(statr - lw, 13, statr, HEADER_H - 13);
+        if (on) fill_round(rt, g_listen_btn, OC_R_CONTROL, OC_COL_ACCENT);
+        else    stroke_round(rt, g_listen_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        uint32_t lcol = on ? 0xFFFFFF : OC_COL_MUTED;
+        draw_lucide(rt, on ? OC_ICON_VOLUME : OC_ICON_MUTE,
+                    rf(g_listen_btn.left + 5, g_listen_btn.top + 4,
+                       g_listen_btn.left + 23, g_listen_btn.bottom - 4), lcol);
+        if (lq[0])
+            draw_text(rt, lq, g_meta, rf(g_listen_btn.left + 25, g_listen_btn.top,
+                                          g_listen_btn.right, g_listen_btn.bottom), lcol);
+        statr = g_listen_btn.left - 12;
+    } else {
+        g_listen_btn = rf(0, 0, 0, 0);
+    }
+
     if (ulbl[0]) {
         const char *lbl = ulbl;
         float bw = text_width(lbl, g_meta) + UIS(22);
@@ -14966,6 +15044,14 @@ static void a11y_publish_scene(const oc_model *m) {
                  ATOK(AT_VIEW, (uint64_t)(g_navrows[i].act + 1000)));
     }
 
+    /* Talking mode's toggle, with its state in the name: a button that reads
+     * "Read aloud" whether it is on or off tells a listener nothing. */
+    if (g_listen_btn.right > g_listen_btn.left && n < OC_ACC_MAX) {
+        int on = oc_model_listening_channel(m) == g_sel;
+        acc_push(items, &n, OC_ACC_BUTTON, "header.listen",
+                 on ? "Reading aloud: on" : "Reading aloud: off",
+                 g_listen_btn, ATOK(AT_MENU, 86));
+    }
     if (g_sb_unread_chip.right > g_sb_unread_chip.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_TAB, "sidebar.unreads",
                  g_sb.unreads_only ? "Unreads only: on" : "Unreads only: off",
@@ -15900,6 +15986,69 @@ static void vm_frame_update(void) {
 static void vm_set_title(HWND hwnd, int recording) {
     SetWindowTextW(hwnd, recording ? L"● Recording - OpenChime" : L"OpenChime");
     if (g_win) SDL_SetWindowTitle(g_win, recording ? "\xE2\x97\x8F Recording - OpenChime" : "OpenChime");
+}
+
+/* ---- talking mode (REQ-291-295, ARCH-111) ---------------------------------
+ *
+ * The core queues and fetches; this plays. A rendering is an audio-only MP4 the
+ * player reads straight out of memory, and the player BORROWS those bytes, so
+ * they live exactly as long as it does. */
+
+static void listen_drop_player(void) {
+    if (g_listen_player) oc_player_close(g_listen_player);
+    g_listen_player = NULL;
+    free(g_listen_bytes);
+    g_listen_bytes = NULL;
+    g_listen_len = 0;
+    g_listen_msg = 0;
+}
+
+/* Turn talking mode on for the conversation on screen, or off. */
+static void listen_set(HWND hwnd, int on) {
+    if (!g_client) return;
+    listen_drop_player();
+    oc_client_listen(g_client, on ? g_sel : 0, on);
+    if (on) toast_push("Reading new messages aloud", 0);
+    oc_a11y_announce(on ? "Reading new messages aloud" : "Stopped reading aloud");
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Once a frame: start what is ready, retire what has finished, and stop
+ * altogether if the user has gone somewhere else -- nothing plays from a
+ * conversation that is not on screen. */
+static void listen_tick(HWND hwnd, const oc_model *m) {
+    if (!g_client || !m) return;
+    uint64_t ch = oc_model_listening_channel(m);
+    if (ch && ch != g_sel) { listen_set(hwnd, 0); return; }
+
+    if (g_listen_player) {
+        oc_player_status st;
+        oc_player_status_get(g_listen_player, &st);
+        if (st.state == OC_PLAYER_ENDED || st.state == OC_PLAYER_ERROR) {
+            listen_drop_player();
+            oc_client_listen_done(g_client);      /* on to the next message */
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return;
+    }
+    if (!ch) return;
+
+    uint8_t *mp4 = NULL;
+    size_t len = 0;
+    uint64_t id = oc_model_listen_take_audio((oc_model *)m, &mp4, &len);
+    if (!id) return;
+    g_listen_bytes = mp4;
+    g_listen_len = len;
+    g_listen_msg = id;
+    g_listen_player = oc_player_open(mp4, len);
+    if (!g_listen_player) {
+        /* Nothing to be done with it: drop it and move on rather than stopping. */
+        listen_drop_player();
+        oc_client_listen_done(g_client);
+        return;
+    }
+    oc_player_play(g_listen_player);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void vm_player_close(void) {
@@ -18174,6 +18323,13 @@ static int on_click(HWND hwnd, int x, int y) {
      * stale list is worse than a moment's load. */
     for (int t = 0; t < TAB_COUNT; t++)
         if (in_rect(g_tab_r[t], x, y)) { select_tab(t); return 1; }
+    /* Talking mode on or off for the conversation on screen (REQ-291). */
+    if (in_rect(g_listen_btn, x, y)) {
+        const oc_model *lm = model();
+        int on = lm && oc_model_listening_channel(lm) == g_sel;
+        listen_set(hwnd, on ? 0 : 1);
+        return 1;
+    }
     /* The member chip toggles the roster pane. */
     if (in_rect(g_memchip, x, y)) {
         g_show_members = !g_show_members;
@@ -19020,11 +19176,16 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
     snprintf(b->ws[b->n++], 256, "%s", workspace);
 }
 
-static void connect_start(const char *ws, const char *cred) {
+/* Returns 0 when the workspace does not resolve, having started nothing. The
+ * caller must SAY so: this used to return void, leaving g_client NULL, and on the
+ * command-line path that meant a window created hidden and never shown -- a live
+ * process, no window, no error, indistinguishable from a client that failed to
+ * start at all. */
+static int connect_start(const char *ws, const char *cred) {
     oc_endpoint ep;
     if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
         snprintf(g_host, sizeof g_host, "%s", "?");
-        return;
+        return 0;
     }
     snprintf(g_host, sizeof g_host, "%s", ep.host);
     g_port = ep.port;
@@ -19042,6 +19203,7 @@ static void connect_start(const char *ws, const char *cred) {
         memcpy(user, cred, n); user[n] = 0;
     }
     remember_workspace(ws, user[0] ? user : NULL);
+    return 1;
 }
 
 /* Connect every remembered workspace except `skip`, which is already up. Only
@@ -19094,6 +19256,7 @@ static void reset_session(void) {
             }
         g_ws_active = -1;
         g_n_notify_hw = 0;      /* slot indices just shifted */
+        listen_drop_player();     /* the player borrows bytes the core is about to free */
         oc_client_stop(g_client);
         g_client = NULL;
     }
@@ -19531,7 +19694,13 @@ static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
     g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
     g_view = VIEW_HOME;
-    connect_start(ws, cred ? cred : "");
+    if (!connect_start(ws, cred ? cred : "")) {
+        /* Nothing is running now, so the sign-in view is where the user can act:
+         * it words an unresolvable workspace already. */
+        g_view = VIEW_SIGNIN;
+        signin_begin(hwnd, ws, cred);
+        snprintf(g_si_err, sizeof g_si_err, "'%s' not found — does not resolve in DNS", ws);
+    }
     layout_signin(hwnd);
     layout_composer(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
@@ -20083,7 +20252,13 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             { FF_TEXT,   "Pronouns",     "Shown beside your name.", "" },
             { FF_TEXT,   "Phone",        "Only people in this workspace can see it.", "" },
             { FF_SELECT, "Timezone",     OC_TZ_OPTIONS, "" },
+            { FF_SELECT, "Read-aloud voice", OC_VOICE_AUTO, "" },
         };
+        /* The voice is only a field where the daemon speaks (REQ-295); against
+         * one that does not, the form is the six it always was. */
+        const oc_model *vm2 = model();
+        int nfields = (vm2 && oc_model_tts_available(vm2)) ? 7 : 6;
+        if (nfields == 7) f[6].hint = voice_options(vm2);
         const oc_model *pm2 = model();
         const char *had_name = "";
         if (pm2) for (size_t i = 0; i < pm2->n_users; i++)
@@ -20100,6 +20275,9 @@ static void menu_dispatch(HWND hwnd, int cmd) {
                 f[5].hint = tz_options_for(pm2->users[i].timezone);
                 { int ti = tz_find(f[5].hint, pm2->users[i].timezone);
                   snprintf(f[5].value, sizeof f[5].value, "%d", ti < 0 ? 0 : ti); }
+                if (nfields == 7)
+                    snprintf(f[6].value, sizeof f[6].value, "%d",
+                             voice_index_of(pm2, pm2->users[i].voice_id));
                 had_name = pm2->users[i].name;
                 break;
             }
@@ -20112,10 +20290,14 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             g_form_side.upload_cmd = 55;
             g_form_side.remove_cmd = 56;
         }
-        if (!form_dialog(hwnd, "Edit profile", f, 6)) break;
+        if (!form_dialog(hwnd, "Edit profile", f, nfields)) break;
         char tz[64]; sel_opt(f[5].hint, atoi(f[5].value), tz, sizeof tz);
         if (!strcmp(tz, OC_TZ_UNSET)) tz[0] = '\0';
-        oc_client_set_profile(g_client, f[0].value, f[2].value, f[3].value, f[4].value, tz);
+        /* An empty voice keeps whatever is set, which is exactly what
+         * "Automatic" means to the daemon: it picks, once, and that choice then
+         * shows here as the voice it chose. */
+        const char *voice = nfields == 7 ? voice_id_at(model(), atoi(f[6].value)) : "";
+        oc_client_set_profile(g_client, f[0].value, f[2].value, f[3].value, f[4].value, tz, voice);
         /* The display name is its own op on the wire (SET_DISPLAY_NAME), so the
          * one screen makes two calls — and only when it CHANGED, because a
          * rename fans a PROFILE_UPDATED to every connection in the workspace and
@@ -20216,6 +20398,11 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         sidebar_opts_save();
         InvalidateRect(hwnd, NULL, FALSE);
         break;
+    case 86: {   /* talking mode, from its header button or a screen reader */
+        const oc_model *lm = model();
+        if (lm && oc_model_tts_available(lm) && g_sel)
+            listen_set(hwnd, oc_model_listening_channel(lm) != g_sel);
+        break; }
     case 84: {   /* REQ-072: upload an image and register it as :name: */
         if (!g_client) break;
         oc_field f[1] = { { FF_TEXT, "Shortcode",
@@ -20633,6 +20820,22 @@ static void test_dump(const char *path) {
                         (unsigned long long)dc->msgs[i].attach[k].id,
                         dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
                         dc->msgs[i].attach[k].reclaimed);
+    }
+    /* Talking mode (REQ-291-295). `has_audio` is the line that matters: a player
+     * that opened no speaker still runs, still ends, and still moves on to the
+     * next message, so a machine where the device would not open looks from
+     * every other line exactly like one that is reading a channel aloud. */
+    {
+        oc_player_status ls = { 0 };
+        if (g_listen_player) oc_player_status_get(g_listen_player, &ls);
+        fprintf(f, "listen ch=%llu queued=%u playing=%llu skipped=%u player=%d"
+                   " state=%d has_audio=%d pos=%u/%u msg=%llu bytes=%zu\n",
+                (unsigned long long)oc_model_listening_channel(m),
+                oc_model_listen_queued(m),
+                (unsigned long long)oc_model_listen_playing(m),
+                oc_model_listen_skipped(m), g_listen_player != NULL,
+                (int)ls.state, ls.has_audio, ls.position_ms, ls.duration_ms,
+                (unsigned long long)g_listen_msg, g_listen_len);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
     /* Modal + the settings a form modal can change, so snapshot/commit/restore is
@@ -21893,7 +22096,7 @@ static void test_poll(HWND hwnd) {
         int np = 0; pf[np++] = buf;
         for (char *q = buf; *q && np < 5; q++)
             if (*q == '|') { *q = '\0'; pf[np++] = q + 1; }
-        oc_client_set_profile(g_client, pf[1], pf[2], pf[3], pf[4], pf[0]);
+        oc_client_set_profile(g_client, pf[1], pf[2], pf[3], pf[4], pf[0], "");
         test_ack("ok");
     } else if (!strcmp(verb, "mkhook")) {
         /* Bypass the Create-webhook form, as mkchan and upload bypass theirs: the
@@ -22183,6 +22386,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * and gating the poll on one left that sign-in on "Signing in…"
              * forever — success, failure and the timeout all unread. */
             if (!g_client && g_view == VIEW_SIGNIN && g_si_connecting) signin_poll(hwnd);
+            /* The window is created hidden when connecting, so the settings can
+             * place it where it was left. Shown here if they never arrive --
+             * OUTSIDE the g_client gate below, because the case that needs it
+             * most is the one where there is no client: a workspace that did not
+             * resolve left the window hidden for ever. */
+            if (!g_geom_applied && g_geom_deadline && GetTickCount64() > g_geom_deadline) {
+                g_geom_applied = 1;
+                show_and_focus(hwnd);
+            }
             /* Signing out of the last workspace leaves no client, so the tick
              * below — which owns the badge — never runs again, and an overlay
              * advertising unread mail in a session that no longer exists would
@@ -22340,10 +22552,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_geom_dirty_at = 0;
                 prefs_save();
             }
-            if (!g_geom_applied && g_geom_deadline && GetTickCount64() > g_geom_deadline) {
-                g_geom_applied = 1;                 /* settings never came */
-                show_and_focus(hwnd);
-            }
+
             /* OS notifications. Raised for messages that arrive while
              * the window is not in front; whether one is warranted is the
              * shared evaluator's call (oc_notify_decide). The first pass after
@@ -22640,6 +22849,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* A fetch that never came back — a reclaimed or oversized image.
              * Mark it so the transcript stops asking on every frame. */
             vm_tick(hwnd, m);
+            listen_tick(hwnd, m);            /* talking mode (ARCH-111) */
             /* Transfers queue in the core, so a thumbnail waiting behind a video
              * download is late, not lost: the clock only runs while nothing
              * else is moving. */
@@ -23688,7 +23898,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (int i = 0; i < g_n_wss; i++)
             if (g_wss[i].client && g_wss[i].client != g_client) oc_client_stop(g_wss[i].client);
         g_n_wss = 0;
-        if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+        if (g_client) { listen_drop_player(); oc_client_stop(g_client); g_client = NULL; }
         /* The ring is marked and removed HERE rather than after the message
          * loop, because reaching WM_DESTROY is what "exited normally" means —
          * and anything that does not reach it leaves the file, which is exactly
@@ -23790,8 +24000,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
      * OC_COL_* reads through it. */
     /* SYSTEM by default: match the desktop unless the user says otherwise. */
     oc_theme_apply(OC_THEME_SYSTEM);
+    /* ONE attempt, whatever the outcome. Starting the client twice here put two
+     * net threads on one workspace, each authenticating and each writing the same
+     * credential, with the first orphaned where nothing ticks it. */
+    if (direct && !connect_start(aws, acred)) {
+        /* Said, not swallowed: the sign-in view carries the reason, and is shown
+         * like any other first run rather than held back for settings that are
+         * never coming. */
+        direct = 0;
+        snprintf(pre_ws, sizeof pre_ws, "%s", aws);
+        g_view = VIEW_SIGNIN;
+    }
     if (direct) {
-        connect_start(aws, acred);
         /* bring up EVERY other remembered workspace that has a stored
          * token, not just the one you used last. This was blocked purely on
          * with one client there was nowhere to put them, so unread

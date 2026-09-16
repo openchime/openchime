@@ -38,7 +38,12 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 12: every attachment entry — on BROADCAST, THREAD_REPLY, and everything that
+/* 13: read-aloud (REQ-291-295, ARCH-111). SET_PROFILE, PROFILE_INFO and every
+ * USER_LIST entry carry the speaking voice; a USER_LIST entry is inside a
+ * repeated list, so the added field shifts every entry after the first.
+ * TTS_INFO and AUDIO_GET/INFO/CHUNK/END (0x00DC-0x00E0) are new.
+ *
+ * 12: every attachment entry — on BROADCAST, THREAD_REPLY, and everything that
  * replays them — carries a media kind, and for a video message its duration,
  * size and poster (REQ-162/165, ARCH-110); FILE_ENTRY carries the kind and
  * duration. An entry sits inside a repeated list, so one added byte shifts every
@@ -88,7 +93,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 12u
+#define OC_PROTOCOL_VERSION 13u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -343,6 +348,17 @@ typedef enum {
      * type, byte cap, bounds — and stores the rest as display facts. */
     OC_MSG_ATTACH_MEDIA_SET = 0x00DA, /* C->S, mark an upload as a video message */
     OC_MSG_ATTACH_MEDIA_OK  = 0x00DB, /* S->C, accepted */
+    /* Read-aloud (REQ-291-295, ARCH-111, docs/READ-ALOUD.md §6). TTS_INFO after
+     * authentication says whether this daemon speaks messages and in which
+     * voices; a client that never receives it shows nothing of the feature.
+     * AUDIO_* then fetch one message's speech, on the shape of the attachment
+     * download (ARCH-69) — the same gate, backpressure and chunking, over a
+     * rendering the daemon made and cached rather than a file someone uploaded. */
+    OC_MSG_TTS_INFO         = 0x00DC, /* S->C, read-aloud availability and voices */
+    OC_MSG_AUDIO_GET        = 0x00DD, /* C->S, the speech of one message */
+    OC_MSG_AUDIO_INFO       = 0x00DE, /* S->C, its duration and size */
+    OC_MSG_AUDIO_CHUNK      = 0x00DF, /* S->C, a slice of the rendering */
+    OC_MSG_AUDIO_END        = 0x00E0, /* S->C, the whole rendering is sent */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -410,6 +426,8 @@ typedef enum {
     OC_ERR_INVALID_MESSAGE     = 3020, /* nothing to send: an empty body (REQ-224) */
     OC_ERR_MEDIA_INVALID       = 3021, /* ATTACH_MEDIA_SET refused: kind, bounds, type or poster (REQ-164) */
     OC_ERR_MEDIA_TOO_LARGE     = 3022, /* the video exceeds MAX_VIDEO_MESSAGE_SIZE (REQ-164) */
+    OC_ERR_NOT_RENDERABLE      = 3023, /* the message has nothing to say aloud (REQ-294) */
+    OC_ERR_TTS_UNAVAILABLE     = 3024, /* read-aloud is off, busy or the render failed (REQ-295) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -853,7 +871,10 @@ typedef struct { oc_slice emoji; oc_slice text; uint64_t expires_at; } oc_set_st
 /* The whole profile in one frame, because it is edited on one screen (REQ-240)
  * and a field-at-a-time wire would make Cancel mean "some of it stuck". */
 typedef struct { oc_slice full_name; oc_slice title; oc_slice pronouns;
-                 oc_slice phone; oc_slice timezone; } oc_set_profile;
+                 oc_slice phone; oc_slice timezone;
+                 /* The voice this person is read aloud in (REQ-292): one of the
+                  * ids TTS_INFO listed, or empty to keep the default. */
+                 oc_slice voice_id; } oc_set_profile;
 /* An id, not bytes: the image goes up through the ordinary attachment
  * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
  * store all keep working. 0 clears the avatar. */
@@ -876,7 +897,7 @@ typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
                  uint8_t role; oc_slice full_name; oc_slice pronouns;
-                 oc_slice phone; } oc_profile_info;
+                 oc_slice phone; oc_slice voice_id; } oc_profile_info;
 /* Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
 /* REQ-182. `current` marks the connection asking — you should be able to tell which
@@ -1070,6 +1091,17 @@ typedef struct { uint64_t attachment_id; oc_slice filename; oc_slice mime; uint6
 typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_download_chunk;
 typedef struct { uint64_t attachment_id; } oc_download_end;
 typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
+
+/* Read-aloud (REQ-291-295, ARCH-111). A voice is named by a stable id and shown
+ * by its label; `preview` is the sentence a client plays to audition it. */
+#define OC_TTS_VOICE_MAX 16
+typedef struct { oc_slice id; oc_slice label; } oc_tts_voice;
+typedef struct { uint8_t available; oc_slice model_version; uint8_t count;
+                 oc_tts_voice voices[OC_TTS_VOICE_MAX]; oc_slice preview; } oc_tts_info;
+typedef struct { uint64_t message_id; } oc_audio_get;
+typedef struct { uint64_t message_id; uint32_t duration_ms; uint64_t total_size; } oc_audio_info;
+typedef struct { uint64_t message_id; uint32_t seq; oc_slice data; } oc_audio_chunk;
+typedef struct { uint64_t message_id; } oc_audio_end;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
 /* `title`, `timezone` and the custom status ride here as of protocol 7 (REQ-289).
  * They were on PROFILE_INFO alone, which the daemon sends ONLY to the user who
@@ -1083,7 +1115,10 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                  /* Both are drawn BESIDE a name, so the directory (REQ-289) and
                   * every roster need them from here — PROFILE_INFO reaches only
                   * the person who edited it. `phone` is deliberately absent. */
-                 oc_slice full_name; oc_slice pronouns; } oc_user_list_entry;
+                 oc_slice full_name; oc_slice pronouns;
+                 /* Everyone hears the same voice for the same author (REQ-292),
+                  * so it travels with the roster, not only with the card. */
+                 oc_slice voice_id; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 typedef struct { uint8_t role; } oc_invite_user;
@@ -1300,6 +1335,11 @@ oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_c
 oc_result oc_encode_upload_ack(oc_wbuf *w, uint16_t version, const oc_upload_ack *m);
 oc_result oc_encode_upload_end(oc_wbuf *w, uint16_t version, const oc_upload_end *m);
 oc_result oc_encode_upload_ok(oc_wbuf *w, uint16_t version, const oc_upload_ok *m);
+oc_result oc_encode_tts_info(oc_wbuf *w, uint16_t version, const oc_tts_info *m);
+oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *m);
+oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info *m);
+oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
+oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
 oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m);
 oc_result oc_encode_download_info(oc_wbuf *w, uint16_t version, const oc_download_info *m);
 oc_result oc_encode_download_chunk(oc_wbuf *w, uint16_t version, const oc_download_chunk *m);
@@ -1456,6 +1496,11 @@ oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);
 oc_result oc_decode_upload_ack(oc_rbuf *p, oc_upload_ack *m);
 oc_result oc_decode_upload_end(oc_rbuf *p, oc_upload_end *m);
 oc_result oc_decode_upload_ok(oc_rbuf *p, oc_upload_ok *m);
+oc_result oc_decode_tts_info(oc_rbuf *p, oc_tts_info *m);
+oc_result oc_decode_audio_get(oc_rbuf *p, oc_audio_get *m);
+oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
+oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
+oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
 oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m);
 oc_result oc_decode_download_info(oc_rbuf *p, oc_download_info *m);
 oc_result oc_decode_download_chunk(oc_rbuf *p, oc_download_chunk *m);

@@ -87,6 +87,10 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) now, screenshare (ARCH-87) next | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) now, the audio client (ARCH-73) next | https://opus-codec.org | BSD-3-Clause |
+| **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model, built from source **minimal and static** (only the model's operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud, ARCH-111) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
+| **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **embedded in the daemon** | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
+| **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build_ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
+| **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/`, with its notice) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
 Fetched + built by `scripts/build_mbedtls.sh` from the official GitHub release
 tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
@@ -122,10 +126,36 @@ Both build **static-only**. libvpx is configured VP9-only and real-time-only, wi
 no examples, tools, docs or unit tests, and needs **nasm** for its assembly; its
 mingw build threads through winpthreads, which the Win32 link therefore pulls in
 statically. Output goes to `third_party/libvpx-1.17.0[-win]/` and
-`third_party/opus-1.6.1[-win]/` (gitignored). **The daemon links neither** — it
+`third_party/opus-1.6.1[-win]/` (gitignored). **The daemon links no libvpx** — it
 relays Opus without decoding it (ARCH-73) and stores a video message as opaque
-bytes (ARCH-110). Both are BSD-3-Clause, whose binary-redistribution clause wants
+bytes (ARCH-110) — and links libopus only to encode read-aloud renders (ARCH-111). Both are BSD-3-Clause, whose binary-redistribution clause wants
 the notice carried with a shipped client.
+
+**Read-aloud's engine and model** (ARCH-111) come the same way, with more to
+say because ONNX Runtime is the one C++ dependency and the model is large:
+
+- `scripts/build_onnxruntime.sh` fetches the v1.30.0 **source** tarball
+  (SHA-256-verified) and builds it with its own `tools/ci_build/build.py` as a
+  minimal static library: `--minimal_build`, `--include_ops_by_config
+  daemon/tts_kitten.ops.config` with type reduction, `--disable_ml_ops`,
+  `--disable_exceptions`, no shared library, no tests. Its CMake downloads ONNX
+  Runtime's own dependencies at the URLs and hashes pinned upstream in
+  `cmake/deps.txt`; the one Python package its build script needs (flatbuffers, to
+  read the operator config) is fetched as a pinned wheel and unpacked, not
+  installed. The dozens of archives it produces are merged into one
+  `third_party/onnxruntime-1.30.0/lib/libonnxruntime.a`. It needs CMake 3.28+, a
+  C++17 compiler and Python 3, and takes about 20 minutes. The daemon links it with
+  `-static-libstdc++ -static-libgcc`, so no C++ runtime is required of the host.
+- `scripts/build_kitten.sh` fetches the model at pinned Hugging Face and GitHub
+  revisions (SHA-256-verified) and converts it to `.ort` with `scripts/tts_convert.c`
+  linked against ONNX Runtime's **prebuilt** full release (also pinned; a build tool
+  on the build machine only, `build_onnxruntime.sh converter`). The converted file is
+  not byte-reproducible, so its input and the converter are what is pinned.
+- `daemon/tts_embed.S` embeds the converted model, the voices and ttskit's data in
+  `openchimed`. `make TTS=0` builds a daemon without any of it.
+
+ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
+notices travel with every package through `packaging/licenses.sh`.
 
 ## 3. System / OS packages (linked at build)
 

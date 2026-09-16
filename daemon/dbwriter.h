@@ -170,7 +170,15 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_UNFURL_STORE = 96,
        /* Mark a finalized upload as a video message (REQ-162/164, ARCH-110).
         * attachment_id + media_* below; att_size carries the byte cap. Write. */
-       OC_JOB_ATTACH_MEDIA_SET = 97 };
+       OC_JOB_ATTACH_MEDIA_SET = 97,
+       /* Read-aloud (REQ-291-293, ARCH-111). LOOKUP is the whole question a
+        * client's AUDIO_GET asks: may this user read the message, is there
+        * anything to say, in whose voice, and has that rendering been made
+        * already. Read. STORE records a finished rendering, TOUCH marks one used
+        * (both conn_id 0, fire and forget), VOICE_SET writes back the voice the
+        * daemon chose for an author so it is visible and correctable. Writes. */
+       OC_JOB_TTS_LOOKUP = 98, OC_JOB_TTS_STORE = 99, OC_JOB_TTS_TOUCH = 100,
+       OC_JOB_TTS_VOICE_SET = 101 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -229,6 +237,19 @@ typedef struct oc_job {
     char          *pf_pronouns;
     char          *pf_phone;
     char          *pf_timezone;
+    char          *pf_voice_id;   /* read-aloud's voice (REQ-292); "" keeps the current one */
+
+    /* Read-aloud (ARCH-111). LOOKUP reads message_id + user_id and needs the
+     * model version to find a rendering made by THIS model; STORE and TOUCH
+     * carry what the render worker produced. `tts_text` on a result is the
+     * speakable form the daemon will hand the worker. */
+    char          *tts_model_version;
+    char          *tts_voices;    /* the engine's voice ids, comma separated */
+    char          *tts_blob_key;
+    uint8_t        tts_handle[32];
+    uint64_t       tts_bytes;
+    uint32_t       tts_duration_ms;
+    uint8_t        tts_voice;
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -427,7 +448,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * unf_* strings, and `members` for the recipients. */
        OC_RES_UNFURL_STORED = 88,
        /* ATTACH_MEDIA_SET accepted (attachment_id), or refused (err_code). */
-       OC_RES_MEDIA_OK = 89, OC_RES_MEDIA_ERR = 90 };
+       OC_RES_MEDIA_OK = 89, OC_RES_MEDIA_ERR = 90,
+       /* Read-aloud (ARCH-111): what to do about one AUDIO_GET -- serve the
+        * stored rendering, render it first, or refuse (err_code). */
+       OC_RES_TTS_META = 91, OC_RES_TTS_ERR = 92 };
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */
@@ -580,6 +604,9 @@ typedef struct {
      * and PROFILE_INFO carries it to whoever opened the card. */
     char    *full_name;     /* heap; may be "" */
     char    *pronouns;      /* heap; may be "" */
+    /* The voice this person is read aloud in (REQ-292). Everyone hears the same
+     * one for the same author, so the roster carries it like a name decoration. */
+    char    *voice_id;      /* heap; may be "" */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
@@ -849,7 +876,17 @@ typedef struct oc_dbres {
      * `reclaim` and `n_reclaim`, splitting a pointer from its count, which is exactly
      * the pairing a reader relies on. */
     char                   *st_emoji, *st_text, *pf_title, *pf_tz;
-    char                   *pf_full_name, *pf_pronouns, *pf_phone;
+    char                   *pf_full_name, *pf_pronouns, *pf_phone, *pf_voice_id;
+    /* OC_RES_TTS_META (ARCH-111): `tts_cached` says the rendering is stored
+     * already, in which case tts_blob_key/tts_bytes/tts_duration_ms describe it;
+     * otherwise tts_text is what to render, in voice `tts_voice`. `tts_persist`
+     * asks the caller to write that voice back to the author's profile. */
+    char                   *tts_text, *tts_blob_key;
+    uint8_t                 tts_handle[32];
+    uint64_t                tts_bytes;
+    uint32_t                tts_duration_ms;
+    uint8_t                 tts_voice, tts_cached, tts_persist;
+    uint64_t                tts_author_id;
     uint64_t                st_expires, pf_avatar;
     /* OC_RES_FILE_CHANNELS. */
     oc_file_channel_entry  *fchans;
@@ -863,6 +900,7 @@ typedef struct oc_dbres {
     uint64_t                maint_orphans;   /* counts, for the log line */
     uint64_t                maint_expired;
     uint64_t                maint_evicted;
+    uint64_t                maint_renders;   /* read-aloud renderings reclaimed (ARCH-111) */
     /* Storage report (REQ-214). The free-space half is filled in by the net
      * thread from its cached statvfs sample; the writer supplies what only the
      * database knows. */

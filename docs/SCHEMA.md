@@ -1057,6 +1057,45 @@ an orphan. The sweep reads this column instead: a poster is kept while its video
 is sent and unreclaimed, reclaimed in the same pass as its video, and collected as
 an orphan once its video is not live. The index serves that lookup.
 
+## 3ag. Migration 0042 — the voice a person is read in, and the renderings (REQ-292/293, ARCH-111)
+
+```sql
+ALTER TABLE users ADD COLUMN voice_id TEXT;
+CREATE TABLE rendered_audio (
+  handle        BLOB NOT NULL,
+  model_version TEXT NOT NULL,
+  blob_key      TEXT NOT NULL,
+  bytes         INTEGER NOT NULL,
+  duration_ms   INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_used_ms  INTEGER NOT NULL,
+  PRIMARY KEY (handle, model_version)
+) WITHOUT ROWID;
+CREATE INDEX rendered_audio_lru ON rendered_audio(last_used_ms);
+```
+
+*`users.voice_id` is the AUTHOR's voice, not a listener's preference.* One
+rendering serves every listener (ARCH-111), so the voice belongs to the person
+being read and is a fact on their profile like `pronouns` beside it. Nullable: an
+absent value means the daemon has not chosen one yet. It chooses on the first
+request — matching declared pronouns where there are any, else a stable hash of
+the user id — and writes that choice back, which is what makes it visible on the
+card and changeable, rather than a rule recomputed differently by a later build.
+
+*`rendered_audio` is a cache, keyed on what was said and how.* `handle` is
+SHA-256 over the speakable text and the voice, so identical text in the same voice
+is rendered once and an edit simply mints another handle. `model_version` names
+the model, the pronunciation data and the speaking rate together: change any of
+them and the old rendering is not served in a voice the daemon no longer has. The
+pair is the key, so both versions can sit side by side while one is retired.
+
+*A row points at a blob* (`blob_key`, §3g's store) and holds only what the
+`AUDIO_INFO` frame needs. Nothing references it, and losing one costs a
+re-render — so unlike an attachment (§3g's tombstones, REQ-215) it is **evicted
+first and without a tombstone**: the storage sweep takes the least recently
+listened-to renderings before anything a user uploaded, which is what the
+`last_used_ms` index is for. Serving one marks it used.
+
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.

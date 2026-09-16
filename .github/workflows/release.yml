@@ -274,7 +274,8 @@ jobs:
     name: ${{ matrix.arch }} packages
     needs: version
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # A cache miss compiles ONNX Runtime for read-aloud (below) before the daemon.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -343,6 +344,35 @@ jobs:
           # rpmbuild, which used to come from the Rocky container.
           sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev bzip2 rpm
 
+      # Read-aloud's engine and model (ARCH-111), built with the same toolchain
+      # and glibc target as the daemon: ONNX Runtime compiled from source as one
+      # minimal static archive, and the voice model converted for this
+      # architecture. Both are functions of the files in the key and of the zig
+      # version, so a hit skips about 25 minutes and a change rebuilds.
+      - name: Restore the read-aloud engine and model
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/onnxruntime-1.30.0
+            build/kitten
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'daemon/tts_kitten.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c') }}
+
+      # zig's bundled Clang compiles for a baseline CPU with 512-bit vectors off,
+      # so ONNX Runtime's AVX-512 kernels (which enable AVX-512 per file) need
+      # -mevex512 to be allowed them; it changes nothing elsewhere and does not
+      # exist on arm64. The converter links the prebuilt ONNX Runtime and runs only
+      # here, so it uses the runner's own compiler.
+      - name: Build read-aloud's engine and model
+        run: |
+          set -euo pipefail
+          extra=""
+          [ "${{ matrix.zig }}" = x86_64 ] && extra="-mevex512"
+          printf '#!/bin/sh\nexec /opt/zig/zig cc -target %s-linux-gnu.2.34 %s "$@"\n' "${{ matrix.zig }}" "$extra" > /tmp/zig-ort-cc
+          printf '#!/bin/sh\nexec /opt/zig/zig c++ -target %s-linux-gnu.2.34 %s "$@"\n' "${{ matrix.zig }}" "$extra" > /tmp/zig-ort-cxx
+          chmod +x /tmp/zig-ort-cc /tmp/zig-ort-cxx
+          CC=/tmp/zig-ort-cc CXX=/tmp/zig-ort-cxx scripts/build_onnxruntime.sh
+          scripts/build_kitten.sh
+
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.
       #
@@ -362,10 +392,13 @@ jobs:
             -I/tmp/sqinc -L/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH) "\$@"
           EOF
           chmod +x /tmp/zcc
-          make CC=/tmp/zcc OC_VERSION="$VERSION"
+          make CC=/tmp/zcc TTS_CXXLIB=-lc++ OC_VERSION="$VERSION"
           strip openchimed -o "$DIST/openchimed"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
           "./$DIST/openchimed" --version
+          # Read-aloud is inside the shipped binary and works: a render from the
+          # stripped file, with the voice model embedded in it.
+          "./$DIST/openchimed" --tts-say expr-voice-2-f "This release speaks." /tmp/release-check.wav
 
       # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
       # is invisible in a passing build -- a binary needing 2.38 links and runs
