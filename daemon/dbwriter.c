@@ -8,6 +8,7 @@
  */
 
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
+#include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "dbwriter.h"
 #include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
 #include "url.h"
@@ -24,6 +25,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <mbedtls/sha256.h>
 #include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
@@ -200,6 +202,10 @@ static void job_free(oc_job *j) {
     free(j->pf_full_name);
     free(j->pf_title);
     free(j->pf_pronouns);
+    free(j->pf_voice_id);
+    free(j->tts_model_version);
+    free(j->tts_voices);
+    free(j->tts_blob_key);
     free(j->pf_phone);
     free(j->pf_timezone);
     free(j->emoji);
@@ -360,7 +366,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->body);
     /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
-    free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone);
+    free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
+    free(r->tts_text); free(r->tts_blob_key);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
     free(r->sessions);
@@ -400,7 +407,7 @@ void oc_dbres_free(oc_dbres *r) {
         free(r->ulist[i].email); free(r->ulist[i].display_name);
         free(r->ulist[i].title); free(r->ulist[i].timezone);
         free(r->ulist[i].status_emoji); free(r->ulist[i].status_text);
-        free(r->ulist[i].full_name); free(r->ulist[i].pronouns);
+        free(r->ulist[i].full_name); free(r->ulist[i].pronouns); free(r->ulist[i].voice_id);
     }
     free(r->ulist);
     free(r->emoji);
@@ -981,7 +988,7 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
-        "       COALESCE(full_name,''), COALESCE(pronouns,'') "
+        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,'') "
         "FROM users ORDER BY id;", -1, &st, NULL);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
@@ -1008,6 +1015,7 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
         }
         arr[n].full_name    = strdup((const char *)sqlite3_column_text(st, 11));
         arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
+        arr[n].voice_id     = strdup((const char *)sqlite3_column_text(st, 13));
         n++;
     }
     sqlite3_finalize(st);
@@ -4910,7 +4918,8 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         "SELECT COALESCE(display_name,''), COALESCE(email,''), COALESCE(status_emoji,''), "
         "       COALESCE(status_text,''), status_expires_ms, COALESCE(title,''), "
         "       COALESCE(timezone,''), COALESCE(avatar_attachment_id,0), role, "
-        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(phone,'') "
+        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(phone,''), "
+        "       COALESCE(voice_id,'') "
         "  FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -4944,6 +4953,8 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->pf_full_name = strdup(fn ? (const char *)fn : "");
         r->pf_pronouns  = strdup(pr ? (const char *)pr : "");
         r->pf_phone     = strdup(ph ? (const char *)ph : "");
+        const unsigned char *vc = sqlite3_column_text(st, 12);
+        r->pf_voice_id  = strdup(vc ? (const char *)vc : "");
     }
     sqlite3_finalize(st);
 }
@@ -4983,7 +4994,10 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
      * committed together, so a partial write cannot leave the card showing a
      * mix of what was saved and what was not. */
     sqlite3_prepare_v2(db,
-        "UPDATE users SET full_name=?1, title=?2, pronouns=?3, phone=?4, timezone=?5 "
+        "UPDATE users SET full_name=?1, title=?2, pronouns=?3, phone=?4, timezone=?5, "
+        /* An empty voice keeps the one in place: a client that does not know
+         * about read-aloud sends nothing there, and must not clear it. */
+        "       voice_id=CASE WHEN ?7 = '' THEN voice_id ELSE ?7 END "
         "  WHERE id=?6;", -1, &st, NULL);
     sqlite3_bind_text (st, 1, j->pf_full_name ? j->pf_full_name : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_text (st, 2, j->pf_title     ? j->pf_title     : "", -1, SQLITE_TRANSIENT);
@@ -4991,6 +5005,7 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_text (st, 4, j->pf_phone     ? j->pf_phone     : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_text (st, 5, j->pf_timezone  ? j->pf_timezone  : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
+    sqlite3_bind_text (st, 7, j->pf_voice_id  ? j->pf_voice_id  : "", -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_finalize(st);
     build_profile(db, j->user_id, r);
@@ -6242,6 +6257,232 @@ static oc_dbres *process_change_password(sqlite3 *db, const oc_job *j) {
     return profile_ok(j, lookup_display_name(db, j->user_id));
 }
 
+/* ---- read-aloud (REQ-291-293, ARCH-111) ------------------------------------ */
+
+/* The names a mention resolves to, for the speakable text. The roster is looked
+ * up per name rather than preloaded: a message has at most a handful of mentions
+ * (OC_MENTION_MAX), and the same query the mention store uses answers it. */
+typedef struct { sqlite3 *db; uint64_t channel_id; char name[64]; } speak_names;
+
+static const char *speak_resolve(void *ctx, const char *name) {
+    speak_names *sn = ctx;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(sn->db,
+            "SELECT u.display_name FROM users u"
+            "  JOIN channel_members cm ON cm.user_id = u.id"
+            " WHERE cm.channel_id = ?1 AND u.disabled = 0"
+            "   AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return NULL;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)sn->channel_id);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    const char *out = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *dn = sqlite3_column_text(st, 0);
+        if (dn) { snprintf(sn->name, sizeof sn->name, "%s", (const char *)dn); out = sn->name; }
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+/* The voice an author is read in (REQ-292). A voice they already have is kept if
+ * the engine still has it; otherwise one is chosen from a stable hash of the user
+ * id, which makes it the same on every restart and different between neighbours.
+ * Declared pronouns pick the half of the list that matches, by the -f/-m suffix
+ * the voice ids carry. The choice is written back (`tts_persist`) so it is a fact
+ * on the profile someone can change, not a rule recomputed elsewhere. */
+static int speak_voice_for(const char *voices, const char *have, const char *pronouns,
+                           uint64_t user_id, int *persist) {
+    char list[512];
+    snprintf(list, sizeof list, "%s", voices ? voices : "");
+    char *ids[OC_TTS_VOICE_MAX];
+    int n = 0;
+    for (char *p = list; *p && n < OC_TTS_VOICE_MAX;) {
+        ids[n++] = p;
+        char *comma = strchr(p, ',');
+        if (!comma) break;
+        *comma = '\0';
+        p = comma + 1;
+    }
+    *persist = 0;
+    if (n == 0) return 0;
+    for (int i = 0; i < n; i++)
+        if (have && *have && strcmp(have, ids[i]) == 0) return i;
+
+    char want = 0;
+    if (pronouns && *pronouns) {
+        char low[64];
+        size_t k = 0;
+        for (const char *c = pronouns; *c && k + 1 < sizeof low; c++) low[k++] = (char)tolower((unsigned char)*c);
+        low[k] = '\0';
+        if (strstr(low, "she")) want = 'f';
+        else if (strstr(low, "he")) want = 'm';
+    }
+    int pick[OC_TTS_VOICE_MAX], np = 0;
+    for (int i = 0; i < n; i++) {
+        size_t l = strlen(ids[i]);
+        if (!want || (l >= 2 && ids[i][l - 2] == '-' && ids[i][l - 1] == want)) pick[np++] = i;
+    }
+    if (np == 0) { for (int i = 0; i < n; i++) pick[np++] = i; }
+    /* A hash of the id, not the id itself: consecutive sign-ups should not walk
+     * the list in order and give a whole team the same two voices. */
+    uint64_t h = 1469598103934665603ull ^ user_id;
+    h *= 1099511628211ull;
+    h ^= h >> 29;
+    *persist = 1;
+    return pick[(size_t)(h % (uint64_t)np)];
+}
+
+/* Everything one AUDIO_GET needs to decide (ARCH-111): the read gate, what is
+ * said, in whose voice, and whether that rendering already exists. Read. */
+static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->message_id = j->message_id;
+    r->type = OC_RES_TTS_ERR;
+    r->err_code = OC_ERR_UNKNOWN_MESSAGE;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.channel_id, m.author_id, m.deleted_at_ms IS NOT NULL, m.body,"
+            "       COALESCE(u.voice_id,''), COALESCE(u.pronouns,'')"
+            "  FROM messages m LEFT JOIN users u ON u.id = m.author_id"
+            " WHERE m.id = ?1;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 2) != 0) {
+        sqlite3_finalize(st);
+        return r;
+    }
+    uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0);
+    uint64_t author = (uint64_t)sqlite3_column_int64(st, 1);
+    const char *body = (const char *)sqlite3_column_blob(st, 3);
+    size_t body_len = (size_t)sqlite3_column_bytes(st, 3);
+    char have_voice[64], pronouns[64];
+    snprintf(have_voice, sizeof have_voice, "%s", (const char *)sqlite3_column_text(st, 4));
+    snprintf(pronouns, sizeof pronouns, "%s", (const char *)sqlite3_column_text(st, 5));
+    char *body_copy = body_len ? malloc(body_len) : NULL;
+    if (body_copy) memcpy(body_copy, body, body_len);
+    sqlite3_finalize(st);
+
+    /* The same gate as reading the message: speech is the message (REQ-291). */
+    if (!channel_read_access(db, cid, j->user_id)) {
+        free(body_copy);
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    r->channel_id = cid;
+    r->tts_author_id = author;
+
+    speak_names sn = { db, cid, "" };
+    char *speak = malloc(OC_SPEAK_MAX + 1);
+    size_t n = speak && body_copy ? oc_speakable(body_copy, body_len, speak_resolve, &sn, speak, OC_SPEAK_MAX + 1) : 0;
+    free(body_copy);
+    if (n == 0) {
+        free(speak);
+        r->err_code = OC_ERR_NOT_RENDERABLE;          /* nothing to say (REQ-294) */
+        return r;
+    }
+
+    int persist = 0;
+    int voice = speak_voice_for(j->tts_voices, have_voice, pronouns, author, &persist);
+    r->tts_voice = (uint8_t)voice;
+    r->tts_persist = (uint8_t)persist;
+
+    /* The handle is what was said and who says it, so the same text in the same
+     * voice is one rendering and an edit is simply another handle. */
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, (const unsigned char *)speak, n);
+    mbedtls_sha256_update(&sha, (const unsigned char *)"\0", 1);
+    mbedtls_sha256_update(&sha, (const unsigned char *)&voice, sizeof voice);
+    mbedtls_sha256_finish(&sha, r->tts_handle);
+    mbedtls_sha256_free(&sha);
+    r->type = OC_RES_TTS_META;
+    r->tts_text = speak;
+
+    if (sqlite3_prepare_v2(db,
+            "SELECT blob_key, bytes, duration_ms FROM rendered_audio"
+            " WHERE handle = ?1 AND model_version = ?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(st, 1, r->tts_handle, 32, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, j->tts_model_version ? j->tts_model_version : "", -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            r->tts_cached = 1;
+            r->tts_blob_key = strdup((const char *)sqlite3_column_text(st, 0));
+            r->tts_bytes = (uint64_t)sqlite3_column_int64(st, 1);
+            r->tts_duration_ms = (uint32_t)sqlite3_column_int(st, 2);
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
+/* A finished rendering becomes a cache row. Write, fire and forget: if it is
+ * lost the next request renders again, which is the whole point of a cache that
+ * needs no tombstone. */
+static oc_dbres *process_tts_store(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO rendered_audio"
+            "  (handle, model_version, blob_key, bytes, duration_ms, created_at_ms, last_used_ms)"
+            "  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6);", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    uint64_t now = dbw_now_ms();
+    sqlite3_bind_blob (st, 1, j->tts_handle, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, j->tts_model_version ? j->tts_model_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, j->tts_blob_key ? j->tts_blob_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->tts_bytes);
+    sqlite3_bind_int  (st, 5, (int)j->tts_duration_ms);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)now);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Serving a stored rendering makes it recently used, which is what the storage
+ * sweep evicts by. Write, fire and forget. */
+static oc_dbres *process_tts_touch(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE rendered_audio SET last_used_ms = ?3"
+            " WHERE handle = ?1 AND model_version = ?2;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_blob (st, 1, j->tts_handle, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, j->tts_model_version ? j->tts_model_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Write back the voice the daemon chose for an author, once, so the profile
+ * shows it. Never overwrites a voice the user set. Write, fire and forget. */
+static oc_dbres *process_tts_voice_set(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE users SET voice_id = ?2"
+            " WHERE id = ?1 AND (voice_id IS NULL OR voice_id = '');", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_text (st, 2, j->pf_voice_id ? j->pf_voice_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return r;
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j);
@@ -6263,7 +6504,8 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
-           type == OC_JOB_AUDIT_QUERY;
+           type == OC_JOB_AUDIT_QUERY ||
+           type == OC_JOB_TTS_LOOKUP;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -6283,6 +6525,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
+    if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
     if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);
@@ -6306,6 +6549,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_LOGOUT)        return process_logout(w->db, j);
     if (j->type == OC_JOB_EDIT)          return process_edit(w->db, j);
     if (j->type == OC_JOB_UNFURL_STORE)  return process_unfurl_store(w->db, j);
+    if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
+    if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
+    if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
     if (j->type == OC_JOB_DELETE)        return process_delete(w->db, j);
     if (j->type == OC_JOB_CREATE_CHANNEL) return process_create_channel(w->db, j);
     if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);
@@ -6567,6 +6813,47 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
 
     /* Age out the audit log alongside the blobs (REQ-251a), per family. */
     prune_audit(db, j->audit_max_age_ms);
+
+    /* Tier 0 (ARCH-111): read-aloud renderings, before anything a user uploaded.
+     * A rendering is the daemon's own work and can be made again from the message
+     * it speaks, so under pressure it is the cheapest thing in the store to lose:
+     * the cost is one re-render, and nothing is shown in its place. Least recently
+     * listened to first, and no tombstone — unlike an attachment (ARCH-77), there
+     * is nothing for a reader to be told about. */
+    if (j->maint_evict && r->n_reclaim < cap) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT handle, model_version, blob_key FROM rendered_audio"
+                " ORDER BY last_used_ms ASC LIMIT ?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)(cap - r->n_reclaim));
+            while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+                const void *handle = sqlite3_column_blob(st, 0);
+                int handle_len = sqlite3_column_bytes(st, 0);
+                const unsigned char *ver = sqlite3_column_text(st, 1);
+                const char *key = (const char *)sqlite3_column_text(st, 2);
+                char *dup = key ? strdup(key) : NULL;
+                if (!dup) continue;
+                sqlite3_stmt *del = NULL;
+                int gone = 0;
+                if (sqlite3_prepare_v2(db,
+                        "DELETE FROM rendered_audio WHERE handle = ?1 AND model_version = ?2;",
+                        -1, &del, NULL) == SQLITE_OK) {
+                    sqlite3_bind_blob(del, 1, handle, handle_len, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(del, 2, ver ? (const char *)ver : "", -1, SQLITE_TRANSIENT);
+                    gone = sqlite3_step(del) == SQLITE_DONE && sqlite3_changes(db) > 0;
+                    sqlite3_finalize(del);
+                }
+                if (!gone) { free(dup); continue; }
+                /* attachment_id 0: this is not an attachment, and the net thread
+                 * needs only the key to delete the bytes. */
+                r->reclaim[r->n_reclaim].storage_key = dup;
+                r->reclaim[r->n_reclaim].attachment_id = 0;
+                r->n_reclaim++;
+                r->maint_renders++;
+            }
+            sqlite3_finalize(st);
+        }
+    }
 
     /* Tier 1 (REQ-213): orphans — uploaded but never referenced by a message,
      * and old enough that an in-flight upload cannot be caught by mistake. This

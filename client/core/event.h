@@ -142,7 +142,19 @@ enum {
      * Arrives after the BROADCAST it belongs to (or on replay), and again for
      * the same url if the daemon re-fetched: the fold is an upsert. */
     OC_EV_UNFURL,
-    OC_EV_FORWARD
+    OC_EV_FORWARD,
+    /* Read-aloud (REQ-291-295, ARCH-111). TTS_INFO replaces what the client knows
+     * about the daemon's speech: a BEGIN, then one VOICE per voice, as the emoji
+     * and settings lists do. body on BEGIN is the model version, topic the
+     * preview sentence; on VOICE, body is the id and topic the label. */
+    OC_EV_TTS_BEGIN,
+    OC_EV_TTS_VOICE,
+    /* One message's speech has arrived, ready to play: message_id, count=bytes,
+     * body=the MP4 (NOT a C string). The model owns it from here. */
+    OC_EV_LISTEN_AUDIO,
+    /* ...or it will not: message_id, status = the reason code (0 = nothing to
+     * say). Talking mode moves on rather than stopping. */
+    OC_EV_LISTEN_SKIP
 };
 
 typedef struct {
@@ -199,6 +211,7 @@ typedef struct {
     char     pf_tz[48];
     char     pf_full_name[64];
     char     pf_pronouns[32];
+    char     pf_voice[32];   /* the voice this person is read aloud in (REQ-292) */
     /* PROFILE_INFO only — a phone number is not on the roster. */
     char     pf_phone[40];
     /* The recurring schedule (REQ-136) and the two alert lists (REQ-135). Inline
@@ -327,6 +340,9 @@ enum {
      * Uploads both, sends ATTACH_MEDIA_SET, then SEND or SEND_REPLY. */
     OC_CMD_POST_VIDEO,
     OC_CMD_CANCEL_TRANSFER, /* xfer_tag: drop it from the queue, or abort it if running */
+    /* Fetch one message's speech (ARCH-111): message_id. Queued with the other
+     * transfers, so it never overlaps a download. */
+    OC_CMD_LISTEN_FETCH,
     OC_CMD_QUIT
 };
 

@@ -72,6 +72,13 @@ typedef struct {
     /* Link unfurls (REQ-222, ARCH-105). Always on — there is no switch.
      * `allow_private` disables the SSRF gate and exists only for tests. */
     struct { const char *ca_bundle; int allow_private; } unfurl;
+
+    /* Read-aloud (REQ-291-295, ARCH-111). Built into the daemon and on by
+     * default: there is nothing to install. `enabled` 0 turns it off, and a
+     * daemon built with `make TTS=0` has it off whatever this says. `queue` is
+     * how many renders may wait, `idle_secs` how long the model stays loaded with
+     * nothing to do, `rate` how many AUDIO_GETs a connection may make a minute. */
+    struct { int enabled, queue, idle_secs, rate; } tts;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.

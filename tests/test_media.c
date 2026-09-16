@@ -90,6 +90,104 @@ static void test_mp4_roundtrip(void) {
     free(file);
 }
 
+/* Audio only, as a read-aloud render is: one Opus track, no video, accepted by
+ * the same reader; a video writer still needs its video, an audio writer its audio. */
+static void test_mp4_audio_only(void) {
+    oc_mp4_writer *w = oc_mp4_writer_open_audio(24000);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint8_t pkt[24];
+    int ok = 1;
+    for (unsigned j = 0; j < 100; j++) {
+        memset(pkt, (int)(0xB0 | (j & 15)), sizeof pkt);
+        if (oc_mp4_write_audio(w, pkt, 10 + j % 14, 960) != 0) ok = 0;
+    }
+    CHECK(ok);
+    uint8_t b[4] = {1, 2, 3, 4};
+    CHECK(oc_mp4_write_video(w, b, 4, 0, 1) != 0);
+    uint8_t *file = NULL; size_t len = 0; uint32_t dur = 0;
+    CHECK(oc_mp4_writer_finish(w, &file, &len, &dur) == 0);
+    if (!file) return;
+    oc_mp4_info info;
+    CHECK(oc_mp4_parse(file, len, &info) == 0);
+    CHECK(!info.video.present && info.width == 0);
+    CHECK(info.audio.present && info.audio.n_samples == 100 && info.audio.timescale == 48000);
+    CHECK(info.opus_channels == 1 && info.opus_preskip == 312);
+    ok = 1;
+    for (uint32_t j = 0; j < info.audio.n_samples; j++) {
+        const oc_mp4_sample *s = &info.audio.samples[j];
+        if (s->size != 10 + j % 14 || s->dts != (uint64_t)j * 960 || file[s->offset] != (0xB0 | (j & 15))) ok = 0;
+    }
+    CHECK(ok);
+    /* 100 × 20 ms less the 312-sample pre-skip (6.5 ms). */
+    CHECK(info.duration_ms == 1993 && dur == 1993);
+    CHECK(oc_mp4_keyframe_before(&info, 0) == -1);
+    oc_mp4_info_free(&info);
+    free(file);
+
+    w = oc_mp4_writer_open_audio(24000);
+    CHECK(oc_mp4_writer_finish(w, &file, &len, &dur) != 0);         /* nothing written */
+    w = oc_mp4_writer_open(64, 64);
+    CHECK(oc_mp4_write_audio(w, pkt, 20, 960) == 0);
+    CHECK(oc_mp4_writer_finish(w, &file, &len, &dur) != 0);         /* a video file with no video */
+    CHECK(oc_mp4_writer_open_audio(0) == NULL);
+}
+
+/* A read-aloud rendering plays: an audio-only file has no picture, so the player
+ * runs on the audio clock alone and ends where the audio does (ARCH-111). */
+static void test_player_audio_only(void) {
+    setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+    oc_opusenc *enc = oc_opusenc_open();
+    CHECK(enc != NULL);
+    if (!enc) return;
+    oc_mp4_writer *w = oc_mp4_writer_open_audio(OC_OPUS_RATE);
+    CHECK(w != NULL);
+    int16_t pcm[OC_OPUS_FRAME];
+    uint8_t pkt[OC_OPUS_MAX_PACKET];
+    int ok = 1;
+    for (int f = 0; f < 50; f++) {                        /* one second */
+        for (int i = 0; i < OC_OPUS_FRAME; i++)
+            pcm[i] = (int16_t)(8000 * sin(2 * M_PI * 440.0 * (f * OC_OPUS_FRAME + i) / OC_OPUS_RATE));
+        int n = oc_opusenc_encode(enc, pcm, pkt, sizeof pkt);
+        if (n <= 0 || oc_mp4_write_audio(w, pkt, (size_t)n, OC_OPUS_FRAME) != 0) ok = 0;
+    }
+    oc_opusenc_close(enc);
+    CHECK(ok);
+    uint8_t *file = NULL; size_t len = 0; uint32_t dur = 0;
+    CHECK(oc_mp4_writer_finish(w, &file, &len, &dur) == 0);
+    if (!file) return;
+
+    oc_player *p = oc_player_open(file, len);
+    CHECK(p != NULL);
+    if (p) {
+        oc_player_play(p);
+        oc_player_status st;
+        /* It must REACH THE END, not merely start: the clock of an audio-only
+         * file is the speaker's own count of what it has consumed, so any frame
+         * handed over and not counted leaves the clock short of the duration for
+         * ever. The player then stays PLAYING on a file that is long finished,
+         * which is silent to every other assertion here -- and to a listener it
+         * is a channel that reads one message aloud and then nothing, ever
+         * (REQ-291). Two seconds for one second of audio. */
+        int ended = 0;
+        for (int i = 0; i < 200 && !ended; i++) {
+            oc_player_status_get(p, &st);
+            if (st.state == OC_PLAYER_ENDED) ended = 1;
+            else msleep(10);
+        }
+        oc_player_status_get(p, &st);
+        CHECK(ended && st.has_audio && st.duration_ms == dur);
+        CHECK(st.position_ms == dur);
+        CHECK(st.state != OC_PLAYER_ERROR);
+        /* No picture, ever: a frame request is answered with nothing rather than
+         * with a stale or invented one. */
+        CHECK(oc_player_frame(p, NULL, 0, NULL, NULL, NULL) == 0);
+        oc_player_close(p);
+    }
+    free(file);
+    unsetenv("OPENCHIME_TEST_AUDIO");
+}
+
 static uint32_t rng_state = 12345;
 static uint32_t rnd(void) { rng_state = rng_state * 1103515245u + 12345u; return rng_state >> 8; }
 
@@ -458,6 +556,8 @@ static void test_player(void) {
 int run_media_tests(void) {
     printf("media:\n");
     test_mp4_roundtrip();
+    test_mp4_audio_only();
+    test_player_audio_only();
     test_mp4_fuzz();
     test_vp9_roundtrip();
     test_opus_roundtrip();

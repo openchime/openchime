@@ -2,6 +2,8 @@
  *
  * Box layout written (docs/VIDEO-MESSAGES.md §5):
  *   ftyp · moov{ mvhd · trak(video) · trak(audio) } · mdat
+ * or, audio-only (read-aloud):
+ *   ftyp · moov{ mvhd · trak(audio) } · mdat
  * The whole file is assembled in memory (ARCH-88: a client writes no files).
  * Each sample is its own chunk (stsc has one entry), which keeps the tables
  * trivially correct for interleaved writing and costs a few bytes a sample.
@@ -64,7 +66,8 @@ typedef struct { wsample *s; uint32_t n, cap; } wtrack;
 
 struct oc_mp4_writer {
     bbuf     data;                  /* sample bytes, in the order written: mdat's payload */
-    int      width, height;
+    int      width, height;         /* 0 × 0: audio-only */
+    unsigned input_rate;            /* dOps input sample rate */
     wtrack   video, audio;
     int64_t  last_pts_us;
     int      have_video;
@@ -86,6 +89,15 @@ oc_mp4_writer *oc_mp4_writer_open(int width, int height) {
     oc_mp4_writer *w = calloc(1, sizeof *w);
     if (!w) return NULL;
     w->width = width; w->height = height;
+    w->input_rate = OC_MP4_AUDIO_TIMESCALE;
+    return w;
+}
+
+oc_mp4_writer *oc_mp4_writer_open_audio(unsigned input_rate) {
+    if (input_rate == 0) return NULL;
+    oc_mp4_writer *w = calloc(1, sizeof *w);
+    if (!w) return NULL;
+    w->input_rate = input_rate;
     return w;
 }
 
@@ -100,7 +112,7 @@ static int data_append(oc_mp4_writer *w, const uint8_t *data, size_t len, uint64
 uint64_t oc_mp4_writer_bytes(const oc_mp4_writer *w) { return w ? w->data.n : 0; }
 
 int oc_mp4_write_video(oc_mp4_writer *w, const uint8_t *data, size_t len, int64_t pts_us, int keyframe) {
-    if (!w || !data) return -1;
+    if (!w || !data || w->width == 0) return -1;
     if (!w->have_video) {
         if (!keyframe) return -1;                 /* a track must start on a keyframe */
         w->last_pts_us = pts_us; w->have_video = 1;
@@ -286,7 +298,7 @@ static void build_moov(bbuf *b, const oc_mp4_writer *w, uint64_t data_base) {
         u8(b, 0);                                          /* version */
         u8(b, 1);                                          /* output channels */
         u16(b, OC_MP4_OPUS_PRESKIP);
-        u32(b, OC_MP4_AUDIO_TIMESCALE);                    /* input sample rate */
+        u32(b, w->input_rate);                             /* input sample rate */
         u16(b, 0);                                         /* output gain */
         u8(b, 0);                                          /* channel mapping family 0 */
         box_end(b, dops);
@@ -305,7 +317,8 @@ void oc_mp4_writer_abort(oc_mp4_writer *w) {
 }
 
 int oc_mp4_writer_finish(oc_mp4_writer *w, uint8_t **out, size_t *len, uint32_t *duration_ms) {
-    if (!w || !out || !len || !w->video.n || w->data.bad) { oc_mp4_writer_abort(w); return -1; }
+    int empty = w && (w->width ? w->video.n == 0 : w->audio.n == 0);
+    if (!w || !out || !len || empty || w->data.bad) { oc_mp4_writer_abort(w); return -1; }
     *out = NULL; *len = 0;
 
     bbuf file = {0};
@@ -522,10 +535,10 @@ int oc_mp4_parse(const uint8_t *data, size_t len, oc_mp4_info *info) {
             rc = -1;                                       /* any other track: not this profile */
         }
     }
-    if (rc != 0 || !info->video.present) { oc_mp4_info_free(info); return -1; }
-    if (info->vp9_profile != 0 || info->vp9_bit_depth != 8) { oc_mp4_info_free(info); return -1; }
+    if (rc != 0 || (!info->video.present && !info->audio.present)) { oc_mp4_info_free(info); return -1; }
+    if (info->video.present && (info->vp9_profile != 0 || info->vp9_bit_depth != 8)) { oc_mp4_info_free(info); return -1; }
 
-    uint64_t vms = info->video.duration * 1000 / info->video.timescale, ams = 0;
+    uint64_t vms = info->video.present ? info->video.duration * 1000 / info->video.timescale : 0, ams = 0;
     if (info->audio.present) {
         uint64_t d = info->audio.duration > info->opus_preskip ? info->audio.duration - info->opus_preskip : 0;
         ams = d * 1000 / info->audio.timescale;

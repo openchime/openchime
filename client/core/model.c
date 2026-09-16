@@ -165,6 +165,7 @@ void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap) {
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->listen_ready);
     for (uint8_t i = 0; i < m->n_fetched; i++) free(m->fetched[i].data);
     for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
     free(m->channels);
@@ -391,6 +392,39 @@ const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
 uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
 uint32_t    oc_model_max_users(const oc_model *m)       { return m->max_users; }
 const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_name; }
+
+/* ---- read-aloud (ARCH-111) ---------------------------------------------- */
+
+uint8_t     oc_model_tts_available(const oc_model *m)   { return m->tts_available; }
+uint8_t     oc_model_tts_voice_count(const oc_model *m) { return m->n_voices; }
+const char *oc_model_tts_preview(const oc_model *m)     { return m->tts_preview; }
+
+const oc_voice *oc_model_tts_voice(const oc_model *m, uint8_t i) {
+    return i < m->n_voices ? &m->voices[i] : NULL;
+}
+
+const char *oc_model_tts_voice_label(const oc_model *m, const char *voice_id) {
+    for (uint8_t i = 0; voice_id && i < m->n_voices; i++)
+        if (strcmp(m->voices[i].id, voice_id) == 0) return m->voices[i].label;
+    return "";
+}
+
+uint64_t oc_model_listening_channel(const oc_model *m) { return m->listen_channel; }
+uint8_t  oc_model_listen_queued(const oc_model *m)     { return m->n_listen_queue; }
+uint64_t oc_model_listen_playing(const oc_model *m)    { return m->listen_playing; }
+uint32_t oc_model_listen_skipped(const oc_model *m)    { return m->listen_skipped; }
+
+uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
+    if (!m->listen_ready) return 0;
+    *mp4 = m->listen_ready;
+    *len = m->listen_ready_len;
+    uint64_t id = m->listen_ready_id;
+    m->listen_ready = NULL;
+    m->listen_ready_len = 0;
+    m->listen_ready_id = 0;
+    m->listen_playing = id;
+    return id;
+}
 const char *oc_model_deployment_name(const oc_model *m) {
     switch (m->deployment_mode) {
         case 1:  return "federated";
@@ -1116,9 +1150,55 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                                  oc_model_is_priority(m, e->author_id),
                                  c->notify_level, men, kw, 0, 0, 0))
                 c->unread++;
+            /* Talking mode speaks what arrives from now on (ARCH-111), except
+             * one's own messages: you know what you just typed, and hearing it
+             * read back -- over the next person's reply, since the queue plays
+             * end to end -- is only in the way. A listener too far behind loses
+             * the oldest rather than the newest: what is being said now matters
+             * more than what was said while the queue was backing up. */
+            if (m->listen_channel == e->channel_id && e->author_id != m->user_id) {
+                if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
+                    memmove(m->listen_queue, m->listen_queue + 1,
+                            (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
+                    m->n_listen_queue--;
+                    m->listen_skipped++;
+                }
+                m->listen_queue[m->n_listen_queue++] = e->message_id;
+            }
         }
         break;
     }
+    case OC_EV_TTS_BEGIN:
+        /* Replaces what we knew: the daemon says this again on every reconnect,
+         * and it may have been rebuilt without read-aloud in between. */
+        m->tts_available = (uint8_t)e->status;
+        m->n_voices = 0;
+        snprintf(m->tts_model_version, sizeof m->tts_model_version, "%s", e->body ? e->body : "");
+        snprintf(m->tts_preview, sizeof m->tts_preview, "%s", e->topic ? e->topic : "");
+        break;
+    case OC_EV_TTS_VOICE:
+        if (m->n_voices < OC_VOICE_MAX) {
+            oc_voice *v = &m->voices[m->n_voices++];
+            snprintf(v->id, sizeof v->id, "%s", e->body ? e->body : "");
+            snprintf(v->label, sizeof v->label, "%s", e->topic ? e->topic : "");
+        }
+        break;
+    case OC_EV_LISTEN_AUDIO:
+        if (m->listen_channel && e->message_id == m->listen_fetching) {
+            free(m->listen_ready);
+            m->listen_ready = (uint8_t *)e->body;
+            m->listen_ready_len = e->count;
+            m->listen_ready_id = e->message_id;
+            e->body = NULL;                       /* the model owns the bytes now */
+            m->listen_fetching = 0;
+        }
+        break;
+    case OC_EV_LISTEN_SKIP:
+        if (e->message_id == m->listen_fetching) {
+            m->listen_fetching = 0;
+            m->listen_skipped++;
+        }
+        break;
     case OC_EV_PRESENCE:
         presence_set(m, e->user_id, e->status, e->op);
         break;
@@ -1257,12 +1337,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         for (size_t i = 0; i < m->n_users; i++)
             if (m->users[i].user_id == e->user_id) { mem = &m->users[i]; break; }
         if (!mem) break;                 /* not in the roster: nothing to attach to */
-        const char *f[8] = { "", "", "", "", "", "", "", "" };
-        char buf[768];
+        const char *f[9] = { "", "", "", "", "", "", "", "", "" };
+        char buf[800];
         snprintf(buf, sizeof buf, "%s", e->body ? e->body : "");
         int nf = 0;
         f[nf++] = buf;
-        for (char *q = buf; *q && nf < 8; q++)
+        for (char *q = buf; *q && nf < 9; q++)
             if (*q == '\x1f') { *q = '\0'; f[nf++] = q + 1; }
         /* Each field is a bounded copy out of the 768-byte split buffer above,
          * so the precision states the destination's own bound rather than
@@ -1281,6 +1361,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         FOLD_FIELD(mem->full_name,    f[5]);
         FOLD_FIELD(mem->pronouns,     f[6]);
         FOLD_FIELD(mem->phone,        f[7]);
+        FOLD_FIELD(mem->voice_id,     f[8]);
 #undef FOLD_FIELD
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
@@ -1700,6 +1781,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 snprintf(m->users[i].status_text, sizeof m->users[i].status_text, "%s", e->author_name);
                 snprintf(m->users[i].full_name, sizeof m->users[i].full_name, "%s", e->pf_full_name);
                 snprintf(m->users[i].pronouns, sizeof m->users[i].pronouns, "%s", e->pf_pronouns);
+                snprintf(m->users[i].voice_id, sizeof m->users[i].voice_id, "%s", e->pf_voice);
                 break;
             }
         break;

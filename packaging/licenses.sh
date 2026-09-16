@@ -8,12 +8,15 @@
 #
 # Only what the DAEMON links is listed. termbox2 and utf8proc are TUI-only and
 # lucide is client artwork; none is in openchimed, and claiming otherwise would
-# be its own kind of wrong.
+# be its own kind of wrong. Read-aloud (ARCH-111) is built into the daemon by
+# default, and with it ONNX Runtime, the Kitten voice model and data derived from
+# CMUdict; a daemon built with `make TTS=0` is described with TTS=0 here too.
 #
-#   licenses.sh <mbedtls-dir>
+#   [TTS=0] licenses.sh <mbedtls-dir>
 set -euo pipefail
 
 MBEDTLS_DIR="${1:?usage: licenses.sh <mbedtls-dir>}"
+TTS="${TTS:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 emit() {
@@ -62,6 +65,19 @@ in full here, as those licences require.
   jsmn             MIT          JSON tokenizer (OIDC and webhook payloads)
 HEADER
 
+if [ "$TTS" = 1 ]; then
+  cat <<'HEADER'
+
+and, for read-aloud (built into the binary):
+
+  ONNX Runtime 1.30.0  MIT          neural network inference, built minimal and
+                                    static, with the notices of the components
+                                    compiled into it
+  Kitten TTS mini 0.8  Apache-2.0   the voice model, embedded
+  CMUdict              BSD-style    source of the embedded pronunciation data
+HEADER
+fi
+
 # The daemon's own licence ships with the daemon. It is not a third-party notice
 # -- it is the offer of terms that makes redistributing this binary lawful, and
 # the AGPL requires it to travel with the work.
@@ -69,3 +85,10 @@ emit "openchimed -- GNU Affero General Public License v3.0 or later" "${root}/LI
 
 emit "Mbed TLS 3.6.2 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
 emit "jsmn -- MIT License" "${root}/third_party/jsmn/LICENSE"
+
+if [ "$TTS" = 1 ]; then
+  emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0/LICENSE"
+  emit "ONNX Runtime 1.30.0 -- third-party notices" "${root}/third_party/onnxruntime-1.30.0/ThirdPartyNotices.txt"
+  emit "Kitten TTS mini 0.8 -- Apache License 2.0" "${root}/build/kitten/LICENSE"
+  emit "CMU Pronouncing Dictionary -- BSD-style licence" "${root}/ttskit/data/CMUDICT-LICENSE"
+fi

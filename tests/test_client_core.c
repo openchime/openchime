@@ -16,8 +16,11 @@
 #include "dbwriter.h"
 #include "protocol.h"
 #include "tls.h"
+#include "tts_render.h"
+#include "oc_mp4.h"
 #include "check.h"
 
+#include <math.h>
 #include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
 #include "oc_port.h"      /* oc_utc_offset_min: the value the core sends on connect */
 
@@ -36,6 +39,31 @@ struct core_loop_arg {
     oc_tls_server        *srv;
     oc_dbwriter          *dbw;
     volatile sig_atomic_t stop;
+};
+
+/* Read-aloud with a stub voice (ARCH-111): the core's half is the queue, the
+ * fetch and the bytes, none of which needs a real model. */
+static void *core_tts_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
+static void core_tts_close(void *e) { (void)e; }
+static const char *core_tts_voice_id(int v) { return v == 0 ? "core-voice-m" : "core-voice-f"; }
+static const char *core_tts_voice_label(int v) { return v == 0 ? "Core Low" : "Core High"; }
+
+static int core_tts_say(void *e, const char *segment, int voice, float **pcm, size_t *n,
+                        char *err, size_t cap) {
+    (void)e; (void)voice; (void)err; (void)cap;
+    size_t samples = strlen(segment) * 240;          /* 10 ms a character at 24 kHz */
+    *pcm = calloc(samples, sizeof **pcm);
+    if (!*pcm) return -1;
+    for (size_t i = 0; i < samples; i++) (*pcm)[i] = (float)(0.2 * sin(2 * M_PI * 220.0 * (double)i / 24000.0));
+    *n = samples;
+    return 0;
+}
+
+static const oc_tts_engine CORE_TTS = {
+    .version = "core-stub-1", .rate = 24000, .voices = 2, .ctx = NULL,
+    .voice_id = core_tts_voice_id, .voice_label = core_tts_voice_label,
+    .preview = "This is a test voice.",
+    .open = core_tts_open, .close = core_tts_close, .say = core_tts_say,
 };
 
 static void *core_loop_thread(void *p) {
@@ -864,6 +892,18 @@ static void test_resolve(void) {
     CHECK(oc_resolve_domain("chat.acme.com", "openchime.example", d, sizeof d) == 0 &&
           strcmp(d, "chat.acme.com") == 0);
     CHECK(oc_resolve_domain("acme", NULL, d, sizeof d) == 0 && strcmp(d, "acme") == 0);
+    /* `localhost` is a host, not an org shorthand: suffixing it gave
+     * "localhost.openchime.example", which resolves nowhere — so the address a
+     * developer reaches for first was the one address that could not work. */
+    CHECK(oc_resolve_domain("localhost", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost") == 0);
+    CHECK(oc_resolve_domain("localhost:8443", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost") == 0);
+    CHECK(oc_resolve_domain("LocalHost.", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost") == 0);
+    /* A name that merely starts that way is still an org name. */
+    CHECK(oc_resolve_domain("localhost-eu", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "localhost-eu.openchime.example") == 0);
     /* A scheme and :port are stripped. */
     CHECK(oc_resolve_domain("openchime://chat.acme.com:8443", "x", d, sizeof d) == 0 &&
           strcmp(d, "chat.acme.com") == 0);
@@ -897,7 +937,10 @@ static void test_last_error(void) {
 }
 
 /* A mock oc_secret (in-memory keyring) for the credential-cache routing test. */
-static struct { char account[64]; uint8_t val[512]; size_t len; int used; } g_mock[8];
+/* `val` is sized well past the credential blob for the same reason the libsecret
+ * backend's hex buffer is: a mock that starts refusing writes when the blob grows
+ * would fail these tests everywhere except at the line that actually changed. */
+static struct { char account[64]; uint8_t val[1024]; size_t len; int used; } g_mock[8];
 static int mock_get(void *ctx, const char *a, uint8_t *out, size_t cap, size_t *len) {
     (void)ctx;
     for (int i = 0; i < 8; i++)
@@ -907,6 +950,19 @@ static int mock_get(void *ctx, const char *a, uint8_t *out, size_t cap, size_t *
         }
     return 0;
 }
+/* What the backend actually holds, so the migration can be asserted on bytes
+ * rather than on the API agreeing with itself. */
+static size_t mock_len_of(const char *a) {
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) return g_mock[i].len;
+    return 0;
+}
+static int mock_ver_of(const char *a) {
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) return g_mock[i].val[0];
+    return -1;
+}
+
 static int mock_put(void *ctx, const char *a, const uint8_t *v, size_t n) {
     (void)ctx;
     if (n > sizeof g_mock[0].val) return 0;
@@ -956,7 +1012,7 @@ static void test_store_no_persistence_without_keyring(void) {
     if (!s) return;
     uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], got[OC_SESSION_TOKEN_LEN];
     memset(tok, 0xAB, sizeof tok); memset(pin, 0xCD, sizeof pin);
-    oc_store_save_session(s, "acme:443", tok, 0);
+    oc_store_save_session(s, "acme:443", tok, 0, "dana");
     oc_store_save_pin(s, "acme:443", pin);
     oc_store_workspace_remember(s, "acme:443", "acme.example.com", "dana", 1000);
     CHECK(oc_store_load_session(s, "acme:443", got, NULL, 0) == 0);
@@ -1002,7 +1058,7 @@ static void test_workspace_book(void) {
      * — in one go, leaving nothing behind. */
     uint8_t tok[OC_SESSION_TOKEN_LEN];
     for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
-    oc_store_save_session(s, "acme:443", tok, 0);
+    oc_store_save_session(s, "acme:443", tok, 0, "dana");
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1);
 
     oc_store_workspace_forget(s, "acme:443");
@@ -1015,6 +1071,104 @@ static void test_workspace_book(void) {
 
 /* With a secret set, the session token round-trips through the keyring vtable and
  * does NOT land in the SQLite column; clearing goes through the vtable too. */
+/* Whose token is it? This is the assertion the first attempt at the fix could
+ * not have passed: it compared against the BOOK's username, which the Win32
+ * client writes with the account it is about to TRY, immediately after starting
+ * the net thread (connect_start). So the book said "bob" while the token was
+ * alice's, the comparison agreed, and the second client came up as the first
+ * one's user. The token's account is written only with the token, by the code
+ * that obtained it, and nothing a frontend does can move it. */
+static void test_session_owner(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(0xA0 + i);
+    char who[128];
+
+    /* No token, no owner. */
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 0);
+
+    oc_store_save_session(s, "acme:443", tok, 0, "alice");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "alice") == 0);
+
+    /* Exactly what the GUI does at connect time, for an account that has not
+     * authenticated and may never. The token is still alice's. */
+    oc_store_workspace_remember(s, "acme:443", "acme:443", "bob", 1000);
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "alice") == 0);
+
+    /* A silent reconnect names nobody and must not blank the record. */
+    oc_store_save_session(s, "acme:443", tok, 0, "");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "alice") == 0);
+
+    /* Signing in as somebody else replaces both together. */
+    oc_store_save_session(s, "acme:443", tok, 0, "bob");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 1 && strcmp(who, "bob") == 0);
+
+    /* The owner goes out with the token, and the pin stays. */
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    for (unsigned i = 0; i < OC_TLS_FINGERPRINT_LEN; i++) pin[i] = (uint8_t)(i + 7);
+    oc_store_save_pin(s, "acme:443", pin);
+    oc_store_clear_session(s, "acme:443");
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 0);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 0);
+    uint8_t back[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_store_load_pin(s, "acme:443", back) == 1 && memcmp(back, pin, sizeof pin) == 0);
+    oc_store_close(s);
+}
+
+/* An entry written by a client from before tokens recorded their account is read,
+ * not discarded. Discarding it would take the TOFU pin with it, and a dropped pin
+ * is a silent re-pin on the next connect (ARCH-10) — a downgrade in what the
+ * client promises, paid by everyone who upgrades. */
+static void test_store_legacy_entry(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    /* Version 1: [ver][flags][expiry][token 32][pin 32][last_used][label 128][user 128]. */
+    enum { V1_LABEL = 128, V1_USER = 128,
+           V1_BLOB = 2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8 + V1_LABEL + V1_USER };
+    uint8_t v1[V1_BLOB];
+    memset(v1, 0, sizeof v1);
+    v1[0] = 1;
+    v1[1] = 1 | 2 | 4;                                  /* token + pin + book */
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) v1[10 + i] = (uint8_t)(i + 1);
+    for (unsigned i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)
+        v1[10 + OC_SESSION_TOKEN_LEN + i] = (uint8_t)(0x40 + i);
+    char *lbl = (char *)(v1 + 18 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN);
+    snprintf(lbl, V1_LABEL, "%s", "acme.example.com");
+    snprintf(lbl + V1_LABEL, V1_USER, "%s", "dana");
+    CHECK(mock_put(NULL, "acme:443", v1, sizeof v1) == 1);
+
+    /* Everything it held survives being read by this version... */
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
+    CHECK(oc_store_load_pin(s, "acme:443", pin) == 1 && pin[0] == 0x40);
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 1 && strcmp(b.label[0], "acme.example.com") == 0 && strcmp(b.user[0], "dana") == 0);
+    /* ...and the one thing it cannot hold reads as unknown, not as nobody. */
+    char who[128];
+    CHECK(oc_store_session_user(s, "acme:443", who, sizeof who) == 0);
+
+    /* The next write of anything upgrades the entry in place, keeping the rest. */
+    oc_store_save_pin(s, "acme:443", pin);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 2);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
+    memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 1 && strcmp(b.user[0], "dana") == 0);
+    oc_store_close(s);
+}
+
 static void test_secret_routing(void) {
     memset(g_mock, 0, sizeof g_mock);
     oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
@@ -1028,7 +1182,7 @@ static void test_secret_routing(void) {
     CHECK(s != NULL);
     if (s) {
         oc_store_set_secret(s, &sec);
-        oc_store_save_session(s, "host:1", tok, 0);
+        oc_store_save_session(s, "host:1", tok, 0, "dana");
         uint8_t got[OC_SESSION_TOKEN_LEN];
         CHECK(oc_store_load_session(s, "host:1", got, NULL, 0) == 1 &&
               memcmp(got, tok, OC_SESSION_TOKEN_LEN) == 0);      /* via the keyring */
@@ -1263,6 +1417,8 @@ int run_client_core_tests(void) {
     test_secret_routing();
     test_store_no_persistence_without_keyring();
     test_workspace_book();
+    test_session_owner();
+    test_store_legacy_entry();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -1294,6 +1450,9 @@ int run_client_core_tests(void) {
     if (tz_saved) snprintf(tz_saved_buf, sizeof tz_saved_buf, "%s", tz_saved);
     setenv("TZ", "Asia/Kolkata", 1);
     tzset();
+
+    /* The daemon this test drives speaks with a stub voice (ARCH-111). */
+    oc_netloop_set_tts(&CORE_TTS);
 
     struct core_loop_arg arg;
     arg.port = 19000 + (int)(getpid() % 2000);
@@ -1744,6 +1903,99 @@ int run_client_core_tests(void) {
          * tenant invite token (shown once in the model), then removes him, which
          * marks him disabled in the roster and drops his connection. This runs
          * last, since removal closes erik's client (b). */
+        /* Talking mode (REQ-291-295, ARCH-111): the daemon's voices arrive with
+         * the connection, messages that arrive while it is on are queued and
+         * their speech fetched in order, and what has nothing to say is skipped
+         * without stalling the queue. */
+        {
+            const oc_model *ma = oc_client_model(a);
+            CHECK(WAIT_FOR(a, oc_model_tts_available(m)));
+            CHECK(oc_model_tts_voice_count(ma) == 2);
+            CHECK(strcmp(oc_model_tts_voice(ma, 0)->id, "core-voice-m") == 0);
+            CHECK(strcmp(oc_model_tts_voice(ma, 1)->label, "Core High") == 0);
+            CHECK(strcmp(oc_model_tts_preview(ma), "This is a test voice.") == 0);
+            CHECK(strcmp(oc_model_tts_voice_label(ma, "core-voice-f"), "Core High") == 0);
+            CHECK(strcmp(oc_model_tts_voice_label(ma, "nope"), "") == 0);
+
+            /* Off by default: what was said before the toggle is not read. */
+            CHECK(oc_model_listening_channel(ma) == 0);
+            oc_client_send(b, 1, "Said before anyone was listening.");
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Said before anyone was listening.")));
+            CHECK(oc_model_listen_queued(ma) == 0);
+
+            oc_client_listen(a, 1, 1);
+            CHECK(oc_model_listening_channel(ma) == 1);
+
+            /* From now on: the speech of what arrives, in order. */
+            oc_client_send(b, 1, "The first thing to be read aloud.");
+            uint8_t *mp4 = NULL;
+            size_t mlen = 0;
+            uint64_t spoken = 0;
+            for (int t = 0; t < 8 && !spoken; t++)
+                WAIT_FOR(a, (spoken = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0);
+            CHECK(spoken != 0 && mp4 != NULL && mlen > 0);
+            if (mp4) {
+                /* What arrives is playable: an audio-only Opus MP4. */
+                oc_mp4_info info;
+                CHECK(oc_mp4_parse(mp4, mlen, &info) == 0);
+                CHECK(!info.video.present && info.audio.present && info.duration_ms > 0);
+                oc_mp4_info_free(&info);
+                free(mp4);
+                mp4 = NULL;
+            }
+            CHECK(oc_model_listen_playing(ma) == spoken);
+
+            /* The next message waits its turn while that one is playing. */
+            oc_client_send(b, 1, "The second thing to be read aloud.");
+            CHECK(WAIT_FOR(a, m->n_listen_queue == 1));
+            oc_client_listen_done(a);                       /* the frontend finished playing */
+            uint64_t second = 0;
+            for (int t = 0; t < 8 && !second; t++)
+                WAIT_FOR(a, (second = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0);
+            CHECK(second != 0 && second != spoken);
+            free(mp4);
+            mp4 = NULL;
+            oc_client_listen_done(a);
+
+            /* What the listener types is not read back to them. They know what
+             * they just said, and the queue plays end to end, so it would land
+             * on top of the next person's reply. */
+            oc_client_send(a, 1, "Typed by the listener, not read aloud.");
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Typed by the listener, not read aloud.")));
+            /* Asserted on what is OFFERED TO PLAY, not on the queue: an empty
+             * queue proves nothing here, because the pump takes the only entry
+             * out of it the moment nothing else is playing. */
+            uint64_t mine = 0;
+            for (int t = 0; t < 4 && !mine; t++)
+                WAIT_FOR(a, (mine = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0);
+            CHECK(mine == 0);
+            free(mp4);
+            mp4 = NULL;
+
+            /* A message with nothing to say is passed over, and the one after it
+             * is still spoken: the queue does not stall on it (REQ-294). */
+            uint32_t skipped_before = oc_model_listen_skipped(ma);
+            oc_client_send(b, 1, "\xF0\x9F\x8E\x89");
+            oc_client_send(b, 1, "And on to the next one.");
+            uint64_t third = 0;
+            for (int t = 0; t < 8 && !third; t++)
+                WAIT_FOR(a, (third = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0);
+            CHECK(third != 0);
+            CHECK(oc_model_listen_skipped(ma) > skipped_before);
+            free(mp4);
+            mp4 = NULL;
+            oc_client_listen_done(a);
+
+            /* Turning it off forgets the queue; a later message is not spoken. */
+            oc_client_listen(a, 1, 0);
+            CHECK(oc_model_listening_channel(ma) == 0 && oc_model_listen_queued(ma) == 0);
+            oc_client_send(b, 1, "Nobody is listening to this one.");
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Nobody is listening to this one.")));
+            uint8_t *none = NULL;
+            size_t nlen = 0;
+            CHECK(oc_model_listen_take_audio((oc_model *)ma, &none, &nlen) == 0);
+        }
+
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
         oc_client_invite_user(a, OC_ROLE_MEMBER);
@@ -1784,13 +2036,96 @@ int run_client_core_tests(void) {
                 CHECK(oc_store_load_pin(chk, inst, pin) == 1);
                 oc_store_close(chk);
             }
-            /* Wrong password, but the stored token authenticates it anyway. */
+            /* Wrong password, but the stored token authenticates it anyway —
+             * for the SAME account, which is whose token it is. */
+            uint64_t faye_id = 0;
             oc_client *s2 = oc_client_start_secure("127.0.0.1", arg.port, "faye:WRONG-pw",
                                                    sp, &store_sec);
             CHECK(s2 != NULL);
             if (s2) {
                 CHECK(WAIT_FOR(s2, m->authed && m->user_id != 0));
+                faye_id = oc_client_model(s2)->user_id;
                 oc_client_stop(s2);
+            }
+
+            /* ...and signing in as SOMEBODY ELSE at the same address is that
+             * somebody else. A workspace holds one credential, so faye's token
+             * is sitting right there; riding in on it would authenticate gil as
+             * faye, with the credential he gave never consulted — two accounts on
+             * one machine, and the second one is the first one.
+             *
+             * The book is written first, exactly as the Win32 client writes it in
+             * connect_start: the account it is ABOUT to try, before there is an
+             * answer. Without this line the test passes against a fix that reads
+             * the book instead of the token's own account — which is how the
+             * first attempt at this fix shipped and failed on the real client. */
+            {
+                oc_store *poison = oc_store_open(sp);
+                if (poison) {
+                    oc_store_set_secret(poison, &store_sec);
+                    oc_store_workspace_remember(poison, inst, inst, "gil",
+                                                (uint64_t)time(NULL) * 1000);
+                    oc_store_close(poison);
+                }
+            }
+            oc_client *s3 = oc_client_start_secure("127.0.0.1", arg.port, "gil:pw-gil",
+                                                   sp, &store_sec);
+            CHECK(s3 != NULL);
+            if (s3) {
+                CHECK(WAIT_FOR(s3, m->authed && m->user_id != 0));
+                uint64_t gil_id = oc_client_model(s3)->user_id;
+                CHECK(faye_id != 0 && gil_id != 0 && gil_id != faye_id);
+                oc_client_stop(s3);
+            }
+
+            /* The token now belongs to gil, so his relaunch is still silent: a
+             * wrong password rides in on it exactly as faye's did. */
+            oc_client *s4 = oc_client_start_secure("127.0.0.1", arg.port, "gil:WRONG-pw",
+                                                   sp, &store_sec);
+            CHECK(s4 != NULL);
+            if (s4) {
+                CHECK(WAIT_FOR(s4, m->authed && m->user_id != 0));
+                CHECK(oc_client_model(s4)->user_id != faye_id);
+                oc_client_stop(s4);
+            }
+
+            /* An entry with a token but no recorded account — what an older
+             * client left behind — authenticates with the password. Proved by a
+             * WRONG password FAILING: "the right password works" would be true
+             * either way and proves nothing about which credential was used. */
+            {
+                oc_store *legacy = oc_store_open(sp);
+                if (legacy) {
+                    oc_store_set_secret(legacy, &store_sec);
+                    uint8_t tok[OC_SESSION_TOKEN_LEN];
+                    if (oc_store_load_session(legacy, inst, tok, NULL, 0)) {
+                        oc_store_clear_session(legacy, inst);           /* drops the account */
+                        oc_store_save_session(legacy, inst, tok, 0, ""); /* token, owner unknown */
+                    }
+                    char who[64];
+                    CHECK(oc_store_session_user(legacy, inst, who, sizeof who) == 0);
+                    oc_store_close(legacy);
+                }
+                oc_client *sl = oc_client_start_secure("127.0.0.1", arg.port, "gil:WRONG-pw",
+                                                       sp, &store_sec);
+                CHECK(sl != NULL);
+                if (sl) {
+                    int authed = 0;
+                    for (int i = 0; i < 200 && !authed; i++) { oc_client_tick(sl); authed = oc_client_model(sl)->authed; usleep(10000); }
+                    CHECK(!authed);
+                    oc_client_stop(sl);
+                }
+            }
+
+            /* And faye, whose token was replaced, authenticates with her
+             * password rather than as gil. */
+            oc_client *s5 = oc_client_start_secure("127.0.0.1", arg.port, "faye:pw-faye",
+                                                   sp, &store_sec);
+            CHECK(s5 != NULL);
+            if (s5) {
+                CHECK(WAIT_FOR(s5, m->authed && m->user_id != 0));
+                CHECK(oc_client_model(s5)->user_id == faye_id);
+                oc_client_stop(s5);
             }
             unlink(sp); unlink("build/itest_core_store.db-wal"); unlink("build/itest_core_store.db-shm");
         }

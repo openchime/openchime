@@ -165,9 +165,21 @@ static int audio_reposition(worker *w, int64_t at_us) {
     return 0;
 }
 
-/* Move every decoder and the clock to the keyframe at or before `ms`, and show it. */
+/* Move every decoder and the clock to the keyframe at or before `ms`, and show it.
+ * A read-aloud rendering has no video track (ARCH-111): there is no keyframe to
+ * snap to and no picture to show, so the position is exactly what was asked and
+ * only the audio moves. */
 static int seek_to(worker *w, uint32_t ms) {
     oc_player *p = w->p;
+    if (!p->info.video.present) {
+        int64_t at_us = (int64_t)ms * 1000;
+        w->have_pending = 0;
+        if (audio_reposition(w, at_us) != 0) return -1;
+        w->base_us = at_us;
+        w->base_wall = oc_media_clock_us();
+        oc_mutex_lock(&p->mu); p->position_ms = ms; oc_mutex_unlock(&p->mu);
+        return 0;
+    }
     uint64_t dts = (uint64_t)ms * p->info.video.timescale / 1000;
     int k = oc_mp4_keyframe_before(&p->info, dts);
     if (k < 0) k = 0;
@@ -187,9 +199,10 @@ static int seek_to(worker *w, uint32_t ms) {
 static void *player_main(void *arg) {
     oc_player *p = arg;
     worker w = { .p = p };
-    w.vdec = oc_vp9dec_open();
+    w.vdec = p->info.video.present ? oc_vp9dec_open() : NULL;
     w.adec = p->info.audio.present ? oc_opusdec_open(p->info.opus_channels) : NULL;
-    int err = !w.vdec || (p->info.audio.present && !w.adec) || seek_to(&w, 0) != 0;
+    int err = (p->info.video.present && !w.vdec) || (p->info.audio.present && !w.adec) ||
+              seek_to(&w, 0) != 0;
     int64_t end_us = (int64_t)p->info.duration_ms * 1000;
 
     while (!err) {
@@ -332,6 +345,13 @@ void oc_player_status_get(oc_player *p, oc_player_status *st) {
 }
 
 int oc_player_frame(oc_player *p, uint8_t *bgra, size_t cap, int *w, int *h, uint64_t *seq) {
+    /* A read-aloud rendering has no picture at all (ARCH-111), so a caller
+     * playing one asks with nothing to fill in and is told "nothing new". */
+    if (!p->info.video.present || !bgra || !seq) {
+        if (w) *w = 0;
+        if (h) *h = 0;
+        return 0;
+    }
     oc_mutex_lock(&p->mu);
     int rc = 0;
     *w = p->fw; *h = p->fh;

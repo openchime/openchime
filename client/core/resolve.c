@@ -43,7 +43,26 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
     host[j] = '\0';
     if (j == 0) return -1;
 
-    if (!strchr(host, '.') && suffix && *suffix) {   /* bare name -> append suffix */
+    /* `localhost` is a host, not an org shorthand: appending the service suffix
+     * to it produced "localhost.openchime.io", which resolves nowhere, so the one
+     * address every developer reaches for was the one that could not be used.
+     * A trailing dot is the same name, absolutely qualified. */
+    size_t hlen = strlen(host);
+    if (hlen && host[hlen - 1] == '.') host[--hlen] = '\0';
+    int loopback = 1;
+    static const char LH[] = "localhost";
+    if (hlen != sizeof LH - 1) loopback = 0;
+    else for (size_t i = 0; i < hlen && loopback; i++) {
+        char c = host[i] >= 'A' && host[i] <= 'Z' ? (char)(host[i] - 'A' + 'a') : host[i];
+        if (c != LH[i]) loopback = 0;
+    }
+
+    if (loopback) {
+        /* One spelling, because this name becomes the key a session token and a
+         * TOFU pin are stored under: "LocalHost" and "localhost" are the same
+         * host, and keeping both would be two entries for one workspace. */
+        if ((size_t)snprintf(out, cap, "localhost") >= cap) return -1;
+    } else if (!strchr(host, '.') && suffix && *suffix) {   /* bare name -> append suffix */
         if ((size_t)snprintf(out, cap, "%s.%s", host, suffix) >= cap) return -1;
     } else {
         if ((size_t)snprintf(out, cap, "%s", host) >= cap) return -1;

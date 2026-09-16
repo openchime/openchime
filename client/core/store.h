@@ -38,13 +38,27 @@ void      oc_store_set_secret(oc_store *s, oc_secret *secret);
 
 /* Session token (ARCH-58). load returns 1 and fills `token`/`expiry` iff a
  * non-expired token is stored for `workspace` (`now_ms` = current time in ms; use
- * 0 to skip the expiry check). save upserts; clear drops it (logout / expiry). */
+ * 0 to skip the expiry check). save upserts; clear drops it (logout / expiry).
+ *
+ * `account` is WHOSE token it is, and save is the only thing that ever writes it:
+ * a workspace holds one credential, so without it a client asked to sign in as
+ * somebody else rides in on whoever signed in last. NULL or "" preserves what is
+ * recorded, which is what a silent reconnect (no credential) means. It is not the
+ * book's `username` below -- that one is written before an answer is known, by
+ * whoever is about to try. */
 int  oc_store_load_session(oc_store *s, const char *workspace,
                            uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t *expiry,
                            uint64_t now_ms);
 void oc_store_save_session(oc_store *s, const char *workspace,
-                           const uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t expiry);
+                           const uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t expiry,
+                           const char *account);
 void oc_store_clear_session(oc_store *s, const char *workspace);
+
+/* The account the stored token belongs to. Returns 1 and fills `out`, or 0 when
+ * there is no token, or one an older client stored before tokens recorded an
+ * account -- "unknown" and "nobody" are different answers, and a caller deciding
+ * whether a token is its own must not read the first as the second. */
+int  oc_store_session_user(oc_store *s, const char *workspace, char *out, size_t cap);
 
 /* TOFU pin (ARCH-10): the server cert's SHA-256, remembered on first connect and
  * enforced thereafter. load returns 1 and fills `pin` iff one is stored. */
@@ -72,6 +86,7 @@ void oc_store_workspace_remember(oc_store *s, const char *workspace,
                                  const char *label, const char *username,
                                  uint64_t now_ms);
 void oc_store_workspace_forget(oc_store *s, const char *workspace);
+
 typedef void (*oc_store_workspace_cb)(void *ctx, const char *workspace,
                                       const char *label, const char *username,
                                       uint64_t last_used_ms);

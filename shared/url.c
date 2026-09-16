@@ -1,5 +1,5 @@
 /* Bare-address detection — see url.h and MARKDOWN.md §4. Lifted verbatim from
- * the client formatting parser (client/core/richtext.c), which now calls this
+ * the client formatting parser (shared/richtext.c), which now calls this
  * instead of carrying its own copy: the daemon's unfurl fetcher (ARCH-105)
  * needs the same rules, and shared/ is the directory for code the daemon and
  * the client must agree on (mention.c, searchq.c, notify.c). */

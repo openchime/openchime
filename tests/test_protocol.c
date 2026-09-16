@@ -684,12 +684,12 @@ static void test_admin_frames(void) {
             { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice"), 9,
               oc_slice_str("Principal Engineer"), oc_slice_str("America/New_York"),
               oc_slice_str("\xf0\x9f\x8c\xb4"), oc_slice_str("On holiday"),
-              oc_slice_str("Alice Liddell"), oc_slice_str("she/her") },
+              oc_slice_str("Alice Liddell"), oc_slice_str("she/her"), oc_slice_str("expr-voice-2-f") },
             /* Every string empty, which is the common case and the one where an
              * off-by-one in the stride is easiest to miss. */
             { 2, OC_ROLE_MEMBER, 0, oc_slice_str(""), oc_slice_str("Bob"), 0,
               oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
-              oc_slice_str(""), oc_slice_str("") },
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str("") },
         };
         oc_user_list in = { 2, ents };
         ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
@@ -700,7 +700,8 @@ static void test_admin_frames(void) {
         CHECK(slice_eq_str(out[0].pronouns, "she/her"));
         CHECK(slice_eq_str(out[0].title, "Principal Engineer"));
         CHECK(out[1].user_id == 2 && slice_eq_str(out[1].display_name, "Bob"));
-        CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0);
+        CHECK(slice_eq_str(out[0].voice_id, "expr-voice-2-f"));
+        CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0 && out[1].voice_id.len == 0);
     }
     {
         /* SET_PROFILE — the whole screen in one frame, at its own opcode. It
@@ -708,7 +709,7 @@ static void test_admin_frames(void) {
          * presence first and this frame could not be delivered at all. */
         oc_set_profile in = { oc_slice_str("Alice Liddell"), oc_slice_str("Principal Engineer"),
                               oc_slice_str("she/her"), oc_slice_str("+1 555 0100"),
-                              oc_slice_str("America/New_York") };
+                              oc_slice_str("America/New_York"), oc_slice_str("expr-voice-3-m") };
         ROUNDTRIP(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE, h, p);
         CHECK(h.msg_type != OC_MSG_SET_PRESENCE);
         oc_set_profile out;
@@ -718,17 +719,18 @@ static void test_admin_frames(void) {
         CHECK(slice_eq_str(out.pronouns, "she/her"));
         CHECK(slice_eq_str(out.phone, "+1 555 0100"));
         CHECK(slice_eq_str(out.timezone, "America/New_York"));
+        CHECK(slice_eq_str(out.voice_id, "expr-voice-3-m"));
     }
     {
         /* Every field empty: clearing the profile is a thing a user does, and
          * an all-empty frame must survive the round trip rather than truncate. */
         oc_set_profile in = { oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
-                              oc_slice_str(""), oc_slice_str("") };
+                              oc_slice_str(""), oc_slice_str(""), oc_slice_str("") };
         ROUNDTRIP(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE, h, p);
         oc_set_profile out;
         CHECK(oc_decode_set_profile(&p, &out) == OC_OK);
         CHECK(out.full_name.len == 0 && out.title.len == 0 && out.pronouns.len == 0);
-        CHECK(out.phone.len == 0 && out.timezone.len == 0);
+        CHECK(out.phone.len == 0 && out.timezone.len == 0 && out.voice_id.len == 0);
     }
     {
         /* PROFILE_INFO carries phone, which USER_LIST deliberately does not. */
@@ -743,6 +745,7 @@ static void test_admin_frames(void) {
         in.full_name = oc_slice_str("Alice Liddell");
         in.pronouns = oc_slice_str("she/her");
         in.phone = oc_slice_str("+1 555 0100");
+        in.voice_id = oc_slice_str("expr-voice-5-f");
         ROUNDTRIP(oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_INFO, h, p);
         oc_profile_info out;
         CHECK(oc_decode_profile_info(&p, &out) == OC_OK);
@@ -750,6 +753,7 @@ static void test_admin_frames(void) {
         CHECK(slice_eq_str(out.full_name, "Alice Liddell"));
         CHECK(slice_eq_str(out.pronouns, "she/her"));
         CHECK(slice_eq_str(out.phone, "+1 555 0100"));
+        CHECK(slice_eq_str(out.voice_id, "expr-voice-5-f"));
     }
     {
         oc_set_role in = { 7, OC_ROLE_ADMIN };
@@ -1540,6 +1544,83 @@ static void test_storage_status_frames(void) {
  * new reason code belongs in this array, and the compiler says nothing if it is
  * missing -- but the next duplicate does not reach the wire.
  */
+/* Read-aloud's frames (REQ-291-295, ARCH-111): the capability after
+ * authentication, and the download of one message's speech. */
+static void test_tts_frames(void) {
+    uint8_t frame[4096];
+    {
+        oc_tts_info in;
+        memset(&in, 0, sizeof in);
+        in.available = 1;
+        in.model_version = oc_slice_str("kitten-mini-0.8/ttskit-1/rate-1.2");
+        in.count = 2;
+        in.voices[0].id = oc_slice_str("expr-voice-2-m");
+        in.voices[0].label = oc_slice_str("Jasper");
+        in.voices[1].id = oc_slice_str("expr-voice-5-f");
+        in.voices[1].label = oc_slice_str("Kiki");
+        in.preview = oc_slice_str("This is how I read your messages.");
+        ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
+        oc_tts_info out;
+        CHECK(oc_decode_tts_info(&p, &out) == OC_OK);
+        CHECK(out.available == 1 && out.count == 2);
+        CHECK(slice_eq_str(out.model_version, "kitten-mini-0.8/ttskit-1/rate-1.2"));
+        CHECK(slice_eq_str(out.voices[1].id, "expr-voice-5-f"));
+        CHECK(slice_eq_str(out.voices[1].label, "Kiki"));
+        CHECK(slice_eq_str(out.preview, "This is how I read your messages."));
+    }
+    {
+        /* A daemon without read-aloud says so with no voices at all. */
+        oc_tts_info in;
+        memset(&in, 0, sizeof in);
+        in.model_version = oc_slice_str("");
+        in.preview = oc_slice_str("");
+        ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
+        oc_tts_info out;
+        CHECK(oc_decode_tts_info(&p, &out) == OC_OK && out.available == 0 && out.count == 0);
+    }
+    {
+        /* More voices than the frame holds is refused rather than read as a
+         * mis-aligned rest of the payload: the count is a bound, not a hint. */
+        uint8_t payload[] = { 0, 1,                          /* min_ver, max_ver */
+                              1,                             /* available */
+                              0, 1, 'v',                     /* model_version */
+                              OC_TTS_VOICE_MAX + 1 };        /* impossible voice count */
+        oc_rbuf pr;
+        oc_rbuf_init(&pr, payload, sizeof payload);
+        oc_tts_info out;
+        CHECK(oc_decode_tts_info(&pr, &out) != OC_OK);
+    }
+    {
+        oc_audio_get in = { 4242 };
+        ROUNDTRIP(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_GET, h, p);
+        oc_audio_get out;
+        CHECK(oc_decode_audio_get(&p, &out) == OC_OK && out.message_id == 4242);
+    }
+    {
+        oc_audio_info in = { 4242, 5533, 18836 };
+        ROUNDTRIP(oc_encode_audio_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_INFO, h, p);
+        oc_audio_info out;
+        CHECK(oc_decode_audio_info(&p, &out) == OC_OK);
+        CHECK(out.message_id == 4242 && out.duration_ms == 5533 && out.total_size == 18836);
+    }
+    {
+        uint8_t audio[300];
+        for (size_t i = 0; i < sizeof audio; i++) audio[i] = (uint8_t)(i * 7);
+        oc_audio_chunk in = { 4242, 3, { audio, sizeof audio } };
+        ROUNDTRIP(oc_encode_audio_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_CHUNK, h, p);
+        oc_audio_chunk out;
+        CHECK(oc_decode_audio_chunk(&p, &out) == OC_OK);
+        CHECK(out.message_id == 4242 && out.seq == 3 && out.data.len == sizeof audio);
+        CHECK(out.data.ptr && memcmp(out.data.ptr, audio, sizeof audio) == 0);
+    }
+    {
+        oc_audio_end in = { 4242 };
+        ROUNDTRIP(oc_encode_audio_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_END, h, p);
+        oc_audio_end out;
+        CHECK(oc_decode_audio_end(&p, &out) == OC_OK && out.message_id == 4242);
+    }
+}
+
 static void test_reason_codes_unique(void) {
     static const struct { const char *name; int code; } codes[] = {
         { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
@@ -1612,6 +1693,7 @@ int run_protocol_tests(void) {
     test_read_cursor_frames();
     test_storage_status_frames();
     test_profile_frames();
+    test_tts_frames();
     test_call_frames();
     test_backfill_and_error();
     test_size_limits();

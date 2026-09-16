@@ -386,12 +386,19 @@ OS credential store, nothing persists at all.
   costs one re-sign-in and one re-TOFU rather than leaving a plaintext credential
   on disk. macOS Keychain slots behind the same vtable.
 
-**One credential per workspace holds three things**, in a flat versioned blob
-(`SEC_VER`) rather than a schema — there is no database, so there are no tables
-and no migrations:
+**One credential per workspace holds four things**, in a flat versioned blob
+(`SEC_VER`) rather than a schema:
 
 - the **session token**, which is what makes silent reconnect across a restart
   work (REQ-100);
+- **whose token it is** — the account it authenticated as. A workspace holds one
+  credential, so without this a client told to sign in as somebody else rode in
+  on whoever signed in last: the credential it was handed was never consulted,
+  and the second person on a machine simply *was* the first. It is written only
+  by `oc_store_save_session`, in the same write as the token, and cleared with
+  it. It is deliberately **not** the book's account below, which any frontend
+  writes before it knows whether the sign-in worked — reading that one instead is
+  exactly the bug, and it looks like a fix until two people share a machine;
 - the **TOFU pin** (REQ-183), which is not secret but is integrity-sensitive:
   rewriting a pin is how a man-in-the-middle is accepted, so it lives where the
   token does rather than in a file anyone can edit;
@@ -399,6 +406,23 @@ and no migrations:
   account, and a last-used stamp. Because there is one credential per workspace,
   **enumerating the credential store is the book** (`oc_secret_each`), and
   "forget" is a single delete that leaves nothing behind.
+
+**There is one migration, and it reads rather than converts.** Version 2 appended
+the token's account to the end of the blob, so a version 1 entry is a byte-exact
+prefix of one: it is read as it stands with the account unknown, and the next
+write of anything upgrades it in place. Refusing it would have dropped that
+workspace's TOFU pin along with its token, and a dropped pin is a silent re-pin on
+the next connect. The rule this pays for: a token whose account is unknown is not
+reused when a caller names an account — one password sign-in, once, rather than a
+client that is quietly the wrong person. **Downgrading costs more**: an older
+client cannot read a version 2 entry and its next write drops the entry, so going
+back a release is one re-sign-in and one re-TOFU.
+
+**A token belongs to one account, but a workspace has room for one token.** So a
+launch that names an account gets that account, and a launch that names nobody —
+a silent reconnect — gets whoever signed in last at that address. Two accounts on
+one machine therefore means naming the account each time. Keying the store on
+workspace *and* account would remove that, and is not done today.
 
 **Cached history does not exist**, and the **offline outbox is in memory** on the
 net thread for the life of the process (ARCH-88). Every send is recorded there

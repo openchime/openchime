@@ -248,7 +248,9 @@ static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
  * state lives on the net thread and is driven by the serve loop (commands) and
  * dispatch (server frames). */
 typedef struct {
-    int      mode;        /* 0 idle, 1 upload, 2 download, 3 waiting for ATTACH_MEDIA_OK */
+    int      mode;        /* 0 idle, 1 upload, 2 download, 3 waiting for ATTACH_MEDIA_OK,
+                           * 4 a message's speech (ARCH-111): the download shape over
+                           * AUDIO_* frames, keyed by message id rather than attachment */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
     /* An in-memory download: `fp` is NULL and chunks accumulate here
@@ -494,6 +496,31 @@ static void begin_download(disp_ctx *ctx, uint64_t aid, FILE *fp, size_t buf_max
     }
 }
 
+/* A wire string as a heap C string ("" if empty, NULL on failure). */
+static char *slice_dup(oc_slice s) {
+    char *out = malloc(s.len + 1);
+    if (!out) return NULL;
+    if (s.len) memcpy(out, s.ptr, s.len);
+    out[s.len] = '\0';
+    return out;
+}
+
+/* Ask for one message's speech (ARCH-111). Like a download into memory, but the
+ * daemon may have to render it first, so the first frame can be a while coming. */
+static void begin_listen(disp_ctx *ctx, uint64_t message_id) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 4; x->id = message_id; x->buf_max = (size_t)OC_MAX_ATTACHMENT_SIZE;
+    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_audio_get ag = { message_id };
+    if (oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &ag) != OC_OK ||
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) != 0) {
+        oc_ev *e = oc_ev_new(OC_EV_LISTEN_SKIP);
+        if (e) { e->message_id = message_id; oc_queue_push(ctx->to_ui, e); }
+        xfer_reset(x);
+    }
+}
+
 /* Start the active job. Whatever leaves the transfer idle has already finished,
  * with its notice sent; xq_pump then retires it. */
 static void xq_start(disp_ctx *ctx) {
@@ -522,6 +549,8 @@ static void xq_start(disp_ctx *ctx) {
         if (!fp) { xfer_notice(ctx, 2, "download: cannot create file"); return; }
         const char *slash = strrchr(c->body, '/');
         begin_download(ctx, c->message_id, fp, 0, slash ? slash + 1 : c->body);
+    } else if (c->type == OC_CMD_LISTEN_FETCH) {
+        begin_listen(ctx, c->message_id);
     } else if (c->type == OC_CMD_POST_VIDEO) {
         ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
         char pname[128];
@@ -746,6 +775,11 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     size_t n2 = ue[i].pronouns.len < sizeof e->pf_pronouns - 1 ? ue[i].pronouns.len : sizeof e->pf_pronouns - 1;
                     if (n2) memcpy(e->pf_pronouns, ue[i].pronouns.ptr, n2);
                     e->pf_pronouns[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].voice_id.len < sizeof e->pf_voice - 1 ? ue[i].voice_id.len : sizeof e->pf_voice - 1;
+                    if (n2) memcpy(e->pf_voice, ue[i].voice_id.ptr, n2);
+                    e->pf_voice[n2] = '\0';
                 }
                 oc_queue_push(to_ui, e);
             }
@@ -1508,6 +1542,75 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     xfer_reset(x);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_AUDIO_INFO) {
+            oc_audio_info ai;
+            if (oc_decode_audio_info(&p, &ai) == OC_OK && ctx && ctx->xfer->mode == 4 &&
+                ai.message_id == ctx->xfer->id)
+                ctx->xfer->total = ai.total_size;
+        } else if (hdr.msg_type == OC_MSG_AUDIO_CHUNK) {
+            oc_audio_chunk ac;
+            if (oc_decode_audio_chunk(&p, &ac) == OC_OK && ctx && ctx->xfer->mode == 4 &&
+                ac.message_id == ctx->xfer->id && ac.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                int failed = 0;
+                if (ac.data.len) {
+                    if (x->buf_len + ac.data.len > x->buf_max) failed = 1;
+                    else {
+                        if (x->buf_len + ac.data.len > x->buf_cap) {
+                            size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
+                            while (want < x->buf_len + ac.data.len) want *= 2;
+                            uint8_t *g = realloc(x->buf, want);
+                            if (!g) failed = 1; else { x->buf = g; x->buf_cap = want; }
+                        }
+                        if (!failed) {
+                            memcpy(x->buf + x->buf_len, ac.data.ptr, ac.data.len);
+                            x->buf_len += ac.data.len;
+                        }
+                    }
+                }
+                if (failed) {
+                    oc_ev *e = oc_ev_new(OC_EV_LISTEN_SKIP);
+                    if (e) { e->message_id = x->id; oc_queue_push(ctx->to_ui, e); }
+                    xfer_reset(x);
+                } else { x->done += ac.data.len; x->next_seq++; }
+            }
+        } else if (hdr.msg_type == OC_MSG_AUDIO_END) {
+            oc_audio_end ae;
+            if (oc_decode_audio_end(&p, &ae) == OC_OK && ctx && ctx->xfer->mode == 4 &&
+                ae.message_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                int whole = x->buf_len && (!x->total || x->done == x->total);
+                oc_ev *e = oc_ev_new(whole ? OC_EV_LISTEN_AUDIO : OC_EV_LISTEN_SKIP);
+                if (e) {
+                    e->message_id = x->id;
+                    if (whole) {
+                        e->count = (uint32_t)x->buf_len;
+                        e->body = (char *)x->buf;
+                        x->buf = NULL; x->buf_len = x->buf_cap = 0;
+                    }
+                    oc_queue_push(ctx->to_ui, e);
+                }
+                xfer_reset(x);
+            }
+        } else if (hdr.msg_type == OC_MSG_TTS_INFO) {
+            /* What this daemon can say, replaced whole on every connection: a
+             * BEGIN and then one event per voice, as the emoji list is. */
+            oc_tts_info ti;
+            if (oc_decode_tts_info(&p, &ti) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_TTS_BEGIN);
+            if (e) {
+                e->status = ti.available;
+                e->body = slice_dup(ti.model_version);
+                e->topic = slice_dup(ti.preview);
+                oc_queue_push(to_ui, e);
+            }
+            for (uint8_t i = 0; i < ti.count; i++) {
+                oc_ev *ve = oc_ev_new(OC_EV_TTS_VOICE);
+                if (!ve) break;
+                ve->body = slice_dup(ti.voices[i].id);
+                ve->topic = slice_dup(ti.voices[i].label);
+                oc_queue_push(to_ui, ve);
+            }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
             oc_webhook_info wi;
             if (oc_decode_webhook_info(&p, &wi) != OC_OK) return -1;
@@ -1568,11 +1671,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                  * one event. Unpacked in model.c, next to the struct it fills. */
                 size_t need = pi.display_name.len + pi.status_emoji.len +
                               pi.status_text.len + pi.title.len + pi.timezone.len +
-                              pi.full_name.len + pi.pronouns.len + pi.phone.len + 16;
+                              pi.full_name.len + pi.pronouns.len + pi.phone.len +
+                              pi.voice_id.len + 18;
                 e->body = malloc(need);
                 if (e->body) {
                     int k = snprintf(e->body, need,
-                                     "%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s",
+                                     "%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s",
                                      (int)pi.display_name.len, (const char *)pi.display_name.ptr,
                                      (int)pi.status_emoji.len, (const char *)pi.status_emoji.ptr,
                                      (int)pi.status_text.len,  (const char *)pi.status_text.ptr,
@@ -1580,7 +1684,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                                      (int)pi.timezone.len,     (const char *)pi.timezone.ptr,
                                      (int)pi.full_name.len,    (const char *)pi.full_name.ptr,
                                      (int)pi.pronouns.len,     (const char *)pi.pronouns.ptr,
-                                     (int)pi.phone.len,        (const char *)pi.phone.ptr);
+                                     (int)pi.phone.len,        (const char *)pi.phone.ptr,
+                                     (int)pi.voice_id.len,     (const char *)pi.voice_id.ptr);
                     (void)k;
                 }
                 oc_queue_push(to_ui, e);
@@ -1675,11 +1780,27 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     err.code == OC_ERR_STORAGE_FULL         ||
                     /* A video message refused at ATTACH_MEDIA_SET (REQ-164). */
                     (ctx && ctx->xfer->mode == 3 &&
-                     (err.code == OC_ERR_MEDIA_INVALID || err.code == OC_ERR_MEDIA_TOO_LARGE));
+                     (err.code == OC_ERR_MEDIA_INVALID || err.code == OC_ERR_MEDIA_TOO_LARGE)) ||
+                    /* Speech this daemon will not produce (REQ-294/295): the
+                     * message has nothing to say, or read-aloud is off or busy. */
+                    (ctx && ctx->xfer->mode == 4 &&
+                     (err.code == OC_ERR_NOT_RENDERABLE || err.code == OC_ERR_TTS_UNAVAILABLE ||
+                      err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE));
                 if (ctx && ctx->xfer->mode == 3 && about_transfer)
                     xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
                                         ? "video message: larger than this server accepts"
                                         : "video message refused by the server");
+                /* Talking mode moves on: the queue is what matters, not this
+                 * one message (ARCH-111). The reason travels so a frontend can
+                 * say something once rather than for every message. */
+                if (ctx && ctx->xfer->mode == 4 && about_transfer) {
+                    oc_ev *le = oc_ev_new(OC_EV_LISTEN_SKIP);
+                    if (le) {
+                        le->message_id = ctx->xfer->id;
+                        le->status = err.code;
+                        oc_queue_push(ctx->to_ui, le);
+                    }
+                }
                 if (ctx && ctx->xfer->mode != 0 && about_transfer) xfer_reset(ctx->xfer);
                 if (err.fatal) return -1;
             }
@@ -1835,8 +1956,21 @@ static int run_connection(oc_net *n, int reconnecting,
         if (ok.session_token.len == OC_SESSION_TOKEN_LEN) {   /* fresh token (first auth) */
             memcpy(sess, ok.session_token.ptr, OC_SESSION_TOKEN_LEN);
             *have_sess = 1;
-            if (cs && cs->store)   /* persist it so a relaunch reconnects silently */
-                oc_store_save_session(cs->store, cs->workspace, sess, ok.session_expiry);
+            if (cs && cs->store) {   /* persist it so a relaunch reconnects silently */
+                /* With the account it belongs to, in the same write. A session
+                 * reconnect carries no credential, passes "", and keeps the
+                 * account already recorded. */
+                char user[128] = "";
+                const char *cred = n->token ? n->token : "";
+                const char *colon = strchr(cred, ':');
+                if (colon && colon > cred) {
+                    size_t un = (size_t)(colon - cred);
+                    if (un >= sizeof user) un = sizeof user - 1;
+                    memcpy(user, cred, un);
+                    user[un] = '\0';
+                }
+                oc_store_save_session(cs->store, cs->workspace, sess, ok.session_expiry, user);
+            }
         }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
@@ -2339,18 +2473,20 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_SET_PROFILE) {
                 uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                /* Unpack the five \x1f-separated fields client.c packed, beside
-                 * the encode that consumes them. A field the sender left empty
-                 * stays empty here and clears the column: that is the user
-                 * deleting it, which is a thing they did. */
-                char pb[512]; const char *pf[5] = { "", "", "", "", "" };
+                /* Unpack the \x1f-separated fields client.c packed, beside the
+                 * encode that consumes them. A field the sender left empty stays
+                 * empty here and clears the column: that is the user deleting it,
+                 * which is a thing they did. A sender that names fewer fields
+                 * than the frame has -- one that does not set a voice
+                 * (REQ-292) -- leaves the rest empty. */
+                char pb[512]; const char *pf[6] = { "", "", "", "", "", "" };
                 snprintf(pb, sizeof pb, "%s", c->body ? c->body : "");
                 int np = 0; pf[np++] = pb;
-                for (char *q = pb; *q && np < 5; q++)
+                for (char *q = pb; *q && np < 6; q++)
                     if (*q == '\x1f') { *q = '\0'; pf[np++] = q + 1; }
                 oc_set_profile sp = { oc_slice_str(pf[0]), oc_slice_str(pf[1]),
                                       oc_slice_str(pf[2]), oc_slice_str(pf[3]),
-                                      oc_slice_str(pf[4]) };
+                                      oc_slice_str(pf[4]), oc_slice_str(pf[5]) };
                 if (oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
@@ -2403,7 +2539,8 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_read_cursor(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
-            if ((c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
+            if (c->type == OC_CMD_LISTEN_FETCH ||
+                (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
                 (c->type == OC_CMD_DOWNLOAD && c->body) ||
                 (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {
                 xq_add(&n->xq, c);             /* owned by the queue now */
@@ -2482,6 +2619,48 @@ drop:
  * OC_EV_MESSAGE (folded + deduped by the reducer), plus an OC_EV_EDIT/_DELETE so
  * the "(edited)" marker / tombstone survives a relaunch, and seed the backfill
  * cursor. */
+/* Whose session is the stored token? A workspace holds ONE credential, so a
+ * token found for this address belongs to whoever signed in last -- and signing
+ * in AS SOMEBODY ELSE at the same address must not ride in on it. That is not a
+ * corner case: it is two accounts on one machine, and the token silently winning
+ * meant the second client came up as the first one's user, with the credential
+ * it was given never consulted and nothing saying so.
+ *
+ * A caller that supplies no user (a silent reconnect, which carries no
+ * credential) still gets the token: there is nobody else it could be. A caller
+ * that names the account the token was stored for gets it too, which is what
+ * keeps a password-carrying relaunch silent. Anything else authenticates with
+ * what it was given. */
+/* Account names are compared without case: the daemon looks them up that way
+ * (lower(display_name)), so "Alice" and "alice" are one account, and treating
+ * them as two would send a password where a token would have done. */
+static int ascii_ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        int ca = (*a >= 'A' && *a <= 'Z') ? *a - 'A' + 'a' : *a;
+        int cb = (*b >= 'A' && *b <= 'Z') ? *b - 'A' + 'a' : *b;
+        if (ca != cb) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int session_is_ours(const conn_store *cs, const char *cred) {
+    const char *colon = cred ? strchr(cred, ':') : NULL;
+    if (!cred || !cred[0] || !colon || colon == cred) return 1;   /* no account named */
+    char want[128];
+    size_t n = (size_t)(colon - cred);
+    if (n >= sizeof want) n = sizeof want - 1;
+    memcpy(want, cred, n);
+    want[n] = '\0';
+    char have[128];
+    /* Unknown owner -- an entry from a client that stored tokens without them --
+     * means the password, once. Preferring the token there would leave every
+     * existing install with the bug until the day its user happened to sign in
+     * again, which is no fix at all. A mismatch costs a password round trip; it
+     * never costs the wrong identity. */
+    if (!oc_store_session_user(cs->store, cs->workspace, have, sizeof have)) return 0;
+    return ascii_ieq(have, want);
+}
+
 /* The net thread: run one connection after another, silently reconnecting with
  * the session token after an unexpected drop (REQ-100). The model is preserved
  * across reconnects (dedup on high-water), so a blip is invisible beyond a brief
@@ -2507,7 +2686,10 @@ static void *net_thread(void *arg) {
         oc_store_set_secret(cs.store, n->secret);   /* token -> keyring if available */
         cs.have_pin = oc_store_load_pin(cs.store, workspace, cs.pin);
         uint64_t now_ms = (uint64_t)time(NULL) * 1000;
-        if (oc_store_load_session(cs.store, workspace, sess, NULL, now_ms)) {
+        /* Ownership first: a token that is not ours is not worth reading into a
+         * buffer we then have to remember not to use. */
+        if (session_is_ours(&cs, n->token) &&
+            oc_store_load_session(cs.store, workspace, sess, NULL, now_ms)) {
             have_sess = 1;
             reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
         }

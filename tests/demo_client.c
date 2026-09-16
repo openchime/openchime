@@ -156,7 +156,7 @@ static int cmd_send(client *c, uint64_t channel_id, const char *text) {
     s.body = oc_slice_str(text);
     if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK || write_all(&c->conn, buf, w.len) != 0)
         FAIL("send");
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 32; i++) {
         oc_header hdr; oc_rbuf p;
         if (read_frame(c, &hdr, &p) != 0) FAIL("read after send");
         if (hdr.msg_type == OC_MSG_SEND_ACK) {

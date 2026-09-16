@@ -43,4 +43,11 @@ void oc_netloop_set_push(struct oc_push *push);
 struct oc_unfurler;
 void oc_netloop_set_unfurler(struct oc_unfurler *u);
 
+/* Wire read-aloud's synthesis engine (REQ-291-295, ARCH-111). The daemon passes
+ * the voice model built into it; a test passes a stub. Call before
+ * oc_netloop_run; NULL (the default, and a daemon built with TTS=0) means the
+ * daemon advertises no read-aloud and answers AUDIO_GET with TTS_UNAVAILABLE. */
+struct oc_tts_engine;
+void oc_netloop_set_tts(const struct oc_tts_engine *engine);
+
 #endif /* OPENCHIME_NETLOOP_H */

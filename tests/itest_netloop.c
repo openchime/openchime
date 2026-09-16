@@ -11,9 +11,11 @@
 #include "framebuf.h"
 #include "protocol.h"
 #include "tls.h"
+#include "tts_render.h"
 #include "check.h"
 
 #include <arpa/inet.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -203,11 +205,13 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
     for (;;) {
         int r = read_frame_raw(c, hdr, payload);
         if (r != 0) return r;
-        /* Also skip the post-AUTH_OK WORKSPACE_INFO push (like presence/typing,
-         * it arrives unsolicited and would desync a fixed expected-frame stream). */
+        /* Also skip the post-AUTH_OK WORKSPACE_INFO and TTS_INFO pushes (like
+         * presence/typing, they arrive unsolicited and would desync a fixed
+         * expected-frame stream). */
         if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE &&
             hdr->msg_type != OC_MSG_TYPING_UPDATE &&
-            hdr->msg_type != OC_MSG_WORKSPACE_INFO)
+            hdr->msg_type != OC_MSG_WORKSPACE_INFO &&
+            hdr->msg_type != OC_MSG_TTS_INFO)
             return 0;
     }
 }
@@ -250,6 +254,10 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
      * presence snapshot). Consume it here so both read_frame and the raw
      * presence/typing test start from a clean stream. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
+    /* Then whether this daemon reads messages aloud (REQ-295), which is told to
+     * every client at auth whether the answer is yes or no. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_TTS_INFO) return -1;
+    { oc_tts_info ti; if (oc_decode_tts_info(&p, &ti) != OC_OK) return -1; }
     /* Then the pause (REQ-278), which outlives the session that set it and so is
      * told at auth rather than only on request. Asserted, not skipped: a fresh
      * account is not paused, and reading it here keeps every later test's stream
@@ -1253,6 +1261,207 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
     }
     client_close(&b);
     free(fbuf);
+}
+
+/* Read-aloud over the wire (REQ-291-295, ARCH-111), with a stub engine in place
+ * of the voice model: a message is asked for, rendered, streamed and cached; the
+ * second ask is served from the cache without rendering again; a message with
+ * nothing to say and one in a channel the asker cannot read are refused. */
+static int g_stub_says;                       /* renders the stub actually did */
+
+static void *stub_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
+static void stub_close(void *e) { (void)e; }
+static const char *stub_voice_id(int v) { return v % 2 == 0 ? "test-voice-m" : "test-voice-f"; }
+static const char *stub_voice_label(int v) { return v % 2 == 0 ? "Test Low" : "Test High"; }
+
+static int stub_say(void *e, const char *segment, int voice, float **pcm, size_t *n,
+                    char *err, size_t cap) {
+    (void)e; (void)voice; (void)err; (void)cap;
+    __sync_fetch_and_add(&g_stub_says, 1);
+    size_t samples = strlen(segment) * 240;   /* 10 ms a character at 24 kHz */
+    *pcm = malloc(samples * sizeof **pcm);
+    if (!*pcm) return -1;
+    for (size_t i = 0; i < samples; i++) (*pcm)[i] = (float)(0.25 * sin(2 * M_PI * 300.0 * (double)i / 24000.0));
+    *n = samples;
+    return 0;
+}
+
+static const oc_tts_engine STUB_TTS = {
+    .version = "itest-stub-1", .rate = 24000, .voices = 2, .ctx = NULL,
+    .voice_id = stub_voice_id, .voice_label = stub_voice_label,
+    .preview = "A test voice reads this.",
+    .open = stub_open, .close = stub_close, .say = stub_say,
+};
+
+/* Ask for a message's speech and consume the whole stream. Returns the total
+ * bytes, or 0 if the daemon refused (with the reason in *code). */
+static uint64_t fetch_audio(client *c, uint64_t message_id, uint32_t *duration_ms, uint16_t *code) {
+    uint8_t buf[64];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_audio_get ag = { message_id };
+    CHECK(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &ag) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+
+    oc_header hdr;
+    oc_rbuf p;
+    *code = 0;
+    if (duration_ms) *duration_ms = 0;
+    /* A listener is an ordinary connection: a message posted to a channel it is
+     * in arrives while it waits for speech, and is not part of this answer. */
+    do {
+        if (read_frame(c, &hdr, &p) != 0) return 0;
+    } while (hdr.msg_type == OC_MSG_BROADCAST);
+    if (hdr.msg_type == OC_MSG_ERROR) {
+        oc_error e;
+        CHECK(oc_decode_error(&p, &e) == OC_OK);
+        *code = e.code;
+        return 0;
+    }
+    CHECK(hdr.msg_type == OC_MSG_AUDIO_INFO);
+    oc_audio_info ai;
+    CHECK(oc_decode_audio_info(&p, &ai) == OC_OK);
+    CHECK(ai.message_id == message_id);
+    if (duration_ms) *duration_ms = ai.duration_ms;
+    uint64_t got = 0;
+    uint32_t expect_seq = 0;
+    for (;;) {
+        CHECK(read_frame(c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_AUDIO_END) {
+            oc_audio_end ae;
+            CHECK(oc_decode_audio_end(&p, &ae) == OC_OK && ae.message_id == message_id);
+            break;
+        }
+        CHECK(hdr.msg_type == OC_MSG_AUDIO_CHUNK);
+        oc_audio_chunk ac;
+        CHECK(oc_decode_audio_chunk(&p, &ac) == OC_OK);
+        CHECK(ac.message_id == message_id && ac.seq == expect_seq++);
+        got += ac.data.len;
+    }
+    CHECK(got == ai.total_size);
+    return got;
+}
+
+/* Send one message and return its id. */
+static uint64_t say_something(client *c, uint64_t channel_id, const char *body, uint8_t tag) {
+    uint8_t buf[512];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0};
+    s.channel_id = channel_id;
+    memset(s.idem, tag, OC_IDEM_SIZE);
+    s.body = oc_slice_str(body);
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    uint64_t id = 0;
+    for (int i = 0; i < 2; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack;
+            CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+            id = ack.message_id;
+        }
+    }
+    return id;
+}
+
+static void test_read_aloud_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    /* The capability is told at auth, with the stub's voices. */
+    {
+        client cap;
+        CHECK(client_open(&cap, port, pin) == 0);
+        CHECK(do_handshake(&cap) == 0);
+        uint8_t cbuf[256];
+        oc_wbuf cw;
+        oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        CHECK(oc_encode_local_credential(&cw, oc_slice_str("bob"), oc_slice_str("pw-bob")) == OC_OK);
+        uint8_t buf[512];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_auth au = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+        CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK);
+        CHECK(write_all(&cap.conn, buf, w.len) == 0);
+        oc_header hdr;
+        oc_rbuf p;
+        int saw = 0;
+        for (int i = 0; i < 4 && !saw; i++) {
+            CHECK(read_frame_raw(&cap, &hdr, &p) == 0);
+            if (hdr.msg_type != OC_MSG_TTS_INFO) continue;
+            oc_tts_info ti;
+            CHECK(oc_decode_tts_info(&p, &ti) == OC_OK);
+            CHECK(ti.available == 1 && ti.count == 2);
+            CHECK(ti.model_version.len == strlen(STUB_TTS.version));
+            CHECK(ti.voices[0].id.len == 12 && memcmp(ti.voices[0].id.ptr, "test-voice-m", 12) == 0);
+            CHECK(ti.voices[1].label.len == 9 && memcmp(ti.voices[1].label.ptr, "Test High", 9) == 0);
+            saw = 1;
+        }
+        CHECK(saw);
+        client_close(&cap);
+    }
+
+    uint64_t mid = say_something(&a, OC_DEFAULT_CHANNEL, "Deploy finished. Logs are clean.", 0xB1);
+    CHECK(mid != 0);
+
+    /* First ask renders; the stream is a real audio-only MP4. */
+    int before = g_stub_says;
+    uint32_t dur = 0;
+    uint16_t code = 0;
+    uint64_t bytes = fetch_audio(&a, mid, &dur, &code);
+    CHECK(code == 0 && bytes > 0 && dur > 0);
+    CHECK(g_stub_says > before);
+
+    /* Second ask is served from the cache: the same bytes, no new render. */
+    int after_first = g_stub_says;
+    uint32_t dur2 = 0;
+    uint64_t bytes2 = fetch_audio(&a, mid, &dur2, &code);
+    CHECK(code == 0 && bytes2 == bytes && dur2 == dur);
+    CHECK(g_stub_says == after_first);
+
+    /* Another listener gets the same rendering, again without rendering. */
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ub = 0;
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint64_t bytes3 = fetch_audio(&b, mid, NULL, &code);
+    CHECK(code == 0 && bytes3 == bytes && g_stub_says == after_first);
+
+    /* Nothing to say: emoji alone is not renderable (REQ-294). */
+    uint64_t emoji_id = say_something(&a, OC_DEFAULT_CHANNEL, "\xF0\x9F\x9A\x80", 0xB2);
+    CHECK(emoji_id != 0);
+    CHECK(fetch_audio(&a, emoji_id, NULL, &code) == 0 && code == OC_ERR_NOT_RENDERABLE);
+
+    /* An unknown message is unknown, not a render. */
+    CHECK(fetch_audio(&a, mid + 100000, NULL, &code) == 0 && code == OC_ERR_UNKNOWN_MESSAGE);
+
+    /* A private channel alice is in and bob is not: speech obeys the same gate
+     * as reading, because it IS the message (REQ-291). */
+    uint8_t buf[256];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cc = { oc_slice_str("whisper"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    oc_header hdr;
+    oc_rbuf p;
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci;
+    CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t priv_id = say_something(&a, ci.channel_id, "Only for the room.", 0xB3);
+    CHECK(priv_id != 0);
+    CHECK(fetch_audio(&b, priv_id, NULL, &code) == 0 && code == OC_ERR_FORBIDDEN);
+    /* ...and alice, who is in it, is served. */
+    CHECK(fetch_audio(&a, priv_id, NULL, &code) > 0 && code == 0);
+
+    client_close(&a);
+    client_close(&b);
 }
 
 /* Attachments over the wire (REQ-140/141, ARCH-69). A multi-chunk blob is
@@ -2353,6 +2562,9 @@ int run_netloop_tests(void) {
     pthread_t audio_th;
     CHECK(pthread_create(&audio_th, NULL, audio_thread, NULL) == 0);
     oc_netloop_set_audio(asv[0], audio_port);
+    /* Read-aloud with a stub engine (ARCH-111): the wire, the cache and the gate
+     * are the daemon's, and no voice model is needed to prove them. */
+    oc_netloop_set_tts(&STUB_TTS);
 
     unlink("build/itest_netloop.db");
     unlink("build/itest_netloop.db-wal");
@@ -2393,6 +2605,7 @@ int run_netloop_tests(void) {
         test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
         test_presence_dnd(arg.port, pin);
+        test_read_aloud_vertical(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
         test_video_message_vertical(arg.port, pin);
         test_upload_abandoned(arg.port, pin);

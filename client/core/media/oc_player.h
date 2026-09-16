@@ -38,7 +38,9 @@ void oc_player_volume(oc_player *p, float gain);
 void oc_player_status_get(oc_player *p, oc_player_status *st);
 
 /* Copy the presented frame as BGRA into `bgra` (`cap` bytes) if it is newer
- * than `*seq`: 1 copied, 0 nothing new, -1 `cap` too small (`*w`, `*h` set). */
+ * than `*seq`: 1 copied, 0 nothing new, -1 `cap` too small (`*w`, `*h` set).
+ * An audio-only file has no picture: this always answers 0, and `bgra`, `seq`,
+ * `w` and `h` may all be NULL. */
 int oc_player_frame(oc_player *p, uint8_t *bgra, size_t cap, int *w, int *h, uint64_t *seq);
 
 void oc_player_close(oc_player *p);

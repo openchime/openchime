@@ -11,7 +11,7 @@
  * Three contracts, stated here because every caller depends on them:
  *
  *   OFFSETS ARE UTF-8 BYTE OFFSETS into the string the layout was created
- *   from. They match oc_rt_scan's spans (client/core/richtext.h) directly;
+ *   from. They match oc_rt_scan's spans (shared/richtext.h) directly;
  *   whatever wide encoding a backend shapes with is its private business, and
  *   the conversion burden lives in the backend once instead of at every call
  *   site.

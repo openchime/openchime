@@ -166,10 +166,11 @@ minutes of video is at most 155 MB.
 
 ## 5. The MP4 profile
 
-`client/core/media/oc_mp4.{c,h}` writes and reads **exactly one profile**, which is
+`shared/oc_mp4.{c,h}` writes and reads **exactly one profile**, which is
 what makes an in-tree implementation reasonable. No small, maintained library covers
 VP9 and Opus in MP4, and a general demuxer is far more parser than one fixed layout
-needs.
+needs. It lives in `shared/` because the daemon writes the same profile with the video
+`trak` left out, for read-aloud renders (READ-ALOUD.md §4); the reader accepts either.
 
 ```
 ftyp   major "isom", compatible "isom" "iso6" "mp41"

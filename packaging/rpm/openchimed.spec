@@ -35,8 +35,9 @@ Release:        1%{?dist}
 Summary:        OpenChime chat daemon
 
 # The daemon's own code and the components it links. RPM expects one field, so
-# all are named.
-License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT
+# all are named: mbedTLS and the Kitten voice model (Apache-2.0), jsmn and ONNX
+# Runtime (MIT), and the CMUdict-derived pronunciation data (BSD, two clauses).
+License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause
 URL:            https://openchime.io
 BuildArch:      %{_target_cpu}
 

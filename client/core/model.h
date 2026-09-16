@@ -15,6 +15,16 @@
 #include "event.h"
 
 /* One emoji's aggregate on a message: the running count and whether we reacted. */
+/* One of the daemon's voices (ARCH-111): the id a profile stores, and the name a
+ * person picks from. */
+#define OC_VOICE_MAX 16
+typedef struct { char id[32]; char label[32]; } oc_voice;
+
+/* How many messages may wait to be spoken before the oldest is dropped. A
+ * listener who has fallen this far behind a busy channel is not going to catch
+ * up by hearing every one. */
+#define OC_LISTEN_QUEUE_MAX 64
+
 typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
 
 /* One synced client setting (the daemon-side config bucket). key/value sizes
@@ -188,6 +198,7 @@ typedef struct {
      * PROFILE_INFO, and is not held for every member of the roster. */
     char     full_name[64];
     char     pronouns[32];
+    char     voice_id[32];   /* read aloud in this voice (REQ-292); "" = not chosen yet */
     /* Filled by PROFILE_INFO only, never by USER_LIST: a phone number reaches
      * the person who opened the card, not every roster fan-out. Empty until a
      * card is fetched, which is what "not on the roster" means here. */
@@ -302,6 +313,29 @@ typedef struct {
     uint8_t  deployment_mode;         /* 0 standalone · 1 federated · 2 managed */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
+
+    /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
+     * on every reconnect. Without it a frontend shows nothing of the feature. */
+    uint8_t  tts_available;
+    uint8_t  n_voices;
+    char     tts_model_version[64];
+    char     tts_preview[160];        /* the sentence that auditions a voice */
+    oc_voice voices[OC_VOICE_MAX];
+
+    /* Talking mode (one conversation at a time): 0 = off. Messages that arrive
+     * from the moment it is turned on are queued and spoken in order; the queue
+     * running dry is not the end, it waits for the next message. It belongs to
+     * the conversation on screen -- a frontend turns it off when the user leaves,
+     * and turning it on for another conversation replaces it. */
+    uint64_t listen_channel;
+    uint64_t listen_queue[OC_LISTEN_QUEUE_MAX];
+    uint8_t  n_listen_queue;
+    uint64_t listen_fetching;         /* the message whose speech is on its way */
+    uint64_t listen_ready_id;         /* speech in hand, waiting for the frontend */
+    uint8_t *listen_ready;            /* the MP4; owned here until taken */
+    size_t   listen_ready_len;
+    uint64_t listen_playing;          /* what the frontend says it is playing now */
+    uint32_t listen_skipped;          /* messages passed over, for the notice line */
     oc_channel      *channels;
     size_t           n_channels, cap_channels;
     oc_presence_row *presence;
@@ -825,6 +859,27 @@ uint8_t     oc_model_deployment_mode(const oc_model *m);
 const char *oc_model_deployment_name(const oc_model *m);
 const char *oc_model_workspace_name(const oc_model *m);
 uint32_t    oc_model_max_users(const oc_model *m);
+
+/* Read-aloud (TTS_INFO, ARCH-111). `available` 0 means this daemon does not speak
+ * messages and a frontend shows nothing of the feature (REQ-295). The voices are
+ * the ones a person may be read in, and `preview` is the sentence that auditions
+ * one. */
+uint8_t         oc_model_tts_available(const oc_model *m);
+uint8_t         oc_model_tts_voice_count(const oc_model *m);
+const oc_voice *oc_model_tts_voice(const oc_model *m, uint8_t i);
+const char     *oc_model_tts_preview(const oc_model *m);
+/* The label for a voice id ("" if this daemon does not have it). */
+const char     *oc_model_tts_voice_label(const oc_model *m, const char *voice_id);
+
+/* Talking mode: which conversation is being spoken (0 = none), how many messages
+ * are waiting, and which one is being read right now (0 = none yet). */
+uint64_t oc_model_listening_channel(const oc_model *m);
+uint8_t  oc_model_listen_queued(const oc_model *m);
+uint64_t oc_model_listen_playing(const oc_model *m);
+uint32_t oc_model_listen_skipped(const oc_model *m);
+/* Take the speech that is ready to play, if any: the caller owns the bytes and
+ * frees them. Returns the message id, or 0 when nothing is waiting. */
+uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
 
 /* User ids currently typing in `channel_id` (last seen within the timeout),
  * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */
