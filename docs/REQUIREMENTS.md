@@ -1281,18 +1281,22 @@ the requirement says so explicitly rather than implying one.
 *Design: [READ-ALOUD.md](./READ-ALOUD.md) (the feature), [TTSKIT.md](./TTSKIT.md)
 (pronunciation).*
 
-- **REQ-291.** A user has been able to **listen to a channel** instead
-  of reading it: from a message onward, each message that has something to say is
-  spoken in order, in the one language the server provides, with play, pause, skip and stop. Playback runs at one fixed speaking
+- **REQ-291.** *(Built in the Win32 client only)* A user has been able to **listen to a
+  channel** instead of reading it: turned on for the conversation on screen, each message
+  that arrives from that moment on and has something to say is spoken in order, in the one
+  language the server provides, until it is turned off or the user goes elsewhere. It reads
+  forward, not back: there is no starting from an earlier message, no pause and no skip, and
+  a user does not hear their own messages read to them. Playback runs at one fixed speaking
   rate; there is no listener speed setting. What is spoken is the message text made
   speakable — code blocks announced and skipped, links reduced to their site, mentions
   said as names, formatting and emoji dropped, numbers and times read as words.
-- **REQ-292.** Each author has been **read in a voice of their own** —
-  a synthetic voice chosen from a fixed set and held on their profile (REQ-240), the
-  same for every listener on every device. A listener has not overridden it. A new
-  user's voice has defaulted from their declared pronouns, else from a stable choice
-  keyed on their account, and the user has been able to change it with a preview. A
-  change has applied to messages rendered afterwards, not retroactively.
+- **REQ-292.** *(Built in the Win32 client only)* Each author has been **read in a voice of
+  their own** — a synthetic voice chosen from a fixed set and held on their profile
+  (REQ-240), the same for every listener on every device. A listener has not overridden it.
+  A new user's voice has defaulted from their declared pronouns where the server's language
+  is one whose pronouns it reads, else from a stable choice keyed on their account, and the
+  user has been able to change it by name from the list the server offers. A change has
+  applied to messages rendered afterwards, not retroactively.
 - **REQ-293.** Speech has been **synthesized on the server, once per
   message text, voice and language**, by the daemon itself from a voice model built into it (ARCH-111), and
   kept so every later listener and every re-listen reuses it. Identical text in the same
