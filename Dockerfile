@@ -3,7 +3,7 @@
 FROM alpine:3.20 AS build
 # build-base for the toolchain; bash/curl/tar/bzip2 for scripts/build_mbedtls.sh,
 # which `make` invokes to fetch + build the pinned mbedTLS static libs.
-RUN apk add --no-cache build-base sqlite-dev bash curl tar bzip2
+RUN apk add --no-cache build-base bash curl tar bzip2
 WORKDIR /src
 COPY Makefile .
 COPY scripts ./scripts
@@ -27,7 +27,7 @@ FROM alpine:3.20
 # entrypoint no longer seeds one. ca-certificates is for the daemon's *outbound*
 # TLS only -- enrollment, push and S3 -- never for its own listener, which is
 # self-signed and pinned by the client (ARCH-10).
-RUN apk add --no-cache sqlite-libs ca-certificates
+RUN apk add --no-cache ca-certificates
 
 COPY --from=build /src/openchimed /usr/local/bin/openchimed
 COPY entrypoint.sh /entrypoint.sh

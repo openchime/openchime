@@ -85,6 +85,7 @@ emit "openchimed -- GNU Affero General Public License v3.0 or later" "${root}/LI
 
 emit "Mbed TLS 3.6.2 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
 emit "jsmn -- MIT License" "${root}/third_party/jsmn/LICENSE"
+emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
 if [ "$TTS" = 1 ]; then
   emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0/LICENSE"

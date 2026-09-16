@@ -76,7 +76,7 @@ OpenChime daemon ${VERSION} (linux-${ARCH})
 
   sudo ./install.sh
 
-Requires glibc 2.34 or newer and libsqlite3. Everything else -- including TLS --
+Requires glibc 2.34 or newer. Everything else -- including TLS and SQLite --
 is statically linked, so there is nothing further to fetch. That makes this the
 offline install: no package repository, no network.
 

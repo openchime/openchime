@@ -16,6 +16,7 @@ dist/
 !/third_party/lucide/
 !/third_party/miniaudio/
 !/third_party/stb/
+!/third_party/sqlite-3.53.4/
 *.o
 *.db
 *.db-shm

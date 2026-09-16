@@ -62,7 +62,6 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: Danny Heskett <dan@danheskett.com>
 Installed-Size: ${size_kb}
-Depends: libsqlite3-0
 Recommends: ca-certificates
 Homepage: https://openchime.io
 Description: OpenChime chat daemon
