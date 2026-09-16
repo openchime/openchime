@@ -1281,28 +1281,28 @@ the requirement says so explicitly rather than implying one.
 *Design: [READ-ALOUD.md](./READ-ALOUD.md) (the feature), [TTSKIT.md](./TTSKIT.md)
 (pronunciation).*
 
-- **REQ-291.** *(Not built)* A user has been able to **listen to a channel** instead
+- **REQ-291.** A user has been able to **listen to a channel** instead
   of reading it: from a message onward, each message that has something to say is
-  spoken in order, with play, pause, skip and stop. Playback runs at one fixed speaking
+  spoken in order, in the one language the server provides, with play, pause, skip and stop. Playback runs at one fixed speaking
   rate; there is no listener speed setting. What is spoken is the message text made
   speakable — code blocks announced and skipped, links reduced to their site, mentions
   said as names, formatting and emoji dropped, numbers and times read as words.
-- **REQ-292.** *(Not built)* Each author has been **read in a voice of their own** —
+- **REQ-292.** Each author has been **read in a voice of their own** —
   a synthetic voice chosen from a fixed set and held on their profile (REQ-240), the
   same for every listener on every device. A listener has not overridden it. A new
   user's voice has defaulted from their declared pronouns, else from a stable choice
   keyed on their account, and the user has been able to change it with a preview. A
   change has applied to messages rendered afterwards, not retroactively.
-- **REQ-293.** *(Not built)* Speech has been **synthesized on the server, once per
-  message text and voice**, by the daemon itself from a voice model built into it (ARCH-111), and
+- **REQ-293.** Speech has been **synthesized on the server, once per
+  message text, voice and language**, by the daemon itself from a voice model built into it (ARCH-111), and
   kept so every later listener and every re-listen reuses it. Identical text in the same
   voice has been synthesized once. A rendering has been reclaimable storage: reclaimed
   first under pressure, with nothing shown in its place, and synthesized again on the
   next request.
-- **REQ-294.** *(Not built)* A message with **nothing to say** — a bare attachment, only
+- **REQ-294.** A message with **nothing to say** — a bare attachment, only
   emoji — has been marked not renderable and skipped by a listener, rather than played
   as silence or refused as an error.
-- **REQ-295.** *(Not built)* Read-aloud has been **absent where it is turned off**:
+- **REQ-295.** Read-aloud has been **absent where it is turned off**:
   a server whose operator has disabled it has offered nothing and no client has shown it,
   and a server with it on has needed nothing installed or fetched to provide it. No
   message text has left the tenant's own box to be spoken, and no part of the speech

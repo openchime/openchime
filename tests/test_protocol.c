@@ -1553,19 +1553,33 @@ static void test_tts_frames(void) {
         memset(&in, 0, sizeof in);
         in.available = 1;
         in.model_version = oc_slice_str("kitten-mini-0.8/ttskit-1/rate-1.2");
-        in.count = 2;
+        /* Three voices, with language tags of DIFFERENT lengths: the language
+         * sits inside the repeated voice list, so a field appended in the wrong
+         * place, or read as a fixed width, round-trips the first voice and
+         * mis-aligns every one after it. One voice could not tell the
+         * difference; these can. */
+        in.count = 3;
         in.voices[0].id = oc_slice_str("expr-voice-2-m");
         in.voices[0].label = oc_slice_str("Jasper");
+        in.voices[0].lang = oc_slice_str("en-US");
         in.voices[1].id = oc_slice_str("expr-voice-5-f");
         in.voices[1].label = oc_slice_str("Kiki");
+        in.voices[1].lang = oc_slice_str("zh-Hant-HK");
+        in.voices[2].id = oc_slice_str("expr-voice-3-m");
+        in.voices[2].label = oc_slice_str("Bruno");
+        in.voices[2].lang = oc_slice_str("de");
         in.preview = oc_slice_str("This is how I read your messages.");
         ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
         oc_tts_info out;
         CHECK(oc_decode_tts_info(&p, &out) == OC_OK);
-        CHECK(out.available == 1 && out.count == 2);
+        CHECK(out.available == 1 && out.count == 3);
         CHECK(slice_eq_str(out.model_version, "kitten-mini-0.8/ttskit-1/rate-1.2"));
+        CHECK(slice_eq_str(out.voices[0].lang, "en-US"));
         CHECK(slice_eq_str(out.voices[1].id, "expr-voice-5-f"));
         CHECK(slice_eq_str(out.voices[1].label, "Kiki"));
+        CHECK(slice_eq_str(out.voices[1].lang, "zh-Hant-HK"));
+        CHECK(slice_eq_str(out.voices[2].id, "expr-voice-3-m"));
+        CHECK(slice_eq_str(out.voices[2].lang, "de"));
         CHECK(slice_eq_str(out.preview, "This is how I read your messages."));
     }
     {

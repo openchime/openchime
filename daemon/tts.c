@@ -26,8 +26,8 @@ static void *engine_open(void *ctx, char *err, size_t errcap) {
     kitten_engine *k = calloc(1, sizeof *k);
     if (!k) { snprintf(err, errcap, "out of memory"); return NULL; }
     char why[256] = "";
-    k->pron = tts_load_mem(oc_tts_lexicon, OC_TTS_BLOB_LEN(oc_tts_lexicon), oc_tts_guesses,
-                           OC_TTS_BLOB_LEN(oc_tts_guesses), why, sizeof why);
+    k->pron = tts_load_mem(oc_tts_lexicon_en_us, OC_TTS_BLOB_LEN(oc_tts_lexicon_en_us), oc_tts_guesses_en_us,
+                           OC_TTS_BLOB_LEN(oc_tts_guesses_en_us), OC_TTS_LANG, why, sizeof why);
     if (!k->pron) { snprintf(err, errcap, "pronunciation data: %s", why); free(k); return NULL; }
     k->model = kitten_open(oc_tts_kitten_ort, OC_TTS_BLOB_LEN(oc_tts_kitten_ort), oc_tts_kitten_voices,
                            OC_TTS_BLOB_LEN(oc_tts_kitten_voices), why, sizeof why);
@@ -70,6 +70,7 @@ static const char *engine_voice_label(int voice) {
 
 static const oc_tts_engine KITTEN_ENGINE = {
     .version = OC_TTS_MODEL_VERSION,
+    .lang = OC_TTS_LANG,
     .rate = KITTEN_RATE,
     .voices = KITTEN_VOICES,
     .ctx = NULL,
@@ -81,7 +82,12 @@ static const oc_tts_engine KITTEN_ENGINE = {
     .say = engine_say,
 };
 
-const oc_tts_engine *oc_tts_kitten_engine(void) { return &KITTEN_ENGINE; }
+const oc_tts_engine *oc_tts_engine_for(const char *lang) {
+    /* Asked by name even with one row, so that adding the second is adding a row
+     * rather than finding every caller that assumed there was only ever one. */
+    if (lang && *lang && strcmp(lang, KITTEN_ENGINE.lang) == 0) return &KITTEN_ENGINE;
+    return NULL;
+}
 
 /* ---- --tts-say ------------------------------------------------------------------- */
 

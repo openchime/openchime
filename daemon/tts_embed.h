@@ -11,8 +11,8 @@
 
 extern const unsigned char oc_tts_kitten_ort[], oc_tts_kitten_ort_end[];
 extern const unsigned char oc_tts_kitten_voices[], oc_tts_kitten_voices_end[];
-extern const unsigned char oc_tts_lexicon[], oc_tts_lexicon_end[];
-extern const unsigned char oc_tts_guesses[], oc_tts_guesses_end[];
+extern const unsigned char oc_tts_lexicon_en_us[], oc_tts_lexicon_en_us_end[];
+extern const unsigned char oc_tts_guesses_en_us[], oc_tts_guesses_en_us_end[];
 
 #define OC_TTS_BLOB_LEN(name) ((size_t)(name##_end - name))
 

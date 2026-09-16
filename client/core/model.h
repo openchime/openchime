@@ -18,7 +18,7 @@
 /* One of the daemon's voices (ARCH-111): the id a profile stores, and the name a
  * person picks from. */
 #define OC_VOICE_MAX 16
-typedef struct { char id[32]; char label[32]; } oc_voice;
+typedef struct { char id[32]; char label[32]; char lang[16]; } oc_voice;
 
 /* How many messages may wait to be spoken before the oldest is dropped. A
  * listener who has fallen this far behind a busy channel is not going to catch
@@ -318,7 +318,10 @@ typedef struct {
      * on every reconnect. Without it a frontend shows nothing of the feature. */
     uint8_t  tts_available;
     uint8_t  n_voices;
-    char     tts_model_version[64];
+    /* Wide enough for the whole string. It was 64 while the daemon sent 71
+     * characters, so this silently held a truncated version -- harmless only
+     * because nothing compares it, which is exactly how it would go wrong. */
+    char     tts_model_version[96];
     char     tts_preview[160];        /* the sentence that auditions a voice */
     oc_voice voices[OC_VOICE_MAX];
 

@@ -152,6 +152,12 @@ int oc_config_load(char *err, size_t errcap) {
     c->tts.rate      = env_int("OPENCHIME_TTS_RATE", NULL, 60);
     if (c->tts.rate < 1)    c->tts.rate = 1;
     if (c->tts.rate > 6000) c->tts.rate = 6000;
+    /* Which language this deployment reads in. One is built into the binary, so
+     * the only value it accepts is that one -- the knob exists so the language is
+     * named rather than assumed, and so a daemon carrying two can be told which
+     * to use without a new setting appearing from nowhere. An unknown value is
+     * refused at startup by main.c rather than quietly falling back. */
+    c->tts.lang      = env_or2("OPENCHIME_TTS_LANG", NULL, "en-US");
 
     return 0;
 }

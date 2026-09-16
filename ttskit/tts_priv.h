@@ -15,16 +15,24 @@ typedef struct { const uint8_t *p; size_t n; int owned; } tts_map;
 int  tts_map_open(const char *path, tts_map *m);
 void tts_map_close(tts_map *m);
 
+/* The language a data file is for, as a BCP 47 tag ("en-US", "zh-Hant-HK"), NUL
+ * padded. It is written into the file because the only thing that can pair a
+ * lexicon with the wrong guesser is a person, and a mispaired pair does not fail
+ * -- it pronounces nonsense fluently. 16 bytes takes every tag anyone writes. */
+#define TTS_LANG_MAX    16
+
 /* ---- lexicon.bin ----------------------------------------------------------
- * header (32 bytes)   magic "OCTTSLX1", u32 version, u32 count, u32 pool_size,
- *                     u32 reserved x3
+ * header (48 bytes)   magic "OCTTSLX1", u32 version, u32 count, u32 pool_size,
+ *                     u32 reserved x3, char lang[16]
  * index               count x { u32 word_off, u32 ipa_off }, sorted by word bytes
  * pool                NUL-terminated strings; offsets are from the pool's start
  * All integers little-endian. */
 #define TTS_LEX_MAGIC   "OCTTSLX1"
-#define TTS_LEX_VERSION 1u
+#define TTS_LEX_VERSION 2u
+#define TTS_LEX_HEADER  48u
 
-typedef struct { tts_map map; uint32_t count; const uint8_t *index; const char *pool; uint32_t pool_size; } tts_lexicon;
+typedef struct { tts_map map; uint32_t count; const uint8_t *index; const char *pool; uint32_t pool_size;
+                 char lang[TTS_LANG_MAX]; } tts_lexicon;
 /* `mem`, if not NULL, supplies the bytes instead of mapping `path` (which then only
  * names them in messages). */
 int         tts_lexicon_open(const char *path, const tts_map *mem, tts_lexicon *lx, char *err, size_t errcap);
@@ -32,9 +40,9 @@ void        tts_lexicon_close(tts_lexicon *lx);
 const char *tts_lexicon_find(const tts_lexicon *lx, const char *word);
 
 /* ---- guesses.bin -----------------------------------------------------------
- * header (64 bytes)   magic "OCTTSGS1", u32 version, u32 order, u32 n_tokens,
+ * header (80 bytes)   magic "OCTTSGS1", u32 version, u32 order, u32 n_tokens,
  *                     u32 pool_size, u32 count[8] (entries per order, 1-based
- *                     orders in slots 0..7), u32 reserved x2
+ *                     orders in slots 0..7), u32 reserved x2, char lang[16]
  * tokens              n_tokens x { u32 graph_off, u32 phon_off } — graphemes and
  *                     phonemes as written in the ARPA file with '|' removed and
  *                     "_" as the empty phoneme; token 0 is <s>, 1 is </s>
@@ -42,7 +50,8 @@ const char *tts_lexicon_find(const tts_lexicon *lx, const char *word);
  * per order k=1..N    count[k] x { u16 id[k], f32 logprob, f32 backoff }, sorted
  *                     by the id tuple; logprob and backoff are log10 */
 #define TTS_GS_MAGIC    "OCTTSGS1"
-#define TTS_GS_VERSION  1u
+#define TTS_GS_VERSION  2u
+#define TTS_GS_HEADER   80u
 #define TTS_GS_MAXORDER 8
 
 typedef struct {
@@ -56,6 +65,7 @@ typedef struct {
      * decoder asks "which tokens can start here" once per position. */
     uint16_t       *by_first;
     uint32_t        by_first_start[257];
+    char            lang[TTS_LANG_MAX];
 } tts_guesser;
 int  tts_guesser_open(const char *path, const tts_map *mem, tts_guesser *g, char *err, size_t errcap);
 void tts_guesser_close(tts_guesser *g);

@@ -12,7 +12,13 @@
 /* The model version renders are cached under: the model, the pronunciation data
  * (by the first bytes of each file's SHA-256) and the speaking rate. Change any of
  * them and change this, so old renders are made again rather than mixed in. */
-#define OC_TTS_MODEL_VERSION "kitten-mini-0.8/ttskit-d518a2b6.efd55988/rate-1.2/style-chars/tail-quiet"
+/* The language this daemon speaks, as a BCP 47 tag. One language is built in; the
+ * pronunciation data carries the same tag and is refused if it disagrees, and every
+ * voice is announced with it (ARCH-111). Adding a second language is adding another
+ * engine beside this one, not editing this line. */
+#define OC_TTS_LANG "en-US"
+
+#define OC_TTS_MODEL_VERSION OC_TTS_LANG "/kitten-mini-0.8/ttskit-b1338cd8.51cf60b3/rate-1.2/style-chars/tail-quiet"
 
 /* `openchimed --tts-say VOICE TEXT OUT`: render TEXT with the model in this binary
  * through the same path the daemon's renders take, writing the audio-only MP4 (or,

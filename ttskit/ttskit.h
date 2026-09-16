@@ -23,14 +23,22 @@ typedef struct tts tts;
 
 /* Open the data in `dir` (`lexicon.bin` and `guesses.bin`). NULL on failure;
  * `err` (if given) receives a reason. Either file may be absent: without the
- * lexicon every word is guessed, without the guesser unknown words are spelled. */
-tts *tts_load(const char *dir, char *err, size_t errcap);
+ * lexicon every word is guessed, without the guesser unknown words are spelled.
+ *
+ * `lang` is the BCP 47 tag the caller expects ("en-US"); the files carry their
+ * own, and a pair that disagrees with each other or with `lang` is refused. Pass
+ * NULL to accept whatever the files say, which is for tools, not for a program
+ * that is going to speak the result. */
+tts *tts_load(const char *dir, const char *lang, char *err, size_t errcap);
 /* The same, over the two files' bytes already in memory -- embedded in the
  * program, say. Nothing is copied: the bytes must outlive the handle. Both must be
  * given and valid. */
 tts *tts_load_mem(const void *lexicon, size_t lexicon_len, const void *guesses, size_t guesses_len,
-                  char *err, size_t errcap);
+                  const char *lang, char *err, size_t errcap);
 void tts_free(tts *t);
+
+/* The language the loaded data is for, or "" if nothing was loaded. */
+const char *tts_lang(const tts *t);
 
 /* The pronunciation of one word (letters and apostrophes; case ignored), written
  * to `ipa` (NUL-terminated). Returns 1 from the dictionary, 2 guessed, 3 spelled
@@ -56,9 +64,13 @@ size_t tts_text(tts *t, const char *text, char *ipa, size_t cap);
  * unknown symbol. */
 size_t tts_arpa_to_ipa(const char *arpa, int units, char *out, size_t cap);
 
-/* Pack `lexicon.ipa` ("word<TAB>ipa" lines, any order) into `lexicon.bin`. */
-int tts_pack_lexicon(const char *ipa_path, const char *bin_path, char *err, size_t errcap);
-/* Pack a Phonetisaurus ARPA joint n-gram model into `guesses.bin`. */
-int tts_pack_guesser(const char *arpa_path, const char *bin_path, char *err, size_t errcap);
+/* Pack `lexicon.ipa` ("word<TAB>ipa" lines, any order) into `lexicon.bin`, stamped
+ * with the BCP 47 `lang` it is for. A tag too long for the field is refused, never
+ * truncated: a truncated tag names a different language. */
+int tts_pack_lexicon(const char *ipa_path, const char *bin_path, const char *lang,
+                     char *err, size_t errcap);
+/* Pack a Phonetisaurus ARPA joint n-gram model into `guesses.bin`, likewise. */
+int tts_pack_guesser(const char *arpa_path, const char *bin_path, const char *lang,
+                     char *err, size_t errcap);
 
 #endif

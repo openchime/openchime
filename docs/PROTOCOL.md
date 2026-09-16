@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 12** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 14** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -1401,12 +1401,17 @@ download shape without the upload half, keyed by the **message** id the client
 already has.
 
 **`TTS_INFO` (S → C), `0x00DC`** `{ available: u8, model_version: str,
-count: u8, count × { id: str, label: str }, preview: str }` — sent once to every
+count: u8, count × { id: str, label: str, lang: str }, preview: str }` — sent once
+to every
 client just after `WORKSPACE_INFO`, whatever the answer. `available` 0 (with no
 voices) means this daemon does not read messages aloud, and a client showing
 nothing of the feature is the correct result (REQ-295). `model_version` names the
-model, the pronunciation data and the speaking rate together; `preview` is the
-sentence a client plays to audition a voice. At most 16 voices: a longer list is
+language, the model, the pronunciation data and the speaking rate together;
+`preview` is the sentence a client plays to audition a voice. `lang` is the BCP 47
+language that voice speaks, carried per voice rather than per frame because a
+voice belongs to a language — an English model cannot read German — so a client
+can offer the right voices without a second lookup, and a daemon that grows a
+second language needs no new frame. At most 16 voices: a longer list is
 a malformed frame, not a truncated one.
 
 **`AUDIO_GET` (C → S), `0x00DD`** `{ message_id: u64 }` — "read this message to

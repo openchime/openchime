@@ -136,6 +136,7 @@ whatever these say, and tells its clients so.
 | `OPENCHIME_TTS_QUEUE` | `256` | Renderings that may wait for the worker. A full queue answers `TTS_UNAVAILABLE` rather than growing; clamped to 1–4096. |
 | `OPENCHIME_TTS_IDLE_SECS` | `300` | How long the model stays loaded with nothing to render. It loads on the first request (about a quarter of a second) and is released after this, so an idle tenant holds none of its working memory; clamped to 5–86400. |
 | `OPENCHIME_TTS_RATE` | `60` | `AUDIO_GET`s one connection may make a minute. A listener plays messages one at a time, so this bounds a client asking for a whole history at once; clamped to 1–6000. |
+| `OPENCHIME_TTS_LANG` | `en-US` | The language messages are read in, as a BCP 47 tag. One language is built into the binary, and a value it cannot speak is refused at startup rather than fallen back from — reading every message in a language nobody asked for is worse than not starting. The tag is stamped in the pronunciation data and announced with every voice, so a client knows what it is hearing. |
 
 **What it costs.** Nothing while nobody is listening: measured on one core, an
 idle daemon with read-aloud built in holds 1.7 MB against 1.6 MB without it, and

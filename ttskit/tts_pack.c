@@ -20,8 +20,8 @@
 static int usage(void) {
     fprintf(stderr,
         "usage: tts_pack ipa CMUDICT lexicon.ipa train.lex\n"
-        "       tts_pack lexicon lexicon.ipa lexicon.bin\n"
-        "       tts_pack guesser model.arpa guesses.bin\n"
+        "       tts_pack lexicon lexicon.ipa lexicon.bin LANG\n"
+        "       tts_pack guesser model.arpa guesses.bin LANG\n"
         "       tts_pack word DIR WORD...\n"
         "       tts_pack text DIR TEXT\n");
     return 2;
@@ -62,16 +62,18 @@ int main(int argc, char **argv) {
     char err[512] = "";
     if (argc < 2) return usage();
     if (!strcmp(argv[1], "ipa") && argc == 5) return do_ipa(argv[2], argv[3], argv[4]);
-    if (!strcmp(argv[1], "lexicon") && argc == 4) {
-        if (tts_pack_lexicon(argv[2], argv[3], err, sizeof err)) { fprintf(stderr, "tts_pack: %s\n", err); return 1; }
+    if (!strcmp(argv[1], "lexicon") && argc == 5) {
+        if (tts_pack_lexicon(argv[2], argv[3], argv[4], err, sizeof err)) { fprintf(stderr, "tts_pack: %s\n", err); return 1; }
         return 0;
     }
-    if (!strcmp(argv[1], "guesser") && argc == 4) {
-        if (tts_pack_guesser(argv[2], argv[3], err, sizeof err)) { fprintf(stderr, "tts_pack: %s\n", err); return 1; }
+    if (!strcmp(argv[1], "guesser") && argc == 5) {
+        if (tts_pack_guesser(argv[2], argv[3], argv[4], err, sizeof err)) { fprintf(stderr, "tts_pack: %s\n", err); return 1; }
         return 0;
     }
     if ((!strcmp(argv[1], "word") || !strcmp(argv[1], "text")) && argc >= 4) {
-        tts *t = tts_load(argv[2], err, sizeof err);
+        /* NULL: a tool says whatever the data says, rather than asserting a
+         * language it was not told. */
+        tts *t = tts_load(argv[2], NULL, err, sizeof err);
         if (!t) { fprintf(stderr, "tts_pack: %s\n", err); return 1; }
         char out[4096];
         if (!strcmp(argv[1], "text")) {

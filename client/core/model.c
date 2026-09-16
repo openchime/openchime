@@ -1181,6 +1181,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             oc_voice *v = &m->voices[m->n_voices++];
             snprintf(v->id, sizeof v->id, "%s", e->body ? e->body : "");
             snprintf(v->label, sizeof v->label, "%s", e->topic ? e->topic : "");
+            snprintf(v->lang, sizeof v->lang, "%s", e->preview ? e->preview : "");
         }
         break;
     case OC_EV_LISTEN_AUDIO:

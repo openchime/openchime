@@ -37,6 +37,10 @@ PHONETISAURUS_URL="https://files.pythonhosted.org/packages/f8/dd/8bee1dc1f6944fe
 
 ORDER=6
 
+# The language this data is for. It is stamped into both files, and ttskit
+# refuses a pair whose tags disagree with each other or with the caller.
+LANG_TAG="en-US"
+
 fetch() {
   local url="$1" out="$2" want="$3" got
   if [ ! -f "$out" ]; then
@@ -84,8 +88,8 @@ phonetisaurus-train --lexicon train.lex --seq2_del --ngram_order "${ORDER}" > tr
   || { cat train.log >&2; exit 1; }
 
 # 4. The files ttskit maps.
-"${PACK}" lexicon lexicon.ipa lexicon.bin
-"${PACK}" guesser "train/model.o${ORDER}.arpa" guesses.bin
+"${PACK}" lexicon lexicon.ipa lexicon.bin "${LANG_TAG}"
+"${PACK}" guesser "train/model.o${ORDER}.arpa" guesses.bin "${LANG_TAG}"
 
 # 5. The reference: the same words as the committed reference, decoded by
 #    Phonetisaurus's decoder, phonemes joined the way ttskit writes them.
@@ -98,12 +102,12 @@ sha256sum lexicon.bin guesses.bin
 ls -l lexicon.bin guesses.bin | awk '{ print $5, $NF }'
 
 same=1
-cmp -s lexicon.bin "${ROOT}/ttskit/data/lexicon.bin" || same=0
-cmp -s guesses.bin "${ROOT}/ttskit/data/guesses.bin" || same=0
+cmp -s lexicon.bin "${ROOT}/ttskit/data/en-US/lexicon.bin" || same=0
+cmp -s guesses.bin "${ROOT}/ttskit/data/en-US/guesses.bin" || same=0
 cmp -s ttskit_guess_ref.txt "${ROOT}/tests/data/ttskit_guess_ref.txt" || same=0
 
 if [ "${MODE}" = install ]; then
-  cp lexicon.bin guesses.bin "${ROOT}/ttskit/data/"
+  cp lexicon.bin guesses.bin "${ROOT}/ttskit/data/${LANG_TAG}/"
   cp ttskit_guess_ref.txt "${ROOT}/tests/data/"
   echo "build_ttskit_data: installed. Update the pins in tests/test_ttskit.c and TTSKIT.md §8 to the sums above."
 elif [ "${same}" = 1 ]; then

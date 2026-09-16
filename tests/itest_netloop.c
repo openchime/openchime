@@ -1287,7 +1287,7 @@ static int stub_say(void *e, const char *segment, int voice, float **pcm, size_t
 }
 
 static const oc_tts_engine STUB_TTS = {
-    .version = "itest-stub-1", .rate = 24000, .voices = 2, .ctx = NULL,
+    .version = "itest-stub-1", .lang = "en-US", .rate = 24000, .voices = 2, .ctx = NULL,
     .voice_id = stub_voice_id, .voice_label = stub_voice_label,
     .preview = "A test voice reads this.",
     .open = stub_open, .close = stub_close, .say = stub_say,
@@ -1401,6 +1401,11 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
             CHECK(ti.model_version.len == strlen(STUB_TTS.version));
             CHECK(ti.voices[0].id.len == 12 && memcmp(ti.voices[0].id.ptr, "test-voice-m", 12) == 0);
             CHECK(ti.voices[1].label.len == 9 && memcmp(ti.voices[1].label.ptr, "Test High", 9) == 0);
+            /* Every voice says what it speaks. Asserted because a stub engine
+             * with no language compiles clean and sends empty strings, and
+             * every other assertion here would still pass. */
+            CHECK(ti.voices[0].lang.len == 5 && memcmp(ti.voices[0].lang.ptr, "en-US", 5) == 0);
+            CHECK(ti.voices[1].lang.len == 5 && memcmp(ti.voices[1].lang.ptr, "en-US", 5) == 0);
             saw = 1;
         }
         CHECK(saw);

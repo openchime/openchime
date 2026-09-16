@@ -24,6 +24,12 @@ typedef struct oc_tts_engine {
     /* Names the model, its data and its settings together: a render made by one
      * version is never served as another's (READ-ALOUD.md §5). */
     const char *version;
+    /* The language this engine speaks, as a BCP 47 tag ("en-US"). Every voice it
+     * offers is a voice of this language -- an English model cannot read German
+     * -- so it is announced with each of them, and the pronunciation data it
+     * opens must agree with it. A second language is a second engine, not a
+     * setting on this one. */
+    const char *lang;
     unsigned    rate;       /* samples per second `say` produces: 8, 12, 16, 24 or 48 kHz */
     int         voices;     /* valid voice indexes are 0 .. voices-1 */
     void       *ctx;        /* passed to open */
@@ -34,7 +40,7 @@ typedef struct oc_tts_engine {
      * default voice is chosen for someone who states pronouns. */
     const char *(*voice_id)(int voice);
     const char *(*voice_label)(int voice);
-    const char *preview;
+    const char *preview;      /* in `lang`, since that is what it auditions */
 
     /* Load what synthesis needs; NULL with a reason on failure. */
     void *(*open)(void *ctx, char *err, size_t errcap);
@@ -59,8 +65,10 @@ oc_tts_status oc_tts_render(const oc_tts_engine *e, void *engine, const char *te
                             uint8_t **mp4, size_t *len, uint32_t *duration_ms,
                             char *err, size_t errcap);
 
-/* The Kitten mini engine over the data embedded in openchimed (tts.c); only in a
- * daemon built with read-aloud. */
-const oc_tts_engine *oc_tts_kitten_engine(void);
+/* The engine for `lang`, or NULL if this binary has none built in (tts.c); only in
+ * a daemon built with read-aloud. One language ships today, so this is a lookup
+ * over a table of one -- which is the point: a second language is another row
+ * here, and every caller already asks by name. */
+const oc_tts_engine *oc_tts_engine_for(const char *lang);
 
 #endif

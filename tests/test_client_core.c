@@ -60,7 +60,7 @@ static int core_tts_say(void *e, const char *segment, int voice, float **pcm, si
 }
 
 static const oc_tts_engine CORE_TTS = {
-    .version = "core-stub-1", .rate = 24000, .voices = 2, .ctx = NULL,
+    .version = "core-stub-1", .lang = "en-US", .rate = 24000, .voices = 2, .ctx = NULL,
     .voice_id = core_tts_voice_id, .voice_label = core_tts_voice_label,
     .preview = "This is a test voice.",
     .open = core_tts_open, .close = core_tts_close, .say = core_tts_say,

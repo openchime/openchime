@@ -146,7 +146,9 @@ enum {
     /* Read-aloud (REQ-291-295, ARCH-111). TTS_INFO replaces what the client knows
      * about the daemon's speech: a BEGIN, then one VOICE per voice, as the emoji
      * and settings lists do. body on BEGIN is the model version, topic the
-     * preview sentence; on VOICE, body is the id and topic the label. */
+     * preview sentence; on VOICE, body is the id, topic the label and preview
+     * the BCP 47 language it speaks -- the third slot, borrowed the way
+     * OC_EV_UNFURL borrows its own. */
     OC_EV_TTS_BEGIN,
     OC_EV_TTS_VOICE,
     /* One message's speech has arrived, ready to play: message_id, count=bytes,

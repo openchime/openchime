@@ -20,7 +20,14 @@ static int cmp_entry(const void *a, const void *b) {
     return c ? c : (x->seq < y->seq ? -1 : x->seq > y->seq);
 }
 
-int tts_pack_lexicon(const char *ipa_path, const char *bin_path, char *err, size_t errcap) {
+int tts_pack_lexicon(const char *ipa_path, const char *bin_path, const char *lang,
+                     char *err, size_t errcap) {
+    /* Refused rather than truncated: a tag cut to fit would name a different
+     * language, and the loader would then reject the pair it was built for. */
+    if (!lang || !*lang || strlen(lang) >= TTS_LANG_MAX) {
+        tts_seterr(err, errcap, "a language tag of 1 to %u characters is required", TTS_LANG_MAX - 1);
+        return -1;
+    }
     FILE *in = fopen(ipa_path, "r");
     if (!in) { tts_seterr(err, errcap, "cannot open %s", ipa_path); return -1; }
     entry *e = NULL;
@@ -62,9 +69,13 @@ int tts_pack_lexicon(const char *ipa_path, const char *bin_path, char *err, size
     if (!out) { tts_seterr(err, errcap, "cannot create %s", bin_path); goto out; }
     uint32_t pool = 0;
     for (size_t i = 0; i < n; i++) pool += (uint32_t)(strlen(e[i].word) + 1 + strlen(e[i].ipa) + 1);
+    char tag[TTS_LANG_MAX];
+    memset(tag, 0, sizeof tag);
+    memcpy(tag, lang, strlen(lang));
     fwrite(TTS_LEX_MAGIC, 1, 8, out);
     wr32(out, TTS_LEX_VERSION); wr32(out, (uint32_t)n); wr32(out, pool);
     wr32(out, 0); wr32(out, 0); wr32(out, 0);
+    fwrite(tag, 1, sizeof tag, out);
     uint32_t off = 0;
     for (size_t i = 0; i < n; i++) {
         wr32(out, off);
@@ -90,20 +101,29 @@ int tts_lexicon_open(const char *path, const tts_map *mem, tts_lexicon *lx, char
     if (mem ? (lx->map = *mem, lx->map.owned = 0, !mem->p) : tts_map_open(path, &lx->map) != 0) { tts_seterr(err, errcap, "cannot map %s", path); return -1; }
     const uint8_t *p = lx->map.p;
     size_t n = lx->map.n;
-    if (n < 32 || memcmp(p, TTS_LEX_MAGIC, 8) != 0 || tts_rd32(p + 8) != TTS_LEX_VERSION) {
+    if (n < TTS_LEX_HEADER || memcmp(p, TTS_LEX_MAGIC, 8) != 0 || tts_rd32(p + 8) != TTS_LEX_VERSION) {
         tts_seterr(err, errcap, "%s is not a version %u ttskit lexicon", path, TTS_LEX_VERSION);
         tts_map_close(&lx->map);
         return -1;
     }
     uint32_t count = tts_rd32(p + 12), pool = tts_rd32(p + 16);
-    if ((n - 32) / 8 < count || n - 32 - (size_t)count * 8 != pool || pool == 0 || p[n - 1] != '\0') {
+    if ((n - TTS_LEX_HEADER) / 8 < count || n - TTS_LEX_HEADER - (size_t)count * 8 != pool ||
+        pool == 0 || p[n - 1] != '\0') {
         tts_seterr(err, errcap, "%s is truncated or corrupt", path);
         tts_map_close(&lx->map);
         return -1;
     }
+    /* The tag must be a NUL-terminated string inside its own field, so a file
+     * with 16 non-zero bytes there is corrupt rather than a very long name. */
+    if (memchr(p + 32, '\0', TTS_LANG_MAX) == NULL) {
+        tts_seterr(err, errcap, "%s has an unterminated language tag", path);
+        tts_map_close(&lx->map);
+        return -1;
+    }
+    memcpy(lx->lang, p + 32, TTS_LANG_MAX);
     lx->count = count;
-    lx->index = p + 32;
-    lx->pool = (const char *)p + 32 + (size_t)count * 8;
+    lx->index = p + TTS_LEX_HEADER;
+    lx->pool = (const char *)p + TTS_LEX_HEADER + (size_t)count * 8;
     lx->pool_size = pool;
     return 0;
 }

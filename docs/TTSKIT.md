@@ -39,9 +39,9 @@ rendered speech before ttskit was adopted.
 | Step | What happens | Where | Licence |
 |---|---|---|---|
 | 1 | Markdown, code, links, mentions and emoji turned into plain sentences | `shared/speakable.c` | ours |
-| 2 | Numbers, times, money, ordinals, abbreviations written as words | `ttskit/tts_normalize.c` | ours |
-| 3 | Each word looked up in the dictionary | `ttskit/tts_lexicon.c`, `ttskit/data/lexicon.bin` | ours; data from CMUdict |
-| 4 | Words not in it guessed; short capitals spelled | `ttskit/tts_guess.c`, `ttskit/data/guesses.bin` | ours; model trained on the data above |
+| 2 | Numbers, times, money, ordinals, abbreviations written as words | `ttskit/normalize_en.c` | ours |
+| 3 | Each word looked up in the dictionary | `ttskit/tts_lexicon.c`, `ttskit/data/en-US/lexicon.bin` | ours; data from CMUdict |
+| 4 | Words not in it guessed; short capitals spelled | `ttskit/tts_guess.c`, `ttskit/data/en-US/guesses.bin` | ours; model trained on the data above |
 | 5 | Function words in their unstressed forms, words joined with pause marks | `ttskit/tts_text.c` | ours |
 | 6 | IPA characters mapped to the model's token ids | `daemon/tts_kitten_tokens.c`, Kitten's symbol table | ours; table from Kitten (Apache-2.0) |
 | 7 | Token ids and a voice's style vector to 24 kHz audio | `daemon/tts_kitten.c`, Kitten mini through a minimal static ONNX Runtime | Apache-2.0 / MIT |
@@ -65,7 +65,7 @@ MIGRATION  M AY0 G R EY1 SH AH0 N
 The model wants **IPA**, in the conventions espeak-ng uses for US English: the primary-stress
 mark `ˈ` written immediately before the stressed vowel (not at the syllable start), long
 vowels marked `ː`, `ɹ` for r, `ɡ` (the IPA g), and the flap `ɾ` for the t in "water".
-`tts_arpa_to_ipa` converts one pronunciation; the table is in `ttskit/tts_arpa_ipa.c`.
+`tts_arpa_to_ipa` converts one pronunciation; the table is in `ttskit/arpa_ipa_en.c`.
 
 **Vowels** (stressed / unstressed):
 
@@ -169,7 +169,7 @@ and 256 on the same 3,009 at eighteen times; 32 takes about 1.7 ms a word.
 
 ## 6. The data files
 
-Both files live in `ttskit/data/` and are committed. `openchimed` embeds them in its
+Both files live in `ttskit/data/en-US/` and are committed — a directory per language, so adding one is adding a directory rather than renaming files. `openchimed` embeds them in its
 executable and opens them with `tts_load_mem`; `tts_load` maps them from a directory
 instead (the tests and `tts_pack`). Either way nothing is copied: a lookup is a binary
 search over a sorted table and reads only the pages it passes through; the kernel pages
@@ -179,8 +179,8 @@ opening both costs a few kilobytes of heap (the guesser's token index).
 
 | File | Size | gzipped | Contents |
 |---|---|---|---|
-| `lexicon.bin` | 3.8 MB | 1.2 MB | 126,052 words and their IPA |
-| `guesses.bin` | 16.6 MB | 7.3 MB | the order-6 joint n-gram model |
+| `lexicon.bin` | 3.8 MB | 1.2 MB | 126,052 words and their IPA, tagged `en-US` |
+| `guesses.bin` | 16.6 MB | 7.3 MB | the order-6 joint n-gram model, tagged `en-US` |
 | `CMUDICT-LICENSE` | | | CMUdict's notice, which the derived data carries |
 
 Measured resident memory: a process that only spells is 1.5 MB; looking words up in the
@@ -194,7 +194,8 @@ magic, a different version, or sizes that do not add up to the file's length is 
 **`lexicon.bin`**
 
 ```
-header   32 bytes   "OCTTSLX1"  u32 version=1  u32 count  u32 pool_size  u32 reserved x3
+header   48 bytes   "OCTTSLX1"  u32 version=2  u32 count  u32 pool_size  u32 reserved x3
+                    char lang[16]  the BCP 47 tag this data is for, NUL padded
 index    count x 8  { u32 word_off, u32 ipa_off }  sorted by the word's bytes
 pool     pool_size  NUL-terminated strings; offsets count from the pool's start
 ```
@@ -204,8 +205,9 @@ Words are lower case. When CMUdict lists several pronunciations of a word, the f
 **`guesses.bin`**
 
 ```
-header   64 bytes          "OCTTSGS1"  u32 version=1  u32 order  u32 n_tokens  u32 pool_size
+header   80 bytes          "OCTTSGS1"  u32 version=2  u32 order  u32 n_tokens  u32 pool_size
                            u32 count[8] (n-grams per order, orders 1..8)  u32 reserved x2
+                           char lang[16]  the BCP 47 tag this data is for, NUL padded
 tokens   n_tokens x 8      { u32 graph_off, u32 phon_off }   token 0 is <s>, 1 is </s>
 pool     pool_size         NUL-terminated letters and phonemes of each token
 order k  count[k] x (2k+8) { u16 id[k], f32 log10 prob, f32 log10 backoff }  sorted by id tuple
@@ -220,7 +222,7 @@ separators removed and `_` (no phoneme) as the empty string.
 #include "ttskit.h"
 
 char err[256];
-tts *t = tts_load("ttskit/data", err, sizeof err);
+tts *t = tts_load("ttskit/data/en-US", "en-US", err, sizeof err);
 if (!t) { fprintf(stderr, "ttskit: %s\n", err); return 1; }
 
 char ipa[1024];
@@ -235,8 +237,9 @@ tts_free(t);
 
 | Call | Does |
 |---|---|
-| `tts_load(dir, err, cap)` | maps `dir/lexicon.bin` and `dir/guesses.bin`. A missing file is allowed (without the lexicon every word is guessed, without the guesser unknown words are spelled); a file that is present but damaged fails the load with a reason. |
-| `tts_load_mem(lex, lex_len, guess, guess_len, err, cap)` | the same over the two files' bytes already in memory, such as the copies embedded in the daemon. Nothing is copied, so the bytes must outlive the handle; both must be present and valid. |
+| `tts_load(dir, lang, err, cap)` | maps `dir/lexicon.bin` and `dir/guesses.bin`. A missing file is allowed (without the lexicon every word is guessed, without the guesser unknown words are spelled); a file that is present but damaged fails the load with a reason. `lang` is the BCP 47 tag expected: a pair whose tags disagree with each other or with `lang` is refused, since a lexicon of one language and a guesser of another pronounce fluent nonsense with nothing to show for it. `NULL` accepts whatever the files say, which is for tools. |
+| `tts_load_mem(lex, lex_len, guess, guess_len, lang, err, cap)` | the same over the two files' bytes already in memory, such as the copies embedded in the daemon. Nothing is copied, so the bytes must outlive the handle; both must be present and valid. |
+| `tts_lang(t)` | the language the loaded data is for. |
 | `tts_free(t)` | unmaps (or lets go of lent bytes). |
 | `tts_word(t, word, ipa, cap)` | one word; returns 1 dictionary, 2 guessed, 3 spelled, 0 nothing to say (no letters). |
 | `tts_normalize(text, out, cap)` | §4 only; returns the length written. |
@@ -249,13 +252,13 @@ A `tts` is read-only after loading and can be shared by threads.
 **From the command line,** `make tts_pack` builds a small tool that uses the same code:
 
 ```
-$ build/tts_pack word ttskit/data migration Kubernetes API readme
+$ build/tts_pack word ttskit/data/en-US migration Kubernetes API readme
 migration   maɪɡɹˈeɪʃən        lexicon
 Kubernetes  kjˈuːbɚnˈɛtiːz     guessed
 API         ˈeɪ pˈiː ˈaɪ       spelled
 readme      ɹiːədm             guessed
 
-$ build/tts_pack text ttskit/data "It's 5 o'clock"
+$ build/tts_pack text ttskit/data/en-US "It's 5 o'clock"
 ˈɪts fˈaɪv əklˈɑːk
 ```
 
@@ -284,8 +287,10 @@ SHA-256; it is run from the unpacked wheel, not installed.
 4. `phonetisaurus-train --lexicon train.lex --seq2_del --ngram_order 6` — aligns letters to
    phonemes (`--seq2_del` lets a letter stand for no sound, like the e in "make") and trains the
    joint n-gram model, `train/model.o6.arpa`. This is most of the run time.
-5. `tts_pack lexicon lexicon.ipa lexicon.bin` and
-   `tts_pack guesser train/model.o6.arpa guesses.bin` — pack both (§6).
+5. `tts_pack lexicon lexicon.ipa lexicon.bin en-US` and
+   `tts_pack guesser train/model.o6.arpa guesses.bin en-US` — pack both (§6), stamped with
+   the language they are for. A tag of 16 bytes or more is refused rather than truncated:
+   a truncated tag names a different language.
 6. Decodes the reference words (the first column of `tests/data/ttskit_guess_ref.txt`) with
    Phonetisaurus's own decoder, `phonetisaurus-g2pfst`, to regenerate the reference the C
    decoder is tested against.
@@ -296,14 +301,14 @@ SHA-256; it is run from the unpacked wheel, not installed.
 1 GB, and:
 
 ```
-d518a2b696a4000fc82b47d56f01028b9463c104e65f4495bfc689856d472ee9  lexicon.bin   3,814,014 bytes
-efd55988df04bda24622daee8282c3ec39a8fe8d655d6f64d294cfd22318b757  guesses.bin  16,595,940 bytes
+b1338cd8ae4d22c8b8a808e4c1fa1879579acbd3157556488d9f43ba5b559bf7  lexicon.bin   3,814,030 bytes
+51cf60b34b3f23a12a33bb5d5c4a239f92966e5a92e38ee0a649b2df43e0794e  guesses.bin  16,595,956 bytes
 ```
 
 The build is deterministic: a rerun from a clean `build/ttskit-data` reproduces these bytes.
 
 **Verifying the pins.** `make test` hashes both committed files and compares them with the
-sums above, which are also in `tests/test_ttskit.c`. `sha256sum ttskit/data/*.bin` checks
+sums above, which are also in `tests/test_ttskit.c`. `sha256sum ttskit/data/en-US/*.bin` checks
 by hand.
 
 **After `install`:** update the two sums in `tests/test_ttskit.c` and in this section, run

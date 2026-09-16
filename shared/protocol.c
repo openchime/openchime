@@ -1604,6 +1604,7 @@ oc_result oc_encode_tts_info(oc_wbuf *w, uint16_t version, const oc_tts_info *m)
     for (uint8_t i = 0; i < n; i++) {
         oc_w_str(w, m->voices[i].id);
         oc_w_str(w, m->voices[i].label);
+        oc_w_str(w, m->voices[i].lang);
     }
     oc_w_str(w, m->preview);
     return oc_frame_end(w, off);
@@ -2473,6 +2474,7 @@ oc_result oc_decode_tts_info(oc_rbuf *p, oc_tts_info *m) {
     for (uint8_t i = 0; i < n; i++) {
         m->voices[i].id = oc_r_str(p);
         m->voices[i].label = oc_r_str(p);
+        m->voices[i].lang = oc_r_str(p);
     }
     m->preview = oc_r_str(p);
     return r_done(p);

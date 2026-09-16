@@ -232,12 +232,6 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-#ifdef OC_TTS
-    /* Read-aloud's engine: the voice model built into this binary (ARCH-111).
-     * Whether it is used at all is the operator's, through OPENCHIME_TTS. */
-    oc_netloop_set_tts(oc_tts_kitten_engine());
-#endif
-
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
@@ -254,6 +248,23 @@ int main(int argc, char **argv) {
         return 1;
     }
     const oc_config *cfg = oc_config_get();
+
+#ifdef OC_TTS
+    /* Read-aloud's engine: the voice model built into this binary, chosen by the
+     * language asked for (ARCH-111). Whether it is used at all is the operator's,
+     * through OPENCHIME_TTS. A language this binary cannot speak is refused here
+     * rather than fallen back from: starting anyway would read every message in a
+     * language nobody asked for. Necessarily after the config is loaded. */
+    {
+        const oc_tts_engine *tts_engine = oc_tts_engine_for(cfg->tts.lang);
+        if (!tts_engine && cfg->tts.enabled) {
+            fprintf(stderr, "openchimed: no read-aloud voice for OPENCHIME_TTS_LANG=%s "
+                            "(this binary speaks %s)\n", cfg->tts.lang, OC_TTS_LANG);
+            return 2;
+        }
+        oc_netloop_set_tts(tts_engine);
+    }
+#endif
     const char *db_path = cfg->db_path, *cert_path = cfg->tls_cert, *key_path = cfg->tls_key;
     int health_port = cfg->health_port, proto_port = cfg->proto_port;
     fprintf(stderr, "openchimed: deployment=%s workspace=\"%s\"\n",
