@@ -41,8 +41,6 @@ License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause
 URL:            https://openchime.io
 BuildArch:      %{_target_cpu}
 
-# sqlite-libs is the RHEL-family name for what Debian calls libsqlite3-0.
-Requires:       sqlite-libs
 # Needed only for outbound TLS -- federated enrollment, push, and S3-backed
 # attachments. A stand-alone deployment with local blob storage genuinely runs
 # without it, so this is not a hard requirement.

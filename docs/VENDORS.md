@@ -35,20 +35,36 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages now, the audio client next (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
+| **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 
-**Why the daemon uses system SQLite rather than vendoring it (ARCH-20; no client links SQLite at all, ARCH-88).**
-Packaging the daemon raised the question, since a statically linked SQLite would
-leave the `.deb` and `.rpm` depending on nothing but glibc. It stays dynamic
-deliberately: mbedTLS is already static, so **we** already own TLS CVE response,
-and static-linking SQLite would double that — every SQLite CVE would need an
-OpenChime release and an operator upgrade, where today `apt upgrade` or `dnf
-update` fixes it with no action from us. For software distributed *through* those
-package managers, the distribution's security path is the feature. `libsqlite3-0`
-(Debian) / `sqlite-libs` (RHEL) is present on essentially every system, so the
-dependency costs close to nothing. The counter-argument is real and recorded: the
-control-plane repo had to pin SQLite forward past CVE-2025-6965 — but that was a
-native library bundled into a container, which has no distribution update path,
-which is exactly the situation apt and dnf avoid.
+**Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
+client links SQLite at all, ARCH-88).**
+The amalgamation is committed at `third_party/sqlite-3.53.4/` and built by the
+daemon's own rule, so `ldd openchimed` reports libc, libm and the loader and
+nothing else.
+
+The deciding argument is not the dependency count, it is what the dependency
+carried: linking the host's SQLite meant inheriting whatever that distribution
+compiled, **including whether FTS5 was in it**. `daemon/migrate.c` creates
+`messages_fts` as a virtual table `USING fts5`, so a host whose SQLite lacks the
+module fails at migration time, on a machine the operator controls and we do not.
+Pinning the version turns a deployment risk into a build fact, and the build sets
+`SQLITE_ENABLE_FTS5` explicitly.
+
+What this costs is real and worth stating plainly: **SQLite CVE response is now
+ours.** For an operator who installed the `.deb` or `.rpm`, `apt upgrade` used to
+fix a SQLite flaw with no action from us, and now it takes an OpenChime release.
+That price was already being paid four times over — mbedTLS, libopus, ONNX
+Runtime and libstdc++ are all static — so this makes SQLite the fifth such
+library rather than the first, and it is why watching upstream releases is a
+standing obligation rather than a nicety. The container image and the tarball
+never had a distribution update path to give up.
+
+`SQLITE_THREADSAFE=1` matches the system library's default, so vendoring changed
+no concurrency semantics: three threads hold their own connections (the
+dbwriter's writer and reader, and push). The omissions — extension loading,
+deprecated APIs, shared cache, double-quoted string literals — are all things the
+daemon provably does not use.
 
 **Attribution when shipping binaries.** Building from source never triggered the
 vendored licences' notice requirements; distributing packages does. `openchimed`
@@ -164,7 +180,6 @@ published container image; their versions track the OS, not this repo.
 
 | Package | Purpose | Used by | Link | Source | License |
 |---------|---------|---------|------|--------|---------|
-| **SQLite** (`libsqlite3`) | The daemon's database (ARCH-2). **Not linked by any client** (ARCH-88) | Daemon only | `-lsqlite3` | https://sqlite.org | Public Domain |
 | **glibc `resolv`** (`libresolv`) | DNS **SRV** lookup for workspace resolution (REQ-010) | TUI only (Linux) | `-lresolv` | glibc | LGPL-2.1 (glibc) |
 | **pthreads** | Threads (net thread, queues, dbwriter) | Daemon + client | `-lpthread` | glibc / musl | LGPL-2.1 / MIT |
 | **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
@@ -175,9 +190,9 @@ libsecret via `pkg-config` and compiles the keyring backend, else compiles a stu
 and that machine then persists no credential at all (headless / no D-Bus). They are
 *not* linked into the daemon, the test binary, or `make core`.
 
-- **Local build headers:** `libsqlite3-dev` (Ubuntu) / `sqlite-dev` (Alpine), and
-  `libsecret-1-dev` for the keyring backend.
-- **CI installs:** `libsqlite3-dev` + `bzip2` (for the mbedTLS tarball). CI builds
+- **Local build headers:** `libsecret-1-dev` for the keyring backend. SQLite needs
+  none — it is compiled from the committed amalgamation.
+- **CI installs:** `bzip2` (for the mbedTLS tarball). CI builds
   the **Windows** TUI and GUI (`make windows-tui windows-gui`) but not the Linux
   `make tui` target, so it needs neither libsecret nor libresolv: the mingw build
   reaches DNS through `DnsQuery` and the credential store through Credential
@@ -190,7 +205,7 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | **Alpine Linux** | `3.20` | Build + runtime base of the published image | mixed (base OS) | https://alpinelinux.org |
 
 One image, and it is an **output** rather than a tool: the OCI image published to
-GHCR for the hosted model (ARCH-20/76). Runtime Alpine packages: `sqlite-libs`,
+GHCR for the hosted model (ARCH-20/76). Runtime Alpine packages:
 `ca-certificates`.
 
 The project runs no containers for development or testing (ARCH-36), so this
@@ -277,7 +292,7 @@ paths ship; nothing is fetched at runtime.
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 20 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build, static-linked into the Win32 client (ARCH-110). Client-side only; the daemon links no codec. Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
-| **Public Domain** | SQLite | System-linked, **daemon only** — no client links it (ARCH-88) |
+| **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 

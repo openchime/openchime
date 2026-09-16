@@ -69,12 +69,12 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
-          # libsqlite3-dev for the daemon; bzip2 for the vendored mbedTLS
+          # bzip2 for the vendored mbedTLS
           # tarball that `make test` builds via scripts/build_mbedtls.sh; nasm
           # for libvpx's assembly (scripts/build_libvpx.sh). ffmpeg only for
           # ffprobe, which the media tests run over a recorded file as an
           # independent validator -- nothing links it.
-          sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2 nasm ffmpeg
+          sudo apt-get install -y --no-install-recommends bzip2 nasm ffmpeg
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes) and the converted voice model. Both
       # are pure functions of the files in the key, so a hit skips the build and a
@@ -92,11 +92,12 @@ jobs:
         run: |
           set -euo pipefail
           ./openchimed --tts-say expr-voice-2-f "The build renders speech." /tmp/check.wav
-          # Only the C library, the math library and SQLite may be dynamic: ONNX
-          # Runtime and its C++ runtime are inside the binary.
+          # Only the C runtime may be dynamic. ONNX Runtime, its C++ runtime,
+          # mbedTLS, libopus and SQLite are all inside the binary, so anything
+          # else appearing here is a dependency that crept back in.
           ldd openchimed
-          if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|libsqlite3\.so|ld-linux'; then
-            echo "::error::openchimed has a dynamic dependency beyond libc, libm and SQLite"; exit 1
+          if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
+            echo "::error::openchimed has a dynamic dependency beyond libc and libm"; exit 1
           fi
       # Also a prerequisite of `make test`; named here so a duplicate opcode
       # fails as itself rather than inside the test step.
@@ -132,7 +133,7 @@ jobs:
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
           # bzip2 for the vendored mbedTLS tarball that the e2e client builds.
-          sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
+          sudo apt-get install -y --no-install-recommends bzip2
 
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes) and the converted voice model. Both
@@ -275,7 +276,7 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bzip2 clang libsqlite3-dev nasm
+          sudo apt-get install -y --no-install-recommends bzip2 clang nasm
       - name: Build and test with clang
         run: make CC=clang test
       - name: Compile the app-core with clang

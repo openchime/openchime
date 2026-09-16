@@ -285,8 +285,7 @@ jobs:
             zig: x86_64
             zig_sha: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
           - arch: arm64
-            # Native, not cross-compiled: cross-building would need a
-            # foreign-architecture libsqlite3-dev and would leave the result
+            # Native, not cross-compiled: a cross-built daemon would be left
             # untested on the architecture it targets.
             runner: ubuntu-22.04-arm
             zig: aarch64
@@ -340,9 +339,8 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update -qq
-          # libsqlite3-dev for the daemon's only dynamic dependency; rpm supplies
-          # rpmbuild, which used to come from the Rocky container.
-          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev bzip2 rpm
+          # rpm supplies rpmbuild, which used to come from the Rocky container.
+          sudo apt-get install -y -qq --no-install-recommends bzip2 rpm
 
       # Read-aloud's engine and model (ARCH-111), built with the same toolchain
       # and glibc target as the daemon: ONNX Runtime compiled from source as one

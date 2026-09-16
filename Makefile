@@ -25,7 +25,40 @@ CFLAGS ?= -std=c99 -D_GNU_SOURCE -O2
 # flag that forbids them. `override` is what makes this hold: a plain `+=` still
 # loses to a command-line assignment, which is precisely the case being guarded.
 override CFLAGS += $(WARN_CFLAGS)
-LDFLAGS ?= -lsqlite3 -lpthread
+LDFLAGS ?= -lpthread -lm   # -lm: SQLite FTS5 ranking (bm25) calls log()
+
+# The default goal, stated rather than inherited from whichever rule happens to
+# appear first. Without this, adding a rule above `all:` silently makes that rule
+# what a bare `make` builds -- which is exactly what the SQLite rule below did,
+# leaving a tree with no daemon in it and an exit status of 0.
+.DEFAULT_GOAL := all
+
+# --- SQLite (vendored, third_party/sqlite-3.53.4) -----------------------------
+#
+# The amalgamation, compiled into the daemon rather than linked from the host.
+# The point is not the dependency count: the daemon otherwise inherits whatever
+# SQLite the distro ships, INCLUDING whether FTS5 was compiled into it, and
+# migrate.c creates messages_fts as a virtual table USING fts5. A host without
+# that module fails at migration time, on a machine we do not control. Pinning
+# the version makes it a build fact instead.
+#
+# Its own rule, with its own flags: 9 MB of generated C does not survive
+# -Wall -Wextra -Werror, the same accommodation audio_dev.c makes for miniaudio.
+SQLITE_DIR  := third_party/sqlite-3.53.4
+SQLITE_INC  := -I$(SQLITE_DIR)
+SQLITE_O    := build/sqlite3.o
+# FTS5 is required, not tuning. THREADSAFE=1 is the system library's own default,
+# so vendoring changes no concurrency semantics -- three threads hold their own
+# connections (dbwriter's writer and reader, and push). The omissions are things
+# this daemon provably does not use: no extension loading, no deprecated calls,
+# no shared cache, and no double-quoted string literals in any of its SQL.
+SQLITE_DEFS := -DSQLITE_ENABLE_FTS5 -DSQLITE_THREADSAFE=1 -DHAVE_USLEEP=1 \
+               -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED \
+               -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 \
+               -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_SHARED_CACHE
+
+$(SQLITE_O): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h | build
+	$(CC) $(filter-out $(WARN_CFLAGS),$(CFLAGS)) -w $(SQLITE_DEFS) -c $< -o $@
 
 # Release identity (ARCH-20). The release workflow passes the release number it
 # is about to publish (OC_VERSION=7); a source build leaves it unset and the
@@ -183,8 +216,8 @@ TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynam
 TTS_LIBS  := $(ORT_A) $(OPUS_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS)
-	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(TTS_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
+$(BIN): $(SRC) $(TTS_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(SQLITE_O)
+	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
 
 $(ORT_A): daemon/tts_kitten.ops.config
 	scripts/build_onnxruntime.sh
@@ -222,9 +255,9 @@ test: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) $(MEDIA_INC) $(TTSKIT_INC) -DOC_TTS -Itests -Iclient/gui/win32 \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lsqlite3 -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SQLITE_O) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(TTSKIT_INC) -DOC_TTS -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
