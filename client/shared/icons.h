@@ -29,6 +29,11 @@ enum {
     OC_ICON_PIN,
     OC_ICON_CROWN,
     OC_ICON_SHIELD,
+    OC_ICON_VIDEO,
+    OC_ICON_PLAY,
+    OC_ICON_PAUSE,
+    OC_ICON_VOLUME,
+    OC_ICON_MUTE,
     OC_ICON_COUNT
 };
 

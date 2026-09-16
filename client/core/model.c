@@ -133,18 +133,39 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms) {
 }
 
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
-    if (!m || !m->fetched_data) return NULL;
-    uint8_t *d = m->fetched_data;
-    if (attachment_id) *attachment_id = m->fetched_attachment;
-    if (len) *len = m->fetched_len;
-    m->fetched_data = NULL;
-    m->fetched_len = 0;
-    m->fetched_attachment = 0;
+    if (!m || !m->n_fetched) return NULL;
+    uint8_t *d = m->fetched[0].data;
+    if (attachment_id) *attachment_id = m->fetched[0].id;
+    if (len) *len = m->fetched[0].len;
+    memmove(m->fetched, m->fetched + 1, (m->n_fetched - 1) * sizeof m->fetched[0]);
+    m->n_fetched--;
     return d;
 }
 
+void oc_model_format_duration(uint32_t ms, char *out, size_t cap) {
+    uint32_t s = (ms + 500) / 1000;
+    if (s >= 3600) snprintf(out, cap, "%u:%02u:%02u", s / 3600, (s / 60) % 60, s % 60);
+    else           snprintf(out, cap, "%u:%02u", s / 60, s % 60);
+}
+
+void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!msg) return;
+    if (msg->body && msg->body[0]) { snprintf(out, cap, "%s", msg->body); return; }
+    if (!msg->n_attach) return;
+    const oc_attachment *a = &msg->attach[0];
+    if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
+        char d[16];
+        oc_model_format_duration(a->duration_ms, d, sizeof d);
+        snprintf(out, cap, "\xF0\x9F\x8E\xA5 Video message (%s)", d);
+    } else {
+        snprintf(out, cap, "\xF0\x9F\x93\x8E %s", a->filename);
+    }
+}
+
 void oc_model_free(oc_model *m) {
-    free(m->fetched_data);
+    for (uint8_t i = 0; i < m->n_fetched; i++) free(m->fetched[i].data);
     for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
     free(m->channels);
     free(m->presence);
@@ -684,8 +705,8 @@ static void bump_reply_count(oc_model *m, uint64_t message_id, uint32_t count) {
 
 /* Append an attachment to a message, deduped by id. Frees nothing; the caller
  * owns the source strings (copied in). */
-static void msg_add_attach(oc_msg *msg, uint64_t id, const char *filename,
-                           const char *mime, uint64_t size, uint8_t reclaimed) {
+static void msg_add_attach(oc_msg *msg, const oc_ev *e) {
+    uint64_t id = e->parent_id;
     for (uint8_t i = 0; i < msg->n_attach; i++)
         if (msg->attach[i].id == id) return;   /* dedup (backfill re-delivery) */
     if (msg->n_attach >= OC_MAX_ATTACH) return;
@@ -696,25 +717,36 @@ static void msg_add_attach(oc_msg *msg, uint64_t id, const char *filename,
         msg->attach = na; msg->cap_attach = cap;
     }
     oc_attachment *a = &msg->attach[msg->n_attach++];
-    a->id = id; a->size = size; a->reclaimed = reclaimed;
-    snprintf(a->filename, sizeof a->filename, "%s", filename ? filename : "");
-    snprintf(a->mime, sizeof a->mime, "%s", mime ? mime : "");
+    a->id = id; a->size = e->server_time; a->reclaimed = e->status;
+    snprintf(a->filename, sizeof a->filename, "%s", e->body ? e->body : "");
+    snprintf(a->mime, sizeof a->mime, "%s", e->author_name);
+    a->media_kind = e->media_kind;
+    a->duration_ms = e->duration_ms;
+    a->width = e->media_w; a->height = e->media_h;
+    a->poster_id = e->poster_id;
 }
 
 /* Attach an attachment to the message with `message_id`, searching every channel
  * buffer and the open thread's replies (message ids are globally unique). */
-static void attach_to_msg(oc_model *m, uint64_t message_id, uint64_t id,
-                          const char *filename, const char *mime, uint64_t size,
-                          uint8_t reclaimed) {
+static void attach_to_msg(oc_model *m, const oc_ev *e) {
+    uint64_t message_id = e->message_id;
     for (size_t ci = 0; ci < m->n_channels; ci++)
         for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
             if (m->channels[ci].msgs[i].message_id == message_id) {
-                msg_add_attach(&m->channels[ci].msgs[i], id, filename, mime, size, reclaimed);
+                msg_add_attach(&m->channels[ci].msgs[i], e);
+                /* A message that is only a file previews as the file: without
+                 * this a video message sent with no caption left the sidebar
+                 * row blank (REQ-165). */
+                oc_channel *c = &m->channels[ci];
+                const oc_msg *msg = &c->msgs[i];
+                if ((!msg->body || !msg->body[0]) && msg->n_attach == 1 &&
+                    msg->message_id >= c->high_water && c->preview_author == msg->author_id)
+                    oc_model_msg_preview(msg, c->preview, sizeof c->preview);
                 return;
             }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
         if (m->thread_msgs[i].message_id == message_id) {
-            msg_add_attach(&m->thread_msgs[i], id, filename, mime, size, reclaimed);
+            msg_add_attach(&m->thread_msgs[i], e);
             return;
         }
 }
@@ -1155,6 +1187,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         f->size        = e->size;
         f->created_at  = e->server_time;
         f->reclaimed   = e->reclaimed;
+        f->media_kind  = e->media_kind;
+        f->duration_ms = e->duration_ms;
         snprintf(f->filename, sizeof f->filename, "%s", e->body ? e->body : "");
         snprintf(f->mime, sizeof f->mime, "%s", e->emoji);
         break;
@@ -1694,22 +1728,34 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         set_status(m, "webhook deleted");
         break;
     case OC_EV_ATTACHMENT_DATA:
-        /* Only one in flight; a second replaces the first rather than queueing,
-         * because a frontend asks for what it is about to draw. */
-        free(m->fetched_data);
-        m->fetched_attachment = e->message_id;
-        m->fetched_data = (uint8_t *)e->body;
-        m->fetched_len = e->count;
+        /* Held until a frontend takes it. Full means nobody is taking them, and
+         * then the oldest goes: a frontend asks again for what it still wants. */
+        if (m->n_fetched == sizeof m->fetched / sizeof m->fetched[0]) {
+            free(m->fetched[0].data);
+            memmove(m->fetched, m->fetched + 1, (m->n_fetched - 1) * sizeof m->fetched[0]);
+            m->n_fetched--;
+        }
+        m->fetched[m->n_fetched].id = e->message_id;
+        m->fetched[m->n_fetched].data = (uint8_t *)e->body;
+        m->fetched[m->n_fetched].len = e->count;
+        m->n_fetched++;
         e->body = NULL;                      /* the model owns the bytes now */
         break;
     case OC_EV_ATTACHMENT:
         /* parent_id = attachment id, server_time = size, body = filename,
-         * author_name = mime. Arrives right after its OC_EV_MESSAGE. */
-        attach_to_msg(m, e->message_id, e->parent_id, e->body ? e->body : "",
-                      e->author_name, e->server_time, e->status);
+         * author_name = mime, media_* for a video message. Arrives right after
+         * its OC_EV_MESSAGE. */
+        attach_to_msg(m, e);
         break;
     case OC_EV_XFER:
         if (e->body) set_status(m, e->body);
+        m->xfer_tag = e->xfer_tag;
+        m->xfer_done = e->xfer_done;
+        m->xfer_total = e->xfer_total;
+        m->xfer_phase = e->op;
+        break;
+    case OC_EV_MEDIA_POSTED:
+        m->media_posted_tag = e->xfer_tag;
         break;
     case OC_EV_READ_STATE:
         /* Cached history restored at startup is not "new": mark it read so a

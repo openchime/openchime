@@ -218,6 +218,13 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
             snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s \xe2\x80\x94 no longer available",
                      a->filename[0] ? a->filename : "file");
             acol = TB_BLACK | TB_BOLD;
+        } else if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
+            /* A video message (REQ-165). A terminal plays nothing (ARCH-75): say
+             * what it is and how long, and keep the download. */
+            char d[16];
+            oc_model_format_duration(a->duration_ms, d, sizeof d);
+            snprintf(al, sizeof al, "    [video message %s, open in the desktop client] #%llu",
+                     d, (unsigned long long)a->id);
         } else {
             /* 📎 filename (12.3 KB) #id — download with /download <id> */
             double kb = (double)a->size / 1024.0;

@@ -1388,6 +1388,93 @@ static void test_attachments_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* One small upload in a single chunk; returns the attachment id, or 0. */
+static uint64_t upload_small(client *c, uint8_t *fbuf, uint64_t ch, uint8_t idem_byte,
+                             const char *name, const char *mime, const uint8_t *data, size_t len) {
+    oc_header hdr; oc_rbuf p; oc_wbuf w;
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_begin ub = { ch, {0}, oc_slice_str(name), oc_slice_str(mime), len };
+    memset(ub.idem, idem_byte, OC_IDEM_SIZE);
+    if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) != OC_OK || send_frame(c, fbuf, w.len) != 0) return 0;
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_UPLOAD_READY) return 0;
+    oc_upload_ready urd;
+    if (oc_decode_upload_ready(&p, &urd) != OC_OK) return 0;
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_chunk uc = { urd.attachment_id, 0, { data, len } };
+    if (oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) != OC_OK || send_frame(c, fbuf, w.len) != 0) return 0;
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_UPLOAD_ACK) return 0;
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_end ue = { urd.attachment_id };
+    if (oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) != OC_OK || send_frame(c, fbuf, w.len) != 0) return 0;
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_UPLOAD_OK) return 0;
+    return urd.attachment_id;
+}
+
+/* A video message over the wire (REQ-162/165, ARCH-110): poster and video
+ * upload as ordinary attachments, ATTACH_MEDIA_SET is refused for a bad poster
+ * and accepted for a good one, and the member who receives the SEND sees the
+ * media fields inline and can fetch the poster. */
+static void test_video_message_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+    uint64_t ua = 0; CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
+    uint64_t ub = 0; CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    oc_header hdr; oc_rbuf p; oc_wbuf w;
+    uint8_t *fbuf = malloc(OC_MAX_FRAME_SIZE);
+    CHECK(fbuf != NULL);
+    if (!fbuf) return;
+
+    uint8_t jpeg[600], mp4[4000];
+    for (size_t i = 0; i < sizeof jpeg; i++) jpeg[i] = (uint8_t)(i * 7u);
+    for (size_t i = 0; i < sizeof mp4; i++) mp4[i] = (uint8_t)(i * 13u);
+    uint64_t poster = upload_small(&a, fbuf, OC_DEFAULT_CHANNEL, 0xD1, "poster.jpg", "image/jpeg", jpeg, sizeof jpeg);
+    uint64_t video  = upload_small(&a, fbuf, OC_DEFAULT_CHANNEL, 0xD2, "Video message.mp4", "video/mp4", mp4, sizeof mp4);
+    CHECK(poster && video);
+
+    /* The video named as its own poster: refused with an ordinary ERROR. */
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_attach_media_set ms = { video, OC_MEDIA_VIDEO_MESSAGE, 12345, 1280, 720, video };
+    CHECK(oc_encode_attach_media_set(&w, OC_PROTOCOL_VERSION, &ms) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_MEDIA_INVALID);
+
+    ms.poster_id = poster;
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_attach_media_set(&w, OC_PROTOCOL_VERSION, &ms) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ATTACH_MEDIA_OK);
+    oc_attach_media_ok mo; CHECK(oc_decode_attach_media_ok(&p, &mo) == OC_OK && mo.attachment_id == video);
+
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_send sm = {0};
+    sm.channel_id = OC_DEFAULT_CHANNEL; memset(sm.idem, 0xD3, OC_IDEM_SIZE);
+    sm.body = oc_slice_str("a quick update");
+    sm.n_attach = 1; sm.attach_ids[0] = video;
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    int got = 0;
+    for (int i = 0; i < 8 && !got; i++) {
+        if (read_frame(&b, &hdr, &p) != 0) break;
+        if (hdr.msg_type != OC_MSG_BROADCAST) continue;
+        oc_broadcast bc;
+        CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+        got = 1;
+        CHECK(bc.n_attach == 1 && bc.attach[0].id == video);
+        CHECK(bc.attach[0].media_kind == OC_MEDIA_VIDEO_MESSAGE && bc.attach[0].duration_ms == 12345);
+        CHECK(bc.attach[0].width == 1280 && bc.attach[0].height == 720 && bc.attach[0].poster_id == poster);
+    }
+    CHECK(got);
+    uint8_t back[sizeof jpeg];
+    CHECK(download_attachment(&b, poster, back, sizeof back, NULL) == sizeof jpeg);
+    CHECK(memcmp(back, jpeg, sizeof jpeg) == 0);
+
+    free(fbuf);
+    client_close(&a);
+    client_close(&b);
+}
+
 /* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
  * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
  * /webhook/<token>; the channel member receives the message as a BROADCAST and
@@ -2307,6 +2394,7 @@ int run_netloop_tests(void) {
         test_presence_typing(arg.port, pin);
         test_presence_dnd(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
+        test_video_message_vertical(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);

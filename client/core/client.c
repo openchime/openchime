@@ -9,9 +9,21 @@
 #include "queue.h"
 #include "protocol.h"   /* the OC_NOTIFY_* levels are wire constants */
 
+#include "oc_port.h"    /* oc_localtime_r */
+
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+/* A tag for a transfer that has no attachment id yet. The high bit keeps it
+ * apart from every attachment id, which is what a download's tag is. */
+static uint64_t next_xfer_tag(void) {
+    static uint64_t n;
+    return (1ull << 63) | ++n;   /* the UI thread is the only caller */
+}
+
 
 struct oc_client {
     oc_net  *net;
@@ -765,6 +777,7 @@ void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path
     if (!cmd) return;
     cmd->channel_id = channel_id;
     cmd->op = 1;                       /* purpose: avatar */
+    cmd->xfer_tag = next_xfer_tag();
     cmd->body = strdup(path);
     oc_queue_push(&c->cmds, cmd);
 }
@@ -799,6 +812,7 @@ void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name,
     if (!cmd) return;
     cmd->channel_id = channel_id;
     cmd->op = 2;                       /* purpose: custom emoji */
+    cmd->xfer_tag = next_xfer_tag();
     cmd->body = strdup(path);
     cmd->body2 = strdup(name);         /* claimed with this name when it lands */
     oc_queue_push(&c->cmds, cmd);
@@ -892,6 +906,7 @@ void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
     if (!c || !channel_id || !path || !path[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
     if (!cmd) return;
+    cmd->xfer_tag = next_xfer_tag();
     cmd->channel_id = channel_id;
     cmd->body = strdup(path);
     oc_queue_push(&c->cmds, cmd);
@@ -902,6 +917,7 @@ void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_p
     oc_cmd *cmd = oc_cmd_new(OC_CMD_DOWNLOAD);
     if (!cmd) return;
     cmd->message_id = attachment_id;   /* reused as the attachment id */
+    cmd->xfer_tag = attachment_id;
     cmd->body = strdup(dest_path);
     oc_queue_push(&c->cmds, cmd);
 }
@@ -911,6 +927,64 @@ void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
     if (!cmd) return;
     cmd->message_id = attachment_id;
+    cmd->xfer_tag = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+uint64_t oc_client_post_video(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              uint8_t *video, size_t video_len, uint8_t *poster, size_t poster_len,
+                              uint32_t duration_ms, uint16_t width, uint16_t height,
+                              const char *caption) {
+    oc_cmd *cmd = (c && channel_id && video && video_len && poster && poster_len)
+                ? oc_cmd_new(OC_CMD_POST_VIDEO) : NULL;
+    if (!cmd) { free(video); free(poster); return 0; }
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup(caption ? caption : "");
+    /* A name that says whose and when, unique per recording, so a saved copy
+     * does not overwrite the last one: "<DisplayName>-video-<YYYYMMDDHHMMSS>".
+     * The name keeps letters, digits, '-' and '_'; anything else becomes '-'. */
+    {
+        const char *who = oc_model_user_name(&c->model, c->model.user_id);
+        char safe[64]; size_t k = 0;
+        for (const char *p = who ? who : ""; *p && k + 1 < sizeof safe; p++) {
+            unsigned char ch = (unsigned char)*p;
+            safe[k++] = (isalnum(ch) || ch == '-' || ch == '_') ? (char)ch : '-';
+        }
+        safe[k] = '\0';
+        char stamp[16] = "";
+        time_t now = time(NULL); struct tm lt;
+        if (oc_localtime_r(&now, &lt)) strftime(stamp, sizeof stamp, "%Y%m%d%H%M%S", &lt);
+        char base[96];
+        snprintf(base, sizeof base, "%s-video-%s", safe[0] ? safe : "video-message", stamp);
+        cmd->body2 = strdup(base);             /* the uploads add .mp4 and .jpg */
+    }
+    cmd->blob = video;   cmd->blob_len = video_len;
+    cmd->blob2 = poster; cmd->blob2_len = poster_len;
+    cmd->duration_ms = duration_ms;
+    cmd->media_w = width; cmd->media_h = height;
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
+uint64_t oc_client_fetch_media(oc_client *c, uint64_t attachment_id) {
+    if (!c || !attachment_id) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
+    if (!cmd) return 0;
+    cmd->message_id = attachment_id;
+    cmd->op = 1;                       /* a video: the attachment ceiling, not the inline one */
+    cmd->xfer_tag = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+    return attachment_id;
+}
+
+void oc_client_cancel_transfer(oc_client *c, uint64_t tag) {
+    if (!c || !tag) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CANCEL_TRANSFER);
+    if (!cmd) return;
+    cmd->xfer_tag = tag;
     oc_queue_push(&c->cmds, cmd);
 }
 

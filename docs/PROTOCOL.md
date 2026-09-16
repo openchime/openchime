@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 11** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 12** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -185,7 +185,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 - `MAX_BODY_SIZE` = **65,536 bytes** (64 KiB) for a message body (REQ-054).
   The 1 KiB gap between body and frame limits is framing/field-header
   headroom, reconciling REQ-054's "~64KB body" with ARCH-30's "~64KB frame."
-- `MAX_ATTACHMENT_SIZE` = **100 MiB** (default; `OPENCHIME_MAX_ATTACHMENT_SIZE`
+- `MAX_ATTACHMENT_SIZE` = **200 MiB** (default; `OPENCHIME_MAX_ATTACHMENT_SIZE`
   overridable, REQ-140). A file's *bytes* are never in SQLite (they go to object
   storage, ARCH-17/70), but they **do** transport over this protocol — proxied
   through the daemon, split into chunks (§5.14). Each chunk is an ordinary frame:
@@ -884,6 +884,8 @@ streams **`FILE_ENTRY` (`0x003E`)** newest-first, then **`FILES` (`0x003F`)**
 | `reclaimed`     | u8   | `1` when the bytes are gone (REQ-215/217); the row is kept so the loss is visible, but there is nothing to download. |
 | `filename`      | str  | As uploaded.                                          |
 | `mime`          | str  | Declared type; **type filtering is client-side over this**. |
+| `media_kind`    | u8   | `1` for a video message (§5.14a), else `0` — so the view can list it as video. |
+| `duration_ms`   | u32  | A video message's length; `0` otherwise.              |
 
 **`channel_id` 0 means "every channel I can read"** — the same query with a
 membership filter instead of a channel filter, which is what makes a
@@ -1105,7 +1107,7 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 | `before_id`   | u64  | **Keyset paging cursor** — return only messages with a lower id. `0` for the first page. Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
 | `from_name`   | str  | `from:` — restrict to one author. Empty for no constraint. |
 | `in_channel`  | str  | `in:` — restrict to one channel. Empty for no constraint. |
-| `has_mask`    | u8   | `has:` — bitmask, `0x01` file, `0x02` link, `0x04` image. `0` for no constraint. |
+| `has_mask`    | u8   | `has:` — bitmask, `0x01` file, `0x02` link, `0x04` image, `0x08` video. `0` for no constraint. |
 | `after_ms`    | u64  | `after:` — lower time bound, ms since epoch UTC. `0` for none. |
 | `before_ms`   | u64  | `before:` — upper time bound. `0` for none. |
 
@@ -1268,10 +1270,12 @@ needed** (client and daemon share this codec, so there is no older peer to
 negotiate against). The server links each id that is a finalized, still-unlinked
 attachment the caller uploaded to this same channel (others are ignored, i.e.
 simply not shared) and sets its `message_id`. `BROADCAST` correspondingly carries
-a trailing attachment list of `{ attachment_id, filename, mime, size, reclaimed }`
-— the `reclaimed` field is a `u8`, 1 when the blob has been reclaimed by age or
-storage pressure so the row is a tombstone (REQ-215) and no download id is offered
-— so every
+a trailing attachment list of `{ attachment_id, filename, mime, size, reclaimed,
+media_kind }` — `reclaimed` is a `u8`, 1 when the blob has been reclaimed by age or
+storage pressure so the row is a tombstone (REQ-215) and no download id is offered;
+`media_kind` is a `u8`, `0` for an ordinary file and `1` for a video message, in
+which case `{ duration_ms: u32, width: u16, height: u16, poster_id: u64 }` follow
+(§5.14a); any other kind is a malformed frame — so every
 reader — live or via backfill (§6) — sees the attachment through the one message
 model, with no attachment-specific delivery path. Thread replies work the same
 way: `SEND_REPLY` carries the id list and `THREAD_REPLY` the metadata, live and
@@ -1303,6 +1307,45 @@ uncommitted upload, discards the partial blob. Abandoned uploads that never
 finalize are swept by a time-gated cleanup (ARCH-70).
 
 ---
+
+### 5.14a Video messages (REQ-162–165, ARCH-110)
+
+A video message is an **ordinary attachment** — a VP9 and Opus MP4 recorded in the
+client (docs/VIDEO-MESSAGES.md) — plus a **media row** naming its length, size and
+poster. Posting it is four steps, all on frames that already exist but one:
+
+1. Upload the poster JPEG (`UPLOAD_BEGIN` … `UPLOAD_OK`).
+2. Upload the MP4, `mime` `video/mp4`.
+3. **`ATTACH_MEDIA_SET` (C → S), `0x00DA`** `{ attachment_id: u64, media_kind: u8,
+   duration_ms: u32, width: u16, height: u16, poster_id: u64 }`, answered by
+   **`ATTACH_MEDIA_OK` (S → C), `0x00DB`** `{ attachment_id: u64 }`, or an `ERROR`.
+4. `SEND` (or `SEND_REPLY`) with the video's id in the attachment list. The poster
+   is **not** listed; the media row names it.
+
+The daemon refuses with `UNKNOWN_ATTACHMENT` 3011 when the video is not the
+caller's finalized, unreclaimed upload, `MEDIA_TOO_LARGE` 3022 when it exceeds
+`MAX_VIDEO_MESSAGE_SIZE` (`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`, default 160 MiB and
+never above `MAX_ATTACHMENT_SIZE`), and `MEDIA_INVALID` 3021 when: the kind is not
+`1`; the duration is `0` or over 300 000 ms; either dimension is odd, under 2, or
+over 1920×1080; the video is not `video/mp4` or has already been sent; or the
+poster is not a finalized, unsent `image/jpeg` of at most 1 MiB uploaded by the
+same user **to the same channel**, or is itself a video message. A second
+`ATTACH_MEDIA_SET` before the `SEND` replaces the first.
+
+**The duration is the client's report.** The daemon links no codec and cannot
+measure it; the byte cap is the bound it enforces, and duration and size are
+display facts.
+
+**The poster is readable exactly when the video is**, with no rule of its own:
+download authorization is the read gate on the attachment's channel, and the two
+share a channel by construction. It lives exactly as long as the video too: the
+storage sweep keeps it while its video is sent and unreclaimed, reclaims it with
+the video in the same pass, and collects it as an orphan once the video's message
+is deleted.
+
+The media row then rides every attachment entry — `BROADCAST`, `THREAD_REPLY`,
+backfill, history and `LIST_THREAD` — and `FILE_ENTRY` (§5.9b). Search matches any
+video attachment with `has:video` (§5.11).
 
 ### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
 
@@ -2096,6 +2139,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3018` | `TOO_MANY_PINS`       | channel    | no    | The channel already holds 100 pins (REQ-230, ARCH-90). |
 | `3019` | `CHANNEL_ARCHIVED`    | channel    | no    | The channel is archived and read-only (REQ-035). Returned by `SEND`, `SEND_REPLY` and `UPLOAD_BEGIN`; **not** by the webhook post path. |
 | `3020` | `INVALID_MESSAGE`     | messaging  | no    | Nothing to send — an empty body on a scheduled message (REQ-224). |
+| `3021` | `MEDIA_INVALID`       | attachment | no    | `ATTACH_MEDIA_SET` refused: kind, bounds, type, already sent, or poster (§5.14a). |
+| `3022` | `MEDIA_TOO_LARGE`     | attachment | no    | The video exceeds `MAX_VIDEO_MESSAGE_SIZE` (§5.14a). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -2273,6 +2318,8 @@ this table cannot silently gain a shared value.
 | `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
 | `0x00D8` | `SET_PROFILE` | C → S | my profile fields (REQ-240) |
 | `0x00D9` | `FORWARD` | S → C | what a forwarded message points at (REQ-057); also replayed on backfill |
+| `0x00DA` | `ATTACH_MEDIA_SET` | C → S | mark an upload as a video message, with its poster (REQ-162) |
+| `0x00DB` | `ATTACH_MEDIA_OK` | S → C | accepted |
 
 ## 10. Connection state machine
 

@@ -76,6 +76,26 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   notification settings, admin and storage. This document does not enumerate
   them; read the header. A frontend uses only this facade.
 
+- **Transfers queue** (REQ-140/162). A connection runs one transfer at a time,
+  as the daemon requires, so the net thread keeps a FIFO of transfer commands —
+  uploads, downloads, in-memory fetches and video posts — instead of refusing a
+  second one as busy. Each carries a tag its `OC_EV_XFER` progress (at most ten
+  a second) and completion events repeat, and `oc_client_cancel_transfer` drops a
+  queued one or aborts the running one. A fetch already queued for the same
+  attachment is not queued twice. The queue outlives a connection: the job
+  running when the link drops goes back to the front and starts over.
+- **Video messages** (`client/core/media/`, ARCH-110). The media library —
+  capture, the audio device layer, VP9 and Opus, the restricted MP4 writer and
+  reader, the recorder and the player — is kept out of `CORE_SRC`, so a frontend
+  that records nothing (the TUI) links no codec. `oc_client_post_video` takes the
+  recorder's MP4 and poster (in memory: ARCH-88) and runs one queued job: upload
+  the poster, upload the video, `ATTACH_MEDIA_SET`, then `SEND` or `SEND_REPLY`;
+  `OC_EV_MEDIA_POSTED` says it went. `oc_client_fetch_media` fetches a video into
+  memory under the attachment ceiling rather than the 8 MiB inline one.
+  `oc_model_msg_preview` is the one-line summary of a message — its text, or
+  "🎥 Video message (m:ss)" — for sidebars and notifications. See
+  [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
+
 **Headless-testable.** `tests/test_client_core.c` starts the daemon's netloop
 in-process (like the itest) and drives real `oc_client`s against it — connect +
 auth, channel-list populate, send round-trip, unread + mark-read, history

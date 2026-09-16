@@ -302,6 +302,43 @@ oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m)
     return oc_frame_end(w, off);
 }
 
+/* One attachment entry, as every message frame carries it (REQ-140/165). The
+ * media fields follow only for a video message, so an ordinary file costs one
+ * byte more than it did before video messages. */
+static void w_attach_entry(oc_wbuf *w, const oc_attach_entry *a) {
+    oc_w_u64(w, a->id);
+    oc_w_str(w, a->filename);
+    oc_w_str(w, a->mime);
+    oc_w_u64(w, a->size);
+    oc_w_u8(w, a->reclaimed);
+    oc_w_u8(w, a->media_kind);
+    if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
+        oc_w_u32(w, a->duration_ms);
+        oc_w_u16(w, a->width);
+        oc_w_u16(w, a->height);
+        oc_w_u64(w, a->poster_id);
+    }
+}
+
+static oc_result r_attach_entry(oc_rbuf *p, oc_attach_entry *a) {
+    a->id = oc_r_u64(p);
+    a->filename = oc_r_str(p);
+    a->mime = oc_r_str(p);
+    a->size = oc_r_u64(p);
+    a->reclaimed = oc_r_u8(p);
+    a->media_kind = oc_r_u8(p);
+    a->duration_ms = 0; a->width = a->height = 0; a->poster_id = 0;
+    if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {
+        a->duration_ms = oc_r_u32(p);
+        a->width = oc_r_u16(p);
+        a->height = oc_r_u16(p);
+        a->poster_id = oc_r_u64(p);
+    } else if (a->media_kind != OC_MEDIA_NONE) {
+        return OC_E_MALFORMED;               /* a kind this version does not define */
+    }
+    return OC_OK;
+}
+
 oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *m) {
     OC_CHECK_BODY(m->body);
     size_t off = oc_frame_begin(w, version, OC_MSG_BROADCAST);
@@ -320,11 +357,7 @@ oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *
         uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
         oc_w_u16(w, n);
         for (uint16_t i = 0; i < n; i++) {
-            oc_w_u64(w, m->attach[i].id);
-            oc_w_str(w, m->attach[i].filename);
-            oc_w_str(w, m->attach[i].mime);
-            oc_w_u64(w, m->attach[i].size);
-            oc_w_u8(w, m->attach[i].reclaimed);
+            w_attach_entry(w, &m->attach[i]);
         }
         if (m->author_name.len) oc_w_str(w, m->author_name);
     }
@@ -431,6 +464,23 @@ oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_attach_media_set *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ATTACH_MEDIA_SET);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u8(w, m->media_kind);
+    oc_w_u32(w, m->duration_ms);
+    oc_w_u16(w, m->width);
+    oc_w_u16(w, m->height);
+    oc_w_u64(w, m->poster_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_attach_media_ok(oc_wbuf *w, uint16_t version, const oc_attach_media_ok *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ATTACH_MEDIA_OK);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_FORWARD);
     oc_w_u64(w, m->message_id);
@@ -524,6 +574,8 @@ oc_result oc_encode_file_entry(oc_wbuf *w, uint16_t version, const oc_file_entry
     oc_w_u8(w, m->reclaimed);
     oc_w_str(w, m->filename);
     oc_w_str(w, m->mime);
+    oc_w_u8(w, m->media_kind);
+    oc_w_u32(w, m->duration_ms);
     return oc_frame_end(w, off);
 }
 
@@ -587,11 +639,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
         uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
         oc_w_u16(w, n);
         for (uint16_t i = 0; i < n; i++) {
-            oc_w_u64(w, m->attach[i].id);
-            oc_w_str(w, m->attach[i].filename);
-            oc_w_str(w, m->attach[i].mime);
-            oc_w_u64(w, m->attach[i].size);
-            oc_w_u8(w, m->attach[i].reclaimed);
+            w_attach_entry(w, &m->attach[i]);
         }
     }
     return oc_frame_end(w, off);
@@ -1857,11 +1905,7 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
         uint16_t n = oc_r_u16(p);
         if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
         for (uint16_t i = 0; i < n && !p->underflow; i++) {
-            m->attach[i].id = oc_r_u64(p);
-            m->attach[i].filename = oc_r_str(p);
-            m->attach[i].mime = oc_r_str(p);
-            m->attach[i].size = oc_r_u64(p);
-            m->attach[i].reclaimed = oc_r_u8(p);
+            if (r_attach_entry(p, &m->attach[i]) != OC_OK) return OC_E_MALFORMED;
         }
         m->n_attach = n;
         if (!p->underflow && p->pos < p->len) m->author_name = oc_r_str(p);
@@ -1953,6 +1997,21 @@ oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m) {
     m->url = oc_r_str(p);
     m->title = oc_r_str(p);
     m->descr = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->media_kind    = oc_r_u8(p);
+    m->duration_ms   = oc_r_u32(p);
+    m->width         = oc_r_u16(p);
+    m->height        = oc_r_u16(p);
+    m->poster_id     = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_attach_media_ok(oc_rbuf *p, oc_attach_media_ok *m) {
+    m->attachment_id = oc_r_u64(p);
     return r_done(p);
 }
 
@@ -2048,6 +2107,8 @@ oc_result oc_decode_file_entry(oc_rbuf *p, oc_file_entry *m) {
     m->reclaimed     = oc_r_u8(p);
     m->filename      = oc_r_str(p);
     m->mime          = oc_r_str(p);
+    m->media_kind    = oc_r_u8(p);
+    m->duration_ms   = oc_r_u32(p);
     return r_done(p);
 }
 
@@ -2105,11 +2166,7 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
         uint16_t n = oc_r_u16(p);
         if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
         for (uint16_t i = 0; i < n && !p->underflow; i++) {
-            m->attach[i].id = oc_r_u64(p);
-            m->attach[i].filename = oc_r_str(p);
-            m->attach[i].mime = oc_r_str(p);
-            m->attach[i].size = oc_r_u64(p);
-            m->attach[i].reclaimed = oc_r_u8(p);
+            if (r_attach_entry(p, &m->attach[i]) != OC_OK) return OC_E_MALFORMED;
         }
         m->n_attach = n;
     }

@@ -70,8 +70,11 @@ jobs:
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
           # libsqlite3-dev for the daemon; bzip2 for the vendored mbedTLS
-          # tarball that `make test` builds via scripts/build_mbedtls.sh.
-          sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
+          # tarball that `make test` builds via scripts/build_mbedtls.sh; nasm
+          # for libvpx's assembly (scripts/build_libvpx.sh). ffmpeg only for
+          # ffprobe, which the media tests run over a recorded file as an
+          # independent validator -- nothing links it.
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2 nasm ffmpeg
       - name: Build daemon
         run: make
       # Also a prerequisite of `make test`; named here so a duplicate opcode
@@ -239,7 +242,7 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bzip2 clang libsqlite3-dev
+          sudo apt-get install -y --no-install-recommends bzip2 clang libsqlite3-dev nasm
       - name: Build and test with clang
         run: make CC=clang test
       - name: Compile the app-core with clang
@@ -279,9 +282,12 @@ jobs:
           # Windows branch enables CXX unconditionally (see
           # scripts/build_sdl3_windows.sh). Nothing of ours compiles as C++.
           sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 bzip2 curl
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 bzip2 curl nasm
       - name: Cross-build the vendored Windows mbedTLS
         run: scripts/build_mbedtls_windows.sh
+      # libvpx and libopus for the Win32 client's video messages (ARCH-110).
+      - name: Cross-build the vendored Windows libvpx and libopus
+        run: scripts/build_libvpx.sh windows && scripts/build_opus.sh windows
       # cmake is preinstalled on the hosted runners; SDL's own build is CMake,
       # invoked by the fetch script (VENDORS.md §2).
       - name: Cross-build the vendored Windows SDL3

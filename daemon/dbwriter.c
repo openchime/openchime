@@ -1522,8 +1522,10 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
     *n = 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT id, filename, mime, size, reclaimed_at_ms FROM attachments "
-        "WHERE message_id=? ORDER BY id LIMIT ?;", -1, &st, NULL);
+        "SELECT a.id, a.filename, a.mime, a.size, a.reclaimed_at_ms, "
+        "       m.kind, m.duration_ms, m.width, m.height, m.poster_id "
+        "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
+        " WHERE a.message_id=? ORDER BY a.id LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
     sqlite3_bind_int(st, 2, (int)OC_MAX_ATTACH);
     while (sqlite3_step(st) == SQLITE_ROW && *n < OC_MAX_ATTACH) {
@@ -1537,6 +1539,12 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
          * longer available" in place rather than offering a download that is
          * guaranteed to fail (REQ-215/217). */
         a->reclaimed = sqlite3_column_int64(st, 4) != 0 ? 1 : 0;
+        /* A video message's media row (REQ-165); NULLs for an ordinary file. */
+        a->media_kind  = (uint8_t)sqlite3_column_int(st, 5);
+        a->duration_ms = (uint32_t)sqlite3_column_int64(st, 6);
+        a->width       = (uint16_t)sqlite3_column_int(st, 7);
+        a->height      = (uint16_t)sqlite3_column_int(st, 8);
+        a->poster_id   = (uint64_t)sqlite3_column_int64(st, 9);
     }
     sqlite3_finalize(st);
 }
@@ -3042,13 +3050,13 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
      * by membership instead, which is the same set a backfill would show. */
     const char *sql = j->channel_id
         ? "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
-          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime "
-          "  FROM attachments a "
+          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
+          "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
           " ORDER BY a.created_at_ms DESC LIMIT ?2;"
         : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
-          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime "
-          "  FROM attachments a "
+          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
+          "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
           "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
           " ORDER BY a.created_at_ms DESC LIMIT ?2;";
@@ -3070,6 +3078,8 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
         const unsigned char *mt = sqlite3_column_text(st, 8);
         arr[n].filename = strdup(fn ? (const char *)fn : "");
         arr[n].mime     = strdup(mt ? (const char *)mt : "");
+        arr[n].media_kind  = (uint8_t)sqlite3_column_int(st, 9);
+        arr[n].duration_ms = (uint32_t)sqlite3_column_int64(st, 10);
         n++;
     }
     sqlite3_finalize(st);
@@ -3812,6 +3822,10 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         k += snprintf(sql + k, sizeof sql - (size_t)k,
                       " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id "
                       "            AND a.mime LIKE 'image/%%') ");
+    if (j->sq_has & 0x08u)   /* video: by type, so an uploaded .mp4 counts as well as a recorded message */
+        k += snprintf(sql + k, sizeof sql - (size_t)k,
+                      " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id "
+                      "            AND a.mime LIKE 'video/%%') ");
     if (j->sq_has & 0x02u)   /* link: cheap and honest — a substring, not a parser */
         /* CAST, because a message body is stored as a BLOB (sqlite3_bind_blob in
          * process_send: the bytes are UTF-8 and we never let SQLite reinterpret
@@ -4389,6 +4403,92 @@ static oc_dbres *process_attach_finalize(sqlite3 *db, const oc_job *j) {
 
     r->type = OC_RES_ATTACH_OK;
     r->att_size = declared;
+    return r;
+}
+
+/* ATTACH_MEDIA_SET marks a finalized upload as a video message (REQ-162/164,
+ * ARCH-110) and names its poster. Everything checkable is checked here; what is
+ * not — whether the bytes really are a VP9 and Opus MP4 of that length — the
+ * daemon cannot know without a codec it deliberately does not link, so those are
+ * stored as the client's report and the byte cap is the enforced bound.
+ *
+ * The poster must be the same person's upload to the same channel. That is what
+ * makes it readable exactly when its video is: download authorization is the
+ * channel read gate on the attachment's own channel (process_attach_lookup), and
+ * the two share a channel by construction, so no exception to that gate is
+ * needed. Write. */
+static oc_dbres *process_attach_media_set(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->attachment_id = j->attachment_id;
+    r->type = OC_RES_MEDIA_ERR;
+
+    if (j->media_kind != OC_MEDIA_VIDEO_MESSAGE ||
+        j->media_duration_ms == 0 || j->media_duration_ms > OC_MEDIA_MAX_DURATION_MS ||
+        j->media_width < 2 || j->media_width > OC_MEDIA_MAX_WIDTH || (j->media_width & 1) ||
+        j->media_height < 2 || j->media_height > OC_MEDIA_MAX_HEIGHT || (j->media_height & 1) ||
+        j->media_poster_id == 0 || j->media_poster_id == j->attachment_id) {
+        r->err_code = OC_ERR_MEDIA_INVALID;
+        return r;
+    }
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id, uploader_id, message_id, sha256 IS NOT NULL, reclaimed_at_ms, mime, size "
+        "  FROM attachments WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    uint64_t vch = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    uint64_t vup = found ? (uint64_t)sqlite3_column_int64(st, 1) : 0;
+    int linked   = found && sqlite3_column_type(st, 2) != SQLITE_NULL;
+    int final    = found && sqlite3_column_int(st, 3);
+    int gone     = found && sqlite3_column_int64(st, 4) != 0;
+    const unsigned char *vm = found ? sqlite3_column_text(st, 5) : NULL;
+    int is_mp4   = vm && strcmp((const char *)vm, "video/mp4") == 0;
+    uint64_t vsz = found ? (uint64_t)sqlite3_column_int64(st, 6) : 0;
+    sqlite3_finalize(st);
+    /* Not the caller's, not there, or not finished: indistinguishable on
+     * purpose, as for every other attachment operation. */
+    if (!found || vup != j->user_id || !final || gone) { r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r; }
+    /* Once linked the message is out; its media facts are not rewritten after. */
+    if (linked || !is_mp4) { r->err_code = OC_ERR_MEDIA_INVALID; return r; }
+    if (vsz > j->att_size)  { r->err_code = OC_ERR_MEDIA_TOO_LARGE; return r; }
+
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id, uploader_id, message_id, sha256 IS NOT NULL, reclaimed_at_ms, mime, size, "
+        "       EXISTS(SELECT 1 FROM attachment_media WHERE attachment_id=?1) "
+        "  FROM attachments WHERE id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->media_poster_id);
+    found = sqlite3_step(st) == SQLITE_ROW;
+    int poster_ok = found &&
+        (uint64_t)sqlite3_column_int64(st, 0) == vch &&
+        (uint64_t)sqlite3_column_int64(st, 1) == j->user_id &&
+        sqlite3_column_type(st, 2) == SQLITE_NULL &&           /* a poster is never a message's file */
+        sqlite3_column_int(st, 3) &&
+        sqlite3_column_int64(st, 4) == 0 &&
+        sqlite3_column_text(st, 5) && strcmp((const char *)sqlite3_column_text(st, 5), "image/jpeg") == 0 &&
+        (uint64_t)sqlite3_column_int64(st, 6) <= OC_MEDIA_MAX_POSTER_SIZE &&
+        sqlite3_column_int(st, 7) == 0;                        /* a video cannot be another's poster */
+    sqlite3_finalize(st);
+    if (!poster_ok) { r->err_code = OC_ERR_MEDIA_INVALID; return r; }
+
+    sqlite3_prepare_v2(db,
+        "INSERT INTO attachment_media(attachment_id, kind, duration_ms, width, height, poster_id, created_at_ms) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) "
+        "ON CONFLICT(attachment_id) DO UPDATE SET kind=?2, duration_ms=?3, width=?4, height=?5, "
+        "  poster_id=?6;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    sqlite3_bind_int  (st, 2, (int)j->media_kind);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->media_duration_ms);
+    sqlite3_bind_int  (st, 4, (int)j->media_width);
+    sqlite3_bind_int  (st, 5, (int)j->media_height);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)j->media_poster_id);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_MEDIA_OK;
     return r;
 }
 
@@ -6242,6 +6342,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_STORE_ENROLLMENT) return process_store_enrollment(w->db, j);
     if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
+    if (j->type == OC_JOB_ATTACH_MEDIA_SET) return process_attach_media_set(w->db, j);
     if (j->type == OC_JOB_CREATE_WEBHOOK)  return process_create_webhook(w->db, j);
     if (j->type == OC_JOB_REVOKE_INVITE)     return process_revoke_invite(w->db, j);
     if (j->type == OC_JOB_SET_WEBHOOK_STATE) return process_set_webhook_state(w->db, j);
@@ -6431,6 +6532,23 @@ static int reclaim_add(sqlite3 *db, oc_dbres *r, size_t cap,
     return 1;
 }
 
+/* A video just reclaimed takes its poster with it, for the same reason and in
+ * the same pass (REQ-164). A full batch leaves the poster for the orphan tier
+ * of the next pass, which collects it because its video is no longer live. */
+static void reclaim_poster_of(sqlite3 *db, oc_dbres *r, size_t cap, uint64_t video_id,
+                              uint64_t now, int reason) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT a.id, a.storage_key FROM attachment_media m "
+            "  JOIN attachments a ON a.id = m.poster_id "
+            " WHERE m.attachment_id=?1 AND a.reclaimed_at_ms = 0;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)video_id);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
+                    (const char *)sqlite3_column_text(st, 1), now, reason);
+    sqlite3_finalize(st);
+}
+
 /* Run one maintenance pass. Three tiers in order, stopping at the batch cap so a
  * badly over-limit box recovers across several passes instead of stalling the
  * daemon in one long sweep (REQ-212/218). */
@@ -6466,6 +6584,15 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
             "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
             "                  WHERE avatar_attachment_id IS NOT NULL) "
             "  AND id NOT IN (SELECT attachment_id FROM custom_emoji) "
+            /* A video message's POSTER is the same case again, with a lifetime
+             * that ends: it is in use for exactly as long as its video is linked
+             * and not reclaimed. Once the video goes — deleted with its message,
+             * never sent, or reclaimed by the tiers below — the poster is an
+             * orphan like any other and this tier collects it. */
+            "  AND id NOT IN (SELECT m.poster_id FROM attachment_media m "
+            "                   JOIN attachments v ON v.id = m.attachment_id "
+            "                  WHERE m.poster_id IS NOT NULL "
+            "                    AND v.message_id IS NOT NULL AND v.reclaimed_at_ms = 0) "
             "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
         uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
         sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
@@ -6490,14 +6617,20 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
                 /* A custom emoji is in use for the same non-obvious reason an avatar
                  * is: no message references it, so it looks like an orphan. */
                 "  AND id NOT IN (SELECT attachment_id FROM custom_emoji) "
+                /* Posters are never chosen on their own account: one goes with
+                 * its video (reclaim_poster_of), so a video is never left
+                 * showing a blank still. */
+                "  AND id NOT IN (SELECT poster_id FROM attachment_media WHERE poster_id IS NOT NULL) "
                 "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
             uint64_t cutoff = (now > j->maint_max_age_ms) ? now - j->maint_max_age_ms : 0;
             sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
             sqlite3_bind_int64(st, 2, (sqlite3_int64)(cap - r->n_reclaim));
             while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
                 if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
-                                (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_EXPIRED))
+                                (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_EXPIRED)) {
                     r->maint_expired++;
+                    reclaim_poster_of(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0), now, OC_RECLAIM_EXPIRED);
+                }
             }
             sqlite3_finalize(st);
         }
@@ -6519,14 +6652,20 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
                 /* A custom emoji is in use for the same non-obvious reason an avatar
                  * is: no message references it, so it looks like an orphan. */
                 "  AND id NOT IN (SELECT attachment_id FROM custom_emoji) "
+                /* Posters are never chosen on their own account: one goes with
+                 * its video (reclaim_poster_of), so a video is never left
+                 * showing a blank still. */
+                "  AND id NOT IN (SELECT poster_id FROM attachment_media WHERE poster_id IS NOT NULL) "
                 "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
             uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
             sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
             sqlite3_bind_int64(st, 2, (sqlite3_int64)(cap - r->n_reclaim));
             while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
                 if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
-                                (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_EVICTED))
+                                (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_EVICTED)) {
                     r->maint_evicted++;
+                    reclaim_poster_of(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0), now, OC_RECLAIM_EVICTED);
+                }
             }
             sqlite3_finalize(st);
         }

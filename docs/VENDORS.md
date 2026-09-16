@@ -33,6 +33,8 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
+| **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages now, the audio client next (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
+| **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
 
 **Why the daemon uses system SQLite rather than vendoring it (ARCH-20; no client links SQLite at all, ARCH-88).**
 Packaging the daemon raised the question, since a statically linked SQLite would
@@ -66,11 +68,15 @@ raw `tb_*` grid calls — so the toolbox is the shared layer rather than an
 exclusive one.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
-utf8proc/utf8proc_data.c, jsmn/jsmn.h}`, and **each carries its licence file**:
-termbox2's `LICENSE`, utf8proc's `LICENSE.md`, and jsmn's `LICENSE` (extracted
-verbatim from the notice in `jsmn.h`, which is where upstream keeps it). `.gitignore` ignores
-`third_party/*` and whitelists **four** paths: `jsmn/`, `termbox2/`,
-`utf8proc/` and `lucide/` (committed, see below). Everything else under
+utf8proc/utf8proc_data.c, jsmn/jsmn.h, miniaudio/miniaudio.h,
+stb/stb_image_write.h, stb/stb_image.h}`, and **each carries its licence file**:
+termbox2's `LICENSE`, utf8proc's `LICENSE.md`, jsmn's `LICENSE` (extracted
+verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
+`LICENSE` of miniaudio and of stb (each extracted from the notice at the foot of
+its header). miniaudio's implementation is compiled in exactly one translation
+unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
+`third_party/*` and whitelists **six** paths: `jsmn/`, `termbox2/`, `utf8proc/`,
+`miniaudio/`, `stb/` and `lucide/` (committed, see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
 ## 2. Fetched at build time — `scripts/build_*.sh` (gitignored output)
@@ -79,6 +85,8 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it). `.gitig
 |---------|---------|---------|---------|--------|---------|
 | **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), TOFU cert handling, SHA-256/PBKDF2, ES256 verify | Daemon + client (`shared/tls.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
+| **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) now, screenshare (ARCH-87) next | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
+| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) now, the audio client (ARCH-73) next | https://opus-codec.org | BSD-3-Clause |
 
 Fetched + built by `scripts/build_mbedtls.sh` from the official GitHub release
 tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
@@ -105,6 +113,19 @@ genuinely large dependency in the tree, which is exactly why it sits in this
 class and not the committed-single-file one (the reasoning §7 recorded for
 libvpx, now applied). zlib-licensed: no notice needs to travel with a shipped
 binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
+
+**libvpx and libopus** are the codecs (ARCH-110), fetched the same way:
+`scripts/build_libvpx.sh` and `scripts/build_opus.sh`, each taking `native` (the
+Linux build `make test` links) or `windows` (cross-built with mingw for the Win32
+client), each refusing an unverified tarball and an unpinned bump exactly as above.
+Both build **static-only**. libvpx is configured VP9-only and real-time-only, with
+no examples, tools, docs or unit tests, and needs **nasm** for its assembly; its
+mingw build threads through winpthreads, which the Win32 link therefore pulls in
+statically. Output goes to `third_party/libvpx-1.17.0[-win]/` and
+`third_party/opus-1.6.1[-win]/` (gitignored). **The daemon links neither** — it
+relays Opus without decoding it (ARCH-73) and stores a video message as opaque
+bytes (ARCH-110). Both are BSD-3-Clause, whose binary-redistribution clause wants
+the notice carried with a shipped client.
 
 ## 3. System / OS packages (linked at build)
 
@@ -174,36 +195,24 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 |------|---------|------|---------|
 | `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile (mingw); used by `make windows-tui` and `make windows-gui` | Apache-2.0 |
 | `scripts/build_sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (mingw, static, CMake invoked by the script); used by `make windows-gfx-test` | zlib |
+| `scripts/build_libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (mingw, static, nasm); used by `make windows-gui` | BSD-3-Clause |
+| `scripts/build_opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (mingw, static); used by `make windows-gui` | BSD-3-Clause |
+| Media Foundation (`mfplat`, `mfreadwrite`, `mf`, `mfuuid`) | OS | Camera capture for video messages (`client/core/media/cap_mf.c`) | Windows system libraries |
 
 ## 7. Planned — not yet a dependency
 
-- **libopus** — Opus encode/decode for the **audio client** (REQ-150/151).
-  BSD-3-Clause. Not yet linked; the server-relayed audio path carries opaque
-  Opus payloads and does not link libopus (ARCH-73). Client-side only.
-- **miniaudio** — planned single-header device I/O (capture + playback) for the
-  audio client, wrapping ALSA/PulseAudio/PipeWire/CoreAudio/WASAPI.
-  MIT-0/public-domain, vendored like termbox2/utf8proc/jsmn (ARCH-75). Chosen
-  for its **duplex** mode, which AUDIO.md §2 requires so capture and playback
-  share one clock. Not yet vendored.
 - **speexdsp** — planned acoustic echo canceller (`speex_echo_state`) for the
   audio client, BSD-3-Clause, behind the processor vtable in AUDIO.md §3.3 so it
   is swappable. Not yet vendored. See AUDIO.md §6.2 for why it is preferred over
   WebRTC AEC3 as a first implementation despite being the weaker canceller.
-- **libvpx** — planned **VP9** encode/decode for **screenshare** (REQ-161,
-  ARCH-87), **BSD-3-Clause**, with screen-content tuning
-  (`VP9E_SET_TUNE_CONTENT`). Not yet fetched. It belongs in the **fetched at
-  build** class (§2) beside mbedTLS, *not* the committed-single-file class — it is
-  the **first genuinely large dependency** in the tree and does not fit the
-  jsmn/termbox2/utf8proc pattern. **Licence note:** BSD-3-Clause is not on the
-  §"License summary" list today because nothing has needed it; it is squarely
-  within this repo's *permissive* rule (mbedTLS is already Apache-2.0, not MIT),
-  so this is a policy addition rather than an exception. **Patent note:** the
-  reason it is preferred to the alternatives is as much patent as copyright —
-  **openh264** is BSD-licensed but Cisco's royalty arrangement covers only the
-  binaries *Cisco itself distributes*, so building from source leaves us exposed;
-  **x264/x265** are GPL; **AV1** (SVT-AV1 + dav1d, BSD) is the designated
-  successor once realtime software encode is cheaper. Client-side only — the
-  daemon links no video codec, exactly as it links no libopus (ARCH-73/86).
+- **libvpx for screenshare** — the same library §2 fetches for video messages,
+  additionally configured with screen-content tuning (`VP9E_SET_TUNE_CONTENT`)
+  when screenshare (REQ-161, ARCH-87) is built. **Patent note:** it is preferred
+  to the alternatives as much for patents as for copyright — **openh264** is
+  BSD-licensed but Cisco's royalty arrangement covers only the binaries *Cisco
+  itself distributes*, so building from source leaves us exposed; **x264/x265**
+  are GPL; **AV1** (SVT-AV1 + dav1d, BSD) is the designated successor once
+  real-time software encode is cheaper.
 
 ---
 
@@ -211,7 +220,7 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 Most of the graphical clients' icons come from [Lucide](https://lucide.dev)
 (ISC License). We vendor **only the handful of SVGs we use**
-(`third_party/lucide/icons/*.svg` — 15 of them) plus the license
+(`third_party/lucide/icons/*.svg` — 20 of them) plus the license
 (`third_party/lucide/LICENSE`).
 
 **Four icons are ours, not Lucide's**, and live outside `third_party/` for exactly
@@ -233,9 +242,11 @@ paths ship; nothing is fetched at runtime.
 | License | Packages | Notes |
 |---------|----------|-------|
 | **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
-| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 15 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
+| **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
+| **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
+| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 20 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
-| **BSD-3-Clause** | libvpx (VP9) — **planned, not yet fetched** | Screenshare codec (REQ-161, ARCH-87). Client-side only; the daemon links no codec. Permissive, within this repo's posture — see §7 |
+| **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build, static-linked into the Win32 client (ARCH-110). Client-side only; the daemon links no codec. Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **Public Domain** | SQLite | System-linked, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |

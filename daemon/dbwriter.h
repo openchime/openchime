@@ -167,7 +167,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_TZ_OFFSET = 95,
        /* Store a completed link unfurl (REQ-222, ARCH-105). Submitted by the
         * unfurl worker with conn_id 0 — never by a client frame. */
-       OC_JOB_UNFURL_STORE = 96 };
+       OC_JOB_UNFURL_STORE = 96,
+       /* Mark a finalized upload as a video message (REQ-162/164, ARCH-110).
+        * attachment_id + media_* below; att_size carries the byte cap. Write. */
+       OC_JOB_ATTACH_MEDIA_SET = 97 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -313,6 +316,11 @@ typedef struct oc_job {
     char          *filename;   /* heap */
     char          *mime;       /* heap */
     uint8_t        att_sha256[32];
+    /* ATTACH_MEDIA_SET (REQ-162): the client-measured facts and the poster. */
+    uint8_t        media_kind;
+    uint32_t       media_duration_ms;
+    uint16_t       media_width, media_height;
+    uint64_t       media_poster_id;
 
     /* Synced client settings. SET uses client_type + key + value (empty value
      * deletes); LIST uses client_type only. */
@@ -417,7 +425,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_THREAD_LIST = 86, OC_RES_THREAD_ONE = 87,
        /* A stored link unfurl to fan out (REQ-222): message/channel ids,
         * unf_* strings, and `members` for the recipients. */
-       OC_RES_UNFURL_STORED = 88 };
+       OC_RES_UNFURL_STORED = 88,
+       /* ATTACH_MEDIA_SET accepted (attachment_id), or refused (err_code). */
+       OC_RES_MEDIA_OK = 89, OC_RES_MEDIA_ERR = 90 };
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */
@@ -459,6 +469,8 @@ typedef struct {
     uint64_t id, channel_id, message_id, uploader_id, size, created_at;
     uint8_t  reclaimed;
     char    *filename, *mime;   /* heap */
+    uint8_t  media_kind;        /* OC_MEDIA_* (REQ-165) */
+    uint32_t duration_ms;
 } oc_file_row;
 
 /* One row in a PINS result. The body travels with it because a pinned message
@@ -581,6 +593,11 @@ typedef struct {
     char    *mime;       /* heap */
     uint64_t size;
     uint8_t  reclaimed;  /* bytes removed by age or pressure; row is a tombstone */
+    /* A video message's media row (REQ-165), else media_kind 0. */
+    uint8_t  media_kind;
+    uint32_t duration_ms;
+    uint16_t width, height;
+    uint64_t poster_id;
 } oc_attach_meta;
 
 typedef struct {

@@ -333,6 +333,10 @@ oc_tls_status oc_tls_read(oc_tls_conn *c, void *buf, size_t len, size_t *n) {
     return status_of(rc);
 }
 
+size_t oc_tls_pending(const oc_tls_conn *c) {
+    return mbedtls_ssl_get_bytes_avail(&c->ssl);
+}
+
 oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *n) {
     int rc = mbedtls_ssl_write(&c->ssl, (const unsigned char *)buf, len);
     if (rc >= 0) { *n = (size_t)rc; return OC_TLS_OK; }

@@ -25,7 +25,7 @@ drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
 replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile;
-**0040** (§3ae) what a forward points at.
+**0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1026,6 +1026,36 @@ name.* That is what a card can show — five filenames is a wall, "report.txt an
 them and the card itself opens the original. Copying would mean either a second
 row sharing a `storage_key`, which breaks the orphan model reclamation counts on
 (ARCH-77/78), or duplicating the bytes.
+
+## 3af. Migration 0041 — a video message's media row (REQ-162/164, ARCH-110)
+
+```sql
+CREATE TABLE attachment_media (
+  attachment_id INTEGER PRIMARY KEY REFERENCES attachments(id),
+  kind          INTEGER NOT NULL,
+  duration_ms   INTEGER NOT NULL,
+  width         INTEGER NOT NULL,
+  height        INTEGER NOT NULL,
+  poster_id     INTEGER REFERENCES attachments(id),
+  created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX attachment_media_poster ON attachment_media(poster_id);
+```
+
+*A side table keyed on the attachment*, as `forwards` (§3ae) is on the message:
+almost no attachment is a video message, and columns on `attachments` would be
+paid for on every row to serve a rare one. Written by `ATTACH_MEDIA_SET` before
+the video is sent, and fixed once it is.
+
+*`duration_ms`, `width` and `height` are the client's measurements.* The daemon
+links no codec and cannot check them; they are display facts, and the byte cap
+(`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`) is what bounds a video message.
+
+*`poster_id` is an attachment of its own* — the same uploader's JPEG in the same
+channel — that no message references, so the storage sweep (§3g) would take it for
+an orphan. The sweep reads this column instead: a poster is kept while its video
+is sent and unreclaimed, reclaimed in the same pass as its video, and collected as
+an orphan once its video is not live. The index serves that lookup.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

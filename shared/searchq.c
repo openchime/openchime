@@ -71,6 +71,7 @@ void oc_searchq_parse(const char *q, oc_searchq *out) {
             else if (!strcmp(v, "link") || !strcmp(v, "links")) bit = OC_SQ_HAS_LINK;
             else if (!strcmp(v, "image") || !strcmp(v, "images") ||
                      !strcmp(v, "pic") || !strcmp(v, "pics"))   bit = OC_SQ_HAS_IMAGE;
+            else if (!strcmp(v, "video") || !strcmp(v, "videos")) bit = OC_SQ_HAS_VIDEO;
             if (bit) { out->has |= bit; out->n_filters++; }
             else {
                 /* An unknown has: value is kept as TEXT rather than dropped: silently
@@ -132,6 +133,7 @@ void oc_searchq_describe(const oc_searchq *sq, char *out, size_t cap) {
     if (sq->has & OC_SQ_HAS_FILE)  SQ_ADD("%shas:file",  n ? " " : "");
     if (sq->has & OC_SQ_HAS_LINK)  SQ_ADD("%shas:link",  n ? " " : "");
     if (sq->has & OC_SQ_HAS_IMAGE) SQ_ADD("%shas:image", n ? " " : "");
+    if (sq->has & OC_SQ_HAS_VIDEO) SQ_ADD("%shas:video", n ? " " : "");
     /* before == after is what on: parsed into; describe it back the way it was
      * typed rather than as two operators that happen to agree. */
     if (sq->after[0] && sq->before[0] && !strcmp(sq->after, sq->before)) {

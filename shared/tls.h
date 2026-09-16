@@ -112,6 +112,11 @@ void oc_tls_conn_free(oc_tls_conn *c);
  * and call again. */
 oc_tls_status oc_tls_handshake(oc_tls_conn *c);
 oc_tls_status oc_tls_read(oc_tls_conn *c, void *buf, size_t len, size_t *n);
+/* Decrypted bytes TLS already holds for this connection. They are invisible to
+ * poll() on the socket — the record they came in has been read off it — so a
+ * loop that polls before reading must check this first or it waits on data it
+ * already has. */
+size_t oc_tls_pending(const oc_tls_conn *c);
 oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *n);
 
 /* SHA-256 of the peer's certificate after a completed handshake (client side).
