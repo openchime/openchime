@@ -38,7 +38,12 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 13: read-aloud (REQ-291-295, ARCH-111). SET_PROFILE, PROFILE_INFO and every
+/* 14: every voice on TTS_INFO carries the language it speaks (REQ-291-295,
+ * ARCH-111). The voices are a repeated list, so the added field shifts every
+ * voice after the first. Read-aloud was English and said so nowhere a program
+ * could read; one language still ships, and now it is named.
+ *
+ * 13: read-aloud (REQ-291-295, ARCH-111). SET_PROFILE, PROFILE_INFO and every
  * USER_LIST entry carry the speaking voice; a USER_LIST entry is inside a
  * repeated list, so the added field shifts every entry after the first.
  * TTS_INFO and AUDIO_GET/INFO/CHUNK/END (0x00DC-0x00E0) are new.
@@ -93,7 +98,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 13u
+#define OC_PROTOCOL_VERSION 14u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1095,7 +1100,11 @@ typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
 /* Read-aloud (REQ-291-295, ARCH-111). A voice is named by a stable id and shown
  * by its label; `preview` is the sentence a client plays to audition it. */
 #define OC_TTS_VOICE_MAX 16
-typedef struct { oc_slice id; oc_slice label; } oc_tts_voice;
+/* `lang` is the BCP 47 tag the voice speaks ("en-US"). It rides on the voice
+ * rather than on the frame because a voice belongs to a language -- an English
+ * model cannot read German -- so a client can offer the right ones without a
+ * second lookup, and a daemon that grows a second language needs no new frame. */
+typedef struct { oc_slice id; oc_slice label; oc_slice lang; } oc_tts_voice;
 typedef struct { uint8_t available; oc_slice model_version; uint8_t count;
                  oc_tts_voice voices[OC_TTS_VOICE_MAX]; oc_slice preview; } oc_tts_info;
 typedef struct { uint64_t message_id; } oc_audio_get;

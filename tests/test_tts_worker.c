@@ -69,7 +69,7 @@ static const char *stub_voice_id(int v) { return v == 0 ? "stub-voice-m" : "stub
 static const char *stub_voice_label(int v) { return v == 0 ? "Stub Low" : "Stub High"; }
 
 static const oc_tts_engine STUB = {
-    .version = "stub-1", .rate = 24000, .voices = 2, .ctx = NULL,
+    .version = "stub-1", .lang = "en-US", .rate = 24000, .voices = 2, .ctx = NULL,
     .voice_id = stub_voice_id, .voice_label = stub_voice_label,
     .preview = "A stub reads this.",
     .open = stub_open, .close = stub_close, .say = stub_say,

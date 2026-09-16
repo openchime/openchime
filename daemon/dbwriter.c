@@ -205,6 +205,7 @@ static void job_free(oc_job *j) {
     free(j->pf_voice_id);
     free(j->tts_model_version);
     free(j->tts_voices);
+    free(j->tts_lang);
     free(j->tts_blob_key);
     free(j->pf_phone);
     free(j->pf_timezone);
@@ -6290,8 +6291,8 @@ static const char *speak_resolve(void *ctx, const char *name) {
  * Declared pronouns pick the half of the list that matches, by the -f/-m suffix
  * the voice ids carry. The choice is written back (`tts_persist`) so it is a fact
  * on the profile someone can change, not a rule recomputed elsewhere. */
-static int speak_voice_for(const char *voices, const char *have, const char *pronouns,
-                           uint64_t user_id, int *persist) {
+static int speak_voice_for(const char *lang, const char *voices, const char *have,
+                           const char *pronouns, uint64_t user_id, int *persist) {
     char list[512];
     snprintf(list, sizeof list, "%s", voices ? voices : "");
     char *ids[OC_TTS_VOICE_MAX];
@@ -6308,8 +6309,13 @@ static int speak_voice_for(const char *voices, const char *have, const char *pro
     for (int i = 0; i < n; i++)
         if (have && *have && strcmp(have, ids[i]) == 0) return i;
 
+    /* Pronouns pick a voice's presentation only where the daemon can read them,
+     * and it reads English: the test below is for the English words. In another
+     * language the same field holds words this knows nothing about, so the hash
+     * picks instead -- a fair choice rather than a wrong one. Generalising this
+     * needs a second language to generalise against. */
     char want = 0;
-    if (pronouns && *pronouns) {
+    if (pronouns && *pronouns && lang && strncmp(lang, "en", 2) == 0) {
         char low[64];
         size_t k = 0;
         for (const char *c = pronouns; *c && k + 1 < sizeof low; c++) low[k++] = (char)tolower((unsigned char)*c);
@@ -6385,7 +6391,7 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     }
 
     int persist = 0;
-    int voice = speak_voice_for(j->tts_voices, have_voice, pronouns, author, &persist);
+    int voice = speak_voice_for(j->tts_lang, j->tts_voices, have_voice, pronouns, author, &persist);
     r->tts_voice = (uint8_t)voice;
     r->tts_persist = (uint8_t)persist;
 

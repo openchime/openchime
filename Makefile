@@ -171,7 +171,7 @@ ORT_A     := $(ORT_DIR)/lib/libonnxruntime.a
 KITTEN    := build/kitten/kitten.ort
 ifeq ($(TTS),1)
 TTS_SRC   := daemon/tts.c daemon/tts_render.c daemon/tts_worker.c daemon/tts_kitten.c daemon/tts_kitten_tokens.c daemon/tts_embed.S $(TTSKIT_SRC)
-TTS_DEPS  := $(ORT_A) $(OPUS_A) $(KITTEN) build/kitten/voices.npz ttskit/data/lexicon.bin ttskit/data/guesses.bin $(wildcard ttskit/*.h)
+TTS_DEPS  := $(ORT_A) $(OPUS_A) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin $(wildcard ttskit/*.h)
 TTS_FLAGS := -DOC_TTS $(TTSKIT_INC) -I$(ORT_DIR)/include -I$(OPUS_DIR)/include
 # ONNX Runtime is C++: its standard library and runtime support are linked in
 # statically, not required of the host. That is GCC's libstdc++ by default; the

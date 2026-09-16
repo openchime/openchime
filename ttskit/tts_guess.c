@@ -61,7 +61,13 @@ static int tok_id(ptokens *t, const char *name, int add) {
     return (int)t->n++;
 }
 
-int tts_pack_guesser(const char *arpa_path, const char *bin_path, char *err, size_t errcap) {
+int tts_pack_guesser(const char *arpa_path, const char *bin_path, const char *lang,
+                     char *err, size_t errcap) {
+    /* Refused rather than truncated, for the reason tts_pack_lexicon gives. */
+    if (!lang || !*lang || strlen(lang) >= TTS_LANG_MAX) {
+        tts_seterr(err, errcap, "a language tag of 1 to %u characters is required", TTS_LANG_MAX - 1);
+        return -1;
+    }
     FILE *in = fopen(arpa_path, "r");
     if (!in) { tts_seterr(err, errcap, "cannot open %s", arpa_path); return -1; }
     ptokens toks = { 0 };
@@ -147,10 +153,14 @@ int tts_pack_guesser(const char *arpa_path, const char *bin_path, char *err, siz
             }
             pool += (uint32_t)(strlen(graph[i]) + 1 + strlen(phon[i]) + 1);
         }
+        char tag[TTS_LANG_MAX];
+        memset(tag, 0, sizeof tag);
+        memcpy(tag, lang, strlen(lang));
         fwrite(TTS_GS_MAGIC, 1, 8, out);
         w32(out, TTS_GS_VERSION); w32(out, (uint32_t)order); w32(out, toks.n); w32(out, pool);
         for (int k = 1; k <= TTS_GS_MAXORDER; k++) w32(out, k <= order ? cnt[k] : 0);
         w32(out, 0); w32(out, 0);
+        fwrite(tag, 1, sizeof tag, out);
         uint32_t off = 0;
         for (uint32_t i = 0; i < toks.n; i++) {
             w32(out, off); off += (uint32_t)strlen(graph[i]) + 1;
@@ -191,7 +201,7 @@ int tts_guesser_open(const char *path, const tts_map *mem, tts_guesser *g, char 
     if (mem ? (g->map = *mem, g->map.owned = 0, !mem->p) : tts_map_open(path, &g->map) != 0) { tts_seterr(err, errcap, "cannot map %s", path); return -1; }
     const uint8_t *p = g->map.p;
     size_t n = g->map.n;
-    if (n < 64 || memcmp(p, TTS_GS_MAGIC, 8) != 0 || tts_rd32(p + 8) != TTS_GS_VERSION) {
+    if (n < TTS_GS_HEADER || memcmp(p, TTS_GS_MAGIC, 8) != 0 || tts_rd32(p + 8) != TTS_GS_VERSION) {
         tts_seterr(err, errcap, "%s is not a version %u ttskit guesser", path, TTS_GS_VERSION);
         tts_map_close(&g->map);
         return -1;
@@ -199,7 +209,7 @@ int tts_guesser_open(const char *path, const tts_map *mem, tts_guesser *g, char 
     g->order = tts_rd32(p + 12);
     g->n_tokens = tts_rd32(p + 16);
     uint32_t pool = tts_rd32(p + 20);
-    size_t need = 64 + (size_t)g->n_tokens * 8 + pool;
+    size_t need = TTS_GS_HEADER + (size_t)g->n_tokens * 8 + pool;
     int ok = g->order >= 1 && g->order <= TTS_GS_MAXORDER && g->n_tokens >= 2 && g->n_tokens <= 65535 && need <= n;
     for (uint32_t k = 1; ok && k <= g->order; k++) {
         g->count[k] = tts_rd32(p + 24 + (k - 1) * 4);
@@ -213,8 +223,14 @@ int tts_guesser_open(const char *path, const tts_map *mem, tts_guesser *g, char 
         tts_map_close(&g->map);
         return -1;
     }
-    g->tokens = p + 64;
-    g->pool = (const char *)p + 64 + (size_t)g->n_tokens * 8;
+    if (memchr(p + 64, '\0', TTS_LANG_MAX) == NULL) {
+        tts_seterr(err, errcap, "%s has an unterminated language tag", path);
+        tts_map_close(&g->map);
+        return -1;
+    }
+    memcpy(g->lang, p + 64, TTS_LANG_MAX);
+    g->tokens = p + TTS_GS_HEADER;
+    g->pool = (const char *)p + TTS_GS_HEADER + (size_t)g->n_tokens * 8;
     for (uint32_t i = 0; i < g->n_tokens; i++) {
         if (tts_rd32(g->tokens + (size_t)i * 8) >= pool || tts_rd32(g->tokens + (size_t)i * 8 + 4) >= pool) {
             tts_seterr(err, errcap, "%s has a token outside its pool", path);

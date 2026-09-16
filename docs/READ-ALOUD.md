@@ -58,6 +58,16 @@ the same three in turn at 253 MB).
 
 ## 3. Voices
 
+**One language per deployment.** The daemon speaks the language its engine was
+built for — `en-US` today — set by `OPENCHIME_TTS_LANG` and refused at startup if
+this binary has no engine for it, because reading every message in a language
+nobody asked for is worse than not starting. The tag is stamped into the
+pronunciation data (a lexicon of one language with a guesser of another
+pronounces fluent nonsense, so the pair is checked), it is part of the model
+version that keys the cache, and it is announced with every voice on `TTS_INFO`.
+A voice belongs to a language: a second language is a second engine beside this
+one, not a setting on it.
+
 The model is **Kitten mini v0.8** (Apache-2.0), which has eight voices. A user's voice is
 one of them, stored as `users.voice_id` and carried on the profile frames.
 
@@ -111,9 +121,11 @@ config is regenerated with ONNX Runtime's `convert_onnx_models_to_ort.py
 
 ## 5. Render and cache in the daemon
 
-- **The handle** is SHA-256 of the speakable text, a separator, and the voice id. The
-  cache key is `(handle, model_version)`; the model version names the model, the ttskit
-  data and the speaking rate together, so changing any of them re-renders.
+- **The handle** is SHA-256 of the speakable text, a separator, and the voice index. The
+  cache key is `(handle, model_version)`; the model version names the language, the model,
+  the ttskit data and the speaking rate together, so changing any of them re-renders — and
+  two languages cannot collide on one row, which is why no part of the language needs to be
+  in the handle.
 - **A request** checks read access to the message's channel, builds the speakable text,
   and looks the key up. A hit streams the stored render. A miss queues a render, unless one
   for the same key is already in flight, in which case the request waits for that one. A

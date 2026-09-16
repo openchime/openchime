@@ -78,7 +78,7 @@ typedef struct {
      * daemon built with `make TTS=0` has it off whatever this says. `queue` is
      * how many renders may wait, `idle_secs` how long the model stays loaded with
      * nothing to do, `rate` how many AUDIO_GETs a connection may make a minute. */
-    struct { int enabled, queue, idle_secs, rate; } tts;
+    struct { int enabled, queue, idle_secs, rate; const char *lang; } tts;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.

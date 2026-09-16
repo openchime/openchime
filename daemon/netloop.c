@@ -2084,6 +2084,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->message_id = ag.message_id;
             j->tts_model_version = strdup(g_tts_engine->version);
             j->tts_voices = tts_voice_list();
+            j->tts_lang = strdup(g_tts_engine->lang ? g_tts_engine->lang : "");
             oc_dbwriter_submit(dbw, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
@@ -2331,6 +2332,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                     if (!id) break;
                     ti.voices[ti.count].id = oc_slice_str(id);
                     ti.voices[ti.count].label = oc_slice_str(lb ? lb : id);
+                    /* Every voice of this engine speaks the engine's language;
+                     * per-voice is where a multilingual engine would differ. */
+                    ti.voices[ti.count].lang = oc_slice_str(g_tts_engine->lang ? g_tts_engine->lang : "");
                     ti.count++;
                 }
             }

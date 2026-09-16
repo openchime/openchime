@@ -90,7 +90,7 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 | **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model, built from source **minimal and static** (only the model's operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud, ARCH-111) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **embedded in the daemon** | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build_ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
-| **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/`, with its notice) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
+| **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
 Fetched + built by `scripts/build_mbedtls.sh` from the official GitHub release
 tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by

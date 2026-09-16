@@ -245,6 +245,7 @@ typedef struct oc_job {
      * speakable form the daemon will hand the worker. */
     char          *tts_model_version;
     char          *tts_voices;    /* the engine's voice ids, comma separated */
+    char          *tts_lang;      /* the language it speaks; picks the voice rules */
     char          *tts_blob_key;
     uint8_t        tts_handle[32];
     uint64_t       tts_bytes;

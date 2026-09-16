@@ -20,8 +20,8 @@ name##_end:                                      \
 
 BLOB(oc_tts_kitten_ort, "build/kitten/kitten.ort")
 BLOB(oc_tts_kitten_voices, "build/kitten/voices.npz")
-BLOB(oc_tts_lexicon, "ttskit/data/lexicon.bin")
-BLOB(oc_tts_guesses, "ttskit/data/guesses.bin")
+BLOB(oc_tts_lexicon_en_us, "ttskit/data/en-US/lexicon.bin")
+BLOB(oc_tts_guesses_en_us, "ttskit/data/en-US/guesses.bin")
 
 /* Not an executable stack. */
 .section .note.GNU-stack, "", %progbits

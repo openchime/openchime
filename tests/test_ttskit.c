@@ -15,12 +15,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define DATA "ttskit/data"
+#define DATA "ttskit/data/en-US"
+#define LANG "en-US"
 
 /* The committed data files. Regenerating them (scripts/build_ttskit_data.sh)
  * changes these, the reference output below and TTSKIT.md §8 together. */
-static const char *LEXICON_SHA256 = "d518a2b696a4000fc82b47d56f01028b9463c104e65f4495bfc689856d472ee9";
-static const char *GUESSES_SHA256 = "efd55988df04bda24622daee8282c3ec39a8fe8d655d6f64d294cfd22318b757";
+static const char *LEXICON_SHA256 = "b1338cd8ae4d22c8b8a808e4c1fa1879579acbd3157556488d9f43ba5b559bf7";
+static const char *GUESSES_SHA256 = "51cf60b34b3f23a12a33bb5d5c4a239f92966e5a92e38ee0a649b2df43e0794e";
 
 static int ipa_is(const char *arpa, int units, const char *want) {
     char out[256];
@@ -117,14 +118,18 @@ static unsigned char *slurp(const char *path, size_t *n) {
 
 /* Damaged data: a file that is present but wrong refuses to load, so a bad
  * install fails loudly instead of guessing every word. */
-static int refused(const char *dir, const char *name, const unsigned char *p, size_t n) {
+static int refused(const char *dir, const char *name, const unsigned char *p, size_t n,
+                   const char *lang) {
     char path[512], err[256] = "";
     snprintf(path, sizeof path, "%s/%s", dir, name);
     put(path, p, n);
-    tts *t = tts_load(dir, err, sizeof err);
+    tts *t = tts_load(dir, lang, err, sizeof err);
     unlink(path);
     if (t) { tts_free(t); return 0; }
-    return err[0] != '\0';
+    /* The reason must be said. A refusal whose message reads as "the file is
+     * simply absent" is tolerated on the disk path (ttskit/tts_text.c), which
+     * would load half a kit in silence. */
+    return err[0] != '\0' && strstr(err, "cannot map") == NULL;
 }
 
 int run_ttskit_tests(void) {
@@ -174,7 +179,7 @@ int run_ttskit_tests(void) {
     CHECK(norm_is("", ""));
 
     char err[256] = "";
-    tts *t = tts_load(DATA, err, sizeof err);
+    tts *t = tts_load(DATA, LANG, err, sizeof err);
     CHECK(t != NULL);
     if (!t) { printf("    %s\n", err); return failures; }
 
@@ -198,7 +203,7 @@ int run_ttskit_tests(void) {
     tts_free(t);
 
     /* Without data, words are still said: spelled. */
-    t = tts_load("/nonexistent-ttskit-data", err, sizeof err);
+    t = tts_load("/nonexistent-ttskit-data", LANG, err, sizeof err);
     CHECK(t != NULL);
     CHECK(word_is(t, "hello", 3, "ˈeɪtʃ ˈiː ˈɛl ˈɛl ˈoʊ"));
     tts_free(t);
@@ -221,30 +226,67 @@ int run_ttskit_tests(void) {
     unsigned char *lex = slurp(DATA "/lexicon.bin", &ln), *gs = slurp(DATA "/guesses.bin", &gn);
     CHECK(lex && gs && ln > 64 && gn > 64);
     if (lex && gs && ln > 64 && gn > 64) {
-        CHECK(refused(dir, "lexicon.bin", lex, ln / 2));                       /* truncated */
-        CHECK(refused(dir, "guesses.bin", gs, gn / 2));
-        CHECK(refused(dir, "lexicon.bin", (const unsigned char *)"short", 5));
+        CHECK(refused(dir, "lexicon.bin", lex, ln / 2, LANG));                 /* truncated */
+        CHECK(refused(dir, "guesses.bin", gs, gn / 2, LANG));
+        CHECK(refused(dir, "lexicon.bin", (const unsigned char *)"short", 5, LANG));
         memcpy(lex, "OCTTSGS1", 8);                                             /* wrong magic */
-        CHECK(refused(dir, "lexicon.bin", lex, ln));
+        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG));
         memcpy(lex, TTS_LEX_MAGIC, 8);
-        lex[8] = 2;                                                             /* a later version */
-        CHECK(refused(dir, "lexicon.bin", lex, ln));
-        gs[8] = 2;
-        CHECK(refused(dir, "guesses.bin", gs, gn));
+        lex[8] = TTS_LEX_VERSION + 1;                                           /* a later version */
+        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG));
+        lex[8] = TTS_LEX_VERSION;
+        gs[8] = TTS_GS_VERSION + 1;
+        CHECK(refused(dir, "guesses.bin", gs, gn, LANG));
+        gs[8] = TTS_GS_VERSION;
+
+        /* A pair that is not the language asked for, and a pair that disagrees
+         * with itself, are both refused -- the whole point of the tag. Neither
+         * fails as it is used: a lexicon of one language with a guesser of
+         * another pronounces fluent nonsense and nothing downstream can tell. */
+        memcpy(lex + 32, "de-DE", 6);
+        CHECK(refused(dir, "lexicon.bin", lex, ln, LANG));          /* wrong language */
+        {
+            /* A pair that disagrees with ITSELF, which needs both files present:
+             * refused() places one at a time, and one file alone has nothing to
+             * disagree with. Asked for no language in particular, so the only
+             * thing refusing this is the two tags differing. */
+            char lp[512], gp[512], err2[256] = "";
+            snprintf(lp, sizeof lp, "%s/lexicon.bin", dir);
+            snprintf(gp, sizeof gp, "%s/guesses.bin", dir);
+            put(lp, lex, ln);                                        /* de-DE */
+            put(gp, gs, gn);                                         /* en-US */
+            tts *mixed = tts_load(dir, NULL, err2, sizeof err2);
+            CHECK(mixed == NULL && err2[0] && strstr(err2, "cannot map") == NULL);
+            tts_free(mixed);
+            unlink(lp);
+            unlink(gp);
+        }
+        memcpy(lex + 32, LANG, strlen(LANG) + 1);
+        memcpy(gs + 64, "de-DE", 6);
+        CHECK(refused(dir, "guesses.bin", gs, gn, LANG));
+        memcpy(gs + 64, LANG, strlen(LANG) + 1);
+        /* An unterminated tag is corruption, not a very long name. */
+        memset(lex + 32, 'x', 16);
+        CHECK(refused(dir, "lexicon.bin", lex, ln, NULL));
+        memcpy(lex + 32, LANG, strlen(LANG) + 1);
+        memset(lex + 32 + strlen(LANG) + 1, 0, 16 - strlen(LANG) - 1);
     }
     /* The same data lent from memory says the same thing; damaged bytes are refused. */
     if (lex && gs) {
         memcpy(lex, TTS_LEX_MAGIC, 8);
-        lex[8] = 1;
-        gs[8] = 1;
-        t = tts_load_mem(lex, ln, gs, gn, err, sizeof err);
+        lex[8] = TTS_LEX_VERSION;
+        gs[8] = TTS_GS_VERSION;
+        t = tts_load_mem(lex, ln, gs, gn, LANG, err, sizeof err);
         CHECK(t != NULL);
+        CHECK(t && strcmp(tts_lang(t), LANG) == 0);
         CHECK(word_is(t, "migration", 1, "maɪɡɹˈeɪʃən"));
         CHECK(word_is(t, "Kubernetes", 2, "kjˈuːbɚnˈɛtiːz"));
         tts_free(t);
         err[0] = '\0';
-        CHECK(tts_load_mem(lex, ln / 2, gs, gn, err, sizeof err) == NULL && err[0]);
-        CHECK(tts_load_mem(lex, ln, NULL, 0, err, sizeof err) == NULL);
+        CHECK(tts_load_mem(lex, ln / 2, gs, gn, LANG, err, sizeof err) == NULL && err[0]);
+        CHECK(tts_load_mem(lex, ln, NULL, 0, LANG, err, sizeof err) == NULL);
+        err[0] = '\0';
+        CHECK(tts_load_mem(lex, ln, gs, gn, "de-DE", err, sizeof err) == NULL && err[0]);
     }
     free(lex);
     free(gs);

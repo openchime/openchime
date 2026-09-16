@@ -1609,6 +1609,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (!ve) break;
                 ve->body = slice_dup(ti.voices[i].id);
                 ve->topic = slice_dup(ti.voices[i].label);
+                ve->preview = slice_dup(ti.voices[i].lang);
                 oc_queue_push(to_ui, ve);
             }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
