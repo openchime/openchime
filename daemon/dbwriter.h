@@ -178,7 +178,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * (both conn_id 0, fire and forget), VOICE_SET writes back the voice the
         * daemon chose for an author so it is visible and correctable. Writes. */
        OC_JOB_TTS_LOOKUP = 98, OC_JOB_TTS_STORE = 99, OC_JOB_TTS_TOUCH = 100,
-       OC_JOB_TTS_VOICE_SET = 101 };
+       OC_JOB_TTS_VOICE_SET = 101, OC_JOB_TTS_PREVIEW = 102 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -244,6 +244,7 @@ typedef struct oc_job {
      * carry what the render worker produced. `tts_text` on a result is the
      * speakable form the daemon will hand the worker. */
     char          *tts_model_version;
+    char          *tts_text;      /* TTS_PREVIEW: the sentence, said in tts_voice */
     char          *tts_voices;    /* the engine's voice ids, comma separated */
     char          *tts_lang;      /* the language it speaks; picks the voice rules */
     char          *tts_blob_key;

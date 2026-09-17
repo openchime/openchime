@@ -2156,6 +2156,56 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
             continue;
         }
+        /* Hear a voice before choosing it (REQ-292): the voice's audition
+         * sentence, downloaded exactly as a message's speech is, as message 0.
+         * The same one-transfer rule and the same rate limit apply; there is no
+         * read gate, because a preview is nobody's message. */
+        if (hdr.msg_type == OC_MSG_VOICE_PREVIEW_GET) {
+            oc_voice_preview_get vp;
+            if (oc_decode_voice_preview_get(&p, &vp) != OC_OK) return -1;
+            if (c->xfer.state != XFER_NONE) {
+                /* Busy with another download -- most often the next message being
+                 * read aloud. Refuse the preview WITHOUT touching that transfer:
+                 * send_transfer_error resets the connection's transfer, and would
+                 * silently abort a listen for the sake of a voice sample. */
+                uint8_t ctxb[8] = { 0 };               /* message 0: the preview */
+                uint8_t tmp[96]; oc_wbuf ew; oc_wbuf_init(&ew, tmp, sizeof tmp);
+                oc_error e = { OC_ERR_TRANSFER_PROTOCOL, 0, { ctxb, 8 }, oc_slice_str("transfer busy") };
+                oc_encode_error(&ew, OC_PROTOCOL_VERSION, &e);
+                if (out_append(c, tmp, ew.len) != 0) return -1;
+                continue;
+            }
+            c->xfer.audio_message_id = 0;
+            int voice = -1;
+            if (g_tts && g_tts_engine && g_tts_engine->voice_id && vp.voice_id.len) {
+                for (int i = 0; i < g_tts_engine->voices; i++) {
+                    const char *vid = g_tts_engine->voice_id(i);
+                    if (vid && strlen(vid) == vp.voice_id.len && memcmp(vid, vp.voice_id.ptr, vp.voice_id.len) == 0) {
+                        voice = i;
+                        break;
+                    }
+                }
+            }
+            const char *preview = g_tts_engine && g_tts_engine->preview ? g_tts_engine->preview : "";
+            int refuse = !g_tts ? OC_ERR_TTS_UNAVAILABLE
+                       : voice < 0 || !preview[0] ? OC_ERR_TTS_UNAVAILABLE
+                       : !audio_rate_ok(c) ? OC_ERR_TTS_UNAVAILABLE : 0;
+            if (refuse) {                              /* nothing in flight to disturb */
+                if (send_transfer_error(c, 0, (uint16_t)refuse) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_TTS_PREVIEW, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = 0;
+            j->tts_voice = (uint8_t)voice;
+            j->tts_text = strdup(preview);
+            j->tts_model_version = strdup(g_tts_engine->version);
+            oc_dbwriter_submit(dbw, j);
+            c->xfer.audio = 1;
+            c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            continue;
+        }
 #endif
         if (hdr.msg_type == OC_MSG_TRANSFER_CANCEL) {
             oc_transfer_cancel tc;

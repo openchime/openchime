@@ -1329,8 +1329,12 @@ static const oc_tts_engine STUB_TTS = {
     .open = stub_open, .close = stub_close, .say = stub_say,
 };
 
-/* Ask for a message's speech and consume the whole stream. Returns the total
+/* One rendering's download, after whatever request frame asked for it. A message's
+ * speech and a voice's audition (message 0) answer identically. Returns the total
  * bytes, or 0 if the daemon refused (with the reason in *code). */
+static uint64_t read_audio(client *c, uint64_t message_id, uint32_t *duration_ms, uint16_t *code);
+
+/* Ask for a message's speech and consume the whole stream. */
 static uint64_t fetch_audio(client *c, uint64_t message_id, uint32_t *duration_ms, uint16_t *code) {
     uint8_t buf[64];
     oc_wbuf w;
@@ -1338,6 +1342,21 @@ static uint64_t fetch_audio(client *c, uint64_t message_id, uint32_t *duration_m
     oc_audio_get ag = { message_id };
     CHECK(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &ag) == OC_OK);
     CHECK(send_frame(c, buf, w.len) == 0);
+    return read_audio(c, message_id, duration_ms, code);
+}
+
+/* Hear voice `voice_id` say the audition sentence (REQ-292). */
+static uint64_t fetch_preview(client *c, const char *voice_id, uint32_t *duration_ms, uint16_t *code) {
+    uint8_t buf[128];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_voice_preview_get vp = { oc_slice_str(voice_id) };
+    CHECK(oc_encode_voice_preview_get(&w, OC_PROTOCOL_VERSION, &vp) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    return read_audio(c, 0, duration_ms, code);
+}
+
+static uint64_t read_audio(client *c, uint64_t message_id, uint32_t *duration_ms, uint16_t *code) {
 
     oc_header hdr;
     oc_rbuf p;
@@ -1493,6 +1512,39 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
     uint64_t emoji_id = say_something(&a, OC_DEFAULT_CHANNEL, "\xF0\x9F\x9A\x80", 0xB2);
     CHECK(emoji_id != 0);
     CHECK(fetch_audio(&a, emoji_id, NULL, &code) == 0 && code == OC_ERR_NOT_RENDERABLE);
+
+    /* Hearing a voice before choosing it (REQ-292): the audition sentence in that
+     * voice, downloaded as message 0. The first ask renders... */
+    int before_preview = g_stub_says;
+    uint32_t pdur = 0;
+    uint64_t pbytes = fetch_preview(&a, "test-voice-f", &pdur, &code);
+    CHECK(code == 0 && pbytes > 0 && pdur > 0);
+    CHECK(g_stub_says > before_preview);
+    /* ...and the next is the cache: a voice's sample is rendered once for the whole
+     * deployment, however many people audition it. */
+    int after_preview = g_stub_says;
+    uint64_t pbytes2 = fetch_preview(&b, "test-voice-f", NULL, &code);
+    CHECK(code == 0 && pbytes2 == pbytes && g_stub_says == after_preview);
+    /* A different voice is a different rendering. */
+    CHECK(fetch_preview(&a, "test-voice-m", NULL, &code) > 0 && code == 0);
+    CHECK(g_stub_says > after_preview);
+    /* A voice this daemon does not have is refused, not guessed at. */
+    CHECK(fetch_preview(&a, "no-such-voice", NULL, &code) == 0 && code == OC_ERR_TTS_UNAVAILABLE);
+    /* A preview asked for while a message's speech is on its way is refused, and
+     * the speech still arrives whole: auditioning a voice must not abort a listen.
+     * Both requests go in one write so the preview meets the transfer in flight. */
+    {
+        uint8_t two[256];
+        oc_wbuf w2;
+        oc_wbuf_init(&w2, two, sizeof two);
+        oc_audio_get ag = { mid };
+        oc_voice_preview_get vp = { oc_slice_str("test-voice-f") };
+        CHECK(oc_encode_audio_get(&w2, OC_PROTOCOL_VERSION, &ag) == OC_OK);
+        CHECK(oc_encode_voice_preview_get(&w2, OC_PROTOCOL_VERSION, &vp) == OC_OK);
+        CHECK(write_all(&b.conn, two, w2.len) == 0);
+        CHECK(read_audio(&b, 0, NULL, &code) == 0 && code == OC_ERR_TRANSFER_PROTOCOL);
+        CHECK(read_audio(&b, mid, NULL, &code) == bytes && code == 0);
+    }
 
     /* An unknown message is unknown, not a render. */
     CHECK(fetch_audio(&a, mid + 100000, NULL, &code) == 0 && code == OC_ERR_UNKNOWN_MESSAGE);

@@ -515,6 +515,10 @@ static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
  * for. Its buttons dispatch ordinary commands and take effect at once — a photo
  * is uploaded and claimed as it is chosen, not held until OK. */
 static struct { int on; uint64_t uid; int upload_cmd, remove_cmd; rectf up_btn, rm_btn; } g_form_side;
+/* Called when an FF_CHOICE or FF_SELECT field is set to option `val` by a click,
+ * while a form is open. NULL for most forms; set around the one call that needs
+ * it and cleared after. */
+static void (*g_form_on_pick)(int field, int val);
 /* FF_SELECT. `g_form_sel_box` is where each closed field was drawn (its click
  * target); the rest is the open list, and only one is ever open.
  *
@@ -1875,6 +1879,10 @@ static rectf g_memchip;           /* header member-count chip */
  * long as it runs and freed with it. */
 static rectf      g_listen_btn;
 static oc_player *g_listen_player;
+/* A voice's audition, played while choosing a voice (REQ-292). Separate from the
+ * listen player: hearing a sample must not disturb a channel being read aloud. */
+static oc_player *g_preview_player;
+static uint8_t   *g_preview_bytes;
 static uint8_t   *g_listen_bytes;
 static size_t     g_listen_len;
 static uint64_t   g_listen_msg;
@@ -16051,6 +16059,42 @@ static void listen_tick(HWND hwnd, const oc_model *m) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* ---- hearing a voice before choosing it (REQ-292) --------------------------- */
+
+static void preview_drop(void) {
+    if (g_preview_player) oc_player_close(g_preview_player);
+    g_preview_player = NULL;
+    free(g_preview_bytes);                  /* the player borrowed these */
+    g_preview_bytes = NULL;
+}
+
+/* Once a frame: retire a finished sample, and play one that has arrived. A new
+ * sample cuts off one still playing -- the voice worth hearing is the one just
+ * chosen, not the one before it. */
+static void preview_tick(const oc_model *m) {
+    if (g_preview_player) {
+        oc_player_status st;
+        oc_player_status_get(g_preview_player, &st);
+        if (st.state == OC_PLAYER_ENDED || st.state == OC_PLAYER_ERROR) preview_drop();
+    }
+    uint8_t *mp4 = NULL;
+    size_t len = 0;
+    if (!m || !oc_model_preview_take_audio((oc_model *)m, &mp4, &len)) return;
+    preview_drop();
+    g_preview_bytes = mp4;
+    g_preview_player = oc_player_open(mp4, len);
+    if (!g_preview_player) { preview_drop(); return; }
+    oc_player_play(g_preview_player);
+}
+
+/* The Edit-profile form's voice field changed: play what that voice sounds like.
+ * "Automatic" (option 0) is not a voice, so it plays nothing. */
+static void profile_voice_picked(int field, int val) {
+    if (field != 6 || val <= 0 || !g_client) return;
+    const char *id = voice_id_at(model(), val);
+    if (id[0]) oc_client_voice_preview(g_client, id);
+}
+
 static void vm_player_close(void) {
     if (g_vplayer) oc_player_close(g_vplayer);
     g_vplayer = NULL;
@@ -17855,6 +17899,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     snprintf(g_form_f[g_form_sel_field].value,
                              sizeof g_form_f[g_form_sel_field].value, "%d",
                              g_form_sel_rows[i].val);
+                    if (g_form_on_pick) g_form_on_pick(g_form_sel_field, g_form_sel_rows[i].val);
                     g_form_sel_field = -1;
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 1;
@@ -17879,6 +17924,7 @@ static int on_click(HWND hwnd, int x, int y) {
             if (in_rect(g_form_hits[i].r, x, y)) {
                 snprintf(g_form_f[g_form_hits[i].field].value,
                          sizeof g_form_f[g_form_hits[i].field].value, "%d", g_form_hits[i].val);
+                if (g_form_on_pick) g_form_on_pick(g_form_hits[i].field, g_form_hits[i].val);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 1;
             }
@@ -20297,7 +20343,12 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             g_form_side.upload_cmd = 55;
             g_form_side.remove_cmd = 56;
         }
-        if (!form_dialog(hwnd, "Edit profile", f, nfields)) break;
+        /* Hear each voice as it is picked, rather than choosing a name blind and
+         * finding out on every message afterwards. */
+        g_form_on_pick = nfields == 7 ? profile_voice_picked : NULL;
+        int saved = form_dialog(hwnd, "Edit profile", f, nfields);
+        g_form_on_pick = NULL;
+        if (!saved) break;
         char tz[64]; sel_opt(f[5].hint, atoi(f[5].value), tz, sizeof tz);
         if (!strcmp(tz, OC_TZ_UNSET)) tz[0] = '\0';
         /* An empty voice keeps whatever is set, which is exactly what
@@ -20843,6 +20894,14 @@ static void test_dump(const char *path) {
                 oc_model_listen_skipped(m), g_listen_player != NULL,
                 (int)ls.state, ls.has_audio, ls.position_ms, ls.duration_ms,
                 (unsigned long long)g_listen_msg, g_listen_len);
+    }
+    /* A voice's audition (REQ-292): whether one is playing, and whether audio
+     * reaches a device -- the same distinction the listen line draws. */
+    {
+        oc_player_status ps = { 0 };
+        if (g_preview_player) oc_player_status_get(g_preview_player, &ps);
+        fprintf(f, "preview player=%d state=%d has_audio=%d pos=%u/%u\n",
+                g_preview_player != NULL, (int)ps.state, ps.has_audio, ps.position_ms, ps.duration_ms);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
     /* How the client started (scripts/gui_startup.sh). `visible` is whether the
@@ -22864,6 +22923,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * Mark it so the transcript stops asking on every frame. */
             vm_tick(hwnd, m);
             listen_tick(hwnd, m);            /* talking mode (ARCH-111) */
+            preview_tick(m);                 /* a voice being chosen (REQ-292) */
             /* Transfers queue in the core, so a thumbnail waiting behind a video
              * download is late, not lost: the clock only runs while nothing
              * else is moving. */
@@ -23912,7 +23972,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (int i = 0; i < g_n_wss; i++)
             if (g_wss[i].client && g_wss[i].client != g_client) oc_client_stop(g_wss[i].client);
         g_n_wss = 0;
-        if (g_client) { listen_drop_player(); oc_client_stop(g_client); g_client = NULL; }
+        if (g_client) { listen_drop_player(); preview_drop(); oc_client_stop(g_client); g_client = NULL; }
         /* The ring is marked and removed HERE rather than after the message
          * loop, because reaching WM_DESTROY is what "exited normally" means —
          * and anything that does not reach it leaves the file, which is exactly

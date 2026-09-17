@@ -166,6 +166,7 @@ void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap) {
 
 void oc_model_free(oc_model *m) {
     free(m->listen_ready);
+    free(m->preview_ready);
     for (uint8_t i = 0; i < m->n_fetched; i++) free(m->fetched[i].data);
     for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
     free(m->channels);
@@ -425,6 +426,15 @@ uint64_t oc_model_listening_channel(const oc_model *m) { return m->listen_channe
 uint8_t  oc_model_listen_queued(const oc_model *m)     { return m->n_listen_queue; }
 uint64_t oc_model_listen_playing(const oc_model *m)    { return m->listen_playing; }
 uint32_t oc_model_listen_skipped(const oc_model *m)    { return m->listen_skipped; }
+
+int oc_model_preview_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
+    if (!m || !m->preview_ready) return 0;
+    *mp4 = m->preview_ready;
+    *len = m->preview_ready_len;
+    m->preview_ready = NULL;
+    m->preview_ready_len = 0;
+    return 1;
+}
 
 uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len) {
     if (!m->listen_ready) return 0;
@@ -1197,6 +1207,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             snprintf(v->label, sizeof v->label, "%s", e->topic ? e->topic : "");
             snprintf(v->lang, sizeof v->lang, "%s", e->preview ? e->preview : "");
         }
+        break;
+    case OC_EV_VOICE_PREVIEW:
+        free(m->preview_ready);
+        m->preview_ready = (uint8_t *)e->body;      /* taken from the event */
+        m->preview_ready_len = e->count;
+        e->body = NULL;
         break;
     case OC_EV_LISTEN_AUDIO:
         if (m->listen_channel && e->message_id == m->listen_fetching) {

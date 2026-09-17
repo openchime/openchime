@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 15** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 16** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -1454,6 +1454,17 @@ only emoji (REQ-294) — `TTS_UNAVAILABLE` 3024 when read-aloud is off or its qu
 is full, `FORBIDDEN` when the caller cannot read the channel, and
 `UNKNOWN_MESSAGE` for an id that is not there.
 
+**`VOICE_PREVIEW_GET` (C → S), `0x00E2`** `{ voice_id: str }` — "let me hear this
+voice before I choose it" (REQ-292). The daemon renders `TTS_INFO`'s `preview`
+sentence in that voice and answers with the same `AUDIO_INFO` / `AUDIO_CHUNK` /
+`AUDIO_END` sequence, carrying **`message_id` 0**, which no message has. There is
+no gate beyond being signed in: the sentence is the daemon's own, not anyone's
+message. The rendering is cached like any other, so every user auditioning the same
+voice after the first is served without a render. It is a transfer like any other —
+one at a time per connection. Refusals carry `context` 0: `TTS_UNAVAILABLE` 3024
+when read-aloud is off, the queue is full, or `voice_id` is not one `TTS_INFO`
+listed, and `TRANSFER_PROTOCOL` when another transfer is in flight.
+
 ---
 
 ### 5.16 Notification preferences (REQ-130, REQ-131)
@@ -2397,6 +2408,7 @@ this table cannot silently gain a shared value.
 | `0x00DF` | `AUDIO_CHUNK` | S → C | a slice of the rendering |
 | `0x00E0` | `AUDIO_END` | S → C | the whole rendering is sent |
 | `0x00E1` | `CAPABILITIES` | S → C | the features this daemon offers, by name |
+| `0x00E2` | `VOICE_PREVIEW_GET` | C → S | hear a voice say the preview sentence (REQ-292) |
 
 ## 10. Connection state machine
 

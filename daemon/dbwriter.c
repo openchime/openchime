@@ -206,6 +206,7 @@ static void job_free(oc_job *j) {
     free(j->pf_voice_id);
     free(j->tts_model_version);
     free(j->tts_voices);
+    free(j->tts_text);
     free(j->tts_lang);
     free(j->tts_blob_key);
     free(j->pf_phone);
@@ -6289,6 +6290,37 @@ static const char *speak_resolve(void *ctx, const char *name) {
 
 /* Everything one AUDIO_GET needs to decide (ARCH-111): the read gate, what is
  * said, in whose voice, and whether that rendering already exists. Read. */
+/* A rendering's handle: what was said and who says it, so the same text in the
+ * same voice is one rendering and an edit is simply another handle. Shared by
+ * messages and voice previews, which is what lets a preview use the cache. */
+static void tts_handle_of(const char *text, size_t n, int voice, uint8_t out[32]) {
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, (const unsigned char *)text, n);
+    mbedtls_sha256_update(&sha, (const unsigned char *)"\0", 1);
+    mbedtls_sha256_update(&sha, (const unsigned char *)&voice, sizeof voice);
+    mbedtls_sha256_finish(&sha, out);
+    mbedtls_sha256_free(&sha);
+}
+
+/* Whether `r`'s handle is already rendered for this model version. */
+static void tts_probe_cache(sqlite3 *db, const oc_job *j, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT blob_key, bytes, duration_ms FROM rendered_audio"
+            " WHERE handle = ?1 AND model_version = ?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_blob(st, 1, r->tts_handle, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, j->tts_model_version ? j->tts_model_version : "", -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->tts_cached = 1;
+        r->tts_blob_key = strdup((const char *)sqlite3_column_text(st, 0));
+        r->tts_bytes = (uint64_t)sqlite3_column_int64(st, 1);
+        r->tts_duration_ms = (uint32_t)sqlite3_column_int(st, 2);
+    }
+    sqlite3_finalize(st);
+}
+
 static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -6346,30 +6378,33 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
 
     /* The handle is what was said and who says it, so the same text in the same
      * voice is one rendering and an edit is simply another handle. */
-    mbedtls_sha256_context sha;
-    mbedtls_sha256_init(&sha);
-    mbedtls_sha256_starts(&sha, 0);
-    mbedtls_sha256_update(&sha, (const unsigned char *)speak, n);
-    mbedtls_sha256_update(&sha, (const unsigned char *)"\0", 1);
-    mbedtls_sha256_update(&sha, (const unsigned char *)&voice, sizeof voice);
-    mbedtls_sha256_finish(&sha, r->tts_handle);
-    mbedtls_sha256_free(&sha);
+    tts_handle_of(speak, n, voice, r->tts_handle);
     r->type = OC_RES_TTS_META;
     r->tts_text = speak;
+    tts_probe_cache(db, j, r);
+    return r;
+}
 
-    if (sqlite3_prepare_v2(db,
-            "SELECT blob_key, bytes, duration_ms FROM rendered_audio"
-            " WHERE handle = ?1 AND model_version = ?2;", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_blob(st, 1, r->tts_handle, 32, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, j->tts_model_version ? j->tts_model_version : "", -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            r->tts_cached = 1;
-            r->tts_blob_key = strdup((const char *)sqlite3_column_text(st, 0));
-            r->tts_bytes = (uint64_t)sqlite3_column_int64(st, 1);
-            r->tts_duration_ms = (uint32_t)sqlite3_column_int(st, 2);
-        }
-        sqlite3_finalize(st);
-    }
+/* A voice's audition (REQ-292): its preview sentence, through exactly the path a
+ * message takes -- the same handle, so the same cache, so each voice's sample is
+ * rendered once for the whole deployment and then served. It is nobody's message:
+ * there is no read gate, no author and no voice to persist, and it answers as
+ * message 0, which no message is. */
+static oc_dbres *process_tts_preview(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->message_id = 0;
+    r->type = OC_RES_TTS_ERR;
+    r->err_code = OC_ERR_NOT_RENDERABLE;
+    if (!j->tts_text || !j->tts_text[0]) return r;
+    int voice = (int)j->tts_voice;
+    r->tts_voice = (uint8_t)voice;
+    tts_handle_of(j->tts_text, strlen(j->tts_text), voice, r->tts_handle);
+    r->tts_text = strdup(j->tts_text);
+    if (!r->tts_text) { r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_TTS_META;
+    tts_probe_cache(db, j, r);
     return r;
 }
 
@@ -6460,7 +6495,7 @@ static int is_read_job(int type) {
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
            type == OC_JOB_AUDIT_QUERY ||
-           type == OC_JOB_TTS_LOOKUP;
+           type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -6481,6 +6516,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
+    if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
     if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);

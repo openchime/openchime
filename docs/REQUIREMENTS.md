@@ -1296,7 +1296,8 @@ the requirement says so explicitly rather than implying one.
   (REQ-240), the same for every listener on every device. A listener has not overridden it.
   A new user's voice has defaulted from their declared pronouns where the server's language
   is one whose pronouns it reads, else from a stable choice keyed on their account, and the
-  user has been able to change it by name from the list the server offers. A change has
+  user has been able to change it by name from the list the server offers, hearing each
+  voice before choosing it. A change has
   applied to messages rendered afterwards, not retroactively.
 - **REQ-293.** Speech has been **synthesized on the server, once per
   message text, voice and language**, by the daemon itself from a voice model installed beside it (ARCH-111), and

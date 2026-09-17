@@ -337,6 +337,8 @@ typedef struct {
     uint64_t listen_ready_id;         /* speech in hand, waiting for the frontend */
     uint8_t *listen_ready;            /* the MP4; owned here until taken */
     size_t   listen_ready_len;
+    uint8_t *preview_ready;           /* a voice's audition MP4 (REQ-292), owned until taken */
+    size_t   preview_ready_len;
     uint64_t listen_playing;          /* what the frontend says it is playing now */
     uint32_t listen_skipped;          /* messages passed over, for the notice line */
     oc_channel      *channels;
@@ -886,6 +888,10 @@ uint32_t oc_model_listen_skipped(const oc_model *m);
 /* Take the speech that is ready to play, if any: the caller owns the bytes and
  * frees them. Returns the message id, or 0 when nothing is waiting. */
 uint64_t oc_model_listen_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
+/* A voice's audition, if one has arrived: 1 with the MP4 handed over (the caller
+ * frees it), or 0. A newer sample replaces one not yet taken -- only the voice
+ * last chosen is worth hearing. */
+int      oc_model_preview_take_audio(oc_model *m, uint8_t **mp4, size_t *len);
 
 /* User ids currently typing in `channel_id` (last seen within the timeout),
  * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */
