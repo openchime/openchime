@@ -1620,6 +1620,12 @@ oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabili
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voice_preview_get *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_VOICE_PREVIEW_GET);
+    oc_w_str(w, m->voice_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_GET);
     oc_w_u64(w, m->message_id);
@@ -2495,6 +2501,11 @@ oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m) {
     if (n > OC_CAP_MAX) return OC_E_MALFORMED;
     m->count = n;
     for (uint8_t i = 0; i < n; i++) m->names[i] = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_voice_preview_get(oc_rbuf *p, oc_voice_preview_get *m) {
+    m->voice_id = oc_r_str(p);
     return r_done(p);
 }
 

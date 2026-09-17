@@ -1634,6 +1634,12 @@ static void test_tts_frames(void) {
         CHECK(oc_decode_capabilities(&pr, &out) != OC_OK);
     }
     {
+        oc_voice_preview_get in = { oc_slice_str("expr-voice-5-f") };
+        ROUNDTRIP(oc_encode_voice_preview_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_VOICE_PREVIEW_GET, h, p);
+        oc_voice_preview_get out;
+        CHECK(oc_decode_voice_preview_get(&p, &out) == OC_OK && slice_eq_str(out.voice_id, "expr-voice-5-f"));
+    }
+    {
         oc_audio_get in = { 4242 };
         ROUNDTRIP(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_GET, h, p);
         oc_audio_get out;

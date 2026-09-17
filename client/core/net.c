@@ -521,6 +521,20 @@ static void begin_listen(disp_ctx *ctx, uint64_t message_id) {
     }
 }
 
+/* Ask to hear a voice say the audition sentence (REQ-292). The same download as a
+ * message's speech, answered as message 0; a failure is simply no sample, since
+ * the choice it would have helped with is still there to make. */
+static void begin_voice_preview(disp_ctx *ctx, const char *voice_id) {
+    oc_xfer *x = ctx->xfer;
+    memset(x, 0, sizeof *x);
+    x->mode = 5; x->id = 0; x->buf_max = (size_t)OC_MAX_ATTACHMENT_SIZE;
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_voice_preview_get vp = { oc_slice_str(voice_id ? voice_id : "") };
+    if (oc_encode_voice_preview_get(&w, OC_PROTOCOL_VERSION, &vp) != OC_OK ||
+        write_all(ctx->conn, ctx->fd, buf, w.len, ctx->stop) != 0)
+        xfer_reset(x);
+}
+
 /* Start the active job. Whatever leaves the transfer idle has already finished,
  * with its notice sent; xq_pump then retires it. */
 static void xq_start(disp_ctx *ctx) {
@@ -551,6 +565,8 @@ static void xq_start(disp_ctx *ctx) {
         begin_download(ctx, c->message_id, fp, 0, slash ? slash + 1 : c->body);
     } else if (c->type == OC_CMD_LISTEN_FETCH) {
         begin_listen(ctx, c->message_id);
+    } else if (c->type == OC_CMD_VOICE_PREVIEW) {
+        begin_voice_preview(ctx, c->body);
     } else if (c->type == OC_CMD_POST_VIDEO) {
         ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
         char pname[128];
@@ -1544,12 +1560,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             }
         } else if (hdr.msg_type == OC_MSG_AUDIO_INFO) {
             oc_audio_info ai;
-            if (oc_decode_audio_info(&p, &ai) == OC_OK && ctx && ctx->xfer->mode == 4 &&
+            if (oc_decode_audio_info(&p, &ai) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                 ai.message_id == ctx->xfer->id)
                 ctx->xfer->total = ai.total_size;
         } else if (hdr.msg_type == OC_MSG_AUDIO_CHUNK) {
             oc_audio_chunk ac;
-            if (oc_decode_audio_chunk(&p, &ac) == OC_OK && ctx && ctx->xfer->mode == 4 &&
+            if (oc_decode_audio_chunk(&p, &ac) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                 ac.message_id == ctx->xfer->id && ac.seq == ctx->xfer->next_seq) {
                 oc_xfer *x = ctx->xfer;
                 int failed = 0;
@@ -1569,18 +1585,21 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     }
                 }
                 if (failed) {
-                    oc_ev *e = oc_ev_new(OC_EV_LISTEN_SKIP);
-                    if (e) { e->message_id = x->id; oc_queue_push(ctx->to_ui, e); }
+                    if (x->mode == 4) {                    /* a preview just goes without */
+                        oc_ev *e = oc_ev_new(OC_EV_LISTEN_SKIP);
+                        if (e) { e->message_id = x->id; oc_queue_push(ctx->to_ui, e); }
+                    }
                     xfer_reset(x);
                 } else { x->done += ac.data.len; x->next_seq++; }
             }
         } else if (hdr.msg_type == OC_MSG_AUDIO_END) {
             oc_audio_end ae;
-            if (oc_decode_audio_end(&p, &ae) == OC_OK && ctx && ctx->xfer->mode == 4 &&
+            if (oc_decode_audio_end(&p, &ae) == OC_OK && ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                 ae.message_id == ctx->xfer->id) {
                 oc_xfer *x = ctx->xfer;
                 int whole = x->buf_len && (!x->total || x->done == x->total);
-                oc_ev *e = oc_ev_new(whole ? OC_EV_LISTEN_AUDIO : OC_EV_LISTEN_SKIP);
+                oc_ev *e = x->mode == 5 ? (whole ? oc_ev_new(OC_EV_VOICE_PREVIEW) : NULL)
+                                        : oc_ev_new(whole ? OC_EV_LISTEN_AUDIO : OC_EV_LISTEN_SKIP);
                 if (e) {
                     e->message_id = x->id;
                     if (whole) {
@@ -1804,7 +1823,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                      (err.code == OC_ERR_MEDIA_INVALID || err.code == OC_ERR_MEDIA_TOO_LARGE)) ||
                     /* Speech this daemon will not produce (REQ-294/295): the
                      * message has nothing to say, or read-aloud is off or busy. */
-                    (ctx && ctx->xfer->mode == 4 &&
+                    (ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                      (err.code == OC_ERR_NOT_RENDERABLE || err.code == OC_ERR_TTS_UNAVAILABLE ||
                       err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE));
                 if (ctx && ctx->xfer->mode == 3 && about_transfer)
@@ -2560,7 +2579,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_read_cursor(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
-            if (c->type == OC_CMD_LISTEN_FETCH ||
+            if (c->type == OC_CMD_LISTEN_FETCH || (c->type == OC_CMD_VOICE_PREVIEW && c->body) ||
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
                 (c->type == OC_CMD_DOWNLOAD && c->body) ||
                 (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {

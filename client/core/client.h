@@ -309,6 +309,10 @@ void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t messa
  * moves the queue on. */
 void oc_client_listen(oc_client *c, uint64_t channel_id, int on);
 void oc_client_listen_done(oc_client *c);
+/* Hear voice `voice_id` (one TTS_INFO listed) say the audition sentence (REQ-292).
+ * The sample arrives in the model for oc_model_preview_take_audio; nothing
+ * arrives if it cannot be had. Queued behind any transfer already running. */
+void oc_client_voice_preview(oc_client *c, const char *voice_id);
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by

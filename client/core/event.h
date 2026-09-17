@@ -157,6 +157,9 @@ enum {
     /* One message's speech has arrived, ready to play: message_id, count=bytes,
      * body=the MP4 (NOT a C string). The model owns it from here. */
     OC_EV_LISTEN_AUDIO,
+    /* A voice's audition has arrived, ready to play: body = the MP4 (owned by the
+     * event until the model takes it), count = its length. */
+    OC_EV_VOICE_PREVIEW,
     /* ...or it will not: message_id, status = the reason code (0 = nothing to
      * say). Talking mode moves on rather than stopping. */
     OC_EV_LISTEN_SKIP
@@ -348,6 +351,8 @@ enum {
     /* Fetch one message's speech (ARCH-111): message_id. Queued with the other
      * transfers, so it never overlaps a download. */
     OC_CMD_LISTEN_FETCH,
+    /* Hear a voice say the audition sentence (REQ-292): body = voice id. */
+    OC_CMD_VOICE_PREVIEW,
     OC_CMD_QUIT
 };
 

@@ -102,6 +102,15 @@ void oc_client_listen(oc_client *c, uint64_t channel_id, int on) {
     m->listen_channel = (on && channel_id) ? channel_id : 0;
 }
 
+void oc_client_voice_preview(oc_client *c, const char *voice_id) {
+    if (!c || !voice_id || !*voice_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_VOICE_PREVIEW);
+    if (!cmd) return;
+    cmd->body = strdup(voice_id);
+    if (!cmd->body) { oc_cmd_free(cmd); return; }
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_listen_done(oc_client *c) {
     if (!c) return;
     c->model.listen_playing = 0;

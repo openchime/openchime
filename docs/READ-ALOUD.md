@@ -154,7 +154,7 @@ message is about 5 seconds, 15 KB. A thousand rendered messages is about 15 MB.
 
 ## 6. The wire
 
-Protocol version 15; full layouts in PROTOCOL.md §5.14b.
+Protocol version 16; full layouts in PROTOCOL.md §5.14b.
 
 - **`CAPABILITIES` (S→C, `0x00E1`)** after authentication: the features this daemon offers, by
   name. `tts` is present exactly when read-aloud is running — built in, turned on, and its data
@@ -165,6 +165,9 @@ Protocol version 15; full layouts in PROTOCOL.md §5.14b.
 - **`AUDIO_GET` (C→S, `0x00DD`)** `{message_id}` → **`AUDIO_INFO` (`0x00DE`)**
   `{message_id, duration_ms, total_size}`, **`AUDIO_CHUNK` (`0x00DF`)**, **`AUDIO_END`
   (`0x00E0`)** — the attachment download's shape, backpressure and gate.
+- **`VOICE_PREVIEW_GET` (C→S, `0x00E2`)** `{voice_id}` → the same `AUDIO_INFO` /
+  `AUDIO_CHUNK` / `AUDIO_END`, with message id 0: the preview sentence in that voice,
+  rendered once and cached for everyone.
 - **Errors:** `3023 NOT_RENDERABLE` (nothing to say), `3024 TTS_UNAVAILABLE` (read-aloud off,
   or the queue is full, or the render failed).
 - **Profile:** `SET_PROFILE`, `PROFILE_INFO` and `USER_LIST` carry `voice_id`.
@@ -178,7 +181,8 @@ Protocol version 15; full layouts in PROTOCOL.md §5.14b.
   and appending messages that arrive while it plays.
 - **Win32:** "Listen" in the channel header and "Listen from here" on a message; a
   mini-player bar with play/pause, skip, stop and the current author; the voice picker
-  with a preview in Edit profile.
+  in Edit profile, where choosing a voice plays the preview sentence in it before the
+  profile is saved.
 - **TUI:** `/listen` and `/listen stop`, playing through the same queue (ARCH-75 exempts
   a terminal from graphics, not from audio).
 
