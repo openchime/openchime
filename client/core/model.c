@@ -395,7 +395,19 @@ const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_na
 
 /* ---- read-aloud (ARCH-111) ---------------------------------------------- */
 
-uint8_t     oc_model_tts_available(const oc_model *m)   { return m->tts_available; }
+int oc_model_has_capability(const oc_model *m, const char *name) {
+    if (!m || !name || !*name) return 0;
+    size_t n = strlen(name);
+    for (const char *p = m->capabilities; *p;) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) return 1;   /* whole names only */
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return 0;
+}
+uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
 uint8_t     oc_model_tts_voice_count(const oc_model *m) { return m->n_voices; }
 const char *oc_model_tts_preview(const oc_model *m)     { return m->tts_preview; }
 
@@ -1168,10 +1180,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
+    case OC_EV_CAPABILITIES:
+        snprintf(m->capabilities, sizeof m->capabilities, "%s", e->body ? e->body : "");
+        break;
     case OC_EV_TTS_BEGIN:
         /* Replaces what we knew: the daemon says this again on every reconnect,
          * and it may have been rebuilt without read-aloud in between. */
-        m->tts_available = (uint8_t)e->status;
         m->n_voices = 0;
         snprintf(m->tts_model_version, sizeof m->tts_model_version, "%s", e->body ? e->body : "");
         snprintf(m->tts_preview, sizeof m->tts_preview, "%s", e->topic ? e->topic : "");

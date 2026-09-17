@@ -29,6 +29,10 @@ dir="$stage/$name"
 mkdir -p "$dir"
 
 install -m 0755 "$BINARY"                                   "$dir/openchimed"
+# Voices beside the binary: an extracted tarball runs with read-aloud as it
+# stands, because the daemon looks beside itself when nothing is installed.
+VOICES="$(dirname "$BINARY")/voices"
+[ -f "$VOICES/manifest" ] && cp -r "$VOICES" "$dir/voices"
 install -m 0644 "$root/packaging/debian/openchimed.service" "$dir/openchimed.service"
 install -m 0644 "$root/packaging/openchimed.env"            "$dir/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"              > "$dir/COPYRIGHT"
@@ -47,6 +51,11 @@ set -eu
 cd "$(dirname "$0")"
 
 install -D -m 0755 openchimed         /usr/bin/openchimed
+if [ -d voices ]; then
+    mkdir -p /usr/share/openchime
+    rm -rf /usr/share/openchime/voices
+    cp -r voices /usr/share/openchime/voices
+fi
 install -D -m 0644 openchimed.service /lib/systemd/system/openchimed.service
 install -D -m 0644 COPYRIGHT          /usr/share/doc/openchimed/copyright
 
@@ -77,7 +86,8 @@ OpenChime daemon ${VERSION} (linux-${ARCH})
   sudo ./install.sh
 
 Requires glibc 2.34 or newer. Everything else -- including TLS and SQLite --
-is statically linked, so there is nothing further to fetch. That makes this the
+is statically linked, and read-aloud's voice data is in voices/ beside the
+binary, so there is nothing further to fetch. That makes this the
 offline install: no package repository, no network.
 
   Configuration   /etc/openchime/openchimed.env   (every variable: docs/CONFIG.md)

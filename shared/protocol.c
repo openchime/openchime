@@ -1597,7 +1597,6 @@ oc_result oc_encode_upload_ok(oc_wbuf *w, uint16_t version, const oc_upload_ok *
  * count and that many id/label pairs rather than a repeated-entry frame. */
 oc_result oc_encode_tts_info(oc_wbuf *w, uint16_t version, const oc_tts_info *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_TTS_INFO);
-    oc_w_u8(w, m->available);
     oc_w_str(w, m->model_version);
     uint8_t n = m->count > OC_TTS_VOICE_MAX ? OC_TTS_VOICE_MAX : m->count;
     oc_w_u8(w, n);
@@ -1607,6 +1606,17 @@ oc_result oc_encode_tts_info(oc_wbuf *w, uint16_t version, const oc_tts_info *m)
         oc_w_str(w, m->voices[i].lang);
     }
     oc_w_str(w, m->preview);
+    return oc_frame_end(w, off);
+}
+
+/* A count and that many names, like TTS_INFO's voices. The count is clamped on
+ * the way out and a larger one refused on the way in: a malformed frame, not a
+ * truncated list. */
+oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CAPABILITIES);
+    uint8_t n = m->count > OC_CAP_MAX ? OC_CAP_MAX : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) oc_w_str(w, m->names[i]);
     return oc_frame_end(w, off);
 }
 
@@ -2466,7 +2476,6 @@ oc_result oc_decode_upload_ok(oc_rbuf *p, oc_upload_ok *m) {
 
 oc_result oc_decode_tts_info(oc_rbuf *p, oc_tts_info *m) {
     memset(m, 0, sizeof *m);
-    m->available = oc_r_u8(p);
     m->model_version = oc_r_str(p);
     uint8_t n = oc_r_u8(p);
     if (n > OC_TTS_VOICE_MAX) return OC_E_MALFORMED;
@@ -2477,6 +2486,15 @@ oc_result oc_decode_tts_info(oc_rbuf *p, oc_tts_info *m) {
         m->voices[i].lang = oc_r_str(p);
     }
     m->preview = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m) {
+    memset(m, 0, sizeof *m);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_CAP_MAX) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint8_t i = 0; i < n; i++) m->names[i] = oc_r_str(p);
     return r_done(p);
 }
 

@@ -382,20 +382,24 @@ jobs:
       - name: Build the daemon (glibc 2.34)
         run: |
           set -euo pipefail
-          mkdir -p "$DIST" /tmp/sqinc
-          cp /usr/include/sqlite3.h /usr/include/sqlite3ext.h /tmp/sqinc/
+          mkdir -p "$DIST"
+          # No system SQLite: it is compiled in from third_party/sqlite-3.53.4, and
+          # putting the host's sqlite3.h on the include path first would compile
+          # the daemon against a different version from the one it links.
           cat > /tmp/zcc <<EOF
           #!/bin/sh
-          exec /opt/zig/zig cc -target ${{ matrix.zig }}-linux-gnu.2.34 \
-            -I/tmp/sqinc -L/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH) "\$@"
+          exec /opt/zig/zig cc -target ${{ matrix.zig }}-linux-gnu.2.34 "\$@"
           EOF
           chmod +x /tmp/zcc
           make CC=/tmp/zcc TTS_CXXLIB=-lc++ OC_VERSION="$VERSION"
           strip openchimed -o "$DIST/openchimed"
+          # Read-aloud's data travels beside the binary, where `make` assembled
+          # it and wrote its manifest; every package takes it from there.
+          cp -r voices "$DIST/voices"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
           "./$DIST/openchimed" --version
-          # Read-aloud is inside the shipped binary and works: a render from the
-          # stripped file, with the voice model embedded in it.
+          # Read-aloud works from what ships: a render from the stripped file,
+          # finding its voice data beside it and verifying it.
           "./$DIST/openchimed" --tts-say expr-voice-2-f "This release speaks." /tmp/release-check.wav
 
       # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
@@ -465,6 +469,9 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
           /usr/bin/openchimed --version
+          # The package put the voices where an installed daemon looks, and they
+          # verify: a render by the installed binary, from the installed data.
+          /usr/bin/openchimed --tts-say expr-voice-2-f "The package speaks." /tmp/installed-check.wav
 
       # The install above does not touch the unit file: both maintainer scripts
       # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60

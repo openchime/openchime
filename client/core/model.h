@@ -316,7 +316,7 @@ typedef struct {
 
     /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
      * on every reconnect. Without it a frontend shows nothing of the feature. */
-    uint8_t  tts_available;
+    char     capabilities[256];         /* the daemon's feature names, comma separated */
     uint8_t  n_voices;
     /* Wide enough for the whole string. It was 64 while the daemon sent 71
      * characters, so this silently held a truncated version -- harmless only
@@ -867,6 +867,9 @@ uint32_t    oc_model_max_users(const oc_model *m);
  * messages and a frontend shows nothing of the feature (REQ-295). The voices are
  * the ones a person may be read in, and `preview` is the sentence that auditions
  * one. */
+/* Whether the daemon offers the feature called `name` (OC_CAP_*). */
+int             oc_model_has_capability(const oc_model *m, const char *name);
+/* Read-aloud is offered: the "tts" capability. */
 uint8_t         oc_model_tts_available(const oc_model *m);
 uint8_t         oc_model_tts_voice_count(const oc_model *m);
 const oc_voice *oc_model_tts_voice(const oc_model *m, uint8_t i);

@@ -25,6 +25,12 @@ chmod 0755 "$stage"
 # The spec installs from this one directory, so everything it needs is staged
 # under flat names it can predict.
 install -m 0755 "$BINARY"                                      "$stage/openchimed"
+# Read-aloud's data, when it was built beside the binary (see build-deb.sh).
+with_voices=0
+if [ -f "$(dirname "$BINARY")/voices/manifest" ]; then
+  cp -r "$(dirname "$BINARY")/voices" "$stage/voices"
+  with_voices=1
+fi
 install -m 0644 "$root/packaging/debian/openchimed.service"    "$stage/openchimed.service"
 install -m 0644 "$root/packaging/openchimed.env"               "$stage/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"                 > "$stage/copyright"
@@ -38,6 +44,7 @@ rpmbuild -bb \
   --define "_topdir ${topdir}" \
   --define "_version ${VERSION}" \
   --define "_bindir_src ${stage}" \
+  --define "_with_voices ${with_voices}" \
   --define "dist %{nil}" \
   "$root/packaging/rpm/openchimed.spec" >/dev/null
 

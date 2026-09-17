@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 14** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 15** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -1400,12 +1400,24 @@ file itself from the message's text. What the wire carries is therefore the
 download shape without the upload half, keyed by the **message** id the client
 already has.
 
-**`TTS_INFO` (S → C), `0x00DC`** `{ available: u8, model_version: str,
-count: u8, count × { id: str, label: str, lang: str }, preview: str }` — sent once
-to every
-client just after `WORKSPACE_INFO`, whatever the answer. `available` 0 (with no
-voices) means this daemon does not read messages aloud, and a client showing
-nothing of the feature is the correct result (REQ-295). `model_version` names the
+**`CAPABILITIES` (S → C), `0x00E1`** `{ count: u8, count × name: str }` — the
+features this daemon offers, by name, sent once to every client just after
+`WORKSPACE_INFO` and before the frames that describe any feature. A name present
+means the feature is available on this connection; absent means a client shows
+nothing of it, which is the correct result rather than offering something that
+would fail (REQ-295). `tts` is present exactly when read-aloud is running — built
+in, turned on, and its voice data found and verified against its manifest. `stt`
+is named and never present yet, so clients already hide speech-to-text correctly.
+Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
+client ignores a name it does not know. At most 16 names: a longer list is a
+malformed frame.
+
+**`TTS_INFO` (S → C), `0x00DC`** `{ model_version: str, count: u8,
+count × { id: str, label: str, lang: str }, preview: str }` — sent once to every
+client just after `CAPABILITIES`, whatever the answer, with no voices when
+read-aloud is not offered. Whether it is offered is the `tts` capability's to say:
+this frame used to carry its own `available` byte, and two answers to one question
+can disagree. `model_version` names the
 language, the model, the pronunciation data and the speaking rate together;
 `preview` is the sentence a client plays to audition a voice. `lang` is the BCP 47
 language that voice speaks, carried per voice rather than per frame because a
@@ -2384,6 +2396,7 @@ this table cannot silently gain a shared value.
 | `0x00DE` | `AUDIO_INFO` | S → C | its duration and size |
 | `0x00DF` | `AUDIO_CHUNK` | S → C | a slice of the rendering |
 | `0x00E0` | `AUDIO_END` | S → C | the whole rendering is sent |
+| `0x00E1` | `CAPABILITIES` | S → C | the features this daemon offers, by name |
 
 ## 10. Connection state machine
 

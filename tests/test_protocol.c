@@ -1551,7 +1551,6 @@ static void test_tts_frames(void) {
     {
         oc_tts_info in;
         memset(&in, 0, sizeof in);
-        in.available = 1;
         in.model_version = oc_slice_str("kitten-mini-0.8/ttskit-1/rate-1.2");
         /* Three voices, with language tags of DIFFERENT lengths: the language
          * sits inside the repeated voice list, so a field appended in the wrong
@@ -1572,7 +1571,7 @@ static void test_tts_frames(void) {
         ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
         oc_tts_info out;
         CHECK(oc_decode_tts_info(&p, &out) == OC_OK);
-        CHECK(out.available == 1 && out.count == 3);
+        CHECK(out.count == 3);
         CHECK(slice_eq_str(out.model_version, "kitten-mini-0.8/ttskit-1/rate-1.2"));
         CHECK(slice_eq_str(out.voices[0].lang, "en-US"));
         CHECK(slice_eq_str(out.voices[1].id, "expr-voice-5-f"));
@@ -1590,19 +1589,49 @@ static void test_tts_frames(void) {
         in.preview = oc_slice_str("");
         ROUNDTRIP(oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TTS_INFO, h, p);
         oc_tts_info out;
-        CHECK(oc_decode_tts_info(&p, &out) == OC_OK && out.available == 0 && out.count == 0);
+        CHECK(oc_decode_tts_info(&p, &out) == OC_OK && out.count == 0);
     }
     {
         /* More voices than the frame holds is refused rather than read as a
          * mis-aligned rest of the payload: the count is a bound, not a hint. */
         uint8_t payload[] = { 0, 1,                          /* min_ver, max_ver */
-                              1,                             /* available */
                               0, 1, 'v',                     /* model_version */
                               OC_TTS_VOICE_MAX + 1 };        /* impossible voice count */
         oc_rbuf pr;
         oc_rbuf_init(&pr, payload, sizeof payload);
         oc_tts_info out;
         CHECK(oc_decode_tts_info(&pr, &out) != OC_OK);
+    }
+    {
+        /* CAPABILITIES: names round-trip in order, including one a client does
+         * not know, and none at all is a valid answer. */
+        oc_capabilities in;
+        memset(&in, 0, sizeof in);
+        in.count = 3;
+        in.names[0] = oc_slice_str(OC_CAP_TTS);
+        in.names[1] = oc_slice_str("something-new");
+        in.names[2] = oc_slice_str(OC_CAP_STT);
+        ROUNDTRIP(oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CAPABILITIES, h, p);
+        oc_capabilities out;
+        CHECK(oc_decode_capabilities(&p, &out) == OC_OK && out.count == 3);
+        CHECK(slice_eq_str(out.names[0], "tts"));
+        CHECK(slice_eq_str(out.names[1], "something-new"));
+        CHECK(slice_eq_str(out.names[2], "stt"));
+    }
+    {
+        oc_capabilities in;
+        memset(&in, 0, sizeof in);
+        ROUNDTRIP(oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CAPABILITIES, h, p);
+        oc_capabilities out;
+        CHECK(oc_decode_capabilities(&p, &out) == OC_OK && out.count == 0);
+    }
+    {
+        /* More names than the frame holds is refused, as TTS_INFO's voices are. */
+        uint8_t payload[] = { OC_CAP_MAX + 1 };
+        oc_rbuf pr;
+        oc_rbuf_init(&pr, payload, sizeof payload);
+        oc_capabilities out;
+        CHECK(oc_decode_capabilities(&pr, &out) != OC_OK);
     }
     {
         oc_audio_get in = { 4242 };

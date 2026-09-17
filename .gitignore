@@ -1,4 +1,6 @@
 openchimed
+# Read-aloud's data directory, assembled by `make` beside the binary.
+/voices/
 build/
 # Release artefacts (.deb/.rpm/.tar.gz and the stripped binary they share),
 # produced by packaging/build-*.sh and by the release workflow. Built, never

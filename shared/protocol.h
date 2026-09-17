@@ -38,7 +38,14 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 14: every voice on TTS_INFO carries the language it speaks (REQ-291-295,
+/* 15: CAPABILITIES (0x00E1) is new -- the features this daemon offers, by name,
+ * told at auth beside WORKSPACE_INFO -- and TTS_INFO loses its `available` byte,
+ * which the "tts" capability now answers, so there is one source of truth rather
+ * than two that could disagree. Read-aloud's data became files beside the daemon
+ * that can be absent (ARCH-111), which is what made a general answer to "does
+ * this daemon offer X" worth having; speech-to-text is the second name.
+ *
+ * 14: every voice on TTS_INFO carries the language it speaks (REQ-291-295,
  * ARCH-111). The voices are a repeated list, so the added field shifts every
  * voice after the first. Read-aloud was English and said so nowhere a program
  * could read; one language still ships, and now it is named.
@@ -98,7 +105,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 14u
+#define OC_PROTOCOL_VERSION 15u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -364,6 +371,7 @@ typedef enum {
     OC_MSG_AUDIO_INFO       = 0x00DE, /* S->C, its duration and size */
     OC_MSG_AUDIO_CHUNK      = 0x00DF, /* S->C, a slice of the rendering */
     OC_MSG_AUDIO_END        = 0x00E0, /* S->C, the whole rendering is sent */
+    OC_MSG_CAPABILITIES     = 0x00E1, /* S->C, the features this daemon offers, by name */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1106,8 +1114,16 @@ typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
  * model cannot read German -- so a client can offer the right ones without a
  * second lookup, and a daemon that grows a second language needs no new frame. */
 typedef struct { oc_slice id; oc_slice label; oc_slice lang; } oc_tts_voice;
-typedef struct { uint8_t available; oc_slice model_version; uint8_t count;
+typedef struct { oc_slice model_version; uint8_t count;
                  oc_tts_voice voices[OC_TTS_VOICE_MAX]; oc_slice preview; } oc_tts_info;
+/* The features this daemon offers, by name (REQ-295): a name present means the
+ * feature is available on this connection, absent means a client shows nothing
+ * of it. Names rather than bit positions, so there is no ceiling to run into and
+ * nothing to misnumber; a client ignores a name it does not know. */
+#define OC_CAP_MAX 16
+#define OC_CAP_TTS "tts"   /* read a conversation aloud (REQ-291) */
+#define OC_CAP_STT "stt"   /* speak a message and have it land as text */
+typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 typedef struct { uint64_t message_id; } oc_audio_get;
 typedef struct { uint64_t message_id; uint32_t duration_ms; uint64_t total_size; } oc_audio_info;
 typedef struct { uint64_t message_id; uint32_t seq; oc_slice data; } oc_audio_chunk;
@@ -1350,6 +1366,7 @@ oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *
 oc_result oc_encode_audio_info(oc_wbuf *w, uint16_t version, const oc_audio_info *m);
 oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chunk *m);
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
+oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m);
 oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m);
 oc_result oc_encode_download_info(oc_wbuf *w, uint16_t version, const oc_download_info *m);
 oc_result oc_encode_download_chunk(oc_wbuf *w, uint16_t version, const oc_download_chunk *m);
@@ -1511,6 +1528,7 @@ oc_result oc_decode_audio_get(oc_rbuf *p, oc_audio_get *m);
 oc_result oc_decode_audio_info(oc_rbuf *p, oc_audio_info *m);
 oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
+oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m);
 oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m);
 oc_result oc_decode_download_info(oc_rbuf *p, oc_download_info *m);
 oc_result oc_decode_download_chunk(oc_rbuf *p, oc_download_chunk *m);
