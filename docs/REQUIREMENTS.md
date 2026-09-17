@@ -1726,11 +1726,18 @@ None are yet backed by an architecture decision.*
   the query that exists.
 
 - **REQ-229.** A user has been able to start a message **before choosing who it
-  is for** — composing in a first-class pane, addressing it to any mix of
-  channels and people, with the half-written result **preserved as an
-  unaddressed draft** (REQ-223, ARCH-101) so closing the pane has not
-  lost it. Sending has resolved the recipients into the right conversation:
-  an existing channel, a direct message, or a group DM (REQ-056).
+  is for** — composing in a first-class pane, addressing it either to **one
+  channel** or to **one or more people**, never a mix of the two, because a
+  channel and a person are two conversations and a message goes to one. The
+  half-written result — the words **and** the recipients — has been **preserved as
+  an unaddressed draft** (REQ-223, ARCH-101) so closing the pane has not lost it,
+  and reopening it has restored both. The pane's text has never been filed as any
+  conversation's draft. Sending has resolved the recipients into the right
+  conversation: an existing channel, a direct message, or a group DM (REQ-056),
+  and a send that could not be resolved has returned the message to the pane with
+  the reason rather than appearing to have succeeded. Addressing has offered only
+  destinations a message can actually reach: not a removed account, not an
+  archived channel, and not a channel the user has not joined.
 
 - **REQ-225.** *(Not built)* A user has been able to post a **poll** — a question with options
   other members vote on, results tallied and shown live — as a first-class message

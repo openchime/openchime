@@ -458,6 +458,18 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **A draft may be UNADDRESSED.** Slack's New Message pane autosaves before a recipient is chosen ("Saved a moment ago"), and that is most of why it feels safe to close. So `channel_id` is nullable with a `recipients` list beside it, and the addressed case keeps one-draft-per-conversation through a partial unique index rather than the primary key. The alternative — holding an unaddressed draft only in client memory — reintroduces precisely the loss this decision exists to end, one surface later.
 
+  **The RECIPIENTS come back with it, and ONE owner holds the editor.** The
+  unaddressed draft's `recipients` travel both ways — the client kept sending them
+  and then dropping them on the read path, so reopening the pane found the words
+  and not the people, and a restored draft could not be sent without remembering
+  who it had been for. And because the New message pane borrows the conversation's
+  editor rather than growing a second one, a single flag says which of the two
+  owns the text in it, checked by every write. Deriving that from the current view
+  is not equivalent: the view changes at forty sites and changes *before* the text
+  does, so a flush in between filed an unaddressed message as the draft of
+  whatever conversation had just been left — and entering the pane on an empty
+  field deleted that conversation's draft outright.
+
   **A draft is stored on the daemon in its own `drafts` table, keyed on the conversation, with its own ops** — not in the `client_settings` bucket. The bucket was the obvious cheap answer and is the wrong one twice over. It is keyed `(user_id, client_type, key)` and **partitioned per frontend by design**, so a draft written in the Win32 GUI would be invisible in the TUI — the opposite of REQ-223's "synced across that user's devices". And its own schema notes describe its contents as "single-user, low-contention **prefs**": a draft is the one thing we would put there that the user typed as a *message*, and it is the higher-contention case the bucket says it is not for.
 
   **`thread_root` is in the key from the start, defaulting to 0** (the channel itself). The client cannot use it yet — the thread pane shares the one composer, which is why `main_is_conversation()` treats an open thread as a conversation — so this dimension is unused on day one. It is there because the costs are asymmetric: one column now, against a migration on a table of user content plus a change to two wire ops that shipped clients already speak. Thread drafts then become a client-only change with no server work.

@@ -921,6 +921,15 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->body = malloc(d.body.len + 1);
                     if (e->body) { if (d.body.len) memcpy(e->body, d.body.ptr, d.body.len);
                                    e->body[d.body.len] = '\0'; }
+                    /* Who the unaddressed draft was for (REQ-229). The wire has
+                     * carried this since the frame existed; dropping it here is
+                     * why coming back to the pane found the words and not the
+                     * people. `topic` is the spare heap slot on this event. */
+                    if (d.recipients.len) {
+                        e->topic = malloc(d.recipients.len + 1);
+                        if (e->topic) { memcpy(e->topic, d.recipients.ptr, d.recipients.len);
+                                        e->topic[d.recipients.len] = '\0'; }
+                    }
                     oc_queue_push(to_ui, e);
                 }
             }

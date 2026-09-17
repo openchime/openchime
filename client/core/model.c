@@ -182,7 +182,7 @@ void oc_model_free(oc_model *m) {
     free(m->chanmem);
     for (size_t i = 0; i < m->n_saved; i++) free(m->saved[i].body);
     free(m->saved);
-    for (size_t i = 0; i < m->n_drafts; i++) free(m->drafts[i].body);
+    for (size_t i = 0; i < m->n_drafts; i++) { free(m->drafts[i].body); free(m->drafts[i].recipients); }
     free(m->drafts);
     for (size_t i = 0; i < m->n_scheds; i++) free(m->scheds[i].body);
     free(m->scheds);
@@ -229,11 +229,12 @@ static oc_draft_view *draft_find(oc_model *m, uint64_t cid, uint64_t root) {
 /* Upsert, or remove when the body is empty — the daemon reports a deletion as a
  * draft with no text, so both directions arrive through the one frame. */
 static void draft_apply(oc_model *m, uint64_t cid, uint64_t root,
-                        uint64_t updated_ms, const char *body) {
+                        uint64_t updated_ms, const char *body, const char *recipients) {
     oc_draft_view *d = draft_find(m, cid, root);
     if (!body || !body[0]) {
         if (!d) return;
         free(d->body);
+        free(d->recipients);
         *d = m->drafts[--m->n_drafts];            /* dense; order is not meaningful */
         return;
     }
@@ -245,10 +246,14 @@ static void draft_apply(oc_model *m, uint64_t cid, uint64_t root,
             m->drafts = g; m->cap_drafts = nc;
         }
         d = &m->drafts[m->n_drafts++];
-        d->channel_id = cid; d->thread_root = root; d->body = NULL;
+        d->channel_id = cid; d->thread_root = root; d->body = NULL; d->recipients = NULL;
     }
     free(d->body);
     d->body = strdup(body);
+    /* Recipients travel with the body, and NULL means "not stated" rather than
+     * "nobody": a device-sync push that omits them must not wipe the ones this
+     * client just chose. */
+    if (recipients) { free(d->recipients); d->recipients = strdup(recipients); }
     d->updated_ms = updated_ms;
     d->gen = m->draft_gen;
 }
@@ -312,7 +317,20 @@ size_t oc_model_scheduled_failed(const oc_model *m) {
 
 void oc_model_draft_local(oc_model *m, uint64_t channel_id, uint64_t thread_root,
                           const char *body) {
-    if (m && channel_id) draft_apply(m, channel_id, thread_root, 0, body);
+    /* Channel 0 is the New message pane's unaddressed draft (REQ-229) and is a
+     * real key here: refusing it meant the pane's own "Saved" could only ever
+     * come from another device, because the daemon does not echo a draft to the
+     * connection that wrote it. */
+    if (m) draft_apply(m, channel_id, thread_root, 0, body, NULL);
+}
+
+void oc_model_draft_local_to(oc_model *m, const char *recipients, const char *body) {
+    if (m) draft_apply(m, 0, 0, 0, body, recipients ? recipients : "");
+}
+
+const char *oc_model_draft_recipients(const oc_model *m) {
+    const oc_draft_view *d = m ? draft_find((oc_model *)m, 0, 0) : NULL;
+    return d ? d->recipients : NULL;
 }
 
 const char *oc_model_setting(const oc_model *m, const char *key) {
@@ -1709,7 +1727,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         setting_upsert(m, e->author_name, e->body ? e->body : "");
         break;
     case OC_EV_DRAFT:
-        draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body);
+        draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body, e->topic);
         break;
     case OC_EV_THREAD_SUMMARY:
         thread_apply(m, e);
@@ -1740,6 +1758,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         for (size_t i = m->n_drafts; i-- > 0; )
             if (m->drafts[i].gen != m->draft_gen) {
                 free(m->drafts[i].body);
+                free(m->drafts[i].recipients);
                 m->drafts[i] = m->drafts[--m->n_drafts];
             }
         break;

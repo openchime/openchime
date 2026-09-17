@@ -10,6 +10,7 @@
 #include "model.h"
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
+#include "complete.h"    /* who the New message pane may address (REQ-229) */
 
 #include "netloop.h"
 #include "config.h"
@@ -1431,6 +1432,80 @@ static void test_unread_counts_what_notifies(void) {
     }
 }
 
+
+/* Who the To: field in New message may address (REQ-229). The rules are not
+ * decoration: each one here is a message that would otherwise be refused after
+ * the composer had already been emptied, or a channel joined by picking a name
+ * out of an address list. */
+static void tgt_user(oc_model *m, uint64_t id, const char *name, int disabled,
+                     const char *full_name, const char *title) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER;
+    e.user_id = id;
+    e.body = strdup(name);
+    e.status = OC_ROLE_MEMBER;
+    e.op = disabled;
+    if (full_name) snprintf(e.pf_full_name, sizeof e.pf_full_name, "%s", full_name);
+    if (title)     snprintf(e.pf_title, sizeof e.pf_title, "%s", title);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void tgt_channel(oc_model *m, uint64_t id, const char *name, int archived, int joined) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL;
+    e.channel_id = id;
+    e.body = strdup(name);
+    e.status = joined;
+    e.op = 0;               /* an ordinary channel, not a DM */
+    e.archived = (uint8_t)archived;
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static int tgt_has(const oc_model *m, const char *q, const char *name) {
+    oc_target out[12];
+    size_t n = oc_complete_targets(m, q, out, 12);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(out[i].name, name) == 0) return 1;
+    return 0;
+}
+
+static void test_addressable_targets(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    tgt_user(&m, 1, "me", 0, NULL, NULL);
+    tgt_user(&m, 2, "alice", 0, "Alice Aardvark", "Platform");
+    tgt_user(&m, 3, "gene", 0, NULL, NULL);
+    tgt_user(&m, 4, "ghost", 1, NULL, NULL);            /* removed by an admin */
+    tgt_channel(&m, 10, "general", 0, 1);
+    tgt_channel(&m, 11, "attic", 1, 1);                 /* archived: read-only */
+    tgt_channel(&m, 12, "strangers", 0, 0);             /* public, never joined */
+
+    CHECK(tgt_has(&m, "ali", "alice"));
+    CHECK(!tgt_has(&m, "me", "me"));                    /* never yourself */
+    CHECK(!tgt_has(&m, "gho", "ghost"));                /* a removed account */
+    CHECK(tgt_has(&m, "gen", "general"));
+    CHECK(!tgt_has(&m, "att", "attic"));                /* archived is read-only */
+    CHECK(!tgt_has(&m, "str", "strangers"));            /* picking is not joining */
+
+    /* The sigil SELECTS. "#gen" means the channel, not the person called gene,
+     * which is what it means in the composer and everywhere else. */
+    CHECK(tgt_has(&m, "#gen", "general"));
+    CHECK(!tgt_has(&m, "#gen", "gene"));
+    CHECK(tgt_has(&m, "@gen", "gene"));
+    CHECK(!tgt_has(&m, "@gen", "general"));
+
+    /* A colleague is findable by the name they are known by, and by the title the
+     * row already prints beside it -- not only by the handle they log in with. */
+    CHECK(tgt_has(&m, "Aardvark", "alice"));
+    CHECK(tgt_has(&m, "Platform", "alice"));
+
+    oc_model_free(&m);
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
@@ -1441,6 +1516,7 @@ int run_client_core_tests(void) {
     test_thread_notices();
     test_unread_counts_what_notifies();
     test_capabilities();
+    test_addressable_targets();
     test_pins();
     test_resolve();
     test_last_error();
