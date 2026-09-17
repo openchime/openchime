@@ -114,7 +114,23 @@ static void on_udp(int udp_fd) {
 
     participant *me = find_by_token(pkt);        /* token is the first 16 bytes */
     if (!me) return;                             /* unknown/revoked token -> ignore */
-    me->addr = src; me->addr_known = 1;
+    /* The address is bound on first use and never re-learned. The token is not a
+     * secret on the wire: media is unencrypted and the token leads every packet,
+     * so re-learning the return address from whichever packet arrived last let
+     * anyone who saw one datagram redirect that participant's audio to
+     * themselves with one forged packet -- the participant goes silent and the
+     * forger hears the call. A valid token from any other address is dropped.
+     *
+     * A participant whose address really does change (NAT rebinding, a network
+     * switch) is not relayed from the new one, so their packets stop counting,
+     * the silence sweep drops them, and they rejoin with CALL_JOIN, which issues
+     * a fresh token over the authenticated TCP connection (REQ-152). */
+    if (!me->addr_known) {
+        me->addr = src;
+        me->addr_known = 1;
+    } else if (me->addr.sin_addr.s_addr != src.sin_addr.s_addr || me->addr.sin_port != src.sin_port) {
+        return;
+    }
     me->last_seen_ms = now_ms();
 
     const uint8_t *seq = pkt + OC_AUDIO_TOKEN_LEN;         /* 2 bytes */
