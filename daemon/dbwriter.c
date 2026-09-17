@@ -9,6 +9,7 @@
 
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
+#include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
 #include "dbwriter.h"
 #include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
 #include "url.h"
@@ -6285,58 +6286,6 @@ static const char *speak_resolve(void *ctx, const char *name) {
     return out;
 }
 
-/* The voice an author is read in (REQ-292). A voice they already have is kept if
- * the engine still has it; otherwise one is chosen from a stable hash of the user
- * id, which makes it the same on every restart and different between neighbours.
- * Declared pronouns pick the half of the list that matches, by the -f/-m suffix
- * the voice ids carry. The choice is written back (`tts_persist`) so it is a fact
- * on the profile someone can change, not a rule recomputed elsewhere. */
-static int speak_voice_for(const char *lang, const char *voices, const char *have,
-                           const char *pronouns, uint64_t user_id, int *persist) {
-    char list[512];
-    snprintf(list, sizeof list, "%s", voices ? voices : "");
-    char *ids[OC_TTS_VOICE_MAX];
-    int n = 0;
-    for (char *p = list; *p && n < OC_TTS_VOICE_MAX;) {
-        ids[n++] = p;
-        char *comma = strchr(p, ',');
-        if (!comma) break;
-        *comma = '\0';
-        p = comma + 1;
-    }
-    *persist = 0;
-    if (n == 0) return 0;
-    for (int i = 0; i < n; i++)
-        if (have && *have && strcmp(have, ids[i]) == 0) return i;
-
-    /* Pronouns pick a voice's presentation only where the daemon can read them,
-     * and it reads English: the test below is for the English words. In another
-     * language the same field holds words this knows nothing about, so the hash
-     * picks instead -- a fair choice rather than a wrong one. Generalising this
-     * needs a second language to generalise against. */
-    char want = 0;
-    if (pronouns && *pronouns && lang && strncmp(lang, "en", 2) == 0) {
-        char low[64];
-        size_t k = 0;
-        for (const char *c = pronouns; *c && k + 1 < sizeof low; c++) low[k++] = (char)tolower((unsigned char)*c);
-        low[k] = '\0';
-        if (strstr(low, "she")) want = 'f';
-        else if (strstr(low, "he")) want = 'm';
-    }
-    int pick[OC_TTS_VOICE_MAX], np = 0;
-    for (int i = 0; i < n; i++) {
-        size_t l = strlen(ids[i]);
-        if (!want || (l >= 2 && ids[i][l - 2] == '-' && ids[i][l - 1] == want)) pick[np++] = i;
-    }
-    if (np == 0) { for (int i = 0; i < n; i++) pick[np++] = i; }
-    /* A hash of the id, not the id itself: consecutive sign-ups should not walk
-     * the list in order and give a whole team the same two voices. */
-    uint64_t h = 1469598103934665603ull ^ user_id;
-    h *= 1099511628211ull;
-    h ^= h >> 29;
-    *persist = 1;
-    return pick[(size_t)(h % (uint64_t)np)];
-}
 
 /* Everything one AUDIO_GET needs to decide (ARCH-111): the read gate, what is
  * said, in whose voice, and whether that rendering already exists. Read. */
@@ -6391,7 +6340,7 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     }
 
     int persist = 0;
-    int voice = speak_voice_for(j->tts_lang, j->tts_voices, have_voice, pronouns, author, &persist);
+    int voice = oc_voice_pick(j->tts_lang, j->tts_voices, have_voice, pronouns, author, &persist);
     r->tts_voice = (uint8_t)voice;
     r->tts_persist = (uint8_t)persist;
 
