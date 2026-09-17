@@ -564,9 +564,32 @@ static call_t g_calls[OC_MAX_CALLS];   /* channel_id == 0 marks a free slot */
 static int      g_audio_ipc = -1;
 static uint16_t g_audio_udp_port;
 
+/* Supervision (REQ-150). The sidecar is a separate process, and nothing used to
+ * notice when it went away: calls kept forming and every joiner was handed the
+ * UDP port of a process that no longer existed, with nothing in the log to say
+ * so. Now its exit is seen, it is restarted, and if it will not stay up, calls
+ * are refused openly. A death within OC_AUDIO_FAST_DEATH_MS of starting counts as
+ * a fast one; OC_AUDIO_MAX_FAST_DEATHS in a row stops the restarting, so a
+ * sidecar that cannot start does not become a fork loop. */
+#define OC_AUDIO_FAST_DEATH_MS   10000
+#define OC_AUDIO_MAX_FAST_DEATHS 5
+static int    (*g_audio_respawn)(void *ctx);
+static void    *g_audio_respawn_ctx;
+static int      g_audio_down;          /* exited and not coming back: refuse calls */
+static int      g_audio_fast_deaths;
+static uint64_t g_audio_started_ms;
+
 void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port) {
     g_audio_ipc = ipc_fd;
     g_audio_udp_port = udp_port;
+    g_audio_down = 0;
+    g_audio_fast_deaths = 0;
+    g_audio_started_ms = now_ms();
+}
+
+void oc_netloop_set_audio_respawn(int (*respawn)(void *ctx), void *ctx) {
+    g_audio_respawn = respawn;
+    g_audio_respawn_ctx = ctx;
 }
 
 /* Outbound push emitter (ARCH-85), NULL = push disabled. Set before the loop. */
@@ -627,6 +650,49 @@ static void audio_authorize(uint64_t call_id, uint64_t user_id, const uint8_t *t
 
 static void audio_revoke(const uint8_t *token) {
     audio_ipc_send(OC_AUDIO_IPC_REVOKE, token, OC_AUDIO_TOKEN_LEN);
+}
+
+/* The sidecar's IPC socket became readable. The sidecar never writes to it, so
+ * that is always its end closing: it has exited. Restart it if we can, and tell
+ * the new one about every participant already in a call -- their tokens were in
+ * the old one's table, which died with it, and without this every live call goes
+ * silent. Their UDP addresses are learned again from their next packets. */
+static void audio_sidecar_lost(int ep) {
+    epoll_ctl(ep, EPOLL_CTL_DEL, g_audio_ipc, NULL);
+    close(g_audio_ipc);
+    g_audio_ipc = -1;
+
+    uint64_t now = now_ms();
+    if (now - g_audio_started_ms < OC_AUDIO_FAST_DEATH_MS) g_audio_fast_deaths++;
+    else g_audio_fast_deaths = 0;
+
+    if (!g_audio_respawn || g_audio_fast_deaths >= OC_AUDIO_MAX_FAST_DEATHS) {
+        g_audio_down = 1;
+        fprintf(stderr, "netloop: audio sidecar exited%s; calls are refused from now on\n",
+                g_audio_respawn ? " repeatedly on starting" : " and nothing restarts it");
+        return;
+    }
+    int fd = g_audio_respawn(g_audio_respawn_ctx);
+    if (fd < 0) {
+        g_audio_down = 1;
+        fprintf(stderr, "netloop: audio sidecar exited and could not be restarted; calls are refused from now on\n");
+        return;
+    }
+    g_audio_ipc = fd;
+    g_audio_started_ms = now;
+    struct epoll_event aev;
+    memset(&aev, 0, sizeof aev);
+    aev.events = EPOLLIN; aev.data.fd = g_audio_ipc;
+    epoll_ctl(ep, EPOLL_CTL_ADD, g_audio_ipc, &aev);
+
+    int n = 0;
+    for (int i = 0; i < OC_MAX_CALLS; i++) {
+        if (!g_calls[i].channel_id) continue;
+        for (int k = 0; k < g_calls[i].n; k++, n++)
+            audio_authorize(g_calls[i].channel_id, g_calls[i].parts[k].user_id, g_calls[i].parts[k].token);
+    }
+    fprintf(stderr, "netloop: audio sidecar exited and was restarted; %d participant%s re-authorized\n",
+            n, n == 1 ? "" : "s");
 }
 
 static call_t *call_find(uint64_t channel_id) {
@@ -3848,6 +3914,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *jc = find_by_id(conns, r->conn_id);
         if (!jc) break;
         int jfd = jc->fd;
+        if (g_audio_down) {
+            /* No relay, and none coming back: say so, rather than hand the
+             * joiner a UDP port that nothing is listening on. */
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_error e = { OC_ERR_CALL_UNAVAILABLE, 0, { NULL, 0 }, oc_slice_str("calls are unavailable") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, jfd, g_enc, w.len);
+            break;
+        }
         call_t *c = call_get_or_create(r->channel_id);
         uint8_t token[OC_AUDIO_TOKEN_LEN];
         if (!c || oc_rand_bytes(token, sizeof token) != 0 ||
@@ -4487,6 +4562,12 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     ev.events = EPOLLIN; ev.data.fd = xfd;
     epoll_ctl(ep, EPOLL_CTL_ADD, xfd, &ev);
 
+    /* The audio sidecar's IPC socket, watched only for its closing (REQ-150). */
+    if (g_audio_ipc >= 0) {
+        ev.events = EPOLLIN; ev.data.fd = g_audio_ipc;
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_audio_ipc, &ev);
+    }
+
     fprintf(stderr, "netloop: listening on :%d\n", port);
 
     struct epoll_event events[64];
@@ -4538,6 +4619,11 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &cev);
                     c->events = EPOLLIN;
                 }
+                continue;
+            }
+
+            if (g_audio_ipc >= 0 && fd == g_audio_ipc) {
+                audio_sidecar_lost(ep);
                 continue;
             }
 

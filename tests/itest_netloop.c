@@ -31,12 +31,45 @@ struct loop_arg {
     volatile sig_atomic_t stop;
 };
 
-/* An audio sidecar driven on a thread so the call e2e has a live media relay. */
+/* An audio sidecar driven on a thread so the call e2e has a live media relay.
+ * The net loop restarts it when it exits (REQ-150), so starting one is a function
+ * the net loop can call again: each start makes a new IPC socketpair and a new
+ * thread on the same UDP socket, exactly as main.c forks a new process. */
 static struct { int ipc_fd, udp_fd; volatile sig_atomic_t stop; } g_audio_arg;
+static pthread_t g_audio_th;
+static int       g_audio_running;
+static int       g_audio_side = -1;      /* the sidecar's end of the current IPC socket */
+static int       g_audio_daemon = -1;    /* the net loop's end */
+static volatile int g_audio_starts;
+static volatile int g_audio_refuse;      /* make the next restart fail */
 static void *audio_thread(void *p) {
     (void)p;
     oc_audio_sidecar_run(g_audio_arg.ipc_fd, g_audio_arg.udp_fd, &g_audio_arg.stop);
     return NULL;
+}
+static int audio_start(void *ctx) {
+    (void)ctx;
+    if (g_audio_refuse) return -1;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    g_audio_arg.ipc_fd = sv[1];
+    g_audio_arg.stop = 0;
+    if (pthread_create(&g_audio_th, NULL, audio_thread, NULL) != 0) { close(sv[0]); close(sv[1]); return -1; }
+    g_audio_side = sv[1];
+    g_audio_daemon = sv[0];
+    g_audio_running = 1;
+    g_audio_starts++;
+    return sv[0];
+}
+/* The sidecar exits: its thread stops and its end of the IPC socket closes, which
+ * is what the net loop sees when a sidecar process dies. */
+static void audio_kill(void) {
+    if (!g_audio_running) return;
+    g_audio_arg.stop = 1;
+    pthread_join(g_audio_th, NULL);
+    g_audio_running = 0;
+    close(g_audio_side);
+    g_audio_side = -1;
 }
 
 /* token(16) + seq(u16 BE) + payload -> the relay. */
@@ -1971,6 +2004,83 @@ static void test_call_vertical(int port, const uint8_t *pin) {
 /* Full audio path (REQ-150/151): two participants join a call, each gets a UDP
  * endpoint + bearer token in CALL_JOINED, and one participant's audio is relayed
  * to the other by the sidecar, tagged with the sender's user id. */
+/* The relay exits mid-call (REQ-150). The net loop must notice, start another on
+ * the same port, and hand it every live participant's token -- otherwise the new
+ * relay drops everything as unknown and every call goes silent. Then, when a
+ * restart is impossible, a join is refused openly instead of being handed a port
+ * nothing listens on. */
+static void test_call_sidecar_restart(int port, const uint8_t *pin, uint16_t audio_port) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; uint64_t parts[32];
+    uint8_t atok[OC_AUDIO_TOKEN_LEN], btok[OC_AUDIO_TOKEN_LEN];
+    oc_call_join cj = { OC_DEFAULT_CHANNEL };
+    oc_call_joined jd;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
+    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
+    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
+
+    struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
+    relay.sin_family = AF_INET; relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = htons(audio_port);
+    int sa = mk_udp_client(), sb = mk_udp_client();
+    char tmp[64]; uint64_t sender; uint16_t seq;
+
+    /* The relay dies with both of them in the call... */
+    int before = g_audio_starts;
+    audio_kill();
+    for (int i = 0; i < 50 && g_audio_starts == before; i++) usleep(20000);
+    CHECK(g_audio_starts == before + 1);                       /* ...and is started again */
+
+    /* The new relay knows nobody's address, so both announce themselves -- using
+     * the tokens they were given BEFORE the restart. */
+    udp_send_audio(sb, &relay, btok, 0, NULL);
+    udp_send_audio(sa, &relay, atok, 0, NULL);
+    usleep(120000);
+    while (udp_recv_audio(sa, &sender, &seq, tmp, sizeof tmp) >= 0) {}
+    while (udp_recv_audio(sb, &sender, &seq, tmp, sizeof tmp) >= 0) {}
+
+    /* alice speaks, and bob hears her: the new relay was given their tokens. */
+    udp_send_audio(sa, &relay, atok, 9, "back");
+    usleep(80000);
+    char body[64];
+    int n = udp_recv_audio(sb, &sender, &seq, body, sizeof body);
+    CHECK(n == 4 && sender == ua && seq == 9 && memcmp(body, "back", 4) == 0);
+
+    /* Now it dies and cannot be brought back: a new join is refused, openly. */
+    g_audio_refuse = 1;
+    audio_kill();
+    usleep(300000);
+    client c;
+    CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
+    uint64_t uc = 0;
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_CALL_UNAVAILABLE);
+
+    (void)ub;
+    close(sa); close(sb);
+    client_close(&c);
+    client_close(&a);
+    client_close(&b);
+}
+
 static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_port) {
     client a, b;
     CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
@@ -2562,11 +2672,11 @@ int run_netloop_tests(void) {
     CHECK(bind(audio_udp, (struct sockaddr *)&ua, sizeof ua) == 0);
     socklen_t ual = sizeof ua; getsockname(audio_udp, (struct sockaddr *)&ua, &ual);
     uint16_t audio_port = ntohs(ua.sin_port);
-    int asv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, asv) == 0);
-    g_audio_arg.ipc_fd = asv[1]; g_audio_arg.udp_fd = audio_udp; g_audio_arg.stop = 0;
-    pthread_t audio_th;
-    CHECK(pthread_create(&audio_th, NULL, audio_thread, NULL) == 0);
-    oc_netloop_set_audio(asv[0], audio_port);
+    g_audio_arg.udp_fd = audio_udp;
+    int adaemon = audio_start(NULL);
+    CHECK(adaemon >= 0);
+    oc_netloop_set_audio(adaemon, audio_port);
+    oc_netloop_set_audio_respawn(audio_start, NULL);
     /* Read-aloud with a stub engine (ARCH-111): the wire, the cache and the gate
      * are the daemon's, and no voice model is needed to prove them. */
     oc_netloop_set_tts(&STUB_TTS);
@@ -2618,6 +2728,7 @@ int run_netloop_tests(void) {
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
+        test_call_sidecar_restart(arg.port, pin, audio_port);   /* last call test: leaves calls refused */
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
@@ -2632,10 +2743,9 @@ int run_netloop_tests(void) {
     /* Stop the audio sidecar: the netloop is done, so unwire it and close the
      * daemon IPC end (the sidecar exits on EOF), then join + close fds. */
     oc_netloop_set_audio(-1, 0);
-    g_audio_arg.stop = 1;
-    close(asv[0]);
-    pthread_join(audio_th, NULL);
-    close(asv[1]);
+    oc_netloop_set_audio_respawn(NULL, NULL);
+    audio_kill();
+    if (g_audio_daemon >= 0) close(g_audio_daemon);
     close(audio_udp);
 
     oc_dbwriter_stop(dbw);

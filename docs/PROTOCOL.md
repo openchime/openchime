@@ -1937,7 +1937,11 @@ no DB rows and resets on daemon restart.
 
 **`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64 }` — join (or start) the
 channel's call. Authorized by the ordinary channel-read gate; a non-member gets
-`ERROR NOT_A_MEMBER`.
+`ERROR NOT_A_MEMBER`. If the relay has exited and the daemon could not keep it
+running, the join is refused with `ERROR CALL_UNAVAILABLE` (3025) rather than
+answered with a UDP port nothing listens on. A relay that exits and is restarted
+is invisible to callers: the new one is given every live participant's token, and
+learns each address again from their next packet.
 
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
 u64, udp_port: u16, token: bytes, count: u16, count × { user_id: u64 } }` — the
@@ -2195,6 +2199,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3022` | `MEDIA_TOO_LARGE`     | attachment | no    | The video exceeds `MAX_VIDEO_MESSAGE_SIZE` (§5.14a). |
 | `3023` | `NOT_RENDERABLE`      | read-aloud | no    | The message has nothing to say aloud (§5.14b, REQ-294). |
 | `3024` | `TTS_UNAVAILABLE`     | read-aloud | no    | Read-aloud is off, its queue is full, or the render failed (§5.14b). |
+| `3025` | `CALL_UNAVAILABLE`    | calls      | no    | The audio relay exited and could not be restarted, so a `CALL_JOIN` is refused rather than answered with a media port nothing listens on (§5.17). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which

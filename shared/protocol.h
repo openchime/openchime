@@ -433,6 +433,7 @@ typedef enum {
     OC_ERR_MEDIA_TOO_LARGE     = 3022, /* the video exceeds MAX_VIDEO_MESSAGE_SIZE (REQ-164) */
     OC_ERR_NOT_RENDERABLE      = 3023, /* the message has nothing to say aloud (REQ-294) */
     OC_ERR_TTS_UNAVAILABLE     = 3024, /* read-aloud is off, busy or the render failed (REQ-295) */
+    OC_ERR_CALL_UNAVAILABLE    = 3025, /* the audio relay is down and could not be restarted (REQ-150) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
