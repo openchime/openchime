@@ -1592,6 +1592,27 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 }
                 xfer_reset(x);
             }
+        } else if (hdr.msg_type == OC_MSG_CAPABILITIES) {
+            oc_capabilities caps;
+            if (oc_decode_capabilities(&p, &caps) != OC_OK) return -1;
+            char joined[256] = "";
+            size_t used = 0;
+            for (uint8_t i = 0; i < caps.count; i++) {
+                const oc_slice *nm = &caps.names[i];
+                /* A name holding a comma would split into two on the way back
+                 * out; no name the daemon sends has one, so one that does is
+                 * dropped rather than misread. */
+                if (!nm->len || memchr(nm->ptr, ',', nm->len) || used + nm->len + 2 > sizeof joined) continue;
+                if (used) joined[used++] = ',';
+                memcpy(joined + used, nm->ptr, nm->len);
+                used += nm->len;
+                joined[used] = '\0';
+            }
+            oc_ev *e = oc_ev_new(OC_EV_CAPABILITIES);
+            if (e) {
+                e->body = strdup(joined);
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_TTS_INFO) {
             /* What this daemon can say, replaced whole on every connection: a
              * BEGIN and then one event per voice, as the emoji list is. */
@@ -1599,7 +1620,6 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_tts_info(&p, &ti) != OC_OK) return -1;
             oc_ev *e = oc_ev_new(OC_EV_TTS_BEGIN);
             if (e) {
-                e->status = ti.available;
                 e->body = slice_dup(ti.model_version);
                 e->topic = slice_dup(ti.preview);
                 oc_queue_push(to_ui, e);

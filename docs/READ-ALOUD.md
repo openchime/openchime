@@ -1,7 +1,7 @@
 # OpenChime — Read-aloud
 
 How a channel is read aloud: what a listener gets, how a message becomes speakable text,
-how the daemon renders it with the voice model built into it, caches and serves it, and how a client
+how the daemon renders it with the voice model installed beside it, caches and serves it, and how a client
 plays a channel in order. This is the authoritative design; it is cross-referenced from
 ARCHITECTURE.md (ARCH-111), REQUIREMENTS.md (§6.4, REQ-291–295), PROTOCOL.md (§5.14b),
 SCHEMA.md (migration 0042) and CONFIG.md. Pronunciation — turning words into the phonemes
@@ -82,16 +82,25 @@ one of them, stored as `users.voice_id` and carried on the profile frames.
 
 ## 4. Synthesis in the daemon
 
-Everything read-aloud needs is inside `openchimed`; there is no second process and nothing to
-fetch.
+Read-aloud's code is inside `openchimed` and its data is beside it; there is no second process
+and nothing to fetch.
 
-- **What is built in.** ttskit and its data (TTSKIT.md); the Kitten mini model converted to
-  ONNX Runtime's `.ort` format, and its voices; ONNX Runtime itself, built from source as a
+- **What is built in.** ttskit (TTSKIT.md) and ONNX Runtime itself, built from source as a
   minimal static library with only the operators and types this model uses
-  (`daemon/tts_kitten.ops.config`). The model and data are embedded with `.incbin`
-  (`daemon/tts_embed.S`) and used in place: ONNX Runtime reads the weights straight from the
-  binary's pages and ttskit binary-searches its tables there, so the ~110 MB they add costs
-  disk, and memory only for the pages a render touches.
+  (`daemon/tts_kitten.ops.config`). The daemon is under 9 MB.
+- **What is beside it.** The Kitten mini model converted to ONNX Runtime's `.ort` format, its
+  voices, and ttskit's `en-US` lexicon and guesser — about 108 MB — in a data directory: the
+  first of `OPENCHIME_TTS_DATA_DIR`, `/usr/share/openchime/voices` (where the packages put it)
+  and `voices/` beside the executable (where the tarball and a source build put it). They are
+  mapped and used in place: ONNX Runtime reads the weights straight from the file's pages and
+  ttskit binary-searches its tables there, so they cost disk, and memory only for the pages a
+  render touches — the same as when they were embedded, which is why moving them changed the
+  binary's size and nothing else.
+- **A manifest, checked at startup.** `make` has the daemon write `manifest` into the data
+  directory — `openchimed --tts-manifest DIR` — naming the model version it was built with and
+  every file's SHA-256, so the version is exactly the one compiled in. At startup the daemon
+  checks it; data that is absent, belongs to another build, or has been altered or partly
+  copied turns read-aloud off with the reason in the log, and the daemon runs on without it.
 - **One render worker thread.** The net loop puts a request (message handle, voice, speakable
   text) on a bounded queue (`OPENCHIME_TTS_QUEUE`, default 256; full answers
   `TTS_UNAVAILABLE`) and the worker wakes it through an eventfd when a render is stored, the
@@ -145,11 +154,14 @@ message is about 5 seconds, 15 KB. A thousand rendered messages is about 15 MB.
 
 ## 6. The wire
 
-Protocol version 13; full layouts in PROTOCOL.md §5.14b.
+Protocol version 15; full layouts in PROTOCOL.md §5.14b.
 
-- **`TTS_INFO` (S→C, `0x00DC`)** after authentication: available, model version, and the
-  voices (id, label, preview text). Sent only by a daemon with read-aloud on; a client that
-  does not receive it shows nothing.
+- **`CAPABILITIES` (S→C, `0x00E1`)** after authentication: the features this daemon offers, by
+  name. `tts` is present exactly when read-aloud is running — built in, turned on, and its data
+  found and verified. A client told no shows nothing of the feature.
+- **`TTS_INFO` (S→C, `0x00DC`)** after it: the model version, the voices (id, label, language)
+  and the audition sentence. Always sent, empty when read-aloud is not offered; whether it is
+  offered is `CAPABILITIES`' to say, so there is one answer rather than two.
 - **`AUDIO_GET` (C→S, `0x00DD`)** `{message_id}` → **`AUDIO_INFO` (`0x00DE`)**
   `{message_id, duration_ms, total_size}`, **`AUDIO_CHUNK` (`0x00DF`)**, **`AUDIO_END`
   (`0x00E0`)** — the attachment download's shape, backpressure and gate.

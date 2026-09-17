@@ -125,9 +125,9 @@ fail, bounded and silent.
 
 ## Read-aloud
 
-Speech is built into the daemon (ARCH-111): the voice model and the pronunciation
-data are inside the binary, so there is nothing to install and the feature is on
-unless it is turned off. A daemon built with `make TTS=0` has no read-aloud
+Speech is built into the daemon (ARCH-111), and its voice model and pronunciation
+data are files shipped beside it in the same package, so the feature is on unless it
+is turned off or its data is missing. A daemon built with `make TTS=0` has no read-aloud
 whatever these say, and tells its clients so.
 
 | Variable | Default | Meaning |
@@ -136,6 +136,7 @@ whatever these say, and tells its clients so.
 | `OPENCHIME_TTS_QUEUE` | `256` | Renderings that may wait for the worker. A full queue answers `TTS_UNAVAILABLE` rather than growing; clamped to 1–4096. |
 | `OPENCHIME_TTS_IDLE_SECS` | `300` | How long the model stays loaded with nothing to render. It loads on the first request (about a quarter of a second) and is released after this, so an idle tenant holds none of its working memory; clamped to 5–86400. |
 | `OPENCHIME_TTS_RATE` | `60` | `AUDIO_GET`s one connection may make a minute. A listener plays messages one at a time, so this bounds a client asking for a whole history at once; clamped to 1–6000. |
+| `OPENCHIME_TTS_DATA_DIR` | *(search)* | Where read-aloud's voice data is. Unset, the daemon uses `/usr/share/openchime/voices` (where the packages install it), else `voices/` beside its own executable (where the tarball and a source build put it). Set, it uses exactly that directory and never another. The directory's manifest is checked at startup: data that is absent, from a different build, or altered turns read-aloud off with the reason logged — the daemon starts either way. |
 | `OPENCHIME_TTS_LANG` | `en-US` | The language messages are read in, as a BCP 47 tag. One language is built into the binary, and a value it cannot speak is refused at startup rather than fallen back from — reading every message in a language nobody asked for is worse than not starting. The tag is stamped in the pronunciation data and announced with every voice, so a client knows what it is hearing. |
 
 **What it costs.** Nothing while nobody is listening: measured on one core, an

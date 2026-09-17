@@ -4,8 +4,8 @@
  *
  * Takes the IPA ttskit produces and returns 24 kHz mono audio in one of the model's
  * eight voices. The model (ONNX Runtime's .ort format) and the voices table are
- * bytes the caller supplies -- in openchimed, the copies embedded in the binary
- * (tts_embed.h) -- and are used where they lie, not copied.
+ * bytes the caller supplies -- in openchimed, files mapped from the data directory
+ * (tts_data.h) -- and are used where they lie, not copied.
  */
 #ifndef OC_TTS_KITTEN_H
 #define OC_TTS_KITTEN_H

@@ -2377,9 +2377,27 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
         }
 
-        /* Whether this daemon reads messages aloud, and in which voices
-         * (REQ-291/295). Always sent: a client that hears "no" hides the feature
-         * rather than offering something that would fail. */
+        /* What this daemon offers, by name (REQ-295). Always sent, and sent
+         * before the frames that describe each feature, so a client knows what
+         * to expect: a name absent means the client shows nothing of it rather
+         * than offering something that would fail. "tts" is present exactly when
+         * read-aloud is running -- built in, turned on, and its voice data found
+         * and verified. "stt" is never present yet; it is named now so a client
+         * already hides speech-to-text correctly on the day it can be present. */
+        {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_capabilities caps;
+            memset(&caps, 0, sizeof caps);
+#ifdef OC_TTS
+            if (g_tts && g_tts_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_TTS);
+#endif
+            oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &caps);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;   /* dropped on the CAPABILITIES write */
+        }
+
+        /* Which voices read messages aloud (REQ-291/292). Always sent, empty when
+         * read-aloud is not offered; whether it is offered is CAPABILITIES' to say. */
         {
             oc_tts_info ti;
             memset(&ti, 0, sizeof ti);
@@ -2387,7 +2405,6 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             ti.preview = oc_slice_str("");
 #ifdef OC_TTS
             if (g_tts && g_tts_engine) {
-                ti.available = 1;
                 ti.model_version = oc_slice_str(g_tts_engine->version);
                 ti.preview = oc_slice_str(g_tts_engine->preview ? g_tts_engine->preview : "");
                 int n = g_tts_engine->voices;

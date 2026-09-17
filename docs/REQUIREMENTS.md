@@ -1299,7 +1299,7 @@ the requirement says so explicitly rather than implying one.
   user has been able to change it by name from the list the server offers. A change has
   applied to messages rendered afterwards, not retroactively.
 - **REQ-293.** Speech has been **synthesized on the server, once per
-  message text, voice and language**, by the daemon itself from a voice model built into it (ARCH-111), and
+  message text, voice and language**, by the daemon itself from a voice model installed beside it (ARCH-111), and
   kept so every later listener and every re-listen reuses it. Identical text in the same
   voice has been synthesized once. A rendering has been reclaimable storage: reclaimed
   first under pressure, with nothing shown in its place, and synthesized again on the
@@ -1309,7 +1309,7 @@ the requirement says so explicitly rather than implying one.
   as silence or refused as an error.
 - **REQ-295.** Read-aloud has been **absent where it is turned off**:
   a server whose operator has disabled it has offered nothing and no client has shown it,
-  and a server with it on has needed nothing installed or fetched to provide it. No
+  and a server with it on has needed nothing fetched to provide it: the voice data ships in the same package as the daemon, and data that is missing or does not match the daemon has turned read-aloud off, said why in the log, and left the rest of the server running. No
   message text has left the tenant's own box to be spoken, and no part of the speech
   chain has been under a copyleft licence (ARCH-111).
 

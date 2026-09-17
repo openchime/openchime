@@ -33,6 +33,16 @@ trap 'rm -rf "$stage"' EXIT
 chmod 0755 "$stage"
 
 install -D -m 0755 "$BINARY"                                  "$stage/usr/bin/openchimed"
+# Read-aloud's data, if it was built beside the binary: the voice model and the
+# pronunciation data the daemon verifies against its manifest at startup. A build
+# without read-aloud has none, and its package simply offers no read-aloud.
+VOICES="$(dirname "$BINARY")/voices"
+if [ -f "$VOICES/manifest" ]; then
+  mkdir -p "$stage/usr/share/openchime"
+  cp -r "$VOICES" "$stage/usr/share/openchime/voices"
+  find "$stage/usr/share/openchime/voices" -type d -exec chmod 0755 {} +
+  find "$stage/usr/share/openchime/voices" -type f -exec chmod 0644 {} +
+fi
 install -D -m 0644 "$root/packaging/debian/openchimed.service" "$stage/lib/systemd/system/openchimed.service"
 install -D -m 0644 "$root/packaging/openchimed.env"            "$stage/etc/openchime/openchimed.env"
 

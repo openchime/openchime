@@ -69,10 +69,17 @@ install -D -m 0755 %{_bindir_src}/openchimed          %{buildroot}%{_bindir}/ope
 install -D -m 0644 %{_bindir_src}/openchimed.service  %{buildroot}%{_unitdir}/openchimed.service
 install -D -m 0644 %{_bindir_src}/openchimed.env      %{buildroot}%{_sysconfdir}/openchime/openchimed.env
 install -D -m 0644 %{_bindir_src}/copyright           %{buildroot}%{_datadir}/licenses/openchimed/copyright
+%if 0%{?_with_voices}
+mkdir -p %{buildroot}%{_datadir}/openchime
+cp -r %{_bindir_src}/voices %{buildroot}%{_datadir}/openchime/voices
+%endif
 
 %files
 %{_bindir}/openchimed
 %{_unitdir}/openchimed.service
+%if 0%{?_with_voices}
+%{_datadir}/openchime/voices
+%endif
 # noreplace is the %config form that preserves an operator's edits across an
 # upgrade, writing any new version alongside as .rpmnew. It is the RPM
 # equivalent of Debian's conffiles.

@@ -238,7 +238,7 @@ tts_free(t);
 | Call | Does |
 |---|---|
 | `tts_load(dir, lang, err, cap)` | maps `dir/lexicon.bin` and `dir/guesses.bin`. A missing file is allowed (without the lexicon every word is guessed, without the guesser unknown words are spelled); a file that is present but damaged fails the load with a reason. `lang` is the BCP 47 tag expected: a pair whose tags disagree with each other or with `lang` is refused, since a lexicon of one language and a guesser of another pronounce fluent nonsense with nothing to show for it. `NULL` accepts whatever the files say, which is for tools. |
-| `tts_load_mem(lex, lex_len, guess, guess_len, lang, err, cap)` | the same over the two files' bytes already in memory, such as the copies embedded in the daemon. Nothing is copied, so the bytes must outlive the handle; both must be present and valid. |
+| `tts_load_mem(lex, lex_len, guess, guess_len, lang, err, cap)` | the same over the two files' bytes already in memory, such as the files the daemon maps from its data directory. Nothing is copied, so the bytes must outlive the handle; both must be present and valid. |
 | `tts_lang(t)` | the language the loaded data is for. |
 | `tts_free(t)` | unmaps (or lets go of lent bytes). |
 | `tts_word(t, word, ipa, cap)` | one word; returns 1 dictionary, 2 guessed, 3 spelled, 0 nothing to say (no letters). |

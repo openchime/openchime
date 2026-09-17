@@ -256,6 +256,8 @@ int main(int argc, char **argv) {
      * renders one text with the voice model built into this binary. */
     if (argc == 5 && strcmp(argv[1], "--tts-say") == 0)
         return oc_tts_say(argv[2], argv[3], argv[4]);
+    if (argc == 3 && strcmp(argv[1], "--tts-manifest") == 0)
+        return oc_tts_manifest(argv[2]);
 #endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
@@ -302,6 +304,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "openchimed: no read-aloud voice for OPENCHIME_TTS_LANG=%s "
                             "(this binary speaks %s)\n", cfg->tts.lang, OC_TTS_LANG);
             return 2;
+        }
+        /* The voice data is files beside the daemon, not bytes inside it, so it
+         * can be absent -- not installed, or from another build. That is not a
+         * reason to refuse to start: read-aloud is simply off, clients are told so
+         * and show nothing of it, and the log says why. */
+        char why[256] = "";
+        if (tts_engine && cfg->tts.enabled && !oc_tts_data_ready(why, sizeof why)) {
+            fprintf(stderr, "openchimed: read-aloud is off: %s\n", why);
+            tts_engine = NULL;
         }
         oc_netloop_set_tts(tts_engine);
     }

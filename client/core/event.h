@@ -149,6 +149,9 @@ enum {
      * preview sentence; on VOICE, body is the id, topic the label and preview
      * the BCP 47 language it speaks -- the third slot, borrowed the way
      * OC_EV_UNFURL borrows its own. */
+    /* The features this daemon offers, by name (CAPABILITIES): body is the names
+     * joined by commas, and replaces what was known -- sent on every connection. */
+    OC_EV_CAPABILITIES,
     OC_EV_TTS_BEGIN,
     OC_EV_TTS_VOICE,
     /* One message's speech has arrived, ready to play: message_id, count=bytes,

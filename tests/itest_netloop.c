@@ -244,6 +244,7 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
         if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE &&
             hdr->msg_type != OC_MSG_TYPING_UPDATE &&
             hdr->msg_type != OC_MSG_WORKSPACE_INFO &&
+            hdr->msg_type != OC_MSG_CAPABILITIES &&
             hdr->msg_type != OC_MSG_TTS_INFO)
             return 0;
     }
@@ -287,8 +288,10 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
      * presence snapshot). Consume it here so both read_frame and the raw
      * presence/typing test start from a clean stream. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
-    /* Then whether this daemon reads messages aloud (REQ-295), which is told to
-     * every client at auth whether the answer is yes or no. */
+    /* Then what this daemon offers (REQ-295), told to every client at auth. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_CAPABILITIES) return -1;
+    { oc_capabilities cp; if (oc_decode_capabilities(&p, &cp) != OC_OK) return -1; }
+    /* Then read-aloud's voices, sent whether or not it is offered. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_TTS_INFO) return -1;
     { oc_tts_info ti; if (oc_decode_tts_info(&p, &ti) != OC_OK) return -1; }
     /* Then the pause (REQ-278), which outlives the session that set it and so is
@@ -1424,13 +1427,28 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         CHECK(write_all(&cap.conn, buf, w.len) == 0);
         oc_header hdr;
         oc_rbuf p;
-        int saw = 0;
-        for (int i = 0; i < 4 && !saw; i++) {
+        int saw = 0, saw_caps = 0;
+        for (int i = 0; i < 5 && !saw; i++) {
             CHECK(read_frame_raw(&cap, &hdr, &p) == 0);
+            if (hdr.msg_type == OC_MSG_CAPABILITIES) {
+                /* Read-aloud is running, so "tts" is offered; speech-to-text is
+                 * not built, so "stt" is not. */
+                oc_capabilities cp;
+                CHECK(oc_decode_capabilities(&p, &cp) == OC_OK);
+                int tts = 0, stt = 0;
+                for (uint8_t k = 0; k < cp.count; k++) {
+                    if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, "tts", 3) == 0) tts = 1;
+                    if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, "stt", 3) == 0) stt = 1;
+                }
+                CHECK(tts == 1 && stt == 0);
+                saw_caps = 1;
+                continue;
+            }
             if (hdr.msg_type != OC_MSG_TTS_INFO) continue;
+            CHECK(saw_caps);                      /* the capability comes first */
             oc_tts_info ti;
             CHECK(oc_decode_tts_info(&p, &ti) == OC_OK);
-            CHECK(ti.available == 1 && ti.count == 2);
+            CHECK(ti.count == 2);
             CHECK(ti.model_version.len == strlen(STUB_TTS.version));
             CHECK(ti.voices[0].id.len == 12 && memcmp(ti.voices[0].id.ptr, "test-voice-m", 12) == 0);
             CHECK(ti.voices[1].label.len == 9 && memcmp(ti.voices[1].label.ptr, "Test High", 9) == 0);

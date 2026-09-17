@@ -292,6 +292,35 @@ static const unsigned char SRV_ANSWER[] = {
 /* The sidebar helper (6): grouping, filter, sort, collapse — shared by
  * every frontend so the TUI and the GUI cannot disagree about what belongs
  * where. Built against a hand-made model, no daemon needed. */
+/* What the daemon offers, folded into the model (REQ-295). Read-aloud is shown
+ * only where CAPABILITIES names "tts", and the answer is replaced on every
+ * connection rather than added to -- a client that reconnects to a daemon whose
+ * voice data has gone must stop offering the feature, not keep the old yes. */
+static int caps_fold(oc_model *m, const char *names) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CAPABILITIES;
+    e.body = names ? strdup(names) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body);
+    return oc_model_tts_available(m);
+}
+
+static void test_capabilities(void) {
+    oc_model m; oc_model_init(&m);
+    CHECK(oc_model_tts_available(&m) == 0);                 /* nothing said yet: nothing shown */
+    CHECK(caps_fold(&m, "tts") == 1);
+    CHECK(caps_fold(&m, "stt") == 0);                       /* replaced, not accumulated */
+    CHECK(oc_model_has_capability(&m, OC_CAP_STT) == 1);
+    CHECK(caps_fold(&m, "stt,tts") == 1);                   /* order is not meaning */
+    CHECK(caps_fold(&m, "ttsx,xtts,tt") == 0);              /* whole names only */
+    CHECK(caps_fold(&m, "") == 0);                          /* the daemon offers nothing */
+    CHECK(caps_fold(&m, "tts") == 1);
+    CHECK(caps_fold(&m, NULL) == 0);
+    CHECK(oc_model_has_capability(&m, "") == 0);
+    oc_model_free(&m);
+}
+
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
  * and the standalone pins overlay, which is fed by its own frames because a
  * pinned message is usually outside loaded history. */
@@ -1411,6 +1440,7 @@ int run_client_core_tests(void) {
     test_notify_scan();
     test_thread_notices();
     test_unread_counts_what_notifies();
+    test_capabilities();
     test_pins();
     test_resolve();
     test_last_error();
