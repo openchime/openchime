@@ -71,8 +71,10 @@ one, not a setting on it.
 The model is **Kitten mini v0.8** (Apache-2.0), which has eight voices. A user's voice is
 one of them, stored as `users.voice_id` and carried on the profile frames.
 
-- **Default.** Declared pronouns select a voice of matching presentation; otherwise a
-  stable hash of the user id picks one. The choice is written to the profile on first use,
+- **Default.** Declared pronouns select a voice of matching presentation — read as
+  whole words, the first one naming a presentation deciding, so `she/they` is read as
+  she and `they/them`, naming neither, is treated exactly like no pronouns at all;
+  otherwise a stable hash of the user id picks one. The choice is written to the profile on first use,
   so it is visible and correctable rather than recomputed.
 - **Webhook and bot authors** use the hash voice.
 - **A change is not retroactive.** Earlier renderings keep the voice they were made with;

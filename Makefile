@@ -78,7 +78,7 @@ BIN := openchimed
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c \
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c \
               shared/oc_mp4.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/audio_sidecar.c daemon/enroll.c daemon/push.c daemon/unfurl.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/audio_sidecar.c daemon/enroll.c daemon/push.c daemon/unfurl.c daemon/voice_pick.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
