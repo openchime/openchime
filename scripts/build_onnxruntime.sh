@@ -121,8 +121,8 @@ echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static) 
 OUT="${WORK}/out/MinSizeRel"
 rm -rf "${DEST}.new" && mkdir -p "${DEST}.new/lib" "${DEST}.new/include"
 # Every archive the session needs, merged: ORT's own, the ONNX schema, protobuf-lite
-# with its UTF-8 checker, cpuinfo and abseil. protoc and full protobuf are build
-# tools and stay out.
+# with its UTF-8 checker, cpuinfo, abseil and, on arm64, KleidiAI. protoc and full
+# protobuf are build tools and stay out.
 {
   echo "CREATE ${DEST}.new/lib/libonnxruntime.a"
   for a in "${OUT}"/libonnxruntime_*.a \
@@ -135,6 +135,12 @@ rm -rf "${DEST}.new" && mkdir -p "${DEST}.new/lib" "${DEST}.new/include"
     [ -f "$a" ] || { echo "build_onnxruntime: expected archive missing: $a" >&2; exit 1; }
     echo "ADDLIB $a"
   done
+  # KleidiAI, Arm's kernels, which ONNX Runtime builds and calls on arm64 only.
+  if [ "${ARCH}" = aarch64 ]; then
+    a="${OUT}/_deps/kleidiai-build/libkleidiai.a"
+    [ -f "$a" ] || { echo "build_onnxruntime: expected archive missing: $a" >&2; exit 1; }
+    echo "ADDLIB $a"
+  fi
   echo "SAVE"
   echo "END"
 } | ar -M
