@@ -1208,8 +1208,9 @@ the requirement says so explicitly rather than implying one.
   net-thread state; a `CALL_LEAVE` or TCP disconnect drops the participant and
   re-rosters the rest, but the call persists while ≥1 participant remains, and
   rejoin is a fresh `CALL_JOIN` (new token). The media-side mirror is a UDP
-  silence timeout in the sidecar. **Signaling built (PROTOCOL.md §5.17); the UDP
-  relay + timeout land in the sidecar milestone.**
+  silence timeout in the sidecar: a participant silent for 20 seconds is dropped
+  from the relay. Signaling (PROTOCOL.md §5.17), the UDP relay and the timeout are
+  all built.
 
 ### 6.3 Video — camera video excluded; screenshare and video messages admitted
 
