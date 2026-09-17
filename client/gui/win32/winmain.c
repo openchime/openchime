@@ -19181,6 +19181,12 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * command-line path that meant a window created hidden and never shown -- a live
  * process, no window, no error, indistinguishable from a client that failed to
  * start at all. */
+/* How many clients connect_start has started this process. Observable by the
+ * harness (scripts/gui_startup.sh, via test_dump): a startup given a workspace
+ * starts exactly one, and a second is the defect where two net threads shared a
+ * workspace, each authenticating, with the first orphaned. */
+static int g_clients_started;
+
 static int connect_start(const char *ws, const char *cred) {
     oc_endpoint ep;
     if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
@@ -19192,6 +19198,7 @@ static int connect_start(const char *ws, const char *cred) {
     snprintf(g_cur_ws, sizeof g_cur_ws, "%s", ws);
     snprintf(g_cred, sizeof g_cred, "%s", cred);
     g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), g_secret);
+    g_clients_started++;
 
     ws_register();
 
@@ -20838,6 +20845,13 @@ static void test_dump(const char *path) {
                 (unsigned long long)g_listen_msg, g_listen_len);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
+    /* How the client started (scripts/gui_startup.sh). `visible` is whether the
+     * window is on screen at all -- a client that started and showed nothing
+     * looked, from here, exactly like one that never started. `started` counts
+     * clients connect_start began, and `si_err` is the reason the sign-in view
+     * gives, which was once dropped on the way to it. */
+    fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
+            g_main_hwnd ? IsWindowVisible(g_main_hwnd) : 0, g_clients_started, g_si_ws, g_si_err);
     /* Modal + the settings a form modal can change, so snapshot/commit/restore is
      * assertable rather than eyeballed — Cancel silently behaving like Save is
      * exactly the bug this design exists to prevent. */
@@ -24003,12 +24017,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* ONE attempt, whatever the outcome. Starting the client twice here put two
      * net threads on one workspace, each authenticating and each writing the same
      * credential, with the first orphaned where nothing ticks it. */
+    char startup_err[sizeof g_si_err] = "";
     if (direct && !connect_start(aws, acred)) {
         /* Said, not swallowed: the sign-in view carries the reason, and is shown
          * like any other first run rather than held back for settings that are
-         * never coming. */
+         * never coming. The reason is worded as signin_submit words it, so a
+         * workspace that fails on the command line and one that fails when typed
+         * read the same. It is kept aside here and set after signin_begin,
+         * which starts every sign-in from a clean slate and would erase it. */
         direct = 0;
         snprintf(pre_ws, sizeof pre_ws, "%s", aws);
+        oc_endpoint sep;
+        if (oc_resolve(aws, oc_default_suffix(), &sep) == OC_RESOLVE_BAD_WORKSPACE)
+            snprintf(startup_err, sizeof startup_err, "invalid workspace '%s'", aws);
+        else
+            snprintf(startup_err, sizeof startup_err, "'%s' not found — does not resolve in DNS", aws);
         g_view = VIEW_SIGNIN;
     }
     if (direct) {
@@ -24097,7 +24120,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     UpdateWindow(hwnd);
     /* After ShowWindow: SetFocus on a child of a not-yet-shown window does not
      * stick, which left the workspace field unfocused and swallowed typing. */
-    if (!direct) signin_begin(hwnd, pre_ws[0] ? pre_ws : NULL, pre_user[0] ? pre_user : NULL);
+    if (!direct) {
+        signin_begin(hwnd, pre_ws[0] ? pre_ws : NULL, pre_user[0] ? pre_user : NULL);
+        if (startup_err[0]) {
+            snprintf(g_si_err, sizeof g_si_err, "%s", startup_err);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+    }
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {

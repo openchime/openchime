@@ -653,9 +653,31 @@ nothing about typing.
 > writes to the unlinked inode), and every upload fails with an opaque
 > `transfer error`. Match `/proc/<pid>/environ`, as both harnesses do.
 
+## Reading the startup harness
+
+`scripts/gui_startup.sh` answers the question the smoke suite deliberately
+stops short of: **what does the client do between launch and its first frame.**
+It launches the client four ways — a workspace that signs in, one that does not
+resolve (`nosuch.invalid`, reserved never to), one that is malformed, and one
+that resolves but where nothing listens — and asserts on the client's own dump
+for each: that the window is **visible**, that **exactly one** client started,
+which view it landed on, and that a failure **says why**. Fifteen checks, on its
+own fixture daemon and port (9510).
+
+It exists because two defects went out through that stretch and were caught
+only by a person noticing: a workspace that did not resolve left a running
+process with an invisible window and no message, and the fix for it started the
+client twice. The dump's `startup` line (`visible= started= si_ws= si_err=`) is
+what makes both assertable. It was proved to catch both: with the double start
+put back and the sign-in reason dropped, four of its checks fail, each naming
+the defect.
+
+Like the smoke suite it is not in CI, for the same reason, and it is not the
+pre-push gate — run it when a change touches how the client starts.
+
 ## Reading the GUI smoke
 
-`scripts/gui_smoke.sh` is the only GUI harness, and it answers one question —
+`scripts/gui_smoke.sh` answers one question —
 **does the client boot and run** — in about ten seconds across fourteen checks.
 It drives the client through the test hook (`OPENCHIME_TEST_DIR`) and stands up
 its own fixture daemon on its own port. It is the pre-push gate; it is not a
