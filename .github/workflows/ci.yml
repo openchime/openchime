@@ -99,6 +99,32 @@ jobs:
           if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
             echo "::error::openchimed has a dynamic dependency beyond libc and libm"; exit 1
           fi
+      # `make TTS=0` is a supported build that nothing else exercises, and the
+      # default build hides what it lacks: anything the read-aloud libraries
+      # happen to put on the link line -- `-lm` was one, needed by SQLite's FTS5
+      # ranking -- is silently supplied to TTS=1 and missing from TTS=0. So build
+      # it, and start it far enough to answer its health check.
+      - name: The daemon also builds and starts without read-aloud
+        run: |
+          set -euo pipefail
+          make TTS=0 BIN=build/openchimed-notts
+          if ldd build/openchimed-notts | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
+            echo "::error::the TTS=0 daemon has a dynamic dependency beyond libc and libm"; exit 1
+          fi
+          d="$RUNNER_TEMP/notts"; mkdir -p "$d/blobs"
+          OPENCHIME_DB_PATH="$d/oc.db" OPENCHIME_BLOB_DIR="$d/blobs" \
+          OPENCHIME_TLS_CERT="$d/cert.pem" OPENCHIME_TLS_KEY="$d/key.pem" \
+          OPENCHIME_HEALTH_PORT=8181 OPENCHIME_PROTO_PORT=8543 \
+            build/openchimed-notts > "$d/log" 2>&1 &
+          pid=$!
+          ok=
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8181/healthz >/dev/null; then ok=1; break; fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          if [ -z "$ok" ]; then echo "::error::the TTS=0 daemon did not become healthy"; cat "$d/log"; exit 1; fi
       # Also a prerequisite of `make test`; named here so a duplicate opcode
       # fails as itself rather than inside the test step.
       - name: Check opcode uniqueness
