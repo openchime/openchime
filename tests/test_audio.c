@@ -2,7 +2,9 @@
  * the relay on a thread with a socketpair for the daemon IPC and a real UDP
  * socket, plus mock UDP "clients", and checks: an authorized participant's audio
  * is forwarded to its call-mates (tagged with the sender's user id) and to no
- * one else; a different call is isolated; and a REVOKE stops forwarding. */
+ * one else; a different call is isolated; a participant's token used from any
+ * address but the one it was first used from neither speaks nor redirects their
+ * audio; and a REVOKE stops forwarding. */
 
 #include "audio.h"
 #include "check.h"
@@ -128,6 +130,24 @@ int run_audio_tests(void) {
     CHECK(nd == -1);                               /* call isolation */
     int na = udp_recv(cA, &sender, &seq, body, sizeof body);
     CHECK(na == -1);                               /* sender doesn't get its own */
+
+    /* A's token from somewhere else: the address is bound to where A first sent
+     * from, so a stranger holding A's token -- anyone who saw one of A's packets
+     * -- can neither speak as A nor take A's audio. */
+    int cX = mk_client();
+    drain(cA); drain(cB); drain(cC);
+    udp_send(cX, &relay, tA, 50, "spoofed");
+    usleep(50000);
+    nb = udp_recv(cB, &sender, &seq, body, sizeof body);
+    CHECK(nb == -1);                               /* the forged packet is not relayed */
+    udp_send(cB, &relay, tB, 51, "for-A");        /* and A's audio still goes to A */
+    usleep(50000);
+    na = udp_recv(cA, &sender, &seq, body, sizeof body);
+    CHECK(na == 5 && sender == 2 && seq == 51 && memcmp(body, "for-A", 5) == 0);
+    int nx = udp_recv(cX, &sender, &seq, body, sizeof body);
+    CHECK(nx == -1);                               /* nothing reaches the stranger */
+    close(cX);
+    drain(cC);
 
     /* Revoke C; A speaks again -> B still hears, C does not. */
     ipc_send(sv[0], OC_AUDIO_IPC_REVOKE, tC, 16);

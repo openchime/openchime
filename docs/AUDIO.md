@@ -224,6 +224,17 @@ seam that only sees capture cannot ever host an echo canceller.
 datagram. Sequence numbers are per-sender and monotonic; the sidecar does not
 interpret them.
 
+**The return address is bound on first use.** The relay learns where to send a
+participant's audio from the first datagram carrying their token, and after that
+drops that token from any other address. The token leads every packet in the
+clear, so re-learning the address freely would let anyone who saw one packet
+redirect that participant's audio to themselves. A client whose address changes
+mid-call — NAT rebinding, a switch from Wi-Fi to cellular — is therefore not
+relayed from the new one: its packets stop counting, the relay's silence sweep
+drops it, and it must **rejoin with `CALL_JOIN`**, which issues a fresh token over
+the authenticated TCP connection. A client should treat a long receive gap on a
+still-open call as the cue to rejoin.
+
 **Receive.** Demultiplex on `sender_user_id`, route to that sender's jitter
 buffer.
 
@@ -409,6 +420,13 @@ it happens to also sidestep echo entirely while held.
   should not be added casually.
 - **AEC3 escalation.** Whether the C++ dependency is ever acceptable. The ERLE
   harness (§6.4) is what should decide it, on numbers.
+- **Media encryption.** Audio crosses the network unencrypted today: the relay
+  forwards opaque payloads and neither this document nor the protocol specifies
+  any transport security for the UDP path. Binding the address on first use (§4)
+  stops a stolen token redirecting someone's audio, but anyone on the path can
+  still listen. Whether to encrypt — and whether end to end or only to the relay,
+  which changes what the relay can see — has not been decided, and should be,
+  deliberately, before a client ships.
 - **Bandwidth ceiling for large huddles.** With DTX and silence suppression a
   ten-person huddle is mostly one active stream, but the worst case is N × 24
   kbps downstream and there is currently no cap or policy.
