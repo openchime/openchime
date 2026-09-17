@@ -353,21 +353,28 @@ jobs:
           path: |
             third_party/onnxruntime-1.30.0
             build/kitten
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'daemon/tts_kitten.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c') }}
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'scripts/zig_cc.sh', 'daemon/tts_kitten.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c') }}
 
       # zig's bundled Clang compiles for a baseline CPU with 512-bit vectors off,
       # so ONNX Runtime's AVX-512 kernels (which enable AVX-512 per file) need
       # -mevex512 to be allowed them; it changes nothing elsewhere and does not
       # exist on arm64. The converter links the prebuilt ONNX Runtime and runs only
       # here, so it uses the runner's own compiler.
+      #
+      # The compiler goes through scripts/zig_cc.sh, which on arm64 translates
+      # -march: ONNX Runtime and KleidiAI ask for instruction sets that way, and
+      # zig rejects every -march on aarch64.
       - name: Build read-aloud's engine and model
         run: |
           set -euo pipefail
           extra=""
           [ "${{ matrix.zig }}" = x86_64 ] && extra="-mevex512"
-          printf '#!/bin/sh\nexec /opt/zig/zig cc -target %s-linux-gnu.2.34 %s "$@"\n' "${{ matrix.zig }}" "$extra" > /tmp/zig-ort-cc
-          printf '#!/bin/sh\nexec /opt/zig/zig c++ -target %s-linux-gnu.2.34 %s "$@"\n' "${{ matrix.zig }}" "$extra" > /tmp/zig-ort-cxx
-          chmod +x /tmp/zig-ort-cc /tmp/zig-ort-cxx
+          for tool in cc c++; do
+            printf '#!/bin/sh\nexec %s/scripts/zig_cc.sh %s %s-linux-gnu.2.34 %s -- "$@"\n' \
+              "$PWD" "$tool" "${{ matrix.zig }}" "$extra" > "/tmp/zig-ort-$tool"
+            chmod +x "/tmp/zig-ort-$tool"
+          done
+          mv /tmp/zig-ort-c++ /tmp/zig-ort-cxx
           CC=/tmp/zig-ort-cc CXX=/tmp/zig-ort-cxx scripts/build_onnxruntime.sh
           scripts/build_kitten.sh
 

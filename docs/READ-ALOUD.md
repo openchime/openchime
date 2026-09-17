@@ -127,8 +127,10 @@ model once (`scripts/build_kitten.sh`, pinned by SHA-256; the conversion uses th
 full ONNX Runtime, a build tool only). The converted model is not byte-reproducible — the
 converter orders part of its header differently between runs — so the input model and the
 converter are what is pinned. `make TTS=0` builds a daemon without read-aloud. The operator
-config is regenerated with ONNX Runtime's `convert_onnx_models_to_ort.py
---enable_type_reduction` when the model changes.
+config is regenerated with ONNX Runtime's `create_reduced_build_config.py --format ORT
+--enable_type_reduction` when the model changes, from the model as converted on **both**
+architectures: on arm64 ONNX Runtime keeps `MatMul` and `Add` in half precision, where amd64
+casts them to float, so a config taken from one conversion leaves the other unable to load.
 
 ## 5. Render and cache in the daemon
 
