@@ -30,6 +30,15 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
  * default) calls still form but carry no media endpoint. */
 void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port);
 
+/* How to bring the audio sidecar back when it exits: `respawn` starts a new one
+ * on the same UDP port and returns the net loop's end of its IPC socket, or -1.
+ * The net loop notices the exit (EOF on the IPC socket), restarts it, and
+ * re-authorizes everyone already in a call. If it dies again within seconds of
+ * starting, repeatedly, or `respawn` fails, calls are refused from then on
+ * rather than handed a dead port. NULL (the default): an exited sidecar is not
+ * restarted, and calls are refused. Call before oc_netloop_run. */
+void oc_netloop_set_audio_respawn(int (*respawn)(void *ctx), void *ctx);
+
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
  * contentless notify decision to it for offline mobile delivery. Call before
  * oc_netloop_run; NULL (the default) disables push. */
