@@ -125,8 +125,16 @@ static void *run(void *arg) {
         memcpy(n->r.handle, j->handle, 32);
 
         char err[256] = "";
+        int opened_now = 0;
         if (!engine) {
+            struct timespec o0, o1;
+            clock_gettime(CLOCK_MONOTONIC, &o0);
             engine = w->engine->open(w->engine->ctx, err, sizeof err);
+            clock_gettime(CLOCK_MONOTONIC, &o1);
+            opened_now = 1;
+            if (engine)
+                fprintf(stderr, "tts: model loaded in %.0f ms\n",
+                        (double)(o1.tv_sec - o0.tv_sec) * 1000.0 + (double)(o1.tv_nsec - o0.tv_nsec) / 1e6);
             if (engine) {
                 pthread_mutex_lock(&w->mu);
                 w->engine_is_open = 1;
@@ -140,8 +148,24 @@ static void *run(void *arg) {
             uint8_t *mp4 = NULL;
             size_t len = 0;
             uint32_t ms = 0;
+            struct timespec t0, t1, t2;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             n->r.status = oc_tts_render(w->engine, engine, j->text, j->voice, &mp4, &len, &ms, err, sizeof err);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
             if (n->r.status == OC_TTS_OK) store(w, j, mp4, len, ms, &n->r);
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            /* Where the wait goes, per render: the model's time and the store's,
+             * separately. A single total cannot tell "the model is slow" from
+             * "the blob store is", and the answer decides what is worth doing
+             * about it (docs/READ-ALOUD.md §5). */
+            if (n->r.status == OC_TTS_OK) {
+                double render_ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+                double store_ms  = (double)(t2.tv_sec - t1.tv_sec) * 1000.0 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6;
+                fprintf(stderr, "tts: rendered %zu chars, %u ms of audio in %.0f ms (%.2fx), stored in %.0f ms%s\n",
+                        strlen(j->text), ms, render_ms,
+                        ms ? render_ms / (double)ms : 0.0, store_ms,
+                        opened_now ? " (model loaded first)" : "");
+            }
             else if (n->r.status == OC_TTS_FAILED) snprintf(n->r.reason, sizeof n->r.reason, "%.150s", err);
             free(mp4);
         }

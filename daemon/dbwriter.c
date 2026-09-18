@@ -6404,6 +6404,7 @@ static oc_dbres *process_tts_preview(sqlite3 *db, const oc_job *j) {
     r->tts_text = strdup(j->tts_text);
     if (!r->tts_text) { r->err_code = OC_ERR_INTERNAL; return r; }
     r->type = OC_RES_TTS_META;
+    r->tts_warm = j->tts_warm;
     tts_probe_cache(db, j, r);
     return r;
 }

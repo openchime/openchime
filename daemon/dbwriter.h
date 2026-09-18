@@ -252,6 +252,11 @@ typedef struct oc_job {
     uint64_t       tts_bytes;
     uint32_t       tts_duration_ms;
     uint8_t        tts_voice;
+    /* A WARMING job: the same cache probe, with nobody waiting for the answer.
+     * The eight voices all audition with one sentence, so rendering it once per
+     * voice at startup turns every later press of Play into a cache hit
+     * (docs/READ-ALOUD.md §5). */
+    uint8_t        tts_warm;
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -887,7 +892,7 @@ typedef struct oc_dbres {
     uint8_t                 tts_handle[32];
     uint64_t                tts_bytes;
     uint32_t                tts_duration_ms;
-    uint8_t                 tts_voice, tts_cached, tts_persist;
+    uint8_t                 tts_voice, tts_cached, tts_persist, tts_warm;
     uint64_t                tts_author_id;
     uint64_t                st_expires, pf_avatar;
     /* OC_RES_FILE_CHANNELS. */

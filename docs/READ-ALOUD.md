@@ -143,6 +143,15 @@ casts them to float, so a config taken from one conversion leaves the other unab
   and looks the key up. A hit streams the stored render. A miss queues a render, unless one
   for the same key is already in flight, in which case the request waits for that one. A
   finished render writes the cache row and starts every waiting stream.
+- **The auditions are warmed at startup.** All eight voices audition with the same one
+  sentence, so there are exactly eight renderings to have, and the daemon checks for them
+  when it starts — rendering only what is missing, through the ordinary preview path, so a
+  restart costs one database read per voice and a fresh deployment costs about 14 seconds
+  of the render worker once. **Measured on an i5-1335U:** a cold audition is ~1.5–2.1 s of
+  model time (plus ~0.2 s to load the model) against 2.5–3.5 s of audio, so 0.60x real
+  time; warmed, the press of **Play** to the first sound is **109–235 ms**, which is a
+  database read, a blob open and the transfer. The rendering is the whole wait, which is
+  why the answer is to have done it already rather than to make it faster.
 - **Storage.** `rendered_audio` rows point at blobs. The maintenance pass reclaims renders
   before any attachment tier, least recently used first, deleting the row and the blob
   with no tombstone. A reclaimed render is synthesized again when next asked for.
@@ -182,9 +191,12 @@ Protocol version 16; full layouts in PROTOCOL.md §5.14b.
   message in order, skipping `NOT_RENDERABLE`, pausing on `TTS_UNAVAILABLE` with a notice,
   and appending messages that arrive while it plays.
 - **Win32:** "Listen" in the channel header and "Listen from here" on a message; a
-  mini-player bar with play/pause, skip, stop and the current author; the voice picker
-  in Edit profile, where choosing a voice plays the preview sentence in it before the
-  profile is saved.
+  mini-player bar with play/pause, skip, stop and the current author; the voice picker in
+  Edit profile, with a **Play** button beside it that says the audition sentence in the
+  chosen voice. Play, not pick-to-play: walking down a list of eight voices with the
+  keyboard would otherwise fire eight requests, and a sample that starts on its own is a
+  surprise. While one is playing the button reads "Playing…" and does not take a second
+  press; it comes back on its own if the daemon never answers.
 - **TUI:** `/listen` and `/listen stop`, playing through the same queue (ARCH-75 exempts
   a terminal from graphics, not from audio).
 
