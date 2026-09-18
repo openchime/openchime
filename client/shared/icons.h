@@ -34,6 +34,8 @@ enum {
     OC_ICON_PAUSE,
     OC_ICON_VOLUME,
     OC_ICON_MUTE,
+    OC_ICON_MIC,
+    OC_ICON_FREETALK,
     OC_ICON_COUNT
 };
 

@@ -345,15 +345,17 @@ jobs:
       # Read-aloud's engine and model (ARCH-111), built with the same toolchain
       # and glibc target as the daemon: ONNX Runtime compiled from source as one
       # minimal static archive, and the voice model converted for this
-      # architecture. Both are functions of the files in the key and of the zig
+      # architecture; and voice input's recognizer files, fetched as published
+      # (ARCH-112). All are functions of the files in the key and of the zig
       # version, so a hit skips about 25 minutes and a change rebuilds.
-      - name: Restore the read-aloud engine and model
+      - name: Restore the speech engine and models
         uses: actions/cache@v4
         with:
           path: |
             third_party/onnxruntime-1.30.0
             build/kitten
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'scripts/zig_cc.sh', 'daemon/tts_kitten.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c') }}
+            build/moonshine
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'scripts/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c', 'scripts/build_moonshine.sh') }}
 
       # zig's bundled Clang compiles for a baseline CPU with 512-bit vectors off,
       # so ONNX Runtime's AVX-512 kernels (which enable AVX-512 per file) need
@@ -377,6 +379,7 @@ jobs:
           mv /tmp/zig-ort-c++ /tmp/zig-ort-cxx
           CC=/tmp/zig-ort-cc CXX=/tmp/zig-ort-cxx scripts/build_onnxruntime.sh
           scripts/build_kitten.sh
+          scripts/build_moonshine.sh
 
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.
@@ -400,14 +403,21 @@ jobs:
           chmod +x /tmp/zcc
           make CC=/tmp/zcc TTS_CXXLIB=-lc++ OC_VERSION="$VERSION"
           strip openchimed -o "$DIST/openchimed"
-          # Read-aloud's data travels beside the binary, where `make` assembled
-          # it and wrote its manifest; every package takes it from there.
+          # Read-aloud's and voice input's data travel beside the binary, where
+          # `make` assembled them and wrote their manifests; every package takes
+          # them from there.
           cp -r voices "$DIST/voices"
+          cp -r stt "$DIST/stt"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
           "./$DIST/openchimed" --version
           # Read-aloud works from what ships: a render from the stripped file,
           # finding its voice data beside it and verifying it.
           "./$DIST/openchimed" --tts-say expr-voice-2-f "This release speaks." /tmp/release-check.wav
+          # And voice input hears it, from the stt/ data beside the stripped file.
+          heard="$("./$DIST/openchimed" --stt-hear /tmp/release-check.wav)"
+          echo "heard: $heard"
+          printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'this release speaks' || {
+            echo "::error::the release binary did not hear what it said"; exit 1; }
 
       # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
       # is invisible in a passing build -- a binary needing 2.38 links and runs
@@ -479,6 +489,11 @@ jobs:
           # The package put the voices where an installed daemon looks, and they
           # verify: a render by the installed binary, from the installed data.
           /usr/bin/openchimed --tts-say expr-voice-2-f "The package speaks." /tmp/installed-check.wav
+          # And the recognizer's data, the same way.
+          heard="$(/usr/bin/openchimed --stt-hear /tmp/installed-check.wav)"
+          echo "heard: $heard"
+          printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'the package speaks' || {
+            echo "::error::the installed daemon did not hear what it said"; exit 1; }
 
       # The install above does not touch the unit file: both maintainer scripts
       # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60
@@ -710,8 +725,9 @@ jobs:
       - name: Cross-build the vendored Windows mbedTLS
         run: scripts/build_mbedtls_windows.sh
 
-      - name: Cross-build the vendored Windows libvpx and libopus
-        run: scripts/build_libvpx.sh windows && scripts/build_opus.sh windows
+      # speexdsp for voice input's echo canceller (ARCH-112).
+      - name: Cross-build the vendored Windows libvpx, libopus and speexdsp
+        run: scripts/build_libvpx.sh windows && scripts/build_opus.sh windows && scripts/build_speexdsp.sh windows
 
       - name: Build the GUI and the TUI
         run: |

@@ -19,6 +19,7 @@ dist/
 !/third_party/miniaudio/
 !/third_party/stb/
 !/third_party/sqlite-3.53.4/
+!/third_party/libfvad/
 *.o
 *.db
 *.db-shm
@@ -26,3 +27,4 @@ dist/
 .env
 .playwright-mcp/
 __pycache__/
+/stt/

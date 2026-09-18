@@ -1626,6 +1626,48 @@ oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voi
     return oc_frame_end(w, off);
 }
 
+/* Voice input (ARCH-112). */
+oc_result oc_encode_stt_info(oc_wbuf *w, uint16_t version, const oc_stt_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STT_INFO);
+    oc_w_str(w, m->model_version);
+    oc_w_str(w, m->lang);
+    oc_w_u32(w, m->max_segment_ms);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_stt_begin(oc_wbuf *w, uint16_t version, const oc_stt_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STT_BEGIN);
+    oc_w_u32(w, m->segment_id);
+    oc_w_u8(w, m->mode);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->thread_root);
+    oc_w_idem(w, m->idem);
+    oc_w_u32(w, m->sample_count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_stt_chunk(oc_wbuf *w, uint16_t version, const oc_stt_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STT_CHUNK);
+    oc_w_u32(w, m->segment_id);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_stt_end(oc_wbuf *w, uint16_t version, const oc_stt_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STT_END);
+    oc_w_u32(w, m->segment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_stt_text(oc_wbuf *w, uint16_t version, const oc_stt_text *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STT_TEXT);
+    oc_w_u32(w, m->segment_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_str(w, m->text);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_audio_get(oc_wbuf *w, uint16_t version, const oc_audio_get *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUDIO_GET);
     oc_w_u64(w, m->message_id);
@@ -2506,6 +2548,42 @@ oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m) {
 
 oc_result oc_decode_voice_preview_get(oc_rbuf *p, oc_voice_preview_get *m) {
     m->voice_id = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_stt_info(oc_rbuf *p, oc_stt_info *m) {
+    m->model_version = oc_r_str(p);
+    m->lang = oc_r_str(p);
+    m->max_segment_ms = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_stt_begin(oc_rbuf *p, oc_stt_begin *m) {
+    m->segment_id = oc_r_u32(p);
+    m->mode = oc_r_u8(p);
+    m->channel_id = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);
+    oc_r_idem(p, m->idem);
+    m->sample_count = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_stt_chunk(oc_rbuf *p, oc_stt_chunk *m) {
+    m->segment_id = oc_r_u32(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_stt_end(oc_rbuf *p, oc_stt_end *m) {
+    m->segment_id = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_stt_text(oc_rbuf *p, oc_stt_text *m) {
+    m->segment_id = oc_r_u32(p);
+    m->message_id = oc_r_u64(p);
+    m->text = oc_r_str(p);
     return r_done(p);
 }
 

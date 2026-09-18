@@ -23,6 +23,7 @@ typedef struct { char id[32]; char label[32]; char lang[16]; } oc_voice;
 /* How many messages may wait to be spoken before the oldest is dropped. A
  * listener who has fallen this far behind a busy channel is not going to catch
  * up by hearing every one. */
+#define OC_STT_WORDS_MAX 16
 #define OC_LISTEN_QUEUE_MAX 64
 
 typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
@@ -342,6 +343,20 @@ typedef struct {
     size_t   preview_ready_len;
     uint64_t listen_playing;          /* what the frontend says it is playing now */
     uint32_t listen_skipped;          /* messages passed over, for the notice line */
+
+    /* Voice input (REQ-296-300, ARCH-112), from STT_INFO after auth. */
+    char     stt_model_version[96];
+    char     stt_lang[16];
+    uint32_t stt_max_ms;              /* the longest segment the daemon accepts */
+    /* Push-to-talk words waiting for the composer they were spoken into, in the
+     * order spoken. Owned here until the frontend takes them. */
+    struct { char *text; uint64_t channel_id, thread_root; } stt_words[OC_STT_WORDS_MAX];
+    uint8_t  n_stt_words;
+    /* Segments answered, and the last one refused and why, for the frontend to
+     * say so once. */
+    uint32_t stt_answered;
+    uint32_t stt_error_seq;
+    uint16_t stt_error_code;
     oc_channel      *channels;
     size_t           n_channels, cap_channels;
     oc_presence_row *presence;
@@ -879,6 +894,12 @@ uint32_t    oc_model_max_users(const oc_model *m);
 int             oc_model_has_capability(const oc_model *m, const char *name);
 /* Read-aloud is offered: the "tts" capability. */
 uint8_t         oc_model_tts_available(const oc_model *m);
+/* Voice input is offered on this connection (the "stt" capability). */
+uint8_t         oc_model_stt_available(const oc_model *m);
+/* The oldest push-to-talk words spoken into (channel_id, thread_root): 1 and a
+ * malloc'd string the caller frees, or 0 if none are waiting. Words for another
+ * conversation stay until asked for there. */
+int             oc_model_stt_take_words(oc_model *m, uint64_t channel_id, uint64_t thread_root, char **text);
 uint8_t         oc_model_tts_voice_count(const oc_model *m);
 const oc_voice *oc_model_tts_voice(const oc_model *m, uint8_t i);
 const char     *oc_model_tts_preview(const oc_model *m);

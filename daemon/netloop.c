@@ -15,6 +15,10 @@
 #ifdef OC_TTS
 #include "tts_worker.h"
 #endif
+#ifdef OC_STT
+#include "stt_mentions.h"
+#include "stt_worker.h"
+#endif
 #include "storage.h"
 #include "framebuf.h"
 #include "http.h"
@@ -139,6 +143,19 @@ typedef struct {
     uint32_t     send_count;     /* sends counted in the current window */
     uint64_t     audio_win_start;/* the same, for read-aloud requests (ARCH-111) */
     uint32_t     audio_count;
+    /* Voice input (ARCH-112): the segment being uploaded, one at a time, and
+     * the per-connection segment rate. Kept apart from `xfer` so a segment can
+     * arrive while an attachment moves. */
+    struct {
+        int      active;
+        uint32_t id, samples, got, next_seq;
+        uint8_t  mode;
+        uint64_t channel_id, thread_root;
+        uint8_t  idem[OC_IDEM_SIZE];
+        int16_t *pcm;
+    } stt_up;
+    uint64_t     stt_win_start;
+    uint32_t     stt_count;
     uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
     /* The pause's end instant (REQ-278), seeded from AUTH_OK and refreshed when
      * the user sets one. Held here rather than read from the database because
@@ -209,6 +226,35 @@ typedef struct tts_wait {
 static tts_wait *g_tts_waits;
 static uint64_t  g_tts_req_seq;
 static void tts_drop_waiters(uint64_t conn_id);
+#endif
+#ifdef OC_STT
+/* Voice input (ARCH-112): the recognizer and its worker, injected as read-aloud's
+ * are. A segment, once wholly received, is checked (STT_PREP, a read job), then
+ * recognized, then -- in free talk -- posted through the ordinary send path; this
+ * list holds it through those stages, in the order segments arrived, which is the
+ * order every stage answers in. */
+static const oc_stt_engine *g_stt_engine;
+static oc_stt_worker       *g_stt;
+enum { STT_AT_PREP, STT_AT_WORKER, STT_AT_POST };
+typedef struct stt_pend {
+    uint64_t         req, conn_id;
+    uint32_t         segment_id;
+    uint8_t          mode;
+    uint64_t         channel_id, thread_root;
+    uint8_t          idem[OC_IDEM_SIZE];
+    int16_t         *pcm;          /* until the worker takes it */
+    size_t           samples;
+    char           **names;        /* the conversation's members, for mentions */
+    size_t           n_names;
+    char            *text;         /* STT_AT_POST: the words being posted */
+    int              stage;
+    struct stt_pend *next;
+} stt_pend;
+static stt_pend *g_stt_pend;
+static uint64_t  g_stt_req_seq;
+/* Segments one connection may have waiting to be answered. */
+#define OC_STT_WAIT_MAX 4
+static void stt_drop_conn(uint64_t conn_id);
 #endif
 /* Storage maintenance (ARCH-78): policy, the last free-space sample, and when
  * the pass last ran. The sample is refreshed by the pass and read by the upload
@@ -391,6 +437,10 @@ static void conn_close(int ep, conn **conns, int fd) {
     xfer_reset(&c->xfer);
 #ifdef OC_TTS
     tts_drop_waiters(cid);
+#endif
+#ifdef OC_STT
+    free(c->stt_up.pcm);
+    stt_drop_conn(cid);
 #endif
     oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
@@ -605,6 +655,14 @@ static oc_unfurler *g_unfurler;
 void oc_netloop_set_tts(const struct oc_tts_engine *engine) {
 #ifdef OC_TTS
     g_tts_engine = engine;
+#else
+    (void)engine;
+#endif
+}
+
+void oc_netloop_set_stt(const struct oc_stt_engine *engine) {
+#ifdef OC_STT
+    g_stt_engine = engine;
 #else
     (void)engine;
 #endif
@@ -878,6 +936,73 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
     return out_append(c, tmp, w.len);
 }
+
+
+/* --- Voice input (REQ-296-300, ARCH-112) -------------------------------- */
+
+/* Refuse a segment: an ERROR naming it (its id, big-endian, in `context`). */
+static int stt_refuse(conn *c, uint32_t segment_id, uint16_t code, const char *why) {
+    uint8_t ctx[4] = { (uint8_t)(segment_id >> 24), (uint8_t)(segment_id >> 16),
+                       (uint8_t)(segment_id >> 8), (uint8_t)segment_id };
+    uint8_t tmp[160]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_error e = { code, 0, { ctx, sizeof ctx }, oc_slice_str(why) };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
+#ifdef OC_STT
+/* Segments per connection per minute (OPENCHIME_STT_RATE): free talk sends one
+ * every few seconds; this bounds a client sending far faster than anyone talks. */
+static int stt_rate_ok(conn *c) {
+    const oc_config *cfg = oc_config_get();
+    uint64_t now = now_ms();
+    if (now - c->stt_win_start >= 60000u) { c->stt_win_start = now; c->stt_count = 0; }
+    if (c->stt_count >= (unsigned)cfg->stt.rate) return 0;
+    c->stt_count++;
+    return 1;
+}
+
+static size_t stt_waiting(uint64_t conn_id) {
+    size_t n = 0;
+    for (stt_pend *p = g_stt_pend; p; p = p->next) if (p->conn_id == conn_id) n++;
+    return n;
+}
+
+static stt_pend *stt_find(uint64_t req) {
+    for (stt_pend *p = g_stt_pend; p; p = p->next) if (p->req == req) return p;
+    return NULL;
+}
+
+static void stt_free(stt_pend *p) {
+    free(p->pcm);
+    for (size_t i = 0; i < p->n_names; i++) free(p->names[i]);
+    free(p->names);
+    free(p->text);
+    free(p);
+}
+
+static void stt_unlink(stt_pend *x) {
+    for (stt_pend **pp = &g_stt_pend; *pp; pp = &(*pp)->next)
+        if (*pp == x) { *pp = x->next; stt_free(x); return; }
+}
+
+static void stt_append(stt_pend *x) {
+    stt_pend **pp = &g_stt_pend;
+    while (*pp) pp = &(*pp)->next;
+    x->next = NULL;
+    *pp = x;
+}
+
+/* A connection closed: whatever it had waiting is dropped, audio included. A
+ * segment already with the worker comes back to nobody and is freed then. */
+static void stt_drop_conn(uint64_t conn_id) {
+    for (stt_pend **pp = &g_stt_pend; *pp;) {
+        stt_pend *x = *pp;
+        if (x->conn_id == conn_id) { *pp = x->next; stt_free(x); }
+        else pp = &x->next;
+    }
+}
+#endif
 
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
@@ -2115,6 +2240,116 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             c->xfer.attachment_id = db.attachment_id;
             continue;
         }
+        /* Voice input (REQ-296-300, ARCH-112): one segment of speech, uploaded
+         * whole before anything is done with it. */
+        if (hdr.msg_type == OC_MSG_STT_BEGIN) {
+            oc_stt_begin sb;
+            if (oc_decode_stt_begin(&p, &sb) != OC_OK) return -1;
+#ifdef OC_STT
+            const oc_config *scfg = oc_config_get();
+            uint16_t refuse = 0;
+            const char *why = "";
+            if (!g_stt) { refuse = OC_ERR_STT_UNAVAILABLE; why = "voice input is off"; }
+            else if (c->stt_up.active || sb.sample_count == 0 ||
+                     (sb.mode != OC_STT_MODE_PTT && sb.mode != OC_STT_MODE_FREE) ||
+                     (sb.mode == OC_STT_MODE_FREE && sb.channel_id == 0)) {
+                refuse = OC_ERR_TRANSFER_PROTOCOL; why = "bad segment";
+            }
+            else if (sb.sample_count > (uint32_t)scfg->stt.max_secs * OC_STT_RATE) {
+                refuse = OC_ERR_SEGMENT_TOO_LONG; why = "segment too long";
+            }
+            else if (stt_waiting(c->conn_id) >= OC_STT_WAIT_MAX || !stt_rate_ok(c)) {
+                refuse = OC_ERR_STT_UNAVAILABLE; why = "too many segments";
+            }
+            if (!refuse) {
+                c->stt_up.pcm = malloc((size_t)sb.sample_count * sizeof(int16_t));
+                if (!c->stt_up.pcm) { refuse = OC_ERR_STT_UNAVAILABLE; why = "out of memory"; }
+            }
+            if (refuse) { if (stt_refuse(c, sb.segment_id, refuse, why) != 0) return -1; continue; }
+            c->stt_up.active = 1;
+            c->stt_up.id = sb.segment_id;
+            c->stt_up.mode = sb.mode;
+            c->stt_up.channel_id = sb.channel_id;
+            c->stt_up.thread_root = sb.thread_root;
+            memcpy(c->stt_up.idem, sb.idem, OC_IDEM_SIZE);
+            c->stt_up.samples = sb.sample_count;
+            c->stt_up.got = 0;
+            c->stt_up.next_seq = 0;
+#else
+            if (stt_refuse(c, sb.segment_id, OC_ERR_STT_UNAVAILABLE, "voice input is not built in") != 0) return -1;
+#endif
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_STT_CHUNK) {
+            oc_stt_chunk sc;
+            if (oc_decode_stt_chunk(&p, &sc) != OC_OK) return -1;
+#ifdef OC_STT
+            if (!c->stt_up.active || sc.segment_id != c->stt_up.id || sc.seq != c->stt_up.next_seq ||
+                (sc.data.len & 1) || sc.data.len / 2 > (size_t)(c->stt_up.samples - c->stt_up.got)) {
+                /* Out of order or over the declared length: the segment is void. */
+                if (c->stt_up.active && sc.segment_id == c->stt_up.id) {
+                    free(c->stt_up.pcm);
+                    memset(&c->stt_up, 0, sizeof c->stt_up);
+                }
+                if (stt_refuse(c, sc.segment_id, OC_ERR_TRANSFER_PROTOCOL, "bad chunk") != 0) return -1;
+                continue;
+            }
+            for (size_t i = 0; i < sc.data.len / 2; i++)
+                c->stt_up.pcm[c->stt_up.got + i] = (int16_t)(uint16_t)(sc.data.ptr[2 * i] | sc.data.ptr[2 * i + 1] << 8);
+            c->stt_up.got += (uint32_t)(sc.data.len / 2);
+            c->stt_up.next_seq++;
+#endif
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_STT_END) {
+            oc_stt_end se;
+            if (oc_decode_stt_end(&p, &se) != OC_OK) return -1;
+#ifdef OC_STT
+            if (!c->stt_up.active || se.segment_id != c->stt_up.id || c->stt_up.got != c->stt_up.samples) {
+                if (c->stt_up.active && se.segment_id == c->stt_up.id) {
+                    free(c->stt_up.pcm);
+                    memset(&c->stt_up, 0, sizeof c->stt_up);
+                }
+                if (stt_refuse(c, se.segment_id, OC_ERR_TRANSFER_PROTOCOL, "incomplete segment") != 0) return -1;
+                continue;
+            }
+            stt_pend *x = calloc(1, sizeof *x);
+            if (!x) return -1;
+            x->req = ++g_stt_req_seq;
+            x->conn_id = c->conn_id;
+            x->segment_id = c->stt_up.id;
+            x->mode = c->stt_up.mode;
+            x->channel_id = c->stt_up.channel_id;
+            x->thread_root = c->stt_up.thread_root;
+            memcpy(x->idem, c->stt_up.idem, OC_IDEM_SIZE);
+            x->pcm = c->stt_up.pcm;
+            x->samples = c->stt_up.samples;
+            memset(&c->stt_up, 0, sizeof c->stt_up);
+            stt_append(x);
+            if (x->channel_id == 0) {
+                /* Push to talk with no conversation yet (the New message pane):
+                 * nothing to check and nobody to mention, so straight to the
+                 * worker. */
+                x->stage = STT_AT_WORKER;
+                int16_t *pcm = x->pcm;
+                x->pcm = NULL;
+                if (oc_stt_worker_submit(g_stt, x->req, pcm, x->samples) != 0) {
+                    uint32_t sid = x->segment_id;
+                    stt_unlink(x);
+                    if (stt_refuse(c, sid, OC_ERR_STT_UNAVAILABLE, "recognizer busy") != 0) return -1;
+                }
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_STT_PREP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = x->channel_id;
+            j->stt_mode = x->mode;
+            j->stt_req = x->req;
+            oc_dbwriter_submit(dbw, j);
+#endif
+            continue;
+        }
 #ifdef OC_TTS
         if (hdr.msg_type == OC_MSG_AUDIO_GET) {
             oc_audio_get ag;
@@ -2388,6 +2623,107 @@ static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
 
 /* `dbw` because a result can beget a job: read-aloud writes back the voice it
  * chose and marks a served rendering used (ARCH-111). */
+#ifdef OC_STT
+/* The segment a free-talk post came from, by the connection and the token the
+ * speaker gave it -- the same token the send path deduplicates on. */
+static stt_pend *stt_posting(uint64_t conn_id, const uint8_t idem[OC_IDEM_SIZE]) {
+    for (stt_pend *x = g_stt_pend; x; x = x->next)
+        if (x->stage == STT_AT_POST && x->conn_id == conn_id && !memcmp(x->idem, idem, OC_IDEM_SIZE)) return x;
+    return NULL;
+}
+
+static void stt_send_text(int ep, conn **conns, conn *c, uint32_t segment_id, uint64_t message_id, const char *text) {
+    oc_wbuf w;
+    oc_wbuf_init(&w, g_enc, sizeof g_enc);
+    oc_stt_text t = { segment_id, message_id, oc_slice_str(text ? text : "") };
+    if (oc_encode_stt_text(&w, OC_PROTOCOL_VERSION, &t) == OC_OK)
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+}
+
+/* A free-talk post landed: close the segment with the message it became. */
+static void stt_posted(int ep, conn **conns, const oc_dbres *r) {
+    stt_pend *x = r->conn_id ? stt_posting(r->conn_id, r->idem) : NULL;
+    if (!x) return;
+    conn *c = find_by_id(conns, r->conn_id);
+    if (c) stt_send_text(ep, conns, c, x->segment_id, r->message_id, x->text);
+    stt_unlink(x);
+}
+
+/* A free-talk post was refused by the send path (archived meanwhile, rate,
+ * membership): told as a refusal of the segment. Returns 1 if it was one. */
+static int stt_post_failed(int ep, conn **conns, conn *c, const oc_dbres *r) {
+    stt_pend *x = stt_posting(r->conn_id, r->idem);
+    if (!x) return 0;
+    uint32_t sid = x->segment_id;
+    stt_unlink(x);
+    int fd = c->fd;
+    if (stt_refuse(c, sid, r->err_code, "post refused") != 0) { conn_close(ep, conns, fd); return 1; }
+    flush_out(c);
+    update_interest(ep, c);
+    return 1;
+}
+
+/* Recognized segments, in the order they were submitted. Push to talk: the
+ * words go back. Free talk: they are posted as the speaker, through the send
+ * path a typed message takes, and the segment closes when that lands. */
+static void deliver_stt_results(int ep, conn **conns, oc_dbwriter *dbw) {
+    oc_stt_result res;
+    while (g_stt && oc_stt_worker_next_result(g_stt, &res)) {
+        stt_pend *x = stt_find(res.req_id);
+        conn *c = x ? find_by_id(conns, x->conn_id) : NULL;
+        if (!x || !c) {
+            if (x) stt_unlink(x);
+            free(res.text);
+            continue;
+        }
+        int fd = c->fd;
+        if (!res.ok) {
+            fprintf(stderr, "stt: %s\n", res.reason);
+            uint32_t sid = x->segment_id;
+            stt_unlink(x);
+            if (stt_refuse(c, sid, OC_ERR_STT_UNAVAILABLE, "recognition failed") != 0) conn_close(ep, conns, fd);
+            else { flush_out(c); update_interest(ep, c); }
+            continue;
+        }
+        size_t cap = strlen(res.text) * 2 + 64;
+        char *text = malloc(cap);
+        if (text) oc_stt_mentions(res.text, (const char *const *)x->names, x->n_names, text, cap);
+        free(res.text);
+        if (!text) { uint32_t sid = x->segment_id; stt_unlink(x); (void)stt_refuse(c, sid, OC_ERR_INTERNAL, "out of memory"); continue; }
+        if (x->mode == OC_STT_MODE_PTT || !text[0]) {
+            stt_send_text(ep, conns, c, x->segment_id, 0, text);
+            free(text);
+            stt_unlink(x);
+            continue;
+        }
+        if (!send_rate_ok(c)) {
+            uint32_t sid = x->segment_id;
+            free(text);
+            stt_unlink(x);
+            if (stt_refuse(c, sid, OC_ERR_SEND_RATE_LIMITED, "send rate exceeded") != 0) conn_close(ep, conns, fd);
+            else { flush_out(c); update_interest(ep, c); }
+            continue;
+        }
+        oc_job *j = oc_job_new(x->thread_root ? OC_JOB_SEND_REPLY : OC_JOB_SEND, c->conn_id);
+        if (!j || oc_job_set_body(j, (const uint8_t *)text, strlen(text)) != 0) {
+            free(j);   /* nothing else of it was allocated */
+            uint32_t sid = x->segment_id;
+            free(text);
+            stt_unlink(x);
+            (void)stt_refuse(c, sid, OC_ERR_INTERNAL, "out of memory");
+            continue;
+        }
+        j->user_id = c->user_id;
+        j->channel_id = x->channel_id;
+        j->parent_id = x->thread_root;
+        memcpy(j->idem, x->idem, OC_IDEM_LEN);
+        x->text = text;
+        x->stage = STT_AT_POST;
+        oc_dbwriter_submit(dbw, j);
+    }
+}
+#endif
+
 static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
     (void)dbw;
     oc_wbuf w;
@@ -2432,14 +2768,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * to expect: a name absent means the client shows nothing of it rather
          * than offering something that would fail. "tts" is present exactly when
          * read-aloud is running -- built in, turned on, and its voice data found
-         * and verified. "stt" is never present yet; it is named now so a client
-         * already hides speech-to-text correctly on the day it can be present. */
+         * and verified; "stt" exactly when voice input is, on the same terms. */
         {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_capabilities caps;
             memset(&caps, 0, sizeof caps);
 #ifdef OC_TTS
             if (g_tts && g_tts_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_TTS);
+#endif
+#ifdef OC_STT
+            if (g_stt && g_stt_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_STT);
 #endif
             oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &caps);
             send_bytes(ep, conns, fd, g_enc, w.len);
@@ -2476,6 +2814,24 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &ti);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the TTS_INFO write */
+        }
+
+        /* The recognizer, its language and the segment cap (REQ-298). Always
+         * sent, empty when voice input is not offered -- CAPABILITIES says whether
+         * it is. */
+        {
+            oc_stt_info si = { oc_slice_str(""), oc_slice_str(""), 0 };
+#ifdef OC_STT
+            if (g_stt && g_stt_engine) {
+                si.model_version = oc_slice_str(g_stt_engine->version);
+                si.lang = oc_slice_str(g_stt_engine->lang ? g_stt_engine->lang : "");
+                si.max_segment_ms = (uint32_t)oc_config_get()->stt.max_secs * 1000u;
+            }
+#endif
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_stt_info(&w, OC_PROTOCOL_VERSION, &si);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;   /* dropped on the STT_INFO write */
         }
 
         /* A pause outlives the session that set it (REQ-278), so the client is
@@ -2592,11 +2948,17 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
              * result later, or never. */
             unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         }
+#ifdef OC_STT
+        stt_posted(ep, conns, r);
+#endif
         break;
     }
     case OC_RES_SEND_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
+#ifdef OC_STT
+        if (stt_post_failed(ep, conns, c, r)) break;
+#endif
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_slice ctx = { r->idem, OC_IDEM_LEN };
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
@@ -3138,11 +3500,17 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             /* A reply's URLs unfurl like any other body's (REQ-222). */
             unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         }
+#ifdef OC_STT
+        stt_posted(ep, conns, r);
+#endif
         break;
     }
     case OC_RES_REPLY_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
+#ifdef OC_STT
+        if (stt_post_failed(ep, conns, c, r)) break;
+#endif
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_slice ctx = { r->idem, OC_IDEM_LEN };
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("reply rejected") };
@@ -3275,6 +3643,40 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         send_bytes(ep, conns, fd, g_enc, w.len);
         break;
     }
+#ifdef OC_STT
+    case OC_RES_STT_PREP: {
+        /* The check before recognition (ARCH-112). Refused: the segment is
+         * dropped, audio and all, and the speaker told why. Allowed: the member
+         * names ride with it and the audio goes to the worker. */
+        stt_pend *x = stt_find(r->stt_req);
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!x || !c) { if (x) stt_unlink(x); break; }
+        int fd = c->fd;
+        if (r->err_code) {
+            uint32_t sid = x->segment_id;
+            stt_unlink(x);
+            if (stt_refuse(c, sid, r->err_code, "segment refused") != 0) { conn_close(ep, conns, fd); break; }
+            flush_out(c);
+            update_interest(ep, c);
+            break;
+        }
+        x->names = r->stt_names;
+        x->n_names = r->n_stt_names;
+        r->stt_names = NULL;
+        r->n_stt_names = 0;
+        x->stage = STT_AT_WORKER;
+        int16_t *pcm = x->pcm;
+        x->pcm = NULL;
+        if (oc_stt_worker_submit(g_stt, x->req, pcm, x->samples) != 0) {
+            uint32_t sid = x->segment_id;
+            stt_unlink(x);
+            if (stt_refuse(c, sid, OC_ERR_STT_UNAVAILABLE, "recognizer busy") != 0) { conn_close(ep, conns, fd); break; }
+            flush_out(c);
+            update_interest(ep, c);
+        }
+        break;
+    }
+#endif
 #ifdef OC_TTS
     case OC_RES_TTS_META: {
         /* A warming probe has no listener: render what is missing and stop. The
@@ -4588,6 +4990,30 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         }
     }
 
+#ifdef OC_STT
+    /* Voice input's recognition worker (ARCH-112), its own thread beside
+     * read-aloud's so a long render never delays someone mid-sentence. No engine
+     * or an operator who turned it off means no worker, and CAPABILITIES then
+     * leaves "stt" out. The model loads on the first segment. */
+    int stt_eventfd = -1;
+    {
+        const oc_config *cfg = oc_config_get();
+        if (g_stt_engine && cfg->stt.enabled) {
+            g_stt = oc_stt_worker_start(g_stt_engine, (size_t)cfg->stt.queue,
+                                        (unsigned)cfg->stt.idle_secs * 1000u);
+            if (!g_stt) {
+                fprintf(stderr, "stt: cannot start the recognition worker; voice input is off\n");
+            } else {
+                stt_eventfd = oc_stt_worker_eventfd(g_stt);
+                struct epoll_event sev;
+                sev.events = EPOLLIN; sev.data.fd = stt_eventfd;
+                epoll_ctl(ep, EPOLL_CTL_ADD, stt_eventfd, &sev);
+                fprintf(stderr, "stt: voice input on, %s, queue %d, segments up to %ds, model idle %ds\n",
+                        g_stt_engine->version, cfg->stt.queue, cfg->stt.max_secs, cfg->stt.idle_secs);
+            }
+        }
+    }
+#endif
 #ifdef OC_TTS
     /* Read-aloud's render worker (ARCH-111), beside the transfer pool because it
      * writes to the same store. No engine (a daemon built without read-aloud) or
@@ -4735,6 +5161,14 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 continue;
             }
 
+#ifdef OC_STT
+            if (fd == stt_eventfd) {
+                uint64_t cnt;
+                while (read(stt_eventfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                deliver_stt_results(ep, conns, dbw);
+                continue;
+            }
+#endif
 #ifdef OC_TTS
             if (fd == tts_eventfd) {
                 uint64_t cnt;
@@ -4785,6 +5219,12 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         if (conns[fd]) conn_close(ep, conns, fd);
     /* Stop the workers before the store they borrow; this also drains any
      * fire-and-forget cleanup the closes above just queued. */
+#ifdef OC_STT
+    oc_stt_worker_stop(g_stt);
+    g_stt = NULL;
+    for (stt_pend *x = g_stt_pend, *next; x; x = next) { next = x->next; stt_free(x); }
+    g_stt_pend = NULL;
+#endif
 #ifdef OC_TTS
     /* Before the store it writes to, like the transfer pool. */
     oc_tts_worker_stop(g_tts);

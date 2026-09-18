@@ -377,6 +377,14 @@ typedef enum {
     OC_MSG_AUDIO_END        = 0x00E0, /* S->C, the whole rendering is sent */
     OC_MSG_CAPABILITIES     = 0x00E1, /* S->C, the features this daemon offers, by name */
     OC_MSG_VOICE_PREVIEW_GET = 0x00E2, /* C->S, hear a voice say its sample sentence */
+    /* Voice input (REQ-296-300, ARCH-112). The client sends a segment of speech it
+     * has cut at a pause; in push to talk the daemon answers with the words, in
+     * free talk it posts them as the speaker through the ordinary send path. */
+    OC_MSG_STT_INFO         = 0x00E3, /* S->C, the recognizer, its language and segment cap */
+    OC_MSG_STT_BEGIN        = 0x00E4, /* C->S, a segment: mode, target, token, length */
+    OC_MSG_STT_CHUNK        = 0x00E5, /* C->S, a slice of its samples */
+    OC_MSG_STT_END          = 0x00E6, /* C->S, the whole segment is sent */
+    OC_MSG_STT_TEXT         = 0x00E7, /* S->C, what was said, and the message it became */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -447,6 +455,8 @@ typedef enum {
     OC_ERR_NOT_RENDERABLE      = 3023, /* the message has nothing to say aloud (REQ-294) */
     OC_ERR_TTS_UNAVAILABLE     = 3024, /* read-aloud is off, busy or the render failed (REQ-295) */
     OC_ERR_CALL_UNAVAILABLE    = 3025, /* the audio relay is down and could not be restarted (REQ-150) */
+    OC_ERR_SEGMENT_TOO_LONG    = 3026, /* a voice-input segment exceeds the cap (REQ-298) */
+    OC_ERR_STT_UNAVAILABLE     = 3027, /* voice input is off, busy or recognition failed (REQ-300) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -1136,6 +1146,20 @@ typedef struct { oc_slice voice_id; } oc_voice_preview_get;
 typedef struct { uint64_t message_id; uint32_t duration_ms; uint64_t total_size; } oc_audio_info;
 typedef struct { uint64_t message_id; uint32_t seq; oc_slice data; } oc_audio_chunk;
 typedef struct { uint64_t message_id; } oc_audio_end;
+
+/* Voice input (REQ-296-300, ARCH-112). A segment is 16 kHz mono signed 16-bit
+ * little-endian PCM, at most max_segment_ms long. */
+#define OC_STT_RATE        16000u
+#define OC_STT_MODE_PTT    0u   /* push to talk: the words come back */
+#define OC_STT_MODE_FREE   1u   /* free talk: the daemon posts them */
+typedef struct { oc_slice model_version; oc_slice lang; uint32_t max_segment_ms; } oc_stt_info;
+typedef struct { uint32_t segment_id; uint8_t mode; uint64_t channel_id; uint64_t thread_root;
+                 uint8_t idem[OC_IDEM_SIZE]; uint32_t sample_count; } oc_stt_begin;
+typedef struct { uint32_t segment_id; uint32_t seq; oc_slice data; } oc_stt_chunk;
+typedef struct { uint32_t segment_id; } oc_stt_end;
+/* message_id is the message free talk posted; 0 in push to talk or when nothing
+ * was said. */
+typedef struct { uint32_t segment_id; uint64_t message_id; oc_slice text; } oc_stt_text;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
 /* `title`, `timezone` and the custom status ride here as of protocol 7 (REQ-289).
  * They were on PROFILE_INFO alone, which the daemon sends ONLY to the user who
@@ -1376,6 +1400,11 @@ oc_result oc_encode_audio_chunk(oc_wbuf *w, uint16_t version, const oc_audio_chu
 oc_result oc_encode_audio_end(oc_wbuf *w, uint16_t version, const oc_audio_end *m);
 oc_result oc_encode_capabilities(oc_wbuf *w, uint16_t version, const oc_capabilities *m);
 oc_result oc_encode_voice_preview_get(oc_wbuf *w, uint16_t version, const oc_voice_preview_get *m);
+oc_result oc_encode_stt_info(oc_wbuf *w, uint16_t version, const oc_stt_info *m);
+oc_result oc_encode_stt_begin(oc_wbuf *w, uint16_t version, const oc_stt_begin *m);
+oc_result oc_encode_stt_chunk(oc_wbuf *w, uint16_t version, const oc_stt_chunk *m);
+oc_result oc_encode_stt_end(oc_wbuf *w, uint16_t version, const oc_stt_end *m);
+oc_result oc_encode_stt_text(oc_wbuf *w, uint16_t version, const oc_stt_text *m);
 oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m);
 oc_result oc_encode_download_info(oc_wbuf *w, uint16_t version, const oc_download_info *m);
 oc_result oc_encode_download_chunk(oc_wbuf *w, uint16_t version, const oc_download_chunk *m);
@@ -1539,6 +1568,11 @@ oc_result oc_decode_audio_chunk(oc_rbuf *p, oc_audio_chunk *m);
 oc_result oc_decode_audio_end(oc_rbuf *p, oc_audio_end *m);
 oc_result oc_decode_capabilities(oc_rbuf *p, oc_capabilities *m);
 oc_result oc_decode_voice_preview_get(oc_rbuf *p, oc_voice_preview_get *m);
+oc_result oc_decode_stt_info(oc_rbuf *p, oc_stt_info *m);
+oc_result oc_decode_stt_begin(oc_rbuf *p, oc_stt_begin *m);
+oc_result oc_decode_stt_chunk(oc_rbuf *p, oc_stt_chunk *m);
+oc_result oc_decode_stt_end(oc_rbuf *p, oc_stt_end *m);
+oc_result oc_decode_stt_text(oc_rbuf *p, oc_stt_text *m);
 oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m);
 oc_result oc_decode_download_info(oc_rbuf *p, oc_download_info *m);
 oc_result oc_decode_download_chunk(oc_rbuf *p, oc_download_chunk *m);

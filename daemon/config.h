@@ -79,6 +79,12 @@ typedef struct {
      * how many renders may wait, `idle_secs` how long the model stays loaded with
      * nothing to do, `rate` how many AUDIO_GETs a connection may make a minute. */
     struct { int enabled, queue, idle_secs, rate; const char *lang; } tts;
+    /* Voice input (REQ-296-300, ARCH-112). Built in and on by default, with its
+     * own data directory, so either speech feature can be missing without the
+     * other. `queue` bounds segments waiting for the recognizer, `idle_secs` how
+     * long the model stays loaded with nothing to hear, `rate` how many segments
+     * a connection may send a minute, and `max_secs` the longest segment. */
+    struct { int enabled, queue, idle_secs, rate, max_secs; } stt;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.

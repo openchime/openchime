@@ -59,4 +59,11 @@ void oc_netloop_set_unfurler(struct oc_unfurler *u);
 struct oc_tts_engine;
 void oc_netloop_set_tts(const struct oc_tts_engine *engine);
 
+/* Wire voice input's recognizer (REQ-296-300, ARCH-112). The daemon passes the
+ * model built into it; a test passes a stub. Call before oc_netloop_run; NULL
+ * (the default, and a daemon built with STT=0) means the daemon advertises no
+ * voice input and refuses STT_BEGIN with STT_UNAVAILABLE. */
+struct oc_stt_engine;
+void oc_netloop_set_stt(const struct oc_stt_engine *engine);
+
 #endif /* OPENCHIME_NETLOOP_H */

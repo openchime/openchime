@@ -16,9 +16,10 @@ exist.** `CALL_JOIN` / `CALL_LEAVE` / `CALL_JOINED` / `CALL_ROSTER` signaling,
 the per-channel ephemeral roster, per-join bearer tokens, and the forked UDP
 relay sidecar (`daemon/audio_sidecar.c`) all work, including disconnect and
 rejoin (REQ-152). Client-side, the device layer and Opus exist — video messages
-built them (ARCH-110) — but there is no `CALL_*` handling in `client/core`, no UDP
-media path, no jitter buffer or mixer, and no echo cancellation. This document
-specifies that work. Voice input (ARCH-112) builds the echo canceller of §6 first.
+built them (ARCH-110) — and voice input (ARCH-112) built the playback reference,
+the processor seam and the speexdsp echo canceller with its ERLE harness (§3.3,
+§6). There is no `CALL_*` handling in `client/core`, no UDP media path, and no
+jitter buffer or mixer. This document specifies that work.
 
 ---
 
@@ -191,14 +192,18 @@ clock video frames use; playback reports the samples the device has consumed,
 which is the clock a player — or a call's jitter buffer — runs on. Video messages
 record at 48 kHz mono; calls will open it at 16 kHz. `OPENCHIME_TEST_AUDIO=synthetic`
 swaps the devices for a tone source and a real-time sink, so both run in
-`make test` on a machine with no sound hardware. Duplex operation and drift
+`make test` on a machine with no sound hardware; with it, `OPENCHIME_TEST_MIC=<wav>`
+makes the synthetic microphone speak a recording, and `OPENCHIME_TEST_AUDIO=mic-denied`
+refuses the microphone as the operating system refuses a blocked one — which is how
+`scripts/gui_voice.sh` drives voice input. Duplex operation and drift
 detection (build step 1 below) remain to be added for calls.
 
 **Voice input opens it too** (ARCH-112, [VOICE-INPUT.md](./VOICE-INPUT.md)), at
-16 kHz mono, and never while a call or a recording holds the microphone. It builds
-the playback reference — the device layer keeping the frames it emits against the
-media clock — and the processor seam of §3.3 with speexdsp (§6), which the call
-client then inherits.
+16 kHz mono. The microphone has one owner: a second capture is refused
+(`OC_AUDIO_BUSY`). Voice input built the playback reference — every playback
+device's output, mixed to mono at 16 kHz on the media clock (`oc_audio_reference`)
+— and the processor seam of §3.3 with speexdsp (§6), which the call client
+inherits.
 
 ### 3.3 The processor seam
 
@@ -369,6 +374,20 @@ Extending it costs little and buys a lot:
 Most homegrown echo cancellation is unverified precisely because this step is
 skipped.
 
+**Built** (`tests/test_voice.c`, with voice input). speexdsp's linear canceller at
+16 kHz, 20 ms frames and a 300 ms echo path, against a synthetic room: a direct
+path 30 ms late and a decaying tail:
+
+| Case | Result |
+|---|---|
+| Converged | 22.5 dB ERLE |
+| Far end resampled 100 ppm fast | 15.5 dB ERLE — re-converges |
+| Double-talk | 13.2 dB of echo removed; output correlates 0.93 with the near-end voice |
+
+speexdsp's **residual-echo suppressor is left off**: in the same double-talk it
+cut the near-end voice to a correlation of 0.05. The linear filter alone keeps the
+speech, which is the failure the harness exists to catch.
+
 ---
 
 ## 7. Build order
@@ -388,9 +407,10 @@ late — after the seams that make it replaceable exist.
 
 Phase 6 lands after Phase 5 because a mixer produces a single far-end reference
 (§1.1), and because there is no real echo to cancel until real audio is playing
-out of a real speaker. **Voice input (ARCH-112) builds phase 6 earlier**, with the
-client's own playback — read-aloud, video messages — as the far-end reference, so
-the call client arrives with a measured canceller rather than building one.
+out of a real speaker. **Voice input (ARCH-112) built phase 6 earlier**, with the
+client's own playback — read-aloud, video messages, voice auditions — as the
+far-end reference, so the call client arrives with a measured canceller (§6.4)
+rather than building one.
 
 **Nearly all of this is `client/core` work.** The TUI contributes commands and a
 roster panel; every future GUI inherits the engine, the codec, the transport, and

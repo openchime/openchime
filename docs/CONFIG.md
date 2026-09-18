@@ -146,6 +146,28 @@ memory is about 210 MB for a typical sentence and up to 315 MB for a long one, a
 a rendering takes about six tenths of the time it takes to speak. A rendering is
 about 3 KB a second of speech, stored until the disk needs the room.
 
+## Voice input
+
+Speech recognition is built into the daemon (ARCH-112) on the same engine as
+read-aloud, and its recognizer's files ship beside it in the same package, so the
+feature is on unless it is turned off or its data is missing. A daemon built with
+`make STT=0` has no voice input whatever these say, and tells its clients so.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCHIME_STT` | `1` | Let users speak into conversations. `0` turns it off: no speech is accepted, and clients are told the feature is absent (REQ-300). |
+| `OPENCHIME_STT_QUEUE` | `64` | Segments that may wait for the recognizer, across every connection. A full queue answers `STT_UNAVAILABLE` rather than growing; clamped to 1–1024. |
+| `OPENCHIME_STT_IDLE_SECS` | `300` | How long the recognizer stays loaded with nothing to hear. It loads on the first segment (under a tenth of a second) and is released after this; clamped to 5–86400. |
+| `OPENCHIME_STT_RATE` | `60` | Segments one connection may send a minute. Free talk sends one at every pause, so this bounds a client sending far faster than anyone speaks; clamped to 1–6000. |
+| `OPENCHIME_STT_MAX_SECS` | `30` | The longest segment accepted, announced to clients so they cut speech inside it. Moonshine recommends staying under about 30 seconds; clamped to 5–60. |
+| `OPENCHIME_STT_DATA_DIR` | *(search)* | Where the recognizer's files are. Unset, the daemon uses `/usr/share/openchime/stt` (where the packages install them), else `stt/` beside its own executable (where the tarball and a source build put them). Set, it uses exactly that directory and never another. The manifest is checked at startup: data that is absent, from a different build, or altered turns voice input off with the reason logged, and read-aloud and the rest of the daemon start either way. |
+
+**What it costs.** An idle daemon holds 0.1 MB more with voice input built in, and
+the ~45 MB of recognizer files stay on disk until the first segment. Recognizing
+takes about a tenth of the time the speech lasted, on one core; peak memory is
+about 175 MB for a short sentence, 190 MB for six seconds and 360 MB for twenty.
+No audio is kept: a segment is freed once answered.
+
 ---
 
 ## Client-side

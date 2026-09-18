@@ -122,8 +122,21 @@ LIBVPX_DIR := third_party/libvpx-1.17.0
 OPUS_DIR   := third_party/opus-1.6.1
 LIBVPX_A   := $(LIBVPX_DIR)/lib/libvpx.a
 OPUS_A     := $(OPUS_DIR)/lib/libopus.a
-MEDIA_INC  := -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include
-MEDIA_LIBS := $(LIBVPX_A) $(OPUS_A) -ldl -lm
+# speexdsp's echo canceller sits behind the processor seam (AUDIO.md §3.3), for
+# voice input first and calls after (ARCH-112); fetched and built pinned
+# (scripts/build_speexdsp.sh) like the codecs.
+SPEEXDSP_DIR := third_party/speexdsp-1.2.1
+SPEEXDSP_A   := $(SPEEXDSP_DIR)/lib/libspeexdsp.a
+MEDIA_INC  := -Iclient/core/media -I$(LIBVPX_DIR)/include -I$(OPUS_DIR)/include -I$(SPEEXDSP_DIR)/include
+MEDIA_LIBS := $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) -ldl -lm
+
+# --- Voice input (ARCH-112) ---------------------------------------------------
+# The dictation session, the libfvad segmenter (vendored source,
+# third_party/libfvad) and the capture thread, over the media library's device
+# layer and processor. Linked by the Win32 client and the tests.
+VOICE_SRC  := $(wildcard client/core/voice/*.c)
+VOICE_HDRS := $(wildcard client/core/voice/*.h)
+VOICE_INC  := -Iclient/core/voice -Ithird_party/libfvad/include
 
 # --- ttskit (read-aloud pronunciation, ARCH-111) -----------------------------
 # English text to the IPA a voice model reads: a CMUdict-derived dictionary and a
@@ -217,11 +230,37 @@ TTS_FLAGS := -DOC_TTS $(TTSKIT_INC) -I$(ORT_DIR)/include -I$(OPUS_DIR)/include
 # One of its assembly kernels lacks the GNU-stack note, which would otherwise mark
 # the whole daemon's stack executable; the stack stays non-executable.
 TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl
-TTS_LIBS  := $(ORT_A) $(OPUS_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
+TTS_LIBS  := $(OPUS_A)
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(SQLITE_O)
-	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(LDFLAGS)
+# --- Voice input in the daemon (ARCH-112) ---------------------------------------
+# On by default, like read-aloud: the recognizer's code is compiled in and runs on
+# the same minimal ONNX Runtime; Moonshine's published files are DATA, fetched at
+# pinned SHA-256s into build/moonshine and assembled into stt/ beside the binary
+# with a manifest the daemon checks at startup. Absent or mismatched data turns
+# voice input off, and read-aloud with it untouched. `make STT=0` builds without.
+STT ?= 1
+# What `make test` links of voice input whatever STT is: the worker (driven by a
+# stub engine) and the tokenizer -- everything but the model.
+STT_TEST_SRC := daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
+ifeq ($(STT),1)
+STT_SRC   := daemon/stt.c daemon/stt_moonshine.c daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
+STT_DEPS  := $(ORT_A)
+STT_DATA  := stt/manifest
+STT_FLAGS := -DOC_STT -I$(ORT_DIR)/include
+ifneq ($(TTS),1)
+STT_SRC   += daemon/tts_data.c
+endif
+endif
+
+# ONNX Runtime and its C++ runtime, once, for whichever speech features are in.
+ifneq ($(filter 1,$(TTS) $(STT)),)
+TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl
+ORT_LIBS  := $(ORT_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
+endif
+
+$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SQLITE_O)
+	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(ORT_LIBS) $(LDFLAGS)
 
 # The data directory, and its manifest written by the daemon just built -- so the
 # version it names is exactly the version compiled in. Rebuilt whenever the daemon
@@ -231,14 +270,22 @@ voices/manifest: $(BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexi
 	cp $(KITTEN) build/kitten/voices.npz voices/
 	cp ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin voices/en-US/
 	$(abspath $(BIN)) --tts-manifest voices
+# Voice input's data directory, the same way: Moonshine's files and a manifest
+# written by the daemon just built.
+stt/manifest: $(BIN) build/moonshine/.done
+	mkdir -p stt
+	cp $(addprefix build/moonshine/,frontend.model.ort frontend.weights.ort encoder.ort adapter.ort cross_kv.ort decoder_kv.ort tokenizer.bin streaming_config.json) stt/
+	$(abspath $(BIN)) --stt-manifest stt
 # Added here rather than on `all:` above, which make reads before TTS_DATA exists
 # and would expand to nothing.
-all: $(TTS_DATA)
+all: $(TTS_DATA) $(STT_DATA)
 
-$(ORT_A): daemon/tts_kitten.ops.config
+$(ORT_A): daemon/ort.ops.config
 	scripts/build_onnxruntime.sh
 $(KITTEN) build/kitten/voices.npz: scripts/build_kitten.sh scripts/tts_convert.c
 	scripts/build_kitten.sh
+build/moonshine/.done: scripts/build_moonshine.sh
+	scripts/build_moonshine.sh
 
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
@@ -246,6 +293,8 @@ $(LIBVPX_A):
 	scripts/build_libvpx.sh native
 $(OPUS_A):
 	scripts/build_opus.sh native
+$(SPEEXDSP_A):
+	scripts/build_speexdsp.sh native
 
 # The wire contract's one static invariant: no two message types share an opcode.
 # A source check rather than a C test, because a C test cannot enumerate an enum.
@@ -271,9 +320,9 @@ test: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SQLITE_O) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(TTSKIT_INC) -DOC_TTS -Itests -Iclient/gui/win32 \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
@@ -399,8 +448,10 @@ WIN_GUI_BIN := build/openchime.exe
 # have a rule of their own here.
 WIN_LIBVPX_A := third_party/libvpx-1.17.0-win/lib/libvpx.a
 WIN_OPUS_A   := third_party/opus-1.6.1-win/lib/libopus.a
-WIN_MEDIA_A  := $(WIN_LIBVPX_A) $(WIN_OPUS_A)
-WIN_MEDIA_INC := -Iclient/core/media -Ithird_party/libvpx-1.17.0-win/include -Ithird_party/opus-1.6.1-win/include
+WIN_SPEEXDSP_A := third_party/speexdsp-1.2.1-win/lib/libspeexdsp.a
+WIN_MEDIA_A  := $(WIN_LIBVPX_A) $(WIN_OPUS_A) $(WIN_SPEEXDSP_A)
+WIN_MEDIA_INC := -Iclient/core/media -Ithird_party/libvpx-1.17.0-win/include -Ithird_party/opus-1.6.1-win/include \
+                 -Ithird_party/speexdsp-1.2.1-win/include $(VOICE_INC)
 # -lpthread: libvpx's mingw build threads through winpthreads (statically linked
 # here, like everything else, so no DLL ships beside the .exe).
 WIN_MEDIA_SYSLIBS := -lmfplat -lmfreadwrite -lmf -lmfuuid -lole32 -luuid -lpthread
@@ -408,6 +459,8 @@ $(WIN_LIBVPX_A):
 	scripts/build_libvpx.sh windows
 $(WIN_OPUS_A):
 	scripts/build_opus.sh windows
+$(WIN_SPEEXDSP_A):
+	scripts/build_speexdsp.sh windows
 # Debug symbols, split out of the shipped binary (see the strip step below).
 WIN_GUI_SYMS := build/openchime.debug
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
@@ -424,11 +477,11 @@ $(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime
 	$(WINDRES) -I client/gui/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 
 windows-gui: $(WIN_GUI_BIN)
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) \
+$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) \
                 $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/win32/res \
-	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcomdlg32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
 # Split the debug info out rather than discarding it. The client writes real

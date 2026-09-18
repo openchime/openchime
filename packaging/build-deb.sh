@@ -43,6 +43,14 @@ if [ -f "$VOICES/manifest" ]; then
   find "$stage/usr/share/openchime/voices" -type d -exec chmod 0755 {} +
   find "$stage/usr/share/openchime/voices" -type f -exec chmod 0644 {} +
 fi
+# Voice input's recognizer data, the same way (ARCH-112).
+STT="$(dirname "$BINARY")/stt"
+if [ -f "$STT/manifest" ]; then
+  mkdir -p "$stage/usr/share/openchime"
+  cp -r "$STT" "$stage/usr/share/openchime/stt"
+  find "$stage/usr/share/openchime/stt" -type d -exec chmod 0755 {} +
+  find "$stage/usr/share/openchime/stt" -type f -exec chmod 0644 {} +
+fi
 install -D -m 0644 "$root/packaging/debian/openchimed.service" "$stage/lib/systemd/system/openchimed.service"
 install -D -m 0644 "$root/packaging/openchimed.env"            "$stage/etc/openchime/openchimed.env"
 

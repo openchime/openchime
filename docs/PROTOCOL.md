@@ -1407,8 +1407,8 @@ means the feature is available on this connection; absent means a client shows
 nothing of it, which is the correct result rather than offering something that
 would fail (REQ-295). `tts` is present exactly when read-aloud is running — built
 in, turned on, and its voice data found and verified against its manifest. `stt`
-is named and never present yet — voice input (§5.14c) is not built — so clients
-already hide it correctly.
+is present exactly when voice input (§5.14c) is running, on the same terms for the
+recognizer's data.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -1466,15 +1466,13 @@ one at a time per connection. Refusals carry `context` 0: `TTS_UNAVAILABLE` 3024
 when read-aloud is off, the queue is full, or `voice_id` is not one `TTS_INFO`
 listed, and `TRANSFER_PROTOCOL` when another transfer is in flight.
 
-### 5.14c Voice input (REQ-296–300, ARCH-112; not built)
+### 5.14c Voice input (REQ-296–300, ARCH-112)
 
 The client sends a segment of speech it has already cut at a pause. In **push to
 talk** the daemon answers with the words; in **free talk** it posts them as the
 speaker through the ordinary send path — the one `SEND` and `SEND_REPLY` use — so the
-text never travels back to be re-sent. Design in docs/VOICE-INPUT.md. The opcodes and
-error codes below are **reserved**: none is in `shared/protocol.h` yet, so none is in
-the §9 registry or the §8.2 table, which are the code's. Adding frames needs no
-protocol-version bump (§2).
+text never travels back to be re-sent. Design in docs/VOICE-INPUT.md. Adding these
+frames needed no protocol-version bump (§2).
 
 **`STT_INFO` (S → C), `0x00E3`** `{ model_version: str, lang: str, max_segment_ms:
 u32 }` — sent once to every client just after `TTS_INFO`; empty and `0` when voice
@@ -2268,6 +2266,8 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3023` | `NOT_RENDERABLE`      | read-aloud | no    | The message has nothing to say aloud (§5.14b, REQ-294). |
 | `3024` | `TTS_UNAVAILABLE`     | read-aloud | no    | Read-aloud is off, its queue is full, or the render failed (§5.14b). |
 | `3025` | `CALL_UNAVAILABLE`    | calls      | no    | The audio relay exited and could not be restarted, so a `CALL_JOIN` is refused rather than answered with a media port nothing listens on (§5.17). |
+| `3026` | `SEGMENT_TOO_LONG`    | voice input | no   | A segment's `sample_count` exceeds the cap `STT_INFO` announced (§5.14c, REQ-298). |
+| `3027` | `STT_UNAVAILABLE`     | voice input | no   | Voice input is off, too many segments are waiting, the queue is full, or recognition failed (§5.14c, REQ-300). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -2454,6 +2454,11 @@ this table cannot silently gain a shared value.
 | `0x00E0` | `AUDIO_END` | S → C | the whole rendering is sent |
 | `0x00E1` | `CAPABILITIES` | S → C | the features this daemon offers, by name |
 | `0x00E2` | `VOICE_PREVIEW_GET` | C → S | hear a voice say the preview sentence (REQ-292) |
+| `0x00E3` | `STT_INFO` | S → C | voice input's model, language and segment cap (REQ-300) |
+| `0x00E4` | `STT_BEGIN` | C → S | a segment of speech: its mode, target and length (REQ-296) |
+| `0x00E5` | `STT_CHUNK` | C → S | a slice of its samples |
+| `0x00E6` | `STT_END` | C → S | the whole segment is sent |
+| `0x00E7` | `STT_TEXT` | S → C | what was said, and the message it was posted as (REQ-297) |
 
 ## 10. Connection state machine
 

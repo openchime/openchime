@@ -10,13 +10,15 @@
 # lucide is client artwork; none is in openchimed, and claiming otherwise would
 # be its own kind of wrong. Read-aloud (ARCH-111) is built into the daemon by
 # default, and with it ONNX Runtime, the Kitten voice model and data derived from
-# CMUdict; a daemon built with `make TTS=0` is described with TTS=0 here too.
+# CMUdict; voice input (ARCH-112) likewise, with ONNX Runtime and Moonshine. A
+# daemon built with `make TTS=0` or `STT=0` is described with the same here.
 #
-#   [TTS=0] licenses.sh <mbedtls-dir>
+#   [TTS=0] [STT=0] licenses.sh <mbedtls-dir>
 set -euo pipefail
 
 MBEDTLS_DIR="${1:?usage: licenses.sh <mbedtls-dir>}"
 TTS="${TTS:-1}"
+STT="${STT:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 emit() {
@@ -65,16 +67,26 @@ in full here, as those licences require.
   jsmn             MIT          JSON tokenizer (OIDC and webhook payloads)
 HEADER
 
-if [ "$TTS" = 1 ]; then
+if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
   cat <<'HEADER'
 
-and, for read-aloud (built into the binary):
+and, for read-aloud and voice input (built into the binary):
 
   ONNX Runtime 1.30.0  MIT          neural network inference, built minimal and
                                     static, with the notices of the components
                                     compiled into it
+HEADER
+fi
+if [ "$TTS" = 1 ]; then
+  cat <<'HEADER'
   Kitten TTS mini 0.8  Apache-2.0   the voice model, embedded
   CMUdict              BSD-style    source of the embedded pronunciation data
+HEADER
+fi
+if [ "$STT" = 1 ]; then
+  cat <<'HEADER'
+  Moonshine Tiny       MIT          the speech recognizer's model and tokenizer,
+    Streaming (en)                  shipped as data in stt/
 HEADER
 fi
 
@@ -87,9 +99,14 @@ emit "Mbed TLS 3.6.2 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
 emit "jsmn -- MIT License" "${root}/third_party/jsmn/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
-if [ "$TTS" = 1 ]; then
+if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
   emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0/LICENSE"
   emit "ONNX Runtime 1.30.0 -- third-party notices" "${root}/third_party/onnxruntime-1.30.0/ThirdPartyNotices.txt"
+fi
+if [ "$TTS" = 1 ]; then
   emit "Kitten TTS mini 0.8 -- Apache License 2.0" "${root}/build/kitten/LICENSE"
   emit "CMU Pronouncing Dictionary -- BSD-style licence" "${root}/ttskit/data/CMUDICT-LICENSE"
+fi
+if [ "$STT" = 1 ]; then
+  emit "Moonshine Tiny Streaming -- MIT License" "${root}/build/moonshine/LICENSE"
 fi

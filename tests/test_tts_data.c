@@ -46,7 +46,7 @@ int run_tts_data_tests(void) {
     CHECK(oc_tts_data_dir(NULL, nosys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, exev) == 0);
     /* Neither: disabled, with a reason. */
     err[0] = '\0';
-    CHECK(oc_tts_data_dir(NULL, nosys, nosys, out, sizeof out, err, sizeof err) == 0 && contains(err, "no voice data"));
+    CHECK(oc_tts_data_dir(NULL, nosys, nosys, out, sizeof out, err, sizeof err) == 0 && contains(err, "no data"));
 
     /* The running test binary has a directory. */
     CHECK(oc_tts_exe_dir(out, sizeof out) == 1 && out[0] == '/');

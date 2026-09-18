@@ -31,6 +31,12 @@ if [ -f "$(dirname "$BINARY")/voices/manifest" ]; then
   cp -r "$(dirname "$BINARY")/voices" "$stage/voices"
   with_voices=1
 fi
+# And voice input's recognizer data (ARCH-112).
+with_stt=0
+if [ -f "$(dirname "$BINARY")/stt/manifest" ]; then
+  cp -r "$(dirname "$BINARY")/stt" "$stage/stt"
+  with_stt=1
+fi
 install -m 0644 "$root/packaging/debian/openchimed.service"    "$stage/openchimed.service"
 install -m 0644 "$root/packaging/openchimed.env"               "$stage/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"                 > "$stage/copyright"
@@ -45,6 +51,7 @@ rpmbuild -bb \
   --define "_version ${VERSION}" \
   --define "_bindir_src ${stage}" \
   --define "_with_voices ${with_voices}" \
+  --define "_with_stt ${with_stt}" \
   --define "dist %{nil}" \
   "$root/packaging/rpm/openchimed.spec" >/dev/null
 

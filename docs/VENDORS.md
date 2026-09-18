@@ -35,6 +35,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages now, the audio client next (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
+| **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a standalone C library) | Voice input in the Win32 client (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 
 **Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
@@ -85,14 +86,18 @@ exclusive one.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
 utf8proc/utf8proc_data.c, jsmn/jsmn.h, miniaudio/miniaudio.h,
-stb/stb_image_write.h, stb/stb_image.h}`, and **each carries its licence file**:
+stb/stb_image_write.h, stb/stb_image.h}`, libfvad's `include/` and `src/` trees
+(its `LICENSE`, `AUTHORS` and `PATENTS` beside them, compiled in one translation
+unit, `fvad_unit.c`, with our warnings held off vendored code), and **each carries
+its licence file**:
 termbox2's `LICENSE`, utf8proc's `LICENSE.md`, jsmn's `LICENSE` (extracted
 verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 `LICENSE` of miniaudio and of stb (each extracted from the notice at the foot of
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
-`third_party/*` and whitelists **six** paths: `jsmn/`, `termbox2/`, `utf8proc/`,
-`miniaudio/`, `stb/` and `lucide/` (committed, see below). Everything else under
+`third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
+`utf8proc/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/` and `lucide/`
+(see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
 ## 2. Fetched at build time — `scripts/build_*.sh` (gitignored output)
@@ -103,8 +108,10 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) now, screenshare (ARCH-87) next | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) now, the audio client (ARCH-73) next | https://opus-codec.org | BSD-3-Clause |
-| **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model, built from source **minimal and static** (only the model's operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud, ARCH-111) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
+| **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
+| **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: eight files — the frontend, encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
+| **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) now, the audio client next; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build_ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
@@ -153,7 +160,7 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
 - `scripts/build_onnxruntime.sh` fetches the v1.30.0 **source** tarball
   (SHA-256-verified) and builds it with its own `tools/ci_build/build.py` as a
   minimal static library: `--minimal_build`, `--include_ops_by_config
-  daemon/tts_kitten.ops.config` with type reduction, `--disable_ml_ops`,
+  daemon/ort.ops.config` with type reduction, `--disable_ml_ops`,
   `--disable_exceptions`, no shared library, no tests. Its CMake downloads ONNX
   Runtime's own dependencies at the URLs and hashes pinned upstream in
   `cmake/deps.txt`; the one Python package its build script needs (flatbuffers, to
@@ -172,6 +179,22 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
 
 ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
 notices travel with every package through `packaging/licenses.sh`.
+
+**Voice input's recognizer** (ARCH-112) runs on that same ONNX Runtime, whose
+operator config (`daemon/ort.ops.config`) is the union of both models':
+
+- `scripts/build_moonshine.sh` fetches Moonshine's eight published files from its
+  dated CDN directory at pinned SHA-256s, refusing a mismatch. They load in ONNX
+  Runtime 1.30.0 as published, so nothing is converted.
+- `make` assembles them into `stt/` beside `openchimed` with a manifest the daemon
+  checks at startup. `make STT=0` builds a daemon without voice input.
+
+Moonshine's MIT notice travels with every package through `packaging/licenses.sh`.
+
+**speexdsp** is fetched by `scripts/build_speexdsp.sh` — `native` for `make test`,
+`windows` for the Win32 client — SHA-256-verified and refusing an unpinned bump,
+built static and floating point into `third_party/speexdsp-1.2.1[-win]/`
+(gitignored). The daemon links none of it.
 
 ## 3. System / OS packages (linked at build)
 
@@ -242,29 +265,11 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 | `scripts/build_sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (mingw, static, CMake invoked by the script); used by `make windows-gfx-test` | zlib |
 | `scripts/build_libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (mingw, static, nasm); used by `make windows-gui` | BSD-3-Clause |
 | `scripts/build_opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (mingw, static); used by `make windows-gui` | BSD-3-Clause |
+| `scripts/build_speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (mingw, static); used by `make windows-gui` | BSD-3-Clause |
 | Media Foundation (`mfplat`, `mfreadwrite`, `mf`, `mfuuid`) | OS | Camera capture for video messages (`client/core/media/cap_mf.c`) | Windows system libraries |
 
 ## 7. Planned — not yet a dependency
 
-- **libfvad** — the voice-activity detector for voice input (ARCH-112): the WebRTC
-  detector as a standalone C library, BSD-3-Clause. To be **vendored as source**
-  under `third_party/` with its licence and compiled into the client only; the
-  daemon never links it. https://github.com/dpirch/libfvad
-- **Moonshine Tiny Streaming (English)** — the voice-input recognizer (ARCH-112),
-  MIT. Published by Moonshine AI as 8-bit quantized `.ort` files (frontend, encoder,
-  adapter, cross-attention cache and decoder graphs, plus `tokenizer.bin` and
-  `streaming_config.json`, about 45 MB). To be **fetched at pinned SHA-256s** from
-  its dated CDN directory by a `scripts/build_moonshine.sh` and **shipped beside the
-  daemon** as data, run on the ONNX Runtime §2 already builds with its operator
-  config widened to cover both models; nothing new is linked. Moonshine's legacy
-  non-streaming models for languages other than English are under a non-commercial
-  licence and are not used. https://github.com/moonshine-ai/moonshine
-
-- **speexdsp** — the acoustic echo canceller (`speex_echo_state`), BSD-3-Clause,
-  behind the processor vtable in AUDIO.md §3.3 so it is swappable. Built first by
-  voice input (ARCH-112), whose far-end reference is the client's own playback, and
-  reused by the call client. Client only. Not yet vendored. See AUDIO.md §6.2 for why it is preferred over
-  WebRTC AEC3 as a first implementation despite being the weaker canceller.
 - **libvpx for screenshare** — the same library §2 fetches for video messages,
   additionally configured with screen-content tuning (`VP9E_SET_TUNE_CONTENT`)
   when screenshare (REQ-161, ARCH-87) is built. **Patent note:** it is preferred
@@ -280,7 +285,7 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 Most of the graphical clients' icons come from [Lucide](https://lucide.dev)
 (ISC License). We vendor **only the handful of SVGs we use**
-(`third_party/lucide/icons/*.svg` — 20 of them) plus the license
+(`third_party/lucide/icons/*.svg` — 22 of them) plus the license
 (`third_party/lucide/LICENSE`).
 
 **Four icons are ours, not Lucide's**, and live outside `third_party/` for exactly
@@ -302,11 +307,13 @@ paths ship; nothing is fetched at runtime.
 | License | Packages | Notes |
 |---------|----------|-------|
 | **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
+| **MIT** | ONNX Runtime, Moonshine Tiny Streaming | Fetched at build; ONNX Runtime static-linked and Moonshine shipped as data, **daemon only** (ARCH-111/112) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
-| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 20 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
+| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 22 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build and static-linked: both into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
+| **BSD-3-Clause** | speexdsp, libfvad | Voice input in the Win32 client (ARCH-112): speexdsp fetched and static-linked, libfvad vendored and compiled in; **client only** |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |

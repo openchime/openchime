@@ -371,6 +371,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
     free(r->tts_text); free(r->tts_blob_key);
+    for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
+    free(r->stt_names);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
     free(r->sessions);
@@ -6390,6 +6392,53 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
  * rendered once for the whole deployment and then served. It is nobody's message:
  * there is no read gate, no author and no voice to persist, and it answers as
  * message 0, which no message is. */
+/* Voice input's check before a segment is recognized (ARCH-112): the same
+ * access a typed message would need, read-only -- free talk posts, so it needs
+ * post access (a public channel the user has not joined is fine: the send will
+ * join them, as a typed send does); push to talk only returns the words to the
+ * speaker's own composer, so read access is enough. On success, the members'
+ * display names, for a spoken "at Name". */
+static oc_dbres *process_stt_prep(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_STT_PREP;
+    r->stt_req = j->stt_req;
+    r->channel_id = j->channel_id;
+    uint8_t is_public = 0;
+    if (!channel_exists(db, j->channel_id, &is_public)) { r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    int member = is_member(db, j->channel_id, j->user_id);
+    if (j->stt_mode == OC_STT_MODE_FREE) {
+        if (channel_is_archived(db, j->channel_id)) { r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
+        if (!member && !is_public) { r->err_code = OC_ERR_NOT_A_MEMBER; return r; }
+    } else if (!member && !is_public) {
+        r->err_code = OC_ERR_NOT_A_MEMBER;
+        return r;
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT u.display_name FROM channel_members m JOIN users u ON u.id = m.user_id "
+            "WHERE m.channel_id = ?1 AND u.disabled = 0 AND u.display_name IS NOT NULL "
+            "AND u.display_name <> '' LIMIT 512;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    size_t cap = 16;
+    r->stt_names = malloc(cap * sizeof *r->stt_names);
+    while (r->stt_names && sqlite3_step(st) == SQLITE_ROW) {
+        if (r->n_stt_names == cap) {
+            char **g = realloc(r->stt_names, cap * 2 * sizeof *g);
+            if (!g) break;
+            r->stt_names = g;
+            cap *= 2;
+        }
+        const char *name = (const char *)sqlite3_column_text(st, 0);
+        char *dup = name ? strdup(name) : NULL;
+        if (dup) r->stt_names[r->n_stt_names++] = dup;
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
 static oc_dbres *process_tts_preview(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -6496,7 +6545,8 @@ static int is_read_job(int type) {
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
            type == OC_JOB_AUDIT_QUERY ||
-           type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW;
+           type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
+           type == OC_JOB_STT_PREP;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -6518,6 +6568,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
+    if (j->type == OC_JOB_STT_PREP)       return process_stt_prep(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
     if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);

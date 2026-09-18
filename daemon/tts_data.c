@@ -27,21 +27,27 @@ static int is_dir(const char *path) {
     return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-int oc_tts_data_dir(const char *env, const char *system_dir, const char *exe_dir,
-                    char *out, size_t cap, char *err, size_t errcap) {
+int oc_data_dir_find(const char *var, const char *env, const char *system_dir, const char *exe_dir,
+                     const char *beside, char *out, size_t cap, char *err, size_t errcap) {
     if (env && *env) {
-        if (!is_dir(env)) { seterr(err, errcap, "OPENCHIME_TTS_DATA_DIR=%s is not a directory", env); return 0; }
+        if (!is_dir(env)) { seterr(err, errcap, "%s=%s is not a directory", var, env); return 0; }
         return snprintf(out, cap, "%s", env) < (int)cap;
     }
     if (is_dir(system_dir)) return snprintf(out, cap, "%s", system_dir) < (int)cap;
     if (exe_dir && *exe_dir) {
-        char beside[1024];
-        if (snprintf(beside, sizeof beside, "%s/voices", exe_dir) < (int)sizeof beside && is_dir(beside))
-            return snprintf(out, cap, "%s", beside) < (int)cap;
+        char path[1024];
+        if (snprintf(path, sizeof path, "%s/%s", exe_dir, beside) < (int)sizeof path && is_dir(path))
+            return snprintf(out, cap, "%s", path) < (int)cap;
     }
-    seterr(err, errcap, "no voice data: neither %s nor %s/voices exists",
-           system_dir ? system_dir : "(none)", exe_dir && *exe_dir ? exe_dir : "(executable)");
+    seterr(err, errcap, "no data: neither %s nor %s/%s exists",
+           system_dir ? system_dir : "(none)", exe_dir && *exe_dir ? exe_dir : "(executable)", beside);
     return 0;
+}
+
+int oc_tts_data_dir(const char *env, const char *system_dir, const char *exe_dir,
+                    char *out, size_t cap, char *err, size_t errcap) {
+    return oc_data_dir_find("OPENCHIME_TTS_DATA_DIR", env, system_dir, exe_dir, "voices",
+                            out, cap, err, errcap);
 }
 
 int oc_tts_exe_dir(char *out, size_t cap) {

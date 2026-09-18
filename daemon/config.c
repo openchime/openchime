@@ -159,5 +159,24 @@ int oc_config_load(char *err, size_t errcap) {
      * refused at startup by main.c rather than quietly falling back. */
     c->tts.lang      = env_or2("OPENCHIME_TTS_LANG", NULL, "en-US");
 
+    /* Voice input (ARCH-112). Its language is the recognizer's own; there is no
+     * second model to choose between, so it has no language setting. */
+    c->stt.enabled   = env_int("OPENCHIME_STT", NULL, 1) != 0;
+    c->stt.queue     = env_int("OPENCHIME_STT_QUEUE", NULL, 64);
+    if (c->stt.queue < 1)    c->stt.queue = 1;
+    if (c->stt.queue > 1024) c->stt.queue = 1024;
+    c->stt.idle_secs = env_int("OPENCHIME_STT_IDLE_SECS", NULL, 300);
+    if (c->stt.idle_secs < 5)     c->stt.idle_secs = 5;
+    if (c->stt.idle_secs > 86400) c->stt.idle_secs = 86400;
+    /* Free talk cuts at every pause, so a talker sends a segment every few
+     * seconds; this bounds a client sending far faster than anyone speaks. */
+    c->stt.rate      = env_int("OPENCHIME_STT_RATE", NULL, 60);
+    if (c->stt.rate < 1)    c->stt.rate = 1;
+    if (c->stt.rate > 6000) c->stt.rate = 6000;
+    /* Moonshine recommends staying under about 30 seconds of input. */
+    c->stt.max_secs  = env_int("OPENCHIME_STT_MAX_SECS", NULL, 30);
+    if (c->stt.max_secs < 5)  c->stt.max_secs = 5;
+    if (c->stt.max_secs > 60) c->stt.max_secs = 60;
+
     return 0;
 }

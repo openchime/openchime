@@ -62,6 +62,7 @@
 #include "oc_recorder.h"      /* ...recording (REQ-162) */
 #include "oc_player.h"        /* ...and playback (REQ-165) */
 #include "audio_dev.h"        /* ...and the microphone list */
+#include "oc_dictate.h"       /* voice input (REQ-296) */
 
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
@@ -1608,6 +1609,12 @@ enum { VMC_OPEN = 1, VMC_RECORD, VMC_STOP, VMC_DISCARD, VMC_RETAKE, VMC_SEND,
        VMC_PRIVACY, VMC_PLAYPAUSE, VMC_MUTE, VMC_DOWNLOAD, VMC_CLOSE, VMC_CAMERA, VMC_MIC,
        VMC_QUALITY };
 static rectf g_video_btn;                 /* composer: record a video message */
+/* Voice input (REQ-296-300, ARCH-112): the microphone button (hold to talk), the
+ * free-talk toggle, and the session while one is open. */
+static rectf g_mic_btn, g_freetalk_btn;
+static oc_dictate *g_dict;
+static oc_client  *g_dict_client;         /* the client the session sends through */
+static void dict_forget(oc_client *c);    /* fwd: before a client is stopped */
 #define VM_MAX_BTNS    8
 static rectf        g_vm_card, g_vm_seek, g_vm_close;
 static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
@@ -6216,7 +6223,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_QUIT };
+       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -6249,6 +6256,10 @@ static const struct {
     /* The numeric keypad's +/- are different virtual keys and a user with a full
      * keyboard will reach for them. */
     { AM_CTRL | AM_SHIFT, 'L',        ACC_LISTEN,  "Ctrl+Shift+L",     "Read this conversation aloud, from now on" },
+    /* Voice input (REQ-296). The talk key is HELD: accel_dispatch also sees its
+     * key-up, which is what lets go. */
+    { AM_CTRL | AM_SHIFT, VK_SPACE,   ACC_PTT,     "Ctrl+Shift+Space", "Hold to talk into the message box" },
+    { AM_CTRL | AM_SHIFT, 'T',        ACC_FREETALK, "Ctrl+Shift+T",    "Free talk: post what you say, piece by piece" },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
@@ -6262,6 +6273,11 @@ static void modal_finish(int save);            /* fwd */
 static int  modal_open(void);                  /* fwd */
 
 static void app_quit(HWND hwnd);   /* fwd — the deliberate exit (REQ-138) */
+static void dict_ptt_down(HWND hwnd, int by);   /* fwd — voice input (REQ-296) */
+static void dict_ptt_up(HWND hwnd, int by);     /* fwd */
+static void dict_freetalk_toggle(HWND hwnd);    /* fwd */
+static int  g_dict_hold;                        /* what holds push to talk down */
+#define DH_KEY 1                                /* ...the talk key */
 
 static void accel_run(HWND hwnd, int action) {
     switch (action) {
@@ -6275,6 +6291,8 @@ static void accel_run(HWND hwnd, int action) {
         if (lm && oc_model_tts_available(lm) && g_sel)
             listen_set(hwnd, oc_model_listening_channel(lm) != g_sel);
         break; }
+    case ACC_PTT:      dict_ptt_down(hwnd, DH_KEY); break;
+    case ACC_FREETALK: dict_freetalk_toggle(hwnd);  break;
     case ACC_NAV_PREV:        nav_conversation(hwnd, -1, 0); break;
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
     case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
@@ -6319,6 +6337,18 @@ static int mod_down(int vk) {
 
 static int vm_key(HWND hwnd, WPARAM wp);   /* fwd: the video overlay owns the keyboard while up */
 static int accel_dispatch(HWND hwnd, const MSG *m) {
+    /* The held talk key. Letting go of Space ends it whichever modifier went
+     * first, and while it is held its auto-repeat is claimed rather than typed
+     * as spaces into the words being dictated. */
+    if (g_dict_hold == DH_KEY && m->wParam == VK_SPACE &&
+        (m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN ||
+         m->message == WM_KEYUP || m->message == WM_SYSKEYUP)) {
+        if (m->message == WM_KEYUP || m->message == WM_SYSKEYUP) {
+            dict_ptt_up(hwnd, DH_KEY);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 1;
+    }
     if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) return 0;
     if (g_vm && m->message == WM_KEYDOWN && vm_key(hwnd, m->wParam)) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
@@ -6364,6 +6394,10 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
         if (SHORTCUTS[i].action == ACC_NONE || !SHORTCUTS[i].vk) continue;
         if (SHORTCUTS[i].vk != (uint16_t)m->wParam) continue;
         if (SHORTCUTS[i].mods != mods) continue;
+        /* A held key repeats (bit 30: it was already down). Holding the talk key
+         * is one press, so a microphone that failed to open is not retried at
+         * the keyboard's repeat rate. */
+        if (SHORTCUTS[i].action == ACC_PTT && (m->lParam & (1L << 30))) return 1;
         accel_run(hwnd, SHORTCUTS[i].action);
         InvalidateRect(hwnd, NULL, FALSE);
         return 1;
@@ -9817,6 +9851,25 @@ static int composer_ready(void) {
     return ed_len() > 0;
 }
 
+static int dict_offered(void);        /* fwd: voice input can start here */
+static int dict_free_offered(void);   /* fwd: ...and free talk can post here */
+
+/* One voice-input button. Live, it is filled -- danger red for the microphone
+ * held open, the accent for free talk -- and ringed while speech is heard, so the
+ * open microphone is never a secret (REQ-296). */
+static void dict_draw_btn(gfx *rt, rectf r, int icon, int live, uint32_t live_col) {
+    if (r.right <= r.left) return;
+    uint32_t ink = OC_COL_MUTED;
+    if (live) {
+        fill_round(rt, r, OC_R_CONTROL, live_col);
+        if (oc_dictate_speaking(g_dict))
+            stroke_round(rt, rf(r.left - 2, r.top - 2, r.right + 2, r.bottom + 2), OC_R_CONTROL + 2,
+                         live_col, 2.0f);
+        ink = 0xFFFFFF;
+    }
+    draw_lucide(rt, icon, rf(r.left + 8, r.top + 8, r.right - 8, r.bottom - 8), ink);
+}
+
 static void draw_composer(gfx *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -9863,14 +9916,26 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
     g_at_btn = rf(bx0 + COMPOSER_GUTTER + sq * 2 + vsh, cy, bx0 + COMPOSER_GUTTER + sq * 3 + vsh, cy + sq);
     if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
+    /* Voice input after @, and only where the daemon offers it: a button that can
+     * only be refused is worse than none. Free talk also needs somewhere it may
+     * post. They drop off before @ does, being further right. */
+    g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
+    if (dict_offered()) {
+        float mx = bx0 + COMPOSER_GUTTER + sq * 3 + vsh;
+        g_mic_btn = rf(mx, cy, mx + sq, cy + sq);
+        if (dict_free_offered()) g_freetalk_btn = rf(mx + sq, cy, mx + sq * 2, cy + sq);
+    }
+    if (g_freetalk_btn.right > left_limit) g_freetalk_btn = rf(0, 0, 0, 0);
+    if (g_mic_btn.right > left_limit) g_mic_btn = rf(0, 0, 0, 0);
     if (g_video_btn.right > left_limit) g_video_btn = rf(0, 0, 0, 0);
     if (g_attach_btn.right > left_limit) g_attach_btn = rf(0, 0, 0, 0);
     if (g_emoji_btn.right > left_limit) g_emoji_btn = rf(0, 0, 0, 0);
     /* Hover, as every other button in the shell has: the plate under the icon
      * the pointer is on, before the icons are drawn over it. */
     if (!pointer_blocked()) {
-        const rectf *cb[] = { &g_attach_btn, &g_video_btn, &g_emoji_btn, &g_at_btn };
-        for (int i = 0; i < 4; i++)
+        const rectf *cb[] = { &g_attach_btn, &g_video_btn, &g_emoji_btn, &g_at_btn,
+                              &g_mic_btn, &g_freetalk_btn };
+        for (int i = 0; i < 6; i++)
             if (cb[i]->right > cb[i]->left && in_rect(*cb[i], (float)g_mouse_x, (float)g_mouse_y))
                 fill_round(rt, *cb[i], OC_R_CONTROL, OC_COL_HOVER);
     }
@@ -9891,6 +9956,11 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     if (g_at_btn.right > g_at_btn.left)
         draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
                                        g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
+    {
+        uint8_t dm = g_dict ? oc_dictate_mode(g_dict) : 0xFF;
+        dict_draw_btn(rt, g_mic_btn, OC_ICON_MIC, dm == OC_STT_MODE_PTT, OC_COL_DANGER);
+        dict_draw_btn(rt, g_freetalk_btn, OC_ICON_FREETALK, dm == OC_STT_MODE_FREE, OC_COL_ACCENT);
+    }
 
     /* THE FIELD. Between the left buttons and Send, at the rect
      * layout_composer computed — the same rect ed_hit tests against, so what you
@@ -10064,6 +10134,7 @@ static void confirm_run(HWND hwnd) {
             g_forget_after_logout = 1;      /* delete the entry once it lands */
         } else {
             if (live) {                     /* a background one: stop it here */
+                dict_forget(g_wss[slot].client);
                 oc_client_stop(g_wss[slot].client);
                 for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
                 g_n_wss--;
@@ -15528,7 +15599,8 @@ enum {
     AT_FTYPE,         /* the Files type dropdown */
     AT_FUPLOAD,       /* the Files view's Upload button */
     AT_FCHAN,         /* payload: channel id, or 0 for "All files" */
-    AT_FILEROW        /* payload: file id — open it */
+    AT_FILEROW,       /* payload: file id — open it */
+    AT_VOICE          /* payload: 0 = the microphone (talk / stop), 1 = free talk on/off */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -15740,6 +15812,17 @@ static void a11y_publish_scene(const oc_model *m) {
                  ATOK(AT_EMOJI, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.mention", "Mention someone", g_at_btn,
                  ATOK(AT_MENTION, 0));
+        /* Invoke cannot be held, so the microphone toggles for assistive
+         * technology: invoke to talk, invoke again to stop. The state is in the
+         * name, as the toggle's is. */
+        {
+            uint8_t dm = g_dict ? oc_dictate_mode(g_dict) : 0xFF;
+            acc_push(items, &n, OC_ACC_BUTTON, "composer.mic",
+                     dm == OC_STT_MODE_PTT ? "Talk, listening" : "Talk", g_mic_btn, ATOK(AT_VOICE, 0));
+            acc_push(items, &n, OC_ACC_BUTTON, "composer.freetalk",
+                     dm == OC_STT_MODE_FREE ? "Free talk, on" : "Free talk, off", g_freetalk_btn,
+                     ATOK(AT_VOICE, 1));
+        }
         acc_push(items, &n, OC_ACC_BUTTON, "composer.send",
                  ed_len() ? "Send" : "Send, nothing to send", g_send_btn, ATOK(AT_SEND, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.schedule",
@@ -16301,6 +16384,7 @@ static int window_is_covered(void) {
 static void composer_btns_clear(void) {
     g_send_btn = g_sched_btn = g_attach_btn = g_video_btn = rf(0, 0, 0, 0);
     g_emoji_btn = g_at_btn = rf(0, 0, 0, 0);
+    g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
 }
 
 static void layout_composer(HWND hwnd) {
@@ -16769,6 +16853,160 @@ static void listen_tick(HWND hwnd, const oc_model *m) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* ---- voice input (REQ-296-300, ARCH-112) ------------------------------------
+ *
+ * Push to talk: hold the microphone button or Ctrl+Shift+Space, speak, let go;
+ * the words come back into the composer at the caret, unsent. Free talk: turn it
+ * on and talk; the daemon posts each piece as a message. Either way the session
+ * belongs to the conversation on screen and ends when the user leaves it. */
+
+enum { DH_NONE = 0, DH_MOUSE = DH_KEY + 1, DH_INVOKE };   /* g_dict_hold, with DH_KEY */
+static uint32_t g_dict_err_seen;      /* the model's stt_error_seq already reported */
+
+/* Where the composer's words go: the open thread, else the conversation. */
+static void dict_target(uint64_t *ch, uint64_t *root) {
+    const oc_model *m = model();
+    if (m && m->thread_open) { *ch = m->thread_channel; *root = m->thread_parent; }
+    else                     { *ch = g_sel;             *root = 0; }
+}
+
+static int dict_offered(void) {
+    const oc_model *m = model();
+    if (!g_client || !m || !m->authed || !oc_model_stt_available(m)) return 0;
+    if (g_view == VIEW_NEWMSG || g_vm || !main_is_conversation()) return 0;
+    uint64_t ch, root;
+    dict_target(&ch, &root);
+    return ch != 0;
+}
+
+/* Free talk posts, so it is not offered where nothing may be posted (REQ-035). */
+static int dict_free_offered(void) {
+    if (!dict_offered()) return 0;
+    uint64_t ch, root;
+    dict_target(&ch, &root);
+    const oc_channel *c = oc_model_channel((oc_model *)model(), ch);
+    return !(c && c->archived);
+}
+
+/* Close the microphone. `send_rest` 1 sends what was being said (let go, turned
+ * off); 0 drops it (left the conversation). */
+static void dict_stop(HWND hwnd, int send_rest) {
+    g_dict_hold = DH_NONE;
+    if (!g_dict) return;
+    crumb("dict_stop rest=%d", send_rest);
+    oc_dictate_stop(g_dict, send_rest);
+    g_dict = NULL;
+    g_dict_client = NULL;
+    if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* A client is about to be stopped: a session sending through it goes first. */
+static void dict_forget(oc_client *c) {
+    if (g_dict && g_dict_client == c) dict_stop(NULL, 0);
+}
+
+static const char *dict_error_text(int err) {
+    switch (err) {
+    /* One line: a toast is. It names where the fix is, and is spoken whole. */
+    case OC_DICTATE_DENIED:   return "Microphone blocked by Windows privacy settings";
+    case OC_DICTATE_NODEVICE: return "No microphone was found.";
+    case OC_DICTATE_BUSY:     return "The microphone is in use by a recording.";
+    default:                  return "The microphone could not be opened.";
+    }
+}
+
+/* What a refused segment means to the person who spoke it. */
+static const char *dict_refusal_text(uint16_t code) {
+    switch (code) {
+    case OC_ERR_SEGMENT_TOO_LONG:  return "That was too long to recognize in one piece.";
+    case OC_ERR_STT_UNAVAILABLE:   return "Voice input is unavailable right now.";
+    case OC_ERR_NOT_A_MEMBER:      return "You are not a member of this channel.";
+    case OC_ERR_UNKNOWN_CHANNEL:   return "This conversation no longer exists.";
+    case OC_ERR_CHANNEL_ARCHIVED:  return "This channel is archived — it is read-only.";
+    case OC_ERR_SEND_RATE_LIMITED: return "Sending too fast \u2014 that piece was not posted";
+    default:                       return "What you said could not be recognized.";
+    }
+}
+
+static int dict_start(HWND hwnd, uint8_t mode) {
+    dict_stop(hwnd, 1);
+    if (mode == OC_STT_MODE_FREE ? !dict_free_offered() : !dict_offered()) return 0;
+    uint64_t ch, root;
+    dict_target(&ch, &root);
+    /* The microphone chosen for video messages, when one was: it is the same
+     * device a person picked to be heard through. */
+    const char *mic = g_vm_nmics && g_vm_mic < g_vm_nmics ? g_vm_mics[g_vm_mic].id : NULL;
+    int err = 0;
+    g_dict = oc_dictate_start(g_client, mode, ch, root, mic, model()->stt_max_ms, &err);
+    crumb("dict_start mode=%u ch=%llu root=%llu err=%d", (unsigned)mode,
+          (unsigned long long)ch, (unsigned long long)root, err);
+    if (!g_dict) { toast_push(dict_error_text(err), 1); return 0; }
+    g_dict_client = g_client;
+    oc_a11y_announce(mode == OC_STT_MODE_FREE ? "Free talk on" : "Listening");
+    InvalidateRect(hwnd, NULL, FALSE);
+    return 1;
+}
+
+static void dict_ptt_down(HWND hwnd, int by) {
+    if (g_dict_hold) return;
+    if (dict_start(hwnd, OC_STT_MODE_PTT)) g_dict_hold = by;
+}
+
+/* Let go: only what pressed it may release it, so a mouse-up does not end a
+ * hold the keyboard started. */
+static void dict_ptt_up(HWND hwnd, int by) {
+    if (!g_dict_hold || g_dict_hold != by) return;
+    dict_stop(hwnd, 1);
+}
+
+static void dict_freetalk_toggle(HWND hwnd) {
+    if (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE) {
+        dict_stop(hwnd, 1);
+        oc_a11y_announce("Free talk off");
+    } else if (!g_dict_hold) {
+        dict_start(hwnd, OC_STT_MODE_FREE);
+    }
+}
+
+/* Once a frame: end the session when its conversation is no longer on screen,
+ * say what the daemon refused, and put push-to-talk words into the composer they
+ * were spoken into -- each piece one undo step. */
+static void dict_tick(HWND hwnd, const oc_model *m) {
+    if (g_dict) {
+        uint64_t ch, root;
+        dict_target(&ch, &root);
+        if (g_dict_client != g_client || !dict_offered() ||
+            ch != oc_dictate_channel(g_dict) || root != oc_dictate_thread_root(g_dict) ||
+            (oc_dictate_mode(g_dict) == OC_STT_MODE_FREE && !dict_free_offered()))
+            dict_stop(hwnd, 0);
+    }
+    if (!m) return;
+    if (m->stt_error_seq != g_dict_err_seen) {
+        g_dict_err_seen = m->stt_error_seq;
+        toast_push(dict_refusal_text(m->stt_error_code), 1);
+    }
+    if (g_view == VIEW_NEWMSG || !main_is_conversation()) return;
+    uint64_t ch, root;
+    dict_target(&ch, &root);
+    char *text = NULL;
+    while (ch && oc_model_stt_take_words((oc_model *)m, ch, root, &text)) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+        WCHAR *w = n > 0 ? (WCHAR *)malloc(((size_t)n + 1) * sizeof(WCHAR)) : NULL;
+        if (w) {
+            /* A space between these words and any before them on the line. */
+            int at = ed_caret_pos(), o = 0;
+            if (at > 0 && g_ed[at - 1] != L' ' && g_ed[at - 1] != L'\n') w[o++] = L' ';
+            MultiByteToWideChar(CP_UTF8, 0, text, -1, w + o, n);
+            ed_insert(w);
+            ed_changed(hwnd);
+            free(w);
+        }
+        free(text);
+        text = NULL;
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+}
+
 /* ---- hearing a voice before choosing it (REQ-292) --------------------------- */
 
 static void preview_drop(void) {
@@ -16888,6 +17126,8 @@ static void rec_open_devices(HWND hwnd) {
 
 static void vm_open_recorder(HWND hwnd) {
     if (!g_client || !g_sel || g_vm) return;
+    /* The microphone has one owner (ARCH-112): recording ends voice input. */
+    dict_stop(hwnd, 1);
     g_vm = VM_REC;
     SetFocus(hwnd);
     rec_open_devices(hwnd);
@@ -17138,6 +17378,7 @@ static const char *rec_error_text(int err) {
     case OC_REC_MIC_DENIED:      return "Windows is blocking microphone access for OpenChime.";
     case OC_REC_CAMERA_NODEVICE: return "No camera was found.";
     case OC_REC_CAMERA_BUSY:     return "The camera is in use by another app.";
+    case OC_REC_MIC_BUSY:        return "The microphone is in use by voice input.";
     default:                     return "The recording could not start.";
     }
 }
@@ -19370,6 +19611,11 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     if (in_rect(g_video_btn, x, y)) { vm_command(hwnd, VMC_OPEN); return 1; }
+    /* Hold the microphone to talk: the press opens it, the release closes it.
+     * SDL captures the mouse while a button is down, so the release arrives here
+     * wherever the pointer has gone; capturing it again ourselves fought that. */
+    if (in_rect(g_mic_btn, x, y)) { dict_ptt_down(hwnd, DH_MOUSE); return 1; }
+    if (in_rect(g_freetalk_btn, x, y)) { dict_freetalk_toggle(hwnd); return 1; }
     /* The Home sidebar's destinations shelf (REQ-228) — before the conversation
      * rows below it, which start where the shelf ends. */
     /* sidebar_kind(), not transcript_shell(): the shelf is drawn in the Drafts
@@ -20112,6 +20358,7 @@ static void reset_session(void) {
         g_ws_active = -1;
         g_n_notify_hw = 0;      /* slot indices just shifted */
         listen_drop_player();     /* the player borrows bytes the core is about to free */
+        dict_forget(g_client);
         oc_client_stop(g_client);
         g_client = NULL;
     }
@@ -20150,7 +20397,7 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
  * possible when there IS one — at cold start there is nowhere to return to. */
 static void signin_cancel(HWND hwnd) {
     if (!g_si_overlay || !g_client) return;
-    if (g_si_client) { oc_client_stop(g_si_client); g_si_client = NULL; }
+    if (g_si_client) { dict_forget(g_si_client); oc_client_stop(g_si_client); g_si_client = NULL; }
     g_si_connecting = 0; g_si_err[0] = '\0'; g_si_invite[0] = '\0';
     g_si_overlay = 0;
     g_view = VIEW_HOME;
@@ -20231,7 +20478,7 @@ static void signin_fail(HWND hwnd, const char *why) {
     if (strstr(tmp, "auth failed"))
         snprintf(tmp, sizeof tmp, "sign-in failed — check your username and password");
 
-    if (g_si_client) { oc_client_stop(g_si_client); g_si_client = NULL; }
+    if (g_si_client) { dict_forget(g_si_client); oc_client_stop(g_si_client); g_si_client = NULL; }
     g_si_connecting = 0; g_si_step = 2;
     snprintf(g_si_err, sizeof g_si_err, "%s", tmp);
     if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
@@ -21725,6 +21972,23 @@ static void test_dump(const char *path) {
                 (int)ls.state, ls.has_audio, ls.position_ms, ls.duration_ms,
                 (unsigned long long)g_listen_msg, g_listen_len);
     }
+    /* Voice input (REQ-296-300): the controls, the session, and what the daemon
+     * has answered. `sent` against `answered` is whether segments went anywhere. */
+    fprintf(f, "dictate avail=%d offered=%d free_offered=%d on=%d mode=%d hold=%d ch=%llu root=%llu "
+               "level=%d speaking=%d sent=%u answered=%u words=%u err_seq=%u err=%u max_ms=%u "
+               "mic=%.0f,%.0f,%.0f,%.0f freetalk=%.0f,%.0f,%.0f,%.0f\n",
+            oc_model_stt_available(m), dict_offered(), dict_free_offered(), g_dict != NULL,
+            g_dict ? (int)oc_dictate_mode(g_dict) : -1, g_dict_hold,
+            (unsigned long long)(g_dict ? oc_dictate_channel(g_dict) : 0),
+            (unsigned long long)(g_dict ? oc_dictate_thread_root(g_dict) : 0),
+            g_dict ? oc_dictate_level(g_dict) : 0, g_dict ? oc_dictate_speaking(g_dict) : 0,
+            g_dict ? oc_dictate_sent(g_dict) : 0, m->stt_answered, (unsigned)m->n_stt_words,
+            m->stt_error_seq, (unsigned)m->stt_error_code, m->stt_max_ms,
+            g_mic_btn.left, g_mic_btn.top, g_mic_btn.right, g_mic_btn.bottom,
+            g_freetalk_btn.left, g_freetalk_btn.top, g_freetalk_btn.right, g_freetalk_btn.bottom);
+    /* The toasts on screen: how a refusal is told, so a test can read it. */
+    for (int i = 0; i < g_n_toast; i++)
+        fprintf(f, "toast[%d] danger=%d \"%s\"\n", i, g_toast[i].danger, g_toast[i].text);
     /* A voice's audition (REQ-292): whether one is playing, and whether audio
      * reaches a device -- the same distinction the listen line draws. */
     {
@@ -22510,6 +22774,14 @@ static void test_poll(HWND hwnd) {
                 select_channel(m->channels[k].channel_id); break;
             }
         test_ack("ok");
+    } else if (!strcmp(verb, "mousedown") || !strcmp(verb, "mouseup")) {
+        /* The two halves of a click, apart: a HELD button (the microphone's hold
+         * to talk) is only testable with time between them. */
+        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
+        LPARAM pos = MAKELPARAM(PX(x), PX(y));
+        if (!strcmp(verb, "mousedown")) SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+        else                            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+        test_ack("ok");
     } else if (!strcmp(verb, "click")) {
         /* A REAL WM_LBUTTONDOWN/UP pair, not a direct on_click: the composer is a
          * self-drawn field now and its caret placement lives in the button
@@ -22662,7 +22934,18 @@ static void test_poll(HWND hwnd) {
         WCHAR w[512]; int n = to_w(arg, w, 512);
         for (int i = 0; i < n; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
         test_ack("ok");
-    } else if (!strcmp(verb, "key")) {
+    } else if (!strcmp(verb, "dictate")) {
+        /* Voice input through the same calls the controls make: the microphone
+         * button's press and release, and the free-talk toggle. */
+        if      (!strcmp(arg, "ptt-down")) { dict_ptt_down(hwnd, DH_MOUSE); test_ack(g_dict ? "ok" : "err"); }
+        else if (!strcmp(arg, "ptt-up"))   { dict_ptt_up(hwnd, DH_MOUSE); test_ack("ok"); }
+        else if (!strcmp(arg, "free-on") || !strcmp(arg, "free-off")) {
+            int on = !strcmp(arg, "free-on");
+            if (on != (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE)) dict_freetalk_toggle(hwnd);
+            test_ack(on == (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE) ? "ok" : "err");
+        } else test_ack("err");
+        InvalidateRect(hwnd, NULL, FALSE);
+    } else if (!strcmp(verb, "key") || !strcmp(verb, "keyup")) {
         /* A raw virtual key through the real WM_KEYDOWN path, so Esc/Enter/Tab
          * behaviour is drivable at all — without this, every keyboard rule in the
          * app was verifiable only by hand. Names for the ones used most, so a test
@@ -22685,6 +22968,7 @@ static void test_poll(HWND hwnd) {
                  !strcmp(k, "up")    ? VK_UP     :
                  !strcmp(k, "down")  ? VK_DOWN   :
                  !strcmp(k, "f6")    ? VK_F6     :
+                 !strcmp(k, "space") ? VK_SPACE  :
                  !strcmp(k, "slash") ? VK_OEM_2  :
                  /* Named, because a single digit is the DIGIT key (Ctrl+0 is zoom
                   * reset) — `key 8` for VK_BACK would be read as typing "8". */
@@ -22715,15 +22999,19 @@ static void test_poll(HWND hwnd) {
         /* And say it directly, which is what the handlers actually read. */
         g_synth_mods = (int)want;
         MSG km; memset(&km, 0, sizeof km);
-        km.hwnd = hwnd; km.message = (want & AM_ALT) ? WM_SYSKEYDOWN : WM_KEYDOWN;
+        /* `keyup` lets the key go: the release a held key (the talk key) waits for. */
+        int up = !strcmp(verb, "keyup");
+        km.hwnd = hwnd;
+        km.message = (want & AM_ALT) ? (up ? WM_SYSKEYUP : WM_SYSKEYDOWN) : (up ? WM_KEYUP : WM_KEYDOWN);
         km.wParam = (WPARAM)vk;
+        km.lParam = up ? (LPARAM)0xC0000001 : 0;   /* bits 30-31: was down, going up */
         /* Unclaimed keys go to the FOCUSED window, which is where a real keystroke
          * goes. Sending them to the main window instead made Esc look broken: the
          * palette's Esc lives in the palette box's proc, and the main proc has no
          * reason to know about it. */
         if (!accel_dispatch(hwnd, &km)) {
             HWND target = GetFocus();
-            SendMessageW(target ? target : hwnd, km.message, (WPARAM)vk, 0);
+            SendMessageW(target ? target : hwnd, km.message, (WPARAM)vk, km.lParam);
         }
         g_synth_mods = -1;
         ks[VK_CONTROL] = saved_c; ks[VK_MENU] = saved_a; ks[VK_SHIFT] = saved_s;
@@ -22749,6 +23037,7 @@ static void test_poll(HWND hwnd) {
          * dismiss reliably. Same code path the button takes after OK. */
         int slot = ws_find(arg);
         if (slot >= 0 && g_wss[slot].client && slot != g_ws_active) {
+            dict_forget(g_wss[slot].client);
             oc_client_stop(g_wss[slot].client);
             for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
             g_n_wss--;
@@ -23829,6 +24118,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * Mark it so the transcript stops asking on every frame. */
             vm_tick(hwnd, m);
             listen_tick(hwnd, m);            /* talking mode (ARCH-111) */
+            dict_tick(hwnd, m);              /* voice input (REQ-296) */
             preview_tick(m);                 /* a voice being chosen (REQ-292) */
             /* Transfers queue in the core, so a thumbnail waiting behind a video
              * download is late, not lost: the clock only runs while nothing
@@ -24525,6 +24815,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONUP: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        if (g_dict_hold == DH_MOUSE) { dict_ptt_up(hwnd, DH_MOUSE); return 0; }
         if (g_ed_dragging) { ed_mouse_up(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (g_sbar_drag) { g_sbar_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); }
         else if (g_selecting) {
@@ -24666,6 +24957,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case AT_NMPICK:    tgt_accept((int)arg); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
+        case AT_VOICE:
+            if (arg == 1) dict_freetalk_toggle(hwnd);
+            else if (g_dict_hold == DH_INVOKE) dict_ptt_up(hwnd, DH_INVOKE);
+            else dict_ptt_down(hwnd, DH_INVOKE);
+            break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
         case AT_ACTFILTER: {
             uint8_t was = act_wire_filter();
@@ -24779,7 +25075,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
+    case WM_CAPTURECHANGED:
+        /* The press on the microphone lost the mouse -- to another window, or
+         * released with no holder (another app activated): the release will never
+         * arrive here, so this is the release. */
+        if (g_dict_hold == DH_MOUSE && (HWND)lp != hwnd) dict_ptt_up(hwnd, DH_MOUSE);
+        break;
     case WM_KILLFOCUS:
+        /* The talk key's release goes wherever focus went, so the hold ends
+         * here -- a microphone left open behind another app is the one failure
+         * push to talk must not have. */
+        if (g_dict_hold == DH_KEY) dict_ptt_up(hwnd, DH_KEY);
         /* Whatever you were typing is written now: losing focus is the
          * moment you stopped, and waiting out the debounce risks the app being
          * closed or killed in between. */
@@ -24936,9 +25242,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         oc_a11y_shutdown();   /* tell UIA the provider is going, before the window does */
         tray_done();       /* or the icon lingers in the notification area */
         for (int i = 0; i < g_n_wss; i++)
-            if (g_wss[i].client && g_wss[i].client != g_client) oc_client_stop(g_wss[i].client);
+            if (g_wss[i].client && g_wss[i].client != g_client) { dict_forget(g_wss[i].client); oc_client_stop(g_wss[i].client); }
         g_n_wss = 0;
-        if (g_client) { listen_drop_player(); preview_drop(); oc_client_stop(g_client); g_client = NULL; }
+        if (g_client) { dict_forget(g_client); listen_drop_player(); preview_drop(); oc_client_stop(g_client); g_client = NULL; }
         /* The ring is marked and removed HERE rather than after the message
          * loop, because reaching WM_DESTROY is what "exited normally" means —
          * and anything that does not reach it leaves the file, which is exactly
