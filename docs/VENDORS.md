@@ -246,9 +246,24 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 ## 7. Planned — not yet a dependency
 
-- **speexdsp** — planned acoustic echo canceller (`speex_echo_state`) for the
-  audio client, BSD-3-Clause, behind the processor vtable in AUDIO.md §3.3 so it
-  is swappable. Not yet vendored. See AUDIO.md §6.2 for why it is preferred over
+- **libfvad** — the voice-activity detector for voice input (ARCH-112): the WebRTC
+  detector as a standalone C library, BSD-3-Clause. To be **vendored as source**
+  under `third_party/` with its licence and compiled into the client only; the
+  daemon never links it. https://github.com/dpirch/libfvad
+- **Moonshine Tiny Streaming (English)** — the voice-input recognizer (ARCH-112),
+  MIT. Published by Moonshine AI as 8-bit quantized `.ort` files (frontend, encoder,
+  adapter, cross-attention cache and decoder graphs, plus `tokenizer.bin` and
+  `streaming_config.json`, about 45 MB). To be **fetched at pinned SHA-256s** from
+  its dated CDN directory by a `scripts/build_moonshine.sh` and **shipped beside the
+  daemon** as data, run on the ONNX Runtime §2 already builds with its operator
+  config widened to cover both models; nothing new is linked. Moonshine's legacy
+  non-streaming models for languages other than English are under a non-commercial
+  licence and are not used. https://github.com/moonshine-ai/moonshine
+
+- **speexdsp** — the acoustic echo canceller (`speex_echo_state`), BSD-3-Clause,
+  behind the processor vtable in AUDIO.md §3.3 so it is swappable. Built first by
+  voice input (ARCH-112), whose far-end reference is the client's own playback, and
+  reused by the call client. Client only. Not yet vendored. See AUDIO.md §6.2 for why it is preferred over
   WebRTC AEC3 as a first implementation despite being the weaker canceller.
 - **libvpx for screenshare** — the same library §2 fetches for video messages,
   additionally configured with screen-content tuning (`VP9E_SET_TUNE_CONTENT`)
@@ -291,7 +306,7 @@ paths ship; nothing is fetched at runtime.
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 20 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
-| **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build, static-linked into the Win32 client (ARCH-110). Client-side only; the daemon links no codec. Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
+| **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build and static-linked: both into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **Public Domain** | SQLite | Compiled in, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |

@@ -1407,7 +1407,8 @@ means the feature is available on this connection; absent means a client shows
 nothing of it, which is the correct result rather than offering something that
 would fail (REQ-295). `tts` is present exactly when read-aloud is running — built
 in, turned on, and its voice data found and verified against its manifest. `stt`
-is named and never present yet, so clients already hide speech-to-text correctly.
+is named and never present yet — voice input (§5.14c) is not built — so clients
+already hide it correctly.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -1464,6 +1465,50 @@ voice after the first is served without a render. It is a transfer like any othe
 one at a time per connection. Refusals carry `context` 0: `TTS_UNAVAILABLE` 3024
 when read-aloud is off, the queue is full, or `voice_id` is not one `TTS_INFO`
 listed, and `TRANSFER_PROTOCOL` when another transfer is in flight.
+
+### 5.14c Voice input (REQ-296–300, ARCH-112; not built)
+
+The client sends a segment of speech it has already cut at a pause. In **push to
+talk** the daemon answers with the words; in **free talk** it posts them as the
+speaker through the ordinary send path — the one `SEND` and `SEND_REPLY` use — so the
+text never travels back to be re-sent. Design in docs/VOICE-INPUT.md. The opcodes and
+error codes below are **reserved**: none is in `shared/protocol.h` yet, so none is in
+the §9 registry or the §8.2 table, which are the code's. Adding frames needs no
+protocol-version bump (§2).
+
+**`STT_INFO` (S → C), `0x00E3`** `{ model_version: str, lang: str, max_segment_ms:
+u32 }` — sent once to every client just after `TTS_INFO`; empty and `0` when voice
+input is not offered, which is the `stt` capability's to say.
+
+**A segment**, under a `segment_id: u32` the client chooses:
+
+1. **`STT_BEGIN` (C → S), `0x00E4`** `{ segment_id: u32, mode: u8, channel_id: u64,
+   thread_root: u64, idempotency_token: 16B, sample_count: u32 }` — `mode` `0` push
+   to talk, `1` free talk; `thread_root` `0` for the channel itself. In free talk the
+   target is checked with the post access `SEND` uses, before any audio is accepted.
+   16 kHz mono signed 16-bit little-endian PCM follows.
+2. **`STT_CHUNK` (C → S), `0x00E5`** `{ segment_id: u32, seq: u32, data: bytes }` —
+   sequential from `seq` 0, each frame `<= MAX_FRAME_SIZE`.
+3. **`STT_END` (C → S), `0x00E6`** `{ segment_id: u32 }` — the total must equal
+   `sample_count`.
+
+**`STT_TEXT` (S → C), `0x00E7`** `{ segment_id: u32, message_id: u64, text: str }` —
+closes every segment. In free talk `message_id` is the posted message, which also
+reaches every member as the usual `BROADCAST` (or `THREAD_REPLY`); it is `0` in push
+to talk and when nothing was recognized. The idempotency token makes a retried
+segment post once, exactly as `SEND`'s does (§5.1).
+
+One segment uploads at a time per connection and a bounded number wait behind it;
+segments are answered, and posted, **in the order their `STT_END` arrived**. They are
+separate from attachment transfers. The daemon frees a segment's samples once its
+`STT_TEXT` is sent.
+
+Refusals are `ERROR` frames carrying the `segment_id` in `context`: **3026
+`SEGMENT_TOO_LONG`** when `sample_count` exceeds the cap; **3027 `STT_UNAVAILABLE`**
+when voice input is off, too many segments are waiting, the queue is full or
+recognition failed; `NOT_A_MEMBER`, `UNKNOWN_CHANNEL`, `CHANNEL_ARCHIVED` and
+`SEND_RATE_LIMITED` in free talk, as for `SEND`; and `TRANSFER_PROTOCOL` for a chunk
+out of order, a total that does not match, or an `STT_BEGIN` mid-segment.
 
 ---
 

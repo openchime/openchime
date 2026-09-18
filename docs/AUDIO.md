@@ -15,9 +15,10 @@ media stack twice. Camera video remains out of scope (REQ-160).
 exist.** `CALL_JOIN` / `CALL_LEAVE` / `CALL_JOINED` / `CALL_ROSTER` signaling,
 the per-channel ephemeral roster, per-join bearer tokens, and the forked UDP
 relay sidecar (`daemon/audio_sidecar.c`) all work, including disconnect and
-rejoin (REQ-152). What is missing is everything client-side: there is no
-`CALL_*` handling in `client/core`, no Opus, no UDP media path, no audio device
-layer, and no echo cancellation. This document specifies that work.
+rejoin (REQ-152). Client-side, the device layer and Opus exist — video messages
+built them (ARCH-110) — but there is no `CALL_*` handling in `client/core`, no UDP
+media path, no jitter buffer or mixer, and no echo cancellation. This document
+specifies that work. Voice input (ARCH-112) builds the echo canceller of §6 first.
 
 ---
 
@@ -148,8 +149,8 @@ for settling this in Phase 1.
 
 ## 3. The audio engine
 
-A new `client/core/audio.{c,h}` owning **both directions**, independent of the
-network and of any frontend.
+The engine owns **both directions**, independent of the network and of any
+frontend, on the device layer in `client/core/media/audio_dev.{c,h}` (§3.2).
 
 ### 3.1 The real-time contract
 
@@ -192,6 +193,12 @@ record at 48 kHz mono; calls will open it at 16 kHz. `OPENCHIME_TEST_AUDIO=synth
 swaps the devices for a tone source and a real-time sink, so both run in
 `make test` on a machine with no sound hardware. Duplex operation and drift
 detection (build step 1 below) remain to be added for calls.
+
+**Voice input opens it too** (ARCH-112, [VOICE-INPUT.md](./VOICE-INPUT.md)), at
+16 kHz mono, and never while a call or a recording holds the microphone. It builds
+the playback reference — the device layer keeping the frames it emits against the
+media clock — and the processor seam of §3.3 with speexdsp (§6), which the call
+client then inherits.
 
 ### 3.3 The processor seam
 
@@ -381,7 +388,9 @@ late — after the seams that make it replaceable exist.
 
 Phase 6 lands after Phase 5 because a mixer produces a single far-end reference
 (§1.1), and because there is no real echo to cancel until real audio is playing
-out of a real speaker.
+out of a real speaker. **Voice input (ARCH-112) builds phase 6 earlier**, with the
+client's own playback — read-aloud, video messages — as the far-end reference, so
+the call client arrives with a measured canceller rather than building one.
 
 **Nearly all of this is `client/core` work.** The TUI contributes commands and a
 roster panel; every future GUI inherits the engine, the codec, the transport, and

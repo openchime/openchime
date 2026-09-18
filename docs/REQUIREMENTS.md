@@ -1314,6 +1314,40 @@ the requirement says so explicitly rather than implying one.
   message text has left the tenant's own box to be spoken, and no part of the speech
   chain has been under a copyleft licence (ARCH-111).
 
+### 6.5 Voice input
+
+*Design: [VOICE-INPUT.md](./VOICE-INPUT.md).*
+
+- **REQ-296.** *(Not built)* A user has been able to **speak instead of typing** in
+  the composer of a channel, DM or thread, in two modes. In **push to talk**, speech
+  held on a key or button has landed as text in the composer, unsent, for the user to
+  edit before sending. In **free talk**, turned on until turned off or the user goes
+  elsewhere, speech has been cut at pauses and each piece posted as its own message
+  as soon as it was recognized, in the order spoken, with no review step.
+- **REQ-297.** *(Not built)* A spoken message has been **an ordinary text message
+  from the speaker**, posted through the ordinary send path — by the daemon in free
+  talk, by the user from the composer in push to talk — so authorship, permissions,
+  rate limits, search, mentions, edit and delete have applied unchanged. No new
+  message type has existed, and no audio has been stored, attached or posted
+  (REQ-273).
+- **REQ-298.** *(Not built)* The client has decided **where an utterance ends** and
+  the daemon **what was said**: the client has cut speech at pauses and sent each
+  segment over the existing connection, and the daemon has recognized it itself, with
+  a model installed beside it (ARCH-112) — posting it in free talk, returning it to
+  the speaker's connection only in push to talk. A segment has been capped at 30
+  seconds, and its audio discarded once recognized and written nowhere.
+- **REQ-299.** *(Not built)* The microphone has been **open only on the user's say,
+  visibly, and to one use at a time**: from press to release in push to talk, from
+  on to off in free talk, marked as live throughout, never shared with a recording or
+  a call, and a microphone the operating system blocks reported as that (as
+  REQ-166). The client's own playback has been cancelled and never heard as speech.
+- **REQ-300.** *(Not built)* Voice input has been **absent where it is turned off**:
+  a server whose operator has disabled it, or whose recognizer data is missing or
+  does not match the daemon, has offered nothing and no client has shown it, and the
+  rest of the server — read-aloud included — has run on. No audio has left the
+  tenant's own box to be recognized, and nothing in the recognition chain has been
+  under a copyleft licence (ARCH-112).
+
 ---
 
 ## 7. Integrations
@@ -2206,7 +2240,8 @@ feature.*
   there is one kind of recorded message and no second class of audio playback in a
   channel. The exclusion is narrowed, not repealed. Reading a *text* message aloud
   (REQ-291–295) is not a clip: nothing is recorded or posted, and the message is still
-  its text.
+  its text. Nor is speaking one (REQ-296–300): speech is the input, the message is its
+  text, and the audio is discarded once recognized.
 - **REQ-274.** *(Excluded by decision)* **Slack-Connect-style cross-organization shared channels and
   external DMs** have not been supported. Cross-tenant messaging is precluded by
   the island model (ARCH-4/REQ-040); federation between tenants is a separate

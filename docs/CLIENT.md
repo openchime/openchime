@@ -95,6 +95,10 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   `oc_model_msg_preview` is the one-line summary of a message — its text, or
   "🎥 Video message (m:ss)" — for sidebars and notifications. See
   [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md).
+- **Voice input** (`client/core/voice/`, ARCH-112; not built). The dictation
+  session, the libfvad segmenter and the speexdsp echo canceller, over the media
+  library's device layer — linked by the Win32 client. Segments go to the daemon
+  beside, not behind, the transfer queue. See [VOICE-INPUT.md](./VOICE-INPUT.md).
 
 **Headless-testable.** `tests/test_client_core.c` starts the daemon's netloop
 in-process (like the itest) and drives real `oc_client`s against it — connect +
