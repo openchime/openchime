@@ -3277,6 +3277,14 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     }
 #ifdef OC_TTS
     case OC_RES_TTS_META: {
+        /* A warming probe has no listener: render what is missing and stop. The
+         * point is that the next person to press Play waits for a database read
+         * rather than for the model. */
+        if (r->tts_warm) {
+            if (!r->tts_cached && g_tts)
+                oc_tts_worker_submit(g_tts, ++g_tts_req_seq, r->tts_handle, r->tts_voice, r->tts_text);
+            break;
+        }
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         conn_xfer *x = &c->xfer;
@@ -4600,6 +4608,28 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 epoll_ctl(ep, EPOLL_CTL_ADD, tts_eventfd, &tev);
                 fprintf(stderr, "tts: read-aloud on, %d voices, queue %d, model idle %ds\n",
                         g_tts_engine->voices, cfg->tts.queue, cfg->tts.idle_secs);
+                /* WARM THE AUDITIONS. Every voice auditions with the same
+                 * sentence, so there are exactly `voices` renderings to have, and
+                 * having them is the difference between Play answering in a
+                 * database read and answering in two seconds of model time
+                 * (REQ-292). Done through the ordinary preview job, so a
+                 * rendering that already exists is a probe and nothing more --
+                 * the work happens once per deployment, not once per start. */
+                if (g_tts_engine->preview && g_tts_engine->preview[0]) {
+                    int warmed = 0;
+                    for (int v = 0; v < g_tts_engine->voices; v++) {
+                        oc_job *wj = oc_job_new(OC_JOB_TTS_PREVIEW, 0);
+                        if (!wj) break;
+                        wj->tts_warm = 1;
+                        wj->message_id = 0;
+                        wj->tts_voice = (uint8_t)v;
+                        wj->tts_text = strdup(g_tts_engine->preview);
+                        wj->tts_model_version = strdup(g_tts_engine->version);
+                        oc_dbwriter_submit(dbw, wj);
+                        warmed++;
+                    }
+                    fprintf(stderr, "tts: checking %d voice auditions are rendered\n", warmed);
+                }
             }
         } else {
             fprintf(stderr, "tts: read-aloud off\n");

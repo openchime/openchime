@@ -1514,20 +1514,25 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
     CHECK(fetch_audio(&a, emoji_id, NULL, &code) == 0 && code == OC_ERR_NOT_RENDERABLE);
 
     /* Hearing a voice before choosing it (REQ-292): the audition sentence in that
-     * voice, downloaded as message 0. The first ask renders... */
+     * voice, downloaded as message 0. It is ALREADY RENDERED -- the daemon warms
+     * one audition per voice at startup, because all of them say the same
+     * sentence and waiting two seconds to hear a voice you are choosing is the
+     * whole cost of the feature. So the ask costs a cache read and no render. */
     int before_preview = g_stub_says;
     uint32_t pdur = 0;
     uint64_t pbytes = fetch_preview(&a, "test-voice-f", &pdur, &code);
     CHECK(code == 0 && pbytes > 0 && pdur > 0);
-    CHECK(g_stub_says > before_preview);
-    /* ...and the next is the cache: a voice's sample is rendered once for the whole
-     * deployment, however many people audition it. */
+    CHECK(g_stub_says == before_preview);
+    /* The warming rendered every voice, once: two voices, two renders, and they
+     * happened before anybody asked. */
+    CHECK(before_preview >= 2);
+    /* Another listener gets the same bytes, still without rendering. */
     int after_preview = g_stub_says;
     uint64_t pbytes2 = fetch_preview(&b, "test-voice-f", NULL, &code);
     CHECK(code == 0 && pbytes2 == pbytes && g_stub_says == after_preview);
-    /* A different voice is a different rendering. */
+    /* A different voice is a different rendering -- also already warmed. */
     CHECK(fetch_preview(&a, "test-voice-m", NULL, &code) > 0 && code == 0);
-    CHECK(g_stub_says > after_preview);
+    CHECK(g_stub_says == after_preview);
     /* A voice this daemon does not have is refused, not guessed at. */
     CHECK(fetch_preview(&a, "no-such-voice", NULL, &code) == 0 && code == OC_ERR_TTS_UNAVAILABLE);
     /* A preview asked for while a message's speech is on its way is refused, and

@@ -519,6 +519,25 @@ static struct { int on; uint64_t uid; int upload_cmd, remove_cmd; rectf up_btn, 
  * while a form is open. NULL for most forms; set around the one call that needs
  * it and cleared after. */
 static void (*g_form_on_pick)(int field, int val);
+/* An ACTION beside one field: a button that does something with the value the
+ * field currently holds, rather than on the way out of the form. The voice
+ * picker needs one -- you choose a voice by hearing it, and hearing it is a
+ * request to the daemon that takes a moment and can fail. The field owns the
+ * label and the busy state so the button can say which it is in. */
+/* WHICH FIELD HAS THE KEYBOARD, when it is not a native EDIT. Windows' dialog
+ * manager tabs between child windows, and this form's checks, chips and selects
+ * are drawn rather than child windows -- so Tab walked straight past the time
+ * zone and the read-aloud voice, and the only way to either was the mouse. This
+ * is the ring that includes them: -1 when a native field has focus, otherwise
+ * the drawn field's index (or its action button). */
+static int         g_form_focus = -1;
+static int         g_form_focus_btn;          /* the focused stop is the action button */
+static int         g_form_action_field = -1;
+static const char *g_form_action_label;
+static const char *g_form_action_busy_label;
+static int         g_form_action_busy;
+static rectf       g_form_action_btn;
+static void      (*g_form_on_action)(int field);
 /* FF_SELECT. `g_form_sel_box` is where each closed field was drawn (its click
  * target); the rest is the open list, and only one is ever open.
  *
@@ -1882,6 +1901,8 @@ static oc_player *g_listen_player;
 /* A voice's audition, played while choosing a voice (REQ-292). Separate from the
  * listen player: hearing a sample must not disturb a channel being read aloud. */
 static oc_player *g_preview_player;
+static ULONGLONG  g_preview_asked_ms;   /* when the sample was asked for */
+static uint32_t   g_preview_wait_ms;    /* how long the last one took, for the dump */
 static uint8_t   *g_preview_bytes;
 static uint8_t   *g_listen_bytes;
 static size_t     g_listen_len;
@@ -10321,7 +10342,12 @@ static void draw_form(gfx *rt, rectf body) {
             rectf box = rf(body.left, y + 4, body.left + 20, y + 24);
             int on = atoi(f->value) != 0;
             fill_round(rt, box, OC_R_CONTROL, on ? OC_COL_ACCENT : OC_COL_INPUT);
-            if (!on) stroke_round(rt, box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            /* The ring says where the keyboard is, on a drawn field exactly as on
+             * a text one -- without it, tabbing onto a check is invisible. */
+            if (!on || g_form_focus == i)
+                stroke_round(rt, box, OC_R_CONTROL,
+                             g_form_focus == i ? OC_COL_ACCENT : OC_COL_BORDER,
+                             g_form_focus == i ? 1.5f : 1.0f);
             if (on) {
                 g_meta->align = ST_ALIGN_CENTER;
                 draw_text(rt, "\u2713", g_meta, box, 0xFFFFFF);
@@ -10352,6 +10378,10 @@ static void draw_form(gfx *rt, rectf body) {
                 rectf b = rf(bx, cy, bx + bw, cy + 28);
                 int on = (k == cur);
                 draw_chip_r(rt, b, opt, on);
+                /* The chosen chip wears the ring when the row has the keyboard,
+                 * so arrowing along a chip row is visible. */
+                if (g_form_focus == i && on)
+                    stroke_round(rt, b, OC_R_CONTROL, OC_COL_ACCENT, 1.5f);
                 if (g_n_form_hits < (int)(sizeof g_form_hits / sizeof g_form_hits[0])) {
                     g_form_hits[g_n_form_hits].r = b;
                     g_form_hits[g_n_form_hits].field = i;
@@ -10363,9 +10393,28 @@ static void draw_form(gfx *rt, rectf body) {
             }
         } else if (f->kind == FF_SELECT) {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            float action_w = 0;
+            if (i == g_form_action_field && g_form_on_action) {
+                const char *lbl = g_form_action_busy ? g_form_action_busy_label : g_form_action_label;
+                action_w = text_width(lbl, g_ui) + UIS(28);
+                g_form_action_btn = rf(body.right - FORM_BOX_INSET - action_w, y + 22,
+                                       body.right - FORM_BOX_INSET, y + 50);
+                int hot = !g_form_action_busy && in_rect(g_form_action_btn, g_mouse_x, g_mouse_y);
+                fill_round(rt, g_form_action_btn, OC_R_CONTROL,
+                           g_form_action_busy ? OC_COL_INPUT : hot ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, g_form_action_btn, OC_R_CONTROL,
+                             (g_form_focus == i && g_form_focus_btn) ? OC_COL_ACCENT : OC_COL_BORDER,
+                             1.5f);
+                g_ui->align = ST_ALIGN_CENTER;
+                draw_text(rt, lbl, g_ui, g_form_action_btn,
+                          g_form_action_busy ? OC_INK_ON(TH_FAINT, TH_INPUT)
+                                             : OC_INK_ON(TH_TEXT, hot ? TH_HOVER : TH_INPUT));
+                g_ui->align = ST_ALIGN_LEFT;
+                action_w += UIS(8);
+            }
             rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
-                           body.right - FORM_BOX_INSET, y + 50);
-            int open = (g_form_sel_field == i);
+                           body.right - FORM_BOX_INSET - action_w, y + 50);
+            int open = (g_form_sel_field == i) || (g_form_focus == i && !g_form_focus_btn);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The accent ring while the list is open, matching what a focused
              * text field wears: the same "this control has the keyboard" cue,
@@ -11130,6 +11179,92 @@ static int modal_frame_click(HWND hwnd, int x, int y) {
 
 /* Esc cancels, Enter fires the primary. Both in one place so no modal has to
  * remember, and so the two agree about what dismissal means. */
+/* Does field `i` take the keyboard as a drawn field (rather than as an EDIT)? */
+static int form_field_is_drawn(int i) {
+    if (i < 0 || i >= g_form_n) return 0;
+    int k = g_form_f[i].kind;
+    return k == FF_CHECK || k == FF_CHOICE || k == FF_SELECT;
+}
+
+/* Tab and Shift+Tab across every stop in the form: each field, plus the action
+ * button beside one of them. Native fields hand focus to their EDIT; drawn ones
+ * hold it here, which is what makes them reachable at all. */
+static void form_focus_step(HWND owner, int dir) {
+    if (!g_form_open || g_form_n <= 0) return;
+    /* Where we are now: a focused EDIT, or a drawn stop. */
+    int at = g_form_focus;
+    if (at < 0) {
+        HWND f = GetFocus();
+        for (int i = 0; i < g_form_n; i++) if (g_form_edit[i] == f) { at = i; break; }
+        if (at < 0) at = dir > 0 ? -1 : g_form_n;
+    }
+    for (int step = 0; step <= g_form_n + 1; step++) {
+        /* The action button is a stop of its own, immediately after its field. */
+        if (dir > 0 && !g_form_focus_btn && at == g_form_action_field && g_form_on_action) {
+            g_form_focus = at; g_form_focus_btn = 1; SetFocus(owner); return;
+        }
+        if (dir < 0 && g_form_focus_btn) { g_form_focus_btn = 0; g_form_focus = at; SetFocus(owner); return; }
+        g_form_focus_btn = 0;
+        at += dir;
+        if (at >= g_form_n) at = 0;
+        if (at < 0) at = g_form_n - 1;
+        if (dir < 0 && at == g_form_action_field && g_form_on_action) {
+            g_form_focus = at; g_form_focus_btn = 1; SetFocus(owner); return;
+        }
+        if (g_form_edit[at]) {
+            g_form_focus = -1;
+            SetFocus(g_form_edit[at]);
+            SendMessageW(g_form_edit[at], EM_SETSEL, 0, -1);
+            return;
+        }
+        if (form_field_is_drawn(at)) { g_form_focus = at; SetFocus(owner); return; }
+    }
+}
+
+/* The keys a drawn field answers once it has focus: change the value, open the
+ * list, press the button. Returns 1 when the key was the form's. */
+static int form_focus_key(HWND hwnd, WPARAM vk) {
+    if (!g_form_open || g_form_focus < 0 || g_form_focus >= g_form_n) return 0;
+    oc_field *f = &g_form_f[g_form_focus];
+    int nopt = 0;
+    for (const char *p = f->hint; f->kind != FF_CHECK && p && *p; p++) if (*p == '|') nopt++;
+    if (f->hint && f->hint[0] && f->kind != FF_CHECK) nopt++;
+    int val = atoi(f->value);
+    if (g_form_focus_btn) {
+        if (vk == VK_SPACE || vk == VK_RETURN) {
+            if (g_form_on_action && !g_form_action_busy) g_form_on_action(g_form_focus);
+            return 1;
+        }
+        return 0;
+    }
+    if (f->kind == FF_CHECK && (vk == VK_SPACE || vk == VK_RETURN)) {
+        snprintf(f->value, sizeof f->value, "%d", val ? 0 : 1);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    if (f->kind == FF_SELECT && (vk == VK_SPACE || vk == VK_RETURN)) {
+        g_form_sel_field = g_form_focus;
+        g_form_sel_scroll = val - FORM_SEL_VISIBLE / 2;
+        if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    if ((f->kind == FF_CHOICE || f->kind == FF_SELECT) &&
+        (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN)) {
+        int d = (vk == VK_RIGHT || vk == VK_DOWN) ? 1 : -1;
+        int nv = val + d;
+        if (nv < 0) nv = 0;
+        if (nopt && nv >= nopt) nv = nopt - 1;
+        if (nv != val) {
+            snprintf(f->value, sizeof f->value, "%d", nv);
+            if (g_form_on_pick) g_form_on_pick(g_form_focus, nv);
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    return 0;
+}
+
 static int modal_key(HWND hwnd, WPARAM vk) {
     (void)hwnd;
     if (!modal_open()) return 0;
@@ -11141,6 +11276,7 @@ static int modal_key(HWND hwnd, WPARAM vk) {
     /* And for a form's open FF_SELECT list: Escape closes the list, not the card
      * it is standing on. */
     if (vk == VK_ESCAPE && g_form_sel_field >= 0) { g_form_sel_field = -1; return 1; }
+    if (g_form_sel_field < 0 && form_focus_key(hwnd, vk)) return 1;
     /* Same rule for an emoji picker floating over the card. */
     if (vk == VK_ESCAPE && g_pick_open && picker_floats()) {
         picker_close(hwnd);
@@ -16075,7 +16211,19 @@ static void preview_tick(const oc_model *m) {
     if (g_preview_player) {
         oc_player_status st;
         oc_player_status_get(g_preview_player, &st);
-        if (st.state == OC_PLAYER_ENDED || st.state == OC_PLAYER_ERROR) preview_drop();
+        if (st.state == OC_PLAYER_ENDED || st.state == OC_PLAYER_ERROR) {
+            preview_drop();
+            g_form_action_busy = 0;          /* the button is a button again */
+        }
+    }
+    /* Nothing came back. The daemon may have refused (read-aloud off, an unknown
+     * voice) or the connection may have gone; either way the button must not
+     * stay disabled forever waiting for a sample that is not coming. */
+    if (g_form_action_busy && !g_preview_player && g_preview_asked_ms &&
+        GetTickCount64() - g_preview_asked_ms > 12000) {
+        g_form_action_busy = 0;
+        g_preview_asked_ms = 0;
+        toast_push("That voice could not be played just now.", 1);
     }
     uint8_t *mp4 = NULL;
     size_t len = 0;
@@ -16083,16 +16231,45 @@ static void preview_tick(const oc_model *m) {
     preview_drop();
     g_preview_bytes = mp4;
     g_preview_player = oc_player_open(mp4, len);
-    if (!g_preview_player) { preview_drop(); return; }
+    if (!g_preview_player) { preview_drop(); g_form_action_busy = 0; return; }
     oc_player_play(g_preview_player);
+    /* How long the whole round trip took, measured where the user feels it:
+     * from the press to the first sound. */
+    if (g_preview_asked_ms) {
+        crumb("preview ready in %llu ms",
+              (unsigned long long)(GetTickCount64() - g_preview_asked_ms));
+        g_preview_wait_ms = (uint32_t)(GetTickCount64() - g_preview_asked_ms);
+        g_preview_asked_ms = 0;
+    }
 }
 
-/* The Edit-profile form's voice field changed: play what that voice sounds like.
- * "Automatic" (option 0) is not a voice, so it plays nothing. */
+/* The Edit-profile form's voice field changed. Choosing is not hearing: the
+ * sample plays when you ask for it, from the button beside the field, so picking
+ * your way down a list of eight does not fire eight requests at a daemon that
+ * renders each one. */
 static void profile_voice_picked(int field, int val) {
-    if (field != 6 || val <= 0 || !g_client) return;
+    (void)val;
+    if (field != 6) return;
+    /* A new voice retires the last sample: what is playing must be what the
+     * field says, or the button is lying about which voice you heard. */
+    preview_drop();
+    g_form_action_busy = 0;
+}
+
+/* "Play" beside the voice field: ask the daemon for this voice saying the
+ * audition sentence. The button goes to "Playing…" and stops being a button
+ * until the sample has played, failed, or given up -- a second press while the
+ * first is in flight would queue a second render of the same thing. */
+static void profile_voice_play(int field) {
+    if (field != 6 || !g_client) return;
+    int val = atoi(g_form_f[field].value);
+    if (val <= 0) { toast_push("Pick a voice first \u2014 \u201cAutomatic\u201d is chosen by the server.", 0); return; }
     const char *id = voice_id_at(model(), val);
-    if (id[0]) oc_client_voice_preview(g_client, id);
+    if (!id[0]) return;
+    preview_drop();
+    oc_client_voice_preview(g_client, id);
+    g_form_action_busy = 1;
+    g_preview_asked_ms = GetTickCount64();
 }
 
 static void vm_player_close(void) {
@@ -17920,6 +18097,14 @@ static int on_click(HWND hwnd, int x, int y) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 1;
             }
+        /* The action beside a field, before the field itself: it is drawn inside
+         * the field's row and would otherwise be read as a click on the row. */
+        if (g_form_on_action && g_form_action_field >= 0 && !g_form_action_busy &&
+            in_rect(g_form_action_btn, x, y)) {
+            g_form_on_action(g_form_action_field);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 1;
+        }
         for (int i = 0; i < g_n_form_hits; i++)
             if (in_rect(g_form_hits[i].r, x, y)) {
                 snprintf(g_form_f[g_form_hits[i].field].value,
@@ -19664,6 +19849,7 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
     g_form_sel_field = -1; g_form_sel_scroll = 0;
     modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
     layout_natives(owner);
+    g_form_focus = -1; g_form_focus_btn = 0;
     for (int i = 0; i < n; i++)
         if (g_form_edit[i]) { SetFocus(g_form_edit[i]); SendMessageW(g_form_edit[i], EM_SETSEL, 0, -1); break; }
 
@@ -19673,6 +19859,21 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
          * modal_key when focus is elsewhere, so the loop does not second-guess them.
          * Tab between the fields: the dialog manager skips hidden and disabled
          * children, and everything else of ours is hidden while a modal is up. */
+        /* TAB IS OURS, not the dialog manager's. IsDialogMessage only walks
+         * child windows, and this form's checks, chips and selects are drawn --
+         * so the time zone and the read-aloud voice were unreachable from the
+         * keyboard entirely. */
+        if (m.message == WM_KEYDOWN && m.wParam == VK_TAB) {
+            form_focus_step(owner, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+            InvalidateRect(owner, NULL, FALSE);
+            continue;
+        }
+        /* A drawn field with the keyboard answers its own keys before the dialog
+         * manager turns them into something else (Space on a button, say). */
+        if (m.message == WM_KEYDOWN && g_form_focus >= 0 && form_focus_key(owner, m.wParam)) {
+            InvalidateRect(owner, NULL, FALSE);
+            continue;
+        }
         if (IsDialogMessageW(owner, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
@@ -20346,8 +20547,19 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         /* Hear each voice as it is picked, rather than choosing a name blind and
          * finding out on every message afterwards. */
         g_form_on_pick = nfields == 7 ? profile_voice_picked : NULL;
+        if (nfields == 7) {
+            g_form_action_field = 6;
+            g_form_action_label = "Play";
+            g_form_action_busy_label = "Playing\u2026";
+            g_form_on_action = profile_voice_play;
+            g_form_action_busy = 0;
+        }
         int saved = form_dialog(hwnd, "Edit profile", f, nfields);
         g_form_on_pick = NULL;
+        g_form_on_action = NULL;
+        g_form_action_field = -1;
+        g_form_action_busy = 0;
+        preview_drop();
         if (!saved) break;
         char tz[64]; sel_opt(f[5].hint, atoi(f[5].value), tz, sizeof tz);
         if (!strcmp(tz, OC_TZ_UNSET)) tz[0] = '\0';
@@ -20900,8 +21112,9 @@ static void test_dump(const char *path) {
     {
         oc_player_status ps = { 0 };
         if (g_preview_player) oc_player_status_get(g_preview_player, &ps);
-        fprintf(f, "preview player=%d state=%d has_audio=%d pos=%u/%u\n",
-                g_preview_player != NULL, (int)ps.state, ps.has_audio, ps.position_ms, ps.duration_ms);
+        fprintf(f, "preview player=%d state=%d has_audio=%d pos=%u/%u wait_ms=%u busy=%d\n",
+                g_preview_player != NULL, (int)ps.state, ps.has_audio, ps.position_ms, ps.duration_ms,
+                g_preview_wait_ms, g_form_action_busy);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
     /* How the client started (scripts/gui_startup.sh). `visible` is whether the
@@ -22277,6 +22490,17 @@ static void test_poll(HWND hwnd) {
         if (composer_remeasure()) layout_composer(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
+    } else if (!strcmp(verb, "voicepreview")) {
+        /* Ask for a voice's audition and time it. The answer is `preview
+         * wait_ms=` in the dump: what the button's "Playing…" state costs, which
+         * is the number the warm cache exists to change. */
+        if (g_client && arg[0]) {
+            preview_drop();
+            g_preview_asked_ms = GetTickCount64();
+            g_preview_wait_ms = 0;
+            oc_client_voice_preview(g_client, arg);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "newmsg")) {
         /* Open the New Message pane exactly as its entry points do (REQ-229) —
          * a verb rather than a click at a measured coordinate, because the
