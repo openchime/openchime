@@ -1042,18 +1042,33 @@ size_t oc_complete_targets(const oc_model *m, const char *query,
                            oc_target *out, size_t max) {
     if (!m || !out || max == 0) return 0;
     const char *q = query ? query : "";
-    /* A leading sigil is accepted and ignored rather than treated as a filter:
-     * somebody typing "@ali" in a To: field means the person, not a literal. */
-    if (*q == '@' || *q == '#') q++;
+    /* A leading sigil SELECTS, it does not merely get skipped. "@" means people
+     * and "#" means channels, which is what the sigil means everywhere else in
+     * the product -- typing "#gen" and being offered a person called Gene is the
+     * field ignoring what you told it. */
+    int want_people = 1, want_channels = 1;
+    if (*q == '@') { want_channels = 0; q++; }
+    else if (*q == '#') { want_people = 0; q++; }
     size_t n = 0;
     /* Two passes so prefix matches lead, and within each pass people lead —
      * you address a person more often than a channel. */
     for (int band = 0; band < 2 && n < max; band++) {
-        for (size_t i = 0; i < m->n_users && n < max; i++) {
+        for (size_t i = 0; want_people && i < m->n_users && n < max; i++) {
             const char *nm = m->users[i].name;
             if (!nm || !nm[0] || m->users[i].user_id == m->user_id) continue;  /* not yourself */
-            int pre = ci_prefix(nm, q);
-            if (band == 0 ? !pre : (pre || !ci_contains(nm, q))) continue;
+            /* Somebody an admin removed is not a destination: they stay on the
+             * roster so old messages keep their author, and addressing one gets
+             * the message refused with the body already gone from the box. */
+            if (m->users[i].disabled) continue;
+            /* A colleague is findable by the name they are KNOWN by as well as
+             * the handle they log in with: the row already shows the title
+             * beside the name, so searching only the handle meant the field said
+             * there was nobody by a name it would have printed. */
+            const char *fn = m->users[i].full_name, *ti = m->users[i].title;
+            int pre = ci_prefix(nm, q) || (fn && fn[0] && ci_prefix(fn, q));
+            int any = pre || ci_contains(nm, q) || (fn && fn[0] && ci_contains(fn, q)) ||
+                      (ti && ti[0] && ci_contains(ti, q));
+            if (band == 0 ? !pre : (pre || !any)) continue;
             out[n].id = m->users[i].user_id;
             out[n].is_channel = 0;
             snprintf(out[n].name, sizeof out[n].name, "%s", nm);
@@ -1062,9 +1077,15 @@ size_t oc_complete_targets(const oc_model *m, const char *query,
             snprintf(out[n].sub, sizeof out[n].sub, "%s", m->users[i].title);
             n++;
         }
-        for (size_t i = 0; i < m->n_channels && n < max; i++) {
+        for (size_t i = 0; want_channels && i < m->n_channels && n < max; i++) {
             const oc_channel *c = &m->channels[i];
             if (c->kind == OC_CHANNEL_KIND_DM || !c->name || !c->name[0]) continue;
+            /* An archived channel is read-only (REQ-035), so it is not somewhere
+             * a new message can go -- the daemon refuses the post, by which time
+             * the composer has been emptied. And a channel you have not joined
+             * is not offered here: picking a name out of an address list is not
+             * consent to join, which is what posting to one does. */
+            if (c->archived || !c->joined) continue;
             int pre = ci_prefix(c->name, q);
             if (band == 0 ? !pre : (pre || !ci_contains(c->name, q))) continue;
             out[n].id = c->channel_id;

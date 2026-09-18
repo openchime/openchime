@@ -266,6 +266,7 @@ typedef struct {
     uint64_t thread_root;
     uint64_t updated_ms;
     char    *body;        /* heap, never NULL for a stored draft */
+    char    *recipients;  /* heap or NULL; the unaddressed draft's ids (REQ-229) */
     uint32_t gen;
 } oc_draft_view;
 
@@ -749,8 +750,13 @@ void        oc_model_drafts_begin(oc_model *m);
  * connection that wrote it (ARCH-101 — echoing it back is how a client ends up
  * overwriting the composer someone is still typing in), so without this our own
  * drafts would be invisible to our own sidebar until the next connect. */
+/* Who an unaddressed draft (channel 0) was addressed to: a comma-separated user
+ * id list, or NULL. The pane restores its chips from this. */
+const char *oc_model_draft_recipients(const oc_model *m);
 void        oc_model_draft_local(oc_model *m, uint64_t channel_id,
                                  uint64_t thread_root, const char *body);
+/* The same, for the unaddressed draft: body and recipients together. */
+void        oc_model_draft_local_to(oc_model *m, const char *recipients, const char *body);
 /* How many scheduled messages are waiting, and how many failed — the pane's two
  * counts, and the only reason the sidebar row needs to know about them. */
 size_t      oc_model_scheduled_pending(const oc_model *m);

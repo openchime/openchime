@@ -2492,6 +2492,12 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
  * paint; it used to live beside the click router, which is why the frame could not
  * see it. */
 static int in_rect(rectf r, int x, int y) {
+    /* AN EMPTY RECT CONTAINS NOTHING. The app disables a control by zeroing its
+     * rect -- a row scrolled out of view, a button a view does not draw -- and an
+     * inclusive test made every one of those match a click at exactly (0,0):
+     * found live, where one click in the top-left corner added a recipient from a
+     * suggestion list that was not on screen. */
+    if (r.right <= r.left || r.bottom <= r.top) return 0;
     return (float)x >= r.left && (float)x <= r.right && (float)y >= r.top && (float)y <= r.bottom;
 }
 
@@ -3094,7 +3100,25 @@ static void draw_chip_r(gfx *rt, rectf b, const char *label, int on) {
  * The model is updated locally as well as sent: the daemon deliberately does not
  * echo a draft to the connection that wrote it, so the sidebar marker and the
  * Drafts view would otherwise not see our own until the next connect. */
+static void newmsg_flush(void);                 /* fwd: the pane owns its own draft */
+
+/* WHO OWNS THE TEXT IN THE EDITOR. There is one editor and two kinds of author:
+ * a conversation's draft and the New message pane's unaddressed one. This flag is
+ * the answer, set when the text is taken and cleared when it is handed back, and
+ * every write consults it. It is not `g_view == VIEW_NEWMSG`: the view changes at
+ * 40 sites and changes BEFORE the text does, so a flush in between filed the
+ * wrong body under the wrong key -- which is how an unaddressed message became a
+ * draft of the channel you had just left. */
+static int g_ed_is_newmsg;
+
 static void draft_flush(uint64_t cid) {
+    /* The New message pane BORROWS this editor, so its text is not any channel's
+     * draft -- writing it as one filed an unaddressed message under whatever was
+     * open before, and entering the pane on an empty field deleted that channel's
+     * draft outright. Every path that flushes on the way out (leaving, blur,
+     * close, quit) lands here, so the redirect belongs here rather than at four
+     * call sites that must each remember. */
+    if (g_ed_is_newmsg) { newmsg_flush(); return; }
     if (!cid || !g_client || g_edit_msg) return;   /* an edit-in-progress is not a draft */
     WCHAR w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
@@ -3140,9 +3164,15 @@ static void draft_restore(uint64_t cid) {
     g_draft_dirty = 0;
 }
 
+static void nm_editor_release(void);             /* fwd: one owner for the editor */
+
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
     crumb("select_channel %llu", (unsigned long long)cid);
+    /* If the New message pane still holds the editor, it gives it up HERE --
+     * before the flush below, which would otherwise file the pane's text as this
+     * channel's draft. */
+    nm_editor_release();
     if (g_sel && g_sel != cid) draft_flush(g_sel);   /* leaving writes it, if changed */
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
@@ -12047,6 +12077,186 @@ static void draw_browse(gfx *rt, const oc_model *m, rectf body) {
     ovl_end(rt, body);
 }
 
+static void copy_to_clipboard(HWND hwnd, const char *utf8);   /* fwd: tfield */
+static uint64_t g_tgt_blink;      /* the To: caret's phase, reset on every edit */
+
+/* ---- a one-line text field ---------------------------------------------
+ * The rich editor (ed_*) is a single global instance bound to the composer, so a
+ * second field cannot borrow it; before this, the To: query was a bare char[] you
+ * could only append to and byte-delete from the end. That is not a text field: no
+ * caret, no insertion point, no selection, no clipboard, and one Backspace left a
+ * half-finished UTF-8 sequence behind.
+ *
+ * Byte indices into UTF-8, stepped on character boundaries. Kept small and
+ * self-contained so the palette and the find bar can adopt it next. */
+typedef struct {
+    char buf[80];
+    int  len;       /* bytes, never inside a character */
+    int  caret;     /* byte index of the insertion point */
+    int  anchor;    /* the other end of the selection; == caret when there is none */
+    WCHAR pending;  /* a high surrogate waiting for its pair */
+} tfield;
+
+static int tf_lead(const tfield *t, int i) {          /* is `i` a character start? */
+    return i <= 0 || i >= t->len || ((unsigned char)t->buf[i] & 0xC0) != 0x80;
+}
+static int tf_left(const tfield *t, int i)  { do { i--; } while (i > 0 && !tf_lead(t, i)); return i < 0 ? 0 : i; }
+static int tf_right(const tfield *t, int i) { do { i++; } while (i < t->len && !tf_lead(t, i)); return i > t->len ? t->len : i; }
+static int tf_has_sel(const tfield *t) { return t->caret != t->anchor; }
+static int tf_lo(const tfield *t) { return t->caret < t->anchor ? t->caret : t->anchor; }
+static int tf_hi(const tfield *t) { return t->caret > t->anchor ? t->caret : t->anchor; }
+
+static void tf_clear(tfield *t) { t->buf[0] = 0; t->len = t->caret = t->anchor = 0; t->pending = 0; }
+
+/* A word boundary for Ctrl+Left/Right and Ctrl+Backspace: runs of spaces, then a
+ * run of non-spaces, which is what every other field on the platform does. */
+static int tf_word_left(const tfield *t, int i) {
+    while (i > 0 && t->buf[tf_left(t, i)] == ' ') i = tf_left(t, i);
+    while (i > 0 && t->buf[tf_left(t, i)] != ' ') i = tf_left(t, i);
+    return i;
+}
+static int tf_word_right(const tfield *t, int i) {
+    while (i < t->len && t->buf[i] != ' ') i = tf_right(t, i);
+    while (i < t->len && t->buf[i] == ' ') i = tf_right(t, i);
+    return i;
+}
+
+static void tf_del_range(tfield *t, int a, int b) {
+    if (a < 0) a = 0;
+    if (b > t->len) b = t->len;
+    if (a >= b) return;
+    memmove(t->buf + a, t->buf + b, (size_t)(t->len - b) + 1);
+    t->len -= b - a;
+    t->caret = t->anchor = a;
+}
+
+/* Returns 1 when anything was inserted. Refuses rather than truncates a character:
+ * half of one is not text. */
+static int tf_insert(tfield *t, const char *u8, int n) {
+    if (n <= 0) return 0;
+    if (tf_has_sel(t)) tf_del_range(t, tf_lo(t), tf_hi(t));
+    if (t->len + n >= (int)sizeof t->buf) return 0;
+    memmove(t->buf + t->caret + n, t->buf + t->caret, (size_t)(t->len - t->caret) + 1);
+    memcpy(t->buf + t->caret, u8, (size_t)n);
+    t->len += n;
+    t->caret = t->anchor = t->caret + n;
+    return 1;
+}
+
+/* One WM_CHAR. Surrogate pairs arrive as two messages and are joined here —
+ * converting each half on its own dropped every astral character silently. */
+static int tf_char(tfield *t, WCHAR ch) {
+    if (ch < 0x20 || ch == 0x7F) return 0;        /* control keys are not text */
+    WCHAR w[2];
+    int wn = 0;
+    if (ch >= 0xD800 && ch <= 0xDBFF) { t->pending = ch; return 1; }
+    if (ch >= 0xDC00 && ch <= 0xDFFF) {
+        if (!t->pending) return 1;
+        w[wn++] = t->pending; w[wn++] = ch; t->pending = 0;
+    } else { t->pending = 0; w[wn++] = ch; }
+    char u8[8];
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, wn, u8, (int)sizeof u8, NULL, NULL);
+    return tf_insert(t, u8, n) ? 1 : 1;           /* full is still the field's key */
+}
+
+static void tf_copy(const tfield *t, HWND hwnd) {
+    if (!tf_has_sel(t)) return;
+    int a = tf_lo(t), n = tf_hi(t) - a;
+    char *s = (char *)malloc((size_t)n + 1);
+    if (!s) return;
+    memcpy(s, t->buf + a, (size_t)n); s[n] = 0;
+    copy_to_clipboard(hwnd, s);
+    free(s);
+}
+
+static int tf_paste(tfield *t, HWND hwnd) {
+    if (!OpenClipboard(hwnd)) return 0;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    int did = 0;
+    if (h) {
+        const WCHAR *src = (const WCHAR *)GlobalLock(h);
+        if (src) {
+            /* One line: a pasted newline ends the paste rather than becoming a
+             * glyph nobody can see in a single-line field. */
+            char u8[128];
+            int wl = 0;
+            while (src[wl] && src[wl] != L'\r' && src[wl] != L'\n' && wl < 60) wl++;
+            int n = WideCharToMultiByte(CP_UTF8, 0, src, wl, u8, (int)sizeof u8, NULL, NULL);
+            did = tf_insert(t, u8, n);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return did;
+}
+
+/* The caret position for a click at `x`, measured against the same format the
+ * field draws with, so the caret lands where the pointer is. */
+static int tf_hit(const tfield *t, fmtw *fmt, float x0, float x) {
+    char tmp[sizeof t->buf];
+    int best = 0;
+    float bestd = -1;
+    for (int i = 0; i <= t->len; i = (i >= t->len ? t->len + 1 : tf_right(t, i))) {
+        memcpy(tmp, t->buf, (size_t)i); tmp[i] = 0;
+        float w = text_width(tmp, fmt);
+        float d = x - (x0 + w);
+        if (d < 0) d = -d;
+        if (bestd < 0 || d < bestd) { bestd = d; best = i; }
+        if (i > t->len) break;
+    }
+    return best;
+}
+
+/* The field's own keys. Returns 1 when it took the key — the caller must not let
+ * anything it declines reach another field. */
+static int tf_key(tfield *t, HWND hwnd, WPARAM vk, int ctrl, int shift) {
+    int before = t->caret;
+    switch (vk) {
+    case VK_LEFT:  t->caret = ctrl ? tf_word_left(t, t->caret) : tf_left(t, t->caret); break;
+    case VK_RIGHT: t->caret = ctrl ? tf_word_right(t, t->caret) : tf_right(t, t->caret); break;
+    case VK_HOME:  t->caret = 0; break;
+    case VK_END:   t->caret = t->len; break;
+    case VK_BACK:
+        if (tf_has_sel(t)) { tf_del_range(t, tf_lo(t), tf_hi(t)); return 1; }
+        if (t->caret > 0) {
+            tf_del_range(t, ctrl ? tf_word_left(t, t->caret) : tf_left(t, t->caret), t->caret);
+            return 1;
+        }
+        return 0;                                  /* empty: the caller may act */
+    case VK_DELETE:
+        if (tf_has_sel(t)) { tf_del_range(t, tf_lo(t), tf_hi(t)); return 1; }
+        if (t->caret < t->len) { tf_del_range(t, t->caret, ctrl ? tf_word_right(t, t->caret) : tf_right(t, t->caret)); return 1; }
+        return 1;
+    case 'A': if (!ctrl) return 0; t->anchor = 0; t->caret = t->len; return 1;
+    case 'C': if (!ctrl) return 0; tf_copy(t, hwnd); return 1;
+    case 'X': if (!ctrl) return 0; tf_copy(t, hwnd); tf_del_range(t, tf_lo(t), tf_hi(t)); return 1;
+    case 'V': if (!ctrl) return 0; tf_paste(t, hwnd); return 1;
+    default: return 0;
+    }
+    if (!shift) t->anchor = t->caret;
+    return t->caret != before || !shift;
+}
+
+/* Selection behind, text, then the caret on top. `x0` is the text's left edge. */
+static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
+                    uint32_t ink, int focused) {
+    char tmp[sizeof t->buf];
+    if (focused && tf_has_sel(t)) {
+        int a = tf_lo(t), b = tf_hi(t);
+        memcpy(tmp, t->buf, (size_t)a); tmp[a] = 0;
+        float wa = text_width(tmp, fmt);
+        memcpy(tmp, t->buf, (size_t)b); tmp[b] = 0;
+        float wb = text_width(tmp, fmt);
+        fill(rt, rf(x0 + wa, box.top + UIS(6), x0 + wb, box.bottom - UIS(6)), OC_COL_SELECT);
+    }
+    if (t->len) draw_text(rt, t->buf, fmt, rf(x0, box.top, box.right - UIS(12), box.bottom), ink);
+    if (focused && ((GetTickCount64() - g_tgt_blink) / 530) % 2 == 0) {
+        memcpy(tmp, t->buf, (size_t)t->caret); tmp[t->caret] = 0;
+        float wc = text_width(tmp, fmt);
+        fill(rt, rf(x0 + wc, box.top + UIS(7), x0 + wc + 1.0f, box.bottom - UIS(7)), OC_COL_TEXT);
+    }
+}
+
 /* ---- the target picker (REQ-229) -------------------------------------------
  * A first-class control, not a dropdown welded to one pane: chips for what you
  * have chosen, a type-ahead over PEOPLE AND CHANNELS together, and a list you
@@ -12060,18 +12270,29 @@ static void draw_browse(gfx *rt, const oc_model *m, rectf body) {
 enum { TGT_MAX = 12, TGT_CHIPS_MAX = 8 };
 static struct { uint64_t id; int is_channel; char name[80]; } g_tgt_chip[TGT_CHIPS_MAX];
 static int   g_n_tgt_chip;
-static char  g_tgt_query[80];
+static tfield g_tgt_q;
+/* One chip per Backspace PRESS: an auto-repeat used to walk the whole list. */
+static int   g_tgt_chip_armed;
+static float g_tgt_qx, g_tgt_qy;            /* where the query's text starts */
+static int   g_tgt_top;                     /* first visible match, for the wheel */
+static rectf g_tgt_list;                    /* the floating list, for hit-testing */
+static rectf g_tgt_chip_r[TGT_CHIPS_MAX];   /* each chip's whole rect, wrapped */
 static oc_target g_tgt[TGT_MAX];
 static int   g_n_tgt, g_tgt_sel;
 static rectf g_tgt_rows[TGT_MAX], g_tgt_chip_x[TGT_CHIPS_MAX], g_tgt_box;
 
 static void tgt_clear(void) {
-    g_n_tgt_chip = 0; g_tgt_query[0] = 0; g_n_tgt = 0; g_tgt_sel = 0;
+    g_n_tgt_chip = 0; tf_clear(&g_tgt_q); g_n_tgt = 0; g_tgt_sel = 0;
 }
+
+/* The recipients are half of an unaddressed draft, so changing them makes it
+ * unsaved -- only typing used to, which meant choosing three people and leaving
+ * saved nothing at all. */
+static void tgt_touch(void) { g_draft_dirty = 1; g_draft_touch_ms = GetTickCount64(); }
 
 static void tgt_rebuild(void) {
     const oc_model *m = model();
-    g_n_tgt = m ? (int)oc_complete_targets(m, g_tgt_query, g_tgt, TGT_MAX) : 0;
+    g_n_tgt = m ? (int)oc_complete_targets(m, g_tgt_q.buf, g_tgt, TGT_MAX) : 0;
     /* Anything already chosen drops out of the list: offering it again is an
      * invitation to a duplicate the control would then have to refuse. */
     for (int i = 0; i < g_n_tgt; ) {
@@ -12086,7 +12307,13 @@ static void tgt_rebuild(void) {
 }
 
 static void tgt_accept(int i) {
-    if (i < 0 || i >= g_n_tgt || g_n_tgt_chip >= TGT_CHIPS_MAX) return;
+    if (i < 0 || i >= g_n_tgt) return;
+    if (g_n_tgt_chip >= TGT_CHIPS_MAX) {
+        /* A control that refuses in silence reads as a broken one: the ninth
+         * Enter did nothing and said nothing about why. */
+        toast_push("A message goes to at most 8 people.", 0);
+        return;
+    }
     /* A CHANNEL is a whole destination on its own: mixing "#general and @bob"
      * is two conversations wearing one address, so choosing a channel replaces
      * whatever was there rather than joining it. */
@@ -12097,15 +12324,21 @@ static void tgt_accept(int i) {
     g_tgt_chip[g_n_tgt_chip].is_channel = g_tgt[i].is_channel;
     snprintf(g_tgt_chip[g_n_tgt_chip].name, sizeof g_tgt_chip[0].name, "%s", g_tgt[i].name);
     g_n_tgt_chip++;
-    g_tgt_query[0] = 0;
+    tf_clear(&g_tgt_q);
+    tgt_touch();
     tgt_rebuild();
 }
 
 /* Returns 1 when the key was the picker's. Called before the composer sees it,
- * and only while the To: field has focus. */
-static int tgt_key(WPARAM vk) {
-    if (vk == VK_DOWN)  { if (g_n_tgt) g_tgt_sel = (g_tgt_sel + 1) % g_n_tgt; return 1; }
-    if (vk == VK_UP)    { if (g_n_tgt) g_tgt_sel = (g_tgt_sel + g_n_tgt - 1) % g_n_tgt; return 1; }
+ * and only while the To: field has focus.
+ *
+ * The QUERY's keys come first and are the field's own (tf_key): caret movement,
+ * selection, clipboard, and deleting in either direction. What the field declines
+ * is the picker's — the list, the chips, and the two keys that leave. Nothing
+ * falls past this function while the To: field has focus. */
+static int tgt_key(HWND hwnd, WPARAM vk, int ctrl, int shift) {
+    if (vk == VK_DOWN)  { if (g_n_tgt) { g_tgt_sel = g_tgt_sel + 1 >= g_n_tgt ? g_n_tgt - 1 : g_tgt_sel + 1; } return 1; }
+    if (vk == VK_UP)    { if (g_n_tgt) { g_tgt_sel = g_tgt_sel > 0 ? g_tgt_sel - 1 : 0; } return 1; }
     /* Enter takes the highlighted candidate — but only if there IS one. With
      * nothing to accept it is not the picker's key, and falls through to the
      * caller, which moves to the message. Tab is never the picker's: it is the
@@ -12115,119 +12348,179 @@ static int tgt_key(WPARAM vk) {
      * roster, so an Enter that kept accepting from it would add whoever
      * happened to be first every time you pressed it — which is what it did. */
     if (vk == VK_RETURN) {
-        if (g_tgt_query[0] && g_n_tgt) { tgt_accept(g_tgt_sel); return 1; }
+        if (g_tgt_q.len && g_n_tgt) { tgt_accept(g_tgt_sel); return 1; }
         return 0;
     }
-    if (vk == VK_ESCAPE) { g_tgt_query[0] = 0; tgt_rebuild(); return 1; }
+    /* Escape clears the query when there is one; with an empty box it is not the
+     * picker's key, and the pane closes on it. */
+    if (vk == VK_ESCAPE) {
+        if (!g_tgt_q.len) return 0;
+        tf_clear(&g_tgt_q); tgt_rebuild(); return 1;
+    }
+    if (vk == VK_TAB) return 0;                 /* the pane's key, not the field's */
+    {
+        int had = g_tgt_q.len;
+        if (tf_key(&g_tgt_q, hwnd, vk, ctrl, shift)) {
+            g_tgt_blink = GetTickCount64();
+            /* A changed query is a new list, so the highlight goes back to the
+             * top: leaving it where it was let Enter accept a row that had
+             * scrolled out from under it and was never on screen. */
+            if (g_tgt_q.len != had) { g_tgt_sel = 0; tgt_rebuild(); }
+            return 1;
+        }
+    }
+    /* Backspace on an empty query takes the last CHIP, which is what every
+     * address field does and what makes a mis-click cheap to undo. It repeats
+     * only after the key is released: holding Backspace to clear a name used to
+     * carry on and eat the recipients behind it. */
     if (vk == VK_BACK) {
-        size_t n = strlen(g_tgt_query);
-        /* Backspace on an empty query takes the last CHIP, which is what every
-         * address field does and what makes a mis-click cheap to undo. */
-        if (n) g_tgt_query[n - 1] = 0;
-        else if (g_n_tgt_chip) g_n_tgt_chip--;
-        tgt_rebuild();
+        if (g_n_tgt_chip && !g_tgt_chip_armed) { g_n_tgt_chip--; g_tgt_chip_armed = 1; tgt_touch(); tgt_rebuild(); }
         return 1;
     }
-    return 0;
+    return 1;
 }
 
 static int tgt_char(WCHAR ch) {
-    if (ch < 0x20) return 0;
-    size_t n = strlen(g_tgt_query);
-    if (n + 4 >= sizeof g_tgt_query) return 1;
-    char u8[8];
-    int b = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, u8, sizeof u8, NULL, NULL);
-    if (b <= 0) return 1;
-    memcpy(g_tgt_query + n, u8, (size_t)b);
-    g_tgt_query[n + b] = 0;
+    if (!tf_char(&g_tgt_q, ch)) return 0;
+    g_tgt_blink = GetTickCount64();
+    g_tgt_sel = 0;
     tgt_rebuild();
     return 1;
 }
 
-/* Draw the field and, when there is something to show, the list under it.
- * Returns the field's height so the caller can place what follows. */
-static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused,
-                      float list_max_h) {
-    g_tgt_box = box;
-    fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
-    stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
-    draw_text(rt, "To:", g_ui_b, rf(box.left + 12, box.top + 8, box.left + 44, box.bottom),
-              OC_COL_MUTED);
-    float x = box.left + 44;
+/* Draw the field. Returns its height: the chips WRAP, so the field grows with
+ * what is in it rather than running its contents out past its own border.
+ *
+ * Every metric here is scaled. Half of them were raw pixels inside a box that was
+ * itself a raw 38, so the parts moved against each other as the text size changed
+ * — the chip got shorter as its label got bigger. */
+static float tgt_draw(gfx *rt, rectf box, int focused) {
+    const float ipad = UIS(8), gap = UIS(6), rowh = UIS(26);
+    float labelw = text_width("To:", g_ui_b) + UIS(8);
+    float x0 = box.left + UIS(12) + labelw;
+    float right = box.right - UIS(12);
+    float qmin = UIS(90);                 /* the query keeps a usable width */
+
+    /* Lay the chips out first, so the field's height is known before it is
+     * filled: a box drawn to one size and packed to another is how the chips got
+     * out of it. */
+    float x = x0, y = box.top + ipad;
+    int rows = 1;
     for (int i = 0; i < g_n_tgt_chip; i++) {
         char label[96];
         snprintf(label, sizeof label, "%s%s", g_tgt_chip[i].is_channel ? "#" : "@",
                  g_tgt_chip[i].name);
-        float w = text_width(label, g_meta) + 30;
-        rectf chip = rf(x, box.top + 7, x + w, box.top + 31);
+        float w = text_width(label, g_meta) + UIS(9) * 2 + UIS(16);
+        if (w > right - x0) w = right - x0;                 /* a very long name */
+        if (x > x0 && x + w > right) { x = x0; y += rowh + UIS(4); rows++; }
+        g_tgt_chip_r[i] = rf(x, y, x + w, y + rowh);
+        x += w + gap;
+    }
+    if (g_n_tgt_chip && right - x < qmin) { x = x0; y += rowh + UIS(4); rows++; }
+    g_tgt_qx = x + UIS(2);
+    g_tgt_qy = y;
+    float h = (float)rows * rowh + (float)(rows - 1) * UIS(4) + ipad * 2;
+    if (h < UIS(38)) h = UIS(38);
+    box.bottom = box.top + h;
+    g_tgt_box = box;
+
+    fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
+    stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+    /* Label, chips and query share ONE centre line per row: every format here is
+     * centred in its rect, and the rects are the rows themselves. */
+    draw_text(rt, "To:", g_ui_b, rf(box.left + UIS(12), box.top + ipad, x0, box.top + ipad + rowh),
+              OC_INK_ON(TH_MUTED, TH_INPUT));
+
+    for (int i = 0; i < g_n_tgt_chip; i++) {
+        char label[96];
+        snprintf(label, sizeof label, "%s%s", g_tgt_chip[i].is_channel ? "#" : "@",
+                 g_tgt_chip[i].name);
+        rectf chip = g_tgt_chip_r[i];
+        rectf close = rf(chip.right - UIS(9) - UIS(16), chip.top, chip.right - UIS(9), chip.bottom);
+        int hot = in_rect(close, g_mouse_x, g_mouse_y);
         fill_round(rt, chip, OC_R_CONTROL, OC_COL_SELECT);
-        draw_text(rt, label, g_meta, rf(chip.left + 10, chip.top + 4, chip.right - 18, chip.bottom),
-                  OC_COL_TEXT);
-        draw_text(rt, "\u00D7", g_meta, rf(chip.right - 16, chip.top + 4, chip.right - 4, chip.bottom),
-                  OC_COL_MUTED);
-        g_tgt_chip_x[i] = rf(chip.right - 20, chip.top, chip.right, chip.bottom);
-        x += w + 6;
+        draw_text(rt, label, g_meta, rf(chip.left + UIS(9), chip.top, close.left, chip.bottom),
+                  OC_INK_ON(TH_TEXT, TH_SELECT));
+        /* The × is the only way to drop a recipient with the mouse, so it says so
+         * on hover rather than being a faint glyph you have to guess at. */
+        if (hot) fill_round(rt, close, OC_R_CONTROL, OC_COL_HOVER);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "×", g_meta, close,
+                  hot ? OC_INK_ON(TH_TEXT, TH_HOVER) : OC_INK_ON(TH_MUTED, TH_SELECT));
+        g_meta->align = ST_ALIGN_LEFT;
+        g_tgt_chip_x[i] = close;
     }
-    /* The query, or the placeholder that says what this field takes. */
-    if (g_tgt_query[0])
-        draw_text(rt, g_tgt_query, g_body, rf(x + 2, box.top + 8, box.right - 12, box.bottom), OC_COL_TEXT);
-    else if (!g_n_tgt_chip)
-        draw_text(rt, "#a-channel, or somebody", g_body,
-                  rf(x + 2, box.top + 8, box.right - 12, box.bottom), OC_COL_FAINT);
 
-    if (!focused || (!g_tgt_query[0] && g_n_tgt_chip)) return box.bottom - box.top;
-    if (!g_n_tgt) tgt_rebuild();
-    if (!g_n_tgt) return box.bottom - box.top;
+    rectf qrow = rf(g_tgt_qx, g_tgt_qy, right, g_tgt_qy + rowh);
+    if (g_tgt_q.len || focused)
+        tf_draw(rt, &g_tgt_q, g_ui, qrow, g_tgt_qx, OC_INK_ON(TH_TEXT, TH_INPUT), focused);
+    if (!g_tgt_q.len && !g_n_tgt_chip)
+        draw_text(rt, "#a-channel, or somebody", g_ui,
+                  rf(g_tgt_qx + UIS(4), qrow.top, right, qrow.bottom),
+                  OC_INK_ON(TH_FAINT, TH_INPUT));
+    return h;
+}
 
-    float rowh = UIS(34), ly = box.bottom + UIS(4);
-    /* THE LIST TAKES ONLY THE ROOM IT WAS GIVEN. It used to size itself to the
-     * number of matches and push the composer down by exactly that much, so a
-     * long list at a large text size pushed the composer -- and the list's own
-     * lower rows -- off the bottom of the window, where they were still drawn
-     * and could not be seen or clicked. A suggestion nobody can reach is worse
-     * than a shorter list, so the list is what gives way. */
+/* The suggestion list, drawn AFTER the composer so it floats over it — like the
+ * composer's own autocomplete, and unlike the version that pushed the message box
+ * (and everything you had written in it) down the pane on every keystroke. */
+static void tgt_list_draw(gfx *rt, const oc_model *m, float top, float bottom, int focused) {
+    for (int i = 0; i < TGT_MAX; i++) g_tgt_rows[i] = rf(0, 0, 0, 0);
+    g_tgt_list = rf(0, 0, 0, 0);
+    if (!focused) return;
+    if (!g_tgt_q.len && g_n_tgt_chip) return;        /* nothing to choose yet */
+    if (!g_n_tgt) return;
+    float rowh = UIS(34), ly = top + UIS(4);
     int shown = g_n_tgt;
-    if (list_max_h > 0) {
-        int fits = (int)((list_max_h - 8) / rowh);
-        if (fits < 1) fits = 1;          /* one row, or the field says nothing */
-        if (shown > fits) shown = fits;
-    }
-    /* The window SCROLLS to hold the selection rather than the match list being
-     * truncated to fit. Up and Down cycle through every match, so a cap alone
-     * would let the selection walk off the end of what is drawn -- pressing
-     * Enter would then accept something the field never showed, which is worse
-     * than the clipping this is fixing. */
-    int first = 0;
-    if (g_tgt_sel >= shown) first = g_tgt_sel - shown + 1;
+    /* The list takes only the room there is, and never less than one row: the
+     * clamp is unconditional, because the case it exists for is exactly the one
+     * where the arithmetic goes negative. */
+    int fits = (int)((bottom - ly - UIS(8)) / rowh);
+    if (fits < 1) fits = 1;
+    if (shown > fits) shown = fits;
+    int first = g_tgt_top;
+    if (g_tgt_sel < first) first = g_tgt_sel;
+    if (g_tgt_sel >= first + shown) first = g_tgt_sel - shown + 1;
     if (first > g_n_tgt - shown) first = g_n_tgt - shown;
     if (first < 0) first = 0;
-    for (int i = 0; i < g_n_tgt; i++)
-        if (i < first || i >= first + shown) g_tgt_rows[i] = rf(0, 0, 0, 0);
-    float lh = (float)shown * rowh + 8;
-    rectf list = rf(box.left, ly, box.right, ly + lh);
-    fill_round(rt, list, OC_R_CONTROL, OC_COL_BASE);
-    stroke_round(rt, list, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    float y = ly + 4;
+    g_tgt_top = first;
+
+    float lh = (float)shown * rowh + UIS(8);
+    rectf list = rf(g_tgt_box.left, ly, g_tgt_box.right, ly + lh);
+    g_tgt_list = list;
+    /* The same surface and drop shadow as the composer's autocomplete and the
+     * menus, so a floating list reads as one kind of thing. */
+    fill_round(rt, rf(list.left + 2, list.top + 4, list.right + 2, list.bottom + 4),
+               OC_R_CONTROL, OC_COL_RAIL);
+    fill_round(rt, list, OC_R_OVERLAY, OC_COL_INPUT);
+    stroke_round(rt, list, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
+    float y = ly + UIS(4);
     for (int i = first; i < first + shown; i++) {
-        rectf row = rf(list.left + 4, y, list.right - 4, y + rowh);
-        if (i == g_tgt_sel) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+        rectf row = rf(list.left + UIS(4), y, list.right - UIS(4), y + rowh);
+        int hot = in_rect(row, g_mouse_x, g_mouse_y);
+        uint32_t surface = TH_INPUT;
+        if (i == g_tgt_sel) { fill_round(rt, row, OC_R_CONTROL, OC_COL_SELECT); surface = TH_SELECT; }
+        else if (hot)       { fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);  surface = TH_HOVER; }
+        float ava = UIS(24), ax = row.left + UIS(8);
+        rectf avr = rf(ax, row.top + (rowh - ava) / 2, ax + ava, row.top + (rowh + ava) / 2);
         if (g_tgt[i].is_channel) {
-            draw_text(rt, "#", g_ui_b, rf(row.left + 12, row.top + 6, row.left + 30, row.bottom),
-                      OC_COL_MUTED);
+            g_ui_b->align = ST_ALIGN_CENTER;
+            draw_text(rt, "#", g_ui_b, avr, OC_INK_ON(TH_MUTED, surface));
+            g_ui_b->align = ST_ALIGN_LEFT;
         } else {
-            draw_user_avatar(rt, m, g_tgt[i].id, g_tgt[i].name,
-                             rf(row.left + 8, row.top + 5, row.left + 32, row.top + 29),
-                             g_meta);
+            draw_user_avatar(rt, m, g_tgt[i].id, g_tgt[i].name, avr, g_meta);
         }
-        draw_text(rt, g_tgt[i].name, g_ui, rf(row.left + 40, row.top + 7, row.right - 140, row.bottom),
-                  OC_COL_TEXT);
+        float subw = g_tgt[i].sub[0] ? UIS(124) : 0;
+        draw_text(rt, g_tgt[i].name, g_ui,
+                  rf(avr.right + UIS(8), row.top, row.right - UIS(12) - subw, row.bottom),
+                  OC_INK_ON(TH_TEXT, surface));
         if (g_tgt[i].sub[0])
             draw_text(rt, g_tgt[i].sub, g_meta,
-                      rf(row.right - 136, row.top + 8, row.right - 12, row.bottom), OC_COL_FAINT);
+                      rf(row.right - UIS(12) - subw, row.top, row.right - UIS(12), row.bottom),
+                      OC_INK_ON(TH_FAINT, surface));
         g_tgt_rows[i] = row;
         y += rowh;
     }
-    return (list.bottom - box.top);
 }
 
 /* ---- New message (REQ-229) -------------------------------------------------
@@ -12241,66 +12534,121 @@ static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused,
  * The composer is THE composer: ed_draw() binds the field to whatever rect it
  * is drawn into, so this pane borrows the same editor, undo stack, IME handling
  * and formatting toolbar rather than growing a second one that would drift. */
-static rectf g_nm_send, g_nm_ed;
+static rectf g_nm_send, g_nm_sched, g_nm_ed, g_nm_attach, g_nm_emoji, g_nm_at;
 static int         g_nm_to_focus = 1;      /* the To: field owns the keys first */
+static WCHAR       g_nm_saved[DRAFT_TEXT_MAX];  /* the text the draft holds */
 static uint64_t    g_nm_wait_uid;          /* a DM we asked for, to send into */
-static char       *g_nm_pending;           /* what to send once it exists */
+static char       *g_nm_pending;
+static ULONGLONG   g_nm_pending_at;   /* when it was handed over, for the deadline */
+static uint64_t    g_nm_pending_when; /* 0 to send on arrival, else the scheduled time */
 
 static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
     char sub[96] = "";
     /* Slack's "Saved a moment ago". Ours says the same thing when there is a
      * draft behind the pane, and nothing when there is not — a promise of
      * safety that is not true yet is worse than no promise. */
-    const char *saved = oc_model_draft(m, 0, 0);
-    if (saved && saved[0]) snprintf(sub, sizeof sub, "Saved");
+    /* "Saved" is about what is IN THE BOX, not about a draft existing: it used to
+     * appear while you typed past what had been written, and to report another
+     * device's unaddressed draft as though it were this one. */
+    {
+        WCHAR now[DRAFT_TEXT_MAX];
+        int n = ed_get(now, DRAFT_TEXT_MAX);
+        if (n < 0) now[0] = 0;
+        const char *stored = oc_model_draft(m, 0, 0);
+        if (stored && stored[0] && lstrcmpW(now, g_nm_saved) == 0)
+            snprintf(sub, sizeof sub, "Saved");
+        else if (now[0])
+            snprintf(sub, sizeof sub, "Saving\u2026");
+    }
     rectf body = view_header(rt, reg, "New message", sub[0] ? sub : NULL);
 
-    float pad = 24;
-    rectf tobox = rf(body.left + pad, body.top + 16, body.right - pad, body.top + 54);
-    float eh = 150;   /* toolbar + text + the action row */
-    /* What is left for the suggestion list once the composer has its room. The
-     * composer is the point of the pane, so it is not the thing that yields. */
-    float list_max = (body.bottom - 16 - eh - 16) - (tobox.bottom + UIS(4.0f));
-    float grew = tgt_draw(rt, m, tobox, g_nm_to_focus, list_max);
+    /* Everything here scales, and the pane's left edge is the header's, not four
+     * pixels off it. */
+    const float pad = UIS(20), gap = UIS(16);
+    rectf tobox = rf(body.left + pad, body.top + gap, body.right - pad, body.top + gap + UIS(38));
+    float toh = tgt_draw(rt, tobox, g_nm_to_focus);
 
-    /* The composer sits below whatever the picker's list took, so an open list
-     * pushes it down rather than covering it. */
-    float ey = tobox.top + grew + 16;
+    /* The composer GROWS with what is in it, up to a limit, exactly as the
+     * conversation's does: a box whose text area shrank as the text size rose
+     * showed less of your message the bigger you asked for it to be. */
+    float ey = tobox.top + toh + gap;
+    float lh = ed_line_h();
+    int lines = 1;
+    if (g_nm_ed.right > g_nm_ed.left) lines = ed_lines(g_nm_ed.right - g_nm_ed.left);
+    if (lines < 3) lines = 3;
+    if (lines > 8) lines = 8;
+    float eh = composer_tb() + COMPOSER_PAD + (float)lines * lh + COMPOSER_GAP +
+               COMPOSER_ACTIONS + COMPOSER_PAD;
+    if (ey + eh > body.bottom - gap) eh = body.bottom - gap - ey;
     rectf edbox = rf(body.left + pad, ey, body.right - pad, ey + eh);
     fill_round(rt, edbox, OC_R_CONTROL, OC_COL_INPUT);
-    stroke_round(rt, edbox, OC_R_CONTROL, g_nm_to_focus ? OC_COL_BORDER : OC_COL_ACCENT, 1.0f);
+    stroke_round(rt, edbox, OC_R_CONTROL, !g_nm_to_focus ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
     if (composer_toolbar_on()) draw_fmt_toolbar(rt, edbox.left, edbox.top, edbox.right);
+
     /* The same three bands as the conversation composer — toolbar, text, actions
      * — because it is the same control. Send sat OUTSIDE the box here, which made
      * the two look like different things doing the same job. */
-    g_nm_ed = rf(edbox.left + COMPOSER_PAD, edbox.top + composer_tb() + 8,
-                 edbox.right - COMPOSER_PAD, edbox.bottom - COMPOSER_ACTIONS - 6);
+    float aty = edbox.bottom - COMPOSER_PAD - COMPOSER_ACTIONS;
+    g_nm_ed = rf(edbox.left + COMPOSER_PAD, edbox.top + composer_tb() + COMPOSER_PAD,
+                 edbox.right - COMPOSER_PAD, aty - COMPOSER_GAP);
+    if (g_nm_ed.bottom < g_nm_ed.top + lh) g_nm_ed.bottom = g_nm_ed.top + lh;
     ed_draw(rt, g_nm_ed);
-    if (!ed_len() && !g_nm_to_focus)
-        draw_text(rt, "Start a new message", g_body,
-                  rf(g_nm_ed.left, g_nm_ed.top, g_nm_ed.right, g_nm_ed.top + 22), OC_COL_FAINT);
+    /* The cue is ed_draw's — composer_cue() answers "Start a new message" for
+     * this view — so it is not painted a second time here, in a colour the
+     * contrast ladder would not have allowed. */
 
     int ready = (g_n_tgt_chip > 0 && ed_len() > 0);
     {
         float sq = COMPOSER_BTN;
-        float cy = edbox.bottom - COMPOSER_PAD + (COMPOSER_ACTIONS - sq) / 2 - COMPOSER_ACTIONS + 6;
-        /* Chrome only: the pane's attach/emoji/mention wiring is the conversation
-         * composer's, and it needs a channel — which this pane does not have until
-         * you have chosen one. Drawn so the control reads the same in both places,
-         * greyed so it does not promise what it cannot do here. */
+        float cy = aty + (COMPOSER_ACTIONS - sq) / 2;
+        /* Attach, emoji and mention: the same three the conversation composer
+         * offers, and they WORK here — the emoji picker and the mention insert
+         * act on this editor, and an attachment waits for the conversation the
+         * send resolves. Drawn disabled only when the pane cannot honour them. */
+        static const int IC[3] = { OC_ICON_PLUS, OC_ICON_SMILE, OC_ICON_AT };
+        rectf *HIT[3] = { &g_nm_attach, &g_nm_emoji, &g_nm_at };
         for (int i = 0; i < 3; i++) {
-            static const int IC[3] = { OC_ICON_PLUS, OC_ICON_SMILE, OC_ICON_AT };
-            rectf b = rf(edbox.left + 6 + sq * i, cy, edbox.left + 6 + sq * (i + 1), cy + sq);
-            draw_lucide(rt, IC[i], rf(b.left + 8, b.top + 8, b.right - 8, b.bottom - 8),
-                        OC_COL_FAINT);
+            rectf b = rf(edbox.left + COMPOSER_GUTTER + sq * i, cy,
+                         edbox.left + COMPOSER_GUTTER + sq * (i + 1), cy + sq);
+            *HIT[i] = b;
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            if (hot) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+            draw_lucide(rt, IC[i], rf(b.left + sq * 0.235f, b.top + sq * 0.235f,
+                                      b.right - sq * 0.235f, b.bottom - sq * 0.235f),
+                        hot ? OC_INK_ON(TH_TEXT, TH_HOVER) : OC_INK_ON(TH_MUTED, TH_INPUT));
         }
-        g_nm_send = rf(edbox.right - 6 - sq, cy, edbox.right - 6, cy + sq);
-        fill_round(rt, g_nm_send, OC_R_CONTROL, ready ? OC_COL_ACCENT : OC_COL_INPUT);
-        if (!ready) stroke_round(rt, g_nm_send, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        draw_lucide(rt, OC_ICON_SEND, rf(g_nm_send.left + 8, g_nm_send.top + 8,
-                                         g_nm_send.right - 8, g_nm_send.bottom - 8),
-                    ready ? 0xFFFFFF : OC_COL_FAINT);
+        /* Send and Send later, the same split button the conversation has — drawn
+         * whether or not it can act, because a control that appears only when it
+         * is usable is a feature nobody finds (REQ-224). */
+        float chev = sq * 0.62f;
+        g_nm_sched = rf(edbox.right - COMPOSER_GUTTER - chev, cy, edbox.right - COMPOSER_GUTTER, cy + sq);
+        g_nm_send  = rf(g_nm_sched.left - sq, cy, g_nm_sched.left, cy + sq);
+        int hot  = ready && in_rect(g_nm_send, g_mouse_x, g_mouse_y);
+        int shot = ready && in_rect(g_nm_sched, g_mouse_x, g_mouse_y);
+        rectf whole = rf(g_nm_send.left, cy, g_nm_sched.right, cy + sq);
+        fill_round(rt, whole, OC_R_CONTROL, ready ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (ready && (hot || shot))
+            fill_round(rt, hot ? g_nm_send : g_nm_sched, OC_R_CONTROL, OC_COL_ACCENT_DIM);
+        if (!ready) stroke_round(rt, whole, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        /* One hairline seam, so the two halves read as two buttons. */
+        fill(rt, rf(g_nm_sched.left, cy + UIS(6), g_nm_sched.left + 1.0f, cy + sq - UIS(6)),
+             ready ? 0xFFFFFF : OC_COL_BORDER);
+        draw_lucide(rt, OC_ICON_SEND, rf(g_nm_send.left + sq * 0.235f, g_nm_send.top + sq * 0.235f,
+                                         g_nm_send.right - sq * 0.235f, g_nm_send.bottom - sq * 0.235f),
+                    ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT));
+        {   /* The same two strokes the conversation's chevron is drawn with, for
+             * the reason given there: the glyph reads as a different family. */
+            uint32_t cc = ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT);
+            float ccx = (g_nm_sched.left + g_nm_sched.right) / 2 + 0.5f;
+            float ccy = cy + sq / 2, d = 3.2f;
+            gfx_line(rt, ccx - d, ccy - d / 2, ccx, ccy + d / 2, 1.6f, cc, 1.0f);
+            gfx_line(rt, ccx, ccy + d / 2, ccx + d, ccy - d / 2, 1.6f, cc, 1.0f);
+        }
     }
+
+    /* LAST, so it floats over the composer instead of pushing it down the pane
+     * on every keystroke. */
+    tgt_list_draw(rt, m, tobox.top + toh, body.bottom - gap, g_nm_to_focus);
 }
 
 /* The pane's own draft (REQ-229, ARCH-101 as amended): channel 0, recipients
@@ -12308,7 +12656,7 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
  * so closing the pane — or the app — does not lose what you wrote before you
  * had decided who it was for. */
 static void newmsg_flush(void) {
-    if (!g_client || g_view != VIEW_NEWMSG) return;
+    if (!g_client || !g_ed_is_newmsg) return;
     WCHAR w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n < 0) n = 0;
@@ -12325,12 +12673,34 @@ static void newmsg_flush(void) {
     oc_client_set_draft_to(g_client, rcpt, b);
     {
         const oc_model *m = model();
-        if (m) oc_model_draft_local((oc_model *)m, 0, 0, b);
+        if (m) oc_model_draft_local_to((oc_model *)m, rcpt, b);
     }
+    lstrcpynW(g_nm_saved, w, DRAFT_TEXT_MAX);      /* what "Saved" is about */
     free(b);
 }
 
-/* Coming back to the pane picks up what was left in it. */
+/* Take the editor for the pane: the conversation's draft is written first, then
+ * the pane's own text is put in. */
+static void nm_editor_take(void) {
+    if (g_ed_is_newmsg) return;
+    if (g_sel) draft_flush(g_sel);
+    g_ed_is_newmsg = 1;
+}
+
+/* Hand it back: the pane's draft is written, then the conversation's text
+ * returns -- otherwise the message you were addressing stays in the composer of
+ * whatever you switched to, ready to be sent there by the next Enter. */
+static void nm_editor_release(void) {
+    if (!g_ed_is_newmsg) return;
+    newmsg_flush();
+    g_ed_is_newmsg = 0;
+    if (g_sel) draft_restore(g_sel);
+    else ed_clear();
+}
+
+/* Coming back to the pane picks up what was left in it — the words AND the
+ * people. Restoring only the words left a draft that could not be sent without
+ * remembering, unaided, who it had been for. */
 static void newmsg_restore(void) {
     const oc_model *m = model();
     const char *d = m ? oc_model_draft(m, 0, 0) : NULL;
@@ -12338,7 +12708,29 @@ static void newmsg_restore(void) {
         WCHAR w[DRAFT_TEXT_MAX];
         to_w(d, w, DRAFT_TEXT_MAX);
         ed_set(w);
-    } else ed_clear();
+        lstrcpynW(g_nm_saved, w, DRAFT_TEXT_MAX);
+    } else { ed_clear(); g_nm_saved[0] = 0; }
+
+    const char *rc = m ? oc_model_draft_recipients(m) : NULL;
+    for (const char *p = rc; p && *p; ) {
+        uint64_t id = strtoull(p, NULL, 10);
+        const char *comma = strchr(p, ',');
+        p = comma ? comma + 1 : NULL;
+        if (!id || g_n_tgt_chip >= TGT_CHIPS_MAX) continue;
+        /* A chip is a name, and the name comes from the roster now rather than
+         * from the draft: somebody renamed since you wrote it should appear as
+         * they are, and somebody who has since been removed should not appear at
+         * all rather than as an id that cannot be sent to. */
+        const oc_member *u = NULL;
+        for (size_t k = 0; m && k < m->n_users; k++)
+            if (m->users[k].user_id == id) { u = &m->users[k]; break; }
+        if (!u || u->disabled || !u->name[0]) continue;
+        g_tgt_chip[g_n_tgt_chip].id = id;
+        g_tgt_chip[g_n_tgt_chip].is_channel = 0;
+        snprintf(g_tgt_chip[g_n_tgt_chip].name, sizeof g_tgt_chip[0].name, "%s", u->name);
+        g_n_tgt_chip++;
+    }
+    tgt_rebuild();
 }
 
 /* Start a new message: the New message view, with its To field taking the keys.
@@ -12346,18 +12738,72 @@ static void newmsg_restore(void) {
  * list's pencil, the Drafts pane's New) so they cannot come to mean different
  * things. */
 static void open_new_message(HWND hwnd) {
+    nm_editor_take();
     g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
     newmsg_restore(); layout_composer(hwnd);
+}
+
+/* Leave the pane the way you came in. The draft is flushed first -- the pane's
+ * own draft, through draft_flush's redirect -- so nothing typed is lost, and the
+ * view returns to the conversation that was open. */
+static void newmsg_close(HWND hwnd) {
+    if (g_view != VIEW_NEWMSG) return;
+    nm_editor_release();
+    g_view = VIEW_HOME;
+    g_nm_to_focus = 1;
+    layout_composer(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 /* Resolve the chips into a conversation and post. A channel goes straight
  * there; people need a DM opened first, which is asynchronous — so the body is
  * held and sent when the channel arrives (the tick watches for it). */
-static void newmsg_send(HWND hwnd) {
-    if (!g_client || !g_n_tgt_chip || !ed_len()) return;
+/* now, or then. `at` is 0 for a send and a wall-clock ms for a schedule. */
+static void newmsg_deliver(uint64_t cid, const char *body, uint64_t at) {
+    if (at) {
+        char when[96], msg[176];
+        oc_client_schedule(g_client, cid, 0, at, body);
+        sch_describe(at, when, sizeof when);
+        snprintf(msg, sizeof msg, "Scheduled for %s \u2014 see Drafts, scheduled & sent.", when);
+        toast_push(msg, 0);
+    } else {
+        oc_client_send(g_client, cid, body);
+    }
+}
+
+/* Send the pane's message, or -- when `at` is non-zero -- schedule it for then.
+ * Both need the same conversation, and when that conversation does not exist yet
+ * both wait for the daemon to create it (REQ-224, REQ-229). */
+static void newmsg_send_at(HWND hwnd, uint64_t at) {
+    if (!g_client) return;
+    /* A refusal SAYS WHY. A send button that does nothing when pressed is
+     * indistinguishable from one that is broken, and this one had three ways to
+     * return in silence. */
+    if (!g_n_tgt_chip) { toast_push("Who is this for? Add a channel or a person above.", 0); return; }
+    if (!ed_len())     { toast_push("There is nothing to send yet.", 0); return; }
     WCHAR w[DRAFT_TEXT_MAX];          /* ED_MAX + 1; asserted where ED_MAX lives */
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n <= 0) return;
+    {   /* Whitespace alone is nothing to say, exactly as the composer holds. */
+        int only_ws = 1;
+        for (int i = 0; i < n; i++)
+            if (w[i] != L' ' && w[i] != L'\t' && w[i] != L'\n' && w[i] != L'\r') { only_ws = 0; break; }
+        if (only_ws) { toast_push("There is nothing to send yet.", 0); return; }
+    }
+    /* An archived channel is read-only (REQ-035). Refuse here, with the message
+     * still in the box, rather than emptying the box and letting the daemon
+     * refuse it into a toast that no longer has the text. */
+    if (g_tgt_chip[0].is_channel) {
+        const oc_model *cm = model();
+        const oc_channel *cc = cm ? oc_model_channel((oc_model *)cm, g_tgt_chip[0].id) : NULL;
+        if (cc && cc->archived) {
+            toast_push("That channel is archived \u2014 it is read-only.", 1);
+            return;
+        }
+    }
+    /* One send at a time. A second press while the first is still waiting for its
+     * conversation used to free the first message and replace it. */
+    if (g_nm_pending) { toast_push("Still sending the last one\u2026", 0); return; }
     int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
@@ -12367,18 +12813,24 @@ static void newmsg_send(HWND hwnd) {
      * draft on its way out, and with the message still in the box it wrote the
      * message being sent into the previous channel's draft. */
     ed_clear();
+    /* The pane is done with the editor: its draft is already being cleared below,
+     * and select_channel() is about to put a conversation's draft in this field. */
+    newmsg_flush();
+    g_ed_is_newmsg = 0;
+    g_nm_pending_when = at;
     if (g_tgt_chip[0].is_channel) {
-        oc_client_send(g_client, g_tgt_chip[0].id, b);
-        select_channel(g_tgt_chip[0].id);
-        g_view = VIEW_HOME;
+        newmsg_deliver(g_tgt_chip[0].id, b, at);
+        if (!at) { select_channel(g_tgt_chip[0].id); g_view = VIEW_HOME; }
     } else if (g_n_tgt_chip == 1) {
         const oc_model *m = model();
         const oc_channel *ex = m ? dm_with(m, g_tgt_chip[0].id) : NULL;
-        if (ex) { oc_client_send(g_client, ex->channel_id, b); select_channel(ex->channel_id);
-                  g_view = VIEW_HOME; }
-        else {   /* ask for the DM, send when it exists */
+        if (ex) {
+            newmsg_deliver(ex->channel_id, b, at);
+            if (!at) { select_channel(ex->channel_id); g_view = VIEW_HOME; }
+        } else {   /* ask for the DM, deliver when it exists */
             free(g_nm_pending); g_nm_pending = strdup(b);
             g_nm_wait_uid = g_tgt_chip[0].id;
+            g_nm_pending_at = GetTickCount64();
             oc_client_open_dm(g_client, g_tgt_chip[0].id);
         }
     } else {
@@ -12387,6 +12839,7 @@ static void newmsg_send(HWND hwnd) {
             if (!g_tgt_chip[i].is_channel) ids[k++] = g_tgt_chip[i].id;
         free(g_nm_pending); g_nm_pending = strdup(b);
         g_nm_wait_uid = 0;
+        g_nm_pending_at = GetTickCount64();
         g_n_group_pending = k;
         for (int i = 0; i < k; i++) g_group_pending[i] = ids[i];
         oc_client_open_group_dm(g_client, ids, k);
@@ -12457,7 +12910,13 @@ static void draw_msgish_row(gfx *rt, const oc_model *m, rectf row,
     draw_lucide(rt, icon, rf(row.left + 12, row.top + 8, row.left + 32, row.top + 28), icon_col);
     const oc_channel *ch = oc_model_channel((oc_model *)m, channel_id);
     char where[128];
-    if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+    if (!channel_id) {
+        /* The New message pane's unaddressed draft (REQ-229). It is a draft with
+         * no conversation yet, which the row used to print as the literal
+         * "#channel" -- a destination nobody has. */
+        const char *rc = oc_model_draft_recipients(m);
+        snprintf(where, sizeof where, "%s", (rc && rc[0]) ? "New message" : "New message (no recipients yet)");
+    } else if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
         const char *pn = oc_model_user_name((oc_model *)m, ch->peer_id);
         snprintf(where, sizeof where, "@%s", (pn && pn[0]) ? pn : "dm");
     } else {
@@ -13638,7 +14097,11 @@ static void ed_insert_n(const WCHAR *s, int n) {
 
 static int  ed_len(void) { return g_ed_len; }
 static int  ed_caret_pos(void) { return g_ed_caret; }
-static int  ed_focused(void) { return g_ed_focus; }
+/* The composer has the keyboard only when nothing in front of it does. In the
+ * New message pane the To: field takes every character while it is focused, so
+ * the editor must not draw a caret there: a caret in the body while the letters
+ * land in the address line is the field lying about where you are typing. */
+static int  ed_focused(void) { return g_ed_focus && !(g_view == VIEW_NEWMSG && g_nm_to_focus); }
 
 static int ed_get(WCHAR *out, int cap) {
     int n = g_ed_len < cap - 1 ? g_ed_len : cap - 1;
@@ -14199,7 +14662,7 @@ static void ed_caret_kill(void) {
 
 /* `cr` is the caret rect in DIPs, as the field draws it. */
 static void ed_caret_sync(rectf cr) {
-    if (!g_ed_focus) { ed_caret_kill(); return; }
+    if (!ed_focused()) { ed_caret_kill(); return; }
     g_caret_placed = 1;
     int h = PX(cr.bottom - cr.top);
     if (h < 1) h = 1;
@@ -14326,8 +14789,12 @@ static void ed_changed(HWND hwnd) {
      * notification's replacement, and the rate limit is the same 2s. */
     DWORD now = GetTickCount();
     if (g_client && g_sel && now - g_last_typing > 2000) {
-        oc_client_typing(g_client, g_sel);
-        g_last_typing = now;
+        /* Not from the New message pane: its text is for somebody who is not in
+         * the channel g_sel names, and they would see you typing into theirs. */
+        if (g_view != VIEW_NEWMSG) {
+            oc_client_typing(g_client, g_sel);
+            g_last_typing = now;
+        }
     }
     ed_repair_orphans();      /* before anything measures or draws */
     ed_remember();
@@ -14444,13 +14911,33 @@ static int ed_key(HWND hwnd, WPARAM vk) {
      * (REQ-229): Enter there accepts a name rather than sending half a message
      * to nobody. */
     if (g_view == VIEW_NEWMSG && g_nm_to_focus) {
-        if (tgt_key(vk)) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        /* Tab, or Enter with nothing left to pick: on to the message itself. */
+        if (tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        /* Tab, or Enter with nothing left to pick: on to the message itself.
+         * Shift+Tab is the other direction and there is nothing before this
+         * field, so it stays -- taking it as "next" made Shift+Tab move forward,
+         * which is the one thing it cannot mean. */
+        if (vk == VK_TAB && mod_down(VK_SHIFT)) return 1;
         if (vk == VK_TAB || vk == VK_RETURN) {
             g_nm_to_focus = 0; ed_focus(hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
             return 1;
         }
+        /* EVERY OTHER KEY STOPS HERE. The field that has the keys is the field
+         * that gets them: letting the rest fall through to the composer meant
+         * Ctrl+V pasted into a message you could not see, Ctrl+A and Delete wiped
+         * it, and the arrows walked a caret that was not drawn -- all while the
+         * ring and the characters were on the To: field. Escape is the one key
+         * the shell may still have (closing the pane, below). */
+        if (vk == VK_ESCAPE) { newmsg_close(hwnd); return 1; }
+        return 1;
+    }
+    if (g_view == VIEW_NEWMSG && vk == VK_ESCAPE) { newmsg_close(hwnd); return 1; }
+    /* Shift+Tab from the message goes back to the recipients: a field you can
+     * only leave is a keyboard trap. */
+    if (g_view == VIEW_NEWMSG && !g_nm_to_focus && vk == VK_TAB && mod_down(VK_SHIFT)) {
+        g_nm_to_focus = 1; tgt_rebuild();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
     }
     if (!g_ed_focus) return 0;
     int ctrl = mod_down(VK_CONTROL);
@@ -14516,6 +15003,10 @@ static int ed_key(HWND hwnd, WPARAM vk) {
          * Enter interchangeable for accepting one. */
         if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
         if (shift) { ed_newline(); changed = 1; break; }
+        /* In the New message pane the message goes where the pane says it goes.
+         * composer_send() posts to g_sel -- the channel that was open before --
+         * so Enter used to file a private message into the last room you read. */
+        if (g_view == VIEW_NEWMSG) { newmsg_send_at(hwnd, 0); return 1; }
         composer_send();
         return 1;
     case VK_TAB:
@@ -14579,6 +15070,11 @@ static int ed_hit(float x, float y) {
 static int ed_mouse_down(HWND hwnd, float x, float y) {
     if (!in_rect(g_ed_box, x, y)) return 0;
     ed_focus(hwnd);
+    /* A click in the body is the whole answer to which field has the keys. The
+     * New message pane's own click handler says so too, but it never runs: this
+     * is called first (WM_LBUTTONDOWN) and consumes the click, which left the
+     * caret in the body while every character went on to the To: query. */
+    g_nm_to_focus = 0;
     ed_intent_clear();
     g_ed_caret = g_ed_anchor = ed_canon(ed_hit(x, y));
     g_ed_dragging = 1;
@@ -14662,7 +15158,11 @@ static void ed_ime_place(HWND hwnd) {
 
 static int ed_ime(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     (void)wp;
-    if (!g_ed_focus) return 0;
+    /* ed_focused(), not g_ed_focus: with the New message pane's To: field focused
+     * the composition belongs to that field, and splicing it into the body put
+     * the recipient's name inside the message with the candidate window over a
+     * field nobody was typing in. */
+    if (!ed_focused()) return 0;
     if (msg == WM_IME_STARTCOMPOSITION) {
         g_ed_comp_len = 0; g_ed_comp[0] = 0;
         ed_invalidate_layout();
@@ -14772,7 +15272,7 @@ static void ed_draw(gfx *rt, rectf box) {
 
     /* The caret: 530ms phases, and it does not blink while typing (ed_changed
      * resets the phase) because a caret that vanishes mid-keystroke reads as lag. */
-    if (g_ed_focus) {
+    if (ed_focused()) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
             ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0) {
@@ -14867,6 +15367,10 @@ enum {
     AT_MENU,          /* payload: a menu_dispatch command */
     AT_VIDEO,         /* payload: a video overlay command (VMC_*) */
     AT_SEND,          /* the composer's send */
+    AT_NMTO,          /* New message: the To: field */
+    AT_NMBODY,        /* New message: the message box */
+    AT_NMCHIP,        /* New message: remove one recipient */
+    AT_NMPICK,        /* New message: accept one match */
     AT_DTAB,          /* payload: drafts tab index */
     AT_ACTFILTER,     /* payload: activity filter index */
     AT_THREAD,        /* payload: thread root id — open it */
@@ -15113,6 +15617,54 @@ static void a11y_publish_scene(const oc_model *m) {
             snprintf(aid, sizeof aid, "composer.format.%s", FMT_AID[i]);
             acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_AID[i], g_fmt_btn[i],
                      ATOK(AT_FMT, i));
+        }
+    }
+
+    if (g_view == VIEW_NEWMSG) {
+        char nm[OC_ACC_NAME_MAX];
+        nm[0] = 0;
+        {
+            size_t used = (size_t)snprintf(nm, sizeof nm, "To:");
+            for (int i = 0; i < g_n_tgt_chip && used + 24 < sizeof nm; i++)
+                used += (size_t)snprintf(nm + used, sizeof nm - used, " %s%s",
+                                         g_tgt_chip[i].is_channel ? "#" : "@", g_tgt_chip[i].name);
+            if (!g_n_tgt_chip) snprintf(nm + used, sizeof nm - used, " nobody chosen yet");
+        }
+        for (int i = 0; i < g_n_tgt_chip && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX], label[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "newmsg.recipient.%d", i);
+            snprintf(label, sizeof label, "Remove %s%s",
+                     g_tgt_chip[i].is_channel ? "#" : "", g_tgt_chip[i].name);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, label, g_tgt_chip_x[i],
+                     ATOK(AT_NMCHIP, i));
+        }
+        acc_push(items, &n, OC_ACC_COMPOSER, "newmsg.to", nm, g_tgt_box, ATOK(AT_NMTO, 0));
+        for (int i = 0; i < g_n_tgt && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "newmsg.match.%d", i);
+            if (g_tgt_rows[i].right <= g_tgt_rows[i].left) continue;
+            acc_push(items, &n, OC_ACC_BUTTON, aid, g_tgt[i].name, g_tgt_rows[i],
+                     ATOK(AT_NMPICK, i));
+        }
+        acc_push(items, &n, OC_ACC_COMPOSER, "newmsg.message", "Message", g_nm_ed,
+                 ATOK(AT_NMBODY, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "newmsg.send",
+                 (g_n_tgt_chip && ed_len()) ? "Send" :
+                 !g_n_tgt_chip ? "Send, nobody chosen yet" : "Send, nothing to send",
+                 g_nm_send, ATOK(AT_SEND, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "newmsg.schedule",
+                 (g_n_tgt_chip && ed_len()) ? "Send later" : "Send later, nothing to schedule",
+                 g_nm_sched, ATOK(AT_SCHEDMENU, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "newmsg.emoji", "Emoji", g_nm_emoji, ATOK(AT_EMOJI, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "newmsg.mention", "Mention someone", g_nm_at,
+                 ATOK(AT_MENTION, 0));
+        static const char *NFMT_AID[FMT_COUNT] = {
+            "bold", "italic", "strike", "code", "quote", "bullets", "numbers"
+        };
+        for (int i = 0; i < FMT_COUNT && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "newmsg.format.%s", NFMT_AID[i]);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, NFMT_AID[i], g_fmt_btn[i], ATOK(AT_FMT, i));
         }
     }
 
@@ -15388,7 +15940,13 @@ static void sched_menu_run(HWND hwnd, int cmd) {
  * custom card, so a message scheduled either way leaves the composer, its draft
  * and the toast in the same state. */
 static void sched_at(HWND hwnd, uint64_t at) {
-    if (!g_client || !g_sel || ed_len() <= 0) return;
+    if (!g_client || ed_len() <= 0) return;
+    /* From the New message pane the destination is the pane's, not g_sel -- and
+     * it is the same journey as a send, with a time on it: the conversation is
+     * resolved, created if it does not exist, and the message goes when it does.
+     * Send later used to refuse anyone you had not already written to. */
+    if (g_view == VIEW_NEWMSG) { newmsg_send_at(hwnd, at); return; }
+    if (!g_sel) return;
     WCHAR w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n <= 0) return;
@@ -15418,6 +15976,11 @@ static void sched_at(HWND hwnd, uint64_t at) {
 
 static void composer_send(void) {
     crumb("composer_send ch=%llu", (unsigned long long)g_sel);
+    /* Not the New message pane's send. That pane addresses its own recipients
+     * (newmsg_send); reaching this from there -- through a stale button rect, an
+     * accessibility action or a key -- posted the message to whatever channel was
+     * last open. One send per pane, and this is the conversation's. */
+    if (g_view == VIEW_NEWMSG) { newmsg_send_at(GetActiveWindow(), 0); return; }
     if (!g_client || !g_sel) return;
     /* Refuse locally in an archived channel so the text is not lost to a server
      * rejection you have to read in a toast (REQ-035). The daemon refuses it
@@ -15594,6 +16157,16 @@ static int window_is_covered(void) {
            g_view == VIEW_SIGNIN;
 }
 
+/* The conversation composer's buttons are assigned by draw_composer and by
+ * nothing else, so in any view that does not draw it they keep the rects they had
+ * in the last conversation -- live, invisible, and over empty background. One of
+ * them is Send, which posts to g_sel: in the New message pane a click on blank
+ * space filed the message you were addressing into the channel you had left. */
+static void composer_btns_clear(void) {
+    g_send_btn = g_sched_btn = g_attach_btn = g_video_btn = rf(0, 0, 0, 0);
+    g_emoji_btn = g_at_btn = rf(0, 0, 0, 0);
+}
+
 static void layout_composer(HWND hwnd) {
     layout_find(hwnd);
     /* The composer is drawn, not moved: this computes the TEXT RECT that
@@ -15606,11 +16179,12 @@ static void layout_composer(HWND hwnd) {
      * the conversation rule below must not take it away: without this, every
      * relayout dropped focus and the keys went nowhere — the pane looked
      * focused and swallowed what you typed. */
-    if (g_view == VIEW_NEWMSG && !window_is_covered()) return;
+    if (g_view == VIEW_NEWMSG && !window_is_covered()) { composer_btns_clear(); return; }
     if (!main_is_conversation() || window_is_covered()) {
         g_ed_box = rf(0, 0, 0, 0);
         for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0);
         g_fmt_hover = -1;
+        composer_btns_clear();
         g_ed_focus = 0;
         return;
     }
@@ -17538,21 +18112,59 @@ static int on_click(HWND hwnd, int x, int y) {
         if (!in_rect(g_pal_panel, x, y)) palette_close(hwnd);
         return 1;
     }
-    /* The New Message pane owns its clicks (REQ-229), like every other pane. */
-    if (g_view == VIEW_NEWMSG) {
+    /* The New Message pane owns the clicks IN IT (REQ-229), like every other pane
+     * -- the main region only. Claiming the whole window swallowed the sidebar
+     * and the rail, so in this view you could not click your way out of it. */
+    if (g_view == VIEW_NEWMSG && !window_is_covered() && (float)x > RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_tgt_chip; i++)
             if (in_rect(g_tgt_chip_x[i], x, y)) {
                 for (int k = i; k + 1 < g_n_tgt_chip; k++) g_tgt_chip[k] = g_tgt_chip[k + 1];
-                g_n_tgt_chip--; tgt_rebuild(); return 1;
+                g_n_tgt_chip--; tgt_touch(); tgt_rebuild(); return 1;
             }
         if (g_nm_to_focus)
             for (int i = 0; i < g_n_tgt; i++)
                 if (in_rect(g_tgt_rows[i], x, y)) { tgt_accept(i); return 1; }
-        if (in_rect(g_tgt_box, x, y)) { g_nm_to_focus = 1; tgt_rebuild(); return 1; }
-        if (in_rect(g_nm_send, x, y)) { newmsg_send(hwnd); return 1; }
+        /* A click in the To: field puts the CARET where the pointer is, like any
+         * text field; clicking it used only to mean "focus", so there was nowhere
+         * to type but the end. */
+        if (in_rect(g_tgt_box, x, y)) {
+            g_nm_to_focus = 1;
+            g_tgt_q.caret = g_tgt_q.anchor = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)x);
+            g_tgt_blink = GetTickCount64();
+            tgt_rebuild();
+            return 1;
+        }
+        if (in_rect(g_nm_send, x, y)) { newmsg_send_at(hwnd, 0); return 1; }
+        if (in_rect(g_nm_sched, x, y)) {
+            if (g_n_tgt_chip && ed_len()) sched_menu_open(x, y);
+            else toast_push("Choose who this is for, and write something to send.", 0);
+            return 1;
+        }
+        if (in_rect(g_nm_emoji, x, y)) { g_nm_to_focus = 0; ed_focus(hwnd); picker_open(hwnd, 0); return 1; }
+        if (in_rect(g_nm_at, x, y))    { g_nm_to_focus = 0; ed_focus(hwnd); ed_insert(L"@"); ac_rebuild(); return 1; }
+        if (in_rect(g_nm_attach, x, y)) {
+            /* An attachment needs a conversation to hang on, and this pane does
+             * not have one until the send resolves it. Say so, rather than
+             * opening a file dialog whose result has nowhere to go. */
+            toast_push("Choose who this is for first \u2014 then you can attach a file.", 0);
+            return 1;
+        }
         if (in_rect(g_nm_ed, x, y)) { g_nm_to_focus = 0; ed_focus(hwnd); ed_mouse_down(hwnd, (float)x, (float)y); return 1; }
         for (int i = 0; i < FMT_COUNT; i++)
-            if (in_rect(g_fmt_btn[i], x, y)) { ed_format(i); ed_changed(hwnd); return 1; }
+            if (in_rect(g_fmt_btn[i], x, y)) {
+                /* Acting on the message means being in it: the toolbar formatted
+                 * the body while the keys stayed on the To: field. */
+                g_nm_to_focus = 0; ed_focus(hwnd);
+                ed_format(i); ed_changed(hwnd); return 1;
+            }
+        /* A click on the pane's own background is not nothing: it dismisses the
+         * open suggestion list, the way clicking off any popover does. The list
+         * stayed open under a click that appeared to do nothing at all. */
+        if (g_nm_to_focus && g_n_tgt) { g_nm_to_focus = 0; ed_focus(hwnd); return 1; }
+        /* THE PANE KEEPS THE CLICK. Below this point are other views' handlers,
+         * including the conversation composer's Send -- a fall-through here sent
+         * the message to the wrong channel from a button that is not on screen. */
+        return 1;
     }
     /* The Drafts pane's tabs, its Cancel buttons and its empty-state button. */
     if (g_view == VIEW_DRAFTS) {
@@ -17580,7 +18192,12 @@ static int on_click(HWND hwnd, int x, int y) {
                 oc_client_cancel_scheduled(g_client, g_listrows[i].mid);
                 return 1;
             }
-            if (in_rect(g_listrows[i].row, x, y) && g_listrows[i].cid) {
+            if (in_rect(g_listrows[i].row, x, y)) {
+                /* An unaddressed draft has no conversation to open: it opens the
+                 * pane it was written in, which is where it can be finished. The
+                 * row used to be dead because the click was gated on a channel id
+                 * it does not have. */
+                if (!g_listrows[i].cid) { open_new_message(hwnd); return 1; }
                 select_channel(g_listrows[i].cid);
                 g_view = VIEW_HOME;
                 return 1;
@@ -20498,6 +21115,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
          * failed the whole thing, and ARCH-82 says this GUI is affordance-driven.
          * The picker is the same list of people, with a tick. */
         close_overlays();
+        nm_editor_take();
         g_view = VIEW_NEWMSG; g_nm_to_focus = 1;
         tgt_clear();
         newmsg_restore();
@@ -20909,6 +21527,22 @@ static void test_dump(const char *path) {
      * looked, from here, exactly like one that never started. `started` counts
      * clients connect_start began, and `si_err` is the reason the sign-in view
      * gives, which was once dropped on the way to it. */
+    /* The New message pane, as one line: which field has the keys, who it is for,
+     * what the query holds and where its caret is, and whether a send is waiting
+     * for a conversation to exist. Every one of those was a defect that could not
+     * be asserted before it could be read. */
+    if (g_view == VIEW_NEWMSG || g_nm_pending) {
+        char chips[256] = "";
+        size_t used = 0;
+        for (int i = 0; i < g_n_tgt_chip && used + 24 < sizeof chips; i++)
+            used += (size_t)snprintf(chips + used, sizeof chips - used, "%s%s%s",
+                                     used ? "," : "", g_tgt_chip[i].is_channel ? "#" : "@",
+                                     g_tgt_chip[i].name);
+        fprintf(f, "newmsg focus=%s chips=\"%s\" q=\"%s\" caret=%d sel=%d matches=%d "
+                   "body=%d pending=%d\n",
+                g_nm_to_focus ? "to" : "body", chips, g_tgt_q.buf, g_tgt_q.caret,
+                g_tgt_sel, g_n_tgt, ed_len(), g_nm_pending ? 1 : 0);
+    }
     fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
             g_main_hwnd ? IsWindowVisible(g_main_hwnd) : 0, g_clients_started, g_si_ws, g_si_err);
     /* Modal + the settings a form modal can change, so snapshot/commit/restore is
@@ -21225,6 +21859,11 @@ static void test_dump(const char *path) {
             g_tgt_box.left, g_tgt_box.top, g_tgt_box.right, g_tgt_box.bottom,
             g_nm_send.left, g_nm_send.top, g_nm_send.right, g_nm_send.bottom,
             g_nm_to_focus, g_n_tgt_chip, g_n_tgt);
+    /* The first suggestion row, so a test can click a match rather than measure a
+     * screenshot for it -- the list floats over the composer, and a click landing
+     * in the composer instead is exactly the defect this makes assertable. */
+    fprintf(f, "newmsgrow0 %.0f,%.0f,%.0f,%.0f\n",
+            g_tgt_rows[0].left, g_tgt_rows[0].top, g_tgt_rows[0].right, g_tgt_rows[0].bottom);
     /* Pausing (REQ-278): whether MY notifications are paused and until
      * when, plus how many people the roster shows as not-to-be-disturbed — the
      * fact is a drawn crescent, which no assertion could read from pixels. */
@@ -22281,9 +22920,7 @@ static void test_poll(HWND hwnd) {
         /* Open the New Message pane exactly as its entry points do (REQ-229) —
          * a verb rather than a click at a measured coordinate, because the
          * pencil moves with the sidebar. */
-        g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
-        newmsg_restore();
-        layout_composer(hwnd);
+        open_new_message(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
     } else if (!strcmp(verb, "dmcompose")) {
@@ -22487,6 +23124,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 permalink_follow(hwnd, u);
             }
             files_view_sync();
+            /* One owner, enforced: the pane can be left by 40 different lines
+             * that only set g_view. Whichever it was, the editor comes back to
+             * the conversation here rather than carrying an unaddressed message
+             * into a composer that would send it somewhere else. */
+            if (g_ed_is_newmsg && g_view != VIEW_NEWMSG) {
+                nm_editor_release();
+                layout_composer(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (!g_ed_is_newmsg && g_view == VIEW_NEWMSG) {
+                /* And the way IN: arriving by a route that only sets the view
+                 * left the pane holding the previous conversation's draft, with
+                 * the keys wherever they happened to be -- so the first thing
+                 * typed went into someone else's message. */
+                nm_editor_take();
+                g_nm_to_focus = 1;
+                tgt_clear();
+                newmsg_restore();
+                layout_composer(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             /* The debounced draft write. On this tick rather than a
              * timer of its own: there is already one heartbeat driving the
              * client, and a second would be a second thing to start, stop and
@@ -22603,17 +23260,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             /* A New Message addressed to people had to wait for the DM to be
              * created (REQ-229). It exists now, so the message goes. */
+            /* A HELD MESSAGE HAS A DEADLINE. It waits for a conversation the
+             * daemon has to create, and if that never arrives -- refused, offline,
+             * a user who has been removed -- the old code waited forever with the
+             * composer already emptied, which looks exactly like a message that
+             * was sent. The text comes back into the pane instead, with the
+             * reason, so it can be sent again. */
+            if (g_nm_pending && GetTickCount64() - g_nm_pending_at > 15000) {
+                WCHAR back[DRAFT_TEXT_MAX];
+                to_w(g_nm_pending, back, DRAFT_TEXT_MAX);
+                free(g_nm_pending); g_nm_pending = NULL;
+                g_nm_wait_uid = 0; g_n_group_pending = 0;
+                open_new_message(hwnd);
+                ed_set(back);
+                ed_changed(hwnd);
+                toast_push("That conversation could not be opened \u2014 your message is back here.", 1);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             if (g_nm_pending) {
                 const oc_channel *nc = NULL;
                 if (g_nm_wait_uid) nc = dm_with(m, g_nm_wait_uid);
                 else if (g_n_group_pending) nc = group_dm_with(m, g_group_pending, g_n_group_pending);
                 if (nc) {
-                    oc_client_send(g_client, nc->channel_id, g_nm_pending);
+                    newmsg_deliver(nc->channel_id, g_nm_pending, g_nm_pending_when);
+                    int was_scheduled = g_nm_pending_when != 0;
+                    g_nm_pending_when = 0;
                     free(g_nm_pending); g_nm_pending = NULL;
                     g_nm_wait_uid = 0; g_n_group_pending = 0;
-                    g_view = VIEW_HOME;
-                    select_channel(nc->channel_id);
-                    layout_composer(hwnd);
+                    /* Follow the message into its conversation only if the user
+                     * is still where they pressed send. Doing it unconditionally
+                     * yanked them out of whatever they had started reading in the
+                     * second the daemon took to answer. */
+                    if (!was_scheduled && (g_view == VIEW_NEWMSG || g_view == VIEW_HOME)) {
+                        g_view = VIEW_HOME;
+                        select_channel(nc->channel_id);
+                        layout_composer(hwnd);
+                    }
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
             }
@@ -23196,6 +23878,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         wpt.x = (LONG)DIPF(wpt.x); wpt.y = (LONG)DIPF(wpt.y);
         float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         const oc_model *wm = model();
+        if (g_view == VIEW_NEWMSG && g_n_tgt &&
+            in_rect(g_tgt_list, (float)wpt.x, (float)wpt.y)) {
+            /* A list with more matches than rows needs a mouse way through it;
+             * the arrow keys were the only one. */
+            g_tgt_top -= (int)(dy / 48.0f);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_sch_open && in_rect(g_sch_tlist, (float)wpt.x, (float)wpt.y)) {
             g_sch_tscroll -= dy;
             InvalidateRect(hwnd, NULL, FALSE);
@@ -23300,11 +23990,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDBLCLK: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
         g_dbl_ms = GetTickCount64(); g_dbl_x = mx; g_dbl_y = my;
-        if (!window_is_covered() && ed_select_word(hwnd, (float)mx, (float)my)) {
+        if (!window_is_covered() &&
+            !(g_view == VIEW_NEWMSG && in_rect(g_tgt_list, (float)mx, (float)my)) &&
+            ed_select_word(hwnd, (float)mx, (float)my)) {
             InvalidateRect(hwnd, NULL, FALSE); return 0;
         }
         if (!any_overlay(model()) && selection_word(hwnd, mx, my, 0)) {
             InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
+        /* A double-click in the To: field takes the word under it, as in any text
+         * field; anywhere else in the pane it is an ordinary click. Both used to
+         * be discarded here, so the second click of a double removed one chip of
+         * two and a double-click on a match did nothing. */
+        if (g_view == VIEW_NEWMSG && !window_is_covered()) {
+            if (in_rect(g_tgt_box, (float)mx, (float)my) && g_nm_to_focus && g_tgt_q.len) {
+                int at = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)mx);
+                g_tgt_q.anchor = tf_word_left(&g_tgt_q, at);
+                g_tgt_q.caret  = tf_word_right(&g_tgt_q, at);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            on_click(hwnd, mx, my);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
         }
         return 0;
     }
@@ -23328,7 +24036,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* The composer first: it is a self-drawn field now, so a click in it
          * places the caret rather than being swallowed by a child window. Before
          * on_click, or the transcript's selection would start under it. */
-        if (!window_is_covered() && ed_mouse_down(hwnd, (float)mx, (float)my)) return 0;
+        /* The composer claims clicks in its own rect before anything else — but
+         * not through a popover drawn ON TOP of it. The New message pane's
+         * suggestion list floats over the composer, so a click on a match landed
+         * in the message box instead and the recipient was never added. */
+        if (!window_is_covered() &&
+            !(g_view == VIEW_NEWMSG && in_rect(g_tgt_list, (float)mx, (float)my)) &&
+            ed_mouse_down(hwnd, (float)mx, (float)my)) return 0;
         if (!any_overlay(model()) && pt_in(g_sbar_thumb, mx, my)) {
             g_sbar_drag = 1; g_sbar_grab = (float)my - g_sbar_thumb.top;
             SetCapture(hwnd);
@@ -23348,9 +24062,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Hand over a link, I-BEAM over the composer's text: the field is a
          * custom control, so nothing else will ever ask for the text cursor —
          * the I-beam SDL cursor existed from day one and had no caller. */
-        cursor_want(g_link_hover[0] ? 2
-                    : (!pointer_blocked() && main_is_conversation() &&
-                       in_rect(g_ed_box, (float)mx, (float)my)) ? 1 : 0);
+        /* Both text fields in the New message pane are text fields, so both take
+         * the I-beam -- the pane is not a conversation, which is the only reason
+         * the pointer stayed an arrow over a box you can type in. */
+        int over_text = !pointer_blocked() &&
+            ((main_is_conversation() && in_rect(g_ed_box, (float)mx, (float)my)) ||
+             (g_view == VIEW_NEWMSG && (in_rect(g_nm_ed, (float)mx, (float)my) ||
+                                        in_rect(g_tgt_box, (float)mx, (float)my))));
+        cursor_want(g_link_hover[0] ? 2 : over_text ? 1 : 0);
         /* Recorded before anything consumes the message, so shared chrome can ask
          * where the pointer is without every widget tracking its own hover. */
         if (mx != g_mouse_x || g_mouse_y != my) {
@@ -23606,6 +24325,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
      * with the SDL cursor (and does not chain), so the app's cursor choice is
      * pushed through SDL_SetCursor from the hover machine instead —
      * cursor_apply(), called from WM_MOUSEMOVE. */
+    case WM_KEYUP:
+        /* Backspace deletes ONE chip per press. The repeat that follows a held
+         * key used to walk backwards through the recipients, so clearing a
+         * mistyped name took the people behind it with it. */
+        if (wp == VK_BACK) g_tgt_chip_armed = 0;
+        break;
     case WM_KEYDOWN:
         /* Ctrl+C copies the TRANSCRIPT selection — but only when there is one,
          * and only unshifted. It used to claim the key outright, which meant
@@ -23707,6 +24432,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case AT_SEND:      composer_send(); break;
+        case AT_NMTO:      g_nm_to_focus = 1; tgt_rebuild(); break;
+        case AT_NMBODY:    g_nm_to_focus = 0; ed_focus(hwnd); break;
+        case AT_NMCHIP:
+            if ((int)arg < g_n_tgt_chip) {
+                for (int k = (int)arg; k + 1 < g_n_tgt_chip; k++) g_tgt_chip[k] = g_tgt_chip[k + 1];
+                g_n_tgt_chip--; tgt_touch(); tgt_rebuild();
+            }
+            break;
+        case AT_NMPICK:    tgt_accept((int)arg); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
         case AT_ACTFILTER: {
@@ -23797,7 +24531,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case AT_SCHEDMENU:
             /* The same menu the chevron opens, built where it is built — a second
              * copy of its items here would be a second thing to keep in step. */
-            if (composer_ready())
+            if (g_view == VIEW_NEWMSG) {
+                if (g_n_tgt_chip && ed_len())
+                    sched_menu_open((g_nm_sched.left + g_nm_sched.right) / 2,
+                                    (g_nm_sched.top + g_nm_sched.bottom) / 2);
+            } else if (composer_ready())
                 sched_menu_open((g_sched_btn.left + g_sched_btn.right) / 2,
                                 (g_sched_btn.top + g_sched_btn.bottom) / 2);
             break;
@@ -23887,6 +24625,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < g_n_wss; i++)
                 if (g_wss[i].client && g_wss[i].client != g_client)
                     pending += oc_client_outbox_pending(g_wss[i].client);
+            /* A New message waiting for its conversation to exist is unsent too.
+             * It is not in the outbox -- it has nowhere to go yet -- so it was
+             * discarded on quit without a word. */
+            if (g_nm_pending) pending++;
             if (pending > 0) {
                 WCHAR w[320]; char line[320];
                 snprintf(line, sizeof line,

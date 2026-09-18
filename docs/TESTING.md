@@ -675,6 +675,32 @@ the defect.
 Like the smoke suite it is not in CI, for the same reason, and it is not the
 pre-push gate — run it when a change touches how the client starts.
 
+## Reading the New message harness
+
+`scripts/gui_newmsg.sh` asks the three questions the New message pane (REQ-229)
+answered wrongly for its whole life, in 23 checks on its own fixture daemon and
+port (9520):
+
+- **Does the field that looks focused get the keys?** Characters, and the keys
+  that are not characters — Delete, Ctrl+A, Ctrl+V — while the To: field has
+  focus. They used to fall through to the message body behind it, so Ctrl+V
+  pasted into a message nobody could see and Ctrl+A then Delete wiped it.
+- **Does the message go where the pane says?** It posts into `#general` first, so
+  a wrong send has somewhere visible to land, then addresses a message to bob and
+  presses Enter. `#general`'s message count must not move and the DM's must.
+- **Does what you typed survive?** Leaving and returning must bring back the words
+  **and** the recipients, and the pane's text must never become the selected
+  conversation's draft.
+
+It reads the dump's `newmsg` line — `focus= chips= q= caret= sel= matches= body=
+pending=` — which exists so those states can be asserted rather than described.
+Both halves of the pane are in it: which field owns the keyboard, who the message
+is addressed to, what the query holds and where its caret sits.
+
+Like the other GUI harnesses it is not in CI (the daemon is Linux-only and
+GitHub's Windows runners cannot host it). Run it when a change touches the pane,
+the target picker, or the composer's key routing.
+
 ## Reading the GUI smoke
 
 `scripts/gui_smoke.sh` answers one question —
