@@ -16806,9 +16806,12 @@ static void listen_drop_player(void) {
 }
 
 /* Turn talking mode on for the conversation on screen, or off. */
+static int g_listen_heard;   /* a message finished playing since the channel was last marked read */
+
 static void listen_set(HWND hwnd, int on) {
     if (!g_client) return;
     listen_drop_player();
+    g_listen_heard = 0;
     oc_client_listen(g_client, on ? g_sel : 0, on);
     if (on) toast_push("Reading new messages aloud", 0);
     oc_a11y_announce(on ? "Reading new messages aloud" : "Stopped reading aloud");
@@ -16829,11 +16832,25 @@ static void listen_tick(HWND hwnd, const oc_model *m) {
         if (st.state == OC_PLAYER_ENDED || st.state == OC_PLAYER_ERROR) {
             listen_drop_player();
             oc_client_listen_done(g_client);      /* on to the next message */
+            g_listen_heard = 1;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return;
     }
     if (!ch) return;
+
+    /* Heard is read. Once everything that arrived has been spoken -- nothing
+     * queued, fetching or waiting to play -- the conversation is caught up, and
+     * its unread badge would be claiming otherwise. Not before: a message still
+     * in the queue has not been heard, and marking read is the whole channel. */
+    if (g_listen_heard && !oc_model_listen_queued(m) && !m->listen_fetching && !m->listen_ready) {
+        g_listen_heard = 0;
+        const oc_channel *lc = oc_model_channel((oc_model *)m, ch);
+        if (lc && lc->unread) {
+            oc_client_mark_read(g_client, ch);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+    }
 
     uint8_t *mp4 = NULL;
     size_t len = 0;
