@@ -142,6 +142,21 @@ framework, and OpenChime follows suit.
   camera and tone, and `ffprobe` (installed in CI as a validator, never linked)
   checks the file it writes; the player plays, seeks and copes with a slow
   decoder. `tests/test_video_media.c` covers the protocol and daemon side.
+- **Voice input** (ARCH-112) — `tests/test_voice.c`: the segmenter over
+  synthetic voiced sound with known pauses (free talk, the cap, push to talk) and
+  the ERLE harness (AUDIO.md §6.4: converged, 100 ppm drift, double-talk);
+  `tests/test_stt.c`: the tokenizer, spoken mentions and the recognition worker
+  against a stub engine (order, a full queue, idle release, the token ceiling);
+  `tests/test_protocol.c` round-trips the `STT_*` frames; `itest_netloop` drives
+  the daemon's vertical — the capability and cap at auth; push to talk answered to
+  the speaker only; free talk posted through the send path, in order, idempotently,
+  refused for a non-member or an archived channel; nothing heard, recognition
+  failing, over the cap, a chunk out of order; a segment still being heard when
+  its speaker leaves never posted; the per-connection rate; and, in loops of their
+  own, voice input turned off and with no engine (as when its data is missing);
+  `test_client_core` shows free talk arriving as `BROADCAST`s with no client
+  `SEND`, push to talk returning words and sending nothing, and one microphone
+  owner.
 - **Rate limiter** (REQ-190/191) and the **connection state machine**
   ([PROTOCOL.md](./PROTOCOL.md) §10) — legal transitions accepted, illegal
   frames rejected with the expected reason code.
@@ -287,12 +302,16 @@ Jobs:
 Everything runs non-interactively and communicates pass/fail purely through
 exit codes, so no scenario depends on a human reading output.
 
-**Audio.** `tests/test_audio.c` covers the **relay sidecar only** — forwarding,
-call isolation, and `REVOKE`. Echo cancellation has **no harness**: AUDIO.md §6.4
-designs one (a synthetic room impulse response convolved with a far-end signal,
-near-end speech mixed in, and **ERLE** in dB as the measured output, with clock
-drift injected by resampling one side) and sequences it with the audio client,
-which does not exist. It is a design, not a test that runs.
+**Audio.** `tests/test_audio.c` covers the **relay sidecar** — forwarding, call
+isolation, and `REVOKE`. Echo cancellation is measured by the ERLE harness in
+`tests/test_voice.c` (AUDIO.md §6.4), which voice input built: a synthetic room
+impulse response over a far-end signal, near-end speech mixed in, clock drift
+injected by resampling one side, and ERLE in dB asserted.
+
+**Speech.** The `build` job renders a sentence with read-aloud and requires
+`openchimed --stt-hear` to hear its words, so each speech feature checks the other
+by content; the release repeats it on the stripped binary and on the installed
+`.deb`. The same job builds `make TTS=0 STT=0` and starts it.
 
 New unit-test binaries are added to the `build` job's `make test`.
 
@@ -743,6 +762,21 @@ intent and an intent that was never sent look identical. Prefer asserting on
 `error_seq`, which only ever increments — `last_error` is cleared on
 `OC_EV_CONNECTED`/`OC_EV_AUTH_OK`, so a reconnect between the failure and the
 check can erase the evidence a wait is polling for.
+
+## Reading the voice harness
+
+`scripts/gui_voice.sh` drives voice input in the Win32 client end to end against
+its own fixture daemon (port 9510), with real recognition: read-aloud renders a
+sentence, and `OPENCHIME_TEST_AUDIO=synthetic` with `OPENCHIME_TEST_MIC=<wav>`
+makes the client's microphone speak it. It asserts push to talk by the held key,
+by UI Automation and by the mouse (words in the composer, nothing sent), free talk
+(the words posted, the composer untouched), that leaving the conversation and
+opening the video recorder end a session, that a blocked microphone
+(`OPENCHIME_TEST_AUDIO=mic-denied`) is reported, and that with `OPENCHIME_STT=0`
+there are no controls at all. It reads the dump's `dictate` line — `avail=
+offered= on= mode= hold= sent= answered= words= err=` and the button rects — and
+its `toast[n]` lines. Not in CI, for the smoke's reason. Run it when a change
+touches voice input, the composer's controls or the device layer.
 
 ## The visual audit — checking a render with no render to compare it to
 

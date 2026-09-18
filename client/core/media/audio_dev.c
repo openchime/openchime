@@ -72,6 +72,97 @@ static size_t ring_pop(ring *r, int16_t *s, size_t n) {
     return n;
 }
 
+/* ---- the far-end reference -------------------------------------------------------- */
+
+/* One slot per open playback device: its output, mono at 16 kHz, in a ring
+ * indexed by sample number since the slot's clock base. Each slot has exactly
+ * one producer (its device's callback, or the synthetic sink), so a reader can
+ * sum the slots without a lock. */
+#define REF_SLOTS 4
+#define REF_CAP   32768                       /* 2 s at 16 kHz; a power of two */
+typedef struct {
+    atomic_int           used;
+    _Atomic int64_t      base_us;             /* media clock of sample 0 */
+    atomic_uint_fast64_t written;             /* samples produced */
+    int16_t              buf[REF_CAP];
+    /* The producer's resampler: an average over each output sample's span. */
+    uint64_t             acc_pos;
+    int64_t              acc_sum;
+    int                  acc_n;
+} ref_slot;
+static ref_slot g_ref[REF_SLOTS];
+
+static int ref_claim(void) {
+    for (int i = 0; i < REF_SLOTS; i++) {
+        int zero = 0;
+        if (atomic_compare_exchange_strong(&g_ref[i].used, &zero, 2)) {   /* 2: being reset */
+            atomic_store(&g_ref[i].base_us, 0);
+            atomic_store(&g_ref[i].written, 0);
+            g_ref[i].acc_pos = 0;
+            g_ref[i].acc_sum = 0;
+            g_ref[i].acc_n = 0;
+            atomic_store(&g_ref[i].used, 1);
+            return i;
+        }
+    }
+    return -1;                                /* more players than slots: not referenced */
+}
+
+/* Feed `frames` interleaved frames at `rate` into slot `k`. Real-time safe. */
+static void ref_feed(int k, const int16_t *s, size_t frames, int channels, int rate) {
+    if (k < 0 || !frames) return;
+    ref_slot *r = &g_ref[k];
+    uint64_t w = atomic_load(&r->written);
+    if (atomic_load(&r->base_us) == 0)
+        atomic_store(&r->base_us, oc_media_clock_us() - (int64_t)frames * 1000000 / rate);
+    for (size_t f = 0; f < frames; f++) {
+        int32_t mono = 0;
+        for (int c = 0; c < channels; c++) mono += s ? s[f * (size_t)channels + (size_t)c] : 0;
+        r->acc_sum += mono / channels;
+        r->acc_n++;
+        r->acc_pos += OC_AUDIO_REF_RATE;
+        while (r->acc_pos >= (uint64_t)rate) {
+            r->acc_pos -= (uint64_t)rate;
+            r->buf[w & (REF_CAP - 1)] = (int16_t)(r->acc_n ? r->acc_sum / r->acc_n : 0);
+            w++;
+            r->acc_sum = 0;
+            r->acc_n = 0;
+        }
+    }
+    atomic_store(&r->written, w);
+}
+
+int oc_audio_reference(int64_t start_us, int16_t *out, size_t n) {
+    int32_t mix[1024];
+    int contributed = 0;
+    memset(out, 0, n * sizeof *out);
+    for (size_t at = 0; at < n; at += 1024) {
+        size_t len = n - at < 1024 ? n - at : 1024;
+        memset(mix, 0, sizeof mix);
+        for (int k = 0; k < REF_SLOTS; k++) {
+            ref_slot *r = &g_ref[k];
+            int64_t base = atomic_load(&r->base_us);
+            if (atomic_load(&r->used) != 1 || base == 0) continue;
+            uint64_t w = atomic_load(&r->written);
+            int64_t first = (start_us - base) * OC_AUDIO_REF_RATE / 1000000 + (int64_t)at;
+            int any = 0;
+            for (size_t i = 0; i < len; i++) {
+                int64_t idx = first + (int64_t)i;
+                if (idx < 0 || (uint64_t)idx >= w || w - (uint64_t)idx > REF_CAP) continue;
+                mix[i] += r->buf[(uint64_t)idx & (REF_CAP - 1)];
+                any = 1;
+            }
+            if (any && at == 0) contributed++;
+        }
+        for (size_t i = 0; i < len; i++)
+            out[at + i] = (int16_t)(mix[i] > 32767 ? 32767 : mix[i] < -32768 ? -32768 : mix[i]);
+    }
+    return contributed;
+}
+
+/* The microphone's one owner (OC_AUDIO_BUSY). */
+static atomic_int g_capture_open;
+
 /* ---- devices ---------------------------------------------------------------------- */
 
 struct oc_audio_dev {
@@ -97,6 +188,12 @@ struct oc_audio_dev {
     /* Synthetic: when the tone source / real-time sink last caught up. */
     int64_t       syn_start_us;
     uint64_t      syn_frames;
+    /* Synthetic capture: what the microphone "hears" instead of the tone, when
+     * OPENCHIME_TEST_MIC names a WAV (played once, then silence). */
+    int16_t      *syn_clip;
+    size_t        syn_clip_n;
+    int           ref_slot;           /* playback: its far-end reference slot, or -1 */
+    int           owns_mic;           /* capture: holds g_capture_open */
 };
 
 /* Carry out a flush the producer asked for, on the consumer's side, where the
@@ -116,7 +213,52 @@ static void take_flush(oc_audio_dev *d) {
 
 static int use_synthetic(void) {
     const char *t = getenv("OPENCHIME_TEST_AUDIO");
-    return t && strcmp(t, "synthetic") == 0;
+    return t && (strcmp(t, "synthetic") == 0 || strcmp(t, "mic-denied") == 0);
+}
+
+/* `OPENCHIME_TEST_AUDIO=mic-denied`: the synthetic devices, with the microphone
+ * refused as the operating system refuses one it blocks. */
+static int mic_denied(void) {
+    const char *t = getenv("OPENCHIME_TEST_AUDIO");
+    return t && strcmp(t, "mic-denied") == 0;
+}
+
+/* OPENCHIME_TEST_MIC: a 16-bit PCM WAV at `rate` with `channels`, for the
+ * synthetic microphone to speak -- so voice input is testable end to end on a
+ * machine with no microphone. NULL (and the tone) when unset or unusable. */
+static int16_t *load_test_clip(int rate, int channels, size_t *n_out) {
+    const char *path = getenv("OPENCHIME_TEST_MIC");
+    if (!path || !*path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    unsigned char h[12];
+    int16_t *pcm = NULL;
+    int ok_fmt = 0;
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) goto done;
+    for (;;) {
+        unsigned char c[8];
+        if (fread(c, 1, 8, f) != 8) break;
+        uint32_t len = (uint32_t)c[4] | (uint32_t)c[5] << 8 | (uint32_t)c[6] << 16 | (uint32_t)c[7] << 24;
+        if (!memcmp(c, "fmt ", 4) && len >= 16) {
+            unsigned char fm[16];
+            if (fread(fm, 1, 16, f) != 16) break;
+            unsigned tag = fm[0] | fm[1] << 8, ch = fm[2] | fm[3] << 8, bits = fm[14] | fm[15] << 8;
+            uint32_t sr = (uint32_t)fm[4] | (uint32_t)fm[5] << 8 | (uint32_t)fm[6] << 16 | (uint32_t)fm[7] << 24;
+            ok_fmt = tag == 1 && (int)ch == channels && bits == 16 && (int)sr == rate;
+            if (fseek(f, (long)(len - 16 + (len & 1)), SEEK_CUR) != 0) break;
+        } else if (!memcmp(c, "data", 4)) {
+            if (!ok_fmt || len < 2) break;
+            pcm = malloc(len);
+            if (pcm && fread(pcm, 1, len, f) == len) *n_out = len / 2 / (size_t)channels;
+            else { free(pcm); pcm = NULL; }
+            break;
+        } else if (fseek(f, (long)(len + (len & 1)), SEEK_CUR) != 0) {
+            break;
+        }
+    }
+done:
+    fclose(f);
+    return pcm;
 }
 
 static int peak(const int16_t *s, size_t n) {
@@ -152,6 +294,8 @@ static void playback_cb(ma_device *dev, void *out, const void *in, ma_uint32 fra
     if (got < n) memset(o + got, 0, (n - got) * sizeof *o);
     atomic_fetch_add(&d->played, got / (size_t)d->channels);
     atomic_store(&d->level, peak(o, got));
+    /* What the speaker is given is what the microphone may hear back. */
+    ref_feed(d->ref_slot, o, frames, d->channels, d->rate);
 }
 
 int oc_audio_list(int capture, oc_audio_device *out, int cap) {
@@ -211,12 +355,22 @@ static oc_audio_dev *open_dev(int capture, const char *id, int rate, int channel
     oc_audio_dev *d = calloc(1, sizeof *d);
     if (!d) { *err = OC_AUDIO_FAILED; return NULL; }
     d->capture = capture; d->rate = rate; d->channels = channels;
+    d->ref_slot = -1;
     atomic_store(&d->gain, 1.0f);
+    if (capture && mic_denied()) { free(d); *err = OC_AUDIO_DENIED; return NULL; }
+    if (capture) {
+        int zero = 0;
+        if (!atomic_compare_exchange_strong(&g_capture_open, &zero, 1)) { free(d); *err = OC_AUDIO_BUSY; return NULL; }
+        d->owns_mic = 1;
+    } else {
+        d->ref_slot = ref_claim();
+    }
     /* Two seconds of samples: enough to ride out a slow reader or writer. */
-    if (ring_init(&d->ring, (size_t)rate * (size_t)channels * 2) != 0) { free(d); *err = OC_AUDIO_FAILED; return NULL; }
+    if (ring_init(&d->ring, (size_t)rate * (size_t)channels * 2) != 0) { oc_audio_close(d); *err = OC_AUDIO_FAILED; return NULL; }
 
     if (use_synthetic()) {
         d->synthetic = 1;
+        if (capture) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
         d->syn_start_us = oc_media_clock_us();
         atomic_store(&d->base_us, d->syn_start_us);
         *err = OC_AUDIO_OK;
@@ -273,19 +427,28 @@ static void synthetic_catch_up(oc_audio_dev *d) {
     while (frames > 0) {
         size_t n = frames > 960 ? 960 : frames;
         if (d->capture) {
-            for (size_t i = 0; i < n; i++) {
-                double t = (double)(d->syn_frames + i) / d->rate;
-                int16_t v = (int16_t)(8000.0 * __builtin_sin(2.0 * 3.141592653589793 * 440.0 * t));
-                for (int c = 0; c < d->channels; c++) chunk[i * (size_t)d->channels + (size_t)c] = v;
+            if (d->syn_clip) {
+                for (size_t i = 0; i < n * (size_t)d->channels; i++) {
+                    size_t k = (size_t)d->syn_frames * (size_t)d->channels + i;
+                    chunk[i] = k < d->syn_clip_n * (size_t)d->channels ? d->syn_clip[k] : 0;
+                }
+            } else {
+                for (size_t i = 0; i < n; i++) {
+                    double t = (double)(d->syn_frames + i) / d->rate;
+                    int16_t v = (int16_t)(8000.0 * __builtin_sin(2.0 * 3.141592653589793 * 440.0 * t));
+                    for (int c = 0; c < d->channels; c++) chunk[i * (size_t)d->channels + (size_t)c] = v;
+                }
             }
             size_t put = ring_push(&d->ring, chunk, n * (size_t)d->channels);
             if (put < n * (size_t)d->channels)
                 atomic_fetch_add(&d->overruns, (n * (size_t)d->channels - put) / (size_t)d->channels);
             atomic_fetch_add(&d->pushed, n);
-            atomic_store(&d->level, 8000);
+            atomic_store(&d->level, d->syn_clip ? peak(chunk, n * (size_t)d->channels) : 8000);
         } else {
-            size_t got = ring_pop(&d->ring, NULL, n * (size_t)d->channels);
+            size_t got = ring_pop(&d->ring, chunk, n * (size_t)d->channels);
+            if (got < n * (size_t)d->channels) memset(chunk + got, 0, (n * (size_t)d->channels - got) * sizeof *chunk);
             atomic_fetch_add(&d->played, got / (size_t)d->channels);
+            ref_feed(d->ref_slot, chunk, n, d->channels, d->rate);
         }
         d->syn_frames += n;
         frames -= n;
@@ -341,6 +504,9 @@ void oc_audio_close(oc_audio_dev *d) {
     if (!d) return;
     if (d->have_dev) ma_device_uninit(&d->dev);
     if (d->have_ctx) ma_context_uninit(&d->ctx);
+    if (d->ref_slot >= 0) atomic_store(&g_ref[d->ref_slot].used, 0);
+    if (d->owns_mic) atomic_store(&g_capture_open, 0);
+    free(d->syn_clip);
     free(d->ring.buf);
     free(d);
 }

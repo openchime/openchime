@@ -86,8 +86,8 @@ Read-aloud's code is inside `openchimed` and its data is beside it; there is no 
 and nothing to fetch.
 
 - **What is built in.** ttskit (TTSKIT.md) and ONNX Runtime itself, built from source as a
-  minimal static library with only the operators and types this model uses
-  (`daemon/tts_kitten.ops.config`). The daemon is under 9 MB.
+  minimal static library with only the operators and types its models use
+  (`daemon/ort.ops.config`). The daemon is under 9 MB.
 - **What is beside it.** The Kitten mini model converted to ONNX Runtime's `.ort` format, its
   voices, and ttskit's `en-US` lexicon and guesser — about 108 MB — in a data directory: the
   first of `OPENCHIME_TTS_DATA_DIR`, `/usr/share/openchime/voices` (where the packages put it)

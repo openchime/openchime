@@ -7,8 +7,8 @@
 #   scripts/build_onnxruntime.sh converter the prebuilt full library too, which
 #                                          only the build uses to convert the model
 #
-# Minimal means: only the operator kernels (and types) Kitten uses
-# (daemon/tts_kitten.ops.config), the compact .ort model format only (no protobuf
+# Minimal means: only the operator kernels (and types) the daemon's models use
+# (daemon/ort.ops.config), the compact .ort model format only (no protobuf
 # model parser at run time), no traditional-ML operators, no exceptions, no GPU
 # providers, no shared library. The dozens of static archives the build makes are
 # merged into third_party/onnxruntime-<v>/lib/libonnxruntime.a, beside the C API
@@ -81,7 +81,7 @@ fi
 
 # --- the minimal static library -----------------------------------------------
 DEST="onnxruntime-${ORT_VERSION}"
-OPS="${ROOT}/daemon/tts_kitten.ops.config"
+OPS="${ROOT}/daemon/ort.ops.config"
 STAMP="$(sha256sum "${OPS}" | cut -d" " -f1) ${CC:-cc} ${CXX:-c++}"
 if [ -f "${DEST}/lib/libonnxruntime.a" ] && [ "$(cat "${DEST}/.stamp" 2>/dev/null)" = "${STAMP}" ]; then
   echo "build_onnxruntime: up to date — third_party/${DEST}/lib/libonnxruntime.a"

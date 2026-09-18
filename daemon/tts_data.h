@@ -25,6 +25,12 @@
 int oc_tts_data_dir(const char *env, const char *system_dir, const char *exe_dir,
                     char *out, size_t cap, char *err, size_t errcap);
 
+/* The same choice for any speech feature's data: `var` names the environment
+ * variable in messages, and `beside` is the directory name looked for next to the
+ * executable ("voices" for read-aloud, "stt" for voice input). */
+int oc_data_dir_find(const char *var, const char *env, const char *system_dir, const char *exe_dir,
+                     const char *beside, char *out, size_t cap, char *err, size_t errcap);
+
 /* The directory holding the running executable, from /proc/self/exe. 1 or 0. */
 int oc_tts_exe_dir(char *out, size_t cap);
 

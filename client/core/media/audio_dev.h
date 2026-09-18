@@ -8,7 +8,12 @@
  *
  * `OPENCHIME_TEST_AUDIO=synthetic` replaces the devices with a 440 Hz tone
  * source and a sink that consumes at real-time pace, so recording and playback
- * run in tests on a machine with no sound hardware. */
+ * run in tests on a machine with no sound hardware. With it,
+ * `OPENCHIME_TEST_MIC=<file.wav>` (16-bit PCM at the capture rate and channel
+ * count) is what the synthetic microphone hears instead of the tone: the file
+ * once, then silence, so voice input can be driven with real speech.
+ * `OPENCHIME_TEST_AUDIO=mic-denied` is the synthetic devices with every capture
+ * refused as OC_AUDIO_DENIED, as a microphone the operating system blocks is. */
 #ifndef OC_AUDIO_DEV_H
 #define OC_AUDIO_DEV_H
 
@@ -20,6 +25,10 @@ enum {
     OC_AUDIO_DENIED   = -1,
     OC_AUDIO_NODEVICE = -2,
     OC_AUDIO_FAILED   = -3,
+    /* The microphone is held by something else in this process: it has one
+     * owner at a time -- a video recording, voice input or a call, never two
+     * (ARCH-112). */
+    OC_AUDIO_BUSY     = -4,
 };
 
 typedef struct {
@@ -57,6 +66,14 @@ uint64_t oc_audio_playback_position(oc_audio_dev *d);
 void oc_audio_playback_flush(oc_audio_dev *d);
 /* Output gain 0..1 (mute is 0). */
 void oc_audio_playback_volume(oc_audio_dev *d, float gain);
+
+/* The far-end reference (docs/AUDIO.md §3.3, §6): everything every open playback
+ * device has handed out, mixed to mono and resampled to 16 kHz, on the media
+ * clock. Writes the `n` samples that were played from `start_us` onward into
+ * `out` (silence where nothing was), for an echo canceller to align with a
+ * capture frame stamped `start_us`. Returns how many devices contributed. */
+#define OC_AUDIO_REF_RATE 16000
+int oc_audio_reference(int64_t start_us, int16_t *out, size_t n);
 
 /* Peak level of the most recent callback's samples, 0..32767 (the level meter). */
 int oc_audio_level(oc_audio_dev *d);

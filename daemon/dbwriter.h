@@ -178,7 +178,13 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * (both conn_id 0, fire and forget), VOICE_SET writes back the voice the
         * daemon chose for an author so it is visible and correctable. Writes. */
        OC_JOB_TTS_LOOKUP = 98, OC_JOB_TTS_STORE = 99, OC_JOB_TTS_TOUCH = 100,
-       OC_JOB_TTS_VOICE_SET = 101, OC_JOB_TTS_PREVIEW = 102 };
+       OC_JOB_TTS_VOICE_SET = 101, OC_JOB_TTS_PREVIEW = 102,
+       /* Voice input (REQ-296-300, ARCH-112): before a segment is recognized,
+        * may this user put words in this conversation -- post, in free talk;
+        * read, in push to talk -- and who are its members, by display name, for
+        * turning a spoken "at Name" into a mention. user_id, channel_id,
+        * stt_mode, stt_req. Read. */
+       OC_JOB_STT_PREP = 103 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -376,6 +382,9 @@ typedef struct oc_job {
     uint64_t       audit_before_ms;   /* AUDIT_QUERY: page backwards from here (0 = newest) */
     uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
     int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
+    /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
+    uint64_t       stt_req;
+    uint8_t        stt_mode;
 } oc_job;
 
 /* --- Results (writer -> net thread) ------------------------------------- */
@@ -458,7 +467,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_MEDIA_OK = 89, OC_RES_MEDIA_ERR = 90,
        /* Read-aloud (ARCH-111): what to do about one AUDIO_GET -- serve the
         * stored rendering, render it first, or refuse (err_code). */
-       OC_RES_TTS_META = 91, OC_RES_TTS_ERR = 92 };
+       OC_RES_TTS_META = 91, OC_RES_TTS_ERR = 92,
+       /* Voice input (ARCH-112): the STT_PREP answer -- err_code 0 and the
+        * member names, or the refusal. stt_req names the segment. */
+       OC_RES_STT_PREP = 93 };
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */
@@ -927,6 +939,12 @@ typedef struct oc_dbres {
      * the *other* members' current cursors to backfill the acker. */
     oc_read_cursor_row     *rcur;            /* heap array */
     size_t                  n_rcur;
+
+    /* OC_RES_STT_PREP (ARCH-112): the segment, and the conversation's members'
+     * display names (heap strings) for mention normalization. */
+    uint64_t                stt_req;
+    char                  **stt_names;
+    size_t                  n_stt_names;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

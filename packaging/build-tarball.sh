@@ -33,6 +33,9 @@ install -m 0755 "$BINARY"                                   "$dir/openchimed"
 # stands, because the daemon looks beside itself when nothing is installed.
 VOICES="$(dirname "$BINARY")/voices"
 [ -f "$VOICES/manifest" ] && cp -r "$VOICES" "$dir/voices"
+# And voice input's recognizer data in stt/, for the same reason.
+STT="$(dirname "$BINARY")/stt"
+[ -f "$STT/manifest" ] && cp -r "$STT" "$dir/stt"
 install -m 0644 "$root/packaging/debian/openchimed.service" "$dir/openchimed.service"
 install -m 0644 "$root/packaging/openchimed.env"            "$dir/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"              > "$dir/COPYRIGHT"
@@ -55,6 +58,11 @@ if [ -d voices ]; then
     mkdir -p /usr/share/openchime
     rm -rf /usr/share/openchime/voices
     cp -r voices /usr/share/openchime/voices
+fi
+if [ -d stt ]; then
+    mkdir -p /usr/share/openchime
+    rm -rf /usr/share/openchime/stt
+    cp -r stt /usr/share/openchime/stt
 fi
 install -D -m 0644 openchimed.service /lib/systemd/system/openchimed.service
 install -D -m 0644 COPYRIGHT          /usr/share/doc/openchimed/copyright
@@ -86,8 +94,8 @@ OpenChime daemon ${VERSION} (linux-${ARCH})
   sudo ./install.sh
 
 Requires glibc 2.34 or newer. Everything else -- including TLS and SQLite --
-is statically linked, and read-aloud's voice data is in voices/ beside the
-binary, so there is nothing further to fetch. That makes this the
+is statically linked, read-aloud's voice data is in voices/ and voice input's
+recognizer in stt/ beside the binary, so there is nothing further to fetch. That makes this the
 offline install: no package repository, no network.
 
   Configuration   /etc/openchime/openchimed.env   (every variable: docs/CONFIG.md)

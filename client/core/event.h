@@ -162,7 +162,18 @@ enum {
     OC_EV_VOICE_PREVIEW,
     /* ...or it will not: message_id, status = the reason code (0 = nothing to
      * say). Talking mode moves on rather than stopping. */
-    OC_EV_LISTEN_SKIP
+    OC_EV_LISTEN_SKIP,
+    /* Voice input (ARCH-112). STT_INFO: body = model version, topic = language,
+     * count = the longest segment in ms (0 = not offered). */
+    OC_EV_STT_INFO,
+    /* A segment answered: count = segment id, op = mode, channel_id and
+     * parent_id (the thread root) = where it was spoken, message_id = the
+     * message free talk posted (0 in push to talk or when nothing was heard),
+     * body = the words. */
+    OC_EV_STT_TEXT,
+    /* A segment refused: count = segment id, op = mode, status = the reason
+     * code (it does not fit a uint8_t, so it rides `size`). */
+    OC_EV_STT_ERROR
 };
 
 typedef struct {
@@ -353,6 +364,11 @@ enum {
     OC_CMD_LISTEN_FETCH,
     /* Hear a voice say the audition sentence (REQ-292): body = voice id. */
     OC_CMD_VOICE_PREVIEW,
+    /* One segment of speech (ARCH-112): xfer_tag = segment id, op = mode,
+     * channel_id and message_id (the thread root) = the target, blob = the
+     * 16 kHz mono PCM as little-endian 16-bit samples. Sent at once, beside and
+     * never behind the transfer queue. */
+    OC_CMD_STT_SEGMENT,
     OC_CMD_QUIT
 };
 

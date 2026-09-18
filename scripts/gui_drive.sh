@@ -12,7 +12,9 @@
 # Commands: shot <winpath> | send <text> | channel <name> | click x y |
 #           rclick x y | members | scroll <dy> | size w h | dump <winpath> |
 #           formnext <v1>|<v2>|... (arm the next modal form) |
-#           search [query] | find <text>
+#           search [query] | find <text> | key [ctrl+|alt+|shift+]<key> |
+#           keyup <key> | mousedown x y | mouseup x y |
+#           dictate ptt-down|ptt-up|free-on|free-off
 #
 # `shot <name>` and `dump <name>` take a bare name; every other path is a
 # Windows path.
@@ -101,8 +103,10 @@ case "${1:-}" in
     powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
     sleep 1
     rm -f "$LIN_DIR"/cmd "$LIN_DIR"/ack
-    # WSLENV is required for the env var to cross into the Windows process.
-    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
+    # WSLENV is required for the env var to cross into the Windows process. The
+    # test-audio pair crosses too when set: OPENCHIME_TEST_AUDIO=synthetic, and
+    # OPENCHIME_TEST_MIC=<windows path to a WAV> for a microphone that speaks.
+    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC" OPENCHIME_TEST_DIR="$WIN_DIR" \
         setsid "$EXE" "$ws" "$cred" >/dev/null 2>&1 < /dev/null &
     disown; sleep 3; echo "launched"; exit 0 ;;
   kill)

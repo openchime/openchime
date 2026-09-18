@@ -18,6 +18,9 @@
 #include "protocol.h"
 #include "tls.h"
 #include "tts_render.h"
+#include "stt_render.h"
+#include "audio_dev.h"
+#include "oc_dictate.h"
 #include "oc_mp4.h"
 #include "check.h"
 
@@ -66,6 +69,32 @@ static const oc_tts_engine CORE_TTS = {
     .preview = "This is a test voice.",
     .open = core_tts_open, .close = core_tts_close, .say = core_tts_say,
 };
+
+/* Voice input with a stub recognizer (ARCH-112): the first sample is a code, the
+ * second a marker -- 1 says "spoken <marker> at erik", 3 fails. */
+static void *core_stt_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
+static void core_stt_close(void *e) { (void)e; }
+static int core_stt_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
+    (void)e;
+    int code = n > 0 ? pcm[0] : 0, marker = n > 1 ? pcm[1] : 0;
+    if (code == 3) { snprintf(err, cap, "stub failure"); return -1; }
+    char buf[64] = "";
+    if (code == 1) snprintf(buf, sizeof buf, "spoken %d at erik", marker);
+    *text = strdup(buf);
+    return *text ? 0 : -1;
+}
+static const oc_stt_engine CORE_STT = {
+    .version = "core-stt-1", .lang = "en-US", .ctx = NULL,
+    .open = core_stt_open, .close = core_stt_close, .hear = core_stt_hear,
+};
+
+static void stt_say(oc_client *c, uint8_t mode, uint64_t channel, int16_t code, int16_t marker) {
+    int16_t pcm[8000];
+    memset(pcm, 0, sizeof pcm);
+    pcm[0] = code;
+    pcm[1] = marker;
+    CHECK(oc_client_stt_send(c, mode, channel, 0, pcm, 8000) != 0);
+}
 
 static void *core_loop_thread(void *p) {
     struct core_loop_arg *a = (struct core_loop_arg *)p;
@@ -1559,6 +1588,7 @@ int run_client_core_tests(void) {
 
     /* The daemon this test drives speaks with a stub voice (ARCH-111). */
     oc_netloop_set_tts(&CORE_TTS);
+    oc_netloop_set_stt(&CORE_STT);
 
     struct core_loop_arg arg;
     arg.port = 19000 + (int)(getpid() % 2000);
@@ -2100,6 +2130,80 @@ int run_client_core_tests(void) {
             uint8_t *none = NULL;
             size_t nlen = 0;
             CHECK(oc_model_listen_take_audio((oc_model *)ma, &none, &nlen) == 0);
+        }
+
+        /* Voice input (REQ-296-300, ARCH-112), with the stub recognizer. */
+        {
+            const oc_model *ma = oc_client_model(a);
+            CHECK(WAIT_FOR(a, oc_model_stt_available(m)));
+            CHECK(ma->stt_max_ms == 30000 && strcmp(ma->stt_lang, "en-US") == 0);
+
+            /* Push to talk: the words come back for the composer they were
+             * spoken into, with the spoken mention made a mention, and nothing
+             * is posted. */
+            size_t before_b = 0;
+            stt_say(a, OC_STT_MODE_PTT, 1, 1, 5);
+            char *words = NULL;
+            CHECK(WAIT_FOR(a, oc_model_stt_take_words((oc_model *)m, 1, 0, &words)));
+            CHECK(words && strcmp(words, "spoken 5 @erik") == 0);
+            free(words);
+            words = NULL;
+            CHECK(!channel_has_body(oc_client_model(b), 1, "spoken 5 @erik"));
+            (void)before_b;
+
+            /* Words for another conversation wait for it. */
+            stt_say(a, OC_STT_MODE_PTT, 2, 1, 6);
+            uint32_t answered = ma->stt_answered;
+            CHECK(WAIT_FOR(a, m->stt_answered > answered));
+            CHECK(!oc_model_stt_take_words((oc_model *)ma, 1, 0, &words));
+            CHECK(oc_model_stt_take_words((oc_model *)ma, 2, 0, &words) && strcmp(words, "spoken 6 @erik") == 0);
+            free(words);
+            words = NULL;
+
+            /* Free talk: each segment is posted by the daemon, in order, as
+             * dana; erik reads them as ordinary messages. The client never sent
+             * a SEND for them. */
+            stt_say(a, OC_STT_MODE_FREE, 1, 1, 7);
+            stt_say(a, OC_STT_MODE_FREE, 1, 1, 8);
+            CHECK(WAIT_FOR(b, channel_has_body(m, 1, "spoken 7 @erik") && channel_has_body(m, 1, "spoken 8 @erik")));
+            CHECK(WAIT_FOR(a, channel_has_body(m, 1, "spoken 8 @erik")));
+            {
+                const oc_model *mb = oc_client_model(b);
+                uint64_t id7 = 0, id8 = 0, author = 0;
+                for (size_t i = 0; i < mb->n_channels; i++) {
+                    if (mb->channels[i].channel_id != 1) continue;
+                    for (size_t j = 0; j < mb->channels[i].n_msgs; j++) {
+                        const char *body = mb->channels[i].msgs[j].body;
+                        if (body && !strcmp(body, "spoken 7 @erik")) { id7 = mb->channels[i].msgs[j].message_id; author = mb->channels[i].msgs[j].author_id; }
+                        if (body && !strcmp(body, "spoken 8 @erik")) id8 = mb->channels[i].msgs[j].message_id;
+                    }
+                }
+                CHECK(id7 != 0 && id8 > id7);               /* in the order spoken */
+                CHECK(author == ma->user_id);               /* as the speaker */
+            }
+
+            /* A refusal reaches the model as one, with its reason. */
+            uint32_t errs = ma->stt_error_seq;
+            stt_say(a, OC_STT_MODE_PTT, 1, 3, 0);
+            CHECK(WAIT_FOR(a, m->stt_error_seq > errs));
+            CHECK(ma->stt_error_code == OC_ERR_STT_UNAVAILABLE);
+
+            /* The microphone has one owner: while dictation holds it, nothing
+             * else can open it, and stopping gives it back. */
+            setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+            int derr = 0;
+            oc_dictate *dict = oc_dictate_start(a, OC_STT_MODE_FREE, 1, 0, NULL, ma->stt_max_ms, &derr);
+            CHECK(dict != NULL && derr == OC_DICTATE_OK);
+            int aerr = 0;
+            oc_audio_dev *other = oc_audio_capture_open(NULL, 48000, 1, &aerr);
+            CHECK(other == NULL && aerr == OC_AUDIO_BUSY);
+            oc_dictate *second = oc_dictate_start(a, OC_STT_MODE_PTT, 1, 0, NULL, ma->stt_max_ms, &derr);
+            CHECK(second == NULL && derr == OC_DICTATE_BUSY);
+            oc_dictate_stop(dict, 0);
+            other = oc_audio_capture_open(NULL, 48000, 1, &aerr);
+            CHECK(other != NULL);
+            oc_audio_close(other);
+            unsetenv("OPENCHIME_TEST_AUDIO");
         }
 
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);

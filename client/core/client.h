@@ -314,6 +314,15 @@ void oc_client_listen_done(oc_client *c);
  * arrives if it cannot be had. Queued behind any transfer already running. */
 void oc_client_voice_preview(oc_client *c, const char *voice_id);
 
+/* Voice input (REQ-296-300, ARCH-112): send one segment of 16 kHz mono speech
+ * for `mode` (OC_STT_MODE_PTT / _FREE) spoken into (channel_id, thread_root).
+ * Safe to call from a capture thread. In free talk the daemon posts the words
+ * as a message; in push to talk they come back for the composer
+ * (oc_model_stt_take_words). Returns the segment id, 0 if it could not be
+ * queued. The audio is copied; nothing is written to disk. */
+uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
+                            const int16_t *pcm, size_t samples);
+
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by
  * id to `dest_path`. Progress + completion arrive as OC_EV_XFER status lines. */

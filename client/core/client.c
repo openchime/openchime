@@ -12,6 +12,7 @@
 #include "oc_port.h"    /* oc_localtime_r */
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -100,6 +101,29 @@ void oc_client_listen(oc_client *c, uint64_t channel_id, int on) {
     m->n_listen_queue = 0;
     m->listen_skipped = 0;
     m->listen_channel = (on && channel_id) ? channel_id : 0;
+}
+
+uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
+                            const int16_t *pcm, size_t samples) {
+    static _Atomic uint32_t next_id;
+    if (!c || !pcm || !samples) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_STT_SEGMENT);
+    if (!cmd) return 0;
+    cmd->blob = malloc(samples * 2);
+    if (!cmd->blob) { oc_cmd_free(cmd); return 0; }
+    for (size_t i = 0; i < samples; i++) {          /* little-endian on the wire */
+        uint16_t v = (uint16_t)pcm[i];
+        cmd->blob[2 * i] = (uint8_t)v;
+        cmd->blob[2 * i + 1] = (uint8_t)(v >> 8);
+    }
+    cmd->blob_len = samples * 2;
+    uint32_t id = atomic_fetch_add(&next_id, 1) + 1;
+    cmd->xfer_tag = id;
+    cmd->op = mode;
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    oc_queue_push(&c->cmds, cmd);
+    return id;
 }
 
 void oc_client_voice_preview(oc_client *c, const char *voice_id) {

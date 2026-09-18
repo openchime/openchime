@@ -23,6 +23,10 @@
 #include "tts.h"
 #include "tts_render.h"
 #endif
+#ifdef OC_STT
+#include "stt.h"
+#include "stt_render.h"
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -259,6 +263,14 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--tts-manifest") == 0)
         return oc_tts_manifest(argv[2]);
 #endif
+#ifdef OC_STT
+    /* Voice input's check (stt.h): recognize one recording with the model in
+     * this binary. */
+    if (argc == 3 && strcmp(argv[1], "--stt-hear") == 0)
+        return oc_stt_hear(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--stt-manifest") == 0)
+        return oc_stt_manifest(argv[2]);
+#endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("openchimed %s (protocol %u)\n", OC_VERSION,
@@ -315,6 +327,20 @@ int main(int argc, char **argv) {
             tts_engine = NULL;
         }
         oc_netloop_set_tts(tts_engine);
+    }
+#endif
+#ifdef OC_STT
+    /* Voice input's engine (ARCH-112): the recognizer built into this binary,
+     * its data beside it in a directory of its own. Absent data turns voice input
+     * off -- clients are told and show nothing -- and nothing else. */
+    {
+        const oc_stt_engine *stt_engine = cfg->stt.enabled ? oc_stt_engine_for(OC_STT_LANG) : NULL;
+        char why[256] = "";
+        if (stt_engine && !oc_stt_data_ready(why, sizeof why)) {
+            fprintf(stderr, "openchimed: voice input is off: %s\n", why);
+            stt_engine = NULL;
+        }
+        oc_netloop_set_stt(stt_engine);
     }
 #endif
     const char *db_path = cfg->db_path, *cert_path = cfg->tls_cert, *key_path = cfg->tls_key;

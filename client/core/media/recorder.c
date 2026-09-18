@@ -383,6 +383,7 @@ oc_recorder *oc_recorder_open(const oc_recorder_opts *opts, int *err) {
     int aerr;
     r->mic = oc_audio_capture_open(o.mic_id, OC_OPUS_RATE, 1, &aerr);
     if (!r->mic && aerr == OC_AUDIO_DENIED) { *err = OC_REC_MIC_DENIED; oc_recorder_close(r); return NULL; }
+    if (!r->mic && aerr == OC_AUDIO_BUSY) { *err = OC_REC_MIC_BUSY; oc_recorder_close(r); return NULL; }
     r->has_audio = r->mic != NULL;
 
     r->state = OC_REC_PREVIEW;

@@ -40,6 +40,8 @@ int run_ttskit_tests(void);
 int run_tts_worker_tests(void);
 int run_voice_pick_tests(void);
 int run_tts_data_tests(void);
+int run_stt_tests(void);
+int run_voice_tests(void);
 int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
 int run_theme_tests(void);
@@ -79,6 +81,8 @@ int main(void) {
     total += run_tts_worker_tests();
     total += run_voice_pick_tests();
     total += run_tts_data_tests();
+    total += run_stt_tests();
+    total += run_voice_tests();
     total += run_unfurl_tests();
     total += run_sdltext_map_tests();
     total += run_theme_tests();

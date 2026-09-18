@@ -167,6 +167,8 @@ void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap) {
 void oc_model_free(oc_model *m) {
     free(m->listen_ready);
     free(m->preview_ready);
+    for (uint8_t i = 0; i < m->n_stt_words; i++) free(m->stt_words[i].text);
+    m->n_stt_words = 0;
     for (uint8_t i = 0; i < m->n_fetched; i++) free(m->fetched[i].data);
     for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
     free(m->channels);
@@ -427,6 +429,18 @@ int oc_model_has_capability(const oc_model *m, const char *name) {
     return 0;
 }
 uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
+uint8_t     oc_model_stt_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_STT); }
+
+int oc_model_stt_take_words(oc_model *m, uint64_t channel_id, uint64_t thread_root, char **text) {
+    for (uint8_t i = 0; i < m->n_stt_words; i++) {
+        if (m->stt_words[i].channel_id != channel_id || m->stt_words[i].thread_root != thread_root) continue;
+        *text = m->stt_words[i].text;
+        memmove(&m->stt_words[i], &m->stt_words[i + 1], (size_t)(m->n_stt_words - i - 1) * sizeof m->stt_words[0]);
+        m->n_stt_words--;
+        return 1;
+    }
+    return 0;
+}
 uint8_t     oc_model_tts_voice_count(const oc_model *m) { return m->n_voices; }
 const char *oc_model_tts_preview(const oc_model *m)     { return m->tts_preview; }
 
@@ -1241,6 +1255,33 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             e->body = NULL;                       /* the model owns the bytes now */
             m->listen_fetching = 0;
         }
+        break;
+    case OC_EV_STT_INFO:
+        snprintf(m->stt_model_version, sizeof m->stt_model_version, "%s", e->body ? e->body : "");
+        snprintf(m->stt_lang, sizeof m->stt_lang, "%s", e->topic ? e->topic : "");
+        m->stt_max_ms = e->count;
+        break;
+    case OC_EV_STT_TEXT:
+        m->stt_answered++;
+        /* Free talk's words are already a message, arriving as a BROADCAST like
+         * any other; only push to talk's are the composer's to take. */
+        if (e->op == OC_STT_MODE_PTT && e->body && e->body[0]) {
+            if (m->n_stt_words == OC_STT_WORDS_MAX) {      /* nobody is taking them: drop the oldest */
+                free(m->stt_words[0].text);
+                memmove(&m->stt_words[0], &m->stt_words[1], (OC_STT_WORDS_MAX - 1) * sizeof m->stt_words[0]);
+                m->n_stt_words--;
+            }
+            m->stt_words[m->n_stt_words].text = e->body;
+            m->stt_words[m->n_stt_words].channel_id = e->channel_id;
+            m->stt_words[m->n_stt_words].thread_root = e->parent_id;
+            m->n_stt_words++;
+            e->body = NULL;                               /* the model owns it now */
+        }
+        break;
+    case OC_EV_STT_ERROR:
+        m->stt_answered++;
+        m->stt_error_code = (uint16_t)e->size;
+        m->stt_error_seq++;
         break;
     case OC_EV_LISTEN_SKIP:
         if (e->message_id == m->listen_fetching) {

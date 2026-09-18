@@ -41,6 +41,15 @@ typedef struct {
     uint64_t  progress_ms;     /* when the last progress tick went out */
 } oc_xqueue;
 
+/* Voice-input segments sent and not yet answered (ARCH-112), so an answer can
+ * say where it was spoken and in which mode. Net-thread only. The daemon keeps a
+ * handful waiting per connection, so a small ring is plenty. */
+#define OC_STT_SENT_MAX 16
+typedef struct {
+    struct { uint32_t id; uint8_t mode; uint64_t channel_id, thread_root; } v[OC_STT_SENT_MAX];
+    unsigned next;
+} oc_stt_sent;
+
 struct oc_net {
     oc_thread_t   thread;
     volatile int  stop;
@@ -55,6 +64,7 @@ struct oc_net {
     oc_queue     *to_ui;
     oc_queue     *from_ui;
     oc_xqueue     xq;
+    oc_stt_sent   stt;           /* voice-input segments awaiting an answer */
 };
 
 /* ---- the offline outbox, in memory (REQ-102, ARCH-88) ----------------------
@@ -319,6 +329,7 @@ typedef struct {
     const char  *client_type; /* which settings bucket this frontend syncs */
     uint16_t     version;     /* negotiated at WELCOME; every frame must carry it */
     oc_xqueue   *xq;
+    oc_stt_sent *stt;
 } disp_ctx;
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
@@ -497,6 +508,54 @@ static void begin_download(disp_ctx *ctx, uint64_t aid, FILE *fp, size_t buf_max
 }
 
 /* A wire string as a heap C string ("" if empty, NULL on failure). */
+/* Record a segment as sent, and look up where one was spoken. */
+static void stt_note(oc_stt_sent *t, uint32_t id, uint8_t mode, uint64_t channel_id, uint64_t root) {
+    unsigned i = t->next++ % OC_STT_SENT_MAX;
+    t->v[i].id = id;
+    t->v[i].mode = mode;
+    t->v[i].channel_id = channel_id;
+    t->v[i].thread_root = root;
+}
+
+static void stt_where(disp_ctx *ctx, uint32_t id, oc_ev *e) {
+    if (!ctx || !ctx->stt) return;
+    for (unsigned i = 0; i < OC_STT_SENT_MAX; i++) {
+        if (ctx->stt->v[i].id != id) continue;
+        e->op = ctx->stt->v[i].mode;
+        e->channel_id = ctx->stt->v[i].channel_id;
+        e->parent_id = ctx->stt->v[i].thread_root;
+        return;
+    }
+}
+
+/* Send one whole segment: STT_BEGIN, the samples in frames that stay under the
+ * size limit, STT_END. Written straight out, not queued behind a transfer: the
+ * speaker is waiting on it. Returns 0 or -1 if the connection failed. */
+static int send_stt_segment(oc_tls_conn *conn, int fd, volatile int *stop, oc_stt_sent *t, const oc_cmd *c) {
+    static uint8_t buf[OC_MAX_FRAME_SIZE];
+    oc_wbuf w;
+    uint32_t id = (uint32_t)c->xfer_tag;
+    oc_stt_begin sb = { id, c->op, c->channel_id, c->message_id, {0}, (uint32_t)(c->blob_len / 2) };
+    gen_idem(sb.idem);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &sb) != OC_OK) return 0;
+    if (write_all(conn, fd, buf, w.len, stop) != 0) return -1;
+    stt_note(t, id, c->op, c->channel_id, c->message_id);
+    const size_t per = 60000;               /* even, and well inside a frame */
+    uint32_t seq = 0;
+    for (size_t off = 0; off < c->blob_len; off += per) {
+        size_t n = c->blob_len - off < per ? c->blob_len - off : per;
+        oc_stt_chunk ch = { id, seq++, { c->blob + off, n } };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        if (oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &ch) != OC_OK) return 0;
+        if (write_all(conn, fd, buf, w.len, stop) != 0) return -1;
+    }
+    oc_stt_end se = { id };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_stt_end(&w, OC_PROTOCOL_VERSION, &se) != OC_OK) return 0;
+    return write_all(conn, fd, buf, w.len, stop);
+}
+
 static char *slice_dup(oc_slice s) {
     char *out = malloc(s.len + 1);
     if (!out) return NULL;
@@ -1780,6 +1839,27 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_webhook_deleted(&p, &wd) != OC_OK) return -1;
             oc_ev *e = oc_ev_new(OC_EV_WEBHOOK_DELETED);
             if (e) { e->message_id = wd.webhook_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_STT_INFO) {
+            oc_stt_info si;
+            if (oc_decode_stt_info(&p, &si) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_STT_INFO);
+            if (e) {
+                e->body = slice_dup(si.model_version);
+                e->topic = slice_dup(si.lang);
+                e->count = si.max_segment_ms;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_STT_TEXT) {
+            oc_stt_text st;
+            if (oc_decode_stt_text(&p, &st) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_STT_TEXT);
+            if (e) {
+                e->count = st.segment_id;
+                e->message_id = st.message_id;
+                e->body = slice_dup(st.text);
+                stt_where(ctx, st.segment_id, e);
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_SEND_ACK) {
             /* The server has durably accepted a send: clear it from the outbox so
              * it isn't resent (REQ-102). The matching BROADCAST already folded it
@@ -1789,7 +1869,20 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (ctx->obox) obox_remove(ctx->obox, ack.idem);
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
-            if (oc_decode_error(&p, &err) == OC_OK) {
+            if (oc_decode_error(&p, &err) != OC_OK) {
+                /* Malformed: nothing to act on. */
+            } else if (err.context.len == 4 && !err.fatal) {
+                /* A refused voice-input segment: its id, not an attachment's or a
+                 * send's, is the context. The frontend says what it means. */
+                oc_ev *e = oc_ev_new(OC_EV_STT_ERROR);
+                if (e) {
+                    e->count = (uint32_t)err.context.ptr[0] << 24 | (uint32_t)err.context.ptr[1] << 16 |
+                               (uint32_t)err.context.ptr[2] << 8 | err.context.ptr[3];
+                    e->size = err.code;
+                    stt_where(ctx, e->count, e);
+                    oc_queue_push(to_ui, e);
+                }
+            } else {
                 char msg[256];
                 size_t n = err.message.len < sizeof msg - 1 ? err.message.len : sizeof msg - 1;
                 memcpy(msg, err.message.ptr, n); msg[n] = '\0';
@@ -2104,7 +2197,7 @@ static int run_connection(oc_net *n, int reconnecting,
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
-                     cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq };
+                     cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
@@ -2581,6 +2674,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_set_notify_default sd = { c->op };
                 if (oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_STT_SEGMENT) {
+                /* A failed write is a dropped connection, which the read side
+                 * notices; the segment is lost with it, as its audio is kept
+                 * nowhere to resend from. */
+                (void)send_stt_segment(&conn, fd, &n->stop, &n->stt, c);
             }
             if (c->type == OC_CMD_SET_READ_CURSOR) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);

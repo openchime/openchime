@@ -1640,6 +1640,45 @@ static void test_tts_frames(void) {
         CHECK(oc_decode_voice_preview_get(&p, &out) == OC_OK && slice_eq_str(out.voice_id, "expr-voice-5-f"));
     }
     {
+        oc_stt_info in = { oc_slice_str("moonshine-tiny-streaming-en/quantized_26_08_21"), oc_slice_str("en-US"), 30000 };
+        ROUNDTRIP(oc_encode_stt_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_INFO, h, p);
+        oc_stt_info out;
+        CHECK(oc_decode_stt_info(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.model_version, "moonshine-tiny-streaming-en/quantized_26_08_21"));
+        CHECK(slice_eq_str(out.lang, "en-US") && out.max_segment_ms == 30000);
+    }
+    {
+        oc_stt_begin in = { 7, OC_STT_MODE_FREE, 42, 900, {0}, 480000 };
+        for (int i = 0; i < 16; i++) in.idem[i] = (uint8_t)(0xA0 + i);
+        ROUNDTRIP(oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_BEGIN, h, p);
+        oc_stt_begin out;
+        CHECK(oc_decode_stt_begin(&p, &out) == OC_OK);
+        CHECK(out.segment_id == 7 && out.mode == OC_STT_MODE_FREE && out.channel_id == 42);
+        CHECK(out.thread_root == 900 && out.sample_count == 480000);
+        CHECK(!memcmp(out.idem, in.idem, 16));
+    }
+    {
+        uint8_t pcm[6] = { 1, 2, 3, 4, 5, 6 };
+        oc_stt_chunk in = { 7, 3, { pcm, sizeof pcm } };
+        ROUNDTRIP(oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_CHUNK, h, p);
+        oc_stt_chunk out;
+        CHECK(oc_decode_stt_chunk(&p, &out) == OC_OK);
+        CHECK(out.segment_id == 7 && out.seq == 3 && out.data.len == 6 && !memcmp(out.data.ptr, pcm, 6));
+    }
+    {
+        oc_stt_end in = { 7 };
+        ROUNDTRIP(oc_encode_stt_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_END, h, p);
+        oc_stt_end out;
+        CHECK(oc_decode_stt_end(&p, &out) == OC_OK && out.segment_id == 7);
+    }
+    {
+        oc_stt_text in = { 7, 555, oc_slice_str("Send the report to @dana.") };
+        ROUNDTRIP(oc_encode_stt_text(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_STT_TEXT, h, p);
+        oc_stt_text out;
+        CHECK(oc_decode_stt_text(&p, &out) == OC_OK);
+        CHECK(out.segment_id == 7 && out.message_id == 555 && slice_eq_str(out.text, "Send the report to @dana."));
+    }
+    {
         oc_audio_get in = { 4242 };
         ROUNDTRIP(oc_encode_audio_get(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUDIO_GET, h, p);
         oc_audio_get out;

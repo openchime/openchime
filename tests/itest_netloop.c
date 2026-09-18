@@ -12,6 +12,7 @@
 #include "protocol.h"
 #include "tls.h"
 #include "tts_render.h"
+#include "stt_render.h"
 #include "check.h"
 
 #include <arpa/inet.h>
@@ -19,6 +20,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
@@ -245,7 +247,8 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_TYPING_UPDATE &&
             hdr->msg_type != OC_MSG_WORKSPACE_INFO &&
             hdr->msg_type != OC_MSG_CAPABILITIES &&
-            hdr->msg_type != OC_MSG_TTS_INFO)
+            hdr->msg_type != OC_MSG_TTS_INFO &&
+            hdr->msg_type != OC_MSG_STT_INFO)
             return 0;
     }
 }
@@ -272,6 +275,10 @@ static int do_handshake(client *c) {
     return (ch.methods & OC_AUTH_LOCAL) ? 0 : -1;
 }
 
+/* What the last do_auth was told of voice input: the capability, and the cap. */
+static int      g_auth_stt;
+static uint32_t g_auth_stt_max_ms;
+
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
@@ -290,10 +297,19 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
     /* Then what this daemon offers (REQ-295), told to every client at auth. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_CAPABILITIES) return -1;
-    { oc_capabilities cp; if (oc_decode_capabilities(&p, &cp) != OC_OK) return -1; }
+    {
+        oc_capabilities cp;
+        if (oc_decode_capabilities(&p, &cp) != OC_OK) return -1;
+        g_auth_stt = 0;
+        for (uint8_t k = 0; k < cp.count; k++)
+            if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, OC_CAP_STT, 3) == 0) g_auth_stt = 1;
+    }
     /* Then read-aloud's voices, sent whether or not it is offered. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_TTS_INFO) return -1;
     { oc_tts_info ti; if (oc_decode_tts_info(&p, &ti) != OC_OK) return -1; }
+    /* Then voice input's recognizer, likewise sent whether or not it is offered. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_STT_INFO) return -1;
+    { oc_stt_info si; if (oc_decode_stt_info(&p, &si) != OC_OK) return -1; g_auth_stt_max_ms = si.max_segment_ms; }
     /* Then the pause (REQ-278), which outlives the session that set it and so is
      * told at auth rather than only on request. Asserted, not skipped: a fresh
      * account is not paused, and reading it here keeps every later test's stream
@@ -1450,8 +1466,8 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         for (int i = 0; i < 5 && !saw; i++) {
             CHECK(read_frame_raw(&cap, &hdr, &p) == 0);
             if (hdr.msg_type == OC_MSG_CAPABILITIES) {
-                /* Read-aloud is running, so "tts" is offered; speech-to-text is
-                 * not built, so "stt" is not. */
+                /* Read-aloud and voice input are both running (stub engines),
+                 * so both are offered. */
                 oc_capabilities cp;
                 CHECK(oc_decode_capabilities(&p, &cp) == OC_OK);
                 int tts = 0, stt = 0;
@@ -1459,7 +1475,7 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
                     if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, "tts", 3) == 0) tts = 1;
                     if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, "stt", 3) == 0) stt = 1;
                 }
-                CHECK(tts == 1 && stt == 0);
+                CHECK(tts == 1 && stt == 1);
                 saw_caps = 1;
                 continue;
             }
@@ -1575,6 +1591,352 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
 
     client_close(&a);
     client_close(&b);
+}
+
+
+/* Voice input over the wire (REQ-296-300, ARCH-112), with a stub recognizer in
+ * place of the model. The stub reads a code from the first sample and a marker
+ * from the second: 1 says "segment <marker> at bob", 2 hears nothing, 3 fails. */
+static void *stt_stub_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
+static void stt_stub_close(void *e) { (void)e; }
+static int stt_stub_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
+    (void)e;
+    int code = n > 0 ? pcm[0] : 0, marker = n > 1 ? pcm[1] : 0;
+    if (code == 3) { snprintf(err, cap, "stub failure"); return -1; }
+    char buf[64] = "";
+    if (code == 1) snprintf(buf, sizeof buf, "segment %d at bob", marker);
+    if (code == 4) {                          /* slow: still being heard when its speaker leaves */
+        struct timespec ts = { 0, 300 * 1000000L };
+        nanosleep(&ts, NULL);
+        snprintf(buf, sizeof buf, "late words %d", marker);
+    }
+    *text = strdup(buf);
+    return *text ? 0 : -1;
+}
+static const oc_stt_engine STUB_STT = {
+    .version = "itest-stt-1", .lang = "en-US", .ctx = NULL,
+    .open = stt_stub_open, .close = stt_stub_close, .hear = stt_stub_hear,
+};
+
+/* Send one whole segment: BEGIN, the samples in chunks, END. */
+static void stt_send(client *c, uint32_t id, uint8_t mode, uint64_t channel, uint64_t root, uint8_t tag,
+                     uint32_t samples, int16_t code, int16_t marker) {
+    uint8_t *buf = malloc(OC_MAX_FRAME_SIZE);
+    CHECK(buf != NULL);
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+    oc_stt_begin sb = { id, mode, channel, root, {0}, samples };
+    memset(sb.idem, tag, OC_IDEM_SIZE);
+    CHECK(oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    uint8_t *pcm = calloc((size_t)samples ? samples : 1, 2);
+    CHECK(pcm != NULL);
+    if (samples > 0) { pcm[0] = (uint8_t)code; pcm[1] = (uint8_t)(code >> 8); }
+    if (samples > 1) { pcm[2] = (uint8_t)marker; pcm[3] = (uint8_t)(marker >> 8); }
+    uint32_t seq = 0;
+    for (size_t off = 0; off < (size_t)samples * 2; off += 60000) {
+        size_t len = (size_t)samples * 2 - off < 60000 ? (size_t)samples * 2 - off : 60000;
+        oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+        oc_stt_chunk ch = { id, seq++, { pcm + off, len } };
+        CHECK(oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &ch) == OC_OK);
+        CHECK(send_frame(c, buf, w.len) == 0);
+    }
+    oc_wbuf_init(&w, buf, OC_MAX_FRAME_SIZE);
+    oc_stt_end se = { id };
+    CHECK(oc_encode_stt_end(&w, OC_PROTOCOL_VERSION, &se) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+    free(pcm);
+    free(buf);
+}
+
+/* Read until segment `id` is answered: its STT_TEXT (1, text and message id
+ * out) or an ERROR naming it (0, the code out). BROADCAST bodies seen on the
+ * way are appended to `bodies` (newline-separated) when it is given. */
+static int stt_await(client *c, uint32_t id, char *text, size_t tcap, uint64_t *mid, uint16_t *code,
+                     char *bodies, size_t bcap) {
+    for (int i = 0; i < 40; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type == OC_MSG_STT_TEXT) {
+            oc_stt_text t;
+            CHECK(oc_decode_stt_text(&p, &t) == OC_OK);
+            if (t.segment_id != id) continue;
+            if (text) snprintf(text, tcap, "%.*s", (int)t.text.len, (const char *)t.text.ptr);
+            if (mid) *mid = t.message_id;
+            return 1;
+        }
+        if (hdr.msg_type == OC_MSG_ERROR) {
+            oc_error e;
+            CHECK(oc_decode_error(&p, &e) == OC_OK);
+            if (e.context.len == 4) {
+                uint32_t sid = (uint32_t)e.context.ptr[0] << 24 | (uint32_t)e.context.ptr[1] << 16 |
+                               (uint32_t)e.context.ptr[2] << 8 | e.context.ptr[3];
+                if (sid == id) { if (code) *code = e.code; return 0; }
+            }
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_BROADCAST && bodies) {
+            oc_broadcast b;
+            if (oc_decode_broadcast(&p, &b) == OC_OK) {
+                size_t n = strlen(bodies);
+                snprintf(bodies + n, bcap - n, "%.*s\n", (int)b.body.len, (const char *)b.body.ptr);
+            }
+        }
+    }
+    return -1;
+}
+
+/* Read `c` until `want` BROADCAST bodies have arrived, appending them. */
+static void read_broadcasts(client *c, int want, char *bodies, size_t cap) {
+    for (int i = 0, got = 0; i < 40 && got < want; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(c, &hdr, &p) == 0);
+        if (hdr.msg_type != OC_MSG_BROADCAST) continue;
+        oc_broadcast b;
+        CHECK(oc_decode_broadcast(&p, &b) == OC_OK);
+        size_t n = strlen(bodies);
+        snprintf(bodies + n, cap - n, "%.*s\n", (int)b.body.len, (const char *)b.body.ptr);
+        got++;
+    }
+}
+
+static void test_voice_input_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ub = 0;
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    char text[256];
+    uint64_t mid = 99;
+    uint16_t code = 0;
+
+    /* Offered at auth, with the cap a client cuts speech inside. */
+    CHECK(g_auth_stt == 1 && g_auth_stt_max_ms == 30000);
+
+    /* Push to talk: the words come back to the speaker only, with a spoken
+     * "at bob" turned into a mention, and nothing is posted. */
+    stt_send(&a, 1, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x61, 16000, 1, 5);
+    CHECK(stt_await(&a, 1, text, sizeof text, &mid, &code, NULL, 0) == 1);
+    CHECK(strcmp(text, "segment 5 @bob") == 0 && mid == 0);
+
+    /* Free talk: two segments sent back to back are posted by the daemon, as
+     * alice, in order; everyone gets them as ordinary BROADCASTs and alice's
+     * segments close with the message ids. No SEND came from the client. */
+    char a_bodies[512] = "", b_bodies[512] = "";
+    uint64_t m1 = 0, m2 = 0;
+    stt_send(&a, 2, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x62, 8000, 1, 7);
+    stt_send(&a, 3, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x63, 8000, 1, 8);
+    CHECK(stt_await(&a, 2, text, sizeof text, &m1, &code, a_bodies, sizeof a_bodies) == 1);
+    CHECK(strcmp(text, "segment 7 @bob") == 0 && m1 != 0);
+    CHECK(stt_await(&a, 3, text, sizeof text, &m2, &code, a_bodies, sizeof a_bodies) == 1);
+    CHECK(strcmp(text, "segment 8 @bob") == 0 && m2 > m1);
+    read_broadcasts(&b, 2, b_bodies, sizeof b_bodies);
+    CHECK(strcmp(b_bodies, "segment 7 @bob\nsegment 8 @bob\n") == 0);
+
+    /* The same token again is the same message, not a second one: a retried
+     * segment posts once, exactly as a retried SEND does. */
+    uint64_t m3 = 0;
+    stt_send(&a, 4, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x62, 8000, 1, 7);
+    CHECK(stt_await(&a, 4, text, sizeof text, &m3, &code, NULL, 0) == 1);
+    CHECK(m3 == m1);
+
+    /* Nothing heard: answered with no text and no message. */
+    stt_send(&a, 5, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x65, 4000, 2, 0);
+    CHECK(stt_await(&a, 5, text, sizeof text, &mid, &code, NULL, 0) == 1);
+    CHECK(text[0] == 0 && mid == 0);
+
+    /* Recognition failing is a refusal of that segment, not of the connection. */
+    stt_send(&a, 6, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x66, 4000, 3, 0);
+    CHECK(stt_await(&a, 6, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_STT_UNAVAILABLE);
+
+    /* Over the cap: refused at BEGIN, before any audio. */
+    {
+        uint8_t buf[128];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_stt_begin sb = { 7, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, {0}, 31u * OC_STT_RATE };
+        CHECK(oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        CHECK(stt_await(&a, 7, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_SEGMENT_TOO_LONG);
+    }
+
+    /* A chunk out of order voids the segment. */
+    {
+        uint8_t buf[128];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_stt_begin sb = { 8, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, {0}, 100 };
+        CHECK(oc_encode_stt_begin(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        uint8_t two[4] = {0};
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_stt_chunk ch = { 8, 1, { two, sizeof two } };
+        CHECK(oc_encode_stt_chunk(&w, OC_PROTOCOL_VERSION, &ch) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        CHECK(stt_await(&a, 8, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_TRANSFER_PROTOCOL);
+    }
+
+    /* Free talk into a private channel bob is not in: refused before it is
+     * recognized, as a SEND there would be. */
+    {
+        uint8_t buf[256];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_create_channel cc = { oc_slice_str("hushed"), 0 };
+        CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+        oc_channel_info ci;
+        CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+        stt_send(&b, 9, OC_STT_MODE_FREE, ci.channel_id, 0, 0x69, 4000, 1, 1);
+        CHECK(stt_await(&b, 9, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_NOT_A_MEMBER);
+    }
+
+    /* Free talk into an archived channel: refused as a SEND there is (REQ-035). */
+    {
+        uint8_t buf[256];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_create_channel cc = { oc_slice_str("stilled"), 1 };
+        CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+        oc_channel_info ci;
+        CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+        uint64_t stilled = ci.channel_id;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_update_channel uc = { stilled, OC_CHUP_ARCHIVE, oc_slice_str("") };
+        CHECK(oc_encode_update_channel(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        int archived = 0;                      /* committed before anything is spoken there */
+        for (int i = 0; i < 20 && !archived; i++) {
+            CHECK(read_frame(&a, &hdr, &p) == 0);
+            if (hdr.msg_type != OC_MSG_CHANNEL_INFO) continue;
+            CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+            archived = ci.channel_id == stilled && ci.archived;
+        }
+        CHECK(archived);
+        stt_send(&a, 10, OC_STT_MODE_FREE, stilled, 0, 0x6A, 4000, 1, 1);
+        CHECK(stt_await(&a, 10, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_CHANNEL_ARCHIVED);
+    }
+
+    /* A speaker who leaves takes what they said with them: a segment still being
+     * heard when its connection closes is never posted. The worker hears in
+     * order, so had it been posted it would reach bob before the next one. */
+    {
+        client c;
+        CHECK(client_open(&c, port, pin) == 0);
+        CHECK(do_handshake(&c) == 0);
+        uint64_t uc = 0;
+        CHECK(do_auth(&c, "alice", "pw-alice", &uc) == 0);
+        stt_send(&c, 11, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x6B, 4000, 4, 1);
+        client_close(&c);
+        struct timespec ts = { 0, 100 * 1000000L };
+        nanosleep(&ts, NULL);                  /* the close is seen while it is heard */
+        char bodies[256] = "";
+        stt_send(&a, 12, OC_STT_MODE_FREE, OC_DEFAULT_CHANNEL, 0, 0x6C, 4000, 1, 12);
+        CHECK(stt_await(&a, 12, text, sizeof text, &mid, &code, NULL, 0) == 1 && mid != 0);
+        read_broadcasts(&b, 1, bodies, sizeof bodies);
+        CHECK(strcmp(bodies, "segment 12 @bob\n") == 0);
+    }
+
+    client_close(&a);
+    client_close(&b);
+}
+
+/* OPENCHIME_STT_RATE: segments one connection may send a minute. The window
+ * opens at a connection's first segment, so a fresh one sending one more than
+ * the limit meets it within the minute whatever the clock says. */
+static void test_voice_input_rate(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "carol", "pw", &ua) == 0);
+    uint16_t code = 0;
+    char text[64];
+    for (uint32_t i = 0; i < 60; i++) {
+        stt_send(&a, 100 + i, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x70, 1, 2, 0);
+        CHECK(stt_await(&a, 100 + i, text, sizeof text, NULL, &code, NULL, 0) == 1);
+    }
+    stt_send(&a, 160, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x70, 1, 2, 0);
+    CHECK(stt_await(&a, 160, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_STT_UNAVAILABLE);
+    client_close(&a);
+}
+
+/* Voice input absent (REQ-300): turned off by the operator, or with no engine --
+ * which is how a daemon whose recognizer data is missing or does not match runs
+ * (main.c hands the loop none). Either way it is not offered, a segment is
+ * refused, and the rest of the daemon serves on. Its own loop, run after the
+ * shared one has stopped: the recognizer worker is the loop's. */
+static void test_voice_input_absent(int port, int by_env) {
+    if (by_env) setenv("OPENCHIME_STT", "0", 1);
+    else        oc_netloop_set_stt(NULL);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    unlink("build/itest_stt_off.db");
+    unlink("build/itest_stt_off.db-wal");
+    unlink("build/itest_stt_off.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_stt_off.db");
+    CHECK(dbw2 != NULL);
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_stt == 0 && g_auth_stt_max_ms == 0);
+    uint16_t code = 0;
+    stt_send(&a, 1, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x71, 1600, 1, 1);
+    CHECK(stt_await(&a, 1, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_STT_UNAVAILABLE);
+    /* The chunks and end of the refused segment are not an error of their own:
+     * the connection still sends and is answered. */
+    uint8_t buf[128];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0};
+    s.channel_id = OC_DEFAULT_CHANNEL;
+    memset(s.idem, 0x72, OC_IDEM_SIZE);
+    s.body = oc_slice_str("typed instead");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    int acked = 0;
+    for (int i = 0; i < 20 && !acked; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        acked = hdr.msg_type == OC_MSG_SEND_ACK;
+    }
+    CHECK(acked);
+    client_close(&a);
+
+    arg2.stop = 1;
+    pthread_join(th2, NULL);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    if (by_env) unsetenv("OPENCHIME_STT");
+    else        oc_netloop_set_stt(&STUB_STT);
+    unlink("build/itest_stt_off.db");
+    unlink("build/itest_stt_off.db-wal");
+    unlink("build/itest_stt_off.db-shm");
 }
 
 /* Attachments over the wire (REQ-140/141, ARCH-69). A multi-chunk blob is
@@ -2755,6 +3117,7 @@ int run_netloop_tests(void) {
     /* Read-aloud with a stub engine (ARCH-111): the wire, the cache and the gate
      * are the daemon's, and no voice model is needed to prove them. */
     oc_netloop_set_tts(&STUB_TTS);
+    oc_netloop_set_stt(&STUB_STT);
 
     unlink("build/itest_netloop.db");
     unlink("build/itest_netloop.db-wal");
@@ -2796,6 +3159,8 @@ int run_netloop_tests(void) {
         test_presence_typing(arg.port, pin);
         test_presence_dnd(arg.port, pin);
         test_read_aloud_vertical(arg.port, pin);
+        test_voice_input_vertical(arg.port, pin);
+        test_voice_input_rate(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
         test_video_message_vertical(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
@@ -2814,6 +3179,11 @@ int run_netloop_tests(void) {
 
     arg.stop = 1;
     pthread_join(th, NULL);
+
+    if (failures == 0) {
+        test_voice_input_absent(arg.port + 124, 1);
+        test_voice_input_absent(arg.port + 125, 0);
+    }
 
     /* Stop the audio sidecar: the netloop is done, so unwire it and close the
      * daemon IPC end (the sidecar exits on EOF), then join + close fds. */

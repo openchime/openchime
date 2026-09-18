@@ -26,6 +26,8 @@ enum {
     OC_REC_CAMERA_BUSY     = -3,
     OC_REC_MIC_DENIED      = -4,
     OC_REC_FAILED          = -5,
+    /* Voice input holds the microphone; it has one owner at a time (ARCH-112). */
+    OC_REC_MIC_BUSY        = -6,
 };
 
 typedef enum {
