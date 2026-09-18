@@ -3064,12 +3064,14 @@ static int already_backfilled(uint64_t cid) {
     return 0;
 }
 
+static void profile_close(void);   /* fwd: the pane and its user id change together */
+
 static void close_overlays(void) {
     const oc_model *mm = model();
     g_prefs_open = 0;
     g_browse_open = 0;
     g_sessions_open = 0;
-    g_profile_uid = 0;
+    profile_close();
     g_notify_open = 0;
     g_keys_open = 0;
     g_wsmgr_open = 0;
@@ -8735,6 +8737,15 @@ static rectf g_rp_back, g_rp_close;
 static void rp_push(int mode) { g_rp_mode = mode; g_show_members = 1; }
 static void rp_pop(void) { g_rp_mode = RP_MEMBERS; g_profile_uid = 0; }
 
+/* Close the profile, if one is open. "Which profile is showing" is two
+ * variables, the pane's mode and the user id, and they change together or not
+ * at all: clearing the id alone left the pane in profile mode drawing user 0 --
+ * "user", Offline, a Message button -- in place of whoever had been there. */
+static void profile_close(void) {
+    if (g_rp_mode == RP_PROFILE) rp_pop();
+    g_profile_uid = 0;
+}
+
 /* Open somebody's profile — the ONLY way the pane is opened, so an id we cannot
  * resolve can never reach it. It used to be set directly at two call sites, and an
  * id the roster does not know produced a card reading "user", "Offline", a blank
@@ -8784,6 +8795,13 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
               g_chrome_hover == 4 ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 
+    /* The card is for someone this workspace knows, or it is not drawn: the
+     * same rule profile_open enforces at the door, held here too so no path
+     * that sets the pane can draw a person who does not exist. */
+    if (g_rp_mode == RP_PROFILE) {
+        const char *pn = g_profile_uid ? oc_model_user_name((oc_model *)m, g_profile_uid) : NULL;
+        if (!pn || !pn[0]) rp_pop();
+    }
     if (g_rp_mode == RP_PROFILE)  { g_n_memrows = 0; draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
     if (g_rp_mode == RP_REACTORS) { g_n_memrows = 0; draw_reactors_list(rt, m, rf(x0, 40, W, H)); return; }
 
@@ -11192,7 +11210,12 @@ static void modal_enter(HWND hwnd, int *flag) {
     /* Scheduling is about the conversation you are in, so it keeps you there too. */
     int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open);
     int prev_view = g_view;
+    /* A modal covers the window; it is not about the profile beside it. Edit
+     * profile is opened FROM your own card, and saving it should leave that card
+     * showing -- updated -- not close it underneath you. */
+    uint64_t kept_profile = g_rp_mode == RP_PROFILE ? g_profile_uid : 0;
     close_overlays();
+    if (kept_profile) { g_profile_uid = kept_profile; rp_push(RP_PROFILE); }
     /* The transient overlays too, and this was a real bug rather than tidiness:
      * the command palette and the emoji picker each claim EVERY click while open
      * (on_click returns early for them), and layout_natives hides their boxes
