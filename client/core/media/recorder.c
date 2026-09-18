@@ -11,6 +11,7 @@
 #include "oc_capture.h"
 #include "oc_codec.h"
 #include "oc_mp4.h"
+#include "oc_processor.h"
 #include "audio_dev.h"
 #include "oc_thread.h"
 
@@ -59,9 +60,31 @@ static void sleep_ms(int ms) {
 #endif
 }
 
+/* Timestamped audio waiting to be mixed: samples[0] was captured at pts_us. */
+#define MIX_BUF (OC_OPUS_RATE * 2)
+typedef struct {
+    oc_audio_dev *dev;
+    int16_t       buf[MIX_BUF];
+    size_t        n;
+    int64_t       pts_us;
+} mix_src;
+
 struct oc_recorder {
-    oc_capture   *cam;
+    oc_capture   *cam;                  /* the camera, or the screen or window */
     oc_audio_dev *mic;
+    /* A screen recording: the camera in its box, the computer's sound. */
+    int           screen, corner, source_gone;
+    oc_capture   *inset;
+    oc_frame      inset_latest, comp;   /* under mu */
+    int           inset_have;
+    oc_thread_t   inset_thread;
+    int           inset_started;
+    oc_audio_dev *loop;
+    mix_src       mic_s, loop_s;        /* encode thread */
+    const oc_audio_processor *proc;
+    void         *proc_state;
+    int64_t       a_t;                  /* where the next mixed block starts */
+    int64_t       last_video_us;
     int           width, height, fps;   /* the camera's frames */
     int           want_h;               /* the chosen quality */
     int           enc_w, enc_h;         /* what is encoded now */
@@ -103,7 +126,27 @@ static uint32_t cap_from_env(uint32_t cap) {
     return cap;
 }
 
-/* ---- capture thread ------------------------------------------------------------- */
+/* ---- capture threads ------------------------------------------------------------ */
+
+/* The camera of a screen recording: its latest frame, for the box. */
+static void *inset_main(void *arg) {
+    oc_recorder *r = arg;
+    for (;;) {
+        oc_frame f;
+        int rc = oc_capture_next(r->inset, &f, 100);
+        oc_mutex_lock(&r->mu);
+        if (r->quit || rc < 0) { oc_mutex_unlock(&r->mu); break; }   /* a lost camera keeps its last frame */
+        if (rc == 1) {
+            if (!r->inset_have || r->inset_latest.width != f.width || r->inset_latest.height != f.height) {
+                oc_frame_free(&r->inset_latest);
+                r->inset_have = oc_frame_alloc(&r->inset_latest, f.width, f.height) == 0;
+            }
+            if (r->inset_have) oc_frame_copy(&r->inset_latest, &f);
+        }
+        oc_mutex_unlock(&r->mu);
+    }
+    return NULL;
+}
 
 static void *capture_main(void *arg) {
     oc_recorder *r = arg;
@@ -113,17 +156,35 @@ static void *capture_main(void *arg) {
         oc_mutex_lock(&r->mu);
         if (r->quit) { oc_mutex_unlock(&r->mu); break; }
         if (rc < 0) {
-            if (r->state == OC_REC_RECORDING || r->state == OC_REC_PREVIEW) r->state = OC_REC_ERROR;
+            /* A window closed while it was recorded: keep what came before it,
+             * as Stop would. Anything else is a failure. */
+            if (rc == OC_CAP_GONE && r->state == OC_REC_RECORDING) {
+                r->source_gone = 1;
+                r->stop_requested = 1;
+            } else if (r->state == OC_REC_RECORDING || r->state == OC_REC_PREVIEW) {
+                if (rc == OC_CAP_GONE) r->source_gone = 1;
+                r->state = OC_REC_ERROR;
+            }
             oc_cond_signal(&r->cv);
             oc_mutex_unlock(&r->mu);
             break;
         }
         /* Until recording starts this thread is the microphone ring's only
          * reader, and discards what it reads so the ring never overflows; from
-         * RECORDING on (a state never left for PREVIEW) the encode thread is. */
-        if (r->state == OC_REC_PREVIEW && r->mic) {
+         * RECORDING on (a state never left for PREVIEW) the encode thread is.
+         * The computer's sound likewise. */
+        if (r->state == OC_REC_PREVIEW) {
             int16_t discard[960];
-            while (oc_audio_capture_read(r->mic, discard, 960, NULL) > 0) {}
+            if (r->mic) while (oc_audio_capture_read(r->mic, discard, 960, NULL) > 0) {}
+            if (r->loop) while (oc_audio_capture_read(r->loop, discard, 960, NULL) > 0) {}
+        }
+        /* The camera boxed into its corner, before anyone -- preview or
+         * encoder -- sees the frame. */
+        if (rc == 1 && r->inset && r->inset_have && r->comp.plane[0] &&
+            f.width == r->comp.width && f.height == r->comp.height) {
+            oc_frame_copy(&r->comp, &f);
+            oc_i420_inset(&r->comp, &r->inset_latest, r->corner);
+            f = r->comp;
         }
         if (rc == 1 && f.width == r->width && f.height == r->height) {
             oc_frame_copy(&r->latest, &f);
@@ -190,6 +251,93 @@ static void pump_audio(oc_recorder *r, oc_opusenc *oe, enc_ctx *e, int16_t *acc,
     }
 }
 
+/* ---- the computer's sound, mixed with the microphone ------------------------ */
+
+/* Read what is waiting into a source's buffer. A device's samples are
+ * contiguous, so only an empty buffer takes a new timestamp. */
+static void mix_fill(mix_src *s) {
+    if (!s->dev) return;
+    while (s->n < MIX_BUF) {
+        int64_t pts = 0;
+        size_t got = oc_audio_capture_read(s->dev, s->buf + s->n, MIX_BUF - s->n, &pts);
+        if (got == 0) break;
+        if (s->n == 0) s->pts_us = pts;
+        s->n += got;
+    }
+}
+
+/* Drop what is older than `t`. */
+static void mix_drop_before(mix_src *s, int64_t t) {
+    if (s->n == 0 || s->pts_us >= t) return;
+    size_t k = (size_t)((t - s->pts_us) * OC_OPUS_RATE / 1000000);
+    if (k >= s->n) { s->n = 0; return; }
+    memmove(s->buf, s->buf + k, (s->n - k) * sizeof *s->buf);
+    s->n -= k;
+    s->pts_us += (int64_t)k * 1000000 / OC_OPUS_RATE;
+}
+
+/* Samples available from `t` on; a stretch before the first one is silence. */
+static size_t mix_avail(mix_src *s, int64_t t) {
+    mix_drop_before(s, t);
+    if (s->n == 0) return 0;
+    size_t lead = s->pts_us > t ? (size_t)((s->pts_us - t) * OC_OPUS_RATE / 1000000) : 0;
+    return lead + s->n;
+}
+
+/* One 20 ms block from `t`: the samples there, silence where there are none. */
+static void mix_take(mix_src *s, int64_t t, int16_t *out) {
+    memset(out, 0, OC_OPUS_FRAME * sizeof *out);
+    mix_drop_before(s, t);
+    if (s->n == 0) return;
+    size_t lead = s->pts_us > t ? (size_t)((s->pts_us - t) * OC_OPUS_RATE / 1000000) : 0;
+    if (lead >= OC_OPUS_FRAME) return;
+    size_t k = OC_OPUS_FRAME - lead < s->n ? OC_OPUS_FRAME - lead : s->n;
+    memcpy(out + lead, s->buf, k * sizeof *out);
+    memmove(s->buf, s->buf + k, (s->n - k) * sizeof *s->buf);
+    s->n -= k;
+    s->pts_us += (int64_t)k * 1000000 / OC_OPUS_RATE;
+}
+
+/* Mix the microphone and the computer's sound into 20 ms blocks on one
+ * timeline from the first frame. The microphone is echo-cancelled against the
+ * computer's sound first -- speakers heard back by the microphone would
+ * otherwise be recorded twice, the second time late. A block waits for both
+ * sources until it is 300 ms old, then takes silence for what never came: the
+ * computer is silent by saying nothing at all. `flush` covers the last frame. */
+static void pump_mix(oc_recorder *r, oc_opusenc *oe, enc_ctx *e, int flush) {
+    int16_t mic[OC_OPUS_FRAME], loop[OC_OPUS_FRAME], mix[OC_OPUS_FRAME];
+    uint8_t pkt[OC_OPUS_MAX_PACKET];
+    mix_fill(&r->mic_s);
+    mix_fill(&r->loop_s);
+    for (;;) {
+        int64_t t = r->a_t, now = oc_media_clock_us();
+        if (flush) {
+            if (t > r->last_video_us) break;
+        } else {
+            int late = now - t > 300000;
+            if (r->mic_s.dev && mix_avail(&r->mic_s, t) < OC_OPUS_FRAME && !late) break;
+            if (r->loop_s.dev && mix_avail(&r->loop_s, t) < OC_OPUS_FRAME && !late) break;
+            if (now - t < 20000) break;                   /* not yet happened */
+        }
+        mix_take(&r->mic_s, t, mic);
+        mix_take(&r->loop_s, t, loop);
+        if (r->mic_s.dev && r->loop_s.dev && r->proc_state)
+            r->proc->process(r->proc_state, mic, loop, OC_OPUS_FRAME);
+        for (int i = 0; i < OC_OPUS_FRAME; i++) {
+            int v = (r->mic_s.dev ? mic[i] : 0) + loop[i];
+            mix[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        }
+        int n = oc_opusenc_encode(oe, mix, pkt, sizeof pkt);
+        if (n < 0 || oc_mp4_write_audio(e->mp4, pkt, (size_t)n, OC_OPUS_FRAME) != 0) { e->failed = 1; return; }
+        r->a_t += (int64_t)OC_OPUS_FRAME * 1000000 / OC_OPUS_RATE;
+    }
+}
+
+static void pump(oc_recorder *r, oc_opusenc *oe, enc_ctx *e, int16_t *acc, size_t *acc_n, int flush) {
+    if (r->loop) pump_mix(r, oe, e, flush);
+    else if (r->mic) pump_audio(r, oe, e, acc, acc_n, flush);
+}
+
 static void *encode_main(void *arg) {
     oc_recorder *r = arg;
     oc_vp9enc  *ve = NULL;
@@ -217,10 +365,10 @@ static void *encode_main(void *arg) {
             enc_fps = r->fps;
             oc_frame_free(&small);
             if ((ew != r->width || eh != r->height) && oc_frame_alloc(&small, ew, eh) != 0) goto fail;
-            ve = oc_vp9enc_open(ew, eh, enc_fps);
-            oe = r->mic ? oc_opusenc_open() : NULL;
+            ve = r->screen ? oc_vp9enc_open_screen(ew, eh, enc_fps) : oc_vp9enc_open(ew, eh, enc_fps);
+            oe = r->mic || r->loop ? oc_opusenc_open() : NULL;
             e.mp4 = oc_mp4_writer_open(ew, eh);
-            if (!ve || (r->mic && !oe) || !e.mp4) goto fail;
+            if (!ve || ((r->mic || r->loop) && !oe) || !e.mp4) goto fail;
             oc_mutex_lock(&r->mu); r->enc_w = ew; r->enc_h = eh; oc_mutex_unlock(&r->mu);
             next_frame_us = 0;
             recording = 1;
@@ -241,7 +389,7 @@ static void *encode_main(void *arg) {
         if (!have && !finishing) {
             /* Wait briefly for a frame; audio keeps draining meanwhile. */
             oc_mutex_unlock(&r->mu);
-            if (r->mic && r->t0_us) pump_audio(r, oe, &e, acc, &acc_n, 0);
+            if (r->t0_us) pump(r, oe, &e, acc, &acc_n, 0);
             sleep_ms(5);
             if (e.failed) goto fail;
             continue;
@@ -251,8 +399,9 @@ static void *encode_main(void *arg) {
         if (have) {
             if (!r->t0_us) {
                 r->t0_us = work.pts_us;
+                r->a_t = work.pts_us;
                 /* Drop microphone samples from before the first frame. */
-                if (r->mic) pump_audio(r, oe, &e, acc, &acc_n, 0);
+                pump(r, oe, &e, acc, &acc_n, 0);
             }
             uint32_t elapsed = (uint32_t)((work.pts_us - r->t0_us) / 1000);
             if (elapsed >= r->cap_ms || oc_mp4_writer_bytes(e.mp4) >= r->max_bytes) {
@@ -270,7 +419,7 @@ static void *encode_main(void *arg) {
                     int ew, eh;
                     encode_size(r->width, r->height, sh, &ew, &eh);
                     enc_fps = sh <= 360 ? 24 : r->fps;
-                    ve = oc_vp9enc_open(ew, eh, enc_fps);
+                    ve = r->screen ? oc_vp9enc_open_screen(ew, eh, enc_fps) : oc_vp9enc_open(ew, eh, enc_fps);
                     oc_frame_free(&small);
                     if (!ve || oc_frame_alloc(&small, ew, eh) != 0) goto fail;
                     oc_mutex_lock(&r->mu); r->stepped_down = 1; r->enc_w = ew; r->enc_h = eh; oc_mutex_unlock(&r->mu);
@@ -284,7 +433,8 @@ static void *encode_main(void *arg) {
                 }
                 oc_mutex_lock(&r->mu); r->elapsed_ms = elapsed; oc_mutex_unlock(&r->mu);
             }
-            if (r->mic) pump_audio(r, oe, &e, acc, &acc_n, 0);
+            r->last_video_us = work.pts_us;
+            pump(r, oe, &e, acc, &acc_n, 0);
             if (e.failed) goto fail;
         }
 
@@ -295,7 +445,7 @@ static void *encode_main(void *arg) {
             oc_mutex_unlock(&r->mu);
             if (!r->t0_us) goto fail;                       /* stopped before any frame */
             oc_vp9enc_encode(ve, NULL, 0, emit_video, &e);
-            if (r->mic) pump_audio(r, oe, &e, acc, &acc_n, 1);
+            pump(r, oe, &e, acc, &acc_n, 1);
             if (e.failed) goto fail;
             oc_rec_result res = {0};
             int rc = oc_mp4_writer_finish(e.mp4, &res.video, &res.video_len, &res.duration_ms);
@@ -355,12 +505,35 @@ oc_recorder *oc_recorder_open(const oc_recorder_opts *opts, int *err) {
     r->max_bytes = o.max_bytes ? o.max_bytes : OC_RECORDER_MAX_BYTES;
 
     int cerr;
-    r->cam = oc_capture_open(o.camera_id, want_w, want_h, fps, &cerr);
-    if (!r->cam) {
-        *err = cerr == OC_CAP_DENIED ? OC_REC_CAMERA_DENIED : cerr == OC_CAP_NODEVICE ? OC_REC_CAMERA_NODEVICE
-             : cerr == OC_CAP_BUSY ? OC_REC_CAMERA_BUSY : OC_REC_FAILED;
-        oc_recorder_close(r);
-        return NULL;
+    r->screen = o.screen_id && *o.screen_id;
+    r->corner = o.corner >= OC_CORNER_BR && o.corner <= OC_CORNER_TL ? o.corner : OC_CORNER_BR;
+    if (r->screen) {
+        r->cam = oc_capture_open_screen(o.screen_id, want_w, want_h, fps, &cerr);
+        if (!r->cam) {
+            *err = cerr == OC_CAP_DENIED ? OC_REC_SCREEN_DENIED : cerr == OC_CAP_NODEVICE ? OC_REC_SCREEN_UNSUPPORTED
+                 : cerr == OC_CAP_GONE ? OC_REC_SCREEN_GONE : OC_REC_FAILED;
+            oc_recorder_close(r);
+            return NULL;
+        }
+        if (o.with_camera) {
+            /* The box is a fifth of the width: a small camera frame is plenty. */
+            r->inset = oc_capture_open(o.camera_id, 640, 360, fps, &cerr);
+            if (!r->inset) {
+                *err = cerr == OC_CAP_DENIED ? OC_REC_CAMERA_DENIED : cerr == OC_CAP_NODEVICE ? OC_REC_CAMERA_NODEVICE
+                     : cerr == OC_CAP_BUSY ? OC_REC_CAMERA_BUSY : OC_REC_FAILED;
+                oc_recorder_close(r);
+                return NULL;
+            }
+            if (oc_capture_start(r->inset) != OC_CAP_OK) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
+        }
+    } else {
+        r->cam = oc_capture_open(o.camera_id, want_w, want_h, fps, &cerr);
+        if (!r->cam) {
+            *err = cerr == OC_CAP_DENIED ? OC_REC_CAMERA_DENIED : cerr == OC_CAP_NODEVICE ? OC_REC_CAMERA_NODEVICE
+                 : cerr == OC_CAP_BUSY ? OC_REC_CAMERA_BUSY : OC_REC_FAILED;
+            oc_recorder_close(r);
+            return NULL;
+        }
     }
     if (oc_capture_start(r->cam) != OC_CAP_OK) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
     /* The backend reports its real size with the first frame. */
@@ -368,13 +541,16 @@ oc_recorder *oc_recorder_open(const oc_recorder_opts *opts, int *err) {
     int rc = 0;
     for (int tries = 0; tries < 30 && rc == 0; tries++) rc = oc_capture_next(r->cam, &first, 100);
     if (rc != 1) {
-        if (rc == 0) oc_capture_set_detail("no frame from the camera within 3 s");
-        *err = rc == OC_CAP_DENIED ? OC_REC_CAMERA_DENIED : OC_REC_FAILED;
+        if (rc == 0) oc_capture_set_detail(r->screen ? "no frame from the screen within 3 s"
+                                                     : "no frame from the camera within 3 s");
+        *err = rc == OC_CAP_DENIED ? (r->screen ? OC_REC_SCREEN_DENIED : OC_REC_CAMERA_DENIED)
+             : rc == OC_CAP_GONE ? OC_REC_SCREEN_GONE : OC_REC_FAILED;
         oc_recorder_close(r);
         return NULL;
     }
     r->width = first.width; r->height = first.height;
     if (oc_frame_alloc(&r->latest, r->width, r->height) != 0) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
+    if (r->inset && oc_frame_alloc(&r->comp, r->width, r->height) != 0) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
     for (int i = 0; i < QUEUE_FRAMES; i++)
         if (oc_frame_alloc(&r->pool[i], r->width, r->height) != 0) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
     oc_frame_copy(&r->latest, &first);
@@ -384,9 +560,24 @@ oc_recorder *oc_recorder_open(const oc_recorder_opts *opts, int *err) {
     r->mic = oc_audio_capture_open(o.mic_id, OC_OPUS_RATE, 1, &aerr);
     if (!r->mic && aerr == OC_AUDIO_DENIED) { *err = OC_REC_MIC_DENIED; oc_recorder_close(r); return NULL; }
     if (!r->mic && aerr == OC_AUDIO_BUSY) { *err = OC_REC_MIC_BUSY; oc_recorder_close(r); return NULL; }
-    r->has_audio = r->mic != NULL;
+    /* The computer's sound, when asked for. A machine that cannot give it records
+     * without it rather than not at all, as with no microphone. */
+    if (r->screen && o.computer_sound) {
+        r->loop = oc_audio_loopback_open(NULL, OC_OPUS_RATE, 1, &aerr);
+        r->mic_s.dev = r->mic;
+        r->loop_s.dev = r->loop;
+        if (r->loop && r->mic) {
+            r->proc = &OC_PROCESSOR_SPEEX_48K;
+            r->proc_state = r->proc->open(OC_OPUS_RATE, OC_OPUS_FRAME);
+        }
+    }
+    r->has_audio = r->mic != NULL || r->loop != NULL;
 
     r->state = OC_REC_PREVIEW;
+    if (r->inset) {
+        if (oc_thread_create(&r->inset_thread, inset_main, r) != 0) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
+        r->inset_started = 1;
+    }
     if (oc_thread_create(&r->cap_thread, capture_main, r) != 0) { *err = OC_REC_FAILED; oc_recorder_close(r); return NULL; }
     if (oc_thread_create(&r->enc_thread, encode_main, r) != 0) {
         oc_mutex_lock(&r->mu); r->quit = 1; oc_mutex_unlock(&r->mu);
@@ -449,6 +640,9 @@ void oc_recorder_status(oc_recorder *r, oc_rec_status *st) {
     st->enc_width = r->enc_w;
     st->enc_height = r->enc_h;
     st->dropped_frames = r->dropped;
+    st->screen = r->screen;
+    st->computer_sound = r->loop != NULL;
+    st->source_gone = r->source_gone;
     oc_mutex_unlock(&r->mu);
 }
 
@@ -462,16 +656,24 @@ int oc_recorder_take(oc_recorder *r, oc_rec_result *out) {
 
 void oc_recorder_close(oc_recorder *r) {
     if (!r) return;
-    if (r->threads_started) {
+    if (r->threads_started || r->inset_started) {
         oc_mutex_lock(&r->mu);
         r->quit = 1;
         oc_cond_signal(&r->cv);
         oc_mutex_unlock(&r->mu);
-        oc_thread_join(r->cap_thread);
-        oc_thread_join(r->enc_thread);
+        if (r->threads_started) {
+            oc_thread_join(r->cap_thread);
+            oc_thread_join(r->enc_thread);
+        }
+        if (r->inset_started) oc_thread_join(r->inset_thread);
     }
     if (r->cam) { oc_capture_stop(r->cam); oc_capture_close(r->cam); }
+    if (r->inset) { oc_capture_stop(r->inset); oc_capture_close(r->inset); }
     oc_audio_close(r->mic);
+    oc_audio_close(r->loop);
+    if (r->proc_state) r->proc->close(r->proc_state);
+    oc_frame_free(&r->inset_latest);
+    oc_frame_free(&r->comp);
     oc_frame_free(&r->latest);
     for (int i = 0; i < QUEUE_FRAMES; i++) oc_frame_free(&r->pool[i]);
     oc_rec_result_free(&r->result);

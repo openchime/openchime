@@ -228,6 +228,16 @@ The signature is the important part: `process` receives **both** the capture
 frame and the playback frame that was emitted at the same instant. A processor
 seam that only sees capture cannot ever host an echo canceller.
 
+Three processors are built: `OC_PROCESSOR_NONE`; `OC_PROCESSOR_SPEEX`, speexdsp's
+linear canceller, which voice input runs at 16 kHz (ARCH-112); and
+`OC_PROCESSOR_SPEEX_48K`, for full-band audio — a screen recording's microphone
+against the computer's sound (VIDEO-MESSAGES.md §4.2) — which runs the 16 kHz
+canceller on the band below 7 kHz and takes the echo it finds out of the 48 kHz
+microphone, 1 ms late for its filters. The computer's own sound comes from the
+device layer's **loopback** device (`oc_audio_loopback_open`), which captures what
+an output device plays and writes the stretches where nothing played as silence,
+so its samples stay on the media clock.
+
 ---
 
 ## 4. Media transport
@@ -383,6 +393,7 @@ path 30 ms late and a decaying tail:
 | Converged | 22.5 dB ERLE |
 | Far end resampled 100 ppm fast | 15.5 dB ERLE — re-converges |
 | Double-talk | 13.2 dB of echo removed; output correlates 0.93 with the near-end voice |
+| The same rooms at 48 kHz, on the 16 kHz band (`OC_PROCESSOR_SPEEX_48K`) | 22.1 dB converged; 13.2 dB in double-talk, voice correlating 0.93 — against 23.2 dB, 11.0 dB and 0.88 for speexdsp run at 48 kHz |
 
 speexdsp's **residual-echo suppressor is left off**: in the same double-talk it
 cut the near-end voice to a correlation of 0.05. The linear filter alone keeps the

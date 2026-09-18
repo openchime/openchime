@@ -1,6 +1,7 @@
-/* The camera capture interface (REQ-163, ARCH-110, docs/VIDEO-MESSAGES.md §3).
- * One interface for every platform; every backend delivers oc_frame (planar
- * I420, BT.709 limited range, even dimensions) stamped from oc_media_clock_us(). */
+/* The capture interface (REQ-163, ARCH-110, docs/VIDEO-MESSAGES.md §3): cameras,
+ * and screens and windows. One interface for every platform; every backend
+ * delivers oc_frame (planar I420, BT.709 limited range, even dimensions) stamped
+ * from oc_media_clock_us(). */
 #ifndef OC_CAPTURE_H
 #define OC_CAPTURE_H
 
@@ -12,11 +13,16 @@ enum {
     OC_CAP_NODEVICE = -2,
     OC_CAP_BUSY     = -3,    /* another application holds it */
     OC_CAP_FAILED   = -4,
+    OC_CAP_GONE     = -5,    /* what was being captured went away: a window closed */
 };
+
+/* What a device is. */
+enum { OC_SOURCE_CAMERA = 0, OC_SOURCE_SCREEN, OC_SOURCE_WINDOW };
 
 typedef struct {
     char id[256];            /* backend-specific; pass to oc_capture_open */
     char name[128];          /* UTF-8, for a picker */
+    int  kind;               /* OC_SOURCE_* */
 } oc_capture_device;
 
 typedef struct oc_capture oc_capture;
@@ -45,12 +51,28 @@ void oc_capture_stop(oc_capture *c);
 /* Release the device at once (REQ-166). */
 void oc_capture_close(oc_capture *c);
 
+/* Screens and windows (REQ-162): listed apart from the cameras, monitors first.
+ * Returns the count, 0 where screen capture is not available. */
+int  oc_capture_list_screens(oc_capture_device *out, int cap);
+/* Open a screen or window. Frames come at one size for the whole capture: the
+ * source's shape fitted inside max_w×max_h when it opened, even; a window that
+ * is resized later is fitted into that size. A screen backend reports a frame
+ * only when something changed, and this front end repeats the last one so that
+ * frames still arrive at `fps` while nothing moves. */
+oc_capture *oc_capture_open_screen(const char *device_id, int max_w, int max_h, int fps, int *err);
+
 /* The backends. `OPENCHIME_TEST_CAPTURE=synthetic|denied` selects the synthetic
- * one; otherwise the platform's. */
+ * ones; otherwise the platform's. `synthetic-camera` makes only the camera
+ * synthetic, so a real screen can be recorded with a known picture in its box. */
 extern const oc_capture_backend oc_capture_synthetic;
 extern const oc_capture_backend oc_capture_denied;
+/* A synthetic screen: 2560×1600 of text-like stripes that change five times a
+ * second, so fitting and the repeating of still frames are exercised.
+ * `OPENCHIME_TEST_SCREEN_GONE_MS` makes it go away after that long. */
+extern const oc_capture_backend oc_capture_synthetic_screen;
 /* NULL where this platform's backend is not built yet. */
 const oc_capture_backend *oc_capture_platform(void);
+const oc_capture_backend *oc_capture_screen_platform(void);
 
 /* Why the last open or read failed, in words a log can carry: the step and the
  * platform's code ("SetCurrentMediaType NV12: 0xC00D5212"). "" when nothing has

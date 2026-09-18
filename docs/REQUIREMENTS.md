@@ -1237,14 +1237,18 @@ the requirement says so explicitly rather than implying one.
   call may hold clients on different platforms simultaneously and a codec
   disagreement would break the call outright; the codec has therefore been
   negotiated on the wire (PROTOCOL.md §5.17) rather than chosen per frontend.
-  Remote control, recording, screen-audio capture, simultaneous sharers, and
-  camera video have all been out of scope (REQ-160). A **text-only frontend has
+  Remote control, recording the share, the computer's sound, simultaneous
+  sharers, and camera video have all been out of scope of a call (REQ-160); a
+  *recorded* screen is a video message (REQ-162). A **text-only frontend has
   been permanently exempt** (ARCH-75 — the TUI renders no graphics), showing only
   that a share is in progress and by whom. **Not started; sequenced behind the
   audio client** (REQ-150–152), whose media transport it builds on.
 - **REQ-162.** A user has been able to **record a video message and
   post it** into a channel, a DM or a thread, with the composer's text as its
-  caption. Recording only — no trimming or editing — and **capped at five
+  caption. It has recorded **the camera, a screen or one window**, and a screen or
+  window **with the camera in a box** in the corner the user picked; its sound has
+  been the microphone, and on a screen recording the **computer's sound** too when
+  the user chose it. Recording only — no trimming or editing — and **capped at five
   minutes**, where recording stops on its own. The recording is reviewed before it
   is sent (play it back, retake, discard or send) and **nothing leaves the machine
   until Send** (ARCH-110).
@@ -1254,9 +1258,11 @@ the requirement says so explicitly rather than implying one.
   camera delivers. Six backends have been designed: Media Foundation (Windows),
   V4L2 (Linux), AVFoundation (macOS), AVCaptureSession (iOS), Camera2 through the
   NDK (Android) and `getUserMedia` (web). A backend is built together with the
-  client for its platform; the Win32 client's is the first. Microphone and
-  speaker have gone through the audio device layer the call client uses (REQ-151,
-  AUDIO.md §3.2).
+  client for its platform; the Win32 client's is the first. **A screen or window
+  is a source behind the same interface** — on Windows, Windows.Graphics.Capture —
+  so the camera box is composited and the result encoded exactly as a camera is.
+  Microphone, speaker and the computer's own sound have gone through the audio
+  device layer the call client uses (REQ-151, AUDIO.md §3.2).
 - **REQ-164.** A video message has been stored as **VP9 video and
   Opus audio in MP4**, encoded in the client (ARCH-110). The daemon has linked no
   codec and treats the file as an ordinary attachment (REQ-140) with media
@@ -1275,7 +1281,12 @@ the requirement says so explicitly rather than implying one.
   a way to the system setting, never as a generic failure; a recording in progress
   has been visibly marked; the camera has been released as soon as the recording
   surface closes; and a recording has never been written to disk, so one that was
-  discarded or interrupted by a crash has left nothing behind (ARCH-88).
+  discarded or interrupted by a crash has left nothing behind (ARCH-88). **A screen
+  recording** has shown what it captures while it does — the operating system's own
+  capture border around it, and a recording bar with the time and Stop — kept its
+  own controls out of the picture where the system allows, recorded the computer's
+  sound only when that was chosen, and ended, keeping what it had, when the window
+  it recorded closed.
 
 ### 6.4 Read-aloud
 

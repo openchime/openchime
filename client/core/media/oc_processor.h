@@ -25,5 +25,13 @@ extern const oc_audio_processor OC_PROCESSOR_NONE;
  * device's output and input buffering and the room together. */
 #define OC_AEC_TAIL_MS 300
 extern const oc_audio_processor OC_PROCESSOR_SPEEX;
+/* The same canceller for full-band 48 kHz audio -- a screen recording's
+ * microphone against the computer's sound (REQ-162). speexdsp run at 48 kHz
+ * models the echo path with three times the taps and, measured in the ERLE
+ * harness, keeps too little of a voice talking over it; so the canceller runs at
+ * 16 kHz, where it is proven, and the echo it finds there is taken out of the
+ * full-band microphone, which keeps everything above 8 kHz. Frames are 48 kHz
+ * and a multiple of 3; the output is 1 ms later than the input. */
+extern const oc_audio_processor OC_PROCESSOR_SPEEX_48K;
 
 #endif

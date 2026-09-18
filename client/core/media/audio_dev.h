@@ -49,6 +49,15 @@ int oc_audio_list(int capture, oc_audio_device *out, int cap);
 oc_audio_dev *oc_audio_capture_open(const char *id, int rate, int channels, int *err);
 oc_audio_dev *oc_audio_playback_open(const char *id, int rate, int channels, int *err);
 
+/* The computer's own sound: what the output device (`output_id`, NULL for the
+ * default) is playing, captured as it goes out -- WASAPI loopback. Read like a
+ * capture device. It is not the microphone and takes nothing from its one owner.
+ * A stretch where nothing played reads as silence at the right times.
+ * Synthetic: a 660 Hz tone over quieter ones; `OPENCHIME_TEST_MIC_ECHO=1` makes
+ * the synthetic microphone hear it back 20 ms later at half strength, over its
+ * own tone, and `=only` makes that echo all it hears. */
+oc_audio_dev *oc_audio_loopback_open(const char *output_id, int rate, int channels, int *err);
+
 /* Capture: take up to `frames` frames. `*pts_us` receives the capture time of
  * the first one returned. Returns the frame count (0 when none are waiting). */
 size_t oc_audio_capture_read(oc_audio_dev *d, int16_t *pcm, size_t frames, int64_t *pts_us);

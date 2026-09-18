@@ -151,3 +151,58 @@ void oc_i420_scale(const oc_frame *src, oc_frame *dst) {
         scale_plane(src->plane[p], src->width / 2, src->height / 2, src->stride[p],
                     dst->plane[p], dst->width / 2, dst->height / 2, dst->stride[p]);
 }
+
+int oc_i420_view(const oc_frame *f, int x, int y, int w, int h, oc_frame *view) {
+    memset(view, 0, sizeof *view);
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 || ((x | y | w | h) & 1) ||
+        x + w > f->width || y + h > f->height) return -1;
+    view->width = w; view->height = h;
+    view->pts_us = f->pts_us;
+    view->plane[0] = f->plane[0] + (size_t)y * f->stride[0] + x;
+    view->plane[1] = f->plane[1] + (size_t)(y / 2) * f->stride[1] + x / 2;
+    view->plane[2] = f->plane[2] + (size_t)(y / 2) * f->stride[2] + x / 2;
+    for (int p = 0; p < 3; p++) view->stride[p] = f->stride[p];
+    return 0;
+}
+
+void oc_i420_fill(oc_frame *f, uint8_t y, uint8_t u, uint8_t v) {
+    const uint8_t val[3] = { y, u, v };
+    for (int p = 0; p < 3; p++) {
+        int w = p ? f->width / 2 : f->width, h = p ? f->height / 2 : f->height;
+        for (int r = 0; r < h; r++) memset(f->plane[p] + (size_t)r * f->stride[p], val[p], (size_t)w);
+    }
+}
+
+void oc_i420_fit(const oc_frame *src, oc_frame *dst) {
+    int w = dst->width, h = (int)((int64_t)dst->width * src->height / src->width);
+    if (h > dst->height) { h = dst->height; w = (int)((int64_t)dst->height * src->width / src->height); }
+    w &= ~1; h &= ~1;
+    if (w < 2) w = 2;
+    if (h < 2) h = 2;
+    int x = ((dst->width - w) / 2) & ~1, y = ((dst->height - h) / 2) & ~1;
+    if (w != dst->width || h != dst->height) oc_i420_fill(dst, 16, 128, 128);   /* black, limited range */
+    oc_frame view;
+    if (oc_i420_view(dst, x, y, w, h, &view) == 0) oc_i420_scale(src, &view);
+    dst->pts_us = src->pts_us;
+}
+
+void oc_inset_rect(int fw, int fh, int cw, int ch, int corner, int *x, int *y, int *w, int *h) {
+    int bw = (fw / 5) & ~1;
+    int bh = cw > 0 ? (int)((int64_t)bw * ch / cw) & ~1 : 0;
+    if (bh > fh / 2) { bh = (fh / 2) & ~1; bw = ch > 0 ? (int)((int64_t)bh * cw / ch) & ~1 : 0; }
+    int m = (fw / 50) & ~1;
+    *w = bw; *h = bh;
+    *x = (corner == OC_CORNER_BL || corner == OC_CORNER_TL) ? m : (fw - m - bw) & ~1;
+    *y = (corner == OC_CORNER_TR || corner == OC_CORNER_TL) ? m : (fh - m - bh) & ~1;
+}
+
+void oc_i420_inset(oc_frame *dst, const oc_frame *cam, int corner) {
+    int x, y, w, h;
+    oc_inset_rect(dst->width, dst->height, cam->width, cam->height, corner, &x, &y, &w, &h);
+    if (w < 8 || h < 8) return;
+    oc_frame box, pic;
+    if (oc_i420_view(dst, x, y, w, h, &box) != 0) return;
+    oc_i420_fill(&box, 235, 128, 128);                  /* the border: white, limited range */
+    if (oc_i420_view(dst, x + 2, y + 2, w - 4, h - 4, &pic) != 0) return;
+    oc_i420_scale(cam, &pic);
+}

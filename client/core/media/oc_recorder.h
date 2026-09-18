@@ -1,5 +1,6 @@
 /* Recording a video message (REQ-162, ARCH-110, docs/VIDEO-MESSAGES.md §4): a
- * camera and a microphone in, a VP9 + Opus MP4 and a JPEG poster out — both in
+ * camera -- or a screen or window, with the camera in a box -- and a microphone
+ * and the computer's sound in, a VP9 + Opus MP4 and a JPEG poster out, both in
  * memory, since a client writes no files (ARCH-88).
  *
  * Opening a recorder opens the devices and starts the preview; nothing is
@@ -28,6 +29,11 @@ enum {
     OC_REC_FAILED          = -5,
     /* Voice input holds the microphone; it has one owner at a time (ARCH-112). */
     OC_REC_MIC_BUSY        = -6,
+    /* A screen recording: the system refused the capture; this Windows cannot
+     * capture screens; the screen or window is gone. */
+    OC_REC_SCREEN_DENIED   = -7,
+    OC_REC_SCREEN_UNSUPPORTED = -8,
+    OC_REC_SCREEN_GONE     = -9,
 };
 
 typedef enum {
@@ -42,8 +48,16 @@ typedef struct {
     const char *camera_id;   /* NULL or "" for the default */
     const char *mic_id;
     uint32_t    cap_ms;      /* 0 for OC_RECORDER_CAP_MS; OPENCHIME_TEST_VIDEO_CAP_MS overrides */
-    int         width, height, fps;   /* 0 for 1280×720 at 30 */
+    int         width, height, fps;   /* 0 for 1280×720 at 30; a screen fits inside the size */
     uint64_t    max_bytes;   /* 0 for OC_RECORDER_MAX_BYTES */
+    /* A screen recording: a screen or window from oc_capture_list_screens, NULL
+     * or "" to record the camera. With `with_camera`, camera_id's camera is
+     * boxed into `corner` (OC_CORNER_*). `computer_sound` adds what the
+     * computer plays, mixed with the microphone. */
+    const char *screen_id;
+    int         with_camera;
+    int         corner;
+    int         computer_sound;
 } oc_recorder_opts;
 
 typedef struct {
@@ -55,6 +69,9 @@ typedef struct {
     int          stepped_down;       /* the encoder fell behind and dropped a size */
     int          enc_width, enc_height;   /* what is being encoded */
     uint64_t     dropped_frames;
+    int          screen;             /* recording a screen or window */
+    int          computer_sound;     /* the computer's sound is being recorded */
+    int          source_gone;        /* the window closed; what came before was kept */
 } oc_rec_status;
 
 typedef struct {

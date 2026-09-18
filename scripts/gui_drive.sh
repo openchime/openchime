@@ -103,10 +103,18 @@ case "${1:-}" in
     powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
     sleep 1
     rm -f "$LIN_DIR"/cmd "$LIN_DIR"/ack
+    # OC_DRIVE_LOCAL=1 runs a copy from a local Windows directory: Windows refuses
+    # a real camera to an executable started from the WSL share (TESTING.md).
+    if [ "${OC_DRIVE_LOCAL:-0}" = "1" ]; then
+      mkdir -p /mnt/c/Temp/octest-bin
+      cp "$EXE" /mnt/c/Temp/octest-bin/openchime.exe
+      EXE=/mnt/c/Temp/octest-bin/openchime.exe
+    fi
     # WSLENV is required for the env var to cross into the Windows process. The
-    # test-audio pair crosses too when set: OPENCHIME_TEST_AUDIO=synthetic, and
-    # OPENCHIME_TEST_MIC=<windows path to a WAV> for a microphone that speaks.
-    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC" OPENCHIME_TEST_DIR="$WIN_DIR" \
+    # test switches cross too when set: OPENCHIME_TEST_AUDIO=synthetic,
+    # OPENCHIME_TEST_MIC=<windows path to a WAV> for a microphone that speaks,
+    # OPENCHIME_TEST_CAPTURE=synthetic|synthetic-camera|denied, and the rest.
+    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_MIC_ECHO:OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_VIDEO_CAP_MS:OPENCHIME_TEST_SCREEN_GONE_MS" OPENCHIME_TEST_DIR="$WIN_DIR" \
         setsid "$EXE" "$ws" "$cred" >/dev/null 2>&1 < /dev/null &
     disown; sleep 3; echo "launched"; exit 0 ;;
   kill)

@@ -553,6 +553,329 @@ static void test_player(void) {
     oc_mp4_info_free(&info);
 }
 
+/* ---- screen recording (REQ-162) ------------------------------------------------------ */
+
+/* A frame's box, a view into it, the camera box's geometry. */
+static void test_i420_view(void) {
+    oc_frame f, v;
+    CHECK(oc_frame_alloc(&f, 64, 48) == 0);
+    oc_i420_fill(&f, 16, 128, 128);
+    CHECK(oc_i420_view(&f, 3, 0, 8, 8, &v) != 0);          /* odd position */
+    CHECK(oc_i420_view(&f, 0, 0, 7, 8, &v) != 0);          /* odd size */
+    CHECK(oc_i420_view(&f, 60, 0, 8, 8, &v) != 0);         /* outside */
+    CHECK(oc_i420_view(&f, 56, 40, 8, 8, &v) == 0);        /* the last whole box */
+    oc_i420_fill(&v, 200, 90, 160);
+    int inside = 1, outside = 1;
+    for (int y = 0; y < 48; y++)
+        for (int x = 0; x < 64; x++) {
+            int in = x >= 56 && y >= 40, val = f.plane[0][y * f.stride[0] + x];
+            if (in && val != 200) inside = 0;
+            if (!in && val != 16) outside = 0;
+        }
+    CHECK(inside && outside);
+    CHECK(f.plane[1][20 * f.stride[1] + 28] == 90 && f.plane[2][20 * f.stride[2] + 28] == 160);
+    CHECK(f.plane[1][19 * f.stride[1] + 27] == 128);
+    oc_frame_free(&f);
+
+    /* A fifth of the width, the camera's shape, 2% in from the chosen corner. */
+    int x, y, w, h;
+    oc_inset_rect(1920, 1080, 640, 360, OC_CORNER_BR, &x, &y, &w, &h);
+    CHECK(w == 384 && h == 216 && x == 1920 - 38 - 384 && y == 1080 - 38 - 216);
+    oc_inset_rect(1920, 1080, 640, 360, OC_CORNER_TL, &x, &y, &w, &h);
+    CHECK(x == 38 && y == 38);
+    oc_inset_rect(1920, 1080, 640, 360, OC_CORNER_TR, &x, &y, &w, &h);
+    CHECK(x == 1920 - 38 - 384 && y == 38);
+    oc_inset_rect(1920, 1080, 640, 360, OC_CORNER_BL, &x, &y, &w, &h);
+    CHECK(x == 38 && y == 1080 - 38 - 216);
+    /* A tall camera on a short frame is held to half the frame's height, and
+     * everything stays even (a box must be a view). */
+    oc_inset_rect(1152, 720, 480, 640, OC_CORNER_BR, &x, &y, &w, &h);
+    CHECK(h <= 360 && !((x | y | w | h) & 1) && x + w <= 1152 && y + h <= 720);
+}
+
+/* The screen front end: the synthetic screen changes five times a second, and
+ * frames still come at the frame rate, all one size, fitted inside the maximum. */
+static void test_screen_source(void) {
+    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    oc_capture_device d[4];
+    CHECK(oc_capture_list_screens(d, 4) == 2);
+    CHECK(d[0].kind == OC_SOURCE_SCREEN && d[1].kind == OC_SOURCE_WINDOW);
+    int err;
+    oc_capture *c = oc_capture_open_screen("screen:synthetic", 1280, 720, 30, &err);
+    CHECK(c != NULL && err == OC_CAP_OK);
+    if (!c) return;
+    CHECK(oc_capture_start(c) == OC_CAP_OK);
+    int frames = 0, changes = 0, prev = -1, size_ok = 1;
+    int64_t t0 = oc_media_clock_us();
+    while (oc_media_clock_us() - t0 < 1000000) {
+        oc_frame f;
+        int rc = oc_capture_next(c, &f, 100);
+        CHECK(rc >= 0);
+        if (rc != 1) continue;
+        frames++;
+        if (f.width != 1152 || f.height != 720) size_ok = 0;
+        int n = oc_capture_synthetic_frame_number(&f);
+        if (n != prev) { changes++; prev = n; }
+    }
+    printf("  screen source: %d frames, %d changes in 1 s\n", frames, changes);
+    CHECK(size_ok);
+    CHECK(frames >= 27 && frames <= 32);                   /* the rate, though the screen is mostly still */
+    CHECK(changes >= 4 && changes <= 7);
+    oc_capture_stop(c);
+    oc_capture_close(c);
+}
+
+/* Decode the video frame at sample `k` (from the keyframe before it) into `out`. */
+static int decode_video_at(const uint8_t *mp4, const oc_mp4_info *info, uint32_t k, oc_frame *out) {
+    int key = oc_mp4_keyframe_before(info, info->video.samples[k].dts);
+    if (key < 0) return -1;
+    oc_vp9dec *dec = oc_vp9dec_open();
+    if (!dec) return -1;
+    int ok = -1;
+    for (uint32_t i = (uint32_t)key; i <= k; i++) {
+        oc_frame f;
+        const oc_mp4_sample *s = &info->video.samples[i];
+        if (oc_vp9dec_decode(dec, mp4 + s->offset, s->size, (int64_t)i, &f) != 0) break;
+        if (i == k && oc_frame_alloc(out, f.width, f.height) == 0) { oc_frame_copy(out, &f); ok = 0; }
+    }
+    oc_vp9dec_close(dec);
+    return ok;
+}
+
+/* How colourful a rectangle is: the mean distance of its chroma from grey. */
+static double chroma_in(const oc_frame *f, int x, int y, int w, int h) {
+    double sum = 0;
+    int n = 0;
+    for (int j = y / 2; j < (y + h) / 2; j++)
+        for (int i = x / 2; i < (x + w) / 2; i++) {
+            sum += abs(f->plane[1][j * f->stride[1] + i] - 128) + abs(f->plane[2][j * f->stride[2] + i] - 128);
+            n++;
+        }
+    return n ? sum / n : 0;
+}
+
+/* The whole audio track, decoded, pre-skip removed. */
+static int16_t *decode_audio(const uint8_t *mp4, const oc_mp4_info *info, size_t *n_out) {
+    *n_out = 0;
+    if (!info->audio.present) return NULL;
+    size_t cap = (size_t)info->audio.n_samples * 960 + 960;
+    int16_t *pcm = malloc(cap * sizeof *pcm);
+    oc_opusdec *d = oc_opusdec_open(1);
+    if (!pcm || !d) { free(pcm); oc_opusdec_close(d); return NULL; }
+    size_t n = 0;
+    for (uint32_t i = 0; i < info->audio.n_samples; i++) {
+        const oc_mp4_sample *s = &info->audio.samples[i];
+        int got = oc_opusdec_decode(d, mp4 + s->offset, s->size, pcm + n, (int)(cap - n));
+        if (got > 0) n += (size_t)got;
+    }
+    oc_opusdec_close(d);
+    size_t skip = info->opus_preskip < n ? info->opus_preskip : n;
+    memmove(pcm, pcm + skip, (n - skip) * sizeof *pcm);
+    *n_out = n - skip;
+    return pcm;
+}
+
+/* The amplitude of one frequency in a stretch of samples (Goertzel). */
+static double tone_amp(const int16_t *x, size_t n, double hz) {
+    double w = 2 * 3.141592653589793 * hz / 48000.0, c = 2 * cos(w), s1 = 0, s2 = 0;
+    for (size_t i = 0; i < n; i++) { double s0 = x[i] + c * s1 - s2; s2 = s1; s1 = s0; }
+    double re = s1 - s2 * cos(w), im = s2 * sin(w);
+    return 2.0 * sqrt(re * re + im * im) / (double)n;
+}
+
+static void test_screen_recording(void) {
+    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "3000", 1);
+    /* The microphone hears the computer's sound back, 20 ms late at half strength:
+     * a room, on a machine with speakers. */
+    setenv("OPENCHIME_TEST_MIC_ECHO", "1", 1);
+
+    for (int corner = OC_CORNER_BR; corner <= OC_CORNER_TL; corner++) {
+        oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "screen:synthetic",
+                               .with_camera = 1, .corner = corner, .computer_sound = 1 };
+        int err;
+        oc_recorder *r = oc_recorder_open(&o, &err);
+        CHECK(r != NULL && err == OC_REC_OK);
+        if (!r) continue;
+        oc_rec_status st;
+        oc_recorder_status(r, &st);
+        CHECK(st.screen && st.computer_sound && st.has_audio);
+        CHECK(oc_recorder_start(r) == 0);
+        CHECK(wait_state(r, OC_REC_DONE, 8000, &st));
+        oc_rec_result res = {0};
+        CHECK(oc_recorder_take(r, &res) == 0);
+        oc_recorder_close(r);
+        /* A 16:10 screen fitted inside 1280×720. */
+        CHECK(res.width == 1152 && res.height == 720);
+        CHECK(res.duration_ms >= 2950 && res.duration_ms <= 3100);
+        oc_mp4_info info;
+        if (!res.video || oc_mp4_parse(res.video, res.video_len, &info) != 0) { CHECK(0); oc_rec_result_free(&res); continue; }
+        /* Every frame at the rate, though the screen changed five times a second. */
+        CHECK(info.video.n_samples >= 80 && info.video.n_samples <= 92);
+        oc_frame f;
+        if (decode_video_at(res.video, &info, info.video.n_samples / 2, &f) == 0) {
+            int x, y, w, h;
+            oc_inset_rect(f.width, f.height, 640, 360, corner, &x, &y, &w, &h);
+            double box = chroma_in(&f, x + 8, y + 8, w - 16, h - 16);
+            double page = chroma_in(&f, f.width / 2 - 100, f.height / 2 - 60, 200, 120);
+            /* The opposite corner, where no box is. */
+            int ox, oy, ow, oh;
+            oc_inset_rect(f.width, f.height, 640, 360, corner ^ 3, &ox, &oy, &ow, &oh);
+            double away = chroma_in(&f, ox + 8, oy + 8, ow - 16, oh - 16);
+            printf("  corner %d: box chroma %.1f, page %.1f, opposite corner %.1f\n", corner, box, page, away);
+            CHECK(box > 40.0);                          /* the camera's colour bars */
+            CHECK(page < 4.0 && away < 4.0);            /* the grey page */
+            oc_frame_free(&f);
+        } else {
+            CHECK(0);
+        }
+        /* Sound, with the narrator talking over the computer the whole time:
+         * both are in the mix, and the voice is there. Only that is asserted.
+         * A steady tone talking without a pause over another steady tone is the
+         * canceller's worst case, and what it does to the recording there varies
+         * from run to run -- measured over twelve recordings, the voice kept
+         * 73-97% and the computer's sound came out at 0.74-1.39 of its level
+         * (1.26 is no canceller at all). What it does with speech, which pauses,
+         * is the ERLE harness's to say (tests/test_voice.c), deterministically;
+         * the echo-only case below is what shows it is wired in. */
+        size_t n = 0;
+        int16_t *pcm = decode_audio(res.video, &info, &n);
+        if (pcm && n > 48000) {
+            const int16_t *tail = pcm + n - 48000;
+            double a440 = tone_amp(tail, 48000, 440), a660 = tone_amp(tail, 48000, 660);
+            printf("  corner %d: 440 Hz %.0f (mic 8000), 660 Hz %.0f (computer 6000)\n", corner, a440, a660);
+            CHECK(a440 > 8000 * 0.6 && a440 < 8000 * 1.1);
+            CHECK(a660 > 6000 * 0.6 && a660 < 6000 * 1.5);
+        } else {
+            CHECK(0);
+        }
+        free(pcm);
+        CHECK(ffprobe_ok(res.video, res.video_len, res.duration_ms));
+        oc_mp4_info_free(&info);
+        oc_rec_result_free(&res);
+    }
+    /* The microphone hears nothing but the computer's sound coming back from
+     * the speakers. Cancelled, the computer's sound is in the recording once, at
+     * its own level; uncancelled it would be about 1.26 times that (the echo is
+     * half strength, 20 ms late). */
+    setenv("OPENCHIME_TEST_MIC_ECHO", "only", 1);
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "5000", 1);
+    {
+        oc_recorder_opts o = { .height = 360, .fps = 30, .screen_id = "screen:synthetic", .computer_sound = 1 };
+        int err;
+        oc_recorder *r = oc_recorder_open(&o, &err);
+        CHECK(r != NULL);
+        if (r) {
+            oc_rec_status st;
+            CHECK(oc_recorder_start(r) == 0);
+            CHECK(wait_state(r, OC_REC_DONE, 10000, &st));
+            oc_rec_result res = {0};
+            CHECK(oc_recorder_take(r, &res) == 0);
+            oc_recorder_close(r);
+            oc_mp4_info info;
+            if (res.video && oc_mp4_parse(res.video, res.video_len, &info) == 0) {
+                size_t n = 0;
+                int16_t *pcm = decode_audio(res.video, &info, &n);
+                if (pcm && n > 96000) {
+                    const int16_t *tail = pcm + n - 96000;          /* the last two seconds */
+                    double a660 = tone_amp(tail, 96000, 660);
+                    printf("  echo only: 660 Hz %.0f (once: 6000; twice, uncancelled: ~7560)\n", a660);
+                    CHECK(a660 > 6000 * 0.9 && a660 < 6000 * 1.1);
+                } else {
+                    CHECK(0);
+                }
+                free(pcm);
+                oc_mp4_info_free(&info);
+            }
+            oc_rec_result_free(&res);
+        }
+    }
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "3000", 1);
+    unsetenv("OPENCHIME_TEST_MIC_ECHO");
+
+    /* A window, no camera, no computer sound: no box anywhere, the microphone only. */
+    {
+        oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "window:synthetic" };
+        int err;
+        oc_recorder *r = oc_recorder_open(&o, &err);
+        CHECK(r != NULL);
+        if (r) {
+            oc_rec_status st;
+            CHECK(oc_recorder_start(r) == 0);
+            CHECK(wait_state(r, OC_REC_DONE, 8000, &st));
+            CHECK(!st.computer_sound);
+            oc_rec_result res = {0};
+            CHECK(oc_recorder_take(r, &res) == 0);
+            oc_recorder_close(r);
+            oc_mp4_info info;
+            if (res.video && oc_mp4_parse(res.video, res.video_len, &info) == 0) {
+                oc_frame f;
+                if (decode_video_at(res.video, &info, info.video.n_samples / 2, &f) == 0) {
+                    double all = chroma_in(&f, 0, 0, f.width, f.height);
+                    printf("  window, no camera: chroma %.1f\n", all);
+                    CHECK(all < 4.0);
+                    oc_frame_free(&f);
+                }
+                size_t n = 0;
+                int16_t *pcm = decode_audio(res.video, &info, &n);
+                if (pcm && n > 48000) {
+                    const int16_t *tail = pcm + n - 48000;
+                    printf("  window, microphone only: 440 Hz %.0f, 660 Hz %.0f\n",
+                           tone_amp(tail, 48000, 440), tone_amp(tail, 48000, 660));
+                    CHECK(tone_amp(tail, 48000, 440) > 6000 && tone_amp(tail, 48000, 660) < 500);
+                }
+                free(pcm);
+                oc_mp4_info_free(&info);
+            }
+            oc_rec_result_free(&res);
+        }
+    }
+
+    /* The window closes mid-recording: what came before it is kept. */
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "300000", 1);
+    setenv("OPENCHIME_TEST_SCREEN_GONE_MS", "1500", 1);
+    {
+        oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "window:synthetic" };
+        int err;
+        oc_recorder *r = oc_recorder_open(&o, &err);
+        CHECK(r != NULL);
+        if (r) {
+            oc_rec_status st;
+            CHECK(oc_recorder_start(r) == 0);
+            CHECK(wait_state(r, OC_REC_DONE, 8000, &st));
+            CHECK(st.source_gone);
+            oc_rec_result res = {0};
+            CHECK(oc_recorder_take(r, &res) == 0);
+            printf("  window gone at 1.5 s: kept %u ms\n", res.duration_ms);
+            CHECK(res.duration_ms >= 1000 && res.duration_ms <= 1600);
+            oc_rec_result_free(&res);
+            oc_recorder_close(r);
+        }
+    }
+    /* Gone before anything was captured: refused as that. */
+    setenv("OPENCHIME_TEST_SCREEN_GONE_MS", "0", 1);
+    {
+        oc_recorder_opts o = { .height = 720, .screen_id = "window:synthetic" };
+        int err;
+        oc_recorder *r = oc_recorder_open(&o, &err);
+        CHECK(r == NULL && err == OC_REC_SCREEN_GONE);
+        if (r) oc_recorder_close(r);
+    }
+    unsetenv("OPENCHIME_TEST_SCREEN_GONE_MS");
+    /* The system refuses the capture. */
+    setenv("OPENCHIME_TEST_CAPTURE", "denied", 1);
+    {
+        oc_recorder_opts o = { .height = 720, .screen_id = "screen:synthetic" };
+        int err;
+        oc_recorder *r = oc_recorder_open(&o, &err);
+        CHECK(r == NULL && err == OC_REC_SCREEN_DENIED);
+        if (r) oc_recorder_close(r);
+    }
+    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    unsetenv("OPENCHIME_TEST_VIDEO_CAP_MS");
+}
+
 int run_media_tests(void) {
     printf("media:\n");
     test_mp4_roundtrip();
@@ -562,6 +885,9 @@ int run_media_tests(void) {
     test_vp9_roundtrip();
     test_opus_roundtrip();
     test_recorder();
+    test_i420_view();
+    test_screen_source();
+    test_screen_recording();
     test_player();
     oc_rec_result_free(&g_rec);
     unsetenv("OPENCHIME_TEST_CAPTURE");

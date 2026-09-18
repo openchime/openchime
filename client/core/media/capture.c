@@ -23,13 +23,25 @@ void oc_capture_set_detail(const char *fmt, ...) {
 struct oc_capture {
     const oc_capture_backend *b;
     void *impl;
+    /* A screen: the backend reports changes, and frames are paced out here. */
+    int      screen;
+    int64_t  period_us, due_us;
+    oc_frame last;
+    int      have_last;
 };
 
 static const oc_capture_backend *pick(void) {
     const char *t = getenv("OPENCHIME_TEST_CAPTURE");
-    if (t && strcmp(t, "synthetic") == 0) return &oc_capture_synthetic;
+    if (t && (strcmp(t, "synthetic") == 0 || strcmp(t, "synthetic-camera") == 0)) return &oc_capture_synthetic;
     if (t && strcmp(t, "denied") == 0) return &oc_capture_denied;
     return oc_capture_platform();
+}
+
+static const oc_capture_backend *pick_screen(void) {
+    const char *t = getenv("OPENCHIME_TEST_CAPTURE");
+    if (t && strcmp(t, "synthetic") == 0) return &oc_capture_synthetic_screen;
+    if (t && strcmp(t, "denied") == 0) return &oc_capture_denied;
+    return oc_capture_screen_platform();
 }
 
 int oc_capture_list(oc_capture_device *out, int cap) {
@@ -51,12 +63,75 @@ oc_capture *oc_capture_open(const char *device_id, int want_w, int want_h, int w
     return c;
 }
 
-int  oc_capture_start(oc_capture *c) { return c->b->start(c->impl); }
-int  oc_capture_next(oc_capture *c, oc_frame *f, int timeout_ms) { return c->b->next(c->impl, f, timeout_ms); }
+int oc_capture_list_screens(oc_capture_device *out, int cap) {
+    const oc_capture_backend *b = pick_screen();
+    return b ? b->list(out, cap) : 0;
+}
+
+oc_capture *oc_capture_open_screen(const char *device_id, int max_w, int max_h, int fps, int *err) {
+    int dummy;
+    if (!err) err = &dummy;
+    const oc_capture_backend *b = pick_screen();
+    if (!b) { *err = OC_CAP_NODEVICE; return NULL; }
+    oc_capture *c = calloc(1, sizeof *c);
+    if (!c) { *err = OC_CAP_FAILED; return NULL; }
+    *err = OC_CAP_OK;
+    c->b = b;
+    c->screen = 1;
+    c->period_us = 1000000 / (fps > 0 && fps <= 120 ? fps : 30);
+    c->impl = b->open(device_id, max_w, max_h, fps, err);
+    if (!c->impl) { if (*err == OC_CAP_OK) *err = OC_CAP_FAILED; free(c); return NULL; }
+    return c;
+}
+
+int oc_capture_start(oc_capture *c) {
+    c->due_us = 0;
+    return c->b->start(c->impl);
+}
+
+static void sleep_us(int64_t us);
+
+/* A screen's frames: whatever changed most recently, handed out once per
+ * period. The backend is asked for changes in slices no longer than the time to
+ * the next frame, so a change arriving just before it is due is the one shown. */
+static int screen_next(oc_capture *c, oc_frame *f, int timeout_ms) {
+    int64_t now = oc_media_clock_us(), end = now + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        int64_t until = c->have_last ? c->due_us - now : (end - now);
+        int slice = until > 0 ? (int)((until + 999) / 1000) : 0;
+        oc_frame nf;
+        int rc = c->b->next(c->impl, &nf, slice);
+        if (rc < 0) return rc;
+        if (rc == 1) {
+            if (!c->have_last || c->last.width != nf.width || c->last.height != nf.height) {
+                oc_frame_free(&c->last);
+                if (oc_frame_alloc(&c->last, nf.width, nf.height) != 0) return OC_CAP_FAILED;
+            }
+            oc_frame_copy(&c->last, &nf);
+            if (!c->have_last) c->due_us = oc_media_clock_us();   /* the first frame goes out at once */
+            c->have_last = 1;
+        }
+        now = oc_media_clock_us();
+        if (c->have_last && now >= c->due_us) {
+            c->due_us += c->period_us;
+            if (c->due_us < now) c->due_us = now + c->period_us;   /* no burst after a stall */
+            c->last.pts_us = now;
+            *f = c->last;
+            return 1;
+        }
+        if (now >= end) return 0;
+        if (rc == 0 && slice == 0) sleep_us(1000);
+    }
+}
+
+int  oc_capture_next(oc_capture *c, oc_frame *f, int timeout_ms) {
+    return c->screen ? screen_next(c, f, timeout_ms) : c->b->next(c->impl, f, timeout_ms);
+}
 void oc_capture_stop(oc_capture *c) { c->b->stop(c->impl); }
 void oc_capture_close(oc_capture *c) {
     if (!c) return;
     c->b->close(c->impl);
+    oc_frame_free(&c->last);
     free(c);
 }
 
@@ -81,6 +156,7 @@ static int syn_list(oc_capture_device *out, int cap) {
     memset(out, 0, sizeof *out);
     strcpy(out->id, "synthetic");
     strcpy(out->name, "Test pattern");
+    out->kind = OC_SOURCE_CAMERA;
     return 1;
 }
 
@@ -181,6 +257,112 @@ int oc_capture_synthetic_frame_number(const oc_frame *f) {
     return n;
 }
 
+/* ---- synthetic screen ------------------------------------------------------------ */
+
+/* A 2560×1600 page: a light background and rows of dark "words", with the change
+ * count spelled along the top in the camera pattern's blocks. It changes five
+ * times a second -- a screen is mostly still -- and is fitted into the size the
+ * capture opened at, so both halves of a screen source are exercised: fitting,
+ * and the front end repeating a still frame at the frame rate. */
+
+#define SCR_W 2560
+#define SCR_H 1600
+#define SCR_CHANGE_US 200000
+
+typedef struct {
+    oc_frame page, out;
+    int      running;
+    long     n;
+    int64_t  next_us, gone_at_us;
+} scr;
+
+static int scr_list(oc_capture_device *out, int cap) {
+    if (cap < 2) return 0;
+    memset(out, 0, 2 * sizeof *out);
+    strcpy(out[0].id, "screen:synthetic");
+    strcpy(out[0].name, "Test screen");
+    out[0].kind = OC_SOURCE_SCREEN;
+    strcpy(out[1].id, "window:synthetic");
+    strcpy(out[1].name, "Test window");
+    out[1].kind = OC_SOURCE_WINDOW;
+    return 2;
+}
+
+static void *scr_open(const char *id, int max_w, int max_h, int fps, int *err) {
+    (void)id; (void)fps;
+    scr *s = calloc(1, sizeof *s);
+    if (!s) { *err = OC_CAP_FAILED; return NULL; }
+    if (max_w <= 0) max_w = 1920;
+    if (max_h <= 0) max_h = 1080;
+    int w = max_w, h = (int)((int64_t)max_w * SCR_H / SCR_W);
+    if (h > max_h) { h = max_h; w = (int)((int64_t)max_h * SCR_W / SCR_H); }
+    if (oc_frame_alloc(&s->page, SCR_W, SCR_H) != 0 || oc_frame_alloc(&s->out, w & ~1, h & ~1) != 0) {
+        oc_frame_free(&s->page); free(s); *err = OC_CAP_FAILED; return NULL;
+    }
+    return s;
+}
+
+static int scr_start(void *impl) {
+    scr *s = impl;
+    s->running = 1; s->n = 0;
+    s->next_us = oc_media_clock_us();
+    const char *g = getenv("OPENCHIME_TEST_SCREEN_GONE_MS");
+    s->gone_at_us = g && *g ? s->next_us + strtol(g, NULL, 10) * 1000 : 0;
+    return OC_CAP_OK;
+}
+
+static void scr_draw(scr *s) {
+    oc_frame *f = &s->page;
+    oc_i420_fill(f, 220, 128, 128);
+    int band = SCR_H / 8, bw = SCR_W / SYN_BITS;
+    for (int y = 0; y < band; y++) {
+        uint8_t *row = f->plane[0] + (size_t)y * f->stride[0];
+        for (int x = 0; x < SCR_W; x++) {
+            int bit = x / bw;
+            row[x] = bit < SYN_BITS && ((s->n >> (SYN_BITS - 1 - bit)) & 1) ? 235 : 16;
+        }
+    }
+    /* Rows of words; the page scrolls by one row per change. */
+    for (int line = 0; line < 40; line++) {
+        int y0 = band + 40 + line * 32 - (int)(s->n % 32);
+        if (y0 < band + 8 || y0 + 16 > SCR_H) continue;
+        for (int x0 = 80; x0 < SCR_W - 200; ) {
+            int len = 40 + (int)(((unsigned)(line * 131 + x0 * 7) % 9) * 20);
+            for (int y = y0; y < y0 + 16; y++)
+                memset(f->plane[0] + (size_t)y * f->stride[0] + x0, 40, (size_t)len);
+            x0 += len + 24;
+        }
+    }
+}
+
+static int scr_next(void *impl, oc_frame *f, int timeout_ms) {
+    scr *s = impl;
+    if (!s->running) return OC_CAP_FAILED;
+    int64_t now = oc_media_clock_us();
+    if (s->gone_at_us && now >= s->gone_at_us) { oc_capture_set_detail("the test screen went away"); return OC_CAP_GONE; }
+    int64_t wait = s->next_us - now;
+    if (wait > (int64_t)timeout_ms * 1000) { sleep_us((int64_t)timeout_ms * 1000); return 0; }
+    sleep_us(wait);
+    scr_draw(s);
+    oc_i420_fit(&s->page, &s->out);
+    s->out.pts_us = oc_media_clock_us();
+    s->n++;
+    s->next_us += SCR_CHANGE_US;
+    if (s->out.pts_us - s->next_us > SCR_CHANGE_US) s->next_us = s->out.pts_us;
+    *f = s->out;
+    return 1;
+}
+
+static void scr_stop(void *impl) { ((scr *)impl)->running = 0; }
+static void scr_close(void *impl) {
+    scr *s = impl;
+    oc_frame_free(&s->page);
+    oc_frame_free(&s->out);
+    free(s);
+}
+
+const oc_capture_backend oc_capture_synthetic_screen = { scr_list, scr_open, scr_start, scr_next, scr_stop, scr_close };
+
 /* ---- denied ------------------------------------------------------------------------ */
 
 static void *denied_open(const char *id, int w, int h, int fps, int *err) {
@@ -194,4 +376,5 @@ const oc_capture_backend oc_capture_denied = { syn_list, denied_open, syn_start,
 #ifndef _WIN32
 /* Built with each platform's client (docs/VIDEO-MESSAGES.md §3.2). */
 const oc_capture_backend *oc_capture_platform(void) { return NULL; }
+const oc_capture_backend *oc_capture_screen_platform(void) { return NULL; }
 #endif

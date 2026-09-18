@@ -16,6 +16,9 @@ typedef struct oc_vp9enc oc_vp9enc;
 /* Real-time VP9 at `fps`, CBR at a bitrate chosen for the resolution, a keyframe
  * at least every two seconds. NULL on failure. */
 oc_vp9enc *oc_vp9enc_open(int width, int height, int fps);
+/* The same, tuned for a screen (VP9E_CONTENT_SCREEN): sharp text and flat areas
+ * over motion, for a recorded screen or window (REQ-162). */
+oc_vp9enc *oc_vp9enc_open_screen(int width, int height, int fps);
 /* The bitrate (kbit/s) oc_vp9enc_open picks for a resolution. */
 unsigned   oc_vp9enc_bitrate_kbps(int width, int height);
 

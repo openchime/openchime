@@ -1603,11 +1603,16 @@ static int      g_n_fwd_hits;
 static uint64_t g_lightbox;
 /* The video message overlay (recording card or player) is up; see draw_video_overlay. */
 static int g_vm;
+/* A screen recording is counting down, recording or finishing: the card and its
+ * backdrop step aside so the screen can be used, and the recording bar stands in
+ * for them. The overlay neither draws nor takes input while this is set. */
+static int g_vm_away;
+#define VM_UP() (g_vm && !g_vm_away)
 /* The recording quality, as a height: 360, 720 or 1080. Synced with the prefs. */
 static int g_vm_quality = 720;
 enum { VMC_OPEN = 1, VMC_RECORD, VMC_STOP, VMC_DISCARD, VMC_RETAKE, VMC_SEND,
        VMC_PRIVACY, VMC_PLAYPAUSE, VMC_MUTE, VMC_DOWNLOAD, VMC_CLOSE, VMC_CAMERA, VMC_MIC,
-       VMC_QUALITY };
+       VMC_QUALITY, VMC_SOURCE, VMC_CORNER, VMC_SOUND };
 static rectf g_video_btn;                 /* composer: record a video message */
 /* Voice input (REQ-296-300, ARCH-112): the microphone button (hold to talk), the
  * free-talk toggle, and the session while one is open. */
@@ -1615,8 +1620,8 @@ static rectf g_mic_btn, g_freetalk_btn;
 static oc_dictate *g_dict;
 static oc_client  *g_dict_client;         /* the client the session sends through */
 static void dict_forget(oc_client *c);    /* fwd: before a client is stopped */
-#define VM_MAX_BTNS    8
-static rectf        g_vm_card, g_vm_seek, g_vm_close;
+#define VM_MAX_BTNS    12
+static rectf        g_vm_card, g_vm_seek, g_vm_close, g_vm_vbox;
 static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
 static int          g_n_vm_btns;
 static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H);   /* fwd */
@@ -3106,7 +3111,7 @@ static int  modal_open(void);          /* fwd — pointer_blocked() asks */
  * it lives later in the file and gates native children rather than hover. */
 static int pointer_blocked(void) {
     return g_menu != MENU_NONE || g_pick_open || g_pal_open || g_more_open ||
-           g_tp_open || g_lightbox || g_vm || modal_open() || g_view == VIEW_SIGNIN;
+           g_tp_open || g_lightbox || VM_UP() || modal_open() || g_view == VIEW_SIGNIN;
 }
 
 static int in_rect(rectf r, int x, int y);   /* fwd */
@@ -6352,7 +6357,7 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
         return 1;
     }
     if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) return 0;
-    if (g_vm && m->message == WM_KEYDOWN && vm_key(hwnd, m->wParam)) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
+    if (VM_UP() && m->message == WM_KEYDOWN && vm_key(hwnd, m->wParam)) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
      * modal_key in the window proc. */
@@ -15813,11 +15818,11 @@ static void a11y_publish_scene(const oc_model *m) {
      * in its NAME, since an element that is present but refuses is the case a
      * locator alone cannot distinguish. */
     /* The video overlay's buttons, named for what they do (REQ-290). */
-    if (g_vm) {
+    if (VM_UP()) {
         static const char *VMID[] = { "", "composer.video", "rec.record", "rec.stop", "rec.discard",
                                       "rec.retake", "rec.send", "rec.privacy", "player.play",
                                       "player.mute", "player.download", "vm.close", "rec.camera", "rec.mic",
-                                      "rec.quality" };
+                                      "rec.quality", "rec.source", "rec.corner", "rec.computersound" };
         for (int i = 0; i < g_n_vm_btns; i++) {
             int cmd = g_vm_btns[i].cmd;
             const char *aid = (cmd > 0 && cmd < (int)(sizeof VMID / sizeof VMID[0])) ? VMID[cmd] : "vm.button";
@@ -16395,7 +16400,7 @@ static int main_is_conversation(void) {
 /* Does something own the whole window right now? A native child underneath it
  * must be hidden, because there is no z-order to lose — see layout_natives. */
 static int window_is_covered(void) {
-    return modal_open() || g_pal_open || g_lightbox || g_vm || g_menu || g_more_open ||
+    return modal_open() || g_pal_open || g_lightbox || VM_UP() || g_menu || g_more_open ||
            g_view == VIEW_SIGNIN;
 }
 
@@ -16742,6 +16747,18 @@ static int          g_vm_muted;
 static oc_capture_device g_vm_cams[8];
 static oc_audio_device   g_vm_mics[8];
 static int          g_vm_ncams, g_vm_nmics, g_vm_cam, g_vm_mic;
+/* A screen recording (REQ-162): the screens and windows there are to record, the
+ * one chosen (by id, since the list changes as windows come and go; "" is the
+ * camera), the camera box's corner, whether the box is left out, and whether the
+ * computer's sound is recorded. */
+static oc_capture_device g_vm_screens[24];
+static int          g_vm_nscreens;
+static char         g_vm_src[256];
+static int          g_vm_corner = OC_CORNER_BR;
+static int          g_vm_nocam, g_vm_sound;
+static int          g_vm_gone;          /* the recorded window closed; the take stops there */
+static HWND         g_recbar;           /* the recording bar, while a screen records */
+static int          g_recbar_excluded;  /* ... and kept out of the capture */
 static float        g_vm_volume = 1.0f;      /* 0..1, Up and Down in the player */
 static uint64_t     g_vm_post_tag;            /* the last send, for its outcome toast */
 static gfx_tex     *g_vm_tex;
@@ -17132,14 +17149,141 @@ static void vm_player_close(void) {
 
 /* Close everything: the camera and microphone are released here, at once
  * (REQ-166), and an unsent take is freed. */
+/* ---- the recording bar ------------------------------------------------------
+ *
+ * While a screen records, the card steps aside so the screen can be used, and
+ * this small always-on-top window stands in for it: what is happening, the time,
+ * and Stop and Discard. Real Win32 controls, so a screen reader finds them
+ * without help. Windows that can keep a window out of a capture keep this one
+ * out (WDA_EXCLUDEFROMCAPTURE, Windows 10 2004 and later); elsewhere it appears
+ * in the recording, which the docs say (REQ-166). */
+enum { RECBAR_TEXT = 1, RECBAR_STOP, RECBAR_DISCARD };
+static HWND g_recbar_text, g_recbar_stop;
+static char g_recbar_line[96];
+
+static void vm_command(HWND hwnd, int cmd);   /* fwd */
+
+static LRESULT CALLBACK recbar_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == RECBAR_STOP)    { vm_command(g_main_hwnd, VMC_STOP); return 0; }
+        if (LOWORD(wp) == RECBAR_DISCARD) { vm_command(g_main_hwnd, VMC_DISCARD); return 0; }
+        break;
+    case WM_CLOSE:                                  /* the caption's close is Stop, never a silent loss */
+        vm_command(g_main_hwnd, VMC_STOP);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void recbar_open(HWND owner) {
+    static int registered;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registered) {
+        WNDCLASSEXW wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.lpfnWndProc = recbar_proc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"OpenChimeRecordingBar";
+        if (!RegisterClassExW(&wc)) return;
+        registered = 1;
+    }
+    int w = PX(380), h = PX(96);
+    RECT wa = { 0, 0, 1280, 720 };
+    MONITORINFO mi; mi.cbSize = sizeof mi;
+    if (GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mi)) wa = mi.rcWork;
+    g_recbar = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"OpenChimeRecordingBar",
+                               L"OpenChime \u2014 recording", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               wa.left + (wa.right - wa.left - w) / 2, wa.top + PX(12), w, h,
+                               NULL, NULL, inst, NULL);
+    if (!g_recbar) return;
+    RECT cr; GetClientRect(g_recbar, &cr);
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    int bw = PX(80), bh = PX(28), pad = PX(10);
+    g_recbar_text = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                                    pad, (cr.bottom - bh) / 2, cr.right - 2 * bw - 4 * pad, bh,
+                                    g_recbar, (HMENU)(INT_PTR)RECBAR_TEXT, inst, NULL);
+    g_recbar_stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                    cr.right - 2 * bw - 2 * pad, (cr.bottom - bh) / 2, bw, bh,
+                                    g_recbar, (HMENU)(INT_PTR)RECBAR_STOP, inst, NULL);
+    HWND discard = CreateWindowExW(0, L"BUTTON", L"Discard", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                   cr.right - bw - pad, (cr.bottom - bh) / 2, bw, bh,
+                                   g_recbar, (HMENU)(INT_PTR)RECBAR_DISCARD, inst, NULL);
+    SendMessageW(g_recbar_text, WM_SETFONT, (WPARAM)font, TRUE);
+    SendMessageW(g_recbar_stop, WM_SETFONT, (WPARAM)font, TRUE);
+    SendMessageW(discard, WM_SETFONT, (WPARAM)font, TRUE);
+    g_recbar_excluded = SetWindowDisplayAffinity(g_recbar, 0x11 /* WDA_EXCLUDEFROMCAPTURE */) ? 1 : 0;
+    g_recbar_line[0] = '\0';
+    ShowWindow(g_recbar, SW_SHOWNOACTIVATE);
+    crumb("recbar open excluded=%d", g_recbar_excluded);
+}
+
+static void recbar_close(void) {
+    if (g_recbar) DestroyWindow(g_recbar);
+    g_recbar = g_recbar_text = g_recbar_stop = NULL;
+    g_recbar_line[0] = '\0';
+}
+
+/* What the bar says: the countdown, the time, or that it is finishing. */
+static void recbar_update(void) {
+    if (!g_recbar) return;
+    char line[96] = "";
+    if (g_rec_phase == REC_COUNTDOWN) {
+        int left = 3 - (int)((GetTickCount64() - g_rec_count_at) / 1000);
+        snprintf(line, sizeof line, "Recording in %d\xE2\x80\xA6", left < 1 ? 1 : left);
+    } else if (g_rec_phase == REC_RECORDING && g_rec) {
+        oc_rec_status st; oc_recorder_status(g_rec, &st);
+        char e[16], c[16];
+        oc_model_format_duration(st.elapsed_ms, e, sizeof e);
+        oc_model_format_duration(st.cap_ms, c, sizeof c);
+        snprintf(line, sizeof line, "\xE2\x97\x8F Recording  %s / %s", e, c);
+    } else if (g_rec_phase == REC_FINISHING) {
+        snprintf(line, sizeof line, "Finishing\xE2\x80\xA6");
+    }
+    if (strcmp(line, g_recbar_line) == 0) return;
+    snprintf(g_recbar_line, sizeof g_recbar_line, "%s", line);
+    WCHAR w[96]; to_w(line, w, 96);
+    SetWindowTextW(g_recbar_text, w);
+    SetWindowTextW(g_recbar_stop, g_rec_phase == REC_COUNTDOWN ? L"Cancel" : L"Stop");
+    EnableWindow(g_recbar_stop, g_rec_phase != REC_FINISHING);
+}
+
+/* Step the card aside for a screen recording, or bring it back. Called after
+ * anything that can change the phase. */
+static void vm_update_away(HWND hwnd) {
+    int away = g_vm == VM_REC && g_vm_src[0] &&
+               (g_rec_phase == REC_COUNTDOWN || g_rec_phase == REC_RECORDING || g_rec_phase == REC_FINISHING);
+    if (away && !g_recbar) recbar_open(hwnd);
+    if (!away && g_recbar) {
+        recbar_close();
+        /* The card is back: so is the window it lives in. */
+        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+    g_vm_away = away;
+    recbar_update();
+}
+
 static void vm_close(HWND hwnd) {
     vm_player_close();
     if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
     oc_rec_result_free(&g_rec_res);
     g_vm = VM_CLOSED; g_rec_phase = REC_PREVIEW; g_rec_err = 0;
     g_vplay_aid = 0; g_vplay_loading = 0;
+    vm_update_away(hwnd);
     vm_set_title(hwnd, 0);
     InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* The chosen screen or window, or NULL for the camera (or when it has gone). */
+static const oc_capture_device *vm_source(void) {
+    if (!g_vm_src[0]) return NULL;
+    for (int i = 0; i < g_vm_nscreens; i++)
+        if (!strcmp(g_vm_screens[i].id, g_vm_src)) return &g_vm_screens[i];
+    return NULL;
 }
 
 static void rec_open_devices(HWND hwnd) {
@@ -17148,11 +17292,22 @@ static void rec_open_devices(HWND hwnd) {
     if (g_vm_ncams < 0) g_vm_ncams = 0;
     g_vm_nmics = oc_audio_list(1, g_vm_mics, 8);
     if (g_vm_nmics < 0) g_vm_nmics = 0;
+    g_vm_nscreens = oc_capture_list_screens(g_vm_screens, 24);
+    if (g_vm_nscreens < 0) g_vm_nscreens = 0;
+    if (!vm_source()) g_vm_src[0] = '\0';          /* the window chosen last time is gone */
     if (g_vm_cam >= g_vm_ncams) g_vm_cam = 0;
     if (g_vm_mic >= g_vm_nmics) g_vm_mic = 0;
     if (g_vm_ncams) o.camera_id = g_vm_cams[g_vm_cam].id;
     if (g_vm_nmics) o.mic_id = g_vm_mics[g_vm_mic].id;
     o.height = g_vm_quality;
+    g_vm_gone = 0;
+    const oc_capture_device *src = vm_source();
+    if (src) {
+        o.screen_id = src->id;
+        o.with_camera = g_vm_ncams > 0 && !g_vm_nocam;
+        o.corner = g_vm_corner;
+        o.computer_sound = g_vm_sound;
+    }
     int err = 0;
     g_rec = oc_recorder_open(&o, &err);
     g_rec_err = err;
@@ -17229,8 +17384,18 @@ static void vm_send(HWND hwnd) {
 }
 
 /* A device chosen from a dropdown: reopen the recorder on it. */
+/* Reopen the recorder after a choice on the card changed what it records. */
+static void vm_reopen(HWND hwnd) {
+    if (g_vm != VM_REC || (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR)) return;
+    if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
+    vm_tex_drop();
+    rec_open_devices(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 static void vm_pick_device(HWND hwnd, int camera, int ix) {
     if (g_vm != VM_REC || (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR)) return;
+    if (camera && g_vm_nocam && ix < g_vm_ncams) { g_vm_nocam = 0; g_vm_cam = ix; vm_reopen(hwnd); return; }
     if (camera) { if (ix >= g_vm_ncams || ix == g_vm_cam) return; g_vm_cam = ix; }
     else        { if (ix >= g_vm_nmics || ix == g_vm_mic) return; g_vm_mic = ix; }
     if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
@@ -17297,8 +17462,14 @@ static void vm_command(HWND hwnd, int cmd) {
         char lbl[300];
         int n = cam ? g_vm_ncams : g_vm_nmics, cur = cam ? g_vm_cam : g_vm_mic;
         mi_section(cam ? "CAMERA" : "MICROPHONE");
+        /* A screen recording may leave the camera out altogether. */
+        int nocam = cam && vm_source() && g_vm_nocam;
+        if (cam && vm_source()) {
+            snprintf(lbl, sizeof lbl, "%sNo camera", nocam ? "\xE2\x9C\x93 " : "    ");
+            mi_item(958, lbl);
+        }
         for (int i = 0; i < n; i++) {
-            snprintf(lbl, sizeof lbl, "%s%s", i == cur ? "\xE2\x9C\x93 " : "    ",
+            snprintf(lbl, sizeof lbl, "%s%s", i == cur && !nocam ? "\xE2\x9C\x93 " : "    ",
                      cam ? g_vm_cams[i].name : g_vm_mics[i].name);
             mi_item((cam ? 950 : 970) + i, lbl);
         }
@@ -17313,6 +17484,50 @@ static void vm_command(HWND hwnd, int cmd) {
         if (g_menu_y < 8) g_menu_y = 8;
         break;
     }
+    case VMC_SOURCE:
+    case VMC_CORNER: {
+        /* What to record -- the camera, a screen, a window -- and where the camera
+         * box goes. Commands 2000+ and 2040+ come back through menu_dispatch. The
+         * windows are listed afresh: they come and go. */
+        if (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR) break;
+        rectf field = rf(0, 0, 0, 0);
+        for (int i = 0; i < g_n_vm_btns; i++) if (g_vm_btns[i].cmd == cmd) field = g_vm_btns[i].r;
+        g_n_mi = 0;
+        char lbl[300];
+        if (cmd == VMC_SOURCE) {
+            g_vm_nscreens = oc_capture_list_screens(g_vm_screens, 24);
+            if (g_vm_nscreens < 0) g_vm_nscreens = 0;
+            mi_section("RECORD");
+            snprintf(lbl, sizeof lbl, "%sCamera", !vm_source() ? "\xE2\x9C\x93 " : "    ");
+            mi_item(2000, lbl);
+            for (int i = 0; i < g_vm_nscreens && i < 24; i++) {
+                snprintf(lbl, sizeof lbl, "%s%s: %s", !strcmp(g_vm_src, g_vm_screens[i].id) ? "\xE2\x9C\x93 " : "    ",
+                         g_vm_screens[i].kind == OC_SOURCE_WINDOW ? "Window" : "Screen", g_vm_screens[i].name);
+                mi_item(2001 + i, lbl);
+            }
+        } else {
+            static const char *CORNER[4] = { "Bottom right", "Bottom left", "Top right", "Top left" };
+            mi_section("CAMERA BOX");
+            for (int c = 0; c < 4; c++) {
+                snprintf(lbl, sizeof lbl, "%s%s", g_vm_corner == c ? "\xE2\x9C\x93 " : "    ", CORNER[c]);
+                mi_item(2040 + c, lbl);
+            }
+        }
+        g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
+        g_menu_w = field.right - field.left > UIS(260) ? field.right - field.left : UIS(260);
+        float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+        RECT rc; GetClientRect(hwnd, &rc);
+        g_menu_x = field.left;
+        g_menu_y = field.bottom + 4;
+        if (g_menu_y + h > DIPF(rc.bottom) - 8) g_menu_y = field.top - 4 - h;
+        if (g_menu_y < 8) g_menu_y = 8;
+        break;
+    }
+    case VMC_SOUND:
+        if (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR) break;
+        g_vm_sound = !g_vm_sound;
+        vm_reopen(hwnd);
+        break;
     case VMC_PRIVACY: {
         const WCHAR *uri = (g_rec_err == OC_REC_MIC_DENIED) ? L"ms-settings:privacy-microphone"
                                                            : L"ms-settings:privacy-webcam";
@@ -17338,6 +17553,7 @@ static void vm_command(HWND hwnd, int cmd) {
         }
         break;
     }
+    vm_update_away(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -17360,6 +17576,7 @@ static void vm_tick(HWND hwnd, const oc_model *m) {
     if (g_rec && (g_rec_phase == REC_RECORDING || g_rec_phase == REC_FINISHING)) {
         oc_rec_status st; oc_recorder_status(g_rec, &st);
         if (st.state == OC_REC_FINISHING) g_rec_phase = REC_FINISHING;
+        if (st.source_gone) g_vm_gone = 1;
         if (st.state == OC_REC_DONE && oc_recorder_take(g_rec, &g_rec_res) == 0) {
             /* The camera goes as soon as the take exists: review plays the
              * recording, not the camera (REQ-166). */
@@ -17369,10 +17586,11 @@ static void vm_tick(HWND hwnd, const oc_model *m) {
             g_rec_phase = REC_REVIEW;
             vm_set_title(hwnd, 0);
         } else if (st.state == OC_REC_ERROR) {
-            g_rec_phase = REC_ERROR; g_rec_err = OC_REC_FAILED;
+            g_rec_phase = REC_ERROR; g_rec_err = st.source_gone ? OC_REC_SCREEN_GONE : OC_REC_FAILED;
             vm_set_title(hwnd, 0);
         }
     }
+    vm_update_away(hwnd);
 }
 
 static void vm_btn(gfx *rt, rectf r, const char *label, int cmd, int primary, int danger) {
@@ -17419,6 +17637,9 @@ static const char *rec_error_text(int err) {
     case OC_REC_CAMERA_NODEVICE: return "No camera was found.";
     case OC_REC_CAMERA_BUSY:     return "The camera is in use by another app.";
     case OC_REC_MIC_BUSY:        return "The microphone is in use by voice input.";
+    case OC_REC_SCREEN_DENIED:   return "Windows would not let OpenChime record that.";
+    case OC_REC_SCREEN_UNSUPPORTED: return "This version of Windows cannot record the screen.";
+    case OC_REC_SCREEN_GONE:     return "That window is no longer open.";
     default:                     return "The recording could not start.";
     }
 }
@@ -17426,7 +17647,7 @@ static const char *rec_error_text(int err) {
 static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
     g_n_vm_btns = 0;
     g_vm_seek = g_vm_close = rf(0, 0, 0, 0);
-    if (!g_vm) return;
+    if (!VM_UP()) return;
     vm_frame_update();
     gfx_fill(rt, gr(rf(0, 0, W, H)), 0x000000, g_vm == VM_PLAY ? 0.95f : 0.55f);
     float bh = UIS(34);
@@ -17434,7 +17655,9 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
     if (g_vm == VM_REC) {
         float cw = UIS(640); if (cw > W - 40) cw = W - 40;
         float vh = cw * 9.0f / 16.0f;
-        float ch = UIS(56) + vh + UIS(52) + UIS(60);
+        /* A row of its own for what to record, where screens can be recorded. */
+        float orow = g_vm_nscreens > 0 ? bh + UIS(10) : 0;
+        float ch = UIS(56) + vh + UIS(52) + UIS(60) + orow;
         if (ch > H - 40) { vh -= ch - (H - 40); ch = H - 40; }
         rectf card = rf((W - cw) / 2, (H - ch) / 2, (W + cw) / 2, (H + ch) / 2);
         g_vm_card = card;
@@ -17448,13 +17671,15 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
         draw_text(rt, "\xC3\x97", g_ui, g_vm_close, OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
         rectf vbox = rf(card.left + UIS(20), card.top + UIS(56), card.right - UIS(20), card.top + UIS(56) + vh);
+        g_vm_vbox = vbox;
         char errline[320];
         snprintf(errline, sizeof errline, "%s%s%s", rec_error_text(g_rec_err),
                  g_rec_detail[0] && g_rec_err == OC_REC_FAILED ? "  (" : "",
                  g_rec_detail[0] && g_rec_err == OC_REC_FAILED ? g_rec_detail : "");
         if (g_rec_detail[0] && g_rec_err == OC_REC_FAILED) strncat(errline, ")", sizeof errline - strlen(errline) - 1);
         const char *ph = g_rec_phase == REC_ERROR ? errline
-                       : g_rec_phase == REC_FINISHING ? "Finishing\xE2\x80\xA6" : "Starting the camera\xE2\x80\xA6";
+                       : g_rec_phase == REC_FINISHING ? "Finishing\xE2\x80\xA6"
+                       : vm_source() ? "Starting the capture\xE2\x80\xA6" : "Starting the camera\xE2\x80\xA6";
         vm_draw_video(rt, vbox, ph);
 
         /* Status line: countdown, the red recording mark and timer, the level. */
@@ -17558,7 +17783,8 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
                 int open = g_menu == MENU_SECTION && g_menu_x == f.left;
                 fill_round(rt, f, OC_R_CONTROL, hot || open ? OC_COL_HOVER : OC_COL_INPUT);
                 stroke_round(rt, f, OC_R_CONTROL, open ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
-                const char *name = cam ? g_vm_cams[g_vm_cam].name : g_vm_mics[g_vm_mic].name;
+                const char *name = cam ? (vm_source() && g_vm_nocam ? "No camera" : g_vm_cams[g_vm_cam].name)
+                                       : g_vm_mics[g_vm_mic].name;
                 draw_text(rt, name, g_ui, rf(f.left + UIS(10), f.top + (bh - UIS(20)) / 2,
                                              f.right - UIS(30), f.top + (bh + UIS(20)) / 2), OC_COL_TEXT);
                 draw_text(rt, "\xE2\x96\xBE", g_ui, rf(f.right - UIS(22), f.top + (bh - UIS(20)) / 2,
@@ -17571,6 +17797,65 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
                     g_n_vm_btns++;
                 }
                 lx += room + 10;
+            }
+            /* What to record, the camera box's corner, and the computer's sound. */
+            if (orow > 0) {
+                float oy = by - bh - UIS(10), ox = card.left + UIS(20);
+                const oc_capture_device *src = vm_source();
+                char sl[200];
+                snprintf(sl, sizeof sl, "Record: %s%s", src ? (src->kind == OC_SOURCE_WINDOW ? "window \xE2\x80\x94 " : "")
+                                                            : "Camera", src ? src->name : "");
+                float sw = (card.right - card.left - UIS(40)) * 0.5f;
+                struct { rectf r; const char *label; int cmd, drop, on; } o[3];
+                int no = 0;
+                o[no].r = rf(ox, oy, ox + sw, oy + bh); o[no].label = sl; o[no].cmd = VMC_SOURCE; o[no].drop = 1; o[no].on = 0; no++;
+                ox += sw + 10;
+                if (src) {
+                    static const char *CORNER[4] = { "Box: bottom right", "Box: bottom left", "Box: top right", "Box: top left" };
+                    if (g_vm_ncams > 0 && !g_vm_nocam) {
+                        float cwid = UIS(150);
+                        o[no].r = rf(ox, oy, ox + cwid, oy + bh); o[no].label = CORNER[g_vm_corner & 3];
+                        o[no].cmd = VMC_CORNER; o[no].drop = 1; o[no].on = 0; no++;
+                        ox += cwid + 10;
+                    }
+                    float tw = card.right - UIS(20) - ox;
+                    if (tw > UIS(120)) {
+                        o[no].r = rf(ox, oy, ox + tw, oy + bh); o[no].label = "Computer sound";
+                        o[no].cmd = VMC_SOUND; o[no].drop = 0; o[no].on = g_vm_sound; no++;
+                    }
+                }
+                for (int i = 0; i < no; i++) {
+                    rectf f = o[i].r;
+                    int hot = in_rect(f, (float)g_mouse_x, (float)g_mouse_y);
+                    int open = g_menu == MENU_SECTION && g_menu_x == f.left;
+                    fill_round(rt, f, OC_R_CONTROL, hot || open ? OC_COL_HOVER : OC_COL_INPUT);
+                    stroke_round(rt, f, OC_R_CONTROL, open ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+                    float tx = f.left + UIS(10);
+                    if (!o[i].drop) {           /* a checkbox */
+                        rectf b = rf(tx, f.top + (bh - UIS(14)) / 2, tx + UIS(14), f.top + (bh + UIS(14)) / 2);
+                        if (o[i].on) fill_round(rt, b, UIS(3), OC_COL_ACCENT);
+                        stroke_round(rt, b, UIS(3), o[i].on ? OC_COL_ACCENT : OC_COL_MUTED, 1.2f);
+                        if (o[i].on) {
+                            gfx_line(rt, b.left + UIS(3), b.top + UIS(7), b.left + UIS(6), b.top + UIS(10), 1.6f, 0xFFFFFF, 1.0f);
+                            gfx_line(rt, b.left + UIS(6), b.top + UIS(10), b.right - UIS(3), b.top + UIS(4), 1.6f, 0xFFFFFF, 1.0f);
+                        }
+                        tx = b.right + UIS(8);
+                    }
+                    draw_text(rt, o[i].label, g_ui, rf(tx, f.top + (bh - UIS(20)) / 2,
+                                                       f.right - (o[i].drop ? UIS(30) : UIS(8)), f.top + (bh + UIS(20)) / 2),
+                              OC_COL_TEXT);
+                    if (o[i].drop)
+                        draw_text(rt, "\xE2\x96\xBE", g_ui, rf(f.right - UIS(22), f.top + (bh - UIS(20)) / 2,
+                                                                 f.right - UIS(6), f.top + (bh + UIS(20)) / 2), OC_COL_MUTED);
+                    if (g_n_vm_btns < VM_MAX_BTNS) {
+                        g_vm_btns[g_n_vm_btns].r = f;
+                        g_vm_btns[g_n_vm_btns].cmd = o[i].cmd;
+                        if (o[i].drop) snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "%s", o[i].label);
+                        else snprintf(g_vm_btns[g_n_vm_btns].label, sizeof g_vm_btns[0].label, "Computer sound, %s",
+                                      o[i].on ? "on" : "off");
+                        g_n_vm_btns++;
+                    }
+                }
             }
         }
         return;
@@ -17642,7 +17927,7 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
 
 /* Clicks while the overlay is up: always consumed. */
 static int vm_click(HWND hwnd, int x, int y) {
-    if (!g_vm) return 0;
+    if (!VM_UP()) return 0;
     if (g_menu) {                       /* a device dropdown is open over the card */
         for (int i = 0; i < g_n_mirows; i++)
             if ((float)y >= g_mirows[i].top && (float)y < g_mirows[i].bot &&
@@ -17669,7 +17954,7 @@ static int vm_click(HWND hwnd, int x, int y) {
 }
 
 static int vm_key(HWND hwnd, WPARAM wp) {
-    if (!g_vm) return 0;
+    if (!VM_UP()) return 0;
     if (g_menu) { if (wp == VK_ESCAPE) { g_menu = MENU_NONE; g_menu_hover = -1; } return 1; }
     if (wp == VK_ESCAPE) { vm_command(hwnd, g_rec_phase == REC_RECORDING ? VMC_STOP : VMC_CLOSE); return 1; }
     if (g_vplayer) {
@@ -21285,6 +21570,23 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 970: case 971: case 972: case 973: case 974: case 975: case 976: case 977:
         vm_pick_device(hwnd, cmd < 970, cmd < 970 ? cmd - 950 : cmd - 970);
         break;
+    case 958:                                          /* a screen recording without the camera box */
+        if (!g_vm_nocam) { g_vm_nocam = 1; vm_reopen(hwnd); }
+        break;
+    case 2040: case 2041: case 2042: case 2043:
+        if (g_vm_corner != cmd - 2040) { g_vm_corner = cmd - 2040; vm_reopen(hwnd); }
+        break;
+    case 2000: case 2001: case 2002: case 2003: case 2004: case 2005: case 2006: case 2007: case 2008: case 2009: case 2010: case 2011: case 2012: case 2013: case 2014: case 2015: case 2016: case 2017: case 2018: case 2019: case 2020: case 2021: case 2022: case 2023: case 2024:
+        /* What to record: 2000 the camera, 2001+ a screen or window. */
+        if (g_vm == VM_REC && (g_rec_phase == REC_PREVIEW || g_rec_phase == REC_ERROR)) {
+            int k = cmd - 2001;
+            const char *id = k >= 0 && k < g_vm_nscreens ? g_vm_screens[k].id : "";
+            if (strcmp(id, g_vm_src)) {
+                snprintf(g_vm_src, sizeof g_vm_src, "%s", id);
+                vm_reopen(hwnd);
+            }
+        }
+        break;
     case 990: case 991: case 992: {
         int q = cmd == 990 ? 360 : cmd == 991 ? 720 : 1080;
         if (q != g_vm_quality) {
@@ -22714,6 +23016,17 @@ static void test_dump(const char *path) {
                     g_vm_btns[i].r.left, g_vm_btns[i].r.top, g_vm_btns[i].r.right, g_vm_btns[i].r.bottom);
         fprintf(f, "video_btn %.0f %.0f %.0f %.0f\n", g_video_btn.left, g_video_btn.top,
                 g_video_btn.right, g_video_btn.bottom);
+        /* A screen recording (REQ-162): what is chosen, whether the card has
+         * stepped aside for the recording bar, and whether the bar is kept out of
+         * the capture. */
+        fprintf(f, "vmsrc src=\"%s\" corner=%d sound=%d nocam=%d nscreens=%d away=%d bar=%d excluded=%d gone=%d "
+                   "rec_w=%d rec_h=%d frame_w=%d frame_h=%d vbox=%.0f,%.0f,%.0f,%.0f\n",
+                g_vm_src, g_vm_corner, g_vm_sound, g_vm_nocam, g_vm_nscreens, g_vm_away, g_recbar != NULL,
+                g_recbar_excluded, g_vm_gone, g_rec_res.width, g_rec_res.height, g_vm_tw, g_vm_th,
+                g_vm_vbox.left, g_vm_vbox.top, g_vm_vbox.right, g_vm_vbox.bottom);
+        for (int i = 0; i < g_vm_nscreens; i++)
+            fprintf(f, "vmscreen[%d] kind=%d id=\"%s\" name=\"%s\"\n", i, g_vm_screens[i].kind,
+                    g_vm_screens[i].id, g_vm_screens[i].name);
     }
     fprintf(f, "thumb_hover=%llu thumb_tools=%d\n", (unsigned long long)g_thumb_hover, g_n_thumb_dl);
     for (int i = 0; i < g_n_thumb_dl; i++)
@@ -23500,6 +23813,32 @@ static void test_poll(HWND hwnd) {
         };
         int done = 0;
         if (!strncmp(arg, "seek ", 5) && g_vplayer) { oc_player_seek(g_vplayer, (uint32_t)atol(arg + 5)); done = 1; }
+        /* A screen recording's choices (REQ-162): `source camera|<id>` (an id from
+         * the dump's vmscreen lines), `corner br|bl|tr|tl`, `sound on|off`,
+         * `nocam on|off` -- through the same menu commands the card uses. */
+        if (!done && !strncmp(arg, "source ", 7)) {
+            const char *id = arg + 7;
+            if (!strcmp(id, "camera")) { menu_dispatch(hwnd, 2000); done = 1; }
+            else {
+                g_vm_nscreens = oc_capture_list_screens(g_vm_screens, 24);
+                for (int i = 0; i < g_vm_nscreens; i++)
+                    if (!strcmp(g_vm_screens[i].id, id)) { menu_dispatch(hwnd, 2001 + i); done = 1; break; }
+            }
+        }
+        if (!done && !strncmp(arg, "corner ", 7)) {
+            static const char *C[4] = { "br", "bl", "tr", "tl" };
+            for (int c = 0; c < 4; c++) if (!strcmp(arg + 7, C[c])) { menu_dispatch(hwnd, 2040 + c); done = 1; }
+        }
+        if (!done && !strncmp(arg, "sound ", 6)) {
+            int on = !strcmp(arg + 6, "on");
+            if (on != g_vm_sound) vm_command(hwnd, VMC_SOUND);
+            done = 1;
+        }
+        if (!done && !strncmp(arg, "nocam ", 6)) {
+            if (!strcmp(arg + 6, "on")) menu_dispatch(hwnd, 958);
+            else if (g_vm_nocam) vm_pick_device(hwnd, 1, g_vm_cam);
+            done = 1;
+        }
         for (size_t i = 0; !done && i < sizeof VMV / sizeof VMV[0]; i++)
             if (!strcmp(arg, VMV[i].name)) { vm_command(hwnd, VMV[i].cmd); done = 1; }
         test_ack(done ? "ok" : "err");
@@ -24899,7 +25238,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 'C' && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) && g_has_sel) {
             copy_selection(hwnd); return 0;
         }
-        if (g_vm && vm_key(hwnd, wp)) { InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (VM_UP() && vm_key(hwnd, wp)) { InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
