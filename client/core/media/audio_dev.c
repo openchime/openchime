@@ -192,6 +192,7 @@ struct oc_audio_dev {
      * OPENCHIME_TEST_MIC names a WAV (played once, then silence). */
     int16_t      *syn_clip;
     size_t        syn_clip_n;
+    int           loopback;           /* capture of what the output device plays */
     int           ref_slot;           /* playback: its far-end reference slot, or -1 */
     int           owns_mic;           /* capture: holds g_capture_open */
 };
@@ -273,6 +274,25 @@ static void capture_cb(ma_device *dev, void *out, const void *in, ma_uint32 fram
     if (!in || frames == 0) return;
     if (atomic_load(&d->pushed) == 0 && atomic_load(&d->base_us) == 0)
         atomic_store(&d->base_us, oc_media_clock_us() - (int64_t)frames * 1000000 / d->rate);
+    /* A loopback device is silent by not calling at all while nothing plays, so
+     * the stream would close up over the gap and every later sample would be
+     * stamped too early. The gap is written as silence instead, which keeps
+     * sample k at base + k/rate like a microphone's. */
+    if (d->loopback) {
+        int64_t at = oc_media_clock_us() - (int64_t)frames * 1000000 / d->rate;
+        int64_t expect = atomic_load(&d->base_us) +
+                         (int64_t)(atomic_load(&d->pushed) * 1000000 / (uint64_t)d->rate);
+        if (at - expect > 40000) {
+            static const int16_t zeros[480 * 2];
+            uint64_t gap = (uint64_t)((at - expect) * d->rate / 1000000);
+            while (gap > 0) {
+                size_t n = gap > 480 ? 480 : (size_t)gap;
+                ring_push(&d->ring, zeros, n * (size_t)d->channels);
+                atomic_fetch_add(&d->pushed, n);
+                gap -= n;
+            }
+        }
+    }
     size_t n = (size_t)frames * (size_t)d->channels;
     size_t put = ring_push(&d->ring, in, n);
     if (put < n) atomic_fetch_add(&d->overruns, (n - put) / (size_t)d->channels);
@@ -348,17 +368,19 @@ static int parse_id(const char *hex, ma_device_id *id) {
     return 0;
 }
 
-static oc_audio_dev *open_dev(int capture, const char *id, int rate, int channels, int *err) {
+static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rate, int channels, int *err) {
     int dummy;
     if (!err) err = &dummy;
     if (rate < 8000 || rate > 192000 || channels < 1 || channels > 2) { *err = OC_AUDIO_FAILED; return NULL; }
     oc_audio_dev *d = calloc(1, sizeof *d);
     if (!d) { *err = OC_AUDIO_FAILED; return NULL; }
-    d->capture = capture; d->rate = rate; d->channels = channels;
+    d->capture = capture; d->loopback = loopback; d->rate = rate; d->channels = channels;
     d->ref_slot = -1;
     atomic_store(&d->gain, 1.0f);
-    if (capture && mic_denied()) { free(d); *err = OC_AUDIO_DENIED; return NULL; }
-    if (capture) {
+    if (capture && !loopback && mic_denied()) { free(d); *err = OC_AUDIO_DENIED; return NULL; }
+    if (loopback) {
+        /* Not the microphone: it has its own owner, and this takes nothing from it. */
+    } else if (capture) {
         int zero = 0;
         if (!atomic_compare_exchange_strong(&g_capture_open, &zero, 1)) { free(d); *err = OC_AUDIO_BUSY; return NULL; }
         d->owns_mic = 1;
@@ -370,7 +392,7 @@ static oc_audio_dev *open_dev(int capture, const char *id, int rate, int channel
 
     if (use_synthetic()) {
         d->synthetic = 1;
-        if (capture) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
+        if (capture && !loopback) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
         d->syn_start_us = oc_media_clock_us();
         atomic_store(&d->base_us, d->syn_start_us);
         *err = OC_AUDIO_OK;
@@ -381,8 +403,10 @@ static oc_audio_dev *open_dev(int capture, const char *id, int rate, int channel
     d->have_ctx = 1;
     ma_device_id dev_id;
     int have_id = id && *id && parse_id(id, &dev_id) == 0;
-    ma_device_config cfg = ma_device_config_init(capture ? ma_device_type_capture : ma_device_type_playback);
+    ma_device_config cfg = ma_device_config_init(loopback ? ma_device_type_loopback
+                                                 : capture ? ma_device_type_capture : ma_device_type_playback);
     if (capture) {
+        /* A loopback device is named by the OUTPUT it listens to; NULL is the default. */
         cfg.capture.pDeviceID = have_id ? &dev_id : NULL;
         cfg.capture.format = ma_format_s16;
         cfg.capture.channels = (ma_uint32)channels;
@@ -409,10 +433,33 @@ static oc_audio_dev *open_dev(int capture, const char *id, int rate, int channel
 }
 
 oc_audio_dev *oc_audio_capture_open(const char *id, int rate, int channels, int *err) {
-    return open_dev(1, id, rate, channels, err);
+    return open_dev(1, 0, id, rate, channels, err);
 }
 oc_audio_dev *oc_audio_playback_open(const char *id, int rate, int channels, int *err) {
-    return open_dev(0, id, rate, channels, err);
+    return open_dev(0, 0, id, rate, channels, err);
+}
+oc_audio_dev *oc_audio_loopback_open(const char *output_id, int rate, int channels, int *err) {
+    return open_dev(1, 1, output_id, rate, channels, err);
+}
+
+/* The synthetic computer sound: a 660 Hz tone over a spread of quieter ones, a
+ * continuous function of the media clock alone -- so a synthetic microphone can
+ * hear it back as an echo (OPENCHIME_TEST_MIC_ECHO) exactly as a room would,
+ * whenever either opened. Continuous matters: a signal computed per sample index
+ * shifts by whole samples as two clocks' grids slide past each other, which a
+ * canceller sees as a room that keeps changing. */
+static double syn_loop_value(double t_s) {
+    static const double hz[6] = { 1234.0, 1777.0, 2391.0, 3113.0, 4567.0, 6007.0 };
+    double v = 6000.0 * __builtin_sin(2.0 * 3.141592653589793 * 660.0 * t_s);
+    for (int i = 0; i < 6; i++) v += 700.0 * __builtin_sin(2.0 * 3.141592653589793 * hz[i] * t_s + i);
+    return v;
+}
+
+/* 0 none; 1 the echo over the microphone's own tone; 2 the echo alone. */
+static int mic_echo(void) {
+    const char *t = getenv("OPENCHIME_TEST_MIC_ECHO");
+    if (!t || !*t || strcmp(t, "0") == 0) return 0;
+    return strcmp(t, "only") == 0 ? 2 : 1;
 }
 
 /* The synthetic devices run their "callback" lazily, from the reader's or
@@ -432,11 +479,22 @@ static void synthetic_catch_up(oc_audio_dev *d) {
                     size_t k = (size_t)d->syn_frames * (size_t)d->channels + i;
                     chunk[i] = k < d->syn_clip_n * (size_t)d->channels ? d->syn_clip[k] : 0;
                 }
+            } else if (d->loopback) {
+                for (size_t i = 0; i < n; i++) {
+                    double t = ((double)d->syn_start_us + (double)(d->syn_frames + i) * 1e6 / d->rate) / 1e6;
+                    int16_t v = (int16_t)syn_loop_value(t);
+                    for (int c = 0; c < d->channels; c++) chunk[i * (size_t)d->channels + (size_t)c] = v;
+                }
             } else {
+                int echo = mic_echo();
                 for (size_t i = 0; i < n; i++) {
                     double t = (double)(d->syn_frames + i) / d->rate;
-                    int16_t v = (int16_t)(8000.0 * __builtin_sin(2.0 * 3.141592653589793 * 440.0 * t));
-                    for (int c = 0; c < d->channels; c++) chunk[i * (size_t)d->channels + (size_t)c] = v;
+                    double v = echo == 2 ? 0.0 : 8000.0 * __builtin_sin(2.0 * 3.141592653589793 * 440.0 * t);
+                    /* The speakers heard back 20 ms later at half strength. */
+                    if (echo) v += 0.5 * syn_loop_value(((double)d->syn_start_us + (double)(d->syn_frames + i) * 1e6 / d->rate) / 1e6 - 0.020);
+                    if (v > 32767) v = 32767;
+                    if (v < -32768) v = -32768;
+                    for (int c = 0; c < d->channels; c++) chunk[i * (size_t)d->channels + (size_t)c] = (int16_t)v;
                 }
             }
             size_t put = ring_push(&d->ring, chunk, n * (size_t)d->channels);

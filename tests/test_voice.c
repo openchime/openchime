@@ -137,7 +137,8 @@ static void test_segmenter(void) {
 
 /* ---- the ERLE harness (AUDIO.md §6.4) ---- */
 
-/* A synthetic room: a direct path after `delay` samples and a decaying tail. */
+/* A synthetic room at 16 kHz: a direct path after `delay` samples and a
+ * decaying tail. */
 #define RIR_LEN 1600
 static void make_rir(double *h, int delay) {
     memset(h, 0, RIR_LEN * sizeof *h);
@@ -145,43 +146,96 @@ static void make_rir(double *h, int delay) {
     for (int k = delay + 1; k < RIR_LEN; k++) h[k] = 0.25 * noise() * exp(-(double)(k - delay) / 250.0);
 }
 
-/* Push `far` through the room, add `near`, run the processor frame by frame
- * with `far` as its reference, and report ERLE in dB over [from, to) (echo
- * energy in, over what is left of it out), and the correlation of the output
- * with `near` over the same span when `near` is given. */
-static double run_aec(const int16_t *far, const int16_t *echo_src, const int16_t *near, size_t n,
-                      size_t from, size_t to, double *near_corr) {
+/* The echo of `src` in a fresh room: 30 ms of acoustic and buffering delay. */
+static int16_t *make_echo(const int16_t *src, size_t n) {
     static double h[RIR_LEN];
-    make_rir(h, 480);                          /* 30 ms of acoustic and buffering delay */
-    int16_t *mic = malloc(n * sizeof *mic), *echo = malloc(n * sizeof *echo);
+    make_rir(h, 480);
+    int16_t *echo = malloc(n * sizeof *echo);
+    if (!echo) return NULL;
     for (size_t i = 0; i < n; i++) {
         double e = 0;
-        for (int k = 0; k < RIR_LEN && (size_t)k <= i; k++) e += h[k] * echo_src[i - (size_t)k];
+        for (int k = 0; k < RIR_LEN && (size_t)k <= i; k++) e += h[k] * src[i - (size_t)k];
         echo[i] = (int16_t)e;
-        double m = e + (near ? near[i] : 0);
+    }
+    return echo;
+}
+
+/* Add `near` to `echo`, run the processor frame by frame with `far` as its
+ * reference, and report ERLE in dB over [from, to) (echo energy in, over what
+ * is left of it out), and the correlation of the output with `near` over the
+ * same span when `near` is given. `lag` is how much later than its input the
+ * processor's output comes. */
+static double run_aec_core(const oc_audio_processor *proc, int rate, int frame, int lag, const int16_t *far,
+                           const int16_t *echo, const int16_t *near,
+                           size_t n, size_t from, size_t to, double *near_corr) {
+    int16_t *mic = malloc(n * sizeof *mic);
+    for (size_t i = 0; i < n; i++) {
+        double m = (double)echo[i] + (near ? near[i] : 0);
         mic[i] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m);
     }
-    void *p = OC_PROCESSOR_SPEEX.open(RATE, 320);
+    void *p = proc->open(rate, frame);
     CHECK(p != NULL);
     double ein = 0, eout = 0, xy = 0, yy = 0, xx = 0;
-    for (size_t at = 0; at + 320 <= n; at += 320) {
-        int16_t frame[320];
-        memcpy(frame, mic + at, sizeof frame);
-        OC_PROCESSOR_SPEEX.process(p, frame, far + at, 320);
-        for (int i = 0; i < 320; i++) {
+    int16_t *buf = malloc((size_t)frame * sizeof *buf);
+    for (size_t at = 0; p && at + (size_t)frame <= n; at += (size_t)frame) {
+        memcpy(buf, mic + at, (size_t)frame * sizeof *buf);
+        proc->process(p, buf, far + at, frame);
+        for (int i = 0; i < frame; i++) {
             size_t k = at + (size_t)i;
-            if (k < from || k >= to) continue;
-            double resid = (double)frame[i] - (near ? near[k] : 0);
-            ein += (double)echo[k] * echo[k];
+            if (k < from || k >= to || k < (size_t)lag) continue;
+            size_t j = k - (size_t)lag;        /* the input this output sample is */
+            double resid = (double)buf[i] - (near ? near[j] : 0);
+            ein += (double)echo[j] * echo[j];
             eout += resid * resid;
-            if (near) { xy += (double)frame[i] * near[k]; yy += (double)frame[i] * frame[i]; xx += (double)near[k] * near[k]; }
+            if (near) { xy += (double)buf[i] * near[j]; yy += (double)buf[i] * buf[i]; xx += (double)near[j] * near[j]; }
         }
     }
-    OC_PROCESSOR_SPEEX.close(p);
+    free(buf);
+    if (p) proc->close(p);
     if (near_corr) *near_corr = (yy > 0 && xx > 0) ? xy / sqrt(yy * xx) : 0;
     free(mic);
-    free(echo);
     return 10 * log10((ein + 1) / (eout + 1));
+}
+
+/* Voice input's canceller: 16 kHz, 20 ms frames, in a fresh room. The echo is
+ * kept in `*echo_out` when asked for, so the same room can be heard again. */
+static double run_aec(const int16_t *far, const int16_t *echo_src, const int16_t *near, size_t n,
+                      size_t from, size_t to, double *near_corr, int16_t **echo_out) {
+    int16_t *echo = make_echo(echo_src, n);
+    CHECK(echo != NULL);
+    if (!echo) return 0;
+    double r = run_aec_core(&OC_PROCESSOR_SPEEX, RATE, 320, 0, far, echo, near, n, from, to, near_corr);
+    if (echo_out) *echo_out = echo; else free(echo);
+    return r;
+}
+
+/* A 16 kHz signal at 48 kHz: zero-stuffed and low-passed at 7.5 kHz (a 97-tap
+ * windowed sinc), so it has no images above the band -- what the signal would
+ * have been had it been made at 48 kHz. Linear interpolation leaves images of
+ * the voice and the far end up to 24 kHz, which no microphone would ever carry. */
+static int16_t *up3(const int16_t *x, size_t n) {
+    enum { TAPS = 97 };
+    static double h[TAPS];
+    const double pi = 3.141592653589793, fc = 7500.0 / 48000.0;
+    double sum = 0;
+    for (int k = 0; k < TAPS; k++) {
+        int m = k - TAPS / 2;
+        h[k] = (m == 0 ? 2 * fc : sin(2 * pi * fc * m) / (pi * m)) * (0.54 - 0.46 * cos(2 * pi * k / (TAPS - 1)));
+        sum += h[k];
+    }
+    int16_t *y = malloc(3 * n * sizeof *y);
+    if (!y) return NULL;
+    for (size_t i = 0; i < 3 * n; i++) {
+        double acc = 0;
+        /* Only every third input is non-zero: those at i + TAPS/2 - k divisible by 3. */
+        for (int k = 0; k < TAPS; k++) {
+            long j = (long)i + TAPS / 2 - k;
+            if (j < 0 || j % 3 || (size_t)(j / 3) >= n) continue;
+            acc += h[k] * 3.0 / sum * x[j / 3];
+        }
+        y[i] = (int16_t)(acc > 32767 ? 32767 : acc < -32768 ? -32768 : acc);
+    }
+    return y;
 }
 
 static void test_erle(void) {
@@ -194,7 +248,8 @@ static void test_erle(void) {
 
     /* Converged: measured over the last four seconds, after the filter has had
      * four to learn the room. */
-    double erle = run_aec(far, far, NULL, n, (size_t)RATE * 4, n, NULL);
+    int16_t *echo_conv = NULL, *echo_dt = NULL;
+    double erle = run_aec(far, far, NULL, n, (size_t)RATE * 4, n, NULL, &echo_conv);
     printf("  ERLE, converged: %.1f dB\n", erle);
     CHECK(erle >= 20.0);
 
@@ -208,7 +263,7 @@ static void test_erle(void) {
         double f = x - (double)k;
         drifted[i] = (int16_t)(k + 1 < n ? far[k] * (1 - f) + far[k + 1] * f : 0);
     }
-    double erle_drift = run_aec(far, drifted, NULL, n, (size_t)RATE * 4, n, NULL);
+    double erle_drift = run_aec(far, drifted, NULL, n, (size_t)RATE * 4, n, NULL, NULL);
     printf("  ERLE, 100 ppm drift: %.1f dB\n", erle_drift);
     CHECK(erle_drift >= 12.0);
 
@@ -219,10 +274,38 @@ static void test_erle(void) {
     quiet(near, &at, 5000);
     voiced(near, &at, 3000, 220, 4000);
     double corr = 0;
-    double erle_dt = run_aec(far, far, near, n, (size_t)RATE * 5 + 3200, n, &corr);
+    double erle_dt = run_aec(far, far, near, n, (size_t)RATE * 5 + 3200, n, &corr, &echo_dt);
     printf("  double-talk: %.1f dB of echo removed, output correlates %.2f with the near-end voice\n", erle_dt, corr);
     CHECK(corr >= 0.8);
     CHECK(erle_dt >= 10.0);
+
+    /* A screen recording's canceller (REQ-162): 48 kHz and 20 ms frames, the
+     * computer's own sound as the reference, the narrator's voice as the near
+     * end. The 16 kHz canceller runs on the band where speech and echo are, and
+     * its echo estimate is taken out of the full-band microphone, which comes
+     * out 48 samples (1 ms) late for the band filters. The rooms are the ones
+     * above, band-limited up to 48 kHz, so the numbers compare directly. */
+    {
+        int16_t *far48 = up3(far, n), *near48 = up3(near, n);
+        int16_t *conv48 = echo_conv ? up3(echo_conv, n) : NULL, *dt48 = echo_dt ? up3(echo_dt, n) : NULL;
+        CHECK(far48 && near48 && conv48 && dt48);
+        if (far48 && near48 && conv48 && dt48) {
+            size_t n48 = 3 * n;
+            double e48 = run_aec_core(&OC_PROCESSOR_SPEEX_48K, 48000, 960, 48, far48, conv48, NULL,
+                                      n48, 48000 * 4, n48, NULL);
+            double c48 = 0;
+            double d48 = run_aec_core(&OC_PROCESSOR_SPEEX_48K, 48000, 960, 48, far48, dt48, near48,
+                                      n48, 48000 * 5 + 9600, n48, &c48);
+            printf("  48 kHz (16 kHz band): ERLE converged %.1f dB; double-talk %.1f dB, voice correlates %.2f\n",
+                   e48, d48, c48);
+            CHECK(e48 >= 20.0);
+            CHECK(c48 >= 0.8);
+            CHECK(d48 >= 10.0);
+        }
+        free(far48); free(near48); free(conv48); free(dt48);
+    }
+    free(echo_conv);
+    free(echo_dt);
 
     free(far);
     free(drifted);

@@ -36,7 +36,12 @@ unsigned oc_vp9enc_bitrate_kbps(int width, int height) {
     return 800;
 }
 
-oc_vp9enc *oc_vp9enc_open(int width, int height, int fps) {
+static oc_vp9enc *open_enc(int width, int height, int fps, int screen);
+
+oc_vp9enc *oc_vp9enc_open(int width, int height, int fps) { return open_enc(width, height, fps, 0); }
+oc_vp9enc *oc_vp9enc_open_screen(int width, int height, int fps) { return open_enc(width, height, fps, 1); }
+
+static oc_vp9enc *open_enc(int width, int height, int fps, int screen) {
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) || fps <= 0) return NULL;
     oc_vp9enc *e = calloc(1, sizeof *e);
     if (!e) return NULL;
@@ -70,6 +75,7 @@ oc_vp9enc *oc_vp9enc_open(int width, int height, int fps) {
     vpx_codec_control(&e->ctx, VP9E_SET_AQ_MODE, 3);
     vpx_codec_control(&e->ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
     vpx_codec_control(&e->ctx, VP9E_SET_COLOR_RANGE, VPX_CR_STUDIO_RANGE);
+    if (screen) vpx_codec_control(&e->ctx, VP9E_SET_TUNE_CONTENT, VP9E_CONTENT_SCREEN);
     e->width = width; e->height = height; e->fps = fps;
     return e;
 }

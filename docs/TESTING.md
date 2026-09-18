@@ -142,6 +142,14 @@ framework, and OpenChime follows suit.
   camera and tone, and `ffprobe` (installed in CI as a validator, never linked)
   checks the file it writes; the player plays, seeks and copes with a slow
   decoder. `tests/test_video_media.c` covers the protocol and daemon side.
+- **Screen recording** (`tests/test_media.c`, REQ-162) — the camera box's geometry
+  and the frame views that draw it; the screen front end repeating a still screen
+  at the frame rate; recordings of the synthetic screen with the camera boxed into
+  each corner (checked by colour in a decoded frame), of a window without one, of
+  a window that goes away; the computer's sound mixed with the microphone and,
+  with the microphone hearing only its echo, present once. The canceller that does
+  it is measured in the ERLE harness (`tests/test_voice.c`) at 48 kHz on the same
+  rooms as voice input's.
 - **Voice input** (ARCH-112) — `tests/test_voice.c`: the segmenter over
   synthetic voiced sound with known pauses (free talk, the cap, push to talk) and
   the ERLE harness (AUDIO.md §6.4: converged, 100 ppm drift, double-talk);
@@ -648,7 +656,8 @@ activation to an executable started from the WSL share (`\\wsl.localhost\…`):
 `ActivateObject` fails with `0x80070490`, element not found, and the card says
 the recording could not start, with that step in brackets. `gui_drive.sh launch`
 runs `build/openchime.exe` from the share, which is fine for everything else;
-for a camera test, copy it to a Windows directory and start it from there.
+for a camera test, copy it to a Windows directory and start it from there —
+`OC_DRIVE_LOCAL=1` makes `launch` do exactly that.
 
 **Two verbs put text in the composer, and they are not interchangeable.**
 `type` sets the buffer directly (`ed_set`), bypassing the editor's own rules;
@@ -762,6 +771,25 @@ intent and an intent that was never sent look identical. Prefer asserting on
 `error_seq`, which only ever increments — `last_error` is cleared on
 `OC_EV_CONNECTED`/`OC_EV_AUTH_OK`, so a reconnect between the failure and the
 check can erase the evidence a wait is polling for.
+
+## Reading the screen-recording harness
+
+`scripts/gui_screenrec.sh` records with real Windows.Graphics.Capture against its
+own fixture daemon (port 9530), with a known picture in the camera box
+(`OPENCHIME_TEST_CAPTURE=synthetic-camera`) and known sound
+(`OPENCHIME_TEST_AUDIO=synthetic`: the microphone 440 Hz, the computer 660 Hz). It
+asserts the screens and windows listed, the box in the chosen corner of the preview
+(colour bars at the rectangle the dump's `vmsrc` line and `oc_inset_rect` put it),
+the card stepping aside for the recording bar, the bar kept out of the capture and
+read and pressed through UI Automation (`scripts/uia_recbar.ps1`), Stop ending the
+take at the fitted size, the file the daemon stores — found in the fixture's blob
+directory — being VP9 and Opus at that size with both tones in it (`ffprobe`,
+`ffmpeg`), and a window closed mid-take keeping what came before.
+
+**Keep the Remote Desktop window open while it runs.** A session that is not drawn
+captures its screens as black; a window is captured either way. `gui_drive.sh
+launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
+camera needs.
 
 ## Reading the voice harness
 

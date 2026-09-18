@@ -46,4 +46,23 @@ void oc_i420_to_bgra(const oc_frame *src, uint8_t *dst, int dst_stride);
  * down resolution while recording. */
 void oc_i420_scale(const oc_frame *src, oc_frame *dst);
 
+/* A frame that is a window onto part of another: its planes point into `f`'s at
+ * (x, y) with `f`'s strides, so scaling or filling into it draws into `f`. The
+ * rectangle must lie inside `f`, with even position and size. 0, or -1. */
+int  oc_i420_view(const oc_frame *f, int x, int y, int w, int h, oc_frame *view);
+/* Paint every pixel of `f` one colour, given in Y, U and V. */
+void oc_i420_fill(oc_frame *f, uint8_t y, uint8_t u, uint8_t v);
+/* Scale `src` into `dst` keeping its shape, centred, with black bars where the
+ * shapes differ -- a window that is resized while it is recorded still fills
+ * the one size the recording has. */
+void oc_i420_fit(const oc_frame *src, oc_frame *dst);
+
+/* The camera box of a screen recording (REQ-162): a fifth of the frame's width,
+ * the camera's shape, a margin of 2% of the width from the edges, in one corner.
+ * Even position and size throughout, so it can be a view. */
+enum { OC_CORNER_BR = 0, OC_CORNER_BL, OC_CORNER_TR, OC_CORNER_TL };
+void oc_inset_rect(int fw, int fh, int cw, int ch, int corner, int *x, int *y, int *w, int *h);
+/* Draw `cam` into `dst` in that box, with a 2-pixel light border around it. */
+void oc_i420_inset(oc_frame *dst, const oc_frame *cam, int corner);
+
 #endif
