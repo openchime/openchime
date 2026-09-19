@@ -611,6 +611,7 @@ typedef struct {
     uint8_t  slot;
     uint8_t  token[OC_AUDIO_TOKEN_LEN];
     uint8_t  device_key[OC_CALL_DEVICE_KEY_LEN];
+    uint8_t  codecs;               /* the video codecs it can decode (ARCH-87) */
 } call_part;
 typedef struct {
     uint64_t  channel_id;          /* 0 marks a free slot */
@@ -627,6 +628,8 @@ typedef struct {
     uint64_t *members;             /* heap: the conversation's members, refreshed on each
                                     * join and invitation -- who is told about the call */
     size_t    n_members;
+    uint64_t  sharer_conn;         /* the participant sharing a screen, 0 for none; one
+                                    * at a time (REQ-161) */
 } call_t;
 static call_t   g_calls[OC_MAX_CALLS];
 static uint64_t g_next_call_id;
@@ -881,6 +884,18 @@ static int call_invited(const call_t *c, uint64_t user_id) {
     return -1;
 }
 
+/* Take participant `idx` out of the list; a sharer who goes stops sharing. */
+static void call_remove_part(call_t *c, int idx) {
+    if (c->parts[idx].conn_id == c->sharer_conn) c->sharer_conn = 0;
+    c->parts[idx] = c->parts[--c->n];
+}
+
+/* Who is sharing, by user; 0 for nobody. */
+static uint64_t call_sharer(const call_t *c) {
+    for (int k = 0; k < c->n; k++) if (c->parts[k].conn_id == c->sharer_conn) return c->parts[k].user_id;
+    return 0;
+}
+
 static void call_uninvite(call_t *c, uint64_t user_id) {
     int k = call_invited(c, user_id);
     if (k >= 0) c->invited[k] = c->invited[--c->n_inv];
@@ -917,7 +932,8 @@ static size_t call_encode_state(const call_t *c, int ended, uint8_t *buf, size_t
     uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
     for (int k = 0; k < c->n; k++) parts[k] = c->parts[k].user_id;
     oc_call_state st = { c->channel_id, c->call_id, c->starter, c->started_at, (uint8_t)(ended ? 1 : 0),
-                         (uint16_t)c->n, parts, (uint16_t)c->n_inv, c->invited };
+                         (uint16_t)c->n, parts, (uint16_t)c->n_inv, c->invited,
+                         ended || !c->sharer_conn ? 0 : call_sharer(c) };
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
     return oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &st) == OC_OK ? w.len : 0;
 }
@@ -945,6 +961,7 @@ static void call_fill_parts(const call_t *c, oc_call_part *out) {
         out[k].user_id = c->parts[k].user_id;
         out[k].slot = c->parts[k].slot;
         memcpy(out[k].device_key, c->parts[k].device_key, OC_CALL_DEVICE_KEY_LEN);
+        out[k].codecs = c->parts[k].codecs;
     }
 }
 
@@ -1001,7 +1018,7 @@ static void call_finish(int ep, conn **conns, call_t *c) {
  * rest, who rekey (CALLS.md §5.3). The last one out ends the call. */
 static void call_drop(int ep, conn **conns, call_t *c, int idx) {
     audio_revoke(c->parts[idx].token);
-    c->parts[idx] = c->parts[--c->n];
+    call_remove_part(c, idx);
     if (c->n == 0) { call_finish(ep, conns, c); return; }
     c->epoch++;
     uint64_t ch = c->channel_id;
@@ -2329,6 +2346,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 j->call_op = OC_CALL_OP_JOIN;
                 j->channel_id = cj.channel_id;
                 memcpy(j->call_key, cj.device_key, OC_CALL_DEVICE_KEY_LEN);
+                j->call_codecs = cj.codecs;
                 j->n_call_uids = cj.n_invite;
             } else {
                 oc_call_invite ci;
@@ -2376,6 +2394,24 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             else if (cc->starter != c->user_id) send_call_error(ep, c, OC_ERR_NOT_CALL_STARTER,
                                                                 "only the starter can end the call");
             else call_finish(ep, conns, cc);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_SHARE) {
+            /* Start or stop sharing a screen (REQ-161). One sharer at a time: a
+             * start takes over from whoever was sharing, who learns it from the
+             * CALL_STATE that follows. A stop from someone not sharing is a no-op. */
+            oc_call_share sh;
+            if (oc_decode_call_share(&p, &sh) != OC_OK) return -1;
+            int idx;
+            call_t *cc = call_of_conn(c->conn_id, &idx);
+            if (!cc || cc->channel_id != sh.channel_id) {
+                send_call_error(ep, c, OC_ERR_NOT_IN_CALL, "not in this call");
+                continue;
+            }
+            uint64_t was = cc->sharer_conn;
+            if (sh.on) cc->sharer_conn = c->conn_id;
+            else if (cc->sharer_conn == c->conn_id) cc->sharer_conn = 0;
+            if (cc->sharer_conn != was) call_send_state(ep, conns, cc, 0);
             continue;
         }
         if (hdr.msg_type == OC_MSG_CALL_KEY) {
@@ -4743,7 +4779,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             /* The same call: out and straight back in below, so a rejoin by the
              * only one in it does not end the call (or write it as missed). */
             audio_revoke(prev->parts[idx].token);
-            prev->parts[idx] = prev->parts[--prev->n];
+            call_remove_part(prev, idx);
         } else if (prev) {
             call_drop(ep, conns, prev, idx);
         }
@@ -4764,7 +4800,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (k >= 0) {
                 moved_from = c->parts[k].conn_id;
                 audio_revoke(c->parts[k].token);
-                c->parts[k] = c->parts[--c->n];
+                call_remove_part(c, k);
             }
             if (c->n >= oc_config_get()->call_max) {
                 send_call_error(ep, jc, OC_ERR_CALL_FULL, "the call is full");
@@ -4790,6 +4826,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         pt->slot = call_free_slot(c);
         memcpy(pt->token, token, sizeof token);
         memcpy(pt->device_key, r->call_key, OC_CALL_DEVICE_KEY_LEN);
+        pt->codecs = r->call_codecs;
         c->n++;
         c->epoch++;
         call_uninvite(c, jc->user_id);

@@ -138,7 +138,10 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
             if (oc_store_device_key(store, workspace, cs->sk, cs->pk) < 0) return -1;
             cs->have_key = 1;
         }
-        oc_call_join cj = { c->channel_id, {0}, c->n_uids, c->uids };
+        oc_mutex_lock(&cs->mu);
+        uint8_t codecs = cs->media ? cs->media->codecs : 0;
+        oc_mutex_unlock(&cs->mu);
+        oc_call_join cj = { c->channel_id, {0}, c->n_uids, c->uids, codecs };
         memcpy(cj.device_key, cs->pk, OC_CALL_DEVICE_KEY_LEN);
         rc = oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj);
         break;
@@ -161,6 +164,11 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
     case OC_CMD_CALL_END: {
         oc_call_end ce = { c->channel_id };
         rc = oc_encode_call_end(&w, OC_PROTOCOL_VERSION, &ce);
+        break;
+    }
+    case OC_CMD_CALL_SHARE: {
+        oc_call_share sh = { c->channel_id, c->op ? 1 : 0 };
+        rc = oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &sh);
         break;
     }
     default:
@@ -269,11 +277,17 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
             v->ended = st.ended;
             v->n_parts = st.n_parts;
             v->n_invited = st.n_invited;
+            v->sharer = st.ended ? 0 : st.sharer;
             memcpy(v->parts, parts, st.n_parts * sizeof parts[0]);
             memcpy(v->invited, inv, st.n_invited * sizeof inv[0]);
             oc_queue_push(to_ui, e);
         } else {
             oc_ev_free(e);
+        }
+        if (cs->in_call && st.call_id == cs->call_id && !st.ended) {
+            oc_mutex_lock(&cs->mu);
+            if (cs->media && cs->media->sharer) cs->media->sharer(cs->mctx, st.sharer);
+            oc_mutex_unlock(&cs->mu);
         }
         /* Ended for everyone -- by its starter, or its last participant left. */
         if (st.ended && cs->in_call && st.call_id == cs->call_id) leave_local(cs, to_ui);

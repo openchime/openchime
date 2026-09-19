@@ -285,7 +285,7 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 Most of the graphical clients' icons come from [Lucide](https://lucide.dev)
 (ISC License). We vendor **only the handful of SVGs we use**
-(`third_party/lucide/icons/*.svg` — 26 of them) plus the license
+(`third_party/lucide/icons/*.svg` — 30 of them) plus the license
 (`third_party/lucide/LICENSE`).
 
 **Four icons are ours, not Lucide's**, and live outside `third_party/` for exactly
@@ -310,7 +310,7 @@ paths ship; nothing is fetched at runtime.
 | **MIT** | ONNX Runtime, Moonshine Tiny Streaming | Fetched at build; ONNX Runtime static-linked and Moonshine shipped as data, **daemon only** (ARCH-111/112) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
-| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 22 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
+| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 26 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build and static-linked: both into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the Win32 client (ARCH-112): speexdsp fetched and static-linked, libfvad vendored and compiled in; **client only** |

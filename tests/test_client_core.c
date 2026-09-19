@@ -23,6 +23,7 @@
 #include "oc_dictate.h"
 #include "oc_mp4.h"
 #include "oc_call_engine.h"
+#include "oc_capture.h"
 #include "audio.h"        /* the relay, run on a thread for the call test */
 #include "e2e_hpke.h"
 #include "e2e_sframe.h"
@@ -1566,6 +1567,9 @@ static struct {
     pthread_mutex_t mu;
     tap_pkt  seen[TAP_KEEP];                 /* client -> relay payloads that carried audio */
     int      n_seen, bad_header;
+    int      big;                            /* payloads over 1000 bytes: a shared screen's */
+    volatile int drop_pm;                    /* client -> relay packets lost, per mille */
+    unsigned rng;
     volatile int stop;
 } g_tap;
 static pthread_t g_tap_th;
@@ -1613,8 +1617,11 @@ static void *tap_thread(void *p) {
                         if (oc_sframe_header_decode(buf + 18, (size_t)n - 18, &kid, &ctr, &hl) != 0) g_tap.bad_header++;
                         else if (g_tap.n_seen < TAP_KEEP && (size_t)n > 18 + hl)
                             g_tap.seen[g_tap.n_seen++] = (tap_pkt){ kid, buf[18 + hl], (size_t)n - 18, mono_ms() };
+                        if (n > 1000) g_tap.big++;
                         pthread_mutex_unlock(&g_tap.mu);
                     }
+                    g_tap.rng = g_tap.rng * 1664525u + 1013904223u;
+                    if (n > 18 && g_tap.drop_pm && (int)((g_tap.rng >> 8) % 1000) < g_tap.drop_pm) continue;
                     sendto(g_tap.cl[k].up, buf, (size_t)n, 0, (struct sockaddr *)&relay, sizeof relay);
                 }
             }
@@ -1686,6 +1693,100 @@ static double heard(tone_io *t, int k) {
         if (cond) { _ok = 1; break; } usleep(20000); } _ok; })
 
 static int calls_in(const oc_model *m, uint64_t ch) { return oc_model_call_in(m, ch) != NULL; }
+
+/* The newest frame of a share on `e`, and whether the synthetic screen's frame
+ * numbers in what arrived kept rising. */
+typedef struct { oc_frame f; uint32_t seq, fno; int frames, last, rising, bad, gone; } view_watch;
+
+static void watch(oc_call_engine *e, view_watch *w) {
+    int r = oc_call_engine_share_frame(e, &w->f, &w->seq, &w->fno);
+    if (r < 0) { w->gone = 1; return; }
+    if (r == 0) return;
+    w->gone = 0;
+    int n = oc_capture_synthetic_frame_number(&w->f);
+    if (n < 0) w->bad++;
+    else { if (n < w->last) w->rising = 0; w->last = n; }
+    w->frames++;
+}
+
+/* Screen sharing in the call (REQ-161): dana shares the synthetic screen; erik
+ * sees it, at its size, the frames in order; the relay sees only SFrame; a tenth
+ * of the packets lost on the way costs NACKs and resends, not the picture; faye
+ * joins late and has a picture within a few seconds; erik takes over, which stops
+ * dana's; erik stops, and the picture goes. */
+static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
+                           oc_call_engine *ea, oc_call_engine *eb, oc_call_engine *ec) {
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b), *mc = oc_client_model(c);
+    uint64_t ua = ma->user_id, ub = mb->user_id;
+    oc_call_stats st;
+    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    view_watch wb = { .last = -1, .rising = 1 }, wa = { .last = -1, .rising = 1 }, wc = { .last = -1, .rising = 1 };
+    int big0 = g_tap.big;
+
+    CHECK(oc_call_engine_share_start(ea, "screen:synthetic", 1280, 800) == 0);
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.share_state == 1);                               /* waiting for the daemon */
+    oc_client_call_share(a, 1, 1);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
+    CHECK(CALL_WAIT(6000, ({ watch(eb, &wb); wb.frames >= 10; })));
+    CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
+    oc_call_engine_stats(ea, &st);
+    printf("  dana shares: erik has %d frames at %dx%d; dana sends %dx%d at %d fps, %d kbps, %u keyframes\n",
+           wb.frames, wb.f.width, wb.f.height, st.share_width, st.share_height, st.share_fps, st.share_kbps,
+           st.share_keyframes);
+    pthread_mutex_lock(&g_tap.mu);
+    int big = g_tap.big - big0, bad = g_tap.bad_header;
+    pthread_mutex_unlock(&g_tap.mu);
+    CHECK(big > 10 && bad == 0);                              /* the screen went as SFrame, in fragments */
+
+    /* A tenth of everything lost on the way to the relay: the picture keeps coming. */
+    oc_call_engine_stats(eb, &st);
+    uint32_t nacks0 = st.view_nacks;
+    int got0 = wb.frames;
+    g_tap.drop_pm = 100;
+    uint64_t until = mono_ms() + 4000;
+    CALL_WAIT(5000, ({ watch(eb, &wb); mono_ms() > until; }));
+    g_tap.drop_pm = 0;
+    oc_call_engine_stats(eb, &st);
+    oc_call_stats sa; oc_call_engine_stats(ea, &sa);
+    printf("  at 10%% loss for 4 s: erik has %d more frames, %u NACKs, dana resent %u, %u PLIs, %u given up;"
+           " dana's rate %d kbps at %dx%d\n", wb.frames - got0, st.view_nacks - nacks0, sa.share_resent,
+           st.view_plis, st.view_skipped, sa.share_kbps, sa.share_width, sa.share_height);
+    CHECK(wb.frames - got0 >= 8 && st.view_nacks > nacks0 && sa.share_resent > 0 && wb.rising && wb.bad == 0);
+
+    /* faye joins late: a keyframe comes for her. */
+    uint64_t joined = mono_ms();
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
+    CHECK(CALL_WAIT(6000, ({ watch(ec, &wc); wc.frames >= 1; })));
+    printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
+           wc.f.width, wc.f.height, wc.last);
+    /* The loss above halved the rate, which may have stepped the size down to
+     * fit 1280x720: the shape is what holds. */
+    CHECK(mono_ms() - joined < 5000 && wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
+
+    /* erik takes over: dana's share stops, and dana sees erik's. */
+    CHECK(oc_call_engine_share_start(eb, "window:synthetic", 1280, 800) == 0);
+    oc_client_call_share(b, 1, 1);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
+    CHECK(CALL_WAIT(6000, ({ watch(ea, &wa); wa.frames >= 5; })));
+    CHECK(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
+
+    /* erik stops: nobody shares, and the picture goes. */
+    oc_call_engine_share_stop(eb);
+    oc_client_call_share(b, 1, 0);
+    CHECK(CALL_WAIT(3000, ma->call.sharer == 0 && mb->call.sharer == 0 && mc->call.sharer == 0));
+    CHECK(CALL_WAIT(3000, ({ watch(ea, &wa); wa.gone; })));
+    oc_call_engine_stats(eb, &st);
+    CHECK(st.share_state == 0 && st.sharer == 0);
+
+    oc_client_call_leave(c, 1);
+    CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
+    oc_frame_free(&wa.f); oc_frame_free(&wb.f); oc_frame_free(&wc.f);
+    unsetenv("OPENCHIME_TEST_CAPTURE");
+}
 
 static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
@@ -1802,6 +1903,8 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_call_engine_stats(eb, &st);
     CHECK(st.sent > 100 && !st.muted);
     oc_call_engine_set_volume(ea, ub, 1.0f);
+
+    test_share_e2e(a, b, c, ea, eb, ec);
 
     /* erik may not end it; dana, who started it, may -- for everyone. */
     uint32_t errs = mb->call_error_seq;

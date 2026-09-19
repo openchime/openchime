@@ -398,6 +398,7 @@ typedef struct oc_job {
     uint64_t      *call_uids;
     uint16_t       n_call_uids;
     uint8_t        call_key[OC_CALL_DEVICE_KEY_LEN];   /* a join's device key, echoed */
+    uint8_t        call_codecs;                        /* a join's decodable codecs, echoed */
 } oc_job;
 
 /* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
@@ -974,6 +975,7 @@ typedef struct oc_dbres {
     uint64_t               *call_uids;       /* heap */
     size_t                  n_call_uids;
     uint8_t                 call_key[OC_CALL_DEVICE_KEY_LEN];
+    uint8_t                 call_codecs;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

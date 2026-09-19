@@ -45,9 +45,11 @@ client  → sidecar :  token(16) ‖ seq(u16 BE) ‖ payload
 sidecar → client  :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
 ```
 
-The payload is an SFrame ciphertext (CALLS.md §5.4) — the Opus frame and its
-frame number, encrypted under the sender's key for the epoch — or empty, a
-keep-alive. The relay sees neither the audio nor who is speaking.
+The payload is an SFrame ciphertext (CALLS.md §5.4) — a typed plaintext: the
+Opus frame and its frame number, a mute state, or a shared screen's fragments and
+its viewers' requests (VIDEO.md §5), encrypted under the sender's key for the
+epoch — or empty, a keep-alive. The relay sees neither the audio nor who is
+speaking.
 
 Every packet a client receives is tagged with **who sent it**. In a five-person
 call a client receives up to four independent streams.
@@ -262,8 +264,8 @@ its own warning calls it "a hack pending a complete rewrite"; whether someone is
 speaking is judged by level. Opus encodes it: VoIP mode,
 16 kHz, 24 kbit/s VBR, with **in-band FEC**, a packet-loss hint taken from the
 loss the others' packets show, and **DTX**, so a packet of two bytes or fewer —
-silence the encoder need not have sent — is not sent. What is sent is the frame
-number and the Opus packet, encrypted as one SFrame (CALLS.md §5.4), behind
+silence the encoder need not have sent — is not sent. What is sent is the audio
+type, the frame number and the Opus packet, encrypted as one SFrame (CALLS.md §5.4), behind
 `token ‖ seq` to the relay. A muted client sends no audio, only, once a second,
 an encrypted packet saying it is muted; and every client sends an empty
 **keep-alive** at least every 5 s, so the relay's 20 s silence sweep takes only
@@ -281,7 +283,8 @@ over the authenticated TCP connection.
 
 **Receive.** Demultiplex on `sender_user_id`; drop a packet whose SFrame KID is
 not a key that sender gave, that fails authentication, or that the replay window
-has seen; route the rest to that sender's jitter buffer by frame number. Loss is
+has seen; route audio to that sender's jitter buffer by frame number, and a
+shared screen's packets to the share's reassembly (VIDEO.md §5). Loss is
 counted from gaps in the authenticated SFrame counter — a gap in frame numbers
 alone may be DTX.
 

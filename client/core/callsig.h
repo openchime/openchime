@@ -43,6 +43,12 @@ typedef struct {
                    const uint8_t key[OC_CALL_KEY_LEN]);
     /* Out of the call. */
     void (*stop)(void *ctx);
+    /* Who in this call is sharing a screen now, 0 for nobody (REQ-161): an
+     * engine sends its share only once the daemon names it, stops when someone
+     * takes over, and shows only the sharer's. */
+    void (*sharer)(void *ctx, uint64_t user);
+    /* The video codecs it can decode, OC_CALL_CODEC_* bits, told on joining. */
+    uint8_t codecs;
 } oc_call_media;
 
 /* Sends one encoded frame on the connection; 0 on success. */

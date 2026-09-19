@@ -188,6 +188,20 @@ framework, and OpenChime follows suit.
   leave, only keys the leaver never had; mute (seen by the others), push to talk
   and per-person volume; only the starter ending; the missed call; and the device
   key stored, re-read, upgraded from a version 2 entry and forgotten on sign-out.
+- **Screen sharing** (REQ-161, ARCH-86/87) — `tests/test_share_media.c`: a sharer
+  and a viewer over a simulated network that loses, delays, reorders and
+  duplicates — fragments at the edge sizes, 5% loss recovered by NACKs, a whole
+  frame lost and asked for, a frame beyond recovery given up for a keyframe, a
+  late joiner's keyframe, the rate's halving, hold, growth, floor and ceiling, the
+  size stepping down and back, malformed fragments refused, and the synthetic
+  screen through VP9 and a lossy network back to readable, rising frame numbers.
+  `itest_netloop`: `CALL_SHARE` start, take-over, a stop that is not the sharer's,
+  leave and disconnect clearing it, someone outside the call refused, codecs on
+  the roster. `test_client_core`: through the daemon and the tapped relay, dana
+  shares the synthetic screen and erik decodes it at its size with rising frame
+  numbers, the relay seeing only SFrame; 10% loss at the tap costs NACKs and
+  resends, not the picture; faye joins late and has a picture within seconds;
+  erik takes over, stopping dana's; erik stops and the picture goes.
 - **Rate limiter** (REQ-190/191) and the **connection state machine**
   ([PROTOCOL.md](./PROTOCOL.md) §10) — legal transitions accepted, illegal
   frames rejected with the expected reason code.
@@ -827,12 +841,18 @@ there and a call's audio is UDP. It asserts the start and bob's invitation (his
 Calls section and a notification), both in the call hearing each other with
 every packet decrypting once the keys are in, noise suppression taking a steady
 hum out, bob muted and seen muted, push to talk, a per-person volume, only the
-starter ending, and the missed-call line. It reads the dump's `call` line — `in=
+starter ending, the missed-call line, and screen sharing — alice shares the
+synthetic screen (`OPENCHIME_TEST_CAPTURE=synthetic`), bob's view shows it with
+readable, rising frame numbers, full screen and Esc, actual size, the
+accessibility names, bob taking over and stopping. It reads the dump's `call` line — `in=
 parts= epoch= sent= keepalives= tx_epoch= self= slot=` — its `call.peer` lines —
-`packets= lost= level= keyed= muted= undecryptable= volume=` — and `calls[n]` and
-`callevents`. The `call` verb drives it: `call start|join|open|leave|end|decline
+`packets= lost= level= keyed= muted= undecryptable= volume=` — its `share` line —
+`sharer= on= state= bar= view_frames= tex= px_fno= full= actual=`, `px_fno` being
+the synthetic screen's frame number read from the decoded pixels — and `calls[n]`
+and `callevents`. The `call` verb drives it: `call start|join|open|leave|end|decline
 [ch]`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
-`call volume <uid> <percent>`. Not in CI, for the smoke's reason.
+`call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
+Not in CI, for the smoke's reason.
 
 ## Reading the voice harness
 

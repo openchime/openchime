@@ -1149,15 +1149,16 @@ static void test_call_frames(void) {
     memset(pa, 0, sizeof pa);
     pa[0].user_id = 10; pa[0].slot = 0; memset(pa[0].device_key, 0xAA, OC_CALL_DEVICE_KEY_LEN);
     pa[1].user_id = 20; pa[1].slot = 3; memset(pa[1].device_key, 0xBB, OC_CALL_DEVICE_KEY_LEN);
+    pa[0].codecs = OC_CALL_CODEC_VP9; pa[1].codecs = 0x03;
     {
         uint64_t inv[3] = { 20, 30, 40 };
-        oc_call_join in = { 7, {0}, 3, inv };
+        oc_call_join in = { 7, {0}, 3, inv, OC_CALL_CODEC_VP9 };
         memset(in.device_key, 0x5C, OC_CALL_DEVICE_KEY_LEN);
         ROUNDTRIP(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOIN, h, p);
         oc_call_join out; uint64_t got[4];
         CHECK(oc_decode_call_join(&p, &out, got, 4) == OC_OK && out.channel_id == 7);
         CHECK(out.device_key[0] == 0x5C && out.device_key[31] == 0x5C);
-        CHECK(out.n_invite == 3 && got[0] == 20 && got[2] == 40);
+        CHECK(out.n_invite == 3 && got[0] == 20 && got[2] == 40 && out.codecs == OC_CALL_CODEC_VP9);
         /* A list longer than the caller's room is malformed, not cut short. */
         oc_rbuf_init(&p, w.data + OC_HEADER_SIZE, w.len - OC_HEADER_SIZE);
         CHECK(oc_decode_call_join(&p, &out, got, 2) == OC_E_MALFORMED);
@@ -1178,6 +1179,7 @@ static void test_call_frames(void) {
         CHECK(out.started_at == 1751200500000ull && out.count == 2);
         CHECK(got[0].user_id == 10 && got[1].user_id == 20 && got[1].slot == 3);
         CHECK(got[0].device_key[0] == 0xAA && got[1].device_key[31] == 0xBB);
+        CHECK(got[0].codecs == OC_CALL_CODEC_VP9 && got[1].codecs == 0x03);
     }
     {
         oc_call_roster in = { 7, 99, 6, 2, pa };
@@ -1185,6 +1187,7 @@ static void test_call_frames(void) {
         oc_call_roster out; oc_call_part got[8];
         CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2 && out.epoch == 6);
         CHECK(out.call_id == 99 && got[1].user_id == 20 && got[1].device_key[0] == 0xBB);
+        CHECK(got[1].codecs == 0x03);
     }
     {
         uint64_t users[2] = { 30, 40 };
@@ -1205,12 +1208,13 @@ static void test_call_frames(void) {
     }
     {
         uint64_t parts[2] = { 10, 20 }, inv[1] = { 30 };
-        oc_call_state in = { 7, 99, 10, 1751200500000ull, 1, 2, parts, 1, inv };
+        oc_call_state in = { 7, 99, 10, 1751200500000ull, 1, 2, parts, 1, inv, 20 };
         ROUNDTRIP(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_STATE, h, p);
         oc_call_state out; uint64_t gp[4], gi[4];
         CHECK(oc_decode_call_state(&p, &out, gp, 4, gi, 4) == OC_OK);
         CHECK(out.call_id == 99 && out.starter == 10 && out.ended == 1);
         CHECK(out.n_parts == 2 && gp[1] == 20 && out.n_invited == 1 && gi[0] == 30);
+        CHECK(out.sharer == 20);
     }
     {
         uint8_t s1[OC_CALL_SEALED_LEN], s2[OC_CALL_SEALED_LEN];
@@ -1229,6 +1233,12 @@ static void test_call_frames(void) {
         oc_call_key_for out;
         CHECK(oc_decode_call_key_for(&p, &out) == OC_OK && out.sender == 10 && out.epoch == 6);
         CHECK(out.call_id == 99 && out.sealed.len == OC_CALL_SEALED_LEN && out.sealed.ptr[5] == 9);
+    }
+    {
+        oc_call_share in = { 7, 1 };
+        ROUNDTRIP(oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_SHARE, h, p);
+        oc_call_share out;
+        CHECK(oc_decode_call_share(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
     }
 }
 

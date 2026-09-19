@@ -2392,7 +2392,7 @@ static int read_type(client *c, uint16_t type, oc_header *hdr, oc_rbuf *p) {
 /* Send a CALL_JOIN: `key` fills the device key, `inv` names whom a start invites. */
 static int call_join(client *c, uint64_t ch, uint8_t key, const uint64_t *inv, uint16_t ninv) {
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_join cj = { ch, {0}, ninv, inv };
+    oc_call_join cj = { ch, {0}, ninv, inv, OC_CALL_CODEC_VP9 };
     memset(cj.device_key, key, OC_CALL_DEVICE_KEY_LEN);
     if (oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) != OC_OK) return -1;
     return send_frame(c, buf, w.len);
@@ -2582,6 +2582,87 @@ static void test_call_vertical(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+static int call_share(client *c, uint64_t ch, int on) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_share m = { ch, (uint8_t)on };
+    if (oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return -1;
+    return send_frame(c, buf, w.len);
+}
+
+/* The next CALL_STATE for `call_id` whose sharer is `sharer`, passing over the
+ * earlier ones; -1 if it never comes. */
+static int wait_sharer(client *c, uint64_t call_id, uint64_t sharer, oc_call_state *st) {
+    uint64_t sp[32], si[32];
+    for (int i = 0; i < 16; i++) {
+        if (read_state(c, st, sp, si) != 0) return -1;
+        if (st->call_id == call_id && st->sharer == sharer) return 0;
+    }
+    return -1;
+}
+
+/* Screen sharing's signalling (REQ-161): each participant's codecs on the
+ * roster; a share named on CALL_STATE; a start taking over from the sharer; a
+ * stop from someone not sharing changing nothing; a sharer who leaves or
+ * disconnects no longer sharing; and someone outside the call refused. */
+static void test_call_share(int port, const uint8_t *pin) {
+    client a, b, c;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    const uint64_t ch = OC_DEFAULT_CHANNEL;
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd; oc_call_state st;
+    uint16_t code = 0;
+
+    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    uint64_t call_id = jd.call_id;
+    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.count == 2);
+    CHECK(parts[0].codecs == OC_CALL_CODEC_VP9 && parts[1].codecs == OC_CALL_CODEC_VP9);
+
+    /* carol is not in the call: she cannot share into it. */
+    CHECK(call_share(&c, ch, 1) == 0);
+    CHECK(read_error(&c, &code) == 0 && code == OC_ERR_NOT_IN_CALL);
+
+    /* alice shares; everyone told, carol too (she is in the audience). */
+    CHECK(call_share(&a, ch, 1) == 0);
+    CHECK(wait_sharer(&b, call_id, ua, &st) == 0 && !st.ended);
+    CHECK(wait_sharer(&c, call_id, ua, &st) == 0);
+    /* bob takes over; alice learns she is no longer sharing. */
+    CHECK(call_share(&b, ch, 1) == 0);
+    CHECK(wait_sharer(&a, call_id, ub, &st) == 0);
+    /* alice's stop is not bob's: nothing changes, so the next state anyone sees
+     * is bob's own stop. */
+    CHECK(call_share(&a, ch, 0) == 0);
+    CHECK(call_share(&b, ch, 0) == 0);
+    { uint64_t sp[32], si[32];
+      CHECK(read_state(&c, &st, sp, si) == 0 && st.sharer == ub);      /* the take-over */
+      CHECK(read_state(&c, &st, sp, si) == 0 && st.sharer == 0 && st.n_parts == 2); }
+
+    /* A sharer who leaves stops sharing. */
+    CHECK(call_share(&b, ch, 1) == 0);
+    CHECK(wait_sharer(&a, call_id, ub, &st) == 0);
+    CHECK(call_simple(&b, OC_MSG_CALL_LEAVE, ch) == 0);
+    CHECK(wait_sharer(&a, call_id, 0, &st) == 0 && st.n_parts == 1);
+    /* ...and so does one who disconnects. */
+    CHECK(call_join(&b, ch, 0xB2, NULL, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(call_share(&b, ch, 1) == 0);
+    CHECK(wait_sharer(&a, call_id, ub, &st) == 0);
+    client_close(&b);
+    CHECK(wait_sharer(&a, call_id, 0, &st) == 0 && st.n_parts == 1);
+
+    CHECK(call_simple(&a, OC_MSG_CALL_END, ch) == 0);
+    client_close(&c);
+    client_close(&a);
+}
+
 /* Full audio path (REQ-150/151): two participants join a call, each gets a UDP
  * endpoint + bearer token in CALL_JOINED, and one participant's audio is relayed
  * to the other by the sidecar, tagged with the sender's user id. */
@@ -2600,7 +2681,7 @@ static void test_call_sidecar_restart(int port, const uint8_t *pin, uint16_t aud
 
     oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; oc_call_part parts[32];
     uint8_t atok[OC_AUDIO_TOKEN_LEN], btok[OC_AUDIO_TOKEN_LEN];
-    oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL };
+    oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
     oc_call_joined jd;
 
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -2675,7 +2756,7 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
 
     /* alice joins -> CALL_JOINED with the real UDP port + a 16-byte token. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL };
+    oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
     CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
@@ -3349,6 +3430,7 @@ int run_netloop_tests(void) {
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);
+        test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
         test_call_sidecar_restart(arg.port, pin, audio_port);   /* last call test: leaves calls refused */
         test_concurrent_load(arg.port, pin);

@@ -4311,6 +4311,7 @@ static oc_dbres *process_call_auth(sqlite3 *db, const oc_job *j) {
     r->user_id = j->user_id;
     r->call_op = j->call_op;
     memcpy(r->call_key, j->call_key, sizeof r->call_key);
+    r->call_codecs = j->call_codecs;
     if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_CALL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;
         return r;

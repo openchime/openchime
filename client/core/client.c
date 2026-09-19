@@ -261,6 +261,15 @@ void oc_client_call_leave(oc_client *c, uint64_t channel_id)   { call_cmd(c, OC_
 void oc_client_call_decline(oc_client *c, uint64_t channel_id) { call_cmd(c, OC_CMD_CALL_DECLINE, channel_id, NULL, 0); }
 void oc_client_call_end(oc_client *c, uint64_t channel_id)     { call_cmd(c, OC_CMD_CALL_END, channel_id, NULL, 0); }
 
+void oc_client_call_share(oc_client *c, uint64_t channel_id, int on) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CALL_SHARE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = (uint8_t)(on ? 1 : 0);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n) {
     if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, channel_id, uids, n);
 }
