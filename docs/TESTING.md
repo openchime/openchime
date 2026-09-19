@@ -840,7 +840,12 @@ starts again; leaving for a conversation with no draft and coming back; a
 narrower and a wider window. It reads the dump's `ed` line — `lines=` (what the
 text wraps to at the width it is drawn at) against `fit_lines=` (what the box
 holds), which must agree up to the box's four-line maximum, past which the text
-scrolls. Not in CI, for the smoke's reason.
+scrolls.
+It also asserts that the formatting row and the action row are built to one
+measure — the same button size, left edge and pitch, from the dump's `fmtbar`
+and `actrow` lines — and that resting the pointer on each action button shows a
+tooltip naming it, as the formatting buttons do (`actrow tip=`). Not in CI, for
+the smoke's reason.
 
 ## Reading the calls harness
 
