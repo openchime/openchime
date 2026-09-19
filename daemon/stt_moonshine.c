@@ -397,9 +397,12 @@ int moonshine_hear(moonshine *m, const float *pcm, size_t samples, char **text, 
     if (moonshine_detok(&m->tok, ids, nids, out, cap) < 0) { free(out); seterr(err, errcap, "detokenize"); goto done; }
     *text = out;
     rc = 0;
-done:
+done: {
+    /* A block of its own: C99 lets a label only precede a statement, and a
+     * declaration here is a C23 extension the release's compiler refuses. */
     OrtValue *all[] = { v_feat, encoded, v_pos, memory, kv[0], kv[1], self_k, self_v };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) if (all[i]) ort->ReleaseValue(all[i]);
+    }
     free(feat);
     free(ids);
     return rc;

@@ -85,6 +85,8 @@ typedef struct {
      * long the model stays loaded with nothing to hear, `rate` how many segments
      * a connection may send a minute, and `max_secs` the longest segment. */
     struct { int enabled, queue, idle_secs, rate, max_secs; } stt;
+    /* Calls (REQ-305): the most people in one call, 2 to OC_MAX_CALL_PARTICIPANTS. */
+    int call_max;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.

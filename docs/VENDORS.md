@@ -104,7 +104,7 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
-| **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), TOFU cert handling, SHA-256/PBKDF2, ES256 verify | Daemon + client (`shared/tls.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
+| **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), TOFU cert handling, SHA-256/PBKDF2, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) now, screenshare (ARCH-87) next | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) now, the audio client (ARCH-73) next | https://opus-codec.org | BSD-3-Clause |
@@ -285,7 +285,7 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 Most of the graphical clients' icons come from [Lucide](https://lucide.dev)
 (ISC License). We vendor **only the handful of SVGs we use**
-(`third_party/lucide/icons/*.svg` — 22 of them) plus the license
+(`third_party/lucide/icons/*.svg` — 26 of them) plus the license
 (`third_party/lucide/LICENSE`).
 
 **Four icons are ours, not Lucide's**, and live outside `third_party/` for exactly

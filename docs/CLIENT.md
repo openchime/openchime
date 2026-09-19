@@ -99,6 +99,14 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   session, the libfvad segmenter and the speexdsp echo canceller, over the media
   library's device layer — linked by the Win32 client. Segments go to the daemon
   beside, not behind, the transfer queue. See [VOICE-INPUT.md](./VOICE-INPUT.md).
+- **Calls** (ARCH-73/113). Signaling, the device key and the media keys are the
+  core's, on the network thread (`client/core/callsig.c`): `oc_client_call_start`,
+  `_join`, `_leave`, `_decline`, `_end` and `_invite`, answered in the model as
+  `calls` (the Calls section), `call`/`in_call` and `call_error`, with invitations
+  worth a toast drained by `oc_client_call_notify_take`. The audio is the
+  engine's (`client/core/call/`, linked by the Win32 client and the tests),
+  plugged in with `oc_client_set_call_media` behind the `oc_call_media` seam, so
+  the TUI links no codec. See [CALLS.md](./CALLS.md) and [AUDIO.md](./AUDIO.md).
 
 **Headless-testable.** `tests/test_client_core.c` starts the daemon's netloop
 in-process (like the itest) and drives real `oc_client`s against it — connect +
@@ -390,7 +398,7 @@ OS credential store, nothing persists at all.
   costs one re-sign-in and one re-TOFU rather than leaving a plaintext credential
   on disk. macOS Keychain slots behind the same vtable.
 
-**One credential per workspace holds four things**, in a flat versioned blob
+**One credential per workspace holds five things**, in a flat versioned blob
 (`SEC_VER`) rather than a schema:
 
 - the **session token**, which is what makes silent reconnect across a restart
@@ -409,9 +417,15 @@ OS credential store, nothing persists at all.
 - the **workspace book** fields (REQ-012) — the address the user typed, the
   account, and a last-used stamp. Because there is one credential per workspace,
   **enumerating the credential store is the book** (`oc_secret_each`), and
-  "forget" is a single delete that leaves nothing behind.
+  "forget" is a single delete that leaves nothing behind;
+- the **device key** (ARCH-113) — this device's X25519 private key for calls in
+  the workspace, made on the first call and forgotten with the session on sign
+  out. It is the most secret thing here, and here for the token's reason: this is
+  the one place the client keeps anything.
 
-**There is one migration, and it reads rather than converts.** Version 2 appended
+**Migrations read rather than convert.** Version 3 appended the device key and
+version 2 the token's account, each at the end, so an older entry is a byte-exact
+prefix of a newer one. Version 2 appended
 the token's account to the end of the blob, so a version 1 entry is a byte-exact
 prefix of one: it is read as it stands with the account unknown, and the next
 write of anything upgrades it in place. Refusing it would have dropped that

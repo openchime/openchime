@@ -327,9 +327,9 @@ int oc_push_dnd_active(int enabled, int start_min, int end_min, int now_min) {
     return oc_notify_in_window(start_min, end_min, now_min);
 }
 
-int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id, uint64_t root_id, int now_min,
-                    uint64_t now_ms, oc_push_target *out, int max) {
+static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
+                   uint64_t message_id, uint64_t root_id, uint64_t invitee, int now_min,
+                   uint64_t now_ms, oc_push_target *out, int max) {
     sqlite3_stmt *st = NULL;
     /* ONE evaluator, asked once per recipient. This query FETCHES the nine
      * inputs the notify decision takes and decides none of them; the order they
@@ -372,9 +372,13 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * read as an audience: every MENTIONS-level member of the channel
              * was pushed because somebody else\'s word appeared. A kind this
              * predicate does not know is not a broadcast. */
+            /* A call invitation (REQ-302) is addressed to its invitee
+             * alone and counts as mentioning them (?6 names them, 0 for a
+             * message): muted, quiet and paused still silence it. */
+            "       ( ?6 <> 0 OR "
             "       EXISTS(SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
             "               AND (  (mn.user_id = cm.user_id AND mn.kind = 0) "
-            "                   OR mn.kind IN (1,2,3) )), "
+            "                   OR mn.kind IN (1,2,3) )) ), "
             /* KEYWORD_HIT, separately: REQ-135 makes it part of the MENTIONS
              * level rather than a switch of its own, and it is always personal
              * — the row carries the user whose term matched. */
@@ -408,7 +412,8 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * point of this query (ARCH-89, ARCH-103): the precedence order used
              * to be stated twice, once in SQL and once in each client, and the
              * two had already drifted. */
-            "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0;",
+            "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
+            "  AND (?6 = 0 OR cm.user_id = ?6);",
             -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
@@ -419,6 +424,7 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
     /* 0 for an ordinary send: the branch above is then dead by its own ?5 <> 0
      * test, so a channel message keeps exactly the audience it had. */
     sqlite3_bind_int64(st, 5, (sqlite3_int64)root_id);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)invitee);
 
     int n = 0;
     while (n < max && sqlite3_step(st) == SQLITE_ROW) {
@@ -471,6 +477,18 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
     return n;
 }
 
+int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
+                    uint64_t message_id, uint64_t root_id, int now_min,
+                    uint64_t now_ms, oc_push_target *out, int max) {
+    return collect(db, channel_id, author_id, message_id, root_id, 0, now_min, now_ms, out, max);
+}
+
+int oc_push_collect_call(sqlite3 *db, uint64_t channel_id, uint64_t inviter, uint64_t invitee,
+                         uint64_t now_ms, oc_push_target *out, int max) {
+    if (!invitee) return 0;
+    return collect(db, channel_id, inviter, 0, 0, invitee, 0, now_ms, out, max);
+}
+
 int oc_push_sign(const char *privkey_pem, const char *audience, const char *body,
                  long ts, char *sig_b64, size_t sig_cap) {
     push_rng rng;
@@ -511,6 +529,11 @@ done:
 
 int oc_push_build_body(uint64_t channel_id, const oc_push_target *targets, int n,
                        char *out, size_t cap) {
+    return oc_push_build_body_kind(channel_id, 0, targets, n, out, cap);
+}
+
+int oc_push_build_body_kind(uint64_t channel_id, int call, const oc_push_target *targets, int n,
+                            char *out, size_t cap) {
     char chbuf[24];
     snprintf(chbuf, sizeof chbuf, "%llu", (unsigned long long)channel_id);
 
@@ -521,8 +544,8 @@ int oc_push_build_body(uint64_t channel_id, const oc_push_target *targets, int n
     for (int i = 0; i < n; i++) {
         const char *plat = targets[i].platform == OC_PUSH_FCM ? "fcm" : "apns";
         w = snprintf(out + off, cap - off,
-                     "%s{\"platform\":\"%s\",\"token\":\"%s\",\"channelId\":\"%s\"}",
-                     i ? "," : "", plat, targets[i].token, chbuf);
+                     "%s{\"platform\":\"%s\",\"token\":\"%s\",\"channelId\":\"%s\"%s}",
+                     i ? "," : "", plat, targets[i].token, chbuf, call ? ",\"kind\":\"call\"" : "");
         if (w < 0 || (size_t)w >= cap - off) return -1;
         off += (size_t)w;
     }
@@ -538,6 +561,7 @@ typedef struct pnode {
     uint64_t author_id;
     uint64_t message_id;   /* what makes the MENTIONS level answerable */
     uint64_t root_id;      /* thread root for a reply, 0 for a channel send */
+    uint64_t invitee;      /* a call invitation's invitee; 0 for a message */
     struct pnode *next;
 } pnode;
 
@@ -563,20 +587,23 @@ static void prune_cb(void *ud, const char *token) {
 }
 
 static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                      uint64_t message_id, uint64_t root_id) {
+                      uint64_t message_id, uint64_t root_id, uint64_t invitee) {
     time_t nowsec = time(NULL);
     int now_min = (int)((nowsec / 60) % 1440);      /* minutes-of-day UTC */
 
     oc_push_target targets[OC_PUSH_MAX_TARGETS];
-    int n = oc_push_collect(p->rdb, channel_id, author_id, message_id, root_id,
+    int n = invitee
+          ? oc_push_collect_call(p->rdb, channel_id, author_id, invitee, (uint64_t)nowsec * 1000ull,
+                                 targets, OC_PUSH_MAX_TARGETS)
+          : oc_push_collect(p->rdb, channel_id, author_id, message_id, root_id,
                             now_min, (uint64_t)nowsec * 1000ull, targets,
                             OC_PUSH_MAX_TARGETS);
     if (n <= 0) return;
 
-    size_t cap = (size_t)n * (OC_DEVICE_TOKEN_MAX + 96) + 64;
+    size_t cap = (size_t)n * (OC_DEVICE_TOKEN_MAX + 112) + 64;
     char *body = malloc(cap);
     if (!body) return;
-    if (oc_push_build_body(channel_id, targets, n, body, cap) != 0) { free(body); return; }
+    if (oc_push_build_body_kind(channel_id, invitee != 0, targets, n, body, cap) != 0) { free(body); return; }
 
     long ts = (long)nowsec;
     char sig[512];
@@ -604,7 +631,7 @@ static void *worker(void *arg) {
         p->qlen--;
         pthread_mutex_unlock(&p->mu);
 
-        do_notify(p, node->channel_id, node->author_id, node->message_id, node->root_id);
+        do_notify(p, node->channel_id, node->author_id, node->message_id, node->root_id, node->invitee);
         free(node);
     }
     return NULL;
@@ -646,8 +673,8 @@ fail:
     return NULL;
 }
 
-void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id, uint64_t root_id) {
+static void enqueue(oc_push *p, uint64_t channel_id, uint64_t author_id,
+                    uint64_t message_id, uint64_t root_id, uint64_t invitee) {
     if (!p) return;
     pthread_mutex_lock(&p->mu);
     if (p->stopping || p->qlen >= OC_PUSH_MAX_QUEUE) { pthread_mutex_unlock(&p->mu); return; }
@@ -657,11 +684,21 @@ void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
     node->author_id = author_id;
     node->message_id = message_id;
     node->root_id = root_id;
+    node->invitee = invitee;
     if (p->tail) p->tail->next = node; else p->head = node;
     p->tail = node;
     p->qlen++;
     pthread_cond_signal(&p->cv);
     pthread_mutex_unlock(&p->mu);
+}
+
+void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
+                    uint64_t message_id, uint64_t root_id) {
+    enqueue(p, channel_id, author_id, message_id, root_id, 0);
+}
+
+void oc_push_notify_call(oc_push *p, uint64_t channel_id, uint64_t inviter, uint64_t invitee) {
+    if (invitee) enqueue(p, channel_id, inviter, 0, 0, invitee);
 }
 
 void oc_push_stop(oc_push *p) {

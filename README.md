@@ -49,8 +49,9 @@ today is not a document — it is the
 | [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
 | [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, how to bring the federated stack up by hand, and the GUI's two harnesses — the boot check and the visual audit that checks a render against itself rather than against a second binary. |
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
-| [AUDIO.md](docs/AUDIO.md) | The design for server-relayed audio calls: the huddle model, client-side mixing, and echo cancellation. The server half is built; the client half is not. |
-| [VIDEO.md](docs/VIDEO.md) | The screenshare design: why the codec is a wire contract rather than a per-platform choice, and why it is sequenced behind the audio client. Not started. |
+| [CALLS.md](docs/CALLS.md) | Calls: the Calls section, starting, inviting, ending and missed calls, the call view, and the end-to-end encryption — device keys, per-sender keys sealed with HPKE, packets in SFrame — with what it does and does not guarantee. |
+| [AUDIO.md](docs/AUDIO.md) | A call's audio: the relay that never decodes, the client engine — echo cancellation, noise suppression, Opus with FEC and DTX, the adaptive jitter buffer, the mixer — and the ERLE harness that measures the canceller. |
+| [VIDEO.md](docs/VIDEO.md) | The screenshare design: why the codec is a wire contract rather than a per-platform choice, and how it builds on the call's media transport. Not started. |
 | [VIDEO-MESSAGES.md](docs/VIDEO-MESSAGES.md) | Recorded video messages: the capture interface and its six platform backends, VP9 and Opus in a restricted MP4, the recorder and player, how a message travels as an attachment, consent, and the tests that prove it. |
 | [READ-ALOUD.md](docs/READ-ALOUD.md) | Read-aloud: a channel spoken in each author's voice — rendered once by the daemon from a voice model installed beside it, cached, and played by the clients. |
 | [VOICE-INPUT.md](docs/VOICE-INPUT.md) | Voice input for the Win32 client: push to talk into the composer, or free talk the daemon posts as you speak — cut at pauses in the client, echo-cancelled, recognized by the daemon with Moonshine Tiny Streaming. |
@@ -76,9 +77,9 @@ send, custom emoji, **link unfurls** fetched in-daemon behind an SSRF gate,
 attachments proxied to object storage with per-channel file
 and member listings, incoming webhooks, an audit log, and reconnect backfill. The
 daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
-**enrolls** with it for federated deployments (ARCH-84). Server-relayed **audio**
-signaling and the UDP sidecar are built; the client-side codec is not
-([docs/AUDIO.md](docs/AUDIO.md)).
+**enrolls** with it for federated deployments (ARCH-84). **Calls** are relayed by a
+UDP sidecar that never decodes them and are encrypted end to end between the
+participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDIO.md)).
 
 For what is known to be wrong with it, see the
 **[issue tracker](https://github.com/openchime/openchime/issues)**. No daemon

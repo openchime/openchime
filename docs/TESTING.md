@@ -165,6 +165,29 @@ framework, and OpenChime follows suit.
   `test_client_core` shows free talk arriving as `BROADCAST`s with no client
   `SEND`, push to talk returning words and sending nothing, and one microphone
   owner.
+- **Calls** (REQ-150–152, REQ-301–306, ARCH-73/113) — `tests/test_e2e.c`: SFrame
+  against RFC 9605's vectors (every header encoding, suite 0x0004's key, salt and
+  ciphertext), HPKE Auth mode against RFC 9180 A.1.3 (the ephemeral, receiver and
+  sender keys, the sealed message), then what vectors do not cover — altered
+  headers, bodies and tags, another key for the same KID, the replay window,
+  another receiver or sender, another info or aad, a low-order key refused.
+  `tests/test_call_media.c`: the jitter buffer on a simulated network — steady,
+  0–120 ms of jitter with reordering, 10% and 20% loss, bursts, duplicates, DTX
+  gaps, a network worse than its ceiling — asserting every frame that arrived is
+  played, single losses rebuilt from FEC and the target in bounds; and Opus at
+  16 kHz with FEC, concealment and DTX. `itest_netloop`: a start with
+  invitations, the roster with slots, keys and epochs, sealed keys forwarded only
+  between participants for the current epoch, the cap, declining, only the
+  starter ending, a leave naming another conversation doing nothing, the missed
+  call, one call per connection, a non-member refused, a rejoin's old token
+  revoked, and the relay's sweep reported and applied. `test_client_core`: two
+  and then three client cores in a call through the daemon and a relay with a
+  **tap** in front of it, synthetic tones out and Goertzel measurements in —
+  each hears the others at full level and never itself; a joiner misses only the
+  grace; the tap sees only SFrame, never a repeating plaintext byte; after a
+  leave, only keys the leaver never had; mute (seen by the others), push to talk
+  and per-person volume; only the starter ending; the missed call; and the device
+  key stored, re-read, upgraded from a version 2 entry and forgotten on sign-out.
 - **Rate limiter** (REQ-190/191) and the **connection state machine**
   ([PROTOCOL.md](./PROTOCOL.md) §10) — legal transitions accepted, illegal
   frames rejected with the expected reason code.
@@ -303,7 +326,10 @@ Jobs:
   tested by nothing).
 - **`core`** — a standalone compile-check of the client app-core (ARCH-74).
 - **`second-compiler`** — `make CC=clang test`, so an assumption only gcc
-  accepts fails in CI rather than on someone's machine.
+  accepts fails in CI rather than on someone's machine. The `build` job also
+  compiles the daemon's sources with the release's own compiler (`make
+  check-release-cc`: zig's clang, targeting the release's glibc), which is
+  stricter than either and was not checked before a release failed on it.
 - **`windows`** — the Windows cross-compile of the TUI and GUI
   (`make windows-tui windows-gui`), so the ported client stays building.
 
@@ -790,6 +816,23 @@ directory — being VP9 and Opus at that size with both tones in it (`ffprobe`,
 captures its screens as black; a window is captured either way. `gui_drive.sh
 launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
+
+## Reading the calls harness
+
+`scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`
+against its own fixture daemon (port 9620): alice's synthetic microphone at
+440 Hz, bob's at 660 Hz (`OPENCHIME_TEST_TONE`). The clients reach the daemon at
+the WSL machine's own address rather than 127.0.0.1, because WSL forwards only TCP
+there and a call's audio is UDP. It asserts the start and bob's invitation (his
+Calls section and a notification), both in the call hearing each other with
+every packet decrypting once the keys are in, noise suppression taking a steady
+hum out, bob muted and seen muted, push to talk, a per-person volume, only the
+starter ending, and the missed-call line. It reads the dump's `call` line — `in=
+parts= epoch= sent= keepalives= tx_epoch= self= slot=` — its `call.peer` lines —
+`packets= lost= level= keyed= muted= undecryptable= volume=` — and `calls[n]` and
+`callevents`. The `call` verb drives it: `call start|join|open|leave|end|decline
+[ch]`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
+`call volume <uid> <percent>`. Not in CI, for the smoke's reason.
 
 ## Reading the voice harness
 

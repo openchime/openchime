@@ -65,6 +65,7 @@ struct oc_net {
     oc_queue     *from_ui;
     oc_xqueue     xq;
     oc_stt_sent   stt;           /* voice-input segments awaiting an answer */
+    oc_callsig    calls;         /* the call this device is in, and its keys (ARCH-113) */
 };
 
 /* ---- the offline outbox, in memory (REQ-102, ARCH-88) ----------------------
@@ -330,7 +331,15 @@ typedef struct {
     uint16_t     version;     /* negotiated at WELCOME; every frame must carry it */
     oc_xqueue   *xq;
     oc_stt_sent *stt;
+    oc_callsig  *calls;
+    const char  *host;        /* where the relay is, for a call (CALLS.md §4) */
 } disp_ctx;
+
+/* How the call module writes a frame: on this connection, like everything else. */
+static int ctx_write(void *wctx, const uint8_t *buf, size_t len) {
+    disp_ctx *ctx = wctx;
+    return write_all(ctx->conn, ctx->fd, buf, len, ctx->stop);
+}
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
 static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
@@ -708,6 +717,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             return -1;
         }
 
+        /* Calls (REQ-150, ARCH-113): the call module answers its own frames. */
+        if (ctx->calls) {
+            int cr = oc_callsig_frame(ctx->calls, hdr.msg_type, &p, ctx->host, ctx_write, ctx, to_ui);
+            if (cr < 0) return -1;
+            if (cr > 0) continue;
+        }
+
         if (hdr.msg_type == OC_MSG_BROADCAST) {
             oc_broadcast b;
             if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
@@ -717,6 +733,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->author_id = b.author_id;
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
+                e->msg_kind = b.kind;
                 if (b.author_name.len) {
                     size_t an = b.author_name.len < sizeof e->author_name - 1
                                     ? b.author_name.len : sizeof e->author_name - 1;
@@ -779,6 +796,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (e) {
                 e->status = wi.deployment_mode;
                 e->count  = wi.max_users;
+                e->op     = wi.call_max;
                 e->body = malloc(wi.workspace_name.len + 1);
                 if (e->body) { memcpy(e->body, wi.workspace_name.ptr, wi.workspace_name.len); e->body[wi.workspace_name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -1882,6 +1900,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     stt_where(ctx, e->count, e);
                     oc_queue_push(to_ui, e);
                 }
+            } else if (err.code == OC_ERR_CALL_UNAVAILABLE || err.code == OC_ERR_CALL_FULL ||
+                       err.code == OC_ERR_NOT_CALL_STARTER || err.code == OC_ERR_NOT_IN_CALL ||
+                       (err.code == OC_ERR_NOT_A_MEMBER && err.message.len == 16 &&
+                        memcmp(err.message.ptr, "call join denied", 16) == 0)) {
+                /* A call request refused (REQ-150, REQ-305): the call view says
+                 * why, in its own words, rather than a status line. */
+                oc_ev *e = oc_ev_new(OC_EV_CALL_ERROR);
+                if (e) { e->size = err.code; oc_queue_push(to_ui, e); }
             } else {
                 char msg[256];
                 size_t n = err.message.len < sizeof msg - 1 ? err.message.len : sizeof msg - 1;
@@ -2197,11 +2223,18 @@ static int run_connection(oc_net *n, int reconnecting,
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
-                     cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt };
+                     cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
+                     &n->calls, n->host };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
             if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); rc = RC_STOP; goto drop; }
+            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_END) {
+                (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
+                                         ctx_write, &ctx, n->to_ui);
+                oc_cmd_free(c);
+                continue;
+            }
             if (c->type == OC_CMD_BACKFILL) {
                 /* Replay history for one channel from the last id we already hold
                  * (cached-history cursor, ARCH-45/46) — 0 the first time. Replies
@@ -2754,6 +2787,9 @@ static int run_connection(oc_net *n, int reconnecting,
     }
 
 drop:
+    /* The daemon takes a closed connection out of its call (REQ-152); so does
+     * this side, at once, rather than leave the audio running to nobody. */
+    oc_callsig_lost(&n->calls, n->to_ui);
     xfer_reset(&xfer);   /* close any half-done transfer file */
     xq_requeue_active(&n->xq);
     oc_framebuf_free(&fb);
@@ -2926,10 +2962,16 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
     snprintf(n->client_type, sizeof n->client_type, "%s", "tui");
     n->to_ui = to_ui;
     n->from_ui = from_ui;
+    oc_callsig_init(&n->calls);
     if (oc_thread_create(&n->thread, net_thread, n) != 0) {
+        oc_callsig_destroy(&n->calls);
         free(n->token); free(n->invite); free(n->store_path); free(n); return NULL;
     }
     return n;
+}
+
+void oc_net_set_call_media(oc_net *n, const oc_call_media *media, void *ctx) {
+    if (n) oc_callsig_set_media(&n->calls, media, ctx);
 }
 
 void oc_net_set_invite(oc_net *n, const char *token) {
@@ -2955,6 +2997,7 @@ void oc_net_stop(oc_net *n) {
     if (n->xq.active) oc_cmd_free(n->xq.active);
     for (size_t i = 0; i < n->xq.n; i++) oc_cmd_free(n->xq.q[i]);
     free(n->xq.q);
+    oc_callsig_destroy(&n->calls);
     free(n->token);
     free(n->store_path);
     free(n);

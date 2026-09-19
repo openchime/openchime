@@ -77,7 +77,7 @@ BIN := openchimed
 # both the daemon and the client), daemon/ is the server, client/ is the app.
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c \
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c \
-              shared/oc_mp4.c
+              shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c
 DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/audio_sidecar.c daemon/enroll.c daemon/push.c daemon/unfurl.c daemon/voice_pick.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
@@ -138,6 +138,15 @@ VOICE_SRC  := $(wildcard client/core/voice/*.c)
 VOICE_HDRS := $(wildcard client/core/voice/*.h)
 VOICE_INC  := -Iclient/core/voice -Ithird_party/libfvad/include
 
+# --- Calls (ARCH-113, docs/CALLS.md) -----------------------------------------
+# The media engine behind the core's oc_call_media seam: the microphone through
+# the canceller and speexdsp's preprocessor, Opus, SFrame, the relay socket, the
+# jitter buffers and the mixer. Linked by the Win32 client and the tests; the
+# core does the signaling and the keys, and links no codec.
+CALL_SRC  := $(wildcard client/core/call/*.c)
+CALL_HDRS := $(wildcard client/core/call/*.h)
+CALL_INC  := -Iclient/core/call
+
 # --- ttskit (read-aloud pronunciation, ARCH-111) -----------------------------
 # English text to the IPA a voice model reads: a CMUdict-derived dictionary and a
 # trained guesser, both committed as memory-mapped data in ttskit/data. Pure C, no
@@ -185,7 +194,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test check-opcodes check-refs core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
+.PHONY: all run test check-opcodes check-refs check-release-cc core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
 
 all: $(BIN)
 
@@ -309,6 +318,18 @@ check-opcodes:
 check-refs:
 	scripts/check_refs.sh
 
+# The daemon's sources through the RELEASE's compiler, with the release's flags,
+# stopping short of the link (the release links an ONNX Runtime built by the same
+# compiler, which CI does not build). A newer clang refuses things CI's accepts --
+# a declaration after a label, a C23 extension, broke a release this way -- and
+# the release is the wrong place to learn it. `RELEASE_CC` is what release.yml
+# compiles with.
+RELEASE_CC ?= /opt/zig/zig cc -target x86_64-linux-gnu.2.34
+check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS)
+	@for f in $(SRC) $(TTS_SRC) $(STT_SRC); do \
+	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -c -o /dev/null $$f || exit 1; \
+	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC)) sources clean"
+
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI.
 test: check-opcodes check-refs $(TEST_BIN)
@@ -320,9 +341,9 @@ test: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
@@ -466,7 +487,7 @@ WIN_GUI_SYMS := build/openchime.debug
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
            $(SDLTEXT_WIN) $(GFX_SRC)
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-               $(CORE_INC) -Iclient/gui/win32 -Iclient/shared \
+               $(CORE_INC) $(CALL_INC) -Iclient/gui/win32 -Iclient/shared \
                $(SDLTEXT_INC) -Iclient/gui/gfx -I$(SDL3_WIN)/include
 
 # Resources (app icon + VERSIONINFO). Regenerate the .ico with
@@ -477,11 +498,11 @@ $(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime
 	$(WINDRES) -I client/gui/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 
 windows-gui: $(WIN_GUI_BIN)
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) \
+$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) $(CALL_HDRS) \
                 $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/win32/res \
-	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
+	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcomdlg32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
 # Split the debug info out rather than discarding it. The client writes real

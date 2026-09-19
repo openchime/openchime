@@ -430,6 +430,7 @@ int oc_model_has_capability(const oc_model *m, const char *name) {
 }
 uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
 uint8_t     oc_model_stt_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_STT); }
+uint8_t     oc_model_calls_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_CALLS); }
 
 int oc_model_stt_take_words(oc_model *m, uint64_t channel_id, uint64_t thread_root, char **text) {
     for (uint8_t i = 0; i < m->n_stt_words; i++) {
@@ -914,7 +915,7 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
 /* Append a message, stealing ownership of `*body` (set to NULL on success).
  * Returns 1 if a message was appended, 0 if it was a dedup/alloc no-op. */
 static int channel_append(oc_channel *c, uint64_t author_id, const char *author_name,
-                          uint64_t message_id, uint64_t server_time, char **body) {
+                          uint64_t message_id, uint64_t server_time, uint8_t kind, char **body) {
     /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
      * server did not assign one (shouldn't happen for a BROADCAST) — keep it.
      *
@@ -950,6 +951,7 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
     msg->author_id = author_id;
     msg->message_id = message_id;
     msg->server_time = server_time;
+    msg->kind = kind;
     *body = NULL;
     if (message_id > c->high_water) c->high_water = message_id;
     return 1;
@@ -1025,6 +1027,8 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
          * way; it is a filter here because a message of yours must not become
          * the subject of somebody else's notification either. */
         if (msg->author_id == m->user_id) continue;
+        /* A missed call (REQ-304) never notifies: the invitation already did. */
+        if (msg->kind != OC_MSG_KIND_MESSAGE) continue;
 
         int men = 0, kw = 0;
         if (msg->body) {
@@ -1099,6 +1103,68 @@ size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
     return kept;
 }
 
+const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id) {
+    for (size_t i = 0; i < m->n_calls; i++)
+        if (m->calls[i].channel_id == channel_id) return &m->calls[i];
+    return NULL;
+}
+
+int oc_model_call_invited(const oc_call_view *v, uint64_t user_id) {
+    if (!v) return 0;
+    for (uint16_t i = 0; i < v->n_invited; i++) if (v->invited[i] == user_id) return 1;
+    return 0;
+}
+
+size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
+                                 oc_call_notice *out, size_t max) {
+    if (!m) return 0;
+    size_t kept = 0;
+    for (size_t i = 0; i < m->n_call_notices; i++) {
+        oc_call_notice *n = &m->call_notices[i];
+        const oc_channel *c = oc_model_channel(m, n->channel_id);
+        const oc_call_view *v = oc_model_call_in(m, n->channel_id);
+        /* Still standing: not taken, declined or ended since it arrived. */
+        if (!v || v->call_id != n->call_id || !oc_model_call_invited(v, m->user_id)) continue;
+        int muted = c ? c->muted : 0;
+        unsigned level = c ? c->notify_level : OC_NOTIFY_ALL;
+        if (!oc_notify_decide(0, muted, oc_model_is_priority(m, n->starter), level,
+                              1, 0, 0, quiet, paused)) continue;
+        if (out && kept < max) out[kept++] = *n;
+    }
+    m->n_call_notices = 0;
+    return kept;
+}
+
+/* CALL_STATE (REQ-303): upsert the conversation's entry, or drop it when the
+ * call is over. An invitation this user did not hold before is queued for the
+ * toast pass. */
+static void call_state_fold(oc_model *m, const oc_call_view *v) {
+    size_t i = 0;
+    while (i < m->n_calls && m->calls[i].channel_id != v->channel_id) i++;
+    int had_invite = i < m->n_calls && m->calls[i].call_id == v->call_id &&
+                     oc_model_call_invited(&m->calls[i], m->user_id);
+    if (v->ended) {
+        if (i < m->n_calls) m->calls[i] = m->calls[--m->n_calls];
+        return;
+    }
+    if (i == m->n_calls) {
+        if (m->n_calls == OC_MAX_CALLS_LISTED) return;
+        m->n_calls++;
+    }
+    m->calls[i] = *v;
+    if (!had_invite && oc_model_call_invited(v, m->user_id)) {
+        if (m->n_call_notices == OC_MAX_CALL_NOTICES) {
+            memmove(m->call_notices, m->call_notices + 1,
+                    (OC_MAX_CALL_NOTICES - 1) * sizeof *m->call_notices);
+            m->n_call_notices--;
+        }
+        oc_call_notice *n = &m->call_notices[m->n_call_notices++];
+        n->channel_id = v->channel_id;
+        n->call_id = v->call_id;
+        n->starter = v->starter;
+    }
+}
+
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_presence; i++)
         if (m->presence[i].user_id == user_id) return m->presence[i].status;
@@ -1136,6 +1202,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_WORKSPACE_INFO:
         m->deployment_mode = e->status;
         m->max_users = e->count;
+        m->call_max = e->op;
         snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
         break;
     case OC_EV_CHANNEL: {
@@ -1181,7 +1248,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             snprintf(c->preview, sizeof c->preview, "%s", e->body);
             c->preview_author = e->author_id;
         }
-        if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time, &e->body)) {
+        if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
+                                e->msg_kind, &e->body)) {
             /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
              * the pause left out — they say when to interrupt you, not whether
              * a message mattered, and a badge that emptied itself overnight
@@ -1210,7 +1278,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
              * end to end -- is only in the way. A listener too far behind loses
              * the oldest rather than the newest: what is being said now matters
              * more than what was said while the queue was backing up. */
-            if (m->listen_channel == e->channel_id && e->author_id != m->user_id) {
+            if (m->listen_channel == e->channel_id && e->author_id != m->user_id &&
+                e->msg_kind == OC_MSG_KIND_MESSAGE) {
                 if (m->n_listen_queue == OC_LISTEN_QUEUE_MAX) {
                     memmove(m->listen_queue, m->listen_queue + 1,
                             (OC_LISTEN_QUEUE_MAX - 1) * sizeof *m->listen_queue);
@@ -1943,6 +2012,43 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->connected = false;
         m->authed = false;
         set_status(m, "disconnected");
+        /* The daemon tells a new connection every call there is; what was
+         * listed here may have ended meanwhile. */
+        m->n_calls = 0;
+        m->call_pending = 0;
+        break;
+    case OC_EV_CALL_STATE:
+        if (e->call) call_state_fold(m, e->call);
+        if (e->call && m->in_call && m->call.call_id == e->call->call_id && !e->call->ended) {
+            m->call.starter = e->call->starter;
+            m->call.started_at = e->call->started_at;
+            m->call.n_invited = e->call->n_invited;
+            memcpy(m->call.invited, e->call->invited, e->call->n_invited * sizeof e->call->invited[0]);
+        }
+        break;
+    case OC_EV_CALL_JOINED:
+        if (!e->call) break;
+        m->in_call = 1;
+        m->call = *e->call;
+        if (m->call_pending == e->call->channel_id) m->call_pending = 0;
+        break;
+    case OC_EV_CALL_ROSTER:
+        if (!e->call || !m->in_call || e->call->call_id != m->call.call_id) break;
+        m->call.epoch = e->call->epoch;
+        m->call.n_parts = e->call->n_parts;
+        memcpy(m->call.parts, e->call->parts, e->call->n_parts * sizeof e->call->parts[0]);
+        memcpy(m->call.slots, e->call->slots, e->call->n_parts * sizeof e->call->slots[0]);
+        break;
+    case OC_EV_CALL_LEFT:
+        if (m->in_call && m->call.channel_id == e->channel_id) {
+            m->in_call = 0;
+            memset(&m->call, 0, sizeof m->call);
+        }
+        break;
+    case OC_EV_CALL_ERROR:
+        m->call_pending = 0;
+        m->call_error = (uint16_t)e->size;
+        m->call_error_seq++;
         break;
     case OC_EV_MENTION_UNRESOLVED:
         /* REQ-287. Stored rather than shown: the model does not know what a

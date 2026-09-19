@@ -38,6 +38,21 @@ typedef struct {
     uint8_t  outcome;   /* 1 ok, 0 denied/failed */
 } oc_audit_view;
 
+/* A call as the model holds it (REQ-150, REQ-301-305): what CALL_STATE says of a
+ * call in the Calls section, or -- on CALL_JOINED / CALL_ROSTER -- of the call
+ * this client is in, with each participant's slot. Heap-owned by the event and
+ * handed to the model, which keeps its own copy. */
+typedef struct {
+    uint64_t channel_id, call_id, starter, started_at;
+    uint32_t epoch;
+    uint8_t  ended;
+    uint8_t  my_slot;
+    uint16_t n_parts, n_invited;
+    uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
+    uint8_t  slots[OC_MAX_CALL_PARTICIPANTS];
+    uint64_t invited[OC_MAX_CALL_INVITES];
+} oc_call_view;
+
 /* net thread -> UI thread */
 enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
@@ -173,7 +188,18 @@ enum {
     OC_EV_STT_TEXT,
     /* A segment refused: count = segment id, op = mode, status = the reason
      * code (it does not fit a uint8_t, so it rides `size`). */
-    OC_EV_STT_ERROR
+    OC_EV_STT_ERROR,
+    /* Calls (REQ-150, REQ-301-305). STATE: a call for the Calls section, in
+     * `call` (ended set when it is over). JOINED: this client is in the call in
+     * `call`. ROSTER: that call's participants changed. LEFT: this client is in
+     * no call any more (left, ended, moved to another device, disconnected);
+     * channel_id says which. ERROR: a call request refused, the reason code in
+     * `size`, channel_id where known. */
+    OC_EV_CALL_STATE,
+    OC_EV_CALL_JOINED,
+    OC_EV_CALL_ROSTER,
+    OC_EV_CALL_LEFT,
+    OC_EV_CALL_ERROR
 };
 
 typedef struct {
@@ -254,6 +280,8 @@ typedef struct {
     /* XFER / MEDIA_POSTED: which queued transfer (the tag its command carried),
      * and bytes moved of the total. */
     uint64_t xfer_tag, xfer_done, xfer_total;
+    oc_call_view *call;   /* heap; the CALL_* events */
+    uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -369,6 +397,14 @@ enum {
      * 16 kHz mono PCM as little-endian 16-bit samples. Sent at once, beside and
      * never behind the transfer queue. */
     OC_CMD_STT_SEGMENT,
+    /* Calls (REQ-150, REQ-301-305), all on `channel_id`. JOIN starts or joins,
+     * inviting `uids` when it starts; INVITE asks `uids`; LEAVE, DECLINE and END
+     * (the starter's) carry nothing else. */
+    OC_CMD_CALL_JOIN,
+    OC_CMD_CALL_INVITE,
+    OC_CMD_CALL_LEAVE,
+    OC_CMD_CALL_DECLINE,
+    OC_CMD_CALL_END,
     OC_CMD_QUIT
 };
 
@@ -406,6 +442,9 @@ typedef struct {
     size_t   blob_len, blob2_len;
     uint32_t duration_ms;
     uint16_t media_w, media_h;
+    /* CALL_JOIN / CALL_INVITE: the people asked. Inline, capped by the wire. */
+    uint64_t uids[OC_MAX_CALL_INVITES];
+    uint16_t n_uids;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

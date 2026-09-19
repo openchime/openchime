@@ -11,6 +11,7 @@
 #ifndef OC_NET_H
 #define OC_NET_H
 
+#include "callsig.h"
 #include "queue.h"
 #include "secret.h"
 
@@ -39,6 +40,10 @@ void oc_net_reconnect(oc_net *n);
  * right after start, before soliciting settings; identifies the per-frontend
  * bucket so a TUI's synced prefs stay separate from a future GUI's. */
 void oc_net_set_client_type(oc_net *n, const char *client_type);
+
+/* The media engine calls go to (callsig.h); NULL removes it. Returns once no call
+ * into the old one is running, so it may be freed after. */
+void oc_net_set_call_media(oc_net *n, const oc_call_media *media, void *ctx);
 
 /* Signal the thread to stop, join it, and free. */
 void oc_net_stop(oc_net *n);

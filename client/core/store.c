@@ -20,6 +20,8 @@
 
 #include "store.h"
 
+#include "e2e_hpke.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,11 +37,12 @@ static uint64_t get_u64(const uint8_t *p) {
  * but it is integrity-sensitive — rewriting a pin is how a MITM gets accepted
  * (ARCH-10) — so it belongs beside the credential, not in a file anyone can
  * edit. The book fields ride along so the credential IS the book entry. */
-#define SEC_VER    2
+#define SEC_VER    3
 #define SEC_LABEL  128
 #define SEC_USER   128
 #define SEC_OWNER  128
 /* [ver][flags][expiry u64][token 32][pin 32][last_used u64][label 128][user 128][owner 128]
+ * [device key 32]
  *
  * `user` and `owner` are NOT the same fact, and conflating them was a real bug:
  *
@@ -57,10 +60,16 @@ static uint64_t get_u64(const uint8_t *p) {
  * `owner` is appended at the END so a version 1 entry is a byte-exact prefix of
  * this one: sec_load zeroes the buffer first and every backend writes only the
  * bytes it holds, so an old entry migrates by being read. Insert a field anywhere
- * but the end and that stops being true. */
+ * but the end and that stops being true.
+ *
+ * Version 3 appends the DEVICE KEY -- this device's X25519 private key for calls
+ * in this workspace (ARCH-113, CALLS.md §5.2) -- by the same rule. It is the most
+ * secret thing here and sits beside the token for the reason the token does: the
+ * credential store is the one place this client keeps anything. */
 #define SEC_BLOB_V1 (2 + 8 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN + 8 + SEC_LABEL + SEC_USER)
-#define SEC_BLOB    (SEC_BLOB_V1 + SEC_OWNER)
-enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8 };
+#define SEC_BLOB_V2 (SEC_BLOB_V1 + SEC_OWNER)
+#define SEC_BLOB    (SEC_BLOB_V2 + OC_X25519_LEN)
+enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8, SEC_HAS_DEVKEY = 16 };
 #define SEC_EXPIRY(b) ((b) + 2)
 #define SEC_TOKEN(b)  ((b) + 10)
 #define SEC_PIN(b)    ((b) + 10 + OC_SESSION_TOKEN_LEN)
@@ -68,6 +77,7 @@ enum { SEC_HAS_TOKEN = 1, SEC_HAS_PIN = 2, SEC_HAS_BOOK = 4, SEC_HAS_OWNER = 8 }
 #define SEC_LBL(b)    ((char *)((b) + 18 + OC_SESSION_TOKEN_LEN + OC_TLS_FINGERPRINT_LEN))
 #define SEC_USR(b)    (SEC_LBL(b) + SEC_LABEL)
 #define SEC_OWN(b)    (SEC_USR(b) + SEC_USER)
+#define SEC_DEVKEY(b) ((uint8_t *)SEC_OWN(b) + SEC_OWNER)
 
 static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
     size_t got = 0;
@@ -81,8 +91,10 @@ static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
      * write of any kind upgrades the entry in place, because sec_store stamps
      * the current version. */
     int v1 = (got == SEC_BLOB_V1 && blob[0] == 1);
-    if (!v1 && (got != SEC_BLOB || blob[0] != SEC_VER)) { memset(blob, 0, SEC_BLOB); return 0; }
-    if (v1) blob[1] &= (uint8_t)~SEC_HAS_OWNER;   /* a bit that did not exist then */
+    int v2 = (got == SEC_BLOB_V2 && blob[0] == 2);
+    if (!v1 && !v2 && (got != SEC_BLOB || blob[0] != SEC_VER)) { memset(blob, 0, SEC_BLOB); return 0; }
+    if (v1) blob[1] &= (uint8_t)~SEC_HAS_OWNER;   /* bits that did not exist then */
+    if (v1 || v2) blob[1] &= (uint8_t)~SEC_HAS_DEVKEY;
     SEC_LBL(blob)[SEC_LABEL - 1] = '\0';   /* fixed-width fields; never trust the tail */
     SEC_USR(blob)[SEC_USER - 1]  = '\0';
     SEC_OWN(blob)[SEC_OWNER - 1] = '\0';
@@ -94,7 +106,7 @@ static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
  * though today's callers have nothing better to do than log it. */
 static int sec_store(oc_store *s, const char *ws, uint8_t *blob) {
     blob[0] = SEC_VER;
-    if (!(blob[1] & (SEC_HAS_TOKEN | SEC_HAS_PIN | SEC_HAS_BOOK | SEC_HAS_OWNER))) {
+    if (!(blob[1] & (SEC_HAS_TOKEN | SEC_HAS_PIN | SEC_HAS_BOOK | SEC_HAS_OWNER | SEC_HAS_DEVKEY))) {
         oc_secret_del(s->secret, ws);
         return 1;
     }
@@ -156,11 +168,15 @@ void oc_store_clear_session(oc_store *s, const char *workspace) {
     if (!s || !workspace || !s->secret) return;
     uint8_t b[SEC_BLOB];
     if (!sec_load(s, workspace, b)) { oc_secret_del(s->secret, workspace); return; }
-    b[1] &= (uint8_t)~(SEC_HAS_TOKEN | SEC_HAS_OWNER);
+    b[1] &= (uint8_t)~(SEC_HAS_TOKEN | SEC_HAS_OWNER | SEC_HAS_DEVKEY);
     memset(SEC_TOKEN(b), 0, OC_SESSION_TOKEN_LEN);
     memset(SEC_OWN(b), 0, SEC_OWNER);               /* the owner goes with the token */
+    /* And the device key with them: it was this account's on this machine, and
+     * whoever signs in next makes their own (CALLS.md §5.2). */
+    oc_e2e_wipe(SEC_DEVKEY(b), OC_X25519_LEN);
     put_u64(SEC_EXPIRY(b), 0);
     sec_store(s, workspace, b);                     /* the pin survives a logout */
+    oc_e2e_wipe(b, sizeof b);
 }
 
 int oc_store_session_user(oc_store *s, const char *workspace, char *out, size_t cap) {
@@ -196,6 +212,27 @@ void oc_store_save_pin(oc_store *s, const char *workspace,
     sec_store(s, workspace, b);
 }
 
+
+/* ---- the device key (ARCH-113) ---------------------------------------------- */
+
+int oc_store_device_key(oc_store *s, const char *workspace,
+                        uint8_t sk[OC_X25519_LEN], uint8_t pk[OC_X25519_LEN]) {
+    uint8_t b[SEC_BLOB];
+    int have = s && workspace && s->secret && sec_load(s, workspace, b) && (b[1] & SEC_HAS_DEVKEY);
+    if (have) {
+        memcpy(sk, SEC_DEVKEY(b), OC_X25519_LEN);
+        oc_e2e_wipe(b, sizeof b);
+        if (oc_x25519_public(sk, pk) == 0) return 1;
+    }
+    if (oc_x25519_keypair(sk, pk) != 0) return -1;
+    if (!s || !workspace || !s->secret) return 0;     /* this session's alone */
+    sec_load(s, workspace, b);
+    b[1] |= SEC_HAS_DEVKEY;
+    memcpy(SEC_DEVKEY(b), sk, OC_X25519_LEN);
+    int ok = sec_store(s, workspace, b);
+    oc_e2e_wipe(b, sizeof b);
+    return ok ? 1 : 0;
+}
 
 /* ---- the workspace book (credential enumeration) ---------------------------
  * No file: one credential per workspace, so listing the credentials IS listing

@@ -22,6 +22,10 @@
 #include "audio_dev.h"
 #include "oc_dictate.h"
 #include "oc_mp4.h"
+#include "oc_call_engine.h"
+#include "audio.h"        /* the relay, run on a thread for the call test */
+#include "e2e_hpke.h"
+#include "e2e_sframe.h"
 #include "check.h"
 
 #include <math.h>
@@ -30,6 +34,8 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -1220,7 +1226,7 @@ static void test_store_legacy_entry(void) {
 
     /* The next write of anything upgrades the entry in place, keeping the rest. */
     oc_store_save_pin(s, "acme:443", pin);
-    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 2);
+    CHECK(mock_len_of("acme:443") > (size_t)V1_BLOB && mock_ver_of("acme:443") == 3);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1 && tok[0] == 1);
     memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
@@ -1535,6 +1541,332 @@ static void test_addressable_targets(void) {
     oc_model_free(&m);
 }
 
+/* ---- calls end to end (REQ-150, REQ-301-305, ARCH-113) -------------------------
+ * A relay on a thread, as itest_netloop runs one, and a TAP in front of it: a UDP
+ * forwarder the daemon advertises as the relay's port, with an upstream socket per
+ * client so the relay still tells the clients apart. What passes through it is
+ * what anyone on the network -- or the relay itself -- would see. */
+
+static struct { int ipc, udp; volatile sig_atomic_t stop; } g_relay;
+static pthread_t g_relay_th;
+static void *relay_thread(void *p) {
+    (void)p;
+    oc_audio_sidecar_run(g_relay.ipc, g_relay.udp, &g_relay.stop);
+    return NULL;
+}
+
+#define TAP_CLIENTS 8
+#define TAP_KEEP    4000
+typedef struct { uint64_t kid; uint8_t b0; size_t len; uint64_t t_ms; } tap_pkt;
+static struct {
+    int      front;                          /* where the clients send */
+    uint16_t relay_port;
+    struct { struct sockaddr_in from; int up; } cl[TAP_CLIENTS];
+    int      n_cl;
+    pthread_mutex_t mu;
+    tap_pkt  seen[TAP_KEEP];                 /* client -> relay payloads that carried audio */
+    int      n_seen, bad_header;
+    volatile int stop;
+} g_tap;
+static pthread_t g_tap_th;
+
+static uint64_t mono_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void *tap_thread(void *p) {
+    (void)p;
+    struct sockaddr_in relay;
+    memset(&relay, 0, sizeof relay);
+    relay.sin_family = AF_INET;
+    relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = htons(g_tap.relay_port);
+    uint8_t buf[2048];
+    while (!g_tap.stop) {
+        /* Only the sockets polled are looked at afterwards: a client first seen
+         * in this pass has no revents yet, and reading one anyway is a blocking
+         * recv on an empty socket. Every recv is non-blocking all the same. */
+        struct pollfd pf[1 + TAP_CLIENTS];
+        memset(pf, 0, sizeof pf);
+        int polled = g_tap.n_cl;
+        pf[0].fd = g_tap.front; pf[0].events = POLLIN;
+        for (int i = 0; i < polled; i++) { pf[1 + i].fd = g_tap.cl[i].up; pf[1 + i].events = POLLIN; }
+        if (poll(pf, (nfds_t)(1 + polled), 50) <= 0) continue;
+        if (pf[0].revents & POLLIN) {
+            struct sockaddr_in from; socklen_t fl = sizeof from;
+            ssize_t n = recvfrom(g_tap.front, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+            if (n > 0) {
+                int k = 0;
+                while (k < g_tap.n_cl && (g_tap.cl[k].from.sin_port != from.sin_port ||
+                                          g_tap.cl[k].from.sin_addr.s_addr != from.sin_addr.s_addr)) k++;
+                if (k == g_tap.n_cl && k < TAP_CLIENTS) {
+                    g_tap.cl[k].from = from;
+                    g_tap.cl[k].up = socket(AF_INET, SOCK_DGRAM, 0);
+                    g_tap.n_cl++;
+                }
+                if (k < g_tap.n_cl) {
+                    /* token(16) seq(2) payload: record what the payload looks like. */
+                    if (n > 18) {
+                        uint64_t kid, ctr; size_t hl;
+                        pthread_mutex_lock(&g_tap.mu);
+                        if (oc_sframe_header_decode(buf + 18, (size_t)n - 18, &kid, &ctr, &hl) != 0) g_tap.bad_header++;
+                        else if (g_tap.n_seen < TAP_KEEP && (size_t)n > 18 + hl)
+                            g_tap.seen[g_tap.n_seen++] = (tap_pkt){ kid, buf[18 + hl], (size_t)n - 18, mono_ms() };
+                        pthread_mutex_unlock(&g_tap.mu);
+                    }
+                    sendto(g_tap.cl[k].up, buf, (size_t)n, 0, (struct sockaddr *)&relay, sizeof relay);
+                }
+            }
+        }
+        for (int i = 0; i < polled; i++)
+            if (pf[1 + i].revents & POLLIN) {
+                ssize_t n = recv(g_tap.cl[i].up, buf, sizeof buf, MSG_DONTWAIT);
+                if (n > 0) sendto(g_tap.front, buf, (size_t)n, 0, (struct sockaddr *)&g_tap.cl[i].from, sizeof g_tap.cl[i].from);
+            }
+    }
+    return NULL;
+}
+
+/* A test's microphone and ears: a tone out, and how much of each tone came in. */
+typedef struct {
+    double freq, phase;
+    pthread_mutex_t mu;
+    double hear[3];              /* amplitude of each listened-for tone, last 0.5 s */
+    double acc[3][25];
+    int    at, frames;
+} tone_io;
+static const double LISTEN[3] = { 440.0, 660.0, 880.0 };
+
+static void tone_source(void *ctx, int16_t *pcm, int n) {
+    tone_io *t = ctx;
+    for (int i = 0; i < n; i++) {
+        pcm[i] = (int16_t)(6000.0 * sin(t->phase));
+        t->phase += 2 * M_PI * t->freq / 16000.0;
+        if (t->phase > 2 * M_PI) t->phase -= 2 * M_PI;
+    }
+}
+
+/* Goertzel: the amplitude of one frequency in a frame, through a Hann window so
+ * a loud tone 220 Hz away does not leak into the one being measured. */
+static double goertzel(const int16_t *x, int n, double f) {
+    double w = 2 * M_PI * f / 16000.0, c = 2 * cos(w), s1 = 0, s2 = 0;
+    for (int i = 0; i < n; i++) {
+        double h = 0.5 - 0.5 * cos(2 * M_PI * i / (n - 1));
+        double s = x[i] * h + c * s1 - s2; s2 = s1; s1 = s;
+    }
+    double p = s1 * s1 + s2 * s2 - c * s1 * s2;
+    return 4 * sqrt(p > 0 ? p : 0) / n;    /* x2 for the window's loss of gain */
+}
+
+static void tone_sink(void *ctx, const int16_t *pcm, int n) {
+    tone_io *t = ctx;
+    pthread_mutex_lock(&t->mu);
+    for (int k = 0; k < 3; k++) {
+        t->acc[k][t->at] = goertzel(pcm, n, LISTEN[k]);
+        double sum = 0;
+        for (int i = 0; i < 25; i++) sum += t->acc[k][i];
+        t->hear[k] = sum / 25;
+    }
+    t->at = (t->at + 1) % 25;
+    t->frames++;
+    pthread_mutex_unlock(&t->mu);
+}
+
+static double heard(tone_io *t, int k) {
+    pthread_mutex_lock(&t->mu);
+    double v = t->hear[k];
+    pthread_mutex_unlock(&t->mu);
+    return v;
+}
+
+/* Wait up to `ms` for `cond`, ticking the three clients meanwhile. */
+#define CALL_WAIT(ms, cond) ({ int _ok = 0; for (int _i = 0; _i < (ms) / 20; _i++) { \
+        oc_client_tick(a); oc_client_tick(b); if (c) oc_client_tick(c); \
+        if (cond) { _ok = 1; break; } usleep(20000); } _ok; })
+
+static int calls_in(const oc_model *m, uint64_t ch) { return oc_model_call_in(m, ch) != NULL; }
+
+static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts ob = { NULL, NULL, 0, tone_source, tone_sink, &tb };
+    oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
+    oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob), *ec = oc_call_engine_new(&occ);
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(b, oc_call_engine_media(), eb);
+    oc_client *c = oc_client_start("127.0.0.1", port, "faye:pw-faye");
+    CHECK(c != NULL);
+    if (!c) { oc_call_engine_free(ea); oc_call_engine_free(eb); oc_call_engine_free(ec); return; }
+    oc_client_set_call_media(c, oc_call_engine_media(), ec);
+    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b), *mc = oc_client_model(c);
+    uint64_t ua = ma->user_id, ub = mb->user_id, uc = mc->user_id;
+    oc_call_stats st;
+
+    /* dana starts a call in channel 1, inviting erik: she is in it; erik sees it
+     * in his Calls list as an invitation, and it is one worth a toast. */
+    uint64_t inv[1] = { ub };
+    oc_client_call_start(a, 1, inv, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1 && ma->call.starter == ua));
+    CHECK(CALL_WAIT(3000, calls_in(mb, 1) && oc_model_call_invited(oc_model_call_in(mb, 1), ub)));
+    oc_call_notice nt[4];
+    CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 1 && nt[0].channel_id == 1 && nt[0].starter == ua);
+    CHECK(oc_client_call_notify_take(b, 0, 0, nt, 4) == 0);        /* considered once */
+
+    /* erik joins: each hears the other's tone and not their own. */
+    oc_client_call_join(b, 1);
+    CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(6000, heard(&ta, 1) > 1500 && heard(&tb, 0) > 1500));
+    /* Once settled, each at the level it was sent (6000), less what Opus and
+     * the limiter take -- not a fraction of it, which would be frames lost. */
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
+    printf("  two in the call: dana hears 660 Hz at %.0f, erik hears 440 Hz at %.0f\n", heard(&ta, 1), heard(&tb, 0));
+    CHECK(heard(&ta, 0) < 300 && heard(&tb, 1) < 300);
+    oc_call_engine_stats(ea, &st);
+    CHECK(st.active && st.n_peers == 1 && st.peers[0].user_id == ub && st.peers[0].packets > 20);
+    CHECK(st.peers[0].keyed);
+    /* A joiner misses at most the grace (CALLS.md §5.3): the others go on with
+     * the previous key for a second, which a joiner never gets. After that
+     * nothing fails to decrypt. */
+    {
+        CHECK(CALL_WAIT(3000, 0) == 0);
+        oc_call_engine_stats(eb, &st);
+        uint32_t u1 = st.n_peers ? st.peers[0].undecryptable : 0, p1 = st.n_peers ? st.peers[0].packets : 0;
+        CHECK(CALL_WAIT(1000, 0) == 0);
+        oc_call_engine_stats(eb, &st);
+        CHECK(st.n_peers == 1 && st.peers[0].undecryptable == u1 && st.peers[0].packets > p1 + 20);
+        printf("  erik's first second: %u packets he could not decrypt, none since\n", u1);
+    }
+
+    /* faye joins: a new epoch, new keys all round, and everyone hears everyone. */
+    uint32_t epoch2 = ma->call.epoch;
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && ma->call.n_parts == 3 && mb->call.n_parts == 3));
+    CHECK(ma->call.epoch > epoch2);
+    CHECK(CALL_WAIT(8000, heard(&ta, 1) > 1000 && heard(&ta, 2) > 1000 && heard(&tb, 0) > 1000 &&
+                           heard(&tb, 2) > 1000 && heard(&tc, 0) > 1000 && heard(&tc, 1) > 1000));
+    CHECK(CALL_WAIT(4000, heard(&tc, 0) > 4800 && heard(&tc, 1) > 4800 && heard(&tb, 2) > 4800));
+    printf("  three: dana hears 660 %.0f / 880 %.0f, faye hears 440 %.0f / 660 %.0f\n",
+           heard(&ta, 1), heard(&ta, 2), heard(&tc, 0), heard(&tc, 1));
+
+    /* faye leaves. Everyone after her epoch sends under keys she was never given:
+     * the relay may forward to her or not, it makes no difference. */
+    uint32_t her_last = mc->call.epoch;
+    oc_client_call_leave(c, 1);
+    CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
+    CHECK(ma->call.epoch > her_last);
+    uint64_t after_leave = mono_ms() + 1500;          /* past the 1 s grace */
+    CHECK(CALL_WAIT(3000, mono_ms() > after_leave + 800));
+    {
+        int later = 0, newer = 0;
+        pthread_mutex_lock(&g_tap.mu);
+        for (int i = 0; i < g_tap.n_seen; i++)
+            if (g_tap.seen[i].t_ms > after_leave) { later++; if ((g_tap.seen[i].kid >> 8) > her_last) newer++; }
+        pthread_mutex_unlock(&g_tap.mu);
+        CHECK(later > 20 && newer == later);
+    }
+    CHECK(CALL_WAIT(4000, heard(&ta, 2) < 300 && heard(&ta, 1) > 1000));    /* 880 Hz is gone */
+
+    /* What the network carried was ciphertext: every audio payload an SFrame
+     * header and then bytes that do not repeat. In the clear the first byte
+     * after it would be the high byte of the frame number -- the same for every
+     * packet of a call this short. */
+    {
+        int distinct = 0, seen_b[256] = {0};
+        pthread_mutex_lock(&g_tap.mu);
+        for (int i = 0; i < g_tap.n_seen; i++) if (!seen_b[g_tap.seen[i].b0]++) distinct++;
+        int n = g_tap.n_seen, bad = g_tap.bad_header;
+        pthread_mutex_unlock(&g_tap.mu);
+        printf("  the relay saw %d audio packets: %d distinct leading bytes, %d without an SFrame header\n",
+               n, distinct, bad);
+        CHECK(n > 200 && distinct > 200 && bad == 0);
+    }
+
+    /* erik mutes: dana stops hearing him. Push to talk, held, lets him through. */
+    oc_call_engine_set_mute(eb, 1);
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) < 300));
+    /* ...and she can see that he is muted, which only the call's keys say. */
+    CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.n_peers == 1 && st.peers[0].muted; })));
+    oc_call_engine_set_ptt(eb, 1);
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) > 1000));
+    oc_call_engine_set_ptt(eb, 0);
+    oc_call_engine_set_mute(eb, 0);
+
+    /* dana turns erik down to nothing: she hears nothing of him, and he is
+     * still sending. */
+    oc_call_engine_set_volume(ea, ub, 0.0f);
+    CHECK(CALL_WAIT(4000, heard(&ta, 1) < 100));
+    oc_call_engine_stats(eb, &st);
+    CHECK(st.sent > 100 && !st.muted);
+    oc_call_engine_set_volume(ea, ub, 1.0f);
+
+    /* erik may not end it; dana, who started it, may -- for everyone. */
+    uint32_t errs = mb->call_error_seq;
+    oc_client_call_end(b, 1);
+    CHECK(CALL_WAIT(3000, mb->call_error_seq != errs && mb->call_error == OC_ERR_NOT_CALL_STARTER));
+    oc_client_call_end(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call && !calls_in(ma, 1) && !calls_in(mb, 1)));
+    oc_call_engine_stats(eb, &st);
+    CHECK(!st.active);
+
+    /* A missed call: dana starts one inviting faye, nobody comes, dana leaves.
+     * faye's history gains a line that is a call event, not something dana said. */
+    uint64_t inv_c[1] = { uc };
+    oc_client_call_start(a, 1, inv_c, 1);
+    CHECK(CALL_WAIT(3000, ma->in_call));
+    CHECK(CALL_WAIT(3000, calls_in(mc, 1)));
+    oc_client_call_leave(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !calls_in(mc, 1)));
+    int missed = 0;
+    CHECK(CALL_WAIT(3000, ({
+        const oc_channel *ch = oc_model_channel((oc_model *)mc, 1);
+        missed = 0;
+        for (size_t i = 0; ch && i < ch->n_msgs; i++)
+            if (ch->msgs[i].kind == OC_MSG_KIND_CALL && ch->msgs[i].author_id == ua &&
+                ch->msgs[i].body && strcmp(ch->msgs[i].body, "Missed call") == 0) missed = 1;
+        missed; })));
+
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(b, NULL, NULL);
+    oc_client_stop(c);
+    oc_call_engine_free(ea);
+    oc_call_engine_free(eb);
+    oc_call_engine_free(ec);
+}
+
+/* The device key (ARCH-113): made once and kept beside the token, the same one
+ * read back, a version 2 entry upgraded in place, and forgotten with the
+ * session. */
+static void test_device_key(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+    uint8_t sk[32], pk[32], sk2[32], pk2[32], pkc[32];
+    CHECK(oc_store_device_key(s, "acme:443", sk, pk) == 1);
+    CHECK(oc_x25519_public(sk, pkc) == 0 && memcmp(pkc, pk, 32) == 0);
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1);
+    CHECK(memcmp(sk, sk2, 32) == 0 && memcmp(pk, pk2, 32) == 0);
+    CHECK(mock_ver_of("acme:443") == 3);
+    /* Another workspace, another key. */
+    CHECK(oc_store_device_key(s, "other:443", sk2, pk2) == 1 && memcmp(pk, pk2, 32) != 0);
+    /* Signing out forgets it: the next one is new. */
+    uint8_t tok[OC_SESSION_TOKEN_LEN] = { 1 };
+    oc_store_save_session(s, "acme:443", tok, 0, "dana");
+    oc_store_clear_session(s, "acme:443");
+    CHECK(oc_store_device_key(s, "acme:443", sk2, pk2) == 1 && memcmp(pk, pk2, 32) != 0);
+    /* No credential store: a key for this session only. */
+    oc_store *none = oc_store_open("ignored");
+    CHECK(oc_store_device_key(none, "acme:443", sk2, pk2) == 0);
+    oc_store_close(none);
+    oc_store_close(s);
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
@@ -1554,6 +1886,7 @@ int run_client_core_tests(void) {
     test_workspace_book();
     test_session_owner();
     test_store_legacy_entry();
+    test_device_key();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -1589,6 +1922,28 @@ int run_client_core_tests(void) {
     /* The daemon this test drives speaks with a stub voice (ARCH-111). */
     oc_netloop_set_tts(&CORE_TTS);
     oc_netloop_set_stt(&CORE_STT);
+
+    /* A relay, and the tap in front of it that the daemon advertises (calls). */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        g_relay.udp = socket(AF_INET, SOCK_DGRAM, 0);
+        g_tap.front = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in ra; memset(&ra, 0, sizeof ra);
+        ra.sin_family = AF_INET; ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        struct sockaddr_in ta = ra;
+        CHECK(bind(g_relay.udp, (struct sockaddr *)&ra, sizeof ra) == 0);
+        CHECK(bind(g_tap.front, (struct sockaddr *)&ta, sizeof ta) == 0);
+        socklen_t l = sizeof ra; getsockname(g_relay.udp, (struct sockaddr *)&ra, &l);
+        l = sizeof ta; getsockname(g_tap.front, (struct sockaddr *)&ta, &l);
+        g_tap.relay_port = ntohs(ra.sin_port);
+        pthread_mutex_init(&g_tap.mu, NULL);
+        g_relay.ipc = sv[1];
+        g_relay.stop = 0;
+        CHECK(pthread_create(&g_relay_th, NULL, relay_thread, NULL) == 0);
+        CHECK(pthread_create(&g_tap_th, NULL, tap_thread, NULL) == 0);
+        oc_netloop_set_audio(sv[0], ntohs(ta.sin_port));
+    }
 
     struct core_loop_arg arg;
     arg.port = 19000 + (int)(getpid() % 2000);
@@ -2206,6 +2561,8 @@ int run_client_core_tests(void) {
             unsetenv("OPENCHIME_TEST_AUDIO");
         }
 
+        test_calls_e2e(a, b, arg.port);
+
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
         oc_client_invite_user(a, OC_ROLE_MEMBER);
@@ -2438,6 +2795,14 @@ int run_client_core_tests(void) {
 
     arg.stop = 1;
     pthread_join(th, NULL);
+    oc_netloop_set_audio(-1, 0);
+    g_relay.stop = 1;
+    pthread_join(g_relay_th, NULL);
+    g_tap.stop = 1;
+    pthread_join(g_tap_th, NULL);
+    close(g_relay.udp);
+    close(g_tap.front);
+    for (int i = 0; i < g_tap.n_cl; i++) close(g_tap.cl[i].up);
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
     unlink("build/itest_core.db");

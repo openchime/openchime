@@ -19,10 +19,11 @@ COPY third_party/sqlite-3.53.4 ./third_party/sqlite-3.53.4
 # Stamped by the release so a running container reports the release it came from
 # (`openchimed --version`). Unset for a local build, which reports "dev".
 ARG OC_VERSION=
-# Without read-aloud (TTS=0): its engine is built for the glibc toolchain the
-# release packages use, not for musl. The image gains it by carrying the release
-# binary on a glibc base instead of compiling its own.
-RUN make TTS=0 OC_VERSION="$OC_VERSION"
+# Without read-aloud or voice input (TTS=0 STT=0): their engine, ONNX Runtime, is
+# built for the glibc toolchain the release packages use, not for musl. The image
+# gains them by carrying the release binary on a glibc base instead of compiling
+# its own.
+RUN make TTS=0 STT=0 OC_VERSION="$OC_VERSION"
 
 FROM alpine:3.20
 

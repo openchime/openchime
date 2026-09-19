@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 16** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 17** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -339,6 +339,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `deployment_mode` | u8   | `0` standalone, `1` federated, `2` managed (ARCH-76).       |
 | `max_users`       | u32  | Registered-user cap; `0` = unlimited.                       |
 | `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
+| `call_max`        | u8   | The most people in one call, `OPENCHIME_CALL_MAX` (REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
 
 ### 4.4 `LOGOUT` (client → server), msg_type `0x0013`
 
@@ -420,6 +421,7 @@ tenant-monotonic (ARCH-43).
 | `channel_id`   | u64  | Channel the message belongs to.              |
 | `author_id`    | u64  | Authoring user's id.                         |
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
+| `kind`         | u8   | `0` something someone said; `1` a call event the daemon wrote — a missed call (REQ-304, §5.17). Any other value is malformed. |
 | `body`         | lstr | Message body (§7).                           |
 
 The frame may then carry the **optional trailing block** (§5.14): the attachment
@@ -1408,7 +1410,8 @@ nothing of it, which is the correct result rather than offering something that
 would fail (REQ-295). `tts` is present exactly when read-aloud is running — built
 in, turned on, and its voice data found and verified against its manifest. `stt`
 is present exactly when voice input (§5.14c) is running, on the same terms for the
-recognizer's data.
+recognizer's data. `calls` is present when the audio relay is up to carry calls
+(§5.17).
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -1992,49 +1995,105 @@ message's stored unfurls** and re-fetches from the new body, so a removed URL's
 preview cannot be replayed. Always on — there is no switch. Adding the frame
 needed no protocol-version bump; a peer that does not know it never expects it.
 
-### 5.17 Audio call signaling (REQ-150, REQ-152)
+### 5.17 Calls (REQ-150-152, REQ-301-305, ARCH-73, ARCH-113)
 
-Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
-separate UDP sidecar (ARCH-31) — built, forked at daemon startup, and handed each
-join's token over its IPC socket — but a call is *set up* over
-this TCP protocol. A call is **one per channel** (`call_id == channel_id`), and
-its roster is **ephemeral net-thread state** (like presence, ARCH-67) — it holds
-no DB rows and resets on daemon restart.
+Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over a
+separate UDP sidecar (ARCH-31), forked at daemon startup and handed each
+participant's token over its IPC socket, and a call is *set up* over this TCP
+protocol. A conversation has **at most one call**; a call has an id of its own
+(`call_id`), so a later call in the same conversation is a different one. Calls
+are **ephemeral net-thread state** (like presence, ARCH-67): no DB rows, and a
+daemon restart ends them. [CALLS.md](./CALLS.md) is the design, including the
+end-to-end encryption this section carries the keys for.
 
-**`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64 }` — join (or start) the
-channel's call. Authorized by the ordinary channel-read gate; a non-member gets
-`ERROR NOT_A_MEMBER`. If the relay has exited and the daemon could not keep it
-running, the join is refused with `ERROR CALL_UNAVAILABLE` (3025) rather than
-answered with a UDP port nothing listens on. A relay that exits and is restarted
-is invisible to callers: the new one is given every live participant's token, and
-learns each address again from their next packet.
+A **participant** is a user on one connection, with a **slot** (0-255, the low
+byte of every SFrame KID it sends under) and its **device key** (an X25519
+public key). A connection is in at most one call, and a user in a call from one
+device: joining from a second moves them. The **epoch** starts at 1 and goes up
+by one on every join and every leave. The cap is `OPENCHIME_CALL_MAX` (default
+10), announced on `WORKSPACE_INFO` as `call_max`.
+
+**`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64, device_key: 32 bytes,
+n: u16, n × { user_id: u64 } }` — start the conversation's call, or join the one
+there. Authorized by the channel-read gate (`ERROR NOT_A_MEMBER`, message "call
+join denied"). A start invites the users named, those of them who may read the
+conversation, keeping participants plus invitations within the cap; joining a
+call already there names nobody, and a name is ignored. A call already at the
+cap is refused with `ERROR CALL_FULL` (3028). A connection already in another
+call leaves it first; one in this call is taken out and put back, with a fresh
+token and slot — how a client whose address changed is relayed again. A relay
+that has exited and could not be restarted refuses the join with
+`ERROR CALL_UNAVAILABLE` (3025).
 
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
-u64, udp_port: u16, token: bytes, count: u16, count × { user_id: u64 } }` — the
-joiner's confirmation: the current roster plus their **private** media endpoint —
-the audio sidecar's `udp_port` and a per-join 16-byte bearer `token`. The client
-then speaks **UDP directly to the sidecar** (out of band from this TCP protocol):
-`token(16) ‖ seq(u16) ‖ opus-payload` to it, and receives
-`sender_user_id(u64) ‖ seq(u16) ‖ opus-payload` from it (the sidecar relays
-opaque payloads to the other participants — it never decodes Opus). See
-`daemon/audio.h` for the exact media framing.
+u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
+started_at: u64, n: u16, n × participant }`, where a participant is `{ user_id:
+u64, slot: u8, device_key: 32 bytes }` — the joiner's private media endpoint
+(the relay's `udp_port` and a 16-byte bearer `token`), its slot, and the call as
+it stands. The client then speaks UDP directly to the relay:
+`token(16) ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
+payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
+ciphertext (CALLS.md §5.4); an empty one is a keep-alive.
 
 **`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ channel_id:
-u64, call_id: u64, count: u16, count × { user_id: u64 } }` — pushed to every
-other participant whenever the roster changes (a join, a leave, or a
-disconnect).
+u64, call_id: u64, epoch: u32, n: u16, n × participant }` — on every join and
+leave. A device that finds its own slot gone from the roster is out of the call
+(its user moved to another device, or the relay swept it).
 
-**`CALL_LEAVE` (C → S), `0x00A1`** `{ channel_id: u64 }` — leave the call.
+**`CALL_LEAVE` (C → S), `0x00A1`** `{ channel_id: u64 }` — leave the call in
+this conversation; naming another conversation does nothing. The last one out
+ends the call.
 
-**Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE` or on TCP
-disconnect (the net thread removes them and pushes a fresh `CALL_ROSTER` to the
-rest), but the **call persists as long as one participant remains**; the dropped
-user simply re-`CALL_JOIN`s (minting a fresh token). The media-side silence
-timeout that mirrors this lives in the sidecar.
+**`CALL_INVITE` (C → S), `0x00A4`** `{ channel_id: u64, n: u16, n × { user_id:
+u64 } }` — a participant asks more people, each of whom must be able to read the
+conversation. Participants plus invitations past the cap: `ERROR CALL_FULL`,
+and nobody is added. Not a participant: `ERROR NOT_IN_CALL` (3030).
+
+**`CALL_DECLINE` (C → S), `0x00A5`** `{ channel_id: u64 }` — an invitee says
+no. A decline from someone not invited does nothing.
+
+**`CALL_END` (C → S), `0x00A6`** `{ channel_id: u64 }` — the starter ends the
+call for everyone. Anyone else: `ERROR NOT_CALL_STARTER` (3029); no call:
+`ERROR NOT_IN_CALL`.
+
+**`CALL_STATE` (S → C), `0x00A7`** `{ channel_id: u64, call_id: u64, starter:
+u64, started_at: u64, ended: u8, np: u16, np × { user_id: u64 }, ni: u16,
+ni × { user_id: u64 } }` — a call as the Calls section lists it: who is in it
+and who is invited. Sent on every change to the conversation's members, its
+invitees and its participants, and at sign-in, after `SNOOZE`, once for each call
+there is. `ended = 1` is the last word on a call.
+
+**`CALL_KEY` (C → S), `0x00A8`** `{ channel_id: u64, call_id: u64, epoch: u32,
+n: u16, n × { recipient: u64, sealed: bytes } }` — a participant's media key for
+the epoch, sealed to each other participant's device key (64 bytes: the HPKE
+`enc` and the sealed 16-byte key with its tag, CALLS.md §5.3). The daemon
+forwards each copy, unread, to its recipient if both are in the call and the
+epoch is the current one; a copy for an earlier epoch is dropped, since its
+sender makes one for the current epoch from the roster it is about to receive.
+The sender is not in the call: `ERROR NOT_IN_CALL`.
+
+**`CALL_KEY_FOR` (S → C), `0x00A9`** `{ channel_id: u64, call_id: u64, epoch:
+u32, sender: u64, sealed: bytes }` — one sealed key, from its sender.
+
+**Invitations notify** (REQ-302): the client decides a toast from `CALL_STATE`
+through the shared evaluator with the invitation as a mention, and the daemon
+pushes to the invitee's phones on the same terms, with `"kind":"call"` in the
+contentless payload (§5.16).
+
+**Missed calls** (REQ-304): a call that ends with nobody but its starter ever
+having joined, and somebody invited, leaves a message of kind *call event* in the
+conversation, authored by the starter, body "Missed call" — an ordinary
+`BROADCAST` with `kind = 1` (§5.3).
+
+**Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE`, on TCP
+disconnect, and when the relay's silence sweep drops it (it reports the token
+GONE over IPC; a client keeps alive every 5 s, so only the vanished are swept).
+Each drop is a new epoch for the rest, who rekey. The dropped user rejoins with
+`CALL_JOIN`.
 
 **Screenshare — reserved wire additions (REQ-161, ARCH-86/87; not built).**
-Screenshare rides this same call and relay unchanged: the sidecar forwards an
-encoded video payload opaquely exactly as it forwards Opus, so there is no
+Screenshare rides this same call and relay unchanged: the relay forwards an
+encoded video payload opaquely exactly as it forwards audio, so there is no
 server-side codec. That has one consequence the wire must carry, recorded here
 while the frames are still cheap to extend — **the server cannot transcode**
 (ARCH-18/73 forbid it decoding anything), and a call may hold clients on
@@ -2048,14 +2107,14 @@ to prevent for frames. The reserved additions, none implemented:
   succeeded (by AV1) without a flag day;
 - **share start/stop signaling** — who is sharing, so clients render the right
   surface and the roster reflects it;
-- a **fragment header** in the sidecar's UDP framing — `OC_AUDIO_MAX_PACKET` is
+- a **fragment header** in the relay's UDP framing — `OC_AUDIO_MAX_PACKET` is
   1400 bytes, correct for an ~80-byte Opus frame and useless for a keyframe of
   tens of KB;
 - a **keyframe-request** path from receiver to sharer, since a lost video packet
   corrupts the picture until the next IDR (Opus conceals loss with PLC; video
   does not).
 
-The last two are relay-*visible* but not relay-*interpreted* — the sidecar keeps
+The last two are relay-*visible* but not relay-*interpreted* — the relay keeps
 forwarding opaque payloads behind a larger header — so ARCH-18/73 hold. Note also
 that `seq` is `u16`, which wraps in roughly a minute at video packet rates, so
 reassembly must tolerate wrap or the field widens. Full design in
@@ -2268,6 +2327,9 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3025` | `CALL_UNAVAILABLE`    | calls      | no    | The audio relay exited and could not be restarted, so a `CALL_JOIN` is refused rather than answered with a media port nothing listens on (§5.17). |
 | `3026` | `SEGMENT_TOO_LONG`    | voice input | no   | A segment's `sample_count` exceeds the cap `STT_INFO` announced (§5.14c, REQ-298). |
 | `3027` | `STT_UNAVAILABLE`     | voice input | no   | Voice input is off, too many segments are waiting, the queue is full, or recognition failed (§5.14c, REQ-300). |
+| `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past `OPENCHIME_CALL_MAX` (§5.17, REQ-305). |
+| `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
+| `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -2411,10 +2473,16 @@ this table cannot silently gain a shared value.
 | `0x0098` | `STORAGE_STATUS` | S → C | usage + policy + what maintenance reclaimed |
 | `0x0099` | `AUDIT_QUERY` | C → S | owner/admin: page the audit log (REQ-251) |
 | `0x009A` | `AUDIT_PAGE` | S → C | a page of entries, newest first |
-| `0x00A0` | `CALL_JOIN` | C → S | join a channel's audio call (REQ-150) |
+| `0x00A0` | `CALL_JOIN` | C → S | start or join a conversation's call, with the device key and whom a start invites (REQ-150/301) |
 | `0x00A1` | `CALL_LEAVE` | C → S | leave the call |
-| `0x00A2` | `CALL_JOINED` | S → C | to the joiner: call id + UDP endpoint/token + roster |
-| `0x00A3` | `CALL_ROSTER` | S → C | to participants: roster changed |
+| `0x00A2` | `CALL_JOINED` | S → C | to the joiner: UDP endpoint/token, slot, epoch, starter, roster with device keys |
+| `0x00A3` | `CALL_ROSTER` | S → C | to participants: roster and epoch changed |
+| `0x00A4` | `CALL_INVITE` | C → S | a participant invites more people (REQ-302) |
+| `0x00A5` | `CALL_DECLINE` | C → S | an invitee declines |
+| `0x00A6` | `CALL_END` | C → S | the starter ends the call for everyone |
+| `0x00A7` | `CALL_STATE` | S → C | a call as the Calls section lists it, on every change and at sign-in (REQ-303) |
+| `0x00A8` | `CALL_KEY` | C → S | a participant's media key, sealed to each other participant (ARCH-113) |
+| `0x00A9` | `CALL_KEY_FOR` | S → C | one sealed media key, from its sender |
 | `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
 | `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
 | `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |

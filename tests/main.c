@@ -45,6 +45,8 @@ int run_voice_tests(void);
 int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
 int run_theme_tests(void);
+int run_e2e_tests(void);
+int run_call_media_tests(void);
 
 int main(void) {
     int total = 0;
@@ -86,6 +88,8 @@ int main(void) {
     total += run_unfurl_tests();
     total += run_sdltext_map_tests();
     total += run_theme_tests();
+    total += run_e2e_tests();
+    total += run_call_media_tests();
 
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);

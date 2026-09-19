@@ -1109,20 +1109,14 @@ the requirement says so explicitly rather than implying one.
   client preference or server state; it affects the count a client displays, not
   the notify decision, which argues for the synced `client_settings` bucket
   rather than a new server surface.]**
-- **REQ-285.** *(Not built)* A user has been **notified when a call has started** in a channel
-  or DM they are a member of, subject to the same notification settings as a
-  message (REQ-281) — because a call is time-sensitive in a way a message is not:
-  a missed message is read later, a missed call is simply missed. The
-  notification has named the conversation and who started it, and joining from it
-  has landed the user in the call.
-
-  Recorded now, ahead of the client it needs. The daemon's call signaling and
-  ephemeral roster already exist (REQ-150–152, ARCH-73) — `CALL_JOIN` on an empty
-  roster *is* the "call started" event — so this is a notify decision over state
-  the server already keeps, not new call machinery. It ships with the audio
-  client rather than before it. **[needs ARCH decision — whether call-start is a
-  level a user can set independently, as Slack does, or simply follows the
-  conversation's level.]**
+- **REQ-285.** A user has been **notified when a call has started** in a channel
+  or DM they are a member of and asks them, subject to the same notification
+  settings as a message (REQ-281) — because a call is time-sensitive in a way a
+  message is not: a missed message is read later, a missed call is simply
+  missed. The notification has named who started it and where, and its Join has
+  landed the user in the call. A call's invitation is how it asks (REQ-302): it
+  follows the conversation's settings as a mention does, rather than being a
+  level of its own.
 - **REQ-286.** *(Partly built)* A desktop client's **window and notification-area behaviour has
   been specified and user-controllable**: whether closing the window **quits the
   application or leaves it running in the notification area / tray** still
@@ -1189,28 +1183,50 @@ the requirement says so explicitly rather than implying one.
 
 ### 6.2 Audio Conferencing
 
-*Design: [AUDIO.md](./AUDIO.md).*
+*Design: [CALLS.md](./CALLS.md) — the feature and its encryption — and
+[AUDIO.md](./AUDIO.md), the media engine.*
 
-- **REQ-150.** *(Built in the daemon; no client reaches it)* A user has been able to start or join a server-relayed audio
-  call scoped to a channel or a direct message. No peer-to-peer or ICE
-  negotiation path has existed (ARCH-18). Built (server side): `CALL_JOIN`
-  forms/joins the channel's call and returns a UDP media endpoint + token.
-- **REQ-151.** *(Built in the daemon; no client reaches it)* Audio has been encoded with Opus and relayed over an isolated
-  UDP-based sidecar process, kept out of the daemon's TCP event loop so a
-  call cannot starve message delivery on the same tenant (ARCH-18). Built: the
-  forked `audio_sidecar` relays opaque Opus payloads over UDP (ARCH-28/31/73);
-  the daemon never touches the codec. The client-side Opus encode/decode is
-  Phase-2 client work.
-- **REQ-152.** *(Built in the daemon; no client reaches it)* A participant's connection loss during a call has not
-  terminated the call for other participants; the daemon has continued
-  relaying for remaining participants and has allowed the disconnected
-  participant to rejoin. Resolved (ARCH-73): the call roster is ephemeral
-  net-thread state; a `CALL_LEAVE` or TCP disconnect drops the participant and
-  re-rosters the rest, but the call persists while ≥1 participant remains, and
-  rejoin is a fresh `CALL_JOIN` (new token). The media-side mirror is a UDP
-  silence timeout in the sidecar: a participant silent for 20 seconds is dropped
-  from the relay. Signaling (PROTOCOL.md §5.17), the UDP relay and the timeout are
-  all built.
+- **REQ-150.** A user has been able to start or join a server-relayed audio call
+  in a channel, a direct message or a group DM, from the Win32 client. No
+  peer-to-peer or ICE negotiation path has existed (ARCH-18).
+- **REQ-151.** Audio has been encoded with Opus by the client — 16 kHz, in-band
+  FEC and DTX, through the echo canceller and noise suppression — and relayed
+  over an isolated UDP sidecar process, kept out of the daemon's TCP event loop
+  so a call cannot starve message delivery on the same tenant (ARCH-18). The
+  daemon never touches the codec (ARCH-28/31/73).
+- **REQ-152.** A participant's connection loss during a call has not ended the
+  call for the others; the daemon has kept relaying for them and has let the
+  disconnected participant rejoin. A `CALL_LEAVE`, a TCP disconnect or the
+  relay's silence sweep (20 s) drops the participant, the rest rekey, and the
+  call persists while one remains; rejoin is a fresh `CALL_JOIN` (ARCH-73).
+- **REQ-301.** A user has been able to **start a call** from a conversation's
+  header or the **+** on the Calls section. Starting in a channel or a group DM
+  has invited every member up to the cap, and where the members outnumber it the
+  starter has picked, with the most recently active ticked; a DM has invited the
+  other person. The starter has been taken to the call. The call has ended when
+  its last participant left, or when its **starter ended it for everyone**.
+- **REQ-302.** An invitation has been **listed and notified** — a toast with
+  Join and Decline on the desktop, a push on a phone — through the same decision
+  as a mention (REQ-281, ARCH-103), so a muted conversation, the schedule and a
+  pause have silenced it. There has been no ringing loop. An invitation has
+  lasted until taken, declined or the call ended, and anyone in a call has been
+  able to invite anyone who can read the conversation.
+- **REQ-303.** The Home sidebar has had a **Calls** section beside Channels and
+  Direct messages, listing the active calls in conversations the user belongs
+  to and every call they are invited to, each opening a **call view**: who is
+  in it, with speaking and muted marks and a volume for each, and Mute, push to
+  talk, the microphone and speaker with a live level, noise suppression, Invite,
+  Leave and — for the starter — End.
+- **REQ-304.** A call that ended with nobody but its starter having joined has
+  left a **"Missed call"** line in the conversation's history, a call event
+  rather than a message (ARCH-90), not searched, not read aloud and not
+  notifying.
+- **REQ-305.** A call has held at most **`OPENCHIME_CALL_MAX`** people (default
+  10, from 2 to 32); a join or invitation past it has been refused as full.
+- **REQ-306.** A call has been **end-to-end encrypted**: the daemon, the relay
+  and the network have carried audio only the participants' devices could
+  decrypt, with keys that change on every join and leave (ARCH-113). A safety
+  number to detect a daemon substituting a device key has not been built.
 
 ### 6.3 Video — camera video excluded; screenshare and video messages admitted
 
@@ -1241,8 +1257,8 @@ the requirement says so explicitly rather than implying one.
   sharers, and camera video have all been out of scope of a call (REQ-160); a
   *recorded* screen is a video message (REQ-162). A **text-only frontend has
   been permanently exempt** (ARCH-75 — the TUI renders no graphics), showing only
-  that a share is in progress and by whom. **Not started; sequenced behind the
-  audio client** (REQ-150–152), whose media transport it builds on.
+  that a share is in progress and by whom. **Not started;** it builds on the
+  audio client's media transport (REQ-150–152).
 - **REQ-162.** A user has been able to **record a video message and
   post it** into a channel, a DM or a thread, with the composer's text as its
   caption. It has recorded **the camera, a screen or one window**, and a screen or
@@ -1435,7 +1451,10 @@ the requirement says so explicitly rather than implying one.
 ### 8.1 Transport and Session Security
 
 - **REQ-180.** Every client-daemon connection has been encrypted in transit;
-  the system has offered no unencrypted TCP fallback (ARCH-6, ARCH-10).
+  the system has offered no unencrypted TCP fallback (ARCH-6, ARCH-10). A call's
+  audio, which travels over UDP beside that connection, has been encrypted end to
+  end between the participants' devices, so neither the network nor the daemon
+  can hear it (REQ-306, ARCH-113).
 - **REQ-181.** A session has been the daemon's own to control: after a
   successful auth (REQ-023) the daemon has minted an opaque session token with a
   daemon-set expiry, recorded in a local `sessions` table (ARCH-58), rather than

@@ -184,7 +184,14 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * read, in push to talk -- and who are its members, by display name, for
         * turning a spoken "at Name" into a mention. user_id, channel_id,
         * stt_mode, stt_req. Read. */
-       OC_JOB_STT_PREP = 103 };
+       OC_JOB_STT_PREP = 103,
+       /* Calls (REQ-301-305). CALL_AUTH (40, above) answers a join or an
+        * invitation: may the actor read the conversation, which of `call_uids`
+        * may, and who are its members. CALL_EVENT writes a call event -- a
+        * missed call -- as a message of kind OC_MSG_KIND_CALL, authored by
+        * user_id in channel_id, body in body/body_len; the net thread raises it
+        * with no connection behind it. Write. */
+       OC_JOB_CALL_EVENT = 104 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -385,7 +392,17 @@ typedef struct oc_job {
     /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
     uint64_t       stt_req;
     uint8_t        stt_mode;
+    /* CALL_AUTH (REQ-301/302): what is being asked -- OC_CALL_OP_* -- and the
+     * users to invite, heap. */
+    uint8_t        call_op;
+    uint64_t      *call_uids;
+    uint16_t       n_call_uids;
+    uint8_t        call_key[OC_CALL_DEVICE_KEY_LEN];   /* a join's device key, echoed */
 } oc_job;
+
+/* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
+ * invitation from someone already in the call. */
+enum { OC_CALL_OP_JOIN = 0, OC_CALL_OP_INVITE = 1 };
 
 /* --- Results (writer -> net thread) ------------------------------------- */
 
@@ -470,7 +487,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_TTS_META = 91, OC_RES_TTS_ERR = 92,
        /* Voice input (ARCH-112): the STT_PREP answer -- err_code 0 and the
         * member names, or the refusal. stt_req names the segment. */
-       OC_RES_STT_PREP = 93 };
+       OC_RES_STT_PREP = 93,
+       /* A call event written (REQ-304): the SEND-shaped fields and `members`,
+        * which the net thread broadcasts with kind OC_MSG_KIND_CALL. */
+       OC_RES_CALL_EVENT = 94 };
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */
@@ -666,6 +686,7 @@ typedef struct {
      * into a SAVED_UPDATED, exactly as pins do above. */
     uint8_t  saved;
     uint64_t saved_at;
+    uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -945,6 +966,14 @@ typedef struct oc_dbres {
     uint64_t                stt_req;
     char                  **stt_names;
     size_t                  n_stt_names;
+
+    /* OC_RES_CALL_AUTH (REQ-301/302): the question it answers, and which of the
+     * users asked about may read the conversation -- the ones who may be
+     * invited. `members` carries the conversation's members. */
+    uint8_t                 call_op;
+    uint64_t               *call_uids;       /* heap */
+    size_t                  n_call_uids;
+    uint8_t                 call_key[OC_CALL_DEVICE_KEY_LEN];
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

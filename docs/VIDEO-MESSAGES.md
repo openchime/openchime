@@ -148,7 +148,7 @@ Audio goes through the **miniaudio** device layer AUDIO.md §3.2 chose for calls
 in `client/core/media/audio_dev.{c,h}`: device lists, capture and playback, and
 lock-free single-producer rings between the device callback and the media threads.
 The callback never allocates, locks or does I/O. Video messages build this layer
-first; the call client reuses it. Recording opens capture at **48 kHz mono**
+first; the call engine uses it too. Recording opens capture at **48 kHz mono**
 (calls run at 16 kHz), resampled by miniaudio when the device runs at another rate.
 **The computer's sound** is the output device's WASAPI loopback, opened through the
 same layer (`oc_audio_loopback_open`). It is not the microphone and takes nothing

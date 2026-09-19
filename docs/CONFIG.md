@@ -121,7 +121,8 @@ fail, bounded and silent.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_AUDIO_PORT` | `0` (ephemeral) | UDP port for the forked audio-relay sidecar (ARCH-28/73). **`0` means the kernel picks a free port, not that audio is off** — the daemon binds the socket, reads the assigned port back with `getsockname`, forks the sidecar unconditionally, and advertises that port in `CALL_JOINED`. Setting a value pins the port. The relay forwards opaque payloads; the daemon never decodes a codec. |
+| `OPENCHIME_AUDIO_PORT` | `0` (ephemeral) | UDP port for the forked audio-relay sidecar (ARCH-28/73). **`0` means the kernel picks a free port, not that audio is off** — the daemon binds the socket, reads the assigned port back with `getsockname`, forks the sidecar unconditionally, and advertises that port in `CALL_JOINED`. Setting a value pins the port. The relay forwards opaque payloads — SFrame ciphertext (ARCH-113) — and the daemon never decodes a codec. A client behind NAT reaches it over UDP, so the port has to be reachable as the protocol port is. |
+| `OPENCHIME_CALL_MAX` | `10` | The most people in one call (REQ-305), clamped to 2–32 and announced to clients on `WORKSPACE_INFO`. Every participant receives and mixes every other's stream (AUDIO.md §1.1), so this bounds each client's download and decoding as well as the relay's fan-out. |
 
 ## Read-aloud
 
@@ -195,5 +196,9 @@ deployment configuration: `OPENCHIME_UNFURL_ALLOW_PRIVATE` (disables the unfurl
 fetcher's SSRF gate so a test can fetch a loopback fixture — never set it in a
 deployment), `OC_FUZZ_RANDOM_ITERS` / `OC_FUZZ_FRAMED_ITERS` (fuzz
 depth, defaults 30000 / 15000), `OC_NETLOOP_MAX_FD` (4096, a compile-time
-constant, **not** an environment variable), and `OC_AUDIO_SILENCE_MS` (sidecar
-UDP silence sweep).
+constant, **not** an environment variable), `OC_AUDIO_SILENCE_MS` (sidecar
+UDP silence sweep, which a test shortens with `oc_audio_sidecar_set_silence_ms`),
+and, in the clients, `OPENCHIME_TEST_AUDIO`, `OPENCHIME_TEST_MIC` and
+`OPENCHIME_TEST_TONE` — the synthetic audio devices, what the synthetic
+microphone speaks, and its tone (440 Hz unless set), which `scripts/gui_calls.sh`
+gives each of its two clients so either can tell whom it hears.

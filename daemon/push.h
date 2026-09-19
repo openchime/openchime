@@ -31,6 +31,11 @@ oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
 void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
                     uint64_t message_id, uint64_t root_id);
 
+/* Enqueue a call invitation's push (REQ-302): to `invitee` alone, treated as a
+ * mention of them, with "kind":"call" in the contentless payload so the gateway
+ * can raise a call-style notification. Fire-and-forget; a no-op if p is NULL. */
+void oc_push_notify_call(oc_push *p, uint64_t channel_id, uint64_t inviter, uint64_t invitee);
+
 void oc_push_stop(oc_push *p);
 
 /* ---- exposed for testing ---- */
@@ -58,6 +63,12 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
                     uint64_t message_id, uint64_t root_id, int now_min,
                     uint64_t now_ms, oc_push_target *out, int max);
 
+/* The same, for a call invitation: `invitee`'s device tokens, if the invitation
+ * notifies them -- the MENTIONS level passes it; mute, the schedule and a pause
+ * silence it (ARCH-103). */
+int oc_push_collect_call(sqlite3 *db, uint64_t channel_id, uint64_t inviter, uint64_t invitee,
+                         uint64_t now_ms, oc_push_target *out, int max);
+
 /* Sign the CP-12 canonical string for `body` with the enrollment key ->
  * base64(DER ECDSA) into sig_b64. Returns 0 on success. */
 int oc_push_sign(const char *privkey_pem, const char *audience, const char *body,
@@ -66,5 +77,9 @@ int oc_push_sign(const char *privkey_pem, const char *audience, const char *body
 /* Build the contentless notify JSON body from targets. Returns 0 on success. */
 int oc_push_build_body(uint64_t channel_id, const oc_push_target *targets, int n,
                        char *out, size_t cap);
+/* The same with `call` set: each notification also says "kind":"call". Still no
+ * names and no content. */
+int oc_push_build_body_kind(uint64_t channel_id, int call, const oc_push_target *targets, int n,
+                            char *out, size_t cap);
 
 #endif /* OPENCHIME_PUSH_H */

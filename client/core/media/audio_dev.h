@@ -13,7 +13,8 @@
  * count) is what the synthetic microphone hears instead of the tone: the file
  * once, then silence, so voice input can be driven with real speech.
  * `OPENCHIME_TEST_AUDIO=mic-denied` is the synthetic devices with every capture
- * refused as OC_AUDIO_DENIED, as a microphone the operating system blocks is. */
+ * refused as OC_AUDIO_DENIED, as a microphone the operating system blocks is.
+ * `OPENCHIME_TEST_TONE=<hz>` changes the synthetic microphone's tone. */
 #ifndef OC_AUDIO_DEV_H
 #define OC_AUDIO_DEV_H
 

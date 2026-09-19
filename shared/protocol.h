@@ -38,7 +38,15 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 16: VOICE_PREVIEW_GET (0x00E2) is new -- hear a voice say the audition
+/* 17: calls (REQ-301-305, ARCH-113). CALL_JOIN carries the joiner's device key
+ * and whom a start invites; CALL_JOINED and CALL_ROSTER carry each participant's
+ * slot and device key and the call's epoch, and CALL_JOINED its starter and start;
+ * CALL_INVITE, CALL_DECLINE, CALL_END, CALL_STATE, CALL_KEY and CALL_KEY_FOR
+ * (0x00A4-0x00A9) are new. BROADCAST carries the message's kind, so a missed
+ * call reads as one rather than as something its starter said. WORKSPACE_INFO
+ * carries the call cap.
+ *
+ * 16: VOICE_PREVIEW_GET (0x00E2) is new -- hear a voice say the audition
  * sentence before choosing it (REQ-292). The answer is the ordinary
  * AUDIO_INFO/CHUNK/END download with message_id 0, which no message has.
  *
@@ -109,7 +117,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 16u
+#define OC_PROTOCOL_VERSION 17u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -285,10 +293,16 @@ typedef enum {
     OC_MSG_STORAGE_STATUS      = 0x0098, /* S->C, usage + policy + what maintenance reclaimed */
     OC_MSG_AUDIT_QUERY         = 0x0099, /* C->S, owner/admin: page the audit log (REQ-251) */
     OC_MSG_AUDIT_PAGE          = 0x009A, /* S->C, a page of entries, newest first */
-    OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a channel's audio call (REQ-150) */
+    OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, start or join a conversation's call (REQ-150/301) */
     OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
-    OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
-    OC_MSG_CALL_ROSTER      = 0x00A3, /* S->C, to participants: roster changed */
+    OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: UDP endpoint/token, slot, epoch, roster */
+    OC_MSG_CALL_ROSTER      = 0x00A3, /* S->C, to participants: roster and epoch changed */
+    OC_MSG_CALL_INVITE      = 0x00A4, /* C->S, a participant invites more people (REQ-302) */
+    OC_MSG_CALL_DECLINE     = 0x00A5, /* C->S, an invitee declines */
+    OC_MSG_CALL_END         = 0x00A6, /* C->S, the starter ends the call for everyone */
+    OC_MSG_CALL_STATE       = 0x00A7, /* S->C, a call as the Calls section lists it (REQ-303) */
+    OC_MSG_CALL_KEY         = 0x00A8, /* C->S, a participant's media key sealed to each other (ARCH-113) */
+    OC_MSG_CALL_KEY_FOR     = 0x00A9, /* S->C, one sealed media key, from its sender */
     OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
     OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
     OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
@@ -457,6 +471,9 @@ typedef enum {
     OC_ERR_CALL_UNAVAILABLE    = 3025, /* the audio relay is down and could not be restarted (REQ-150) */
     OC_ERR_SEGMENT_TOO_LONG    = 3026, /* a voice-input segment exceeds the cap (REQ-298) */
     OC_ERR_STT_UNAVAILABLE     = 3027, /* voice input is off, busy or recognition failed (REQ-300) */
+    OC_ERR_CALL_FULL           = 3028, /* the call is at OPENCHIME_CALL_MAX (REQ-305) */
+    OC_ERR_NOT_CALL_STARTER    = 3029, /* only the call's starter may end it for everyone (REQ-301) */
+    OC_ERR_NOT_IN_CALL         = 3030, /* no such call, or the sender is not in it */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -567,8 +584,18 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_PRESENCE_ONLINE  1u
 #define OC_PRESENCE_AWAY    2u
 
-/* Audio calls (REQ-150-152): one call per channel, small participant sets. */
+/* Audio calls (REQ-150-152, REQ-301-305): one call per conversation. The daemon
+ * caps a call at OPENCHIME_CALL_MAX, clamped to this; it also bounds a frame's
+ * participant and invitee lists. */
 #define OC_MAX_CALL_PARTICIPANTS 32u
+#define OC_CALL_DEVICE_KEY_LEN   32u   /* an X25519 public key (ARCH-113) */
+#define OC_CALL_SEALED_LEN       64u   /* HPKE enc(32) + a 16-byte key + its 16-byte tag */
+#define OC_MAX_CALL_INVITES      OC_MAX_CALL_PARTICIPANTS
+
+/* What a message is (SCHEMA.md messages.kind): said by someone, or a call event
+ * the daemon wrote (REQ-304, ARCH-90). */
+#define OC_MSG_KIND_MESSAGE 0u
+#define OC_MSG_KIND_CALL    1u
 
 /* Per-channel notification level (REQ-130). */
 #define OC_NOTIFY_ALL      0u
@@ -721,7 +748,10 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 /* Pushed after AUTH_OK: infra facts about this workspace, from the daemon's
  * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
  * workspace_name may be empty (client falls back to the host subdomain). */
-typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name; } oc_workspace_info;
+/* call_max is the most people in one call (OPENCHIME_CALL_MAX, REQ-305), so a
+ * client starting one in a large channel knows when the starter has to pick. */
+typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
+                 uint8_t call_max; } oc_workspace_info;
 /* src_channel/src_message are the forward source (REQ-057), zero when the
  * message is not a forward. The client asserts nothing but the two ids: the
  * daemon resolves the author, the excerpt and the attachment count from the
@@ -731,7 +761,11 @@ typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body;
                  uint64_t src_channel; uint64_t src_message;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send;
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
-typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body;
+/* `kind` is OC_MSG_KIND_*: an ordinary message, or a call event the daemon wrote
+ * (a missed call, REQ-304) that a client draws as a line of history rather than
+ * as something said. */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
+                 uint8_t kind; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  oc_slice author_name; } oc_broadcast;  /* override name (webhooks); empty = use author_id */
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
@@ -1098,15 +1132,36 @@ typedef struct {
 
 typedef struct { oc_slice client_type; uint16_t count;
                  const oc_client_setting_entry *entries; } oc_client_settings;
-/* Audio call signaling (REQ-150). CALL_JOINED carries the joiner's private UDP
- * endpoint + bearer token (empty until the sidecar milestone) plus the roster;
- * CALL_ROSTER carries just the participant list, pushed on any change. */
-typedef struct { uint64_t channel_id; } oc_call_join;
+/* Audio call signaling (REQ-150, REQ-301-305, ARCH-73). A participant is a user
+ * on one device: the slot the daemon gave it for the call's length (the low byte
+ * of its SFrame KIDs) and the device's public key, which the others seal their
+ * media keys to (ARCH-113, CALLS.md §5). */
+typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN]; } oc_call_part;
+/* Start or join. `invite` names who a start invites; joining a call already
+ * there names nobody. */
+typedef struct { uint64_t channel_id; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN];
+                 uint16_t n_invite; const uint64_t *invite; } oc_call_join;
 typedef struct { uint64_t channel_id; } oc_call_leave;
 typedef struct { uint64_t channel_id; uint64_t call_id; uint16_t udp_port; oc_slice token;
-                 uint16_t count; const uint64_t *participants; } oc_call_joined;
-typedef struct { uint64_t channel_id; uint64_t call_id;
-                 uint16_t count; const uint64_t *participants; } oc_call_roster;
+                 uint8_t slot; uint32_t epoch; uint64_t starter; uint64_t started_at;
+                 uint16_t count; const oc_call_part *parts; } oc_call_joined;
+typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch;
+                 uint16_t count; const oc_call_part *parts; } oc_call_roster;
+typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *users; } oc_call_invite;
+typedef struct { uint64_t channel_id; } oc_call_decline;
+typedef struct { uint64_t channel_id; } oc_call_end;
+/* What the Calls section lists, sent on every change and at sign-in. `ended`
+ * says the call is over: the last one about it. */
+typedef struct { uint64_t channel_id; uint64_t call_id; uint64_t starter; uint64_t started_at;
+                 uint8_t ended; uint16_t n_parts; const uint64_t *parts;
+                 uint16_t n_invited; const uint64_t *invited; } oc_call_state;
+/* A media key sealed to each recipient (HPKE enc ‖ ciphertext, opaque to the
+ * daemon). */
+typedef struct { uint64_t recipient; oc_slice sealed; } oc_call_key_entry;
+typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch;
+                 uint16_t count; const oc_call_key_entry *entries; } oc_call_key;
+typedef struct { uint64_t channel_id; uint64_t call_id; uint32_t epoch; uint64_t sender;
+                 oc_slice sealed; } oc_call_key_for;
 /* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
  * sha256 is a 32-byte digest carried as `bytes`. */
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
@@ -1138,6 +1193,7 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_MAX 16
 #define OC_CAP_TTS "tts"   /* read a conversation aloud (REQ-291) */
 #define OC_CAP_STT "stt"   /* speak a message and have it land as text */
+#define OC_CAP_CALLS "calls" /* talk in a call (REQ-150, REQ-301) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 typedef struct { uint64_t message_id; } oc_audio_get;
 /* Hear voice `voice_id` (an id TTS_INFO listed) say TTS_INFO's preview sentence.
@@ -1387,6 +1443,12 @@ oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *
 oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m);
 oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m);
 oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m);
+oc_result oc_encode_call_invite(oc_wbuf *w, uint16_t version, const oc_call_invite *m);
+oc_result oc_encode_call_decline(oc_wbuf *w, uint16_t version, const oc_call_decline *m);
+oc_result oc_encode_call_end(oc_wbuf *w, uint16_t version, const oc_call_end *m);
+oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state *m);
+oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m);
+oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key_for *m);
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
 oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
 oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
@@ -1550,11 +1612,20 @@ oc_result oc_decode_list_client_settings(oc_rbuf *p, oc_list_client_settings *m)
  * view into the frame. */
 oc_result oc_decode_client_settings(oc_rbuf *p, oc_client_settings *m,
                                     oc_client_setting_entry *entries, uint16_t cap);
-oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m);
+/* The call frames decode their lists into caller buffers of `cap` entries; a
+ * longer list is malformed rather than clamped, since a roster or a key list cut
+ * short would be a wrong one. */
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uint16_t cap);
 oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m);
-/* CALL_JOINED/CALL_ROSTER decode the participant ids into a caller buffer. */
-oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, uint64_t *parts, uint16_t cap);
-oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, uint64_t *parts, uint16_t cap);
+oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, oc_call_part *parts, uint16_t cap);
+oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, oc_call_part *parts, uint16_t cap);
+oc_result oc_decode_call_invite(oc_rbuf *p, oc_call_invite *m, uint64_t *users, uint16_t cap);
+oc_result oc_decode_call_decline(oc_rbuf *p, oc_call_decline *m);
+oc_result oc_decode_call_end(oc_rbuf *p, oc_call_end *m);
+oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, uint16_t pcap,
+                               uint64_t *invited, uint16_t icap);
+oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entries, uint16_t cap);
+oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m);
 oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
 oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
 oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);

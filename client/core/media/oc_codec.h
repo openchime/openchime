@@ -64,4 +64,28 @@ oc_opusdec *oc_opusdec_open(int channels);
 int  oc_opusdec_decode(oc_opusdec *d, const uint8_t *data, size_t len, int16_t *pcm, int cap);
 void oc_opusdec_close(oc_opusdec *d);
 
+/* ---- Opus for calls (docs/CALLS.md §3) --------------------------------------- */
+
+#define OC_VOICE_RATE   16000
+#define OC_VOICE_FRAME  320              /* 20 ms at 16 kHz */
+
+/* Mono, 16 kHz, VOIP, `kbps` VBR, with in-band FEC and DTX. The encoder frames
+ * are OC_VOICE_FRAME samples. */
+oc_opusenc *oc_opusenc_open_voice(int kbps);
+/* Tell the encoder how much loss the network shows (0-100), which is how much
+ * FEC it puts in each packet. */
+void oc_opusenc_set_loss(oc_opusenc *e, int percent);
+/* Encode OC_VOICE_FRAME samples. Returns the packet length, or -1. With DTX a
+ * packet of 2 bytes or fewer is silence the encoder need not have sent: the
+ * caller does not send it. */
+int  oc_opusenc_encode_voice(oc_opusenc *e, const int16_t *pcm, uint8_t *out, size_t cap);
+
+/* A mono decoder at `rate`. */
+oc_opusdec *oc_opusdec_open_rate(int rate);
+/* One frame of `frame` samples: `data` decoded; or, with `fec`, the frame
+ * BEFORE `data` rebuilt from the redundancy `data` carries; or, with `data`
+ * NULL, a frame concealed from what came before (PLC). Returns samples or -1. */
+int  oc_opusdec_decode_frame(oc_opusdec *d, const uint8_t *data, size_t len, int fec,
+                             int16_t *pcm, int frame);
+
 #endif
