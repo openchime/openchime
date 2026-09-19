@@ -19,6 +19,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXE="$HERE/build/openchime.exe"
 PORT="${OC_PAIR_PORT:-9600}"
+# Where the clients reach the daemon. 127.0.0.1 by default, which WSL forwards to
+# the daemon for TCP only: a call's audio is UDP, so a pair that calls names the
+# WSL machine's own address instead (gui_calls.sh does).
+HOST="${OC_PAIR_HOST:-127.0.0.1}"
 DEV="${OC_PAIR_DIR:-/tmp/openchime-pair}"
 PIDS="$DEV/pids"
 
@@ -60,7 +64,8 @@ up)
         OPENCHIME_BLOB_DIR="$DEV/blobs" \
         OPENCHIME_PROTO_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
         OPENCHIME_WORKSPACE_NAME="Acme HQ" \
-        OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" \
+        OPENCHIME_BOOTSTRAP_USERS="${OC_PAIR_USERS:-alice:pw:owner,bob:pw:member}" \
+        OPENCHIME_CALL_MAX="${OC_PAIR_CALL_MAX:-10}" \
         OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
         setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &
     disown
@@ -76,8 +81,8 @@ up)
   # Each client gets its OWN test dir, so the two command channels never cross.
   for who in a b; do
     case $who in
-      a) user=alice; wdir=$WIN_A; ldir=$LIN_A; host=127.0.0.1 ;;
-      b) user=bob;   wdir=$WIN_B; ldir=$LIN_B; host=127.0.0.1 ;;
+      a) user=alice; wdir=$WIN_A; ldir=$LIN_A; host=$HOST ;;
+      b) user=bob;   wdir=$WIN_B; ldir=$LIN_B; host=$HOST ;;
     esac
     rm -f "$ldir"/cmd "$ldir"/ack
 
@@ -102,7 +107,16 @@ up)
     powershell.exe -NoProfile -Command "cmdkey /delete:openchime:${host}:${PORT}" \
       >/dev/null 2>&1 || true
 
-    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$wdir" \
+    # The test audio switches go through to the client as they do in
+    # gui_drive.sh -- synthetic devices, a spoken file, and each client's own
+    # microphone tone (OC_PAIR_TONE_A / _B), so a pair in a call can tell whom
+    # it is hearing. Unset, they are forwarded as nothing and change nothing.
+    tone=""
+    [ "$who" = a ] && tone="${OC_PAIR_TONE_A:-}"
+    [ "$who" = b ] && tone="${OC_PAIR_TONE_B:-}"
+    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_TONE" \
+      OPENCHIME_TEST_DIR="$wdir" OPENCHIME_TEST_TONE="$tone" \
+      OPENCHIME_TEST_AUDIO="${OPENCHIME_TEST_AUDIO:-}" OPENCHIME_TEST_MIC="${OPENCHIME_TEST_MIC:-}" \
       setsid "$EXE" "$host:$PORT" "$user:pw" >/dev/null 2>&1 &
     disown
 
@@ -154,7 +168,13 @@ down)
         "Get-Process -Id $p -EA SilentlyContinue | Stop-Process -Force" >/dev/null 2>&1 || true
     done < "$PIDS"
   fi
-  pkill -f "OPENCHIME_PROTO_PORT=$PORT" 2>/dev/null || true
+  # The daemon by its ENVIRONMENT: the port is not on its command line, so a
+  # pattern over the command line matched nothing and every `up` after the
+  # first found the old daemon, with the old database, still listening.
+  for p in $(pgrep -x openchimed 2>/dev/null); do
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
+      grep -qx "OPENCHIME_PROTO_PORT=$PORT" && kill "$p" 2>/dev/null
+  done
   echo "pair down"
   ;;
 *) echo "usage: gui_pair.sh up | a <cmd...> | b <cmd...> | down" >&2; exit 2 ;;

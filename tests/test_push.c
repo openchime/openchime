@@ -1053,13 +1053,64 @@ static void test_collect_matches_evaluator(void) {
     cleanup_db(path);
 }
 
+/* A call invitation (REQ-302): the invitee's phones and nobody else's, as a
+ * mention of them -- so the MENTIONS level lets it through, mute and quiet hours
+ * silence it -- and a body that says it is a call and still names nothing. */
+static void test_call_invite(void) {
+    const char *path = "build/test_push_call.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t alice = oc_dbwriter_register_local(w, "c-alice", "pw", OC_ROLE_OWNER, 2048);
+    uint64_t bob   = oc_dbwriter_register_local(w, "c-bob",   "pw", OC_ROLE_MEMBER, 2048);
+    uint64_t carol = oc_dbwriter_register_local(w, "c-carol", "pw", OC_ROLE_MEMBER, 2048);
+    CHECK(alice && bob && carol);
+    CHECK(oc_dbwriter_register_device_token(w, bob,   OC_PUSH_APNS, "tok-cb"));
+    CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_FCM,  "tok-cc"));
+    set_level(w, bob, 1, OC_NOTIFY_MENTIONS);
+
+    oc_push_target t[8];
+    sqlite3 *rdb = NULL;
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    /* bob invited: his phone only, though his level is MENTIONS and carol's ALL. */
+    int n = oc_push_collect_call(rdb, 1, alice, bob, (uint64_t)100 * 60000ull, t, 8);
+    CHECK(n == 1 && strcmp(t[0].token, "tok-cb") == 0);
+    CHECK(oc_push_collect_call(rdb, 1, alice, 0, (uint64_t)100 * 60000ull, t, 8) == 0);
+    sqlite3_close(rdb);
+
+    /* Quiet hours silence it; so does a mute, which nothing pierces. */
+    set_quiet(w, bob, 60, 120);
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    CHECK(oc_push_collect_call(rdb, 1, alice, bob, (uint64_t)100 * 60000ull, t, 8) == 0);
+    CHECK(oc_push_collect_call(rdb, 1, alice, bob, (uint64_t)200 * 60000ull, t, 8) == 1);
+    sqlite3_close(rdb);
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_MUTE, 0);
+        j->user_id = bob; j->channel_id = 1; j->hook_disabled = 1;   /* muted */
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    CHECK(oc_push_collect_call(rdb, 1, alice, bob, (uint64_t)200 * 60000ull, t, 8) == 0);
+    sqlite3_close(rdb);
+    oc_dbwriter_stop(w);
+
+    char body[512];
+    CHECK(oc_push_build_body_kind(7, 1, t, 1, body, sizeof body) == 0);
+    CHECK(strstr(body, "\"kind\":\"call\"") && strstr(body, "\"channelId\":\"7\"") && !strstr(body, "c-alice"));
+    CHECK(oc_push_build_body_kind(7, 0, t, 1, body, sizeof body) == 0 && !strstr(body, "kind"));
+    cleanup_db(path);
+}
+
 int run_push_tests(void) {
     printf("test_push: DND window (incl wrap-around), recipient collect "
            "(level/DND/author gating), CP-12 sign+verify, contentless body, "
            "global default + mute as push gates, "
            "a keyword hit that is one person's and not an audience, "
            "collect swept against the shared evaluator over all 192 states, "
-           "device-token register/unregister/prune, notify->relay->prune round-trip\n");
+           "device-token register/unregister/prune, notify->relay->prune round-trip, "
+           "a call invitation to its invitee alone\n");
     test_dnd();
     test_build_body();
     test_sign_verify();
@@ -1068,5 +1119,6 @@ int run_push_tests(void) {
     test_keyword_is_not_a_broadcast();
     test_collect_matches_evaluator();
     test_notify_roundtrip();
+    test_call_invite();
     return failures;
 }

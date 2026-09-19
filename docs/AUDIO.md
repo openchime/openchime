@@ -1,35 +1,33 @@
 # OpenChime — Audio
 
-How a voice call works: the huddle model, the media path, the client audio
-engine, and acoustic echo cancellation. This is the authoritative design; it is
-cross-referenced from ARCHITECTURE.md (ARCH-18, ARCH-28, ARCH-31, ARCH-73),
-REQUIREMENTS.md (§6.2, REQ-150–152), PROTOCOL.md (§5.17), and CLIENT.md.
+How a voice call's audio works: the media path, the client audio engine, and
+acoustic echo cancellation. The feature — the Calls section, invitations, ending,
+missed calls — and the end-to-end encryption are [CALLS.md](./CALLS.md). This is
+cross-referenced from ARCHITECTURE.md (ARCH-18, ARCH-28, ARCH-31, ARCH-73,
+ARCH-113), REQUIREMENTS.md (§6.2, REQ-150–152, REQ-301–306), PROTOCOL.md (§5.17),
+and CLIENT.md.
 
 **This document is audio only.** **Screenshare is [VIDEO.md](./VIDEO.md)**
-(REQ-161, ARCH-86/87) — it rides this same call, sidecar, and UDP path, and is
-**sequenced behind everything here**: the media transport, jitter buffer, and
-device layer of §§2–4 are its prerequisites, so building it first would build the
-media stack twice. Camera video remains out of scope (REQ-160).
+(REQ-161, ARCH-86/87) — it rides this same call, sidecar, and UDP path, and
+builds on the media transport, jitter buffer and device layer of §§2–4. Camera
+video remains out of scope (REQ-160).
 
-**Status.** **The server half is built and tested; the client half does not
-exist.** `CALL_JOIN` / `CALL_LEAVE` / `CALL_JOINED` / `CALL_ROSTER` signaling,
-the per-channel ephemeral roster, per-join bearer tokens, and the forked UDP
-relay sidecar (`daemon/audio_sidecar.c`) all work, including disconnect and
-rejoin (REQ-152). Client-side, the device layer and Opus exist — video messages
-built them (ARCH-110) — and voice input (ARCH-112) built the playback reference,
-the processor seam and the speexdsp echo canceller with its ERLE harness (§3.3,
-§6). There is no `CALL_*` handling in `client/core`, no UDP media path, and no
-jitter buffer or mixer. This document specifies that work.
+**Both halves are built.** The daemon's signaling, its ephemeral call state and
+the forked UDP relay (`daemon/audio_sidecar.c`); the client's signaling and keys
+in the core (`client/core/callsig.c`, on the network thread); and the media
+engine (`client/core/call/`): capture through the echo canceller and speexdsp's
+preprocessor, Opus, SFrame, the relay socket, a jitter buffer and decoder per
+sender, and the mixer. The Win32 client carries it; the TUI has no calls (§8).
 
 ---
 
-## 1. The model: huddles, not calls
+## 1. The model: one call per conversation
 
-A call is **one per channel** (`call_id == channel_id`), with an ephemeral
-roster of N participants (ARCH-73). It is a **huddle**: anyone with channel-read
-access joins the channel's ongoing call, the call persists while at least one
-participant remains, and a dropped participant rejoins with a fresh
-`CALL_JOIN`.
+A conversation has at most **one call** at a time, with an ephemeral roster of
+up to `OPENCHIME_CALL_MAX` participants (ARCH-73). Anyone who can read the
+conversation may join it; starting one invites its members; it lasts while one
+participant remains, or until its starter ends it; a dropped participant rejoins
+with a fresh `CALL_JOIN` (CALLS.md §1).
 
 **A 1:1 call is the degenerate case, not a separate feature.** A DM channel has
 two members, so a call there is a two-person huddle over exactly the same code
@@ -43,12 +41,16 @@ opaque payloads** rather than mixing them. The media framing makes this visible
 (`daemon/audio.h`):
 
 ```
-client  → sidecar :  token(16) ‖ seq(u16 BE) ‖ opus-payload
-sidecar → client  :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ opus-payload
+client  → sidecar :  token(16) ‖ seq(u16 BE) ‖ payload
+sidecar → client  :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
 ```
 
+The payload is an SFrame ciphertext (CALLS.md §5.4) — the Opus frame and its
+frame number, encrypted under the sender's key for the epoch — or empty, a
+keep-alive. The relay sees neither the audio nor who is speaking.
+
 Every packet a client receives is tagged with **who sent it**. In a five-person
-huddle a client receives five independent streams.
+call a client receives up to four independent streams.
 
 This single decision drives most of the client design below: **the client
 decodes N streams and mixes them itself.** Opus decoders are stateful per
@@ -81,8 +83,8 @@ outbound mapping.
    └──────┬──────┘                                                 └──────┬──────┘
           │                                                               │
    ┌──────┴───────────────────────────────────────────────────────────────┴──────┐
-   │  audio engine (duplex callback; clock shared only on some hardware)         │
-   │     capture ──→ [ processor: AEC ] ──→ encode                               │
+   │  audio engine (capture + playback devices, aligned by the reference)        │
+   │     capture ──→ [ AEC ] ──→ [ NS/AGC ] ──→ gate ──→ encode ──→ SFrame       │
    │     playback ←── mixer ←── jitter buffers ←── decode                        │
    │                     └────────────────────────→ AEC far-end reference        │
    └─────────────────────────────────────────────────────────────────────────────┘
@@ -95,7 +97,13 @@ is wideband rather than fullband audio — clearly better than a phone call,
 short of music-grade. For a work huddle that is the right trade, and it is the
 single cheapest lever on echo-canceller cost.
 
-The device is opened in **duplex mode** — both directions in one callback.
+Capture and playback are opened as **two devices**, and aligned through the
+playback reference: the device layer records every frame a playback device hands
+out against the media clock, and the canceller takes from it the frames played at
+the instant a capture frame was taken (§3.3, `oc_audio_reference`). A device's
+own **duplex mode** — both directions in one callback — would give that
+alignment by construction, which is why it is worth understanding what it does
+and does not buy.
 
 **Duplex gives one callback, not necessarily one clock.** That distinction
 matters and is easy to get wrong. On most platforms capture and playback are
@@ -121,7 +129,10 @@ The happy part: the configuration where AEC matters most (built-in laptop) is
 also the one with a shared clock. The nasty case — a separate microphone and
 speakers — is both the hardest for drift and a real setup people use.
 
-So the engine does three things rather than assuming the problem away:
+So the engine should do three things rather than assume the problem away. It
+does the first — the defaults are the system's, which on a laptop are the
+built-in pair — and the canceller re-converges under 100 ppm of drift (§6.4); the
+other two are §9's open decision:
 
 - **Prefer a single physical device**, defaulting to the built-in one.
 - **Detect drift at runtime** by tracking capture versus playback sample counts;
@@ -143,8 +154,8 @@ pipeline is exactly mSBC's rate, so on a wideband-capable headset we lose nothin
 to our own choice — the Bluetooth link is the bottleneck, not us.
 
 Finally, **it is expensive to retrofit.** Decoupled capture and playback paths are
-the natural thing to build and the hard thing to undo, which is the real argument
-for settling this in Phase 1.
+the natural thing to build and the hard thing to undo; the engine keeps them
+decoupled but aligned through the reference, which is what the canceller needs.
 
 ---
 
@@ -190,20 +201,21 @@ callback to its media thread with a lock-free single-producer ring. The callback
 never allocates, locks or does I/O; captured samples are stamped from the media
 clock video frames use; playback reports the samples the device has consumed,
 which is the clock a player — or a call's jitter buffer — runs on. Video messages
-record at 48 kHz mono; calls will open it at 16 kHz. `OPENCHIME_TEST_AUDIO=synthetic`
+record at 48 kHz mono; calls open it at 16 kHz. `OPENCHIME_TEST_AUDIO=synthetic`
 swaps the devices for a tone source and a real-time sink, so both run in
 `make test` on a machine with no sound hardware; with it, `OPENCHIME_TEST_MIC=<wav>`
 makes the synthetic microphone speak a recording, and `OPENCHIME_TEST_AUDIO=mic-denied`
 refuses the microphone as the operating system refuses a blocked one — which is how
-`scripts/gui_voice.sh` drives voice input. Duplex operation and drift
-detection (build step 1 below) remain to be added for calls.
+`scripts/gui_voice.sh` drives voice input — and `OPENCHIME_TEST_TONE` changes the
+synthetic microphone's tone, which is how `scripts/gui_calls.sh` tells two clients
+apart.
 
 **Voice input opens it too** (ARCH-112, [VOICE-INPUT.md](./VOICE-INPUT.md)), at
 16 kHz mono. The microphone has one owner: a second capture is refused
-(`OC_AUDIO_BUSY`). Voice input built the playback reference — every playback
-device's output, mixed to mono at 16 kHz on the media clock (`oc_audio_reference`)
-— and the processor seam of §3.3 with speexdsp (§6), which the call client
-inherits.
+(`OC_AUDIO_BUSY`), and joining a call stops voice input and closes the video
+recorder. Voice input built the playback reference — every playback device's
+output, mixed to mono at 16 kHz on the media clock (`oc_audio_reference`) — and
+the processor seam of §3.3 with speexdsp (§6), which the call engine uses.
 
 ### 3.3 The processor seam
 
@@ -242,9 +254,20 @@ so its samples stay on the media clock.
 
 ## 4. Media transport
 
-**Send.** Encode a 20 ms frame, prepend `token(16) ‖ seq(u16)`, one UDP
-datagram. Sequence numbers are per-sender and monotonic; the sidecar does not
-interpret them.
+**Send.** Every 20 ms of captured audio is a frame, numbered whether or not it is
+sent. It passes the echo canceller, then speexdsp's **preprocessor** — noise
+suppression (−25 dB) and automatic gain, which the call view can turn off — then
+the mute and push-to-talk gate. speexdsp's voice-activity detector is not used:
+its own warning calls it "a hack pending a complete rewrite"; whether someone is
+speaking is judged by level. Opus encodes it: VoIP mode,
+16 kHz, 24 kbit/s VBR, with **in-band FEC**, a packet-loss hint taken from the
+loss the others' packets show, and **DTX**, so a packet of two bytes or fewer —
+silence the encoder need not have sent — is not sent. What is sent is the frame
+number and the Opus packet, encrypted as one SFrame (CALLS.md §5.4), behind
+`token ‖ seq` to the relay. A muted client sends no audio, only, once a second,
+an encrypted packet saying it is muted; and every client sends an empty
+**keep-alive** at least every 5 s, so the relay's 20 s silence sweep takes only
+the vanished and never someone quiet.
 
 **The return address is bound on first use.** The relay learns where to send a
 participant's audio from the first datagram carrying their token, and after that
@@ -253,56 +276,49 @@ clear, so re-learning the address freely would let anyone who saw one packet
 redirect that participant's audio to themselves. A client whose address changes
 mid-call — NAT rebinding, a switch from Wi-Fi to cellular — is therefore not
 relayed from the new one: its packets stop counting, the relay's silence sweep
-drops it, and it must **rejoin with `CALL_JOIN`**, which issues a fresh token over
-the authenticated TCP connection. A client should treat a long receive gap on a
-still-open call as the cue to rejoin.
+drops it and says so, and it rejoins with `CALL_JOIN`, which issues a fresh token
+over the authenticated TCP connection.
 
-**Receive.** Demultiplex on `sender_user_id`, route to that sender's jitter
-buffer.
+**Receive.** Demultiplex on `sender_user_id`; drop a packet whose SFrame KID is
+not a key that sender gave, that fails authentication, or that the replay window
+has seen; route the rest to that sender's jitter buffer by frame number. Loss is
+counted from gaps in the authenticated SFrame counter — a gap in frame numbers
+alone may be DTX.
 
-**Jitter buffer**, one per sender: a fixed initial depth of 60–100 ms, reordering
-by sequence number and holding late packets briefly rather than discarding them.
-A gap that cannot be filled is concealed with **Opus PLC** (`opus_decode` with a
-NULL payload), which synthesizes plausible audio rather than emitting silence —
-the difference between a call that sounds lossy and one that sounds broken.
+**Jitter buffer**, one per sender (`client/core/call/jitter.c`): ordered by frame
+number, duplicates dropped. Its **target delay adapts**: the 95th percentile of
+how late packets arrive relative to the earliest over the last two seconds, plus
+a frame, between 40 and 240 ms. It reaches the target by waiting — at the start
+of a talk spurt, or by concealing a frame when a packet came too late — and gives
+delay back only by skipping a frame while nothing is being said, so speech is
+never cut to catch up. A lost frame whose successor has arrived is rebuilt from
+the successor's **FEC**; otherwise **Opus PLC** (`opus_decode` with no payload)
+conceals up to three frames, then there is silence until the next packet, which
+starts a new talk spurt. `tests/test_call_media.c` holds it to that on a simulated
+network.
 
-Adaptive depth (growing the buffer under observed jitter, shrinking it when the
-network is calm) is a later refinement; a fixed depth is correct and shippable
-first.
+**Mixing.** The playout thread runs on the speaker's clock — it keeps 60 ms queued
+and makes a frame whenever the device takes one — pulling a frame from every
+sender, applying that person's volume (0 to 2), summing in 32 bits and limiting
+with a soft knee above −3 dBFS, so many people at once get quieter rather than
+distorted. The mix plays through the device layer, which is what puts it in the
+canceller's reference.
 
-**Mixing.** Sum the decoded streams into one buffer with headroom, since
-summing N speakers can clip. Simple attenuation proportional to active speakers
-is sufficient; automatic gain control is out of scope for a first version.
-
-**Silence suppression.** A participant who is not speaking should not send
-packets. Opus's own DTX plus a simple energy gate is enough, and it matters more
-than it sounds: in a ten-person huddle where one person is talking, naive
-always-send costs ten times the bandwidth for nine streams of silence.
-
----
+**Speaking** marks come from each sender's decoded level, computed where it is
+heard: the server cannot know, since it never decodes.
 
 ## 5. Call signaling in the app-core
 
-Signaling is ordinary TCP protocol work and is independent of media, so it is
-the first thing to build and the first thing that can be demonstrated (§7).
-**None of this section exists yet** — `client/core` has no `CALL_*` support at
-all; the daemon side (signaling + the forked UDP relay) is built (ARCH-73).
-
-- **Commands:** `OC_CMD_CALL_JOIN` / `OC_CMD_CALL_LEAVE`.
-- **Events:** `OC_EV_CALL_JOINED` (roster + media endpoint + token),
-  `OC_EV_CALL_ROSTER` (roster changed).
-- **Model:** the active call's `channel_id`, the participant list, and per-
-  participant state a frontend needs to render — at minimum *speaking* and
-  *muted*.
-
-The media endpoint and token from `CALL_JOINED` are handed to the audio engine;
-they never reach a frontend.
-
-**Speaking indication** is derived client-side from received packet energy per
-sender, not signaled by the server — the server cannot know, since it never
-decodes.
-
----
+Signaling is ordinary protocol work on the network thread (`client/core/callsig.c`):
+`OC_CMD_CALL_JOIN/INVITE/LEAVE/DECLINE/END` out, and `CALL_JOINED`, `CALL_ROSTER`,
+`CALL_STATE` and `CALL_KEY_FOR` in. It keeps the device key, makes and seals the
+media key on every epoch and opens the others' (CALLS.md §5), and folds the call
+into the model as `OC_EV_CALL_*`: the Calls section's list, the call this client
+is in, a refusal. The media endpoint, the token and every key go to the engine
+through the **`oc_call_media` seam** — start, roster, the key to send with, a
+sender's key, stop — and never reach a frontend. The seam is why the core links
+no codec: the TUI builds without the engine, and a frontend that does calls plugs
+it in with `oc_client_set_call_media`.
 
 ## 6. Acoustic echo cancellation
 
@@ -399,74 +415,49 @@ speexdsp's **residual-echo suppressor is left off**: in the same double-talk it
 cut the near-end voice to a correlation of 0.05. The linear filter alone keeps the
 speech, which is the failure the harness exists to catch.
 
----
-
-## 7. Build order
-
-Each phase is independently demonstrable, and the risky work is deliberately
-late — after the seams that make it replaceable exist.
-
-| Phase | Deliverable | Proves |
-|---|---|---|
-| **1** | Duplex engine + ring buffers + drift detection + local loopback | the device layer, in isolation |
-| **2** | Opus encode → decode round-trip locally | the codec |
-| **3** | `CALL_*` signaling in the app-core; TUI shows the roster | the control plane, with no media |
-| **4** | UDP media with one peer, jitter buffer, PLC | **1:1 audio works** |
-| **5** | Per-sender decoders + mixer | **huddles work** |
-| **6** | ERLE harness, then speexdsp behind the vtable | echo cancellation, measured |
-| **7** | TUI: join/leave via the command palette + menus, roster, mute, push-to-talk, device pick | usable |
-
-Phase 6 lands after Phase 5 because a mixer produces a single far-end reference
-(§1.1), and because there is no real echo to cancel until real audio is playing
-out of a real speaker. **Voice input (ARCH-112) built phase 6 earlier**, with the
-client's own playback — read-aloud, video messages, voice auditions — as the
-far-end reference, so the call client arrives with a measured canceller (§6.4)
-rather than building one.
-
-**Nearly all of this is `client/core` work.** The TUI contributes commands and a
-roster panel; every future GUI inherits the engine, the codec, the transport, and
-the canceller unchanged.
+**After the canceller, the preprocessor.** A call runs speexdsp's preprocessor on
+the cancelled frame: noise suppression and automatic gain, after cancellation so
+the far end's echo is gone before the gain can lift it. It is what makes a steady hum disappear — `scripts/gui_calls.sh` checks that
+with a test tone, which to it is a hum — and why the call view offers it as a
+switch.
 
 ---
+
+## 7. Where it lives
+
+| Piece | Where |
+|---|---|
+| Device layer, playback reference, processor seam, canceller | `client/core/media/` (ARCH-110/112) |
+| Opus at 16 kHz with FEC, DTX and concealment | `client/core/media/opus.c` |
+| Signaling, device key, media keys | `client/core/callsig.c`, `client/core/store.c` |
+| Engine: capture, preprocessor, SFrame, socket, jitter buffers, mixer | `client/core/call/` |
+| HPKE and SFrame | `shared/e2e_hpke.c`, `shared/e2e_sframe.c` |
+| Call state, invitations, keys forwarded, missed calls | `daemon/netloop.c`, `daemon/dbwriter.c` |
+| Relay | `daemon/audio_sidecar.c` |
+| Calls section, call view, strip, toasts, keys | `client/gui/win32/winmain.c` |
 
 ## 8. TUI surface
 
-**There are no slash commands** (ARCH-83) — the TUI is menu- and screen-driven,
-so joining and leaving a huddle are actions in the **Ctrl+K command palette** and
-the channel action menu, exactly like every other TUI action.
-
-The roster renders in the Members panel or a dedicated overlay, showing
-per-participant *speaking* and *muted* state. Mute is a key binding, not a menu
-item — it is used mid-sentence.
-
-**Push-to-talk is a first-class control, not an echo workaround.** It is the
-natural terminal idiom, it is what users of a keyboard-driven client expect, and
-it happens to also sidestep echo entirely while held.
-
----
+The TUI has no calls: it links the core without the engine and offers nothing
+of them. **There are no slash commands** (ARCH-83), so if it gains calls, joining
+and leaving are actions in the Ctrl+K command palette and the channel action
+menu, the roster renders in the Members panel with speaking and muted marks, mute
+is a key binding rather than a menu item — it is used mid-sentence — and
+**push-to-talk is a first-class control**, the natural terminal idiom, which also
+sidesteps echo entirely while held.
 
 ## 9. Open decisions
 
-- **Split-device drift policy.** §2 detects divergent clocks; what to *do* then
-  is undecided — resample one side to compensate, or disable cancellation and
-  say so. Resampling is more work and can itself colour the far-end reference.
-- **Adaptive jitter depth.** Fixed first; adaptive is a later refinement, and
-  needs a policy for how fast to grow and shrink.
-- **Automatic gain control.** Out of scope for a first version, but a quiet
-  participant in a large huddle is a real complaint, and AGC interacts with AEC
-  (it changes the far-end reference level) so the seam should be settled before
-  it is added.
+- **Split-device drift policy.** The canceller re-converges under drift (§6.4),
+  but nothing detects divergent clocks, and what to *do* then is undecided —
+  resample one side to compensate, or disable cancellation and say so. Resampling
+  is more work and can itself colour the far-end reference.
 - **Recording.** Not designed. It has obvious compliance weight (REQ-252) and
-  should not be added casually.
+  should not be added casually — and a recording would have to be made by a
+  participant, since nothing else can hear the call (ARCH-113).
 - **AEC3 escalation.** Whether the C++ dependency is ever acceptable. The ERLE
   harness (§6.4) is what should decide it, on numbers.
-- **Media encryption.** Audio crosses the network unencrypted today: the relay
-  forwards opaque payloads and neither this document nor the protocol specifies
-  any transport security for the UDP path. Binding the address on first use (§4)
-  stops a stolen token redirecting someone's audio, but anyone on the path can
-  still listen. Whether to encrypt — and whether end to end or only to the relay,
-  which changes what the relay can see — has not been decided, and should be,
-  deliberately, before a client ships.
-- **Bandwidth ceiling for large huddles.** With DTX and silence suppression a
-  ten-person huddle is mostly one active stream, but the worst case is N × 24
-  kbps downstream and there is currently no cap or policy.
+- **Safety numbers.** The daemon hands out device keys; a number two people can
+  compare, to know no key was substituted, is the follow-up CALLS.md §5.6 names.
+- **IPv6.** The relay listens on IPv4 only, and a client reaches it at the
+  address its TCP connection resolved to.

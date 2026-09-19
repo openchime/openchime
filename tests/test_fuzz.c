@@ -99,12 +99,22 @@ static void decode_all(const uint8_t *buf, size_t len) {
       CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     { oc_snooze sn; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_snooze(&p, &sn); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
-    oc_call_join cj; D(oc_decode_call_join(&p, &cj));
+    { oc_call_join cj; uint64_t inv[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_join(&p, &cj, inv, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_call_leave cle; D(oc_decode_call_leave(&p, &cle));
-    { oc_call_joined jn; uint64_t pr[4]; oc_rbuf_init(&p, buf, len);
+    { oc_call_joined jn; oc_call_part pr[4]; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_call_joined(&p, &jn, pr, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
-    { oc_call_roster ros; uint64_t pr[4]; oc_rbuf_init(&p, buf, len);
+    { oc_call_roster ros; oc_call_part pr[4]; oc_rbuf_init(&p, buf, len);
       rc = oc_decode_call_roster(&p, &ros, pr, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_call_invite ci; uint64_t us[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_invite(&p, &ci, us, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    oc_call_decline cdc; D(oc_decode_call_decline(&p, &cdc));
+    oc_call_end cen; D(oc_decode_call_end(&p, &cen));
+    { oc_call_state cs; uint64_t pp[4], ii[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_state(&p, &cs, pp, 4, ii, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_call_key ck; oc_call_key_entry ke[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_key(&p, &ck, ke, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    oc_call_key_for ckf; D(oc_decode_call_key_for(&p, &ckf));
     oc_upload_begin ub; D(oc_decode_upload_begin(&p, &ub));
     oc_upload_ready urd; D(oc_decode_upload_ready(&p, &urd));
     oc_upload_chunk uc; D(oc_decode_upload_chunk(&p, &uc));

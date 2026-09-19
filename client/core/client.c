@@ -235,6 +235,45 @@ void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* ---- calls (REQ-150, REQ-301-305) ------------------------------------------ */
+
+static void call_cmd(oc_client *c, int type, uint64_t channel_id, const uint64_t *uids, int n) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    if (n > (int)OC_MAX_CALL_INVITES) n = (int)OC_MAX_CALL_INVITES;
+    for (int i = 0; uids && i < n; i++) cmd->uids[cmd->n_uids++] = uids[i];
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n) {
+    if (!c) return;
+    c->model.call_pending = channel_id;
+    call_cmd(c, OC_CMD_CALL_JOIN, channel_id, invite, n);
+}
+
+void oc_client_call_join(oc_client *c, uint64_t channel_id) {
+    oc_client_call_start(c, channel_id, NULL, 0);
+}
+
+void oc_client_call_leave(oc_client *c, uint64_t channel_id)   { call_cmd(c, OC_CMD_CALL_LEAVE, channel_id, NULL, 0); }
+void oc_client_call_decline(oc_client *c, uint64_t channel_id) { call_cmd(c, OC_CMD_CALL_DECLINE, channel_id, NULL, 0); }
+void oc_client_call_end(oc_client *c, uint64_t channel_id)     { call_cmd(c, OC_CMD_CALL_END, channel_id, NULL, 0); }
+
+void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n) {
+    if (n > 0) call_cmd(c, OC_CMD_CALL_INVITE, channel_id, uids, n);
+}
+
+void oc_client_set_call_media(oc_client *c, const oc_call_media *media, void *ctx) {
+    if (c) oc_net_set_call_media(c->net, media, ctx);
+}
+
+size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
+                                  oc_call_notice *out, size_t max) {
+    return c ? oc_model_call_notify_take(&c->model, quiet, paused, out, max) : 0;
+}
+
 void oc_client_typing(oc_client *c, uint64_t channel_id) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_TYPING);

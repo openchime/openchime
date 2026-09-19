@@ -936,6 +936,14 @@ static const char MIGRATION_0042[] =
     ") WITHOUT ROWID;"
     "CREATE INDEX rendered_audio_lru ON rendered_audio(last_used_ms);";
 
+static const char MIGRATION_0043[] =
+    /* Calls (REQ-304, ARCH-90): what a message is. 0 is something someone said,
+     * every row until now; 1 is a call event the daemon wrote -- a missed call --
+     * which a client draws as a line of history, search does not find, and
+     * read-aloud does not say. The body still reads sensibly ("Missed call"), so
+     * anything that ignores the column shows sense rather than nothing. */
+    "ALTER TABLE messages ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -979,6 +987,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 40, MIGRATION_0040 },
     { 41, MIGRATION_0041 },
     { 42, MIGRATION_0042 },
+    { 43, MIGRATION_0043 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

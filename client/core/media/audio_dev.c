@@ -455,6 +455,15 @@ static double syn_loop_value(double t_s) {
     return v;
 }
 
+/* The synthetic microphone's tone: 440 Hz, or OPENCHIME_TEST_TONE's. Two clients
+ * on one machine in a call each speak their own, so either can tell which of
+ * them it is hearing. */
+static double mic_tone_hz(void) {
+    const char *t = getenv("OPENCHIME_TEST_TONE");
+    double hz = t && *t ? atof(t) : 0.0;
+    return hz > 20.0 && hz < 7000.0 ? hz : 440.0;
+}
+
 /* 0 none; 1 the echo over the microphone's own tone; 2 the echo alone. */
 static int mic_echo(void) {
     const char *t = getenv("OPENCHIME_TEST_MIC_ECHO");
@@ -487,9 +496,10 @@ static void synthetic_catch_up(oc_audio_dev *d) {
                 }
             } else {
                 int echo = mic_echo();
+                double hz = mic_tone_hz();
                 for (size_t i = 0; i < n; i++) {
                     double t = (double)(d->syn_frames + i) / d->rate;
-                    double v = echo == 2 ? 0.0 : 8000.0 * __builtin_sin(2.0 * 3.141592653589793 * 440.0 * t);
+                    double v = echo == 2 ? 0.0 : 8000.0 * __builtin_sin(2.0 * 3.141592653589793 * hz * t);
                     /* The speakers heard back 20 ms later at half strength. */
                     if (echo) v += 0.5 * syn_loop_value(((double)d->syn_start_us + (double)(d->syn_frames + i) * 1e6 / d->rate) / 1e6 - 0.020);
                     if (v > 32767) v = 32767;

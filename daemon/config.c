@@ -178,5 +178,12 @@ int oc_config_load(char *err, size_t errcap) {
     if (c->stt.max_secs < 5)  c->stt.max_secs = 5;
     if (c->stt.max_secs > 60) c->stt.max_secs = 60;
 
+    /* A call's size (REQ-305). Every participant receives every other's stream
+     * and mixes them itself (AUDIO.md §1.1), so the cap bounds each client's
+     * download and decoding, not only the relay's fan-out. */
+    c->call_max = env_int("OPENCHIME_CALL_MAX", NULL, 10);
+    if (c->call_max < 2) c->call_max = 2;
+    if (c->call_max > (int)OC_MAX_CALL_PARTICIPANTS) c->call_max = (int)OC_MAX_CALL_PARTICIPANTS;
+
     return 0;
 }

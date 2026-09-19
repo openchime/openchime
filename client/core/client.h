@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "callsig.h"
 #include "model.h"
 #include "secret.h"
 
@@ -322,6 +323,26 @@ void oc_client_voice_preview(oc_client *c, const char *voice_id);
  * queued. The audio is copied; nothing is written to disk. */
 uint32_t oc_client_stt_send(oc_client *c, uint8_t mode, uint64_t channel_id, uint64_t thread_root,
                             const int16_t *pcm, size_t samples);
+
+/* Calls (REQ-150, REQ-301-305, docs/CALLS.md). Start a call in a conversation,
+ * inviting `invite` (the members, up to the cap, or the starter's pick); join the
+ * call already there; leave it; decline an invitation; end it for everyone (the
+ * starter only); invite more people. The daemon's answers fold into the model:
+ * `calls` for the Calls section, `call` / `in_call` for the one this client is
+ * in, `call_error` for a refusal. */
+void oc_client_call_start(oc_client *c, uint64_t channel_id, const uint64_t *invite, int n);
+void oc_client_call_join(oc_client *c, uint64_t channel_id);
+void oc_client_call_leave(oc_client *c, uint64_t channel_id);
+void oc_client_call_decline(oc_client *c, uint64_t channel_id);
+void oc_client_call_end(oc_client *c, uint64_t channel_id);
+void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n);
+/* Where the audio goes (callsig.h): a frontend that does calls plugs in its
+ * media engine before offering them. NULL removes it; on return nothing is
+ * calling into the old one. */
+void oc_client_set_call_media(oc_client *c, const oc_call_media *media, void *ctx);
+/* Drain the invitations worth a toast (oc_model_call_notify_take). */
+size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
+                                  oc_call_notice *out, size_t max);
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by

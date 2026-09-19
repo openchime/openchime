@@ -1096,6 +1096,26 @@ first and without a tombstone**: the storage sweep takes the least recently
 listened-to renderings before anything a user uploaded, which is what the
 `last_used_ms` index is for. Serving one marks it used.
 
+## 3ah. Migration 0043 — what a message is (REQ-304, ARCH-90/113)
+
+```sql
+ALTER TABLE messages ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+```
+
+*`0` is something someone said* — every row until now. *`1` is a call event* the
+daemon wrote: a missed call, when a call ends with nobody but its starter having
+joined (CALLS.md §4). It is authored by the call's starter, so it has an author,
+and carries a readable body ("Missed call"), so anything that ignores the column
+still shows sense. It is otherwise an ordinary row — unread, backfill, history —
+travelling on `BROADCAST` with its kind (PROTOCOL.md §5.3); full-text search and
+read-aloud skip it.
+
+Calls themselves have **no table**: a call, its participants, their device keys
+and its invitations are net-thread memory, ended by a restart like presence
+(ARCH-67/73). A device's public key reaches the daemon on `CALL_JOIN` and is kept
+for the length of that participation; its private key never leaves the device
+(ARCH-113).
+
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.

@@ -134,6 +134,21 @@ jobs:
           done
           kill "$pid" 2>/dev/null || true
           if [ -z "$ok" ]; then echo "::error::the TTS=0 STT=0 daemon did not become healthy"; cat "$d/log"; exit 1; fi
+      # The release compiles the daemon with zig's clang against glibc 2.34, and a
+      # newer clang refuses things this runner's accepts: a declaration after a
+      # label (a C23 extension) passed every job here and broke a release. So
+      # the daemon's sources go through that exact compiler, pinned as release.yml
+      # pins it, with the release's flags.
+      - name: The daemon compiles with the release's compiler
+        env:
+          ZIG_VERSION: '0.13.0'
+          ZIG_SHA: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo mkdir -p /opt/zig && sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          make check-release-cc
       # Also a prerequisite of `make test`; named here so a duplicate opcode
       # fails as itself rather than inside the test step.
       - name: Check opcode uniqueness

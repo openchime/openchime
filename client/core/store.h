@@ -67,6 +67,15 @@ int  oc_store_load_pin(oc_store *s, const char *workspace,
 void oc_store_save_pin(oc_store *s, const char *workspace,
                        const uint8_t pin[OC_TLS_FINGERPRINT_LEN]);
 
+/* This device's key pair for calls in `workspace` (ARCH-113, CALLS.md §5.2): the
+ * X25519 private key kept in the credential store beside the token, made the
+ * first time it is asked for. Returns 1 when it is stored (found or made and
+ * saved), 0 when it was made for this session only -- no credential store, or it
+ * refused the write -- and -1 when no key could be made at all. A logout
+ * (clear_session) forgets it. */
+int  oc_store_device_key(oc_store *s, const char *workspace,
+                         uint8_t sk[32], uint8_t pk[32]);
+
 /* The workspace book (REQ-012): the list of workspaces this machine knows about,
  * so a frontend can offer a switcher without the user retyping an address. One
  * row per workspace, holding the `label` the user typed (`acme.example.com` —

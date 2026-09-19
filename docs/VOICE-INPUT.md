@@ -28,10 +28,11 @@ Absent where the operator turned it off or the recognizer's data is missing (REQ
 
 ## 2. The microphone
 
-- **One owner at a time.** Voice input, video recording and (later) a call never hold
+- **One owner at a time.** Voice input, video recording and a call never hold
   the microphone together: the device layer refuses a second capture
   (`OC_AUDIO_BUSY`). Opening the video recorder ends voice input, and the recorder's
-  overlay covers the composer, so voice input cannot start under it.
+  overlay covers the composer, so voice input cannot start under it. Joining a call
+  ends both; in a call, the talk key is the call's push to talk.
 - Opened only while in use — press to release, or free talk on to off — with a
   live-microphone mark on the composer. A microphone the OS blocks is reported as
   blocked by Windows' privacy settings (REQ-166).
@@ -45,8 +46,8 @@ The client's own playback — read-aloud, video messages, voice auditions — mu
 be heard as speech. All of it plays through the device layer, which records the frames
 it emits against the media clock; that playback stream is the **far-end reference**.
 Capture passes through the `oc_audio_processor` seam (AUDIO.md §3.3) running
-**speexdsp**'s linear echo canceller before the detector sees it. The call client
-reuses both.
+**speexdsp**'s linear echo canceller before the detector sees it. The call engine
+uses both.
 
 The ERLE harness (AUDIO.md §6.4) measures it on a synthetic room: **22.5 dB** of echo
 removed once converged, **15.5 dB** with the two clocks 100 ppm apart, and **13.2 dB**

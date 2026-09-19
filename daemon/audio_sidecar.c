@@ -29,6 +29,9 @@ typedef struct {
 } participant;
 
 static participant g_parts[OC_AUDIO_MAX_PARTS];
+static uint64_t g_silence_ms = OC_AUDIO_SILENCE_MS;
+
+void oc_audio_sidecar_set_silence_ms(uint64_t ms) { g_silence_ms = ms ? ms : OC_AUDIO_SILENCE_MS; }
 
 static uint64_t now_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -115,7 +118,7 @@ static void on_udp(int udp_fd) {
     participant *me = find_by_token(pkt);        /* token is the first 16 bytes */
     if (!me) return;                             /* unknown/revoked token -> ignore */
     /* The address is bound on first use and never re-learned. The token is not a
-     * secret on the wire: media is unencrypted and the token leads every packet,
+     * secret on the wire: it leads every packet in the clear,
      * so re-learning the return address from whichever packet arrived last let
      * anyone who saw one datagram redirect that participant's audio to
      * themselves with one forged packet -- the participant goes silent and the
@@ -151,11 +154,22 @@ static void on_udp(int udp_fd) {
     }
 }
 
-static void sweep_silent(void) {
+/* Drop the silent and tell the daemon, which takes them out of their call. The
+ * report is best-effort, as every IPC write is: a daemon too busy to read it
+ * still drops the participant when its connection closes. */
+static void sweep_silent(int ipc_fd) {
     uint64_t now = now_ms();
     for (int i = 0; i < OC_AUDIO_MAX_PARTS; i++)
-        if (g_parts[i].used && now - g_parts[i].last_seen_ms > OC_AUDIO_SILENCE_MS)
+        if (g_parts[i].used && now - g_parts[i].last_seen_ms > g_silence_ms) {
             g_parts[i].used = 0;
+            uint8_t m[5 + OC_AUDIO_TOKEN_LEN];
+            uint32_t mlen = 1 + OC_AUDIO_TOKEN_LEN;
+            m[0] = (uint8_t)(mlen >> 24); m[1] = (uint8_t)(mlen >> 16);
+            m[2] = (uint8_t)(mlen >> 8);  m[3] = (uint8_t)mlen;
+            m[4] = OC_AUDIO_IPC_GONE;
+            memcpy(m + 5, g_parts[i].token, OC_AUDIO_TOKEN_LEN);
+            ssize_t n = write(ipc_fd, m, sizeof m); (void)n;
+        }
 }
 
 int oc_audio_sidecar_run(int ipc_fd, int udp_fd, volatile sig_atomic_t *stop) {
@@ -182,7 +196,7 @@ int oc_audio_sidecar_run(int ipc_fd, int udp_fd, volatile sig_atomic_t *stop) {
                 if (on_ipc(ipc_fd, ipc_buf, &ipc_have, sizeof ipc_buf) < 0) { close(ep); return 0; }
             }
         }
-        sweep_silent();
+        sweep_silent(ipc_fd);
     }
     close(ep);
     return 0;

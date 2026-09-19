@@ -229,6 +229,7 @@ static void job_free(oc_job *j) {
     free(j->unf_url);
     free(j->unf_title);
     free(j->unf_descr);
+    free(j->call_uids);
     free(j);
 }
 
@@ -373,6 +374,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->tts_text); free(r->tts_blob_key);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
+    free(r->call_uids);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
     free(r->sessions);
@@ -3811,6 +3813,8 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         "FROM %s messages m %s "
         "JOIN channels c ON c.id = m.channel_id "
         "WHERE m.deleted_at_ms IS NULL "
+        /* A call event (REQ-304) is history, not something anyone said. */
+        "  AND m.kind = 0 "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
         "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
         have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(COALESCE(m.body,''),1,160)",
@@ -4050,7 +4054,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             /* And this user's saved-for-later state, for the same reason. LEFT
              * JOIN rather than EXISTS so the timestamp comes with it, and keyed on
              * the REQUESTING user because a saved item is private (REQ-231). */
-            "  COALESCE(s.created_at_ms,0) "
+            "  COALESCE(s.created_at_ms,0), m.kind "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
             "                LEFT JOIN pins  p ON p.message_id = m.id "
             "                LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4 "
@@ -4092,6 +4096,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->pinned_at = (uint64_t)sqlite3_column_int64(st, 8);
             m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
             m->saved     = m->saved_at != 0;
+            m->kind      = (uint8_t)sqlite3_column_int(st, 10);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -4159,14 +4164,15 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
      * user because it is private (REQ-231), where a pin belongs to the channel. */ \
     "         COALESCE(p.pinned_by,0) AS pinned_by," \
     "         COALESCE(p.created_at_ms,0) AS pinned_at," \
-    "         COALESCE(s.created_at_ms,0) AS saved_at" \
+    "         COALESCE(s.created_at_ms,0) AS saved_at," \
+    "         m.kind AS kind" \
     "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
     "                    LEFT JOIN pins p ON p.message_id = m.id" \
     "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
 
     const char *sql = j->hist_around
         ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at FROM ("
+          "       pinned_by, pinned_at, saved_at, kind FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
           "   ORDER BY m.id DESC LIMIT ?3)"
@@ -4176,7 +4182,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
         : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
-          "       pinned_by, pinned_at, saved_at FROM ("
+          "       pinned_by, pinned_at, saved_at, kind FROM ("
           OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
           "   ORDER BY m.id DESC LIMIT ?3"
@@ -4220,6 +4226,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->pinned_at = (uint64_t)sqlite3_column_int64(st, 8);
         m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
         m->saved     = m->saved_at != 0;
+        m->kind      = (uint8_t)sqlite3_column_int(st, 10);
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -4279,20 +4286,79 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Authorize joining a channel's audio call (REQ-150): the ordinary channel-read
- * gate. The net thread owns the ephemeral call roster; this is just the access
- * check. Read (query connection). */
+/* An account that exists and is not disabled: someone a call can invite. */
+static int user_is_active(sqlite3 *db, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE id=? AND disabled=0;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+        ok = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* A call's access question (REQ-150, REQ-301/302): may the actor read the
+ * conversation -- the ordinary channel-read gate, since anyone who may read it
+ * may join its call -- which of the users named may read it too (only they can
+ * be invited), and who its members are, the audience the net thread tells about
+ * the call. The net thread owns the call itself. Read (query connection). */
 static oc_dbres *process_call_auth(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->channel_id = j->channel_id;
     r->user_id = j->user_id;
-    if (channel_read_access(db, j->channel_id, j->user_id)) {
-        r->type = OC_RES_CALL_AUTH;
-    } else {
+    r->call_op = j->call_op;
+    memcpy(r->call_key, j->call_key, sizeof r->call_key);
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_CALL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;
+        return r;
     }
+    r->type = OC_RES_CALL_AUTH;
+    load_members(db, j->channel_id, r);
+    if (j->n_call_uids) {
+        r->call_uids = malloc(j->n_call_uids * sizeof *r->call_uids);
+        for (uint16_t i = 0; r->call_uids && i < j->n_call_uids; i++) {
+            uint64_t u = j->call_uids[i];
+            if (u && u != j->user_id && user_is_active(db, u) &&
+                channel_read_access(db, j->channel_id, u))
+                r->call_uids[r->n_call_uids++] = u;
+        }
+    }
+    return r;
+}
+
+/* Write a call event (REQ-304): a message of kind OC_MSG_KIND_CALL in the
+ * conversation, authored by the call's starter, carrying a readable body. It is
+ * an ordinary row in every other respect -- unread, backfill, history -- so the
+ * one thing that marks it is the kind. Write. */
+static oc_dbres *process_call_event(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_CALL_EVENT;
+    r->err_code = OC_ERR_INTERNAL;
+    uint64_t ts = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO messages(channel_id, author_id, body, created_at_ms, kind) VALUES(?, ?, ?, ?, ?);",
+            -1, &st, NULL) != SQLITE_OK) return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_blob (st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    sqlite3_bind_int  (st, 5, (int)OC_MSG_KIND_CALL);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return r;
+    r->err_code = 0;
+    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);
+    r->channel_id = j->channel_id;
+    r->author_id = j->user_id;
+    r->server_time = ts;
+    if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    load_members(db, j->channel_id, r);
     return r;
 }
 
@@ -6334,7 +6400,7 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT m.channel_id, m.author_id, m.deleted_at_ms IS NOT NULL, m.body,"
-            "       COALESCE(u.voice_id,''), COALESCE(u.pronouns,'')"
+            "       COALESCE(u.voice_id,''), COALESCE(u.pronouns,''), m.kind"
             "  FROM messages m LEFT JOIN users u ON u.id = m.author_id"
             " WHERE m.id = ?1;", -1, &st, NULL) != SQLITE_OK)
         return r;
@@ -6350,6 +6416,8 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     char have_voice[64], pronouns[64];
     snprintf(have_voice, sizeof have_voice, "%s", (const char *)sqlite3_column_text(st, 4));
     snprintf(pronouns, sizeof pronouns, "%s", (const char *)sqlite3_column_text(st, 5));
+    /* A call event (REQ-304) is not something its author said: nothing to read. */
+    if (sqlite3_column_int(st, 6) != OC_MSG_KIND_MESSAGE) body_len = 0;
     char *body_copy = body_len ? malloc(body_len) : NULL;
     if (body_copy) memcpy(body_copy, body, body_len);
     sqlite3_finalize(st);
@@ -6637,6 +6705,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_WEBHOOK_STATE) return process_set_webhook_state(w->db, j);
     if (j->type == OC_JOB_ROTATE_WEBHOOK)    return process_rotate_webhook(w->db, j);
     if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
+    if (j->type == OC_JOB_CALL_EVENT)      return process_call_event(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_MUTE)        return process_set_mute(w->db, j);

@@ -96,6 +96,9 @@ typedef struct {
      * replayed after a reconnect so a bookmark survives a reload. */
     uint8_t      saved;
     uint64_t     saved_at;
+    /* OC_MSG_KIND_*: a call event (a missed call, REQ-304) is drawn as a line of
+     * history rather than as something its author said. */
+    uint8_t      kind;
     /* Link previews (REQ-222): fanned after the BROADCAST, replayed on
      * backfill, cleared on edit (the daemon drops and re-fetches). */
     oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
@@ -125,6 +128,20 @@ typedef struct {
     uint8_t  keyword_hit;
     char     body[256];    /* NUL-terminated excerpt, for the toast */
 } oc_thread_notice;
+
+/* Calls (REQ-150, REQ-301-305). The Calls section lists at most this many; a
+ * workspace with more calls going at once than a sidebar can show has a
+ * different problem. */
+#define OC_MAX_CALLS_LISTED 32
+#define OC_MAX_CALL_NOTICES 8
+
+/* An invitation that may deserve a toast (REQ-302), decided when it is taken,
+ * like a thread reply: mute, the schedule and the pause can change between. */
+typedef struct {
+    uint64_t channel_id;
+    uint64_t call_id;
+    uint64_t starter;
+} oc_call_notice;
 
 typedef struct {
     uint64_t channel_id;
@@ -563,6 +580,24 @@ typedef struct {
         char     names[192];   /* comma-joined, ready to show */
         uint32_t seq;
     } unresolved;
+
+    /* Calls (REQ-150, REQ-301-305, CALLS.md). `calls` is the Calls section: every
+     * call in a conversation this user belongs to or is invited to, as CALL_STATE
+     * last said, ended ones removed; the daemon sends them all again after a
+     * reconnect. `call` is the one this client is in, while `in_call`, with each
+     * participant's slot. `call_pending` is a start or join on its way. */
+    oc_call_view calls[OC_MAX_CALLS_LISTED];
+    size_t       n_calls;
+    uint8_t      call_max;              /* the daemon's cap on a call (REQ-305) */
+    uint8_t      in_call;
+    oc_call_view call;
+    uint64_t     call_pending;          /* the channel a join is on its way to, 0 = none */
+    /* The last refusal: an OC_ERR_* code, `seq` bumping per occurrence, as the
+     * error line's does. */
+    uint16_t     call_error;
+    uint32_t     call_error_seq;
+    oc_call_notice call_notices[OC_MAX_CALL_NOTICES];
+    size_t       n_call_notices;
 } oc_model;
 
 void oc_model_init(oc_model *m);
@@ -871,6 +906,16 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
  * to the workspace rather than the channel. */
 size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
                                    oc_thread_notice *out, size_t max);
+
+/* Calls (REQ-301-305). The Calls section's entry for a conversation, or NULL. */
+const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id);
+/* Is `user_id` invited to `v` and not yet in it? */
+int oc_model_call_invited(const oc_call_view *v, uint64_t user_id);
+/* Drain the invitations worth a toast: each is a mention of this user, so a
+ * muted conversation, the schedule (`quiet`) and a pause (`paused`) silence it
+ * and the level cannot (ARCH-103). Considered once, whatever the verdict. */
+size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
+                                 oc_call_notice *out, size_t max);
 /* Record a presence value (used for our own presence, which the server does not
  * echo back to us). */
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
@@ -896,6 +941,8 @@ int             oc_model_has_capability(const oc_model *m, const char *name);
 uint8_t         oc_model_tts_available(const oc_model *m);
 /* Voice input is offered on this connection (the "stt" capability). */
 uint8_t         oc_model_stt_available(const oc_model *m);
+/* The daemon offers calls: its relay is up (REQ-150). */
+uint8_t         oc_model_calls_available(const oc_model *m);
 /* The oldest push-to-talk words spoken into (channel_id, thread_root): 1 and a
  * malloc'd string the caller frees, or 0 if none are waiting. Words for another
  * conversation stay until asked for there. */

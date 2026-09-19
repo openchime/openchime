@@ -142,16 +142,16 @@ static void test_auth_frames(void) {
     }
     {
         /* WORKSPACE_INFO — deployment mode + user cap + (optional) name. */
-        oc_workspace_info in = { 2 /* managed */, 500, oc_slice_str("Acme HQ") };
+        oc_workspace_info in = { 2 /* managed */, 500, oc_slice_str("Acme HQ"), 10 };
         ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
         oc_workspace_info out;
         CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
-        CHECK(out.deployment_mode == 2 && out.max_users == 500);
+        CHECK(out.deployment_mode == 2 && out.max_users == 500 && out.call_max == 10);
         CHECK(slice_eq_str(out.workspace_name, "Acme HQ"));
     }
     {
         /* WORKSPACE_INFO — empty name (client derives from the host subdomain). */
-        oc_workspace_info in = { 0, 0, oc_slice_str("") };
+        oc_workspace_info in = { 0, 0, oc_slice_str(""), 0 };
         ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
         oc_workspace_info out;
         CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
@@ -222,7 +222,7 @@ static void test_messaging_frames(void) {
         CHECK(out.server_time == 1751200500000ull);
     }
     {
-        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, oc_slice_str("hello channel"), 0, {{0}}, {0} };
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, 0, oc_slice_str("hello channel"), 0, {{0}}, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -1145,10 +1145,22 @@ static void test_profile_frames(void) {
 }
 
 static void test_call_frames(void) {
+    oc_call_part pa[2];
+    memset(pa, 0, sizeof pa);
+    pa[0].user_id = 10; pa[0].slot = 0; memset(pa[0].device_key, 0xAA, OC_CALL_DEVICE_KEY_LEN);
+    pa[1].user_id = 20; pa[1].slot = 3; memset(pa[1].device_key, 0xBB, OC_CALL_DEVICE_KEY_LEN);
     {
-        oc_call_join in = { 7 };
+        uint64_t inv[3] = { 20, 30, 40 };
+        oc_call_join in = { 7, {0}, 3, inv };
+        memset(in.device_key, 0x5C, OC_CALL_DEVICE_KEY_LEN);
         ROUNDTRIP(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOIN, h, p);
-        oc_call_join out; CHECK(oc_decode_call_join(&p, &out) == OC_OK && out.channel_id == 7);
+        oc_call_join out; uint64_t got[4];
+        CHECK(oc_decode_call_join(&p, &out, got, 4) == OC_OK && out.channel_id == 7);
+        CHECK(out.device_key[0] == 0x5C && out.device_key[31] == 0x5C);
+        CHECK(out.n_invite == 3 && got[0] == 20 && got[2] == 40);
+        /* A list longer than the caller's room is malformed, not cut short. */
+        oc_rbuf_init(&p, w.data + OC_HEADER_SIZE, w.len - OC_HEADER_SIZE);
+        CHECK(oc_decode_call_join(&p, &out, got, 2) == OC_E_MALFORMED);
     }
     {
         oc_call_leave in = { 7 };
@@ -1156,23 +1168,67 @@ static void test_call_frames(void) {
         oc_call_leave out; CHECK(oc_decode_call_leave(&p, &out) == OC_OK && out.channel_id == 7);
     }
     {
-        uint64_t parts[3] = { 10, 20, 30 };
         uint8_t tok[16]; for (int i = 0; i < 16; i++) tok[i] = (uint8_t)(i + 1);
-        oc_call_joined in = { 7, 7, 41234, { tok, 16 }, 3, parts };
+        oc_call_joined in = { 7, 99, 41234, { tok, 16 }, 3, 5, 10, 1751200500000ull, 2, pa };
         ROUNDTRIP(oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOINED, h, p);
-        oc_call_joined out; uint64_t got[8];
+        oc_call_joined out; oc_call_part got[8];
         CHECK(oc_decode_call_joined(&p, &out, got, 8) == OC_OK);
-        CHECK(out.channel_id == 7 && out.call_id == 7 && out.udp_port == 41234);
-        CHECK(out.token.len == 16 && out.count == 3);
-        CHECK(got[0] == 10 && got[1] == 20 && got[2] == 30);
+        CHECK(out.channel_id == 7 && out.call_id == 99 && out.udp_port == 41234);
+        CHECK(out.token.len == 16 && out.slot == 3 && out.epoch == 5 && out.starter == 10);
+        CHECK(out.started_at == 1751200500000ull && out.count == 2);
+        CHECK(got[0].user_id == 10 && got[1].user_id == 20 && got[1].slot == 3);
+        CHECK(got[0].device_key[0] == 0xAA && got[1].device_key[31] == 0xBB);
     }
     {
-        uint64_t parts[2] = { 10, 20 };
-        oc_call_roster in = { 7, 7, 2, parts };
+        oc_call_roster in = { 7, 99, 6, 2, pa };
         ROUNDTRIP(oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_ROSTER, h, p);
-        oc_call_roster out; uint64_t got[8];
-        CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2);
-        CHECK(got[0] == 10 && got[1] == 20);
+        oc_call_roster out; oc_call_part got[8];
+        CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2 && out.epoch == 6);
+        CHECK(out.call_id == 99 && got[1].user_id == 20 && got[1].device_key[0] == 0xBB);
+    }
+    {
+        uint64_t users[2] = { 30, 40 };
+        oc_call_invite in = { 7, 2, users };
+        ROUNDTRIP(oc_encode_call_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_INVITE, h, p);
+        oc_call_invite out; uint64_t got[4];
+        CHECK(oc_decode_call_invite(&p, &out, got, 4) == OC_OK && out.count == 2 && got[1] == 40);
+    }
+    {
+        oc_call_decline in = { 7 };
+        ROUNDTRIP(oc_encode_call_decline(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_DECLINE, h, p);
+        oc_call_decline out; CHECK(oc_decode_call_decline(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        oc_call_end in = { 7 };
+        ROUNDTRIP(oc_encode_call_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_END, h, p);
+        oc_call_end out; CHECK(oc_decode_call_end(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        uint64_t parts[2] = { 10, 20 }, inv[1] = { 30 };
+        oc_call_state in = { 7, 99, 10, 1751200500000ull, 1, 2, parts, 1, inv };
+        ROUNDTRIP(oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_STATE, h, p);
+        oc_call_state out; uint64_t gp[4], gi[4];
+        CHECK(oc_decode_call_state(&p, &out, gp, 4, gi, 4) == OC_OK);
+        CHECK(out.call_id == 99 && out.starter == 10 && out.ended == 1);
+        CHECK(out.n_parts == 2 && gp[1] == 20 && out.n_invited == 1 && gi[0] == 30);
+    }
+    {
+        uint8_t s1[OC_CALL_SEALED_LEN], s2[OC_CALL_SEALED_LEN];
+        memset(s1, 1, sizeof s1); memset(s2, 2, sizeof s2);
+        oc_call_key_entry e[2] = { { 20, { s1, sizeof s1 } }, { 30, { s2, sizeof s2 } } };
+        oc_call_key in = { 7, 99, 6, 2, e };
+        ROUNDTRIP(oc_encode_call_key(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_KEY, h, p);
+        oc_call_key out; oc_call_key_entry got[4];
+        CHECK(oc_decode_call_key(&p, &out, got, 4) == OC_OK && out.count == 2 && out.epoch == 6);
+        CHECK(got[1].recipient == 30 && got[1].sealed.len == OC_CALL_SEALED_LEN && got[1].sealed.ptr[0] == 2);
+    }
+    {
+        uint8_t s1[OC_CALL_SEALED_LEN]; memset(s1, 9, sizeof s1);
+        oc_call_key_for in = { 7, 99, 6, 10, { s1, sizeof s1 } };
+        ROUNDTRIP(oc_encode_call_key_for(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_KEY_FOR, h, p);
+        oc_call_key_for out;
+        CHECK(oc_decode_call_key_for(&p, &out) == OC_OK && out.sender == 10 && out.epoch == 6);
+        CHECK(out.call_id == 99 && out.sealed.len == OC_CALL_SEALED_LEN && out.sealed.ptr[5] == 9);
     }
 }
 
@@ -1335,7 +1391,7 @@ static void test_attachment_frames(void) {
     }
     /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
-        oc_broadcast in = { 5, 3, 42, 999, oc_slice_str("here"), 0, {{0}}, {0} };
+        oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("here"), 0, {{0}}, {0} };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
@@ -1350,7 +1406,7 @@ static void test_attachment_frames(void) {
     /* Author name with NO attachments: a zero attachment count precedes the name
      * (REQ-170 display-name override, ARCH-71). */
     {
-        oc_broadcast in = { 6, 3, 42, 999, oc_slice_str("hi"), 0, {{0}}, {0} };
+        oc_broadcast in = { 6, 3, 42, 999, 0, oc_slice_str("hi"), 0, {{0}}, {0} };
         in.author_name = oc_slice_str("Zapier");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
@@ -1360,7 +1416,7 @@ static void test_attachment_frames(void) {
     }
     /* No attachments and no name -> byte-identical to the original layout. */
     {
-        oc_broadcast in = { 7, 3, 42, 999, oc_slice_str("plain"), 0, {{0}}, {0} };
+        oc_broadcast in = { 7, 3, 42, 999, 0, oc_slice_str("plain"), 0, {{0}}, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);

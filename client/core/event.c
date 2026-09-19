@@ -12,6 +12,7 @@ void oc_ev_free(oc_ev *e) {
     free(e->body);
     free(e->topic);
     free(e->preview);
+    free(e->call);
     free(e);
 }
 

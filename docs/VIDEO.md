@@ -8,8 +8,8 @@ PROTOCOL.md (§5.17), and [AUDIO.md](./AUDIO.md).
 
 **Status. Designed, not started.** No screenshare code exists in any client or in
 the daemon. This document exists so the decisions taken are recorded before the
-work begins, not to signal that it is scheduled — it is explicitly **sequenced
-behind the audio client** (§8), which itself is at phase 0.
+work begins, not to signal that it is scheduled. It builds on the audio client's
+media transport (§8), which is built (CALLS.md, AUDIO.md).
 
 **This document is screenshare only.** Camera video calling remains excluded by
 REQ-160 and nothing here reverses that (§2). Recorded **video messages** are a
@@ -143,9 +143,9 @@ untouched by it, and all of it is new:
    video packet rates — it wraps in roughly a minute. Reassembly must tolerate
    wrap, or the field widens.
 
-This is the real cost of the feature, and it is why §8 sequences it behind the
-audio client rather than beside it: every one of these is a media-transport
-problem that the audio work has to solve first in simpler form.
+This is the real cost of the feature: every one of these is a media-transport
+problem the audio work solved in simpler form, and screenshare extends rather than
+repeats (§8).
 
 ## 6. Protocol additions
 
@@ -186,21 +186,15 @@ the one shared VP9 encoder, so the wire stays identical across platforms.
 
 ## 8. Sequencing and the prerequisite
 
-**Screenshare is gated behind the audio client.** AUDIO.md §7 is a seven-phase
-plan and the client half is at phase 0 — no device layer, no ring buffers, no
-jitter buffer, no UDP media path, no `CALL_*` handling in `client/core` (verified:
-`client/` contains no `CALL_JOIN`, Opus, or UDP media code).
+**Screenshare builds on the audio client.** The device layer, the UDP media path
+to the relay, per-sender jitter buffers, end-to-end encryption and `CALL_*`
+signaling exist (AUDIO.md §7, CALLS.md). Screenshare sits on top of them and
+extends what video needs that audio did not:
 
-Screenshare sits on top of all of it. Built first, the media transport gets built
-twice.
-
-The order that follows from this document:
-
-1. AUDIO.md phases 1–5 — device layer, Opus, `CALL_*` signaling, UDP media,
-   jitter buffer, mixing.
-2. The transport gaps of §5, which audio needs in simpler form anyway.
-3. Screenshare, revisiting the §4 codec choice against whatever hardware
-   encode landscape exists by then.
+1. The transport gaps of §5 — fragmentation, keyframe requests, a wider `seq`.
+2. Screenshare itself, revisiting the §4 codec choice against whatever hardware
+   encode landscape exists by then. Its frames are SFrame-encrypted as audio's
+   are, under the same per-sender keys.
 
 ## 9. Bandwidth and the flat-plan collision
 

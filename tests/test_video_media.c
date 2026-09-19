@@ -43,7 +43,7 @@ static void test_wire(void) {
     /* A BROADCAST with an ordinary file and a video message side by side: the
      * media fields ride only the video's entry, and the entry after it still
      * decodes in place. */
-    oc_broadcast in = { 5, 3, 42, 999, oc_slice_str("clip"), 0, {{0}}, {0} };
+    oc_broadcast in = { 5, 3, 42, 999, 0, oc_slice_str("clip"), 0, {{0}}, {0} };
     in.n_attach = 3;
     in.attach[0].id = 70; in.attach[0].filename = oc_slice_str("a.txt");
     in.attach[0].mime = oc_slice_str("text/plain"); in.attach[0].size = 10;
@@ -68,7 +68,7 @@ static void test_wire(void) {
 
     /* An unknown media kind is malformed, not guessed at. */
     {
-        oc_broadcast one = { 5, 3, 42, 999, oc_slice_str("x"), 0, {{0}}, {0} };
+        oc_broadcast one = { 5, 3, 42, 999, 0, oc_slice_str("x"), 0, {{0}}, {0} };
         one.n_attach = 1; one.attach[0].id = 1; one.attach[0].filename = oc_slice_str("f");
         one.attach[0].mime = oc_slice_str("m"); one.attach[0].size = 1;
         oc_wbuf_init(&w, buf, sizeof buf);
