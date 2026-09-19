@@ -73,8 +73,9 @@ jobs:
           # tarball that `make test` builds via scripts/build_mbedtls.sh; nasm
           # for libvpx's assembly (scripts/build_libvpx.sh). ffmpeg only for
           # ffprobe, which the media tests run over a recorded file as an
-          # independent validator -- nothing links it.
-          sudo apt-get install -y --no-install-recommends bzip2 nasm ffmpeg
+          # independent validator -- nothing links it. gdb so that a test binary
+          # that crashes prints every thread's stack (tests/main.c).
+          sudo apt-get install -y --no-install-recommends bzip2 nasm ffmpeg gdb
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes), the converted voice model, and
       # voice input's recognizer files (ARCH-112). All are pure functions of the
