@@ -219,15 +219,21 @@ static void shell_scale_update(float client_w_dip, float client_h_dip) {
 #define COMPOSER_MT     UIS(12.0f)    /* above the box */
 #define COMPOSER_MB     UIS(16.0f)    /* below it */
 #define COMPOSER_PAD    UIS(12.0f)    /* box inner */
-#define COMPOSER_BTN    UIS(34.0f)    /* the square buttons */
+/* ONE measure for every icon button in the box, the formatting row's and the
+ * action row's alike, so the two rows read as one control: the same plate, the
+ * same icon, the same pitch, starting where the icon lines up with the text's
+ * left edge. They were built to two measures (24 and 34, inset 8 and 12), and the
+ * icons of one row neither lined up with nor matched the other's. */
+#define COMPOSER_BTN    UIS(28.0f)    /* the square buttons, both rows */
+#define COMPOSER_GLYPH  UIS(16.0f)    /* the icon inside one */
+#define COMPOSER_PITCH  (COMPOSER_BTN + UIS(2.0f))
 #define COMPOSER_LINE   UIS(20.0f)    /* one wrapped line of text */
 #define COMPOSER_MAX_LINES 4
 /* The formatting row: Slack puts it at the TOP of the input, above the text,
  * and so do we — the bottom row already holds attach/emoji/mention/send, and a
  * second row of small buttons beside them would read as one undifferentiated
  * strip of chrome instead of two jobs. */
-#define COMPOSER_TB     UIS(30.0f)    /* the formatting toolbar row */
-#define COMPOSER_FMT    UIS(24.0f)    /* its square buttons */
+#define COMPOSER_TB     UIS(32.0f)    /* the formatting toolbar row */
 /* ...and it is only there in the rich editor. In plain text the
  * toolbar would be a row of buttons for markup you are already looking at, and
  * leaving its 30px behind would be a gap with nothing in it. The height is a
@@ -2092,6 +2098,8 @@ static rectf g_send_btn;          /* composer send-button hit-box */
 static rectf g_sched_btn;         /* "send later" chevron beside it (REQ-224) */
 static rectf g_emoji_btn;         /* composer emoji-picker hit-box */
 static rectf g_at_btn;            /* composer mention button */
+/* The New message pane's own copies (REQ-229). */
+static rectf g_nm_send, g_nm_sched, g_nm_ed, g_nm_attach, g_nm_emoji, g_nm_at;
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* The formatting toolbar (REQ-220). One entry per button, in the order
@@ -2109,6 +2117,14 @@ static int         g_fmt_hover = -1;
 #define FMT_TIP_MS 500
 static ULONGLONG   g_fmt_hover_since;   /* tick when g_fmt_hover last changed */
 static int         g_fmt_tip_shown;     /* dwell crossed; repainted once */
+/* The ACTION row's tooltips, on the same dwell: which button the pointer rests
+ * on (ACT_*, -1 none) and since when. */
+enum { ACT_ATTACH = 0, ACT_VIDEO, ACT_EMOJI, ACT_MENTION, ACT_MIC, ACT_FREETALK, ACT_SEND,
+       ACT_SCHEDULE, ACT_NM_ATTACH, ACT_NM_EMOJI, ACT_NM_MENTION, ACT_NM_SEND, ACT_NM_SCHEDULE,
+       ACT_COUNT };
+static int         g_act_hover = -1;
+static ULONGLONG   g_act_hover_since;
+static int         g_act_tip_shown;
 /* Which half of the composer's send split-button the pointer is over:
  * 0 neither, 1 Send, 2 the "send later" dropdown. */
 static int         g_send_hover = 0;
@@ -10168,20 +10184,91 @@ static void draw_fmt_icon(gfx *rt, int which, rectf b, uint32_t c) {
     }
 }
 
+/* What each button is called, and its key if it has one: the tooltip says both
+ * and the accessibility name says the first, from the one table, so the two
+ * cannot drift. The chord is exactly as ed_key and the accelerators bind it — a
+ * tooltip that teaches the shortcut retires itself. */
+static const char *const FMT_NAME[FMT_COUNT] = {
+    "Bold", "Italic", "Strikethrough", "Code", "Blockquote", "Bulleted list", "Numbered list"
+};
+static const char *const FMT_CHORD[FMT_COUNT] = {
+    "Ctrl+B", "Ctrl+I", "Ctrl+Shift+X", "Ctrl+Shift+C", "Ctrl+Shift+9", "Ctrl+Shift+8", "Ctrl+Shift+7"
+};
+static const char *const ACT_NAME[ACT_COUNT] = {
+    "Attach a file", "Record a video message", "Emoji", "Mention someone", "Hold to talk",
+    "Free talk", "Send", "Send later",
+    "Attach a file", "Emoji", "Mention someone", "Send", "Send later"
+};
+static const char *const ACT_CHORD[ACT_COUNT] = {
+    "", "", "", "@", "Ctrl+Shift+Space", "Ctrl+Shift+T", "Enter", "",
+    "", "", "@", "Enter", ""
+};
+
+/* The rect each action button was last drawn at; empty when it is not drawn. */
+static rectf act_rect(int i) {
+    switch (i) {
+    case ACT_ATTACH:      return g_attach_btn;
+    case ACT_VIDEO:       return g_video_btn;
+    case ACT_EMOJI:       return g_emoji_btn;
+    case ACT_MENTION:     return g_at_btn;
+    case ACT_MIC:         return g_mic_btn;
+    case ACT_FREETALK:    return g_freetalk_btn;
+    case ACT_SEND:        return g_send_btn;
+    case ACT_SCHEDULE:    return g_sched_btn;
+    case ACT_NM_ATTACH:   return g_nm_attach;
+    case ACT_NM_EMOJI:    return g_nm_emoji;
+    case ACT_NM_MENTION:  return g_nm_at;
+    case ACT_NM_SEND:     return g_nm_send;
+    case ACT_NM_SCHEDULE: return g_nm_sched;
+    default:              return rf(0, 0, 0, 0);
+    }
+}
+
+/* Where the icon goes inside a button: the glyph size, centred, shrinking with a
+ * button that had to shrink. */
+static rectf composer_glyph(rectf b) {
+    float w = b.right - b.left, g = COMPOSER_GLYPH < w * 0.6f ? COMPOSER_GLYPH : w * 0.6f;
+    float cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
+    return rf(cx - g / 2, cy - g / 2, cx + g / 2, cy + g / 2);
+}
+
+/* The first button's left edge: its icon starts where the text does. */
+static float composer_row_x(float bx0) {
+    return bx0 + COMPOSER_PAD - (COMPOSER_BTN - COMPOSER_GLYPH) / 2;
+}
+
+/* A tooltip above `b`: its name, and its key in a quieter colour. Drawn in the
+ * floating style the image hover-toolbar established — dark panel, light text,
+ * theme-agnostic — above the button so it never covers what it names, clamped
+ * inside [lim0, lim1] so a button flush to the window edge keeps its tip on
+ * screen. */
+static void draw_tip(gfx *rt, rectf b, const char *name, const char *chord, float lim0, float lim1) {
+    float nw = text_width(name, g_meta);
+    float cw = chord && chord[0] ? text_width(chord, g_meta) : 0;
+    float tw = nw + (cw > 0 ? 10 + cw : 0) + 24, th = 26.0f;
+    float tx = (b.left + b.right) / 2 - tw / 2;
+    if (tx + tw > lim1 + 4) tx = lim1 + 4 - tw;
+    if (tx < lim0 - 4) tx = lim0 - 4;
+    rectf tip = rf(tx, b.top - th - 6, tx + tw, b.top - 6);
+    fill_round(rt, rf(tip.left + 1, tip.top + 2, tip.right + 1, tip.bottom + 2), OC_R_CONTROL, OC_COL_RAIL);   /* shadow */
+    fill_round_a(rt, tip, OC_R_CONTROL, 0x000000, 0.82f);
+    draw_text(rt, name, g_meta, rf(tip.left + 12, tip.top, tip.right, tip.bottom), 0xFFFFFF);
+    if (cw > 0)
+        draw_text(rt, chord, g_meta, rf(tip.left + 12 + nw + 10, tip.top, tip.right, tip.bottom), 0xA8ADB4);
+}
+
+/* The action row's tooltip, if the pointer has rested on one of `first`..`last`. */
+static void draw_act_tip(gfx *rt, int first, int last, float lim0, float lim1) {
+    if (g_act_hover < first || g_act_hover > last) return;
+    rectf b = act_rect(g_act_hover);
+    if (b.right <= b.left || GetTickCount64() - g_act_hover_since < FMT_TIP_MS) return;
+    draw_tip(rt, b, ACT_NAME[g_act_hover], ACT_CHORD[g_act_hover], lim0, lim1);
+}
+
 static void draw_fmt_toolbar(gfx *rt, float bx0, float by0, float bx1) {
-    static const char *TIPS[FMT_COUNT] = {
-        "Bold", "Italic", "Strikethrough", "Code", "Blockquote",
-        "Bulleted list", "Numbered list"
-    };
-    /* The chord beside the name, exactly as ed_key binds it — a tooltip that
-     * teaches the shortcut retires itself. */
-    static const char *CHORDS[FMT_COUNT] = {
-        "Ctrl+B", "Ctrl+I", "Ctrl+Shift+X", "Ctrl+Shift+C",
-        "Ctrl+Shift+9", "Ctrl+Shift+8", "Ctrl+Shift+7"
-    };
-    float sq = COMPOSER_FMT;
+    float sq = COMPOSER_BTN;
     float y = by0 + (COMPOSER_TB - sq) / 2;
-    float x = bx0 + 8;
+    float x = composer_row_x(bx0);
     for (int i = 0; i < FMT_COUNT; i++) {
         /* A gap before the block forms: emphasis wraps a selection, a block
          * marker changes whole lines, and the two are not the same gesture. */
@@ -10191,39 +10278,20 @@ static void draw_fmt_toolbar(gfx *rt, float bx0, float by0, float bx1) {
          * WINDOW — found as composer.format.numbers escaping. Every one
          * of them has a keyboard chord and a palette entry, so a button that does
          * not fit is hidden rather than unreachable. */
-        if (x + sq > bx1 - 8) {
+        if (x + sq > bx1 - COMPOSER_PAD) {
             for (int j = i; j < FMT_COUNT; j++) g_fmt_btn[j] = rf(0, 0, 0, 0);
             break;
         }
         g_fmt_btn[i] = rf(x, y, x + sq, y + sq);
         if (g_fmt_hover == i) fill_round(rt, g_fmt_btn[i], OC_R_CONTROL, OC_COL_HOVER);
         draw_fmt_icon(rt, i, g_fmt_btn[i], g_fmt_hover == i ? OC_COL_TEXT : OC_COL_MUTED);
-        x += sq + 2;
+        x += COMPOSER_PITCH;
     }
-    /* The tooltip, once the pointer has RESTED on a button. Drawn in the
-     * floating style the image hover-toolbar established — dark panel, light
-     * text, theme-agnostic — above the button so it never covers the field,
-     * clamped so a bar flush to the window edge keeps its tip on screen. */
+    /* The tooltip, once the pointer has RESTED on a button (draw_tip). */
     if (g_fmt_hover >= 0 && g_fmt_hover < FMT_COUNT &&
         g_fmt_btn[g_fmt_hover].right > 0 &&
-        GetTickCount64() - g_fmt_hover_since >= FMT_TIP_MS) {
-        const rectf *b = &g_fmt_btn[g_fmt_hover];
-        float nw = text_width(TIPS[g_fmt_hover], g_meta);
-        float cw = text_width(CHORDS[g_fmt_hover], g_meta);
-        float tw = nw + 10 + cw + 24, th = 26.0f;
-        float cx = (b->left + b->right) / 2;
-        float tx = cx - tw / 2;
-        if (tx < bx0 - 4) tx = bx0 - 4;          /* keep the tip over the composer, */
-        if (tx + tw > bx1 + 4) tx = bx1 + 4 - tw; /* which is always on screen */
-        rectf tip = rf(tx, b->top - th - 6, tx + tw, b->top - 6);
-        fill_round(rt, rf(tip.left + 1, tip.top + 2, tip.right + 1, tip.bottom + 2), OC_R_CONTROL, OC_COL_RAIL);                        /* shadow */
-        fill_round_a(rt, tip, OC_R_CONTROL, 0x000000, 0.82f);
-        draw_text(rt, TIPS[g_fmt_hover], g_meta,
-                  rf(tip.left + 12, tip.top, tip.right, tip.bottom), 0xFFFFFF);
-        draw_text(rt, CHORDS[g_fmt_hover], g_meta,
-                  rf(tip.left + 12 + nw + 10, tip.top, tip.right, tip.bottom),
-                  0xA8ADB4);
-    }
+        GetTickCount64() - g_fmt_hover_since >= FMT_TIP_MS)
+        draw_tip(rt, g_fmt_btn[g_fmt_hover], FMT_NAME[g_fmt_hover], FMT_CHORD[g_fmt_hover], bx0, bx1);
 }
 
 /* THE ONE SOURCE for the composer's inner geometry.
@@ -10285,7 +10353,7 @@ static void dict_draw_btn(gfx *rt, rectf r, int icon, int live, uint32_t live_co
                          live_col, 2.0f);
         ink = 0xFFFFFF;
     }
-    draw_lucide(rt, icon, rf(r.left + 8, r.top + 8, r.right - 8, r.bottom - 8), ink);
+    draw_lucide(rt, icon, composer_glyph(r), ink);
 }
 
 static void draw_composer(gfx *rt, float x0, float w, float h) {
@@ -10309,7 +10377,10 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     float sq = COMPOSER_BTN;
     float cy = cy_act;
 
-    g_attach_btn = rf(bx0 + COMPOSER_GUTTER, cy, bx0 + COMPOSER_GUTTER + sq, cy + sq);
+    /* The same start and pitch as the formatting row above (composer_row_x). */
+    float rx = composer_row_x(bx0), pitch = COMPOSER_PITCH;
+#define ACT_AT(k) rf(rx + pitch * (float)(k), cy, rx + pitch * (float)(k) + sq, cy + sq)
+    g_attach_btn = ACT_AT(0);
 
     /* A monochrome line icon, not a colour glyph: this is chrome, and it sat
      * next to a grey "+" and a grey paper plane as the only coloured control in
@@ -10318,10 +10389,9 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     /* Record a video message (REQ-162), beside attach: shown only where there is
      * a camera, since a button that can only fail is worse than none. */
     int vcam = have_camera();
-    g_video_btn = vcam ? rf(bx0 + COMPOSER_GUTTER + sq, cy, bx0 + COMPOSER_GUTTER + sq * 2, cy + sq)
-                       : rf(0, 0, 0, 0);
-    float vsh = vcam ? sq : 0;
-    g_emoji_btn = rf(bx0 + COMPOSER_GUTTER + sq + vsh, cy, bx0 + COMPOSER_GUTTER + sq * 2 + vsh, cy + sq);
+    g_video_btn = vcam ? ACT_AT(1) : rf(0, 0, 0, 0);
+    int vk = vcam ? 1 : 0;
+    g_emoji_btn = ACT_AT(1 + vk);
 
     /* Mention. The '@' trigger already worked when typed; ARCH-82 says the GUI
      * is affordance-driven, so it needs to be visible too.
@@ -10332,17 +10402,17 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * composer.mention+composer.send. Send is the one that must always
      * be there, so the optional icons drop off from the right. */
     float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
-    g_at_btn = rf(bx0 + COMPOSER_GUTTER + sq * 2 + vsh, cy, bx0 + COMPOSER_GUTTER + sq * 3 + vsh, cy + sq);
+    g_at_btn = ACT_AT(2 + vk);
     if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
     /* Voice input after @, and only where the daemon offers it: a button that can
      * only be refused is worse than none. Free talk also needs somewhere it may
      * post. They drop off before @ does, being further right. */
     g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
     if (dict_offered()) {
-        float mx = bx0 + COMPOSER_GUTTER + sq * 3 + vsh;
-        g_mic_btn = rf(mx, cy, mx + sq, cy + sq);
-        if (dict_free_offered()) g_freetalk_btn = rf(mx + sq, cy, mx + sq * 2, cy + sq);
+        g_mic_btn = ACT_AT(3 + vk);
+        if (dict_free_offered()) g_freetalk_btn = ACT_AT(4 + vk);
     }
+#undef ACT_AT
     if (g_freetalk_btn.right > left_limit) g_freetalk_btn = rf(0, 0, 0, 0);
     if (g_mic_btn.right > left_limit) g_mic_btn = rf(0, 0, 0, 0);
     if (g_video_btn.right > left_limit) g_video_btn = rf(0, 0, 0, 0);
@@ -10358,22 +10428,16 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
                 fill_round(rt, *cb[i], OC_R_CONTROL, OC_COL_HOVER);
     }
     if (g_video_btn.right > g_video_btn.left)
-        draw_lucide(rt, OC_ICON_VIDEO, rf(g_video_btn.left + 8, g_video_btn.top + 8,
-                                          g_video_btn.right - 8, g_video_btn.bottom - 8), OC_COL_MUTED);
+        draw_lucide(rt, OC_ICON_VIDEO, composer_glyph(g_video_btn), OC_COL_MUTED);
     if (g_attach_btn.right > g_attach_btn.left)
-        draw_lucide(rt, OC_ICON_PLUS, rf(g_attach_btn.left + 8, g_attach_btn.top + 8,
-                                         g_attach_btn.right - 8, g_attach_btn.bottom - 8),
-                    OC_COL_MUTED);
+        draw_lucide(rt, OC_ICON_PLUS, composer_glyph(g_attach_btn), OC_COL_MUTED);
     /* A monochrome line icon, not a colour glyph: this is chrome, and it sat next
      * to a grey "+" and a grey paper plane as the only coloured control in the
      * whole shell. Colour is for content. */
     if (g_emoji_btn.right > g_emoji_btn.left)
-        draw_lucide(rt, OC_ICON_SMILE, rf(g_emoji_btn.left + 8, g_emoji_btn.top + 8,
-                                          g_emoji_btn.right - 8, g_emoji_btn.bottom - 8),
-                    OC_COL_MUTED);
+        draw_lucide(rt, OC_ICON_SMILE, composer_glyph(g_emoji_btn), OC_COL_MUTED);
     if (g_at_btn.right > g_at_btn.left)
-        draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
-                                       g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
+        draw_lucide(rt, OC_ICON_AT, composer_glyph(g_at_btn), OC_COL_MUTED);
     {
         uint8_t dm = g_dict ? oc_dictate_mode(g_dict) : 0xFF;
         dict_draw_btn(rt, g_mic_btn, OC_ICON_MIC, dm == OC_STT_MODE_PTT, OC_COL_DANGER);
@@ -10473,10 +10537,9 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     }
     /* Proportional, not a raw 8: against a shrunken square a fixed inset
      * eventually inverts the icon's own rect. */
-    float si = ssq * 0.235f;
-    draw_lucide(rt, OC_ICON_SEND, rf(g_send_btn.left + si, g_send_btn.top + si,
-                                     g_send_btn.right - si, g_send_btn.bottom - si),
-                has_text ? 0xFFFFFF : OC_COL_FAINT);
+    draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_send_btn), has_text ? 0xFFFFFF : OC_COL_FAINT);
+    /* LAST, over everything in the box: the action row's tooltip. */
+    draw_act_tip(rt, ACT_ATTACH, ACT_SCHEDULE, bx0, bx1);
 }
 
 /* Your-account surfaces are MODALS, not panes (the three-column rule): the left
@@ -13165,7 +13228,6 @@ static void tgt_list_draw(gfx *rt, const oc_model *m, float top, float bottom, i
  * The composer is THE composer: ed_draw() binds the field to whatever rect it
  * is drawn into, so this pane borrows the same editor, undo stack, IME handling
  * and formatting toolbar rather than growing a second one that would drift. */
-static rectf g_nm_send, g_nm_sched, g_nm_ed, g_nm_attach, g_nm_emoji, g_nm_at;
 static int         g_nm_to_focus = 1;      /* the To: field owns the keys first */
 static WCHAR       g_nm_saved[DRAFT_TEXT_MAX];  /* the text the draft holds */
 static uint64_t    g_nm_wait_uid;          /* a DM we asked for, to send into */
@@ -13239,13 +13301,12 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         static const int IC[3] = { OC_ICON_PLUS, OC_ICON_SMILE, OC_ICON_AT };
         rectf *HIT[3] = { &g_nm_attach, &g_nm_emoji, &g_nm_at };
         for (int i = 0; i < 3; i++) {
-            rectf b = rf(edbox.left + COMPOSER_GUTTER + sq * i, cy,
-                         edbox.left + COMPOSER_GUTTER + sq * (i + 1), cy + sq);
+            float rx = composer_row_x(edbox.left) + COMPOSER_PITCH * (float)i;
+            rectf b = rf(rx, cy, rx + sq, cy + sq);
             *HIT[i] = b;
             int hot = in_rect(b, g_mouse_x, g_mouse_y);
             if (hot) fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
-            draw_lucide(rt, IC[i], rf(b.left + sq * 0.235f, b.top + sq * 0.235f,
-                                      b.right - sq * 0.235f, b.bottom - sq * 0.235f),
+            draw_lucide(rt, IC[i], composer_glyph(b),
                         hot ? OC_INK_ON(TH_TEXT, TH_HOVER) : OC_INK_ON(TH_MUTED, TH_INPUT));
         }
         /* Send and Send later, the same split button the conversation has — drawn
@@ -13264,8 +13325,7 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         /* One hairline seam, so the two halves read as two buttons. */
         fill(rt, rf(g_nm_sched.left, cy + UIS(6), g_nm_sched.left + 1.0f, cy + sq - UIS(6)),
              ready ? 0xFFFFFF : OC_COL_BORDER);
-        draw_lucide(rt, OC_ICON_SEND, rf(g_nm_send.left + sq * 0.235f, g_nm_send.top + sq * 0.235f,
-                                         g_nm_send.right - sq * 0.235f, g_nm_send.bottom - sq * 0.235f),
+        draw_lucide(rt, OC_ICON_SEND, composer_glyph(g_nm_send),
                     ready ? 0xFFFFFF : OC_INK_ON(TH_FAINT, TH_INPUT));
         {   /* The same two strokes the conversation's chevron is drawn with, for
              * the reason given there: the glyph reads as a different family. */
@@ -13277,6 +13337,7 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
         }
     }
 
+    draw_act_tip(rt, ACT_NM_ATTACH, ACT_NM_SCHEDULE, edbox.left, edbox.right);
     /* LAST, so it floats over the composer instead of pushing it down the pane
      * on every keystroke. */
     tgt_list_draw(rt, m, tobox.top + toh, body.bottom - gap, g_nm_to_focus);
@@ -16616,7 +16677,7 @@ static void a11y_publish_scene(const oc_model *m) {
         for (int i = 0; i < FMT_COUNT && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "composer.format.%s", FMT_AID[i]);
-            acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_AID[i], g_fmt_btn[i],
+            acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_NAME[i], g_fmt_btn[i],
                      ATOK(AT_FMT, i));
         }
     }
@@ -24471,6 +24532,23 @@ static void test_dump(const char *path) {
         fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_fmt_btn[i].left, g_fmt_btn[i].top,
                 g_fmt_btn[i].right, g_fmt_btn[i].bottom);
     fprintf(f, "\n");
+    /* The action row, in ACT_* order, and the tooltip on screen now -- the name
+     * a tooltip is showing, or none: the two rows' buttons can be compared, and
+     * "does this button say what it is" asked, without a screenshot. */
+    {
+        ULONGLONG now = GetTickCount64();
+        const char *tip = "";
+        if (g_fmt_hover >= 0 && g_fmt_hover < FMT_COUNT && now - g_fmt_hover_since >= FMT_TIP_MS)
+            tip = FMT_NAME[g_fmt_hover];
+        else if (g_act_hover >= 0 && now - g_act_hover_since >= FMT_TIP_MS)
+            tip = ACT_NAME[g_act_hover];
+        fprintf(f, "actrow hover=%d tip=\"%s\"", g_act_hover, tip);
+        for (int i = 0; i < ACT_COUNT; i++) {
+            rectf r = act_rect(i);
+            fprintf(f, " %.0f,%.0f,%.0f,%.0f", r.left, r.top, r.right, r.bottom);
+        }
+        fprintf(f, "\n");
+    }
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -25572,6 +25650,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_fmt_tip_shown = 1;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            if (g_act_hover >= 0 && !g_act_tip_shown &&
+                GetTickCount64() - g_act_hover_since >= FMT_TIP_MS) {
+                g_act_tip_shown = 1;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             /* Poll the attempt's outcome HERE, not only in the g_client-gated
              * block below: signing in from the signed-out state has no g_client,
              * and gating the poll on one left that sign-in on "Signing in…"
@@ -26609,6 +26692,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_fmt_hover = fh;
                 g_fmt_hover_since = GetTickCount64();   /* tooltip dwell restarts */
                 g_fmt_tip_shown = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        {   /* The action rows' tooltips: which button the pointer rests on, on
+             * the toolbar's dwell. Every drawn one is asked, both panes', since
+             * an undrawn one has an empty rect. */
+            int ah = -1;
+            if (!pointer_blocked())
+                for (int i = 0; i < ACT_COUNT; i++) {
+                    rectf r = act_rect(i);
+                    if (r.right > r.left && in_rect(r, (float)mx, (float)my)) { ah = i; break; }
+                }
+            if (ah != g_act_hover) {
+                g_act_hover = ah;
+                g_act_hover_since = GetTickCount64();
+                g_act_tip_shown = 0;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
         }
