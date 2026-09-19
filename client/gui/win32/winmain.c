@@ -1803,6 +1803,12 @@ static int      g_sessions_open;   /* REQ-182 */
 static int      g_confirm_open;
 static int      g_confirm_act;
 static uint64_t g_confirm_id;
+static uint64_t g_confirm_root;     /* CONF_DRAFT_DELETE: the draft's thread root */
+/* What a themed confirmation (confirm_open) will do if confirmed. */
+enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
+       CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
+       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE };
+
 static char     g_confirm_title[80];
 static char     g_confirm_body[320];
 static char     g_confirm_ok[32];
@@ -2032,7 +2038,7 @@ static int g_n_moreflyrows;
  * 200+, 900+) and a message's "Edit = 21" would have collided with a notification
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
-       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD };
+       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD, MENU_DRAFT };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box (it predates the flyout below and stays a row — six separate rows
  * would bury the rest of the message actions).
@@ -2053,6 +2059,14 @@ static int   g_menu_hover = -1;              /* hovered item index */
 static int   g_menu_headerblock;             /* draw the workspace header on top */
 static uint64_t g_menu_target;               /* what a context menu is about */
 static uint64_t g_menu_target2;             /* its channel, for a message */
+
+/* Is a context menu open about this? The row it was opened on stays lit while it
+ * is: the pointer leaves the row for the menu, which clears the row's hover, and
+ * a menu with nothing marked beside it does not say what it will act on. Asked
+ * from the menu's own kind and target, so there is no second record to clear. */
+static int menu_about(int kind, uint64_t target) {
+    return g_menu == kind && g_menu_target == target;
+}
 static rectf g_menu_emoji[8];         /* per-glyph hit-boxes in MK_EMOJIROW */
 static int   g_n_menu_emoji;
 static struct { float top, bot; int cmd, kind; const char *label; } g_mirows[28];
@@ -3220,6 +3234,52 @@ static void draft_restore(uint64_t cid) {
     }
     g_draft_dirty = 0;
     if (g_main_hwnd && composer_refit(g_main_hwnd)) InvalidateRect(g_main_hwnd, NULL, FALSE);
+}
+
+/* Throw a draft away (REQ-223, REQ-228): the stored copy, everywhere it is synced
+ * -- an empty body deletes -- and this client's copy of it too. The composer keeps
+ * the last conversation's text while another view is up, and leaving that
+ * conversation writes what the composer holds, so without clearing it here the
+ * draft would come straight back. `cid` 0 is the unaddressed draft (REQ-229). */
+static void draft_delete(uint64_t cid, uint64_t root) {
+    if (!g_client) return;
+    /* The daemon does not echo a draft to the connection that wrote it, so this
+     * client's copy is updated here, as draft_flush does for a save. */
+    oc_model *dm = (oc_model *)model();
+    if (!cid) {
+        oc_client_set_draft_to(g_client, "", "");
+        if (dm) oc_model_draft_local_to(dm, "", "");
+        if (g_ed_is_newmsg) ed_clear();
+        toast_push("Draft deleted", 0);
+        return;
+    }
+    oc_client_set_draft(g_client, cid, root, "");
+    if (dm) oc_model_draft_local(dm, cid, root, "");
+    if (root == 0 && cid == g_sel && !g_ed_is_newmsg && !g_edit_msg) {
+        ed_clear();
+        g_draft_sent_cid = cid;
+        g_draft_sent[0] = 0;
+        g_draft_dirty = 0;
+    }
+    toast_push("Draft deleted", 0);
+}
+
+/* Ask first: a draft is writing, and deleting it cannot be undone. Slack asks too. */
+static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
+                         const char *body, const char *ok_label);   /* fwd */
+static void channel_label(const oc_model *m, const oc_channel *c, char *out, size_t cap);   /* fwd */
+static void draft_delete_ask(HWND hwnd, uint64_t cid, uint64_t root) {
+    const oc_model *m = model();
+    char where[96] = "", body[200];
+    const oc_channel *c = m && cid ? oc_model_channel((oc_model *)m, cid) : NULL;
+    if (c) channel_label(m, c, where, sizeof where);
+    if (!cid)       snprintf(body, sizeof body, "Your unaddressed message will be deleted. This can\u2019t be undone.");
+    else if (root)  snprintf(body, sizeof body, "Your draft reply in %s will be deleted. This can\u2019t be undone.",
+                             where[0] ? where : "this conversation");
+    else            snprintf(body, sizeof body, "Your draft in %s will be deleted. This can\u2019t be undone.",
+                             where[0] ? where : "this conversation");
+    g_confirm_root = root;
+    confirm_open(hwnd, CONF_DRAFT_DELETE, cid, "Delete draft?", body, "Delete");
 }
 
 static void nm_editor_release(void);             /* fwd: one owner for the editor */
@@ -4443,7 +4503,8 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
              * Hover is the cue the shelf rows two inches up already give; never
              * on the selected row, because SELECT already owns it. */
             int row_surface = selected ? TH_SELECT
-                            : (g_sb_hover_cid && r->channel_id == g_sb_hover_cid) ? TH_HOVER
+                            : ((g_sb_hover_cid && r->channel_id == g_sb_hover_cid) ||
+                               menu_about(MENU_CHANNEL, r->channel_id)) ? TH_HOVER
                             : TH_SIDEBAR;
             if (row_surface != TH_SIDEBAR)
                 fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), OC_R_CONTROL,
@@ -5473,7 +5534,8 @@ static void draw_msglist(gfx *rt, const oc_model *m,
             float bx = x0 + AVA + 12;
             float by = y + MSG_PIN(&msgs[first + i]) + MSG_BODY_DY(grouped[i]);
             /* Hover highlight behind the whole row (main transcript only). */
-            if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
+            if ((capture && !g_selecting && g_hover_mid == msgs[first + i].message_id) ||
+                menu_about(MENU_MSG, msgs[first + i].message_id))
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
             /* A message that names YOU gets the row tinted, which is the
              * "highlighted for the mentioned party" half of REQ-221 — a
@@ -9238,14 +9300,14 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
         /* A member row opens the profile — say so on the way in, as every other
          * clickable row in the app does. */
-        if (g_mem_hover && cm->user_id == g_mem_hover)
+        int lit = (g_mem_hover && cm->user_id == g_mem_hover) || menu_about(MENU_MEMBER, cm->user_id);
+        if (lit)
             fill_round(rt, rf(x0 + 4, y + 1, W - 4, y + ROW_H - 1), OC_R_CONTROL, OC_COL_HOVER);
         /* The primitive rather than the composite: this row has no avatar, so
          * the dot is chrome in its own right and has no tile to be sized by. */
         draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
                               oc_model_presence_of(m, cm->user_id),
-                              (g_mem_hover && cm->user_id == g_mem_hover)
-                                  ? OC_COL_HOVER : OC_COL_SIDEBAR,
+                              lit ? OC_COL_HOVER : OC_COL_SIDEBAR,
                               oc_model_dnd_of(m, cm->user_id), 2.0f);
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
@@ -10568,9 +10630,8 @@ static rectf g_modal_card;
  * The pending action is an id plus a target rather than a function pointer, so the
  * modal frame's generic dispatch can run it without a per-confirmation callback.
  */
-enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
-       CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
-       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD };
+/* The confirmations' actions (CONF_*) are declared with the rest of its state,
+ * above, since actions far above this section open them. */
 
 /* REQ-287: who the "add them" confirmation would add, and where. Kept beside the
  * confirmation rather than read from the model when it runs, because the model
@@ -10626,6 +10687,7 @@ static void confirm_run(HWND hwnd) {
             sw_book_load();
         }
         break; }
+    case CONF_DRAFT_DELETE: draft_delete(g_confirm_id, g_confirm_root); break;
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
     case CONF_CHANNEL_PRIVATE: oc_client_update_channel(g_client, g_confirm_id,
@@ -12493,7 +12555,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
 }
 
 /* Rows of the two per-user views, so a click can jump to the message. */
-static struct { rectf row, act; uint64_t mid, cid; } g_listrows[128];
+static struct { rectf row, act; uint64_t mid, cid, root; } g_listrows[128];
 static int g_n_listrows;
 static uint64_t g_listrow_hover;
 
@@ -14288,17 +14350,34 @@ static void draw_drafts(gfx *rt, const oc_model *m, rectf reg) {
             if (y + rowh < body.top) { y += rowh; continue; }
             if (y > body.bottom) break;
             rectf row = rf(body.left + 12, y, body.right - 12, y + rowh - 6);
-            if (g_listrow_hover == dv->channel_id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+            if (g_listrow_hover == dv->channel_id ||
+                (menu_about(MENU_DRAFT, dv->channel_id) && g_menu_target2 == dv->thread_root))
+                fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
             /* When it was last touched, right-aligned as Slack's drafts list has
              * it: a list of drafts with no times cannot be triaged, and the row
              * already had the field. */
             char dwhen[24] = "";
             if (dv->updated_ms) rel_time(dv->updated_ms, dwhen, sizeof dwhen);
-            draw_msgish_row(rt, m, row, dv->channel_id, dv->body, dwhen[0] ? dwhen : NULL,
+            /* Delete on the row, as Cancel is on a scheduled one: a list you can
+             * only add to is one that only grows. The time moves left of it. */
+            float dw = text_width("Delete", g_meta) + UIS(24);
+            rectf del = rf(row.right - dw - UIS(12), row.top + UIS(8), row.right - UIS(12), row.top + UIS(32));
+            rectf trow = rf(row.left, row.top, del.left - UIS(6), row.bottom);
+            draw_msgish_row(rt, m, trow, dv->channel_id, dv->body, dwhen[0] ? dwhen : NULL,
                             OC_ICON_SQUARE_PEN, OC_COL_MUTED, NULL);
+            {
+                int hot = in_rect(del, (float)g_mouse_x, (float)g_mouse_y) && !pointer_blocked();
+                if (hot) fill_round(rt, del, OC_R_CONTROL, OC_COL_HOVER);
+                stroke_round(rt, del, OC_R_CONTROL, hot ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+                g_meta->align = ST_ALIGN_CENTER;
+                draw_text(rt, "Delete", g_meta, rf(del.left, del.top + 4, del.right, del.bottom),
+                          hot ? OC_COL_DANGER : OC_COL_MUTED);
+                g_meta->align = ST_ALIGN_LEFT;
+            }
             if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
                 g_listrows[g_n_listrows].row = row;
-                g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+                g_listrows[g_n_listrows].act = del;
+                g_listrows[g_n_listrows].root = dv->thread_root;
                 /* The hover machine keys on .mid, and the painter above compares
                  * g_listrow_hover to the channel id — a draft has no message id,
                  * and storing 0 here meant a draft row could never read as
@@ -16384,6 +16463,8 @@ enum {
     AT_NMCHIP,        /* New message: remove one recipient */
     AT_NMPICK,        /* New message: accept one match */
     AT_DTAB,          /* payload: drafts tab index */
+    AT_DRAFTROW,      /* payload: Drafts row index — open it */
+    AT_DRAFTDEL,      /* payload: Drafts row index — delete it, after asking */
     AT_ACTFILTER,     /* payload: activity filter index */
     AT_THREAD,        /* payload: thread root id — open it */
     AT_PEOPLE,        /* payload: user id — open the profile */
@@ -16750,6 +16831,23 @@ static void a11y_publish_scene(const oc_model *m) {
             snprintf(aid, sizeof aid, "drafts.tab.%s", DT_AID[i]);
             acc_push(items, &n, OC_ACC_TAB, aid, DT_AID[i], g_dtab_hit[i], ATOK(AT_DTAB, i));
         }
+        /* Each draft, and its Delete: the list and its one destructive action were
+         * drawn and clickable and absent from this tree. Delete is invoked through
+         * the same menu command the context menu runs, so it asks first too. */
+        if (g_dtab == DTAB_DRAFTS && m)
+            for (int i = 0; i < g_n_listrows && n + 2 <= OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX], where[96] = "";
+                const oc_channel *c = g_listrows[i].cid ? oc_model_channel((oc_model *)m, g_listrows[i].cid) : NULL;
+                if (c) channel_label(m, c, where, sizeof where);
+                snprintf(aid, sizeof aid, "drafts.row.%d", i);
+                snprintf(nm, sizeof nm, "Draft %s %s", g_listrows[i].root ? "reply in" : "in",
+                         where[0] ? where : "a new message");
+                acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_listrows[i].row, ATOK(AT_DRAFTROW, (uint64_t)i));
+                snprintf(aid, sizeof aid, "drafts.delete.%d", i);
+                snprintf(nm, sizeof nm, "Delete draft %s %s", g_listrows[i].root ? "reply in" : "in",
+                         where[0] ? where : "a new message");
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_listrows[i].act, ATOK(AT_DRAFTDEL, (uint64_t)i));
+            }
     }
     if (g_view == VIEW_THREADS && m) {
         acc_push(items, &n, OC_ACC_BUTTON, "threads.unreadonly",
@@ -19767,6 +19865,10 @@ static int on_click(HWND hwnd, int x, int y) {
                 oc_client_cancel_scheduled(g_client, g_listrows[i].mid);
                 return 1;
             }
+            if (g_dtab == DTAB_DRAFTS && in_rect(g_listrows[i].act, x, y)) {
+                draft_delete_ask(hwnd, g_listrows[i].cid, g_listrows[i].root);
+                return 1;
+            }
             if (in_rect(g_listrows[i].row, x, y)) {
                 /* An unaddressed draft has no conversation to open: it opens the
                  * pane it was written in, which is where it can be finished. The
@@ -21146,6 +21248,10 @@ static void copy_selection(HWND hwnd) {
     CloseClipboard();
 }
 
+/* The Drafts row's context menu (on_rclick) and what it acts on. */
+enum { DRAFT_CMD_OPEN = 2600, DRAFT_CMD_DELETE = 2601 };
+static uint64_t g_dmenu_cid, g_dmenu_root;
+
 static void on_rclick(HWND hwnd, int x, int y) {
     const oc_model *m = model();
     if (!m) return;
@@ -21158,6 +21264,32 @@ static void on_rclick(HWND hwnd, int x, int y) {
                 /* Right-clicking a header opens the same menu as its kebab. */
                 if (g_rows[i].header) open_section_menu(hwnd, g_rows[i].sec);
                 else show_channel_menu(hwnd, m, g_rows[i].cid, (float)x, (float)y);
+                return;
+            }
+        return;
+    }
+    /* A draft's row: open it, or delete it. */
+    if (g_view == VIEW_DRAFTS && g_dtab == DTAB_DRAFTS) {
+        for (int i = 0; i < g_n_listrows; i++)
+            if (in_rect(g_listrows[i].row, (float)x, (float)y)) {
+                g_dmenu_cid = g_listrows[i].cid;
+                g_dmenu_root = g_listrows[i].root;
+                g_n_mi = 0;
+                mi_section("DRAFT");
+                mi_item(DRAFT_CMD_OPEN, "Open");
+                mi_item(DRAFT_CMD_DELETE, "Delete draft\u2026");
+                g_menu = MENU_DRAFT; g_menu_headerblock = 0; g_menu_hover = -1;
+                g_menu_target = g_dmenu_cid; g_menu_target2 = g_dmenu_root;
+                g_menu_w = UIS(220);
+                g_menu_x = (float)x; g_menu_y = (float)y;
+                {   /* On screen, as the message menu keeps itself. */
+                    float mh = 12; for (int k = 0; k < g_n_mi; k++) mh += menu_item_h(g_mi[k].kind);
+                    RECT rc; GetClientRect(hwnd, &rc);
+                    float H = DIPF(rc.bottom), W = DIPF(rc.right);
+                    if (g_menu_y + mh > H - 8) g_menu_y = H - 8 - mh;
+                    if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
                 return;
             }
         return;
@@ -23063,6 +23195,13 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (form_dialog(hwnd, "Create a channel", f, 2) && f[0].value[0])
             oc_client_create_channel_ex(g_client, f[0].value, atoi(f[1].value) == 0);
         break; }
+    case 2600:                                         /* DRAFT_CMD_OPEN */
+        if (!g_dmenu_cid) open_new_message(hwnd);
+        else { select_channel(g_dmenu_cid); g_view = VIEW_HOME; }
+        break;
+    case 2601:                                         /* DRAFT_CMD_DELETE */
+        draft_delete_ask(hwnd, g_dmenu_cid, g_dmenu_root);
+        break;
     case 900: case 901: case 902: case 903: case 904: g_file_filter = cmd - 900; break;
     case 950: case 951: case 952: case 953: case 954: case 955: case 956: case 957:
     case 970: case 971: case 972: case 973: case 974: case 975: case 976: case 977:
@@ -23970,6 +24109,10 @@ static void test_dump(const char *path) {
                 g_selfcard_btn[i].cmd,
                 g_selfcard_btn[i].r.left, g_selfcard_btn[i].r.top,
                 g_selfcard_btn[i].r.right, g_selfcard_btn[i].r.bottom);
+    /* The members pane's rows, so a row can be pointed at by who it is. */
+    for (int i = 0; i < g_n_memrows; i++)
+        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f\n", (unsigned long long)g_memrows[i].uid,
+                g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom);
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
@@ -24251,6 +24394,16 @@ static void test_dump(const char *path) {
         fprintf(f, "draftn=%zu draftrail=%d drafthere=%d\n",
                 m ? m->n_drafts : (size_t)0, rail,
                 (m && g_sel) ? oc_model_has_draft(m, g_sel) : 0);
+        /* The Drafts tab's rows as drawn: each one's conversation, thread root and
+         * Delete button, and what the row menu last opened on. */
+        if (g_view == VIEW_DRAFTS && g_dtab == DTAB_DRAFTS) {
+            fprintf(f, "draftrows n=%d menu_cid=%llu", g_n_listrows, (unsigned long long)g_dmenu_cid);
+            for (int i = 0; i < g_n_listrows; i++)
+                fprintf(f, " %llu:%llu@%.0f,%.0f,%.0f,%.0f", (unsigned long long)g_listrows[i].cid,
+                        (unsigned long long)g_listrows[i].root, g_listrows[i].act.left, g_listrows[i].act.top,
+                        g_listrows[i].act.right, g_listrows[i].act.bottom);
+            fprintf(f, "\n");
+        }
     }
     /* The Drafts pane's tabs and its shelf row, so a test can click them
      * without measuring a screenshot — pixels in a shot are DEVICE pixels and
@@ -27060,6 +27213,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else dict_ptt_down(hwnd, DH_INVOKE);
             break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
+        case AT_DRAFTROW:
+        case AT_DRAFTDEL:
+            if ((int)arg < g_n_listrows && g_view == VIEW_DRAFTS && g_dtab == DTAB_DRAFTS) {
+                g_dmenu_cid = g_listrows[arg].cid;
+                g_dmenu_root = g_listrows[arg].root;
+                menu_dispatch(hwnd, kind == AT_DRAFTDEL ? DRAFT_CMD_DELETE : DRAFT_CMD_OPEN);
+            }
+            break;
         case AT_ACTFILTER: {
             uint8_t was = act_wire_filter();
             g_act_filter = (int)arg;

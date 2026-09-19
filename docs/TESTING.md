@@ -847,6 +847,21 @@ and `actrow` lines — and that resting the pointer on each action button shows 
 tooltip naming it, as the formatting buttons do (`actrow tip=`). Not in CI, for
 the smoke's reason.
 
+## Reading the drafts harness
+
+`scripts/gui_drafts.sh` deletes drafts in the Win32 client against its own fixture
+daemon (port 9560): each Drafts row's Delete, published to assistive technology;
+the confirmation, where Cancel keeps the draft; a confirmed delete gone from the
+list, the count and the sidebar, and not written back by the composer, which still
+holds that conversation's text; the row's context menu doing the same. It then
+checks that every context menu — a message's, a sidebar conversation's, a
+member's, a draft's — keeps its row lit while it is open and only while, by
+reading the row's pixels from a screenshot with the pointer moved off both the
+menu and the row: hover alone could not, since a menu being open is what clears
+or freezes it. It reads the dump's `draftn=`, `draftrows` (each row's
+conversation, thread and Delete rect), `modal=`, `memrow` and `a11yitem` lines.
+Not in CI, for the smoke's reason.
+
 ## Reading the calls harness
 
 `scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`
