@@ -11,7 +11,10 @@
 #     client starts again -- not laid out for one line and clipped;
 #   - leaving for a conversation with no draft shrinks the box to one line, and
 #     coming back grows it again;
-#   - a narrower or wider window re-wraps it, and the box follows.
+#   - a narrower or wider window re-wraps it, and the box follows;
+#   - the formatting row and the action row are built to one measure -- the same
+#     button size, the same left edge, the same pitch -- and every action button,
+#     rested on, shows a tooltip saying what it is, as the formatting buttons do.
 #
 # "Tall enough" is read from the dump's `ed` line: `lines=` is how many lines the
 # text wraps to at the width it is drawn at, `fit_lines=` how many the box holds.
@@ -104,6 +107,51 @@ check "narrower, the box follows the re-wrap" fits 3
 wider() { fits 2 && [ "$(ed_key lines)" -lt "${n1:-99}" ]; }
 check "wider, fewer lines, and the box follows" wider
 "$DRIVE" size 1100 800 >/dev/null
+
+say "== the two rows of buttons"
+"$DRIVE" channel 2 >/dev/null
+snap > /tmp/oc-composer-rows.txt
+# fmtbar: seven l,t,r,b after hover=; actrow: thirteen after tip="..." (ACT_* order).
+fmt=( $(grep -m1 '^fmtbar ' /tmp/oc-composer-rows.txt | cut -d' ' -f3-) )
+act=( $(grep -m1 '^actrow ' /tmp/oc-composer-rows.txt | sed 's/.*tip="[^"]*" //') )
+w_of() { local l t r b; IFS=, read -r l t r b <<< "$1"; echo $((r - l)); }
+l_of() { echo "${1%%,*}"; }
+same_size() { [ "$(w_of "${fmt[0]}")" = "$(w_of "${act[0]}")" ] && [ "$(w_of "${fmt[0]}")" -gt 0 ]; }
+same_left() { [ "$(l_of "${fmt[0]}")" = "$(l_of "${act[0]}")" ]; }
+# The action row's pitch between drawn buttons (the first four ACT_* that exist)
+# against the formatting row's first four.
+same_pitch() {
+  local fp=$(( $(l_of "${fmt[1]}") - $(l_of "${fmt[0]}") )) prev="" i ok=1 n=0
+  for i in 0 1 2 3 4 5; do
+    [ "$(w_of "${act[$i]}")" -gt 0 ] || continue
+    local x; x="$(l_of "${act[$i]}")"
+    [ -n "$prev" ] && { [ $((x - prev)) = "$fp" ] || ok=0; n=$((n + 1)); }
+    prev="$x"
+  done
+  [ "$ok" = 1 ] && [ "$n" -ge 2 ]
+}
+check "the two rows' buttons are one size (${fmt[0]} vs ${act[0]})" same_size
+check "...start at one left edge" same_left
+check "...and step at one pitch" same_pitch
+# Rest on each drawn action button in turn: its tooltip must name it.
+NAMES=("Attach a file" "Record a video message" "Emoji" "Mention someone" "Hold to talk" "Free talk" "Send" "Send later")
+tip_is() { snap | grep -m1 '^actrow ' | grep -q "tip=\"$1\""; }
+for i in 0 1 2 3 4 5 6 7; do
+  wd="$(w_of "${act[$i]}")"; [ "$wd" -gt 0 ] || continue
+  IFS=, read -r l t r b <<< "${act[$i]}"
+  "$DRIVE" move $(( (l + r) / 2 )) $(( (t + b) / 2 )) >/dev/null
+  sleep 0.8
+  check "resting on it, the ${NAMES[$i]} button says so" tip_is "${NAMES[$i]}"
+done
+IFS=, read -r l t r b <<< "${fmt[0]}"
+"$DRIVE" move $(( (l + r) / 2 )) $(( (t + b) / 2 )) >/dev/null
+sleep 0.8
+check "and the formatting row still does (Bold)" tip_is "Bold"
+"$DRIVE" move 10 10 >/dev/null
+none() { tip_is ""; }
+check "away from them, no tooltip" none
+"$DRIVE" shot composer_rows >/dev/null
+rm -f /tmp/oc-composer-rows.txt
 
 say ""
 say "gui_composer: $((checks - fails))/$checks passed in $((SECONDS - START))s"
