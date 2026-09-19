@@ -831,6 +831,17 @@ captures its screens as black; a window is captured either way. `gui_drive.sh
 launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
 
+## Reading the composer harness
+
+`scripts/gui_composer.sh` drives the Win32 message box against its own fixture
+daemon (port 9540) and asserts that the box is always tall enough for its text,
+however the text got there: a draft long enough to wrap, restored when the client
+starts again; leaving for a conversation with no draft and coming back; a
+narrower and a wider window. It reads the dump's `ed` line — `lines=` (what the
+text wraps to at the width it is drawn at) against `fit_lines=` (what the box
+holds), which must agree up to the box's four-line maximum, past which the text
+scrolls. Not in CI, for the smoke's reason.
+
 ## Reading the calls harness
 
 `scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`

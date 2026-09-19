@@ -3185,6 +3185,8 @@ static void draft_flush(uint64_t cid) {
     { HWND hw = GetActiveWindow(); if (hw) InvalidateRect(hw, NULL, FALSE); }
 }
 
+static int composer_refit(HWND hwnd);   /* fwd */
+
 /* Put `cid`'s stored draft in the composer, or clear it. */
 static void draft_restore(uint64_t cid) {
     const oc_model *m = model();
@@ -3201,6 +3203,7 @@ static void draft_restore(uint64_t cid) {
         g_draft_sent[0] = 0;
     }
     g_draft_dirty = 0;
+    if (g_main_hwnd && composer_refit(g_main_hwnd)) InvalidateRect(g_main_hwnd, NULL, FALSE);
 }
 
 static void nm_editor_release(void);             /* fwd: one owner for the editor */
@@ -14617,6 +14620,9 @@ static void paint(HWND hwnd) {
     float W = DIPF(rc.right - rc.left), H = DIPF(rc.bottom - rc.top);
     const oc_model *m = model();
 
+    /* The box fits its text before anything is drawn against its height -- the
+     * transcript above it, the popovers anchored to it. */
+    if (main_is_conversation()) composer_refit(hwnd);
     gfx_begin(rt, OC_COL_BASE);
     g_caret_placed = 0;
     render_scene(rt, m, W, H);
@@ -17104,6 +17110,18 @@ static int composer_remeasure(void) {
     if (want == g_composer_h) return 0;
     g_composer_h = want;
     return 1;
+}
+
+/* Size the box to its text, however the text got there. Typing re-measures
+ * through ed_changed, but text can also arrive by being SET -- a draft restored
+ * when the client starts or a conversation opens -- and before the first layout
+ * the width is a guess, so a measure can be right for the guess and wrong for the
+ * field. Twice at most: measuring can move the field, and the second measure is at
+ * the width the first laid out. Returns 1 if anything moved. */
+static int composer_refit(HWND hwnd) {
+    int moved = 0;
+    for (int i = 0; i < 2 && composer_remeasure(); i++) { layout_composer(hwnd); moved = 1; }
+    return moved;
 }
 
 /* Position the RichEdit over the composer region for the current window size. */
@@ -23966,10 +23984,15 @@ static void test_dump(const char *path) {
                         cr.left, cr.top, cr.right, cr.bottom, cr.bottom - cr.top);
             else fprintf(f, "edcaret none\n");
         }
-        fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d text=\"%s\"\n",
+        /* The box's height and the lines it holds at the width it is drawn at:
+         * a box sized for fewer lines than its text has clips the text. */
+        float box_w = g_ed_box.right - g_ed_box.left;
+        fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d composer_h=%.0f"
+                   " lines=%d fit_lines=%d text=\"%s\"\n",
                 ed_len(), ed_caret_pos(), ed_has_sel(), ed_focused(),
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
-                g_ed_comp_len, ed8);
+                g_ed_comp_len, g_composer_h, box_w > 0 ? ed_lines(box_w) : 0,
+                ed_line_h() > 0 ? (int)((box_w > 0 ? g_ed_box.bottom - g_ed_box.top : 0) / ed_line_h() + 0.5f) : 0, ed8);
     }
     /* The About tab's admin buttons, so a test can click the one it means rather
      * than arithmetic that breaks the next time a button is added between them —
