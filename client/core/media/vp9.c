@@ -20,9 +20,11 @@ static int cores(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? 
 struct oc_vp9enc {
     vpx_codec_ctx_t ctx;
     vpx_image_t     img;
+    vpx_codec_enc_cfg_t cfg;
     int             width, height, fps;
-    int64_t         first_pts_us;
+    int64_t         first_pts_us, last_pts_us;
     int             started;
+    int             share;          /* durations from the timestamps; keyframes on request */
 };
 
 unsigned oc_vp9enc_bitrate_kbps(int width, int height) {
@@ -36,12 +38,22 @@ unsigned oc_vp9enc_bitrate_kbps(int width, int height) {
     return 800;
 }
 
-static oc_vp9enc *open_enc(int width, int height, int fps, int screen);
+static oc_vp9enc *open_enc(int width, int height, int fps, int screen, unsigned share_kbps);
 
-oc_vp9enc *oc_vp9enc_open(int width, int height, int fps) { return open_enc(width, height, fps, 0); }
-oc_vp9enc *oc_vp9enc_open_screen(int width, int height, int fps) { return open_enc(width, height, fps, 1); }
+oc_vp9enc *oc_vp9enc_open(int width, int height, int fps) { return open_enc(width, height, fps, 0, 0); }
+oc_vp9enc *oc_vp9enc_open_screen(int width, int height, int fps) { return open_enc(width, height, fps, 1, 0); }
+oc_vp9enc *oc_vp9enc_open_share(int width, int height, unsigned kbps) {
+    return open_enc(width, height, 15, 1, kbps ? kbps : 1);
+}
 
-static oc_vp9enc *open_enc(int width, int height, int fps, int screen) {
+int oc_vp9enc_set_bitrate(oc_vp9enc *e, unsigned kbps) {
+    if (!e || !kbps) return -1;
+    if (e->cfg.rc_target_bitrate == kbps) return 0;
+    e->cfg.rc_target_bitrate = kbps;
+    return vpx_codec_enc_config_set(&e->ctx, &e->cfg) == VPX_CODEC_OK ? 0 : -1;
+}
+
+static oc_vp9enc *open_enc(int width, int height, int fps, int screen, unsigned share_kbps) {
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) || fps <= 0) return NULL;
     oc_vp9enc *e = calloc(1, sizeof *e);
     if (!e) return NULL;
@@ -68,6 +80,10 @@ static oc_vp9enc *open_enc(int width, int height, int fps, int screen) {
     cfg.kf_mode = VPX_KF_AUTO;
     cfg.kf_min_dist = 0;
     cfg.kf_max_dist = (unsigned)(2 * fps);
+    if (share_kbps) {
+        cfg.rc_target_bitrate = share_kbps;
+        cfg.kf_mode = VPX_KF_DISABLED;
+    }
     if (vpx_codec_enc_init(&e->ctx, vpx_codec_vp9_cx(), &cfg, 0) != VPX_CODEC_OK) { free(e); return NULL; }
     vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 8);
     vpx_codec_control(&e->ctx, VP9E_SET_ROW_MT, 1);
@@ -77,6 +93,8 @@ static oc_vp9enc *open_enc(int width, int height, int fps, int screen) {
     vpx_codec_control(&e->ctx, VP9E_SET_COLOR_RANGE, VPX_CR_STUDIO_RANGE);
     if (screen) vpx_codec_control(&e->ctx, VP9E_SET_TUNE_CONTENT, VP9E_CONTENT_SCREEN);
     e->width = width; e->height = height; e->fps = fps;
+    e->cfg = cfg;
+    e->share = share_kbps != 0;
     return e;
 }
 
@@ -92,6 +110,14 @@ int oc_vp9enc_encode(oc_vp9enc *e, const oc_frame *f, int force_keyframe,
         for (int p = 0; p < 3; p++) { e->img.planes[p] = f->plane[p]; e->img.stride[p] = f->stride[p]; }
         img = &e->img;
         pts = f->pts_us - e->first_pts_us;
+        if (e->share && e->last_pts_us) {
+            int64_t d = f->pts_us - e->last_pts_us;
+            dur = (unsigned long)(d < 33333 ? 33333 : d > 1000000 ? 1000000 : d);
+        }
+        if (e->share && e->last_pts_us && f->pts_us <= e->last_pts_us) {
+            pts = e->last_pts_us + 1 - e->first_pts_us;      /* libvpx wants them rising */
+        }
+        e->last_pts_us = e->first_pts_us + pts;
     }
     if (vpx_codec_encode(&e->ctx, img, pts, dur, force_keyframe ? VPX_EFLAG_FORCE_KF : 0,
                          VPX_DL_REALTIME) != VPX_CODEC_OK)

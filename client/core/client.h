@@ -336,6 +336,10 @@ void oc_client_call_leave(oc_client *c, uint64_t channel_id);
 void oc_client_call_decline(oc_client *c, uint64_t channel_id);
 void oc_client_call_end(oc_client *c, uint64_t channel_id);
 void oc_client_call_invite(oc_client *c, uint64_t channel_id, const uint64_t *uids, int n);
+/* Start (on) or stop sharing a screen in the call this client is in (REQ-161).
+ * The daemon's CALL_STATE names the sharer; the media engine sends once it is
+ * this device. */
+void oc_client_call_share(oc_client *c, uint64_t channel_id, int on);
 /* Where the audio goes (callsig.h): a frontend that does calls plugs in its
  * media engine before offering them. NULL removes it; on return nothing is
  * calling into the old one. */

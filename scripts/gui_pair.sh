@@ -108,15 +108,17 @@ up)
       >/dev/null 2>&1 || true
 
     # The test audio switches go through to the client as they do in
-    # gui_drive.sh -- synthetic devices, a spoken file, and each client's own
+    # gui_drive.sh -- synthetic devices (and screens, OPENCHIME_TEST_CAPTURE), a
+    # spoken file, and each client's own
     # microphone tone (OC_PAIR_TONE_A / _B), so a pair in a call can tell whom
     # it is hearing. Unset, they are forwarded as nothing and change nothing.
     tone=""
     [ "$who" = a ] && tone="${OC_PAIR_TONE_A:-}"
     [ "$who" = b ] && tone="${OC_PAIR_TONE_B:-}"
-    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_TONE" \
+    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_TONE:OPENCHIME_TEST_CAPTURE" \
       OPENCHIME_TEST_DIR="$wdir" OPENCHIME_TEST_TONE="$tone" \
       OPENCHIME_TEST_AUDIO="${OPENCHIME_TEST_AUDIO:-}" OPENCHIME_TEST_MIC="${OPENCHIME_TEST_MIC:-}" \
+      OPENCHIME_TEST_CAPTURE="${OPENCHIME_TEST_CAPTURE:-}" \
       setsid "$EXE" "$host:$PORT" "$user:pw" >/dev/null 2>&1 &
     disown
 

@@ -3896,7 +3896,9 @@ static void sidebar_surface(gfx *rt, float h) {
 enum { CC_MUTE = 2100, CC_LEAVE, CC_END, CC_JOIN, CC_DECLINE, CC_INVITE, CC_NS,
        CC_MICMENU, CC_SPKMENU, CC_HDR, CC_PLUS, CC_OPEN, CC_PICK_GO, CC_PICK_CANCEL,
        CC_MIC0 = 2200, CC_SPK0 = 2220, CC_CONV0 = 2240, CC_VOLDN0 = 2300, CC_VOLUP0 = 2340,
-       CC_ROW0 = 2380, CC_PICK0 = 2420, CC_LAST = 2499 };
+       CC_ROW0 = 2380, CC_PICK0 = 2420,
+       CC_SHARE = 2500, CC_SHARE_STOP, CC_SHARE_FULL, CC_SHARE_ACTUAL, CC_SRC0 = 2520,
+       CC_LAST = 2549 };
 #define CC_MAX_DEV   16
 #define CC_MAX_CONV  40
 #define CC_MAX_PICK  64
@@ -3925,6 +3927,28 @@ typedef struct { rectf r; int cmd; char aid[40]; char name[96]; } call_btn;
 static call_btn        g_call_btns[CC_MAX_PICK + 48];
 static int             g_n_call_btns;
 
+/* Screen sharing (REQ-161, VIDEO.md): what this device shares, and the picture of
+ * what someone else does. */
+#define CC_MAX_SRC 24
+static oc_capture_device g_share_srcs[CC_MAX_SRC];   /* the picker's screens and windows */
+static int      g_share_nsrcs;
+static int      g_share_on;              /* this device asked to share and has not stopped */
+static char     g_share_id[256], g_share_name[128];
+static int      g_share_full, g_share_actual;        /* the viewer's full screen and 1:1 */
+static float    g_share_sx, g_share_sy;  /* the 1:1 picture's scroll */
+static gfx_tex *g_share_tex;
+static int      g_share_tw, g_share_th;
+static uint32_t g_share_seq, g_share_fno;
+static oc_frame g_share_frame;
+static uint8_t *g_share_px;
+static size_t   g_share_pxcap;
+static uint64_t g_share_seen;            /* the sharer last told about */
+static rectf    g_share_stage;
+static HWND     g_sharebar, g_sharebar_text, g_shareborder;
+static int      g_sharebar_excluded;
+static ULONGLONG g_share_err_until;      /* say that sharing failed until then */
+static int      g_share_pick_pending;    /* Ctrl+Shift+S away from the call: pick once it is drawn */
+
 /* A device remembered by a hash of its id (prefs o:/p:): short enough for the
  * synced settings, and an id another machine does not have simply matches
  * nothing there, which means that machine's default. */
@@ -3939,6 +3963,7 @@ static void call_rects_reset(void) {
     g_n_call_btns = 0;
     g_n_call_rows = 0;
     g_call_hdr_btn = g_calls_plus = g_cstrip = g_cstrip_mute = g_cstrip_leave = rf(0, 0, 0, 0);
+    g_share_stage = rf(0, 0, 0, 0);
 }
 
 static int call_btn_add(rectf r, int cmd, const char *aid, const char *name) {
@@ -3953,6 +3978,69 @@ static int call_btn_add(rectf r, int cmd, const char *aid, const char *name) {
 /* The engine is in a call for the client on screen. */
 static int call_here(const oc_model *m) {
     return m && m->in_call && g_call_client == g_client;
+}
+
+static void share_tex_drop(void) {
+    if (g_share_tex) gfx_tex_destroy(g_share_tex);
+    g_share_tex = NULL;
+    g_share_tw = g_share_th = 0;
+    oc_frame_free(&g_share_frame);
+}
+
+/* The newest frame of someone else's share, uploaded when it changed. */
+static void share_frame_update(void) {
+    if (!g_gfx || !g_call_engine) return;
+    int r = oc_call_engine_share_frame(g_call_engine, &g_share_frame, &g_share_seq, &g_share_fno);
+    if (r < 0) { share_tex_drop(); return; }
+    if (r == 0) return;
+    int w = g_share_frame.width, h = g_share_frame.height;
+    size_t want = (size_t)w * (size_t)h * 4u;
+    if (g_share_pxcap < want) {
+        uint8_t *p = realloc(g_share_px, want);
+        if (!p) return;
+        g_share_px = p; g_share_pxcap = want;
+    }
+    oc_i420_to_bgra(&g_share_frame, g_share_px, w * 4);
+    if (g_share_tex) gfx_tex_destroy(g_share_tex);
+    g_share_tex = gfx_tex_create_text(g_gfx, g_share_px, w * 4, w, h);
+    g_share_tw = g_share_tex ? w : 0; g_share_th = g_share_tex ? h : 0;
+}
+
+/* Someone else is sharing in the call this client is in: who, else 0. */
+static uint64_t share_other(const oc_model *m) {
+    return call_here(m) && m->call.sharer && m->call.sharer != m->user_id ? m->call.sharer : 0;
+}
+
+/* The picture in `box`: fitted, or one screen pixel to one pixel and scrolled. */
+static void draw_share_stage(gfx *rt, rectf box) {
+    g_share_stage = box;
+    fill(rt, box, 0x000000);
+    if (!g_share_tex) {
+        g_ui->align = ST_ALIGN_CENTER;
+        float cy = (box.top + box.bottom) / 2;
+        draw_text(rt, "Waiting for the picture\u2026", g_ui, rf(box.left + 16, cy - 10, box.right - 16, cy + 12), 0xC8C8C8);
+        g_ui->align = ST_ALIGN_LEFT;
+        return;
+    }
+    float bw = box.right - box.left, bh = box.bottom - box.top, dw, dh, x, y;
+    if (g_share_actual) {
+        dw = DIPF(g_share_tw); dh = DIPF(g_share_th);
+        float mx = dw > bw ? dw - bw : 0, my = dh > bh ? dh - bh : 0;
+        if (g_share_sx > mx) g_share_sx = mx;
+        if (g_share_sy > my) g_share_sy = my;
+        if (g_share_sx < 0) g_share_sx = 0;
+        if (g_share_sy < 0) g_share_sy = 0;
+        x = dw > bw ? box.left - g_share_sx : box.left + (bw - dw) / 2;
+        y = dh > bh ? box.top - g_share_sy : box.top + (bh - dh) / 2;
+    } else {
+        float sc = bw / (float)g_share_tw;
+        if (bh / (float)g_share_th < sc) sc = bh / (float)g_share_th;
+        dw = (float)g_share_tw * sc; dh = (float)g_share_th * sc;
+        x = box.left + (bw - dw) / 2; y = box.top + (bh - dh) / 2;
+    }
+    gfx_clip_push(rt, gr(box));
+    gfx_tex_draw(rt, g_share_tex, gr(rf(x, y, x + dw, y + dh)), 0.0f, 1.0f);
+    gfx_clip_pop(rt);
 }
 
 static uint64_t wall_ms(void) { return (uint64_t)time(NULL) * 1000u; }
@@ -4023,7 +4111,9 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
         if (on) fill_round(rt, row, OC_R_CONTROL, OC_COL_SELECT);
         else if (in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         float ic = UIS(18.0f), iy = sy + (ROW_H - ic) / 2;
-        draw_lucide(rt, OC_ICON_PHONE, rf(sx0 + UIS(10), iy, sx0 + UIS(10) + ic, iy + ic),
+        /* A call with a screen being shared says so, as Slack's huddle row does. */
+        draw_lucide(rt, v->sharer ? OC_ICON_SCREEN_SHARE : OC_ICON_PHONE,
+                    rf(sx0 + UIS(10), iy, sx0 + UIS(10) + ic, iy + ic),
                     mine || invited ? OC_COL_ACCENT : OC_COL_MUTED);
         char lbl[96], count[16];
         call_conv_label(m, v->channel_id, lbl, sizeof lbl);
@@ -4069,9 +4159,16 @@ static void draw_call_strip(gfx *rt, const oc_model *m, float h) {
     char lbl[96], dur[16], line[140];
     call_conv_label(m, m->call.channel_id, lbl, sizeof lbl);
     call_duration(m->call.started_at, dur, sizeof dur);
-    snprintf(line, sizeof line, "%s  \u00B7  %s", lbl, dur);
-    draw_lucide(rt, OC_ICON_PHONE, rf(x0 + UIS(8), g_cstrip.top + UIS(8), x0 + UIS(24), g_cstrip.top + UIS(24)),
-                OC_COL_ONLINE);
+    if (m->call.sharer == m->user_id) {
+        snprintf(line, sizeof line, "%s  \u00B7  You're sharing", lbl);
+    } else if (m->call.sharer) {
+        const char *sn = oc_model_user_name(m, m->call.sharer);
+        snprintf(line, sizeof line, "%s  \u00B7  %s is sharing", lbl, (sn && sn[0]) ? sn : "Someone");
+    } else {
+        snprintf(line, sizeof line, "%s  \u00B7  %s", lbl, dur);
+    }
+    draw_lucide(rt, m->call.sharer ? OC_ICON_SCREEN_SHARE : OC_ICON_PHONE,
+                rf(x0 + UIS(8), g_cstrip.top + UIS(8), x0 + UIS(24), g_cstrip.top + UIS(24)), OC_COL_ONLINE);
     draw_text(rt, line, g_ui_b, rf(x0 + UIS(30), g_cstrip.top + 2, x1 - 8, g_cstrip.top + UIS(30)), OC_COL_TEXT);
     int muted = g_call_engine && oc_call_engine_muted(g_call_engine);
     float bw = (x1 - x0 - UIS(24)) / 2;
@@ -6468,7 +6565,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE };
+       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -6505,6 +6602,7 @@ static const struct {
      * key-up, which is what lets go. */
     { AM_CTRL | AM_SHIFT, VK_SPACE,   ACC_PTT,     "Ctrl+Shift+Space", "Hold to talk into the message box; in a call, hold to talk while muted" },
     { AM_CTRL | AM_SHIFT, 'M',        ACC_CALL_MUTE, "Ctrl+Shift+M",   "Mute or unmute yourself in a call" },
+    { AM_CTRL | AM_SHIFT, 'S',        ACC_CALL_SHARE, "Ctrl+Shift+S",  "Share your screen in a call, or stop sharing" },
     { AM_CTRL | AM_SHIFT, 'T',        ACC_FREETALK, "Ctrl+Shift+T",    "Free talk: post what you say, piece by piece" },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
@@ -6526,6 +6624,7 @@ static int  g_dict_hold;                        /* what holds push to talk down 
 #define DH_KEY 1                                /* ...the talk key */
 
 static int  call_ptt(HWND hwnd, int down);      /* fwd — calls (REQ-150) */
+static void call_open_view(HWND hwnd, uint64_t ch);   /* fwd */
 static void menu_dispatch(HWND hwnd, int cmd);  /* fwd */
 static void accel_run(HWND hwnd, int action) {
     switch (action) {
@@ -6541,6 +6640,17 @@ static void accel_run(HWND hwnd, int action) {
         break; }
     case ACC_PTT:      if (!call_ptt(hwnd, 1)) dict_ptt_down(hwnd, DH_KEY); break;
     case ACC_CALL_MUTE: if (call_here(model())) menu_dispatch(hwnd, CC_MUTE); break;
+    case ACC_CALL_SHARE:
+        if (call_here(model())) {
+            /* The picker opens under the call's Share button, so the call is shown. */
+            if (!g_share_on && !(g_view == VIEW_CALL && g_call_view_ch == model()->call.channel_id)) {
+                call_open_view(hwnd, model()->call.channel_id);
+                g_share_pick_pending = 1;
+            } else {
+                menu_dispatch(hwnd, g_share_on ? CC_SHARE_STOP : CC_SHARE);
+            }
+        }
+        break;
     case ACC_FREETALK: dict_freetalk_toggle(hwnd);  break;
     case ACC_NAV_PREV:        nav_conversation(hwnd, -1, 0); break;
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
@@ -6619,6 +6729,7 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * claims the key when one of these four is actually up. */
     if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE) {
         if (g_tp_open)   { g_tp_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_share_full && !g_menu) { g_share_full = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_sub_open)  { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
@@ -13595,9 +13706,11 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
 /* ---- the call view --------------------------------------------------------------------- */
 
 static void draw_call_picker(gfx *rt, const oc_model *m, rectf body);   /* below */
+static void draw_share_full(gfx *rt, const oc_model *m, float W, float H);   /* below */
 
 static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     g_n_call_btns = 0;
+    g_share_stage = rf(0, 0, 0, 0);
     char lbl[96], sub[200];
     call_conv_label(m, g_call_view_ch, lbl, sizeof lbl);
     const oc_call_view *v = oc_model_call_in(m, g_call_view_ch);
@@ -13633,14 +13746,72 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     memset(&st, 0, sizeof st);
     if (in && g_call_engine) oc_call_engine_stats(g_call_engine, &st);
 
-    /* The people: a card each, with a ring while they speak and a mark when
-     * they say they are muted. */
     uint64_t people[OC_MAX_CALL_PARTICIPANTS];
     int np = 0;
     if (in) for (int i = 0; i < m->call.n_parts && np < 32; i++) people[np++] = m->call.parts[i];
     else if (v) for (int i = 0; i < v->n_parts && np < 32; i++) people[np++] = v->parts[i];
     float cardw = UIS(176.0f), cardh = UIS(150.0f), gap = UIS(14.0f);
     float gx = body.left + 24, gy = body.top + 36;
+
+    /* Sharing a screen (REQ-161). Your own share is said, not shown: a picture
+     * of it would contain itself, smaller, for ever. */
+    uint64_t other = share_other(m);
+    if (in && m->call.sharer == m->user_id) {
+        rectf ban = rf(body.left + 24, body.top + 30, body.right - 24, body.top + 30 + UIS(56));
+        fill_round(rt, ban, OC_R_CONTROL, OC_COL_SELECT);
+        draw_lucide(rt, OC_ICON_SCREEN_SHARE, rf(ban.left + UIS(14), ban.top + UIS(16), ban.left + UIS(38),
+                                                ban.top + UIS(40)), OC_COL_ONLINE);
+        char yl[200];
+        snprintf(yl, sizeof yl, "You're sharing %s", g_share_name[0] ? g_share_name : "your screen");
+        draw_text(rt, yl, g_ui_b, rf(ban.left + UIS(50), ban.top + UIS(6), ban.right - 12, ban.top + UIS(30)),
+                  OC_COL_TEXT);
+        draw_text(rt, "Everyone in the call can see it. Stop sharing when you are done.", g_meta,
+                  rf(ban.left + UIS(50), ban.top + UIS(28), ban.right - 12, ban.bottom - 4), OC_COL_MUTED);
+        gy += UIS(66);
+    }
+    if (other) {
+        /* Someone else's screen takes the stage, fitted; the people become a row
+         * of faces under it, as they do in a Slack huddle. */
+        share_frame_update();
+        const char *sn = oc_model_user_name(m, other);
+        char sl[160];
+        snprintf(sl, sizeof sl, "%s is sharing their screen", (sn && sn[0]) ? sn : "Someone");
+        float ty = body.top + 30, th = UIS(30);
+        const char *al = g_share_actual ? "Fit to window" : "Actual size";
+        rectf ab = rf(body.right - 24 - call_button_w(al, -1), ty, body.right - 24, ty + th);
+        rectf fb = rf(ab.left - 8 - call_button_w("Full screen", OC_ICON_MAXIMIZE), ty, ab.left - 8, ty + th);
+        draw_text(rt, sl, g_ui_b, rf(body.left + 24, ty, fb.left - 8, ty + th), OC_COL_TEXT);
+        call_button(rt, fb, OC_ICON_MAXIMIZE, "Full screen", 0, 0);
+        call_btn_add(fb, CC_SHARE_FULL, "call.share.fullscreen", "Full screen");
+        call_button(rt, ab, -1, al, g_share_actual, 0);
+        call_btn_add(ab, CC_SHARE_ACTUAL, "call.share.actualsize", al);
+        float strip = UIS(52);
+        rectf stage = rf(body.left + 24, ty + th + 8, body.right - 24, body.bottom - UIS(176) - strip);
+        if (stage.bottom > stage.top + UIS(60)) draw_share_stage(rt, stage);
+        float av = UIS(40), ax = body.left + 24, ay = stage.bottom + 8;
+        for (int i = 0; i < np && ax + av < body.right - 24; i++) {
+            uint64_t uid = people[i];
+            const oc_call_peer_stats *ps = NULL;
+            for (int k = 0; k < st.n_peers; k++) if (st.peers[k].user_id == uid) ps = &st.peers[k];
+            int me = uid == m->user_id;
+            rectf avr = rf(ax, ay, ax + av, ay + av);
+            const char *nm = oc_model_user_name(m, uid);
+            draw_user_avatar(rt, m, uid, (nm && nm[0]) ? nm : "?", avr, g_ui_b);
+            if (me ? st.speaking : ps && ps->speaking)
+                stroke_round(rt, rf(avr.left - 3, avr.top - 3, avr.right + 3, avr.bottom + 3),
+                             avatar_corner(avr) + 3, OC_COL_ONLINE, 2.5f);
+            if (me ? st.muted && !st.ptt : ps && ps->muted) {
+                rectf mb = rf(avr.right - UIS(12), avr.bottom - UIS(12), avr.right + UIS(4), avr.bottom + UIS(4));
+                fill_round(rt, mb, UIS(8), OC_COL_DANGER);
+                draw_lucide(rt, OC_ICON_MIC_OFF, rf(mb.left + 2, mb.top + 2, mb.right - 2, mb.bottom - 2), 0xFFFFFF);
+            }
+            ax += av + UIS(12);
+        }
+        np = 0;                                  /* no cards */
+    }
+
+    /* The people: a card each, with a ring while they speak and a mark when
+     * they say they are muted. */
     int cols = (int)((body.right - body.left - 48 + gap) / (cardw + gap));
     if (cols < 1) cols = 1;
     for (int i = 0; i < np; i++) {
@@ -13771,8 +13942,22 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     b = rf(x, by, x + call_button_w("Invite", OC_ICON_USER_PLUS), by + bh);
     call_button(rt, b, OC_ICON_USER_PLUS, "Invite", 0, 0);
     call_btn_add(b, CC_INVITE, "call.invite", "Invite");
-    /* Leave and End at the far right, End only for the one who may. */
+    x = b.right + 10;
+    /* Leave and End at the far right, End only for the one who may; Share
+     * between, shortened to fit what is left rather than running under them. */
     float rx = body.right - 24;
+    {
+        float right = rx - call_button_w("Leave", OC_ICON_PHONE_OFF) - 10;
+        if (m->call.starter == m->user_id) right -= call_button_w("End for everyone", -1) + 10;
+        const char *shl = g_share_on ? "Stop sharing" : "Share screen";
+        const char *name = shl;
+        if (x + call_button_w(shl, OC_ICON_SCREEN_SHARE) > right) shl = g_share_on ? "Stop" : "Share";
+        float w = call_button_w(shl, OC_ICON_SCREEN_SHARE);
+        if (x + w > right) { shl = ""; w = UIS(46); }
+        b = rf(x, by, x + w, by + bh);
+        call_button(rt, b, g_share_on ? OC_ICON_SCREEN_SHARE_OFF : OC_ICON_SCREEN_SHARE, shl, g_share_on, 0);
+        call_btn_add(b, g_share_on ? CC_SHARE_STOP : CC_SHARE, g_share_on ? "call.share.stop" : "call.share", name);
+    }
     if (m->call.starter == m->user_id) {
         b = rf(rx - call_button_w("End for everyone", -1), by, rx, by + bh);
         call_button(rt, b, -1, "End for everyone", 0, 2);
@@ -13784,10 +13969,11 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     call_btn_add(b, CC_LEAVE, "call.leave", "Leave");
     const char *hint = st.mic_error ? "The microphone could not be opened: you can listen, but not be heard."
                      : st.speaker_error ? "The speaker could not be opened."
+                     : GetTickCount64() < g_share_err_until ? "Sharing stopped: what was shared went away, or Windows refused it."
                      : muted ? "Muted. Hold Ctrl+Shift+Space to talk; Ctrl+Shift+M to unmute."
                      : "Ctrl+Shift+M mutes. Hold Ctrl+Shift+Space to talk while muted.";
     draw_text(rt, hint, g_meta, rf(body.left + 24, row1 - UIS(26), body.right - 24, row1 - 4),
-              st.mic_error || st.speaker_error ? OC_COL_DANGER : OC_COL_FAINT);
+              st.mic_error || st.speaker_error || st.share_error ? OC_COL_DANGER : OC_COL_FAINT);
 }
 
 /* The member picker (REQ-301/302): who a start asks when the conversation has
@@ -14399,6 +14585,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     }
     draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
+    draw_share_full(rt, m, W, H);      /* a shared screen, full screen, when asked for */
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
@@ -16354,6 +16541,13 @@ static void a11y_publish_scene(const oc_model *m) {
     for (int i = 0; i < g_n_call_btns && n < OC_ACC_MAX; i++)
         acc_push(items, &n, OC_ACC_BUTTON, g_call_btns[i].aid, g_call_btns[i].name, g_call_btns[i].r,
                  ATOK(AT_MENU, (uint64_t)g_call_btns[i].cmd));
+    /* The shared picture itself, by whose it is; invoking it goes full screen. */
+    if (g_share_stage.right > g_share_stage.left && n < OC_ACC_MAX) {
+        const char *sn = oc_model_user_name(m, m->call.sharer);
+        char nm[160];
+        snprintf(nm, sizeof nm, "%s's shared screen", (sn && sn[0]) ? sn : "Someone");
+        acc_push(items, &n, OC_ACC_LISTITEM, "call.share.stage", nm, g_share_stage, ATOK(AT_MENU, CC_SHARE_FULL));
+    }
     if (g_sb_unread_chip.right > g_sb_unread_chip.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_TAB, "sidebar.unreads",
                  g_sb.unreads_only ? "Unreads only: on" : "Unreads only: off",
@@ -19391,6 +19585,8 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     if (vm_click(hwnd, x, y)) return 1;
     if (modal_frame_click(hwnd, x, y)) return 1;
+    /* A shared screen full screen covers everything: only its own bar answers. */
+    if (g_share_full && !g_menu && !modal_open()) { call_click(hwnd, x, y); return 1; }
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
     /* A pane's ✕. One test for every pane, because there is one header:
      * they all occupy the middle column and only one can be up. Gated on a pane
@@ -22149,8 +22345,13 @@ static void call_engine_ensure(void) {
 
 /* A client is about to be stopped: if its call is the engine's, the engine lets
  * go of it first, and nothing will call into the engine for it again. */
+static void share_end(int tell);                                      /* fwd: sharing, below */
+static void share_tick(HWND hwnd);                                    /* fwd */
+static void share_open_picker(HWND hwnd);                             /* fwd */
+static int  share_begin(HWND hwnd, const char *id, const char *name); /* fwd */
 static void call_forget(oc_client *c) {
     if (!c || !g_call_engine) return;
+    if (g_call_client == c && g_share_on) share_end(0);
     oc_client_set_call_media(c, NULL, NULL);
     if (g_call_client == c) { g_call_client = NULL; g_call_ptt = 0; }
 }
@@ -22258,6 +22459,7 @@ static void call_tick(HWND hwnd) {
         g_call_err_at = GetTickCount64();
         if (m->call_error == OC_ERR_CALL_FULL) oc_a11y_announce("The call is full");
     }
+    if (m) share_tick(hwnd);
 }
 
 static void call_open_device_menu(HWND hwnd, int speakers) {
@@ -22396,7 +22598,25 @@ static void call_cmd(HWND hwnd, int cmd) {
     case CC_PICK_CANCEL:
         g_cpick_ch = 0;
         break;
+    case CC_SHARE:
+        if (in && !g_share_on) share_open_picker(hwnd);
+        return;
+    case CC_SHARE_STOP:
+        if (g_share_on) { share_end(1); oc_a11y_announce("You stopped sharing"); }
+        break;
+    case CC_SHARE_FULL:
+        g_share_full = share_other(m) ? !g_share_full : 0;
+        break;
+    case CC_SHARE_ACTUAL:
+        g_share_actual = !g_share_actual;
+        g_share_sx = g_share_sy = 0;
+        break;
     default:
+        if (cmd >= CC_SRC0 && cmd < CC_SRC0 + CC_MAX_SRC) {
+            int i = cmd - CC_SRC0;
+            if (in && !g_share_on && i < g_share_nsrcs) share_begin(hwnd, g_share_srcs[i].id, g_share_srcs[i].name);
+            break;
+        }
         if (cmd >= CC_MIC0 && cmd < CC_MIC0 + CC_MAX_DEV) {
             int i = cmd - CC_MIC0;
             if (i < g_call_nmics) g_call_mic_h = oc_hash32(g_call_mics[i].id);
@@ -22457,6 +22677,275 @@ static int call_ptt(HWND hwnd, int down) {
     oc_call_engine_set_ptt(g_call_engine, down);
     InvalidateRect(hwnd, NULL, FALSE);
     return 1;
+}
+
+/* ---- sharing a screen (REQ-161, VIDEO.md) ----------------------------------------
+ *
+ * Share screen opens the recorder's list of screens and windows; picking one
+ * starts the engine's capture and tells the daemon, whose CALL_STATE names this
+ * device the sharer, which is when frames go. While it shares, a small bar --
+ * "You're sharing", and Stop sharing -- floats at the top of the screen, and a
+ * green frame marks what is shared, both kept out of the capture where Windows
+ * allows it (WDA_EXCLUDEFROMCAPTURE), as the recording bar is. */
+
+enum { SHAREBAR_TEXT = 1, SHAREBAR_STOP };
+
+static LRESULT CALLBACK sharebar_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == SHAREBAR_STOP) { menu_dispatch(g_main_hwnd, CC_SHARE_STOP); return 0; }
+        break;
+    case WM_CLOSE:                                  /* the caption's close stops sharing */
+        menu_dispatch(g_main_hwnd, CC_SHARE_STOP);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+/* The screen rectangle of what is shared: a monitor by its place in the list the
+ * capture backend made, or a window by its handle. 0 if it cannot be found. */
+typedef struct { int want, at; RECT r; int found; } mon_find;
+static BOOL CALLBACK share_mon_cb(HMONITOR hm, HDC dc, LPRECT rc, LPARAM lp) {
+    (void)hm; (void)dc;
+    mon_find *f = (mon_find *)lp;
+    if (f->at++ == f->want) { f->r = *rc; f->found = 1; return FALSE; }
+    return TRUE;
+}
+
+static int share_target_rect(RECT *out) {
+    if (!strncmp(g_share_id, "screen:", 7) && g_share_id[7] >= '0' && g_share_id[7] <= '9') {
+        mon_find f = { atoi(g_share_id + 7), 0, { 0, 0, 0, 0 }, 0 };
+        EnumDisplayMonitors(NULL, NULL, share_mon_cb, (LPARAM)&f);
+        if (f.found) *out = f.r;
+        return f.found;
+    }
+    if (!strncmp(g_share_id, "window:", 7)) {
+        HWND w = (HWND)(uintptr_t)strtoull(g_share_id + 7, NULL, 16);
+        if (!w || !IsWindow(w) || IsIconic(w)) return 0;
+        if (DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS, out, sizeof *out) != S_OK && !GetWindowRect(w, out))
+            return 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* The green frame: a click-through window the size of what is shared, drawn as
+ * a border with the inside keyed out. */
+static LRESULT CALLBACK shareborder_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HBRUSH key = CreateSolidBrush(RGB(255, 0, 255)), green = CreateSolidBrush(RGB(0x2B, 0xAC, 0x76));
+        FillRect(dc, &rc, green);
+        int t = PX(4);
+        RECT in = { rc.left + t, rc.top + t, rc.right - t, rc.bottom - t };
+        FillRect(dc, &in, key);
+        DeleteObject(key); DeleteObject(green);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void shareborder_place(void) {
+    if (!g_shareborder) return;
+    RECT r;
+    if (!share_target_rect(&r)) { ShowWindow(g_shareborder, SW_HIDE); return; }
+    SetWindowPos(g_shareborder, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void sharebar_open(HWND owner) {
+    static int registered;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registered) {
+        WNDCLASSEXW wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.lpfnWndProc = sharebar_proc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"OpenChimeShareBar";
+        if (!RegisterClassExW(&wc)) return;
+        wc.lpfnWndProc = shareborder_proc;
+        wc.hbrBackground = NULL;
+        wc.lpszClassName = L"OpenChimeShareBorder";
+        if (!RegisterClassExW(&wc)) return;
+        registered = 1;
+    }
+    int w = PX(360), h = PX(80);
+    RECT wa = { 0, 0, 1280, 720 }, tr;
+    MONITORINFO mi; mi.cbSize = sizeof mi;
+    HMONITOR hm = share_target_rect(&tr) ? MonitorFromRect(&tr, MONITOR_DEFAULTTONEAREST)
+                                         : MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(hm, &mi)) wa = mi.rcWork;
+    g_sharebar = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"OpenChimeShareBar",
+                                 L"OpenChime \u2014 sharing", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                                 wa.left + (wa.right - wa.left - w) / 2, wa.top + PX(12), w, h,
+                                 NULL, NULL, inst, NULL);
+    if (!g_sharebar) return;
+    RECT cr; GetClientRect(g_sharebar, &cr);
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    int bw = PX(110), bh = PX(28), pad = PX(10);
+    g_sharebar_text = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                                      pad, (cr.bottom - bh) / 2, cr.right - bw - 3 * pad, bh,
+                                      g_sharebar, (HMENU)(INT_PTR)SHAREBAR_TEXT, inst, NULL);
+    HWND stop = CreateWindowExW(0, L"BUTTON", L"Stop sharing", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                cr.right - bw - pad, (cr.bottom - bh) / 2, bw, bh,
+                                g_sharebar, (HMENU)(INT_PTR)SHAREBAR_STOP, inst, NULL);
+    SendMessageW(g_sharebar_text, WM_SETFONT, (WPARAM)font, TRUE);
+    SendMessageW(stop, WM_SETFONT, (WPARAM)font, TRUE);
+    WCHAR wl[200]; char line[200];
+    snprintf(line, sizeof line, "You're sharing %s", g_share_name[0] ? g_share_name : "your screen");
+    to_w(line, wl, 200);
+    SetWindowTextW(g_sharebar_text, wl);
+    g_sharebar_excluded = SetWindowDisplayAffinity(g_sharebar, 0x11 /* WDA_EXCLUDEFROMCAPTURE */) ? 1 : 0;
+    ShowWindow(g_sharebar, SW_SHOWNOACTIVATE);
+    g_shareborder = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT |
+                                    WS_EX_NOACTIVATE, L"OpenChimeShareBorder", L"", WS_POPUP,
+                                    0, 0, 1, 1, NULL, NULL, inst, NULL);
+    if (g_shareborder) {
+        SetLayeredWindowAttributes(g_shareborder, RGB(255, 0, 255), 0, LWA_COLORKEY);
+        SetWindowDisplayAffinity(g_shareborder, 0x11);
+        shareborder_place();
+    }
+    crumb("sharebar open excluded=%d", g_sharebar_excluded);
+}
+
+static void sharebar_close(void) {
+    if (g_sharebar) DestroyWindow(g_sharebar);
+    if (g_shareborder) DestroyWindow(g_shareborder);
+    g_sharebar = g_sharebar_text = g_shareborder = NULL;
+}
+
+/* The screens and windows there are to share, as the recorder lists them. */
+static void share_open_picker(HWND hwnd) {
+    g_share_nsrcs = oc_capture_list_screens(g_share_srcs, CC_MAX_SRC);
+    if (g_share_nsrcs < 0) g_share_nsrcs = 0;
+    g_n_mi = 0;
+    mi_section("SHARE");
+    char lbl[300];
+    if (!g_share_nsrcs) mi_item(0, "Nothing here can be shared");
+    for (int i = 0; i < g_share_nsrcs && i < CC_MAX_SRC; i++) {
+        snprintf(lbl, sizeof lbl, "%s: %s", g_share_srcs[i].kind == OC_SOURCE_WINDOW ? "Window" : "Screen",
+                 g_share_srcs[i].name);
+        mi_item(CC_SRC0 + i, lbl);
+    }
+    rectf field = rf(0, 0, 0, 0);
+    for (int i = 0; i < g_n_call_btns; i++) if (g_call_btns[i].cmd == CC_SHARE) field = g_call_btns[i].r;
+    g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_w = UIS(340);
+    float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+    g_menu_x = field.right > field.left ? field.left : UIS(300);
+    g_menu_y = (field.bottom > field.top ? field.top : UIS(400)) - 4 - h;
+    if (g_menu_y < 8) g_menu_y = 8;
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Share `id` (a device id from oc_capture_list_screens) under the name `name`. */
+static int share_begin(HWND hwnd, const char *id, const char *name) {
+    const oc_model *m = model();
+    if (!call_here(m) || !g_call_engine) return 0;
+    if (oc_call_engine_share_start(g_call_engine, id, 1920, 1080) != 0) {
+        toast_push("Screen sharing could not start.", 1);
+        return 0;
+    }
+    snprintf(g_share_id, sizeof g_share_id, "%s", id);
+    snprintf(g_share_name, sizeof g_share_name, "%s", name && name[0] ? name : "your screen");
+    g_share_on = 1;
+    g_share_err_until = 0;
+    oc_client_call_share(g_client, m->call.channel_id, 1);
+    sharebar_close();
+    sharebar_open(hwnd);
+    oc_a11y_announce("You are sharing your screen");
+    return 1;
+}
+
+/* Stop, whether asked to here or because it cannot go on. */
+static void share_end(int tell) {
+    const oc_model *m = model();
+    if (g_call_engine) oc_call_engine_share_stop(g_call_engine);
+    /* Told even before the daemon has named this device: the start is on its
+     * way, and a stop after it undoes it. A stop from a non-sharer is nothing. */
+    if (tell && g_share_on && call_here(m)) oc_client_call_share(g_client, m->call.channel_id, 0);
+    g_share_on = 0;
+    sharebar_close();
+}
+
+/* Once a tick, from call_tick: what the engine and the daemon say about sharing. */
+static void share_tick(HWND hwnd) {
+    const oc_model *m = model();
+    int in = call_here(m);
+    if (g_share_pick_pending) {
+        int drawn = 0;
+        for (int i = 0; i < g_n_call_btns; i++) if (g_call_btns[i].cmd == CC_SHARE) drawn = 1;
+        if (drawn || !in) g_share_pick_pending = 0;
+        if (drawn) share_open_picker(hwnd);
+    }
+    if (g_share_on) {
+        oc_call_stats st;
+        memset(&st, 0, sizeof st);
+        if (g_call_engine) oc_call_engine_stats(g_call_engine, &st);
+        if (!in) {
+            share_end(0);                              /* the call is over for this device */
+        } else if (st.share_taken) {
+            /* Someone took over: one sharer at a time. */
+            const char *sn = oc_model_user_name(m, m->call.sharer);
+            char t[160];
+            snprintf(t, sizeof t, "%s is sharing now, so your screen is no longer shared.", (sn && sn[0]) ? sn : "Someone");
+            share_end(0);
+            toast_push(t, 0);
+        } else if (st.share_state == 0) {
+            share_end(1);                              /* the source went away, or never opened */
+            g_share_err_until = GetTickCount64() + 8000;
+            toast_push("Screen sharing stopped.", 1);
+        } else {
+            shareborder_place();                       /* a shared window moves */
+        }
+    }
+    uint64_t sharer = in ? m->call.sharer : 0;
+    if (sharer != g_share_seen) {
+        if (sharer && sharer != m->user_id) {
+            const char *sn = oc_model_user_name(m, sharer);
+            char t[160];
+            snprintf(t, sizeof t, "%s started sharing their screen", (sn && sn[0]) ? sn : "Someone");
+            oc_a11y_announce(t);
+            /* A toast only when the call is not on screen: there, the picture says it. */
+            if (!(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id)) toast_push(t, 0);
+        }
+        if (!sharer || sharer == m->user_id) { share_tex_drop(); g_share_full = 0; }
+        g_share_actual = 0;
+        g_share_sx = g_share_sy = 0;
+        g_share_seen = sharer;
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+}
+
+/* Full screen: the shared picture over the whole window, and a bar under it. */
+static void draw_share_full(gfx *rt, const oc_model *m, float W, float H) {
+    uint64_t other = share_other(m);
+    if (!g_share_full || !other) { g_share_full = 0; return; }
+    call_rects_reset();                            /* nothing underneath answers a click */
+    share_frame_update();
+    float bar = UIS(56);
+    draw_share_stage(rt, rf(0, 0, W, H - bar));
+    rectf b = rf(0, H - bar, W, H);
+    fill(rt, b, OC_COL_BASE);
+    const char *sn = oc_model_user_name(m, other);
+    char sl[160];
+    snprintf(sl, sizeof sl, "%s's screen", (sn && sn[0]) ? sn : "Someone's");
+    float bh = UIS(36), by = b.top + (bar - bh) / 2, x = W - 16;
+    rectf ex = rf(x - call_button_w("Exit full screen", OC_ICON_MINIMIZE), by, x, by + bh);
+    call_button(rt, ex, OC_ICON_MINIMIZE, "Exit full screen", 0, 0);
+    call_btn_add(ex, CC_SHARE_FULL, "call.share.fullscreen", "Exit full screen");
+    const char *al = g_share_actual ? "Fit to window" : "Actual size";
+    rectf ab = rf(ex.left - 10 - call_button_w(al, -1), by, ex.left - 10, by + bh);
+    call_button(rt, ab, -1, al, g_share_actual, 0);
+    call_btn_add(ab, CC_SHARE_ACTUAL, "call.share.actualsize", al);
+    draw_text(rt, sl, g_ui_b, rf(16, b.top, ab.left - 10, b.bottom), OC_COL_TEXT);
 }
 
 /* An invitation toast (REQ-302): Join and Decline, and the call sound. */
@@ -23276,6 +23765,28 @@ static void test_dump(const char *path) {
                     cs.peers[i].lost, cs.peers[i].late, cs.peers[i].fec, cs.peers[i].plc,
                     cs.peers[i].undecryptable,
                     (int)(oc_call_engine_volume(g_call_engine, cs.peers[i].user_id) * 100 + 0.5f));
+        /* Screen sharing (REQ-161): who shares, this device's share, and the
+         * picture of someone else's -- its size, the synthetic screen's frame
+         * number read from its pixels, and the luma at its centre. */
+        {
+            int fpx = g_share_frame.width ? oc_capture_synthetic_frame_number(&g_share_frame) : -1;
+            int centre = g_share_frame.width
+                ? g_share_frame.plane[0][(size_t)(g_share_frame.height / 2) * (size_t)g_share_frame.stride[0] +
+                                         (size_t)(g_share_frame.width / 2)] : -1;
+            fprintf(f, "share sharer=%llu on=%d state=%d taken=%d err=%d src=\"%s\" w=%d h=%d fps=%d kbps=%d"
+                       " frames=%u keyframes=%u resent=%u nacks_in=%u plis_in=%u reports=%u"
+                       " view=%dx%d view_frames=%u view_fno=%u view_nacks=%u view_plis=%u view_skipped=%u"
+                       " view_errors=%d tex=%dx%d px_fno=%d centre=%d full=%d actual=%d"
+                       " stage=%.0f,%.0f,%.0f,%.0f bar=%d excluded=%d border=%d\n",
+                    (unsigned long long)(m->in_call ? m->call.sharer : 0), g_share_on, cs.share_state,
+                    cs.share_taken, cs.share_error, g_share_name, cs.share_width, cs.share_height,
+                    cs.share_fps, cs.share_kbps, cs.share_frames, cs.share_keyframes, cs.share_resent,
+                    cs.share_nacks, cs.share_plis, cs.share_reports, cs.view_width, cs.view_height,
+                    cs.view_frames, cs.view_frame_no, cs.view_nacks, cs.view_plis, cs.view_skipped,
+                    (int)cs.view_errors, g_share_tw, g_share_th, fpx, centre, g_share_full, g_share_actual,
+                    g_share_stage.left, g_share_stage.top, g_share_stage.right, g_share_stage.bottom,
+                    g_sharebar != NULL, g_sharebar_excluded, g_shareborder != NULL && IsWindowVisible(g_shareborder));
+        }
         /* Missed calls, as the transcripts hold them (REQ-304). */
         {
             size_t ne = 0;
@@ -24288,7 +24799,8 @@ static void test_poll(HWND hwnd) {
         /* Calls through the calls the controls make (REQ-150, REQ-301-305):
          *   call start [ch] | join [ch] | open [ch] | leave | end | decline [ch]
          *   call mute | unmute | ptt-down | ptt-up | ns on|off
-         *   call invite <uid> [uid...] | volume <uid> <percent> | pick-go */
+         *   call invite <uid> [uid...] | volume <uid> <percent> | pick-go
+         *   call share <device id or name> | share pick | share stop | share full | share actual */
         char sc[32] = "", rest[256] = "";
         sscanf(arg, "%31s %255[^\n]", sc, rest);
         const oc_model *cm = model();
@@ -24318,6 +24830,19 @@ static void test_poll(HWND hwnd) {
                 ids[n++] = strtoull(t, NULL, 10);
             ok = call_here(cm) && n > 0;
             if (ok) oc_client_call_invite(g_client, cm->call.channel_id, ids, n);
+        }
+        else if (!strcmp(sc, "share")) {
+            if (!strcmp(rest, "pick"))        call_cmd(hwnd, CC_SHARE);
+            else if (!strcmp(rest, "stop"))   { ok = g_share_on; call_cmd(hwnd, CC_SHARE_STOP); }
+            else if (!strcmp(rest, "full"))   { ok = share_other(cm) != 0; call_cmd(hwnd, CC_SHARE_FULL); }
+            else if (!strcmp(rest, "actual")) call_cmd(hwnd, CC_SHARE_ACTUAL);
+            else {
+                g_share_nsrcs = oc_capture_list_screens(g_share_srcs, CC_MAX_SRC);
+                int k = -1;
+                for (int i = 0; i < g_share_nsrcs; i++)
+                    if (!strcmp(g_share_srcs[i].id, rest) || !strcmp(g_share_srcs[i].name, rest)) k = i;
+                ok = k >= 0 && !g_share_on && share_begin(hwnd, g_share_srcs[k].id, g_share_srcs[k].name);
+            }
         }
         else if (!strcmp(sc, "volume")) {
             unsigned long long uid = 0; int pct = 100;
@@ -25846,6 +26371,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (g_sch_open && in_rect(g_sch_tlist, (float)wpt.x, (float)wpt.y)) {
             g_sch_tscroll -= dy;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        /* A shared screen at actual size scrolls under the wheel; Shift, across. */
+        if (g_share_actual && g_share_tex && in_rect(g_share_stage, (float)wpt.x, (float)wpt.y)) {
+            if (GetKeyState(VK_SHIFT) & 0x8000) g_share_sx -= dy; else g_share_sy -= dy;
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }

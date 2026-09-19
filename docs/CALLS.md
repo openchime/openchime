@@ -49,16 +49,23 @@ opens the **call view**. With nothing to list it says "No calls".
 **The call view** shows the conversation's name and how long the call has run, the roster —
 each person's avatar, a ring while they speak, a mark when they are muted, and a volume for
 each — and the controls: **Mute**, the push-to-talk hint, the **microphone** and
-**speaker** pickers with a live level, **Noise suppression**, **Invite**, **Leave** and, for
-the starter, **End for everyone**. Before joining it shows who is in the call and **Join**
+**speaker** pickers with a live level, **Noise suppression**, **Invite**, **Share screen**,
+**Leave** and, for the starter, **End for everyone**. Before joining it shows who is in the call and **Join**
 (and **Decline** for an invitation). The conversation's messages are a click away.
 
 **While in a call elsewhere**, a strip at the foot of the sidebar shows the conversation and
-the call's length, with Mute, Leave, and a way back to the call view.
+the call's length — or who is sharing a screen — with Mute, Leave, and a way back to the
+call view.
+
+**Sharing a screen** (REQ-161): anyone in the call can share a screen or a window, one
+person at a time — starting a share takes over from whoever was sharing. The others see it
+on the call view's stage, fitted, or full screen, or at actual size; the sharer sees a bar
+saying so, with Stop sharing, and a green frame around what is shared. [VIDEO.md](./VIDEO.md)
+is the design.
 
 **Keys.** Ctrl+Shift+M mutes and unmutes. Holding **Ctrl+Shift+Space** talks while muted
 (push to talk) — voice input's chord; in a call the call owns the microphone, so the two
-never compete.
+never compete. **Ctrl+Shift+S** shares your screen, or stops sharing it.
 
 **Devices and noise suppression** are remembered with the other preferences: the devices
 by a hash of their ids, so another machine, which has other ids, uses its own defaults.
@@ -98,13 +105,15 @@ The engine is AUDIO.md's design, in `client/core/call/`:
 
 PROTOCOL.md §5.17 has the frames. In short:
 
-- `CALL_JOIN {channel, device key, invitees}` — start or join. Starting names the invitees;
-  joining an existing call names none.
+- `CALL_JOIN {channel, device key, codecs, invitees}` — start or join. Starting names the
+  invitees; joining an existing call names none. `codecs` says which video codecs the
+  joiner can decode.
 - `CALL_JOINED` to the joiner: the relay's port, the joiner's media token and slot, the
   call's id, starter, start time and epoch, and every participant with their device key.
   `CALL_ROSTER` to the others: the participants and the epoch, on every change.
 - `CALL_INVITE`, `CALL_DECLINE`, `CALL_END` (the starter only), `CALL_LEAVE`.
-- `CALL_STATE {channel, call, starter, started, participants, invited, ended}` to every
+- `CALL_SHARE {channel, on}` — start or stop sharing a screen; one sharer at a time.
+- `CALL_STATE {channel, call, starter, started, participants, invited, sharer, ended}` to every
   member of the conversation, every invitee and every participant on every change, and at
   sign-in for each call there is: what the Calls section lists.
 - `CALL_KEY` / `CALL_KEY_FOR`: sealed media keys (§5), forwarded unread.
@@ -119,7 +128,8 @@ anywhere. It is not searchable, not read aloud and never notifies. ARCH-90 exclu
 messages; this is the one kind it admits.
 
 **The relay** (ARCH-31) is unchanged: it forwards opaque payloads tagged with the sender and
-never decodes them. What it forwards is now ciphertext. When its silence sweep drops a
+never decodes them — audio, a shared screen and the viewers' requests alike. What it
+forwards is ciphertext. When its silence sweep drops a
 participant it tells the daemon, which removes them from the call so the roster stays
 honest.
 
@@ -181,8 +191,17 @@ counts those packets and requires none after.
 ### 5.4 Packets
 
 Each packet is an SFrame ciphertext: the SFrame header (KID, CTR), then the AES-GCM
-encryption, with the header as AAD, of the frame number (u32) and the Opus packet — or,
-with the frame number `0xFFFFFFFF`, of one byte of state (bit 0: muted).
+encryption, with the header as AAD, of a plaintext whose first byte is its **type**:
+
+| Type | Then |
+|---|---|
+| 0 audio | the frame number (u32) and the Opus packet |
+| 1 state | one byte: bit 0 muted |
+| 2 video | a fragment of a shared screen's frame (VIDEO.md §5.2) |
+| 3 control | a viewer's NACK, keyframe request or report, to the sharer (VIDEO.md §5.3) |
+
+Every type is sealed under the same key with the same counter, so the counter never
+repeats however the types interleave.
 
 - **KID** = `epoch << 8 | slot`, where the **slot** (0–255) is the number the daemon gives a
   participant for as long as they are in the call. A KID therefore names one sender's key
@@ -202,7 +221,7 @@ CTR is older than a **1024-packet window** or already seen in it (replay).
 
 ### 5.5 What it guarantees
 
-- The daemon, the relay and the network cannot decrypt any audio.
+- The daemon, the relay and the network cannot decrypt any audio, or any shared screen.
 - A packet altered or replayed on the way is dropped.
 - **Someone who leaves** cannot decrypt what is said after they leave — past the 1 s grace
   in which the others still use the previous epoch's key (and the relay stops forwarding
@@ -231,5 +250,6 @@ Auth mode; RFC 9605 C.1 headers and C.3 suite 0x0004), and then what the vectors
 cover: tampering, a wrong key or another sender, another info or aad, low-order keys, the
 replay window. The client end-to-end test, which runs the switches between epochs, (`test_client_core.c`) taps the relay and checks it sees only
 ciphertext, and that after a participant leaves every packet is under an epoch it was
-never given a key for. `scripts/gui_calls.sh` runs two Win32 clients in a call and checks
-each receives the other's packets, every one decrypting once the keys are in.
+never given a key for; and a shared screen crosses it as SFrame too (VIDEO.md §9).
+`scripts/gui_calls.sh` runs two Win32 clients in a call and checks each receives the other's
+packets, every one decrypting once the keys are in.

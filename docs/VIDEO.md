@@ -1,15 +1,11 @@
 # OpenChime — Screenshare
 
-How screen sharing works: what it is and is not, why it rides the existing audio
-relay unchanged, the codec decision, and the transport work the codec does *not*
-solve. This is the authoritative design; it is cross-referenced from
-ARCHITECTURE.md (ARCH-86, ARCH-87), REQUIREMENTS.md (§6.3, REQ-160/161),
-PROTOCOL.md (§5.17), and [AUDIO.md](./AUDIO.md).
-
-**Status. Designed, not started.** No screenshare code exists in any client or in
-the daemon. This document exists so the decisions taken are recorded before the
-work begins, not to signal that it is scheduled. It builds on the audio client's
-media transport (§8), which is built (CALLS.md, AUDIO.md).
+How screen sharing works: what it is and is not, why it rides the existing call
+relay unchanged, the codec, and the transport built on top of it — fragments,
+loss recovery and rate control. This is the authoritative design; it is
+cross-referenced from ARCHITECTURE.md (ARCH-86, ARCH-87), REQUIREMENTS.md (§6.3,
+REQ-160/161), PROTOCOL.md (§5.17), [CALLS.md](./CALLS.md) and
+[AUDIO.md](./AUDIO.md).
 
 **This document is screenshare only.** Camera video calling remains excluded by
 REQ-160 and nothing here reverses that (§2). Recorded **video messages** are a
@@ -22,43 +18,29 @@ separate design with no real-time path: [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md)
 Screenshare is the one video-shaped feature with a clear, bounded work-chat
 justification: showing someone an error, a diff, a design, or a spreadsheet.
 Both reference products ship it — Slack in huddles, Pumble from its $2.49 Pro
-tier.
-
-It is worth being clear-eyed about what that means competitively: shipping
-screenshare buys **parity, not differentiation**. It closes a checkbox gap; it
-does not win a deal the way self-hosting, data residency, or read receipts do.
-That is an argument about *sequencing*, not about whether the feature is
-legitimate.
+tier. It buys **parity, not differentiation**.
 
 ## 2. Scope — screenshare is not video calling
 
 | In scope | Out of scope |
 |---|---|
-| One participant shares a screen or window; others view it | Camera / webcam video (REQ-160 stands) |
-| View-only for the receivers | Remote control of the sharer's machine |
-| Screen audio is **not** captured; voice rides the existing audio path | Recording the share |
-| One sharer at a time per call | Simultaneous shares / picture-in-picture grids |
+| One participant shares a screen or window; the others view it | Camera / webcam video (REQ-160 stands) |
+| View-only for the viewers | Remote control of the sharer's machine |
+| Screen audio is **not** captured; voice rides the call's audio | Recording the share |
+| **One sharer at a time**; starting a share takes over from whoever was sharing | Simultaneous shares / picture-in-picture grids |
+| | Drawing on someone's share |
 
-**Camera video calling stays excluded (REQ-160).** Screenshare is admitted as
-REQ-161 because its content profile (mostly static, low frame rate, one sender) is
-fundamentally cheaper than camera video and its use case is concrete. A recorded
-video message (REQ-162–166) is admitted as well, and is not part of this document:
-it is a file posted as an attachment and played back in the client, with no call,
-relay or stream involved ([VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md), ARCH-110).
+Sharing is part of every call: there is no switch to turn it off. What bounds its
+cost is the bitrate ceiling (§6).
 
 ## 3. It rides the existing relay unchanged
 
-The single most useful property of the current design: **the sidecar never
-decodes anything.** `daemon/audio.h` states it — it "forwards opaque payloads (an
-SFU), so there is no codec dependency here." A video payload relays exactly as an
-Opus payload does, tagged with the sender's id.
+**The relay never decodes anything.** It forwards opaque payloads tagged with the
+sender (`daemon/audio.h`), and a share's packets relay exactly as audio's do. So
+screenshare needs **no server-side codec and no change to the relay's framing or
+forwarding** (ARCH-86); the daemon stays free of libvpx as it is of libopus.
 
-So screenshare needs **no server-side codec, and no change to the relay's
-forwarding logic** (ARCH-86). The daemon stays free of libvpx exactly as it is
-free of libopus today (ARCH-73).
-
-The same property has a hard consequence, recorded here because it is the thing
-most likely to be forgotten:
+The same property has a hard consequence:
 
 > **There is no transcoding fallback, and there cannot be one.** A conventional
 > media server bridges participants that disagree on a codec by decoding and
@@ -66,178 +48,223 @@ most likely to be forgotten:
 > can contain a macOS client and a Windows client simultaneously, so if two
 > clients disagree on the codec **the call simply does not work**.
 
-That makes the codec a **wire contract**, at the same level as the frame version
-(ARCH-8) or the `oc/1` ALPN (ARCH-54) — not a per-frontend build choice. It is
-settled in ARCH-87 and negotiated on the wire (§6).
+That makes the codec a **wire contract** (ARCH-87), carried on `CALL_JOIN` (§7).
+
+The relay does drain its socket in batches and asks for a 4 MB socket buffer each
+way, since a keyframe arrives as a burst of a hundred packets or more.
 
 ## 4. Codec — VP9 via libvpx (ARCH-87)
 
-**Exactly one mandatory baseline codec: VP9, encoded and decoded with libvpx
-(BSD-3-Clause), with screen-content tuning enabled.**
+**Exactly one mandatory codec: VP9, encoded and decoded with libvpx
+(BSD-3-Clause), with screen-content tuning enabled** — the libvpx the video
+recorder already links (VENDORS.md).
 
-Why VP9 specifically:
+Why VP9:
 
-- **Permissive licence.** BSD-3-Clause. VENDORS.md's rule is *permissive* — "MIT,
-  Apache-2.0, Public Domain, or optional dynamic LGPL" — and mbedTLS is already
-  Apache-2.0, so BSD-3 fits the posture. It is not on the current list only
-  because nothing has needed it.
+- **Permissive licence.** BSD-3-Clause.
 - **Royalty-free in practice.** Google's patent grant; the MPEG-LA VP8 pool
-  settled in 2013. Contrast **openh264**, whose BSD licence hides a trap: Cisco's
-  royalty arrangement covers only the binaries **Cisco itself distributes**, so
-  building from source leaves us exposed. **x264/x265 are GPL** and fail the
-  licence posture outright.
-- **Identical on every client by construction.** One C source built for Linux,
-  Windows, macOS, Android, and iOS. This is what §3's no-transcode constraint
-  actually requires — not "a codec available on each platform," but *the same
-  codec everywhere*.
+  settled in 2013. Contrast **openh264**, whose BSD licence covers only the
+  binaries **Cisco itself distributes**; **x264/x265 are GPL**.
+- **Identical on every client by construction.** One C source built for every
+  platform — what §3's no-transcode constraint requires.
 - **Screen-content tuning.** `VP9E_SET_TUNE_CONTENT` = `VP9E_CONTENT_SCREEN`
-  enables screen-oriented coding tools. This matters more than it sounds: text
-  has hard edges that DCT-based codecs handle badly at low bitrate, producing
-  ringing that makes a share *unreadable* — the one failure mode screenshare
-  cannot have. Legibility, not perceptual quality, sets the bitrate floor.
-- **Decode is cheap and often hardware-accelerated** (Android MediaCodec, most
-  desktop GPUs, and natively in every current browser should a DOM/WASM frontend
-  ever land, ARCH-74). This is the right asymmetry: one participant encodes, N
-  decode.
-
-**Ship VP9 alone — no VP8 fallback.** Two permitted codecs means a negotiation
-matrix in which some client pairs cannot talk. One mandatory baseline is the
-correct shape for a relay that cannot transcode.
+  keeps text's hard edges sharp at low bitrate. An unreadable share is the one
+  failure screenshare cannot have.
+- **Decode is cheap.** One participant encodes; N decode.
 
 **Rejected alternatives**, recorded so they are not relitigated:
 
 | Option | Why not |
 |---|---|
-| **Platform-native codecs** (Media Foundation, VideoToolbox, MediaCodec) | Fatal under §3: a Mac and a Windows client in one call must interoperate, and the server cannot bridge them. A per-platform codec is not a shortcut, it is a broken call. |
+| **Platform-native codecs** (Media Foundation, VideoToolbox, MediaCodec) | Fatal under §3: a Mac and a Windows client in one call must interoperate, and the server cannot bridge them. |
 | **openh264** | Patent grant covers only Cisco-distributed binaries. |
 | **x264 / x265** | GPL — fails the licence posture. |
-| **FFmpeg / libavcodec** | LGPL is acceptable dynamically linked (as libsecret is), but it is an enormous dependency for one codec. |
-| **AV1** (SVT-AV1 + dav1d) | Technically the best screen-content option and genuinely royalty-free by design, but realtime 1080p software encode is materially harder than VP9 and the build is heavier. **Revisit when hardware AV1 encode is commonplace** — the wire-contract negotiation in §6 exists so this can change without breaking old clients. |
-| **VP8** | Cheaper CPU, but no screen-content tuning — the specific reason to prefer VP9 here. |
+| **FFmpeg / libavcodec** | An enormous dependency for one codec. |
+| **AV1** (SVT-AV1 + dav1d) | The best screen-content option and royalty-free, but realtime software encode is materially harder. **The designated successor**: a client says which codecs it can decode (§7), so a second codec can arrive without a flag day. |
+| **VP8** | Cheaper CPU, but no screen-content tuning. |
 
-**Honest costs.** libvpx offers software encode only; hardware VP9 *encoders* are
-rare and not portably reachable through it, so the sharer's CPU carries a
-realtime encode, and VP9 is materially slower than VP8. Practically this is
-manageable — screenshare is fine at 5–10 fps, and `deadline=realtime` plus
-`cpu-used` trade compression for speed — but it is a real load on the sharer's
-machine and must be measured, not assumed. libvpx is also the **first genuinely
-large dependency** in the tree; it does not fit the committed-single-file pattern
-(termbox2 / utf8proc / jsmn) and belongs in VENDORS.md's *fetched at build* class
-beside mbedTLS, pinned by a `scripts/build_*.sh`.
+The encoder (`oc_vp9enc_open_share`) is realtime, `cpu-used` 8, CBR at the
+bitrate rate control sets (§6), with each frame's duration taken from the time
+since the one before — a share's frame rate varies — and **keyframes only when
+asked for**: the loss recovery below decides when one is needed.
 
-## 5. What the codec does not solve
+## 5. The media path
 
-Choosing VP9 settles the smallest question in the feature. The transport work is
-untouched by it, and all of it is new:
+Everything below is in the client, inside the call's encryption. The pure rules —
+fragmenting, reassembly, NACK, PLI, rate — are `client/core/call/share.c`
+(`oc_share.h`), with no sockets or threads; the call engine
+(`client/core/call/call_engine.c`) runs them.
 
-1. **Fragmentation.** `OC_AUDIO_MAX_PACKET` is **1400** — one sub-MTU datagram.
-   That is right for ~80-byte Opus frames and useless for a keyframe of tens of
-   KB. A fragment/reassembly header is needed in the sidecar framing (§6).
-2. **Loss recovery.** Opus conceals a dropped packet with PLC; a dropped video
-   packet corrupts the picture until the next IDR. Needs NACK/retransmission,
-   FEC, or a receiver-driven keyframe request — none exist.
-3. **Rate control.** There is no congestion control and no bitrate adaptation
-   anywhere in the media path. Without them the choice is a pinned conservative
-   bitrate (unreadable the moment someone scrolls) or unshed spikes under load.
-4. **Sequence width.** `seq` is `u16`, fine for 50 packets/s of audio, tight at
-   video packet rates — it wraps in roughly a minute. Reassembly must tolerate
-   wrap, or the field widens.
+### 5.1 Packets
 
-This is the real cost of the feature: every one of these is a media-transport
-problem the audio work solved in simpler form, and screenshare extends rather than
-repeats (§8).
+Every call packet's plaintext starts with a **type** (CALLS.md §5.4):
 
-## 6. Protocol additions
+| Type | Plaintext after the type byte |
+|---|---|
+| 0 audio | `frame(u32) ‖ opus` |
+| 1 state | `flags(u8)` — bit 0 muted |
+| 2 video | `frame(u32) ‖ frag(u16) ‖ nfrags(u16) ‖ flags(u8) ‖ width(u16) ‖ height(u16) ‖ bytes` |
+| 3 control | `target(u64) ‖ kind(u8) ‖ body` |
 
-**`CALL_JOINED` carries no codec field today** (`{channel_id, call_id, udp_port,
-token, roster}`, PROTOCOL.md §5.17). Video cannot be added without one: the first
-codec change would break every older client with no handshake to catch it — the
-mistake ARCH-41 exists to prevent for frames.
+All four are sealed under the sender's SFrame key for the epoch with **one
+counter across the types**, so a nonce is never reused. Nothing new is added to
+key exchange.
 
-The additions screenshare needs, none of which are built:
+### 5.2 Fragments
 
-- a **codec identifier** negotiated at `CALL_JOINED`, so §4's baseline can change
-  later (to AV1, per §4's rejected-alternatives note) without a flag day;
-- **share start/stop signaling** — who is sharing, so clients render the right
-  surface and the roster shows it;
-- a **fragment header** in the sidecar's UDP framing (§5.1), which is the one
-  media-plane wire change;
-- a **keyframe request** path from receiver to sharer (§5.2).
+An encoded frame is split into fragments of at most **1100 bytes**, each its own
+packet: with the 14-byte header, the SFrame overhead and the relay's framing, a
+packet stays under the relay's 1400-byte datagram. A frame of up to 1024
+fragments (1.1 MB) can be sent; `flags` bit 0 marks a keyframe. Frames and
+fragments are numbered **inside the encryption**, so the relay's unauthenticated
+16-bit `seq` is not used, as it is not for audio. Frame numbers carry on across a
+sharer's shares, so a viewer tells an old share's stragglers from a new one's.
 
-Fragmentation and keyframe requests are relay-visible but not
-relay-*interpreted*: the sidecar keeps forwarding opaque payloads and simply
-carries a larger header. That preserves ARCH-18/73.
+A viewer reassembles by frame number in 32 slots, tolerating reordering and
+duplicates, and hands frames to the decoder **in order**. It starts at a keyframe,
+and whenever frames were lost it starts again at the next complete keyframe.
 
-## 7. Client surfaces
+### 5.3 Loss recovery: NACK, then PLI
 
-**The TUI is excluded, permanently and by design.** ARCH-75: the TUI "never
-renders graphics — no images, ever." A shared screen cannot be rendered in a cell
-grid. The TUI's ceiling is showing *that* a share is in progress and who is
-sharing — roster state, not pixels.
+Control packets go from a viewer to the sharer, relayed to everyone and acted on
+only by the user they name.
 
-That leaves screenshare as a **graphical-frontend-only** feature, and today the
-only graphical frontend is the Windows GUI. The argument depends on there being
-exactly one graphical client, and on the audio prerequisite below.
+- **NACK** `{frame(u32), n(u16), frag(u16)×n}` — n = 0 means the whole frame. A
+  viewer asks for fragments missing **60 ms** after their frame began to arrive,
+  at most three times, and for a whole frame missing when a later one arrives.
+  The sharer keeps **a second** of what it sent and sends the named fragments
+  again.
+- **PLI** `{}` — a keyframe, please. A viewer asks when a frame it needs is still
+  incomplete after **300 ms** (it gives that frame up), when the decoder fails, and
+  on arriving: a viewer who joins late waits 250 ms for the keyframe a new share
+  starts with, then asks. At most one PLI per 500 ms from a viewer, and none while
+  a keyframe is already arriving. The sharer sends a keyframe for a PLI **at most
+  once a second**, and **every ten seconds** regardless.
 
-Capture APIs are per-platform (DXGI Desktop Duplication, ScreenCaptureKit,
-PipeWire portals) and that is fine — **capture is a frontend concern, the codec
-is not.** The captured frames cross into `client/core` and are encoded there by
-the one shared VP9 encoder, so the wire stays identical across platforms.
+### 5.4 Rate control
 
-## 8. Sequencing and the prerequisite
+Every **500 ms** each viewer sends a **REPORT** `{loss‰(u16), kbps(u32)}`: the
+loss over that time, counted from gaps in the sharer's authenticated SFrame
+counter, and the video bitrate received. The sharer's rate is what the
+worst-placed viewer can take:
 
-**Screenshare builds on the audio client.** The device layer, the UDP media path
-to the relay, per-sender jitter buffers, end-to-end encryption and `CALL_*`
-signaling exist (AUDIO.md §7, CALLS.md). Screenshare sits on top of them and
-extends what video needs that audio did not:
+- any viewer losing **more than 5%** halves it (at most once a second);
+- anyone losing more than 2% holds it;
+- otherwise it grows by **a tenth a second**;
+- between **150 kbit/s** and the built-in ceiling of **2500 kbit/s**, starting at
+  1200.
 
-1. The transport gaps of §5 — fragmentation, keyframe requests, a wider `seq`.
-2. Screenshare itself, revisiting the §4 codec choice against whatever hardware
-   encode landscape exists by then. Its frames are SFrame-encrypted as audio's
-   are, under the same per-sender keys.
+A viewer who leaves the call stops holding the rate down.
 
-## 9. Bandwidth and the flat-plan collision
+### 5.5 What is sent
 
-Screenshare bitrate is far more content-dependent than camera video, because
-codecs encode inter-frame differences and a static screen produces almost none:
+The source is captured at up to **15 fps**, fitted inside **1920×1080**. A frame
+identical to the last one sent (a fingerprint of its pixels) is skipped, unless
+half a second has passed: a still screen goes at **2 fps**, which is what lets VP9
+sharpen it and costs almost nothing. Below 600 kbit/s the frame is fitted inside
+**1280×720** instead, and back at the full size above 1000 — the gap keeps it from
+flapping. A change of size reopens the encoder with a keyframe.
+
+### 5.6 The engine
+
+In the call engine, beside the audio threads:
+
+- a **share thread** while this device shares: capture → change check → fit →
+  encode → fragments → sealed and sent;
+- a **view thread** for the whole call: asks for what is missing, reports, takes
+  whole frames in order, decodes, and publishes the newest picture for the
+  frontend (`oc_call_engine_share_frame`).
+
+A share starts in two steps. `oc_call_engine_share_start` opens the source (so a
+refusal is known at once), and the frontend sends `CALL_SHARE` on; frames go only
+once the daemon's `CALL_STATE` names this device the sharer. When a `CALL_STATE`
+names someone else, this device's share stops.
+
+## 6. Bandwidth
+
+Screenshare bitrate is content-dependent, because a static screen produces
+almost no inter-frame difference:
 
 | Content (1080p) | Typical bitrate |
 |---|---|
-| Static slides, a document, an idle editor (2–5 fps) | 100–300 kbps |
-| Scrolling code, dragging windows (10–15 fps) | 500 kbps – 1.5 Mbps |
-| Full motion — video playback, animation (30 fps) | 3–6 Mbps |
+| Static slides, a document, an idle editor | 100–300 kbps |
+| Scrolling code, dragging windows | 500 kbps – 1.5 Mbps |
+| Full motion — video playback, animation | more than the ceiling allows |
 
-So typical work usage is **300 kbps – 1.5 Mbps**, not the multi-Mbps figure a
-"video" label suggests. The problems are not the single stream:
+The **ceiling of 2.5 Mbit/s** bounds each share, and there is one share per
+call, so the relay's egress for a share is at most `2.5 Mbit/s × (N−1)` — about
+22 Mbit/s for a ten-person call. That is what makes sharing safe to have on
+without a switch. Full-motion video shared at the ceiling is watchable, not
+smooth.
 
-- **Fan-out multiplies it.** The SFU sends every stream to every participant, so
-  egress is `bitrate × (N−1)`. Even 1 Mbps is ~9 Mbps out of one box for a
-  10-person call. WebRTC SFUs handle this with simulcast and per-receiver
-  adaptation; we have neither (§5.3).
-- **The variance is unbounded**, and without rate control it cannot be shed.
-- **Egress is billed, and the hosted plan is flat.** CP-4 is $99/month with **no
-  metering** — deliberately, so "the control plane needs zero runtime metric from
-  the box for billing." A bandwidth-heavy feature on an unmetered flat plan means
-  one screenshare-heavy tenant moves the unit economics with no pricing lever to
-  absorb it.
+**The hosted plan is flat** (CP-4 is $99/month with no metering). A
+screenshare-heavy tenant moves its unit economics with no pricing lever; the
+ceiling bounds the damage per call. This is recorded as input to the control
+plane's pricing, which is out of scope for this repo.
 
-The last point is a **business-model collision, not an engineering one**, and it
-is the strongest argument against shipping screenshare casually. It is recorded
-here as input to the control plane's CP-4, not as a pricing proposal — pricing is
-out of scope for this repo (REQUIREMENTS.md preamble).
+## 7. Signaling
 
-## 10. Open decisions
+PROTOCOL.md §5.17 has the frames:
 
-- **Rate-control policy.** Fixed conservative bitrate, receiver-feedback
-  adaptation, or content-adaptive framerate. Undecided; §5.3 is the blocker.
-- **Loss-recovery mechanism.** NACK vs FEC vs keyframe-on-request. Cheapest
-  first is probably keyframe-on-request, at the cost of a visible stall.
-- **Egress policy for the hosted plan.** Whether screenshare is capped, disabled,
-  or metered on the flat plan — a CP-4 question (§9).
-- **Whether a still-frame mode ships first.** Periodic JPEG stills over the
-  existing TCP attachment path (§5.14) need no codec, no UDP, no fragmentation
-  and no new dependency, and cover "look at my error message" — most of what
-  screenshare is used for. It is days rather than months, but it is **not**
-  screenshare and must not be presented as such.
-- **Screen audio.** Currently out of scope (§2); sharing a video with sound would
-  need it, and it interacts with the AEC design (AUDIO.md §6).
+- `CALL_JOIN` carries **the video codecs the joiner can decode**, as bits
+  (`OC_CALL_CODEC_VP9` = 1); `CALL_JOINED` and `CALL_ROSTER` carry each
+  participant's. Every client decodes VP9, so today it is VP9; a later codec is a
+  new bit, used only when everyone has it.
+- `CALL_SHARE {channel, on}` starts or stops sharing. The daemon keeps **one
+  sharer per call**: a start takes over. Someone not in the call is refused
+  (`NOT_IN_CALL`); a stop from someone not sharing changes nothing.
+- `CALL_STATE` carries `sharer` (0 for nobody), so the Calls section, the call
+  view and every participant know who is sharing.
+- A sharer who leaves, disconnects, is swept by the relay, or rejoins stops
+  sharing.
+
+## 8. Client surfaces
+
+**Windows** (`client/gui/win32/winmain.c`), after Slack's huddles:
+
+- **Share screen** beside Invite in the call view, and **Ctrl+Shift+S**, open the
+  list of screens and windows — the video recorder's (`oc_capture_list_screens`).
+- **While you share**: a small bar at the top of the screen — "You're sharing …"
+  and **Stop sharing** — and a **green frame** around what is shared, both kept out
+  of the capture where Windows allows it (`WDA_EXCLUDEFROMCAPTURE`), as the
+  recording bar is. The call view says "You're sharing …" and does not show the
+  picture, which would contain itself. Someone else starting to share stops yours
+  and says so.
+- **Watching**: the share takes the call view's stage, fitted, under "Alice is
+  sharing their screen", with the people as a row of faces beneath it.
+  **Full screen** covers the window (Esc returns); **Actual size** shows it one
+  pixel to one pixel, scrolled with the wheel (Shift for across).
+- **Elsewhere**: the in-call strip says "Alice is sharing", the Calls section's
+  row shows a screen, and a toast says "Alice started sharing their screen" when
+  the call is not on screen.
+- **Accessibility**: `call.share`, `call.share.stop`, `call.share.fullscreen`,
+  `call.share.actualsize`, and the picture itself as `call.share.stage`, named
+  "Alice's shared screen".
+
+**The TUI** renders no graphics (ARCH-75) and shows no calls, so no shares either.
+
+**Capture** is per platform — Windows Graphics Capture, with the synthetic screen
+for tests (`OPENCHIME_TEST_CAPTURE=synthetic`) — and **the codec is not**: frames
+cross into `client/core` and are encoded there, so the wire is the same everywhere.
+
+## 9. Tests
+
+- `tests/test_share_media.c`: a sharer and a viewer over a simulated network that
+  loses, delays, reorders and duplicates — fragments at the edge sizes, 5% loss
+  recovered by NACKs, a whole frame lost and asked for, a frame that cannot be
+  recovered given up for a PLI and a keyframe, a late joiner, the rate's halving,
+  holding, growth, floor and ceiling, the size's step down and back, malformed
+  fragments refused, and the synthetic screen through VP9 and a lossy network back
+  to readable frame numbers.
+- `tests/itest_netloop.c`: `CALL_SHARE` start, take-over, a stop that is not the
+  sharer's, leave and disconnect clearing it, someone outside the call refused,
+  and codecs on the roster.
+- `tests/test_client_core.c`: through the real daemon and relay, with a tap
+  between them — dana shares the synthetic screen and erik decodes it at its size
+  with rising frame numbers; the relay carries only SFrame; 10% loss at the tap
+  costs NACKs and resends, not the picture; faye joins late and has a picture
+  within seconds; erik takes over, which stops dana's; erik stops and the picture
+  goes.
+- `scripts/gui_calls.sh`: two Win32 clients — alice shares, bob's view shows her
+  screen with readable, rising frame numbers; full screen, Esc, actual size; the
+  accessibility names; bob takes over; bob stops.

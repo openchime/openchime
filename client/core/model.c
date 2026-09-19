@@ -2023,6 +2023,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             m->call.starter = e->call->starter;
             m->call.started_at = e->call->started_at;
             m->call.n_invited = e->call->n_invited;
+            m->call.sharer = e->call->sharer;
             memcpy(m->call.invited, e->call->invited, e->call->n_invited * sizeof e->call->invited[0]);
         }
         break;

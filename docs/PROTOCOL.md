@@ -13,18 +13,17 @@ direct messages (§5.12), channel management (§5.7), tenant administration (§5
 reconnect backfill and the error frame — plus presence and
 typing (§5.13, REQ-120/121), attachments (§5.14), incoming webhooks (§5.15),
 notification preferences (§5.16), synced client settings (§5.16a), self-service
-profile (§5.16b), audio-call signaling (§5.17, REQ-150–152), and push device
+profile (§5.16b), call signaling and screen sharing (§5.17, REQ-150–152, REQ-161), and push device
 tokens.
 
 **§9 is the complete list; §5's prose is not.** The registry is generated from
-`shared/protocol.h` and carries all 158 message types. The narrative sections
+`shared/protocol.h` and carries all 179 message types. The narrative sections
 below specify the payload layouts for the families they name, and a number of
 later families — drafts, scheduled send, the notification schedule and pause,
 keywords, custom emoji, group DMs, invite and session management, webhook
 enable/rotate, cross-channel threads, unresolved-mention notices, and the
 per-channel file census — are listed in §9 with their opcodes and directions but
-are specified in §§5.16d–5.16j. The remaining protocol-level deferral is the
-**screenshare** addition reserved in §5.17 (REQ-161, unbuilt).
+are specified in §§5.16d–5.16j.
 
 **Status.** Implemented. The frames in this document are realized in
 `shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
@@ -170,7 +169,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 17** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 18** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -1995,7 +1994,7 @@ message's stored unfurls** and re-fetches from the new body, so a removed URL's
 preview cannot be replayed. Always on — there is no switch. Adding the frame
 needed no protocol-version bump; a peer that does not know it never expects it.
 
-### 5.17 Calls (REQ-150-152, REQ-301-305, ARCH-73, ARCH-113)
+### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over a
 separate UDP sidecar (ARCH-31), forked at daemon startup and handed each
@@ -2014,8 +2013,9 @@ by one on every join and every leave. The cap is `OPENCHIME_CALL_MAX` (default
 10), announced on `WORKSPACE_INFO` as `call_max`.
 
 **`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64, device_key: 32 bytes,
-n: u16, n × { user_id: u64 } }` — start the conversation's call, or join the one
-there. Authorized by the channel-read gate (`ERROR NOT_A_MEMBER`, message "call
+codecs: u8, n: u16, n × { user_id: u64 } }` — start the conversation's call, or
+join the one there. `codecs` is the video codecs the joiner can decode, as bits:
+`1` VP9 (ARCH-87); a client with no video, `0`. Authorized by the channel-read gate (`ERROR NOT_A_MEMBER`, message "call
 join denied"). A start invites the users named, those of them who may read the
 conversation, keeping participants plus invitations within the cap; joining a
 call already there names nobody, and a name is ignored. A call already at the
@@ -2028,7 +2028,7 @@ that has exited and could not be restarted refuses the join with
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
 u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
 started_at: u64, n: u16, n × participant }`, where a participant is `{ user_id:
-u64, slot: u8, device_key: 32 bytes }` — the joiner's private media endpoint
+u64, slot: u8, device_key: 32 bytes, codecs: u8 }` — the joiner's private media endpoint
 (the relay's `udp_port` and a 16-byte bearer `token`), its slot, and the call as
 it stands. The client then speaks UDP directly to the relay:
 `token(16) ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
@@ -2058,8 +2058,8 @@ call for everyone. Anyone else: `ERROR NOT_CALL_STARTER` (3029); no call:
 
 **`CALL_STATE` (S → C), `0x00A7`** `{ channel_id: u64, call_id: u64, starter:
 u64, started_at: u64, ended: u8, np: u16, np × { user_id: u64 }, ni: u16,
-ni × { user_id: u64 } }` — a call as the Calls section lists it: who is in it
-and who is invited. Sent on every change to the conversation's members, its
+ni × { user_id: u64 }, sharer: u64 }` — a call as the Calls section lists it: who
+is in it, who is invited, and who is sharing a screen (`0` nobody). Sent on every change to the conversation's members, its
 invitees and its participants, and at sign-in, after `SNOOZE`, once for each call
 there is. `ended = 1` is the last word on a call.
 
@@ -2091,34 +2091,22 @@ GONE over IPC; a client keeps alive every 5 s, so only the vanished are swept).
 Each drop is a new epoch for the rest, who rekey. The dropped user rejoins with
 `CALL_JOIN`.
 
-**Screenshare — reserved wire additions (REQ-161, ARCH-86/87; not built).**
-Screenshare rides this same call and relay unchanged: the relay forwards an
-encoded video payload opaquely exactly as it forwards audio, so there is no
-server-side codec. That has one consequence the wire must carry, recorded here
-while the frames are still cheap to extend — **the server cannot transcode**
-(ARCH-18/73 forbid it decoding anything), and a call may hold clients on
-different platforms at once, so a codec disagreement breaks the call outright.
-The codec is therefore a **wire contract**, not a frontend build choice, and
-`CALL_JOINED` **carries no codec field today**. Adding video without one would
-break every older client on the first codec change — the failure ARCH-41 exists
-to prevent for frames. The reserved additions, none implemented:
+**`CALL_SHARE` (C → S), `0x00AA`** `{ channel_id: u64, on: u8 }` — start
+(`on = 1`) or stop sharing a screen in the call (REQ-161). **One sharer per
+call**: a start takes over from whoever was sharing, who learns it from the
+`CALL_STATE` that follows and stops. A stop from someone not sharing changes
+nothing. Not a participant: `ERROR NOT_IN_CALL`. A sharer who leaves,
+disconnects, is swept by the relay or rejoins is no longer the sharer. Each
+change is a `CALL_STATE`.
 
-- a **codec identifier** on `CALL_JOINED`, so the ARCH-87 baseline (VP9) can be
-  succeeded (by AV1) without a flag day;
-- **share start/stop signaling** — who is sharing, so clients render the right
-  surface and the roster reflects it;
-- a **fragment header** in the relay's UDP framing — `OC_AUDIO_MAX_PACKET` is
-  1400 bytes, correct for an ~80-byte Opus frame and useless for a keyframe of
-  tens of KB;
-- a **keyframe-request** path from receiver to sharer, since a lost video packet
-  corrupts the picture until the next IDR (Opus conceals loss with PLC; video
-  does not).
-
-The last two are relay-*visible* but not relay-*interpreted* — the relay keeps
-forwarding opaque payloads behind a larger header — so ARCH-18/73 hold. Note also
-that `seq` is `u16`, which wraps in roughly a minute at video packet rates, so
-reassembly must tolerate wrap or the field widens. Full design in
-[VIDEO.md](./VIDEO.md).
+**Screen sharing on the wire (ARCH-86/87).** The share rides this call and relay
+unchanged: its packets are the same SFrame ciphertexts on the same UDP path, and
+the relay forwards them opaquely. It cannot transcode (ARCH-18/73), and a call can
+hold clients on different platforms, so the codec is a **wire contract** —
+`codecs` above, one mandatory codec today (VP9), a new bit for a successor.
+Fragments, NACKs, keyframe requests and rate reports travel **inside the
+encryption** as typed packets (CALLS.md §5.4); the relay's framing does not
+change. [VIDEO.md](./VIDEO.md) is the design.
 
 ### Push device tokens (REQ-132/133, ARCH-85)
 
@@ -2473,7 +2461,7 @@ this table cannot silently gain a shared value.
 | `0x0098` | `STORAGE_STATUS` | S → C | usage + policy + what maintenance reclaimed |
 | `0x0099` | `AUDIT_QUERY` | C → S | owner/admin: page the audit log (REQ-251) |
 | `0x009A` | `AUDIT_PAGE` | S → C | a page of entries, newest first |
-| `0x00A0` | `CALL_JOIN` | C → S | start or join a conversation's call, with the device key and whom a start invites (REQ-150/301) |
+| `0x00A0` | `CALL_JOIN` | C → S | start or join a conversation's call, with the device key, the codecs it decodes and whom a start invites (REQ-150/301) |
 | `0x00A1` | `CALL_LEAVE` | C → S | leave the call |
 | `0x00A2` | `CALL_JOINED` | S → C | to the joiner: UDP endpoint/token, slot, epoch, starter, roster with device keys |
 | `0x00A3` | `CALL_ROSTER` | S → C | to participants: roster and epoch changed |
@@ -2483,6 +2471,7 @@ this table cannot silently gain a shared value.
 | `0x00A7` | `CALL_STATE` | S → C | a call as the Calls section lists it, on every change and at sign-in (REQ-303) |
 | `0x00A8` | `CALL_KEY` | C → S | a participant's media key, sealed to each other participant (ARCH-113) |
 | `0x00A9` | `CALL_KEY_FOR` | S → C | one sealed media key, from its sender |
+| `0x00AA` | `CALL_SHARE` | C → S | start or stop sharing a screen in the call; a start takes over (REQ-161) |
 | `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
 | `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
 | `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |

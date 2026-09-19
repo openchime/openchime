@@ -51,6 +51,7 @@ typedef struct {
     uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
     uint8_t  slots[OC_MAX_CALL_PARTICIPANTS];
     uint64_t invited[OC_MAX_CALL_INVITES];
+    uint64_t sharer;      /* who is sharing a screen, 0 for nobody (REQ-161) */
 } oc_call_view;
 
 /* net thread -> UI thread */
@@ -399,12 +400,14 @@ enum {
     OC_CMD_STT_SEGMENT,
     /* Calls (REQ-150, REQ-301-305), all on `channel_id`. JOIN starts or joins,
      * inviting `uids` when it starts; INVITE asks `uids`; LEAVE, DECLINE and END
-     * (the starter's) carry nothing else. */
+     * (the starter's) carry nothing else; SHARE starts (op 1) or stops (op 0)
+     * sharing a screen (REQ-161). */
     OC_CMD_CALL_JOIN,
     OC_CMD_CALL_INVITE,
     OC_CMD_CALL_LEAVE,
     OC_CMD_CALL_DECLINE,
     OC_CMD_CALL_END,
+    OC_CMD_CALL_SHARE,
     OC_CMD_QUIT
 };
 

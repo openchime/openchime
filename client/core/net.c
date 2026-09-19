@@ -2229,7 +2229,7 @@ static int run_connection(oc_net *n, int reconnecting,
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
             if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); rc = RC_STOP; goto drop; }
-            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_END) {
+            if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_SHARE) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
                                          ctx_write, &ctx, n->to_ui);
                 oc_cmd_free(c);

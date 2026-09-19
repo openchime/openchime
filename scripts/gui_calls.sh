@@ -18,6 +18,10 @@
 #   - bob mutes: alice stops receiving his audio and sees that he is muted;
 #     holding the talk key lets him through again;
 #   - a volume set for bob is the one the engine plays him at;
+#   - alice shares the synthetic screen: bob's call view shows it, at its size,
+#     its frame numbers rising; her bar is up and her view says she is sharing;
+#     bob goes full screen and to actual size and back; bob takes over, which
+#     stops alice's; bob stops, and the picture goes;
 #   - the keys: Ctrl+Shift+M mutes and unmutes, Ctrl+Shift+Space held talks;
 #   - away from the call, the strip at the foot of the sidebar mutes and brings
 #     you back, and the header's call button opens the call;
@@ -42,6 +46,7 @@ export OC_PAIR_PORT="${OC_PAIR_PORT:-9620}"
 export OC_PAIR_DIR="${OC_PAIR_DIR:-/tmp/oc-calls}"
 export OC_PAIR_HOST="${OC_PAIR_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 export OPENCHIME_TEST_AUDIO=synthetic
+export OPENCHIME_TEST_CAPTURE=synthetic   # the synthetic screen, for sharing
 export OC_PAIR_TONE_A=440 OC_PAIR_TONE_B=660
 CH=1                                   # #general: both are members
 
@@ -183,6 +188,51 @@ dump a
 vol25() { [ "$(peer a volume)" = 25 ]; }
 check "the engine plays bob at 25%" vol25
 "$PAIR" a call volume "$bob_id" 100 >/dev/null
+
+say "== alice shares her screen"
+"$PAIR" b call open $CH >/dev/null
+"$PAIR" a call open $CH >/dev/null
+dump a
+has_aid() { grep -q "^a11yitem $2 " "/tmp/oc-calls-dump-$1.txt"; }
+check "alice's call view offers Share screen (call.share)" has_aid a call.share
+"$PAIR" a call share "screen:synthetic" >/dev/null
+sfield() { field "$1" 'share ' "$2"; }
+a_sharing()   { [ "$(sfield a state)" = 2 ] && [ "$(sfield a bar)" = 1 ]; }
+b_sees_a()    { [ "$(sfield b sharer)" = "$(field a 'call ' self)" ] && ge "$(sfield b view_frames)" 10; }
+b_picture()   { [ "$(sfield b tex)" = 1728x1080 ] && ge "$(sfield b px_fno)" 1; }
+check "alice's share is confirmed, and her bar is up" waitfor a 10 a_sharing
+check "bob receives it" waitfor b 15 b_sees_a
+check "bob's call view shows it at 1728x1080 (2560x1600 fitted into 1920x1080), with a readable frame number" waitfor b 10 b_picture
+f1="$(sfield b px_fno)"; sleep 2; dump b
+rising() { gt "$(sfield b px_fno)" "${f1:-0}"; }
+check "...which keeps moving on (frame ${f1:-?} two seconds ago)" rising
+check "alice's view offers Stop sharing (call.share.stop)" has_aid a call.share.stop
+check "bob's names the picture and offers Full screen and Actual size" \
+  bash -c "grep -q '^a11yitem call.share.stage ' /tmp/oc-calls-dump-b.txt && grep -q '^a11yitem call.share.fullscreen ' /tmp/oc-calls-dump-b.txt && grep -q '^a11yitem call.share.actualsize ' /tmp/oc-calls-dump-b.txt"
+"$PAIR" b shot share_viewer >/dev/null
+"$PAIR" a shot share_sharer >/dev/null
+"$PAIR" b call share full >/dev/null
+full() { [ "$(sfield b full)" = 1 ]; }
+notfull() { [ "$(sfield b full)" = 0 ]; }
+check "bob goes full screen" waitfor b 4 full
+"$PAIR" b shot share_full >/dev/null
+"$PAIR" b key esc >/dev/null
+check "Esc brings him back" waitfor b 4 notfull
+"$PAIR" b call share actual >/dev/null
+actual() { [ "$(sfield b actual)" = 1 ]; }
+check "actual size" waitfor b 4 actual
+"$PAIR" b call share actual >/dev/null
+
+say "== bob takes over, then stops"
+"$PAIR" b call share "window:synthetic" >/dev/null
+a_taken() { [ "$(sfield a on)" = 0 ] && [ "$(sfield a bar)" = 0 ] && [ "$(sfield a sharer)" = "$(field b 'call ' self)" ]; }
+a_sees_b() { ge "$(sfield a view_frames)" 5 && [ "$(sfield a tex)" = 1728x1080 ]; }
+check "alice's share stops, and bob is the sharer" waitfor a 10 a_taken
+check "alice sees bob's" waitfor a 15 a_sees_b
+"$PAIR" b call share stop >/dev/null
+nobody() { [ "$(sfield "$1" sharer)" = 0 ] && [ "$(sfield "$1" tex)" = 0x0 ]; }
+check "bob stops: nobody shares, and alice's picture is gone" waitfor a 10 nobody a
+check "...and bob's bar is down" waitfor b 4 bash -c "[ \"\$(grep -m1 '^share ' /tmp/oc-calls-dump-b.txt | tr ' ' '\n' | grep -m1 '^bar=' | cut -d= -f2)\" = 0 ]"
 
 say "== ending"
 "$PAIR" b call end >/dev/null

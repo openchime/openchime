@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "callsig.h"
+#include "oc_media.h"
 
 typedef struct oc_call_engine oc_call_engine;
 
@@ -47,6 +48,20 @@ float oc_call_engine_volume(const oc_call_engine *e, uint64_t user_id);
 void  oc_call_engine_set_devices(oc_call_engine *e, const char *mic_id, const char *speaker_id);
 void  oc_call_engine_set_noise_suppression(oc_call_engine *e, int on);
 
+/* Share a screen or window (REQ-161): `device_id` from oc_capture_list_screens,
+ * fitted inside max_w×max_h (0: 1920×1080). The source opens now; frames go out
+ * once the daemon names this device the sharer, so the frontend also sends
+ * oc_client_call_share(c, channel, 1). Someone else starting to share stops this
+ * one (share_taken in the stats). 0, or -1 when not in a call. */
+int   oc_call_engine_share_start(oc_call_engine *e, const char *device_id, int max_w, int max_h);
+/* Stop sharing; the frontend also sends oc_client_call_share(c, channel, 0). */
+void  oc_call_engine_share_stop(oc_call_engine *e);
+/* The newest frame of someone else's share, copied into `dst` (allocated or
+ * resized here; oc_frame_free it) when it is newer than `*seq`: 1 with `*seq`
+ * and `*frame_no` (the sharer's frame number) updated; 0 if nothing new; -1 once
+ * the share has gone, so the frontend stops showing it. */
+int   oc_call_engine_share_frame(oc_call_engine *e, oc_frame *dst, uint32_t *seq, uint32_t *frame_no);
+
 /* What is happening, for the call view and the test harness. */
 typedef struct {
     uint64_t user_id;
@@ -73,6 +88,16 @@ typedef struct {
     int      target_ms;         /* the largest jitter-buffer target */
     int      n_peers;
     oc_call_peer_stats peers[32];
+
+    /* Screen sharing. */
+    uint64_t sharer;            /* who the daemon says is sharing, 0 nobody */
+    int      share_state;       /* this device: 0 not sharing, 1 waiting for the daemon, 2 sharing */
+    int      share_taken;       /* someone took over from this device */
+    int      share_error;       /* OC_CAP_* from the source, 0 fine */
+    int      share_width, share_height, share_fps, share_kbps;
+    uint32_t share_frames, share_keyframes, share_resent, share_nacks, share_plis, share_reports;
+    int      view_width, view_height;   /* someone else's share, as decoded */
+    uint32_t view_frames, view_frame_no, view_nacks, view_plis, view_skipped, view_errors;
 } oc_call_stats;
 
 void oc_call_engine_stats(oc_call_engine *e, oc_call_stats *out);

@@ -1494,6 +1494,7 @@ static void w_call_parts(oc_wbuf *w, uint16_t n, const oc_call_part *parts) {
         oc_w_u64(w, parts[i].user_id);
         oc_w_u8(w, parts[i].slot);
         w_raw(w, parts[i].device_key, OC_CALL_DEVICE_KEY_LEN);
+        oc_w_u8(w, parts[i].codecs);
     }
 }
 
@@ -1504,6 +1505,7 @@ static void r_call_parts(oc_rbuf *p, uint16_t *count, oc_call_part *parts, uint1
         parts[i].user_id = oc_r_u64(p);
         parts[i].slot = oc_r_u8(p);
         r_raw(p, parts[i].device_key, OC_CALL_DEVICE_KEY_LEN);
+        parts[i].codecs = oc_r_u8(p);
     }
     *count = n;
 }
@@ -1524,6 +1526,7 @@ oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *
     size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOIN);
     oc_w_u64(w, m->channel_id);
     w_raw(w, m->device_key, OC_CALL_DEVICE_KEY_LEN);
+    oc_w_u8(w, m->codecs);
     w_u64s(w, m->n_invite, m->invite);
     return oc_frame_end(w, off);
 }
@@ -1585,6 +1588,7 @@ oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state
     oc_w_u8(w, m->ended);
     w_u64s(w, m->n_parts, m->parts);
     w_u64s(w, m->n_invited, m->invited);
+    oc_w_u64(w, m->sharer);
     return oc_frame_end(w, off);
 }
 
@@ -1611,9 +1615,17 @@ oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_SHARE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->on);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uint16_t cap) {
     m->channel_id = oc_r_u64(p);
     r_raw(p, m->device_key, OC_CALL_DEVICE_KEY_LEN);
+    m->codecs = oc_r_u8(p);
     m->n_invite = 0;
     m->invite = invite;
     r_u64s(p, &m->n_invite, invite, cap);
@@ -1680,6 +1692,7 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
     m->invited = invited;
     r_u64s(p, &m->n_parts, parts, pcap);
     r_u64s(p, &m->n_invited, invited, icap);
+    m->sharer = oc_r_u64(p);
     return r_done(p);
 }
 
@@ -1705,6 +1718,12 @@ oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m) {
     m->epoch = oc_r_u32(p);
     m->sender = oc_r_u64(p);
     m->sealed = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m) {
+    m->channel_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
     return r_done(p);
 }
 

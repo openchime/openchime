@@ -38,7 +38,12 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 17: calls (REQ-301-305, ARCH-113). CALL_JOIN carries the joiner's device key
+/* 18: screen sharing in calls (REQ-161, ARCH-86/87). CALL_JOIN carries the
+ * video codecs the joiner can decode, and so does each participant on
+ * CALL_JOINED and CALL_ROSTER; CALL_STATE carries who is sharing; CALL_SHARE
+ * (0x00AA) is new.
+ *
+ * 17: calls (REQ-301-305, ARCH-113). CALL_JOIN carries the joiner's device key
  * and whom a start invites; CALL_JOINED and CALL_ROSTER carry each participant's
  * slot and device key and the call's epoch, and CALL_JOINED its starter and start;
  * CALL_INVITE, CALL_DECLINE, CALL_END, CALL_STATE, CALL_KEY and CALL_KEY_FOR
@@ -117,7 +122,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 17u
+#define OC_PROTOCOL_VERSION 18u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -303,6 +308,7 @@ typedef enum {
     OC_MSG_CALL_STATE       = 0x00A7, /* S->C, a call as the Calls section lists it (REQ-303) */
     OC_MSG_CALL_KEY         = 0x00A8, /* C->S, a participant's media key sealed to each other (ARCH-113) */
     OC_MSG_CALL_KEY_FOR     = 0x00A9, /* S->C, one sealed media key, from its sender */
+    OC_MSG_CALL_SHARE       = 0x00AA, /* C->S, start or stop sharing a screen in the call (REQ-161) */
     OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
     OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
     OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
@@ -1136,11 +1142,15 @@ typedef struct { oc_slice client_type; uint16_t count;
  * on one device: the slot the daemon gave it for the call's length (the low byte
  * of its SFrame KIDs) and the device's public key, which the others seal their
  * media keys to (ARCH-113, CALLS.md §5). */
-typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN]; } oc_call_part;
+typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN];
+                 uint8_t codecs; } oc_call_part;
+/* The video codecs a participant can decode, as bits (ARCH-87). VP9 is the one
+ * every client has; a later codec is a new bit, chosen only when everyone has it. */
+#define OC_CALL_CODEC_VP9 0x01u
 /* Start or join. `invite` names who a start invites; joining a call already
- * there names nobody. */
+ * there names nobody. `codecs` is what the joiner can decode. */
 typedef struct { uint64_t channel_id; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN];
-                 uint16_t n_invite; const uint64_t *invite; } oc_call_join;
+                 uint16_t n_invite; const uint64_t *invite; uint8_t codecs; } oc_call_join;
 typedef struct { uint64_t channel_id; } oc_call_leave;
 typedef struct { uint64_t channel_id; uint64_t call_id; uint16_t udp_port; oc_slice token;
                  uint8_t slot; uint32_t epoch; uint64_t starter; uint64_t started_at;
@@ -1151,10 +1161,14 @@ typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *users; } o
 typedef struct { uint64_t channel_id; } oc_call_decline;
 typedef struct { uint64_t channel_id; } oc_call_end;
 /* What the Calls section lists, sent on every change and at sign-in. `ended`
- * says the call is over: the last one about it. */
+ * says the call is over: the last one about it. `sharer` is who is sharing a
+ * screen, 0 for nobody (REQ-161). */
 typedef struct { uint64_t channel_id; uint64_t call_id; uint64_t starter; uint64_t started_at;
                  uint8_t ended; uint16_t n_parts; const uint64_t *parts;
-                 uint16_t n_invited; const uint64_t *invited; } oc_call_state;
+                 uint16_t n_invited; const uint64_t *invited; uint64_t sharer; } oc_call_state;
+/* Start (on = 1) or stop sharing a screen. One sharer at a time: a start takes
+ * over from whoever was sharing (REQ-161). */
+typedef struct { uint64_t channel_id; uint8_t on; } oc_call_share;
 /* A media key sealed to each recipient (HPKE enc ‖ ciphertext, opaque to the
  * daemon). */
 typedef struct { uint64_t recipient; oc_slice sealed; } oc_call_key_entry;
@@ -1449,6 +1463,7 @@ oc_result oc_encode_call_end(oc_wbuf *w, uint16_t version, const oc_call_end *m)
 oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state *m);
 oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m);
 oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key_for *m);
+oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m);
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
 oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
 oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
@@ -1626,6 +1641,7 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
                                uint64_t *invited, uint16_t icap);
 oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entries, uint16_t cap);
 oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m);
+oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m);
 oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
 oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
 oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);

@@ -109,14 +109,16 @@ static int on_ipc(int ipc_fd, uint8_t *buf, size_t *have, size_t cap) {
 
 /* --- UDP: relay one datagram to the sender's call-mates ------------------- */
 
-static void on_udp(int udp_fd) {
+/* Returns 0 once the socket is drained. */
+static int on_udp(int udp_fd) {
     uint8_t pkt[OC_AUDIO_MAX_PACKET];
     struct sockaddr_in src; socklen_t sl = sizeof src;
     ssize_t n = recvfrom(udp_fd, pkt, sizeof pkt, 0, (struct sockaddr *)&src, &sl);
-    if (n < (ssize_t)OC_AUDIO_C2S_HDR) return;   /* too short to be a valid packet */
+    if (n < 0) return 0;
+    if (n < (ssize_t)OC_AUDIO_C2S_HDR) return 1; /* too short to be a valid packet */
 
     participant *me = find_by_token(pkt);        /* token is the first 16 bytes */
-    if (!me) return;                             /* unknown/revoked token -> ignore */
+    if (!me) return 1;                           /* unknown/revoked token -> ignore */
     /* The address is bound on first use and never re-learned. The token is not a
      * secret on the wire: it leads every packet in the clear,
      * so re-learning the return address from whichever packet arrived last let
@@ -132,7 +134,7 @@ static void on_udp(int udp_fd) {
         me->addr = src;
         me->addr_known = 1;
     } else if (me->addr.sin_addr.s_addr != src.sin_addr.s_addr || me->addr.sin_port != src.sin_port) {
-        return;
+        return 1;
     }
     me->last_seen_ms = now_ms();
 
@@ -152,6 +154,7 @@ static void on_udp(int udp_fd) {
         if (!e->used || e == me || e->call_id != me->call_id || !e->addr_known) continue;
         sendto(udp_fd, out, olen, 0, (struct sockaddr *)&e->addr, sizeof e->addr);
     }
+    return 1;
 }
 
 /* Drop the silent and tell the daemon, which takes them out of their call. The
@@ -179,6 +182,11 @@ int oc_audio_sidecar_run(int ipc_fd, int udp_fd, volatile sig_atomic_t *stop) {
         int f = fd == 0 ? ipc_fd : udp_fd;
         int fl = fcntl(f, F_GETFL, 0); if (fl >= 0) fcntl(f, F_SETFL, fl | O_NONBLOCK);
     }
+    /* A shared screen's keyframe arrives as a burst of a hundred packets or more
+     * (VIDEO.md §5): room for several, both ways, rather than the default's few. */
+    int bufsz = 4 << 20;
+    setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz);
+    setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz);
     int ep = epoll_create1(0);
     if (ep < 0) return -1;
     struct epoll_event ev;
@@ -191,7 +199,7 @@ int oc_audio_sidecar_run(int ipc_fd, int udp_fd, volatile sig_atomic_t *stop) {
         int nfds = epoll_wait(ep, events, 16, 1000);   /* 1s tick drives the sweep */
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
-            if (fd == udp_fd) on_udp(udp_fd);
+            if (fd == udp_fd) { for (int k = 0; k < 256 && on_udp(udp_fd); k++) {} }
             else if (fd == ipc_fd) {
                 if (on_ipc(ipc_fd, ipc_buf, &ipc_have, sizeof ipc_buf) < 0) { close(ep); return 0; }
             }

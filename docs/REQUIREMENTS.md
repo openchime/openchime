@@ -1244,21 +1244,25 @@ the requirement says so explicitly rather than implying one.
   client (REQ-162–166) — is admitted too, because it needs no real-time path at
   all: it is a file, an attachment and a message. Camera video *calling* stays
   excluded. The exclusion is narrowed, not repealed.
-- **REQ-161.** *(Not built)* A participant in a call has been able to **share a screen or
-  window** to the other participants, view-only. Screenshare has ridden the
-  existing server-relay media path unchanged (ARCH-73/86): the sidecar forwards
-  the encoded payload opaquely exactly as it forwards Opus, so no server-side
-  codec has existed and no transcoding has been possible. Consequently **all
-  clients have spoken one mandatory codec — VP9 via libvpx (ARCH-87)** — since a
-  call may hold clients on different platforms simultaneously and a codec
-  disagreement would break the call outright; the codec has therefore been
-  negotiated on the wire (PROTOCOL.md §5.17) rather than chosen per frontend.
-  Remote control, recording the share, the computer's sound, simultaneous
-  sharers, and camera video have all been out of scope of a call (REQ-160); a
-  *recorded* screen is a video message (REQ-162). A **text-only frontend has
-  been permanently exempt** (ARCH-75 — the TUI renders no graphics), showing only
-  that a share is in progress and by whom. **Not started;** it builds on the
-  audio client's media transport (REQ-150–152).
+- **REQ-161.** A participant in a call has been able to **share a screen or
+  window** to the other participants, view-only, one sharer at a time: starting
+  a share takes over from whoever was sharing. Screenshare has ridden the
+  existing server-relay media path unchanged (ARCH-73/86): the relay forwards the
+  encoded payload opaquely exactly as it forwards Opus, inside the call's
+  end-to-end encryption, so no server-side codec has existed and no transcoding
+  has been possible. Consequently **all clients have spoken one mandatory codec —
+  VP9 via libvpx (ARCH-87)** — negotiated on the wire (PROTOCOL.md §5.17) rather
+  than chosen per frontend. Lost packets have been asked for again and a keyframe
+  requested when a picture could not be recovered; the bitrate has followed what
+  the viewers receive, within a ceiling of 2.5 Mbit/s; sharing has been part of
+  every call, with no switch to turn it off. The sharer has seen that they are
+  sharing and a way to stop, and a frame around what is shared; the viewers have
+  seen it fitted, full screen or at actual size. Remote control, recording the
+  share, the computer's sound, drawing on a share, simultaneous sharers, and
+  camera video have all been out of scope of a call (REQ-160); a *recorded*
+  screen is a video message (REQ-162). A **text-only frontend has been
+  permanently exempt** (ARCH-75 — the TUI renders no graphics). [VIDEO.md](./VIDEO.md)
+  is the design.
 - **REQ-162.** A user has been able to **record a video message and
   post it** into a channel, a DM or a thread, with the composer's text as its
   caption. It has recorded **the camera, a screen or one window**, and a screen or

@@ -1032,6 +1032,7 @@ to change a format's size, so any preference that moves the scale must call
 - **Then — the rest of the specified scope.** REQUIREMENTS.md §§1–16 carries it,
   each requirement marked with whether it is built; whatever is not built and
   matters is an issue in the [tracker](https://github.com/openchime/openchime/issues).
-- **Then — remaining platforms + screenshare.** The portable GUI on Linux and
-  macOS (a text backend + native shim each, ARCH-80), a web DOM UI, and mobile — and, gated behind the audio client,
-  **screenshare** (REQ-161, [VIDEO.md](./VIDEO.md)).
+- **Then — remaining platforms.** The portable GUI on Linux and
+  macOS (a text backend + native shim each, ARCH-80), a web DOM UI, and mobile —
+  each with its own screen capture for sharing in calls; the codec and the
+  transport are in the core (REQ-161, [VIDEO.md](./VIDEO.md)).
