@@ -6646,7 +6646,8 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE };
+       ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
+       ACC_MARK_ALL_READ };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -6685,6 +6686,9 @@ static const struct {
     { AM_CTRL | AM_SHIFT, 'M',        ACC_CALL_MUTE, "Ctrl+Shift+M",   "Mute or unmute yourself in a call" },
     { AM_CTRL | AM_SHIFT, 'S',        ACC_CALL_SHARE, "Ctrl+Shift+S",  "Share your screen in a call, or stop sharing" },
     { AM_CTRL | AM_SHIFT, 'T',        ACC_FREETALK, "Ctrl+Shift+T",    "Free talk: post what you say, piece by piece" },
+    /* Shift+Esc, as the reference client binds it. Plain Esc closes whatever is
+     * open, so the Esc handler below stands aside while Shift is held. */
+    { AM_SHIFT,           VK_ESCAPE,  ACC_MARK_ALL_READ, "Shift+Esc",  "Mark every conversation read" },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
@@ -6721,6 +6725,9 @@ static void accel_run(HWND hwnd, int action) {
         break; }
     case ACC_PTT:      if (!call_ptt(hwnd, 1)) dict_ptt_down(hwnd, DH_KEY); break;
     case ACC_CALL_MUTE: if (call_here(model())) menu_dispatch(hwnd, CC_MUTE); break;
+    /* The same command the workspace menu and the palette run (73), so the three
+     * ways to it cannot drift. */
+    case ACC_MARK_ALL_READ: menu_dispatch(hwnd, 73); break;
     case ACC_CALL_SHARE:
         if (call_here(model())) {
             /* The picker opens under the call's Share button, so the call is shown. */
@@ -6808,7 +6815,9 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * above. Everything else about Esc is focus-specific (cancel an edit, close the
      * picker, drop a selection) and stays in the control that owns it, so this only
      * claims the key when one of these four is actually up. */
-    if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE) {
+    /* Shift+Esc is a shortcut of its own (marking everything read) and must reach
+     * the table below; bare Esc dismisses what is open. */
+    if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE && !mod_down(VK_SHIFT)) {
         if (g_tp_open)   { g_tp_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_share_full && !g_menu) { g_share_full = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_sub_open)  { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
