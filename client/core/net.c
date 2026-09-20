@@ -23,6 +23,7 @@
 #  include <bcrypt.h>
 #endif
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
@@ -52,6 +53,10 @@ typedef struct {
 
 struct oc_net {
     oc_thread_t   thread;
+    /* How many sends are queued on THIS connection, published by its own net
+     * thread for the UI thread to read (obox_publish). One per oc_net: a global
+     * made every signed-in workspace report whichever thread published last. */
+    atomic_int    obox_pending;
     volatile int  stop;
     volatile int  reconnect_now;   /* set by oc_net_reconnect: cut short the backoff */
     char          host[256];
@@ -81,14 +86,23 @@ struct oc_net {
  * back after a reconnect as a bare note with its attribution silently gone. */
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; char *body;
                  uint64_t src_channel, src_message; } obox_row;
-typedef struct { obox_row *v; size_t n, cap; } obox;
+/* `owner` is the connection whose sends these are: what obox_publish tells. */
+typedef struct { obox_row *v; size_t n, cap; oc_net *owner; } obox;
 
 /* The UI thread must not walk the outbox (net-thread-owned), so the net thread
- * publishes just its size here. A stale-by-one-tick read is fine: this drives a
- * confirm-on-quit prompt, not a correctness decision. */
-static volatile int g_obox_pending;
-static void obox_publish(const obox *o) { g_obox_pending = (int)o->n; }
-int oc_net_outbox_pending(oc_net *n) { (void)n; return g_obox_pending; }
+ * publishes just its size on the connection that owns it. A stale-by-one-tick
+ * read is fine: this drives a confirm-on-quit prompt, not a correctness decision.
+ *
+ * It is per-connection because the outbox is. A single global made a client with
+ * two workspaces signed in report whichever net thread published last: a
+ * workspace with messages queued read zero because the other one had none, so the
+ * app could quit without the warning that count exists to raise -- and the two
+ * threads writing it was a data race besides. Atomic, because two threads do
+ * publish, each to its own. */
+static void obox_publish(const obox *o) {
+    if (o->owner) atomic_store(&o->owner->obox_pending, (int)o->n);
+}
+int oc_net_outbox_pending(oc_net *n) { return n ? atomic_load(&n->obox_pending) : 0; }
 
 static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, const char *body,
                      uint64_t src_channel, uint64_t src_message) {
@@ -1883,9 +1897,15 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             /* The server has durably accepted a send: clear it from the outbox so
              * it isn't resent (REQ-102). The matching BROADCAST already folded it
              * into the model. */
+            /* Gated on the OUTBOX, and nothing else. It used to require ctx->store
+             * as well -- the local persistence store, which this has nothing to do
+             * with -- so a client without one (the TUI unpersisted, every test
+             * client) never cleared a single row: the count only grew, and every
+             * reconnect resent the whole history of the process for the daemon to
+             * dedup. */
             oc_send_ack ack;
-            if (oc_decode_send_ack(&p, &ack) == OC_OK && ctx && ctx->store)
-                if (ctx->obox) obox_remove(ctx->obox, ack.idem);
+            if (oc_decode_send_ack(&p, &ack) == OC_OK && ctx && ctx->obox)
+                obox_remove(ctx->obox, ack.idem);
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) != OC_OK) {
@@ -2855,6 +2875,7 @@ static void *net_thread(void *arg) {
     oc_net *n = (oc_net *)arg;
     oc_hwtab hw; memset(&hw, 0, sizeof hw);
     obox outbox; memset(&outbox, 0, sizeof outbox);
+    outbox.owner = n;                  /* the count goes to this workspace, not a global */
     uint8_t sess[OC_SESSION_TOKEN_LEN];
     int have_sess = 0, reconnecting = 0, backoff_ms = 0;
 

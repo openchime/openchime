@@ -485,9 +485,14 @@ prompt. A rejected token (expired/revoked) is dropped and, if a password is
 still held, retried once with it; logging out clears the stored token.
 
 **The offline outbox (REQ-102) is built** (see §5): the net thread records each
-send in the store before delivery, resends the outbox on reconnect, and clears a
+send in the outbox before delivery, resends the outbox on reconnect, and clears a
 row on its `SEND_ACK` — so an offline-composed send goes out on the next
-connection, deduped by the daemon.
+connection, deduped by the daemon. **One outbox per connection**, and so one count
+per connection: `oc_net_outbox_pending` answers for the `oc_net` it is given, and
+a frontend with several workspaces signed in adds them up (the Win32 quit prompt
+does). It was a single global written by every net thread, which made the answer
+whichever thread published last — a workspace holding unsent messages reporting
+none, which is exactly the case the prompt exists for.
 
 **Workspace resolution is built (REQ-010/011,** `client/core/resolve.c`**).** A
 user-typed workspace — a full domain (`chat.acme.com`) or a bare

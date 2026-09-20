@@ -2921,6 +2921,52 @@ int run_client_core_tests(void) {
             }
         }
 
+        /* The count of unsent messages belongs to the CONNECTION that holds them
+         * (REQ-102, ARCH-88). It was one global written by every net thread, so a
+         * client with two workspaces signed in read whichever thread published
+         * last: a workspace holding unsent messages could report none, and that
+         * count is what warns before quitting. Two clients here are two
+         * workspaces: separate connections, separate threads, separate outboxes.
+         *
+         * A send to a channel that does not exist is refused, so its row STAYS in
+         * the outbox -- a stable state to read both counts in, rather than the
+         * instant between a send and its acknowledgement. */
+        {
+            oc_client *w1 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+            oc_client *w2 = oc_client_start("127.0.0.1", arg.port, "gil:pw-gil");
+            CHECK(w1 != NULL && w2 != NULL);
+            if (w1 && w2) {
+                CHECK(WAIT_FOR(w1, m->authed));
+                CHECK(WAIT_FOR(w2, m->authed));
+                oc_client_send(w1, 999999, "nowhere to go");
+                oc_client_send(w1, 999999, "nor this one");
+                oc_client_send(w2, 999999, "the other workspace's own");
+                int p1 = 0, p2 = 0;
+                for (int t = 0; t < 400 && !(p1 == 2 && p2 == 1); t++) {
+                    p1 = oc_client_outbox_pending(w1);
+                    p2 = oc_client_outbox_pending(w2);
+                    usleep(5000);
+                }
+                CHECK(p1 == 2);                /* two refused sends, held by w1 */
+                CHECK(p2 == 1);                /* one, held by w2, whoever published last */
+
+                /* And an ACCEPTED send leaves nothing behind: the row goes on the
+                 * acknowledgement. The removal used to be gated on the local store,
+                 * so a client without one counted every message it ever sent as
+                 * unsent, for ever. */
+                oc_client_send(w2, 1, "this one is accepted");
+                CHECK(WAIT_FOR(w2, channel_has_body(m, 1, "this one is accepted")));
+                for (int t = 0; t < 400 && oc_client_outbox_pending(w2) != 1; t++) usleep(5000);
+                CHECK(oc_client_outbox_pending(w2) == 1);   /* just the refused one */
+                CHECK(oc_client_outbox_pending(w1) == 2);   /* w2's ack is not w1's */
+                oc_client_stop(w1);
+                oc_client_stop(w2);
+            } else {
+                if (w1) oc_client_stop(w1);
+                if (w2) oc_client_stop(w2);
+            }
+        }
+
         /* offline outbox (REQ-102), now in memory: a message composed while the
          * daemon is down is held by the net thread and resent when the connection
          * comes back — within the life of the process, which is what REQ-102 asks
