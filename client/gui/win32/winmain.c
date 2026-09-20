@@ -886,6 +886,11 @@ static uint64_t g_sel;              /* selected channel id (0 = none) */
 static float    g_scroll;           /* px scrolled up from the bottom of the transcript */
 static float    g_scroll_max;       /* recomputed each paint, for input clamping */
 static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = none) */
+/* The message the KEYBOARD is on (0 = none), moved with Ctrl+Up/Ctrl+Down. It is
+ * what Shift+F10 and the Menu key open the actions for: pin, save, forward, copy
+ * link, edit, delete, mark unread and react had no route but a right-click
+ * (REQ-264). Drawn lit like a hovered row, so where the keyboard is is visible. */
+static uint64_t g_kb_mid;
 /* The URL under the cursor, and the one the press landed on. Two,
  * not one, because a link opens on RELEASE over the same address it was pressed
  * on: opening on press would make dragging a selection that starts inside a URL
@@ -2072,6 +2077,26 @@ static int   g_menu_headerblock;             /* draw the workspace header on top
 static uint64_t g_menu_target;               /* what a context menu is about */
 static uint64_t g_menu_target2;             /* its channel, for a message */
 
+/* Move the highlight through an open menu, skipping what cannot be chosen
+ * (sections, separators, the profile popover's identity header). `d` is +1 or -1;
+ * from nothing highlighted, +1 lands on the first choosable item and -1 on the
+ * last. Returns 0 when the menu holds nothing to choose. */
+static int menu_pickable(int i) {
+    if (i < 0 || i >= g_n_mi) return 0;
+    int k = g_mi[i].kind;
+    return k == MK_ITEM || k == MK_SUB || k == MK_STATUSROW || k == MK_EMOJIROW;
+}
+static int menu_move(int d) {
+    int i = g_menu_hover;
+    for (int n = 0; n < g_n_mi; n++) {
+        i = (i < 0) ? (d > 0 ? 0 : g_n_mi - 1) : i + d;
+        if (i < 0) i = g_n_mi - 1;
+        if (i >= g_n_mi) i = 0;
+        if (menu_pickable(i)) { g_menu_hover = i; return 1; }
+    }
+    return 0;
+}
+
 /* Is a context menu open about this? The row it was opened on stays lit while it
  * is: the pointer leaves the row for the menu, which clears the row's hover, and
  * a menu with nothing marked beside it does not say what it will act on. Asked
@@ -2086,6 +2111,7 @@ static int   g_n_mirows;
 /* The pause-notifications flyout (the app's one submenu): its own state, on
  * the More-flyout pattern — g_menu stays a single panel. */
 static int   g_sub_open;                    /* 0 or SUBCMD_PAUSE */
+static int   g_sub_hover = -1;              /* the flyout row the keyboard is on */
 static float g_sub_anchor_top;              /* the parent row's top */
 static rectf g_sub_panel;
 static struct { float top, bot; int cmd; char label[48]; } g_subrows[8];
@@ -3333,6 +3359,7 @@ static void select_channel(uint64_t cid) {
      * (ARCH-88), and the list is small. */
     oc_client_list_members(g_client, cid);
     g_mem_scroll = 0;                    /* another roster starts at its top */
+    g_kb_mid = 0;                        /* ...and the keyboard on no message */
     g_tab = TAB_MESSAGES;                /* a new channel opens on its transcript */
     draft_restore(cid);
     ac_close();
@@ -3910,7 +3937,7 @@ static void draw_menu(gfx *rt) {
 }
 
 static void submenu_close(void) {
-    g_sub_open = 0; g_n_subrows = 0;
+    g_sub_open = 0; g_n_subrows = 0; g_sub_hover = -1;
     g_sub_panel = rf(0, 0, 0, 0);
 }
 
@@ -3950,7 +3977,7 @@ static void draw_submenu(gfx *rt, float W, float H) {
             cy += 11.0f;
         }
         rectf r = rf(px, cy, px + w, cy + rowh);
-        if (in_rect(r, g_mouse_x, g_mouse_y))
+        if (in_rect(r, g_mouse_x, g_mouse_y) || g_sub_hover == i)
             fill_round(rt, rf(px + 5, cy + 2, px + w - 5, cy + rowh - 2), OC_R_CONTROL, OC_COL_HOVER);
         draw_text(rt, rows[i].label, g_ui, rf(px + 16, cy, px + w - 12, cy + rowh), OC_COL_TEXT);
         if (g_n_subrows < (int)(sizeof g_subrows / sizeof g_subrows[0])) {
@@ -3961,6 +3988,28 @@ static void draw_submenu(gfx *rt, float W, float H) {
         }
         cy += rowh;
     }
+}
+
+/* The flyout under the keyboard: its rows are recorded by the paint above, so
+ * this walks what is actually drawn. */
+static void sub_move(int d) {
+    if (g_n_subrows <= 0) return;
+    int i = g_sub_hover < 0 ? (d > 0 ? -1 : g_n_subrows) : g_sub_hover;
+    i += d;
+    if (i < 0) i = g_n_subrows - 1;
+    if (i >= g_n_subrows) i = 0;
+    g_sub_hover = i;
+}
+/* Open the highlighted parent's flyout without a pointer. The anchor is the
+ * drawn row's top, which is what the mouse path uses; the rows are matched by
+ * command, since the drawn list holds only the rows that have one. */
+static void sub_open_from_keyboard(void) {
+    if (g_menu_hover < 0 || g_menu_hover >= g_n_mi) return;
+    int cmd = g_mi[g_menu_hover].cmd;
+    for (int i = 0; i < g_n_mirows; i++)
+        if (g_mirows[i].cmd == cmd) { g_sub_anchor_top = g_mirows[i].top; break; }
+    g_sub_open = cmd;
+    g_sub_hover = 0;
 }
 
 /* The second column's surface: its background AND the 1px edge against the
@@ -5550,7 +5599,10 @@ static void draw_msglist(gfx *rt, const oc_model *m,
             float by = y + MSG_PIN(&msgs[first + i]) + MSG_BODY_DY(grouped[i]);
             /* Hover highlight behind the whole row (main transcript only). */
             int row_hot = capture && !g_selecting && g_hover_mid == msgs[first + i].message_id;
-            if (row_hot || menu_about(MENU_MSG, msgs[first + i].message_id))
+            /* Where the keyboard is, lit the same way: the pointer is not the
+             * only thing that can be on a row. */
+            int row_kb = capture && g_kb_mid && g_kb_mid == msgs[first + i].message_id;
+            if (row_hot || row_kb || menu_about(MENU_MSG, msgs[first + i].message_id))
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
             /* The quick reactions, on the row under the pointer: the most frequent
              * action in a chat product, at one press rather than two. The same six
@@ -6753,6 +6805,12 @@ static const struct {
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
     { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
+    /* The same actions without a pointer. Display-only rows: the keys are
+     * handled in accel_dispatch ahead of this table, because what they do
+     * depends on what is open. */
+    { 0,                  0,          ACC_NONE,  "Ctrl+Up / Ctrl+Down","Move through the messages" },
+    { 0,                  0,          ACC_NONE,  "Shift+F10 / Menu",   "Actions for the message you are on, or for this conversation" },
+    { 0,                  0,          ACC_NONE,  "Up / Down, Enter",   "Move through an open menu and choose" },
 };
 
 static void search_open(HWND hwnd);            /* fwd */
@@ -6772,6 +6830,10 @@ static int  call_ptt(HWND hwnd, int down);      /* fwd — calls (REQ-150) */
 static void call_open_view(HWND hwnd, uint64_t ch);   /* fwd */
 static int  ws_go(HWND hwnd, int slot);        /* fwd — Ctrl+<digit> and the switcher */
 static void menu_dispatch(HWND hwnd, int cmd);  /* fwd */
+static void menu_run_kind(HWND hwnd, int kind, int cmd);  /* fwd — a menu item chosen */
+static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
+static void kb_row_move(HWND hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
+static void kb_context_menu(HWND hwnd);         /* fwd — Shift+F10 / the Menu key */
 static void accel_run(HWND hwnd, int action) {
     switch (action) {
     case ACC_QUIT:    app_quit(hwnd);     break;
@@ -6870,6 +6932,64 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * leave two things claiming the screen. Esc and Enter reach it through
      * modal_key in the window proc. */
     if (modal_open()) return 0;
+    /* An OPEN MENU owns the keyboard, as a menu does: the arrows move through it,
+     * Enter chooses, Right opens a flyout and Left closes one. Without this the
+     * keyboard route to a context menu would end at opening it -- every item in
+     * it still needing a pointer, which is the same gap one step later
+     * (REQ-264). Ahead of everything below, including the Esc block, which keeps
+     * closing it. */
+    if (m->message == WM_KEYDOWN && g_menu && !modal_open()) {
+        WPARAM k = m->wParam;
+        if (k == VK_DOWN || k == VK_UP) {
+            if (g_sub_open) sub_move(k == VK_DOWN ? 1 : -1);
+            else            menu_move(k == VK_DOWN ? 1 : -1);
+            InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+        if (k == VK_HOME || k == VK_END) {
+            if (!g_sub_open) { g_menu_hover = -1; menu_move(k == VK_HOME ? 1 : -1); }
+            InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+        if (k == VK_RIGHT && !g_sub_open && g_menu_hover >= 0 &&
+            g_mi[g_menu_hover].kind == MK_SUB) {
+            sub_open_from_keyboard(); InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+        if (k == VK_LEFT && g_sub_open) { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (k == VK_RETURN || k == VK_SPACE) {
+            if (g_sub_open) {
+                if (g_sub_hover >= 0 && g_sub_hover < g_n_subrows) {
+                    int cmd = g_subrows[g_sub_hover].cmd;
+                    submenu_close();
+                    g_menu = MENU_NONE; g_menu_hover = -1;
+                    menu_dispatch(hwnd, cmd);
+                }
+            } else if (g_menu_hover >= 0 && g_menu_hover < g_n_mi) {
+                if (g_mi[g_menu_hover].kind == MK_SUB) { sub_open_from_keyboard(); }
+                else {
+                    int cmd = g_mi[g_menu_hover].cmd, kind = g_menu;
+                    submenu_close();
+                    g_menu = MENU_NONE; g_menu_hover = -1;
+                    menu_run_kind(hwnd, kind, cmd);
+                }
+            }
+            InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+    }
+    /* Ctrl+Up / Ctrl+Down walk the transcript, and Shift+F10 or the Menu key open
+     * the actions for where they land -- the keyboard route to the context menu
+     * (REQ-264). With no message focused the menu is the conversation's own, which
+     * is the sidebar row's menu reached without the sidebar. */
+    if (m->message == WM_KEYDOWN && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) &&
+        (m->wParam == VK_UP || m->wParam == VK_DOWN) && transcript_shell() && !g_menu) {
+        kb_row_move(hwnd, m->wParam == VK_DOWN ? 1 : -1);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    if (m->message == WM_KEYDOWN && !g_menu && !modal_open() &&
+        (m->wParam == VK_APPS || (m->wParam == VK_F10 && mod_down(VK_SHIFT)))) {
+        kb_context_menu(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
     /* Esc dismisses a transient overlay FIRST, whatever has focus. The
      * menu/flyout/lightbox/palette Esc handling lives in the main window's proc,
      * which the composer's focus makes unreachable — the same trap as the chords
@@ -6885,6 +7005,7 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
         if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_lightbox)  { g_lightbox = 0;     InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_kb_mid)    { g_kb_mid = 0;       InvalidateRect(hwnd, NULL, FALSE); return 1; }
         /* Focus-specific Esc (drop the completion list, cancel an edit, clear a
          * selection) stays with the control that owns it — fall through. */
         if (g_n_ac > 0 || g_edit_msg || g_has_sel) return 0;
@@ -23897,6 +24018,62 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
     }
 }
 
+/* ---- the keyboard's own route to a context menu (REQ-264) -------------------
+ *
+ * Every action in the message menu -- pin, save, forward, copy link, edit,
+ * delete, mark unread, react -- was reachable only by right-clicking, so with no
+ * pointer the richest action set in the app could not be reached at all. These
+ * two give it a route: Ctrl+Up / Ctrl+Down put the keyboard ON a message, and
+ * Shift+F10 (or the Menu key, which is what a keyboard with one sends) opens that
+ * message's actions. The menu that opens is then walked with the arrows and
+ * chosen from with Enter, handled where the keys arrive.
+ *
+ * The rows come from the last paint, which is what the pointer hit-tests against
+ * too, so the keyboard and the mouse cannot disagree about where a message is. */
+static void kb_row_move(HWND hwnd, int d) {
+    (void)hwnd;
+    if (g_n_msgrows <= 0) { g_kb_mid = 0; return; }
+    int cur = -1;
+    for (int i = 0; i < g_n_msgrows; i++)
+        if (g_msgrows[i].mid == g_kb_mid) { cur = i; break; }
+    if (cur < 0) {                       /* nothing focused: start at the newest */
+        g_kb_mid = g_msgrows[g_n_msgrows - 1].mid;
+        return;
+    }
+    int nx = cur + d;
+    if (nx >= 0 && nx < g_n_msgrows) { g_kb_mid = g_msgrows[nx].mid; return; }
+    /* Off the end of what is drawn: scroll instead, and leave the focus where it
+     * is. The next press finds the row that has just come into view -- which is
+     * how a keyboard walks a list longer than its window. */
+    g_scroll += (d < 0) ? 120.0f : -120.0f;
+    if (g_scroll < 0) g_scroll = 0;
+    if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
+}
+
+static void kb_context_menu(HWND hwnd) {
+    const oc_model *m = model();
+    if (!m) return;
+    if (g_kb_mid) {
+        for (int i = 0; i < g_n_msgrows; i++)
+            if (g_msgrows[i].mid == g_kb_mid) {
+                show_msg_menu(hwnd, m, g_kb_mid,
+                              g_msgrows[i].left + UIS(60), g_msgrows[i].top + UIS(20));
+                menu_move(1);            /* on the first item, ready for Enter */
+                return;
+            }
+        return;
+    }
+    /* No message focused: the conversation's own menu -- the sidebar row's, got
+     * at without the sidebar. Anchored on that row when it is drawn, so it opens
+     * where a right-click would have opened it. */
+    if (!g_sel) return;
+    float cy = 120.0f;
+    for (int i = 0; i < g_n_rows; i++)
+        if (!g_rows[i].header && g_rows[i].cid == g_sel) { cy = g_rows[i].top + UIS(8); break; }
+    show_channel_menu(hwnd, m, g_sel, RAIL_W + UIS(40), cy);
+    menu_move(1);
+}
+
 static void channel_menu_run(HWND hwnd, int cmd) {
     const oc_model *m = model();
     uint64_t cid = g_menu_target;
@@ -24970,6 +25147,13 @@ static void test_dump(const char *path) {
         fprintf(f, " %s:%d@%.0f,%.0f,%.0f,%.0f", g_hrx[i].emoji, g_hrx[i].mine,
                 g_hrx[i].r.left, g_hrx[i].r.top, g_hrx[i].r.right, g_hrx[i].r.bottom);
     fprintf(f, "\n");
+    /* Where the KEYBOARD is, and what an open menu is highlighting: both had to
+     * be readable for the keyboard route to the context menu to be testable at
+     * all (REQ-264). */
+    fprintf(f, "kbfocus mid=%llu menuhover=%d menuhovercmd=%d subhover=%d subopen=%d\n",
+            (unsigned long long)g_kb_mid, g_menu_hover,
+            (g_menu && g_menu_hover >= 0 && g_menu_hover < g_n_mi) ? g_mi[g_menu_hover].cmd : -1,
+            g_sub_hover, g_sub_open);
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -25407,6 +25591,13 @@ static void test_poll(HWND hwnd) {
                  !strcmp(k, "tab")   ? VK_TAB    :
                  !strcmp(k, "up")    ? VK_UP     :
                  !strcmp(k, "down")  ? VK_DOWN   :
+                 /* The function keys by name, and the Menu key that a keyboard
+                  * with one sends: without these `key f10` reached atoi(), which
+                  * answers 0 -- a key the harness "pressed" and nothing received,
+                  * acked "ok" either way. */
+                 (k[0] == 'f' && k[1] >= '1' && k[1] <= '9' && atoi(k + 1) >= 1 && atoi(k + 1) <= 12)
+                     ? (VK_F1 + atoi(k + 1) - 1) :
+                 (!strcmp(k, "menu") || !strcmp(k, "apps")) ? VK_APPS :
                  !strcmp(k, "f6")    ? VK_F6     :
                  !strcmp(k, "space") ? VK_SPACE  :
                  !strcmp(k, "slash") ? VK_OEM_2  :
