@@ -523,6 +523,25 @@ void oc_client_list_files(oc_client *c, uint64_t channel_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* The next page of the open files list (REQ-143). The cursor is the last row the
+ * model holds -- its created-at and id -- so a file uploaded meanwhile cannot
+ * make a row repeat or vanish, and the entries that arrive are APPENDED to the
+ * ones already listed rather than replacing them. Nothing happens when the
+ * daemon said there are no more, or while a page is already on its way. */
+void oc_client_list_files_more(oc_client *c) {
+    if (!c) return;
+    oc_model *m = &c->model;
+    if (!m->filelist_open || m->filelist_loading || !m->files_more || m->n_files == 0) return;
+    const oc_file_view *last = &m->files[m->n_files - 1];
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILES);
+    if (!cmd) return;
+    cmd->channel_id = m->filelist_channel;
+    cmd->server_time = last->created_at;
+    cmd->message_id = last->id;
+    m->filelist_loading = 1;           /* the entries append; the list stays */
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_close_files(oc_client *c) {
     if (c) oc_model_close_filelist(&c->model);
 }

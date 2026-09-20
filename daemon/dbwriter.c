@@ -11,6 +11,8 @@
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
 #include "dbwriter.h"
+
+#include "config.h"   /* the page size a files listing answers with (REQ-143) */
 #include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
 #include "url.h"
 #include "migrate.h"
@@ -3063,25 +3065,61 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     /* One channel reads 0023's index directly; the workspace-wide form filters
      * by membership instead, which is the same set a backfill would show. */
+    /* Newest first, and the cursor is BOTH keys: two files uploaded in the same
+     * millisecond order by id, so a page boundary between them neither repeats a
+     * row nor drops one. `(created, id) < (?, ?)` is a row-value comparison,
+     * which is exactly that rule written once. A first page asks with no cursor.
+     *
+     * One row more than the page is read, and not sent: it is how the daemon
+     * knows whether to say there are more, without a second COUNT over the same
+     * index. */
+    /* One page's worth, from the configuration read at startup (config.c): the
+     * query path must not read the environment, which another thread may be
+     * changing. Clamped here too, because a writer driven without a loaded
+     * configuration -- the suite that tests this query does exactly that -- would
+     * otherwise read a page of zero rows and answer that a channel has no files. */
+    int cfg_page = oc_config_get()->file_page;
+    if (cfg_page < 1 || cfg_page > (int)OC_MAX_FILE_LIST) cfg_page = (int)OC_MAX_FILE_LIST;
+    size_t page = (size_t)cfg_page;
+    int paged = j->files_before_ms != 0 || j->files_before_id != 0;
     const char *sql = j->channel_id
+        ? (paged
         ? "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
           "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
-          " ORDER BY a.created_at_ms DESC LIMIT ?2;"
+          "   AND (a.created_at_ms, a.id) < (?3, ?4) "
+          " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;"
+        : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
+          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
+          "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
+          " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
+          " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;")
+        : (paged
+        ? "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
+          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
+          "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
+          " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
+          "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
+          "   AND (a.created_at_ms, a.id) < (?3, ?4) "
+          " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;"
         : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
           "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime, m.kind, m.duration_ms "
           "  FROM attachments a LEFT JOIN attachment_media m ON m.attachment_id = a.id "
           " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
           "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
-          " ORDER BY a.created_at_ms DESC LIMIT ?2;";
+          " ORDER BY a.created_at_ms DESC, a.id DESC LIMIT ?2;");
     sqlite3_prepare_v2(db, sql, -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)(j->channel_id ? j->channel_id : j->user_id));
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_FILE_LIST);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(page + 1));
+    if (paged) {
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->files_before_ms);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)j->files_before_id);
+    }
 
-    oc_file_row *arr = calloc(OC_MAX_FILE_LIST, sizeof *arr);
+    oc_file_row *arr = calloc(page, sizeof *arr);
     size_t n = 0;
-    while (arr && n < OC_MAX_FILE_LIST && sqlite3_step(st) == SQLITE_ROW) {
+    while (arr && n < page && sqlite3_step(st) == SQLITE_ROW) {
         arr[n].id          = (uint64_t)sqlite3_column_int64(st, 0);
         arr[n].channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
         arr[n].message_id  = (uint64_t)sqlite3_column_int64(st, 2);
@@ -3097,6 +3135,8 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
         arr[n].duration_ms = (uint32_t)sqlite3_column_int64(st, 10);
         n++;
     }
+    /* The page filled: whether a row beyond it exists is the one extra step. */
+    r->flist_more = (n == page && sqlite3_step(st) == SQLITE_ROW) ? 1 : 0;
     sqlite3_finalize(st);
     r->flist = arr;
     r->n_flist = n;

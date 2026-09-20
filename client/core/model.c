@@ -552,6 +552,7 @@ void oc_model_close_filelist(oc_model *m) {
     free(m->files);
     m->files = NULL;
     m->n_files = m->cap_files = 0;
+    m->files_more = 0;
     m->filelist_open = m->filelist_loading = 0;
     m->filelist_channel = 0;
 }
@@ -1433,7 +1434,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     }
     case OC_EV_FILES_END:
-        if (m->filelist_open && m->filelist_channel == e->channel_id) m->filelist_loading = 0;
+        if (m->filelist_open && m->filelist_channel == e->channel_id) {
+            m->filelist_loading = 0;
+            m->files_more = (uint8_t)(e->status ? 1 : 0);
+        }
         break;
     case OC_EV_SAVED_MSG: {
         if (!m->saved_open || !m->saved_loading) break;

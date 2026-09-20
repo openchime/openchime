@@ -387,6 +387,9 @@ typedef struct oc_job {
     uint32_t       maint_batch;       /* cap on rows reclaimed in one pass */
     uint32_t       audit_limit;       /* AUDIT_QUERY: rows per page */
     uint64_t       audit_before_ms;   /* AUDIT_QUERY: page backwards from here (0 = newest) */
+    /* LIST_FILES: the keyset cursor -- the created-at and id of the last row the
+     * caller has, 0/0 for the first page (REQ-143). */
+    uint64_t       files_before_ms, files_before_id;
     uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
     int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
     /* STT_PREP (ARCH-112): the segment this answers, and its mode. */
@@ -825,6 +828,7 @@ typedef struct oc_dbres {
     size_t           n_cmlist;
     oc_file_row     *flist;         /* heap array; FILE_LIST */
     size_t           n_flist;
+    uint8_t          flist_more;    /* the page filled and rows remain */
 
     /* Saved items + activity (REQ-231/139). */
     uint8_t          save_op;

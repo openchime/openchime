@@ -184,6 +184,9 @@ int oc_config_load(char *err, size_t errcap) {
     c->call_max = env_int("OPENCHIME_CALL_MAX", NULL, 10);
     if (c->call_max < 2) c->call_max = 2;
     if (c->call_max > (int)OC_MAX_CALL_PARTICIPANTS) c->call_max = (int)OC_MAX_CALL_PARTICIPANTS;
+    c->file_page = env_int("OPENCHIME_FILE_PAGE", NULL, (int)OC_MAX_FILE_LIST);
+    if (c->file_page < 1) c->file_page = 1;
+    if (c->file_page > (int)OC_MAX_FILE_LIST) c->file_page = (int)OC_MAX_FILE_LIST;
 
     return 0;
 }

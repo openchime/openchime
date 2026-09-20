@@ -87,6 +87,11 @@ typedef struct {
     struct { int enabled, queue, idle_secs, rate, max_secs; } stt;
     /* Calls (REQ-305): the most people in one call, 2 to OC_MAX_CALL_PARTICIPANTS. */
     int call_max;
+    /* How many files one LIST_FILES page carries (REQ-143). The wire's maximum
+     * by default; smaller only so a test can see a second page without
+     * uploading two hundred and one files. Read once at startup, like every
+     * other setting, so the query path never touches the environment. */
+    int file_page;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.

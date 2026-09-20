@@ -38,7 +38,14 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 18: screen sharing in calls (REQ-161, ARCH-86/87). CALL_JOIN carries the
+/* 19: LIST_FILES pages (REQ-143). The request carries a keyset cursor -- the
+ * created-at and id of the last row a client already has, 0/0 for the first page
+ * -- and FILES says whether more remain. The list was capped at 200 with no way
+ * to ask for the next ones, so a channel older than a few hundred files could
+ * not be browsed past them; search has had a keyset cursor since it was built,
+ * and this is the same shape. Both frames change layout, so the version moves.
+ *
+ * 18: screen sharing in calls (REQ-161, ARCH-86/87). CALL_JOIN carries the
  * video codecs the joiner can decode, and so does each participant on
  * CALL_JOINED and CALL_ROSTER; CALL_STATE carries who is sharing; CALL_SHARE
  * (0x00AA) is new.
@@ -122,7 +129,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 18u
+#define OC_PROTOCOL_VERSION 19u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -847,7 +854,11 @@ typedef struct { uint64_t channel_id; uint32_t count; } oc_members;
 
 /* channel_id 0 means "every channel I can read" — the same query with a wider
  * WHERE, which is what makes a workspace-wide files view free. */
-typedef struct { uint64_t channel_id; } oc_list_files;
+/* `before_ms`/`before_id` are the keyset cursor: the created-at and id of the
+ * last entry the caller already has, so the next page is what sorts strictly
+ * after it. 0/0 asks for the first page. Not an offset, so a file uploaded
+ * mid-paging cannot make a row repeat or vanish. */
+typedef struct { uint64_t channel_id; uint64_t before_ms; uint64_t before_id; } oc_list_files;
 typedef struct {
     uint64_t attachment_id, channel_id, message_id, uploader_id;
     uint64_t size, created_at;
@@ -856,7 +867,8 @@ typedef struct {
     uint8_t  media_kind;         /* OC_MEDIA_*; a video message is listed as video (REQ-165) */
     uint32_t duration_ms;
 } oc_file_entry;
-typedef struct { uint64_t channel_id; uint32_t count; } oc_files;
+/* `more` is 1 when the daemon stopped at the page limit and rows remain. */
+typedef struct { uint64_t channel_id; uint32_t count; uint8_t more; } oc_files;
 
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;

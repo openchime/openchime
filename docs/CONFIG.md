@@ -65,6 +65,7 @@ present the S3 backend is used, otherwise the local filesystem is** (ARCH-70).
 | `OPENCHIME_BLOB_BACKEND` | *(auto)* | Forces a backend (`fs` / `s3`) instead of inferring from the credentials. Mainly for tests. |
 | `OPENCHIME_MAX_ATTACHMENT_SIZE` | `OC_MAX_ATTACHMENT_SIZE` (200 MiB) | Per-attachment byte ceiling, declared up front on `UPLOAD_BEGIN`. |
 | `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` | `OC_MAX_VIDEO_MESSAGE_SIZE` (160 MiB) | Byte ceiling on a video message (REQ-164), checked by `ATTACH_MEDIA_SET`; clamped to the attachment ceiling. This, not the duration, is what bounds one: the daemon links no codec, so the length a client reports is shown, not verified. |
+| `OPENCHIME_FILE_PAGE` | `OC_MAX_FILE_LIST` (200) | Rows in one page of a `LIST_FILES` answer (PROTOCOL.md §5.9b), clamped to 1–200. The client asks for the next page with the cursor the last row gives it, so this changes how many arrive at a time, not how many can be browsed. Mainly for tests, which want a page small enough to reach a second one. |
 | `OPENCHIME_XFER_WORKERS` | `2` | Transfer-pool worker threads; blob I/O runs here, never on the net loop (ARCH-69). |
 | `OPENCHIME_S3_ENDPOINT` | *(none)* | S3-compatible endpoint. An `https://` scheme (or any non-443 port with `http://`) selects the transport; HTTPS is CA-verified with hostname checking. |
 | `OPENCHIME_S3_BUCKET` | *(none)* | Bucket name (path-style addressing). |

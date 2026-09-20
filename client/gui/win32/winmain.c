@@ -7238,6 +7238,7 @@ static int  g_file_sort;
 static char g_file_q[64];
 static rectf g_file_type_btn, g_file_sort_btn, g_file_scope_btn;
 static rectf g_file_up_btn, g_file_search_box;
+static rectf g_file_more_btn;     /* "Load more", while the daemon says there are */
 /* The channel census, built only while showing everything — see files_index. */
 static oc_gui_chan_count g_fchan[64];
 static int g_n_fchan;
@@ -7577,10 +7578,24 @@ static void draw_file_rows(gfx *rt, const oc_model *m, rectf body,
      * because the list could not scroll, and a count of unreachable rows is a worse
      * answer than a scrollbar. The 200-row SERVER cap below is different — that one
      * is a real limit and still has to be said. */
-    /* The server caps the response; saying so beats a list that silently stops. */
-    if (m->n_files >= OC_MAX_FILE_LIST && y < body.bottom)
-        draw_text(rt, "Showing the most recent 200. Older files are in search.", g_meta,
-                  rf(body.left + 20, y + 8, body.right - 20, y + 28), OC_COL_FAINT);
+    /* The daemon answers a page at a time and says when more remain (REQ-143):
+     * a button that asks for them, where the apology for an unreachable tail
+     * used to be. While a page is on its way it says so and refuses a second
+     * press, since the request in flight is the one that answers it. */
+    g_file_more_btn = rf(0, 0, 0, 0);
+    if (m->files_more && y < body.bottom) {
+        const char *lbl = m->filelist_loading ? "Loading\u2026" : "Load more";
+        float bw = text_width(lbl, g_ui) + UIS(32), bh = UIS(30);
+        rectf b = rf(body.left + 20, y + 8, body.left + 20 + bw, y + 8 + bh);
+        int hot = !m->filelist_loading && in_rect(b, (float)g_mouse_x, (float)g_mouse_y) && !pointer_blocked();
+        fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, lbl, g_ui, rf(b.left, b.top + UIS(4), b.right, b.bottom),
+                  m->filelist_loading ? OC_COL_MUTED : OC_COL_TEXT);
+        g_ui->align = ST_ALIGN_LEFT;
+        if (!m->filelist_loading) g_file_more_btn = b;
+    }
 }
 
 static void draw_filelist(gfx *rt, const oc_model *m, rectf reg) {
@@ -16587,6 +16602,7 @@ enum {
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
     AT_HOVERREACT,    /* payload: quick-reaction index on the hovered message */
+    AT_FMORE,         /* the files list's next page (REQ-143) */
     AT_DRAFTROW,      /* payload: Drafts row index — open it */
     AT_DRAFTDEL,      /* payload: Drafts row index — delete it, after asking */
     AT_ACTFILTER,     /* payload: activity filter index */
@@ -17016,6 +17032,10 @@ static void a11y_publish_scene(const oc_model *m) {
     if (g_view == VIEW_FILES) {
         acc_push(items, &n, OC_ACC_BUTTON, "files.upload", "Upload",
                  g_file_up_btn, ATOK(AT_FUPLOAD, 0));
+        /* The next page, while the daemon says there is one. */
+        if (g_file_more_btn.right > g_file_more_btn.left && n < OC_ACC_MAX)
+            acc_push(items, &n, OC_ACC_BUTTON, "files.loadmore", "Load more files",
+                     g_file_more_btn, ATOK(AT_FMORE, 0));
         for (int i = 0; i < FS_SCOPES && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "files.scope.%d", i);
@@ -19701,6 +19721,11 @@ static void files_view_sync(void) {
 }
 
 static int files_click(HWND hwnd, int x, int y) {
+    /* "Load more" first: it sits under the rows and nothing else claims it. */
+    if (in_rect(g_file_more_btn, (float)x, (float)y)) {
+        if (g_client) oc_client_list_files_more(g_client);
+        return 1;
+    }
     for (int i = 0; i < FF_KINDS; i++)
         if (in_rect(g_file_filters[i], (float)x, (float)y)) { g_file_filter = i; return 1; }
     for (int i = 0; i < FS_SCOPES; i++)
@@ -24526,6 +24551,16 @@ static void test_dump(const char *path) {
                     g_rxn_chip[i].r.left, g_rxn_chip[i].r.top, g_rxn_chip[i].r.right,
                     g_rxn_chip[i].r.bottom);
     }
+    /* The files list and its paging (REQ-143): how many rows are held, whether
+     * the daemon says more remain, and where "Load more" is. */
+    {
+        const oc_model *fm2 = model();
+        fprintf(f, "files n=%zu more=%d loading=%d rows=%d chan=%llu more_btn=%.0f,%.0f,%.0f,%.0f\n",
+                fm2 ? fm2->n_files : (size_t)0, fm2 ? fm2->files_more : 0,
+                fm2 ? fm2->filelist_loading : 0, g_n_filerows,
+                (unsigned long long)(fm2 ? fm2->filelist_channel : 0),
+                g_file_more_btn.left, g_file_more_btn.top, g_file_more_btn.right, g_file_more_btn.bottom);
+    }
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
@@ -27419,6 +27454,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else dict_ptt_down(hwnd, DH_INVOKE);
             break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
+        case AT_FMORE: if (g_client) oc_client_list_files_more(g_client); break;
         case AT_HOVERREACT:
             if ((int)arg < g_n_hrx && g_hrx_mid && g_client)
                 oc_client_react(g_client, g_sel, g_hrx_mid, g_hrx[arg].emoji,

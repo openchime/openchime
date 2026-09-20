@@ -169,7 +169,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 18** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 19** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -872,9 +872,20 @@ in. Enumerating a channel **requires being a member of it**; otherwise this is a
 way to discover who is in a private channel you were never invited to
 (`NOT_A_MEMBER`).
 
-**`LIST_FILES` (client → server), msg_type `0x003D`** `{ channel_id: u64 }`
-streams **`FILE_ENTRY` (`0x003E`)** newest-first, then **`FILES` (`0x003F`)**
-`{ channel_id, count: u32 }`. Capped at 200.
+**`LIST_FILES` (client → server), msg_type `0x003D`**
+`{ channel_id: u64, before_ms: u64, before_id: u64 }` streams
+**`FILE_ENTRY` (`0x003E`)** newest-first, then **`FILES` (`0x003F`)**
+`{ channel_id, count: u32, more: u8 }`.
+
+A page holds at most `OPENCHIME_FILE_PAGE` rows (default 200, the most the frame
+budget allows). `before_ms`/`before_id` are the **keyset cursor**: the
+`created_at` and `attachment_id` of the last row the client already has, and
+`0`/`0` for the first page. The daemon returns the rows strictly older than that
+pair — `(created_at_ms, id) < (before_ms, before_id)`, the row-value comparison
+the newest-first index serves directly — so a page is not disturbed by uploads
+arriving between requests, as an offset would be. `more` says whether a further
+page exists, which the daemon knows by asking for one row beyond the page and
+not sending it. Search has paged this way since it was built (§5.11).
 
 | Field           | Type | Notes                                                 |
 |-----------------|------|-------------------------------------------------------|
@@ -2376,7 +2387,7 @@ this table cannot silently gain a shared value.
 | `0x003C` | `MEMBERS` | S → C | terminator of a LIST_MEMBERS response |
 | `0x003D` | `LIST_FILES` | C → S | (REQ-143), files in a channel (0 = everywhere) |
 | `0x003E` | `FILE_ENTRY` | S → C | one shared file (streamed) |
-| `0x003F` | `FILES` | S → C | terminator of a LIST_FILES response |
+| `0x003F` | `FILES` | S → C | terminator of a LIST_FILES response, saying whether more remain |
 | `0x0040` | `LIST_USERS` | C → S | tenant user enumeration |
 | `0x0041` | `USER_LIST` | S → C |  |
 | `0x0042` | `SET_ROLE` | C → S | (ARCH-60, REQ-030) |
