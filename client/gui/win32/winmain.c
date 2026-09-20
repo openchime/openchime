@@ -1940,6 +1940,13 @@ static int g_tab_hover = -1;
 /* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
 static struct { rectf r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
 static int g_n_chips;
+/* The strip that appears on the message under the pointer: the quick reactions,
+ * one press each (REQ-070). Its cells are hit-tested like a chip and toggle the
+ * same way; only the row under the pointer has one, so there is at most one
+ * strip on screen. */
+static struct { rectf r; char emoji[40]; uint8_t mine; } g_hrx[6];
+static int g_n_hrx;
+static uint64_t g_hrx_mid;
 static rectf g_about_topic, g_about_rename, g_about_archive, g_about_hooks;
 static rectf g_about_visibility;
 static struct { rectf row, dl; int ix; } g_filerows[64];
@@ -5502,6 +5509,8 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * only one of the two lists is drawn per frame — resetting only on `capture`
      * would leave the thread's chips pointing at stale rectangles. */
     g_n_chips = 0;
+    g_n_hrx = 0;
+    g_hrx_mid = 0;
     if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; g_n_fwd_hits = 0; }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
@@ -5534,9 +5543,50 @@ static void draw_msglist(gfx *rt, const oc_model *m,
             float bx = x0 + AVA + 12;
             float by = y + MSG_PIN(&msgs[first + i]) + MSG_BODY_DY(grouped[i]);
             /* Hover highlight behind the whole row (main transcript only). */
-            if ((capture && !g_selecting && g_hover_mid == msgs[first + i].message_id) ||
-                menu_about(MENU_MSG, msgs[first + i].message_id))
+            int row_hot = capture && !g_selecting && g_hover_mid == msgs[first + i].message_id;
+            if (row_hot || menu_about(MENU_MSG, msgs[first + i].message_id))
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
+            /* The quick reactions, on the row under the pointer: the most frequent
+             * action in a chat product, at one press rather than two. The same six
+             * the message menu offers and the same toggle, so a strip and a menu
+             * cannot disagree about what a press does. Not on a deleted message,
+             * which has nothing to react to. */
+            if (row_hot && !msgs[first + i].deleted && g_n_quick > 0 && !pointer_blocked()) {
+                float cell = UIS(26.0f), pad = UIS(3.0f);
+                float sw = (cell + pad) * (float)g_n_quick + pad;
+                float sx = reg.right - UIS(16) - sw, sy = y - UIS(10);
+                if (sy < reg.top) sy = reg.top;
+                if (sx < reg.left + UIS(8)) sx = reg.left + UIS(8);
+                rectf strip = rf(sx, sy, sx + sw, sy + cell + pad * 2);
+                fill_round(rt, strip, OC_R_CONTROL, OC_COL_BASE);
+                stroke_round(rt, strip, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+                g_n_hrx = 0;
+                g_hrx_mid = msgs[first + i].message_id;
+                for (int q = 0; q < g_n_quick && q < 6; q++) {
+                    if (!REACT_EMO[q]) continue;
+                    rectf c2 = rf(sx + pad + (cell + pad) * (float)q, sy + pad,
+                                  sx + pad + (cell + pad) * (float)q + cell, sy + pad + cell);
+                    int mine = reaction_is_mine(&msgs[first + i], REACT_EMO[q]);
+                    if (mine) fill_round(rt, c2, OC_R_CONTROL, OC_COL_SELECT);
+                    else if (in_rect(c2, (float)g_mouse_x, (float)g_mouse_y))
+                        fill_round(rt, c2, OC_R_CONTROL, OC_COL_HOVER);
+                    draw_emoji_fmt(rt, REACT_EMO[q], rf(c2.left + 3, c2.top + 1, c2.right - 3, c2.bottom - 1),
+                                   g_emoji_s);
+                    /* The transcript's own hit-box array carries the press, as the
+                     * who-reacted pane's chips do: one rule for the direction. */
+                    if (g_n_chips < (int)(sizeof g_chips / sizeof g_chips[0])) {
+                        g_chips[g_n_chips].r = c2;
+                        g_chips[g_n_chips].mid = msgs[first + i].message_id;
+                        g_chips[g_n_chips].mine = (uint8_t)mine;
+                        snprintf(g_chips[g_n_chips].emoji, sizeof g_chips[0].emoji, "%s", REACT_EMO[q]);
+                        g_n_chips++;
+                    }
+                    g_hrx[g_n_hrx].r = c2;
+                    g_hrx[g_n_hrx].mine = (uint8_t)mine;
+                    snprintf(g_hrx[g_n_hrx].emoji, sizeof g_hrx[0].emoji, "%s", REACT_EMO[q]);
+                    g_n_hrx++;
+                }
+            }
             /* A message that names YOU gets the row tinted, which is the
              * "highlighted for the mentioned party" half of REQ-221 — a
              * coloured word alone is easy to scroll past. Same scanner as the
@@ -16536,6 +16586,7 @@ enum {
     AT_NMPICK,        /* New message: accept one match */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
+    AT_HOVERREACT,    /* payload: quick-reaction index on the hovered message */
     AT_DRAFTROW,      /* payload: Drafts row index — open it */
     AT_DRAFTDEL,      /* payload: Drafts row index — delete it, after asking */
     AT_ACTFILTER,     /* payload: activity filter index */
@@ -16896,6 +16947,14 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_TAB, aid, AF_AID[i], g_act_filters[i],
                      ATOK(AT_ACTFILTER, i));
         }
+    }
+    /* The hovered message's quick reactions, while the strip is up. */
+    for (int i = 0; i < g_n_hrx && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+        snprintf(aid, sizeof aid, "msg.react.%d", i);
+        snprintf(nm, sizeof nm, "%s, %s", g_hrx[i].emoji,
+                 g_hrx[i].mine ? "yours: press to take it back" : "press to react");
+        acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_hrx[i].r, ATOK(AT_HOVERREACT, (uint64_t)i));
     }
     /* The who-reacted pane's chips: pressable, and each says what pressing does. */
     for (int i = 0; i < g_n_rxn_chip && n < OC_ACC_MAX; i++) {
@@ -24833,6 +24892,12 @@ static void test_dump(const char *path) {
         }
         fprintf(f, "\n");
     }
+    /* The quick-reaction strip on the hovered message, as drawn. */
+    fprintf(f, "hoverreact mid=%llu n=%d", (unsigned long long)g_hrx_mid, g_n_hrx);
+    for (int i = 0; i < g_n_hrx; i++)
+        fprintf(f, " %s:%d@%.0f,%.0f,%.0f,%.0f", g_hrx[i].emoji, g_hrx[i].mine,
+                g_hrx[i].r.left, g_hrx[i].r.top, g_hrx[i].r.right, g_hrx[i].r.bottom);
+    fprintf(f, "\n");
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -27354,6 +27419,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else dict_ptt_down(hwnd, DH_INVOKE);
             break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
+        case AT_HOVERREACT:
+            if ((int)arg < g_n_hrx && g_hrx_mid && g_client)
+                oc_client_react(g_client, g_sel, g_hrx_mid, g_hrx[arg].emoji,
+                                g_hrx[arg].mine ? OC_REACT_REMOVE : OC_REACT_ADD);
+            break;
         case AT_REACTCHIP: {
             const oc_model *rm = model();
             if ((int)arg < g_n_rxn_chip && rm && rm->reactlist_open && g_client) {
