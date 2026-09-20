@@ -206,6 +206,26 @@ framework, and OpenChime follows suit.
   ([PROTOCOL.md](./PROTOCOL.md) §10) — legal transitions accepted, illegal
   frames rejected with the expected reason code.
 
+### 2.2a When the binary itself crashes
+
+A crash used to leave nothing to work with: the binary's output is block-buffered
+into CI's pipe, so the suite that was running went down with the process, and
+there was no backtrace — one crash on CI was knowable only as "Segmentation fault
+(core dumped)". `tests/main.c` now line-buffers its output, names each suite as it
+starts it, and handles the fatal signals: a crash prints the signal, the suite,
+how far into the run it was, the faulting address, the crashing thread's stack
+resolved to file and line by `addr2line`, and — where `gdb` is installed, as it is
+on CI — every thread's stack. Then it raises the signal again, so the exit status
+is the one it would have been.
+
+Two switches help hunt a crash that appears once in fifty runs, rather than
+paying four minutes of unrelated suites per attempt:
+
+- `OC_TEST_ONLY=audio,media` runs only the suites whose names contain those;
+- `OC_TEST_REPEAT=20` runs the selection that many times.
+
+Unset, nothing changes.
+
 ### 2.3 Determinism rules
 
 Unit tests must be reproducible and independent of wall-clock or environment:
