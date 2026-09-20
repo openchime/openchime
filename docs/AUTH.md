@@ -26,7 +26,10 @@ rate-limited both per account and per source IP (REQ-191). Tenant management is
 and `REMOVE_USER` (which locks a member out via the `users.disabled` flag added in
 migration 0003, checked in every auth path). Moderation-delete (REQ-032) and
 channel management (REQ-031) also landed. **Remaining:** a configurable OIDC
-bootstrap-owner subject, and email magic-link invite delivery (§7).
+bootstrap-owner subject, and email magic-link invite delivery (§7). The exchange
+every source is to share — proof of possession, who may join, direct
+connections, a second step for local accounts, managed enrollment — is designed
+in §8 and not built.
 
 ---
 
@@ -415,3 +418,212 @@ Tracked so the omissions are deliberate:
 - **Cert-vs-restore interaction** (the TOFU fingerprint changing when a database
   is restored onto a new box) — addressed by persisting the TLS identity in the
   database (ARCH-66b); orthogonal to auth.
+
+---
+
+## 8. The sign-in contract — designed, not built
+
+One exchange serves every identity source of §1, so a client is written once and
+adding a source changes no frame. **Nothing in this section is built**: §2–§5
+describe what runs today, and PROTOCOL.md §4 documents the frames that exist.
+This is the contract the daemon, the clients and the central service are each to
+implement, stated once so the three cannot drift apart.
+
+### 8.1 The exchange
+
+```
+client                                            daemon
+  | ---- HELLO ---------------------------------> |
+  | <--- WELCOME, AUTH_CHALLENGE{sources} ------- |   each source: id, kind, label
+  |                                               |
+  |  a local source:                              |
+  | ---- AUTH{local, source, user, password} ---> |
+  |                                               |
+  |  a browser source (the relay, a direct connection):
+  | ---- AUTH_BEGIN{source, redirect_uri, challenge} -> |
+  | <--- AUTH_REDIRECT{authorize_url} ----------- |   the daemon builds the whole URL
+  |        … the person signs in in their browser; the client may disconnect …
+  | ---- AUTH{oidc, source, verifier, what came back} -> |
+  |                                               |
+  | <--- AUTH_OK | AUTH_CONTINUE | ERROR -------- |
+```
+
+- **`AUTH_CHALLENGE` lists sources** — `{id, kind, label}`, `kind` being `local`,
+  `relay` or `oidc` — in place of the methods bitset and `oidc_params`. The client
+  draws one control per source from the labels: fixed text for local accounts and
+  the relay, the operator's own words for a direct connection ("Acme SSO").
+  Resuming a session (§4) is always accepted and is not a listed source.
+- **The daemon builds the authorize URL.** The client never assembles or parses an
+  operator's or a provider's string, so it is the same client for the relay and
+  for a direct connection, and the workspace's audience reaches the relay from the
+  one party that knows it. The client opens the URL only if it is `https` (plain
+  `http` to loopback, for development).
+- **`redirect_uri` is loopback** (RFC 8252); the daemon refuses anything else
+  before it echoes it into a URL.
+- **No connection is held open while the browser is.** Nothing between
+  `AUTH_REDIRECT` and `AUTH` lives on the connection (§8.2), so the client may
+  disconnect and an unauthenticated connection can be short-lived.
+- **`AUTH_CONTINUE`** answers a first step that is correct but not sufficient
+  (§8.6). It exists from the start so a second factor changes no handshake.
+- **Errors a client can explain:** `AUTH_NOT_ALLOWED` (a valid identity that may
+  not join, §8.4), `AUTH_SOURCE_UNAVAILABLE` (a provider that cannot be reached,
+  §8.5), `AUTH_MFA_REQUIRED`, beside the codes that exist.
+- This changes frame layouts, so the protocol version moves — once. Daemon and
+  clients each speak exactly one version today; from the first public release the
+  daemon accepts the previous version as well, so a daemon upgrade is never a
+  flag day for its clients. Opcodes are assigned when the frames are built.
+
+### 8.2 Proof of possession
+
+The client makes a random 32-byte **verifier** per attempt and sends
+`challenge = base64url(SHA-256(verifier))` in `AUTH_BEGIN` — RFC 7636's
+construction, used here between the client and the daemon.
+
+- **Through the relay,** the daemon puts the challenge in the authorize URL as
+  `nonce`, central copies it into the token it mints, and the daemon accepts a
+  token only when it arrives with the verifier whose hash is that `nonce` — and
+  only once: a token's `jti` is remembered until its `exp`.
+- **Through a direct connection,** the daemon keeps the challenge with the pending
+  sign-in it created (§8.5) and requires the verifier with the code.
+
+A token or a code lifted from the loopback redirect, from browser history, or by
+another account on a shared machine is therefore useless: whoever presents it
+must also hold the verifier, which never left the client. The relay path needs no
+state in the daemon to check it, and the check survives the client reconnecting
+between the two frames.
+
+### 8.3 The relay's token
+
+Standard JWT, ES256, as §3.3. The claims:
+
+| Claim | Meaning |
+|---|---|
+| `iss`, `aud` | Central, and this workspace's opaque id — as today. |
+| `sub` | `<upstream issuer>|<stable subject>`. For Google the provider's `sub`. For Microsoft, `oid` under the tenant's issuer — `https://login.microsoftonline.com/<tid>/v2.0|<oid>` — not the per-application `sub`. |
+| `idp` | Which provider vouched: `google`, `microsoft`. |
+| `tenant` | The organization the provider places the person in: Google's hosted domain, Microsoft's tenant id. Absent for a personal account. |
+| `email`, `email_verified`, `name` | As the provider gave them. `email_verified` is true only when the provider says so; for Microsoft, only when the address's domain is verified by the tenant. |
+| `nonce`, `jti` | §8.2. |
+| `iat`, `nbf`, `exp` | `exp` at most 300 seconds after `iat`. |
+
+`iss`, `aud`, `sub`, `nonce`, `jti`, `iat` and `exp` are **required**; a token
+missing one is refused. Claim strings are JSON-unescaped, and an over-long claim is
+refused rather than truncated — a truncated subject is a different person's
+subject.
+
+**The subject is the provider's stable one so that a person is the same identity
+whichever way they arrive.** A workspace that starts on the relay's Microsoft
+sign-in and later connects directly to its own tenant (§8.5) sees the same
+`<issuer>|<oid>` and keeps its accounts, roles and history.
+
+**Keys.** `OPENCHIME_OIDC_PUBKEY[_FILE]` may hold several PEM keys. A token's
+`kid` is the signing key's RFC 7638 thumbprint; the daemon computes the same
+thumbprint for each key it pins and verifies with the one that matches, refusing
+an unknown `kid`. Rotation is then an overlap — ship the new key beside the old,
+switch the signer, retire the old — with still no online key fetch (ARCH-26).
+
+**Which provider.** `/oidc/authorize` takes `workspace`, `redirect_uri` and
+`nonce`. Central sends the person straight to the workspace's provider when it has
+one, and asks when it has several; which providers a workspace offers is a fact in
+central's registry, because it configures central's page and not the box. A new
+provider at central therefore needs no daemon or client release.
+
+**Where the relay is.** At the origin of `OPENCHIME_ENROLL_URL` — a workspace must
+be enrolled for central to mint for it, so the relay needs no address of its own.
+`OPENCHIME_OIDC_PARAMS` has no part in this exchange.
+
+### 8.4 Identity, and who may join
+
+**A person is `(upstream issuer, subject)`**, held in a `user_identities` table,
+whichever source delivered them. One rule keeps the sources honest: an identity
+whose issuer belongs to one of the deployment's direct connections is accepted
+only from that connection, never from the relay.
+
+**Who may join is one setting, `OPENCHIME_OIDC_ALLOW`** — a comma-separated list
+of rules, default deny, evaluated only for an identity the workspace has not seen:
+
+| Rule | Admits |
+|---|---|
+| `owner:<email>` | that verified address, created as **owner**. It also applies whenever the workspace has no active owner, which makes it the recovery path as well as the first-run one. |
+| `tenant:google:<hosted domain>`, `tenant:microsoft:<tenant id>` | anyone the provider places in that organization, as member. |
+| `domain:<domain>` | a **verified** address at that domain, as member. |
+
+An identity that matches no rule joins only through an **invite bound to its
+address** — tenant data an owner or admin creates (`INVITE_USER` carrying an
+email), consumed at that address's first verified sign-in, setting the role.
+Otherwise the answer is `AUTH_NOT_ALLOWED`, audited with the provider and tenant.
+A known identity signs in without consulting the rules, unless disabled; the seat
+cap is unchanged.
+
+Rules on an address need `email_verified`, because an unverified address is
+whatever its holder typed. Tenant rules exist because that is not enough: a
+Microsoft address is often absent or unverified, so a domain rule alone cannot say
+"only our organization". A `domain:` rule needs no proof that the operator owns
+the domain — it admits that domain's people into the operator's *own* workspace,
+so a false claim harms nobody else.
+
+Bearer invite tokens (§2) remain for the local source only, and `REDEEM_INVITE` is
+refused where local accounts are not enabled: with a provider in charge, a bearer
+token would be the phishable credential the provider exists to remove.
+
+A first sign-in sets the display name and address from the token; later ones
+update the identity row only, and never overwrite a name the person chose.
+
+### 8.5 Direct connections
+
+One setting per connection, `OPENCHIME_OIDC_CONNECT_<n>`, holding
+`label=…;issuer=…;client_id=…;secret_file=…;subject=sub|oid`. The secret is
+optional — a public client with PKCE where the provider allows one — and
+`subject=oid` makes a Microsoft tenant's identities match the relay's (§8.3). Each
+connection is a source in `AUTH_CHALLENGE`.
+
+- **Discovery and keys** are fetched over CA-verified TLS at boot and on an unknown
+  `kid`, rate-limited and cached. A provider that cannot be reached makes its
+  source `AUTH_SOURCE_UNAVAILABLE`; sessions already issued are untouched (§3.4's
+  login-time-only dependency, now on the operator's provider).
+- **`AUTH_BEGIN`** creates a pending sign-in — `state`, the daemon's own PKCE
+  verifier, a nonce, the client's challenge, ten minutes to live — and returns the
+  provider's authorize URL.
+- **`AUTH{oidc}`** carries the code, the `state` and the client's verifier. A
+  worker of the push and unfurl kind redeems the code at the token endpoint;
+  nothing blocking runs on the writer.
+- **The ID token** is accepted under an algorithm allow-list (RS256, PS256, ES256),
+  with `iss` exact, `aud` containing the client id (`azp` when there are several),
+  `exp`, `iat`, `nbf`, and the nonce. §8.4 then applies unchanged.
+- **The redirect** is `127.0.0.1` or `localhost` as the connection says, with an
+  optional list of ports for a provider that matches the port exactly.
+
+### 8.6 A second step for local accounts
+
+A correct password on an account with a second factor (REQ-184) answers
+`AUTH_CONTINUE{totp}`. The connection is then half-authenticated for two minutes
+and accepts only `AUTH` carrying the code; attempts have a limiter of their own.
+A provider's own second factor is the provider's business and never reaches this
+step.
+
+### 8.7 Enrolling a managed workspace
+
+Exactly one party mints a workspace's audience. **Self-hosted:** the daemon, as
+§3.6 — an operator couriers the code. **Managed:** central, which starts the box
+with `OPENCHIME_OIDC_AUDIENCE` and a one-time `OPENCHIME_ENROLL_TICKET`. The daemon
+adopts that audience, generates its own key as it always does, and claims the
+binding: the ticket, its public key, and a signature over
+`openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`.
+Central checks the ticket — single use, short-lived — and the signature, stores
+the public key and activates. The ticket is the authorization the operator's
+paste is in the self-hosted flow; the private key still never leaves the box.
+
+Requests the daemon signs afterwards name what they are for: the canonical string
+becomes `openchime-machine-v2|<aud>|<unix_ts>|<METHOD>|<path>|<sha256hex(body)>`,
+so a signed request cannot be replayed at a second endpoint.
+
+### 8.8 What this does to configuration
+
+| Setting | Change |
+|---|---|
+| `OPENCHIME_AUTH_MODE` | Becomes a list of the built-in sources — `local`, `relay`, or `local,relay` — with `oidc` still read as `relay`. A direct connection is enabled by being configured. |
+| `OPENCHIME_OIDC_PUBKEY[_FILE]` | May hold several keys (§8.3). |
+| `OPENCHIME_OIDC_ALLOW` | New: who may join (§8.4). |
+| `OPENCHIME_OIDC_CONNECT_<n>` | New, one per direct connection (§8.5). |
+| `OPENCHIME_ENROLL_TICKET` | New, managed workspaces only (§8.7). |
+| `OPENCHIME_OIDC_PARAMS` | Goes. |

@@ -283,7 +283,9 @@ Client                                  Server
 After `WELCOME`, the daemon sends `AUTH_CHALLENGE` advertising the auth method(s)
 it accepts; the client MUST authenticate before sending any messaging frame. A
 messaging frame received before `AUTH_OK` is answered with `ERROR AUTH_REQUIRED`
-(fatal). Full design in [AUTH.md](./AUTH.md).
+(fatal). Full design in [AUTH.md](./AUTH.md). The exchange designed to replace the
+methods bitset and `oidc_params` — one shape for every identity source — is
+AUTH.md §8; it is not built, and none of its frames are in this document.
 
 ### 4.1 `AUTH_CHALLENGE` (server → client), msg_type `0x0012`
 

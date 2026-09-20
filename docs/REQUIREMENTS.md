@@ -224,6 +224,21 @@ the requirement says so explicitly rather than implying one.
   with a dev endpoint that deliberately bypasses the browser flow. That last one
   is the open item, and is tracked; the first is settled, and the second stands
   until the direct connection exists.
+- **REQ-028.** *(Not built)* In a deployment using OIDC — brokered or direct — an identity the
+  workspace has not seen has joined only when its operator allowed it: by a
+  configured rule naming an owner's address, an organization's tenant at the
+  provider, or a verified email domain, or by an invitation an owner or admin
+  bound to that address. Every rule on an address has required the provider to
+  have verified it, and the default has been to refuse. The decision has been the
+  daemon's, which owns the `users` table; the central service has held no member
+  list (REQ-040). A refusal has been distinguishable to the client from a bad
+  credential, and audited ([AUTH.md](./AUTH.md) §8.4).
+- **REQ-029.** *(Not built)* A brokered or direct sign-in has been usable only by the client
+  that began it, and only once: the client has held a secret the browser never
+  carried, and the daemon has refused a token or code presented without it, or
+  presented a second time. A token captured from the redirect, from browser
+  history, or by another account on the same machine has granted nothing
+  ([AUTH.md](./AUTH.md) §8.2).
 
 ### 1.3 Authorization and Roles
 
