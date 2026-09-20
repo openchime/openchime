@@ -50,11 +50,22 @@ fi
 rm -rf "$OC_DEV_DIR"
 
 drive() { "$DRIVE" "$@" >/dev/null 2>&1; }
+# A press: down AND up, as a keyboard does. The `key` verb sends the down only,
+# deliberately, so a held key can be tested -- and a handler that re-arms on the
+# release then ignores every press after the first. Backspace in the To: field is
+# one: it takes one recipient per press and re-arms on WM_KEYUP, so a run that
+# never released it deleted one chip and silently no-opped every Backspace after.
+# Anything pressed more than once in a run goes through this.
+press() { drive key "$1"; drive keyup "$1"; }
 snap()  { "$DRIVE" dump nm >/dev/null 2>&1; cat "$LIN_DIR/nm.txt" 2>/dev/null; }
 key_of()    { printf '%s' "$1" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2; }
 quoted_of() { printf '%s' "$1" | grep -o "\b$2=\"[^\"]*\"" | head -1 | sed "s/^$2=\"//; s/\"\$//"; }
 nm_of()     { printf '%s' "$1" | grep -o "^newmsg .*" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2; }
 nmq_of()    { printf '%s' "$1" | grep -o "^newmsg .*" | grep -o "\b$2=\"[^\"]*\"" | head -1 | sed "s/^$2=\"//; s/\"\$//"; }
+# How many recipients the pane holds. The dump joins them with commas, so an
+# empty list is 0 and "@bob,@carol" is 2.
+nchips_of() { local c; c="$(nmq_of "$1" chips)"; [ -z "$c" ] && { echo 0; return; }
+              printf '%s' "$c" | tr ',' '\n' | grep -c . ; }
 
 wait_for() {
   local pred="$1" i
@@ -136,7 +147,7 @@ say "1b. a match is chosen by clicking it"
 drive key shift+tab
 drive key ctrl+a
 drive key delete
-drive key backspace          # drop the chip from case 1, so the list has room
+press backspace              # drop the chip from case 1, so the list has room
 drive typekeys "car"
 # The rects come from the PAINT, so wait for the list to be drawn rather than
 # reading the frame before it.
@@ -165,7 +176,7 @@ d="$(snap)"
 [ "$(nm_of "$d" caret)" = "3" ] && ok "Left moves the caret inside the query" \
   || fail "caret is at $(nm_of "$d" caret) after two Lefts in 'carol'"
 # "carol" with the caret between r and o: Backspace takes the r, not the l.
-drive key backspace
+press backspace
 d="$(snap)"
 [ "$(nmq_of "$d" q)" = "caol" ] && ok "Backspace deletes at the caret, not at the end" \
   || fail "query is '$(nmq_of "$d" q)' after a mid-string Backspace"
@@ -234,16 +245,56 @@ d="$(snap)"
 [ "$(key_of "$d" draftn)" = "1" ] && ok "exactly one draft exists — the pane's own" \
   || fail "$(key_of "$d" draftn) drafts exist, not 1"
 
-# --- 6. sending needs a recipient, and says so ---------------------------------
-say "6. a refusal says why"
+# --- 6. Backspace takes one recipient per press ---------------------------------
+# The rule the client enforces on the key's release, which is why a press in this
+# script is a press and not a hold. Two recipients, so taking too many shows.
+say "6. Backspace takes one recipient per press"
 drive view newmsg
-drive key backspace          # drop the restored recipient
-drive key tab
-drive typekeys "nobody is addressed"
+drive typekeys "carol"
+drive key enter              # the top match, beside the restored @bob
+d="$(snap)"
+[ "$(nchips_of "$d")" = "2" ] && ok "two recipients: $(nmq_of "$d" chips)" \
+  || fail "the pane holds '$(nmq_of "$d" chips)', not two recipients"
+press backspace
+d="$(snap)"
+[ "$(nchips_of "$d")" = "1" ] && ok "one press takes one: $(nmq_of "$d" chips)" \
+  || fail "one Backspace left '$(nmq_of "$d" chips)'"
+# Two again, and now the key is HELD -- pressed twice without a release. The
+# second recipient must survive, which is what the latch is for: a held key used
+# to walk backwards through the whole list and take the people behind the one
+# aimed at.
+drive typekeys "carol"
 drive key enter
 d="$(snap)"
-[ "$(nm_of "$d" body)" != "0" ] && ok "the message is still in the box" \
-  || fail "the message was cleared with nobody to send it to"
+[ "$(nchips_of "$d")" = "2" ] && ok "two again, to hold the key against" \
+  || fail "the pane holds '$(nmq_of "$d" chips)', not two"
+drive key backspace
+drive key backspace
+d="$(snap)"
+[ "$(nchips_of "$d")" = "1" ] && ok "a held Backspace takes only the one it started on: $(nmq_of "$d" chips)" \
+  || fail "holding Backspace left $(nchips_of "$d") recipients ('$(nmq_of "$d" chips)'), not 1"
+drive keyup backspace
+press backspace              # released and re-armed: the last one goes
+
+# --- 7. sending needs a recipient, and says so ---------------------------------
+say "7. a refusal says why"
+# The recipients are gone BEFORE Enter is pressed, asserted here: this check used
+# to run with the restored recipient still attached, so the message was sent and
+# whether the check passed depended on which dump line was read first.
+d="$(snap)"
+[ "$(nchips_of "$d")" = "0" ] && ok "nobody is addressed" \
+  || fail "'$(nmq_of "$d" chips)' is still addressed -- the refusal cannot be tested"
+drive key tab
+drive typekeys "nobody is addressed"
+before_body="$(nm_of "$(snap)" body)"
+drive key enter
+d="$(snap)"
+[ "$(nm_of "$d" body)" = "$before_body" ] && ok "the message is still in the box ($before_body characters)" \
+  || fail "the message went from $before_body characters to $(nm_of "$d" body) with nobody to send it to"
+case "$d" in
+  *'Who is this for?'*) ok "and a toast says why" ;;
+  *) fail "nothing said why the send did not happen" ;;
+esac
 
 say ""
 say "$checks checks, $fails failed"

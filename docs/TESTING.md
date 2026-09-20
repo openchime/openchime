@@ -726,6 +726,17 @@ rich-mode typing rules (pending styles, continuation, delimiter handling) run
 exactly as they do for a user. Testing an editor behaviour with `type` proves
 nothing about typing.
 
+**`key` presses a key down; it does not let it go.** The release is its own verb
+(`keyup`), so a harness can hold a key — push to talk needs exactly that. The cost
+is that a handler which re-arms on the release sees the first press and then
+nothing: Backspace in the To: field takes one recipient per press and clears its
+latch in `WM_KEYUP`, so a script that never released it deleted one chip and
+silently did nothing on every Backspace after, while the checks that followed
+asserted against a state the run never reached. **Anything pressed more than once
+in a run must be released**, which is what `gui_newmsg.sh`'s `press` helper does:
+`drive key <k>; drive keyup <k>`. Hold a key only where the hold is the thing
+under test.
+
 > **The smoke owns its own daemon.** It defaults to
 > port **9500** and `/tmp/oc-smoke`, wipes that directory, and **verifies the
 > workspace it reached is the fixture** — name plus the presence of alice, bob
@@ -765,8 +776,8 @@ pre-push gate — run it when a change touches how the client starts.
 
 ## Reading the New message harness
 
-`scripts/gui_newmsg.sh` asks the three questions the New message pane (REQ-229)
-answered wrongly for its whole life, in 23 checks on its own fixture daemon and
+`scripts/gui_newmsg.sh` asks the questions the New message pane (REQ-229)
+answered wrongly for its whole life, in 32 checks on its own fixture daemon and
 port (9520):
 
 - **Does the field that looks focused get the keys?** Characters, and the keys
@@ -779,6 +790,15 @@ port (9520):
 - **Does what you typed survive?** Leaving and returning must bring back the words
   **and** the recipients, and the pane's text must never become the selected
   conversation's draft.
+- **Does Backspace take one recipient per press?** One press takes one; the key
+  held — pressed again without a release — takes no more, which is the rule that
+  stopped a held key walking backwards through the whole list.
+- **Does a send with nobody addressed refuse, and say so?** The recipients being
+  gone is asserted *before* Enter is pressed, the message must still be in the box
+  afterwards, and a toast must say why. This check used to run with a recipient
+  still attached — the message was sent and the check passed or failed on which
+  dump line was read first — because the harness pressed Backspace without
+  releasing it (see the `key`/`keyup` rule above).
 
 It reads the dump's `newmsg` line — `focus= chips= q= caret= sel= matches= body=
 pending=` — which exists so those states can be asserted rather than described.
