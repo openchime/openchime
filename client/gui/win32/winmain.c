@@ -8125,15 +8125,66 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
     }
 }
 
+/* The pane's own chips, for the accessibility tree; the CLICK is the transcript's
+ * (g_chips), so a chip here and a chip on the message run one rule. */
+static struct { rectf r; char emoji[40]; int count; uint8_t mine; } g_rxn_chip[24];
+static int g_n_rxn_chip;
+
 /* Who reacted (REQ-071) — a list of PEOPLE, so it belongs in the context pane
- * beside the conversation rather than replacing it. */
+ * beside the conversation rather than replacing it. Above them, one chip per
+ * distinct emoji with its count: the same chip the message carries, so it can be
+ * clicked to add yours or take it back without going back to the message. */
 static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg) {
+    g_n_rxn_chip = 0;
     if (m->n_reactors == 0) {
         draw_text(rt, "No reactions.", g_meta,
                   rf(reg.left + 16, reg.top + 8, reg.right - 12, reg.top + 30), OC_COL_FAINT);
         return;
     }
     float y = reg.top + 6;
+    {
+        /* Distinct emoji, in the order they first appear, with how many reacted
+         * and whether you are one of them. */
+        float cx = reg.left + 14, ch = 24, top = y;
+        for (size_t i = 0; i < m->n_reactors; i++) {
+            const char *e = m->reactors[i].emoji;
+            int seen = 0;
+            for (int k = 0; k < g_n_rxn_chip; k++) if (!strcmp(g_rxn_chip[k].emoji, e)) seen = 1;
+            if (seen || g_n_rxn_chip >= (int)(sizeof g_rxn_chip / sizeof g_rxn_chip[0])) continue;
+            int count = 0, mine = 0;
+            for (size_t j = 0; j < m->n_reactors; j++)
+                if (!strcmp(m->reactors[j].emoji, e)) {
+                    count++;
+                    if (m->reactors[j].user_id == m->user_id) mine = 1;
+                }
+            char cnt[16];
+            snprintf(cnt, sizeof cnt, "%d", count);
+            float cw = 34 + text_width(cnt, g_meta);
+            if (cx + cw > reg.right - 12) { cx = reg.left + 14; top += ch + 5; }
+            rectf chip = rf(cx, top, cx + cw, top + ch);
+            fill_round(rt, chip, OC_R_CONTROL, mine ? OC_COL_SELECT : OC_COL_INPUT);
+            stroke_round(rt, chip, OC_R_CONTROL, mine ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+            draw_emoji_fmt(rt, e, rf(cx + 4, top, cx + 22, top + ch), g_emoji_s);
+            draw_text(rt, cnt, g_meta, rf(cx + 24, top, chip.right - 4, top + ch),
+                      mine ? OC_COL_TEXT : OC_COL_MUTED);
+            /* The transcript's hit-box array, so the toggle -- and which way it
+             * goes -- is decided in one place (on_click). */
+            if (g_n_chips < (int)(sizeof g_chips / sizeof g_chips[0])) {
+                g_chips[g_n_chips].r = chip;
+                g_chips[g_n_chips].mid = m->reactlist_message;
+                g_chips[g_n_chips].mine = (uint8_t)mine;
+                snprintf(g_chips[g_n_chips].emoji, sizeof g_chips[g_n_chips].emoji, "%s", e);
+                g_n_chips++;
+            }
+            g_rxn_chip[g_n_rxn_chip].r = chip;
+            g_rxn_chip[g_n_rxn_chip].count = count;
+            g_rxn_chip[g_n_rxn_chip].mine = (uint8_t)mine;
+            snprintf(g_rxn_chip[g_n_rxn_chip].emoji, sizeof g_rxn_chip[0].emoji, "%s", e);
+            g_n_rxn_chip++;
+            cx += cw + 5;
+        }
+        y = top + ch + 10;
+    }
     for (size_t i = 0; i < m->n_reactors && y < reg.bottom; i++) {
         const oc_reactor_row *rr = &m->reactors[i];
         draw_emoji_fmt(rt, rr->emoji, rf(reg.left + 14, y, reg.left + 38, y + ROW_H), g_emoji_s);
@@ -16484,6 +16535,7 @@ enum {
     AT_NMCHIP,        /* New message: remove one recipient */
     AT_NMPICK,        /* New message: accept one match */
     AT_DTAB,          /* payload: drafts tab index */
+    AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
     AT_DRAFTROW,      /* payload: Drafts row index — open it */
     AT_DRAFTDEL,      /* payload: Drafts row index — delete it, after asking */
     AT_ACTFILTER,     /* payload: activity filter index */
@@ -16844,6 +16896,14 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_TAB, aid, AF_AID[i], g_act_filters[i],
                      ATOK(AT_ACTFILTER, i));
         }
+    }
+    /* The who-reacted pane's chips: pressable, and each says what pressing does. */
+    for (int i = 0; i < g_n_rxn_chip && n < OC_ACC_MAX; i++) {
+        char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+        snprintf(aid, sizeof aid, "reactors.chip.%d", i);
+        snprintf(nm, sizeof nm, "%s %d, %s", g_rxn_chip[i].emoji, g_rxn_chip[i].count,
+                 g_rxn_chip[i].mine ? "yours: press to take it back" : "press to react");
+        acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_rxn_chip[i].r, ATOK(AT_REACTCHIP, (uint64_t)i));
     }
     if (g_view == VIEW_DRAFTS) {
         static const char *DT_AID[DTAB_COUNT] = { "drafts", "scheduled", "sent" };
@@ -20782,6 +20842,11 @@ static int on_click(HWND hwnd, int x, int y) {
                 rch = rm->thread_channel;
             oc_client_react(g_client, rch, g_chips[i].mid, g_chips[i].emoji,
                             g_chips[i].mine ? OC_REACT_REMOVE : OC_REACT_ADD);
+            /* The who-reacted pane is a snapshot the server sent, not something
+             * the reaction events update, so a chip pressed THERE has to ask for
+             * it again or the pane keeps showing what was true a moment ago. */
+            if (rm && rm->reactlist_open && rm->reactlist_message == g_chips[i].mid)
+                oc_client_list_reactions(g_client, rch, g_chips[i].mid);
             return 1;
         }
     if (files_click(hwnd, x, y)) return 1;
@@ -24387,6 +24452,21 @@ static void test_dump(const char *path) {
                     g_quick_tile[i].bottom, g_quick_clear[i].right > g_quick_clear[i].left);
         }
     }
+    /* The who-reacted pane: the message it is about, and its chips as drawn --
+     * each one's emoji, how many reacted with it, whether you are one of them,
+     * and where it is. */
+    {
+        const oc_model *rm2 = model();
+        fprintf(f, "reactors open=%d msg=%llu people=%zu chips=%d\n",
+                rm2 ? rm2->reactlist_open : 0,
+                (unsigned long long)(rm2 ? rm2->reactlist_message : 0),
+                rm2 ? rm2->n_reactors : (size_t)0, g_n_rxn_chip);
+        for (int i = 0; i < g_n_rxn_chip; i++)
+            fprintf(f, "  rxnchip %d emoji=\"%s\" count=%d mine=%d r=%.0f,%.0f,%.0f,%.0f\n", i,
+                    g_rxn_chip[i].emoji, g_rxn_chip[i].count, g_rxn_chip[i].mine,
+                    g_rxn_chip[i].r.left, g_rxn_chip[i].r.top, g_rxn_chip[i].r.right,
+                    g_rxn_chip[i].r.bottom);
+    }
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
@@ -25552,6 +25632,19 @@ static void test_poll(HWND hwnd) {
         if (!mid && dc && dc->n_msgs) mid = dc->msgs[dc->n_msgs - 1].message_id;
         if (g_client && mid) { oc_client_delete(g_client, g_sel, (uint64_t)mid); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "reactors")) {
+        /* Open the who-reacted pane for a message; mid 0 = the newest. The menu
+         * item it stands in for needs a click at a measured point in a menu. */
+        unsigned long long mid = strtoull(arg, NULL, 10);
+        const oc_model *wm2 = model();
+        const oc_channel *wc = wm2 && g_sel ? oc_model_channel((oc_model *)wm2, g_sel) : NULL;
+        if (!mid && wc && wc->n_msgs) mid = wc->msgs[wc->n_msgs - 1].message_id;
+        if (g_client && mid) {
+            close_overlays();
+            oc_client_list_reactions(g_client, g_sel, (uint64_t)mid);
+            rp_push(RP_REACTORS);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "react")) {
         /* "<mid> <emoji>"; mid 0 = the newest message. Bypasses the modal menu. */
         unsigned long long mid = 0; char emo[40] = {0};
@@ -27261,6 +27354,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else dict_ptt_down(hwnd, DH_INVOKE);
             break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
+        case AT_REACTCHIP: {
+            const oc_model *rm = model();
+            if ((int)arg < g_n_rxn_chip && rm && rm->reactlist_open && g_client) {
+                oc_client_react(g_client, g_sel, rm->reactlist_message, g_rxn_chip[arg].emoji,
+                                g_rxn_chip[arg].mine ? OC_REACT_REMOVE : OC_REACT_ADD);
+                oc_client_list_reactions(g_client, g_sel, rm->reactlist_message);
+            }
+            break;
+        }
         case AT_DRAFTROW:
         case AT_DRAFTDEL:
             if ((int)arg < g_n_listrows && g_view == VIEW_DRAFTS && g_dtab == DTAB_DRAFTS) {
