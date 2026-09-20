@@ -989,6 +989,32 @@ because the pane still draws a full first screen and the maximum is computed fro
 the roster either way. It passed 11/11 against a deliberately broken build. What
 distinguishes the two is whether anybody past the first screen is ever drawn.
 
+## Reading the keyboard-menu harness
+
+`scripts/gui_keymenu.sh` drives the keyboard's route to the context menu
+(REQ-269) against its own fixture daemon (port 9610), with the pointer parked off
+every row so nothing it asserts can be the mouse's doing. It covers Ctrl+Down and
+Ctrl+Up putting the keyboard on a message and moving between them; Shift+F10
+opening that message's actions with an item already highlighted; the arrows moving
+the highlight and **Enter running the highlighted item**; Esc closing the menu and
+Esc again taking the keyboard off the row; and Shift+F10 with nothing focused
+opening the conversation's own menu. It reads the dump's `kbfocus mid= menuhover=
+menuhovercmd= subhover= subopen=` line and `menu=`.
+
+**Enter is proven by effect, and the effect is read back.** The harness walks to
+"Copy link", presses Enter, then pastes into the composer and requires the
+permalink to name the focused message — a menu that merely closed would prove
+neither that the highlighted item ran nor that it ran on the right row. The
+clipboard is **seeded with something else first**: Windows keeps it across runs,
+so a link copied by an earlier run would satisfy that check whether or not this
+run copied anything.
+
+**Every verb's ack is checked** (`k` for keys, `snap` for the dump). One run
+failed a single arrow-key check and passed on re-run; rather than call it flaky,
+the script now names a dropped verb where it happens — an unanswered `key` looks
+exactly like a key that did nothing, and an unanswered `dump` leaves the previous
+file on disk for everything after it to read.
+
 ## Reading the calls harness
 
 `scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`

@@ -2199,7 +2199,12 @@ REQ-269, whose accessibility half is a real open decision.*
   keeps the marker partial.* The client is keyboard-operable in the ordinary
   paths (composer, completion, conversation movement, command palette, shortcut
   sheet) and answers `WM_GETOBJECT` with a **UI Automation provider over the
-  self-drawn UI**, raising UIA events and carrying a real system caret. A
+  self-drawn UI**, raising UIA events and carrying a real system caret. The
+  **context menus have a keyboard route**: Ctrl+Up / Ctrl+Down put the keyboard on
+  a message, Shift+F10 (or the Menu key) opens that message's actions — or, with
+  no message under the keyboard, the conversation's own — and the menu that opens
+  is walked with the arrows and chosen from with Enter. The members pane's menu
+  is still pointer-only, for want of a keyboard focus in that pane. A
   self-drawn UI gets nothing for free here, which is exactly why this is a
   requirement and not an assumption: the cost grows with every pane added.
 
