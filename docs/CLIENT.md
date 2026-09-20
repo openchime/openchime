@@ -248,9 +248,15 @@ model; translate input to intents }, stop.
   - **channel management** — `n` in the Channels pane creates a channel; the
     channel menu's Join/Open/Leave manage membership; non-joined public channels
     show dimmed with a `+`.
-  - **roster + presence** — the Members panel lists the tenant roster with
-    online/away/offline dots + roles; the launcher's "Set away/online" sets your
-    own presence.
+  - **roster + presence** — the Members panel lists the channel's own members
+    (REQ-031) with online/away/offline dots + roles; the launcher's "Set
+    away/online" sets your own presence. The pane **scrolls under the wheel**,
+    with a thumb when there is more below: a channel roster runs to 500 and the
+    pane holds about twenty, and the list used to stop drawing at the bottom edge
+    with no offset at all, which put everybody past the fold out of reach from
+    here. The offset is clamped to the content on every paint, since the roster
+    arrives after the pane opens, and it returns to the top when the channel
+    changes.
   - **direct messages** — `n` in the Members pane (or a member menu's "Message")
     opens a 1:1 DM, titled `@peer` in the sidebar (the daemon reports the DM peer
     in `CHANNEL_INFO`).

@@ -968,6 +968,27 @@ The paging underneath is proven without a screen in `test_client_core.c`, which
 asks the daemon for pages of two and checks the second continues from the first
 rather than repeating it. Not in CI, for the smoke's reason.
 
+## Reading the members harness
+
+`scripts/gui_members.sh` scrolls the members pane (REQ-031) against its own
+fixture daemon (port 9600) bootstrapped with sixty people — `OC_DEV_USERS`, all of
+whom land in `#general` on registration — so the roster is three times what the
+pane holds. It asserts that only what fits is drawn and the pane says the rest is
+below it; that the wheel reaches **every** member, counted as the distinct people
+drawn on the way down (sixty of sixty); that the bottom row is then somebody the
+first screen never showed, and answers a click by opening that person's profile;
+that the offset stops at both ends rather than running past them; and that
+switching channel puts the pane back at its own top. It reads the dump's
+`members n= rows= scroll= max=` line and the `memrow uid= r=` lines, and drives
+the `wheel` verb in detents of 120.
+
+**Counting the people is the check; reading the bottom row is not.** A first
+version asserted that the last drawn row was a real member and that the offset
+reached its maximum — both of which hold with the scroll offset removed entirely,
+because the pane still draws a full first screen and the maximum is computed from
+the roster either way. It passed 11/11 against a deliberately broken build. What
+distinguishes the two is whether anybody past the first screen is ever drawn.
+
 ## Reading the calls harness
 
 `scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`
