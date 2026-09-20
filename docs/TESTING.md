@@ -851,6 +851,19 @@ captures its screens as black; a window is captured either way. `gui_drive.sh
 launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
 
+## Reading the reactions harness
+
+`scripts/gui_reactions.sh` drives the who-reacted pane (REQ-070/071) over
+`gui_pair.sh` (port 9580): bob reacts, so alice's pane has somebody else's
+reaction to join. It asserts a chip per distinct emoji with its count, marked
+when it is yours; that pressing one adds your reaction and pressing it again
+takes it back, with the message agreeing; and that each chip is published to
+assistive technology saying which it would do. The take-back check requires the
+chip to have BEEN yours, or it would pass on a chip that was never pressed. It
+reads the dump's `reactors` and `rxnchip` lines. The window is sized wide enough
+for the context pane the list lives in, or nothing draws. Not in CI, for the
+smoke's reason.
+
 ## Reading the shortcuts harness
 
 `scripts/gui_shortcuts.sh` drives the Win32 client's keyboard shortcuts over
