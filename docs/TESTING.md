@@ -831,6 +831,16 @@ captures its screens as black; a window is captured either way. `gui_drive.sh
 launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
 
+## Reading the shortcuts harness
+
+`scripts/gui_shortcuts.sh` drives the Win32 client's keyboard shortcuts over
+`gui_pair.sh` (port 9570) and asserts the EFFECT of each key, not that it
+dispatched: two clients, so bob can leave something unread for alice. Today it
+covers Shift+Esc — every conversation read, as the reference client binds it —
+and that bare Esc still closes what is open and marks nothing. It reads the
+dump's `marks ch … unread=` lines and its `toast[n]` lines. Not in CI, for the
+smoke's reason.
+
 ## Reading the composer harness
 
 `scripts/gui_composer.sh` drives the Win32 message box against its own fixture
