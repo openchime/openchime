@@ -6689,6 +6689,10 @@ static const struct {
     /* Shift+Esc, as the reference client binds it. Plain Esc closes whatever is
      * open, so the Esc handler below stands aside while Shift is held. */
     { AM_SHIFT,           VK_ESCAPE,  ACC_MARK_ALL_READ, "Shift+Esc",  "Mark every conversation read" },
+    /* Ctrl and a digit, as the reference client binds it: the digit is the
+     * workspace's place in the rail, counting from 1. Handled in the dispatcher
+     * below rather than as nine rows, so this one is the documentation. */
+    { 0,                  0,          ACC_NONE,    "Ctrl+1 \u2026 Ctrl+9", "Switch to that workspace" },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
@@ -6710,6 +6714,7 @@ static int  g_dict_hold;                        /* what holds push to talk down 
 
 static int  call_ptt(HWND hwnd, int down);      /* fwd — calls (REQ-150) */
 static void call_open_view(HWND hwnd, uint64_t ch);   /* fwd */
+static int  ws_go(HWND hwnd, int slot);        /* fwd — Ctrl+<digit> and the switcher */
 static void menu_dispatch(HWND hwnd, int cmd);  /* fwd */
 static void accel_run(HWND hwnd, int action) {
     switch (action) {
@@ -6847,6 +6852,13 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
     if (mod_down(VK_CONTROL)) mods |= AM_CTRL;
     if (mod_down(VK_MENU))    mods |= AM_ALT;
     if (mod_down(VK_SHIFT))   mods |= AM_SHIFT;
+    /* Ctrl+<digit>: the workspace at that place in the rail. Claimed whether or
+     * not there is one, so Ctrl+4 with three signed in does not fall through to
+     * whatever else a bare "4" would do. */
+    if (mods == AM_CTRL && m->wParam >= '1' && m->wParam <= '9') {
+        ws_go(hwnd, (int)m->wParam - '1');
+        return 1;
+    }
     for (size_t i = 0; i < sizeof SHORTCUTS / sizeof SHORTCUTS[0]; i++) {
         if (SHORTCUTS[i].action == ACC_NONE || !SHORTCUTS[i].vk) continue;
         if (SHORTCUTS[i].vk != (uint16_t)m->wParam) continue;
@@ -21535,6 +21547,30 @@ static void ws_save_active(void) {
     w->port = g_port;
 }
 
+/* Put slot `i` on screen, from wherever the request came: the rail's switcher,
+ * Ctrl+<number>, or the harness. 1 if it went, 0 if there is no such workspace
+ * -- Ctrl+5 with three signed in does nothing rather than something surprising.
+ * Announced, because a switch with no visible cursor movement is silent to a
+ * screen reader (REQ-269). */
+static void ws_load(int i);   /* fwd */
+static int ws_go(HWND hwnd, int i) {
+    if (i < 0 || i >= g_n_wss || i == g_ws_active) return i >= 0 && i < g_n_wss;
+    ws_save_active();
+    close_overlays();
+    ws_load(i);
+    layout_composer(hwnd);
+    {
+        const oc_model *m = model();
+        char said[128];
+        char name[80];
+        ws_display_name(m, name, sizeof name);
+        snprintf(said, sizeof said, "%s", name[0] ? name : g_wss[i].ws);
+        oc_a11y_announce(said);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+    return 1;
+}
+
 /* Make slot `i` the one on screen. */
 static void ws_load(int i) {
     if (i < 0 || i >= g_n_wss) return;
@@ -22504,13 +22540,19 @@ static void open_switcher(HWND hwnd) {
             const oc_model *wm = oc_client_model(g_wss[slot].client);
             if (wm) for (size_t c = 0; c < wm->n_channels; c++) unread += wm->channels[c].unread;
         }
-        char lbl[140];
+        char lbl[140], key[16] = "";
+        /* The digit Ctrl reaches it by -- its place among the signed-in
+         * workspaces, which is what ws_go counts. It REPLACES "(connected)"
+         * rather than following it: the two say the same thing, and both
+         * together ran the row past the menu's edge. A remembered workspace that
+         * is not signed in has no digit, and says none. */
+        if (slot >= 0 && slot < 9) snprintf(key, sizeof key, "  Ctrl+%d", slot + 1);
         if (g_sw[i].current)
-            snprintf(lbl, sizeof lbl, "%s  \xE2\x9C\x93", g_sw[i].label);
+            snprintf(lbl, sizeof lbl, "%s  \xE2\x9C\x93%s", g_sw[i].label, key);
         else if (unread > 0)
-            snprintf(lbl, sizeof lbl, "%s  \xE2\x80\xA2 %d", g_sw[i].label, unread);
+            snprintf(lbl, sizeof lbl, "%s  \xE2\x80\xA2 %d%s", g_sw[i].label, unread, key);
         else if (slot >= 0 && g_wss[slot].client)
-            snprintf(lbl, sizeof lbl, "%s  (connected)", g_sw[i].label);
+            snprintf(lbl, sizeof lbl, key[0] ? "%s%s" : "%s  (connected)%s", g_sw[i].label, key);
         else
             /* Remembered but not signed in — the state a sign-out now leaves
              * behind, and a click away from being live again. */
@@ -25229,10 +25271,7 @@ static void test_poll(HWND hwnd) {
         sw_book_load();
         test_ack("ok");
     } else if (!strcmp(verb, "wsgo")) {
-        int i = atoi(arg);
-        if (i >= 0 && i < g_n_wss) { ws_save_active(); close_overlays(); ws_load(i);
-                                     layout_composer(hwnd); test_ack("ok"); }
-        else test_ack("err");
+        test_ack(ws_go(hwnd, atoi(arg)) ? "ok" : "err");
     } else if (!strcmp(verb, "toast")) {
         /* Through the real chain, so the harness exercises what a message does
          * -- including which backend actually carried it. */

@@ -837,9 +837,14 @@ camera needs.
 `gui_pair.sh` (port 9570) and asserts the EFFECT of each key, not that it
 dispatched: two clients, so bob can leave something unread for alice. Today it
 covers Shift+Esc — every conversation read, as the reference client binds it —
-and that bare Esc still closes what is open and marks nothing. It reads the
-dump's `marks ch … unread=` lines and its `toast[n]` lines. Not in CI, for the
-smoke's reason.
+and that bare Esc still closes what is open and marks nothing; and Ctrl+<digit>,
+which goes to that workspace counting from 1 in the rail's order, with a digit
+past the last one doing nothing. The workspace half starts a **second daemon** on
+the next port, because a client keys a workspace by its address and signing in
+twice to one address is one workspace; and it sets the starting point through the
+switcher's own path before each key, so a check cannot begin where it means to
+end. It reads the dump's `marks ch … unread=`, `toast[n]` and
+`workspaces=/active=` lines. Not in CI, for the smoke's reason.
 
 ## Reading the composer harness
 
