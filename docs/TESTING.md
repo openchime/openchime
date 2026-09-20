@@ -860,7 +860,10 @@ when it is yours; that pressing one adds your reaction and pressing it again
 takes it back, with the message agreeing; and that each chip is published to
 assistive technology saying which it would do. The take-back check requires the
 chip to have BEEN yours, or it would pass on a chip that was never pressed. It
-reads the dump's `reactors` and `rxnchip` lines. The window is sized wide enough
+then covers the strip of quick reactions on the message under the pointer: six
+cells, published to assistive technology, one press to react and another to take
+it back, and gone once the pointer leaves the row. It reads the dump's
+`reactors`, `rxnchip` and `hoverreact` lines. The window is sized wide enough
 for the context pane the list lives in, or nothing draws. Not in CI, for the
 smoke's reason.
 

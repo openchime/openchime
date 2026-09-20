@@ -13,7 +13,9 @@
 #   - pressing a chip that is not yours adds your reaction: the count rises, the
 #     chip is marked yours, and the message itself agrees;
 #   - pressing it again takes it back;
-#   - each chip is published to assistive technology, saying which it would do.
+#   - each chip is published to assistive technology, saying which it would do;
+#   - the message under the pointer carries a strip of the quick reactions, one
+#     press each, which appears only while the pointer is on it.
 #
 # Two clients over gui_pair.sh: bob reacts first, so alice's pane has somebody
 # else's reaction to join.
@@ -92,6 +94,38 @@ click_chip
 back() { [ "$was_mine" = 1 ] && [ "$(chip mine)" = 0 ] && [ "$(chip count)" = 1 ]; }
 check "the chip was yours, and now is not, and counts one" waitfor 10 back
 rm -f "$D"
+
+say "== the hovered message carries the quick reactions"
+hrx()  { snap; grep -m1 '^hoverreact ' "$D" | grep -o "\b$1=[^ ]*" | head -1 | cut -d= -f2; }
+# The first cell's rect and whether it is already yours, from the dump.
+cell0_rect() { snap; grep -m1 '^hoverreact ' "$D" | tr ' ' '\n' | sed -n 4p | cut -d@ -f2; }
+cell0_mine() { snap; grep -m1 '^hoverreact ' "$D" | tr ' ' '\n' | sed -n 4p | cut -d: -f2 | cut -d@ -f1; }
+click_cell0() {
+  local l t r b; IFS=, read -r l t r b <<< "$(cell0_rect)"
+  [ -n "${b:-}" ] || return 1
+  "$PAIR" a click $(( (l + r) / 2 )) $(( (t + b) / 2 )) >/dev/null
+}
+"$PAIR" a send "hover over me" >/dev/null
+sleep 1
+snap
+BY="$(grep -m1 '^  msgrow ' "$D" | grep -o 'body=[0-9,]*' | cut -d, -f2)"
+"$PAIR" a move 600 "$BY" >/dev/null
+six() { [ "$(hrx n)" = 6 ]; }
+check "six quick reactions on the row under the pointer" waitfor 5 six
+"$PAIR" a shot reactions_hoverstrip >/dev/null
+check "each is published to assistive technology" bash -c "grep -q '^a11yitem msg.react.0 ' $D"
+not_mine_yet() { [ "$(cell0_mine)" = 0 ]; }
+check "...and the first is not yours yet" not_mine_yet
+click_cell0
+"$PAIR" a move 600 "$BY" >/dev/null
+now_mine() { [ "$(cell0_mine)" = 1 ]; }
+check "pressing the first one reacts" waitfor 10 now_mine
+click_cell0
+"$PAIR" a move 600 "$BY" >/dev/null
+check "pressing it again takes it back" waitfor 10 not_mine_yet
+"$PAIR" a move 200 300 >/dev/null
+gone() { [ "$(hrx n)" = 0 ]; }
+check "off the row, the strip goes" waitfor 5 gone
 
 say ""
 say "gui_reactions: $((checks - fails))/$checks passed in $((SECONDS - START))s"
