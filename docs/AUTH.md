@@ -5,10 +5,11 @@ This is the authoritative design; it is cross-referenced from ARCHITECTURE.md
 (ARCH-19, ARCH-55–ARCH-60), REQUIREMENTS.md (§1.2, §8.1), PROTOCOL.md (§4), and
 SCHEMA.md (migration 0002).
 
-**Status.** **Both modes are implemented.** Local mode verifies username +
+**Status.** **Two of the three identity sources (§1) are implemented, one per
+deployment; a direct connection is not built.** Local mode verifies username +
 password against PBKDF2-HMAC-SHA256 credentials (`local_credentials`); OIDC mode
-verifies a central-issued ES256 JWT against a pinned key (`daemon/jwt.c`, jsmn
-for the claims) and JIT-provisions the user. Both converge on a daemon-issued
+— the relay source — verifies a central-issued ES256 JWT against a pinned key
+(`daemon/jwt.c`, jsmn for the claims) and JIT-provisions the user. Both converge on a daemon-issued
 session (§4) and accept session tokens on reconnect (`process_auth` in
 `daemon/dbwriter.c`, crypto in `daemon/auth.c`, wire frames in PROTOCOL.md §4).
 The mode is chosen at boot: default local (`OPENCHIME_BOOTSTRAP_USERS` provisions the
@@ -29,32 +30,47 @@ bootstrap-owner subject, and email magic-link invite delivery (§7).
 
 ---
 
-## 1. Two modes, one session
+## 1. Identity sources, one session
 
-Authentication has **two modes, chosen per deployment** (ARCH-55). They differ
-only in how identity is *proven*; both then **converge on a daemon-issued
-session** (§4), so everything downstream — SEND, backfill, reconnect,
-revocation — is identical regardless of mode.
+A deployment proves identity through one or more **identity sources**, enabled
+in its configuration (ARCH-55). They differ only in how identity is *proven*;
+all then **converge on a daemon-issued session** (§4), so everything downstream
+— SEND, backfill, reconnect, revocation — is identical whichever source was
+used.
 
-The three rows below are exactly the three deployment models of ARCH-76 — OIDC
-is one of the functions a deployment federates, so the auth mode follows from
-the model rather than being an independent choice.
-
-| Deployment model (ARCH-76) | Mode | How identity is proven |
+| Source | How identity is proven | Depends on |
 |---|---|---|
-| **Self-hosted stand-alone** | **Local** | The daemon manages accounts + passwords itself. No dependency on any OpenChime-operated service — this model is fully air-gappable. |
-| **Self-hosted federated** | **Local** or **OIDC (via relay)** | Opting in to the federated OIDC function means the client logs in with Google/MS/Apple through the project's central service, which re-issues a token the daemon trusts. A federated deployment may equally decline OIDC and stay on local accounts while federating only push, directory, SCIM, DNS, or packages. |
-| **Hosted** | **OIDC (in-house)** | The same central service, operated by the project alongside the daemons. |
+| **Local** (§2) | The daemon manages accounts + passwords itself. | Nothing outside the box — fully air-gappable. |
+| **Relay** (§3) | The client logs in with Google/MS/Apple through the project's central service, which re-issues a token the daemon trusts. | The project's central service, at login time only. |
+| **Direct connection** | The client logs in at an OIDC provider the operator names, and the daemon is the relying party: it redeems the code and validates the provider's ID token. | The operator's own provider. No OpenChime-operated service. |
 
-There is deliberately **no "point the daemon straight at your own IdP" mode**:
-OIDC always routes through the central service. This keeps the daemon maximally
-lean (it never fetches JWKS or handles multiple providers — it verifies one JWT
-from one pinned key, §3.3) and means self-hosters never register provider apps
-or hold provider credentials. A self-hoster who wants social login
-but no central involvement should instead run local mode. **v1 supports one mode
-per tenant** (local XOR oidc); both-at-once is a future extension.
+What a deployment may enable follows from the three deployment models of
+ARCH-76, because the relay is one of the functions a deployment federates and
+the other two sources need nothing from the project.
 
-A deployment's mode is set in the daemon's static config (ARCH-26) and
+| Deployment model (ARCH-76) | Sources |
+|---|---|
+| **Self-hosted stand-alone** | **Local**, a **direct connection**, or both. No dependency on any OpenChime-operated service; on local accounts alone this model is fully air-gappable. |
+| **Self-hosted federated** | Any of the three. Opting in to the federated OIDC function is what adds the relay; a federated deployment may equally decline it and federate only push, directory, SCIM, DNS, or packages. |
+| **Hosted** | The **relay**, operated by the project alongside the daemons, or a **direct connection** to the customer's own provider. |
+
+The two OIDC sources answer different needs. The relay keeps the daemon
+maximally lean on that path (it never fetches JWKS or handles multiple providers
+— it verifies one JWT from one pinned key, §3.3) and means a self-hoster never
+registers provider apps or holds provider credentials; its price is a login-time
+dependency on the project, and the project seeing who signs in where (§3.4). A
+direct connection is for the operator who would rather hold those credentials
+than pay that price, and it is the only single sign-on a stand-alone deployment
+can have. **SAML is not a source** (REQ-027).
+
+**Sources may be enabled together** — an organization's provider for staff
+beside local accounts for contractors or a break-glass owner.
+
+**Built today:** local accounts and the relay's verification half, **one source
+per deployment**, selected by `OPENCHIME_AUTH_MODE`. A direct connection, and
+enabling sources together, are not built.
+
+A deployment's sources are set in the daemon's static config (ARCH-26) and
 advertised to the client in-protocol via `AUTH_CHALLENGE` (§5).
 
 ---
@@ -109,11 +125,11 @@ each operator registering provider apps.
 
 The **central service** (maintainer-controlled) is the OIDC Relying Party: it
 holds the Google/MS/Apple client credentials, runs the login flow, and
-**re-issues** an OpenChime **ES256 JWT** (§3.3) that the daemon trusts. All the
-OIDC machinery — JWKS fetching, provider quirks, key rotation, multi-provider
-handling — lives in that service (a higher-level web service), **never in the C
-daemon**. The daemon only verifies one JWT signature against one configured,
-pinned public key (plus a tiny vendored JSON reader for the claims).
+**re-issues** an OpenChime **ES256 JWT** (§3.3) that the daemon trusts. For this
+source all the OIDC machinery — JWKS fetching, provider quirks, key rotation,
+multi-provider handling — lives in that service (a higher-level web service),
+**not in the C daemon**. The daemon only verifies one JWT signature against one
+configured, pinned public key (plus a tiny vendored JSON reader for the claims).
 
 ### 3.2 The flow — the client is the courier
 
@@ -249,8 +265,9 @@ targets the high-frequency message path, not the auth bootstrap.)
 - **Privacy tradeoff:** in relay-OIDC the central service sees *who* logs into
   which workspace (identities, not message content — it never touches
   messages/channels). A self-hoster wanting zero project visibility declines the
-  OIDC function and uses local mode; declining every federated function is
-  exactly the self-hosted stand-alone model (ARCH-76).
+  relay and uses local accounts or a direct connection to their own provider
+  (§1); declining every federated function is exactly the self-hosted
+  stand-alone model (ARCH-76).
 
 ### 3.5 Reconciling with the island model (REQ-041)
 
@@ -393,8 +410,6 @@ unit-tested in `daemon/roles.c`.
 
 Tracked so the omissions are deliberate:
 
-- **Both auth modes in one tenant** (e.g. OIDC for staff + local for
-  contractors) — v1 is one mode per tenant.
 - **Email magic-link** local login (needs outbound email; not air-gapped-safe).
 - **Argon2** password hashing (a small vendored lib; PBKDF2 ships first).
 - **Cert-vs-restore interaction** (the TOFU fingerprint changing when a database

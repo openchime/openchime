@@ -143,16 +143,20 @@ the requirement says so explicitly rather than implying one.
 
 ### 1.2 Authentication
 
-- **REQ-020.** *(Built in the daemon; no client reaches it)* The system has authenticated a user in one of two deployment-selected
-  modes (ARCH-19, ARCH-55, [AUTH.md](./AUTH.md)): **local** (daemon-managed
-  username+password) or **OIDC** (social login via the project's central
-  service). Because OIDC is a federated function (ARCH-76), self-hosted
-  stand-alone deployments have used **local** mode; self-hosted federated
-  deployments have used either, choosing OIDC precisely by opting in; hosted
-  deployments have used OIDC. In OIDC mode the login has been a client-driven browser flow using
+- **REQ-020.** *(Local and the relay's daemon half built, one source at a time; no client reaches the relay; direct connections not built)* The system has authenticated a user through the
+  **identity sources** its deployment enables (ARCH-19, ARCH-55,
+  [AUTH.md](./AUTH.md)): **local** (daemon-managed username+password), the
+  **relay** (social login via the project's central service), or a **direct
+  connection** to an OIDC provider the operator names (REQ-027). Local accounts
+  and direct connections depend on no project-operated service, so self-hosted
+  stand-alone deployments have used either; the relay is a federated function
+  (ARCH-76), so self-hosted federated deployments have added it precisely by
+  opting in; hosted deployments have used the relay or a direct connection to
+  the customer's own provider. A deployment has enabled more than one source
+  together. Through the relay or a direct connection the login has been a client-driven browser flow using
   platform-native auth session APIs — `ASWebAuthenticationSession` on iOS/macOS,
-  a loopback redirect on desktop — with PKCE. The daemon has advertised its mode
-  to the client before authentication.
+  a loopback redirect on desktop — with PKCE. The daemon has advertised its
+  enabled sources to the client before authentication.
 - **REQ-021.** *(Not built)* The system has supported OIDC login against Microsoft Entra
   ID and Google Workspace as identity providers. Provider integration has lived
   in the central service (ARCH-56), not the daemon.
@@ -160,13 +164,15 @@ the requirement says so explicitly rather than implying one.
   Store compliance for any app offering third-party login. The system has
   not supported Facebook login. (Also brokered by the central service.)
 - **REQ-023.** The daemon has established a session only against a verified
-  credential appropriate to its mode, rejecting a connection outright on any
-  mismatch without partial trust (ARCH-19): in **OIDC mode** an ES256 JWT
+  credential appropriate to the source, rejecting a connection outright on any
+  mismatch without partial trust (ARCH-19): through the **relay**, an ES256 JWT
   re-issued by the central service, verified against a pinned key with the
-  algorithm pinned to `ES256` plus `iss`/`aud`/`exp` checks (ARCH-56/57) — the
-  daemon has not validated raw *provider* JWTs or fetched provider JWKS itself;
-  in **local mode** a username+password checked against the stored PBKDF2 hash
-  (ARCH-59).
+  algorithm pinned to `ES256` plus `iss`/`aud`/`exp` checks (ARCH-56/57) — on
+  this path the daemon has not validated raw *provider* JWTs or fetched provider
+  JWKS itself; through a **direct connection** *(not built)*, the provider's own
+  ID token, which the daemon has obtained as the relying party and validated
+  against that provider's published keys; with **local** accounts a
+  username+password checked against the stored PBKDF2 hash (ARCH-59).
 - **REQ-024.** In local mode the daemon has managed accounts itself: passwords
   hashed with PBKDF2-HMAC-SHA256 and never stored in the clear, the first owner
   bootstrapped from a one-time setup token, further users created by invite
@@ -185,16 +191,16 @@ the requirement says so explicitly rather than implying one.
   (ARCH-59), so it has granted no capability a token does not. **[needs ARCH
   decision — invite-link token model (multi-use vs. per-redeem), expiry, and
   revocation storage.]**
-- **REQ-027.** *(Excluded by decision)* The system's only single-sign-on has been **OIDC brokered through
-  the project's central service** (REQ-020, ARCH-55/56); it has supported neither
-  **SAML 2.0** nor a **bring-your-own-IdP** mode pointing the daemon directly at
-  an organization's identity provider. This is a deliberate exclusion, not a
-  deferred feature: ARCH-55 routes all OIDC through central to keep the daemon
-  free of JWKS fetching and multi-provider handling, and SAML has never been
-  built, designed, or scheduled — so an organization whose procurement mandates
-  SAML is unserved. The ARCH-55-consistent path, were it ever wanted, is central
-  terminating SAML and re-issuing the same ES256 JWT (a control-plane concern in
-  `openchime-saas`, not a daemon one).
+- **REQ-027.** *(Not built)* An organization has been able to point the daemon **directly at its own
+  OIDC identity provider** — a **bring-your-own-IdP** connection in which the
+  daemon is the relying party (ARCH-55) and no project-operated service takes
+  part in the login — beside, or instead of, OIDC brokered through the
+  project's central service (REQ-020/025). The system has **not** supported
+  **SAML 2.0**, and that is a deliberate exclusion, not a deferred feature: SAML
+  has never been built, designed, or scheduled — so an organization whose
+  procurement mandates SAML is unserved. The ARCH-55-consistent path, were it
+  ever wanted, is central terminating SAML and re-issuing the same ES256 JWT (a
+  control-plane concern in `openchime-saas`, not a daemon one).
 
   **The exact position, stated so it is never inferred from a tick in a table:**
 
@@ -202,20 +208,22 @@ the requirement says so explicitly rather than implying one.
   |---|---|---|---|
   | SAML 2.0 | from Business+ | top tier only | **not supported** — not built, not designed, not scheduled |
   | OIDC / social login | yes | OAuth2, top tier | **designed, daemon side built**, brokered by the central relay (ARCH-56/57) |
-  | Bring-your-own IdP, direct to the server | yes | yes | **excluded by design** (ARCH-55) — OIDC always routes through central |
-  | Providers reachable | any IdP | any IdP | **Google only**; Entra and Apple sit behind the same seam |
+  | Bring-your-own IdP, direct to the server | yes | yes | **decided, not built** (ARCH-55) — the daemon as relying party to the operator's own OIDC provider |
+  | Providers reachable | any IdP | any IdP | **Google only**, through the relay; Entra and Apple sit behind the same seam, and any other OIDC provider waits on the direct connection |
   | End-to-end login working today | yes | yes | **no** — the client courier half does not exist |
 
   Three consequences follow, and each is a fact about the product rather than a
-  plan. An RFP requiring SAML 2.0 disqualifies this system outright. Our OIDC is
+  plan. An RFP requiring SAML 2.0 disqualifies this system outright. The relay is
   not equivalent to their SSO: it costs a self-hoster a login-time dependency on
   the project and gives the project visibility into who signs in to which
-  workspace (AUTH.md §3.4), so a stand-alone deployment declining that runs local
+  workspace (AUTH.md §3.4). The direct connection is what removes both, and
+  until it is built a stand-alone deployment declining the relay runs local
   accounts only. And **nobody completes an OIDC login in any deployment model**,
   because the daemon verifies and the control plane mints while nothing carries
   the token between them — `scripts/demo-oidc.sh` proves the mint↔verify contract
   with a dev endpoint that deliberately bypasses the browser flow. That last one
-  is the open item, and is tracked; the first two are settled.
+  is the open item, and is tracked; the first is settled, and the second stands
+  until the direct connection exists.
 
 ### 1.3 Authorization and Roles
 

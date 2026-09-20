@@ -308,9 +308,9 @@ A `method` discriminator selects the credential the payload carries (ARCH-59 for
 The daemon verifies per its mode and rejects on any mismatch with a fatal
 `ERROR`: `AUTH_INVALID_TOKEN` (bad/expired/ wrong-audience token or bad
 password), `AUTH_RATE_LIMITED` (too many failed attempts, REQ-191), or
-`AUTH_REQUIRED` (method not offered by this deployment). The daemon never
-validates raw *provider* JWTs or fetches provider JWKS — in `oidc` it verifies a
-central-issued ES256 JWT against a single pinned key (AUTH.md §3).
+`AUTH_REQUIRED` (method not offered by this deployment). The `oidc` credential
+is the relay's: a central-issued ES256 JWT, verified against a single pinned key
+(AUTH.md §3), never a raw *provider* token.
 
 ### 4.3 `AUTH_OK` (server → client), msg_type `0x0011`
 
