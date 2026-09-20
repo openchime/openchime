@@ -1769,6 +1769,11 @@ static int      g_selecting;    /* left button held, dragging a selection */
  * profile, which is how the profile pane kept appearing unbidden. */
 static struct { rectf r; uint64_t uid; } g_memrows[256];
 static int g_n_memrows;
+/* The members pane scrolls (REQ-031): a channel roster runs to 500, the pane
+ * holds about twenty, and the rest used to be unreachable -- the list simply
+ * stopped drawing at the bottom edge. `g_mem_max` is how far it can go, computed
+ * in the paint that knows the pane's height. */
+static float g_mem_scroll, g_mem_max;
 
 /* Search-overlay result hit-boxes (row -> its channel AND message). */
 static struct { float top, bot; uint64_t cid, mid; } g_searchrows[128];
@@ -3327,6 +3332,7 @@ static void select_channel(uint64_t cid) {
      * cached: membership changes from other clients, a client stores nothing
      * (ARCH-88), and the list is small. */
     oc_client_list_members(g_client, cid);
+    g_mem_scroll = 0;                    /* another roster starts at its top */
     g_tab = TAB_MESSAGES;                /* a new channel opens on its transcript */
     draft_restore(cid);
     ac_close();
@@ -9431,9 +9437,24 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                   rf(x0 + 16, 44, W - 12, 68), OC_COL_FAINT);
         return;
     }
+    /* Scroll first, so the rows below know where they are. The offset is clamped
+     * to the content every paint rather than when the wheel turns: the roster
+     * arrives after the pane opens and shrinks when somebody leaves, and a clamp
+     * that only ran on the wheel would leave the pane scrolled past its end with
+     * nothing in it. */
+    float view = H - 40;
+    float content = (float)m->n_chanmem * ROW_H;
+    g_mem_max = content > view ? content - view : 0;
+    if (g_mem_scroll > g_mem_max) g_mem_scroll = g_mem_max;
+    if (g_mem_scroll < 0) g_mem_scroll = 0;
+    y -= g_mem_scroll;
+    /* Clipped to the body, so a row scrolled half under the header is cut off by
+     * it rather than drawn over it. */
+    gfx_clip_push(rt, gr(rf(x0, 40, W, H)));
     for (size_t i = 0; i < m->n_chanmem; i++) {
         const oc_chan_member *cm = &m->chanmem[i];
         if (y > H) break;
+        if (y + ROW_H <= 40) { y += ROW_H; continue; }   /* scrolled above the header */
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
         /* A member row opens the profile — say so on the way in, as every other
          * clickable row in the app does. */
@@ -9484,10 +9505,21 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             }
         }
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
-            g_memrows[g_n_memrows].r = rf(x0, y, W, y + ROW_H);
+            /* Clipped to the body: a row half under the header must not take a
+             * click aimed at the header. */
+            g_memrows[g_n_memrows].r = rf(x0, y < 40 ? 40 : y, W, y + ROW_H);
             g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
         }
         y += ROW_H;
+    }
+    gfx_clip_pop(rt);
+    /* A thumb, in the style the overlay panes use: without one there is nothing
+     * on screen to say the list continues. */
+    if (g_mem_max > 0.5f) {
+        float track = view - 8, thumb = view / (view + g_mem_max) * track;
+        if (thumb < 30) thumb = 30;
+        float top = 44 + (g_mem_scroll / g_mem_max) * (track - thumb);
+        fill_round(rt, rf(W - 10, top, W - 4, top + thumb), OC_R_PILL, OC_COL_FAINT);
     }
 }
 
@@ -24310,6 +24342,11 @@ static void test_dump(const char *path) {
                 g_selfcard_btn[i].r.left, g_selfcard_btn[i].r.top,
                 g_selfcard_btn[i].r.right, g_selfcard_btn[i].r.bottom);
     /* The members pane's rows, so a row can be pointed at by who it is. */
+    /* The roster, and how far through it the pane is looking: rows= is what is
+     * DRAWN, n= what the channel has, so a harness can tell "the rest is below"
+     * from "the rest is not there". */
+    fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
+            m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
     for (int i = 0; i < g_n_memrows; i++)
         fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f\n", (unsigned long long)g_memrows[i].uid,
                 g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom);
@@ -26921,6 +26958,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
+        }
+        /* The members pane owns the wheel over itself. Ahead of the sidebar and
+         * the transcript below, which would otherwise scroll while the pointer
+         * sits on the roster -- the pane's own rows being what the wheel is for. */
+        {
+            RECT wrc; GetClientRect(hwnd, &wrc);
+            float cw = DIPF(wrc.right);
+            float mw = members_w(cw);
+            if (mw > 0 && g_show_members && g_rp_mode == RP_MEMBERS &&
+                (float)wpt.x >= cw - mw && (float)wpt.y >= 40.0f) {
+                g_mem_scroll -= dy;
+                if (g_mem_scroll < 0) g_mem_scroll = 0;
+                if (g_mem_scroll > g_mem_max) g_mem_scroll = g_mem_max;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
         }
         if (transcript_shell()
             && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
