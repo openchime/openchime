@@ -224,7 +224,12 @@ paying four minutes of unrelated suites per attempt:
 - `OC_TEST_ONLY=audio,media` runs only the suites whose names contain those;
 - `OC_TEST_REPEAT=20` runs the selection that many times.
 
-Unset, nothing changes.
+Unset, nothing changes. A repeated suite runs **in one process**, so a suite that
+leaves a fixture switched must put it back or the second round fails somewhere
+that has nothing to do with the cause: `itest_netloop` sets a flag that makes the
+audio sidecar refuse to start, to prove a join is refused openly when the relay
+cannot be brought back, and while it stayed set the second round died at
+`adaemon >= 0` in the suite's *setup*.
 
 ### 2.3 Determinism rules
 
@@ -240,6 +245,21 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   (`oc_dbwriter_set_idem_retention`, `OPENCHIME_MAINT_INTERVAL_MS`,
   `OPENCHIME_SCHED_TICK_MS`), which is what lets a suite compress a clock it
   cannot fake.
+- **A real-time rate is reported, not asserted narrowly.** Capture and recording
+  run in real time, so how many frames a second of them yields is a property of
+  the machine: a host that cannot encode 720p at 30 fps produces fewer frames,
+  which is the recorder behaving correctly. A narrow band around the nominal count
+  therefore tests the host — two such checks in `test_media.c` failed on two
+  pinned CPUs and under ThreadSanitizer with nothing wrong in the tree. What a
+  rate check may assert is what belongs to the code: that it never runs *faster*
+  than it was asked to (the count, and the median gap between frames), that the
+  timestamps go forwards, that there is no hole in the run (a whole second with no
+  frame is a stop, which no load explains), and a **generous floor** — a fifth of
+  the rate — below which there is nothing to watch. `check_frame_rate` in
+  `test_media.c` is that check, and it prints the measured rate, which is the
+  number a benchmark wants and a unit suite cannot assert. The same applies to a
+  recording's *length*: stopping early loses what was being recorded and is a
+  defect, stopping a little late is a busy machine.
 - Unit tests touch no network. **Several suites use real files on disk**, not
   `:memory:` — `test_dbwriter`, `test_push`, `test_client_core`, `itest_netloop`
   and `itest_slow_blob` each open a database under `build/`, because they

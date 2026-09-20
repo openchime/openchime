@@ -2736,6 +2736,11 @@ static void test_call_sidecar_restart(int port, const uint8_t *pin, uint16_t aud
     CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
     oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_CALL_UNAVAILABLE);
 
+    /* Put the fixture back: the refusal is this test's, and leaving it set meant
+     * a second run of the suite in one process (OC_TEST_REPEAT) could not start a
+     * sidecar at all and failed at the first check, pointing nowhere near here. */
+    g_audio_refuse = 0;
+
     (void)ub;
     close(sa); close(sb);
     client_close(&c);
