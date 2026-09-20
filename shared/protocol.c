@@ -562,6 +562,8 @@ oc_result oc_encode_members(oc_wbuf *w, uint16_t version, const oc_members *m) {
 oc_result oc_encode_list_files(oc_wbuf *w, uint16_t version, const oc_list_files *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_FILES);
     oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->before_ms);
+    oc_w_u64(w, m->before_id);
     return oc_frame_end(w, off);
 }
 
@@ -585,6 +587,7 @@ oc_result oc_encode_files(oc_wbuf *w, uint16_t version, const oc_files *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_FILES);
     oc_w_u64(w, m->channel_id);
     oc_w_u32(w, m->count);
+    oc_w_u8(w, m->more);
     return oc_frame_end(w, off);
 }
 
@@ -2384,6 +2387,8 @@ oc_result oc_decode_members(oc_rbuf *p, oc_members *m) {
 
 oc_result oc_decode_list_files(oc_rbuf *p, oc_list_files *m) {
     m->channel_id = oc_r_u64(p);
+    m->before_ms  = oc_r_u64(p);
+    m->before_id  = oc_r_u64(p);
     return r_done(p);
 }
 
@@ -2405,6 +2410,7 @@ oc_result oc_decode_file_entry(oc_rbuf *p, oc_file_entry *m) {
 oc_result oc_decode_files(oc_rbuf *p, oc_files *m) {
     m->channel_id = oc_r_u64(p);
     m->count      = oc_r_u32(p);
+    m->more       = oc_r_u8(p);
     return r_done(p);
 }
 

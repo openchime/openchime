@@ -1738,6 +1738,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->channel_id = lf.channel_id;   /* 0 = every channel I can read */
+            j->files_before_ms = lf.before_ms;
+            j->files_before_id = lf.before_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -3775,7 +3777,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         }
         if (!conns[c->fd]) break;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_files term = { r->channel_id, (uint32_t)r->n_flist };
+        oc_files term = { r->channel_id, (uint32_t)r->n_flist, r->flist_more };
         oc_encode_files(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;

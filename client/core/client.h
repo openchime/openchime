@@ -170,6 +170,10 @@ void oc_client_list_members(oc_client *c, uint64_t channel_id);
 /* Files shared in a channel, or (channel_id 0) across every channel the user
  * can read (REQ-143, ARCH-91). */
 void oc_client_list_files(oc_client *c, uint64_t channel_id);
+/* The next page of the open list, from where it left off (REQ-143). A no-op
+ * unless the daemon said more remain and no page is already in flight; the rows
+ * are appended to `files`. */
+void oc_client_list_files_more(oc_client *c);
 void oc_client_close_files(oc_client *c);
 
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id);

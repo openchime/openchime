@@ -958,7 +958,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_files ff;
             if (oc_decode_files(&p, &ff) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_FILES_END);
-                if (e) { e->channel_id = ff.channel_id; e->count = ff.count; oc_queue_push(to_ui, e); }
+                if (e) { e->channel_id = ff.channel_id; e->count = ff.count;
+                         e->status = ff.more; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_SAVED_UPDATED) {
             oc_saved_updated su;
@@ -2420,7 +2421,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_LIST_FILES) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_list_files lf = { c->channel_id };
+                oc_list_files lf = { c->channel_id, c->server_time, c->message_id };
                 if (oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &lf) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

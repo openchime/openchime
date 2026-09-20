@@ -1155,6 +1155,17 @@ static oc_dbres *list_files(oc_dbwriter *w, uint64_t uid, uint64_t ch) {
     return wait_result(w);
 }
 
+/* The same listing from a keyset cursor: the rows strictly older than
+ * (created, id), as a second page asks for them (REQ-143). */
+static oc_dbres *list_files_before(oc_dbwriter *w, uint64_t uid, uint64_t ch,
+                                   uint64_t before_ms, uint64_t before_id) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_FILES, 241);
+    j->user_id = uid; j->channel_id = ch;
+    j->files_before_ms = before_ms; j->files_before_id = before_id;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
 static void test_channel_details(void) {
     const char *path = "build/test_dbwriter_details.db";
     cleanup_db(path);
@@ -1239,6 +1250,21 @@ static void test_channel_details(void) {
     CHECK(strcmp(r->flist[0].mime, "image/png") == 0);
     CHECK(r->flist[1].id == 3 && r->flist[1].reclaimed == 1);
     CHECK(r->flist[2].id == 1 && r->flist[2].reclaimed == 0);
+    oc_dbres_free(r);
+
+    /* A cursor takes the rows older than the one it names, and no others: from
+     * the newest row (id 2, ms 3000) come the two behind it, in the same order,
+     * with 2 itself absent -- so a second page continues the first rather than
+     * repeating its last row. Nothing remains after the oldest. */
+    r = list_files_before(w, alice, secret, 3000, 2);
+    CHECK(r && r->type == OC_RES_FILE_LIST);
+    CHECK(r->n_flist == 2);
+    CHECK(r->flist[0].id == 3 && r->flist[1].id == 1);
+    CHECK(r->flist_more == 0);
+    oc_dbres_free(r);
+
+    r = list_files_before(w, alice, secret, 1000, 1);
+    CHECK(r && r->type == OC_RES_FILE_LIST && r->n_flist == 0 && r->flist_more == 0);
     oc_dbres_free(r);
 
     r = list_files(w, carol, secret);

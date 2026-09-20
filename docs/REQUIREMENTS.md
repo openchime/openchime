@@ -1179,7 +1179,11 @@ the requirement says so explicitly rather than implying one.
   streams a channel's shared files newest-first, or (channel 0) every channel the
   caller can read; migration 0023 adds the one index that access pattern needed.
   Pending uploads are excluded, reclaimed rows are listed and flagged. Filtering
-  by type is client-side over the returned `mime`.
+  by type is client-side over the returned `mime`. The answer comes a page at a
+  time (200 rows, `OPENCHIME_FILE_PAGE`) and says whether more remain; the client
+  asks for the next page with the keyset cursor the last row it holds gives it,
+  and the Win32 files view offers "Load more" while there are more, so a channel
+  with thousands of files can be browsed past the first page.
 
 ### 6.2 Audio Conferencing
 

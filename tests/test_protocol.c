@@ -1434,6 +1434,48 @@ static void test_attachment_frames(void) {
     }
 }
 
+/* The files list and its paging cursor (REQ-143): the request carries where the
+ * caller left off, the terminator says whether more remain. */
+static void test_file_frames(void) {
+    {
+        oc_list_files in = { 7, 1751200500000ull, 42 };
+        ROUNDTRIP(oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_FILES, h, p);
+        oc_list_files out;
+        CHECK(oc_decode_list_files(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.before_ms == 1751200500000ull && out.before_id == 42);
+    }
+    {   /* The first page asks with no cursor. */
+        oc_list_files in = { 0, 0, 0 };
+        ROUNDTRIP(oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_FILES, h, p);
+        oc_list_files out;
+        CHECK(oc_decode_list_files(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 0 && out.before_ms == 0 && out.before_id == 0);
+    }
+    {
+        oc_file_entry in = { 11, 7, 22, 33, 4096, 1751200500000ull, 1,
+                             oc_slice_str("notes.pdf"), oc_slice_str("application/pdf"), 0, 0 };
+        ROUNDTRIP(oc_encode_file_entry(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FILE_ENTRY, h, p);
+        oc_file_entry out;
+        CHECK(oc_decode_file_entry(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 11 && out.channel_id == 7 && out.message_id == 22);
+        CHECK(out.uploader_id == 33 && out.size == 4096 && out.reclaimed == 1);
+        CHECK(out.filename.len == 9 && memcmp(out.filename.ptr, "notes.pdf", 9) == 0);
+    }
+    {
+        oc_files in = { 7, 200, 1 };
+        ROUNDTRIP(oc_encode_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FILES, h, p);
+        oc_files out;
+        CHECK(oc_decode_files(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.count == 200 && out.more == 1);
+    }
+    {   /* The last page says so. */
+        oc_files in = { 7, 3, 0 };
+        ROUNDTRIP(oc_encode_files(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FILES, h, p);
+        oc_files out;
+        CHECK(oc_decode_files(&p, &out) == OC_OK && out.more == 0 && out.count == 3);
+    }
+}
+
 static void test_backfill_and_error(void) {
     {
         oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
@@ -1840,6 +1882,7 @@ int run_protocol_tests(void) {
     test_search_frames();
     test_presence_frames();
     test_attachment_frames();
+    test_file_frames();
     test_webhook_frames();
     test_notify_frames();
     test_draft_frames();

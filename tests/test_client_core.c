@@ -1995,6 +1995,10 @@ int run_client_core_tests(void) {
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
      * how itest_netloop provisions it. */
     setenv("OPENCHIME_BLOB_DIR", "build/itest_core_blobs", 1);
+    /* Two files to a page, so the paging below is exercised with three uploads
+     * rather than two hundred and one. Read once, by the config the loop thread
+     * loads before the netloop runs. */
+    setenv("OPENCHIME_FILE_PAGE", "2", 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -2382,6 +2386,56 @@ int run_client_core_tests(void) {
 
             free(blob);
             unlink(src); unlink(dst);
+        }
+
+        /* The files list pages (REQ-143). Three files, two to a page: the first
+         * page says there are more, the second brings the rest and says there are
+         * not, and no row appears twice. The daemon's page size is 2 here. */
+        {
+            uint64_t seen[8];
+            size_t n_seen = 0;
+            for (int k = 0; k < 3; k++) {
+                char path[64];
+                snprintf(path, sizeof path, "build/itest_core_page%d.bin", k);
+                FILE *pf = fopen(path, "wb");
+                CHECK(pf != NULL);
+                if (pf) { fputc('a' + k, pf); fclose(pf); }
+                oc_client_upload(a, 1, path);
+                /* One at a time, so their order is the order they were shared. */
+                size_t want = (size_t)k + 2;   /* the earlier upload is already there */
+                CHECK(WAIT_FOR(a, ({
+                    size_t nf = 0;
+                    const oc_channel *ch = oc_model_channel((oc_model *)m, 1);
+                    for (size_t i2 = 0; ch && i2 < ch->n_msgs; i2++) nf += ch->msgs[i2].n_attach;
+                    nf >= want; })));
+            }
+            const oc_model *am = oc_client_model(a);
+            oc_client_list_files(a, 1);
+            CHECK(WAIT_FOR(a, !m->filelist_loading && m->n_files > 0));
+            CHECK(am->n_files == 2);
+            CHECK(am->files_more == 1);
+            for (size_t i2 = 0; i2 < am->n_files; i2++) seen[n_seen++] = am->files[i2].id;
+            /* Newest first, and strictly ordered: the cursor is (created, id). */
+            CHECK(am->files[0].created_at >= am->files[1].created_at);
+            oc_client_list_files_more(a);
+            CHECK(WAIT_FOR(a, !m->filelist_loading && m->n_files > 2));
+            /* Four files are shared by now: the multi-chunk upload above and these
+             * three, so the second page brings two more and the list holds four. */
+            CHECK(am->n_files == 4);
+            int repeated = 0;
+            for (size_t i2 = 2; i2 < am->n_files; i2++)
+                for (size_t j2 = 0; j2 < n_seen; j2++) if (am->files[i2].id == seen[j2]) repeated = 1;
+            CHECK(!repeated);
+            /* The last page says so, and asking again does nothing. */
+            CHECK(WAIT_FOR(a, m->files_more == 0));
+            size_t had = am->n_files;
+            oc_client_list_files_more(a);
+            CHECK(WAIT_FOR(a, m->n_files == had));
+            for (int k = 0; k < 3; k++) {
+                char path[64];
+                snprintf(path, sizeof path, "build/itest_core_page%d.bin", k);
+                unlink(path);
+            }
         }
 
         /* video messages (REQ-162/165): dana asks for an earlier file's bytes and

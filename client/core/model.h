@@ -435,6 +435,10 @@ typedef struct {
     uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
     oc_file_view *files;
     size_t    n_files, cap_files;
+    /* The daemon stopped at a page boundary and more remain (REQ-143): what a
+     * "load more" affordance is drawn from, and what oc_client_list_files_more
+     * refuses without. */
+    uint8_t   files_more;
     /* The caller's own live sessions (REQ-182). Refreshed on open like every other
      * report; a client caches nothing (ARCH-88). */
     uint8_t   sessions_open, sessions_loading;

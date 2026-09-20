@@ -913,6 +913,21 @@ or freezes it. It reads the dump's `draftn=`, `draftrows` (each row's
 conversation, thread and Delete rect), `modal=`, `memrow` and `a11yitem` lines.
 Not in CI, for the smoke's reason.
 
+## Reading the files harness
+
+`scripts/gui_files.sh` pages the Win32 files view (REQ-143) against its own
+fixture daemon (port 9590) with `OPENCHIME_FILE_PAGE=2`, so three uploads are
+enough to see paging a real daemon would only show past two hundred files. It
+asserts that the first page holds its two rows and says more remain; that "Load
+more" is published to assistive technology; that pressing it APPENDS the next
+page rather than replacing what is shown — three rows, each file once — and that
+the button then goes, there being no more. It reads the dump's `files` line:
+`n=` (rows held), `more=` (the daemon says more remain), `loading=`, `rows=`
+(rows drawn) and `more_btn=` (the button's rect, `0,0,0,0` when it is not there).
+The paging underneath is proven without a screen in `test_client_core.c`, which
+asks the daemon for pages of two and checks the second continues from the first
+rather than repeating it. Not in CI, for the smoke's reason.
+
 ## Reading the calls harness
 
 `scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`
