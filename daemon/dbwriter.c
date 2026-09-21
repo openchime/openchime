@@ -61,7 +61,7 @@ struct oc_dbwriter {
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
-    oc_ratelimit   *source_rl;               /* failed local-auth per source IP */
+    oc_ratelimit   *source_rl;               /* failed sign-ins per source IP, every source */
 
     /* Idempotency-map pruning (ARCH-44): drop sent_messages rows older than the
      * retention window, at most once per interval. Writer-thread state only. */
@@ -891,6 +891,32 @@ static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
     return r;
 }
 
+static const char *jwt_reason(oc_jwt_result jr) {
+    switch (jr) {
+    case OC_JWT_E_ALG:       return "alg";
+    case OC_JWT_E_SIGNATURE: return "signature";
+    case OC_JWT_E_CLAIMS:    return "claims";
+    case OC_JWT_E_EXPIRED:   return "expired";
+    case OC_JWT_E_KEY:       return "key";
+    default:                 return "format";
+    }
+}
+
+/* A refused OIDC sign-in: counted against its source and written down, exactly
+ * as a wrong password is (REQ-191, REQ-251). Never the token — only why it was
+ * refused and where it came from. Bounded by the limiter: a throttled attempt
+ * returned before it got here. */
+static oc_dbres *oidc_refuse(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint16_t code,
+                             const char *action, const char *who, const char *reason) {
+    char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 96];
+    if (j->source[0]) oc_ratelimit_record(w->source_rl, j->source, dbw_now_ms());
+    snprintf(detail, sizeof detail, "%s%s%s", reason, j->source[0] ? " from=" : "", j->source);
+    audit_log(w->db, OC_AUDIT_SECURITY, action, 0, NULL, 0, who, 0, detail);
+    r->type = OC_RES_AUTH_ERR;
+    r->err_code = code;
+    return r;
+}
+
 /* Prove identity (local password, an OIDC ES256 JWT, or an existing session
  * token) and converge on a daemon-issued session (AUTH.md §4). */
 static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
@@ -902,6 +928,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     uint64_t uid = 0, sess_exp = 0, sess_id = 0;
     uint8_t role = OC_ROLE_MEMBER;
     int fresh = 1;   /* mint a new session unless this is a session re-auth */
+    char how[OC_JWT_MAX_SHORT + 32] = "source=local";   /* what auth.success records */
 
     if (j->method == OC_AUTH_LOCAL) {
         if (!(w->auth_methods & OC_AUTH_LOCAL)) {
@@ -949,19 +976,28 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         if (!w->oidc_enabled) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
         }
+        /* The per-source limiter stands in front of every source, and in front of
+         * the signature work as it stands in front of PBKDF2. Throttled attempts
+         * are dropped silently and unaudited, for the reason given above. */
+        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, j->source, dbw_now_ms())) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
+        }
         oc_jwt_claims claims;
         oc_jwt_result jr = oc_jwt_verify(j->token, j->token_len,
                                          w->oidc_pubkey_pem, strlen(w->oidc_pubkey_pem) + 1,
                                          w->oidc_issuer, w->oidc_audience,
                                          dbw_now_ms() / 1000u, &claims);
         if (jr != OC_JWT_OK) {
-            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+            char reason[48];
+            snprintf(reason, sizeof reason, "source=relay reason=%s", jwt_reason(jr));
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL, reason);
         }
         /* Single use, claimed only once everything else about the token is good, so
          * a token that fails for another reason does not burn its id. */
         if (!w->seen_jti ||
             !seen_jti_claim(w->seen_jti, claims.jti, claims.exp, dbw_now_ms() / 1000u)) {
-            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", claims.email,
+                               "source=relay reason=replayed");
         }
         /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
         char subject[OC_JWT_MAX_FIELD * 2 + 8];
@@ -974,7 +1010,8 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         char issuer[OC_JWT_MAX_FIELD];
         const char *person = NULL;
         if (!split_identity(claims.sub, issuer, sizeof issuer, &person)) {
-            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", claims.email,
+                               "source=relay reason=subject");
         }
         /* An account from before identities were rows is found by the string it was
          * filed under, and gets its row at this sign-in. */
@@ -982,11 +1019,11 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         if (!uid) uid = user_by_subject(db, subject);
         int known = uid != 0;
         if (!known && verdict == OC_JOIN_DENY) {
-            char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 32];
-            snprintf(detail, sizeof detail, "idp=%s tenant=%s", claims.idp, claims.tenant);
-            audit_log(db, OC_AUDIT_SECURITY, "auth.denied", 0, NULL, 0, claims.email, 0, detail);
-            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_NOT_ALLOWED; return r;
+            char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
+            snprintf(detail, sizeof detail, "source=relay idp=%s tenant=%s", claims.idp, claims.tenant);
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_NOT_ALLOWED, "auth.denied", claims.email, detail);
         }
+        snprintf(how, sizeof how, "source=relay idp=%s", claims.idp);
         /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
          * user past the workspace limit (an existing user still logs in). */
         if (!known && user_slots_full(db, subject, strlen(subject), w->max_users)) {
@@ -999,9 +1036,15 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
             set_role(db, uid, OC_ROLE_OWNER);
         if (uid) role = get_role(db, uid);   /* membership ensured on the common path */
     } else if (j->method == OC_AUTH_SESSION) {
+        /* A session token is 32 random bytes, so guessing one is hopeless — but the
+         * limiter is per source, and a source hammering any door is the same source. */
+        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, j->source, dbw_now_ms())) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
+        }
         uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp,
                              &sess_id);
         fresh = 0;
+        if (uid == 0 && j->source[0]) oc_ratelimit_record(w->source_rl, j->source, dbw_now_ms());
     } else {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
     }
@@ -1035,7 +1078,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         /* Only a fresh local/OIDC login, never a session reconnect (REQ-251):
          * "who signed in, when" means a new credential was proven, not that an
          * already-authenticated connection resumed. */
-        audit_actor(db, OC_AUDIT_SECURITY, "auth.success", uid, 0, NULL, 1, NULL);
+        audit_actor(db, OC_AUDIT_SECURITY, "auth.success", uid, 0, NULL, 1, how);
     } else {
         r->has_session_token = 0;   /* no new token on reconnect (PROTOCOL.md §4.3) */
         r->session_expiry = sess_exp;

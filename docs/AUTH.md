@@ -83,8 +83,13 @@ authority.
   attempts with `ERROR AUTH_RATE_LIMITED`. The per-source cap is higher than
   per-account, so many users behind one NAT are tolerated while an account-spray
   from a single IP is still stopped; a successful login clears the account
-  counter but not the source counter. This is why REQ-191 lives with the auth
-  design — it is squarely a local-password concern.
+  counter but not the source counter.
+  The per-source counter stands in front of **every** source: a refused relay
+  token and a wrong session token count against the address they came from, the
+  check runs before any signature work, and a refused relay sign-in is audited as
+  `auth.failed` (or `auth.denied`, when the identity was valid and no rule admits
+  it) with its reason and address — never the token. `auth.success` records the
+  source and the provider.
 
 ---
 

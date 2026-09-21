@@ -975,6 +975,73 @@ static void test_oidc_join_rules(void) {
     cleanup_db(path);
 }
 
+/* Present `token` as an OIDC or session credential from `source`; the reason code. */
+static uint16_t auth_token_from(oc_dbwriter *w, uint64_t conn, uint8_t method,
+                                const void *token, size_t tlen, const char *source) {
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn);
+    j->method = method;
+    snprintf(j->source, sizeof j->source, "%s", source);
+    oc_job_set_token(j, token, tlen);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_AUTH_OK) ? 0 : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+/* Every source answers to the per-source limiter, and a refused OIDC sign-in is
+ * written down as a wrong password is (REQ-191, REQ-251). */
+static void test_oidc_limits_and_audit(void) {
+    const char *path = "build/test_dbwriter_oidc_rl.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-rl") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+
+    /* Twenty refusals from one address, then the door is shut to it — before any
+     * signature work, and to a session guess as well as a token. */
+    for (int i = 0; i < 20; i++)
+        CHECK(auth_token_from(w, 50, OC_AUTH_OIDC, "a.b.c", 5, "203.0.113.7") == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(auth_token_from(w, 51, OC_AUTH_OIDC, "a.b.c", 5, "203.0.113.7") == OC_ERR_AUTH_RATE_LIMITED);
+    uint8_t guess[OC_SESSION_TOKEN_LEN]; memset(guess, 7, sizeof guess);
+    CHECK(auth_token_from(w, 52, OC_AUTH_SESSION, guess, sizeof guess, "203.0.113.7") == OC_ERR_AUTH_RATE_LIMITED);
+    /* Another address is untouched, and a bad session guess counts against it. */
+    CHECK(auth_token_from(w, 53, OC_AUTH_SESSION, guess, sizeof guess, "203.0.113.8") == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* A good sign-in, a replay of it, and a stranger. */
+    uint8_t role; int err;
+    CHECK(oidc_signin(w, &is, 54, "g|pat", "r1",
+                      "\"idp\":\"google\",\"tenant\":\"acme.example\"", &role, &err) != 0);
+    CHECK(oidc_signin(w, &is, 55, "g|sam", "r2",
+                      "\"email\":\"sam@elsewhere.example\",\"idp\":\"google\"", &role, &err) == 0);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw,
+            "SELECT (SELECT COUNT(*) FROM audit_log WHERE action='auth.failed' AND outcome=0"
+            "         AND detail='source=relay reason=format from=203.0.113.7'),"
+            " (SELECT COUNT(*) FROM audit_log WHERE action='auth.denied'"
+            "         AND target='sam@elsewhere.example' AND detail LIKE 'source=relay idp=google%'),"
+            " (SELECT COUNT(*) FROM audit_log WHERE action='auth.success'"
+            "         AND detail='source=relay idp=google');", -1, &st, NULL);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        CHECK(sqlite3_column_int(st, 0) == 20);   /* the throttled 21st left no row */
+        CHECK(sqlite3_column_int(st, 1) == 1);
+        CHECK(sqlite3_column_int(st, 2) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+    cleanup_db(path);
+}
+
 /* Failed local-auth attempts are throttled per account (REQ-191). After the
  * configured number of failures the account is AUTH_RATE_LIMITED — even with
  * the correct password — while other accounts stay unaffected. */
@@ -5410,6 +5477,7 @@ int run_dbwriter_tests(void) {
     test_auth_and_send();
     test_oidc_auth();
     test_oidc_join_rules();
+    test_oidc_limits_and_audit();
     test_auth_rate_limit();
     test_source_rate_limit();
     test_logout();
