@@ -12,7 +12,10 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 
+#include <stdio.h>
 #include <string.h>
+
+#include "../daemon/jwt.h"
 
 static const char OC_ISSUER_B64URL[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -100,6 +103,27 @@ static inline size_t oc_issuer_mint(oc_issuer *is, const char *hdr_json,
     out[o++] = '.';
     o += oc_b64url_encode(raw, sizeof raw, out + o);
     return o;
+}
+
+/* The JOSE header central sends: ES256, and the signing key's RFC 7638
+ * thumbprint as `kid`, which is how the daemon picks among its pinned keys. */
+static inline void oc_issuer_header(const oc_issuer *is, char *out, size_t cap) {
+    char kid[OC_JWT_THUMBPRINT_LEN + 1] = "";
+    oc_jwt_key_thumbprint(is->pem, strlen(is->pem) + 1, kid);
+    snprintf(out, cap, "{\"alg\":\"ES256\",\"typ\":\"JWT\",\"kid\":\"%s\"}", kid);
+}
+
+/* A contract-shaped payload (AUTH.md §8.3) around the claims a test varies.
+ * `extra` is spliced in verbatim before the closing brace ("" for none). */
+static inline void oc_issuer_payload(char *out, size_t cap, const char *iss, const char *aud,
+                                     const char *sub, const char *jti,
+                                     unsigned long long iat, unsigned long long exp,
+                                     const char *extra) {
+    snprintf(out, cap,
+        "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"%s\",\"jti\":\"%s\","
+        "\"nonce\":\"47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU\","
+        "\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu%s%s}",
+        iss, aud, sub, jti, iat, iat, exp, extra[0] ? "," : "", extra);
 }
 
 #endif /* OC_TEST_ISSUER_H */

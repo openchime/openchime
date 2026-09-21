@@ -181,9 +181,13 @@ carrying the identity claims:
 { "iss": "https://central.example",     // the central service — see below
   "aud": "ws_7f3a…9c21",                 // the target workspace's opaque id
   "sub": "<provider issuer>|<subject>",  // stable identity
-  "email": "...", "name": "...",
-  "iat": ..., "exp": ... }
+  "email": "...", "email_verified": true, "name": "...",
+  "idp": "google", "tenant": "acme.example",
+  "nonce": "…", "jti": "…",
+  "iat": ..., "nbf": ..., "exp": ... }
 ```
+
+The claims and what each means are §8.3.
 
 **The audience is an opaque random id — not the DNS name.** The `aud` value is a
 random identifier (≥128-bit) established when the workspace **enrolls** with
@@ -201,15 +205,24 @@ discovery document, because the key is pinned in configuration (§3.4). Any
 value both sides agree on works, and an implementer should not read the example
 as a URL that has to resolve, or as requiring a particular subdomain.
 
-The daemon validates it by **pinning both the key and the algorithm**:
+The daemon validates it by **pinning both the keys and the algorithm**
+(`daemon/jwt.c`):
 
 - it requires `alg = ES256` and rejects anything else — this closes JWT's classic
   footguns (`alg=none`, RS256/HS256 confusion) up front;
 - it verifies the signature with mbedTLS (ES256 = ECDSA-P256, which mbedTLS
   supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
-- it checks `iss` (central), `aud` (== this workspace's configured opaque id — not
-  its hostname — so a token minted for one workspace cannot be replayed at
-  another), and `exp`.
+- it chooses the key by the header's `kid` — the signing key's RFC 7638
+  thumbprint, which it computes for each key it pins — and refuses a token whose
+  `kid` is absent or names none of them (§8.3);
+- it checks `iss` (central) and `aud` (== this workspace's configured opaque id —
+  not its hostname — so a token minted for one workspace cannot be replayed at
+  another);
+- it requires `sub`, `nonce`, `jti`, `iat` and `exp`, refuses a token that is
+  expired, not yet valid, or whose life is longer than 300 seconds, and accepts a
+  `jti` once — the ids of accepted tokens are held in memory until they expire;
+- it JSON-unescapes claim strings and refuses an over-long claim rather than
+  truncating it.
 
 The JWT payload is JSON, so the daemon vendors a single-file JSON tokenizer
 (**jsmn** — MIT, zero-allocation, ~300 lines, in the same spirit as

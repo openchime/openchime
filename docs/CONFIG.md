@@ -50,8 +50,8 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_BOOTSTRAP_USERS` *(alias)* | *(none)* | Dev/test seeding of local accounts. In normal operation the first owner comes from the one-time setup token logged at first run (ARCH-59). |
 | `OPENCHIME_OIDC_ISSUER` *(alias)* | *(none)* | Expected `iss` on the relay-issued ES256 JWT. |
 | `OPENCHIME_OIDC_AUDIENCE` *(alias)* | *(none)* | Expected `aud`. Normally left unset — the enrolled audience from the `enrollment` table wins (ARCH-84). |
-| `OPENCHIME_OIDC_PUBKEY` *(alias)* | *(none)* | Central's pinned ES256 public key, inline PEM. |
-| `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | Same key, read from a file. **The only file the config loader reads.** |
+| `OPENCHIME_OIDC_PUBKEY` *(alias)* | *(none)* | Central's pinned ES256 public keys, inline PEM — one block, or several during a rotation; a token's `kid` chooses among them. |
+| `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | The same, read from a file. **The only file the config loader reads.** |
 | `OPENCHIME_OIDC_PARAMS` *(alias)* | *(empty)* | Extra parameters advertised to the client in `AUTH_CHALLENGE`. |
 
 ## Attachments and blob storage
