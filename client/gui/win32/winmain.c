@@ -27136,6 +27136,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+            /* The session was refused and the connection has given up — expired,
+             * revoked, the account removed. Left alone that is an error line over a
+             * workspace that never comes back. Its dead token goes, its slot is
+             * retired as a sign-out retires it, and ITS sign-in opens — over another
+             * live workspace where there is one, so the app never blanks — with the
+             * workspace already filled in. The book entry
+             * stays: the workspace is a sign-in away, not gone. */
+            if (m->signed_out && !g_logging_out) {
+                char ws[256]; snprintf(ws, sizeof ws, "%s", g_cur_ws);
+                char label[96]; ws_display_name(m, label, sizeof label);
+                ws_clear_session(ws);
+                reset_session();                      /* stops the client, retires the slot */
+                int nxt = ws_first_live(-1);
+                if (nxt >= 0) {
+                    ws_load(nxt);
+                    g_view = VIEW_HOME;
+                    layout_composer(hwnd);
+                }
+                /* Step 1, the workspace filled in: one press of Continue asks it how it
+                 * signs people in. Nothing opens a browser unasked because a token
+                 * expired overnight. */
+                signin_begin(hwnd, ws, NULL);
+                snprintf(g_si_err, sizeof g_si_err, "You were signed out of %.150s. Sign in again.",
+                         label[0] ? label : ws);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
             if (g_await_invite && m->invite_token[0]) {   /* show the minted token once */
                 g_await_invite = 0;
                 show_secret(hwnd, "Invite created", "Invite token", m->invite_token,

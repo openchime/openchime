@@ -414,7 +414,14 @@ owner, pin, device key and book fields together, never overwriting what the name
 already holds. **Remember me** governs the session, not the pin: off
 (`oc_client_start_opts`), no token, account, device key or switcher entry is kept,
 and the certificate pin still is — it is not a secret, and without it every
-connection to that workspace would trust whatever certificate it met (ARCH-10). Cached
+connection to that workspace would trust whatever certificate it met (ARCH-10).
+
+**A refused session is `signed_out`, not an error.** When a stored or reconnecting
+session is refused and there is no credential to fall back on, the core drops the
+dead token, raises `OC_EV_SIGNED_OUT` and stops; the model's `signed_out` is set
+until the next successful sign-in. Both frontends answer it by opening that
+workspace's sign-in with the workspace filled in — over another live workspace
+where there is one — and neither starts a browser sign-in unasked. Cached
 history is gone and the offline outbox lives in memory on the net thread. With no
 OS credential store, nothing persists at all.
 

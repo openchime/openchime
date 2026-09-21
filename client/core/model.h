@@ -569,6 +569,10 @@ typedef struct {
     /* A browser sign-in is waiting (AUTH.md §8.1): the URL to open, and a counter
      * that moves each time one starts, so a frontend opens each URL once. Empty
      * again once the sign-in ends either way. */
+    /* The stored or reconnecting session was refused and the connection has given
+     * up: a frontend opens this workspace's sign-in rather than leave an error line
+     * over a dead workspace. Cleared by the next successful sign-in. */
+    bool     signed_out;
     char     signin_url[2048];
     uint32_t signin_seq;
     /* Bumped every time an error arrives, even an identical one. A frontend that
