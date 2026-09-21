@@ -16841,6 +16841,10 @@ enum {
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
+/* The layer acc_push stamps on what it publishes (oc_acc_item.layer). Raised
+ * around a popup's rows and put back, so no call site has to carry it. */
+static int g_acc_layer;
+
 static void acc_push(oc_acc_item *items, int *n, oc_acc_kind kind, const char *aid,
                      const char *name, rectf r, uint64_t invoke) {
     if (*n >= OC_ACC_MAX) return;
@@ -16853,6 +16857,7 @@ static void acc_push(oc_acc_item *items, int *n, oc_acc_kind kind, const char *a
     snprintf(it->aid, sizeof it->aid, "%s", aid ? aid : "");
     snprintf(it->name, sizeof it->name, "%s", name ? name : "");
     it->invoke = invoke;
+    it->layer = g_acc_layer;
 }
 
 /* The stable name for a rail destination. Derived from the view rather than from
@@ -16891,6 +16896,7 @@ static void a11y_publish_scene(const oc_model *m) {
     int n = 0;
     const WCHAR *ctext = NULL;
     int caret = 0, anchor = 0;
+    g_acc_layer = 0;
 
     /* A MODAL OWNS THE TREE. While a card covers the window, the shell's rows
      * and buttons are unreachable by pointer and must be unreachable by AT and
@@ -17133,6 +17139,8 @@ static void a11y_publish_scene(const oc_model *m) {
                      ATOK(AT_NMCHIP, i));
         }
         acc_push(items, &n, OC_ACC_COMPOSER, "newmsg.to", nm, g_tgt_box, ATOK(AT_NMTO, 0));
+        /* The matches are a dropdown: drawn last, over the message box below. */
+        g_acc_layer = 1;
         for (int i = 0; i < g_n_tgt && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "newmsg.match.%d", i);
@@ -17140,6 +17148,7 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_BUTTON, aid, g_tgt[i].name, g_tgt_rows[i],
                      ATOK(AT_NMPICK, i));
         }
+        g_acc_layer = 0;
         acc_push(items, &n, OC_ACC_COMPOSER, "newmsg.message", "Message", g_nm_ed,
                  ATOK(AT_NMBODY, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "newmsg.send",
@@ -25094,12 +25103,15 @@ static void test_dump(const char *path) {
             } else if (a->r > rcw.right) {
                 outside++;
                 if (!first_out[0]) snprintf(first_out, sizeof first_out, "past-right:%s", a->aid);
-            } else if (md && !strncmp(a->aid, "modal.", 6) &&
-                       (a->r <= ml || a->b <= mt || a->l >= mr || a->t >= mb)) {
-                /* Only the MODAL's own elements are required inside the card. The
-                 * shell behind it is still published and still legitimately
-                 * elsewhere — the first version of this check counted all 33 of
-                 * them and reported a healthy layout as broken. */
+            } else if (md && (a->r <= ml || a->b <= mt || a->l >= mr || a->t >= mb)) {
+                /* EVERY element, not only the ones named `modal.`. A modal owns
+                 * the tree (a11y_publish_scene), so while one is open whatever is
+                 * published is the card's own content and belongs inside it. The
+                 * shell underneath is a different layer and is not in the tree at
+                 * all, which is also why the overlap test below needs no
+                 * exemption for it: a card's button cannot be paired with a
+                 * sidebar row that was never published. Matching on the prefix
+                 * left the status, schedule and form cards' content unchecked. */
                 outside++;
                 if (!first_out[0]) snprintf(first_out, sizeof first_out, "escaped:%s", a->aid);
             }
@@ -25119,6 +25131,15 @@ static void test_dump(const char *path) {
                  * scale matrix while the text was being drawn on top of the "+".
                  * A check with an exemption shaped like the bug is not a check. */
                 if (contains(a, b) || contains(b, a)) continue;
+                /* LAYERS are not a collision either. A dropdown's rows cover the
+                 * field beneath them because that is what a dropdown does; the
+                 * recipient matches over the new-message box read as 21 overlaps
+                 * on a layout with nothing wrong in it, and a check that cries
+                 * wolf is the one that gets discounted. This is not the kind
+                 * test back again: the layer is declared by the code that draws
+                 * the popup, and within a layer every pair is still compared --
+                 * the matches against each other, the box against its icons. */
+                if (a->layer != b->layer) continue;
                 if (a->l < b->r && b->l < a->r && a->t < b->b && b->t < a->b) {
                     overlaps++;
                     if (!first_ov[0]) snprintf(first_ov, sizeof first_ov, "%s+%s", a->aid, b->aid);
