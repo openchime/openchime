@@ -1004,6 +1004,12 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
                                const char *oidc_params);
 
+/* Who may join through an OIDC source (OPENCHIME_OIDC_ALLOW, AUTH.md §8.4).
+ * NULL or "" admits nobody new. Returns -1 with a reason in `err` on a rule it
+ * does not understand; call before the writer serves traffic. */
+int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
+                                     char *err, size_t errcap);
+
 /* Auth methods bitset (OC_AUTH_*) to advertise in AUTH_CHALLENGE, and the
  * OIDC params blob ("" unless OIDC is configured). For the net loop. */
 uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);

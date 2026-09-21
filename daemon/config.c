@@ -116,6 +116,7 @@ int oc_config_load(char *err, size_t errcap) {
     c->oidc.issuer    = env_or2("OPENCHIME_OIDC_ISSUER",   "OC_OIDC_ISSUER",   NULL);
     c->oidc.audience  = env_or2("OPENCHIME_OIDC_AUDIENCE", "OC_OIDC_AUDIENCE", NULL);
     c->oidc.params    = env_or2("OPENCHIME_OIDC_PARAMS",   "OC_OIDC_PARAMS",   "");
+    c->oidc.allow     = getenv("OPENCHIME_OIDC_ALLOW");
     const char *pk_file = env_or2("OPENCHIME_OIDC_PUBKEY_FILE", "OC_OIDC_PUBKEY_FILE", NULL);
     c->oidc.pubkey    = pk_file ? read_file(pk_file)
                                 : env_or2("OPENCHIME_OIDC_PUBKEY", "OC_OIDC_PUBKEY", NULL);

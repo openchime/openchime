@@ -437,6 +437,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "openchimed: OIDC configuration failed\n");
             oc_dbwriter_stop(db); return 1;
         }
+        char why[256];
+        if (oc_dbwriter_configure_join_rules(db, cfg->oidc.allow, why, sizeof why) != 0) {
+            fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW: %s\n", why);
+            oc_dbwriter_stop(db); return 1;
+        }
+        if (!cfg->oidc.allow || !cfg->oidc.allow[0])
+            fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW is empty: nobody new may join "
+                            "by OIDC except through an invite\n");
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
 

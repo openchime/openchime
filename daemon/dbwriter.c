@@ -18,6 +18,7 @@
 #include "migrate.h"
 #include "protocol.h"
 #include "auth.h"
+#include "joinrules.h"
 #include "jwt.h"
 #include "ratelimit.h"
 #include "roles.h"
@@ -57,6 +58,7 @@ struct oc_dbwriter {
     char           *oidc_pubkey_pem;
     char           *oidc_params;             /* advertised blob ("" if none) */
     struct oc_seen_jti *seen_jti;            /* relay tokens already used (AUTH.md §8.2) */
+    oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed local-auth per source IP */
@@ -734,6 +736,36 @@ static int count_owners(sqlite3 *db) {
     return n;
 }
 
+static int user_exists(sqlite3 *db, const char *subject) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE subject=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
+    int yes = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Owners who can still sign in. A removed owner keeps the role on its row, and a
+ * workspace whose only owners are removed has nobody to run it. */
+static int count_active_owners(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE role='owner' AND disabled=0;",
+                       -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void set_role(sqlite3 *db, uint64_t uid, uint8_t role) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET role=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, u8_to_role(role), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)uid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 /* A relay token is good once (AUTH.md §8.2). The ids of the tokens already
  * accepted are held in memory until they expire — a token lives at most
  * OC_JWT_MAX_LIFETIME_SECS, which is what keeps this small — and a full table
@@ -771,8 +803,8 @@ static uint64_t upsert_oidc_user(sqlite3 *db, const char *subject,
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "INSERT INTO users(subject, email, display_name, created_at_ms) VALUES(?,?,?,?) "
-        "ON CONFLICT(subject) DO UPDATE SET email=excluded.email, "
-        "display_name=excluded.display_name;", -1, &st, NULL);
+        "ON CONFLICT(subject) DO UPDATE SET email=excluded.email "
+        "WHERE excluded.email <> '';", -1, &st, NULL);
     sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 2, email, -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 3, name, -1, SQLITE_STATIC);
@@ -888,12 +920,27 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
         char subject[OC_JWT_MAX_FIELD * 2 + 8];
         snprintf(subject, sizeof subject, "oidc:%s|%s", claims.iss, claims.sub);
+        /* Who may join (AUTH.md §8.4). The rules speak only to an identity this
+         * workspace has not seen — a known one signs in without them — except the
+         * owner rule, which also restores an owner to a workspace left with none. */
+        oc_join_verdict verdict = oc_join_rules_eval(w->join_rules, claims.idp, claims.tenant,
+                                                     claims.email, claims.email_verified);
+        int known = user_exists(db, subject);
+        if (!known && verdict == OC_JOIN_DENY) {
+            char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 32];
+            snprintf(detail, sizeof detail, "idp=%s tenant=%s", claims.idp, claims.tenant);
+            audit_log(db, OC_AUDIT_SECURITY, "auth.denied", 0, NULL, 0, claims.email, 0, detail);
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_NOT_ALLOWED; return r;
+        }
         /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
          * user past the workspace limit (an existing user still logs in). */
         if (user_slots_full(db, subject, strlen(subject), w->max_users)) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
         }
         uid = upsert_oidc_user(db, subject, claims.email, claims.name);
+        if (uid && verdict == OC_JOIN_OWNER && !user_disabled(db, uid) &&
+            (!known || count_active_owners(db) == 0))
+            set_role(db, uid, OC_ROLE_OWNER);
         if (uid) role = get_role(db, uid);   /* membership ensured on the common path */
     } else if (j->method == OC_AUTH_SESSION) {
         uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp,
@@ -7253,6 +7300,15 @@ void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users) {
 
 uint8_t oc_dbwriter_auth_methods(oc_dbwriter *w) { return w->auth_methods; }
 
+int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
+                                     char *err, size_t errcap) {
+    oc_join_rules *rules = oc_join_rules_parse(spec, err, errcap);
+    if (!rules) return -1;
+    oc_join_rules_free(w->join_rules);
+    w->join_rules = rules;
+    return 0;
+}
+
 const char *oc_dbwriter_oidc_params(oc_dbwriter *w) {
     return w->oidc_params ? w->oidc_params : "";
 }
@@ -7544,6 +7600,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     free(w->oidc_issuer); free(w->oidc_audience);
     free(w->oidc_pubkey_pem); free(w->oidc_params);
     free(w->seen_jti);
+    oc_join_rules_free(w->join_rules);
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);
     if (w->evfd >= 0) close(w->evfd);
