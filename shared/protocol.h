@@ -129,7 +129,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 19u
+#define OC_PROTOCOL_VERSION 20u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -173,6 +173,9 @@ typedef enum {
     OC_MSG_AUTH_CHALLENGE   = 0x0012, /* S->C */
     OC_MSG_LOGOUT           = 0x0013, /* C->S */
     OC_MSG_WORKSPACE_INFO   = 0x0014, /* S->C, pushed after AUTH_OK */
+    OC_MSG_AUTH_BEGIN       = 0x0015, /* C->S, pre-auth: start a browser sign-in (AUTH.md §8.1) */
+    OC_MSG_AUTH_REDIRECT    = 0x0016, /* S->C: the authorize URL the daemon built */
+    OC_MSG_AUTH_CONTINUE    = 0x0017, /* S->C: a first step that is correct but not sufficient */
     OC_MSG_SEND             = 0x0020, /* C->S */
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
@@ -457,6 +460,7 @@ typedef enum {
     OC_ERR_AUTH_INVALID_TOKEN  = 2002,
     OC_ERR_AUTH_RATE_LIMITED   = 2003,
     OC_ERR_USER_LIMIT          = 2004, /* workspace at its registered-user cap (OPENCHIME_MAX_USERS) */
+    OC_ERR_AUTH_SOURCE_UNAVAILABLE = 2006, /* AUTH_BEGIN named a source this deployment does not offer, or cannot reach */
     OC_ERR_AUTH_NOT_ALLOWED    = 2005, /* a valid identity that no join rule or invite admits (AUTH.md §8.4) */
     OC_ERR_BODY_TOO_LARGE      = 3001,
     OC_ERR_NOT_A_MEMBER        = 3002,
@@ -755,8 +759,23 @@ typedef struct { uint64_t attachment_id; } oc_attach_media_ok;
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
 typedef struct { uint16_t chosen_version; uint64_t server_time; } oc_welcome;
 typedef struct { uint16_t code; oc_slice message; } oc_reject;
-typedef struct { uint8_t methods; oc_slice oidc_params; } oc_auth_challenge;
-typedef struct { uint8_t method; oc_slice credential; } oc_auth;
+/* What a deployment signs people in with (AUTH.md §8.1). A client draws one
+ * control per source; resuming a session is always accepted and is not listed. */
+#define OC_SOURCE_LOCAL 1u   /* daemon-managed accounts: username + password */
+#define OC_SOURCE_RELAY 2u   /* the central service's relay: a browser sign-in */
+#define OC_SOURCE_OIDC  3u   /* the operator's own provider: a browser sign-in */
+#define OC_MAX_SOURCES  8
+#define OC_SOURCE_ID_LOCAL "local"
+#define OC_SOURCE_ID_RELAY "relay"
+typedef struct { oc_slice id; uint8_t kind; oc_slice label; } oc_auth_source;
+typedef struct { uint8_t n_sources; oc_auth_source sources[OC_MAX_SOURCES]; } oc_auth_challenge;
+/* `source` names an entry of the challenge ("" for a session resume). `proof` is
+ * the verifier whose hash the client sent in AUTH_BEGIN (§8.2); empty otherwise. */
+typedef struct { uint8_t method; oc_slice source; oc_slice credential; oc_slice proof; } oc_auth;
+typedef struct { oc_slice source; oc_slice redirect_uri; oc_slice challenge; } oc_auth_begin;
+typedef struct { oc_slice authorize_url; } oc_auth_redirect;
+#define OC_AUTH_STEP_TOTP 1u
+typedef struct { uint8_t step; } oc_auth_continue;
 typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
 typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 /* Pushed after AUTH_OK: infra facts about this workspace, from the daemon's
@@ -1262,7 +1281,9 @@ typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice emai
                  oc_slice voice_id; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
-typedef struct { uint8_t role; } oc_invite_user;
+/* `email` binds the invite to an address, consumed at that address's first
+ * verified sign-in (AUTH.md §8.4); empty mints a bearer token for a local account. */
+typedef struct { uint8_t role; oc_slice email; } oc_invite_user;
 typedef struct { uint64_t user_id; } oc_remove_user;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
@@ -1323,6 +1344,9 @@ oc_result oc_encode_hello(oc_wbuf *w, const oc_hello *m);
 oc_result oc_encode_welcome(oc_wbuf *w, const oc_welcome *m);
 oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m);
 oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m);
+oc_result oc_encode_auth_begin(oc_wbuf *w, uint16_t version, const oc_auth_begin *m);
+oc_result oc_encode_auth_redirect(oc_wbuf *w, uint16_t version, const oc_auth_redirect *m);
+oc_result oc_encode_auth_continue(oc_wbuf *w, uint16_t version, const oc_auth_continue *m);
 oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
 oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_workspace_info *m);
@@ -1531,6 +1555,9 @@ oc_result oc_decode_hello(oc_rbuf *p, oc_hello *m);
 oc_result oc_decode_welcome(oc_rbuf *p, oc_welcome *m);
 oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m);
 oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m);
+oc_result oc_decode_auth_begin(oc_rbuf *p, oc_auth_begin *m);
+oc_result oc_decode_auth_redirect(oc_rbuf *p, oc_auth_redirect *m);
+oc_result oc_decode_auth_continue(oc_rbuf *p, oc_auth_continue *m);
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);
 oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m);

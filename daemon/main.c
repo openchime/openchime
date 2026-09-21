@@ -421,10 +421,42 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* OIDC mode (AUTH.md §3): pin central's ES256 key + issuer/audience. When
-     * set, AUTH_CHALLENGE advertises oidc+session instead of local+session. An
-     * enrolled box (CP-8) uses its daemon-generated audience automatically. */
-    if (strcmp(cfg->auth_mode, "oidc") == 0) {
+    /* Which built-in sources are on (AUTH.md §8.8): OPENCHIME_AUTH_MODE is a list
+     * — `local`, `relay`, or `local,relay` — and `oidc` reads as `relay`. A name
+     * it does not know stops the boot: a typo must not quietly leave a workspace
+     * with no way in, or with one its operator did not mean. */
+    int want_local = 0, want_relay = 0;
+    {
+        const char *p = cfg->auth_mode;
+        while (*p) {
+            const char *e = strchr(p, ',');
+            if (!e) e = p + strlen(p);
+            const char *s = p;
+            while (s < e && (*s == ' ' || *s == '\t')) s++;
+            const char *t = e;
+            while (t > s && (t[-1] == ' ' || t[-1] == '\t')) t--;
+            size_t n = (size_t)(t - s);
+            if (n == 5 && strncmp(s, "local", 5) == 0) want_local = 1;
+            else if ((n == 5 && strncmp(s, "relay", 5) == 0) ||
+                     (n == 4 && strncmp(s, "oidc", 4) == 0)) want_relay = 1;
+            else if (n != 0) {
+                fprintf(stderr, "openchimed: OPENCHIME_AUTH_MODE: unknown source \"%.*s\"\n",
+                        (int)n, s);
+                oc_dbwriter_stop(db); return 1;
+            }
+            p = *e ? e + 1 : e;
+        }
+        if (!want_local && !want_relay) {
+            fprintf(stderr, "openchimed: OPENCHIME_AUTH_MODE names no source\n");
+            oc_dbwriter_stop(db); return 1;
+        }
+    }
+    oc_dbwriter_set_local_enabled(db, want_local);
+
+    /* The relay source (AUTH.md §3): pin central's ES256 keys + issuer/audience.
+     * An enrolled box (CP-8) uses its daemon-generated audience automatically, and
+     * the relay is at the origin it enrolled with (§8.3). */
+    if (want_relay) {
         const char *iss = cfg->oidc.issuer;
         const char *aud = enroll_audience ? enroll_audience : cfg->oidc.audience;
         const char *pem = cfg->oidc.pubkey;   /* resolved in oc_config_load; owned by config */
@@ -433,7 +465,14 @@ int main(int argc, char **argv) {
                             "OPENCHIME_OIDC_AUDIENCE, and OPENCHIME_OIDC_PUBKEY[_FILE]\n");
             oc_dbwriter_stop(db); return 1;
         }
-        if (oc_dbwriter_configure_oidc(db, iss, aud, pem, cfg->oidc.params) != 0) {
+        char origin[256] = "";
+        if (cfg->enroll.url) {
+            const char *scheme = strstr(cfg->enroll.url, "://");
+            const char *path = scheme ? strchr(scheme + 3, '/') : NULL;
+            size_t n = path ? (size_t)(path - cfg->enroll.url) : strlen(cfg->enroll.url);
+            if (scheme && n < sizeof origin) { memcpy(origin, cfg->enroll.url, n); origin[n] = '\0'; }
+        }
+        if (oc_dbwriter_configure_oidc(db, iss, aud, pem, origin) != 0) {
             fprintf(stderr, "openchimed: OIDC configuration failed\n");
             oc_dbwriter_stop(db); return 1;
         }

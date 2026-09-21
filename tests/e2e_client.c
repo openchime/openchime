@@ -134,7 +134,7 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *uid)
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0 || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_until(c, OC_MSG_AUTH_OK, &hdr, &p) != 0) return -1;

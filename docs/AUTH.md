@@ -352,18 +352,18 @@ token on reconnect), the daemon then does the same thing:
 ## 5. Mode selection and the auth handshake
 
 After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
-(PROTOCOL.md §4) advertising the accepted method(s) and, in OIDC mode, the
-central authorize parameters plus this workspace's `audience`. The client renders
-the appropriate login UI and replies with `AUTH`, whose `method` discriminator
-selects the path:
+(PROTOCOL.md §4) listing the sources this deployment signs people in with
+(`OPENCHIME_AUTH_MODE`: `local`, `relay`, or both). The client draws one control
+per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
-- `local` — username + password (first login) → server verifies against
-  `local_credentials`.
-- `oidc` — the central-issued ES256 JWT (§3.3).
+- `local` — username + password → verified against `local_credentials`.
+- `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
+  `AUTH` then carries the central-issued ES256 JWT (§3.3) and the verifier (§8.2).
 - `session` — a previously issued session token (reconnect).
 
-The daemon answers with `AUTH_OK` (session established) or a fatal `ERROR`
-(`AUTH_INVALID_TOKEN`, `AUTH_RATE_LIMITED`, `AUTH_REQUIRED`).
+The daemon answers with `AUTH_OK` (session established) or an `ERROR`
+(`AUTH_INVALID_TOKEN`, `AUTH_RATE_LIMITED`, `AUTH_NOT_ALLOWED`, `AUTH_REQUIRED`).
+The whole exchange is §8.1.
 
 ---
 
@@ -513,7 +513,6 @@ provider at central therefore needs no daemon or client release.
 
 **Where the relay is.** At the origin of `OPENCHIME_ENROLL_URL` — a workspace must
 be enrolled for central to mint for it, so the relay needs no address of its own.
-`OPENCHIME_OIDC_PARAMS` has no part in this exchange.
 
 ### 8.4 Identity, and who may join
 

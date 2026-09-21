@@ -273,7 +273,9 @@ static int do_handshake(client *c) {
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_CHALLENGE) return -1;
     oc_auth_challenge ch;
     if (oc_decode_auth_challenge(&p, &ch) != OC_OK) return -1;
-    return (ch.methods & OC_AUTH_LOCAL) ? 0 : -1;
+    for (uint8_t i = 0; i < ch.n_sources; i++)
+        if (ch.sources[i].kind == OC_SOURCE_LOCAL) return 0;
+    return -1;
 }
 
 /* What the last do_auth was told of voice input: the capability, and the cap. */
@@ -284,7 +286,7 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0) return -1;
     if (write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
@@ -1458,7 +1460,7 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         uint8_t buf[512];
         oc_wbuf w;
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_auth au = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+        oc_auth au = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
         CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK);
         CHECK(write_all(&cap.conn, buf, w.len) == 0);
         oc_header hdr;
@@ -2944,7 +2946,7 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
 
     /* Owner mints a member invite and receives the token. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_invite_user iu = { OC_ROLE_MEMBER };
+    oc_invite_user iu = { OC_ROLE_MEMBER, { NULL, 0 } };
     CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK);
     CHECK(send_frame(&owner, buf, w.len) == 0);
     CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_INVITE_CREATED);
@@ -3355,6 +3357,96 @@ static void test_conn_throttle(int port) {
     unlink("build/itest_throttle.db-shm");
 }
 
+/* Send AUTH_BEGIN; on AUTH_REDIRECT copy the URL out and return 0, on ERROR
+ * return its code, else -1. */
+static int auth_begin(client *c, const char *source, const char *redirect, const char *challenge,
+                      char *url, size_t cap) {
+    uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth_begin b = { oc_slice_str(source), oc_slice_str(redirect), oc_slice_str(challenge) };
+    if (oc_encode_auth_begin(&w, OC_PROTOCOL_VERSION, &b) != OC_OK) return -1;
+    if (write_all(&c->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame(c, &hdr, &p) != 0) return -1;
+    if (hdr.msg_type == OC_MSG_ERROR) {
+        oc_error e;
+        return oc_decode_error(&p, &e) == OC_OK ? (int)e.code : -1;
+    }
+    if (hdr.msg_type != OC_MSG_AUTH_REDIRECT) return -1;
+    oc_auth_redirect ar;
+    if (oc_decode_auth_redirect(&p, &ar) != OC_OK || ar.authorize_url.len >= cap) return -1;
+    memcpy(url, ar.authorize_url.ptr, ar.authorize_url.len);
+    url[ar.authorize_url.len] = '\0';
+    return 0;
+}
+
+/* A browser sign-in starts with the daemon building the relay's authorize URL
+ * (AUTH.md §8.1). Its own loop, because it needs the relay source switched on. */
+static void test_auth_begin(int port) {
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_begin.db");
+    CHECK(dbw2 != NULL);
+    /* Any P-256 public key will do: nothing here presents a token. */
+    static const char PEM[] =
+        "-----BEGIN PUBLIC KEY-----\n"
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDqHKx+q7OAQmDqj5y9NaFRRyMFoH\n"
+        "tdCjHSfxAGUIA9+4UU024HTVfwxlAyEJ/AZuJbyJG5DrtbEcEXSVdX1U1A==\n"
+        "-----END PUBLIC KEY-----\n";
+    CHECK(oc_dbwriter_configure_oidc(dbw2, "https://central.example", "ws_7f3a 9c/21", PEM,
+                                     "https://central.example") == 0);
+
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    static const char CH[] = "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0";
+    client c;
+    CHECK(client_open(&c, port, pin2) == 0);
+    /* Both sources are offered: enabling the relay did not switch passwords off. */
+    {
+        CHECK(send_hello(&c, OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION) == 0);
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WELCOME);
+        CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_CHALLENGE);
+        oc_auth_challenge ch;
+        CHECK(oc_decode_auth_challenge(&p, &ch) == OC_OK);
+        CHECK(ch.n_sources == 2);
+        CHECK(ch.sources[0].kind == OC_SOURCE_LOCAL && ch.sources[1].kind == OC_SOURCE_RELAY);
+        CHECK(ch.sources[1].id.len == 5 && memcmp(ch.sources[1].id.ptr, "relay", 5) == 0);
+    }
+    char url[2048];
+    /* The whole URL is the daemon's, with everything it was given escaped. */
+    CHECK(auth_begin(&c, "relay", "http://127.0.0.1:53111/cb?x=1&y=2", CH, url, sizeof url) == 0);
+    CHECK(strcmp(url, "https://central.example/oidc/authorize?workspace=ws_7f3a%209c%2F21"
+                      "&redirect_uri=http%3A%2F%2F127.0.0.1%3A53111%2Fcb%3Fx%3D1%26y%3D2"
+                      "&nonce=JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0") == 0);
+    CHECK(auth_begin(&c, "relay", "http://localhost/cb", CH, url, sizeof url) == 0);
+    CHECK(auth_begin(&c, "relay", "http://[::1]:9/", CH, url, sizeof url) == 0);
+    /* Anything that is not loopback is refused, however much it looks like it. */
+    static const char *const BAD[] = {
+        "https://127.0.0.1/cb", "http://127.0.0.1.evil.example/cb", "http://127.0.0.1@evil.example/",
+        "http://evil.example/127.0.0.1", "http://localhost.evil.example/", "http://127.0.0.1:99999999/",
+        "http://127.0.0.1:/cb", "http://127.0.0.1/cb#frag", "http://127.0.0.1/c b", "app://callback", "",
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++)
+        CHECK(auth_begin(&c, "relay", BAD[i], CH, url, sizeof url) == OC_ERR_AUTH_INVALID_TOKEN);
+    /* A challenge that cannot be a SHA-256, and a source nobody offered. */
+    CHECK(auth_begin(&c, "relay", "http://127.0.0.1/cb", "short", url, sizeof url) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(auth_begin(&c, "acme-sso", "http://127.0.0.1/cb", CH, url, sizeof url) == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
+    CHECK(auth_begin(&c, "local", "http://127.0.0.1/cb", CH, url, sizeof url) == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
+    client_close(&c);
+
+    arg2.stop = 1;
+    pthread_join(th2, NULL);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
+}
+
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
@@ -3444,6 +3536,7 @@ int run_netloop_tests(void) {
         test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
         test_conn_throttle(arg.port + 123);
+        test_auth_begin(arg.port + 124);
     }
 
     arg.stop = 1;

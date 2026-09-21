@@ -1160,17 +1160,124 @@ static int handle_hello(conn *c, oc_rbuf *payload, oc_dbwriter *dbw) {
     out_append(c, tmp, w.len);
     c->version = chosen;   /* what every later frame on this connection must carry */
 
-    /* Immediately advertise the auth methods this deployment accepts (AUTH.md
-     * §5) — local+session, or oidc+session in OIDC mode — plus the OIDC params
-     * blob (empty in local mode). Sized for an authorize URL in oidc_params. */
+    /* Immediately say which sources this deployment signs people in with
+     * (AUTH.md §8.1). A client draws one control per entry; resuming a session is
+     * always accepted and is not listed. */
     {
         uint8_t cbuf[1024]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        oc_auth_challenge ch = { oc_dbwriter_auth_methods(dbw),
-                                 oc_slice_str(oc_dbwriter_oidc_params(dbw)) };
+        uint8_t methods = oc_dbwriter_auth_methods(dbw);
+        oc_auth_challenge ch;
+        memset(&ch, 0, sizeof ch);
+        if (methods & OC_AUTH_LOCAL)
+            ch.sources[ch.n_sources++] = (oc_auth_source){
+                oc_slice_str(OC_SOURCE_ID_LOCAL), OC_SOURCE_LOCAL, oc_slice_str("Password") };
+        if (methods & OC_AUTH_OIDC)
+            ch.sources[ch.n_sources++] = (oc_auth_source){
+                oc_slice_str(OC_SOURCE_ID_RELAY), OC_SOURCE_RELAY,
+                oc_slice_str("Continue in your browser") };
         oc_encode_auth_challenge(&cw, OC_PROTOCOL_VERSION, &ch);
         out_append(c, cbuf, cw.len);
     }
     return 0;
+}
+
+/* --- AUTH_BEGIN: the relay's authorize URL (AUTH.md §8.1) ---------------- */
+
+/* RFC 8252: a native client's redirect is loopback, plain http, with a port of
+ * its choosing. Anything else is refused before it is echoed into a URL the
+ * person's browser will follow — a token delivered anywhere else is a token
+ * delivered to somebody else. */
+static int is_loopback_redirect(const char *u, size_t n) {
+    static const char *const HOSTS[] = { "http://127.0.0.1", "http://localhost", "http://[::1]" };
+    for (size_t h = 0; h < sizeof HOSTS / sizeof HOSTS[0]; h++) {
+        size_t hl = strlen(HOSTS[h]);
+        if (n <= hl || strncmp(u, HOSTS[h], hl) != 0) continue;
+        const char *p = u + hl, *end = u + n;
+        if (*p == ':') {                       /* optional :port, digits only */
+            p++;
+            const char *d = p;
+            while (p < end && *p >= '0' && *p <= '9') p++;
+            if (p == d || p - d > 5) return 0;
+        }
+        if (p == end) return 1;
+        if (*p != '/') return 0;               /* "127.0.0.1.evil.example" ends here */
+        for (; p < end; p++)
+            if ((unsigned char)*p <= 0x20 || *p == '#' || (unsigned char)*p >= 0x7f) return 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int is_challenge(const char *s, size_t n) {
+    if (n != 43) return 0;                     /* base64url(SHA-256), unpadded */
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '_')) return 0;
+    }
+    return 1;
+}
+
+/* Percent-encode everything but RFC 3986's unreserved set. -1 if it won't fit. */
+static int pct_append(char *out, size_t cap, size_t *o, const char *in, size_t n) {
+    static const char HEX[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        int plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == '-' || c == '_' || c == '.' || c == '~';
+        if (*o + (plain ? 1u : 3u) >= cap) return -1;
+        if (plain) out[(*o)++] = (char)c;
+        else { out[(*o)++] = '%'; out[(*o)++] = HEX[c >> 4]; out[(*o)++] = HEX[c & 15]; }
+    }
+    out[*o] = '\0';
+    return 0;
+}
+
+static void send_auth_error(conn *c, uint16_t code, const char *what) {
+    uint8_t ebuf[160]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+    oc_error e = { code, 0, oc_slice_str("auth"), oc_slice_str(what) };
+    oc_encode_error(&ew, c->version, &e);
+    out_append(c, ebuf, ew.len);
+}
+
+/* The daemon builds the whole URL, so the client never assembles or parses an
+ * operator's string and the audience reaches the relay from the one party that
+ * knows it. Nothing is kept: the challenge rides the URL out and comes back
+ * inside the token as `nonce` (§8.2). */
+static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw) {
+    const char *origin = oc_dbwriter_relay_origin(dbw);
+    const char *aud = oc_dbwriter_oidc_audience(dbw);
+    if (!(oc_dbwriter_auth_methods(dbw) & OC_AUTH_OIDC) || !origin[0] || !aud[0] ||
+        b->source.len != strlen(OC_SOURCE_ID_RELAY) ||
+        memcmp(b->source.ptr, OC_SOURCE_ID_RELAY, b->source.len) != 0) {
+        send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "no such sign-in source");
+        return;
+    }
+    if (!is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+        !is_challenge((const char *)b->challenge.ptr, b->challenge.len)) {
+        send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri must be loopback");
+        return;
+    }
+    char url[2048];
+    size_t o = (size_t)snprintf(url, sizeof url, "%s/oidc/authorize?workspace=", origin);
+    if (o >= sizeof url ||
+        pct_append(url, sizeof url, &o, aud, strlen(aud)) != 0) goto too_long;
+    if (o + 14 >= sizeof url) goto too_long;
+    memcpy(url + o, "&redirect_uri=", 15); o += 14;
+    if (pct_append(url, sizeof url, &o, (const char *)b->redirect_uri.ptr, b->redirect_uri.len) != 0)
+        goto too_long;
+    if (o + 7 >= sizeof url) goto too_long;
+    memcpy(url + o, "&nonce=", 8); o += 7;
+    if (pct_append(url, sizeof url, &o, (const char *)b->challenge.ptr, b->challenge.len) != 0)
+        goto too_long;
+    {
+        uint8_t rbuf[2200]; oc_wbuf rw; oc_wbuf_init(&rw, rbuf, sizeof rbuf);
+        oc_auth_redirect ar = { oc_slice_str(url) };
+        if (oc_encode_auth_redirect(&rw, c->version, &ar) == OC_OK) out_append(c, rbuf, rw.len);
+    }
+    return;
+too_long:
+    send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri is too long");
 }
 
 /* --- Frame dispatch ----------------------------------------------------- */
@@ -1438,7 +1545,14 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 j->method = a.method;
                 memcpy(j->source, c->source, sizeof j->source);
                 if (oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
+                if (a.proof.len && oc_job_set_proof(j, a.proof.ptr, a.proof.len) != 0) return -1;
                 oc_dbwriter_submit(dbw, j);
+                continue;
+            }
+            if (hdr.msg_type == OC_MSG_AUTH_BEGIN) {
+                oc_auth_begin b;
+                if (oc_decode_auth_begin(&p, &b) != OC_OK) return -1;
+                handle_auth_begin(c, &b, dbw);
                 continue;
             }
             if (hdr.msg_type == OC_MSG_REDEEM_INVITE) {
@@ -1604,6 +1718,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->role = iu.role;
+            if (iu.email.len && oc_job_set_email(j, iu.email.ptr, iu.email.len) != 0) return -1;
             oc_dbwriter_submit(dbw, j);
             continue;
         }

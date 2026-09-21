@@ -45,7 +45,7 @@ to stderr; prefer the `OPENCHIME_` name.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_AUTH_MODE` *(alias)* | `local` | `local` (daemon-managed password accounts) or `oidc` (central relay) — the two identity sources (ARCH-55). The variable selects exactly one. |
+| `OPENCHIME_AUTH_MODE` *(alias)* | `local` | Which built-in identity sources are on (ARCH-55): `local` (daemon-managed password accounts), `relay` (the central relay), or `local,relay`. `oidc` reads as `relay`. A name the daemon does not know stops the boot. |
 | `OPENCHIME_MAX_USERS` | `0` (unlimited) | Registered-user cap; new-user creation is refused at the cap with `ERROR USER_LIMIT` across redeem / register / bootstrap / OIDC-JIT. Active users only — removing a member frees a seat (CP-7). |
 | `OPENCHIME_BOOTSTRAP_USERS` *(alias)* | *(none)* | Dev/test seeding of local accounts. In normal operation the first owner comes from the one-time setup token logged at first run (ARCH-59). |
 | `OPENCHIME_OIDC_ISSUER` *(alias)* | *(none)* | Expected `iss` on the relay-issued ES256 JWT. |
@@ -53,7 +53,6 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_OIDC_PUBKEY` *(alias)* | *(none)* | Central's pinned ES256 public keys, inline PEM — one block, or several during a rotation; a token's `kid` chooses among them. |
 | `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | The same, read from a file. **The only file the config loader reads.** |
 | `OPENCHIME_OIDC_ALLOW` | *(none)* | Who may join by OIDC: a comma-separated list of `owner:<email>`, `tenant:google:<hosted domain>`, `tenant:microsoft:<tenant id>` and `domain:<domain>` rules (AUTH.md §8.4). Empty admits nobody new; a rule the daemon does not understand stops the boot. |
-| `OPENCHIME_OIDC_PARAMS` *(alias)* | *(empty)* | Extra parameters advertised to the client in `AUTH_CHALLENGE`. |
 
 ## Attachments and blob storage
 

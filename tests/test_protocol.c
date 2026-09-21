@@ -108,18 +108,60 @@ static void test_handshake_frames(void) {
 
 static void test_auth_frames(void) {
     {
-        /* AUTH_CHALLENGE — the server advertises its enabled methods (a bitset)
-         * plus any OIDC authorize params. */
-        oc_auth_challenge in = { OC_AUTH_LOCAL | OC_AUTH_OIDC, oc_slice_str("issuer=https://c") };
+        /* AUTH_CHALLENGE — the sources this deployment signs people in with. */
+        oc_auth_challenge in;
+        memset(&in, 0, sizeof in);
+        in.n_sources = 2;
+        in.sources[0] = (oc_auth_source){ oc_slice_str("local"), OC_SOURCE_LOCAL, oc_slice_str("Password") };
+        in.sources[1] = (oc_auth_source){ oc_slice_str("relay"), OC_SOURCE_RELAY, oc_slice_str("Continue in your browser") };
         ROUNDTRIP(oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CHALLENGE, h, p);
         oc_auth_challenge out;
         CHECK(oc_decode_auth_challenge(&p, &out) == OC_OK);
-        CHECK(out.methods == (OC_AUTH_LOCAL | OC_AUTH_OIDC));
-        CHECK(slice_eq_str(out.oidc_params, "issuer=https://c"));
+        CHECK(out.n_sources == 2);
+        CHECK(slice_eq_str(out.sources[0].id, "local") && out.sources[0].kind == OC_SOURCE_LOCAL);
+        CHECK(slice_eq_str(out.sources[1].id, "relay") && out.sources[1].kind == OC_SOURCE_RELAY);
+        CHECK(slice_eq_str(out.sources[1].label, "Continue in your browser"));
+    }
+    {
+        /* A count past the ceiling is a malformed frame, not a truncated list. */
+        oc_auth_challenge in;
+        memset(&in, 0, sizeof in);
+        in.n_sources = 1;
+        in.sources[0] = (oc_auth_source){ oc_slice_str("local"), OC_SOURCE_LOCAL, oc_slice_str("Password") };
+        ROUNDTRIP(oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CHALLENGE, h, p);
+        frame[OC_HEADER_SIZE] = OC_MAX_SOURCES + 1;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        oc_auth_challenge out;
+        CHECK(oc_decode_auth_challenge(&p, &out) != OC_OK);
+    }
+    {
+        /* AUTH_BEGIN / AUTH_REDIRECT / AUTH_CONTINUE — a browser sign-in (AUTH.md §8.1). */
+        oc_auth_begin in = { oc_slice_str("relay"), oc_slice_str("http://127.0.0.1:53111/cb"),
+                             oc_slice_str("47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU") };
+        ROUNDTRIP(oc_encode_auth_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_BEGIN, h, p);
+        oc_auth_begin out;
+        CHECK(oc_decode_auth_begin(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.source, "relay"));
+        CHECK(slice_eq_str(out.redirect_uri, "http://127.0.0.1:53111/cb"));
+        CHECK(out.challenge.len == 43);
+    }
+    {
+        oc_auth_redirect in = { oc_slice_str("https://central.example/oidc/authorize?workspace=ws_1") };
+        ROUNDTRIP(oc_encode_auth_redirect(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_REDIRECT, h, p);
+        oc_auth_redirect out;
+        CHECK(oc_decode_auth_redirect(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.authorize_url, "https://central.example/oidc/authorize?workspace=ws_1"));
+    }
+    {
+        oc_auth_continue in = { OC_AUTH_STEP_TOTP };
+        ROUNDTRIP(oc_encode_auth_continue(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CONTINUE, h, p);
+        oc_auth_continue out;
+        CHECK(oc_decode_auth_continue(&p, &out) == OC_OK && out.step == OC_AUTH_STEP_TOTP);
     }
     {
         /* AUTH — method-discriminated credential (here a local password). */
-        oc_auth in = { OC_AUTH_LOCAL, oc_slice_str("alice:hunter2") };
+        oc_auth in = { OC_AUTH_LOCAL, oc_slice_str("local"), oc_slice_str("alice:hunter2"),
+                       oc_slice_str("the-verifier") };
         ROUNDTRIP(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH, h, p);
         oc_auth out;
         CHECK(oc_decode_auth(&p, &out) == OC_OK);
@@ -763,11 +805,12 @@ static void test_admin_frames(void) {
         CHECK(out.user_id == 7 && out.role == OC_ROLE_ADMIN);
     }
     {
-        oc_invite_user in = { OC_ROLE_ADMIN };
+        oc_invite_user in = { OC_ROLE_ADMIN, oc_slice_str("pat@acme.example") };
         ROUNDTRIP(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_USER, h, p);
         oc_invite_user out;
         CHECK(oc_decode_invite_user(&p, &out) == OC_OK);
         CHECK(out.role == OC_ROLE_ADMIN);
+        CHECK(slice_eq_str(out.email, "pat@acme.example"));
     }
     {
         oc_remove_user in = { 42 };
@@ -1830,6 +1873,7 @@ static void test_reason_codes_unique(void) {
         { "AUTH_RATE_LIMITED",      OC_ERR_AUTH_RATE_LIMITED },
         { "USER_LIMIT",             OC_ERR_USER_LIMIT },
         { "AUTH_NOT_ALLOWED",       OC_ERR_AUTH_NOT_ALLOWED },
+        { "AUTH_SOURCE_UNAVAILABLE", OC_ERR_AUTH_SOURCE_UNAVAILABLE },
         { "UNKNOWN_CHANNEL",        OC_ERR_UNKNOWN_CHANNEL },
         { "NOT_A_MEMBER",           OC_ERR_NOT_A_MEMBER },
         { "BODY_TOO_LARGE",         OC_ERR_BODY_TOO_LARGE },

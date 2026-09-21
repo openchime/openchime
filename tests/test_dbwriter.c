@@ -53,7 +53,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 44);
+    CHECK(oc_schema_version(db) == 45);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -757,8 +757,11 @@ static void test_oidc_auth(void) {
     const char *AUD = "acme.example";
     CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem,
                                      "authorize=https://auth.openchime.io/authorize") == 0);
+    /* A source is added, not swapped in; local goes off only when told to. */
+    CHECK(oc_dbwriter_auth_methods(w) == (OC_AUTH_LOCAL | OC_AUTH_OIDC | OC_AUTH_SESSION));
+    oc_dbwriter_set_local_enabled(w, 0);
     CHECK(oc_dbwriter_auth_methods(w) == (OC_AUTH_OIDC | OC_AUTH_SESSION));
-    CHECK(strlen(oc_dbwriter_oidc_params(w)) > 0);
+    CHECK(strlen(oc_dbwriter_relay_origin(w)) > 0);
     char why[128];
     CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
 
@@ -780,6 +783,7 @@ static void test_oidc_auth(void) {
         oc_job *j = oc_job_new(OC_JOB_AUTH, 20);
         j->method = OC_AUTH_OIDC;
         oc_job_set_token(j, token, tlen);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
         CHECK(r && r->type == OC_RES_AUTH_OK);
@@ -798,6 +802,7 @@ static void test_oidc_auth(void) {
         oc_job *j = oc_job_new(OC_JOB_AUTH, 21);
         j->method = OC_AUTH_OIDC;
         oc_job_set_token(j, token, tlen);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
         CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
@@ -812,6 +817,7 @@ static void test_oidc_auth(void) {
         oc_job *j = oc_job_new(OC_JOB_AUTH, 25);
         j->method = OC_AUTH_OIDC;
         oc_job_set_token(j, t2, l2);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
         CHECK(r && r->type == OC_RES_AUTH_OK && r->user_id == uid);
@@ -831,19 +837,35 @@ static void test_oidc_auth(void) {
         oc_job *j = oc_job_new(OC_JOB_AUTH, 23);
         j->method = OC_AUTH_OIDC;
         oc_job_set_token(j, bt, bl);
+        oc_job_set_proof(j, OC_ISSUER_VERIFIER, strlen(OC_ISSUER_VERIFIER));
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
         CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
         oc_dbres_free(r);
     }
 
-    /* Local auth is refused in OIDC mode (one mode per tenant). */
+    /* A bearer invite makes a local account, so it is refused here too. */
+    {
+        uint8_t tok[OC_INVITE_TOKEN_LEN]; memset(tok, 3, sizeof tok);
+        oc_job *j = oc_job_new(OC_JOB_REDEEM, 26);
+        oc_job_set_register(j, "newcomer", "pw", 0, 0);
+        oc_job_set_token(j, tok, sizeof tok);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_REQUIRED);
+        oc_dbres_free(r);
+    }
+
+    /* Local auth is refused where local accounts are switched off. */
     CHECK(auth_local(w, 24, "someone", "pw", NULL, NULL) == 0);
 
     oc_issuer_free(&is);
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }
+
+/* What oidc_signin presents as the verifier; a test swaps it to be the wrong client. */
+static const char *g_oidc_verifier = OC_ISSUER_VERIFIER;
 
 /* One relay sign-in: mints a contract-shaped token and presents it. Returns the
  * user id (0 on refusal), with the role and the error code alongside. */
@@ -858,6 +880,7 @@ static uint64_t oidc_signin(oc_dbwriter *w, oc_issuer *is, uint64_t conn, const 
     oc_job *j = oc_job_new(OC_JOB_AUTH, conn);
     j->method = OC_AUTH_OIDC;
     oc_job_set_token(j, token, tlen);
+    oc_job_set_proof(j, g_oidc_verifier, strlen(g_oidc_verifier));
     oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);
     uint64_t uid = 0;
@@ -925,6 +948,57 @@ static void test_oidc_join_rules(void) {
     CHECK(oidc_signin(w, &is, 37, "g|pat", "j8", PAT, &role, &err) == pat);
     CHECK(role == OC_ROLE_MEMBER);
 
+    /* A token in the wrong hands: whoever presents it must hold the verifier its
+     * nonce is the hash of, and a failed try does not spend the token. */
+    {
+        char hdr[160], payload[1024], token[4096];
+        unsigned long long now = (unsigned long long)time(NULL);
+        oc_issuer_header(&is, hdr, sizeof hdr);
+        oc_issuer_payload(payload, sizeof payload, "https://auth.openchime.io", "acme.example",
+                          "g|pat", "j-stolen", now - 5, now + 290, PAT);
+        size_t tlen = oc_issuer_mint(&is, hdr, payload, token);
+        static const char *const PROOFS[] = { "somebody-else", "", OC_ISSUER_VERIFIER };
+        static const int WANT_OK[] = { 0, 0, 1 };
+        for (int i = 0; i < 3; i++) {
+            oc_job *j = oc_job_new(OC_JOB_AUTH, 60 + (uint64_t)i);
+            j->method = OC_AUTH_OIDC;
+            oc_job_set_token(j, token, tlen);
+            if (PROOFS[i][0]) oc_job_set_proof(j, PROOFS[i], strlen(PROOFS[i]));
+            oc_dbwriter_submit(w, j);
+            oc_dbres *r = wait_result(w);
+            CHECK(r && (r->type == OC_RES_AUTH_OK) == WANT_OK[i]);
+            if (r && !WANT_OK[i]) CHECK(r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+            oc_dbres_free(r);
+        }
+    }
+
+    /* An invite bound to an address admits it where no rule does, with the role the
+     * invite names — once, and only on the provider's word for the address. */
+    {
+        CHECK(oc_dbwriter_configure_join_rules(w, "", why, sizeof why) == 0);
+        const char *LEE = "\"email\":\"Lee@Partner.example\",\"email_verified\":true,\"idp\":\"google\"";
+        const char *LEE_UNVERIFIED = "\"email\":\"lee@partner.example\",\"idp\":\"google\"";
+        CHECK(oidc_signin(w, &is, 70, "g|lee", "i1", LEE, &role, &err) == 0);
+        CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 71);
+        j->user_id = dana; j->role = OC_ROLE_ADMIN;
+        oc_job_set_email(j, "lee@partner.example", 19);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_OK);
+        if (r) {   /* nothing to hand anybody: the token that comes back is zeros */
+            uint8_t zero[OC_INVITE_TOKEN_LEN]; memset(zero, 0, sizeof zero);
+            CHECK(memcmp(r->session_token, zero, sizeof zero) == 0);
+        }
+        oc_dbres_free(r);
+        CHECK(oidc_signin(w, &is, 72, "g|mallory2", "i2", LEE_UNVERIFIED, &role, &err) == 0);
+        uint64_t lee = oidc_signin(w, &is, 73, "g|lee", "i3", LEE, &role, &err);
+        CHECK(lee != 0 && role == OC_ROLE_ADMIN);
+        /* Spent: the same address under another identity finds nothing. */
+        CHECK(oidc_signin(w, &is, 74, "g|lee-again", "i4", LEE, &role, &err) == 0);
+        CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);
+    }
+
     /* A token whose subject is not "<issuer>|<subject>" names nobody. */
     CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
     CHECK(oidc_signin(w, &is, 39, "nobar", "j9", PAT, &role, &err) == 0);
@@ -948,7 +1022,7 @@ static void test_oidc_join_rules(void) {
             " (SELECT COUNT(*) FROM users WHERE display_name='Dana'),"
             " (SELECT COUNT(*) FROM users WHERE display_name='Somebody Else');", -1, &st, NULL);
         CHECK(sqlite3_step(st) == SQLITE_ROW);
-        CHECK(sqlite3_column_int(st, 0) == 2);
+        CHECK(sqlite3_column_int(st, 0) == 3);
         CHECK(sqlite3_column_int(st, 1) == 1);
         CHECK(sqlite3_column_int(st, 2) == 1);
         CHECK(sqlite3_column_int(st, 3) == 1);
