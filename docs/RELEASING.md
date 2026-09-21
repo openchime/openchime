@@ -52,6 +52,13 @@ ships, not when it merges. The job only ever warns — the release is already li
 `smoke` — install the daemon from the repository that was just published — is
 the last job, not a step in the middle of `publish`.
 
+It covers all three channels: apt on the runner, dnf in a `rockylinux:9`
+container, and the container image, pulled by its released tag **with no
+credentials** and run with `--version`. A GHCR package is private until it is
+made public, so an image only a logged-in account can pull would otherwise pass
+every release. The image check is not behind `skip_repo_smoke` — the registry
+does not depend on `/dist` — and runs even when a repository step above it fails.
+
 As a step sitting between writing the repositories and finishing the
 release, it would be a postcondition aborting the steps after it: a failed smoke
 would skip the GitHub release, the tarballs and `:latest`, while apt and dnf were
