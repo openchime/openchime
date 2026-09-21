@@ -126,6 +126,7 @@ int oc_config_load(char *err, size_t errcap) {
     c->enroll.code_file = env_or2("OPENCHIME_ENROLL_CODE_FILE", "OC_ENROLL_CODE_FILE", NULL);
     c->enroll.ca_bundle = env_or2("OPENCHIME_ENROLL_CA_BUNDLE", "OC_ENROLL_CA_BUNDLE", NULL);
     c->enroll.wait_secs = env_int("OPENCHIME_ENROLL_WAIT_SECS", "OC_ENROLL_WAIT_SECS", 0);
+    c->enroll.ticket    = getenv("OPENCHIME_ENROLL_TICKET");
 
     /* Outbound push emitter (ARCH-85). */
     c->push.url       = env_or2("OPENCHIME_PUSH_URL",       "OC_PUSH_URL",       NULL);

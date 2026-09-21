@@ -590,7 +590,12 @@ Exactly one party mints a workspace's audience. **Self-hosted:** the daemon, as
 with `OPENCHIME_OIDC_AUDIENCE` and a one-time `OPENCHIME_ENROLL_TICKET`. The daemon
 adopts that audience, generates its own key as it always does, and claims the
 binding: the ticket, its public key, and a signature over
-`openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`.
+`openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`,
+the key hashed as its SubjectPublicKeyInfo DER, posted to `<enroll url>/claim` as
+`{audienceId, ticket, publicKey, signature}` — the ticket base64url, the key and the
+DER signature base64. The daemon retries while central cannot be reached, for a
+bounded time, and not at all once the ticket is refused; a box that already holds
+a different audience refuses to start rather than become a second workspace.
 Central checks the ticket — single use, short-lived — and the signature, stores
 the public key and activates. The ticket is the authorization the operator's
 paste is in the self-hosted flow; the private key still never leaves the box.

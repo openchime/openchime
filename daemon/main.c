@@ -369,7 +369,61 @@ int main(int argc, char **argv) {
     char *enroll_privkey = NULL, *enroll_audience = NULL;
     int enroll_active = 0;
     const char *enroll_url = cfg->enroll.url;
-    if (enroll_url && *enroll_url) {
+    /* A managed box (AUTH.md §8.7): central minted the audience and started this
+     * box with it and a one-time ticket. Exactly one party mints an audience, so
+     * this path generates a key and nothing else — and a stored audience that is
+     * not the one it was started with stops the boot rather than being replaced. */
+    const char *ticket = cfg->enroll.ticket;
+    int managed_claim = enroll_url && *enroll_url && ticket && *ticket &&
+                        cfg->oidc.audience && *cfg->oidc.audience;
+    if (managed_claim) {
+        if (oc_dbwriter_load_enrollment(db, &enroll_privkey, &enroll_audience, &enroll_active)) {
+            if (strcmp(enroll_audience, cfg->oidc.audience) != 0) {
+                fprintf(stderr, "openchimed: this box holds audience %s but was started with %s; "
+                                "refusing to run as two workspaces\n",
+                        enroll_audience, cfg->oidc.audience);
+                oc_dbwriter_stop(db); return 1;
+            }
+        } else {
+            char pk[1024], unused[128];
+            if (oc_enroll_generate(pk, sizeof pk, unused, sizeof unused) != 0 ||
+                !oc_dbwriter_store_enrollment(db, pk, cfg->oidc.audience, 0)) {
+                fprintf(stderr, "openchimed: enrollment key generation failed\n");
+                oc_dbwriter_stop(db); return 1;
+            }
+            enroll_privkey = strdup(pk);
+            enroll_audience = strdup(cfg->oidc.audience);
+        }
+        /* Claim, for a bounded time: central may still be coming up, or briefly
+         * busy. A refused ticket is not retried — it will be refused again. */
+        if (!enroll_active) {
+            int wait_secs = cfg->enroll.wait_secs > 0 ? cfg->enroll.wait_secs : 120;
+            time_t deadline = time(NULL) + wait_secs;
+            unsigned pause = 2;
+            for (;;) {
+                oc_enroll_result er = oc_enroll_claim(enroll_url, cfg->enroll.ca_bundle,
+                                                      enroll_audience, enroll_privkey, ticket);
+                if (er == OC_ENROLL_ACTIVE) {
+                    oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
+                    enroll_active = 1;
+                    fprintf(stderr, "openchimed: binding claimed (audience=%s)\n", enroll_audience);
+                    break;
+                }
+                if (er == OC_ENROLL_FAILED) {
+                    fprintf(stderr, "openchimed: the enrollment ticket was refused; this box is "
+                                    "not bound and nobody can sign in through the relay\n");
+                    break;
+                }
+                if (time(NULL) >= deadline) {
+                    fprintf(stderr, "openchimed: could not reach central to claim the binding; "
+                                    "retrying on next boot\n");
+                    break;
+                }
+                sleep(pause);
+                if (pause < 16) pause *= 2;
+            }
+        }
+    } else if (enroll_url && *enroll_url) {
         if (!oc_dbwriter_load_enrollment(db, &enroll_privkey, &enroll_audience, &enroll_active)) {
             char pk[1024], aud[128], code[2048];
             if (oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0 &&

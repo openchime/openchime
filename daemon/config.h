@@ -64,7 +64,7 @@ typedef struct {
     const char *bootstrap_users;
 
     /* Federated enrollment (CP-8). */
-    struct { const char *url, *code_file, *ca_bundle; int wait_secs; } enroll;
+    struct { const char *url, *code_file, *ca_bundle, *ticket; int wait_secs; } enroll;
 
     /* Outbound push emitter (ARCH-85). */
     struct { const char *url, *ca_bundle; } push;
