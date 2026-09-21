@@ -64,6 +64,7 @@ struct oc_net {
     int           port;
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
+    char          ws_key[288];  /* the workspace as named (oc_workspace_key); "" = host:port */
     /* A browser sign-in in progress (AUTH.md §8.1): the listener the browser comes
      * back to, the verifier kept for the daemon, and — once the browser has been —
      * the token to present on the next connection. Net thread only, but for
@@ -3049,12 +3050,18 @@ static void *net_thread(void *arg) {
      * the token instead of the password. */
     conn_store cs; memset(&cs, 0, sizeof cs);
     char workspace[288];
-    snprintf(workspace, sizeof workspace, "%s:%d", n->host, n->port);
+    char legacy[288];
+    snprintf(legacy, sizeof legacy, "%s:%d", n->host, n->port);
+    /* Filed under the workspace the person named, not the address resolution
+     * produced for it (oc_workspace_key). */
+    snprintf(workspace, sizeof workspace, "%s", n->ws_key[0] ? n->ws_key : legacy);
     cs.workspace = workspace;
     cs.obox = &outbox;
     cs.store = n->store_path ? oc_store_open(n->store_path) : NULL;
     if (cs.store) {
         oc_store_set_secret(cs.store, n->secret);   /* token -> keyring if available */
+        /* An entry from when the key was the address moves to the name, once. */
+        oc_store_adopt(cs.store, workspace, legacy);
         cs.have_pin = oc_store_load_pin(cs.store, workspace, cs.pin);
         uint64_t now_ms = (uint64_t)time(NULL) * 1000;
         /* Ownership first: a token that is not ours is not worth reading into a
@@ -3165,8 +3172,15 @@ static void *net_thread(void *arg) {
 oc_net *oc_net_start(const char *host, int port, const char *token,
                      const char *store_path, oc_secret *secret,
                      oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_named(NULL, host, port, token, store_path, secret, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port, const char *token,
+                           const char *store_path, oc_secret *secret,
+                           oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
+    if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
     snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
     n->port = port;
     n->token = token ? strdup(token) : NULL;

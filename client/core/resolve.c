@@ -70,6 +70,29 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
     return 0;
 }
 
+int oc_workspace_key(const char *workspace, const char *suffix, char *out, size_t cap) {
+    char domain[256];
+    if (oc_resolve_domain(workspace, suffix, domain, sizeof domain) != 0) return -1;
+    for (char *p = domain; *p; p++)
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+
+    /* A port counts only if it was typed, and only if it is one. */
+    const char *s = workspace;
+    while (*s == ' ') s++;
+    const char *scheme = strstr(s, "://");
+    if (scheme) s = scheme + 3;
+    const char *colon = s;
+    while (*colon && *colon != ':' && *colon != '/') colon++;
+    long port = 0;
+    if (*colon == ':') {
+        char *end = NULL;
+        port = strtol(colon + 1, &end, 10);
+        if (end == colon + 1 || port <= 0 || port > 65535) port = 0;
+    }
+    int n = port ? snprintf(out, cap, "%s:%ld", domain, port) : snprintf(out, cap, "%s", domain);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
 #ifndef _WIN32
 int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostcap, int *port) {
     if (!answer || len <= 0 || !host || hostcap == 0 || !port) return -1;

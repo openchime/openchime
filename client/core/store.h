@@ -3,7 +3,8 @@
  * process restarts the bits a silent relaunch needs: the session token (so we
  * reconnect with OC_AUTH_SESSION instead of a password), the per-host TOFU pin,
  * the cached history, the offline outbox, and the workspace book. Keyed by
- * `workspace` ("host:port"), so one store holds several servers' state.
+ * `workspace` — the workspace as named (oc_workspace_key), not the address it
+ * resolved to — so one store holds several servers' state.
  *
  * **No local storage at all (ARCH-88).** Everything durable is one credential per
  * workspace in the OS credential store: session token, TOFU pin, and the book
@@ -76,10 +77,18 @@ void oc_store_save_pin(oc_store *s, const char *workspace,
 int  oc_store_device_key(oc_store *s, const char *workspace,
                          uint8_t sk[32], uint8_t pk[32]);
 
+/* Move what is filed under `legacy` — an entry keyed by the address resolution
+ * once produced — to `key`, the workspace as named (oc_workspace_key). Token with
+ * its owner and expiry, pin, device key and book fields each move only where
+ * `key` has none, so an entry already made under the name keeps what it has; then
+ * `legacy` is deleted. A no-op when the two are the same or `legacy` holds
+ * nothing. Returns 1 if anything moved. */
+int  oc_store_adopt(oc_store *s, const char *key, const char *legacy);
+
 /* The workspace book (REQ-012): the list of workspaces this machine knows about,
  * so a frontend can offer a switcher without the user retyping an address. One
  * row per workspace, holding the `label` the user typed (`acme.example.com` —
- * friendlier than the resolved "host:port" key) and the `username` they signed
+ * friendlier than the normalised key) and the `username` they signed
  * in as, ordered most-recently-used first.
  *
  * The book is not stored separately: there is one credential per workspace, so

@@ -53,4 +53,13 @@ int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostca
  * the SRV -> A fallback order and the distinct failure statuses. */
 oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpoint *out);
 
+/* The key a workspace's credential entry is filed under: the workspace AS NAMED —
+ * its domain (oc_resolve_domain), lowercased, with the port only if one was
+ * typed. Not the address resolution produced: that is an answer, and answers
+ * change — an SRV record moves, two names share a front door — while the pin and
+ * the session belong to the name a person trusted. `acme`, `Acme` and
+ * `acme.openchime.io` are one key; `127.0.0.1:8443` is its own. 0, or -1 if the
+ * workspace is empty or does not fit. */
+int oc_workspace_key(const char *workspace, const char *suffix, char *out, size_t cap);
+
 #endif /* OC_RESOLVE_H */

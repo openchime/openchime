@@ -113,6 +113,43 @@ static int sec_store(oc_store *s, const char *ws, uint8_t *blob) {
     return oc_secret_put(s->secret, ws, blob, SEC_BLOB);
 }
 
+int oc_store_adopt(oc_store *s, const char *key, const char *legacy) {
+    if (!s || !s->secret || !key || !legacy || !key[0] || !legacy[0] || strcmp(key, legacy) == 0) return 0;
+    uint8_t from[SEC_BLOB], to[SEC_BLOB];
+    if (!sec_load(s, legacy, from)) return 0;
+    sec_load(s, key, to);   /* absent is all zeroes, which is "has nothing" */
+
+    /* The token travels with its expiry and its owner, or not at all: a token
+     * whose owner was left behind is one any account could be handed. */
+    if (!(to[1] & SEC_HAS_TOKEN) && (from[1] & SEC_HAS_TOKEN)) {
+        memcpy(SEC_EXPIRY(to), SEC_EXPIRY(from), 8);
+        memcpy(SEC_TOKEN(to), SEC_TOKEN(from), OC_SESSION_TOKEN_LEN);
+        memcpy(SEC_OWN(to), SEC_OWN(from), SEC_OWNER);
+        to[1] = (uint8_t)((to[1] & ~SEC_HAS_OWNER) | SEC_HAS_TOKEN | (from[1] & SEC_HAS_OWNER));
+    }
+    if (!(to[1] & SEC_HAS_PIN) && (from[1] & SEC_HAS_PIN)) {
+        memcpy(SEC_PIN(to), SEC_PIN(from), OC_TLS_FINGERPRINT_LEN);
+        to[1] |= SEC_HAS_PIN;
+    }
+    if (!(to[1] & SEC_HAS_DEVKEY) && (from[1] & SEC_HAS_DEVKEY)) {
+        memcpy(SEC_DEVKEY(to), SEC_DEVKEY(from), OC_X25519_LEN);
+        to[1] |= SEC_HAS_DEVKEY;
+    }
+    if (!(to[1] & SEC_HAS_BOOK) && (from[1] & SEC_HAS_BOOK)) {
+        memcpy(SEC_USED(to), SEC_USED(from), 8);
+        memcpy(SEC_LBL(to), SEC_LBL(from), SEC_LABEL);
+        memcpy(SEC_USR(to), SEC_USR(from), SEC_USER);
+        to[1] |= SEC_HAS_BOOK;
+    }
+    int ok = sec_store(s, key, to);
+    /* Only once the new entry is written: losing both is the one outcome worse
+     * than keeping the old key. */
+    if (ok) oc_secret_del(s->secret, legacy);
+    memset(from, 0, sizeof from);
+    memset(to, 0, sizeof to);
+    return ok;
+}
+
 /* ---- open / close ---------------------------------------------------------- */
 
 oc_store *oc_store_open(const char *path) {
