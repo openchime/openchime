@@ -51,6 +51,7 @@ struct tb_event {
 #define TB_INPUT_MOUSE   4
 
 /* Keys (control range == the raw control codes) */
+#define TB_KEY_CTRL_B     0x02
 #define TB_KEY_CTRL_C     0x03
 #define TB_KEY_CTRL_F     0x06
 #define TB_KEY_BACKSPACE  0x08

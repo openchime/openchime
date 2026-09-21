@@ -17,6 +17,17 @@
 
 typedef struct oc_net oc_net;
 
+/* One way a workspace signs people in, as its AUTH_CHALLENGE lists it. `kind` is
+ * OC_SOURCE_LOCAL (a password form) or a browser source (a button). */
+typedef struct { char id[64]; char label[96]; uint8_t kind; } oc_signin_source;
+#define OC_PROBE_UNREACHABLE (-1)
+#define OC_PROBE_VERSION     (-2)   /* the server speaks another protocol version */
+
+/* Connect, read how the workspace signs people in, and leave — so a frontend can
+ * draw the right controls before asking for anything. Blocking (a few seconds at
+ * worst); returns the number of sources written to `out`, or OC_PROBE_*. */
+int oc_net_probe(const char *host, int port, oc_signin_source *out, int max);
+
 /* Start the network thread. `token` carries local credentials as
  * "username:password"; NULL or "" means a browser sign-in through the first such
  * source the workspace offers — OC_EV_AUTH_BROWSER then carries the URL for the

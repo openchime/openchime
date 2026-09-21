@@ -52,6 +52,7 @@
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
+#include "net.h"        /* oc_net_probe: how a workspace signs people in */
 
 #include <ctype.h>
 #include <locale.h>
@@ -61,6 +62,13 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+#include <shellapi.h>
+#else
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define SIDEBAR_W 22
 #define COMPOSER_CAP 1024
@@ -1376,7 +1384,41 @@ typedef struct {
     char pass[128];
     int  remember;
     oc_endpoint ep;                       /* filled by oc_resolve on submit */
+    /* How the workspace signs people in (AUTH.md §8.1), asked of it once the
+     * workspace is known: a password form, a browser, or both. */
+    oc_signin_source src[8];
+    int  nsrc;
+    char probed[256];                     /* the workspace `src` was read from */
+    int  browser;                         /* submit means: sign in with the browser */
 } login_form;
+
+static const oc_signin_source *form_browser_source(const login_form *f) {
+    for (int i = 0; i < f->nsrc; i++)
+        if (f->src[i].kind != OC_SOURCE_LOCAL) return &f->src[i];
+    return NULL;
+}
+
+static int form_has_local(const login_form *f) {
+    for (int i = 0; i < f->nsrc; i++)
+        if (f->src[i].kind == OC_SOURCE_LOCAL) return 1;
+    return 0;
+}
+
+/* Resolve the workspace and ask it how it signs people in. 1 on success; 0 with
+ * the reason in `inl`. Asked once per workspace name. */
+static int form_probe(login_form *f, char *inl, size_t cap) {
+    if (f->nsrc > 0 && strcmp(f->probed, f->workspace) == 0) return 1;
+    f->nsrc = 0; f->probed[0] = '\0';
+    oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
+    if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, cap, "invalid workspace '%s'", f->workspace); return 0; }
+    if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found — does not resolve in DNS", f->workspace); return 0; }
+    int n = oc_net_probe(f->ep.host, f->ep.port, f->src, (int)(sizeof f->src / sizeof f->src[0]));
+    if (n == OC_PROBE_VERSION) { snprintf(inl, cap, "this app and that server are different versions"); return 0; }
+    if (n <= 0)                { snprintf(inl, cap, "could not reach %.120s", f->ep.host); return 0; }
+    f->nsrc = n;
+    snprintf(f->probed, sizeof f->probed, "%s", f->workspace);
+    return 1;
+}
 
 
 /* A labeled input row; `focused` highlights the field, `mask` renders dots. */
@@ -1418,6 +1460,15 @@ static int login_dialog(login_form *f, const char *err) {
         draw_field(ix, y + 5, iw, "Password", f->pass, focus == 2, 1);
         char rem[40]; snprintf(rem, sizeof rem, "[%c] Remember me", f->remember ? 'x' : ' ');
         tk_text(ix, y + 7, ix + iw, rem, focus == 3 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
+        /* Once the workspace has said how it signs people in, offer the browser
+         * where it does — and only the browser where it takes no passwords. */
+        const oc_signin_source *bs =
+            strcmp(f->probed, f->workspace) == 0 ? form_browser_source(f) : NULL;
+        if (bs) {
+            char hint[160];
+            snprintf(hint, sizeof hint, "Ctrl+B  %s", bs->label);
+            tk_text(ix, y + 8, ix + iw, hint, TB_GREEN | TB_BOLD, TB_DEFAULT);
+        }
         const char *e = inl[0] ? inl : err;
         if (e) tk_text(ix, y + 9, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
         tk_text(ix, y + bh - 1, ix + iw, " Enter connect · Tab next · Esc quit ",
@@ -1432,12 +1483,20 @@ static int login_dialog(login_form *f, const char *err) {
         if (ev.key == TB_KEY_TAB || ev.key == TB_KEY_ARROW_DOWN) { focus = (focus + 1) & 3; continue; }
         if (ev.key == TB_KEY_ARROW_UP) { focus = (focus + 3) & 3; continue; }
         int is_space = (ev.ch == ' ' || ev.key == TB_KEY_SPACE);
-        if (ev.key == TB_KEY_ENTER) {
+        if (ev.key == TB_KEY_ENTER || ev.key == TB_KEY_CTRL_B) {
+            int want_browser = ev.key == TB_KEY_CTRL_B;
             if (!f->workspace[0]) { snprintf(inl, sizeof inl, "enter a workspace (domain or name)"); focus = 0; continue; }
-            if (!f->user[0])     { snprintf(inl, sizeof inl, "enter a username"); focus = 1; continue; }
-            oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
-            if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, sizeof inl, "invalid workspace '%s'", f->workspace); focus = 0; continue; }
-            if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, sizeof inl, "'%s' not found — does not resolve in DNS", f->workspace); focus = 0; continue; }
+            if (!form_probe(f, inl, sizeof inl)) { focus = 0; continue; }
+            const oc_signin_source *browser = form_browser_source(f);
+            if (want_browser && !browser) { snprintf(inl, sizeof inl, "this workspace signs in with a password"); continue; }
+            /* A workspace with no passwords has one way in; so has an empty form
+             * where the browser is offered. */
+            if (browser && (want_browser || !form_has_local(f) || (!f->user[0] && !f->pass[0]))) {
+                f->browser = 1;
+                return LOGIN_SUBMIT;
+            }
+            if (!f->user[0]) { snprintf(inl, sizeof inl, "enter a username"); focus = 1; continue; }
+            f->browser = 0;
             return LOGIN_SUBMIT;
         }
         if (focus == 3) { if (is_space) f->remember = !f->remember; continue; }
@@ -1455,25 +1514,74 @@ static int login_dialog(login_form *f, const char *err) {
     }
 }
 
+/* Hand a URL to the desktop's browser, if there is one. No shell is involved: the
+ * URL is one argument to the platform's opener, whatever it contains. */
+static void open_in_browser(const char *url) {
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+#else
+    pid_t pid = fork();
+    if (pid != 0) { if (pid > 0) waitpid(pid, NULL, 0); return; }
+    if (fork() != 0) _exit(0);              /* the grandchild is nobody's zombie */
+    int nul = open("/dev/null", O_RDWR);
+    if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }   /* keep the terminal ours */
+#ifdef __APPLE__
+    execlp("open", "open", url, (char *)NULL);
+#else
+    execlp("xdg-open", "xdg-open", url, (char *)NULL);
+#endif
+    _exit(127);
+#endif
+}
+
 /* Tick a freshly-started client until it authenticates, fails, or is cancelled,
  * drawing a "connecting…" screen. Distinguishes auth-fail from unreachable via
  * the model's sticky last_error. */
-static int await_auth(oc_client *cl, const char *host) {
+static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap) {
+    uint32_t opened = 0;                      /* the signin_seq whose URL was opened */
     for (int i = 0; i < 1200; i++) {          /* ~18s at 15ms per tick */
         oc_client_tick(cl);
         const oc_model *m = oc_client_model(cl);
         if (m->authed) return AUTH_R_OK;
-        if (m->last_error[0] && !m->connected)
+        if (m->last_error[0] && !m->connected) {
+            snprintf(why, whycap, "%s", m->last_error);
             return strstr(m->last_error, "reach") ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
+        }
+        int waiting = m->signin_url[0] != '\0';
+        if (waiting) {
+            /* The person is in their browser: the core waits five minutes, so this
+             * does too. The URL is opened once and always shown — a terminal has no
+             * promise of a desktop behind it. */
+            i = 0;
+            if (opened != m->signin_seq) { opened = m->signin_seq; open_in_browser(m->signin_url); }
+        }
         int W = tb_width(), H = tb_height();
         tb_clear();
-        char msg[320]; snprintf(msg, sizeof msg, "Connecting to %s …   (Esc to cancel)", host);
+        char msg[320];
+        if (waiting) snprintf(msg, sizeof msg, "Finish signing in in your browser …   (Esc to cancel)");
+        else         snprintf(msg, sizeof msg, "Connecting to %s …   (Esc to cancel)", host);
         tk_text((W - (int)strlen(msg)) / 2, H / 2, W, msg, TB_WHITE | TB_BOLD, TB_DEFAULT);
+        if (waiting) {
+            const char *lead = "If it did not open, go to:";
+            tk_text((W - (int)strlen(lead)) / 2, H / 2 + 2, W, lead, TB_DEFAULT, TB_DEFAULT);
+            /* Wrapped, not truncated: half a URL signs nobody in. */
+            int uw = W - 4; if (uw < 20) uw = 20;
+            size_t ul = strlen(m->signin_url);
+            for (size_t off = 0, row = 0; off < ul && (int)row < H / 2 - 4; off += (size_t)uw, row++) {
+                char line[512];
+                size_t n = ul - off < (size_t)uw ? ul - off : (size_t)uw;
+                if (n >= sizeof line) n = sizeof line - 1;
+                memcpy(line, m->signin_url + off, n); line[n] = '\0';
+                tk_text(2, H / 2 + 3 + (int)row, W, line, TB_CYAN, TB_DEFAULT);
+            }
+        }
         tb_present();
         struct tb_event ev;
         if (tb_peek_event(&ev, 15) == TB_OK && ev.type == TB_EVENT_KEY &&
-            (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q))
+            (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)) {
+            oc_client_cancel_signin(cl);
             return AUTH_R_CANCELLED;
+        }
     }
     return AUTH_R_UNREACHABLE;
 }
@@ -1504,12 +1612,14 @@ static int run_login(const char *initial_workspace, const char *initial_user,
     char err[320]; err[0] = '\0';
     for (;;) {
         if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
-        char cred[260]; snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
+        char cred[260] = "";   /* empty: the core signs in through the browser */
+        if (!f.browser) snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
         oc_client *cl = oc_client_start_secure(f.ep.host, f.ep.port, cred,
                                                f.remember ? store_path : NULL,
                                                f.remember ? secret : NULL);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
-        int res = await_auth(cl, f.ep.host);
+        char why[200] = "";
+        int res = await_auth(cl, f.ep.host, why, sizeof why);
         if (res == AUTH_R_OK) {
             memset(w, 0, sizeof *w);
             w->cl = cl;
@@ -1524,6 +1634,8 @@ static int run_login(const char *initial_workspace, const char *initial_user,
         oc_client_stop(cl);
         if (res == AUTH_R_CANCELLED) return 0;
         if (res == AUTH_R_UNREACHABLE) snprintf(err, sizeof err, "could not reach %s", f.ep.host);
+        else if (why[0] && strcmp(why, "auth failed") != 0)
+                                      snprintf(err, sizeof err, "%s", why);
         else                          snprintf(err, sizeof err, "sign-in failed — check your username and password");
         f.pass[0] = '\0';   /* clear the password for the retry */
     }
@@ -1550,7 +1662,8 @@ static int open_workspace(const char *key, const char *label, const char *user) 
     if (have_stored_token(g_store_path, host, port, g_secret)) {
         oc_client *cl = oc_client_start_secure(host, port, "", g_store_path, g_secret);
         if (!cl) return -1;
-        if (await_auth(cl, host) != AUTH_R_OK) {         /* token stale/rejected */
+        char why[200] = "";
+        if (await_auth(cl, host, why, sizeof why) != AUTH_R_OK) {         /* token stale/rejected */
             oc_client_stop(cl);
         } else {
             memset(w, 0, sizeof *w);

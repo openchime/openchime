@@ -2055,6 +2055,55 @@ static void signin_forget(oc_net *n) {
     n->oidc_token = NULL;
 }
 
+/* Ask a workspace how it signs people in, before anyone has typed anything
+ * (AUTH.md §8.1): connect, shake hands, read the challenge, leave. No pin is
+ * enforced and none is stored — nothing secret is sent, and what comes back only
+ * decides which controls to draw; the connection that signs in checks the pin. */
+int oc_net_probe(const char *host, int port, oc_signin_source *out, int max) {
+    int fd = dial(host, port);
+    if (fd < 0) return OC_PROBE_UNREACHABLE;
+    oc_tls_client cli;
+    oc_tls_conn conn;
+    oc_framebuf fb;
+    if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
+        oc_closesock(fd);
+        return OC_PROBE_UNREACHABLE;
+    }
+    oc_framebuf_init(&fb);
+    volatile int stop = 0;
+    int rc = OC_PROBE_UNREACHABLE;
+    if (do_handshake(&conn, fd, &stop) != 0) goto done;
+    {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("openchime-client/0.1") };
+        if (oc_encode_hello(&w, &h) != OC_OK || write_all(&conn, fd, buf, w.len, &stop) != 0) goto done;
+        oc_header hdr; oc_rbuf p;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &stop) != 0) goto done;
+        if (hdr.msg_type == OC_MSG_REJECT) { rc = OC_PROBE_VERSION; goto done; }
+        if (hdr.msg_type != OC_MSG_WELCOME) goto done;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &stop) != 0 || hdr.msg_type != OC_MSG_AUTH_CHALLENGE)
+            goto done;
+        oc_auth_challenge ch;
+        if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto done;
+        int n = 0;
+        for (uint8_t i = 0; i < ch.n_sources && n < max; i++) {
+            const oc_auth_source *s = &ch.sources[i];
+            if (s->id.len >= sizeof out[n].id || s->label.len >= sizeof out[n].label) continue;
+            memcpy(out[n].id, s->id.ptr, s->id.len);          out[n].id[s->id.len] = '\0';
+            memcpy(out[n].label, s->label.ptr, s->label.len); out[n].label[s->label.len] = '\0';
+            out[n].kind = s->kind;
+            n++;
+        }
+        rc = n;
+    }
+done:
+    oc_framebuf_free(&fb);
+    oc_tls_conn_free(&conn);
+    oc_tls_client_free(&cli);
+    oc_closesock(fd);
+    return rc;
+}
+
 /* One connection lifecycle: dial → TLS → handshake → auth → serve, then clean up.
  * `reconnecting` selects session-token auth (OC_AUTH_SESSION) over password; the
  * AUTH_OK session token is captured into `sess`/`*have_sess` (kept across
