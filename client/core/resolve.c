@@ -15,6 +15,7 @@
 #  include <ws2tcpip.h>
 #  include <windns.h>
 #else
+#  include <arpa/inet.h>
 #  include <resolv.h>
 #  include <arpa/nameser.h>
 #  include <netinet/in.h>
@@ -68,6 +69,33 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
         if ((size_t)snprintf(out, cap, "%s", host) >= cap) return -1;
     }
     return 0;
+}
+
+int oc_sni_name(const char *name, char *out, size_t cap) {
+    if (!name || !out || cap == 0) return 0;
+    out[0] = '\0';
+    char host[256];
+    size_t n = 0;
+    const char *s = name;
+    if (*s == '[') {                               /* [v6]:port */
+        const char *e = strchr(s, ']');
+        if (!e) return 0;
+        n = (size_t)(e - s - 1);
+        if (n >= sizeof host) return 0;
+        memcpy(host, s + 1, n);
+    } else {
+        /* One colon is host:port; more than one is a bare IPv6 literal. */
+        const char *colon = strchr(s, ':');
+        n = (colon && !strchr(colon + 1, ':')) ? (size_t)(colon - s) : strlen(s);
+        if (n >= sizeof host) return 0;
+        memcpy(host, s, n);
+    }
+    host[n] = '\0';
+    if (n == 0) return 0;
+    unsigned char buf[16];
+    if (inet_pton(AF_INET, host, buf) == 1 || inet_pton(AF_INET6, host, buf) == 1) return 0;
+    if ((size_t)snprintf(out, cap, "%s", host) >= cap) { out[0] = '\0'; return 0; }
+    return 1;
 }
 
 int oc_workspace_key(const char *workspace, const char *suffix, char *out, size_t cap) {
@@ -193,6 +221,7 @@ oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpo
     char domain[256];
     if (oc_resolve_domain(workspace, suffix, domain, sizeof domain) != 0)
         return OC_RESOLVE_BAD_WORKSPACE;
+    snprintf(out->domain, sizeof out->domain, "%s", domain);
 
     /* An explicit `:port` pins host:port directly, skipping SRV. */
     int xport = explicit_port(workspace);

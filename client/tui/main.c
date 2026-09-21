@@ -1412,7 +1412,7 @@ static int form_probe(login_form *f, char *inl, size_t cap) {
     oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
     if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, cap, "invalid workspace '%s'", f->workspace); return 0; }
     if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found — does not resolve in DNS", f->workspace); return 0; }
-    int n = oc_net_probe(f->ep.host, f->ep.port, f->src, (int)(sizeof f->src / sizeof f->src[0]));
+    int n = oc_net_probe(f->ep.domain, f->ep.host, f->ep.port, f->src, (int)(sizeof f->src / sizeof f->src[0]));
     if (n == OC_PROBE_VERSION) { snprintf(inl, cap, "this app and that server are different versions"); return 0; }
     if (n <= 0)                { snprintf(inl, cap, "could not reach %.120s", f->ep.host); return 0; }
     f->nsrc = n;

@@ -22,14 +22,17 @@ typedef enum {
     OC_RESOLVE_NOT_FOUND       /* the workspace does not resolve in DNS (REQ-011) */
 } oc_resolve_status;
 
-typedef struct { char host[256]; int port; } oc_endpoint;
+/* `domain` is the workspace's own name after suffixing — what the connection
+ * names in its TLS handshake (SNI), even when an SRV record sent `host` somewhere
+ * else: a shared front door routes by workspace, not by where it was reached. */
+typedef struct { char host[256]; int port; char domain[256]; } oc_endpoint;
 
 /* The service's own DNS suffix (ARCH-14). A hosted tenant is reached by bare
- * name — `acme` -> `acme.openchime.io` — which is what REQ-010 means by "the
+ * name — `acme` -> `acme.workspace.openchime.io` — which is what REQ-010 means by "the
  * client appends the service's known DNS suffix as a pure client-side string
  * convention". Self-hosted tenants type a full domain instead, which passes
  * through untouched. */
-#define OC_SERVICE_SUFFIX "openchime.io"
+#define OC_SERVICE_SUFFIX "workspace.openchime.io"
 
 /* The suffix a frontend should hand to oc_resolve(): $OPENCHIME_SUFFIX when set
  * (the dev/self-host override), else OC_SERVICE_SUFFIX. Exists so every frontend
@@ -58,8 +61,14 @@ oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpo
  * typed. Not the address resolution produced: that is an answer, and answers
  * change — an SRV record moves, two names share a front door — while the pin and
  * the session belong to the name a person trusted. `acme`, `Acme` and
- * `acme.openchime.io` are one key; `127.0.0.1:8443` is its own. 0, or -1 if the
+ * `acme.workspace.openchime.io` are one key; `127.0.0.1:8443` is its own. 0, or -1 if the
  * workspace is empty or does not fit. */
 int oc_workspace_key(const char *workspace, const char *suffix, char *out, size_t cap);
+
+/* The name a connection to `name` sends as SNI, into `out`: the name itself, minus
+ * any `:port` and brackets — or nothing (returns 0) when it is an IPv4 or IPv6
+ * literal, which RFC 6066 §3 forbids in SNI and mbedTLS would send unchecked.
+ * `localhost` is a name, and is sent. Accepts a workspace key. */
+int oc_sni_name(const char *name, char *out, size_t cap);
 
 #endif /* OC_RESOLVE_H */

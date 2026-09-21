@@ -25,8 +25,10 @@ typedef struct { char id[64]; char label[96]; uint8_t kind; } oc_signin_source;
 
 /* Connect, read how the workspace signs people in, and leave — so a frontend can
  * draw the right controls before asking for anything. Blocking (a few seconds at
- * worst); returns the number of sources written to `out`, or OC_PROBE_*. */
-int oc_net_probe(const char *host, int port, oc_signin_source *out, int max);
+ * worst); returns the number of sources written to `out`, or OC_PROBE_*.
+ * `workspace` is the workspace's domain or key, named in the handshake as the
+ * sign-in connection names it; NULL names `host`. */
+int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max);
 
 /* Start the network thread. `token` carries local credentials as
  * "username:password"; NULL or "" means a browser sign-in through the first such

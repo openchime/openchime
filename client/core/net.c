@@ -8,6 +8,7 @@
 #include "model.h"        /* oc_model_now_ms: one clock for the backoff deadline */
 #include "store.h"
 #include "signin.h"
+#include "resolve.h"     /* oc_sni_name */
 
 #include "protocol.h"
 #include "tls.h"
@@ -2060,7 +2061,7 @@ static void signin_forget(oc_net *n) {
  * (AUTH.md §8.1): connect, shake hands, read the challenge, leave. No pin is
  * enforced and none is stored — nothing secret is sent, and what comes back only
  * decides which controls to draw; the connection that signs in checks the pin. */
-int oc_net_probe(const char *host, int port, oc_signin_source *out, int max) {
+int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max) {
     int fd = dial(host, port);
     if (fd < 0) return OC_PROBE_UNREACHABLE;
     oc_tls_client cli;
@@ -2069,6 +2070,11 @@ int oc_net_probe(const char *host, int port, oc_signin_source *out, int max) {
     if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd);
         return OC_PROBE_UNREACHABLE;
+    }
+    {
+        char sni[256];
+        if (oc_sni_name(workspace && workspace[0] ? workspace : host, sni, sizeof sni))
+            oc_tls_conn_set_hostname(&conn, sni);
     }
     oc_framebuf_init(&fb);
     volatile int stop = 0;
@@ -2132,6 +2138,17 @@ static int run_connection(oc_net *n, int reconnecting,
     if (oc_tls_client_init(&cli, enforce_pin ? cs->pin : NULL) != 0 ||
         oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
+    }
+    /* Name the workspace in the handshake (SNI): a shared front door reads it to
+     * find the workspace's daemon, without terminating anything. It is the
+     * workspace's own domain — its key — even when an SRV record sent this
+     * connection elsewhere, and never an address (RFC 6066 §3). Trust is still the
+     * pin: the verify callback clears the name mismatch a self-signed certificate
+     * would otherwise fail on. */
+    {
+        char sni[256];
+        if (oc_sni_name(n->ws_key[0] ? n->ws_key : n->host, sni, sizeof sni))
+            oc_tls_conn_set_hostname(&conn, sni);
     }
     oc_framebuf_init(&fb);
     /* Attachment transfer state, valid from here to `drop:` (which may reset it). */

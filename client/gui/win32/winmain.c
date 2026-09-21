@@ -22117,7 +22117,7 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
     /* Step 1 is skipped, so its question is asked here: a workspace that takes no
      * passwords goes to the browser, not to a password form it cannot use. An
      * unreachable one falls through to the form, which reports it on submit. */
-    g_si_nsrc = oc_net_probe(g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
+    g_si_nsrc = oc_net_probe(ep.domain, g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
     if (g_si_nsrc < 0) g_si_nsrc = 0;
     if (g_si_nsrc > 0 && !si_has_local() && si_browser_source()) { signin_start_browser(hwnd); return; }
     g_si_step = 2;
@@ -22255,7 +22255,7 @@ static void signin_submit(HWND hwnd) {
         /* Ask the workspace how it signs people in before drawing the step that
          * asks them for anything (AUTH.md §8.1). */
         g_si_nsrc = 0;
-        int n = oc_net_probe(g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
+        int n = oc_net_probe(ep.domain, g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
         if (n == OC_PROBE_VERSION) {
             snprintf(g_si_err, sizeof g_si_err, "this app and that server are different versions");
             goto redraw;

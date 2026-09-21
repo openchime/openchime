@@ -70,6 +70,24 @@ verification, so its result is exactly `BADCERT_SKIP_VERIFY`, which is masked of
 — everything else is a real failure. (The test guards both rules against
 regression.)
 
+### The client names the workspace, and still trusts the pin
+
+Every client connection names its workspace in the handshake (SNI, RFC 6066): the
+workspace's own **domain** — the name as typed, after suffixing — even when an SRV
+record sent the connection to another host, because a shared front door in front
+of several daemons routes by workspace and reads nothing else; it terminates
+nothing and holds no certificate. An IPv4 or IPv6 literal is never sent (RFC 6066
+§3; mbedTLS would send whatever it is given, so `oc_sni_name` decides), and
+`localhost` is a name and is.
+
+**The name is for routing; trust is the pin.** Setting a hostname makes mbedTLS
+check the certificate's name, which a daemon's self-signed certificate does not
+carry. The verify callback clears the leaf's flags on a pin match and on first
+use, and that includes the name mismatch — so a named, pinned handshake completes,
+and a wrong pin fails exactly as it does unnamed. `tests/itest_tls.c` holds both,
+so a change to the callback cannot turn every pinned workspace into "certificate
+changed". A daemon reached directly ignores the name.
+
 ## Non-blocking integration
 
 `shared/tls.c` is written for the epoll event loop (ARCH-22): custom BIO callbacks
