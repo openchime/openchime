@@ -296,15 +296,29 @@ where one exists.
   shared connection or shared query surface (ARCH-4, ARCH-7). Isolation has
   therefore been a property of the deployment topology, not of a
   tenant-ID filter inside shared queries.
-- **REQ-041.** **No shared, always-on runtime component has existed in the
-  message/data path — in any deployment model (ARCH-76).** Every message a
-  tenant sends, stores, backfills, or searches has been handled solely by that
-  tenant's own daemon and database (REQ-040); no OpenChime-operated service has
-  ever received, relayed, stored, or been able to read message content, whether
-  the deployment was stand-alone, federated, or hosted. Workspace resolution has
+- **REQ-041.** **A tenant's messages have been stored only by that tenant's own
+  daemon, and by default have gone nowhere else — in any deployment model
+  (ARCH-76).** Every message a tenant sends, stores, backfills, or searches has
+  been handled by that tenant's own daemon and database (REQ-040), which has been
+  the only store of record for it: no OpenChime-operated service has held a
+  tenant's message history, whether the deployment was stand-alone, federated,
+  or hosted. With nothing configured, no shared, always-on runtime component has
+  sat in the message/data path and message content has left the daemon only
+  toward that workspace's own members. Workspace resolution has
   been plain DNS (REQ-010, ARCH-14), so the name-to-daemon-address mapping has
   lived in static DNS records rather than in a resolution service, and no lookup
   traffic has reached the project.
+
+  **Content has left the daemon for a third party only where the tenant
+  configured it to.** Compliance capture (REQ-276) and send-time DLP (REQ-277)
+  both hand message content to an endpoint the tenant named, and an
+  inspection service the project operates is one of the endpoints a tenant may
+  name. That has been the tenant's decision, made per workspace, visible in its
+  configuration and off until made; it has never been a property of the
+  deployment model, and the daemon has remained where the message is stored
+  whatever inspected it on the way in. The guarantee is therefore about
+  **storage and default behaviour**: where messages live, and that nothing reads
+  them unless the tenant said so — not that content can never be inspected.
 
   A **self-hosted federated** deployment (ARCH-76) has additionally depended on
   OpenChime-operated services for functions it opted into — OIDC login
@@ -314,10 +328,12 @@ where one exists.
   **identity, notification, discovery, or provisioning metadata**: which user
   signed in to which workspace, that a notification is due and for whom, which
   integrations exist, which accounts to provision. **None has carried message
-  content, and none has sat in the message path**, so a federated deployment has
-  held exactly the same data-sovereignty guarantee as a stand-alone one — it has
-  traded independence of *availability* (those functions stop when the project's
-  services are unreachable) for capability, never confidentiality of messages.
+  content, and none has sat in the message path**, so federating has not, by
+  itself, moved any message content: a federated deployment has held exactly
+  the same data-sovereignty guarantee as a stand-alone one — it has traded
+  independence of *availability* (those functions stop when the project's
+  services are unreachable) for capability, and message content has stayed
+  subject to the tenant's own configuration and nothing else.
 
   A **self-hosted stand-alone** deployment has depended on no OpenChime-operated
   service at all at runtime, at the cost of the federated-only features — most

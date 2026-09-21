@@ -262,9 +262,9 @@ targets the high-frequency message path, not the auth bootstrap.)
 
 ### 3.5 Reconciling with the island model (REQ-041)
 
-REQ-041 states that **no shared runtime component sits in the message/data path,
-in any deployment model** — and that holds here: data isolation (REQ-040) is
-untouched. The central OIDC service is contacted at **login time only** (never
+REQ-041 states that **a tenant's messages are stored only by its own daemon and
+by default go nowhere else, in any deployment model** — and that holds here: data
+isolation (REQ-040) is untouched. The central OIDC service is contacted at **login time only** (never
 per-message), brokers **identity only** (it never sees message or channel
 content), and is **absent entirely in local mode**, hence absent from every
 self-hosted stand-alone deployment.
@@ -275,7 +275,8 @@ deployment may also depend on the project for push (ARCH-16), the app directory
 packages (ARCH-20). What unites them, and what REQ-041 actually guarantees, is
 that each brokers identity, notification, discovery, or provisioning metadata
 and **none carries message content**. So federating costs availability
-independence, never message confidentiality.
+independence and moves no message content; content leaves a daemon only toward
+an endpoint the tenant itself configured (REQ-276, REQ-277).
 
 ### 3.6 The central service / relay (separate component)
 
