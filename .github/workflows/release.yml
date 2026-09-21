@@ -1342,7 +1342,7 @@ jobs:
   # repair by hand.
   smoke:
     name: smoke the published repository
-    needs: [publish]
+    needs: [version, publish]
     # Gated on publish having SUCCEEDED because there is nothing to smoke if
     # nothing was published. always() so a skipped or failed sibling job cannot
     # skip the verification with it.
@@ -1354,6 +1354,7 @@ jobs:
       # defined and explained. Repeated rather than shared because a job cannot
       # read another job's env.
       DIST_BASE_URL: https://openchime.io/dist
+      VERSION: ${{ needs.version.outputs.number }}
     steps:
       - name: Smoke the published apt repository
         # Skipped only when explicitly asked. The default stays a hard failure:
@@ -1413,6 +1414,33 @@ jobs:
             dnf install -y openchimed
             openchimed --version
           "
+
+      # The third channel. The README tells people to `podman run` the image, and
+      # a package that cannot be pulled without a login is as unpublished as an
+      # apt index that does not serve -- GHCR packages are private until made
+      # public, and nothing in the pipeline would notice.
+      #
+      # Pulled the way a stranger pulls it: by the released tag, with no
+      # credentials. The empty auth file is what makes that true by construction
+      # rather than by the runner happening to be logged out -- podman reads
+      # REGISTRY_AUTH_FILE and nothing else when it is set.
+      #
+      # Not behind skip_repo_smoke: that switch exists for DIST_BASE_URL being
+      # unserved, and the registry does not depend on it. And !cancelled(), so
+      # a repository step failing above cannot hide what this one would say.
+      - name: Smoke the published container image
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          command -v podman >/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends podman
+          }
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/no-auth.json"
+          echo '{}' > "$REGISTRY_AUTH_FILE"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}"
+          podman pull "$IMAGE"
+          podman run --rm "$IMAGE" --version
 
       - name: Note the skipped smoke test
         if: ${{ inputs.skip_repo_smoke }}
