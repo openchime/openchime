@@ -7,6 +7,7 @@
 #include "event.h"
 #include "model.h"        /* oc_model_now_ms: one clock for the backoff deadline */
 #include "store.h"
+#include "signin.h"
 
 #include "protocol.h"
 #include "tls.h"
@@ -63,6 +64,15 @@ struct oc_net {
     int           port;
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
+    /* A browser sign-in in progress (AUTH.md §8.1): the listener the browser comes
+     * back to, the verifier kept for the daemon, and — once the browser has been —
+     * the token to present on the next connection. Net thread only, but for
+     * `signin_cancel`, which the UI thread sets. */
+    oc_loopback  *loopback;
+    char          verifier[OC_SIGNIN_VERIFIER_LEN + 1];
+    char          source_id[64];
+    char         *oidc_token;
+    volatile int  signin_cancel;
     char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
     char          client_type[32]; /* synced-settings bucket id (default "tui") */
@@ -2000,7 +2010,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
 
 /* ---- the thread ---- */
 
-enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3 };
+enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3,
+       RC_BROWSER = 4 /* the person is in their browser; wait for them, then connect again */ };
 
 /* TOFU pinning defends against a network man-in-the-middle substituting the
  * server's certificate. A loopback connection never leaves the host, so there is
@@ -2010,6 +2021,38 @@ enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3 };
 static int is_loopback(const char *host) {
     return strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0 ||
            strcmp(host, "localhost") == 0;
+}
+
+/* The daemon builds the authorize URL (AUTH.md §8.1), and the client opens it only
+ * over https — or plain http to loopback, which is a developer's relay. */
+static int url_is_openable(const char *u) {
+    if (strncmp(u, "https://", 8) == 0) return 1;
+    static const char *const LOCAL[] = { "http://127.0.0.1", "http://localhost", "http://[::1]" };
+    for (size_t i = 0; i < sizeof LOCAL / sizeof LOCAL[0]; i++) {
+        size_t l = strlen(LOCAL[i]);
+        if (strncmp(u, LOCAL[i], l) == 0 && (u[l] == ':' || u[l] == '/' || u[l] == '\0')) return 1;
+    }
+    return 0;
+}
+
+/* What to tell a person about a refused sign-in. */
+static const char *auth_error_text(uint16_t code, int reconnecting) {
+    switch (code) {
+    case OC_ERR_AUTH_NOT_ALLOWED:        return "this account isn't allowed in this workspace";
+    case OC_ERR_AUTH_RATE_LIMITED:       return "too many attempts — try again in a minute";
+    case OC_ERR_USER_LIMIT:              return "this workspace is full";
+    case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";
+    case OC_ERR_AUTH_REQUIRED:           return "this workspace doesn't sign in that way";
+    default: return reconnecting ? "session expired — please log in again" : "auth failed";
+    }
+}
+
+static void signin_forget(oc_net *n) {
+    oc_loopback_close(n->loopback);
+    n->loopback = NULL;
+    oc_signin_wipe(n->verifier, sizeof n->verifier);
+    if (n->oidc_token) { oc_signin_wipe(n->oidc_token, strlen(n->oidc_token)); free(n->oidc_token); }
+    n->oidc_token = NULL;
 }
 
 /* One connection lifecycle: dial → TLS → handshake → auth → serve, then clean up.
@@ -2096,6 +2139,66 @@ static int run_connection(oc_net *n, int reconnecting,
         if (hdr.msg_type != OC_MSG_AUTH_CHALLENGE) goto drop;
         oc_auth_challenge ch;
         if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto drop;
+
+        /* Which way in. A stored session needs no source. A password goes to the
+         * local source. With no password given, the first browser source offered is
+         * the way: the daemon builds the URL, the frontend opens it, and this
+         * connection ends — nothing is held open while the person is in their
+         * browser (AUTH.md §8.1). */
+        int has_password = n->token && strchr(n->token, ':') != NULL;
+        int fresh = !(reconnecting && *have_sess) && !(n->invite && n->invite[0]);
+        if (fresh && !has_password && !n->oidc_token) {
+            const oc_auth_source *src = NULL;
+            for (uint8_t i = 0; i < ch.n_sources && !src; i++)
+                if (ch.sources[i].kind == OC_SOURCE_RELAY || ch.sources[i].kind == OC_SOURCE_OIDC)
+                    src = &ch.sources[i];
+            if (!src || src->id.len >= sizeof n->source_id) {
+                push_err(n->to_ui, "this workspace signs in with a password");
+                rc = RC_FATAL; goto drop;
+            }
+            memcpy(n->source_id, src->id.ptr, src->id.len);
+            n->source_id[src->id.len] = '\0';
+
+            signin_forget(n);
+            char redirect[160], challenge[OC_SIGNIN_CHALLENGE_LEN + 1];
+            n->loopback = oc_loopback_open(redirect, sizeof redirect);
+            if (!n->loopback || oc_signin_verifier(n->verifier, challenge) != 0) {
+                signin_forget(n);
+                push_err(n->to_ui, "could not start a browser sign-in on this computer");
+                rc = RC_FATAL; goto drop;
+            }
+            uint8_t bb[512]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+            oc_auth_begin ab = { oc_slice_str(n->source_id), oc_slice_str(redirect),
+                                 oc_slice_str(challenge) };
+            if (oc_encode_auth_begin(&bw, OC_PROTOCOL_VERSION, &ab) != OC_OK ||
+                write_all(&conn, fd, bb, bw.len, &n->stop) != 0) { signin_forget(n); goto drop; }
+            if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0 || hdr.version != negotiated) {
+                signin_forget(n); goto drop;
+            }
+            if (hdr.msg_type != OC_MSG_AUTH_REDIRECT) {
+                oc_error er0; uint16_t code = 0;
+                if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+                signin_forget(n);
+                push_err(n->to_ui, auth_error_text(code, 0));
+                rc = RC_FATAL; goto drop;
+            }
+            oc_auth_redirect ar;
+            char url[2048];
+            if (oc_decode_auth_redirect(&p, &ar) != OC_OK || ar.authorize_url.len >= sizeof url) {
+                signin_forget(n); rc = RC_FATAL; goto drop;
+            }
+            memcpy(url, ar.authorize_url.ptr, ar.authorize_url.len);
+            url[ar.authorize_url.len] = '\0';
+            if (!url_is_openable(url)) {
+                signin_forget(n);
+                push_err(n->to_ui, "the server sent a sign-in address this app will not open");
+                rc = RC_FATAL; goto drop;
+            }
+            oc_ev *e = oc_ev_new(OC_EV_AUTH_BROWSER);
+            if (e) { e->body = strdup(url); oc_queue_push(n->to_ui, e); }
+            rc = RC_BROWSER;
+            goto drop;
+        }
     }
 
     /* AUTH -> AUTH_OK. A reconnect re-auths silently with the stored session
@@ -2103,9 +2206,20 @@ static int run_connection(oc_net *n, int reconnecting,
      * (`n->token`). The AUTH_OK session token is captured so a later drop can
      * reconnect without the password. */
     {
-        uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);   /* room for a token */
         oc_result er;
-        if (reconnecting && *have_sess) {
+        if (n->oidc_token && !(reconnecting && *have_sess)) {
+            /* What the browser brought back, with the verifier only this client
+             * holds (AUTH.md §8.2). Both are spent here, whatever the answer. */
+            oc_auth a = { OC_AUTH_OIDC, oc_slice_str(n->source_id), oc_slice_str(n->oidc_token),
+                          oc_slice_str(n->verifier) };
+            er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+            if (er == OC_OK && write_all(&conn, fd, buf, w.len, &n->stop) != 0) er = OC_E_OVERFLOW;
+            oc_signin_wipe(buf, sizeof buf);
+            signin_forget(n);
+            if (er != OC_OK) goto drop;
+            w.len = 0;
+        } else if (reconnecting && *have_sess) {
             oc_auth a = { OC_AUTH_SESSION, { NULL, 0 }, { sess, OC_SESSION_TOKEN_LEN }, { NULL, 0 } };
             er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
         } else {
@@ -2130,14 +2244,16 @@ static int run_connection(oc_net *n, int reconnecting,
                 er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
             }
         }
-        if (er != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
+        if (er != OC_OK || (w.len && write_all(&conn, fd, buf, w.len, &n->stop) != 0)) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
         if (hdr.version != negotiated) goto drop;
         if (hdr.msg_type != OC_MSG_AUTH_OK) {
-            /* Bad password, or an expired/revoked session on reconnect — either
-             * way there is nothing to silently retry. */
-            push_err(n->to_ui, reconnecting ? "session expired — please log in again" : "auth failed");
+            /* Bad password, a refused identity, or an expired/revoked session on
+             * reconnect — either way there is nothing to silently retry. */
+            oc_error er0; uint16_t code = 0;
+            if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+            push_err(n->to_ui, auth_error_text(code, reconnecting));
             rc = RC_FATAL; goto drop;
         }
         oc_auth_ok ok;
@@ -2921,6 +3037,32 @@ static void *net_thread(void *arg) {
             reach_notified = 1;
         }
         if (rc == RC_STOP || n->stop) break;
+        if (rc == RC_BROWSER) {
+            /* The person is in their browser. Five minutes, or until they cancel. */
+            char query[8192], tok[8192];
+            n->signin_cancel = 0;
+            oc_loopback_result lr = OC_LOOPBACK_ERROR;
+            for (int waited = 0; waited < 300 && !n->stop; waited++) {
+                lr = oc_loopback_wait(n->loopback, 1000, &n->signin_cancel, query, sizeof query);
+                if (lr != OC_LOOPBACK_TIMEOUT) break;
+            }
+            oc_loopback_close(n->loopback);
+            n->loopback = NULL;
+            if (n->stop) break;
+            if (lr == OC_LOOPBACK_OK && oc_query_get(query, "token", tok, sizeof tok) == 1) {
+                n->oidc_token = strdup(tok);
+                oc_signin_wipe(tok, sizeof tok);
+                oc_signin_wipe(query, sizeof query);
+                if (n->oidc_token) continue;   /* connect again and present it */
+            }
+            char why[200] = "";
+            if (lr == OC_LOOPBACK_OK) oc_query_get(query, "error", why, sizeof why);
+            signin_forget(n);
+            push_err(n->to_ui, lr == OC_LOOPBACK_CANCELLED ? "sign-in cancelled"
+                             : lr == OC_LOOPBACK_TIMEOUT   ? "sign-in timed out — try again"
+                             : why[0] ? why : "the browser sign-in did not finish");
+            break;
+        }
         if (rc == RC_FATAL) {
             /* A session token (stored or reconnect) was rejected — drop it. If we
              * still hold a password, fall back to it once; otherwise give up. */
@@ -3002,6 +3144,8 @@ void oc_net_set_invite(oc_net *n, const char *token) {
     n->invite = (token && token[0]) ? strdup(token) : NULL;
 }
 
+void oc_net_cancel_signin(oc_net *n) { if (n) n->signin_cancel = 1; }
+
 void oc_net_reconnect(oc_net *n) {
     if (n) n->reconnect_now = 1;   /* the backoff loop polls this and retries at once */
 }
@@ -3020,6 +3164,7 @@ void oc_net_stop(oc_net *n) {
     for (size_t i = 0; i < n->xq.n; i++) oc_cmd_free(n->xq.q[i]);
     free(n->xq.q);
     oc_callsig_destroy(&n->calls);
+    signin_forget(n);
     free(n->token);
     free(n->store_path);
     free(n);

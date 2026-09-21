@@ -58,6 +58,7 @@ typedef struct {
 enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
     OC_EV_AUTH_OK,         /* authenticated; user_id set */
+    OC_EV_AUTH_BROWSER,    /* a browser sign-in is waiting: body = the URL to open */
     OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name */
     OC_EV_MESSAGE,         /* a BROADCAST: channel/author/message_id/time + body */
     OC_EV_CHANNEL,         /* a CHANNEL_LIST entry / CHANNEL_INFO: channel_id + name(body)

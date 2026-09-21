@@ -1188,6 +1188,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->authed = true;
         m->user_id = e->user_id;
         m->last_error[0] = '\0';
+        m->signin_url[0] = '\0';
         /* Self: the server won't tell us. A pause survives a reconnect, and the
          * SNOOZE frame that follows AUTH_OK is what sets it — this only seeds
          * the row. */
@@ -2072,7 +2073,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                  e->body ? e->body : "");
         m->unresolved.seq++;
         break;
+    case OC_EV_AUTH_BROWSER:
+        if (e->body && strlen(e->body) < sizeof m->signin_url) {
+            snprintf(m->signin_url, sizeof m->signin_url, "%s", e->body);
+            m->signin_seq++;
+            set_status(m, "Waiting for your browser…");
+        }
+        break;
     case OC_EV_ERROR:
+        m->signin_url[0] = '\0';
         if (e->body) {
             set_status(m, e->body);
             snprintf(m->last_error, sizeof m->last_error, "%s", e->body);

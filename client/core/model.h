@@ -566,6 +566,11 @@ typedef struct {
     uint64_t reconnect_at_ms;
 
     char     last_error[160];
+    /* A browser sign-in is waiting (AUTH.md §8.1): the URL to open, and a counter
+     * that moves each time one starts, so a frontend opens each URL once. Empty
+     * again once the sign-in ends either way. */
+    char     signin_url[2048];
+    uint32_t signin_seq;
     /* Bumped every time an error arrives, even an identical one. A frontend that
      * notices only when the TEXT changes stays silent when you repeat a failing
      * action — the second attempt looks like it worked. */

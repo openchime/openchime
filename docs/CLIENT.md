@@ -42,6 +42,17 @@ exact `shared/` wire source, so client and server can't drift (the same reason
 
 ## 2. The app-core (`client/core/`)
 
+- **`signin.c` — a browser sign-in's client half** (AUTH.md §8.1–§8.2). The
+  per-attempt verifier and its challenge, from the operating system's random
+  source with no weaker fallback, and the **loopback listener**: `127.0.0.1` on a
+  kernel-chosen port, one `GET` accepted on a path carrying a per-attempt secret,
+  everything else answered 404 and ignored. Given no password, the network thread
+  takes the first browser source the challenge offers, sends `AUTH_BEGIN`, checks
+  the daemon's URL is `https` (or `http` to loopback), publishes it as
+  `model->signin_url` for the frontend to open, and closes the connection. When the
+  browser comes back it connects again and presents the token with the verifier,
+  then wipes both. `oc_client_cancel_signin` and a five-minute timeout end the
+  wait; a refused sign-in reaches `last_error` worded by its code.
 - **`net.c` — the network thread.** A blocking-socket TLS connection (the client
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop

@@ -1143,6 +1143,10 @@ int oc_client_outbox_pending(oc_client *c) {
     return c ? oc_net_outbox_pending(c->net) : 0;
 }
 
+void oc_client_cancel_signin(oc_client *c) {
+    if (c && c->net) oc_net_cancel_signin(c->net);
+}
+
 void oc_client_reconnect(oc_client *c) {
     if (c) oc_net_reconnect(c->net);
 }

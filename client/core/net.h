@@ -18,7 +18,9 @@
 typedef struct oc_net oc_net;
 
 /* Start the network thread. `token` carries local credentials as
- * "username:password". `store_path` (or NULL for in-memory only) is a local
+ * "username:password"; NULL or "" means a browser sign-in through the first such
+ * source the workspace offers — OC_EV_AUTH_BROWSER then carries the URL for the
+ * frontend to open, and the thread waits for the browser to come back. `store_path` (or NULL for in-memory only) is a local
  * SQLite store persisting the session token + TOFU pin, so a relaunch reconnects
  * silently. `secret` (borrowed; NULL = none) routes the session token into an OS
  * keyring instead of the SQLite file. Returns NULL on failure to spawn. */
@@ -35,6 +37,9 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
 void oc_net_set_invite(oc_net *n, const char *token);
 
 void oc_net_reconnect(oc_net *n);
+
+/* Stop waiting for the browser (the person pressed cancel). */
+void oc_net_cancel_signin(oc_net *n);
 
 /* Set the synced-settings bucket id for this client (default "tui"). Call once
  * right after start, before soliciting settings; identifies the per-frontend
