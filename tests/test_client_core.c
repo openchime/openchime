@@ -30,6 +30,7 @@
 #include "check.h"
 #include "issuer.h"       /* mints what central would, for the browser sign-in test */
 #include "signin.h"
+#include "net.h"          /* oc_net_probe */
 
 #include <math.h>
 #include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
@@ -2046,6 +2047,17 @@ static void test_browser_signin(int port) {
 
     const char *DANA = "\"email\":\"dana@acme.example\",\"email_verified\":true,\"name\":\"Dana\",\"idp\":\"google\"";
     const char *STRANGER = "\"email\":\"s@elsewhere.example\",\"email_verified\":true,\"idp\":\"google\"";
+
+    /* Before anyone types anything, a frontend asks how the workspace signs people
+     * in — and this one takes no passwords. */
+    {
+        oc_signin_source src[8];
+        int n = oc_net_probe("127.0.0.1", arg.port, src, 8);
+        CHECK(n == 1);
+        CHECK(n == 1 && src[0].kind == OC_SOURCE_RELAY && strcmp(src[0].id, "relay") == 0);
+        CHECK(n == 1 && strcmp(src[0].label, "Continue in your browser") == 0);
+        CHECK(oc_net_probe("127.0.0.1", 1, src, 8) == OC_PROBE_UNREACHABLE);
+    }
 
     /* No password given: the core asks the daemon for the URL, hands it to the
      * frontend through the model, and waits. The browser comes back; the core
