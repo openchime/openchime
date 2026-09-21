@@ -163,6 +163,78 @@ static void test_tls_pin_mismatch(void) {
     close(lfd);
 }
 
+/* What the client named in its handshake, as the server saw it. */
+static char g_seen_sni[256];
+static int seen_sni_cb(void *ctx, mbedtls_ssl_context *ssl, const unsigned char *name, size_t len) {
+    (void)ctx; (void)ssl;
+    if (len >= sizeof g_seen_sni) len = sizeof g_seen_sni - 1;
+    memcpy(g_seen_sni, name, len);
+    g_seen_sni[len] = '\0';
+    return 0;
+}
+
+/* One handshake against a fresh self-signed server, the client naming `sni` (NULL =
+ * none) and pinning `pin` (NULL = first use). Returns the client's result. */
+static oc_tls_status handshake_naming(const char *sni, int wrong_pin, int first_use) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int yes = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(lfd, (struct sockaddr *)&addr, sizeof addr);
+    listen(lfd, 1);
+    socklen_t alen = sizeof addr;
+    getsockname(lfd, (struct sockaddr *)&addr, &alen);
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    g_seen_sni[0] = '\0';
+    mbedtls_ssl_conf_sni(&srv.conf, seen_sni_cb, NULL);
+    uint8_t fp[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv, fp) == 0);
+    if (wrong_pin) fp[0] ^= 0xFF;
+
+    pthread_t th;
+    struct server_arg arg = { lfd, &srv, 0 };
+    pthread_create(&th, NULL, server_thread, &arg);
+
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    connect(cfd, (struct sockaddr *)&addr, sizeof addr);
+    oc_tls_client cli;
+    CHECK(oc_tls_client_init(&cli, first_use ? NULL : fp) == 0);
+    oc_tls_conn c;
+    CHECK(oc_tls_conn_init(&c, &cli.conf, cfd) == 0);
+    if (sni) CHECK(oc_tls_conn_set_hostname(&c, sni) == 0);
+    oc_tls_status st = handshake_blocking(&c);
+
+    oc_tls_conn_free(&c);
+    close(cfd);
+    pthread_join(th, NULL);
+    oc_tls_client_free(&cli);
+    oc_tls_server_free(&srv);
+    close(lfd);
+    return st;
+}
+
+/* The client names the workspace in its handshake, and trust is STILL the pin, not
+ * the name: the daemon's self-signed certificate carries no such name, and that
+ * must not turn every pinned workspace into "certificate changed". */
+static void test_tls_sni_does_not_replace_the_pin(void) {
+    /* A name the certificate does not carry: pinned, it completes... */
+    CHECK(handshake_naming("acme.workspace.openchime.test", 0, 0) == OC_TLS_OK);
+    CHECK(strcmp(g_seen_sni, "acme.workspace.openchime.test") == 0);
+    /* ...on first use too, before there is a pin... */
+    CHECK(handshake_naming("acme.workspace.openchime.test", 0, 1) == OC_TLS_OK);
+    /* ...and a WRONG pin still fails, name or no name. */
+    CHECK(handshake_naming("acme.workspace.openchime.test", 1, 0) == OC_TLS_ERROR);
+    CHECK(handshake_naming(NULL, 1, 0) == OC_TLS_ERROR);
+    /* No name given, none sent. */
+    CHECK(handshake_naming(NULL, 0, 0) == OC_TLS_OK);
+    CHECK(g_seen_sni[0] == '\0');
+}
+
 /* Accept one connection and handshake as server, nothing more: the ALPN cases
  * below assert on the negotiated protocol, not on any traffic. */
 static void *handshake_only_server(void *p) {
@@ -262,6 +334,7 @@ int run_tls_tests(void) {
     printf("           byte round-trip, pin-mismatch rejection, ALPN demux\n");
     test_tls_handshake_and_echo();
     test_tls_pin_mismatch();
+    test_tls_sni_does_not_replace_the_pin();
     test_tls_alpn_demux();
     return failures;
 }

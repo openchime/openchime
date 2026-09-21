@@ -53,7 +53,8 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   browser comes back it connects again and presents the token with the verifier,
   then wipes both. `oc_client_cancel_signin` and a five-minute timeout end the
   wait; a refused sign-in reaches `last_error` worded by its code.
-  `oc_net_probe` is the step before any of it: connect, read the sources the
+  Every connection — the probe too — names the workspace's domain in its
+  handshake (TLS.md), which is its store key minus any port. `oc_net_probe` is the step before any of it: connect, read the sources the
   workspace offers, leave — so a frontend draws a password form, a browser
   control, or both, before asking for anything. The TUI's sign-in dialog probes
   once the workspace is named, offers the browser on Ctrl+B, goes straight to it

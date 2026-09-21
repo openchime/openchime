@@ -1266,6 +1266,40 @@ static void test_workspace_key(void) {
     CHECK(oc_workspace_key("acme", "openchime.test", tiny, sizeof tiny) != 0);
 }
 
+/* What a connection names in its handshake: the workspace's domain, never an
+ * address (RFC 6066 §3), whatever port or brackets came with it. */
+static void test_sni_name(void) {
+    static const struct { const char *in, *want; } T[] = {
+        { "acme.workspace.openchime.test",      "acme.workspace.openchime.test" },
+        { "chat.acme.example:8443",             "chat.acme.example" },
+        { "localhost",                          "localhost" },        /* a name, and sent */
+        { "localhost:9443",                     "localhost" },
+        { "127.0.0.1",                          NULL },
+        { "127.0.0.1:8443",                     NULL },
+        { "::1",                                NULL },
+        { "2001:db8::1",                        NULL },
+        { "[2001:db8::1]:443",                  NULL },
+        { "[::1]",                              NULL },
+        { "",                                   NULL },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        char out[256] = "x";
+        int sent = oc_sni_name(T[i].in, out, sizeof out);
+        if (sent != (T[i].want != NULL) || (T[i].want && strcmp(out, T[i].want) != 0))
+            printf("  sni(%s) = %d \"%s\"\n", T[i].in, sent, out);
+        CHECK(sent == (T[i].want != NULL));
+        CHECK(T[i].want ? strcmp(out, T[i].want) == 0 : out[0] == '\0');
+    }
+    /* A bare name resolves under the hosted suffix, and OPENCHIME_SUFFIX still wins. */
+    char d[256];
+    unsetenv("OPENCHIME_SUFFIX");
+    CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0);
+    CHECK(strcmp(d, "acme.workspace.openchime.io") == 0);
+    setenv("OPENCHIME_SUFFIX", "chat.example", 1);
+    CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0 && strcmp(d, "acme.chat.example") == 0);
+    unsetenv("OPENCHIME_SUFFIX");
+}
+
 /* An entry from when the key was the resolved address moves to the name — all of
  * it, once — and an entry already under the name keeps what it has. */
 static void test_store_adopt(void) {
@@ -2051,6 +2085,16 @@ static void test_device_key(void) {
  * played here: it reads the URL the daemon built, mints the token central would —
  * carrying the URL's nonce — and delivers it to the client's loopback address. */
 
+/* The name the daemon's TLS layer was given by the last client to connect. */
+static char g_daemon_saw_sni[256];
+static int daemon_sni_cb(void *ctx, mbedtls_ssl_context *ssl, const unsigned char *name, size_t len) {
+    (void)ctx; (void)ssl;
+    if (len >= sizeof g_daemon_saw_sni) len = sizeof g_daemon_saw_sni - 1;
+    memcpy(g_daemon_saw_sni, name, len);
+    g_daemon_saw_sni[len] = '\0';
+    return 0;
+}
+
 /* GET `url_path_and_query` from 127.0.0.1:port; returns the status code. */
 static int browser_get(int port, const char *target) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -2100,6 +2144,7 @@ static int browser_complete(const oc_model *m, oc_issuer *is, const char *sub, c
 static void test_browser_signin(int port) {
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    mbedtls_ssl_conf_sni(&srv.conf, daemon_sni_cb, NULL);   /* a daemon ignores the name; the test reads it */
     unlink("build/test_core_browser.db"); unlink("build/test_core_browser.db-wal");
     unlink("build/test_core_browser.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_browser.db");
@@ -2125,11 +2170,11 @@ static void test_browser_signin(int port) {
      * in — and this one takes no passwords. */
     {
         oc_signin_source src[8];
-        int n = oc_net_probe("127.0.0.1", arg.port, src, 8);
+        int n = oc_net_probe(NULL, "127.0.0.1", arg.port, src, 8);
         CHECK(n == 1);
         CHECK(n == 1 && src[0].kind == OC_SOURCE_RELAY && strcmp(src[0].id, "relay") == 0);
         CHECK(n == 1 && strcmp(src[0].label, "Continue in your browser") == 0);
-        CHECK(oc_net_probe("127.0.0.1", 1, src, 8) == OC_PROBE_UNREACHABLE);
+        CHECK(oc_net_probe(NULL, "127.0.0.1", 1, src, 8) == OC_PROBE_UNREACHABLE);
     }
 
     /* No password given: the core asks the daemon for the URL, hands it to the
@@ -2154,9 +2199,11 @@ static void test_browser_signin(int port) {
         mock_reset();
         oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
         char legacy[64]; snprintf(legacy, sizeof legacy, "127.0.0.1:%d", arg.port);
+        g_daemon_saw_sni[0] = '\0';
         oc_client *old = oc_client_start_secure("127.0.0.1", arg.port, "", "ignored", &sec);
         CHECK(old != NULL);
         CHECK(WAIT_FOR(old, m->signin_url[0] != '\0'));
+        CHECK(g_daemon_saw_sni[0] == '\0');                 /* an address is never named */
         CHECK(browser_complete(oc_client_model(old), &is, "https://accounts.google.com|dana", "b1k", DANA, NULL) == 0);
         CHECK(WAIT_FOR(old, m->authed));
         oc_client_stop(old);
@@ -2167,6 +2214,9 @@ static void test_browser_signin(int port) {
         CHECK(named != NULL);
         CHECK(WAIT_FOR(named, m->authed && m->user_id != 0));
         CHECK(oc_client_model(named)->signin_seq == 0);          /* the session, not the browser */
+        /* The handshake named the WORKSPACE, though the connection went to an address
+         * — which is what lets a shared front door find the workspace's daemon. */
+        CHECK(strcmp(g_daemon_saw_sni, "acme.openchime.test") == 0);
         oc_client_stop(named);
         CHECK(mock_len_of("acme.openchime.test") > 0);
         CHECK(mock_len_of(legacy) == 0);                          /* moved, not copied */
@@ -2240,6 +2290,7 @@ int run_client_core_tests(void) {
     test_resolve();
     test_last_error();
     test_workspace_key();
+    test_sni_name();
     test_store_adopt();
     test_secret_routing();
     test_store_no_persistence_without_keyring();
