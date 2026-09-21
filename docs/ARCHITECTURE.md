@@ -560,7 +560,8 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The invariant is checked, not remembered.** The automation surface (REQ-290)
   already publishes every element's rect; `chromefit` in the test dump counts
-  siblings that overlap and elements drawn entirely off their surface. A healthy
+  siblings that overlap, elements drawn entirely off their surface, and strings
+  whose glyphs do not fit the rect they were drawn into. A healthy
   layout is `0 0` at every scale, and the matrix that found these defects asserts
   it. Overlap is judged **within a layer**: a modal owns the tree outright, so
   the shell under a card is never published beside it, and a popup drawn over

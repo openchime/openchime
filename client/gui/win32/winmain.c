@@ -2774,7 +2774,34 @@ static rectf baseline_align(rectf anchor, const fmtw *af, const fmtw *of,
     return rf(l, anchor.top + dy, r, anchor.bottom + dy);
 }
 
-static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm) {
+/* CLIPPED TEXT, counted as it happens (chromefit's `clipped=`).
+ *
+ * The fit check compares published RECTANGLES, so a label whose box is the right
+ * size and in the right place but whose glyphs do not fit inside it reads as
+ * clean -- the Notifications card at 240 DPI had its section titles cut through
+ * the middle and reported `overlaps=0 outside=0`. Nothing in a tree of rects can
+ * see that; the only place it is knowable is here, where the ink and the rect it
+ * is being drawn into are both in hand.
+ *
+ * INK, not the line box. A line box is ascent + descent + leading, pinned per
+ * size token (ARCH-108), and legitimately overhangs a tight rect with nothing
+ * cut off -- measuring that would report every second label. The raster is the
+ * glyphs themselves.
+ *
+ * Against the text's OWN rect, not the clip in force. A row scrolled under the
+ * fold of a list is cut by the list's clip and is ordinary; the same comparison
+ * from the paint ledger cannot tell it from a defect, which is why that check
+ * reports horizontal cuts only (TESTING.md). A string measured against the box
+ * it was given has no such ambiguity in either axis: the box moving off screen
+ * changes nothing about whether the words fit inside it.
+ *
+ * A DIP of slack, because a raster edge and a rect edge that agree in DIPs can
+ * still land a fraction apart once scaled to device pixels. */
+static int   g_clip_n;            /* strings cut by their own rect, this frame */
+static char  g_clip_first[96];    /* ... and the first of them */
+static float g_clip_worst;        /* the deepest cut, DIPs */
+
+static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm, const char *s) {
     if (!e) return;
     float scale = gfx_scale(rt);
     float dw = e->pw / scale, dh = e->ph / scale;
@@ -2814,6 +2841,44 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm) {
     gfx_ink(rt, e->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
     gfx_clip_pop(rt);
+    /* `s` NULL exempts the string: a colour emoji's raster is not the ink it was
+     * asked for and its advance is not its ink -- a cell clips a few pixels of
+     * trailing advance and looks perfectly right doing it, forty times a picker
+     * (the same exemption the ledger's `content:emoji` tag makes). */
+    /* `s` NULL exempts the string: a colour emoji's raster is not the ink it was
+     * asked for and its advance is not its ink -- a cell clips a few pixels of
+     * trailing advance and looks perfectly right doing it, forty times a picker
+     * (the same exemption the ledger's `content:emoji` tag makes). */
+    if (s && s[0] && g_test_dir[0]) {
+        /* WHOLE LINES, from the layout metrics -- not the raster against the
+         * rect. The raster is the line box, ascent + descent + leading pinned per
+         * size token (ARCH-108), and it overhangs a tight row by a DIP or two
+         * with nothing cut off: measuring that reports every second label in the
+         * client. A line that does not fit is not a rounding question.
+         *
+         * `line_h` is that pinned box, so `mh` divides by it exactly; a third of
+         * a line of slack absorbs the last line's overhang and nothing wider. */
+        float rh = r.bottom - r.top, lh = fm->line_h;
+        int cut = 0;
+        if (lh > 0.5f) {
+            int have = (int)((rh + lh / 3.0f) / lh);
+            int want = (int)((e->mh + lh / 3.0f) / lh);
+            if (have < 1) have = 1;
+            if (want > have) cut = want - have;
+        }
+        /* HORIZONTALLY only where nothing trims. A format that does not wrap is
+         * given DirectWrite's ellipsis (mk_fmt_s), so running out of room ends in
+         * a "…" -- legible, deliberate, and a question of layout style rather
+         * than a defect. A WRAPPING format has no trimming to fall back on, so a
+         * word longer than its column is cut mid-glyph and nothing says so. */
+        float over_w = fm->wrap ? e->mw - (r.right - r.left) : 0;
+        if (cut || over_w > 1.0f) {
+            g_clip_n++;
+            float deep = cut ? cut * lh : over_w;
+            if (deep > g_clip_worst) g_clip_worst = deep;
+            if (!g_clip_first[0]) snprintf(g_clip_first, sizeof g_clip_first, "%s", s);
+        }
+    }
 }
 
 /* Width of `s` in `fmt`, for placing something immediately after it. */
@@ -2896,7 +2961,7 @@ static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
      * perfectly correct doing it, which the truncation check would otherwise
      * report once per cell, forty times a picker. */
     gfx_tag(rt, "content:emoji");
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt, NULL);
     gfx_tag(rt, NULL);
 }
 static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
@@ -2906,7 +2971,7 @@ static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
 static void draw_text(gfx *rt, const char *s, fmtw *fmt,
                       rectf r, uint32_t rgb) {
     if (!fmt) return;
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt, s);
 }
 
 /* Like draw_text, but tints every occurrence of a whitespace-separated term from
@@ -15181,6 +15246,9 @@ static void paint(HWND hwnd) {
      * transcript above it, the popovers anchored to it. */
     if (main_is_conversation()) composer_refit(hwnd);
     gfx_begin(rt, OC_COL_BASE);
+    /* The frame owns the tally: it is a fact about what was just drawn, and the
+     * dump that reports it runs long after the frame ended. */
+    g_clip_n = 0; g_clip_worst = 0; g_clip_first[0] = 0;
     g_caret_placed = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
@@ -25295,8 +25363,10 @@ static void test_dump(const char *path) {
                         snprintf(first_dup, sizeof first_dup, "%s", g_acc_items[i].aid);
                     break;
                 }
-        fprintf(f, "chromefit overlaps=%d outside=%d dup=%d n=%d ov=\"%s\" out=\"%s\" dupid=\"%s\"\n",
-                overlaps, outside, dup, g_a11y_n, first_ov, first_out, first_dup);
+        fprintf(f, "chromefit overlaps=%d outside=%d dup=%d clipped=%d n=%d "
+                   "ov=\"%s\" out=\"%s\" dupid=\"%s\" clip=\"%s\" clippx=%.0f\n",
+                overlaps, outside, dup, g_clip_n, g_a11y_n,
+                first_ov, first_out, first_dup, g_clip_first, g_clip_worst);
         /* THE TREE ITSELF, one line per element, so a check outside the client
          * can ask questions this loop cannot. The one it exists for: does
          * anything actually get DRAWN inside each of these rects? An element
