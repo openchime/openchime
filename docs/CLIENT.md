@@ -675,6 +675,23 @@ and the frame copies its values on open, so `Save` commits and `Cancel`/`✕`/`E
 put them back — all three meaning the same thing. Live-apply makes Cancel a lie:
 it either does nothing, or has to undo changes nobody recorded.
 
+**Dialogs stack.** A dialog opened from another returns to it when it closes,
+whichever way it closes — Remove in Workspaces asks its question and the list is
+still there afterwards, a row shorter and scrolled where it was, so several can
+go in a row. `modal_enter()` remembers the opener's flag and `modal_finish()`
+hands it back without re-taking its snapshot: the dialog on top was a detour, not
+a second opening. Only the list dialogs are resumable; a form, the status card
+and the schedule card hold half-typed input that is collected as they close.
+Leaving is not closing: anything that calls `close_overlays()` — switching
+workspace, signing out — empties the stack, so removing the workspace you are in
+does not hand the dialog back on top of the sign-in.
+
+**The Workspaces list scrolls** between a fixed header and footer, on the shared
+overlay offset the wheel already drives for a modal. The arrows, Page Up/Down,
+Home and End move a row focus the paint keeps in view, and Delete asks to remove
+that row. A row's buttons are published as `wsmgr.<remove|signout|go>.<address>`,
+clipped to the list, and a hit-box scrolled under the footer takes no click.
+
 Not every modal is a form. Workspaces performs immediate irreversible actions and
 Shortcuts is a reference sheet, so neither snapshots and both carry one dismissing
 button. Where the setting lives on the SERVER — per-channel notification levels —

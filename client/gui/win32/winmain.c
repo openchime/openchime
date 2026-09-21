@@ -1854,6 +1854,12 @@ static int   g_n_pal_rows;
 static int g_wsmgr_open;
 static struct { rectf r; int row, act; } g_wsmgr_hits[48];
 static int g_n_wsmgr_hits;
+/* The list scrolls (shared overlay offset, OVL_WSMGR), so a hit-box can sit under
+ * the footer or above the header: a click counts only inside this rect. */
+static rectf g_wsmgr_list;
+/* The row the keyboard is on, -1 before any key. `reveal` asks the next paint to
+ * scroll it into view -- the geometry only exists there. */
+static int g_wsmgr_focus = -1, g_wsmgr_reveal;
 enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
 
 /* Notification-prefs review + the shortcut sheet. */
@@ -3164,8 +3170,29 @@ static int already_backfilled(uint64_t cid) {
 
 static void profile_close(void);   /* fwd: the pane and its user id change together */
 
+/* DIALOGS STACK. A dialog opened from another one returns to it when it closes,
+ * whichever way it closes: Remove in the Workspaces dialog asks its question and
+ * then the list is still there, one workspace shorter, where it was scrolled to,
+ * so the next one can go too. It used to drop to the shell, and each removal was
+ * a trip back through the menu.
+ *
+ * What is remembered is the opener's FLAG, and only for the dialogs that are
+ * nothing but their flag -- the lists. A form, the status card and the schedule
+ * card hold half-typed input in native controls that are collected when they
+ * close, so they are not something that can be set aside and resumed, and they
+ * are never pushed.
+ *
+ * Leaving is not closing. Anything that calls close_overlays() is going somewhere
+ * else -- switching workspace, signing out, opening a conversation -- and empties
+ * the stack, so a dialog is never handed back on top of a place it was not
+ * opened from. modal_enter() is the one caller that is not leaving. */
+static int *g_modal_stack[4];
+static int  g_n_modal_stack;
+static int  g_modal_entering;
+
 static void close_overlays(void) {
     const oc_model *mm = model();
+    if (!g_modal_entering) g_n_modal_stack = 0;
     g_prefs_open = 0;
     g_browse_open = 0;
     g_sessions_open = 0;
@@ -5825,7 +5852,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -8418,11 +8445,32 @@ static void sw_book_load(void);       /* fwd */
 static void draw_wsmgr(gfx *rt, rectf reg) {
     rectf body = reg;   /* the frame drew the title bar (modal_frame) */
     g_n_wsmgr_hits = 0;
-    float y = body.top + UIS(34), rowh = UIS(54);
+    float rowh = UIS(54);
+    /* THE LIST SCROLLS, between a header and a footer that do not. It used to draw
+     * from the top until it ran out of card: the row at the fold was cut by the
+     * footer and everything after it could not be reached by any means. The
+     * shared overlay offset is what the wheel already drives for a modal, and it
+     * belongs to this list until another one claims it -- a confirmation does
+     * not, which is what keeps the position across Remove. */
+    rectf list = rf(body.left, body.top + UIS(28), body.right, body.bottom);
+    if (list.bottom < list.top) list.bottom = list.top;
+    g_wsmgr_list = list;
+    if (g_wsmgr_focus >= g_n_sw) g_wsmgr_focus = g_n_sw - 1;
+    ovl_use(OVL_WSMGR);
+    if (g_wsmgr_reveal && g_wsmgr_focus >= 0) {
+        float top = 6 + (float)g_wsmgr_focus * rowh, visible = list.bottom - list.top;
+        if (top - 6 < g_ovl_scroll)                 g_ovl_scroll = top - 6;
+        if (top + rowh + 6 > g_ovl_scroll + visible) g_ovl_scroll = top + rowh + 6 - visible;
+    }
+    g_wsmgr_reveal = 0;
+    float y = ovl_begin(rt, list, (float)g_n_sw * rowh + 12);
 
     for (int i = 0; i < g_n_sw; i++) {
         int slot = ws_find(g_sw[i].ws);
         int live = (slot >= 0 && g_wss[slot].client);
+        if (i == g_wsmgr_focus)
+            fill_round(rt, rf(body.left + 12, y + 2, body.right - 16, y + rowh - 3),
+                       OC_R_CONTROL, OC_COL_HOVER);
         draw_text(rt, g_sw[i].label, g_ui_b, rf(body.left + 24, y, body.left + 300, y + 22), OC_COL_TEXT);
         /* State on the sub-line rather than its own column: as a column it
          * collided with the buttons whenever the pane was narrow. */
@@ -8454,7 +8502,7 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
             g_meta->align = ST_ALIGN_CENTER;
             draw_text(rt, B[k].lbl, g_meta, b, B[k].col);
             g_meta->align = ST_ALIGN_LEFT;
-            if (g_n_wsmgr_hits < 48) {
+            if (g_n_wsmgr_hits < (int)(sizeof g_wsmgr_hits / sizeof g_wsmgr_hits[0])) {
                 g_wsmgr_hits[g_n_wsmgr_hits].r = b;
                 g_wsmgr_hits[g_n_wsmgr_hits].row = i;
                 g_wsmgr_hits[g_n_wsmgr_hits].act = B[k].act;
@@ -8465,6 +8513,7 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
         fill(rt, rf(body.left + 24, y + rowh - 1, body.right - 24, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
+    ovl_end(rt, list);
     if (g_n_sw == 0) overlay_empty(rt, body, "No workspaces remembered on this device.");
 }
 
@@ -12087,7 +12136,17 @@ static void modal_enter(HWND hwnd, int *flag) {
      * profile is opened FROM your own card, and saving it should leave that card
      * showing -- updated -- not close it underneath you. */
     uint64_t kept_profile = g_rp_mode == RP_PROFILE ? g_profile_uid : 0;
+    /* The dialog this one is being opened from, if it is one that can be resumed
+     * (g_modal_stack). Read before close_overlays() clears it. */
+    int *opener = g_prefs_open ? &g_prefs_open : g_keys_open ? &g_keys_open :
+                  g_wsmgr_open ? &g_wsmgr_open : g_notify_open ? &g_notify_open :
+                  g_browse_open ? &g_browse_open : g_sessions_open ? &g_sessions_open : NULL;
+    if (opener == flag) opener = NULL;
+    g_modal_entering = 1;
     close_overlays();
+    g_modal_entering = 0;
+    if (opener && g_n_modal_stack < (int)(sizeof g_modal_stack / sizeof g_modal_stack[0]))
+        g_modal_stack[g_n_modal_stack++] = opener;
     if (kept_profile) { g_profile_uid = kept_profile; rp_push(RP_PROFILE); }
     /* The transient overlays too, and this was a real bug rather than tidiness:
      * the command palette and the emoji picker each claim EVERY click while open
@@ -12134,6 +12193,16 @@ static void modal_finish(int save) {
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
+    /* Back to the dialog this one was opened from (g_modal_stack). Its snapshot
+     * is the one taken when IT opened and is left alone: the dialog on top was a
+     * detour, not a second opening. The action above may have left instead --
+     * removing the workspace you are in signs you out -- and then the stack is
+     * already empty. */
+    if (g_n_modal_stack > 0) {
+        int *back = g_modal_stack[--g_n_modal_stack];
+        *back = 1;
+        if (back == &g_wsmgr_open) sw_book_load();
+    }
 }
 
 /* Clicks the FRAME owns, tested before any modal's own content. Returns 1 when it
@@ -16820,6 +16889,7 @@ enum {
     AT_THREAD,        /* payload: thread root id — open it */
     AT_PEOPLE,        /* payload: user id — open the profile */
     AT_MODALBTN,      /* payload: modal button index */
+    AT_WSMGR,         /* payload: Workspaces dialog hit-box index */
     AT_FMT,           /* payload: formatting-toolbar button index */
     AT_EMOJI,         /* the composer's emoji picker */
     AT_MENTION,       /* insert the @ trigger, as typing it does */
@@ -17322,6 +17392,24 @@ modal_items:
             snprintf(aid, sizeof aid, "modal.button.%s", low);
             acc_push(items, &n, OC_ACC_BUTTON, aid, g_modal_btns[i].label,
                      g_modal_btns[i].r, ATOK(AT_MODALBTN, i));
+        }
+        /* The Workspaces dialog's row buttons, named for the workspace rather
+         * than the row, and only the part of each the list actually shows: one
+         * scrolled under the footer is not on screen and is not published. */
+        for (int i = 0; g_wsmgr_open && i < g_n_wsmgr_hits && n < OC_ACC_MAX; i++) {
+            int row = g_wsmgr_hits[i].row, act = g_wsmgr_hits[i].act;
+            rectf b = g_wsmgr_hits[i].r;
+            if (row < 0 || row >= g_n_sw) continue;
+            if (b.top < g_wsmgr_list.top)       b.top = g_wsmgr_list.top;
+            if (b.bottom > g_wsmgr_list.bottom) b.bottom = g_wsmgr_list.bottom;
+            char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+            const char *verb = act == WSM_FORGET ? "Remove" : act == WSM_SIGNOUT ? "Sign out of" :
+                               "Open";
+            snprintf(aid, sizeof aid, "wsmgr.%s.%s",
+                     act == WSM_FORGET ? "remove" : act == WSM_SIGNOUT ? "signout" : "go",
+                     g_sw[row].ws);
+            snprintf(nm, sizeof nm, "%s %s", verb, g_sw[row].label);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, nm, b, ATOK(AT_WSMGR, i));
         }
         /* The status dialog publishes its content, which is what lets
          * chromefit PROVE the card fits — the defect this dialog had was a
@@ -20131,6 +20219,80 @@ static void menu_run_kind(HWND hwnd, int kind, int cmd) {
 }
 
 static int call_click(HWND hwnd, int x, int y);   /* fwd: the call's controls */
+/* Ask before removing row `row` of the Workspaces dialog. One place, because the
+ * button and the Delete key both end here. */
+static void wsmgr_ask_forget(HWND hwnd, int row) {
+    if (row < 0 || row >= g_n_sw) return;
+    int slot = ws_find(g_sw[row].ws);
+    int live = (slot >= 0 && g_wss[slot].client);
+    char line[400];
+    snprintf(line, sizeof line,
+             "Remove %s from this device?\n\n"
+             "Its saved sign-in is deleted. You can add it again by entering "
+             "its address.%s",
+             g_sw[row].label[0] ? g_sw[row].label : g_sw[row].ws,
+             live ? "\n\nYou are currently signed in; this signs you out first." : "");
+    /* The workspace address travels with the confirmation, because the
+     * list can be reloaded between asking and answering — a row INDEX
+     * would then remove a different workspace. */
+    snprintf(g_confirm_ws, sizeof g_confirm_ws, "%s", g_sw[row].ws);
+    confirm_open(hwnd, CONF_WS_FORGET, 0, "Remove workspace?", line, "Remove");
+}
+
+/* One row's button, pressed -- by a click or by an invoke through the tree. */
+static void wsmgr_act(HWND hwnd, int row, int act) {
+    if (row < 0 || row >= g_n_sw) return;
+    g_wsmgr_focus = row;
+    char ws[256], user[80];
+    snprintf(ws, sizeof ws, "%s", g_sw[row].ws);
+    snprintf(user, sizeof user, "%s", g_sw[row].user);
+    int slot = ws_find(ws);
+    int live = (slot >= 0 && g_wss[slot].client);
+    switch (act) {
+    case WSM_GO:
+        if (live) { close_overlays(); switch_workspace(hwnd, ws, ""); }
+        else        signin_begin_known(hwnd, ws, user);
+        break;
+    case WSM_SIGNOUT:
+        /* Route through the normal sign-out so the server revokes the
+         * session — a local drop would leave it valid elsewhere. */
+        close_overlays();
+        oc_client_logout(g_client, OC_LOGOUT_THIS);
+        g_logging_out = 1;
+        break;
+    case WSM_FORGET: wsmgr_ask_forget(hwnd, row); break;
+    }
+}
+
+/* The Workspaces dialog's keys: the arrows, Page Up/Down, Home and End move a row
+ * focus that the paint keeps in view, and Delete asks to remove that row. Enter
+ * and Esc stay the frame's. Returns 1 when the key was the list's. */
+static int wsmgr_key(HWND hwnd, WPARAM vk) {
+    if (!g_wsmgr_open || g_n_sw <= 0) return 0;
+    float rowh = UIS(54), visible = g_wsmgr_list.bottom - g_wsmgr_list.top;
+    int page = rowh > 0 ? (int)(visible / rowh) : 1;
+    if (page < 1) page = 1;
+    int at = g_wsmgr_focus;
+    switch (vk) {
+    case VK_DOWN:  at = at < 0 ? 0 : at + 1; break;
+    case VK_UP:    at = at < 0 ? 0 : at - 1; break;
+    case VK_NEXT:  at = at < 0 ? 0 : at + page; break;
+    case VK_PRIOR: at = at < 0 ? 0 : at - page; break;
+    case VK_HOME:  at = 0; break;
+    case VK_END:   at = g_n_sw - 1; break;
+    case VK_DELETE:
+        if (at < 0) return 0;
+        wsmgr_ask_forget(hwnd, at);
+        return 1;
+    default: return 0;
+    }
+    if (at < 0) at = 0;
+    if (at >= g_n_sw) at = g_n_sw - 1;
+    g_wsmgr_focus = at;
+    g_wsmgr_reveal = 1;
+    return 1;
+}
+
 static int on_click(HWND hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* A modal owns the window while it is up: a click outside the card dismisses
@@ -20494,44 +20656,10 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     if (g_wsmgr_open) {
         for (int i = 0; i < g_n_wsmgr_hits; i++) {
-            if (!in_rect(g_wsmgr_hits[i].r, x, y)) continue;
-            int row = g_wsmgr_hits[i].row;
-            if (row < 0 || row >= g_n_sw) return 1;
-            char ws[256], label[80], user[80];
-            snprintf(ws, sizeof ws, "%s", g_sw[row].ws);
-            snprintf(label, sizeof label, "%s", g_sw[row].label);
-            snprintf(user, sizeof user, "%s", g_sw[row].user);
-            int slot = ws_find(ws);
-            int live = (slot >= 0 && g_wss[slot].client);
-            switch (g_wsmgr_hits[i].act) {
-            case WSM_GO:
-                if (live) { close_overlays(); switch_workspace(hwnd, ws, ""); }
-                else        signin_begin_known(hwnd, ws, user);
-                break;
-            case WSM_SIGNOUT:
-                /* Route through the normal sign-out so the server revokes the
-                 * session — a local drop would leave it valid elsewhere. */
-                close_overlays();
-                oc_client_logout(g_client, OC_LOGOUT_THIS);
-                g_logging_out = 1;
-                break;
-            case WSM_FORGET: {
-                WCHAR w[400]; char line[400];
-                snprintf(line, sizeof line,
-                         "Remove %s from this device?\n\n"
-                         "Its saved sign-in is deleted. You can add it again by entering "
-                         "its address.%s",
-                         label[0] ? label : ws,
-                         live ? "\n\nYou are currently signed in; this signs you out first." : "");
-                (void)w;
-                /* The workspace address travels with the confirmation, because the
-                 * list can be reloaded between asking and answering — a row INDEX
-                 * would then remove a different workspace. */
-                snprintf(g_confirm_ws, sizeof g_confirm_ws, "%s", ws);
-                confirm_open(hwnd, CONF_WS_FORGET, 0, "Remove workspace?", line, "Remove");
-                break;
-            }
-            }
+            /* Inside the LIST as well as inside the button: a row scrolled under
+             * the footer still has a hit-box, and it is not there to be clicked. */
+            if (!in_rect(g_wsmgr_list, x, y) || !in_rect(g_wsmgr_hits[i].r, x, y)) continue;
+            wsmgr_act(hwnd, g_wsmgr_hits[i].row, g_wsmgr_hits[i].act);
             return 1;
         }
         return 1;
@@ -24103,7 +24231,11 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             sidebar_opts_save();
         break; }
     case 80: signin_begin_add(hwnd); break;
-    case 81: sw_book_load(); modal_enter(hwnd, &g_wsmgr_open); break;
+    case 81:
+        /* A fresh opening starts at the top with no row chosen; coming BACK to it
+         * from a confirmation keeps both (modal_finish). */
+        sw_book_load(); g_wsmgr_focus = -1; g_ovl_kind = 0;
+        modal_enter(hwnd, &g_wsmgr_open); break;
     default:
         /* Section Filter/Sort (see SEC_CMD). */
         /* The range covers the custom sections too (numbered from
@@ -25867,6 +25999,19 @@ static void test_poll(HWND hwnd) {
         ws_forget(arg);
         sw_book_load();
         test_ack("ok");
+    } else if (!strcmp(verb, "wsbook")) {
+        /* "<workspace> <user>" — a book entry with no sign-in behind it, so the
+         * Workspaces dialog can be given more rows than fit. */
+        char ws[256] = "", user[80] = "";
+        sscanf(arg, "%255s %79s", ws, user);
+        const char *sp = store_path();
+        oc_store *st = (sp && ws[0]) ? oc_store_open(sp) : NULL;
+        if (st) {
+            oc_store_set_secret(st, g_secret);
+            oc_store_workspace_remember(st, ws, NULL, user, (uint64_t)time(NULL) * 1000);
+            oc_store_close(st);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "wsgo")) {
         test_ack(ws_go(hwnd, atoi(arg)) ? "ok" : "err");
     } else if (!strcmp(verb, "toast")) {
@@ -27360,6 +27505,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * worked in every interactive session I tried and failed in the suite,
          * which is the difference between the two. */
         if (modal_open()) {
+            /* A confirmation has nothing to scroll, and the offset it would move
+             * is the list's underneath it -- the one it is about to hand back. */
+            if (g_confirm_open) return 0;
             g_ovl_scroll -= dy;
             if (g_ovl_scroll < 0) g_ovl_scroll = 0;
             if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
@@ -27821,6 +27969,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* Esc and Enter both go to modal_key, so cancel-vs-commit is decided in
          * one place rather than by whichever handler saw the key first. */
+        if (wsmgr_key(hwnd, wp)) { InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (modal_open() && (wp == VK_ESCAPE || wp == VK_RETURN) && modal_key(hwnd, wp)) {
             InvalidateRect(hwnd, NULL, FALSE); return 0;
         }
@@ -27964,6 +28113,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (cmd == MODAL_CANCEL) modal_finish(0);
                 else                          menu_dispatch(hwnd, cmd);
             }
+            break;
+        case AT_WSMGR:
+            if (g_wsmgr_open && (int)arg < g_n_wsmgr_hits)
+                wsmgr_act(hwnd, g_wsmgr_hits[arg].row, g_wsmgr_hits[arg].act);
             break;
         case AT_FMT:       ed_format((int)arg); break;
         case AT_EMOJI:     picker_open(hwnd, 0); break;
