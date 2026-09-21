@@ -1829,6 +1829,7 @@ static void test_reason_codes_unique(void) {
         { "AUTH_REQUIRED",          OC_ERR_AUTH_REQUIRED },
         { "AUTH_RATE_LIMITED",      OC_ERR_AUTH_RATE_LIMITED },
         { "USER_LIMIT",             OC_ERR_USER_LIMIT },
+        { "AUTH_NOT_ALLOWED",       OC_ERR_AUTH_NOT_ALLOWED },
         { "UNKNOWN_CHANNEL",        OC_ERR_UNKNOWN_CHANNEL },
         { "NOT_A_MEMBER",           OC_ERR_NOT_A_MEMBER },
         { "BODY_TOO_LARGE",         OC_ERR_BODY_TOO_LARGE },

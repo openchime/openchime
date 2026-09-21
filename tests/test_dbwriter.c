@@ -759,6 +759,8 @@ static void test_oidc_auth(void) {
                                      "authorize=https://auth.openchime.io/authorize") == 0);
     CHECK(oc_dbwriter_auth_methods(w) == (OC_AUTH_OIDC | OC_AUTH_SESSION));
     CHECK(strlen(oc_dbwriter_oidc_params(w)) > 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
 
     char HDR[160];
     oc_issuer_header(&is, HDR, sizeof HDR);
@@ -766,7 +768,8 @@ static void test_oidc_auth(void) {
     unsigned long long now = (unsigned long long)time(NULL);
     char payload[1024];
     oc_issuer_payload(payload, sizeof payload, ISS, AUD, "google|42", "jti-first", now - 5, now + 290,
-                      "\"email\":\"a@acme.example\",\"name\":\"A\"");
+                      "\"email\":\"a@acme.example\",\"name\":\"A\","
+                      "\"idp\":\"google\",\"tenant\":\"acme.example\"");
     char token[4096];
     size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
 
@@ -837,6 +840,106 @@ static void test_oidc_auth(void) {
     /* Local auth is refused in OIDC mode (one mode per tenant). */
     CHECK(auth_local(w, 24, "someone", "pw", NULL, NULL) == 0);
 
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* One relay sign-in: mints a contract-shaped token and presents it. Returns the
+ * user id (0 on refusal), with the role and the error code alongside. */
+static uint64_t oidc_signin(oc_dbwriter *w, oc_issuer *is, uint64_t conn, const char *sub,
+                            const char *jti, const char *extra, uint8_t *role, int *err) {
+    char hdr[160], payload[1024], token[4096];
+    unsigned long long now = (unsigned long long)time(NULL);
+    oc_issuer_header(is, hdr, sizeof hdr);
+    oc_issuer_payload(payload, sizeof payload, "https://auth.openchime.io", "acme.example",
+                      sub, jti, now - 5, now + 290, extra);
+    size_t tlen = oc_issuer_mint(is, hdr, payload, token);
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn);
+    j->method = OC_AUTH_OIDC;
+    oc_job_set_token(j, token, tlen);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t uid = 0;
+    if (role) *role = 0xFF;
+    if (err) *err = 0;
+    if (r && r->type == OC_RES_AUTH_OK) { uid = r->user_id; if (role) *role = r->role; }
+    else if (r && err) *err = r->err_code;
+    oc_dbres_free(r);
+    return uid;
+}
+
+/* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
+ * new identity, the owner rule creates an owner and restores one. */
+static void test_oidc_join_rules(void) {
+    const char *path = "build/test_dbwriter_join.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-join") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+
+    uint8_t role; int err;
+    const char *DANA = "\"email\":\"dana@acme.example\",\"email_verified\":true,\"name\":\"Dana\",\"idp\":\"google\"";
+    const char *DANA_UNVERIFIED = "\"email\":\"dana@acme.example\",\"email_verified\":false,\"idp\":\"google\"";
+    const char *PAT = "\"email\":\"pat@acme.example\",\"email_verified\":true,\"idp\":\"google\",\"tenant\":\"acme.example\"";
+    const char *STRANGER = "\"email\":\"s@elsewhere.example\",\"email_verified\":true,\"idp\":\"google\"";
+
+    /* No rules configured: a perfectly valid token joins nothing. */
+    CHECK(oidc_signin(w, &is, 30, "g|dana", "j1", DANA, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);
+
+    /* A rule the parser does not understand is refused, and leaves the old rules. */
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "everyone", why, sizeof why) == -1);
+    CHECK(oc_dbwriter_configure_join_rules(w, "owner:dana@acme.example,tenant:google:acme.example",
+                                           why, sizeof why) == 0);
+
+    /* Somebody else claiming the owner's address without the provider's word for it. */
+    CHECK(oidc_signin(w, &is, 31, "g|mallory", "j2", DANA_UNVERIFIED, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);
+
+    /* The named first person is created as the owner. */
+    uint64_t dana = oidc_signin(w, &is, 32, "g|dana", "j3", DANA, &role, &err);
+    CHECK(dana != 0 && role == OC_ROLE_OWNER);
+
+    /* The organization's people join as members; a stranger does not. */
+    uint64_t pat = oidc_signin(w, &is, 33, "g|pat", "j4", PAT, &role, &err);
+    CHECK(pat != 0 && pat != dana && role == OC_ROLE_MEMBER);
+    CHECK(oidc_signin(w, &is, 34, "g|stranger", "j5", STRANGER, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);
+
+    /* A known identity signs in without consulting the rules... */
+    CHECK(oc_dbwriter_configure_join_rules(w, "", why, sizeof why) == 0);
+    CHECK(oidc_signin(w, &is, 35, "g|pat", "j6", PAT, &role, &err) == pat);
+    CHECK(role == OC_ROLE_MEMBER);
+    /* ...and a later sign-in does not take back the name a person chose. */
+    CHECK(oidc_signin(w, &is, 36, "g|dana", "j7",
+                      "\"email\":\"dana@acme.example\",\"email_verified\":true,\"name\":\"Somebody Else\"",
+                      &role, &err) == dana);
+    CHECK(role == OC_ROLE_OWNER);
+
+    /* The owner rule does nothing for a known member while the workspace has an owner. */
+    CHECK(oc_dbwriter_configure_join_rules(w, "owner:pat@acme.example", why, sizeof why) == 0);
+    CHECK(oidc_signin(w, &is, 37, "g|pat", "j8", PAT, &role, &err) == pat);
+    CHECK(role == OC_ROLE_MEMBER);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+
+    /* ...and is the way back for a workspace that has none: a member already here,
+     * named by the rule, becomes the owner at their next sign-in. */
+    w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    CHECK(oc_issuer_init(&is, "oc-dbw-join-2") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+    pat = oidc_signin(w, &is, 40, "g|pat", "k1", PAT, &role, &err);
+    CHECK(pat != 0 && role == OC_ROLE_MEMBER);
+    CHECK(oc_dbwriter_configure_join_rules(w, "owner:pat@acme.example", why, sizeof why) == 0);
+    CHECK(oidc_signin(w, &is, 41, "g|pat", "k2", PAT, &role, &err) == pat);
+    CHECK(role == OC_ROLE_OWNER);
     oc_issuer_free(&is);
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -5276,6 +5379,7 @@ int run_dbwriter_tests(void) {
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
+    test_oidc_join_rules();
     test_auth_rate_limit();
     test_source_rate_limit();
     test_logout();

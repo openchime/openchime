@@ -60,7 +60,7 @@ typedef struct {
 
     /* Auth. */
     const char *auth_mode;          /* "local" | "oidc" */
-    struct { const char *issuer, *audience, *pubkey, *params; } oidc;  /* pubkey resolved */
+    struct { const char *issuer, *audience, *pubkey, *params, *allow; } oidc;  /* pubkey resolved */
     const char *bootstrap_users;
 
     /* Federated enrollment (CP-8). */

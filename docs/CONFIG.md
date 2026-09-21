@@ -52,6 +52,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_OIDC_AUDIENCE` *(alias)* | *(none)* | Expected `aud`. Normally left unset — the enrolled audience from the `enrollment` table wins (ARCH-84). |
 | `OPENCHIME_OIDC_PUBKEY` *(alias)* | *(none)* | Central's pinned ES256 public keys, inline PEM — one block, or several during a rotation; a token's `kid` chooses among them. |
 | `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | The same, read from a file. **The only file the config loader reads.** |
+| `OPENCHIME_OIDC_ALLOW` | *(none)* | Who may join by OIDC: a comma-separated list of `owner:<email>`, `tenant:google:<hosted domain>`, `tenant:microsoft:<tenant id>` and `domain:<domain>` rules (AUTH.md §8.4). Empty admits nobody new; a rule the daemon does not understand stops the boot. |
 | `OPENCHIME_OIDC_PARAMS` *(alias)* | *(empty)* | Extra parameters advertised to the client in `AUTH_CHALLENGE`. |
 
 ## Attachments and blob storage
