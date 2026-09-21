@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Migrations.** The daemon applies migrations 0001–0044 (`daemon/migrate.c`,
+**Migrations.** The daemon applies migrations 0001–0045 (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -1138,6 +1138,13 @@ A sign-in updates this row only: `users.display_name` and `users.email` are set
 at a person's first sign-in and are theirs afterwards. The migration files
 existing accounts from `users.subject` (`oidc:<central issuer>|<issuer>|<subject>`);
 an account whose string has no second bar gets its row at its next sign-in.
+
+## 3aj. Migration 0045 — invites bound to an address (AUTH.md §8.4)
+
+`invites.email` (TEXT, NULL, lowercased). NULL is a bearer invite, redeemed for a
+local account. Set, the invite names who may join where a provider signs people
+in: it is spent by that address's first verified sign-in, which takes the role the
+invite names, and `REDEEM_INVITE` never matches it.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

@@ -56,7 +56,7 @@ struct oc_dbwriter {
     char           *oidc_issuer;
     char           *oidc_audience;
     char           *oidc_pubkey_pem;
-    char           *oidc_params;             /* advertised blob ("" if none) */
+    char           *relay_origin;            /* where the relay is ("" if nowhere) */
     struct oc_seen_jti *seen_jti;            /* relay tokens already used (AUTH.md §8.2) */
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
@@ -177,6 +177,23 @@ int oc_job_set_token(oc_job *j, const void *tok, size_t len) {
     return 0;
 }
 
+int oc_job_set_proof(oc_job *j, const void *proof, size_t len) {
+    j->proof = malloc(len + 1);
+    if (!j->proof) return -1;
+    memcpy(j->proof, proof, len);
+    j->proof[len] = '\0';
+    j->proof_len = len;
+    return 0;
+}
+
+int oc_job_set_email(oc_job *j, const void *email, size_t len) {
+    j->email = malloc(len + 1);
+    if (!j->email) return -1;
+    memcpy(j->email, email, len);
+    j->email[len] = '\0';
+    return 0;
+}
+
 int oc_job_set_register(oc_job *j, const char *username, const char *password,
                         uint8_t role, uint32_t iterations) {
     j->username = username ? strdup(username) : NULL;
@@ -198,6 +215,8 @@ int oc_job_set_body(oc_job *j, const void *body, size_t len) {
 static void job_free(oc_job *j) {
     if (!j) return;
     free(j->token);
+    free(j->proof);
+    free(j->email);
     free(j->sq_from);
     free(j->sq_in);
     free(j->username);
@@ -891,6 +910,36 @@ static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
     return r;
 }
 
+/* An unconsumed, unexpired invite bound to `email` (AUTH.md §8.4). 1 and the
+ * role it grants, or 0. The newest wins when an address was invited twice. */
+static int invite_for_email(sqlite3 *db, const char *email, uint8_t *role) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT role FROM invites WHERE email = lower(?1) AND consumed_at_ms IS NULL "
+        "AND expires_at_ms > ?2 ORDER BY expires_at_ms DESC LIMIT 1;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, email, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *role = role_to_u8((const char *)sqlite3_column_text(st, 0));
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Every open invite for the address is spent at once: the person has joined. */
+static void consume_email_invite(sqlite3 *db, const char *email) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "UPDATE invites SET consumed_at_ms=?2 WHERE email = lower(?1) AND consumed_at_ms IS NULL;",
+        -1, &st, NULL);
+    sqlite3_bind_text(st, 1, email, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 static const char *jwt_reason(oc_jwt_result jr) {
     switch (jr) {
     case OC_JWT_E_ALG:       return "alg";
@@ -992,6 +1041,13 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
             snprintf(reason, sizeof reason, "source=relay reason=%s", jwt_reason(jr));
             return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL, reason);
         }
+        /* Proof of possession (AUTH.md §8.2): the token is good only in the hands
+         * of the client that asked for it, which kept the verifier its nonce is
+         * the hash of. */
+        if (!oc_jwt_nonce_matches(claims.nonce, (const uint8_t *)j->proof, j->proof_len)) {
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", claims.email,
+                               "source=relay reason=verifier");
+        }
         /* Single use, claimed only once everything else about the token is good, so
          * a token that fails for another reason does not burn its id. */
         if (!w->seen_jti ||
@@ -1018,6 +1074,13 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         uid = identity_user(db, issuer, person);
         if (!uid) uid = user_by_subject(db, subject);
         int known = uid != 0;
+        /* An invite bound to this verified address admits it where no rule does,
+         * and says what role it joins with. */
+        uint8_t invited_role = OC_ROLE_MEMBER;
+        int invited = 0;
+        if (!known && verdict == OC_JOIN_DENY && claims.email_verified && claims.email[0])
+            invited = invite_for_email(db, claims.email, &invited_role);
+        if (invited) verdict = OC_JOIN_MEMBER;
         if (!known && verdict == OC_JOIN_DENY) {
             char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
             snprintf(detail, sizeof detail, "source=relay idp=%s tenant=%s", claims.idp, claims.tenant);
@@ -1031,6 +1094,10 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         }
         if (!known) uid = create_oidc_user(db, subject, claims.email, claims.name);
         if (uid) identity_touch(db, uid, issuer, person, &claims);
+        if (uid && invited) {
+            consume_email_invite(db, claims.email);
+            if (invited_role != OC_ROLE_MEMBER) set_role(db, uid, invited_role);
+        }
         if (uid && verdict == OC_JOIN_OWNER && !user_disabled(db, uid) &&
             (!known || count_active_owners(db) == 0))
             set_role(db, uid, OC_ROLE_OWNER);
@@ -1220,26 +1287,34 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
 /* Mint an invite for `role`: random token to the caller, only its SHA-256 +
  * expiry stored. `created_by` is the issuing user (0 -> NULL, e.g. a first-run
  * setup token with no issuer). Returns 0 and fills token/expiry, or -1. */
-static int mint_invite(sqlite3 *db, uint64_t created_by, uint8_t role,
-                       uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
+static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const char *email,
+                           uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
     uint8_t hash[OC_SHA256_LEN];
     if (oc_rand_bytes(token, OC_INVITE_TOKEN_LEN) != 0 ||
         oc_sha256(token, OC_INVITE_TOKEN_LEN, hash) != 0) return -1;
     uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms) VALUES(?,?,?,?);",
+        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email) "
+        "VALUES(?,?,?,?,lower(?));",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     if (created_by) sqlite3_bind_int64(st, 2, (sqlite3_int64)created_by);
     else            sqlite3_bind_null(st, 2);
     sqlite3_bind_text(st, 3, u8_to_role(role), -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
+    if (email && email[0]) sqlite3_bind_text(st, 5, email, -1, SQLITE_STATIC);
+    else                   sqlite3_bind_null(st, 5);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
     if (expiry_out) *expiry_out = expiry;
     return 0;
+}
+
+static int mint_invite(sqlite3 *db, uint64_t created_by, uint8_t role,
+                       uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
+    return mint_invite_for(db, created_by, role, NULL, token, expiry_out);
 }
 
 static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
@@ -1256,12 +1331,20 @@ static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
 
+    /* An invite names an address or mints a bearer token, never both: bound to an
+     * address it is spent by that address's verified sign-in (AUTH.md §8.4), and
+     * the token that comes back is zeros — there is nothing to hand anybody. */
+    const char *email = (j->email && j->email[0]) ? j->email : NULL;
+    if (email && (!strchr(email, '@') || strlen(email) > 254)) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     uint8_t token[OC_INVITE_TOKEN_LEN]; uint64_t expiry = 0;
-    if (mint_invite(db, j->user_id, want, token, &expiry) != 0) {
+    if (mint_invite_for(db, j->user_id, want, email, token, &expiry) != 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    if (email) memset(token, 0, sizeof token);
     audit_actor(db, OC_AUDIT_ADMIN, "user.invite", j->user_id, 0,
-                u8_to_role(j->role), 1, NULL);
+                u8_to_role(j->role), 1, email);
     r->type = OC_RES_INVITE_OK;
     memcpy(r->session_token, token, OC_INVITE_TOKEN_LEN);  /* carries the invite token */
     r->session_expiry = expiry;
@@ -1299,6 +1382,11 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
 
+    /* A bearer invite makes a LOCAL account. Where local accounts are off, it would
+     * be the phishable credential the provider is there to remove (AUTH.md §8.4). */
+    if (!(w->auth_methods & OC_AUTH_LOCAL)) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+    }
     if (j->token_len != OC_INVITE_TOKEN_LEN) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
     }
@@ -1308,7 +1396,8 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     }
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT role, expires_at_ms, consumed_at_ms, created_by FROM invites WHERE token_hash=?;",
+        "SELECT role, expires_at_ms, consumed_at_ms, created_by FROM invites "
+        "WHERE token_hash=? AND email IS NULL;",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     uint8_t role = OC_ROLE_MEMBER; uint64_t expiry = 0; int consumed = 1, found = 0;
@@ -7373,22 +7462,32 @@ int oc_dbwriter_eventfd(oc_dbwriter *w) { return w->evfd; }
 
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
-                               const char *oidc_params) {
+                               const char *relay_origin) {
     if (!issuer || !audience || !pubkey_pem) return -1;
     free(w->oidc_issuer); free(w->oidc_audience);
-    free(w->oidc_pubkey_pem); free(w->oidc_params);
+    free(w->oidc_pubkey_pem); free(w->relay_origin);
     w->oidc_issuer     = strdup(issuer);
     w->oidc_audience   = strdup(audience);
     w->oidc_pubkey_pem = strdup(pubkey_pem);
-    w->oidc_params     = strdup(oidc_params ? oidc_params : "");
+    w->relay_origin    = strdup(relay_origin ? relay_origin : "");
     if (!w->seen_jti) w->seen_jti = calloc(1, sizeof *w->seen_jti);
     if (!w->seen_jti) return -1;
-    if (!w->oidc_issuer || !w->oidc_audience || !w->oidc_pubkey_pem || !w->oidc_params)
+    if (!w->oidc_issuer || !w->oidc_audience || !w->oidc_pubkey_pem || !w->relay_origin)
         return -1;
     w->oidc_enabled = 1;
-    /* v1 is one mode per tenant: OIDC replaces local, session stays. */
-    w->auth_methods = OC_AUTH_OIDC | OC_AUTH_SESSION;
+    /* A source is added, not swapped in: which others are on is the caller's to
+     * say (oc_dbwriter_set_local_enabled). */
+    w->auth_methods |= OC_AUTH_OIDC;
     return 0;
+}
+
+void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on) {
+    if (on) w->auth_methods |= OC_AUTH_LOCAL;
+    else    w->auth_methods &= (uint8_t)~OC_AUTH_LOCAL;
+}
+
+const char *oc_dbwriter_oidc_audience(oc_dbwriter *w) {
+    return w->oidc_audience ? w->oidc_audience : "";
 }
 
 /* Registered-user cap (CP-7, OPENCHIME_MAX_USERS). <=0 means unlimited. Set before
@@ -7408,8 +7507,8 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
     return 0;
 }
 
-const char *oc_dbwriter_oidc_params(oc_dbwriter *w) {
-    return w->oidc_params ? w->oidc_params : "";
+const char *oc_dbwriter_relay_origin(oc_dbwriter *w) {
+    return w->relay_origin ? w->relay_origin : "";
 }
 
 void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
@@ -7697,7 +7796,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     for (oc_job *j = w->rjobs_head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
     free(w->oidc_issuer); free(w->oidc_audience);
-    free(w->oidc_pubkey_pem); free(w->oidc_params);
+    free(w->oidc_pubkey_pem); free(w->relay_origin);
     free(w->seen_jti);
     oc_join_rules_free(w->join_rules);
     oc_ratelimit_free(w->auth_rl);

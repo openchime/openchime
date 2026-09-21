@@ -2106,7 +2106,7 @@ static int run_connection(oc_net *n, int reconnecting,
         uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         oc_result er;
         if (reconnecting && *have_sess) {
-            oc_auth a = { OC_AUTH_SESSION, { sess, OC_SESSION_TOKEN_LEN } };
+            oc_auth a = { OC_AUTH_SESSION, { NULL, 0 }, { sess, OC_SESSION_TOKEN_LEN }, { NULL, 0 } };
             er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
         } else {
             const char *cred = n->token ? n->token : "";
@@ -2126,7 +2126,7 @@ static int run_connection(oc_net *n, int reconnecting,
             } else {
                 uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
                 if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
-                oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+                oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
                 er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
             }
         }
@@ -2598,7 +2598,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_INVITE_USER) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_invite_user iu = { c->op };   /* op = role */
+                oc_invite_user iu = { c->op, { NULL, 0 } };   /* op = role */
                 if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

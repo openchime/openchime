@@ -207,6 +207,9 @@ typedef struct oc_job {
     char          *token;     /* heap; the raw credential bytes (method-specific) */
     size_t         token_len; /* credential length (token has a trailing NUL too) */
     char           source[46];/* peer IP string, for per-source rate limiting ("" if none) */
+    char          *proof;     /* heap; the verifier a browser sign-in carries (AUTH.md §8.2) */
+    size_t         proof_len;
+    char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
 
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */
@@ -991,18 +994,22 @@ void         oc_dbwriter_stop(oc_dbwriter *w);
 /* The eventfd the net thread registers in epoll; readable when results wait. */
 int  oc_dbwriter_eventfd(oc_dbwriter *w);
 
-/* Switch the deployment to OIDC mode (AUTH.md §3): AUTH{oidc} tokens are then
- * verified against the pinned ES256 key, and AUTH_CHALLENGE advertises oidc +
- * session (local is disabled — v1 is one mode per tenant). Copies its args;
- * call once before serving traffic. `pubkey_pem` is a PEM SubjectPublicKeyInfo;
- * `oidc_params` is the opaque blob advertised to clients. Returns 0 / -1. */
+/* Enable the relay source (AUTH.md §3, §8): AUTH{oidc} tokens are verified
+ * against the pinned ES256 keys. Other sources are left as they are. Copies its
+ * args; call once before serving traffic. `pubkey_pem` is one or more PEM
+ * SubjectPublicKeyInfo blocks; `relay_origin` is where AUTH_BEGIN sends a browser
+ * ("" when the box is not enrolled anywhere). Returns 0 / -1. */
 /* Set the registered-user cap (CP-7, OPENCHIME_MAX_USERS); <=0 = unlimited. Call
  * once before serving. */
 void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
 
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
-                               const char *oidc_params);
+                               const char *relay_origin);
+
+/* Local accounts on or off (on by default). Off, AUTH{local} and REDEEM_INVITE
+ * are refused. */
+void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on);
 
 /* Who may join through an OIDC source (OPENCHIME_OIDC_ALLOW, AUTH.md §8.4).
  * NULL or "" admits nobody new. Returns -1 with a reason in `err` on a rule it
@@ -1010,10 +1017,11 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
 int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
                                      char *err, size_t errcap);
 
-/* Auth methods bitset (OC_AUTH_*) to advertise in AUTH_CHALLENGE, and the
- * OIDC params blob ("" unless OIDC is configured). For the net loop. */
+/* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
+ * authorize URL from. For the net loop; set before serving and never after. */
 uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
-const char *oc_dbwriter_oidc_params(oc_dbwriter *w);
+const char *oc_dbwriter_relay_origin(oc_dbwriter *w);
+const char *oc_dbwriter_oidc_audience(oc_dbwriter *w);
 
 /* Override the idempotency-map retention + prune interval (ARCH-44). Production
  * defaults are 24h / 1h; tests set small values to exercise pruning. */
@@ -1024,6 +1032,8 @@ void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
  * (oc_job_set_token / oc_job_set_body copy into heap) then submit. */
 oc_job *oc_job_new(int type, uint64_t conn_id);
 int     oc_job_set_token(oc_job *j, const void *tok, size_t len);
+int     oc_job_set_proof(oc_job *j, const void *proof, size_t len);
+int     oc_job_set_email(oc_job *j, const void *email, size_t len);
 int     oc_job_set_body(oc_job *j, const void *body, size_t len);
 /* Fill a REGISTER job (copies strings). iterations 0 -> OC_PW_ITERATIONS. */
 int     oc_job_set_register(oc_job *j, const char *username, const char *password,

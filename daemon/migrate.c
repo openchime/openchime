@@ -977,6 +977,14 @@ static const char MIGRATION_0044[] =
     "      FROM users WHERE subject LIKE 'oidc:%' AND instr(subject, '|') > 0) "
     "WHERE instr(rest, '|') > 1 AND length(rest) > instr(rest, '|');";
 
+static const char MIGRATION_0045[] =
+    /* Invites bound to an address (AUTH.md §8.4): where a provider signs people
+     * in, an invite names who may join rather than minting a bearer token, and is
+     * spent by that address's first verified sign-in. NULL is a bearer invite for
+     * a local account, which every row until now is. Stored lowercased. */
+    "ALTER TABLE invites ADD COLUMN email TEXT;"
+    "CREATE INDEX invites_email ON invites(email) WHERE email IS NOT NULL;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1022,6 +1030,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 42, MIGRATION_0042 },
     { 43, MIGRATION_0043 },
     { 44, MIGRATION_0044 },
+    { 45, MIGRATION_0045 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

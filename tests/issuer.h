@@ -121,9 +121,12 @@ static inline void oc_issuer_payload(char *out, size_t cap, const char *iss, con
                                      const char *extra) {
     snprintf(out, cap,
         "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"%s\",\"jti\":\"%s\","
-        "\"nonce\":\"47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU\","
+        "\"nonce\":\"JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0\","
         "\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu%s%s}",
         iss, aud, sub, jti, iat, iat, exp, extra[0] ? "," : "", extra);
 }
+
+/* The verifier oc_issuer_payload's nonce is the hash of (AUTH.md §8.2). */
+#define OC_ISSUER_VERIFIER "test-verifier"
 
 #endif /* OC_TEST_ISSUER_H */

@@ -164,7 +164,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 19** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 20** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -275,20 +275,23 @@ Client                                  Server
 
 ## 4. Authentication (REQ-020, REQ-023; ARCH-19/55–60)
 
-After `WELCOME`, the daemon sends `AUTH_CHALLENGE` advertising the auth method(s)
-it accepts; the client MUST authenticate before sending any messaging frame. A
+After `WELCOME`, the daemon sends `AUTH_CHALLENGE` listing the sources it signs
+people in with; the client MUST authenticate before sending any messaging frame. A
 messaging frame received before `AUTH_OK` is answered with `ERROR AUTH_REQUIRED`
-(fatal). Full design in [AUTH.md](./AUTH.md).
+(fatal). Full design in [AUTH.md](./AUTH.md); the exchange is its §8.1.
 
 ### 4.1 `AUTH_CHALLENGE` (server → client), msg_type `0x0012`
 
-Sent immediately after `WELCOME`. Advertises the deployment's auth mode (ARCH-55)
-so the client presents the right login UI.
+Sent immediately after `WELCOME`. One entry per identity source (ARCH-55), so the
+client draws one control per entry. Resuming a session is always accepted and is
+not listed.
 
-| Field         | Type | Notes                                                          |
-|---------------|------|----------------------------------------------------------------|
-| `methods`     | u8   | Bitset of accepted methods: `0x01` local, `0x02` oidc, `0x04` session (reconnect is always accepted alongside the primary mode). |
-| `oidc_params` | str  | Empty unless `oidc` is offered; otherwise a small opaque blob the client passes to its OIDC helper (central authorize URL/`client_id`, this workspace's `audience`). Ignorable by clients that only reconnect. |
+| Field       | Type | Notes                                                          |
+|-------------|------|----------------------------------------------------------------|
+| `n_sources` | u8   | At most 8; a larger count is a malformed frame.                |
+| `id`        | str  | Per source. What `AUTH` and `AUTH_BEGIN` name it by: `local`, `relay`. |
+| `kind`      | u8   | Per source. `1` local (username + password), `2` relay, `3` oidc (the operator's own provider). Kinds `2` and `3` are browser sign-ins (§4.2a). |
+| `label`     | str  | Per source. Text for the control.                              |
 
 ### 4.2 `AUTH` (client → server), msg_type `0x0010`
 
@@ -298,14 +301,47 @@ A `method` discriminator selects the credential the payload carries (ARCH-59 for
 | Field        | Type | Notes                                                          |
 |--------------|------|----------------------------------------------------------------|
 | `method`     | u8   | `0x01` local, `0x02` oidc, `0x04` session.                     |
-| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — the central-issued ES256 JWT (AUTH.md §3.3); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+| `source`     | str  | The `id` of the challenge entry being used; empty for `session`. |
+| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — the central-issued ES256 JWT (AUTH.md §8.3); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+| `proof`      | str  | **oidc** — the verifier whose hash the client sent as `challenge` in `AUTH_BEGIN` (AUTH.md §8.2). Empty otherwise. |
 
-The daemon verifies per its mode and rejects on any mismatch with a fatal
-`ERROR`: `AUTH_INVALID_TOKEN` (bad/expired/ wrong-audience token or bad
-password), `AUTH_RATE_LIMITED` (too many failed attempts, REQ-191), or
-`AUTH_REQUIRED` (method not offered by this deployment). The `oidc` credential
-is the relay's: a central-issued ES256 JWT, verified against a single pinned key
+The daemon rejects on any mismatch with an `ERROR`: `AUTH_INVALID_TOKEN`
+(bad/expired/wrong-audience/replayed token, a verifier that is not the token's, or
+a bad password), `AUTH_RATE_LIMITED` (too many failed attempts from this address,
+REQ-191), `AUTH_NOT_ALLOWED` (a valid identity no join rule or invite admits), or
+`AUTH_REQUIRED` (a source this deployment does not offer). The `oidc` credential
+is the relay's: a central-issued ES256 JWT, verified against the pinned keys
 (AUTH.md §3), never a raw *provider* token.
+
+### 4.2a `AUTH_BEGIN` (client → server), msg_type `0x0015`, and `AUTH_REDIRECT` (server → client), msg_type `0x0016`
+
+How a browser sign-in starts. Pre-auth, and nothing is kept on the connection: the
+client may disconnect while the person is in their browser and present `AUTH` on a
+new one.
+
+| Field          | Type | Notes                                                       |
+|----------------|------|-------------------------------------------------------------|
+| `source`       | str  | The challenge entry's `id`.                                 |
+| `redirect_uri` | str  | Where the browser is sent back. **Loopback only** (RFC 8252): `http://127.0.0.1`, `http://localhost` or `http://[::1]`, an optional port, an optional path. Anything else is refused. |
+| `challenge`    | str  | `base64url(SHA-256(verifier))`, 43 characters, of a random verifier the client keeps. |
+
+The daemon answers `AUTH_REDIRECT`:
+
+| Field           | Type | Notes                                                      |
+|-----------------|------|------------------------------------------------------------|
+| `authorize_url` | str  | The whole URL to open. The client opens it only if it is `https` (plain `http` to loopback, for development), and neither builds nor parses it. |
+
+or a non-fatal `ERROR`: `AUTH_SOURCE_UNAVAILABLE` (no such source, or the box is
+enrolled nowhere to send a browser), `AUTH_INVALID_TOKEN` (a `redirect_uri` that is
+not loopback, or a `challenge` of the wrong shape).
+
+### 4.2b `AUTH_CONTINUE` (server → client), msg_type `0x0017`
+
+Answers a first step that is correct but not sufficient (AUTH.md §8.6).
+
+| Field  | Type | Notes                              |
+|--------|------|------------------------------------|
+| `step` | u8   | What is wanted next: `1` a TOTP code. |
 
 ### 4.3 `AUTH_OK` (server → client), msg_type `0x0011`
 
@@ -707,10 +743,13 @@ On success the actor is acked with **`USER_UPDATED` (server → client), msg_typ
 pushed to the affected user's live connections so their client updates its
 capabilities immediately.
 
-**`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8 }` — owner/admin
-only (only an owner may invite at admin/owner role). Mints a single-use invite
-token for a **new** local account and replies **`INVITE_CREATED` (server →
-client), msg_type `0x0046`**:
+**`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8, email: str }` — owner/admin
+only (only an owner may invite at admin/owner role). With `email` empty it mints a
+single-use invite token for a **new** local account. With `email` set the invite
+is bound to that address instead (AUTH.md §8.4): it is spent by that address's
+first verified sign-in through a provider, no token can redeem it, and the
+`token` that comes back is 32 zero bytes. Either way the reply is
+**`INVITE_CREATED` (server → client), msg_type `0x0046`**:
 
 | Field        | Type  | Notes                                                       |
 |--------------|-------|-------------------------------------------------------------|
@@ -2291,6 +2330,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
 | `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
 | `2005` | `AUTH_NOT_ALLOWED`    | auth       | yes   | A valid identity that no join rule or invite admits (AUTH.md §8.4). An identity the workspace already knows still signs in. |
+| `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | no    | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach. |
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
@@ -2348,6 +2388,9 @@ this table cannot silently gain a shared value.
 | `0x0012` | `AUTH_CHALLENGE` | S → C |  |
 | `0x0013` | `LOGOUT` | C → S |  |
 | `0x0014` | `WORKSPACE_INFO` | S → C | pushed after AUTH_OK |
+| `0x0015` | `AUTH_BEGIN` | C → S | pre-auth: start a browser sign-in |
+| `0x0016` | `AUTH_REDIRECT` | S → C | the authorize URL the daemon built |
+| `0x0017` | `AUTH_CONTINUE` | S → C | a first step that is correct but not sufficient |
 | `0x0020` | `SEND` | C → S |  |
 | `0x0021` | `SEND_ACK` | S → C |  |
 | `0x0022` | `BROADCAST` | S → C |  |

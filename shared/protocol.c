@@ -237,8 +237,33 @@ oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m) {
 
 oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_CHALLENGE);
-    oc_w_u8(w, m->methods);
-    oc_w_str(w, m->oidc_params);
+    uint8_t n = m->n_sources > OC_MAX_SOURCES ? OC_MAX_SOURCES : m->n_sources;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) {
+        oc_w_str(w, m->sources[i].id);
+        oc_w_u8(w, m->sources[i].kind);
+        oc_w_str(w, m->sources[i].label);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_auth_begin(oc_wbuf *w, uint16_t version, const oc_auth_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_BEGIN);
+    oc_w_str(w, m->source);
+    oc_w_str(w, m->redirect_uri);
+    oc_w_str(w, m->challenge);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_auth_redirect(oc_wbuf *w, uint16_t version, const oc_auth_redirect *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_REDIRECT);
+    oc_w_str(w, m->authorize_url);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_auth_continue(oc_wbuf *w, uint16_t version, const oc_auth_continue *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_CONTINUE);
+    oc_w_u8(w, m->step);
     return oc_frame_end(w, off);
 }
 
@@ -246,7 +271,9 @@ oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m) {
     OC_CHECK_BODY(m->credential);
     size_t off = oc_frame_begin(w, version, OC_MSG_AUTH);
     oc_w_u8(w, m->method);
+    oc_w_str(w, m->source);
     oc_w_lstr(w, m->credential);
+    oc_w_str(w, m->proof);
     return oc_frame_end(w, off);
 }
 
@@ -1980,6 +2007,7 @@ oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m)
 oc_result oc_encode_invite_user(oc_wbuf *w, uint16_t version, const oc_invite_user *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_USER);
     oc_w_u8(w, m->role);
+    oc_w_str(w, m->email);
     return oc_frame_end(w, off);
 }
 
@@ -2124,14 +2152,40 @@ oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m) {
 }
 
 oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m) {
-    m->methods = oc_r_u8(p);
-    m->oidc_params = oc_r_str(p);
+    memset(m, 0, sizeof *m);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_MAX_SOURCES) return OC_E_MALFORMED;
+    m->n_sources = n;
+    for (uint8_t i = 0; i < n; i++) {
+        m->sources[i].id = oc_r_str(p);
+        m->sources[i].kind = oc_r_u8(p);
+        m->sources[i].label = oc_r_str(p);
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_begin(oc_rbuf *p, oc_auth_begin *m) {
+    m->source = oc_r_str(p);
+    m->redirect_uri = oc_r_str(p);
+    m->challenge = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_redirect(oc_rbuf *p, oc_auth_redirect *m) {
+    m->authorize_url = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_continue(oc_rbuf *p, oc_auth_continue *m) {
+    m->step = oc_r_u8(p);
     return r_done(p);
 }
 
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m) {
     m->method = oc_r_u8(p);
+    m->source = oc_r_str(p);
     m->credential = oc_r_lstr(p);
+    m->proof = oc_r_str(p);
     return r_done(p);
 }
 
@@ -2908,6 +2962,7 @@ oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m) {
 
 oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m) {
     m->role = oc_r_u8(p);
+    m->email = oc_r_str(p);
     return r_done(p);
 }
 
