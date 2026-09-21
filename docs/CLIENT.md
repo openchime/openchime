@@ -59,6 +59,13 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   once the workspace is named, offers the browser on Ctrl+B, goes straight to it
   where the workspace takes no passwords, and while the browser is open shows the
   URL in full beside trying the platform's opener.
+  The Win32 sign-in card asks at the same point — when step 1 resolves the
+  workspace — and draws one control per source: the password form, and beneath it
+  a button in the daemon's words for a browser source; a workspace that takes no
+  passwords skips the form. While the browser is open the card says so, with
+  Cancel and Esc; under the automation hook the URL is written to
+  `signin_url.txt` in the test directory instead of being opened, so a harness
+  can play the browser.
 - **`net.c` — the network thread.** A blocking-socket TLS connection (the client
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop

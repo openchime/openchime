@@ -42,6 +42,7 @@
 #include <wctype.h>
 
 #include "client.h"
+#include "net.h"          /* oc_net_probe: how a workspace signs people in */
 #include "secret_os.h"
 #include "model.h"
 #include "notify.h"
@@ -2229,6 +2230,26 @@ static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text 
 static ULONGLONG g_si_started;    /* GetTickCount64 when the attempt began */
 static HWND  g_si_e_ws, g_si_e_user, g_si_e_pass;   /* native EDIT children */
 static rectf g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
+/* How the workspace signs people in (AUTH.md §8.1), asked of it at step 1: a
+ * password form, a browser button, or both. */
+static oc_signin_source g_si_src[8];
+static int      g_si_nsrc;
+static int      g_si_browser;        /* the attempt in flight is a browser sign-in */
+static uint32_t g_si_opened_seq;     /* the model's signin_seq whose URL was opened */
+static rectf    g_si_browser_btn;    /* step 2: "Continue in your browser" */
+static rectf    g_si_wait_cancel;    /* while waiting for the browser */
+static void signin_start_browser(HWND hwnd);
+
+static const oc_signin_source *si_browser_source(void) {
+    for (int i = 0; i < g_si_nsrc; i++)
+        if (g_si_src[i].kind != OC_SOURCE_LOCAL) return &g_si_src[i];
+    return NULL;
+}
+static int si_has_local(void) {
+    for (int i = 0; i < g_si_nsrc; i++)
+        if (g_si_src[i].kind == OC_SOURCE_LOCAL) return 1;
+    return 0;
+}
 /* Defined with the rest of the flow, below the core wiring they depend on. */
 static void signin_submit(HWND hwnd);
 static void signin_cancel(HWND hwnd);
@@ -6999,6 +7020,11 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
     /* Shift+Esc is a shortcut of its own (marking everything read) and must reach
      * the table below; bare Esc dismisses what is open. */
     if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE && !mod_down(VK_SHIFT)) {
+        /* Waiting on the browser: the fields are hidden, so nothing else hears Esc. */
+        if (g_view == VIEW_SIGNIN && g_si_connecting && g_si_browser && g_si_client) {
+            oc_client_cancel_signin(g_si_client);
+            return 1;
+        }
         if (g_tp_open)   { g_tp_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_share_full && !g_menu) { g_share_full = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_sub_open)  { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
@@ -9660,12 +9686,13 @@ static si_geom si_layout(float W, float H) {
 
     float head = 26 + 52 + 30 + 30;              /* mark + heading + subheading */
     int   nfields = (g_si_step == 1) ? 1 : 2;
-    float body = g_si_connecting ? 76.0f
+    float body = g_si_connecting ? (g_si_browser ? 120.0f : 76.0f)
                : (float)nfields * 62.0f
                  + (g_si_err[0] ? 34.0f : 0.0f)
                  + (g_si_step == 1 ? 26.0f : 0.0f)   /* advanced-options link */
                  + (g_si_step == 2 ? 30.0f : 0.0f)   /* remember-me row */
                  + 40.0f + 24.0f                      /* button + bottom pad */
+                 + (g_si_step == 2 && si_browser_source() ? 50.0f : 0.0f)   /* browser button */
                  + (g_si_step == 2 ? 26.0f + 22.0f : 0.0f)   /* back + signup links */
                  + (g_si_overlay ? 24.0f : 0.0f);            /* cancel row */
     g.h  = head + body;
@@ -9708,7 +9735,9 @@ static void draw_signin(gfx *rt, float W, float H) {
          * a host). "Sign in to 127.0.0.1:8443" over "127.0.0.1:8443" was the same
          * string twice. */
         char sub[300]; snprintf(sub, sizeof sub, "%s:%d", g_si_host, g_si_port);
-        draw_text(rt, strcmp(head + 11, sub) ? sub : "Enter your credentials",
+        /* A browser sign-in asks for no credentials here, so it does not say so. */
+        draw_text(rt, strcmp(head + 11, sub) ? sub
+                      : (g_si_connecting && g_si_browser) ? "" : "Enter your credentials",
                   g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
     } else {
         draw_text(rt, "Enter your workspace address", g_meta,
@@ -9721,12 +9750,26 @@ static void draw_signin(gfx *rt, float W, float H) {
     /* While connecting the fields are hidden and the card says so — the wait is
      * the whole content, so there is nothing to mis-click. */
     if (g_si_connecting) {
+        const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
+        int waiting = g_si_browser && sm && sm->signin_url[0];
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Signing in\xE2\x80\xA6", g_ui, rf(x0, y + 24, x0 + SI_W, y + 52), OC_COL_MUTED);
+        draw_text(rt, waiting ? "Finish signing in in your browser\xE2\x80\xA6" : "Signing in\xE2\x80\xA6",
+                  g_ui, rf(x0, y + 24, x0 + SI_W, y + 52), OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
         g_si_btn = g_si_remember_box = g_si_back = g_si_adv_link = rf(0, 0, 0, 0);
+        g_si_browser_btn = rf(0, 0, 0, 0);
+        /* A wait that can last minutes needs a way out that is on the screen. */
+        if (g_si_browser) {
+            g_si_wait_cancel = rf(fx, y + 64, fx + fw, y + 86);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Cancel  (Esc)", g_meta, g_si_wait_cancel, OC_COL_ACCENT);
+            g_meta->align = ST_ALIGN_LEFT;
+        } else {
+            g_si_wait_cancel = rf(0, 0, 0, 0);
+        }
         return;
     }
+    g_si_wait_cancel = rf(0, 0, 0, 0);
 
     /* Field chrome. The EDITs are placed on these same rects by layout_signin. */
     const char *labels[2]; int nfields;
@@ -9782,6 +9825,21 @@ static void draw_signin(gfx *rt, float W, float H) {
     draw_text(rt, g_si_step == 1 ? "Continue" : "Sign in", g_ui, g_si_btn, 0xFFFFFF);
     g_ui->align = ST_ALIGN_LEFT;
     y += 50;
+
+    /* One control per source the workspace offers: the password form above, and
+     * beside it a quieter button for the browser, labelled in the daemon's words. */
+    const oc_signin_source *bs = g_si_step == 2 ? si_browser_source() : NULL;
+    if (bs) {
+        g_si_browser_btn = rf(fx, y, fx + fw, y + 40);
+        fill_round(rt, g_si_browser_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_si_browser_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(rt, bs->label, g_ui, g_si_browser_btn, OC_COL_TEXT);
+        g_ui->align = ST_ALIGN_LEFT;
+        y += 50;
+    } else {
+        g_si_browser_btn = rf(0, 0, 0, 0);
+    }
 
     if (g_si_step == 2) {
         g_si_back = rf(fx, y, fx + fw, y + 20);
@@ -20654,8 +20712,13 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     /* The sign-in view owns the window; nothing else is on screen. */
     if (g_view == VIEW_SIGNIN) {
-        if (g_si_connecting) return 1;
+        if (g_si_connecting) {
+            if (g_si_browser && pt_in(g_si_wait_cancel, x, y) && g_si_client)
+                oc_client_cancel_signin(g_si_client);   /* the poll sees the core's answer */
+            return 1;
+        }
         if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
+        if (pt_in(g_si_browser_btn, x, y))   { signin_start_browser(hwnd); return 1; }
         if (pt_in(g_si_cancel, x, y))        { signin_cancel(hwnd); return 1; }
         if (pt_in(g_si_back, x, y))          { signin_back(hwnd);   return 1; }
         if (pt_in(g_si_adv_link, x, y))      { signin_set_advanced(hwnd, !g_si_advanced); return 1; }
@@ -22020,6 +22083,12 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
     signin_begin(hwnd, ws, user);
     snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
     g_si_port = ep.port;
+    /* Step 1 is skipped, so its question is asked here: a workspace that takes no
+     * passwords goes to the browser, not to a password form it cannot use. An
+     * unreachable one falls through to the form, which reports it on submit. */
+    g_si_nsrc = oc_net_probe(g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
+    if (g_si_nsrc < 0) g_si_nsrc = 0;
+    if (g_si_nsrc > 0 && !si_has_local() && si_browser_source()) { signin_start_browser(hwnd); return; }
     g_si_step = 2;
     layout_signin(hwnd);
     /* Set the account AFTER the step-2 layout has shown the field. signin_begin
@@ -22115,10 +22184,14 @@ static void signin_fail(HWND hwnd, const char *why) {
     /* The core reports a rejected credential as the terse "auth failed"; say what
      * the TUI says, since that is the wording a user can act on. */
     if (strstr(tmp, "auth failed"))
-        snprintf(tmp, sizeof tmp, "sign-in failed — check your username and password");
+        snprintf(tmp, sizeof tmp, g_si_browser ? "sign-in failed — try again"
+                                               : "sign-in failed — check your username and password");
 
     if (g_si_client) { dict_forget(g_si_client); oc_client_stop(g_si_client); g_si_client = NULL; }
-    g_si_connecting = 0; g_si_step = 2;
+    g_si_connecting = 0; g_si_browser = 0;
+    /* Back to the credentials — or, where the workspace takes no passwords, to
+     * the step that has something on it. */
+    g_si_step = (g_si_nsrc > 0 && !si_has_local()) ? 1 : 2;
     snprintf(g_si_err, sizeof g_si_err, "%s", tmp);
     if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
     layout_signin(hwnd);
@@ -22148,6 +22221,17 @@ static void signin_submit(HWND hwnd) {
         }
         snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
         g_si_port = ep.port;
+        /* Ask the workspace how it signs people in before drawing the step that
+         * asks them for anything (AUTH.md §8.1). */
+        g_si_nsrc = 0;
+        int n = oc_net_probe(g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
+        if (n == OC_PROBE_VERSION) {
+            snprintf(g_si_err, sizeof g_si_err, "this app and that server are different versions");
+            goto redraw;
+        }
+        if (n <= 0) { snprintf(g_si_err, sizeof g_si_err, "could not reach %.200s", g_si_host); goto redraw; }
+        g_si_nsrc = n;
+        if (!si_has_local() && si_browser_source()) { signin_start_browser(hwnd); return; }
         g_si_step = 2;
         layout_signin(hwnd);
         if (g_si_e_user) SetFocus(g_si_e_user);
@@ -22187,6 +22271,49 @@ redraw:
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* Sign in through the browser: the core asks the daemon for the URL and waits on
+ * its loopback listener; the poll opens the URL when the model carries it. */
+static void signin_start_browser(HWND hwnd) {
+    g_si_err[0] = '\0';
+    snprintf(g_host, sizeof g_host, "%s", g_si_host);
+    g_port = g_si_port;
+    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", g_si_ws);
+    g_cred[0] = '\0';
+    g_si_client = oc_client_start_secure(g_host, g_port, "",
+                                         g_si_remember ? store_path() : NULL,
+                                         g_si_remember ? g_secret : NULL);
+    if (!g_si_client) {
+        snprintf(g_si_err, sizeof g_si_err, "could not start the client");
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+    g_si_browser = 1;
+    g_si_opened_seq = 0;
+    g_si_connecting = 1;
+    g_si_started = GetTickCount64();
+    layout_signin(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* The daemon's authorize URL, to the default browser. The core has already
+ * refused anything that is not https (or http to loopback); re-checked here, at
+ * the call that does the opening. Its own buffer: a sign-in URL is longer than a
+ * link in a message. */
+static void signin_open_url(const char *url) {
+    WCHAR w[2300];
+    if (!url || (_strnicmp(url, "https://", 8) && _strnicmp(url, "http://", 7))) return;
+    /* Under the automation hook the URL goes to a file instead: a harness plays
+     * the browser, and a test run never opens tabs on somebody's desktop. */
+    if (g_test_dir[0]) {
+        char path[600]; snprintf(path, sizeof path, "%s\\signin_url.txt", g_test_dir);
+        FILE *f = fopen(path, "wb");
+        if (f) { fputs(url, f); fclose(f); }
+        return;
+    }
+    if (to_w(url, w, 2300) < 1) return;
+    ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+}
+
 /* Called each tick while an attempt is in flight. Mirrors the TUI's await_auth:
  * authed wins; a sticky last_error with no connection is the failure; and a
  * deadline stops us waiting forever on a black-hole endpoint. */
@@ -22203,6 +22330,7 @@ static void signin_poll(HWND hwnd) {
         g_n_backfilled = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
         g_si_overlay = 0;
         g_si_connecting = 0;
+        g_si_browser = 0;
         g_si_err[0] = '\0';
         g_view = VIEW_HOME;
         ws_register();               /* the client exists; give it a slot */
@@ -22217,6 +22345,17 @@ static void signin_poll(HWND hwnd) {
         return;
     }
     if (m->last_error[0] && !m->connected) { signin_fail(hwnd, m->last_error); return; }
+    if (g_si_browser && m->signin_url[0]) {
+        /* The person is in their browser; the core gives them five minutes, so the
+         * connect deadline does not apply. Each URL is opened once. */
+        g_si_started = GetTickCount64();
+        if (g_si_opened_seq != m->signin_seq) {
+            g_si_opened_seq = m->signin_seq;
+            signin_open_url(m->signin_url);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return;
+    }
     if (GetTickCount64() - g_si_started > SI_TIMEOUT) {
         char why[224]; snprintf(why, sizeof why, "timed out reaching %s", g_si_host);
         signin_fail(hwnd, why);
