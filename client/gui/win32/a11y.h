@@ -53,6 +53,11 @@ typedef struct {
      * opaque here: a11y.c cannot see the app's statics, and giving it a function
      * pointer into them would be the same coupling by another name. */
     uint64_t    invoke;
+    /* Which sheet of the scene it is drawn on: 0 is the surface, 1 a popup laid
+     * over it (a dropdown's rows on top of the field below). Two elements on
+     * different layers covering the same pixels is what a popup IS, so the fit
+     * check compares rects within a layer only. */
+    int         layer;
 } oc_acc_item;
 
 /* Lifecycle. init() resolves the provider entry points; everything below is a

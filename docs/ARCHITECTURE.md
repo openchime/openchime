@@ -562,7 +562,11 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
   already publishes every element's rect; `chromefit` in the test dump counts
   siblings that overlap and elements drawn entirely off their surface. A healthy
   layout is `0 0` at every scale, and the matrix that found these defects asserts
-  it.
+  it. Overlap is judged **within a layer**: a modal owns the tree outright, so
+  the shell under a card is never published beside it, and a popup drawn over
+  the surface — the new-message recipient matches over the message box — is
+  published on a layer of its own by the code that draws it. While a modal is
+  open, everything published must lie inside its card.
 
 - **ARCH-96 (Permalinks — an id pair, and a fetch-around-an-id history mode):** Delivers REQ-232.
 
