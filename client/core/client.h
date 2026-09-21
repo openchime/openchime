@@ -42,6 +42,15 @@ oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
 oc_client *oc_client_start_named(const char *workspace_key, const char *host, int port,
                                  const char *cred, const char *store_path, oc_secret *secret);
 
+/* As oc_client_start_named, with the sign-in screen's Remember-me as `remember`.
+ * Off, the session leaves nothing behind — no token, account, device key or
+ * switcher entry — but the workspace's certificate pin is still kept, so the next
+ * connection is checked against this one rather than trusting whatever it meets.
+ * Pass the store and the secret either way. */
+oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int port,
+                                const char *cred, const char *store_path, oc_secret *secret,
+                                int remember);
+
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);
 

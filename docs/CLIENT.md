@@ -411,7 +411,10 @@ front door, and the pin and the session belong to the name a person trusted. An
 entry an earlier client filed under `host:port`, or under whatever was typed, is
 moved to the key the first time it is found (`oc_store_adopt`) — token with its
 owner, pin, device key and book fields together, never overwriting what the name
-already holds. Cached
+already holds. **Remember me** governs the session, not the pin: off
+(`oc_client_start_opts`), no token, account, device key or switcher entry is kept,
+and the certificate pin still is — it is not a secret, and without it every
+connection to that workspace would trust whatever certificate it met (ARCH-10). Cached
 history is gone and the offline outbox lives in memory on the net thread. With no
 OS credential store, nothing persists at all.
 

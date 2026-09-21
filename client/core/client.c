@@ -49,12 +49,19 @@ oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
 
 oc_client *oc_client_start_named(const char *workspace_key, const char *host, int port,
                                  const char *cred, const char *store_path, oc_secret *secret) {
+    return oc_client_start_opts(workspace_key, host, port, cred, store_path, secret, 1);
+}
+
+oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int port,
+                                const char *cred, const char *store_path, oc_secret *secret,
+                                int remember) {
     oc_client *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     oc_queue_init(&c->events);
     oc_queue_init(&c->cmds);
     oc_model_init(&c->model);
-    c->net = oc_net_start_named(workspace_key, host, port, cred, store_path, secret, &c->events, &c->cmds);
+    c->net = oc_net_start_opts(workspace_key, host, port, cred, store_path, secret, !remember,
+                               &c->events, &c->cmds);
     if (!c->net) {
         oc_queue_destroy(&c->events);
         oc_queue_destroy(&c->cmds);

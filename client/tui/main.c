@@ -1619,9 +1619,8 @@ static int run_login(const char *initial_workspace, const char *initial_user,
         char key[288];
         if (oc_workspace_key(f.workspace, oc_default_suffix(), key, sizeof key) != 0)
             snprintf(key, sizeof key, "%s:%d", f.ep.host, f.ep.port);
-        oc_client *cl = oc_client_start_named(key, f.ep.host, f.ep.port, cred,
-                                              f.remember ? store_path : NULL,
-                                              f.remember ? secret : NULL);
+        oc_client *cl = oc_client_start_opts(key, f.ep.host, f.ep.port, cred,
+                                             store_path, secret, f.remember);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         char why[200] = "";
         int res = await_auth(cl, f.ep.host, why, sizeof why);

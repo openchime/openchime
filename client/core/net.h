@@ -48,6 +48,14 @@ oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port
                            const char *store_path, oc_secret *secret,
                            oc_queue *to_ui, oc_queue *from_ui);
 
+/* As oc_net_start_named. With `pin_only` set nothing about the session is kept —
+ * no token, owner, device key or book entry, which is what Remember-me off means —
+ * but the workspace's TOFU pin still is: it is not a secret, and without it every
+ * connection is a first connection (ARCH-10). */
+oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port, const char *token,
+                          const char *store_path, oc_secret *secret, int pin_only,
+                          oc_queue *to_ui, oc_queue *from_ui);
+
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
 /* Redeem an invite on the FIRST connect instead of authenticating (REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so
