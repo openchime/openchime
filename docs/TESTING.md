@@ -1092,12 +1092,15 @@ advance width of the glyphs, so a rect wider than its clip is a cut string.
 Its *height* is the line box — ascent, descent and leading, pinned per size
 token (ARCH-108) — which legitimately overhangs its seat, and a row half below
 the fold of a scrolling list is ordinary rather than broken. So horizontal
-clipping is reported and vertical clipping is not, and a clip that removes an
-element *entirely* is not reported at all: that is how scrolling works, and
+clipping is reported here and vertical clipping is not, and a clip that removes
+an element *entirely* is not reported at all: that is how scrolling works, and
 from a ledger row a scrolled-out row and a stray one are the same thing. The
 instrument that can tell those apart is the fit check inside the client, which
 is built from the accessibility tree and therefore only ever sees what is
-reachable.
+reachable — and which counts the vertical case itself (`clipped=`, below),
+because it measures a string against the rect it was handed rather than against
+the clip in force, and a box moving off screen says nothing about whether the
+words fit inside it.
 
 The same discipline decides the rest. A scrim is a layer boundary — a modal
 owns the window, the accessibility publisher already skips the shell behind
@@ -1177,3 +1180,32 @@ optional — a dump key to wait for. A verb acks when its handler *ran*, not whe
 the frame showing its effect has been painted, and several of these views paint
 "Loading…" until the daemon answers; sleeping a fixed time instead
 captures a view mid-load, which reads as a layout defect.
+
+## `clipped=`: text that does not fit its own box
+
+`chromefit` compares published rectangles, so a label whose box is the right size
+and in the right place reads as clean however its glyphs actually landed — the
+Notifications card at 240 DPI reported `overlaps=0 outside=0` with its section
+titles cut through the middle. `clipped=` closes that: the count of strings whose
+layout did not fit the rect it was drawn into, with `clip="…"` naming the first
+and `clippx=` the deepest cut in DIPs. The tally belongs to the frame, reset as
+each one begins.
+
+**Whole lines, not pixels.** A line box is ascent + descent + leading, pinned per
+size token (ARCH-108), and legitimately overhangs a tight row by a DIP or two
+with nothing cut off; measuring that reports every second label in the client. A
+line that does not fit is not a rounding question.
+
+**Vertically always, horizontally only where nothing trims.** A format that does
+not wrap is given DirectWrite's ellipsis, so running out of room ends in a "…" —
+legible, deliberate, a question of layout style rather than a defect. A wrapping
+format has no trimming to fall back on, so a word longer than its column is cut
+mid-glyph and nothing says so. Colour emoji are exempt, as they are for the
+ledger's truncation check and for the same reason: an emoji cell clips a few
+pixels of trailing advance and looks perfectly right doing it.
+
+**It has failed, which is the only evidence worth having.** Across nine views ×
+four DPI settings × the text-size extremes it is silent, and names two real cuts:
+the composer's `Message #general` placeholder, gone entirely at 240 DPI, and the
+Activity empty state losing its last word at 192 DPI and the largest text size.
+Both read `overlaps=0 outside=0`.
