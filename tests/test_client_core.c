@@ -2095,6 +2095,12 @@ static int daemon_sni_cb(void *ctx, mbedtls_ssl_context *ssl, const unsigned cha
     return 0;
 }
 
+static void count_book_cb(void *ctx, const char *workspace, const char *label,
+                          const char *username, uint64_t last) {
+    (void)workspace; (void)label; (void)username; (void)last;
+    (*(int *)ctx)++;
+}
+
 /* GET `url_path_and_query` from 127.0.0.1:port; returns the status code. */
 static int browser_get(int port, const char *target) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -2220,6 +2226,43 @@ static void test_browser_signin(int port) {
         oc_client_stop(named);
         CHECK(mock_len_of("acme.openchime.test") > 0);
         CHECK(mock_len_of(legacy) == 0);                          /* moved, not copied */
+        mock_reset();
+    }
+
+    /* Remember-me off leaves nothing of the SESSION behind — and still keeps the
+     * pin, so the next connection is checked against this one (ARCH-10). Against a
+     * non-loopback name the pin would then be enforced; here it is enough that it
+     * was kept, and that nothing else was. */
+    {
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        oc_client *c = oc_client_start_opts("forgetful.openchime.test", "127.0.0.1", arg.port, "",
+                                            "ignored", &sec, 0);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|dana", "b1p", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(c, m->authed));
+        oc_client_stop(c);
+
+        oc_store *chk = oc_store_open("ignored");
+        CHECK(chk != NULL);
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], want[OC_TLS_FINGERPRINT_LEN];
+            char who[64];
+            CHECK(oc_store_load_pin(chk, "forgetful.openchime.test", pin) == 1);
+            CHECK(oc_tls_server_fingerprint(&srv, want) == 0 && memcmp(pin, want, sizeof pin) == 0);
+            CHECK(oc_store_load_session(chk, "forgetful.openchime.test", tok, NULL, 0) == 0);
+            CHECK(oc_store_session_user(chk, "forgetful.openchime.test", who, sizeof who) == 0);
+            oc_store_close(chk);
+        }
+        /* Not in the switcher either: a pin is not a book entry. */
+        int listed = 0;
+        {
+            oc_store *bk = oc_store_open("ignored");
+            if (bk) { oc_store_set_secret(bk, &sec); oc_store_workspace_each(bk, count_book_cb, &listed); oc_store_close(bk); }
+        }
+        CHECK(listed == 0);
         mock_reset();
     }
 

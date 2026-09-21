@@ -66,6 +66,7 @@ struct oc_net {
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
     char          ws_key[288];  /* the workspace as named (oc_workspace_key); "" = host:port */
+    int           pin_only;     /* Remember-me off: keep the TOFU pin, and nothing else */
     /* A browser sign-in in progress (AUTH.md §8.1): the listener the browser comes
      * back to, the verifier kept for the daemon, and — once the browser has been —
      * the token to present on the next connection. Net thread only, but for
@@ -153,6 +154,8 @@ static void obox_free(obox *o) {
  * threaded through run_connection so the net thread persists across restarts. */
 typedef struct {
     oc_store   *store;                          /* NULL = no persistence */
+    oc_store   *pins;        /* where the TOFU pin is kept — set even when `store` is not,
+                               * because a pin is not what Remember-me is about (ARCH-10) */
     const char *workspace;                       /* "host:port" key */
     uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
     int         have_pin;                       /* pin loaded/captured this run */
@@ -2167,7 +2170,7 @@ static int run_connection(oc_net *n, int reconnecting,
      * later connection pins it (TOFU first-use, ARCH-10). */
     if (cs && !cs->have_pin && oc_tls_peer_fingerprint(&conn, cs->pin) == 0) {
         cs->have_pin = 1;
-        if (cs->store) oc_store_save_pin(cs->store, cs->workspace, cs->pin);
+        if (cs->pins) oc_store_save_pin(cs->pins, cs->workspace, cs->pin);
     }
 
     /* HELLO -> WELCOME */
@@ -3074,12 +3077,20 @@ static void *net_thread(void *arg) {
     snprintf(workspace, sizeof workspace, "%s", n->ws_key[0] ? n->ws_key : legacy);
     cs.workspace = workspace;
     cs.obox = &outbox;
-    cs.store = n->store_path ? oc_store_open(n->store_path) : NULL;
-    if (cs.store) {
-        oc_store_set_secret(cs.store, n->secret);   /* token -> keyring if available */
+    /* With Remember-me off nothing about the SESSION is kept — no token, no owner,
+     * no device key, no book entry — but the pin still is: it is not a secret, and
+     * without it every connection to this workspace would be a first connection,
+     * trusting whatever certificate it met (ARCH-10). */
+    oc_store *opened = n->store_path ? oc_store_open(n->store_path) : NULL;
+    cs.pins = opened;
+    cs.store = n->pin_only ? NULL : opened;
+    if (opened) {
+        oc_store_set_secret(opened, n->secret);   /* token -> keyring if available */
         /* An entry from when the key was the address moves to the name, once. */
-        oc_store_adopt(cs.store, workspace, legacy);
-        cs.have_pin = oc_store_load_pin(cs.store, workspace, cs.pin);
+        if (cs.store) oc_store_adopt(opened, workspace, legacy);
+        cs.have_pin = oc_store_load_pin(opened, workspace, cs.pin);
+    }
+    if (cs.store) {
         uint64_t now_ms = (uint64_t)time(NULL) * 1000;
         /* Ownership first: a token that is not ours is not worth reading into a
          * buffer we then have to remember not to use. */
@@ -3178,7 +3189,7 @@ static void *net_thread(void *arg) {
         reconnecting = 1;
     }
 
-    oc_store_close(cs.store);
+    oc_store_close(opened);
     obox_free(&outbox);
     hwtab_free(&hw);
     return NULL;
@@ -3195,9 +3206,16 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
 oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port, const char *token,
                            const char *store_path, oc_secret *secret,
                            oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_opts(workspace_key, host, port, token, store_path, secret, 0, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port, const char *token,
+                          const char *store_path, oc_secret *secret, int pin_only,
+                          oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
+    n->pin_only = pin_only;
     snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
     n->port = port;
     n->token = token ? strdup(token) : NULL;

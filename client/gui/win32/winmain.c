@@ -22284,9 +22284,8 @@ static void signin_submit(HWND hwnd) {
     snprintf(g_cred, sizeof g_cred, "%s:%s", user, pass);
     /* "Remember me" off means leave no trace: passing a NULL store path keeps
      * the session token out of the store entirely (the TUI's mechanism). */
-    g_si_client = oc_client_start_named(g_cur_ws, g_host, g_port, g_cred,
-                                        g_si_remember ? store_path() : NULL,
-                                        g_si_remember ? g_secret : NULL);
+    g_si_client = oc_client_start_opts(g_cur_ws, g_host, g_port, g_cred,
+                                       store_path(), g_secret, g_si_remember);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
     /* Signup: with an invite in hand this connection redeems it instead
      * of authenticating — one step that creates the account and signs in — so
@@ -22310,9 +22309,8 @@ static void signin_start_browser(HWND hwnd) {
     g_port = g_si_port;
     ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
     g_cred[0] = '\0';
-    g_si_client = oc_client_start_named(g_cur_ws, g_host, g_port, "",
-                                         g_si_remember ? store_path() : NULL,
-                                         g_si_remember ? g_secret : NULL);
+    g_si_client = oc_client_start_opts(g_cur_ws, g_host, g_port, "",
+                                       store_path(), g_secret, g_si_remember);
     if (!g_si_client) {
         snprintf(g_si_err, sizeof g_si_err, "could not start the client");
         InvalidateRect(hwnd, NULL, FALSE);
