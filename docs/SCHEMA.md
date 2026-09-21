@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Migrations.** The daemon applies migrations 0001–0043 (`daemon/migrate.c`,
+**Migrations.** The daemon applies migrations 0001–0044 (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -1115,6 +1115,29 @@ and its invitations are net-thread memory, ended by a restart like presence
 (ARCH-67/73). A device's public key reaches the daemon on `CALL_JOIN` and is kept
 for the length of that participation; its private key never leaves the device
 (ARCH-113).
+
+## 3ai. Migration 0044 — identities (AUTH.md §8.4)
+
+A person who signs in by OIDC is **(upstream issuer, subject)**, whichever source
+delivered them, so the same person arriving through the relay and through a
+direct connection is one account.
+
+### `user_identities`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `user_id` | INTEGER NOT NULL → `users.id` | |
+| `issuer` | TEXT NOT NULL | The provider's issuer — the part of the token's `sub` before the first bar. |
+| `subject` | TEXT NOT NULL | The provider's stable subject — the rest. `UNIQUE (issuer, subject)`. |
+| `idp`, `tenant` | TEXT | Which provider vouched, and for which organization, at the last sign-in. |
+| `email`, `email_verified` | TEXT, INTEGER 0/1 | As the provider gave them at the last sign-in. |
+| `first_seen_ms`, `last_login_ms` | INTEGER NOT NULL | |
+
+A sign-in updates this row only: `users.display_name` and `users.email` are set
+at a person's first sign-in and are theirs afterwards. The migration files
+existing accounts from `users.subject` (`oidc:<central issuer>|<issuer>|<subject>`);
+an account whose string has no second bar gets its row at its next sign-in.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

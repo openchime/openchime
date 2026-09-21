@@ -736,15 +736,6 @@ static int count_owners(sqlite3 *db) {
     return n;
 }
 
-static int user_exists(sqlite3 *db, const char *subject) {
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE subject=?;", -1, &st, NULL);
-    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
-    int yes = (sqlite3_step(st) == SQLITE_ROW);
-    sqlite3_finalize(st);
-    return yes;
-}
-
 /* Owners who can still sign in. A removed owner keeps the role on its row, and a
  * workspace whose only owners are removed has nobody to run it. */
 static int count_active_owners(sqlite3 *db) {
@@ -794,30 +785,85 @@ static int seen_jti_claim(struct oc_seen_jti *t, const char *jti, uint64_t exp, 
     return 1;
 }
 
-/* Just-in-time provision an OIDC user by subject (AUTH.md §4); refreshes the
- * email/name on each login. Returns the user id, or 0. Role defaults to member
- * via the schema; promotion is a separate action. */
-static uint64_t upsert_oidc_user(sqlite3 *db, const char *subject,
-                                 const char *email, const char *name) {
-    uint64_t now = dbw_now_ms();
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "INSERT INTO users(subject, email, display_name, created_at_ms) VALUES(?,?,?,?) "
-        "ON CONFLICT(subject) DO UPDATE SET email=excluded.email "
-        "WHERE excluded.email <> '';", -1, &st, NULL);
-    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, email, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 3, name, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
-    sqlite3_step(st);
-    sqlite3_finalize(st);
+/* A person who signs in by OIDC is (upstream issuer, subject) — AUTH.md §8.4 —
+ * and a token's `sub` spells the pair "<issuer>|<subject>". The issuer is a URL
+ * and holds no bar, so the first bar is the seam. 0 unless both halves exist. */
+static int split_identity(const char *sub, char *issuer, size_t icap,
+                          const char **subject) {
+    const char *bar = strchr(sub, '|');
+    if (!bar || bar == sub || bar[1] == '\0') return 0;
+    size_t n = (size_t)(bar - sub);
+    if (n >= icap) return 0;
+    memcpy(issuer, sub, n);
+    issuer[n] = '\0';
+    *subject = bar + 1;
+    return 1;
+}
 
+/* The user this identity belongs to, or 0. */
+static uint64_t identity_user(sqlite3 *db, const char *issuer, const char *subject) {
+    sqlite3_stmt *st = NULL;
+    uint64_t uid = 0;
+    sqlite3_prepare_v2(db, "SELECT user_id FROM user_identities WHERE issuer=? AND subject=?;",
+                       -1, &st, NULL);
+    sqlite3_bind_text(st, 1, issuer, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, subject, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return uid;
+}
+
+static uint64_t user_by_subject(sqlite3 *db, const char *subject) {
+    sqlite3_stmt *st = NULL;
     uint64_t uid = 0;
     sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject=?;", -1, &st, NULL);
     sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
     if (sqlite3_step(st) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     return uid;
+}
+
+/* Record what the provider said this time. The identity row is the only thing a
+ * later sign-in touches: the display name and address on `users` are the
+ * person's own once they exist. Creates the row when `uid` has none yet. */
+static void identity_touch(sqlite3 *db, uint64_t uid, const char *issuer, const char *subject,
+                           const oc_jwt_claims *c) {
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO user_identities(user_id, issuer, subject, idp, tenant, email, "
+        " email_verified, first_seen_ms, last_login_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8) "
+        "ON CONFLICT(issuer, subject) DO UPDATE SET idp=excluded.idp, tenant=excluded.tenant, "
+        " email=excluded.email, email_verified=excluded.email_verified, "
+        " last_login_ms=excluded.last_login_ms;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_text(st, 2, issuer, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 3, subject, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 4, c->idp, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 5, c->tenant, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 6, c->email, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 7, c->email_verified ? 1 : 0);
+    sqlite3_bind_int64(st, 8, (sqlite3_int64)now);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+/* Just-in-time provision a person's first OIDC sign-in: the name and address
+ * come from the token this once. `legacy` keeps `users.subject` unique and
+ * readable for what still keys on it. Returns the user id, or 0. */
+static uint64_t create_oidc_user(sqlite3 *db, const char *legacy,
+                                 const char *email, const char *name) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO users(subject, email, display_name, created_at_ms) VALUES(?,?,?,?);",
+        -1, &st, NULL);
+    sqlite3_bind_text(st, 1, legacy, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, email, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 3, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
 }
 
 static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
@@ -925,7 +971,16 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
          * owner rule, which also restores an owner to a workspace left with none. */
         oc_join_verdict verdict = oc_join_rules_eval(w->join_rules, claims.idp, claims.tenant,
                                                      claims.email, claims.email_verified);
-        int known = user_exists(db, subject);
+        char issuer[OC_JWT_MAX_FIELD];
+        const char *person = NULL;
+        if (!split_identity(claims.sub, issuer, sizeof issuer, &person)) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        /* An account from before identities were rows is found by the string it was
+         * filed under, and gets its row at this sign-in. */
+        uid = identity_user(db, issuer, person);
+        if (!uid) uid = user_by_subject(db, subject);
+        int known = uid != 0;
         if (!known && verdict == OC_JOIN_DENY) {
             char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 32];
             snprintf(detail, sizeof detail, "idp=%s tenant=%s", claims.idp, claims.tenant);
@@ -934,10 +989,11 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         }
         /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
          * user past the workspace limit (an existing user still logs in). */
-        if (user_slots_full(db, subject, strlen(subject), w->max_users)) {
+        if (!known && user_slots_full(db, subject, strlen(subject), w->max_users)) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
         }
-        uid = upsert_oidc_user(db, subject, claims.email, claims.name);
+        if (!known) uid = create_oidc_user(db, subject, claims.email, claims.name);
+        if (uid) identity_touch(db, uid, issuer, person, &claims);
         if (uid && verdict == OC_JOIN_OWNER && !user_disabled(db, uid) &&
             (!known || count_active_owners(db) == 0))
             set_role(db, uid, OC_ROLE_OWNER);

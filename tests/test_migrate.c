@@ -101,14 +101,15 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 43);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events */
+    CHECK(oc_schema_version(db) == 44);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
                              "sessions", "local_credentials", "invites", "reactions",
                              "messages_fts", "delivery_cursors", "server_identity",
                              "attachments", "webhooks", "notification_prefs",
-                             "client_settings", "audit_log", "rendered_audio" };
+                             "client_settings", "audit_log", "rendered_audio",
+                             "user_identities" };
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
     }
@@ -153,6 +154,34 @@ static void test_embedded_schema(void) {
     sqlite3_close(db);
 }
 
+/* 0044 files existing OIDC accounts as (issuer, subject) rows, and leaves alone
+ * what is not one: a local account, and a string with no second bar. */
+static void test_identity_backfill(void) {
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 43, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,email,created_at_ms) VALUES"
+        "(1,'oidc:https://auth.openchime.io|https://accounts.google.com|1234','a@x.example',7),"
+        "(2,'oidc:https://auth.openchime.io|https://login.microsoftonline.com/t/v2.0|ab|cd',NULL,8),"
+        "(3,'local:dana',NULL,9),"
+        "(4,'oidc:https://auth.openchime.io|nobar',NULL,10),"
+        "(5,'oidc:https://auth.openchime.io|trailing|',NULL,11);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM user_identities;") == 2);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM user_identities WHERE user_id=1 AND "
+                     "issuer='https://accounts.google.com' AND subject='1234' AND "
+                     "email='a@x.example' AND email_verified=0 AND first_seen_ms=7;") == 1);
+    /* The issuer ends at the FIRST bar after central's: a subject may hold one. */
+    CHECK(scalar(db, "SELECT COUNT(*) FROM user_identities WHERE user_id=2 AND "
+                     "issuer='https://login.microsoftonline.com/t/v2.0' AND subject='ab|cd';") == 1);
+    /* One person, one row. */
+    CHECK(sqlite3_exec(db, "INSERT INTO user_identities(user_id,issuer,subject,first_seen_ms,"
+                           "last_login_ms) VALUES(3,'https://accounts.google.com','1234',0,0);",
+                       NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
 int run_migrate_tests(void) {
     printf("test_migrate: fresh apply, idempotent rerun, resume, rollback,\n");
     printf("              embedded core schema\n");
@@ -161,5 +190,6 @@ int run_migrate_tests(void) {
     test_resume_partial();
     test_failure_rolls_back();
     test_embedded_schema();
+    test_identity_backfill();
     return failures;
 }

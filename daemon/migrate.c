@@ -944,6 +944,39 @@ static const char MIGRATION_0043[] =
      * anything that ignores the column shows sense rather than nothing. */
     "ALTER TABLE messages ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;";
 
+static const char MIGRATION_0044[] =
+    /* Identities (AUTH.md §8.4): a person who signs in by OIDC is (upstream
+     * issuer, subject), whichever source delivered them, so the same person
+     * arriving through the relay and through a direct connection is one account.
+     * What the provider said at the last sign-in lives here; `users` keeps what
+     * the person chose. Backfilled from the string existing accounts were filed
+     * under, "oidc:<central issuer>|<issuer>|<subject>"; a row whose string has no
+     * second bar gets its identity at its next sign-in instead. */
+    "CREATE TABLE user_identities ("
+    "  id             INTEGER PRIMARY KEY,"
+    "  user_id        INTEGER NOT NULL REFERENCES users(id),"
+    "  issuer         TEXT NOT NULL,"
+    "  subject        TEXT NOT NULL,"
+    "  idp            TEXT,"
+    "  tenant         TEXT,"
+    "  email          TEXT,"
+    "  email_verified INTEGER NOT NULL DEFAULT 0 CHECK (email_verified IN (0,1)),"
+    "  first_seen_ms  INTEGER NOT NULL,"
+    "  last_login_ms  INTEGER NOT NULL,"
+    "  UNIQUE (issuer, subject)"
+    ");"
+    "CREATE INDEX user_identities_user ON user_identities(user_id);"
+    "INSERT OR IGNORE INTO user_identities"
+    "  (user_id, issuer, subject, email, first_seen_ms, last_login_ms) "
+    "SELECT id,"
+    "       substr(rest, 1, instr(rest, '|') - 1),"
+    "       substr(rest, instr(rest, '|') + 1),"
+    "       email, created_at_ms, created_at_ms "
+    "FROM (SELECT id, email, created_at_ms,"
+    "             substr(subject, instr(subject, '|') + 1) AS rest"
+    "      FROM users WHERE subject LIKE 'oidc:%' AND instr(subject, '|') > 0) "
+    "WHERE instr(rest, '|') > 1 AND length(rest) > instr(rest, '|');";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -988,6 +1021,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 41, MIGRATION_0041 },
     { 42, MIGRATION_0042 },
     { 43, MIGRATION_0043 },
+    { 44, MIGRATION_0044 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
