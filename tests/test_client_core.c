@@ -2229,6 +2229,44 @@ static void test_browser_signin(int port) {
         mock_reset();
     }
 
+    /* A session that was good and is not any more, with no credential to try
+     * instead: said as what it is — signed out — so a frontend opens the sign-in
+     * rather than leaving an error line over a dead workspace. The dead token is
+     * dropped; the pin is not. */
+    {
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        const char *KEY = "expired.openchime.test";
+        oc_client *c = oc_client_start_named(KEY, "127.0.0.1", arg.port, "", "ignored", &sec);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|dana", "b1x", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(c, m->authed));
+        CHECK(!oc_client_model(c)->signed_out);
+        oc_client_stop(c);
+
+        /* The token the daemon will not know: the stored one, one bit off. */
+        for (int i = 0; i < 8; i++)
+            if (g_mock[i].used && strcmp(g_mock[i].account, KEY) == 0) g_mock[i].val[10] ^= 0x01;
+
+        oc_client *back = oc_client_start_named(KEY, "127.0.0.1", arg.port, "", "ignored", &sec);
+        CHECK(back != NULL);
+        CHECK(WAIT_FOR(back, m->signed_out));
+        CHECK(!oc_client_model(back)->authed);
+        CHECK(oc_client_model(back)->signin_seq == 0);   /* it did not start a browser sign-in unasked */
+        oc_client_stop(back);
+
+        oc_store *chk = oc_store_open("ignored");
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+            CHECK(oc_store_load_session(chk, KEY, tok, NULL, 0) == 0);
+            CHECK(oc_store_load_pin(chk, KEY, pin) == 1);
+            oc_store_close(chk);
+        }
+        mock_reset();
+    }
+
     /* Remember-me off leaves nothing of the SESSION behind — and still keeps the
      * pin, so the next connection is checked against this one (ARCH-10). Against a
      * non-loopback name the pin would then be enforced; here it is enough that it

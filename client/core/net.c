@@ -3155,6 +3155,10 @@ static void *net_thread(void *arg) {
                 have_sess = 0; reconnecting = 0; backoff_ms = 0;
                 continue;   /* retry immediately with the password */
             }
+            /* A session that was good and is not any more — expired, revoked, the
+             * account removed — with no credential to try instead. Said as what it
+             * is, so a frontend can open the sign-in instead of showing an error. */
+            if (reconnecting) push_simple(n->to_ui, OC_EV_SIGNED_OUT, 0);
             break;
         }
         if (!have_sess) break;   /* never authenticated: nothing to reconnect with */

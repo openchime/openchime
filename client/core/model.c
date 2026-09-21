@@ -1189,6 +1189,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->user_id = e->user_id;
         m->last_error[0] = '\0';
         m->signin_url[0] = '\0';
+        m->signed_out = false;
         /* Self: the server won't tell us. A pause survives a reconnect, and the
          * SNOOZE frame that follows AUTH_OK is what sets it — this only seeds
          * the row. */
@@ -2072,6 +2073,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(m->unresolved.names, sizeof m->unresolved.names, "%s",
                  e->body ? e->body : "");
         m->unresolved.seq++;
+        break;
+    case OC_EV_SIGNED_OUT:
+        m->signed_out = true;
+        m->authed = false;
         break;
     case OC_EV_AUTH_BROWSER:
         if (e->body && strlen(e->body) < sizeof m->signin_url) {

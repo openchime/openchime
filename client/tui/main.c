@@ -1870,6 +1870,31 @@ int main(int argc, char **argv) {
                 g_ws[i].settings_req = 1;
             }
         }
+        /* The active workspace's session was refused and its connection has given
+         * up: open its sign-in, with what the book knows filled in, rather than
+         * leave an error line over a workspace that will never come back. */
+        if (oc_client_model(g_ws[g_active].cl)->signed_out) {
+            ws_session again;
+            char label[256], user[128];
+            snprintf(label, sizeof label, "%s", g_ws[g_active].label);
+            snprintf(user,  sizeof user,  "%s", g_ws[g_active].user);
+            oc_client_stop(g_ws[g_active].cl);
+            if (run_login(label, user, g_store_path, g_secret, &again)) {
+                g_ws[g_active] = again;
+            } else if (g_nws > 1) {
+                /* They declined: close this workspace and show another. */
+                for (int i = g_active; i < g_nws - 1; i++) g_ws[i] = g_ws[i + 1];
+                g_nws--;
+                g_active = 0;
+            } else {
+                /* The only workspace, and it is already stopped: nothing is left for
+                 * the teardown below to stop a second time. */
+                g_nws = 0;
+                running = 0;
+                break;
+            }
+            g_sb_loaded = 0;
+        }
         cl = g_ws[g_active].cl;
 
         const oc_model *m = oc_client_model(cl);
