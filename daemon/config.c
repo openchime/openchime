@@ -1,6 +1,7 @@
 /* Unified daemon configuration loader (env → oc_config). See config.h. */
 
 #include "config.h"
+#include "proxyproto.h"
 #include "protocol.h"   /* OC_MAX_ATTACHMENT_SIZE */
 
 #include <stdio.h>
@@ -104,6 +105,18 @@ int oc_config_load(char *err, size_t errcap) {
     if (c->xfer_workers > 16) c->xfer_workers = 16;
     c->max_conns_per_ip = env_int("OPENCHIME_MAX_CONNS_PER_IP", NULL, 256);
     if (c->max_conns_per_ip < 0) c->max_conns_per_ip = 256;
+    c->trusted_proxies = getenv("OPENCHIME_TRUSTED_PROXIES");
+    {
+        /* A list that cannot be read stops the boot: read wrongly it is either
+         * "every client is one address" or "every connection is refused". */
+        char why[160];
+        oc_trusted_proxies *t = oc_trusted_proxies_parse(c->trusted_proxies, why, sizeof why);
+        if (!t) {
+            snprintf(err, errcap, "OPENCHIME_TRUSTED_PROXIES: %s", why);
+            return -1;
+        }
+        oc_trusted_proxies_free(t);
+    }
     c->blob_dir = env_or2("OPENCHIME_BLOB_DIR", NULL, "/data/blobs");
 
     /* Storage-pressure policy (reuse the storage-domain env parser + clamps). */

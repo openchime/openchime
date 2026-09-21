@@ -51,6 +51,7 @@ typedef struct {
     int      max_users;             /* 0 = unlimited */
     int      xfer_workers;          /* clamped 1..16 */
     int      max_conns_per_ip;      /* 0 disables */
+    const char *trusted_proxies;    /* peers whose PROXY v2 header is believed; NULL = none */
     uint64_t max_attach_size;
     uint64_t max_video_size;        /* video message byte cap (REQ-164); <= max_attach_size */
     const char *blob_dir;
