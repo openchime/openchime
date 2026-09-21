@@ -14,6 +14,7 @@ int run_migrate_tests(void);
 int run_auth_tests(void);
 int run_jwt_tests(void);
 int run_joinrules_tests(void);
+int run_signin_tests(void);
 int run_ratelimit_tests(void);
 int run_roles_tests(void);
 int run_dbwriter_tests(void);
@@ -180,6 +181,7 @@ int main(void) {
     total += SUITE(run_auth_tests);
     total += SUITE(run_jwt_tests);
     total += SUITE(run_joinrules_tests);
+    total += SUITE(run_signin_tests);
     total += SUITE(run_ratelimit_tests);
     total += SUITE(run_roles_tests);
     total += SUITE(run_dbwriter_tests);
