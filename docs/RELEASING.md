@@ -52,11 +52,11 @@ ships, not when it merges. The job only ever warns — the release is already li
 `smoke` — install the daemon from the repository that was just published — is
 the last job, not a step in the middle of `publish`.
 
-It used to be a step, sitting between writing the repositories and finishing the
-release. That made a postcondition abort the steps after it: a failed smoke
-skipped the GitHub release, the tarballs and `:latest`, while apt and dnf were
+As a step sitting between writing the repositories and finishing the
+release, it would be a postcondition aborting the steps after it: a failed smoke
+would skip the GitHub release, the tarballs and `:latest`, while apt and dnf were
 already live. Packages published with nothing
-naming them is the worst reachable state, and it needed a manual repair twice.
+naming them is the worst reachable state.
 
 Once the apt index is written the release is irreversible, so **completing it is
 strictly better than stopping half way**. A red run that says "released, and the
@@ -67,27 +67,26 @@ failure, for the reason below.
 ## The control plane serving `/dist` is an external dependency
 
 `DIST_BASE_URL` is `https://openchime.io/dist`, and the **control plane** serves
-it by reading the bucket. Nothing in this repository can make that true, and it
-has not been true for any release so far: `openchime.io` answers, but `/dist/*`
-returns the application's own 404 — the same body as any unrouted path — so the
-route does not exist in the deployed build.
+it by reading the bucket. Nothing in this repository can make that true. When
+the route is absent, `openchime.io` answers but `/dist/*`
+returns the application's own 404 — the same body as any unrouted path.
 
-The smoke therefore fails by default, deliberately. Auto-detecting the outage
-would mask a genuinely broken repository once serving is live.
+The smoke fails in that case by default, deliberately. Auto-detecting the outage
+would mask a genuinely broken repository.
 
 What `preflight` adds is only *timing*: one HEAD request says at minute one what
 the smoke would otherwise say at minute nine, after every build has run. It
-**warns and continues** — failing there would make releases impossible until an
-external dependency lands, and a release is perfectly publishable without it.
+**warns and continues** — failing there would make releases impossible whenever an
+external dependency is down, and a release is perfectly publishable without it.
 Only the public URL is unreachable.
 
 ## The credentials are checked before anything is built
 
 `preflight` asserts that every required secret and variable is set, and it takes
-seconds. Each one used to be read only at its point of use, and every step that
-reads one is skipped on a dry run — so the first time a missing value could
-surface was a real release, after the CI gate, both package builds, the image
-and the Windows binaries had all run.
+seconds. Each one is otherwise read only at its point of use, and every step that
+reads one is skipped on a dry run — so without it the first time a missing value could
+surface is a real release, after the CI gate, both package builds, the image
+and the Windows binaries have all run.
 
 It gates **`version`**, not merely `publish`, and that is the point: the release
 number is reserved before anything is built and only returned when nothing was
@@ -271,7 +270,7 @@ value fails.
 ## Install coverage, and the rpm gap
 
 A package which builds but does not install is precisely the failure a release
-pipeline exists to catch, and only an install finds it. Coverage today, without
+pipeline exists to catch, and only an install finds it. Coverage, without
 containers (ARCH-36):
 
 - **The `.deb`** is installed on the runner itself and the binary is executed —
@@ -285,8 +284,6 @@ containers (ARCH-36):
 - **The published-repository smoke test has no dnf half** for the same reason.
   The apt half runs on the runner and shares the signing key and object layout
   with the rpm repository, so faults in those still surface there.
-
-The rpm gap is tracked as an open issue rather than treated as settled.
 
 ## Windows signing is optional
 

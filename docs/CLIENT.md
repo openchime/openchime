@@ -13,9 +13,9 @@ client is the reference implementation and runs on the portable stack: an SDL3
 renderer on its own native window, primitives through oc_gfx, text through
 sdltext's DirectWrite backend.
 
-**Status.** The app-core, the **TUI** and the **Win32 GUI** (the reference
-client) are built. Further platforms (the portable GUI on Linux/macOS, Android, a web DOM UI)
-and mobile follow, in the fixed frontend order of §8.
+**Frontends.** The app-core carries the **TUI** and the **Win32 GUI** (the
+reference client). The portable GUI on Linux/macOS, a web DOM UI and mobile are
+further frontends over the same core (§8).
 
 ---
 
@@ -26,11 +26,11 @@ shared/        wire contract: protocol, tls, framebuf, sock   (daemon + client)
 client/core/   the app-core — frontend-agnostic, headless-testable C:
                net thread + session + credential store + the view-model
                (channels, messages, roster, presence, unread) + reducers
-client/tui/    terminal frontend over the core                (first frontend)
+client/tui/    terminal frontend over the core
 client/gui/win32/  the native Win32 GUI over the same core    (reference client)
 client/shared/ assets shared by graphical frontends (baked Lucide icon paths)
 [further desktops]  the same portable GUI layer + a per-platform
-                    text backend and native shim               (later)
+                    text backend and native shim
 ```
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
@@ -252,9 +252,8 @@ model; translate input to intents }, stop.
     (REQ-031) with online/away/offline dots + roles; the launcher's "Set
     away/online" sets your own presence. The pane **scrolls under the wheel**,
     with a thumb when there is more below: a channel roster runs to 500 and the
-    pane holds about twenty, and the list used to stop drawing at the bottom edge
-    with no offset at all, which put everybody past the fold out of reach from
-    here. The offset is clamped to the content on every paint, since the roster
+    pane holds about twenty, so without an offset everybody past the fold would be
+    out of reach from here. The offset is clamped to the content on every paint, since the roster
     arrives after the pane opens, and it returns to the top when the channel
     changes.
   - **direct messages** — `n` in the Members pane (or a member menu's "Message")
@@ -270,7 +269,7 @@ model; translate input to intents }, stop.
     sets the focused channel; the launcher's "Do not disturb" sets the
     do-not-disturb window (REQ-130/131; each SET returns a full sync that the
     model folds in).
-  - **read receipts / seen-by (REQ-090)** — the core now sends a `CLIENT_ACK`
+  - **read receipts / seen-by (REQ-090)** — the core sends a `CLIENT_ACK`
     whenever the focused channel's read marker advances; the daemon fans each
     member's read cursor to the others as `READ_CURSOR`, and the TUI renders a
     dim "✓ seen by …" footer under the last message naming everyone (bar you)
@@ -299,23 +298,12 @@ model; translate input to intents }, stop.
     (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
     Text-only, so files are never rendered inline (REQ-140/141).
 
-  **The TUI reaches a minority of the app-core today** — **most `oc_client_*`
-  entry points have no TUI caller** — pins, saved items, the activity feed, the channel member and
-  file listings, mute, the notification default, group DMs, custom emoji, status
-  and profile fields, drafts, scheduling, threads-follow, the People directory,
-  search operators and paging, and webhook delete among them. The frontend order
-  (all of Win32 first) makes that an accepted consequence rather than a defect;
-  the itemised list is the [issue tracker](https://github.com/openchime/openchime/issues). `oc_client_set_setting` **is called by both frontends** — the TUI persists
+  `oc_client_set_setting` **is called by both frontends** — the TUI persists
   its sidebar sort/filter/collapse through it and the Win32 client its
   preferences.
 
-  Separately, three frames the **daemon** speaks reach **no client**:
-  `CALL_JOIN`/`CALL_LEAVE` (the audio client, REQ-150–152),
-  `REGISTER_DEVICE_TOKEN`/`UNREGISTER_DEVICE_TOKEN` (exercised only by
-  `tests/demo_client.c`, so no shipped client can populate the push registry —
-  ARCH-85), and `TRANSFER_CANCEL`. None is implemented in `client/core`, so those
-  are core work rather than frontend work. `INVITE_TO_CHANNEL`,
-  `REMOVE_FROM_CHANNEL` and `REDEEM_INVITE` **are** implemented
+  `INVITE_TO_CHANNEL`,
+  `REMOVE_FROM_CHANNEL` and `REDEEM_INVITE` are core entry points
   (`oc_client_channel_invite` / `_channel_kick` / `_redeem_invite`) and the Win32
   client surfaces all three.
 - **Windows (`client/gui/win32/`):** **Win32 in pure C** over the
@@ -355,21 +343,18 @@ model; translate input to intents }, stop.
   (`shell_visible()`), and Home and DMs are not the same: the second column holds
   channels in one and conversations in the other (`sidebar_kind()`), and DMs shows
   an index until a conversation is picked. **Activity, Files, Later, Drafts,
-  Threads, People, Admin and Preferences are all developed surfaces** — none is a
-  placeholder — answering REQ-139, REQ-143, REQ-231, REQ-223/224/228, REQ-062,
-  REQ-289 and REQ-261. Per-feature status is the marker on each
-  requirement in [REQUIREMENTS.md](./REQUIREMENTS.md); open work is in the
-  [issue tracker](https://github.com/openchime/openchime/issues).
-- **Linux GUI (later):** the **same portable client** (ARCH-80) — the shared
+  Threads, People, Admin and Preferences are full surfaces**,
+  answering REQ-139, REQ-143, REQ-231, REQ-223/224/228, REQ-062,
+  REQ-289 and REQ-261.
+- **Linux GUI:** the **same portable client** (ARCH-80) — the shared
   app layer over SDL3, with a FreeType/fontconfig text backend and a small
-  native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: by the
-  time a second desktop was due, the client self-drew everything a toolkit
-  would have supplied. Packaging is decided when it lands.
-- **macOS/iOS (later):** the portable client over SDL3 on macOS, with a
+  native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit
+  would supply.
+- **macOS/iOS:** the portable client over SDL3 on macOS, with a
   CoreText backend and an Obj-C native shim where Apple leaves no C surface;
   UIKit on iOS is its own effort over the core.
-- **Android (later):** Android views (Kotlin) over the core.
-- **Web (later):** a DOM UI — WASM can't use native desktop widgets; the core
+- **Android:** Android views (Kotlin) over the core.
+- **Web:** a DOM UI — WASM can't use native desktop widgets; the core
   compiles to WASM and drives a JS/TS view.
 
 ## 4. The wire layer (reused, already tested)
@@ -377,7 +362,7 @@ model; translate input to intents }, stop.
 The core links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
 directions exists), `shared/tls.c` (client TLS + TOFU), `shared/framebuf.c`
 (reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
-PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10) is built:**
+PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10):**
 the first connect to a remote workspace records the cert's SHA-256 in that
 workspace's OS-credential blob (`oc_store_save_pin`, §5) and every later connect
 enforces an exact match; a genuine change is reported distinctly ("the server's security certificate
@@ -445,8 +430,7 @@ back a release is one re-sign-in and one re-TOFU.
 **A token belongs to one account, but a workspace has room for one token.** So a
 launch that names an account gets that account, and a launch that names nobody —
 a silent reconnect — gets whoever signed in last at that address. Two accounts on
-one machine therefore means naming the account each time. Keying the store on
-workspace *and* account would remove that, and is not done today.
+one machine therefore means naming the account each time.
 
 **Cached history does not exist**, and the **offline outbox is in memory** on the
 net thread for the life of the process (ARCH-88). Every send is recorded there
@@ -467,7 +451,7 @@ no offline reading of history, and a queued message dies with the process.
 
 ## 6. Auth + reconnect/offline
 
-**In-session auto-reconnect is built (REQ-100/101).** The net thread runs one
+**In-session auto-reconnect (REQ-100/101).** The net thread runs one
 connection after another in a loop: it captures the `session_token` from
 `AUTH_OK`, and on an unexpected drop it silently re-authenticates with that token
 (`OC_AUTH_SESSION` — no password) under exponential backoff, then
@@ -484,23 +468,23 @@ keybinding belongs to a frontend and not the shared core), and
 `oc_client_reconnect` (bound to
 `Ctrl+R` in the TUI) cuts the current sleep short to retry immediately.
 
-**Cross-restart reconnect is built too (via the §5 store).** The net thread
+**Cross-restart reconnect (via the §5 store).** The net thread
 pre-loads a still-valid stored token and pins the stored fingerprint, so the
 *first* connect after a relaunch already uses `OC_AUTH_SESSION` — no password
 prompt. A rejected token (expired/revoked) is dropped and, if a password is
 still held, retried once with it; logging out clears the stored token.
 
-**The offline outbox (REQ-102) is built** (see §5): the net thread records each
+**The offline outbox (REQ-102)** (see §5): the net thread records each
 send in the outbox before delivery, resends the outbox on reconnect, and clears a
 row on its `SEND_ACK` — so an offline-composed send goes out on the next
 connection, deduped by the daemon. **One outbox per connection**, and so one count
 per connection: `oc_net_outbox_pending` answers for the `oc_net` it is given, and
 a frontend with several workspaces signed in adds them up (the Win32 quit prompt
-does). It was a single global written by every net thread, which made the answer
+does). A single global written by every net thread would make the answer
 whichever thread published last — a workspace holding unsent messages reporting
 none, which is exactly the case the prompt exists for.
 
-**Workspace resolution is built (REQ-010/011,** `client/core/resolve.c`**).** A
+**Workspace resolution (REQ-010/011,** `client/core/resolve.c`**).** A
 user-typed workspace — a full domain (`chat.acme.com`) or a bare
 name (`acme`, which gets the configured `$OPENCHIME_SUFFIX`
 appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
@@ -508,10 +492,9 @@ the domain's A record at 443. A resolution failure is a distinct status, so the
 TUI tells "workspace not found" apart from "could not reach the server" (connect)
 and "auth failed" (login). The TUI accepts `<workspace>` (resolved) or a raw
 `<host> <port>` (dev/local); an explicit `:port` on the workspace
-(`chat.acme.com:9000`) pins the port and skips SRV. The optional `.well-known`
-metadata half is not consulted yet.
+(`chat.acme.com:9000`) pins the port and skips SRV.
 
-**The local login box is built (REQ-020 local mode).** With no credential and no
+**The local login box (REQ-020 local mode).** With no credential and no
 stored session token, the TUI shows a modal **Sign in** dialog — workspace /
 username / masked password / *Remember me* — that resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
@@ -917,9 +900,9 @@ harness scoped to that feature — not by making the boot check longer. A new vi
 or overlay is added to the predicates in `winmain.c`; it does not get a line
 here.
 
-It is not in CI, and that gap is honest: the daemon is epoll-based so it is
+It is not in CI: the daemon is epoll-based so it is
 Linux-only, and GitHub's Windows runners cannot host it (no Linux containers). A
-hosted run needs a self-hosted Windows box. Until then, run it and read it — the
+hosted run needs a self-hosted Windows box. Run it and read it — the
 same discipline as reading CI.
 
 ## Seeing the whole window (Win32 harness)
@@ -983,67 +966,18 @@ separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only wa
 to change a format's size, so any preference that moves the scale must call
 `fonts_build` and then force a relayout.
 
-## 8. Roadmap
+## 8. Frontends
 
-- **Built — the core and the TUI.** On top of the lean core loop
-  (sidebar, backfill on open, send, display names, unread, scrollback), the TUI
-  surfaces: reactions, edit/delete, typing, threads, search, channel management,
-  roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin,
-  webhook management, attachments, and audit log (see §3 for where each lives —
-  and for the honest scope: the TUI reaches a **minority** of the app-core).
-  Also built: the **credential store** and reconnect/offline (REQ-100/101/102
-  — silent session-token reconnect across restarts, persisted TOFU pin,
-  in-memory offline outbox, workspace book), **multiple workspaces**
-  (REQ-012–015), DNS workspace resolution (REQ-010/011), the local **Sign in**
-  dialog, and the **Windows TUI** (ARCH-81). See §5–§6.
-- **Done — Windows GUI depth.** The Win32 GUI surfaces every engine feature
-  (ARCH-82) and its depth work is **closed**: the error/toast + connection
-  surface (**REQ-263**), search with jump-to-match, keyset paging and operators
-  (REQ-080), the sidebar overhaul (**REQ-267**), composer autocomplete + emoji
-  picker (**REQ-265**), the preferences hub (**REQ-261**), the other-user profile
-  viewer (**REQ-266**), the command palette (**REQ-260**), inline images
-  (**REQ-142**), channel rename/topic/archive/visibility
-  (REQ-034/035/036/036a), the activity feed (**REQ-139**), permalinks and
-  jump-in-context (**REQ-232**/ARCH-96), mark-unread/mute/star
-  (REQ-235/137/234), profile depth with avatars and custom status
-  (REQ-240/241/122), the global notify default (REQ-134) and the
-  **N-concurrent-workspace model** (REQ-012–015) are all built.
-  **Accessibility (REQ-269) is built** — a UIA provider over the self-drawn UI, a
-  real system caret and UIA events (**ARCH-99**), with an `AutomationId` and an
-  `InvokePattern` on every actionable element (**REQ-290**), verified
-  from outside the process by `scripts/uia_probe.ps1`. Rich text and its toolbar
-  are built too (**REQ-220**, ARCH-100: a shared parser in `client/core/` plus
-  sdltext byte ranges). The items that pair a client half with a daemon half —
-  drafts, scheduled send, the notification schedule, keywords and priority
-  people, the pause, cross-channel threads, the People directory — are built
-  end to end. Open work is in the
-  [issue tracker](https://github.com/openchime/openchime/issues).
-- **The frontend order is fixed: all of Win32, then the TUI, then the
-  portable-layer migration of the GUI, then further desktops on that layer
-  (ARCH-80).** Win32 is the reference client and it is finished *first* — including
-  the items now waiting on a daemon requirement, which are Win32 work waiting on
-  their other half, not work deferred behind another frontend. The TUI being
-  behind is an accepted consequence of that order, not a reason to reorder it.
-- **Then — TUI catch-up.** The TUI is behind the GUI by **more than twenty**
-  features, every one of which already exists in the app-core — @mentions (REQ-221), pins
-  (REQ-230), saved items (REQ-231), the channel files listing (REQ-143), the
-  per-channel roster (REQ-031), channel management (REQ-034/035/036/038), mute and
-  star (REQ-137/234), mark-unread (REQ-235), the activity feed (REQ-139), in-app
-  preferences and themes (REQ-261/262), profile depth and custom status
-  (REQ-240/241/122), group DMs (REQ-056), custom emoji (REQ-072), rich text
-  (REQ-220), and more. Because the frontend order puts all of Win32 first, the
-  TUI's gap is a consequence of that order rather than tracked work; it is
-  deliberately not tracked as an issue.
-- **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
-  courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
-  (there is no SAML by design, **REQ-027**); plus first-run onboarding
-  (**REQ-268**).
-- **Next — audio client.** Opus encode/decode + UDP to the sidecar — the deferred
-  half of REQ-150/151 ([AUDIO.md](./AUDIO.md)).
-- **Then — the rest of the specified scope.** REQUIREMENTS.md §§1–16 carries it,
-  each requirement marked with whether it is built; whatever is not built and
-  matters is an issue in the [tracker](https://github.com/openchime/openchime/issues).
-- **Then — remaining platforms.** The portable GUI on Linux and
-  macOS (a text backend + native shim each, ARCH-80), a web DOM UI, and mobile —
-  each with its own screen capture for sharing in calls; the codec and the
-  transport are in the core (REQ-161, [VIDEO.md](./VIDEO.md)).
+- **Win32 is the reference client** (ARCH-82): it surfaces every engine feature,
+  and a feature is surfaced there first. Accessibility (REQ-269) is a UIA
+  provider over the self-drawn UI, a real system caret and UIA events
+  (**ARCH-99**), with an `AutomationId` and an `InvokePattern` on every
+  actionable element (**REQ-290**), verified from outside the process by
+  `scripts/uia_probe.ps1`. Rich text and its toolbar (**REQ-220**, ARCH-100) are
+  a shared parser in `client/core/` plus sdltext byte ranges.
+- **The TUI** sits on the same core and is text-only (§3).
+- **Further desktops are ports of the portable layer** (ARCH-80): the portable
+  GUI on Linux and macOS is a text backend + native shim each. A web DOM UI and
+  mobile are their own frontends. Each platform has its own screen capture for
+  sharing in calls; the codec and the transport are in the core (REQ-161,
+  [VIDEO.md](./VIDEO.md)).

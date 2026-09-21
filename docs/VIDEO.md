@@ -208,7 +208,7 @@ PROTOCOL.md §5.17 has the frames:
 
 - `CALL_JOIN` carries **the video codecs the joiner can decode**, as bits
   (`OC_CALL_CODEC_VP9` = 1); `CALL_JOINED` and `CALL_ROSTER` carry each
-  participant's. Every client decodes VP9, so today it is VP9; a later codec is a
+  participant's. Every client decodes VP9, so it is VP9; another codec is a
   new bit, used only when everyone has it.
 - `CALL_SHARE {channel, on}` starts or stops sharing. The daemon keeps **one
   sharer per call**: a start takes over. Someone not in the call is refused

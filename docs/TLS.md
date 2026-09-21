@@ -84,5 +84,4 @@ which would otherwise spin its input loop forever.
 `tests/itest_tls.c` (run by `make test`) is hermetic: it stands up a loopback
 TLS server that generates a self-signed cert, connects a client that pins the
 server's fingerprint, round-trips a byte through the tunnel, and asserts that a
-**wrong** pin makes the handshake fail. The client-side integration scenarios
-that TESTING.md §3.1 had gated on this library decision are now unblocked.
+**wrong** pin makes the handshake fail.

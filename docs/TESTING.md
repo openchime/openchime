@@ -5,8 +5,8 @@ a decision in [ARCHITECTURE.md](./ARCHITECTURE.md) (ARCH-48) and consistent
 with the sibling C project openblocks, whose hand-rolled test convention this
 mirrors.
 
-**Status.** **Both tiers are built and green in CI.** The unit tier below is
-implemented across the codec, framebuf, migrations, auth/JWT/roles/rate-limiting,
+**Coverage.** The unit tier below
+covers the codec, framebuf, migrations, auth/JWT/roles/rate-limiting,
 the DB-writer handlers, storage/maintenance, enrollment, push, and the shared
 @mention scanner (`test_mention` — deliberately its own suite because the daemon
 and every client link that one implementation, ARCH-89), the message-formatting
@@ -79,9 +79,9 @@ order" belongs in integration.
       } while (0)
   ```
 
-- If a future test genuinely needs a file-static helper, that one TU can
-  `#include` the `.c` under test directly (the openblocks technique) — but none
-  currently do, so all link the public API instead.
+- A test that genuinely needs a file-static helper can have its one TU
+  `#include` the `.c` under test directly (the openblocks technique); every
+  other test links the public API instead.
 
 - Built and run by `make test`, compiled `-O0 -g` (debuggable). A non-zero exit
   fails the build and CI. One rule builds the single binary from every
@@ -208,10 +208,10 @@ framework, and OpenChime follows suit.
 
 ### 2.2a When the binary itself crashes
 
-A crash used to leave nothing to work with: the binary's output is block-buffered
-into CI's pipe, so the suite that was running went down with the process, and
-there was no backtrace — one crash on CI was knowable only as "Segmentation fault
-(core dumped)". `tests/main.c` now line-buffers its output, names each suite as it
+A crash would otherwise leave nothing to work with: the binary's output is block-buffered
+into CI's pipe, so the suite that was running goes down with the process, and
+there is no backtrace — a crash on CI is knowable only as "Segmentation fault
+(core dumped)". `tests/main.c` therefore line-buffers its output, names each suite as it
 starts it, and handles the fatal signals: a crash prints the signal, the suite,
 how far into the run it was, the faulting address, the crashing thread's stack
 resolved to file and line by `addr2line`, and — where `gdb` is installed, as it is
@@ -315,7 +315,7 @@ you started yourself (`make run` starts one on `127.0.0.1:8443`).
 
 ### 3.3 Scenarios
 
-Every scenario below is implemented and runs in CI. **Which tier runs it is the
+Every scenario below runs in CI. **Which tier runs it is the
 part that matters**, because the two tiers reach different things: the black-box
 tier drives the daemon over a real socket from a separate process, and the
 in-process suites reach states a black-box client cannot drive.
@@ -392,7 +392,7 @@ exit codes, so no scenario depends on a human reading output.
 
 **Audio.** `tests/test_audio.c` covers the **relay sidecar** — forwarding, call
 isolation, and `REVOKE`. Echo cancellation is measured by the ERLE harness in
-`tests/test_voice.c` (AUDIO.md §6.4), which voice input built: a synthetic room
+`tests/test_voice.c` (AUDIO.md §6.4): a synthetic room
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
 
@@ -504,7 +504,7 @@ entirely, which is what a real reconnect storm uses.
 - Localhost measurement — excludes real network RTT (which would dominate the
   low-single-millisecond local p50) and NIC/kernel socket-buffer memory under
   real load.
-- No periodic large-scale soak test yet; these are point-in-time measurements.
+- These are point-in-time measurements, not a periodic large-scale soak test.
 
 ### Slow-backend isolation (ARCH-69)
 
@@ -679,7 +679,7 @@ next start turns it into a `postmortem-<pid>.txt` naming what the app was doing.
 An absent fault address is itself the finding — it means no handler ran.
 
 The CRT's two exits are routed in as well: `abort()` and an invalid-parameter
-call both raise a real exception now, so they produce the ordinary report
+call both raise a real exception, so they produce the ordinary report
 instead of vanishing.
 
 **Prove it rather than wait for it.** `gui_drive.sh die <av|abort|badparam|fastfail|kill>`
@@ -802,8 +802,8 @@ port (9520):
 
 - **Does the field that looks focused get the keys?** Characters, and the keys
   that are not characters — Delete, Ctrl+A, Ctrl+V — while the To: field has
-  focus. They used to fall through to the message body behind it, so Ctrl+V
-  pasted into a message nobody could see and Ctrl+A then Delete wiped it.
+  focus. Falling through to the message body behind it would mean Ctrl+V
+  pastes into a message nobody can see and Ctrl+A then Delete wipes it.
 - **Does the message go where the pane says?** It posts into `#general` first, so
   a wrong send has somewhere visible to land, then addresses a message to bob and
   presses Enter. `#general`'s message count must not move and the DM's must.
@@ -812,13 +812,12 @@ port (9520):
   conversation's draft.
 - **Does Backspace take one recipient per press?** One press takes one; the key
   held — pressed again without a release — takes no more, which is the rule that
-  stopped a held key walking backwards through the whole list.
+  stops a held key walking backwards through the whole list.
 - **Does a send with nobody addressed refuse, and say so?** The recipients being
   gone is asserted *before* Enter is pressed, the message must still be in the box
-  afterwards, and a toast must say why. This check used to run with a recipient
-  still attached — the message was sent and the check passed or failed on which
-  dump line was read first — because the harness pressed Backspace without
-  releasing it (see the `key`/`keyup` rule above).
+  afterwards, and a toast must say why. The harness releases Backspace between
+  presses (see the `key`/`keyup` rule above); otherwise the check would run with a
+  recipient still attached.
 
 It reads the dump's `newmsg` line — `focus= chips= q= caret= sel= matches= body=
 pending=` — which exists so those states can be asserted rather than described.
@@ -847,9 +846,8 @@ open never happened. Tune the patience with `OC_SMOKE_WAIT_MS` (default 6000).
 rather than hoped for.** It checks the **exit status of every verb**: gui_drive
 exits non-zero when the client never acked, and a caller that discards that
 status turns a dropped command into the *next* assertion failing for an
-unrelated reason. That is not hypothetical — it is what made a previous, much
-larger suite's failures need interpretation before they could be trusted, and
-half of them turned out to be dropped verbs rather than defects.
+unrelated reason — a failure that needs interpretation before it can be
+trusted.
 
 **Its checks cannot pass by accident either.** The message it sends carries a
 per-run unique string, so no assertion can be satisfied by something a previous
@@ -857,9 +855,9 @@ run left in the database; and the run ends by making the client answer one more
 time, because every earlier check reads a dump file that looks identical whether
 the client is alive or died on the last keystroke.
 
-**Keeping it small is the maintenance rule.** The suite that preceded it held a
-few hundred assertions and ran for seven minutes, so it was skipped, so it
-caught nothing — the failure mode of a slow gate is not that it is slow, it is
+**Keeping it small is the maintenance rule.** A suite of a few hundred
+assertions that runs for minutes is skipped, and so
+catches nothing — the failure mode of a slow gate is not that it is slow, it is
 that it stops being run. Verify a feature by driving it, through
 `scripts/gui_drive.sh` or a harness scoped to that feature. Do not add it here.
 
@@ -911,7 +909,7 @@ smoke's reason.
 
 `scripts/gui_shortcuts.sh` drives the Win32 client's keyboard shortcuts over
 `gui_pair.sh` (port 9570) and asserts the EFFECT of each key, not that it
-dispatched: two clients, so bob can leave something unread for alice. Today it
+dispatched: two clients, so bob can leave something unread for alice. It
 covers Shift+Esc — every conversation read, as the reference client binds it —
 and that bare Esc still closes what is open and marks nothing; and Ctrl+<digit>,
 which goes to that workspace counting from 1 in the rail's order, with a digit
@@ -1009,9 +1007,8 @@ clipboard is **seeded with something else first**: Windows keeps it across runs,
 so a link copied by an earlier run would satisfy that check whether or not this
 run copied anything.
 
-**Every verb's ack is checked** (`k` for keys, `snap` for the dump). One run
-failed a single arrow-key check and passed on re-run; rather than call it flaky,
-the script now names a dropped verb where it happens — an unanswered `key` looks
+**Every verb's ack is checked** (`k` for keys, `snap` for the dump). The script
+names a dropped verb where it happens — an unanswered `key` looks
 exactly like a key that did nothing, and an unanswered `dump` leaves the previous
 file on disk for everything after it to read.
 
@@ -1132,9 +1129,9 @@ consistent with itself; only the other account knows. This is what found the
 Admin view still offering conversation rows for a sidebar it does not draw.
 
 **The checks that need pixels** (`scripts/audit/pixels.py`) close the gap
-between what the app asked for and what the renderer produced. The stroke
-tessellator once blew its vertex budget and discarded nine icons whole: the draw
-call happened, the ledger would have recorded it, and nothing appeared. So a
+between what the app asked for and what the renderer produced. A stroke
+tessellator that blows its vertex budget discards icons whole: the draw
+call happens, the ledger records it, and nothing appears. So a
 filled shape must *be* its colour (holes mean uncovered tessellation), an icon
 box must not come back one flat colour, and a disc's rim must be a ramp rather
 than a step. Each is asked only of shapes nothing was drawn over afterwards —
@@ -1143,11 +1140,11 @@ without that filter every button in the app is a finding.
 **The states that must agree** (`scripts/audit/consistency.py`) compare the
 client against itself. A theme reached by a live switch must render as a cold
 start in that theme does; 96 → 192 → 96 must equal a cold 96; a conversation
-reached twice must look the same both times. The first version made the theme
-case a *round trip* — X to Y and back to X — and it passed while the defect it
-was written for was live in the build, because a cache whose key forgets the
+reached twice must look the same both times. The theme case is one switch, from
+a cold start in the other theme, and deliberately not a *round trip* — X to Y and
+back to X — which passes with the defect present, because a cache whose key forgets the
 theme is stale in both directions and lands on the right colours by being wrong
-twice. It is one switch now, from a cold start in the other theme.
+twice.
 
 **Contact sheets** (`scripts/audit/sheets.py`) are for the findings no check
 will ever make. "A 13px marker on an 18px tile looks bad" is a judgement, not a
@@ -1178,6 +1175,5 @@ may ask rather than excusing a result:
 `scripts/audit/scenes.tsv`, one row per surface with the verbs and — not
 optional — a dump key to wait for. A verb acks when its handler *ran*, not when
 the frame showing its effect has been painted, and several of these views paint
-"Loading…" until the daemon answers; an earlier pass slept a fixed time instead
-and captured Admin mid-load, which read as a layout defect and cost a round to
-explain.
+"Loading…" until the daemon answers; sleeping a fixed time instead
+captures a view mid-load, which reads as a layout defect.

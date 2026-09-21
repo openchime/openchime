@@ -80,7 +80,7 @@ void oc_capture_close(oc_capture *c);
 A backend is an `oc_capture_backend` — the same six operations — and the front
 functions forward to the one in use: the synthetic source when
 `OPENCHIME_TEST_CAPTURE` asks for it, otherwise `oc_capture_platform()`, which is
-NULL on a platform whose backend is not built yet.
+NULL on a platform with no backend.
 
 Errors are typed so the UI can say the right thing: `OC_CAP_DENIED` (the operating
 system blocks the camera), `OC_CAP_NODEVICE`, `OC_CAP_BUSY` (another application
@@ -98,16 +98,16 @@ them without trusting either device's own timestamps.
 
 ### 3.2 Backends
 
-| Platform | Source | Native format | Built |
+| Platform | Source | Native format | File |
 |---|---|---|---|
-| Windows | Media Foundation `IMFSourceReader`, video processing enabled, asynchronous | NV12 (the reader converts YUY2 and MJPEG) | built (`cap_mf.c`) |
-| Windows, screens and windows | Windows.Graphics.Capture, a free-threaded frame pool polled from a worker | BGRA through a staging texture | built (`cap_wgc.c`) |
-| Linux | V4L2, mmap streaming | YUYV, or MJPEG decoded with stb_image | with the Linux client |
-| macOS | AVFoundation `AVCaptureVideoDataOutput` | 420YpCbCr8BiPlanar | with the macOS client |
-| iOS | AVCaptureSession, the same output plus orientation | 420YpCbCr8BiPlanar | with the iOS client |
-| Android | Camera2 through the NDK, `AImageReader` | YUV_420_888 with row and pixel strides | with the Android client |
-| Web | `getUserMedia` → `MediaStreamTrackProcessor` → `VideoFrame.copyTo` | I420 | with the web client |
-| Tests | a synthetic source: moving bars, a frame counter, a denied mode; and a synthetic 2560×1600 screen of text that changes five times a second | I420 | built (`capture.c`) |
+| Windows | Media Foundation `IMFSourceReader`, video processing enabled, asynchronous | NV12 (the reader converts YUY2 and MJPEG) | `cap_mf.c` |
+| Windows, screens and windows | Windows.Graphics.Capture, a free-threaded frame pool polled from a worker | BGRA through a staging texture | `cap_wgc.c` |
+| Linux | V4L2, mmap streaming | YUYV, or MJPEG decoded with stb_image | — |
+| macOS | AVFoundation `AVCaptureVideoDataOutput` | 420YpCbCr8BiPlanar | — |
+| iOS | AVCaptureSession, the same output plus orientation | 420YpCbCr8BiPlanar | — |
+| Android | Camera2 through the NDK, `AImageReader` | YUV_420_888 with row and pixel strides | — |
+| Web | `getUserMedia` → `MediaStreamTrackProcessor` → `VideoFrame.copyTo` | I420 | — |
+| Tests | a synthetic source: moving bars, a frame counter, a denied mode; and a synthetic 2560×1600 screen of text that changes five times a second | I420 | `capture.c` |
 
 **The Windows reader runs asynchronously.** A blocking `ReadSample` on a camera
 that stops delivering never returns and cannot be cancelled, so closing the
@@ -329,8 +329,8 @@ view. Search's `has:video` matches `video/` attachments.
 
 ### 7.1 Transfers queue
 
-A connection runs one transfer at a time. The client used to refuse a second one as
-busy; it now **queues** uploads and downloads in order. A video post is one job made
+A connection runs one transfer at a time. The client **queues** uploads and
+downloads in order rather than refusing a second one as busy. A video post is one job made
 of the four steps in §6.1, cancellable as a whole. Progress is reported per chunk,
 throttled, as bytes done and total — for the upload bar and the download ring.
 

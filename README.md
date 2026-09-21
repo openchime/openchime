@@ -22,24 +22,21 @@ availability independence for capability, never message confidentiality
 ("seen by", REQ-090) exist here and in neither Slack nor Pumble, which both
 decline them deliberately. Self-hosting, data residency and the three deployment
 models are ours alone — both references are single-cloud and SaaS-only. The
-clients are native C rather than Electron or web-tech. Two things are **not**
-differentiators and are recorded as such: unlimited history is matched by
+clients are native C rather than Electron or web-tech. One thing is **not** a
+differentiator and is recorded as such: unlimited history is matched by
 Pumble's free tier, so the argument there is data ownership rather than
-retention; and on breadth of client platforms both references are ahead, since
-this project ships a Windows GUI and a Linux/Windows TUI and no macOS, Linux
-GUI, web or mobile client. On single sign-on the position is weaker still — see
-REQ-027.
+retention.
 
 ## The documents
 
 Sixteen, and each has one job. **Start with the first two**: they answer what the
-product is meant to do and why it is built the way it is. What is *wrong* with it
-today is not a document — it is the
+product is meant to do and why it is built the way it is. What is built, missing
+or broken is not a document — it is the
 [issue tracker](https://github.com/openchime/openchime/issues).
 
 | Document | What it is |
 |---|---|
-| [REQUIREMENTS.md](docs/REQUIREMENTS.md) | The product specification — every `REQ-NNN`, written as a contract in present-perfect. Each requirement carries a marker saying whether it is built, so a shipped guarantee reads differently from an intention. |
+| [REQUIREMENTS.md](docs/REQUIREMENTS.md) | The product specification — every `REQ-NNN`, written as a contract in present-perfect. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice and its rationale. Design decisions live here; product scope lives in REQUIREMENTS.md. |
 | [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry is generated from the codec and is the authority on which opcodes are taken. |
 | [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting every migration and why each table is shaped the way it is. |
@@ -61,7 +58,7 @@ today is not a document — it is the
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
 | [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and the GitHub release — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
 
-The daemon is a **feature-complete v1 chat core**. On the foundations — the
+The daemon is the **chat core**. On the foundations — the
 wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
 network loop + a single DB-writer thread, refined by ARCH-66 into a third
 read-only query thread), TLS termination with self-signed TOFU certs (ARCH-10,
@@ -80,12 +77,6 @@ daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
 **enrolls** with it for federated deployments (ARCH-84). **Calls** are relayed by a
 UDP sidecar that never decodes them and are encrypted end to end between the
 participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDIO.md)).
-
-For what is known to be wrong with it, see the
-**[issue tracker](https://github.com/openchime/openchime/issues)**. No daemon
-defect is open there at present; every open defect is in the Windows GUI. What
-remains on the server side is scope rather than repair — a CA-signed certificate
-for the webhook endpoint (REQ-171) among it.
 
 ## Install the daemon
 
@@ -182,22 +173,14 @@ by `make test` (`tests/test_client_core.c`). A standalone compile check:
 make core
 ```
 
-The first frontend is a **TUI** (`make tui`, built on the in-tree `tuikit`
+One frontend is a **TUI** (`make tui`, built on the in-tree `tuikit`
 toolbox over termbox2 + utf8proc, ARCH-83), built on the host like the daemon and
 also shipping on Windows (ARCH-81). It is menu- and screen-driven — panels, context
 menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
 covers live messaging with history backfill, reactions, edit/delete, typing,
 threads, search, channel + DM management, roster + presence, who-reacted,
 notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
-storage and audit overlays, multiple workspaces, and logout. It is
-behind the Windows GUI by **more than twenty** features — among them
-@mentions, pins, saved items, the channel files listing, the per-channel member
-roster, channel topic/rename/archive, mute, star, mark-unread, the activity feed,
-in-app preferences and themes — plus webhook *deletion* and log-out-everywhere.
-All of them already exist in the app-core, so closing the gap is TUI work alone.
-The frontend order is fixed — all of Win32 first — so the TUI's gap is not
-tracked as open work. Some frames the daemon speaks reach no client at all yet —
-see [docs/CLIENT.md](docs/CLIENT.md) §3. The app-core **writes nothing to disk** (ARCH-88/REQ-201): one credential per
+storage and audit overlays, multiple workspaces, and logout. The app-core **writes nothing to disk** (ARCH-88/REQ-201): one credential per
 workspace in the OS credential store carries the session token, the TOFU pin and
 the workspace book, so it reconnects silently across restarts and queues sends
 made while disconnected — in memory, for the life of the process. History comes
@@ -207,36 +190,33 @@ A native **Windows GUI**, pure C, presents through an **SDL3 renderer on its own
 Win32 window**: every primitive is drawn by the in-tree `oc_gfx` layer and every
 glyph is laid out and rasterized by **sdltext** over DirectWrite
 (ARCH-80/106/107). The window class, message loop, tray, IME and the
-accessibility provider stay Win32. Direct2D survives only as sdltext's
-rasterizer on this platform — it is no longer the client's presentation layer.
+accessibility provider stay Win32. Direct2D is used only as sdltext's
+rasterizer on this platform — it is not the client's presentation layer.
 
-Under that it is the most complete client by some distance: every tracked engine
-feature is reachable, and it leads the TUI by a wide margin. Accessibility is
-built (REQ-269/ARCH-99: a UI Automation
+It is the reference client: every engine feature is reachable from it.
+Accessibility is first-class (REQ-269/ARCH-99: a UI Automation
 provider over the self-drawn UI, a system caret and spoken notifications), with
 an automation id and an invoke pattern on every actionable element (REQ-290),
 both verified by a real UIA client from outside the process. Rich text and its
 toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
-and link-unfurl cards are all built end to end with their daemon halves.
+and link-unfurl cards all run end to end with their daemon halves.
 
 **Two harnesses, and they answer different questions.** `scripts/gui_smoke.sh`
 asks whether the client boots and runs — fourteen assertions in about ten
-seconds, run before every push, and deliberately kept that size: the suite that
-preceded it held a few hundred assertions, took seven minutes, and was therefore
-skipped. `scripts/gui_audit.sh` is the long one, walking every surface across
+seconds, run before every push, and deliberately kept that size: a suite that
+takes minutes is a suite that gets skipped. `scripts/gui_audit.sh` is the long one, walking every surface across
 themes, DPI settings and text sizes and checking each captured scene against
 properties it must hold on its own — a string that fits its box, ink that can be
 read against what is behind it, one label not drawn over another, nothing drawn
-where it cannot be reached. It needs no reference image, which is the point: the
-render it would once have been compared against is gone. See
+where it cannot be reached. It needs no reference image: a render is checked against itself
+rather than against a second binary. See
 [TESTING.md](docs/TESTING.md).
 
-Next is **TUI catch-up**, then the remaining desktops. Those are no longer a
-per-toolkit list: ARCH-80 settled on one portable self-rendered application layer
-over SDL3 and sdltext for every desktop, with a thin native shim per platform, so
-Linux and macOS are ports of that layer rather than GTK and AppKit rewrites. A
-web DOM UI and mobile stay their own frontends.
+Every desktop shares one portable self-rendered application layer over SDL3 and
+sdltext, with a thin native shim per platform (ARCH-80), so Linux and macOS are
+ports of that layer rather than GTK and AppKit rewrites. A web DOM UI and mobile
+are their own frontends.
 
 ## Local development environment
 

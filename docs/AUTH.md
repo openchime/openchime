@@ -5,32 +5,6 @@ This is the authoritative design; it is cross-referenced from ARCHITECTURE.md
 (ARCH-19, ARCH-55–ARCH-60), REQUIREMENTS.md (§1.2, §8.1), PROTOCOL.md (§4), and
 SCHEMA.md (migration 0002).
 
-**Status.** **Two of the three identity sources (§1) are implemented, one per
-deployment; a direct connection is not built.** Local mode verifies username +
-password against PBKDF2-HMAC-SHA256 credentials (`local_credentials`); OIDC mode
-— the relay source — verifies a central-issued ES256 JWT against a pinned key
-(`daemon/jwt.c`, jsmn for the claims) and JIT-provisions the user. Both converge on a daemon-issued
-session (§4) and accept session tokens on reconnect (`process_auth` in
-`daemon/dbwriter.c`, crypto in `daemon/auth.c`, wire frames in PROTOCOL.md §4).
-The mode is chosen at boot: default local (`OPENCHIME_BOOTSTRAP_USERS` provisions the
-owner, §2), or `OPENCHIME_AUTH_MODE=oidc` with `OPENCHIME_OIDC_ISSUER` / `OPENCHIME_OIDC_AUDIENCE` /
-`OPENCHIME_OIDC_PUBKEY[_FILE]` — `AUTH_CHALLENGE` then advertises the matching methods
-bitset (`local|session` or `oidc|session`). Failed local-auth is **rate-limited
-per account** (REQ-191, `daemon/ratelimit.c`): after a burst of failures the
-account is refused with `AUTH_RATE_LIMITED`, checked before the expensive PBKDF2.
-Role **changes** are enforced in the writer (`SET_ROLE`, `daemon/roles.c`): the
-owner/admin/member policy plus the ≥1-owner invariant (§6). Failed local-auth is
-rate-limited both per account and per source IP (REQ-191). Tenant management is
-**implemented and exposed over the wire** (PROTOCOL.md §5.8): `SET_ROLE`,
-`LIST_USERS`, `INVITE_USER` + `REDEEM_INVITE` (invite-token account creation, §2),
-and `REMOVE_USER` (which locks a member out via the `users.disabled` flag added in
-migration 0003, checked in every auth path). Moderation-delete (REQ-032) and
-channel management (REQ-031) also landed. **Remaining:** a configurable OIDC
-bootstrap-owner subject, and email magic-link invite delivery (§7). The exchange
-every source is to share — proof of possession, who may join, direct
-connections, a second step for local accounts, managed enrollment — is designed
-in §8 and not built.
-
 ---
 
 ## 1. Identity sources, one session
@@ -69,10 +43,6 @@ can have. **SAML is not a source** (REQ-027).
 **Sources may be enabled together** — an organization's provider for staff
 beside local accounts for contractors or a break-glass owner.
 
-**Built today:** local accounts and the relay's verification half, **one source
-per deployment**, selected by `OPENCHIME_AUTH_MODE`. A direct connection, and
-enabling sources together, are not built.
-
 A deployment's sources are set in the daemon's static config (ARCH-26) and
 advertised to the client in-protocol via `AUTH_CHALLENGE` (§5).
 
@@ -88,8 +58,7 @@ authority.
   per-user random salt and a high iteration count (~600k, OWASP-tier). Only the
   derived hash + salt + iteration count are stored (`local_credentials` table).
   PBKDF2 was chosen over argon2/bcrypt to add **no new dependency** — mbedTLS is
-  already linked and has no argon2; argon2 (a small vendored lib) is a noted
-  future upgrade. Passwords travel only inside the TLS session (REQ-180), so a
+  already linked and has no argon2. Passwords travel only inside the TLS session (REQ-180), so a
   plaintext password in the `AUTH` frame is acceptable on the wire; it is never
   stored.
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
@@ -100,7 +69,7 @@ authority.
   first admin" without requiring email (air-gapped-safe).
 - **Adding users:** an owner/admin creates an account and issues an **invite
   token**; the invitee sets their password by presenting the token. Email
-  magic-link delivery is an optional future enhancement, never required.
+  delivery is never required.
 - **Registered-user cap:** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
   = unlimited). Creating a *new* user past the cap — via invite redeem, direct
   register, bootstrap, or a first-time OIDC login — is refused with
@@ -200,10 +169,8 @@ it over on.
 6. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
 
-The client half of this — the browser launch, the loopback listener and the
-`ASWebAuthenticationSession` path on Apple platforms — is the remaining
-unbuilt piece of REQ-020; the daemon's verification half is built and tested
-(§3.6).
+The client half of this is the browser launch, the loopback listener and, on
+Apple platforms, the `ASWebAuthenticationSession` path.
 
 ### 3.3 The identity token — an ES256 JWT (ARCH-57)
 
@@ -292,7 +259,7 @@ independence, never message confidentiality.
 ### 3.6 The central service / relay (separate component)
 
 The central service + relay are a **separate system** — a web service, not the C
-daemon — and are built independently. Its contract with the daemon is narrow:
+daemon. Its contract with the daemon is narrow:
 
 - run the Authorization-Code-+-PKCE flow against the configured providers;
 - mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
@@ -302,13 +269,13 @@ daemon — and are built independently. Its contract with the daemon is narrow:
   registered audience. This registry is part of the OIDC function and is never
   consulted for workspace discovery, which is plain DNS in every model (ARCH-14).
 
-Until it exists, the daemon's OIDC path is tested with a **test issuer**:
+The daemon's OIDC path is tested with a **test issuer**:
 generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
 configure the daemon with the test public key — the same faking approach as the
 existing TLS/netloop integration tests.
 
 **The daemon's enrollment client (ARCH-84).** How a federated box *obtains* its
-audience id is now implemented daemon-side in `daemon/enroll.c`, gated on
+audience id is implemented daemon-side in `daemon/enroll.c`, gated on
 `OPENCHIME_ENROLL_URL`. On first boot the daemon generates its own ECDSA-P256 keypair +
 a random `audience` (`ws_…`), persists them (so they survive restarts), and prints
 an `oce1.` **enrollment code** the operator couriers into the control-plane
@@ -356,7 +323,7 @@ token on reconnect), the daemon then does the same thing:
 - **Reconnect (REQ-100):** the client re-presents its session token
   (`AUTH{method=session}`); the daemon hashes and looks it up, and resumes
   without a full re-auth. The session lifetime is the daemon's to set (REQ-181) —
-  it is no longer tied to a provider token's expiry.
+  it is not tied to a provider token's expiry.
 - **Revocation (REQ-182):** "log out" / "log out other devices" deletes the
   relevant `sessions` row(s); the next protocol interaction on a revoked session
   fails. This local revocation is exactly what a stateless provider JWT cannot
@@ -389,17 +356,16 @@ Every user holds exactly one tenant-level role — `owner`, `admin`, or `member`
 DB-writer handlers (the single write path); the policy predicates are pure and
 unit-tested in `daemon/roles.c`.
 
-- **Role changes (implemented):** `SET_ROLE` applies the policy — only owner/admin
+- **Role changes:** `SET_ROLE` applies the policy — only owner/admin
   may change roles, only an owner may grant/revoke owner, an admin may only
   promote/keep members — refusing with `FORBIDDEN`.
-- **≥1 owner invariant (implemented):** demoting the tenant's last owner is
+- **≥1 owner invariant:** demoting the tenant's last owner is
   refused with `LAST_OWNER` (REQ-030), checked against a live `COUNT(*)` of owners.
-- **Moderation delete (REQ-032, implemented):** an admin/owner who belongs to the
+- **Moderation delete (REQ-032):** an admin/owner who belongs to the
   channel may delete (not edit) others' messages; `process_delete` performs the
   tombstone after an `oc_role_can_moderate` check for a non-author and records it
-  as a moderator deletion via `messages.deleted_by` (and in the audit log). (This
-  matches the AUTH.md intro and ARCH-60.)
-- **Invite/remove (REQ-033, implemented):** only owner/admin may invite or remove
+  as a moderator deletion via `messages.deleted_by` (and in the audit log).
+- **Invite/remove (REQ-033):** only owner/admin may invite or remove
   tenant members (`oc_role_can_manage_members`), and only an owner may invite at
   or remove an admin/owner. Invite mints a single-use token (`invites`);
   `REMOVE_USER` locks the member out via `users.disabled` (migration 0003) and
@@ -409,25 +375,26 @@ unit-tested in `daemon/roles.c`.
 
 ---
 
-## 7. Deferred
+## 7. Excluded
 
-Tracked so the omissions are deliberate:
+Deliberate omissions from this design:
 
-- **Email magic-link** local login (needs outbound email; not air-gapped-safe).
-- **Argon2** password hashing (a small vendored lib; PBKDF2 ships first).
+- **Email magic-link** local login: it needs outbound email and is not
+  air-gapped-safe.
+- **Argon2** password hashing: mbedTLS has none, so it would add a vendored
+  dependency (§2).
 - **Cert-vs-restore interaction** (the TOFU fingerprint changing when a database
-  is restored onto a new box) — addressed by persisting the TLS identity in the
+  is restored onto a new box): handled by persisting the TLS identity in the
   database (ARCH-66b); orthogonal to auth.
 
 ---
 
-## 8. The sign-in contract — designed, not built
+## 8. The sign-in contract
 
 One exchange serves every identity source of §1, so a client is written once and
-adding a source changes no frame. **Nothing in this section is built**: §2–§5
-describe what runs today, and PROTOCOL.md §4 documents the frames that exist.
-This is the contract the daemon, the clients and the central service are each to
-implement, stated once so the three cannot drift apart.
+adding a source changes no frame. This is the contract the daemon, the clients
+and the central service each implement, stated once so the three cannot drift
+apart.
 
 ### 8.1 The exchange
 
@@ -449,7 +416,7 @@ client                                            daemon
 ```
 
 - **`AUTH_CHALLENGE` lists sources** — `{id, kind, label}`, `kind` being `local`,
-  `relay` or `oidc` — in place of the methods bitset and `oidc_params`. The client
+  `relay` or `oidc`. The client
   draws one control per source from the labels: fixed text for local accounts and
   the relay, the operator's own words for a direct connection ("Acme SSO").
   Resuming a session (§4) is always accepted and is not a listed source.
@@ -464,14 +431,12 @@ client                                            daemon
   `AUTH_REDIRECT` and `AUTH` lives on the connection (§8.2), so the client may
   disconnect and an unauthenticated connection can be short-lived.
 - **`AUTH_CONTINUE`** answers a first step that is correct but not sufficient
-  (§8.6). It exists from the start so a second factor changes no handshake.
+  (§8.6). It is part of the exchange so that a second factor changes no handshake.
 - **Errors a client can explain:** `AUTH_NOT_ALLOWED` (a valid identity that may
   not join, §8.4), `AUTH_SOURCE_UNAVAILABLE` (a provider that cannot be reached,
   §8.5), `AUTH_MFA_REQUIRED`, beside the codes that exist.
-- This changes frame layouts, so the protocol version moves — once. Daemon and
-  clients each speak exactly one version today; from the first public release the
-  daemon accepts the previous version as well, so a daemon upgrade is never a
-  flag day for its clients. Opcodes are assigned when the frames are built.
+- **Protocol versions.** The daemon accepts the previous protocol version as
+  well as its own, so a daemon upgrade is never a flag day for its clients.
 
 ### 8.2 Proof of possession
 
@@ -498,7 +463,7 @@ Standard JWT, ES256, as §3.3. The claims:
 
 | Claim | Meaning |
 |---|---|
-| `iss`, `aud` | Central, and this workspace's opaque id — as today. |
+| `iss`, `aud` | Central, and this workspace's opaque id (§3.3). |
 | `sub` | `<upstream issuer>|<stable subject>`. For Google the provider's `sub`. For Microsoft, `oid` under the tenant's issuer — `https://login.microsoftonline.com/<tid>/v2.0|<oid>` — not the per-application `sub`. |
 | `idp` | Which provider vouched: `google`, `microsoft`. |
 | `tenant` | The organization the provider places the person in: Google's hosted domain, Microsoft's tenant id. Absent for a personal account. |
@@ -519,7 +484,7 @@ sign-in and later connects directly to its own tenant (§8.5) sees the same
 **Keys.** `OPENCHIME_OIDC_PUBKEY[_FILE]` may hold several PEM keys. A token's
 `kid` is the signing key's RFC 7638 thumbprint; the daemon computes the same
 thumbprint for each key it pins and verifies with the one that matches, refusing
-an unknown `kid`. Rotation is then an overlap — ship the new key beside the old,
+an unknown `kid`. Rotation is an overlap — ship the new key beside the old,
 switch the signer, retire the old — with still no online key fetch (ARCH-26).
 
 **Which provider.** `/oidc/authorize` takes `workspace`, `redirect_uri` and
@@ -580,7 +545,7 @@ connection is a source in `AUTH_CHALLENGE`.
 - **Discovery and keys** are fetched over CA-verified TLS at boot and on an unknown
   `kid`, rate-limited and cached. A provider that cannot be reached makes its
   source `AUTH_SOURCE_UNAVAILABLE`; sessions already issued are untouched (§3.4's
-  login-time-only dependency, now on the operator's provider).
+  login-time-only dependency, here on the operator's provider).
 - **`AUTH_BEGIN`** creates a pending sign-in — `state`, the daemon's own PKCE
   verifier, a nonce, the client's challenge, ten minutes to live — and returns the
   provider's authorize URL.
@@ -614,16 +579,15 @@ the public key and activates. The ticket is the authorization the operator's
 paste is in the self-hosted flow; the private key still never leaves the box.
 
 Requests the daemon signs afterwards name what they are for: the canonical string
-becomes `openchime-machine-v2|<aud>|<unix_ts>|<METHOD>|<path>|<sha256hex(body)>`,
+is `openchime-machine-v2|<aud>|<unix_ts>|<METHOD>|<path>|<sha256hex(body)>`,
 so a signed request cannot be replayed at a second endpoint.
 
-### 8.8 What this does to configuration
+### 8.8 Configuration
 
-| Setting | Change |
+| Setting | Meaning |
 |---|---|
-| `OPENCHIME_AUTH_MODE` | Becomes a list of the built-in sources — `local`, `relay`, or `local,relay` — with `oidc` still read as `relay`. A direct connection is enabled by being configured. |
+| `OPENCHIME_AUTH_MODE` | A list of the built-in sources — `local`, `relay`, or `local,relay` — with `oidc` read as `relay`. A direct connection is enabled by being configured. |
 | `OPENCHIME_OIDC_PUBKEY[_FILE]` | May hold several keys (§8.3). |
-| `OPENCHIME_OIDC_ALLOW` | New: who may join (§8.4). |
-| `OPENCHIME_OIDC_CONNECT_<n>` | New, one per direct connection (§8.5). |
-| `OPENCHIME_ENROLL_TICKET` | New, managed workspaces only (§8.7). |
-| `OPENCHIME_OIDC_PARAMS` | Goes. |
+| `OPENCHIME_OIDC_ALLOW` | Who may join (§8.4). |
+| `OPENCHIME_OIDC_CONNECT_<n>` | One per direct connection (§8.5). |
+| `OPENCHIME_ENROLL_TICKET` | Managed workspaces only (§8.7). |

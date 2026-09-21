@@ -171,7 +171,7 @@ and an underline is indistinguishable from a link in most renderings.
 Each frontend maps spans to its own facilities, and the mapping is the frontend's
 business:
 
-- **Win32** — **built.** DirectWrite ranges on the existing
+- **Win32** — DirectWrite ranges on the existing
   layout, the same mechanism `@mention` highlighting already uses
   (`body_layout`), so formatting composes with mentions and custom emoji rather
   than fighting them. **Both the transcript and the composer remove the inline
@@ -217,9 +217,8 @@ business:
   `ShellExecuteW` re-checks the scheme even though the parser already guaranteed
   it, because that call is the dangerous end.
 - **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
-  since a terminal has no proportional styling to lean on. **Not built** —
-  the parser is shared and waiting for it; the TUI shows the
-  markup as source, which the dialect guarantees is legible.
+  since a terminal has no proportional styling to lean on. Markup shown as
+  source stays legible, which the dialect guarantees.
 
 **The composer shows formatting as you type**, which is only affordable because
 the parser is client-side and runs over a ≤4000-unit buffer — the same pass that

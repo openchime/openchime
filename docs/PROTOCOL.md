@@ -2,9 +2,8 @@
 
 This document specifies the OpenChime binary wire protocol at the byte level.
 It is the detailed realization of the frame decisions in
-[ARCHITECTURE.md](./ARCHITECTURE.md) (ARCH-6 through ARCH-9, ARCH-30) and
-resolves the protocol-shaped `[needs ARCH decision]` items in
-[REQUIREMENTS.md](./REQUIREMENTS.md).
+[ARCHITECTURE.md](./ARCHITECTURE.md) (ARCH-6 through ARCH-9, ARCH-30) and of
+the protocol-shaped requirements in [REQUIREMENTS.md](./REQUIREMENTS.md).
 
 **Scope.** This covers connection handshake and version
 negotiation, authentication, the message send/broadcast/ack cycle, message
@@ -25,13 +24,11 @@ enable/rotate, cross-channel threads, unresolved-mention notices, and the
 per-channel file census — are listed in §9 with their opcodes and directions but
 are specified in §§5.16d–5.16j.
 
-**Status.** Implemented. The frames in this document are realized in
+**Code.** The frames in this document are realized in
 `shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
-`daemon/netloop.c` (dispatch). Coverage is uneven: the auth-and-message vertical
-is exercised end to end over a real socket, and the rest in-process
-(TESTING.md §3.3). Where this document and the codec disagree, the codec is
-right, and the disagreement is tracked as an issue rather than silently
-corrected here.
+`daemon/netloop.c` (dispatch). The auth-and-message vertical is exercised end to
+end over a real socket, and the rest in-process (TESTING.md §3.3). Where this
+document and the codec disagree, the codec is right.
 
 ---
 
@@ -50,7 +47,7 @@ corrected here.
 
 ### 1.1 Port and ALPN multiplexing (ARCH-54)
 
-This is a client-facing contract: it is fixed now and clients must conform,
+This is a client-facing contract: it is fixed and clients must conform,
 because changing it later means re-releasing every client.
 
 **Port.** The public port is **443** — the standard TLS port, chosen so clients
@@ -100,9 +97,7 @@ ARCH-25) by **ALPN** negotiated during the TLS handshake:
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
 protocol; one that does not is read by the HTTP/1.1 handler, which serves
 `POST /webhook/<token>` (§5.15) and nothing else on this port — `/healthz` and
-the landing page are on the separate plaintext health port (ARCH-25). The
-CA-signed certificate for the webhook endpoint (ARCH-34, REQ-171) is the part
-that remains unbuilt; the endpoint currently answers on the daemon's TOFU cert.
+the landing page are on the separate plaintext health port (ARCH-25).
 
 The `oc` version suffix (`/1`) tracks the transport-framing generation, distinct from the
 per-frame `version` field in §2.
@@ -283,9 +278,7 @@ Client                                  Server
 After `WELCOME`, the daemon sends `AUTH_CHALLENGE` advertising the auth method(s)
 it accepts; the client MUST authenticate before sending any messaging frame. A
 messaging frame received before `AUTH_OK` is answered with `ERROR AUTH_REQUIRED`
-(fatal). Full design in [AUTH.md](./AUTH.md). The exchange designed to replace the
-methods bitset and `oidc_params` — one shape for every identity source — is
-AUTH.md §8; it is not built, and none of its frames are in this document.
+(fatal). Full design in [AUTH.md](./AUTH.md).
 
 ### 4.1 `AUTH_CHALLENGE` (server → client), msg_type `0x0012`
 
@@ -887,7 +880,7 @@ pair — `(created_at_ms, id) < (before_ms, before_id)`, the row-value compariso
 the newest-first index serves directly — so a page is not disturbed by uploads
 arriving between requests, as an offset would be. `more` says whether a further
 page exists, which the daemon knows by asking for one row beyond the page and
-not sending it. Search has paged this way since it was built (§5.11).
+not sending it. Search pages the same way (§5.11).
 
 | Field           | Type | Notes                                                 |
 |-----------------|------|-------------------------------------------------------|
@@ -965,8 +958,7 @@ folds it the same way whatever prompted it, instead of two frames that can drift
 (`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
 seen_at: u64 }`. `filter` is `0` involved-me (the original question) · `1` unread
 · `2` unread DMs · `3` unread channels I am notified about. An **empty body** is
-read as `0`, so a client built before the filter existed keeps working — the
-frame it sends is exactly the frame it always sent.
+read as `0`, so a client that sends no filter keeps working.
 
 | Field        | Type | Notes                                                     |
 |--------------|------|------------------------------------------------------------|
@@ -1119,7 +1111,7 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 | Field         | Type | Notes                                                    |
 |---------------|------|----------------------------------------------------------|
 | `query`       | str  | Free text. The daemon quotes each whitespace-separated term, so query punctuation is literal and multiple terms are ANDed; it never errors on syntax. May be empty when the filters below carry the whole query. |
-| `limit`       | u16  | Max results wanted; the daemon caps it (currently 50).   |
+| `limit`       | u16  | Max results wanted; the daemon caps it (50).             |
 | `before_id`   | u64  | **Keyset paging cursor** — return only messages with a lower id. `0` for the first page. Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
 | `from_name`   | str  | `from:` — restrict to one author. Empty for no constraint. |
 | `in_channel`  | str  | `in:` — restrict to one channel. Empty for no constraint. |
@@ -1403,9 +1395,6 @@ therefore read-only, REQ-035), `404` (unknown or disabled token), `405`
 (non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
 16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
 
-One gap, tracked: REQ-171's CA-signed certificate for this
-endpoint is not implemented, so it answers on the daemon's TOFU cert.
-
 
 ### 5.14b Read-aloud (REQ-291–295, ARCH-111)
 
@@ -1432,8 +1421,8 @@ malformed frame.
 count × { id: str, label: str, lang: str }, preview: str }` — sent once to every
 client just after `CAPABILITIES`, whatever the answer, with no voices when
 read-aloud is not offered. Whether it is offered is the `tts` capability's to say:
-this frame used to carry its own `available` byte, and two answers to one question
-can disagree. `model_version` names the
+this frame carries no `available` byte of its own, because two answers to one
+question can disagree. `model_version` names the
 language, the model, the pronunciation data and the speaking rate together;
 `preview` is the sentence a client plays to audition a voice. `lang` is the BCP 47
 language that voice speaks, carried per voice rather than per frame because a
@@ -1617,7 +1606,7 @@ rule.
 
 The daemon-side layer of the client config: portable UI prefs a frontend syncs
 across its devices, keyed by a `client_type` bucket so a TUI's prefs stay
-separate from a future GUI's. The daemon is opaque about the keys/values — it
+separate from a GUI's. The daemon is opaque about the keys/values — it
 stores and fans them back; the frontend owns their meaning (SCHEMA.md §3k).
 
 **`SET_CLIENT_SETTING` (C → S), `0x0094`** `{ client_type: str, key: str, value:
@@ -2116,7 +2105,7 @@ change is a `CALL_STATE`.
 unchanged: its packets are the same SFrame ciphertexts on the same UDP path, and
 the relay forwards them opaquely. It cannot transcode (ARCH-18/73), and a call can
 hold clients on different platforms, so the codec is a **wire contract** —
-`codecs` above, one mandatory codec today (VP9), a new bit for a successor.
+`codecs` above, one mandatory codec (VP9), a new bit for a successor.
 Fragments, NACKs, keyframe requests and rate reports travel **inside the
 encryption** as typed packets (CALLS.md §5.4); the relay's framing does not
 change. [VIDEO.md](./VIDEO.md) is the design.

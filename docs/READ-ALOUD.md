@@ -59,7 +59,7 @@ the same three in turn at 253 MB).
 ## 3. Voices
 
 **One language per deployment.** The daemon speaks the language its engine was
-built for — `en-US` today — set by `OPENCHIME_TTS_LANG` and refused at startup if
+built for — `en-US` — set by `OPENCHIME_TTS_LANG` and refused at startup if
 this binary has no engine for it, because reading every message in a language
 nobody asked for is worse than not starting. The tag is stamped into the
 pronunciation data (a lexicon of one language with a guesser of another

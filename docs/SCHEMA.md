@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0040 are applied** (`daemon/migrate.c`,
+**Migrations.** The daemon applies migrations 0001–0043 (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -517,7 +517,7 @@ meaning (PROTOCOL.md: `SET_CLIENT_SETTING` / `LIST_CLIENT_SETTINGS` /
 
 ### `client_settings`
 - `(user_id, client_type, key)` (PK) — one value per user, per frontend bucket,
-  per key. `client_type` (`tui` and `gui` today) partitions the store so
+  per key. `client_type` (`tui` or `gui`) partitions the store so
   one frontend's prefs never collide with another's.
 - `value` (TEXT) — the setting value; an empty value on `SET` deletes the row, so
   the bucket stays sparse and a deleted key falls back to the client's file
@@ -781,9 +781,9 @@ conversation (and only for addressed drafts, which is what the `WHERE` clause
 buys); `idx_drafts_user` orders "all my drafts, newest first", which is what the
 Drafts pane asks for.
 
-*`thread_root` is in the key from the start*, 0 meaning the channel itself. No
-client can write another value yet — the thread pane shares the one composer —
-but the costs are asymmetric: one column now, against a migration on a table of
+*`thread_root` is in the key from the start*, 0 meaning the channel itself. The
+thread pane shares the one composer, so clients write 0, but the costs are
+asymmetric: one column, against a migration on a table of
 **user content** plus a change to two wire ops that shipped clients already
 speak.
 
@@ -951,8 +951,8 @@ row.
 
 *`channel_id` is denormalised* from the message exactly as `mentions` (§3q) and
 `pins` (§3r) do it: the backfill replay reads unfurls by message and must not
-join per row. *No thumbnail column* — og:image is deferred (ARCH-105), and a
-column now would pretend otherwise. Rows are deleted with the message's other
+join per row. *No thumbnail column* — an unfurl carries a title and a description and no
+image (ARCH-105). Rows are deleted with the message's other
 body-attached state on tombstone (§3r's reasoning) and wholesale on edit, since
 they describe the old body; the net thread re-fetches from the new one.
 
@@ -1102,7 +1102,7 @@ listened-to renderings before anything a user uploaded, which is what the
 ALTER TABLE messages ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
 ```
 
-*`0` is something someone said* — every row until now. *`1` is a call event* the
+*`0` is something someone said* — the default, and every ordinary message. *`1` is a call event* the
 daemon wrote: a missed call, when a call ends with nobody but its starter having
 joined (CALLS.md §4). It is authored by the call's starter, so it has an author,
 and carries a readable body ("Missed call"), so anything that ignores the column
@@ -1119,24 +1119,3 @@ for the length of that participation; its private key never leaves the device
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.
-
----
-
-## 4. Deferred to later migrations
-
-Tracked here so the omissions are deliberate, not forgotten:
-
-- **Thread notifications** (REQ-061) — still deferred. Its dependency, @mentions
-  (REQ-221), is now built (§3q), so what remains is deciding *when a reply
-  notifies a thread's participants*, not the mention machinery underneath it.
-- **Polls** (REQ-225) — forward scope, no ARCH decision and no schema.
-  **Snippets** (REQ-226) have half of what they need:
-  fenced code blocks parse and render (REQ-220), but a titled snippet *object*
-  does not exist.
-- **Retention policy** (REQ-250) — opt-in message ageing, distinct from REQ-217's
-  attachment max age (built). No schema, no ARCH decision.
-- **Legal hold** (REQ-252), **compliance capture** (REQ-276) and **DLP**
-  (REQ-277) — scoped in REQUIREMENTS.md, no schema.
-
-- **Screenshare** (REQ-161) — needs no schema; it is ephemeral media state on the
-  same relay path as audio (ARCH-86, [VIDEO.md](./VIDEO.md)).

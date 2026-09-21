@@ -12,7 +12,7 @@ and CLIENT.md.
 builds on the media transport, jitter buffer and device layer of §§2–4. Camera
 video remains out of scope (REQ-160).
 
-**Both halves are built.** The daemon's signaling, its ephemeral call state and
+**Two halves.** The daemon's signaling, its ephemeral call state and
 the forked UDP relay (`daemon/audio_sidecar.c`); the client's signaling and keys
 in the core (`client/core/callsig.c`, on the network thread); and the media
 engine (`client/core/call/`): capture through the echo canceller and speexdsp's
@@ -131,18 +131,11 @@ The happy part: the configuration where AEC matters most (built-in laptop) is
 also the one with a shared clock. The nasty case — a separate microphone and
 speakers — is both the hardest for drift and a real setup people use.
 
-So the engine should do three things rather than assume the problem away. It
-does the first — the defaults are the system's, which on a laptop are the
-built-in pair — and the canceller re-converges under 100 ppm of drift (§6.4); the
-other two are §9's open decision:
+So the engine does not assume the problem away:
 
-- **Prefer a single physical device**, defaulting to the built-in one.
-- **Detect drift at runtime** by tracking capture versus playback sample counts;
-  steady divergence means separate clock domains. That is a few lines, and it
-  converts an invisible failure into a known condition.
-- **Degrade honestly.** On a split-device rig, either compensate by resampling
-  one side or tell the user echo cancellation is unreliable — rather than
-  silently cancelling nothing.
+- **It prefers a single physical device.** The defaults are the system's, which
+  on a laptop are the built-in pair.
+- **The canceller re-converges** under 100 ppm of drift (§6.4).
 
 **Bluetooth deserves its own note**, because it fails in a way clocks do not
 explain. A headset is one physical device, but audio rides two profiles: **A2DP**
@@ -196,7 +189,7 @@ PulseAudio, PipeWire, CoreAudio, and WASAPI behind one API, and — critically �
 supports the duplex mode §2 requires, with resampling so the engine can request
 16 kHz regardless of what the hardware prefers.
 
-**The device layer is built**, by video messages (ARCH-110):
+**The device layer** is shared with video messages (ARCH-110):
 `client/core/media/audio_dev.{c,h}` enumerates capture and playback devices,
 opens either at a requested rate and channel count, and joins each device
 callback to its media thread with a lock-free single-producer ring. The callback
@@ -215,9 +208,9 @@ apart.
 **Voice input opens it too** (ARCH-112, [VOICE-INPUT.md](./VOICE-INPUT.md)), at
 16 kHz mono. The microphone has one owner: a second capture is refused
 (`OC_AUDIO_BUSY`), and joining a call stops voice input and closes the video
-recorder. Voice input built the playback reference — every playback device's
+recorder. Voice input and the call engine share the playback reference — every playback device's
 output, mixed to mono at 16 kHz on the media clock (`oc_audio_reference`) — and
-the processor seam of §3.3 with speexdsp (§6), which the call engine uses.
+the processor seam of §3.3 with speexdsp (§6).
 
 ### 3.3 The processor seam
 
@@ -242,7 +235,7 @@ The signature is the important part: `process` receives **both** the capture
 frame and the playback frame that was emitted at the same instant. A processor
 seam that only sees capture cannot ever host an echo canceller.
 
-Three processors are built: `OC_PROCESSOR_NONE`; `OC_PROCESSOR_SPEEX`, speexdsp's
+There are three processors: `OC_PROCESSOR_NONE`; `OC_PROCESSOR_SPEEX`, speexdsp's
 linear canceller, which voice input runs at 16 kHz (ARCH-112); and
 `OC_PROCESSOR_SPEEX_48K`, for full-band audio — a screen recording's microphone
 against the computer's sound (VIDEO-MESSAGES.md §4.2) — which runs the 16 kHz
@@ -403,7 +396,7 @@ Extending it costs little and buys a lot:
 Most homegrown echo cancellation is unverified precisely because this step is
 skipped.
 
-**Built** (`tests/test_voice.c`, with voice input). speexdsp's linear canceller at
+**The harness** (`tests/test_voice.c`). speexdsp's linear canceller at
 16 kHz, 20 ms frames and a 300 ms echo path, against a synthetic room: a direct
 path 30 ms late and a decaying tail:
 
@@ -449,18 +442,10 @@ is a key binding rather than a menu item — it is used mid-sentence — and
 **push-to-talk is a first-class control**, the natural terminal idiom, which also
 sidesteps echo entirely while held.
 
-## 9. Open decisions
+## 9. Limits
 
-- **Split-device drift policy.** The canceller re-converges under drift (§6.4),
-  but nothing detects divergent clocks, and what to *do* then is undecided —
-  resample one side to compensate, or disable cancellation and say so. Resampling
-  is more work and can itself colour the far-end reference.
-- **Recording.** Not designed. It has obvious compliance weight (REQ-252) and
-  should not be added casually — and a recording would have to be made by a
+- **Recording.** There is no call recording. It has obvious compliance weight
+  (REQ-252), and a recording would have to be made by a
   participant, since nothing else can hear the call (ARCH-113).
-- **AEC3 escalation.** Whether the C++ dependency is ever acceptable. The ERLE
-  harness (§6.4) is what should decide it, on numbers.
-- **Safety numbers.** The daemon hands out device keys; a number two people can
-  compare, to know no key was substituted, is the follow-up CALLS.md §5.6 names.
 - **IPv6.** The relay listens on IPv4 only, and a client reaches it at the
   address its TCP connection resolved to.

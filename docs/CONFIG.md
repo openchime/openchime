@@ -45,7 +45,7 @@ to stderr; prefer the `OPENCHIME_` name.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_AUTH_MODE` *(alias)* | `local` | `local` (daemon-managed password accounts) or `oidc` (central relay) — the two identity sources built (ARCH-55). The variable selects exactly one. |
+| `OPENCHIME_AUTH_MODE` *(alias)* | `local` | `local` (daemon-managed password accounts) or `oidc` (central relay) — the two identity sources (ARCH-55). The variable selects exactly one. |
 | `OPENCHIME_MAX_USERS` | `0` (unlimited) | Registered-user cap; new-user creation is refused at the cap with `ERROR USER_LIMIT` across redeem / register / bootstrap / OIDC-JIT. Active users only — removing a member frees a seat (CP-7). |
 | `OPENCHIME_BOOTSTRAP_USERS` *(alias)* | *(none)* | Dev/test seeding of local accounts. In normal operation the first owner comes from the one-time setup token logged at first run (ARCH-59). |
 | `OPENCHIME_OIDC_ISSUER` *(alias)* | *(none)* | Expected `iss` on the relay-issued ES256 JWT. |

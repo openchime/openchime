@@ -232,7 +232,7 @@ CTR is older than a **1024-packet window** or already seen in it (replay).
 
 - **The daemon hands out the device keys.** A daemon that substituted its own key for a
   participant's could sit in the middle of the key exchange. Detecting that needs a
-  **safety number** the people can compare, which is not built; until it is, the
+  **safety number** the people can compare, and there is none: the
   guarantee holds against a daemon that follows the protocol and against everything
   between the daemon and the devices — the network, the relay, a copy of its memory or
   database — but not against a daemon that has been altered to attack its own users.

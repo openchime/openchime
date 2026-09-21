@@ -33,7 +33,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
-| **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages now, the audio client next (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
+| **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a standalone C library) | Voice input in the Win32 client (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
@@ -52,14 +52,13 @@ module fails at migration time, on a machine the operator controls and we do not
 Pinning the version turns a deployment risk into a build fact, and the build sets
 `SQLITE_ENABLE_FTS5` explicitly.
 
-What this costs is real and worth stating plainly: **SQLite CVE response is now
-ours.** For an operator who installed the `.deb` or `.rpm`, `apt upgrade` used to
-fix a SQLite flaw with no action from us, and now it takes an OpenChime release.
-That price was already being paid four times over — mbedTLS, libopus, ONNX
-Runtime and libstdc++ are all static — so this makes SQLite the fifth such
-library rather than the first, and it is why watching upstream releases is a
+What this costs is real and worth stating plainly: **SQLite CVE response is
+ours.** For an operator who installed the `.deb` or `.rpm`, `apt upgrade` does not
+fix a SQLite flaw; it takes an OpenChime release.
+The same price is paid for mbedTLS, libopus, ONNX
+Runtime and libstdc++, which are all static, and it is why watching upstream releases is a
 standing obligation rather than a nicety. The container image and the tarball
-never had a distribution update path to give up.
+have no distribution update path either way.
 
 `SQLITE_THREADSAFE=1` matches the system library's default, so vendoring changed
 no concurrency semantics: three threads hold their own connections (the
@@ -106,12 +105,12 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 |---------|---------|---------|---------|--------|---------|
 | **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), TOFU cert handling, SHA-256/PBKDF2, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
-| **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) now, screenshare (ARCH-87) next | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
-| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) now, the audio client (ARCH-73) next | https://opus-codec.org | BSD-3-Clause |
+| **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
+| **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73) | https://opus-codec.org | BSD-3-Clause |
 | **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: eight files — the frontend, encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
-| **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) now, the audio client next; never the daemon | https://www.speex.org | BSD-3-Clause |
+| **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build_ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
@@ -137,8 +136,8 @@ exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
 system stays its own business, and this tree's stays make. It is the first
 genuinely large dependency in the tree, which is exactly why it sits in this
-class and not the committed-single-file one (the reasoning §7 recorded for
-libvpx, now applied). zlib-licensed: no notice needs to travel with a shipped
+class and not the committed-single-file one (the reasoning §7 records for
+libvpx). zlib-licensed: no notice needs to travel with a shipped
 binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
 **libvpx and libopus** are the codecs (ARCH-110), fetched the same way:
@@ -268,16 +267,16 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 | `scripts/build_speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (mingw, static); used by `make windows-gui` | BSD-3-Clause |
 | Media Foundation (`mfplat`, `mfreadwrite`, `mf`, `mfuuid`) | OS | Camera capture for video messages (`client/core/media/cap_mf.c`) | Windows system libraries |
 
-## 7. Planned — not yet a dependency
+## 7. Why libvpx
 
 - **libvpx for screenshare** — the same library §2 fetches for video messages,
   additionally configured with screen-content tuning (`VP9E_SET_TUNE_CONTENT`)
-  when screenshare (REQ-161, ARCH-87) is built. **Patent note:** it is preferred
+  for screenshare (REQ-161, ARCH-87). **Patent note:** it is preferred
   to the alternatives as much for patents as for copyright — **openh264** is
   BSD-licensed but Cisco's royalty arrangement covers only the binaries *Cisco
   itself distributes*, so building from source leaves us exposed; **x264/x265**
-  are GPL; **AV1** (SVT-AV1 + dav1d, BSD) is the designated successor once
-  real-time software encode is cheaper.
+  are GPL; **AV1** (SVT-AV1 + dav1d, BSD) has the right licence, but its
+  real-time software encode costs too much.
 
 ---
 
