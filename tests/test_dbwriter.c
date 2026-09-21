@@ -53,7 +53,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 43);
+    CHECK(oc_schema_version(db) == 44);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -924,8 +924,38 @@ static void test_oidc_join_rules(void) {
     CHECK(oc_dbwriter_configure_join_rules(w, "owner:pat@acme.example", why, sizeof why) == 0);
     CHECK(oidc_signin(w, &is, 37, "g|pat", "j8", PAT, &role, &err) == pat);
     CHECK(role == OC_ROLE_MEMBER);
+
+    /* A token whose subject is not "<issuer>|<subject>" names nobody. */
+    CHECK(oc_dbwriter_configure_join_rules(w, "tenant:google:acme.example", why, sizeof why) == 0);
+    CHECK(oidc_signin(w, &is, 39, "nobar", "j9", PAT, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_INVALID_TOKEN);
     oc_issuer_free(&is);
     oc_dbwriter_stop(w);
+
+    /* What is on disk: one identity row per person, carrying what the provider
+     * said last, and the name a first sign-in set — not the later token's. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw,
+            "SELECT (SELECT COUNT(*) FROM user_identities),"
+            " (SELECT COUNT(*) FROM user_identities WHERE issuer='g' AND subject='dana'"
+            "   AND idp='' AND email='dana@acme.example' AND email_verified=1"
+            "   AND last_login_ms >= first_seen_ms),"
+            " (SELECT COUNT(*) FROM user_identities WHERE issuer='g' AND subject='pat'"
+            "   AND idp='google' AND tenant='acme.example'),"
+            " (SELECT COUNT(*) FROM users WHERE display_name='Dana'),"
+            " (SELECT COUNT(*) FROM users WHERE display_name='Somebody Else');", -1, &st, NULL);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        CHECK(sqlite3_column_int(st, 0) == 2);
+        CHECK(sqlite3_column_int(st, 1) == 1);
+        CHECK(sqlite3_column_int(st, 2) == 1);
+        CHECK(sqlite3_column_int(st, 3) == 1);
+        CHECK(sqlite3_column_int(st, 4) == 0);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
     cleanup_db(path);
 
     /* ...and is the way back for a workspace that has none: a member already here,
