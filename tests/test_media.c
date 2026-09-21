@@ -816,7 +816,9 @@ static void test_screen_recording(void) {
          * canceller's worst case, and what it does to the recording there varies
          * from run to run -- measured over twelve recordings, the voice kept
          * 73-97% and the computer's sound came out at 0.74-1.39 of its level
-         * (1.26 is no canceller at all). What it does with speech, which pauses,
+         * (1.26 is no canceller at all), and a loaded machine has taken it to
+         * 0.57. So the computer's floor asks only that it is plainly in the mix,
+         * not how much of it survived. What it does with speech, which pauses,
          * is the ERLE harness's to say (tests/test_voice.c), deterministically;
          * the echo-only case below is what shows it is wired in. */
         size_t n = 0;
@@ -826,7 +828,7 @@ static void test_screen_recording(void) {
             double a440 = tone_amp(tail, 48000, 440), a660 = tone_amp(tail, 48000, 660);
             printf("  corner %d: 440 Hz %.0f (mic 8000), 660 Hz %.0f (computer 6000)\n", corner, a440, a660);
             CHECK(a440 > 8000 * 0.6 && a440 < 8000 * 1.1);
-            CHECK(a660 > 6000 * 0.6 && a660 < 6000 * 1.5);
+            CHECK(a660 > 6000 * 0.25 && a660 < 6000 * 1.5);
         } else {
             CHECK(0);
         }

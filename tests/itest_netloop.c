@@ -44,6 +44,7 @@ static int       g_audio_side = -1;      /* the sidecar's end of the current IPC
 static int       g_audio_daemon = -1;    /* the net loop's end */
 static volatile int g_audio_starts;
 static volatile int g_audio_refuse;      /* make the next restart fail */
+static volatile int g_audio_refused;     /* restarts that were asked for and failed */
 static void *audio_thread(void *p) {
     (void)p;
     oc_audio_sidecar_run(g_audio_arg.ipc_fd, g_audio_arg.udp_fd, &g_audio_arg.stop);
@@ -51,7 +52,7 @@ static void *audio_thread(void *p) {
 }
 static int audio_start(void *ctx) {
     (void)ctx;
-    if (g_audio_refuse) return -1;
+    if (g_audio_refuse) { g_audio_refused++; return -1; }
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
     g_audio_arg.ipc_fd = sv[1];
@@ -1509,6 +1510,12 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         client_close(&cap);
     }
 
+    /* The daemon warms one audition per voice when its loop starts, in the
+     * background, through this same stub. Everything below counts renders, so let
+     * the warming finish first: on a slow runner it otherwise lands between a
+     * "before" and an "after" and reads as a cache that does not cache. */
+    for (int i = 0; i < 500 && g_stub_says < STUB_TTS.voices; i++) usleep(20000);
+
     uint64_t mid = say_something(&a, OC_DEFAULT_CHANNEL, "Deploy finished. Logs are clean.", 0xB1);
     CHECK(mid != 0);
 
@@ -2726,17 +2733,26 @@ static void test_call_sidecar_restart(int port, const uint8_t *pin, uint16_t aud
     while (udp_recv_audio(sa, &sender, &seq, tmp, sizeof tmp) >= 0) {}
     while (udp_recv_audio(sb, &sender, &seq, tmp, sizeof tmp) >= 0) {}
 
-    /* alice speaks, and bob hears her: the new relay was given their tokens. */
-    udp_send_audio(sa, &relay, atok, 9, "back");
-    usleep(80000);
+    /* alice speaks, and bob hears her: the new relay was given their tokens. The
+     * re-authorizing reaches the relay in its own time, so she says it until it
+     * arrives rather than once after a guessed wait. */
     char body[64];
-    int n = udp_recv_audio(sb, &sender, &seq, body, sizeof body);
+    int n = -1;
+    for (int i = 0; i < 10 && n < 0; i++) {   /* each read waits up to a second */
+        udp_send_audio(sb, &relay, btok, 0, NULL);
+        udp_send_audio(sa, &relay, atok, 9, "back");
+        while ((n = udp_recv_audio(sb, &sender, &seq, body, sizeof body)) == 0) {}
+    }
     CHECK(n == 4 && sender == ua && seq == 9 && memcmp(body, "back", 4) == 0);
 
     /* Now it dies and cannot be brought back: a new join is refused, openly. */
+    int refused = g_audio_refused;
     g_audio_refuse = 1;
     audio_kill();
-    usleep(300000);
+    /* Wait for the net loop to have asked for the restart and been refused,
+     * however long a loaded machine takes to get there. */
+    for (int i = 0; i < 500 && g_audio_refused == refused; i++) usleep(20000);
+    CHECK(g_audio_refused == refused + 1);
     client c;
     CHECK(client_open(&c, port, pin) == 0); CHECK(do_handshake(&c) == 0);
     uint64_t uc = 0;
