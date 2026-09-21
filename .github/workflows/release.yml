@@ -380,6 +380,14 @@ jobs:
           CC=/tmp/zig-ort-cc CXX=/tmp/zig-ort-cxx scripts/build_onnxruntime.sh
           scripts/build_kitten.sh
           scripts/build_moonshine.sh
+          # A fresh checkout stamps every source file with the time of the checkout,
+          # which is newer than anything a cache restores. make would then judge the
+          # restored runtime stale against daemon/ort.ops.config and run the script
+          # again under the DAEMON's compiler wrapper — whose name is part of the
+          # script's stamp, so it would not match and a from-source build would start
+          # under a compiler it was never meant for. What this step produced or
+          # restored is current by definition; say so in the one language make reads.
+          find third_party/onnxruntime-1.30.0 build/kitten build/moonshine -type f -exec touch {} +
 
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.
