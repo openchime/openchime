@@ -101,7 +101,8 @@ exactly the self-hosted stand-alone model (ARCH-76).
 |---|---|---|
 | `OPENCHIME_ENROLL_URL` *(alias)* | *(none)* | Control-plane base URL. Setting it enables enrollment: the daemon generates a keypair + opaque audience, prints an `oce1.` code, and performs the challenge/confirm proof-of-possession. |
 | `OPENCHIME_ENROLL_CODE_FILE` *(alias)* | *(none)* | Also write the `oce1.` code to this path, so orchestration can pick it up instead of scraping stderr. |
-| `OPENCHIME_ENROLL_WAIT_SECS` *(alias)* | `0` | Seconds to wait for the operator to reserve the code before giving up for this boot. |
+| `OPENCHIME_ENROLL_WAIT_SECS` *(alias)* | `0` | Seconds to wait for the operator to reserve the code before giving up for this boot. A managed box claiming with a ticket waits 120 when this is unset. |
+| `OPENCHIME_ENROLL_TICKET` | *(none)* | A managed box's one-time ticket (AUTH.md §8.7). With it and `OPENCHIME_OIDC_AUDIENCE` set, the daemon adopts that audience, generates its key, and claims the binding at `OPENCHIME_ENROLL_URL` instead of printing a code. |
 | `OPENCHIME_ENROLL_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the enrollment HTTPS client. |
 | `OPENCHIME_PUSH_URL` *(alias)* | *(none)* | Push-gateway base URL. Push requires **both** this and an active enrollment, which is why it is absent in stand-alone deployments (ARCH-16/85). |
 | `OPENCHIME_PUSH_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the push HTTPS client. |

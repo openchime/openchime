@@ -105,6 +105,135 @@ static void test_code_and_signature(void) {
     mbedtls_pk_free(&pub);
 }
 
+/* A managed box's claim (AUTH.md §8.7): the signature covers the audience and the
+ * hashes of the ticket and of the public key — checked here the way central does. */
+static void test_claim_signature(void) {
+    char pk[1024], aud[128];
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+
+    uint8_t ticket[32];
+    memset(ticket, 7, sizeof ticket);
+    char ticket64[64];
+    size_t tl = 0;
+    CHECK(mbedtls_base64_encode((unsigned char *)ticket64, sizeof ticket64, &tl, ticket, sizeof ticket) == 0);
+    for (size_t i = 0; i < tl; i++) {            /* standard -> url alphabet, unpadded */
+        if (ticket64[i] == '+') ticket64[i] = '-';
+        else if (ticket64[i] == '/') ticket64[i] = '_';
+        else if (ticket64[i] == '=') { ticket64[i] = '\0'; break; }
+    }
+
+    char pub_b64[512], sig_b64[256];
+    CHECK(oc_enroll_sign_claim(pk, aud, ticket64, pub_b64, sizeof pub_b64, sig_b64, sizeof sig_b64) == 0);
+
+    uint8_t der[256], sig[128];
+    size_t derlen = 0, siglen = 0;
+    CHECK(mbedtls_base64_decode(der, sizeof der, &derlen, (const unsigned char *)pub_b64, strlen(pub_b64)) == 0);
+    CHECK(mbedtls_base64_decode(sig, sizeof sig, &siglen, (const unsigned char *)sig_b64, strlen(sig_b64)) == 0);
+    mbedtls_pk_context pub;
+    mbedtls_pk_init(&pub);
+    CHECK(mbedtls_pk_parse_public_key(&pub, der, derlen) == 0);
+    CHECK(mbedtls_pk_get_bitlen(&pub) == 256);
+
+    /* The message, built independently: SHA-256 of the raw ticket and of the DER. */
+    uint8_t th[32], kh[32];
+    mbedtls_sha256(ticket, sizeof ticket, th, 0);
+    mbedtls_sha256(der, derlen, kh, 0);
+    char th64[64], kh64[64];
+    size_t n = 0;
+    mbedtls_base64_encode((unsigned char *)th64, sizeof th64, &n, th, sizeof th);
+    mbedtls_base64_encode((unsigned char *)kh64, sizeof kh64, &n, kh, sizeof kh);
+    for (char *p = th64; *p; p++) { if (*p == '+') *p = '-'; else if (*p == '/') *p = '_'; else if (*p == '=') { *p = '\0'; break; } }
+    for (char *p = kh64; *p; p++) { if (*p == '+') *p = '-'; else if (*p == '/') *p = '_'; else if (*p == '=') { *p = '\0'; break; } }
+    char msg[512];
+    int mn = snprintf(msg, sizeof msg, "openchime-claim-v1|%s|%s|%s", aud, th64, kh64);
+    uint8_t hash[32];
+    mbedtls_sha256((const unsigned char *)msg, (size_t)mn, hash, 0);
+    CHECK(mbedtls_pk_verify(&pub, MBEDTLS_MD_SHA256, hash, sizeof hash, sig, siglen) == 0);
+
+    /* Another audience, or another ticket, is another message. */
+    mn = snprintf(msg, sizeof msg, "openchime-claim-v1|%s|%s|%s", "ws_someone_else", th64, kh64);
+    mbedtls_sha256((const unsigned char *)msg, (size_t)mn, hash, 0);
+    CHECK(mbedtls_pk_verify(&pub, MBEDTLS_MD_SHA256, hash, sizeof hash, sig, siglen) != 0);
+    mbedtls_pk_free(&pub);
+
+    /* A ticket that is not base64url is refused rather than signed. */
+    CHECK(oc_enroll_sign_claim(pk, aud, "not base64!", pub_b64, sizeof pub_b64, sig_b64, sizeof sig_b64) != 0);
+    CHECK(oc_enroll_sign_claim(pk, aud, "", pub_b64, sizeof pub_b64, sig_b64, sizeof sig_b64) != 0);
+}
+
+/* ---- a canned central, for what the claim does with each answer ------------- */
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+struct canned { int listen_fd; int status; char seen[2048]; };
+
+static void *canned_central(void *arg) {
+    struct canned *c = arg;
+    int fd = accept(c->listen_fd, NULL, NULL);
+    if (fd < 0) return NULL;
+    size_t got = 0;
+    for (;;) {                                   /* headers + the small JSON body */
+        ssize_t r = read(fd, c->seen + got, sizeof c->seen - 1 - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+        c->seen[got] = '\0';
+        const char *body = strstr(c->seen, "\r\n\r\n");
+        const char *cl = strstr(c->seen, "Content-Length:");
+        if (body && cl && strlen(body + 4) >= (size_t)atoi(cl + 15)) break;
+    }
+    char resp[160];
+    int n = snprintf(resp, sizeof resp,
+                     "HTTP/1.1 %d X\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
+                     "Connection: close\r\n\r\n{}", c->status);
+    ssize_t w = write(fd, resp, (size_t)n); (void)w;
+    close(fd);
+    return NULL;
+}
+
+static oc_enroll_result claim_against(int status, struct canned *c, const char *pk, const char *aud) {
+    memset(c, 0, sizeof *c);
+    c->status = status;
+    c->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    bind(c->listen_fd, (struct sockaddr *)&a, sizeof a);
+    listen(c->listen_fd, 1);
+    getsockname(c->listen_fd, (struct sockaddr *)&a, &al);
+    pthread_t th;
+    pthread_create(&th, NULL, canned_central, c);
+    char url[96];
+    snprintf(url, sizeof url, "http://127.0.0.1:%u/api/machine/enroll", (unsigned)ntohs(a.sin_port));
+    oc_enroll_result r = oc_enroll_claim(url, NULL, aud, pk, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc");
+    pthread_join(th, NULL);
+    close(c->listen_fd);
+    return r;
+}
+
+static void test_claim_answers(void) {
+    char pk[1024], aud[128];
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    struct canned c;
+
+    CHECK(claim_against(200, &c, pk, aud) == OC_ENROLL_ACTIVE);
+    CHECK(strstr(c.seen, "POST /api/machine/enroll/claim ") == c.seen);
+    CHECK(strstr(c.seen, "\"audienceId\":\"ws_") != NULL);
+    CHECK(strstr(c.seen, "\"ticket\":\"BwcHBwcH") != NULL);
+    CHECK(strstr(c.seen, "\"publicKey\":\"") != NULL && strstr(c.seen, "\"signature\":\"") != NULL);
+
+    CHECK(claim_against(404, &c, pk, aud) == OC_ENROLL_FAILED);    /* refused: do not retry */
+    CHECK(claim_against(400, &c, pk, aud) == OC_ENROLL_FAILED);
+    CHECK(claim_against(429, &c, pk, aud) == OC_ENROLL_PENDING);   /* busy: try again */
+    CHECK(claim_against(503, &c, pk, aud) == OC_ENROLL_PENDING);
+    /* Nobody there at all. */
+    CHECK(oc_enroll_claim("http://127.0.0.1:1/api/machine/enroll", NULL, aud, pk,
+                          "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc") == OC_ENROLL_PENDING);
+}
+
 static void test_persistence(void) {
     oc_dbwriter *w = oc_dbwriter_start(":memory:");
     CHECK(w != NULL);
@@ -144,6 +273,8 @@ int run_enroll_tests(void) {
 
     test_generate(&rng);
     test_code_and_signature();
+    test_claim_signature();
+    test_claim_answers();
     test_persistence();
 
     mbedtls_ctr_drbg_free(&rng);

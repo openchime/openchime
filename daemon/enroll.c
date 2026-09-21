@@ -413,6 +413,106 @@ done:
     return rc;
 }
 
+/* base64url (no padding) -> bytes. Returns the count, or -1. */
+static long b64url_decode(const char *in, uint8_t *out, size_t cap) {
+    size_t o = 0; uint32_t buf = 0; int bits = 0;
+    for (const char *p = in; *p; p++) {
+        int v;
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '-') v = 62;
+        else if (c == '_') v = 63;
+        else return -1;
+        buf = (buf << 6) | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; if (o >= cap) return -1; out[o++] = (uint8_t)((buf >> bits) & 0xFFu); }
+    }
+    return (long)o;
+}
+
+int oc_enroll_sign_claim(const char *privkey_pem, const char *audience, const char *ticket_b64url,
+                         char *pubkey_b64, size_t pubkey_cap, char *sig_b64, size_t sig_cap) {
+    enroll_rng rng;
+    if (rng_init(&rng) != 0) { rng_free(&rng); return -1; }
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    int rc = -1;
+    uint8_t ticket[64];
+    long tl = b64url_decode(ticket_b64url, ticket, sizeof ticket);
+    if (tl <= 0) goto done;
+    if (mbedtls_pk_parse_key(&pk, (const unsigned char *)privkey_pem, strlen(privkey_pem) + 1,
+                             NULL, 0, mbedtls_ctr_drbg_random, &rng.drbg) != 0) goto done;
+
+    uint8_t der[256];
+    int dl = mbedtls_pk_write_pubkey_der(&pk, der, sizeof der);
+    if (dl < 0) goto done;
+    const uint8_t *spki = der + sizeof der - dl;   /* written at the END of the buffer */
+    size_t pl = 0;
+    if (b64_std(spki, (size_t)dl, pubkey_b64, pubkey_cap, &pl) != 0) goto done;
+
+    uint8_t th[32], kh[32];
+    char th64[48], kh64[48];
+    size_t n = 0;
+    if (mbedtls_sha256(ticket, (size_t)tl, th, 0) != 0 ||
+        mbedtls_sha256(spki, (size_t)dl, kh, 0) != 0) goto done;
+    if (b64url(th, sizeof th, th64, sizeof th64, &n) != 0 ||
+        b64url(kh, sizeof kh, kh64, sizeof kh64, &n) != 0) goto done;
+
+    char msg[512];
+    int mn = snprintf(msg, sizeof msg, "openchime-claim-v1|%s|%s|%s", audience, th64, kh64);
+    if (mn < 0 || mn >= (int)sizeof msg) goto done;
+    uint8_t hash[32];
+    if (mbedtls_sha256((const unsigned char *)msg, (size_t)mn, hash, 0) != 0) goto done;
+
+    uint8_t sig[MBEDTLS_PK_SIGNATURE_MAX_SIZE];
+    size_t sig_len = 0;
+    if (mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, sizeof hash, sig, sizeof sig, &sig_len,
+                        mbedtls_ctr_drbg_random, &rng.drbg) != 0) goto done;
+    size_t sl = 0;
+    if (b64_std(sig, sig_len, sig_b64, sig_cap, &sl) != 0) goto done;
+    rc = 0;
+
+done:
+    memset(ticket, 0, sizeof ticket);
+    mbedtls_pk_free(&pk);
+    rng_free(&rng);
+    return rc;
+}
+
+oc_enroll_result oc_enroll_claim(const char *central_url, const char *ca_bundle,
+                                 const char *audience, const char *privkey_pem,
+                                 const char *ticket_b64url) {
+    enroll_ctx ctx;
+    if (parse_url(central_url, &ctx) != 0) return OC_ENROLL_FAILED;
+    if (ctx.use_tls && oc_tls_client_init_ca(&ctx.tls, ca_bundle) != 0) return OC_ENROLL_FAILED;
+
+    oc_enroll_result result = OC_ENROLL_FAILED;
+    char pub[512], sig[256], body[1400];
+    if (oc_enroll_sign_claim(privkey_pem, audience, ticket_b64url, pub, sizeof pub, sig, sizeof sig) != 0)
+        goto done;
+    if (snprintf(body, sizeof body,
+                 "{\"audienceId\":\"%s\",\"ticket\":\"%s\",\"publicKey\":\"%s\",\"signature\":\"%s\"}",
+                 audience, ticket_b64url, pub, sig) >= (int)sizeof body) goto done;
+
+    int status = 0;
+    char resp[1024];
+    size_t rlen = 0;
+    if (post_json(&ctx, "/api/machine/enroll/claim", body, &status, resp, sizeof resp, &rlen) != 0) {
+        result = OC_ENROLL_PENDING;          /* unreachable: worth another try */
+        goto done;
+    }
+    if (status == 200) result = OC_ENROLL_ACTIVE;
+    else if (status == 429 || status >= 500) result = OC_ENROLL_PENDING;
+    else result = OC_ENROLL_FAILED;          /* the ticket was refused; it will be again */
+
+done:
+    memset(body, 0, sizeof body);
+    if (ctx.use_tls) oc_tls_client_free(&ctx.tls);
+    return result;
+}
+
 oc_enroll_result oc_enroll_activate(const char *central_url, const char *ca_bundle,
                                     const char *audience, const char *privkey_pem) {
     enroll_ctx ctx;

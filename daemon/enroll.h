@@ -43,4 +43,20 @@ typedef enum {
 oc_enroll_result oc_enroll_activate(const char *central_url, const char *ca_bundle,
                                     const char *audience, const char *privkey_pem);
 
+/* A managed box's claim (AUTH.md §8.7). `ticket_b64url` is the one-time ticket
+ * the box was started with. Writes the SubjectPublicKeyInfo DER and the ASN.1 DER
+ * signature, both base64, over
+ *   openchime-claim-v1|<aud>|<b64url(SHA-256(ticket))>|<b64url(SHA-256(public key DER))>
+ * so the signature covers the ticket and the key without carrying either. 0 / -1. */
+int oc_enroll_sign_claim(const char *privkey_pem, const char *audience, const char *ticket_b64url,
+                         char *pubkey_b64, size_t pubkey_cap, char *sig_b64, size_t sig_cap);
+
+/* Claim the binding central reserved for `audience`. ACTIVE when central
+ * activated it; FAILED when it refused the ticket (spent, expired, or not this
+ * workspace's — retrying cannot help); PENDING when central could not be reached
+ * or was busy, which is worth another try. */
+oc_enroll_result oc_enroll_claim(const char *central_url, const char *ca_bundle,
+                                 const char *audience, const char *privkey_pem,
+                                 const char *ticket_b64url);
+
 #endif /* OPENCHIME_ENROLL_H */
