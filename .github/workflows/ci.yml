@@ -82,7 +82,7 @@ jobs:
       # files in the key, so a hit skips the build and a change to any of them
       # rebuilds. The timeout allows for a miss.
       - name: Restore the speech engine and models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             third_party/onnxruntime-1.30.0
@@ -192,7 +192,7 @@ jobs:
       # files in the key, so a hit skips the build and a change to any of them
       # rebuilds. The timeout allows for a miss.
       - name: Restore the speech engine and models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             third_party/onnxruntime-1.30.0
