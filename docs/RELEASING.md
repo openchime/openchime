@@ -130,8 +130,15 @@ returning a number is only safe while nothing has been published under it, and
 a failure *after* the repositories go live must burn the number rather than
 hand it back.
 
-`publish` therefore **asserts** the tag exists rather than creating it. If that
-assertion ever fires, something deleted the reservation mid-run.
+`publish` **holds** the number as its first step, before anything is written.
+The tag on the run's commit is the ordinary case. The tag absent is what
+re-running only the failed jobs produces — `unreserve` returned the number and
+`version`, having succeeded, does not run again — so `publish` reserves it again,
+provided it is still exactly the next number. A tag on another commit, or a
+later release already tagged, means the run no longer owns the number, and it
+stops with nothing published. The tagging step near the end still **asserts**
+the tag rather than creating it; if that ever fires, something deleted the
+reservation mid-job.
 
 ## `:latest` moves last
 
