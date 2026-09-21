@@ -1586,7 +1586,7 @@ static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap)
     return AUTH_R_UNREACHABLE;
 }
 
-static int have_stored_token(const char *store_path, const char *host, int port,
+static int have_stored_token(const char *store_path, const char *key, const char *host, int port,
                              oc_secret *secret);
 
 /* Record a workspace in the book so the switcher can offer it later (REQ-012).
@@ -1614,16 +1614,21 @@ static int run_login(const char *initial_workspace, const char *initial_user,
         if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
         char cred[260] = "";   /* empty: the core signs in through the browser */
         if (!f.browser) snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
-        oc_client *cl = oc_client_start_secure(f.ep.host, f.ep.port, cred,
-                                               f.remember ? store_path : NULL,
-                                               f.remember ? secret : NULL);
+        /* Filed under the workspace as the person named it, not the address it
+         * resolved to this time. */
+        char key[288];
+        if (oc_workspace_key(f.workspace, oc_default_suffix(), key, sizeof key) != 0)
+            snprintf(key, sizeof key, "%s:%d", f.ep.host, f.ep.port);
+        oc_client *cl = oc_client_start_named(key, f.ep.host, f.ep.port, cred,
+                                              f.remember ? store_path : NULL,
+                                              f.remember ? secret : NULL);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         char why[200] = "";
         int res = await_auth(cl, f.ep.host, why, sizeof why);
         if (res == AUTH_R_OK) {
             memset(w, 0, sizeof *w);
             w->cl = cl;
-            snprintf(w->key,   sizeof w->key,   "%s:%d", f.ep.host, f.ep.port);
+            snprintf(w->key,   sizeof w->key,   "%s", key);
             snprintf(w->label, sizeof w->label, "%s", f.workspace[0] ? f.workspace : f.ep.host);
             snprintf(w->user,  sizeof w->user,  "%s", f.user);
             /* Only remember it if the user asked us to keep the credential —
@@ -1649,18 +1654,31 @@ static int open_workspace(const char *key, const char *label, const char *user) 
     if (existing >= 0) return existing;                  /* already open */
     if (g_nws >= MAX_WS) return -1;
 
-    char host[256] = ""; int port = 0;
-    const char *colon = strrchr(key, ':');
-    if (!colon) return -1;
-    size_t hl = (size_t)(colon - key);
-    if (hl >= sizeof host) return -1;
-    memcpy(host, key, hl); host[hl] = '\0';
-    port = atoi(colon + 1);
-    if (!port) return -1;
-
+    /* The book remembers what the person typed; resolve that again rather than
+         * trust an address from last time. An entry from when the key WAS the
+         * address resolves as itself. */
+    const char *named = (label && label[0]) ? label : key;
+    oc_endpoint ep;
     ws_session *w = &g_ws[g_nws];
-    if (have_stored_token(g_store_path, host, port, g_secret)) {
-        oc_client *cl = oc_client_start_secure(host, port, "", g_store_path, g_secret);
+    if (oc_resolve(named, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
+        if (!run_login(named, user, g_store_path, g_secret, w)) return -1;
+        return g_nws++;
+    }
+    const char *host = ep.host; int port = ep.port;
+    char nkey[288];
+    if (oc_workspace_key(named, oc_default_suffix(), nkey, sizeof nkey) != 0)
+        snprintf(nkey, sizeof nkey, "%s", key);
+    if (strcmp(nkey, key) != 0) {
+        /* The book's entry is under the old key: move it, so the switcher does not
+         * show the workspace twice. */
+        oc_store *st = g_store_path ? oc_store_open(g_store_path) : NULL;
+        if (st) { oc_store_set_secret(st, g_secret); oc_store_adopt(st, nkey, key); oc_store_close(st); }
+        if (ws_find(nkey) >= 0) return ws_find(nkey);
+        key = nkey;
+    }
+
+    if (have_stored_token(g_store_path, key, host, port, g_secret)) {
+        oc_client *cl = oc_client_start_named(key, host, port, "", g_store_path, g_secret);
         if (!cl) return -1;
         char why[200] = "";
         if (await_auth(cl, host, why, sizeof why) != AUTH_R_OK) {         /* token stale/rejected */
@@ -1681,14 +1699,18 @@ static int open_workspace(const char *key, const char *label, const char *user) 
 
 /* Is a still-valid session token stored for this workspace? If so we skip the
  * login box and let the net thread reconnect silently. */
-static int have_stored_token(const char *store_path, const char *host, int port,
+static int have_stored_token(const char *store_path, const char *key, const char *host, int port,
                              oc_secret *secret) {
     oc_store *s = store_path ? oc_store_open(store_path) : NULL;
     if (!s && !secret) return 0;
     if (s) oc_store_set_secret(s, secret);   /* look in the keyring too */
+    /* Under the workspace as named — and, for an entry from when the key was the
+     * address, under that: the net thread moves it across on first use. */
     char inst[288]; snprintf(inst, sizeof inst, "%s:%d", host, port);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
-    int has = s ? oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000) : 0;
+    uint64_t now = (uint64_t)time(NULL) * 1000;
+    int has = s ? (oc_store_load_session(s, key, tok, NULL, now) ||
+                   oc_store_load_session(s, inst, tok, NULL, now)) : 0;
     oc_store_close(s);
     return has;
 }
@@ -1727,6 +1749,7 @@ int main(int argc, char **argv) {
      * already stored; otherwise prompt. A resolution failure is reported
      * distinctly from connect/auth failure (REQ-011). */
     char host[256] = ""; int port = 0; const char *cred = NULL;
+    char key0[288] = "";                       /* the first workspace's store key */
     int direct = 0;
     const char *prefill = "";
 
@@ -1734,6 +1757,7 @@ int main(int argc, char **argv) {
         snprintf(host, sizeof host, "%s", argv[1]);
         port = atoi(argv[2]);
         cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
+        snprintf(key0, sizeof key0, "%s:%d", host, port);   /* an address IS its name here */
         direct = 1;
     } else if (argc >= 2 || cfg.workspace[0]) {       /* workspace mode (arg or config default) */
         const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
@@ -1744,8 +1768,10 @@ int main(int argc, char **argv) {
         if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found — it does not resolve in DNS\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;
+        if (oc_workspace_key(inst, oc_default_suffix(), key0, sizeof key0) != 0)
+            snprintf(key0, sizeof key0, "%s:%d", host, port);
         if (cli_cred && cli_cred[0])                               { cred = cli_cred; direct = 1; }
-        else if (have_stored_token(store_path, host, port, secret)) { cred = "";      direct = 1; }  /* silent reconnect */
+        else if (have_stored_token(store_path, key0, host, port, secret)) { cred = "";      direct = 1; }  /* silent reconnect */
         else                                                       { prefill = inst; direct = 0; }  /* prompt */
     }                                                /* else: no args -> login box */
     if (!cred) cred = "";
@@ -1760,12 +1786,12 @@ int main(int argc, char **argv) {
     /* The first session. Everything after this point works through g_ws, so the
      * command line is just one more way to open a workspace. */
     if (direct) {
-        oc_client *c0 = oc_client_start_secure(host, port, cred, store_path, secret);
+        oc_client *c0 = oc_client_start_named(key0, host, port, cred, store_path, secret);
         if (!c0) { tb_shutdown(); oc_secret_free(secret); fprintf(stderr, "failed to start client\n"); return 1; }
         ws_session *w = &g_ws[0];
         memset(w, 0, sizeof *w);
         w->cl = c0;
-        snprintf(w->key,   sizeof w->key,   "%s:%d", host, port);
+        snprintf(w->key,   sizeof w->key,   "%s", key0);
         /* Fall back to the full "host:port", not the bare host — two dev
          * workspaces on the same host would otherwise be indistinguishable
          * in the switcher. */

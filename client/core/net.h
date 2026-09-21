@@ -39,6 +39,13 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
                      const char *store_path, oc_secret *secret,
                      oc_queue *to_ui, oc_queue *from_ui);
 
+/* As oc_net_start, with the key the workspace's credential entry is filed under
+ * (oc_workspace_key of what the person typed). NULL keys it by "host:port". An
+ * entry found under "host:port" is moved to the key on first use. */
+oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port, const char *token,
+                           const char *store_path, oc_secret *secret,
+                           oc_queue *to_ui, oc_queue *from_ui);
+
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
 /* Redeem an invite on the FIRST connect instead of authenticating (REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so

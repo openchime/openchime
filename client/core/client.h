@@ -36,6 +36,12 @@ oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
 oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
                                   const char *store_path, oc_secret *secret);
 
+/* As oc_client_start_secure, filing the workspace's session, pin and book entry
+ * under `workspace_key` — oc_workspace_key of what the person typed — rather than
+ * under the address it resolved to. What a frontend should call. */
+oc_client *oc_client_start_named(const char *workspace_key, const char *host, int port,
+                                 const char *cred, const char *store_path, oc_secret *secret);
+
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);
 

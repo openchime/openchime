@@ -21751,6 +21751,24 @@ static int pick_last_workspace(char *ws, size_t wscap, char *user, size_t ucap) 
     return 1;
 }
 
+/* The key a workspace's credential entry is filed under: the workspace as named,
+ * normalised (oc_workspace_key) — one key for the token, the pin and the book
+ * entry, whatever address the name resolves to today. `ws` may already be a key;
+ * the function is idempotent. */
+static void ws_key(const char *ws, char *out, size_t cap) {
+    if (oc_workspace_key(ws, oc_default_suffix(), out, cap) != 0) snprintf(out, cap, "%s", ws ? ws : "");
+}
+
+/* An entry made when the token was filed under the resolved address and the book
+ * under whatever was typed: both move to the key, once. */
+static void ws_adopt(oc_store *s, const char *key, const char *typed, const oc_endpoint *ep) {
+    if (typed && typed[0]) oc_store_adopt(s, key, typed);
+    if (ep) {
+        char inst[288]; snprintf(inst, sizeof inst, "%s:%d", ep->host, ep->port);
+        oc_store_adopt(s, key, inst);
+    }
+}
+
 /* A still-valid session token stored for `ws`? Then the net thread can reconnect
  * silently and we skip the login dialog entirely (uniform with the TUI). */
 static int have_stored_token(const char *ws) {
@@ -21765,9 +21783,10 @@ static int have_stored_token(const char *ws) {
      * reports "no persisted session" and we would show the sign-in screen to a
      * user who is still signed in. */
     oc_store_set_secret(s, g_secret);
-    char inst[288]; snprintf(inst, sizeof inst, "%s:%d", ep.host, ep.port);
+    char key[288]; ws_key(ws, key, sizeof key);
+    ws_adopt(s, key, ws, &ep);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
-    int has = oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000);
+    int has = oc_store_load_session(s, key, tok, NULL, (uint64_t)time(NULL) * 1000);
     oc_store_close(s);
     return has;
 }
@@ -21779,7 +21798,11 @@ static void remember_workspace(const char *ws, const char *user) {
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return;
     oc_store_set_secret(s, g_secret);   /* the book + token live in the credential store */
-    oc_store_workspace_remember(s, ws, ws, user, (uint64_t)time(NULL) * 1000);
+    char key[288]; ws_key(ws, key, sizeof key);
+    ws_adopt(s, key, ws, NULL);
+    /* The label is what the person typed; a reconnect from the book passes the key
+     * itself, and NULL keeps the label already there. */
+    oc_store_workspace_remember(s, key, strcmp(key, ws) ? ws : NULL, user, (uint64_t)time(NULL) * 1000);
     oc_store_close(s);
 }
 
@@ -21876,7 +21899,8 @@ static void ws_clear_session(const char *ws) {
     oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
     if (!st) return;
     oc_store_set_secret(st, g_secret);
-    oc_store_clear_session(st, ws);
+    char key[288]; ws_key(ws, key, sizeof key);
+    oc_store_clear_session(st, key);
     oc_store_close(st);
 }
 
@@ -21887,7 +21911,11 @@ static void ws_forget(const char *ws) {
     oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
     if (!st) return;
     oc_store_set_secret(st, g_secret);
-    oc_store_workspace_forget(st, ws);
+    /* One key holds all of it, so one delete forgets all of it — and anything an
+     * older client left under what was typed goes with it. */
+    char key[288]; ws_key(ws, key, sizeof key);
+    oc_store_workspace_forget(st, key);
+    if (strcmp(key, ws) != 0) oc_store_workspace_forget(st, ws);
     oc_store_close(st);
 }
 
@@ -21991,9 +22019,12 @@ static int connect_start(const char *ws, const char *cred) {
     }
     snprintf(g_host, sizeof g_host, "%s", ep.host);
     g_port = ep.port;
-    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", ws);
+    /* The workspace's identity from here on is its key: what the switcher lists,
+     * what the slots compare, what the store files it under. */
+    char key[288]; ws_key(ws, key, sizeof key);
+    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", key);
     snprintf(g_cred, sizeof g_cred, "%s", cred);
-    g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), g_secret);
+    g_client = oc_client_start_named(key, g_host, g_port, g_cred, store_path(), g_secret);
     g_clients_started++;
 
     ws_register();
@@ -22249,13 +22280,13 @@ static void signin_submit(HWND hwnd) {
 
     snprintf(g_host, sizeof g_host, "%s", g_si_host);
     g_port = g_si_port;
-    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", g_si_ws);
+    ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
     snprintf(g_cred, sizeof g_cred, "%s:%s", user, pass);
     /* "Remember me" off means leave no trace: passing a NULL store path keeps
      * the session token out of the store entirely (the TUI's mechanism). */
-    g_si_client = oc_client_start_secure(g_host, g_port, g_cred,
-                                         g_si_remember ? store_path() : NULL,
-                                         g_si_remember ? g_secret : NULL);
+    g_si_client = oc_client_start_named(g_cur_ws, g_host, g_port, g_cred,
+                                        g_si_remember ? store_path() : NULL,
+                                        g_si_remember ? g_secret : NULL);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
     /* Signup: with an invite in hand this connection redeems it instead
      * of authenticating — one step that creates the account and signs in — so
@@ -22277,9 +22308,9 @@ static void signin_start_browser(HWND hwnd) {
     g_si_err[0] = '\0';
     snprintf(g_host, sizeof g_host, "%s", g_si_host);
     g_port = g_si_port;
-    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", g_si_ws);
+    ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
     g_cred[0] = '\0';
-    g_si_client = oc_client_start_secure(g_host, g_port, "",
+    g_si_client = oc_client_start_named(g_cur_ws, g_host, g_port, "",
                                          g_si_remember ? store_path() : NULL,
                                          g_si_remember ? g_secret : NULL);
     if (!g_si_client) {

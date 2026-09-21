@@ -1238,6 +1238,79 @@ static void test_store_legacy_entry(void) {
     oc_store_close(s);
 }
 
+/* The key a workspace's entry is filed under is the workspace as NAMED — one
+ * spelling per workspace, whatever address it resolves to. */
+static void test_workspace_key(void) {
+    static const struct { const char *typed, *want; } T[] = {
+        { "acme",                         "acme.openchime.test" },   /* bare name -> the suffix */
+        { "Acme",                         "acme.openchime.test" },   /* one spelling */
+        { "  acme",                       "acme.openchime.test" },
+        { "acme.openchime.test",          "acme.openchime.test" },   /* idempotent: a key is a name */
+        { "Chat.Acme.Example",            "chat.acme.example" },
+        { "chat.acme.example.",           "chat.acme.example" },
+        { "https://chat.acme.example/x",  "chat.acme.example" },
+        { "chat.acme.example:8443",       "chat.acme.example:8443" }, /* a typed port is part of the name */
+        { "127.0.0.1:8443",               "127.0.0.1:8443" },
+        { "LocalHost:9443",               "localhost:9443" },
+        { "acme:0",                       "acme.openchime.test" },    /* not a port */
+        { "acme:99999",                   "acme.openchime.test" },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        char key[288] = "";
+        CHECK(oc_workspace_key(T[i].typed, "openchime.test", key, sizeof key) == 0);
+        if (strcmp(key, T[i].want) != 0) printf("  key(%s) = %s, want %s\n", T[i].typed, key, T[i].want);
+        CHECK(strcmp(key, T[i].want) == 0);
+    }
+    char key[288], tiny[4];
+    CHECK(oc_workspace_key("", "openchime.test", key, sizeof key) != 0);
+    CHECK(oc_workspace_key("acme", "openchime.test", tiny, sizeof tiny) != 0);
+}
+
+/* An entry from when the key was the resolved address moves to the name — all of
+ * it, once — and an entry already under the name keeps what it has. */
+static void test_store_adopt(void) {
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], sk[32], pk[32];
+    memset(tok, 0x11, sizeof tok); memset(pin, 0x22, sizeof pin);
+    oc_store_save_session(s, "edge7.fly.example:443", tok, 0, "dana");
+    oc_store_save_pin(s, "edge7.fly.example:443", pin);
+    CHECK(oc_store_device_key(s, "edge7.fly.example:443", sk, pk) == 1);
+    oc_store_workspace_remember(s, "edge7.fly.example:443", "acme", "dana", 5);
+
+    CHECK(oc_store_adopt(s, "acme.openchime.test", "edge7.fly.example:443") == 1);
+    uint8_t got[OC_SESSION_TOKEN_LEN], gpin[OC_TLS_FINGERPRINT_LEN], sk2[32], pk2[32];
+    char owner[64];
+    CHECK(oc_store_load_session(s, "acme.openchime.test", got, NULL, 0) == 1 && memcmp(got, tok, sizeof tok) == 0);
+    CHECK(oc_store_session_user(s, "acme.openchime.test", owner, sizeof owner) == 1 && strcmp(owner, "dana") == 0);
+    CHECK(oc_store_load_pin(s, "acme.openchime.test", gpin) == 1 && memcmp(gpin, pin, sizeof pin) == 0);
+    CHECK(oc_store_device_key(s, "acme.openchime.test", sk2, pk2) == 1 && memcmp(sk, sk2, 32) == 0);
+    CHECK(mock_len_of("edge7.fly.example:443") == 0);             /* the old entry is gone */
+    /* Again is nothing; so is a key adopting itself, and a legacy that is not there. */
+    CHECK(oc_store_adopt(s, "acme.openchime.test", "edge7.fly.example:443") == 0);
+    CHECK(oc_store_adopt(s, "acme.openchime.test", "acme.openchime.test") == 0);
+    CHECK(oc_store_load_session(s, "acme.openchime.test", got, NULL, 0) == 1);
+
+    /* What the Win32 client left: the book under what was typed, the token under the
+     * address. They merge, and what the name already holds is never overwritten. */
+    uint8_t tokB[OC_SESSION_TOKEN_LEN], pinB[OC_TLS_FINGERPRINT_LEN], pinOld[OC_TLS_FINGERPRINT_LEN];
+    memset(tokB, 0x33, sizeof tokB); memset(pinB, 0x44, sizeof pinB); memset(pinOld, 0x55, sizeof pinOld);
+    oc_store_workspace_remember(s, "beta.openchime.test", "Beta", "erik", 9);   /* book only */
+    oc_store_save_pin(s, "beta.openchime.test", pinB);                          /* the name's own pin */
+    oc_store_save_session(s, "10.0.0.9:443", tokB, 0, "erik");
+    oc_store_save_pin(s, "10.0.0.9:443", pinOld);
+    CHECK(oc_store_adopt(s, "beta.openchime.test", "10.0.0.9:443") == 1);
+    CHECK(oc_store_load_session(s, "beta.openchime.test", got, NULL, 0) == 1 && memcmp(got, tokB, sizeof tokB) == 0);
+    CHECK(oc_store_load_pin(s, "beta.openchime.test", gpin) == 1 && memcmp(gpin, pinB, sizeof pinB) == 0);
+    CHECK(mock_len_of("10.0.0.9:443") == 0);
+    oc_store_close(s);
+}
+
 static void test_secret_routing(void) {
     memset(g_mock, 0, sizeof g_mock);
     oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
@@ -2074,6 +2147,32 @@ static void test_browser_signin(int port) {
         CHECK(oc_client_model(c)->signin_url[0] == '\0');
         oc_client_stop(c);
     }
+    /* The credential entry is filed under the workspace as NAMED. A client from
+     * before that filed it under the address; one that names the workspace finds
+     * that entry, moves it, and rides in on its session — no browser this time. */
+    {
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        char legacy[64]; snprintf(legacy, sizeof legacy, "127.0.0.1:%d", arg.port);
+        oc_client *old = oc_client_start_secure("127.0.0.1", arg.port, "", "ignored", &sec);
+        CHECK(old != NULL);
+        CHECK(WAIT_FOR(old, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(old), &is, "https://accounts.google.com|dana", "b1k", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(old, m->authed));
+        oc_client_stop(old);
+        CHECK(mock_len_of(legacy) > 0);
+
+        oc_client *named = oc_client_start_named("acme.openchime.test", "127.0.0.1", arg.port, "",
+                                                 "ignored", &sec);
+        CHECK(named != NULL);
+        CHECK(WAIT_FOR(named, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(named)->signin_seq == 0);          /* the session, not the browser */
+        oc_client_stop(named);
+        CHECK(mock_len_of("acme.openchime.test") > 0);
+        CHECK(mock_len_of(legacy) == 0);                          /* moved, not copied */
+        mock_reset();
+    }
+
     /* A token that was not minted for this client's challenge: the daemon wants the
      * verifier the nonce is the hash of, and this client holds a different one. */
     {
@@ -2140,6 +2239,8 @@ int run_client_core_tests(void) {
     test_pins();
     test_resolve();
     test_last_error();
+    test_workspace_key();
+    test_store_adopt();
     test_secret_routing();
     test_store_no_persistence_without_keyring();
     test_workspace_book();

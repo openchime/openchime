@@ -402,7 +402,15 @@ no database and no file: `client/core/store.c` is a thin front for the OS
 credential store, holding one entry per workspace with the session token, the
 TOFU pin, and the book fields (typed address, account, last-used). Because there
 is one credential per workspace, **enumerating the credential store is the
-workspace book** (`oc_secret_each`), and "forget" is a single delete. Cached
+workspace book** (`oc_secret_each`), and "forget" is a single delete. **The
+entry is keyed by the workspace as named** (`oc_workspace_key`: its domain,
+lowercased, with the port only if one was typed) — not by the address resolution
+produced, which is an answer and can change: an SRV record moves, two names share a
+front door, and the pin and the session belong to the name a person trusted. An
+entry an earlier client filed under `host:port`, or under whatever was typed, is
+moved to the key the first time it is found (`oc_store_adopt`) — token with its
+owner, pin, device key and book fields together, never overwriting what the name
+already holds. Cached
 history is gone and the offline outbox lives in memory on the net thread. With no
 OS credential store, nothing persists at all.
 
