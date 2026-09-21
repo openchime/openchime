@@ -760,13 +760,14 @@ static void test_oidc_auth(void) {
     CHECK(oc_dbwriter_auth_methods(w) == (OC_AUTH_OIDC | OC_AUTH_SESSION));
     CHECK(strlen(oc_dbwriter_oidc_params(w)) > 0);
 
-    const char *HDR = "{\"alg\":\"ES256\",\"typ\":\"JWT\"}";
-    char payload[512];
-    /* exp far in the real future — the daemon checks against wall-clock time. */
-    snprintf(payload, sizeof payload,
-        "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"google|42\","
-        "\"email\":\"a@acme.example\",\"name\":\"A\",\"exp\":4102444800}", ISS, AUD);
-    char token[2048];
+    char HDR[160];
+    oc_issuer_header(&is, HDR, sizeof HDR);
+    /* The daemon checks against wall-clock time, and a relay token is short-lived. */
+    unsigned long long now = (unsigned long long)time(NULL);
+    char payload[1024];
+    oc_issuer_payload(payload, sizeof payload, ISS, AUD, "google|42", "jti-first", now - 5, now + 290,
+                      "\"email\":\"a@acme.example\",\"name\":\"A\"");
+    char token[4096];
     size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
 
     /* A valid central JWT provisions the user and mints a session. */
@@ -789,11 +790,25 @@ static void test_oidc_auth(void) {
     CHECK(role == OC_ROLE_MEMBER);
     CHECK(has_tok == 1);
 
-    /* Re-auth with the same JWT is idempotent (same user). */
+    /* The same token a second time is refused: a relay token is good once. */
     {
         oc_job *j = oc_job_new(OC_JOB_AUTH, 21);
         j->method = OC_AUTH_OIDC;
         oc_job_set_token(j, token, tlen);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+        oc_dbres_free(r);
+    }
+
+    /* A fresh token for the same subject is the same user. */
+    {
+        char p2[1024], t2[4096];
+        oc_issuer_payload(p2, sizeof p2, ISS, AUD, "google|42", "jti-second", now - 5, now + 290, "");
+        size_t l2 = oc_issuer_mint(&is, HDR, p2, t2);
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 25);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, t2, l2);
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
         CHECK(r && r->type == OC_RES_AUTH_OK && r->user_id == uid);
@@ -805,10 +820,10 @@ static void test_oidc_auth(void) {
 
     /* A JWT minted for a different audience is rejected. */
     {
-        char bad[512];
-        snprintf(bad, sizeof bad,
-            "{\"iss\":\"%s\",\"aud\":\"other.example\",\"sub\":\"google|42\",\"exp\":4102444800}", ISS);
-        char bt[2048];
+        char bad[1024];
+        oc_issuer_payload(bad, sizeof bad, ISS, "other.example", "google|42", "jti-third",
+                          now - 5, now + 290, "");
+        char bt[4096];
         size_t bl = oc_issuer_mint(&is, HDR, bad, bt);
         oc_job *j = oc_job_new(OC_JOB_AUTH, 23);
         j->method = OC_AUTH_OIDC;

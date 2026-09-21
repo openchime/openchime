@@ -56,6 +56,7 @@ struct oc_dbwriter {
     char           *oidc_audience;
     char           *oidc_pubkey_pem;
     char           *oidc_params;             /* advertised blob ("" if none) */
+    struct oc_seen_jti *seen_jti;            /* relay tokens already used (AUTH.md §8.2) */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed local-auth per source IP */
@@ -733,6 +734,34 @@ static int count_owners(sqlite3 *db) {
     return n;
 }
 
+/* A relay token is good once (AUTH.md §8.2). The ids of the tokens already
+ * accepted are held in memory until they expire — a token lives at most
+ * OC_JWT_MAX_LIFETIME_SECS, which is what keeps this small — and a full table
+ * refuses rather than forgets: forgetting is what a replay would need. */
+#define OC_SEEN_JTI_CAP 4096
+
+struct oc_seen_jti {
+    struct { char jti[OC_JWT_MAX_SHORT]; uint64_t exp; } slot[OC_SEEN_JTI_CAP];
+};
+
+/* 1 if `jti` was new and is now recorded; 0 if it was seen before, or if no
+ * slot is free. `exp` and `now` are seconds. */
+static int seen_jti_claim(struct oc_seen_jti *t, const char *jti, uint64_t exp, uint64_t now) {
+    int free_slot = -1;
+    for (int i = 0; i < OC_SEEN_JTI_CAP; i++) {
+        if (t->slot[i].jti[0] == '\0' || t->slot[i].exp + 120u < now) {
+            t->slot[i].jti[0] = '\0';
+            if (free_slot < 0) free_slot = i;
+        } else if (strcmp(t->slot[i].jti, jti) == 0) {
+            return 0;
+        }
+    }
+    if (free_slot < 0) return 0;
+    snprintf(t->slot[free_slot].jti, sizeof t->slot[free_slot].jti, "%s", jti);
+    t->slot[free_slot].exp = exp;
+    return 1;
+}
+
 /* Just-in-time provision an OIDC user by subject (AUTH.md §4); refreshes the
  * email/name on each login. Returns the user id, or 0. Role defaults to member
  * via the schema; promotion is a separate action. */
@@ -848,6 +877,12 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
                                          w->oidc_issuer, w->oidc_audience,
                                          dbw_now_ms() / 1000u, &claims);
         if (jr != OC_JWT_OK) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        /* Single use, claimed only once everything else about the token is good, so
+         * a token that fails for another reason does not burn its id. */
+        if (!w->seen_jti ||
+            !seen_jti_claim(w->seen_jti, claims.jti, claims.exp, dbw_now_ms() / 1000u)) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
         }
         /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
@@ -7200,6 +7235,8 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
     w->oidc_audience   = strdup(audience);
     w->oidc_pubkey_pem = strdup(pubkey_pem);
     w->oidc_params     = strdup(oidc_params ? oidc_params : "");
+    if (!w->seen_jti) w->seen_jti = calloc(1, sizeof *w->seen_jti);
+    if (!w->seen_jti) return -1;
     if (!w->oidc_issuer || !w->oidc_audience || !w->oidc_pubkey_pem || !w->oidc_params)
         return -1;
     w->oidc_enabled = 1;
@@ -7506,6 +7543,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
     free(w->oidc_issuer); free(w->oidc_audience);
     free(w->oidc_pubkey_pem); free(w->oidc_params);
+    free(w->seen_jti);
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);
     if (w->evfd >= 0) close(w->evfd);
