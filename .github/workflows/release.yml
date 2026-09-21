@@ -985,6 +985,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Hold the number BEFORE anything is written, not at the tagging step.
+      #
+      # `version` reserves the tag and `unreserve` deletes it when a run fails
+      # having published nothing. Re-running only the failed jobs then skips
+      # `version` -- it succeeded -- so this job arrives with a number whose tag
+      # is gone. Checked only at the tagging step, that was found out after apt
+      # and dnf had been written: the repositories live and nothing naming them.
+      #
+      # So the question is asked here, where every answer is still harmless. The
+      # tag on this commit: held. The tag absent and the number still exactly
+      # the next one: nobody took it, so reserve it again. Anything else -- the
+      # tag on another commit, or a later release already tagged -- is a number
+      # this run no longer owns, and it stops with nothing published.
+      - name: Hold the release number
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          if at=$(git rev-parse -q --verify "refs/tags/release-${VERSION}^{commit}"); then
+            [ "$at" = "$GITHUB_SHA" ] || {
+              echo "::error::release-${VERSION} is on ${at}, not this commit; refusing to publish"
+              exit 1
+            }
+            echo "release-${VERSION} is held"
+            exit 0
+          fi
+          next=$(scripts/version.sh next)
+          [ "$next" = "$VERSION" ] || {
+            echo "::error::release-${VERSION} is not reserved and the next number is ${next}; refusing to publish"
+            exit 1
+          }
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "release-${VERSION}" "$GITHUB_SHA"
+          git push origin "release-${VERSION}"
+          echo "reserved release-${VERSION} again"
+
       # merge-multiple is deliberately absent: without it each artifact unpacks
       # into a directory named after itself, and since every producing job names
       # its artifact for its platform, that reconstitutes dist/<platform>/ here.
@@ -1250,8 +1286,9 @@ jobs:
         run: |
           set -euo pipefail
           # The tag already exists: `version` reserved it before anything was built
-          # (P3-OC-02). Assert rather than create, so a mismatch is loud instead of
-          # silently tagging a second commit with the same number.
+          # (P3-OC-02), and the first step of this job held it. Assert rather than
+          # create, so a mismatch is loud instead of silently tagging a second
+          # commit with the same number.
           git fetch --tags --force --quiet
           git rev-parse -q --verify "refs/tags/release-${VERSION}" >/dev/null || {
             echo "::error::release-${VERSION} was not reserved; refusing to publish"
