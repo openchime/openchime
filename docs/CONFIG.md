@@ -38,6 +38,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_TLS_CERT` | `/data/cert.pem` | Self-signed certificate path. Generated on first run; also persisted in the DB so the TOFU pin survives a restore (ARCH-10/66b). |
 | `OPENCHIME_TLS_KEY` | `/data/key.pem` | Private key for the above. |
 | `OPENCHIME_MAX_CONNS_PER_IP` | `256` | Accept-loop cap on concurrent connections from one source IP. |
+| `OPENCHIME_TRUSTED_PROXIES` | *(none)* | Addresses and CIDR blocks, comma-separated, of TCP forwarders in front of the daemon. A connection from one must begin with a **PROXY protocol v2** header, read before TLS, and the client address it names is what the per-address connection cap and the sign-in limiter count; a trusted peer that sends none is closed. Nobody else's header is read. A list the daemon cannot parse stops the boot. |
 | `OPENCHIME_DEPLOYMENT_MODE` | `standalone` | `standalone` \| `federated` \| `managed` — reported to clients in `WORKSPACE_INFO` (ARCH-76). Does **not** by itself enable federated services; those are gated on their own URLs. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | Human-readable workspace name, reported in `WORKSPACE_INFO`. |
 

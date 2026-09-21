@@ -24,6 +24,7 @@
 #include "http.h"
 #include "protocol.h"
 #include "ratelimit.h"
+#include "proxyproto.h"
 
 #include <mbedtls/sha256.h>
 
@@ -65,7 +66,9 @@
 #define OC_SEND_RATE_MAX       30u
 #define OC_SEND_RATE_WINDOW_MS 3000u
 
-typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
+/* CONN_PROXY: a trusted forwarder's connection, whose PROXY v2 header is read off
+ * the socket before TLS is allowed to see a byte (proxyproto.h). */
+typedef enum { CONN_PROXY, CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
 /* Attachment transfer state (REQ-140/141, ARCH-69). A connection carries at most
  * one transfer at a time. Uploads stream client->blob (net-thread writes to the
@@ -5639,6 +5642,9 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * for a large office behind one NAT; operators tune it. The global cap is
      * OC_NETLOOP_MAX_FD. */
     int max_per_ip = oc_config_get()->max_conns_per_ip;
+    /* Parsed once; main refuses to start on a list it cannot read, so NULL here is
+     * the empty list and nobody is trusted. */
+    oc_trusted_proxies *trusted = oc_trusted_proxies_parse(oc_config_get()->trusted_proxies, NULL, 0);
 
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
@@ -5686,8 +5692,12 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     } else if (ss.ss_family == AF_INET6) {
                         inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, src, sizeof src);
                     }
+                    /* A trusted forwarder speaks for somebody else, and says who in a
+                     * header: the cap is applied once that is read, to the client
+                     * it names rather than to the forwarder. */
+                    int via_proxy = oc_trusted_proxies_match(trusted, &ss);
                     /* Throttle a single IP before spending a conn/TLS context on it. */
-                    if (max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
+                    if (!via_proxy && max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
                         close(cfd);
                         continue;
                     }
@@ -5701,7 +5711,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     c->fd = cfd;
                     memcpy(c->source, src, sizeof c->source);
                     c->conn_id = g_next_conn_id++;
-                    c->state = CONN_HANDSHAKE;
+                    c->state = via_proxy ? CONN_PROXY : CONN_HANDSHAKE;
                     conns[cfd] = c;
                     struct epoll_event cev;
                     memset(&cev, 0, sizeof cev);
@@ -5758,6 +5768,29 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             conn *c = conns[fd];
             if (!c) continue;
 
+            if (c->state == CONN_PROXY) {
+                /* Peek, so that nothing is taken from the socket until the whole
+                 * header is there; then take exactly the header, and TLS starts on
+                 * the byte after it. A trusted peer that sends anything else is
+                 * closed: it is misconfigured, and guessing would mean either
+                 * trusting a header that is not one or feeding one to TLS. */
+                uint8_t hdr[OC_PROXY_V2_MAX];
+                ssize_t got = recv(fd, hdr, sizeof hdr, MSG_PEEK);
+                if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+                if (got <= 0) { conn_close(ep, conns, fd); continue; }
+                char real[46];
+                long hl = oc_proxy_v2_parse(hdr, (size_t)got, real);
+                if (hl == 0) continue;                       /* not all here yet */
+                if (hl < 0 || recv(fd, hdr, (size_t)hl, 0) != hl) { conn_close(ep, conns, fd); continue; }
+                if (real[0]) memcpy(c->source, real, sizeof c->source);
+                /* Counted among the others from that address — itself included. */
+                if (max_per_ip > 0 && conns_from_ip(conns, c->source) > max_per_ip) {
+                    conn_close(ep, conns, fd);
+                    continue;
+                }
+                c->state = CONN_HANDSHAKE;
+            }
+
             if (c->state == CONN_HANDSHAKE) {
                 oc_tls_status st = oc_tls_handshake(&c->tls);
                 if (st == OC_TLS_OK) {
@@ -5805,6 +5838,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_blobs = NULL;
     oc_ratelimit_free(g_webhook_rl);
     g_webhook_rl = NULL;
+    oc_trusted_proxies_free(trusted);
     close(ep);
     close(lfd);
     free(conns);

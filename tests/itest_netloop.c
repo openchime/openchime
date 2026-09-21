@@ -124,7 +124,10 @@ static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     }
 }
 
-static int client_open(client *c, int port, const uint8_t *pin) {
+/* `prefix` (may be NULL) is written to the socket before TLS begins — what a TCP
+ * forwarder's PROXY header is. */
+static int client_open_with(client *c, int port, const uint8_t *pin,
+                            const uint8_t *prefix, size_t prefix_len) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -149,6 +152,7 @@ static int client_open(client *c, int port, const uint8_t *pin) {
         struct timeval tv = { 20, 0 };
         setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     }
+    if (prefix && write(c->fd, prefix, prefix_len) != (ssize_t)prefix_len) return -1;
     /* Concurrent TLS setup across threads (test_concurrent_load opens 8 clients
      * at once) is safe: the vendored mbedTLS is built with MBEDTLS_THREADING. */
     if (oc_tls_client_init(&c->cli, pin) != 0) return -1;
@@ -156,6 +160,10 @@ static int client_open(client *c, int port, const uint8_t *pin) {
     if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
     oc_framebuf_init(&c->fb);
     return 0;
+}
+
+static int client_open(client *c, int port, const uint8_t *pin) {
+    return client_open_with(c, port, pin, NULL, 0);
 }
 
 /* The ALPN list an ordinary HTTPS client offers — curl's default, and what a
@@ -3447,6 +3455,59 @@ static void test_auth_begin(int port) {
     unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
 }
 
+/* Behind a forwarder (proxyproto.h): the address the limits key on is the one the
+ * forwarder's header names, believed only because the forwarder is trusted. Its
+ * own loop, with loopback as the trusted forwarder and a per-address cap of two. */
+static void test_proxy_header(int port) {
+    setenv("OPENCHIME_TRUSTED_PROXIES", "127.0.0.0/8", 1);
+    setenv("OPENCHIME_MAX_CONNS_PER_IP", "2", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_proxy.db");
+    CHECK(dbw2 != NULL);
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    static const uint8_t SIG[12] = { 0x0D,0x0A,0x0D,0x0A,0x00,0x0D,0x0A,0x51,0x55,0x49,0x54,0x0A };
+    uint8_t from7[28], from8[28];
+    memcpy(from7, SIG, 12); from7[12] = 0x21; from7[13] = 0x11; from7[14] = 0; from7[15] = 12;
+    memset(from7 + 16, 0, 12);
+    from7[16] = 203; from7[17] = 0; from7[18] = 113; from7[19] = 7;
+    memcpy(from8, from7, sizeof from8); from8[19] = 8;
+
+    /* TLS begins on the byte after the header, and the session is an ordinary one. */
+    client a, b, c, d, e;
+    CHECK(client_open_with(&a, port, pin2, from7, sizeof from7) == 0);
+    CHECK(do_handshake(&a) == 0);
+    /* The cap counts the CLIENT the header names: two from .7, and the third is
+     * refused — while .8, through the same forwarder, is somebody else. With the
+     * forwarder's own address counted, all of these would be one client. */
+    CHECK(client_open_with(&b, port, pin2, from7, sizeof from7) == 0);
+    int third = client_open_with(&c, port, pin2, from7, sizeof from7);
+    CHECK(third != 0);
+    CHECK(client_open_with(&d, port, pin2, from8, sizeof from8) == 0);
+    /* A trusted forwarder that sends no header is misconfigured, and is closed
+     * rather than guessed about. */
+    int bare = client_open(&e, port, pin2);
+    CHECK(bare != 0);
+
+    client_close(&a); client_close(&b); client_close(&d);
+    if (third == 0) client_close(&c);
+    if (bare == 0) client_close(&e);
+    arg2.stop = 1;
+    pthread_join(th2, NULL);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unsetenv("OPENCHIME_TRUSTED_PROXIES");
+    unsetenv("OPENCHIME_MAX_CONNS_PER_IP");
+    unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
+}
+
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
@@ -3537,6 +3598,7 @@ int run_netloop_tests(void) {
         test_logout_closes(arg.port, pin);
         test_conn_throttle(arg.port + 123);
         test_auth_begin(arg.port + 124);
+        test_proxy_header(arg.port + 125);
     }
 
     arg.stop = 1;

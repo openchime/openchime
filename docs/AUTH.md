@@ -89,7 +89,10 @@ authority.
   check runs before any signature work, and a refused relay sign-in is audited as
   `auth.failed` (or `auth.denied`, when the identity was valid and no rule admits
   it) with its reason and address — never the token. `auth.success` records the
-  source and the provider.
+  source and the provider. Behind a TCP forwarder the address is the client's,
+  taken from the forwarder's PROXY protocol v2 header — believed only from the
+  peers `OPENCHIME_TRUSTED_PROXIES` names (`daemon/proxyproto.c`), since anybody
+  else who sent one could claim any address and walk past the limiter.
 
 ---
 
