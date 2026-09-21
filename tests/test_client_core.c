@@ -28,6 +28,8 @@
 #include "e2e_hpke.h"
 #include "e2e_sframe.h"
 #include "check.h"
+#include "issuer.h"       /* mints what central would, for the browser sign-in test */
+#include "signin.h"
 
 #include <math.h>
 #include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
@@ -1970,6 +1972,148 @@ static void test_device_key(void) {
     oc_store_close(s);
 }
 
+/* ---- a browser sign-in, end to end (AUTH.md §8.1, §8.2) ---------------------
+ * A real daemon with the relay source on, the real client core, and a "browser"
+ * played here: it reads the URL the daemon built, mints the token central would —
+ * carrying the URL's nonce — and delivers it to the client's loopback address. */
+
+/* GET `url_path_and_query` from 127.0.0.1:port; returns the status code. */
+static int browser_get(int port, const char *target) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+    int status = 0;
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+        char req[9000];
+        int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", target);
+        ssize_t w = write(fd, req, (size_t)n); (void)w;
+        char buf[64];
+        ssize_t r = read(fd, buf, sizeof buf - 1);
+        if (r > 12) { buf[r] = '\0'; status = atoi(buf + 9); }
+    }
+    close(fd);
+    return status;
+}
+
+/* Play the browser and central for one waiting sign-in. `email_verified_tenant`
+ * is spliced into the token. 0 once the client's listener has answered 200. */
+static int browser_complete(const oc_model *m, oc_issuer *is, const char *sub, const char *jti,
+                            const char *extra, const char *nonce_override) {
+    const char *q = strchr(m->signin_url, '?');
+    if (!q) return -1;
+    char redirect[256], nonce[64], aud[128];
+    if (oc_query_get(q + 1, "redirect_uri", redirect, sizeof redirect) != 1 ||
+        oc_query_get(q + 1, "nonce", nonce, sizeof nonce) != 1 ||
+        oc_query_get(q + 1, "workspace", aud, sizeof aud) != 1) return -1;
+    if (strncmp(redirect, "http://127.0.0.1:", 17) != 0) return -1;
+    int port = atoi(redirect + 17);
+    const char *path = strchr(redirect + 17, '/');
+    if (!path) return -1;
+
+    char hdr[160], payload[1024], token[4096], target[4400];
+    unsigned long long now = (unsigned long long)time(NULL);
+    oc_issuer_header(is, hdr, sizeof hdr);
+    snprintf(payload, sizeof payload,
+             "{\"iss\":\"https://central.example\",\"aud\":\"%s\",\"sub\":\"%s\",\"jti\":\"%s\","
+             "\"nonce\":\"%s\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu,%s}",
+             aud, sub, jti, nonce_override ? nonce_override : nonce, now - 5, now - 5, now + 290, extra);
+    oc_issuer_mint(is, hdr, payload, token);
+    snprintf(target, sizeof target, "%s?token=%s", path, token);
+    return browser_get(port, target) == 200 ? 0 : -1;
+}
+
+static void test_browser_signin(int port) {
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink("build/test_core_browser.db"); unlink("build/test_core_browser.db-wal");
+    unlink("build/test_core_browser.db-shm");
+    oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_browser.db");
+    CHECK(dbw != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-core-browser") == 0);
+    CHECK(oc_dbwriter_configure_oidc(dbw, "https://central.example", "ws_browser_test", is.pem,
+                                     "https://central.example") == 0);
+    oc_dbwriter_set_local_enabled(dbw, 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(dbw, "owner:dana@acme.example", why, sizeof why) == 0);
+
+    struct core_loop_arg arg;
+    arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+    wait_port_ready(arg.port);
+
+    const char *DANA = "\"email\":\"dana@acme.example\",\"email_verified\":true,\"name\":\"Dana\",\"idp\":\"google\"";
+    const char *STRANGER = "\"email\":\"s@elsewhere.example\",\"email_verified\":true,\"idp\":\"google\"";
+
+    /* No password given: the core asks the daemon for the URL, hands it to the
+     * frontend through the model, and waits. The browser comes back; the core
+     * connects again, presents the token with its verifier, and is in. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        const oc_model *m = oc_client_model(c);
+        CHECK(strncmp(m->signin_url, "https://central.example/oidc/authorize?workspace=ws_browser_test&", 65) == 0);
+        CHECK(m->signin_seq == 1 && !m->authed);
+        CHECK(browser_complete(m, &is, "https://accounts.google.com|dana", "b1", DANA, NULL) == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(c)->signin_url[0] == '\0');
+        oc_client_stop(c);
+    }
+    /* A token that was not minted for this client's challenge: the daemon wants the
+     * verifier the nonce is the hash of, and this client holds a different one. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|dana", "b2", DANA,
+                               "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0") == 0);
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(strcmp(oc_client_model(c)->last_error, "auth failed") == 0 && !oc_client_model(c)->authed);
+        oc_client_stop(c);
+    }
+    /* Somebody the workspace did not name: told so, in words. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|stranger", "b3",
+                               STRANGER, NULL) == 0);
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(strcmp(oc_client_model(c)->last_error, "this account isn't allowed in this workspace") == 0);
+        oc_client_stop(c);
+    }
+    /* The person gives up. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        oc_client_cancel_signin(c);
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(strcmp(oc_client_model(c)->last_error, "sign-in cancelled") == 0);
+        CHECK(oc_client_model(c)->signin_url[0] == '\0');
+        oc_client_stop(c);
+    }
+    /* A password offered to a workspace that takes none is refused in words too. */
+    {
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "dana:pw");
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
+        CHECK(strcmp(oc_client_model(c)->last_error, "this workspace doesn't sign in that way") == 0);
+        oc_client_stop(c);
+    }
+
+    arg.stop = 1;
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_issuer_free(&is);
+    unlink("build/test_core_browser.db"); unlink("build/test_core_browser.db-wal");
+    unlink("build/test_core_browser.db-shm");
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
@@ -3018,5 +3162,6 @@ int run_client_core_tests(void) {
     else                 unsetenv("TZ");
     tzset();
 
+    test_browser_signin(21500 + (int)(getpid() % 2000));
     return failures;
 }

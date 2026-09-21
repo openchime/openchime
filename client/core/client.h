@@ -393,6 +393,10 @@ void oc_client_logout(oc_client *c, uint8_t scope);
  * dropped connection (otherwise a no-op). */
 void oc_client_reconnect(oc_client *c);
 
+/* Stop waiting for a browser sign-in (model->signin_url is set while one waits).
+ * The model then carries "sign-in cancelled" as its last error. */
+void oc_client_cancel_signin(oc_client *c);
+
 /* How many sends are queued but unacknowledged (REQ-102). The outbox lives in
  * memory only (ARCH-88), so a frontend should warn before quitting while this is
  * non-zero — otherwise the user silently loses what they typed. */
