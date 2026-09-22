@@ -58,6 +58,27 @@ typedef struct {
  */
 size_t oc_mention_scan(const char *body, size_t len, oc_mention *out, size_t max);
 
+/* A #channel REFERENCE, which is the same text rule with a different sigil.
+ *
+ * It lives beside the @ scanner rather than in the frontend that draws it
+ * because the two rules are one rule -- what a name may contain, where it may
+ * start, what trailing punctuation belongs to the sentence -- and the way that
+ * rule drifts is by being written down twice. The completer inserts `#name`
+ * (client/core/complete.c); this is what reads it back.
+ *
+ * Unlike a mention it resolves against the CHANNEL list, and only the caller
+ * has one: a reference to a channel that does not exist, or that this user
+ * cannot see, is ordinary text and is not the scanner's business to know. */
+#define OC_CHANREF_MAX 16
+
+typedef struct {
+    size_t start;                       /* byte offset of the '#' in the body */
+    size_t len;                         /* bytes of the whole reference, '#' included */
+    char   name[OC_MENTION_NAME_MAX];   /* text after '#', as written */
+} oc_chanref;
+
+size_t oc_chanref_scan(const char *body, size_t len, oc_chanref *out, size_t max);
+
 /* Does `body` mention `name` (case-insensitive), or carry any broadcast
  * audience? A convenience for the common "is this for me" question; `name` may
  * be NULL to ask only about broadcasts. */

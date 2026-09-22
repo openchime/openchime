@@ -872,6 +872,19 @@ called "Empty". It says "No matches" instead when a find filter is what emptied 
 because "you have none of these" and "none of yours match" are different answers and
 an empty list gives the same silence to both.
 
+**A `#channel` in a message is a link.** The completer inserts `#name`
+(`client/core/complete.c`); `oc_chanref_scan` in `shared/mention.c` reads it back
+— beside the `@` scanner, because the two are one text rule and the way a rule
+drifts is by being written down twice. The transcript styles a reference like a
+mention and opens the conversation on release, the way a URL opens a browser.
+
+Two exclusions, both of them "what looks like a link is one". A reference is
+styled **only when it resolves** against the channels this client holds, so a
+private channel you are not in, and any `#word` that was never a channel, stay
+ordinary text. And a `#` inside a URL belongs to the URL: `https://example.com/#general`
+is one address that opens a browser, and the word-boundary rule cannot see it,
+because the byte before the `#` is a `/`.
+
 ## The composer is ours (ARCH-98)
 
 There is no RichEdit and **no child window**. The field is drawn into the

@@ -55,6 +55,45 @@ size_t oc_mention_scan(const char *body, size_t len, oc_mention *out, size_t max
     return found;
 }
 
+size_t oc_chanref_scan(const char *body, size_t len, oc_chanref *out, size_t max) {
+    size_t found = 0;
+    if (!body) return 0;
+
+    for (size_t i = 0; i < len; i++) {
+        if (body[i] != '#') continue;
+        /* The same word boundary the '@' rule uses, and it earns its keep on a
+         * different case: "C#" and an issue number written "oc#12" are not
+         * references to a channel. */
+        if (i > 0 && name_byte((unsigned char)body[i - 1])) continue;
+        /* A heading is not a reference either. Markdown (REQ-220) gives '#' at
+         * the start of a line to the heading, and "# Notes" would otherwise be a
+         * reference to a channel called nothing at all -- the space already
+         * ends the name, but a run of them ("### Notes") would leave "##" as a
+         * name byte for the next pass rather than a heading. */
+        if (i + 1 < len && (body[i + 1] == '#' || body[i + 1] == ' ')) continue;
+
+        size_t j = i + 1;
+        while (j < len && name_byte((unsigned char)body[j])) j++;
+        while (j > i + 1) {
+            char c = body[j - 1];
+            if (c == '.' || c == '-' || c == '_') j--; else break;
+        }
+        size_t nlen = j - (i + 1);
+        if (nlen == 0 || nlen >= OC_MENTION_NAME_MAX) { i = j > i ? j - 1 : i; continue; }
+
+        if (found < max) {
+            oc_chanref *c = &out[found];
+            c->start = i;
+            c->len   = nlen + 1;
+            memcpy(c->name, body + i + 1, nlen);
+            c->name[nlen] = '\0';
+        }
+        found++;
+        i = j - 1;
+    }
+    return found;
+}
+
 int oc_mention_targets(const char *body, size_t len, const char *name) {
     oc_mention m[32];
     size_t n = oc_mention_scan(body, len, m, 32);
