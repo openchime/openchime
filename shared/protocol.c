@@ -3319,6 +3319,11 @@ oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_mark_all_read(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MARK_ALL_READ);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SESSION_LIST);
     oc_w_u16(w, m->count);

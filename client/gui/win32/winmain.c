@@ -24307,15 +24307,17 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         modal_enter(hwnd, &g_notify_open);
         break;
     case 70: modal_enter(hwnd, &g_prefs_open); break;
-    case 73: {   /* catch-up, as a loop over the existing CLIENT_ACK.
-                  * REQ-238 may later add a true bulk op; this needs no wire
-                  * change and the acks are cumulative per channel anyway. */
+    case 73: {   /* catch-up, in ONE frame (MARK_ALL_READ). This was a loop over
+                  * CLIENT_ACK, which cost a round trip per unread conversation
+                  * and made the one menu item that exists for a busy workspace
+                  * most expensive exactly there. The count is still read from
+                  * the model, because it is what to SAY -- the daemon decides
+                  * what to mark, and may reach one message further. */
         if (!m) break;
         int n = 0;
-        for (size_t i = 0; i < m->n_channels; i++) {
-            const oc_channel *c = &m->channels[i];
-            if (c->high_water > c->read_marker) { oc_client_mark_read(g_client, c->channel_id); n++; }
-        }
+        for (size_t i = 0; i < m->n_channels; i++)
+            if (m->channels[i].high_water > m->channels[i].read_marker) n++;
+        if (n) oc_client_mark_all_read(g_client);
         char msg[64];
         snprintf(msg, sizeof msg, n ? "Marked %d conversation%s read." : "Nothing unread.",
                  n, n == 1 ? "" : "s");

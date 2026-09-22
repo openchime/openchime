@@ -3903,6 +3903,129 @@ static void test_delivery_cursor(void) {
     cleanup_db(path);
 }
 
+/* Catch-up in one job (OC_MSG_MARK_ALL_READ): every membership advances to its
+ * channel's newest message, and only the channels that MOVED are announced.
+ *
+ * Both halves are settled by ORDER, not by waiting. The writer is FIFO, so a
+ * job submitted after the sweep cannot be answered before it: if the next
+ * result to come out is the barrier's, the sweep is finished and said exactly
+ * what has already been read. Sleeping a while and concluding "nothing came"
+ * proves nothing about a writer that was merely slow, and it is how a check
+ * that passes on a fast machine fails in CI.
+ *
+ * The barrier sends into a channel bob is NOT in, so it cannot disturb the
+ * cursors under test. */
+static void test_mark_all_read(void) {
+    const char *path = "build/test_dbwriter_markall.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "ma-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "ma-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* Two channels beside the default with bob in them, and one without him. */
+    oc_dbres *r = create_channel(w, alice, "ma-one", 1);
+    uint64_t c1 = r ? r->channel_id : 0; oc_dbres_free(r);
+    r = create_channel(w, alice, "ma-two", 1);
+    uint64_t c2 = r ? r->channel_id : 0; oc_dbres_free(r);
+    r = create_channel(w, alice, "ma-bare", 1);
+    uint64_t c3 = r ? r->channel_id : 0; oc_dbres_free(r);
+    CHECK(c1 && c2 && c3);
+    r = chan_ref(w, OC_JOB_JOIN_CHANNEL, bob, c1); oc_dbres_free(r);
+    r = chan_ref(w, OC_JOB_JOIN_CHANNEL, bob, c2); oc_dbres_free(r);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x70, sizeof idem);
+    CHECK(send_msg(w, alice, idem, "in default"));
+    CHECK(send_to(w, alice, c1, "in one") == 0);
+    CHECK(send_to(w, alice, c2, "in two") == 0);
+
+    /* bob is caught up on c2 already, so the sweep must leave it alone: a
+     * replayed catch-up fanning a cursor nobody moved is the defect the single
+     * ack guards against, and this op must not reintroduce it per channel. */
+    {
+        sqlite3 *raw = NULL; sqlite3_stmt *st = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_prepare_v2(raw, "SELECT MAX(id) FROM messages WHERE channel_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)c2);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        uint64_t newest_c2 = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st); sqlite3_close(raw);
+        client_ack(w, bob, c2, newest_c2);
+    }
+
+    /* One job, answered with one result per channel that moved: the default
+     * channel and c1, never c2 -- and then the barrier, which is how we know
+     * there was no third. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_MARK_ALL_READ, 1);
+        j->user_id = bob;
+        oc_dbwriter_submit(w, j);
+        oc_job *b = oc_job_new(OC_JOB_SEND, 1);
+        b->user_id = alice; b->channel_id = c3;
+        memset(b->idem, 0xB1, OC_IDEM_LEN);
+        oc_job_set_body(b, "barrier", 7);
+        oc_dbwriter_submit(w, b);
+
+        int seen_default = 0, seen_c1 = 0, seen_c2 = 0, n = 0, barrier = 0;
+        for (int i = 0; i < 8 && !barrier; i++) {
+            oc_dbres *g = wait_result(w);
+            CHECK(g != NULL);
+            if (!g) break;
+            if (g->type == OC_RES_SEND_OK) { barrier = 1; oc_dbres_free(g); break; }
+            CHECK(g->type == OC_RES_READ_CURSOR);
+            CHECK(g->user_id == bob);
+            if (g->channel_id == OC_DEFAULT_CHANNEL) seen_default = 1;
+            if (g->channel_id == c1) seen_c1 = 1;
+            if (g->channel_id == c2) seen_c2 = 1;
+            n++;
+            oc_dbres_free(g);
+        }
+        CHECK(barrier);                       /* the sweep finished */
+        CHECK(n == 2);                        /* and announced exactly two */
+        CHECK(seen_default && seen_c1 && !seen_c2);
+    }
+
+    /* Every cursor now sits at its channel's newest message. */
+    {
+        sqlite3 *raw = NULL; sqlite3_stmt *st = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_prepare_v2(raw,
+            "SELECT COUNT(*) FROM channel_members cm "
+            "JOIN messages m ON m.channel_id = cm.channel_id "
+            "LEFT JOIN delivery_cursors dc ON dc.channel_id = cm.channel_id AND dc.user_id = cm.user_id "
+            "WHERE cm.user_id = ? GROUP BY cm.channel_id "
+            "HAVING MAX(m.id) > COALESCE(dc.message_id, 0);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)bob);
+        CHECK(sqlite3_step(st) == SQLITE_DONE);   /* no channel left behind */
+        sqlite3_finalize(st); sqlite3_close(raw);
+    }
+
+    /* Run again with nothing unread: no work, and nothing announced. The
+     * barrier is the whole assertion -- its result arriving FIRST is what says
+     * the sweep produced none, with no interval to have guessed wrong about. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_MARK_ALL_READ, 1);
+        j->user_id = bob;
+        oc_dbwriter_submit(w, j);
+        oc_job *b = oc_job_new(OC_JOB_SEND, 1);
+        b->user_id = alice; b->channel_id = c3;
+        memset(b->idem, 0xB2, OC_IDEM_LEN);
+        oc_job_set_body(b, "barrier two", 11);
+        oc_dbwriter_submit(w, b);
+
+        oc_dbres *g = wait_result(w);
+        CHECK(g != NULL);
+        CHECK(g && g->type == OC_RES_SEND_OK);   /* nothing preceded it */
+        oc_dbres_free(g);
+    }
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* --- Direct messages (REQ-050) ------------------------------------------ */
 
 static oc_dbres *open_dm(oc_dbwriter *w, uint64_t actor, uint64_t target) {
@@ -5546,7 +5669,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -5578,6 +5701,7 @@ int run_dbwriter_tests(void) {
     test_setup_invite();
     test_tls_identity();
     test_delivery_cursor();
+    test_mark_all_read();
     test_idem_pruning();
     test_backfill();
     test_history_paging();

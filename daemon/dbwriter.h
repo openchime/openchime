@@ -191,7 +191,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * missed call -- as a message of kind OC_MSG_KIND_CALL, authored by
         * user_id in channel_id, body in body/body_len; the net thread raises it
         * with no connection behind it. Write. */
-       OC_JOB_CALL_EVENT = 104 };
+       OC_JOB_CALL_EVENT = 104,
+       /* Catch-up: advance every one of a user's memberships (OC_MSG_MARK_ALL_READ).
+        * A write, and on the writer for the same reason CLIENT_ACK is. */
+       OC_JOB_MARK_ALL_READ = 105 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;

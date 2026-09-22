@@ -2357,7 +2357,7 @@ static void test_browser_signin(int port) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
     test_group_dm_title();
     test_sidebar();
@@ -2539,6 +2539,23 @@ int run_client_core_tests(void) {
         {
             uint64_t seen[8];
             CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
+        }
+
+        /* Catch-up in ONE frame (REQ-238): dana posts again, and erik clears
+         * everything with MARK_ALL_READ instead of acking the channel. The same
+         * seen-by fan-out must then name him on the new message -- which is the
+         * whole path proved end to end: the client's frame, the daemon's
+         * dispatch, the writer's sweep, and the other member's model. His own
+         * unread clears on the call, not on the reply. */
+        oc_client_send(a, 1, "catch up on this");
+        uint64_t mid2 = 0;
+        CHECK(WAIT_FOR(b, (mid2 = message_id_of(oc_client_model(b), 1, "catch up on this")) != 0 &&
+                          channel_unread(oc_client_model(b), 1) == 1));
+        oc_client_mark_all_read(b);
+        CHECK(channel_unread(oc_client_model(b), 1) == 0);
+        {
+            uint64_t seen[8];
+            CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid2, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
         }
 
         /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana

@@ -2083,6 +2083,14 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_MARK_ALL_READ) {
+            /* No body to decode; the frame's presence is the message. */
+            oc_job *j = oc_job_new(OC_JOB_MARK_ALL_READ, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_SESSIONS) {
             oc_job *j = oc_job_new(OC_JOB_LIST_SESSIONS, c->conn_id);
             if (!j) return -1;
