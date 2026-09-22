@@ -408,6 +408,15 @@ static void test_thread_frames(void) {
  * misplaced field shifts every entry after the first rather than corrupting the
  * one it is in. That is the failure the protocol version exists to make loud,
  * and it has moved for exactly this reason before (USER_LIST, twice). */
+/* MARK_ALL_READ has no body: the frame's presence is the whole message. Pinned,
+ * because "no body" is a layout -- a field added later is a version bump, and a
+ * payload that grew without one is what this catches. */
+static void test_mark_all_read_frame(void) {
+    ROUNDTRIP(oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION), OC_MSG_MARK_ALL_READ, h, p);
+    CHECK(h.version == OC_PROTOCOL_VERSION);
+    CHECK(p.len == 0);
+}
+
 static void test_thread_list_frames(void) {
     {
         oc_list_threads in = { OC_THREADF_UNREAD };
@@ -1922,6 +1931,7 @@ int run_protocol_tests(void) {
     test_forward_frame();
     test_thread_frames();
     test_thread_list_frames();
+    test_mark_all_read_frame();
     test_channel_frames();
     test_admin_frames();
     test_search_frames();

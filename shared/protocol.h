@@ -294,6 +294,15 @@ typedef enum {
     OC_MSG_DOWNLOAD_CHUNK   = 0x0088, /* S->C, one download chunk */
     OC_MSG_DOWNLOAD_END     = 0x0089, /* S->C, all bytes sent */
     OC_MSG_TRANSFER_CANCEL  = 0x008A, /* C->S, abort an in-progress transfer */
+    /* Catch-up in one round trip (REQ-238). CLIENT_ACK is per channel,
+     * so "mark everything read" cost one frame per conversation and a workspace
+     * with sixty of them paid sixty round trips for one menu item. Carries
+     * nothing: the caller is the session, and the cursor each channel advances
+     * to is that channel's newest message AT THE DAEMON -- which is the only
+     * definition of "everything" that is true when the request arrives rather
+     * than when it was sent. Not a replacement for CLIENT_ACK, which says
+     * something narrower and is still what entering a conversation sends. */
+    OC_MSG_MARK_ALL_READ    = 0x008B, /* C->S, advance every membership's cursor */
     OC_MSG_SET_NOTIFY_PREF  = 0x0090, /* C->S, set a channel's notification level (REQ-130) */
     /* 0x0091 was SET_DND, REQ-131's single quiet window. REQ-136 replaced it
      * with a schedule (0x00CC) that states ALLOWED hours, so the op is retired
@@ -1428,6 +1437,10 @@ oc_result oc_decode_delete_emoji(oc_rbuf *p, oc_delete_emoji *m);
 oc_result oc_decode_list_emoji(oc_rbuf *p);
 oc_result oc_decode_emoji_list(oc_rbuf *p, oc_emoji_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
+
+/* MARK_ALL_READ carries no body, so there is nothing to decode: the frame's
+ * presence is the whole message and the header already said who sent it. */
+oc_result oc_encode_mark_all_read(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
 oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,
                                  uint16_t *out_count);

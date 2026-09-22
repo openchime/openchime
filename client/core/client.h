@@ -94,6 +94,14 @@ void oc_client_redeem_invite(oc_client *c, const char *invite_token);
  * focused channel. */
 void oc_client_mark_read(oc_client *c, uint64_t channel_id);
 
+/* Catch up on everything in ONE round trip. Marks every channel read in the
+ * local model and sends a single MARK_ALL_READ, where the loop over
+ * oc_client_mark_read sent one frame per unread conversation. The daemon
+ * advances each membership to that channel's newest message as IT sees it, so
+ * anything that arrived while the request was in flight is included -- which is
+ * what "mark everything read" means to the person who chose it. */
+void oc_client_mark_all_read(oc_client *c);
+
 /* React to a message: `op` is 1 (add) or 0 (remove). The server fans back a
  * REACTION_UPDATED that folds into the message's aggregates. */
 void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,

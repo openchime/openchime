@@ -2755,6 +2755,11 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_client_ack(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_MARK_ALL_READ) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SET_DISPLAY_NAME) {
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_display_name sn = { oc_slice_str(c->body ? c->body : "") };

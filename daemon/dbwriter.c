@@ -4209,6 +4209,39 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
  * thread can drive seen-by: fan the acker's new cursor to the channel members and
  * backfill the acker with the other members' current cursors. A stale/duplicate
  * ack (no advance) has no reply. */
+/* One cursor's fan-out, exactly as process_client_ack builds it: who to tell,
+ * and what everybody else's cursor is. Split out so the bulk sweep below and
+ * the single ack cannot drift into describing the same event two ways. */
+static oc_dbres *read_cursor_result(sqlite3 *db, uint64_t conn_id, uint64_t user_id,
+                                    uint64_t channel_id, uint64_t message_id) {
+    sqlite3_stmt *st = NULL;
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_READ_CURSOR;
+    r->conn_id = conn_id;
+    r->channel_id = channel_id;
+    r->user_id = user_id;
+    r->message_id = message_id;
+    load_members(db, channel_id, r);
+
+    size_t cap = 8, n = 0;
+    r->rcur = malloc(cap * sizeof *r->rcur);
+    sqlite3_prepare_v2(db,
+        "SELECT user_id, message_id FROM delivery_cursors WHERE channel_id=? AND user_id<>?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    while (r->rcur && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_read_cursor_row *g = realloc(r->rcur, cap * sizeof *g); if (!g) break; r->rcur = g; }
+        r->rcur[n].user_id    = (uint64_t)sqlite3_column_int64(st, 0);
+        r->rcur[n].message_id = (uint64_t)sqlite3_column_int64(st, 1);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->n_rcur = n;
+    return r;
+}
+
 static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
     /* Was this a real advance? Only broadcast if so (avoids fan-out on replays). */
     sqlite3_stmt *st = NULL;
@@ -4234,32 +4267,81 @@ static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
 
     if (j->message_id <= prev) return NULL;   /* no advance: nothing to broadcast */
 
-    oc_dbres *r = calloc(1, sizeof *r);
-    if (!r) return NULL;
-    r->type = OC_RES_READ_CURSOR;
-    r->conn_id = j->conn_id;
-    r->channel_id = j->channel_id;
-    r->user_id = j->user_id;
-    r->message_id = j->message_id;
-    load_members(db, j->channel_id, r);   /* who to fan the acker's cursor to */
+    return read_cursor_result(db, j->conn_id, j->user_id, j->channel_id, j->message_id);
+}
 
-    /* The other members' current cursors, to bootstrap the acker's seen-by view. */
-    size_t cap = 8, n = 0;
-    r->rcur = malloc(cap * sizeof *r->rcur);
+/* Catch-up (OC_MSG_MARK_ALL_READ, REQ-238): advance every one of this user's memberships
+ * to that channel's newest message, in one transaction.
+ *
+ * The target is read from the DATABASE, not from the client: "everything" means
+ * everything the daemon holds when the request arrives, so a message that landed
+ * while the frame was in flight is included rather than left as a single stubborn
+ * unread the user already tried to clear.
+ *
+ * Only channels that actually MOVE produce a result, for the reason the single
+ * ack has: a replayed catch-up must not fan a cursor nobody advanced. The
+ * results are chained and the whole chain is queued at once (push_result), so
+ * sixty channels are one job and one wake rather than sixty of each. */
+static oc_dbres *process_mark_all_read(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    oc_dbres *head = NULL, *tail = NULL;
+    struct { uint64_t channel_id, message_id; } *adv = NULL;
+    size_t cap = 0, n = 0;
+
+    /* Every membership whose newest message is past this user's cursor, with the
+     * id to advance to. One query: the loop that follows must not ask the
+     * database a question per channel, which is the cost this op exists to
+     * remove. A channel with no messages has no MAX and is skipped by the
+     * comparison, not by a special case. */
     sqlite3_prepare_v2(db,
-        "SELECT user_id, message_id FROM delivery_cursors WHERE channel_id=? AND user_id<>?;",
-        -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
-    while (r->rcur && sqlite3_step(st) == SQLITE_ROW) {
-        if (n == cap) { cap *= 2; oc_read_cursor_row *g = realloc(r->rcur, cap * sizeof *g); if (!g) break; r->rcur = g; }
-        r->rcur[n].user_id    = (uint64_t)sqlite3_column_int64(st, 0);
-        r->rcur[n].message_id = (uint64_t)sqlite3_column_int64(st, 1);
+        "SELECT cm.channel_id, MAX(m.id) AS newest "
+        "FROM channel_members cm "
+        "JOIN messages m ON m.channel_id = cm.channel_id "
+        "LEFT JOIN delivery_cursors dc "
+        "  ON dc.channel_id = cm.channel_id AND dc.user_id = cm.user_id "
+        "WHERE cm.user_id = ? "
+        "GROUP BY cm.channel_id "
+        "HAVING newest > COALESCE(dc.message_id, 0);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            void *g = realloc(adv, nc * sizeof *adv);
+            if (!g) break;
+            adv = g; cap = nc;
+        }
+        adv[n].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
+        adv[n].message_id = (uint64_t)sqlite3_column_int64(st, 1);
         n++;
     }
     sqlite3_finalize(st);
-    r->n_rcur = n;
-    return r;
+    if (!n) { free(adv); return NULL; }
+
+    uint64_t now = dbw_now_ms();
+    sqlite3_prepare_v2(db,
+        "INSERT INTO delivery_cursors(user_id,channel_id,message_id,updated_at_ms) "
+        "VALUES(?,?,?,?) ON CONFLICT(user_id,channel_id) DO UPDATE SET "
+        "message_id=MAX(message_id,excluded.message_id), updated_at_ms=excluded.updated_at_ms;",
+        -1, &st, NULL);
+    for (size_t i = 0; i < n; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)adv[i].channel_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)adv[i].message_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+
+    for (size_t i = 0; i < n; i++) {
+        oc_dbres *r = read_cursor_result(db, j->conn_id, j->user_id,
+                                         adv[i].channel_id, adv[i].message_id);
+        if (!r) continue;
+        if (tail) tail->next = r; else head = r;
+        tail = r;
+    }
+    free(adv);
+    return head;
 }
 
 /* Replay messages newer than each cursor, for channels the user belongs to,
@@ -4570,10 +4652,15 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
 
 static void push_result(oc_dbwriter *w, oc_dbres *r) {
     if (!r) return;
+    /* A CHAIN, not a result: one job may answer with many (catch-up advances
+     * every channel at once). This used to clear `next` and take the head,
+     * which silently dropped the rest -- fine while every processor returned
+     * exactly one, and a leak plus a lost fan-out the moment one did not. */
+    oc_dbres *last = r;
+    while (last->next) last = last->next;
     pthread_mutex_lock(&w->mu);
-    r->next = NULL;
     if (w->res_tail) w->res_tail->next = r; else w->res_head = r;
-    w->res_tail = r;
+    w->res_tail = last;
     pthread_mutex_unlock(&w->mu);
     uint64_t one = 1;
     ssize_t wr = write(w->evfd, &one, sizeof one);
@@ -7004,6 +7091,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);
+    if (j->type == OC_JOB_MARK_ALL_READ)  return process_mark_all_read(w->db, j);
     if (j->type == OC_JOB_LOAD_IDENTITY)  return process_load_identity(w->db, j);
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
     if (j->type == OC_JOB_LOAD_ENROLLMENT)  return process_load_enrollment(w->db, j);

@@ -216,6 +216,18 @@ void oc_client_mark_read(oc_client *c, uint64_t channel_id) {
     }
 }
 
+void oc_client_mark_all_read(oc_client *c) {
+    if (!c) return;
+    /* Locally first, so the sidebar clears on the click rather than on the
+     * reply -- the same order oc_client_mark_read uses. The daemon's own sweep
+     * may reach further (a message that landed in between); the next cursor it
+     * sends back settles it. */
+    for (size_t i = 0; i < c->model.n_channels; i++)
+        oc_model_mark_read(&c->model, c->model.channels[i].channel_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MARK_ALL_READ);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
                      const char *emoji, uint8_t op) {
     if (!c || !emoji || !emoji[0]) return;

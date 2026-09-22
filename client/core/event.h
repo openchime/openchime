@@ -347,6 +347,7 @@ enum {
     OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
     OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
+    OC_CMD_MARK_ALL_READ,   /* MARK_ALL_READ: every membership, in one frame; no fields */
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
     OC_CMD_AUDIT_QUERY,     /* page the audit log (owner/admin): message_id = before_ms */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */

@@ -497,6 +497,23 @@ per-channel (advance-only) and renders "seen by …" on the last message for eve
 member whose cursor has reached it. A duplicate/stale ack (no advance) fans
 nothing, so idle re-acks are silent.
 
+**`MARK_ALL_READ` (C → S), `0x008B`** — no body. Catch-up in one round trip (REQ-238):
+the daemon advances every one of the caller's memberships to that channel's
+newest message, in one job on the writer.
+
+The target is the daemon's newest message **when the request arrives**, not the
+client's view when it was sent, so a message that landed in between is included
+rather than left as one stubborn unread the user already tried to clear. There
+is no reply of its own: each channel that actually moved produces exactly the
+`READ_CURSOR` fan-out a `CLIENT_ACK` advancing it would, and a channel already
+read produces nothing — so a repeated catch-up is silent, for the same reason an
+idle re-ack is. It does not replace `CLIENT_ACK`, which still says the narrower
+thing entering a conversation means.
+
+Added as a frame rather than as a layout change, so `OC_PROTOCOL_VERSION` does
+not move; both peers advertise exactly one version, so a daemon that predates
+the frame is refused at the handshake and never receives it (§3).
+
 ### 5.5 Editing a message (REQ-051)
 
 A user may edit **their own** message; there is no moderator edit (REQ-032). The
@@ -2497,6 +2514,7 @@ this table cannot silently gain a shared value.
 | `0x0088` | `DOWNLOAD_CHUNK` | S → C | one download chunk |
 | `0x0089` | `DOWNLOAD_END` | S → C | all bytes sent |
 | `0x008A` | `TRANSFER_CANCEL` | C → S | abort an in-progress transfer |
+| `0x008B` | `MARK_ALL_READ` | C → S | advance every membership's cursor (§5.4) |
 | `0x0090` | `SET_NOTIFY_PREF` | C → S | set a channel's notification level (REQ-130) |
 | `0x0092` | `LIST_NOTIFY_PREFS` | C → S | request all notification settings |
 | `0x0093` | `NOTIFY_PREFS` | S → C | DND + per-channel levels (also a sync push) |
