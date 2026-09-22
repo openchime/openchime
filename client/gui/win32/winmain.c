@@ -26205,6 +26205,16 @@ static void test_poll(HWND hwnd) {
         int v = atoi(arg);
         if (v >= 0 && v <= 2) { g_pref_deliver = v; prefs_save(); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "wintoast")) {
+        /* wintoast 0|1 -- 0 behaves as if the WinRT toast could not be set up, so
+         * the next `toast` falls to the tray balloon through the real chain. The
+         * balloon is the fallback nobody can otherwise reach on a machine where
+         * toasts work, which is every machine it has been developed on. 1 puts
+         * back whatever initialisation actually found. Nothing is saved. */
+        static int real = -1;
+        if (real < 0) real = g_wintoast_ok;
+        g_wintoast_ok = atoi(arg) ? real : 0;
+        test_ack("ok");
     } else if (!strcmp(verb, "notify")) {
         modal_enter(hwnd, &g_notify_open);
         oc_client_list_notify_prefs(g_client); test_ack("ok");

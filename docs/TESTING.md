@@ -1209,3 +1209,32 @@ four DPI settings × the text-size extremes it is silent, and names two real cut
 the composer's `Message #general` placeholder, gone entirely at 240 DPI, and the
 Activity empty state losing its last word at 192 DPI and the largest text size.
 Both read `overlaps=0 outside=0`.
+
+## Observing the tray balloon
+
+`scripts/gui_balloon.sh` answers whether the tray balloon is **drawn**, which
+nothing else can: the balloon is the middle of the notification chain — WinRT
+toast, else balloon, else the client's own window — and wherever toasts work it
+is never reached. The run turns the toast off for its own duration (`wintoast 0`
+through the test hook; nothing is saved), sends one notification through the real
+chain, and reports two separate facts.
+
+**Accepted** is read from the dump's `notify … by=` field: `2` means
+`Shell_NotifyIconW` took the `NIF_INFO` update and the balloon carried the
+notification. Anything else fails the run.
+
+**Observed** is a capture of the whole desktop, because the shell draws the
+balloon and a capture of our window cannot contain it. A disconnected or locked
+session has no composited desktop; the capture is blank, and the run says *not
+observed* (exit 2) rather than reporting a balloon that is missing. Focus Assist
+hides a balloon the shell has accepted, and the picture is how that is told apart
+from a balloon that is drawn. The picture is for a person to look at — what a
+balloon looks like varies by Windows version, and on Windows 10 and later it is
+rendered as a toast.
+
+**It has been seen.** `by=2` with the desktop captured: the shell drew a dark
+notification card with the app icon, `OpenChime`, and the message's source and
+text on the two lines under it — the shape a real message produces, since the
+run sends one through `notify_deliver` rather than calling the balloon directly.
+A disconnected session is what the blank case is for and is not a failure of the
+client: the first two runs of this script hit exactly that.
