@@ -532,7 +532,9 @@ typedef struct {
 } oc_slice;
 
 /* Write cursor over a caller-provided buffer. Once `overflow` is set, further
- * writes are no-ops and the frame is unusable. */
+ * writes are no-ops and the frame is unusable -- and every encoder takes a frame
+ * that failed back out, so `len` only ever ends on a whole frame: sending `len`
+ * after a failure sends the frames before it and nothing of the one that failed. */
 typedef struct {
     uint8_t *data;
     size_t   cap;
@@ -720,6 +722,14 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * and small enough that one of them is never a question for the frame budget. */
 #define OC_MAX_DESCRIPTION 1000u
 #define OC_MAX_PREVIEW    120u /* bytes of last-message preview in CHANNEL_LIST */
+/* The most entries one CHANNEL_LIST frame carries. A list is as many frames as
+ * it takes -- the client upserts each entry, so several frames merge -- and every
+ * one of them also fits OC_MAX_FRAME_SIZE, which on its own would allow more
+ * short entries than this. The bound is the RECEIVER's: a client decodes a frame
+ * into an array this size, and one entry past it was dropped with no error, so
+ * the daemon sending more is how a sidebar silently lost channels. One constant,
+ * read by both sides, is what stops the two drifting apart again. */
+#define OC_CHANNEL_LIST_PAGE 256u
 
 /* Pin op (REQ-230, ARCH-90) and the per-channel cap. A pin belongs to the
  * channel, not to the pinner: pinning an already-pinned message is a no-op

@@ -161,12 +161,23 @@ static size_t oc_frame_begin(oc_wbuf *w, uint16_t version, uint16_t msg_type) {
 }
 
 /* Finish a frame: backpatch `length` = bytes after the length field, and
- * validate the total frame size against the wire limit. */
+ * validate the total frame size against the wire limit.
+ *
+ * A frame that FAILS is taken back out of the buffer. Without that, a failure
+ * left the buffer holding a frame whose length field was still the zero
+ * placeholder, followed by however much payload had fitted -- and a caller that
+ * sent `w.len` without checking the result (most of them do) put that on the
+ * wire, where the peer read a zero-length frame and then parsed the stray
+ * payload as the next header. One bad frame desynchronised the connection for
+ * every frame after it. Rolled back, `w.len` only ever ends on a whole frame: an
+ * unchecked caller sends nothing rather than something corrupt, and a buffer
+ * holding earlier frames keeps them intact. `overflow` stays set, so nothing is
+ * appended after a failure either. */
 static oc_result oc_frame_end(oc_wbuf *w, size_t length_off) {
-    if (w->overflow) return OC_E_OVERFLOW;
+    if (w->overflow) { w->len = length_off; return OC_E_OVERFLOW; }
     size_t total = w->len - length_off;         /* 4 + version + msg_type + payload */
     size_t length = total - 4;                  /* value the length field carries */
-    if (total > OC_MAX_FRAME_SIZE) return OC_E_TOO_LARGE;
+    if (total > OC_MAX_FRAME_SIZE) { w->len = length_off; return OC_E_TOO_LARGE; }
     uint8_t *p = w->data + length_off;
     p[0] = (uint8_t)(length >> 24); p[1] = (uint8_t)(length >> 16);
     p[2] = (uint8_t)(length >> 8);  p[3] = (uint8_t)length;

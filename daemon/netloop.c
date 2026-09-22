@@ -42,9 +42,6 @@
 #include <unistd.h>
 
 #define OC_NETLOOP_MAX_FD 4096
-/* Cap channels per CHANNEL_LIST frame so it never exceeds the wire limit; a
- * client with more would page (not needed at current scale). */
-#define OC_CHANNEL_LIST_MAX 512
 #define OC_USER_LIST_MAX    512
 #define OC_WEBHOOK_LIST_MAX 256
 #define OC_REACTION_LIST_MAX 1024
@@ -3601,33 +3598,67 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         break;
     }
     case OC_RES_CHANNEL_LIST: {
+        /* PAGED: as many CHANNEL_LIST frames as the list takes. It used to be one
+         * frame capped at 512 entries by a comment promising that kept it inside
+         * the wire limit -- which it did not: 512 entries at their field caps run
+         * to several times OC_MAX_FRAME_SIZE. The encode failed, its result was
+         * ignored, and the half-written frame went out with no length, so a
+         * large workspace desynchronised every client on connect. And a client
+         * keeps OC_CHANNEL_LIST_PAGE entries of a frame, so even a list that fit
+         * lost everything past that without a word.
+         *
+         * Each page takes at most OC_CHANNEL_LIST_PAGE entries, and fewer when
+         * that many would not fit the frame: it halves until the encode is
+         * accepted. Halving from a page that failed converges in a few tries,
+         * and a single entry always fits -- its fields are all capped, and far
+         * below the frame. An empty list is still one frame, because a client
+         * learns "you are in nothing" from it. */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        size_t n = r->n_chlist > OC_CHANNEL_LIST_MAX ? OC_CHANNEL_LIST_MAX : r->n_chlist;
-        oc_channel_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
-        if (n && !ents) n = 0;
-        for (size_t i = 0; i < n; i++) {
-            ents[i].channel_id = r->chlist[i].channel_id;
-            ents[i].name = oc_slice_str(r->chlist[i].name ? r->chlist[i].name : "");
-            ents[i].is_public = r->chlist[i].is_public;
-            ents[i].joined = r->chlist[i].joined;
-            ents[i].kind = r->chlist[i].kind;
-            ents[i].last_message_at = r->chlist[i].last_message_at;
-            ents[i].unread = r->chlist[i].unread;
-            ents[i].peer_id = r->chlist[i].peer_id;
-            ents[i].topic = oc_slice_str(r->chlist[i].topic ? r->chlist[i].topic : "");
-            ents[i].archived = r->chlist[i].archived;
-            ents[i].created_at = r->chlist[i].created_at;
-            ents[i].preview = oc_slice_str(r->chlist[i].preview ? r->chlist[i].preview : "");
-            ents[i].preview_author = r->chlist[i].preview_author;
-            ents[i].n_peers = r->chlist[i].n_peers;               /* REQ-056 */
-            for (uint16_t k = 0; k < r->chlist[i].n_peers; k++)
-                ents[i].peers[k] = r->chlist[i].peers[k];
-        }
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_channel_list cl = { (uint16_t)n, ents };
-        oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &cl);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        size_t total = r->n_chlist, at = 0;
+        oc_channel_list_entry *ents = total ? malloc(
+            (total < OC_CHANNEL_LIST_PAGE ? total : OC_CHANNEL_LIST_PAGE) * sizeof *ents) : NULL;
+        if (total && !ents) total = 0;
+        do {
+            size_t want = total - at;
+            if (want > OC_CHANNEL_LIST_PAGE) want = OC_CHANNEL_LIST_PAGE;
+            for (size_t k = 0; k < want; k++) {
+                const oc_channel_row *cr = &r->chlist[at + k];
+                oc_channel_list_entry *e = &ents[k];
+                e->channel_id = cr->channel_id;
+                e->name = oc_slice_str(cr->name ? cr->name : "");
+                e->is_public = cr->is_public;
+                e->joined = cr->joined;
+                e->kind = cr->kind;
+                e->last_message_at = cr->last_message_at;
+                e->unread = cr->unread;
+                e->peer_id = cr->peer_id;
+                e->topic = oc_slice_str(cr->topic ? cr->topic : "");
+                e->archived = cr->archived;
+                e->created_at = cr->created_at;
+                e->preview = oc_slice_str(cr->preview ? cr->preview : "");
+                e->preview_author = cr->preview_author;
+                e->n_peers = cr->n_peers;                     /* REQ-056 */
+                for (uint16_t q = 0; q < cr->n_peers; q++) e->peers[q] = cr->peers[q];
+            }
+            size_t fit = want;
+            oc_result er;
+            for (;;) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_channel_list cl = { (uint16_t)fit, ents };
+                er = oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &cl);
+                if (er == OC_OK || fit <= 1) break;
+                fit /= 2;
+            }
+            if (er != OC_OK) {
+                /* One entry that does not fit is not reachable with the field
+                 * caps as they are; skip it rather than stall the list on it. */
+                at += 1;
+                continue;
+            }
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+            at += fit;
+        } while (at < total);
         free(ents);
         break;
     }

@@ -638,8 +638,22 @@ public channel plus the private channels the user belongs to:
 
 | Field       | Type            | Notes                                             |
 |-------------|-----------------|---------------------------------------------------|
-| `count`     | u16             | Number of entries.                                |
+| `count`     | u16             | Number of entries **in this frame**.              |
 | `entries[]` | `count` × entry | See below. |
+
+**A list is as many `CHANNEL_LIST` frames as it takes.** Each carries at most
+`OC_CHANNEL_LIST_PAGE` (256) entries, and fewer when that many would not fit
+`OC_MAX_FRAME_SIZE`; a client upserts every entry it receives, so the frames
+merge and there is no terminator to wait for. The page bound is the receiver's:
+a client decodes one frame into an array of that size and drops anything past
+it, so a daemon sending more is how a sidebar silently loses channels. Both
+sides read the one constant.
+
+> A frame that fails to encode is **taken back out of the send buffer**
+> (`oc_frame_end`), so a caller that does not check the result sends nothing
+> rather than a frame whose length field was never written. Before that, a
+> channel list too big for one frame went out headerless and desynchronised the
+> connection for every frame after it.
 
 Each entry, in wire order:
 

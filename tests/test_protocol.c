@@ -408,6 +408,51 @@ static void test_thread_frames(void) {
  * misplaced field shifts every entry after the first rather than corrupting the
  * one it is in. That is the failure the protocol version exists to make loud,
  * and it has moved for exactly this reason before (USER_LIST, twice). */
+/* A frame that fails to encode is taken back OUT of the buffer (oc_frame_end),
+ * so `w.len` only ever ends on a whole frame. Pinned from all three sides,
+ * because the callers that never check the result -- most of them -- are exactly
+ * the ones this protects: they send `w.len`, and it must not include half a frame
+ * with an unwritten length. */
+static void test_failed_frame_rolls_back(void) {
+    static uint8_t big[2 * OC_MAX_FRAME_SIZE];
+    static oc_channel_list_entry ents[300];
+    static char topic[OC_MAX_TOPIC + 1];
+    memset(topic, 'T', OC_MAX_TOPIC); topic[OC_MAX_TOPIC] = '\0';
+    for (int i = 0; i < 300; i++) {
+        memset(&ents[i], 0, sizeof ents[i]);
+        ents[i].channel_id = (uint64_t)(i + 1);
+        ents[i].name = oc_slice_str("a-channel");
+        ents[i].topic = oc_slice_str(topic);
+        ents[i].kind = OC_CHANNEL_KIND;
+    }
+    oc_channel_list huge = { 300, ents };   /* ~110 KB: past the frame limit */
+
+    /* 1. It does not fit the BUFFER: overflow, and nothing is left behind. */
+    {
+        uint8_t small[512]; oc_wbuf w; oc_wbuf_init(&w, small, sizeof small);
+        CHECK(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &huge) == OC_E_OVERFLOW);
+        CHECK(w.len == 0);
+    }
+    /* 2. It fits the buffer but not the WIRE: too large, and nothing left behind. */
+    {
+        oc_wbuf w; oc_wbuf_init(&w, big, sizeof big);
+        CHECK(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &huge) == OC_E_TOO_LARGE);
+        CHECK(w.len == 0);
+    }
+    /* 3. After a good frame: the good one survives whole, the bad one is gone,
+     *    and what is in the buffer still parses as exactly that good frame. */
+    {
+        uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        size_t good = w.len;
+        CHECK(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &huge) == OC_E_OVERFLOW);
+        CHECK(w.len == good);
+        oc_header h; oc_rbuf pl;
+        CHECK(oc_parse_frame(buf, w.len, &h, &pl) == OC_OK);
+        CHECK(h.msg_type == OC_MSG_MARK_ALL_READ && (size_t)h.length + 4u == good);
+    }
+}
+
 /* MARK_ALL_READ has no body: the frame's presence is the whole message. Pinned,
  * because "no body" is a layout -- a field added later is a version bump, and a
  * payload that grew without one is what this catches. */
@@ -1964,6 +2009,7 @@ int run_protocol_tests(void) {
     test_thread_frames();
     test_thread_list_frames();
     test_mark_all_read_frame();
+    test_failed_frame_rolls_back();
     test_channel_description_frames();
     test_channel_frames();
     test_admin_frames();
