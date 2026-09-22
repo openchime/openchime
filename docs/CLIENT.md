@@ -723,6 +723,15 @@ the drawn scene cannot supply, and came out as a solid black bar — the field
 follows the caret instead, and the wheel and the arrows reach every line. A
 channel's description is its first user.
 
+**Text gets the height its glyphs need, not a round number.** A rect written as
+`y + 80` is three lines at 100% and not two at the largest text size on a scaled
+display, and the difference is a sentence losing its last word inside a box every
+rect-based check calls correct — which is what `clipped=` (TESTING.md) exists to
+catch. `text_rect()` measures instead. A field that must stay ONE line, like the
+composer's cue, takes a non-wrapping format so it ends in an ellipsis rather than
+wrapping into a second line there is no room for, and its rect is the format's
+pinned line box.
+
 **A choice of emoji is never typed.** The quick reactions are six slots in
 Preferences → Messages, each opening the emoji picker for that slot: the same
 picker the status dialog uses, floating over the card that owns it
