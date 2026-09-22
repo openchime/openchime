@@ -411,6 +411,38 @@ static void test_thread_frames(void) {
 /* MARK_ALL_READ has no body: the frame's presence is the whole message. Pinned,
  * because "no body" is a layout -- a field added later is a version bump, and a
  * payload that grew without one is what this catches. */
+/* The two description frames (REQ-034), including an empty description -- the
+ * daemon's answer when none is set, which must round-trip as empty and not as
+ * a decode error. */
+static void test_channel_description_frames(void) {
+    {
+        oc_get_channel_description in = { 4242 };
+        ROUNDTRIP(oc_encode_get_channel_description(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_GET_CHANNEL_DESCRIPTION, h, p);
+        oc_get_channel_description out;
+        CHECK(oc_decode_get_channel_description(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 4242);
+    }
+    {
+        oc_channel_description in = { 4242, oc_slice_str("Purpose, norms, links.") };
+        ROUNDTRIP(oc_encode_channel_description(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_CHANNEL_DESCRIPTION, h, p);
+        oc_channel_description out;
+        CHECK(oc_decode_channel_description(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 4242);
+        CHECK(out.description.len == strlen("Purpose, norms, links.") &&
+              memcmp(out.description.ptr, "Purpose, norms, links.", out.description.len) == 0);
+    }
+    {
+        oc_channel_description in = { 7, oc_slice_str("") };
+        ROUNDTRIP(oc_encode_channel_description(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_CHANNEL_DESCRIPTION, h, p);
+        oc_channel_description out;
+        CHECK(oc_decode_channel_description(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.description.len == 0);
+    }
+}
+
 static void test_mark_all_read_frame(void) {
     ROUNDTRIP(oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION), OC_MSG_MARK_ALL_READ, h, p);
     CHECK(h.version == OC_PROTOCOL_VERSION);
@@ -1932,6 +1964,7 @@ int run_protocol_tests(void) {
     test_thread_frames();
     test_thread_list_frames();
     test_mark_all_read_frame();
+    test_channel_description_frames();
     test_channel_frames();
     test_admin_frames();
     test_search_frames();

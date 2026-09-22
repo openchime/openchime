@@ -497,6 +497,22 @@ per-channel (advance-only) and renders "seen by …" on the last message for eve
 member whose cursor has reached it. A duplicate/stale ack (no advance) fans
 nothing, so idle re-acks are silent.
 
+**`GET_CHANNEL_DESCRIPTION` (C → S), `0x008C`** `{ channel_id: u64 }` and
+**`CHANNEL_DESCRIPTION` (S → C), `0x008D`** `{ channel_id: u64, description:
+lstr }` — a channel's long-form description (REQ-034, ARCH-93). It is set with
+`UPDATE_CHANNEL` op `OC_CHUP_DESCRIPTION` (6), by any member, up to
+`OC_MAX_DESCRIPTION` (1,000) bytes, with `""` clearing it — and it is **not**
+carried on `CHANNEL_INFO` or `CHANNEL_LIST`, because the list is one frame for
+every channel and text this long on each entry would stop it fitting.
+
+`CHANNEL_DESCRIPTION` is both the answer to a fetch, to the asker only, and the
+announcement of a change, to every connected member — the way `MSG_EDITED` is
+both an edit's ack and its broadcast. An empty `description` means none is set.
+A fetch is gated like any read: a public channel's to anyone in the workspace, a
+private one's to its members. A private channel an outsider asks about gets
+`ERROR` `UNKNOWN_CHANNEL`, which is also what a channel that does not exist gets:
+a different answer would say it exists.
+
 **`MARK_ALL_READ` (C → S), `0x008B`** — no body. Catch-up in one round trip (REQ-238):
 the daemon advances every one of the caller's memberships to that channel's
 newest message, in one job on the writer.
@@ -2515,6 +2531,8 @@ this table cannot silently gain a shared value.
 | `0x0089` | `DOWNLOAD_END` | S → C | all bytes sent |
 | `0x008A` | `TRANSFER_CANCEL` | C → S | abort an in-progress transfer |
 | `0x008B` | `MARK_ALL_READ` | C → S | advance every membership's cursor (§5.4) |
+| `0x008C` | `GET_CHANNEL_DESCRIPTION` | C → S | a channel's long-form description (§5.4) |
+| `0x008D` | `CHANNEL_DESCRIPTION` | S → C | the answer, and the fan-out of a change |
 | `0x0090` | `SET_NOTIFY_PREF` | C → S | set a channel's notification level (REQ-130) |
 | `0x0092` | `LIST_NOTIFY_PREFS` | C → S | request all notification settings |
 | `0x0093` | `NOTIFY_PREFS` | S → C | DND + per-channel levels (also a sync push) |

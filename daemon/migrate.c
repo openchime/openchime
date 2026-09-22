@@ -985,6 +985,18 @@ static const char MIGRATION_0045[] =
     "ALTER TABLE invites ADD COLUMN email TEXT;"
     "CREATE INDEX invites_email ON invites(email) WHERE email IS NOT NULL;";
 
+static const char MIGRATION_0046[] =
+    /* A channel's long-form DESCRIPTION (REQ-034): its purpose, its norms, the
+     * links it keeps coming back to. Beside the topic, not instead of it -- the
+     * topic is the one line in the header, and a description written into that
+     * column would either overflow the header or be cut to fit it.
+     *
+     * NULL and '' both mean "none", as they do for the topic. It is fetched on
+     * its own frame rather than carried on the channel list (ARCH-93): the list
+     * is one frame for every channel, and text this long on each entry is what
+     * would make a large workspace's list stop fitting. */
+    "ALTER TABLE channels ADD COLUMN description TEXT;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1031,6 +1043,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 43, MIGRATION_0043 },
     { 44, MIGRATION_0044 },
     { 45, MIGRATION_0045 },
+    { 46, MIGRATION_0046 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

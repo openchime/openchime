@@ -53,7 +53,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 45);
+    CHECK(oc_schema_version(db) == 46);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -2343,6 +2343,130 @@ static void test_activity_unreads(void) {
         oc_dbres_free(wait_result(w));
     }
     r = activity(w, alice, OC_ACTF_UNREADS); CHECK(r && r->n_alist == 0); oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A channel's long-form description (REQ-034, ARCH-93): set by any member,
+ * announced to every member, capped, cleared by "", and readable by exactly the
+ * people who could read the channel -- with a private channel's answer to an
+ * outsider indistinguishable from a channel that does not exist. */
+static oc_dbres *get_desc(oc_dbwriter *w, uint64_t uid, uint64_t ch) {
+    oc_job *j = oc_job_new(OC_JOB_GET_CHANNEL_DESCRIPTION, 341);
+    j->user_id = uid; j->channel_id = ch;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static int desc_is(const oc_dbres *r, const char *want) {
+    if (!r || r->type != OC_RES_CHANNEL_DESCRIPTION) return 0;
+    size_t n = strlen(want);
+    return r->body_len == n && (n == 0 || memcmp(r->body, want, n) == 0);
+}
+
+static void test_channel_description(void) {
+    const char *path = "build/test_dbwriter_chandesc.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "cd-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "cd-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "cd-carol", "pw", OC_ROLE_MEMBER);   /* in nothing */
+    CHECK(alice && bob && carol);
+
+    oc_dbres *r = create_channel(w, alice, "handbook", 1);
+    uint64_t pub = r ? r->channel_id : 0; oc_dbres_free(r);
+    r = create_channel(w, alice, "vault", 0);
+    uint64_t priv = r ? r->channel_id : 0; oc_dbres_free(r);
+    CHECK(pub && priv);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, alice, pub, bob));
+
+    /* Never set: known and empty, which is not the same as refused. */
+    r = get_desc(w, bob, pub);
+    CHECK(desc_is(r, ""));
+    oc_dbres_free(r);
+
+    /* Any MEMBER may set it (the topic's rule), and the change fans out. */
+    const char *text = "Where the team handbook lives.\nAsk before editing the style guide.";
+    r = chan_update(w, bob, pub, OC_CHUP_DESCRIPTION, text);
+    CHECK(desc_is(r, text));
+    CHECK(r && r->ch_fanout == 1 && r->n_members >= 2);
+    oc_dbres_free(r);
+
+    /* It is its own column: the topic is untouched by it. */
+    r = chan_update(w, bob, pub, OC_CHUP_TOPIC, "one line");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_topic && strcmp(r->ch_topic, "one line") == 0);
+    oc_dbres_free(r);
+    r = get_desc(w, bob, pub);
+    CHECK(desc_is(r, text));
+    oc_dbres_free(r);
+
+    /* A public channel's description is readable by anyone in the workspace --
+     * the same people the channel directory already shows its topic to. */
+    r = get_desc(w, carol, pub);
+    CHECK(desc_is(r, text));
+    oc_dbres_free(r);
+
+    /* ...but only a member may SET it. */
+    r = chan_update(w, carol, pub, OC_CHUP_DESCRIPTION, "not mine to say");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* The cap, from both sides of it. */
+    {
+        char big[OC_MAX_DESCRIPTION + 2];
+        memset(big, 'd', OC_MAX_DESCRIPTION); big[OC_MAX_DESCRIPTION] = '\0';
+        r = chan_update(w, alice, pub, OC_CHUP_DESCRIPTION, big);          /* exactly the cap */
+        CHECK(r && r->type == OC_RES_CHANNEL_DESCRIPTION && r->body_len == OC_MAX_DESCRIPTION);
+        oc_dbres_free(r);
+        big[OC_MAX_DESCRIPTION] = 'd'; big[OC_MAX_DESCRIPTION + 1] = '\0';
+        r = chan_update(w, alice, pub, OC_CHUP_DESCRIPTION, big);          /* one over */
+        CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+        oc_dbres_free(r);
+    }
+
+    /* "" clears it. */
+    r = chan_update(w, alice, pub, OC_CHUP_DESCRIPTION, "");
+    CHECK(desc_is(r, ""));
+    oc_dbres_free(r);
+    r = get_desc(w, bob, pub);
+    CHECK(desc_is(r, ""));
+    oc_dbres_free(r);
+
+    /* A PRIVATE channel: members read it, and an outsider gets exactly the answer
+     * a channel that does not exist gets -- a different one would say it exists. */
+    r = chan_update(w, alice, priv, OC_CHUP_DESCRIPTION, "the sealed room");
+    CHECK(desc_is(r, "the sealed room"));
+    oc_dbres_free(r);
+    r = get_desc(w, alice, priv);
+    CHECK(desc_is(r, "the sealed room"));
+    oc_dbres_free(r);
+    {
+        oc_dbres *outsider = get_desc(w, carol, priv);
+        oc_dbres *nowhere  = get_desc(w, carol, 987654321u);
+        CHECK(outsider && outsider->type == OC_RES_LIST_ERR &&
+              outsider->err_code == OC_ERR_UNKNOWN_CHANNEL && outsider->body == NULL);
+        CHECK(nowhere && nowhere->type == outsider->type &&
+              nowhere->err_code == outsider->err_code);
+        oc_dbres_free(outsider);
+        oc_dbres_free(nowhere);
+    }
+
+    /* A DM has no description to set, as it has no topic. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_OPEN_DM, 342);
+        j->user_id = alice; j->target_user_id = bob;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *d = wait_result(w);
+        uint64_t dm = d ? d->channel_id : 0;
+        oc_dbres_free(d);
+        CHECK(dm);
+        r = chan_update(w, alice, dm, OC_CHUP_DESCRIPTION, "nope");
+        CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+        oc_dbres_free(r);
+    }
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -5669,7 +5793,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -5712,6 +5836,7 @@ int run_dbwriter_tests(void) {
     test_scheduled();
     test_activity_unreads();
     test_channel_mutability();
+    test_channel_description();
     test_saved_and_activity();
     test_history_around();
     test_delete_clears_message_extras();

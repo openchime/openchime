@@ -194,7 +194,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_CALL_EVENT = 104,
        /* Catch-up: advance every one of a user's memberships (OC_MSG_MARK_ALL_READ).
         * A write, and on the writer for the same reason CLIENT_ACK is. */
-       OC_JOB_MARK_ALL_READ = 105 };
+       OC_JOB_MARK_ALL_READ = 105,
+       /* A channel's long-form description (REQ-034). A read, on the reader. */
+       OC_JOB_GET_CHANNEL_DESCRIPTION = 106 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -500,7 +502,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_STT_PREP = 93,
        /* A call event written (REQ-304): the SEND-shaped fields and `members`,
         * which the net thread broadcasts with kind OC_MSG_KIND_CALL. */
-       OC_RES_CALL_EVENT = 94 };
+       OC_RES_CALL_EVENT = 94,
+       /* A channel's description: the answer to a fetch (to the asker only) and,
+        * with ch_fanout, the announcement of a change (to every member). The
+        * text rides `body`/`body_len`. */
+       OC_RES_CHANNEL_DESCRIPTION = 95 };
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */

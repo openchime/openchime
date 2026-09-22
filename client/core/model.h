@@ -149,6 +149,11 @@ typedef struct {
     oc_msg  *msgs;
     size_t   n_msgs, cap_msgs;
     char    *topic;        /* heap; NULL = none (REQ-034) */
+    /* The long-form description (REQ-034). Not on the channel list, so it is
+     * unknown until asked for: `description_known` is what tells "none" apart
+     * from "never fetched", which a NULL alone cannot. */
+    char    *description;  /* heap; NULL = none, or not yet known */
+    uint8_t  description_known;
     uint8_t  archived;     /* read-only; hidden from the default list (REQ-035) */
     uint64_t created_at;   /* from CHANNEL_INFO; shown in the About surface */
     /* The newest message, for a scannable list. Seeded by CHANNEL_LIST and kept

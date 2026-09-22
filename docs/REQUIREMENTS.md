@@ -240,6 +240,15 @@ where one exists.
   `UPDATE_CHANNEL`; **any member may set it** — it is already visible to the
   channel and a wrong one is corrected in seconds. An empty value clears it.
   Capped at 250 bytes and shown on the channel header's second line.
+
+  Beside the topic, a channel has also carried a **long-form description** — its
+  purpose, its norms, the links it keeps coming back to — which the one header
+  line cannot hold. Any member may set it, on the same reasoning; it is up to
+  1,000 bytes, may run to several lines, and is shown in the channel's About.
+  **Mechanism (ARCH-93, migration 0046):** a `description` column, set with
+  `UPDATE_CHANNEL`'s `OC_CHUP_DESCRIPTION` and fetched on its own frame rather
+  than carried on the channel list. It is readable by exactly the people who may
+  read the channel.
 - **REQ-035.** A channel has been **archivable** by an owner or admin: an
   archived channel has become read-only and hidden from the default channel list
   while its history remained searchable and retrievable (REQ-031/080), and it has

@@ -852,6 +852,20 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_DESCRIPTION) {
+            oc_channel_description cd;
+            if (oc_decode_channel_description(&p, &cd) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHANNEL_DESCRIPTION);
+                if (e) {
+                    e->channel_id = cd.channel_id;
+                    e->body = malloc(cd.description.len + 1);
+                    if (e->body) {
+                        memcpy(e->body, cd.description.ptr, cd.description.len);
+                        e->body[cd.description.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_USER_LIST) {
             oc_user_list_entry ue[512]; uint16_t count = 0;
             if (oc_decode_user_list(&p, ue, 512, &count) != OC_OK) return -1;
@@ -2753,6 +2767,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_client_ack ca = { c->channel_id, c->message_id };
                 if (oc_encode_client_ack(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_GET_CHANNEL_DESCRIPTION) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_get_channel_description gd = { c->channel_id };
+                if (oc_encode_get_channel_description(&w, OC_PROTOCOL_VERSION, &gd) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_MARK_ALL_READ) {

@@ -2652,6 +2652,17 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
     return r_done(p);
 }
 
+oc_result oc_decode_get_channel_description(oc_rbuf *p, oc_get_channel_description *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_channel_description(oc_rbuf *p, oc_channel_description *m) {
+    m->channel_id  = oc_r_u64(p);
+    m->description = oc_r_str(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m) {
     m->user_id = oc_r_u64(p);
     return r_done(p);
@@ -3321,6 +3332,21 @@ oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version) {
 
 oc_result oc_encode_mark_all_read(oc_wbuf *w, uint16_t version) {
     size_t off = oc_frame_begin(w, version, OC_MSG_MARK_ALL_READ);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_get_channel_description(oc_wbuf *w, uint16_t version,
+                                            const oc_get_channel_description *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_GET_CHANNEL_DESCRIPTION);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_channel_description(oc_wbuf *w, uint16_t version,
+                                        const oc_channel_description *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_DESCRIPTION);
+    oc_w_u64(w, m->channel_id);
+    oc_w_str(w, m->description);
     return oc_frame_end(w, off);
 }
 

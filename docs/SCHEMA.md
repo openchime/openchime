@@ -1146,6 +1146,19 @@ local account. Set, the invite names who may join where a provider signs people
 in: it is spent by that address's first verified sign-in, which takes the role the
 invite names, and `REDEEM_INVITE` never matches it.
 
+## 3ak. Migration 0046 — a channel's long-form description (REQ-034, ARCH-93)
+
+`channels.description` (TEXT, NULL). The channel's purpose, norms and standing
+links, beside the one-line `topic` rather than in it. NULL and `''` both mean
+none, as for the topic. Any member may set it, on the same reasoning as the
+topic, and it is capped at `OC_MAX_DESCRIPTION` bytes.
+
+It is **not** carried on `CHANNEL_LIST`. The list is a single frame covering every
+channel, and text this long on each entry is what would make a large workspace's
+list stop fitting the frame; the description is fetched with
+`GET_CHANNEL_DESCRIPTION` when a conversation's About is opened, and pushed to
+members as `CHANNEL_DESCRIPTION` when it changes (PROTOCOL.md).
+
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.
