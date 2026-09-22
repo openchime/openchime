@@ -730,6 +730,14 @@ same way for both:
   rows outlive the frame that made them, so a view drawing no transcript — Files,
   Threads, People — published the last one's rows over its own. `g_msglist_drawn`
   is set by `draw_msglist` and cleared each paint, the way `g_caret_placed` is.
+  The hover reaction strip is the same story with a shorter fix: `draw_msglist`
+  already refills it whenever it runs, so clearing it each paint is enough to
+  make it empty unless this frame drew it.
+- **A popup declares its layer.** The quick reactions float over the row they
+  belong to, so they are published with `g_acc_layer` raised, as the new-message
+  matches are; the overlap half compares within a layer, and covering the row is
+  what the strip is for. Six chips over one row was twelve reported collisions
+  for a pointer resting on a message.
 
 **Prose gets `FF_MULTILINE`.** A native EDIT still — the same reason as every
 text field — with `ES_MULTILINE`, and the one rule that changes is Enter: in a

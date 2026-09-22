@@ -15394,6 +15394,12 @@ static void paint(HWND hwnd) {
      * dump that reports it runs long after the frame ended. */
     g_clip_n = 0; g_clip_worst = 0; g_clip_first[0] = 0;
     g_msglist_drawn = 0;
+    /* The hover strip belongs to the frame that drew it. draw_msglist clears and
+     * refills it whenever it runs, so the only way it goes stale is a frame where
+     * no message list runs at all -- and then the chips were published over Files,
+     * Threads and People, at coordinates nothing painted. Cleared here, the strip
+     * is empty unless this frame put something in it. */
+    g_n_hrx = 0; g_hrx_mid = 0;
     g_caret_placed = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
@@ -17510,7 +17516,13 @@ static void a11y_publish_scene(const oc_model *m) {
                      ATOK(AT_ACTFILTER, i));
         }
     }
-    /* The hovered message's quick reactions, while the strip is up. */
+    /* The hovered message's quick reactions, while the strip is up. A POPUP over
+     * the row it belongs to -- covering it is what a hover strip does -- so it is
+     * published on its own layer, like the new-message matches. Without that, six
+     * chips paired with the row beneath them and the fit check reported twelve
+     * collisions for a pointer resting on a message, which is as ordinary as a
+     * state gets. */
+    g_acc_layer = 1;
     for (int i = 0; i < g_n_hrx && n < OC_ACC_MAX; i++) {
         char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
         snprintf(aid, sizeof aid, "msg.react.%d", i);
@@ -17518,6 +17530,7 @@ static void a11y_publish_scene(const oc_model *m) {
                  g_hrx[i].mine ? "yours: press to take it back" : "press to react");
         acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_hrx[i].r, ATOK(AT_HOVERREACT, (uint64_t)i));
     }
+    g_acc_layer = 0;
     /* The who-reacted pane's chips: pressable, and each says what pressing does. */
     for (int i = 0; i < g_n_rxn_chip && n < OC_ACC_MAX; i++) {
         char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
