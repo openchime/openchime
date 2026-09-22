@@ -713,6 +713,24 @@ deliberately:
   themed app were never worth it — and none of them was dismissible the way every
   other sheet is, screenshot-comparable, or reachable by the harness.
 
+**The tree publishes what is REACHABLE, not what was laid out.** Two rules, both
+about rects that describe space an element is clipped away from — which reads as
+a collision to `chromefit` and as bounds to a screen reader, and is wrong in the
+same way for both:
+
+- **A scrolling surface's rows are clipped to it.** A row's rect is in the list's
+  own coordinates, so the topmost one routinely starts above the list and the
+  last ends below it. It is published as the part that lands on the surface, and
+  a row scrolled out entirely is not published. `acc_push` does this for anything
+  drawn while `g_acc_surface` is set; the transcript's rows do it by hand,
+  because they are published with a name and an id rather than through it. Before
+  this, the first transcript row claimed 80 device pixels of the channel header
+  and paired with both its buttons.
+- **A surface that did not draw this frame publishes nothing.** The transcript's
+  rows outlive the frame that made them, so a view drawing no transcript — Files,
+  Threads, People — published the last one's rows over its own. `g_msglist_drawn`
+  is set by `draw_msglist` and cleared each paint, the way `g_caret_placed` is.
+
 **Prose gets `FF_MULTILINE`.** A native EDIT still — the same reason as every
 text field — with `ES_MULTILINE`, and the one rule that changes is Enter: in a
 multi-line field it is a new line, so saving moves to **Ctrl+Enter**, as it does
