@@ -2147,6 +2147,95 @@ static int browser_complete(const oc_model *m, oc_issuer *is, const char *sub, c
     return browser_get(port, target) == 200 ? 0 : -1;
 }
 
+/* A channel list too large for one frame, AND longer than one frame may carry
+ * (OC_CHANNEL_LIST_PAGE): 300 channels, each with a full-length topic, run to
+ * about 110 KB against a 65 KiB frame. It used to go out as a single frame whose
+ * failed encode left no length, desynchronising the client on connect; and a
+ * client kept the first 256 entries of any frame and dropped the rest without a
+ * word. Every channel has to arrive, and the one past the first page with its
+ * topic whole. */
+static oc_dbres *seed_result(oc_dbwriter *w) {
+    for (int i = 0; i < 1000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) return r;
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static size_t big_channels(const oc_model *m) {
+    size_t n = 0;
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].name && strncmp(m->channels[i].name, "big-", 4) == 0) n++;
+    return n;
+}
+
+static void test_big_channel_list(int port) {
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink("build/test_core_biglist.db"); unlink("build/test_core_biglist.db-wal");
+    unlink("build/test_core_biglist.db-shm");
+    oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_biglist.db");
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    uint64_t uid = oc_dbwriter_register_local(dbw, "hana", "pw-hana", OC_ROLE_OWNER, 2048);
+    CHECK(uid != 0);
+
+    /* Seeded BEFORE the loop runs: once it does, it drains the writer's results,
+     * and these would be answered to a connection that does not exist. */
+    char topic[OC_MAX_TOPIC + 1];
+    memset(topic, 'T', OC_MAX_TOPIC); topic[OC_MAX_TOPIC] = '\0';
+    int made = 0;
+    for (int i = 0; i < 300; i++) {
+        char nm[32]; snprintf(nm, sizeof nm, "big-%03d", i);
+        oc_job *j = oc_job_new(OC_JOB_CREATE_CHANNEL, 1);
+        j->user_id = uid; j->ch_is_public = 1; j->ch_name = strdup(nm);
+        oc_dbwriter_submit(dbw, j);
+        oc_dbres *r = seed_result(dbw);
+        uint64_t cid = (r && r->type == OC_RES_CHANNEL_INFO) ? r->channel_id : 0;
+        oc_dbres_free(r);
+        if (!cid) continue;
+        j = oc_job_new(OC_JOB_UPDATE_CHANNEL, 1);
+        j->user_id = uid; j->channel_id = cid; j->chup_op = OC_CHUP_TOPIC;
+        j->ch_name = strdup(topic);
+        oc_dbwriter_submit(dbw, j);
+        oc_dbres_free(seed_result(dbw));
+        made++;
+    }
+    CHECK(made == 300);
+
+    struct core_loop_arg arg;
+    arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+    wait_port_ready(arg.port);
+
+    oc_client *c = oc_client_start("127.0.0.1", arg.port, "hana:pw-hana");
+    CHECK(c != NULL);
+    if (c) {
+        /* Still connected, and every one of them there -- not 256, and not a
+         * connection lost halfway through the list. */
+        CHECK(WAIT_FOR(c, m->authed && big_channels(m) == 300));
+        const oc_model *m = oc_client_model(c);
+        CHECK(big_channels(m) == 300);
+        CHECK(m->authed);
+        const oc_channel *last = NULL;
+        for (size_t i = 0; i < m->n_channels; i++)
+            if (m->channels[i].name && strcmp(m->channels[i].name, "big-299") == 0)
+                last = &m->channels[i];
+        CHECK(last && last->topic && strlen(last->topic) == OC_MAX_TOPIC);
+        oc_client_stop(c);
+    }
+
+    arg.stop = 1;
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    unlink("build/test_core_biglist.db"); unlink("build/test_core_biglist.db-wal");
+    unlink("build/test_core_biglist.db-shm");
+}
+
 static void test_browser_signin(int port) {
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -2357,7 +2446,7 @@ static void test_browser_signin(int port) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
 
     test_group_dm_title();
     test_sidebar();
@@ -3441,5 +3530,6 @@ int run_client_core_tests(void) {
     tzset();
 
     test_browser_signin(21500 + (int)(getpid() % 2000));
+    test_big_channel_list(23600 + (int)(getpid() % 2000));
     return failures;
 }

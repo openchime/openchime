@@ -787,9 +787,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 }
             }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
-            oc_channel_list_entry ents[256]; uint16_t count = 0;
-            if (oc_decode_channel_list(&p, ents, 256, &count) != OC_OK) return -1;
-            if (count > 256) count = 256;
+            oc_channel_list_entry ents[OC_CHANNEL_LIST_PAGE]; uint16_t count = 0;
+            if (oc_decode_channel_list(&p, ents, OC_CHANNEL_LIST_PAGE, &count) != OC_OK) return -1;
+            if (count > OC_CHANNEL_LIST_PAGE) count = OC_CHANNEL_LIST_PAGE;
             for (uint16_t i = 0; i < count; i++) {
                 oc_ev *e = oc_ev_new(OC_EV_CHANNEL);
                 if (!e) continue;
