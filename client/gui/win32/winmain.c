@@ -899,6 +899,10 @@ static uint64_t g_kb_mid;
  * anyone does with one. */
 static char g_link_hover[1024];
 static char g_link_down[1024];
+/* The same pair for a #channel reference, which opens a conversation rather
+ * than a browser but answers the pointer identically: hand cursor on hover,
+ * open on RELEASE over the one the press landed on. */
+static uint64_t g_chan_hover, g_chan_down;
 
 /* Custom transcript scrollbar (drawn over the D2D surface). Geometry is captured
  * each paint so the mouse handlers can hit-test and drag the thumb. */
@@ -3435,6 +3439,40 @@ static void draft_delete_ask(HWND hwnd, uint64_t cid, uint64_t root) {
 
 static void nm_editor_release(void);             /* fwd: one owner for the editor */
 
+/* The channel a `#name` reference points at, or 0.
+ *
+ * Only one the user can actually reach: a reference resolves against the
+ * channels this client HAS, which is the set they are in plus the public ones
+ * the directory gave them. A name that matches nothing -- a channel on another
+ * workspace, a private one they are not in, or a word that was never a channel
+ * -- stays ordinary text, because a link that goes nowhere is worse than no
+ * link. DMs are excluded: they have no name to write. */
+/* Is byte `pos` inside a URL? A fragment is spelled exactly like a reference --
+ * `https://example.com/#general` -- and the '@' rule's word boundary does not
+ * catch it, because the byte before the '#' is a '/'. The URL owns those bytes:
+ * it is one address, it opens a browser, and a bold segment in the middle of it
+ * claiming otherwise is the link equivalent of two things sharing one name. */
+static int pos_in_link(const char *u8, size_t blen, size_t pos) {
+    oc_rt_span sp[OC_RT_MAX];
+    size_t n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
+    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    for (size_t i = 0; i < n; i++)
+        if ((sp[i].style & OC_RT_LINK) && pos >= sp[i].start && pos < sp[i].start + sp[i].len)
+            return 1;
+    return 0;
+}
+
+static uint64_t chanref_resolve(const char *name) {
+    const oc_model *m = model();
+    if (!m || !name || !name[0]) return 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind == OC_CHANNEL_KIND_DM || !c->name[0]) continue;
+        if (!_stricmp(c->name, name)) return c->channel_id;
+    }
+    return 0;
+}
+
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
     crumb("select_channel %llu", (unsigned long long)cid);
@@ -5039,6 +5077,19 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         for (size_t i = 0; i < nm; i++) {
             st_range_color(lay, mm[i].start, mm[i].len, OC_COL_ACCENT, 1.0f);
             st_range_weight(lay, mm[i].start, mm[i].len, 600);
+        }
+        /* #channel references (shared/mention.h). Styled like a mention, and for
+         * the same reason -- it is a reference to something in the workspace,
+         * not prose -- but ONLY when it resolves: an unresolvable one is left
+         * plain so that what looks like a link is one. */
+        oc_chanref cr[OC_CHANREF_MAX];
+        size_t ncr = oc_chanref_scan(b, blen, cr, OC_CHANREF_MAX);
+        if (ncr > OC_CHANREF_MAX) ncr = OC_CHANREF_MAX;
+        for (size_t i = 0; i < ncr; i++) {
+            if (pos_in_link(b, blen, cr[i].start)) continue;
+            if (!chanref_resolve(cr[i].name)) continue;
+            st_range_color(lay, cr[i].start, cr[i].len, OC_COL_ACCENT, 1.0f);
+            st_range_weight(lay, cr[i].start, cr[i].len, 600);
         }
         /* My keywords (REQ-135), through the daemon's matcher (ARCH-103). */
         const oc_model *km = model();
@@ -21724,6 +21775,52 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
     return 0;
 }
 
+/* The channel a `#name` under the pointer refers to, or 0. The same shape as
+ * link_at and for the same reasons -- spans re-derived per query, `inside`
+ * required so the empty space right of a line is not a hit. */
+static uint64_t chanref_at(int ri, int x, int y) {
+    const oc_model *m = model();
+    const oc_channel *c;
+    const oc_msg *msg;
+    const char *u8;
+    size_t blen, n, i, pos;
+    oc_chanref cr[OC_CHANREF_MAX];
+    mlay_ent *l;
+    bool trailing = false, inside = false;
+    float lx, ly;
+
+    if (ri < 0 || ri >= g_n_msgrows || !m || !g_sel) return 0;
+    c = oc_model_channel((oc_model *)m, g_sel);
+    msg = find_msg(c, g_msgrows[ri].mid);
+    if (!msg || msg->deleted) return 0;
+    u8 = body_text(msg);
+    blen = u8 ? strlen(u8) : 0;
+    if (!blen) return 0;
+
+    lx = (float)x - g_msgrows[ri].bx;
+    ly = (float)y - g_msgrows[ri].by;
+    if (lx < 0 || ly < 0) return 0;
+    l = body_layout(msg, g_msgrows[ri].cw);
+    if (!l) return 0;
+    pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
+    if (!inside) return 0;
+
+    n = oc_chanref_scan(u8, blen, cr, OC_CHANREF_MAX);
+    if (n > OC_CHANREF_MAX) n = OC_CHANREF_MAX;
+    for (i = 0; i < n; i++)
+        if (pos >= cr[i].start && pos < cr[i].start + cr[i].len)
+            return pos_in_link(u8, blen, cr[i].start) ? 0 : chanref_resolve(cr[i].name);
+    return 0;
+}
+
+/* The channel reference under the pointer anywhere in the transcript, or 0. */
+static uint64_t chanref_under(int x, int y) {
+    int r;
+    if (any_overlay(model()) || !transcript_shell()) return 0;
+    r = msgrow_at(x, y);
+    return r < 0 ? 0 : chanref_at(r, x, y);
+}
+
 /* The link under the pointer anywhere in the transcript, or 0. */
 static int link_under(int x, int y, char *out, size_t cap) {
     int r;
@@ -25560,7 +25657,8 @@ static void test_dump(const char *path) {
      * reported: hovering a URL and reading this back is the only way the
      * autolink boundary rules — where a trailing full stop or bracket stops —
      * are checkable from outside the process. */
-    fprintf(f, "link hover=\"%s\"\n", g_link_hover);
+    fprintf(f, "link hover=\"%s\" chan=%llu\n", g_link_hover,
+            (unsigned long long)g_chan_hover);
     fprintf(f, "tsel has=%d a=%llu:%u f=%llu:%u\n", g_has_sel,
             (unsigned long long)g_sel_a_mid, g_sel_a_pos,
             (unsigned long long)g_sel_f_mid, g_sel_f_pos);
@@ -27719,6 +27817,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * on_click consumed it (a thumbnail, a reaction chip), there is no
              * link press to release. */
             link_under(mx, my, g_link_down, sizeof g_link_down);
+            g_chan_down = g_link_down[0] ? 0 : chanref_under(mx, my);
             selection_start(hwnd, mx, my);
         }
         InvalidateRect(hwnd, NULL, FALSE);
@@ -27736,7 +27835,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ((main_is_conversation() && in_rect(g_ed_box, (float)mx, (float)my)) ||
              (g_view == VIEW_NEWMSG && (in_rect(g_nm_ed, (float)mx, (float)my) ||
                                         in_rect(g_tgt_box, (float)mx, (float)my))));
-        cursor_want(g_link_hover[0] ? 2 : over_text ? 1 : 0);
+        cursor_want(g_link_hover[0] || g_chan_hover ? 2 : over_text ? 1 : 0);
         /* Recorded before anything consumes the message, so shared chrome can ask
          * where the pointer is without every widget tracking its own hover. */
         if (mx != g_mouse_x || g_mouse_y != my) {
@@ -27832,12 +27931,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * move behind on the way onto a link. */
         {
             char u[sizeof g_link_hover];
-            int had = g_link_hover[0] != 0;
+            int had = g_link_hover[0] != 0 || g_chan_hover != 0;
+            uint64_t ch;
             if (!link_under(mx, my, u, sizeof u)) u[0] = 0;
-            if (strcmp(u, g_link_hover)) {
+            /* One or the other, never both: a reference cannot sit inside a URL,
+             * and asking for the cheaper answer only when the first says no
+             * keeps the common move (over ordinary text) to one scan. */
+            ch = u[0] ? 0 : chanref_under(mx, my);
+            if (strcmp(u, g_link_hover) || ch != g_chan_hover) {
                 memcpy(g_link_hover, u, strlen(u) + 1);
-                if (u[0])      SetCursor(LoadCursorW(NULL, IDC_HAND));
-                else if (had)  SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                g_chan_hover = ch;
+                if (u[0] || ch) SetCursor(LoadCursorW(NULL, IDC_HAND));
+                else if (had)   SetCursor(LoadCursorW(NULL, IDC_ARROW));
             }
         }
         if (g_sbar_drag) {
@@ -27999,10 +28104,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 char up[sizeof g_link_down];
                 if (link_under(mx, my, up, sizeof up) && !strcmp(up, g_link_down))
                     link_open(g_link_down);
+            } else if (!g_has_sel && g_chan_down) {
+                if (chanref_under(mx, my) == g_chan_down) select_channel(g_chan_down);
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }
-        g_link_down[0] = 0;
+        g_link_down[0] = 0; g_chan_down = 0;
         return 0;
     }
     /* No WM_SETCURSOR arm: SDL's window proc answers it for the client area

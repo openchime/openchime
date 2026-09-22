@@ -146,6 +146,69 @@ static void test_keywords(void) {
     CHECK(oc_keyword_match(S("hi"), "a longer term than the body", NULL, NULL) == 0);
 }
 
+/* --- #channel references -------------------------------------------------- */
+
+static size_t crefs(const char *body) {
+    oc_chanref c[16];
+    return oc_chanref_scan(body, strlen(body), c, 16);
+}
+
+static const char *cfirst(const char *body) {
+    static oc_chanref c[16];
+    size_t n = oc_chanref_scan(body, strlen(body), c, 16);
+    return n ? c[0].name : "";
+}
+
+static void test_chanrefs(void) {
+    CHECK(crefs("see #general") == 1);
+    CHECK(strcmp(cfirst("see #general"), "general") == 0);
+    CHECK(crefs("#general") == 1);                  /* at the very start */
+    CHECK(crefs("#general and #random") == 2);
+    CHECK(crefs("nothing here") == 0);
+    CHECK(crefs("") == 0);
+    CHECK(crefs("#") == 0);                         /* bare sigil */
+
+    /* The same word boundary the '@' rule uses, on the cases it exists for. */
+    CHECK(crefs("C#") == 0);
+    CHECK(crefs("oc#dev") == 0);                    /* glued to a word */
+    CHECK(crefs("oc #dev") == 1);                   /* ... but a lone one counts */
+
+    /* Markdown headings are not references (REQ-220). */
+    CHECK(crefs("# Notes") == 0);
+    CHECK(crefs("### Notes") == 0);
+    CHECK(crefs("#\tNotes") == 0);
+
+    /* Trailing punctuation belongs to the sentence. */
+    CHECK(strcmp(cfirst("in #general."), "general") == 0);
+    CHECK(strcmp(cfirst("in #dev-ops, later"), "dev-ops") == 0);
+
+    /* The span covers the sigil, so a caller can style what was written. */
+    {
+        oc_chanref c[4];
+        const char *b = "go to #general now";
+        CHECK(oc_chanref_scan(b, strlen(b), c, 4) == 1);
+        CHECK(c[0].start == 6);
+        CHECK(c[0].len == strlen("#general"));
+        CHECK(memcmp(b + c[0].start, "#general", c[0].len) == 0);
+    }
+
+    /* Over the cap: the count is the truth, the array is what fitted. */
+    {
+        oc_chanref c[2];
+        CHECK(oc_chanref_scan(S("#a #b #c #d"), c, 2) == 4);
+        CHECK(strcmp(c[0].name, "a") == 0 && strcmp(c[1].name, "b") == 0);
+    }
+
+    /* A name too long to hold is not silently truncated into a shorter one. */
+    {
+        char big[OC_MENTION_NAME_MAX + 8];
+        big[0] = '#';
+        memset(big + 1, 'a', sizeof big - 2);
+        big[sizeof big - 1] = '\0';
+        CHECK(crefs(big) == 0);
+    }
+}
+
 int run_mention_tests(void) {
     failures = 0;
     test_basic();
@@ -156,6 +219,7 @@ int run_mention_tests(void) {
     test_truncation_and_limits();
     test_targets();
     test_keywords();
-    printf("test_mention: scan, word boundaries, trailing punctuation, broadcasts, spans, truncation, targets, keywords\n");
+    test_chanrefs();
+    printf("test_mention: scan, word boundaries, trailing punctuation, broadcasts, spans, truncation, targets, keywords, #channel refs\n");
     return failures;
 }
