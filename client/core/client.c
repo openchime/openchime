@@ -216,6 +216,14 @@ void oc_client_mark_read(oc_client *c, uint64_t channel_id) {
     }
 }
 
+void oc_client_get_channel_description(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_GET_CHANNEL_DESCRIPTION);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_mark_all_read(oc_client *c) {
     if (!c) return;
     /* Locally first, so the sidebar clears on the click rather than on the

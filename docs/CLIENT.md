@@ -713,6 +713,16 @@ deliberately:
   themed app were never worth it — and none of them was dismissible the way every
   other sheet is, screenshot-comparable, or reachable by the harness.
 
+**Prose gets `FF_MULTILINE`.** A native EDIT still — the same reason as every
+text field — with `ES_MULTILINE`, and the one rule that changes is Enter: in a
+multi-line field it is a new line, so saving moves to **Ctrl+Enter**, as it does
+in every editor that has both; Esc still cancels from anywhere. A native EDIT
+keeps its lines as CRLF, so the value is converted on the way in and back to LF
+on the way out. There is no scrollbar: native scrollbars are non-client paint
+the drawn scene cannot supply, and came out as a solid black bar — the field
+follows the caret instead, and the wheel and the arrows reach every line. A
+channel's description is its first user.
+
 **A choice of emoji is never typed.** The quick reactions are six slots in
 Preferences → Messages, each opening the emoji picker for that slot: the same
 picker the status dialog uses, floating over the card that owns it

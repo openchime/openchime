@@ -303,6 +303,15 @@ typedef enum {
      * than when it was sent. Not a replacement for CLIENT_ACK, which says
      * something narrower and is still what entering a conversation sends. */
     OC_MSG_MARK_ALL_READ    = 0x008B, /* C->S, advance every membership's cursor */
+    /* A channel's long-form description (REQ-034, ARCH-93), on frames of its own.
+     * The topic rides every CHANNEL_LIST entry; a description up to
+     * OC_MAX_DESCRIPTION bytes on every entry is what would make the list of a
+     * large workspace stop fitting one frame, so it is asked for when a
+     * conversation's About is opened instead. CHANNEL_DESCRIPTION is both the
+     * answer to that and the fan-out when UPDATE_CHANNEL changes it, the way
+     * MSG_EDITED is both the edit's ack and its broadcast. */
+    OC_MSG_GET_CHANNEL_DESCRIPTION = 0x008C, /* C->S {channel_id} */
+    OC_MSG_CHANNEL_DESCRIPTION     = 0x008D, /* S->C {channel_id, description} */
     OC_MSG_SET_NOTIFY_PREF  = 0x0090, /* C->S, set a channel's notification level (REQ-130) */
     /* 0x0091 was SET_DND, REQ-131's single quiet window. REQ-136 replaced it
      * with a schedule (0x00CC) that states ALLOWED hours, so the op is retired
@@ -701,7 +710,15 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * it as its own action. */
 #define OC_CHUP_PRIVATE   4u   /* owner/admin */
 #define OC_CHUP_PUBLIC    5u   /* owner/admin — see the asymmetry above */
+/* The long-form description (REQ-034). Set through this same frame, because it
+ * is one more column of one row and the op is still the difference -- but it is
+ * ANNOUNCED on CHANNEL_DESCRIPTION rather than CHANNEL_INFO, and never rides the
+ * channel list (ARCH-93): see OC_MSG_GET_CHANNEL_DESCRIPTION. */
+#define OC_CHUP_DESCRIPTION 6u /* any member, as for the topic */
 #define OC_MAX_TOPIC      250u /* bytes; Slack's cap, and a topic is one header line */
+/* Room for a purpose, a few norms and the links a channel keeps coming back to,
+ * and small enough that one of them is never a question for the frame budget. */
+#define OC_MAX_DESCRIPTION 1000u
 #define OC_MAX_PREVIEW    120u /* bytes of last-message preview in CHANNEL_LIST */
 
 /* Pin op (REQ-230, ARCH-90) and the per-channel cap. A pin belongs to the
@@ -1441,6 +1458,17 @@ oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
 /* MARK_ALL_READ carries no body, so there is nothing to decode: the frame's
  * presence is the whole message and the header already said who sent it. */
 oc_result oc_encode_mark_all_read(oc_wbuf *w, uint16_t version);
+
+/* A channel's description (REQ-034). `description` is empty when there is none;
+ * the daemon never sends more than OC_MAX_DESCRIPTION bytes of it. */
+typedef struct { uint64_t channel_id; } oc_get_channel_description;
+typedef struct { uint64_t channel_id; oc_slice description; } oc_channel_description;
+oc_result oc_encode_get_channel_description(oc_wbuf *w, uint16_t version,
+                                            const oc_get_channel_description *m);
+oc_result oc_decode_get_channel_description(oc_rbuf *r, oc_get_channel_description *m);
+oc_result oc_encode_channel_description(oc_wbuf *w, uint16_t version,
+                                        const oc_channel_description *m);
+oc_result oc_decode_channel_description(oc_rbuf *r, oc_channel_description *m);
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
 oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,
                                  uint16_t *out_count);

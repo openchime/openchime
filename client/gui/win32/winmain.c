@@ -476,15 +476,22 @@ static void draw_avatar_presence(gfx *rt, rectf tile,
  * choosing is the option COUNT — chips for a handful you want to see at once, a
  * select for a list you scan. Both carry their options in `hint` as "a|b|c" and
  * both write the chosen INDEX into `value`, so a caller reads them the same way. */
-enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE, FF_SELECT };
+/* FF_MULTILINE is FF_TEXT for PROSE: several lines, where Enter is a new line
+ * rather than "submit" (Ctrl+Enter submits instead). Still a native EDIT, for the
+ * same reason every text field here is one -- caret, selection, IME and undo stay
+ * the platform's problem. */
+enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE, FF_SELECT, FF_MULTILINE };
 
 typedef struct {
     int         kind;
     const char *label;
     const char *hint;              /* FF_CHOICE: "a|b|c"; else an optional sub-label */
-    /* 256 so a full-length channel topic fits (OC_MAX_TOPIC is 250) — at 192 the
-     * dialog silently truncated the very value it was editing. */
-    char        value[256];        /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
+    /* Sized for the LONGEST thing any form edits: a channel description
+     * (OC_MAX_DESCRIPTION is 1000). It was 256, for a full topic (250) -- and at
+     * 192 before that the dialog silently truncated the very value it was
+     * editing. A buffer sized to the field it was written for is how that
+     * happens again the next time a longer one is added. */
+    char        value[1024];       /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
 } oc_field;
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
 
@@ -1969,6 +1976,10 @@ static struct { rectf r; char emoji[40]; uint8_t mine; } g_hrx[6];
 static int g_n_hrx;
 static uint64_t g_hrx_mid;
 static rectf g_about_topic, g_about_rename, g_about_archive, g_about_hooks;
+static rectf g_about_desc;       /* "Edit description" (REQ-034) */
+/* The channel the description was last ASKED for, so the About asks once per
+ * channel rather than once per frame. */
+static uint64_t g_about_desc_asked;
 static rectf g_about_visibility;
 static struct { rectf row, dl; int ix; } g_filerows[64];
 static int g_n_filerows;
@@ -7249,6 +7260,7 @@ static void draw_keys(gfx *rt, rectf reg) {
  * it regardless, so hiding is courtesy, not security. */
 static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
     g_about_topic = g_about_rename = g_about_archive = g_about_hooks = rf(0, 0, 0, 0);
+    g_about_desc = rf(0, 0, 0, 0);
     g_about_visibility = rf(0, 0, 0, 0);
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     if (!c) { overlay_empty(rt, reg, "No channel."); return; }
@@ -7307,6 +7319,36 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, "Set topic", g_meta, g_about_topic, OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         y += inline_btn ? 56 : 90;
+    }
+
+    /* DESCRIPTION (REQ-034): the long-form half, beside the topic rather than in
+     * it. It is not on the channel list (ARCH-93), so the About ASKS -- here,
+     * where every way of arriving at it passes (the tab, a channel switch with the
+     * tab open, a reconnect), rather than at one of those and missing the rest.
+     * The guard makes it once per channel; description_known makes it once ever
+     * until a change is pushed. */
+    if (c->kind != OC_CHANNEL_KIND_DM) {
+        if (!c->description_known && g_about_desc_asked != g_sel && g_client) {
+            oc_client_get_channel_description(g_client, g_sel);
+            g_about_desc_asked = g_sel;
+        }
+        draw_text(rt, "DESCRIPTION", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+        y += 22;
+        const char *d = c->description;
+        const char *shown = d ? d : c->description_known ? "No description yet." : "Loading\u2026";
+        float dh = d ? text_height(d, g_body, w) : 22.0f;
+        if (dh < 22.0f) dh = 22.0f;
+        draw_text(rt, shown, d ? g_body : g_ui, rf(x, y, x + w, y + dh),
+                  d ? OC_COL_TEXT : OC_COL_FAINT);
+        y += dh + 8;
+        const char *lbl = d ? "Edit description" : "Add a description";
+        float bw = text_width(lbl, g_meta) + 32;
+        g_about_desc = rf(x, y, x + bw, y + 28);
+        stroke_round(rt, g_about_desc, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, lbl, g_meta, g_about_desc, OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        y += 44;
     }
 
     /* Facts worth having in one place, none of which needed a new query. */
@@ -11460,6 +11502,10 @@ static const oc_modal_spec *modal_current(void);
  * the size of a three-field sign-up. Checks and choices are drawn with the same
  * chips the rest of the app uses rather than native BUTTONs: a radio button is
  * fine, but two idioms on one card is what this whole item was about. */
+/* A multi-line field's box: five lines of the form's text, which is room to see
+ * a paragraph and its shape without the card outgrowing a small window. */
+#define FORM_MULTI_H (UIS(22.0f) * 5.0f + UIS(8.0f))
+
 static float form_rowh(const oc_field *f, float w) {
     if (f->kind == FF_CHECK)  return UIS(34);
     if (f->kind == FF_CHOICE) {
@@ -11482,6 +11528,8 @@ static float form_rowh(const oc_field *f, float w) {
         }
         return UIS(24.0f) + (float)rows * UIS(34.0f) + UIS(2.0f);
     }
+    if (f->kind == FF_MULTILINE)
+        return UIS(22.0f) + FORM_MULTI_H + ((f->hint && f->hint[0]) ? UIS(26.0f) : UIS(6.0f));
     return (f->hint && f->hint[0]) ? UIS(74.0f) : UIS(54.0f);
 }
 
@@ -11588,8 +11636,9 @@ static void draw_form(gfx *rt, rectf body) {
                       rf(box.right - 22, box.top + 5, box.right - 6, box.bottom), OC_COL_FAINT);
         } else {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            float bh = f->kind == FF_MULTILINE ? FORM_MULTI_H : 28.0f;
             rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
-                           body.right - FORM_BOX_INSET, y + 50);
+                           body.right - FORM_BOX_INSET, y + 22 + bh);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The focused field gets the accent ring, so tabbing is visible: the
              * EDIT itself draws no border of ours. */
@@ -11604,7 +11653,8 @@ static void draw_form(gfx *rt, rectf body) {
             stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
             if (f->hint && f->hint[0])
-                draw_text(rt, f->hint, g_meta, rf(body.left, y + 53, body.right, y + 73), OC_COL_FAINT);
+                draw_text(rt, f->hint, g_meta, rf(body.left, box.bottom + 3, body.right, box.bottom + 23),
+                          OC_COL_FAINT);
         }
         y += rh;
     }
@@ -11702,7 +11752,14 @@ static void form_collect(int save) {
     if (save && g_form_f)
         for (int i = 0; i < g_form_n; i++) {
             if (!g_form_edit[i]) continue;       /* checks/choices are written on click */
-            WCHAR w[256]; GetWindowTextW(g_form_edit[i], w, 256);
+            WCHAR w[2 * sizeof g_form_f[i].value];
+            GetWindowTextW(g_form_edit[i], w, (int)(sizeof w / sizeof w[0]));
+            /* Back to plain LF: CRLF is how the EDIT keeps lines, not how anything
+             * else in the app stores text, and "\r\n" in a description is two
+             * bytes of a thousand spent on a line ending. */
+            WCHAR *d = w;
+            for (WCHAR *q = w; *q; q++) if (*q != L'\r') *d++ = *q;
+            *d = 0;
             WideCharToMultiByte(CP_UTF8, 0, w, -1, g_form_f[i].value,
                                 (int)sizeof g_form_f[i].value, NULL, NULL);
         }
@@ -21335,6 +21392,15 @@ static int on_click(HWND hwnd, int x, int y) {
                 oc_client_update_channel(g_client, g_sel, OC_CHUP_TOPIC, f[0].value);
             return 1;
         }
+        if (ac && in_rect(g_about_desc, x, y)) {
+            /* Enter is a new line here; Ctrl+Enter saves (FF_MULTILINE). */
+            oc_field f[1] = { { FF_MULTILINE, "Description",
+                                "Enter for a new line, Ctrl+Enter to save.", "" } };
+            if (ac->description) snprintf(f[0].value, sizeof f[0].value, "%s", ac->description);
+            if (form_dialog(hwnd, "Channel description", f, 1))
+                oc_client_update_channel(g_client, g_sel, OC_CHUP_DESCRIPTION, f[0].value);
+            return 1;
+        }
         if (ac && in_rect(g_about_rename, x, y)) {
             oc_field f[1] = { { FF_TEXT, "Channel name", "Lowercase, no spaces. The id does not change, so history and membership follow.", "" } };
             snprintf(f[0].value, sizeof f[0].value, "%s", ac->name ? ac->name : "");
@@ -22752,12 +22818,21 @@ static HFONT form_font(void) {
 static WNDPROC g_form_edit_prev;
 
 static LRESULT CALLBACK form_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    /* In a multi-line field Enter is a NEW LINE -- the thing prose needs -- so
+     * submitting moves to Ctrl+Enter there, as it does in every editor that has
+     * both. Esc still cancels from anywhere. */
+    int multi = (GetWindowLongPtrW(hwnd, GWL_STYLE) & ES_MULTILINE) != 0;
     if (msg == WM_KEYDOWN && g_form_open) {
-        if (wp == VK_RETURN) { modal_finish(1); return 0; }
+        if (wp == VK_RETURN && (!multi || (GetKeyState(VK_CONTROL) & 0x8000))) {
+            modal_finish(1); return 0;
+        }
         if (wp == VK_ESCAPE) { modal_finish(0); return 0; }
     }
-    /* A lone Enter in a single-line EDIT otherwise beeps through WM_CHAR. */
-    if (msg == WM_CHAR && (wp == '\r' || wp == 27)) return 0;
+    /* A lone Enter in a single-line EDIT otherwise beeps through WM_CHAR; in a
+     * multi-line one it is the newline, except the Ctrl+Enter that submitted. */
+    if (msg == WM_CHAR && wp == 27) return 0;
+    if (msg == WM_CHAR && wp == '\r' && (!multi || (GetKeyState(VK_CONTROL) & 0x8000))) return 0;
+    if (msg == WM_CHAR && wp == 0x0A && multi) return 0;   /* Ctrl+Enter's LF, already handled */
     return CallWindowProcW(g_form_edit_prev, hwnd, msg, wp, lp);
 }
 
@@ -22798,10 +22873,29 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
      * nobody knows where they go. layout_natives moves and shows them from the
      * rects the first paint records — the same order the composer follows. */
     for (int i = 0; i < n; i++) {
-        if (f[i].kind != FF_TEXT && f[i].kind != FF_PASSWORD) continue;
-        WCHAR wv[256]; to_w(f[i].value, wv, 256);
+        if (f[i].kind != FF_TEXT && f[i].kind != FF_PASSWORD && f[i].kind != FF_MULTILINE) continue;
+        int multi = (f[i].kind == FF_MULTILINE);
+        /* Twice the value: a multi-line EDIT stores its lines as CRLF, and every
+         * "\n" in the value becomes two characters on the way in. */
+        WCHAR wv[2 * sizeof f[i].value];
+        if (multi) {
+            char crlf[2 * sizeof f[i].value]; size_t o = 0;
+            for (const char *q = f[i].value; *q && o + 2 < sizeof crlf; q++) {
+                if (*q == '\n') crlf[o++] = '\r';
+                crlf[o++] = *q;
+            }
+            crlf[o] = '\0';
+            to_w(crlf, wv, (int)(sizeof wv / sizeof wv[0]));
+        } else {
+            to_w(f[i].value, wv, (int)(sizeof wv / sizeof wv[0]));
+        }
         g_form_edit[i] = CreateWindowExW(0, L"EDIT", wv,
-            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL |
+            WS_CHILD | WS_TABSTOP |
+            /* No WS_VSCROLL: a native scrollbar is non-client paint the drawn
+             * scene cannot supply, and it came out as a solid black bar down the
+             * field. ES_AUTOVSCROLL still follows the caret, and the wheel and
+             * the arrows reach every line. */
+            (multi ? (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) : ES_AUTOHSCROLL) |
             (f[i].kind == FF_PASSWORD ? ES_PASSWORD : 0),
             0, 0, 10, 10, owner, NULL, inst, NULL);
         if (g_form_edit[i]) {
@@ -25659,6 +25753,17 @@ static void test_dump(const char *path) {
      * reported: hovering a URL and reading this back is the only way the
      * autolink boundary rules — where a trailing full stop or bracket stops —
      * are checkable from outside the process. */
+    /* The About's buttons, so a test can click them rather than measure a
+     * screenshot, and what it knows of the description (REQ-034). */
+    {
+        const oc_channel *dc = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        fprintf(f, "about topic=%.0f,%.0f,%.0f,%.0f desc=%.0f,%.0f,%.0f,%.0f "
+                   "desc_known=%d desc_len=%zu\n",
+                g_about_topic.left, g_about_topic.top, g_about_topic.right, g_about_topic.bottom,
+                g_about_desc.left, g_about_desc.top, g_about_desc.right, g_about_desc.bottom,
+                dc ? dc->description_known : 0,
+                dc && dc->description ? strlen(dc->description) : (size_t)0);
+    }
     fprintf(f, "link hover=\"%s\" chan=%llu\n", g_link_hover,
             (unsigned long long)g_chan_hover);
     fprintf(f, "tsel has=%d a=%llu:%u f=%llu:%u\n", g_has_sel,

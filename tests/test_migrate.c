@@ -101,7 +101,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 45);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address */
+    CHECK(oc_schema_version(db) == 46);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",

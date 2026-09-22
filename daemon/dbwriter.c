@@ -2559,6 +2559,29 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_step(st); sqlite3_finalize(st);
         audit_actor(db, OC_AUDIT_ADMIN, "channel.topic", j->user_id, 0, NULL, 1, NULL);
+    } else if (j->chup_op == OC_CHUP_DESCRIPTION) {
+        /* Any member, on the topic's reasoning (ARCH-93): it is visible to
+         * everyone in the channel and a wrong one is corrected in seconds. */
+        if (vlen > OC_MAX_DESCRIPTION) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+        }
+        sqlite3_prepare_v2(db, "UPDATE channels SET description=? WHERE id=?;", -1, &st, NULL);
+        if (vlen) sqlite3_bind_text(st, 1, j->ch_name, (int)vlen, SQLITE_STATIC);
+        else      sqlite3_bind_null(st, 1);          /* "" clears it */
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        audit_actor(db, OC_AUDIT_ADMIN, "channel.description", j->user_id, 0, NULL, 1, NULL);
+        /* Announced on its own frame, not CHANNEL_INFO: the text does not ride
+         * the channel-state frame, so a sidebar has nothing to redraw -- only a
+         * member looking at the About has anything to show. */
+        r->type = OC_RES_CHANNEL_DESCRIPTION;
+        if (vlen) {
+            r->body = malloc(vlen);
+            if (r->body) { memcpy(r->body, j->ch_name, vlen); r->body_len = vlen; }
+        }
+        r->ch_fanout = 1;
+        load_members(db, j->channel_id, r);
+        return r;
     } else if (j->chup_op == OC_CHUP_RENAME) {
         if (!oc_role_can_moderate(role)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
@@ -3210,6 +3233,39 @@ static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
  * client to READ it, so a frontend showed the tenant roster beside a channel
  * name and called it "members" — wrong the moment a workspace holds more people
  * than one channel does. */
+/* A channel's description, for whoever may READ the channel (REQ-034): any
+ * tenant user for a public one -- whose topic the channel directory already
+ * shows them -- and members only for a private one.
+ *
+ * "No such channel" and "a private channel you are not in" get the SAME answer,
+ * because channel_read_access cannot tell them apart and must not: a different
+ * error for the second would say the channel exists. */
+static oc_dbres *process_get_channel_description(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    r->type = OC_RES_CHANNEL_DESCRIPTION;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT description FROM channels WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) {
+        const unsigned char *d = sqlite3_column_text(st, 0);
+        size_t n = (size_t)sqlite3_column_bytes(st, 0);
+        if (n > OC_MAX_DESCRIPTION) n = OC_MAX_DESCRIPTION;   /* never more than the cap */
+        if (d && n) {
+            r->body = malloc(n);
+            if (r->body) { memcpy(r->body, d, n); r->body_len = n; }
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
 static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -7006,7 +7062,7 @@ static int is_read_job(int type) {
             * list. Its three siblings — revoke, set-state, rotate — write. */
            type == OC_JOB_LIST_INVITES || type == OC_JOB_GET_PROFILE ||
            type == OC_JOB_LIST_FILE_CHANNELS || type == OC_JOB_LIST_SESSIONS ||
-           type == OC_JOB_LIST_EMOJI ||
+           type == OC_JOB_LIST_EMOJI || type == OC_JOB_GET_CHANNEL_DESCRIPTION ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
@@ -7025,6 +7081,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_REACTIONS) return process_list_reactions(rdb, j);
     if (j->type == OC_JOB_LIST_PINS)      return process_list_pins(rdb, j);
     if (j->type == OC_JOB_LIST_MEMBERS)   return process_list_members(rdb, j);
+    if (j->type == OC_JOB_GET_CHANNEL_DESCRIPTION) return process_get_channel_description(rdb, j);
     if (j->type == OC_JOB_LIST_FILES)     return process_list_files(rdb, j);
     if (j->type == OC_JOB_LIST_SAVED)     return process_list_saved(rdb, j);
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);

@@ -2357,7 +2357,7 @@ static void test_browser_signin(int port) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
     test_group_dm_title();
     test_sidebar();
@@ -2556,6 +2556,22 @@ int run_client_core_tests(void) {
         {
             uint64_t seen[8];
             CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid2, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
+        }
+
+        /* A channel's description (REQ-034) is not on the channel list, so it is
+         * UNKNOWN until asked for -- which is what description_known exists to
+         * say, since a NULL cannot tell "none" from "never fetched". Asking fills
+         * it; and dana setting one reaches erik live, on the same frame. */
+        {
+            oc_channel *ch = oc_model_channel((oc_model *)oc_client_model(b), 1);
+            CHECK(ch && !ch->description_known);
+            oc_client_get_channel_description(b, 1);
+            CHECK(WAIT_FOR(b, (ch = oc_model_channel((oc_model *)oc_client_model(b), 1)) &&
+                              ch->description_known && ch->description == NULL));
+            oc_client_update_channel(a, 1, OC_CHUP_DESCRIPTION, "What this channel is for.");
+            CHECK(WAIT_FOR(b, (ch = oc_model_channel((oc_model *)oc_client_model(b), 1)) &&
+                              ch->description &&
+                              strcmp(ch->description, "What this channel is for.") == 0));
         }
 
         /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana

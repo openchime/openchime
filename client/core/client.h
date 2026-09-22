@@ -171,6 +171,12 @@ void oc_client_close_pins(oc_client *c);
  * The result arrives as a CHANNEL_INFO fanned to every member. */
 void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, const char *value);
 
+/* Ask for a channel's long-form description (REQ-034). It is not on the channel
+ * list, so a surface that shows it asks when it opens; the answer lands in the
+ * model's `description`, with `description_known` set. Setting one is
+ * oc_client_update_channel with OC_CHUP_DESCRIPTION, and every member is told. */
+void oc_client_get_channel_description(oc_client *c, uint64_t channel_id);
+
 /* Save/unsave a message (REQ-231, ARCH-95). Private: only you ever sees it, so
  * nothing is fanned out and the ack comes back to you alone. */
 /* Fetch the messages AROUND one (REQ-232, ARCH-96) — what a permalink, a pin, a

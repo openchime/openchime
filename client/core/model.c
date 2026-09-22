@@ -44,6 +44,7 @@ static void channel_free(oc_channel *c) {
     free(c->msgs);
     free(c->name);
     free(c->topic);
+    free(c->description);
     free(c->readers);
 }
 
@@ -1238,6 +1239,18 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
             free(c->topic);
             c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
+        }
+        break;
+    }
+    case OC_EV_CHANNEL_DESCRIPTION: {
+        /* Both the answer to a fetch and the announcement of a change arrive as
+         * this one frame, so one arm serves the About on open and live. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            free(c->description);
+            c->description = (e->body && e->body[0]) ? e->body : NULL;
+            if (c->description) e->body = NULL;     /* taken */
+            c->description_known = 1;
         }
         break;
     }

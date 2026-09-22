@@ -2083,6 +2083,16 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_GET_CHANNEL_DESCRIPTION) {
+            oc_get_channel_description gd;
+            if (oc_decode_get_channel_description(&p, &gd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_GET_CHANNEL_DESCRIPTION, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = gd.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_MARK_ALL_READ) {
             /* No body to decode; the frame's presence is the message. */
             oc_job *j = oc_job_new(OC_JOB_MARK_ALL_READ, c->conn_id);
@@ -3906,6 +3916,26 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_files term = { r->channel_id, (uint32_t)r->n_flist, r->flist_more };
         oc_encode_files(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CHANNEL_DESCRIPTION: {
+        /* The asker always; with ch_fanout, every other connected member too --
+         * the same split CHANNEL_INFO makes for UPDATE_CHANNEL (ARCH-93). */
+        conn *c = find_by_id(conns, r->conn_id);
+        uint64_t actor = c ? c->user_id : 0;
+        oc_channel_description cd = {
+            r->channel_id, { r->body, r->body ? r->body_len : 0 } };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        if (oc_encode_channel_description(&w, OC_PROTOCOL_VERSION, &cd) != OC_OK) break;
+        size_t len = w.len;
+        if (c) send_bytes(ep, conns, c->fd, g_enc, len);
+        if (r->ch_fanout)
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed && t->user_id != actor &&
+                    in_members(t->user_id, r->members, r->n_members))
+                    send_bytes(ep, conns, fd, g_enc, len);
+            }
         break;
     }
     case OC_RES_LIST_ERR: {
