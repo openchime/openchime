@@ -1048,6 +1048,15 @@ static int g_n_rows;
  * axis will be asked about both. */
 typedef struct { float top, bot, left, right, bx, by, cw; uint64_t mid; } oc_msgrow;
 static oc_msgrow g_msgrows[600];
+/* The transcript region those rows were laid out in, captured with them: a row's
+ * rect is in the list's coordinates and may start above it or end below it.
+ * `g_msglist_drawn` says the transcript was drawn THIS frame -- set by
+ * draw_msglist, cleared each paint, the way g_caret_placed is. The rows outlive
+ * the frame that made them, so without it a view that draws no transcript at all
+ * published the last one's rows: elements at coordinates nothing painted, which
+ * is precisely what the tree must not contain. */
+static rectf g_msglist_reg;
+static int   g_msglist_drawn;
 static int g_n_msgrows;
 /* The same, for the thread pane — replies were read-only because the
  * pane recorded no hit-boxes at all. Its own scroll offset, so opening a thread
@@ -5741,7 +5750,14 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     g_n_chips = 0;
     g_n_hrx = 0;
     g_hrx_mid = 0;
-    if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; g_n_fwd_hits = 0; }
+    if (capture) {
+        g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; g_n_fwd_hits = 0;
+        /* The surface these rows belong to. A row's own rect may start above it
+         * or end below it -- that is what scrolling IS -- so the tree publishes
+         * the part that lands on the transcript (a11y_publish_scene). */
+        g_msglist_reg = reg;
+        g_msglist_drawn = 1;
+    }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (sep[i]) {
@@ -15377,6 +15393,7 @@ static void paint(HWND hwnd) {
     /* The frame owns the tally: it is a fact about what was just drawn, and the
      * dump that reports it runs long after the frame ended. */
     g_clip_n = 0; g_clip_worst = 0; g_clip_first[0] = 0;
+    g_msglist_drawn = 0;
     g_caret_placed = 0;
     render_scene(rt, m, W, H);
     if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
@@ -17120,10 +17137,34 @@ enum {
  * around a popup's rows and put back, so no call site has to carry it. */
 static int g_acc_layer;
 
+/* The SURFACE a published element sits on, when that surface scrolls under
+ * other chrome. Empty means the window, which clips nothing.
+ *
+ * A scrolling list's rows are laid out in the list's own coordinates, so the
+ * topmost row routinely starts above the list and the last one ends below it.
+ * Publishing that rect says the row occupies space it is clipped away from: the
+ * fit check read the first transcript row as overlapping the header's buttons
+ * (nothing was drawn there), and a screen reader would have been told the same.
+ * The tree is meant to be what is REACHABLE, so a row is published as the part
+ * of it that lands on its surface, and a row scrolled entirely out is not
+ * published at all. */
+static rectf g_acc_surface;
+
+/* Clip `r` to the current surface. Returns 0 when nothing of it is left. */
+static int acc_on_surface(rectf *r) {
+    if (g_acc_surface.right <= g_acc_surface.left) return 1;   /* no surface set */
+    if (r->top    < g_acc_surface.top)    r->top    = g_acc_surface.top;
+    if (r->bottom > g_acc_surface.bottom) r->bottom = g_acc_surface.bottom;
+    if (r->left   < g_acc_surface.left)   r->left   = g_acc_surface.left;
+    if (r->right  > g_acc_surface.right)  r->right  = g_acc_surface.right;
+    return r->right > r->left && r->bottom > r->top;
+}
+
 static void acc_push(oc_acc_item *items, int *n, oc_acc_kind kind, const char *aid,
                      const char *name, rectf r, uint64_t invoke) {
     if (*n >= OC_ACC_MAX) return;
     if (r.right <= r.left || r.bottom <= r.top) return;   /* nothing drawn, nothing to say */
+    if (!acc_on_surface(&r)) return;                      /* scrolled off its surface */
     oc_acc_item *it = &items[(*n)++];
     memset(it, 0, sizeof *it);
     it->kind = kind;
@@ -17172,6 +17213,7 @@ static void a11y_publish_scene(const oc_model *m) {
     const WCHAR *ctext = NULL;
     int caret = 0, anchor = 0;
     g_acc_layer = 0;
+    g_acc_surface = rf(0, 0, 0, 0);
 
     /* A MODAL OWNS THE TREE. While a card covers the window, the shell's rows
      * and buttons are unreachable by pointer and must be unreachable by AT and
@@ -17232,17 +17274,26 @@ static void a11y_publish_scene(const oc_model *m) {
     /* Messages, in the order they are drawn. The name is what a person would say
      * reading the transcript aloud — who, when, what — because that is what a
      * screen reader will say. */
-    for (int i = 0; i < g_n_msgrows && n < OC_ACC_MAX; i++) {
+    for (int i = 0; g_msglist_drawn && i < g_n_msgrows && n < OC_ACC_MAX; i++) {
         const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         const oc_msg *msg = c ? find_msg(c, g_msgrows[i].mid) : NULL;
         if (!msg) continue;
+        /* The part of the row that is ON the transcript. A row scrolled under the
+         * header or below the composer is published as what is left of it, and
+         * one scrolled out entirely is not published. */
+        rectf rr = rf(g_msgrows[i].left, g_msgrows[i].top,
+                      g_msgrows[i].right, g_msgrows[i].bot);
+        g_acc_surface = g_msglist_reg;
+        int on = acc_on_surface(&rr);
+        g_acc_surface = rf(0, 0, 0, 0);
+        if (!on) continue;
         oc_acc_item *it = &items[n++];
         memset(it, 0, sizeof *it);
         it->kind = OC_ACC_MESSAGE;
         it->id   = g_msgrows[i].mid;
         snprintf(it->aid, sizeof it->aid, "message.%llu", (unsigned long long)g_msgrows[i].mid);
-        it->l = PX(g_msgrows[i].left);  it->r = PX(g_msgrows[i].right);
-        it->t = PX(g_msgrows[i].top);   it->b = PX(g_msgrows[i].bot);
+        it->l = PX(rr.left);  it->r = PX(rr.right);
+        it->t = PX(rr.top);   it->b = PX(rr.bottom);
         const char *who = msg->author_name[0] ? msg->author_name
                                               : oc_model_user_name(m, msg->author_id);
         char when[24]; rel_time(msg->server_time, when, sizeof when);
