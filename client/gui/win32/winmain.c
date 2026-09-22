@@ -6013,6 +6013,20 @@ static rectf pane_header(gfx *rt, rectf reg, const char *title) {
     return rf(reg.left, reg.top + 34, reg.right, reg.bottom);
 }
 
+/* The rect a wrapped paragraph actually needs, never less than `floor`.
+ *
+ * A fixed height is the shape of this defect: the Activity empty state was given
+ * 72 DIP, which is three lines at 100% and not even two at the largest text size
+ * with a scaled display -- so its last word was cut off inside a box that every
+ * rect-based check called correct. The height of wrapped text is a function of
+ * the text, the width and the scale, and the only honest way to have it is to
+ * measure it. */
+static rectf text_rect(float l, float t, float r, const char *s, fmtw *fmt, float min_h) {
+    float h = text_height(s, fmt, r - l);
+    if (h < min_h) h = min_h;
+    return rf(l, t, r, t + h);
+}
+
 static void overlay_empty(gfx *rt, rectf body, const char *text) {
     g_ui->align = ST_ALIGN_CENTER;
     draw_text(rt, text, g_ui, body, OC_COL_MUTED);
@@ -13291,14 +13305,20 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         }
         y += UIS(78);
     }
-    if (!shown)
-        draw_text(rt, (g_act_filter == AF_UNREADS || g_act_filter == AF_DMS ||
-                       g_act_filter == AF_CHANNELS)
-                        ? "Nothing unread here. You are all caught up."
-                    : m->n_activity ? "Nothing of that kind."
-                                    : "Nothing yet. Mentions, reactions to your messages "
-                                      "and replies to your threads land here.",
-                  g_meta_w, rf(x0 + 16, y + 8, x1 - 12, y + 80), OC_COL_FAINT);
+    if (!shown) {
+        /* MEASURED, not a fixed 72 DIP: that was three lines at 100% and not two
+         * at the largest text size on a scaled display, so the sentence lost its
+         * last word inside a box every rect-based check called correct. */
+        const char *none = (g_act_filter == AF_UNREADS || g_act_filter == AF_DMS ||
+                            g_act_filter == AF_CHANNELS)
+                             ? "Nothing unread here. You are all caught up."
+                         : m->n_activity ? "Nothing of that kind."
+                                         : "Nothing yet. Mentions, reactions to your messages "
+                                           "and replies to your threads land here.";
+        draw_text(rt, none, g_meta_w,
+                  text_rect(x0 + 16, y + 8, x1 - 12, none, g_meta_w, UIS(24.0f)),
+                  OC_COL_FAINT);
+    }
 }
 
 /* Saved items — the Later view (REQ-231). */
@@ -16908,7 +16928,16 @@ static void ed_draw(gfx *rt, rectf box) {
         /* On the INPUT fill, which FAINT does not clear in dark (2.73:1). The
          * cue is the app's standing invitation to type and was the faintest
          * thing in the window. */
-        if (cue[0]) draw_text(rt, cue, g_body, rf(box.left, box.top, box.right, box.top + 20),
+        /* ONE LINE, measured, and ellipsized rather than wrapped. It was drawn
+         * with the WRAPPING body format into a rect a fixed 20 DIP tall: past
+         * about 150% the line box is taller than that, so the whole cue was cut
+         * away and the composer sat empty with no invitation in it at all --
+         * `chromefit`'s clipped= found it at 240 DPI. g_ui does not wrap, so a
+         * long channel name ends in an ellipsis instead of wrapping into a
+         * second line there is no room for, and the rect is the line box, which
+         * is what the glyphs actually need. */
+        float cue_h = g_ui->line_h > 4.0f ? g_ui->line_h : 20.0f;
+        if (cue[0]) draw_text(rt, cue, g_ui, rf(box.left, box.top, box.right, box.top + cue_h),
                               OC_INK_ON(TH_FAINT, TH_INPUT));
     }
 
