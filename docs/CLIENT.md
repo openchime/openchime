@@ -733,6 +733,12 @@ same way for both:
   The hover reaction strip is the same story with a shorter fix: `draw_msglist`
   already refills it whenever it runs, so clearing it each paint is enough to
   make it empty unless this frame drew it.
+- **A RECT is a hit-box as much as a row is.** The conversation header's listen
+  button and member chip are set where they are drawn, so the Files view — which
+  draws its own header with an Upload button in that corner — inherited the
+  listen button's rect and the fit check paired a button nobody could see with
+  the one really there. They are cleared in `render_scene`'s reset block beside
+  the row arrays, where the call header's own button already was.
 - **A popup declares its layer.** The quick reactions float over the row they
   belong to, so they are published with `g_acc_layer` raised, as the new-message
   matches are; the overlap half compares within a layer, and covering the row is

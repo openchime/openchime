@@ -15242,11 +15242,19 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
      * view with one had left behind and offered a screen reader channels that
      * were not on screen. Each of the three was found separately, by a
      * different route -- and each was the same sentence: an array filled during
-     * a draw and cleared only by that draw. */
+     * a draw and cleared only by that draw.
+     *
+     * THE CONVERSATION HEADER'S BUTTONS ARE THE FOURTH, found the same way. The
+     * Files view draws its own header with an Upload button where the listen
+     * button sits, and the channel header's rect outlived the frame that drew
+     * it -- so the fit check paired a button nobody could see with the one
+     * really there. A rect is a hit-box as much as a row is. */
     g_n_msgrows = 0;
     g_n_shelf = 0;
     g_n_rows = 0;
     g_sb_unread_chip = rf(0, 0, 0, 0);
+    /* (the call header's own button is cleared by call_rects_reset above) */
+    g_listen_btn = g_memchip = rf(0, 0, 0, 0);
     /* The caller cleared to OC_COL_BASE via gfx_begin; grayscale text AA and
      * the DIP scale live inside the gfx/sdltext layers (ARCH-106/107). */
     /* Sign-in owns the whole window only when there is nothing behind it. With a
