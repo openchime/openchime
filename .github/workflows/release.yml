@@ -349,7 +349,7 @@ jobs:
       # (ARCH-112). All are functions of the files in the key and of the zig
       # version, so a hit skips about 25 minutes and a change rebuilds.
       - name: Restore the speech engine and models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             third_party/onnxruntime-1.30.0
