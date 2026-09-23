@@ -8,7 +8,12 @@
  * 443. Resolution failure is reported as a distinct status so the caller can tell
  * "this org doesn't exist" apart from "unreachable" and "login failed" (REQ-011).
  *
- * `.well-known` metadata (the optional half of REQ-010) is not consulted yet.
+ * The optional `.well-known` half of REQ-010 is consulted when SRV says nothing:
+ * see wellknown.h for the document, and for why its fetch insists on a verified
+ * chain. It cannot move the host -- the A record does that -- but it may name
+ * the port, which is second in the precedence SRV > `.well-known` > 443
+ * (ARCH-54). A document that is present and malformed is its own failure
+ * (REQ-011), not "this workspace does not exist".
  */
 
 #ifndef OC_RESOLVE_H
@@ -19,13 +24,21 @@
 typedef enum {
     OC_RESOLVE_OK = 0,
     OC_RESOLVE_BAD_WORKSPACE,   /* empty / malformed workspace string */
-    OC_RESOLVE_NOT_FOUND       /* the workspace does not resolve in DNS (REQ-011) */
+    OC_RESOLVE_NOT_FOUND,      /* the workspace does not resolve in DNS (REQ-011) */
+    /* The domain resolves and serves `.well-known` metadata that is not what it
+     * claims to be (REQ-011). Distinct from NOT_FOUND on purpose: the operator
+     * published something, and "does not exist" would send them looking in the
+     * wrong place entirely. */
+    OC_RESOLVE_BAD_METADATA
 } oc_resolve_status;
 
 /* `domain` is the workspace's own name after suffixing — what the connection
  * names in its TLS handshake (SNI), even when an SRV record sent `host` somewhere
  * else: a shared front door routes by workspace, not by where it was reached. */
-typedef struct { char host[256]; int port; char domain[256]; } oc_endpoint;
+/* `fingerprint` is the daemon certificate the `.well-known` document named, if
+ * it named one (ARCH-10) -- carried because the document is where it lives, and
+ * empty otherwise. */
+typedef struct { char host[256]; int port; char domain[256]; char fingerprint[96]; } oc_endpoint;
 
 /* The service's own DNS suffix (ARCH-14). A hosted tenant is reached by bare
  * name — `acme` -> `acme.workspace.openchime.io` — which is what REQ-010 means by "the
