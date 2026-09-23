@@ -57,6 +57,18 @@ likewise vendored — as committed single-file source, both MIT (ARCH-75).
   can forget the workspace to re-pin.
 - **Fingerprint** = SHA-256 of the certificate DER; it may be published
   out-of-band in `.well-known` metadata for verification (ARCH-10/14).
+- **A published fingerprint is checked on the FIRST connection**, the one
+  trust-on-first-use cannot defend. With no pin stored yet and a fingerprint in
+  the workspace's metadata, that fingerprint is the pin: a daemon presenting
+  anything else is refused, and the client says so in its own words ("this
+  workspace publishes the certificate its server should present, and the server
+  presented a different one") rather than reporting the certificate as *changed*
+  — nothing changed, and there is nothing to re-trust. A stored pin takes
+  precedence over the document. **Loopback is not exempt here**, though it is for
+  TOFU: that exemption exists because nothing can sit in the path inside one
+  host, whereas a published fingerprint is a statement about which certificate
+  is the workspace's own. Text that is not 32 bytes of hex is treated as no
+  fingerprint at all, never as a pin half-read.
 
 ### How pinning is enforced with mbedTLS
 

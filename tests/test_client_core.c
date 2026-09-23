@@ -1069,6 +1069,39 @@ static void test_wellknown_parse(void) {
         CHECK(oc_wellknown_read_response(headersonly, strlen(headersonly), &wk) == OC_WK_MALFORMED);
     }
 
+    /* The fingerprint as bytes (ARCH-10). Anything that is not exactly 32 bytes
+     * of hex is refused, because a pin half-read is a different check, not a
+     * weaker one. */
+    {
+        unsigned char b[32];
+        const char *plain = "00112233445566778899aabbccddeeff"
+                            "00112233445566778899aabbccddeeff";
+        CHECK(oc_wellknown_fingerprint_bytes(plain, b) == 0);
+        CHECK(b[0] == 0x00 && b[1] == 0x11 && b[31] == 0xff);
+        /* The colons people paste, and upper case, are the same fingerprint. */
+        char colons[128]; int at = 0;
+        for (int i = 0; i < 32; i++)
+            at += snprintf(colons + at, sizeof colons - at, i ? ":%02X" : "%02X", b[i]);
+        unsigned char c2[32];
+        CHECK(oc_wellknown_fingerprint_bytes(colons, c2) == 0);
+        CHECK(memcmp(b, c2, 32) == 0);
+
+        CHECK(oc_wellknown_fingerprint_bytes("", b) == -1);
+        CHECK(oc_wellknown_fingerprint_bytes("nothex", b) == -1);
+        CHECK(oc_wellknown_fingerprint_bytes("00112233", b) == -1);          /* too short */
+        {
+            char toolong[200];
+            snprintf(toolong, sizeof toolong, "%s00", plain);                /* too long */
+            CHECK(oc_wellknown_fingerprint_bytes(toolong, b) == -1);
+        }
+        {
+            char odd[80];
+            snprintf(odd, sizeof odd, "%.63s", plain);                       /* odd digit */
+            CHECK(oc_wellknown_fingerprint_bytes(odd, b) == -1);
+        }
+        CHECK(oc_wellknown_fingerprint_bytes(NULL, b) == -1);
+    }
+
     /* Bigger than any discovery document: refused without parsing it. */
     {
         static char flood[OC_WK_MAX + 32];
@@ -2361,6 +2394,94 @@ static void test_big_channel_list(int port) {
     unlink("build/test_core_biglist.db-shm");
 }
 
+/* The published fingerprint is CHECKED (ARCH-10). Trust-on-first-use trusts
+ * whatever answers the first connection; a workspace that publishes its
+ * certificate in `.well-known` is stating which one is its own, and the point of
+ * publishing it is that the first connection is refused when it does not match.
+ * Both directions are asserted here, against a real daemon with a real
+ * self-signed certificate: the right fingerprint connects, the wrong one does
+ * not and says why. */
+static void fp_hex(const uint8_t *b, size_t n, char *out, size_t cap) {
+    size_t at = 0;
+    /* at + 2 chars + the NUL: `at + 3 < cap` drops the last byte and yields 62
+     * hex digits, which is not a fingerprint and is refused -- as it should be. */
+    for (size_t i = 0; i < n && at + 3 <= cap; i++)
+        at += (size_t)snprintf(out + at, cap - at, "%02x", b[i]);
+}
+
+static void test_published_fingerprint(int port) {
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink("build/test_core_fp.db"); unlink("build/test_core_fp.db-wal");
+    unlink("build/test_core_fp.db-shm");
+    oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_fp.db");
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
+
+    uint8_t real[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv, real) == 0);
+    char right[2 * OC_TLS_FINGERPRINT_LEN + 1];
+    fp_hex(real, sizeof real, right, sizeof right);
+    uint8_t other[OC_TLS_FINGERPRINT_LEN];
+    memcpy(other, real, sizeof other);
+    other[0] ^= 0x01;                      /* one bit is a different certificate */
+    char wrong[2 * OC_TLS_FINGERPRINT_LEN + 1];
+    fp_hex(other, sizeof other, wrong, sizeof wrong);
+
+    struct core_loop_arg arg;
+    arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+    wait_port_ready(arg.port);
+
+    /* The certificate the workspace published: in, and pinned. */
+    {
+        oc_client *c = oc_client_start_verified("fp-right.openchime.test", "127.0.0.1", arg.port,
+                                                "iris:pw-iris", "ignored", NULL, 1, right);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(WAIT_FOR(c, m->authed));
+            oc_client_stop(c);
+        }
+    }
+
+    /* One bit different: refused, and never authenticated. The store is a fresh
+     * key, so there is no pin -- this is the first connection, the one TOFU
+     * cannot check and this exists to check. */
+    {
+        oc_client *c = oc_client_start_verified("fp-wrong.openchime.test", "127.0.0.1", arg.port,
+                                                "iris:pw-iris", "ignored", NULL, 1, wrong);
+        CHECK(c != NULL);
+        if (c) {
+            int authed = WAIT_FOR(c, m->authed);
+            CHECK(!authed);
+            const oc_model *m = oc_client_model(c);
+            CHECK(strstr(m->last_error, "certificate") != NULL);
+            oc_client_stop(c);
+        }
+    }
+
+    /* Text that is not a fingerprint is no fingerprint, not a pin half-read: the
+     * connection proceeds on trust-on-first-use as it did before. */
+    {
+        oc_client *c = oc_client_start_verified("fp-junk.openchime.test", "127.0.0.1", arg.port,
+                                                "iris:pw-iris", "ignored", NULL, 1, "not-a-fingerprint");
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(WAIT_FOR(c, m->authed));
+            oc_client_stop(c);
+        }
+    }
+
+    arg.stop = 1;
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    unlink("build/test_core_fp.db"); unlink("build/test_core_fp.db-wal");
+    unlink("build/test_core_fp.db-shm");
+}
+
 static void test_browser_signin(int port) {
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -2571,7 +2692,7 @@ static void test_browser_signin(int port) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: sidebar, resolve, .well-known metadata, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
+    printf("test_client_core: sidebar, resolve, .well-known metadata, a published fingerprint, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
 
     test_group_dm_title();
     test_sidebar();
@@ -3657,5 +3778,6 @@ int run_client_core_tests(void) {
 
     test_browser_signin(21500 + (int)(getpid() % 2000));
     test_big_channel_list(23600 + (int)(getpid() % 2000));
+    test_published_fingerprint(25700 + (int)(getpid() % 2000));
     return failures;
 }

@@ -56,6 +56,17 @@ oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port,
                           const char *store_path, oc_secret *secret, int pin_only,
                           oc_queue *to_ui, oc_queue *from_ui);
 
+/* As oc_net_start_opts, with the certificate fingerprint the workspace PUBLISHED
+ * (ARCH-10, via `.well-known`; NULL when it published none, 32 bytes when it
+ * did). It is used only where there is no stored pin yet -- the first connection,
+ * the one trust-on-first-use cannot check -- and a daemon presenting anything
+ * else is refused rather than pinned. A stored pin still wins: it is what this
+ * person already trusted, and a document cannot overrule it. */
+oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int port,
+                              const char *token, const char *store_path, oc_secret *secret,
+                              int pin_only, const unsigned char *published_pin,
+                              oc_queue *to_ui, oc_queue *from_ui);
+
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
 /* Redeem an invite on the FIRST connect instead of authenticating (REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so

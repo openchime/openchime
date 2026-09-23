@@ -51,6 +51,15 @@ oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int
                                 const char *cred, const char *store_path, oc_secret *secret,
                                 int remember);
 
+/* As oc_client_start_opts, with the fingerprint the workspace published in its
+ * `.well-known` metadata (ARCH-10) -- `oc_endpoint.fingerprint` from oc_resolve,
+ * or NULL/"" when it published none. It closes the trust-on-first-use window:
+ * with no pin stored yet, the daemon's certificate must be the published one or
+ * the connection is refused. Unreadable text is treated as no fingerprint. */
+oc_client *oc_client_start_verified(const char *workspace_key, const char *host, int port,
+                                    const char *cred, const char *store_path, oc_secret *secret,
+                                    int remember, const char *published_fingerprint);
+
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);
 

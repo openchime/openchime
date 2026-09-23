@@ -67,6 +67,10 @@ struct oc_net {
     char         *invite;       /* one-shot signup token, else NULL */
     char          ws_key[288];  /* the workspace as named (oc_workspace_key); "" = host:port */
     int           pin_only;     /* Remember-me off: keep the TOFU pin, and nothing else */
+    /* The fingerprint the workspace PUBLISHED (ARCH-10, via `.well-known`), used
+     * only when nothing is pinned yet -- see oc_net_start_verified. */
+    unsigned char published_pin[OC_TLS_FINGERPRINT_LEN];
+    int           have_published_pin;
     /* A browser sign-in in progress (AUTH.md §8.1): the listener the browser comes
      * back to, the verifier kept for the daemon, and — once the browser has been —
      * the token to present on the next connection. Net thread only, but for
@@ -2030,7 +2034,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
 /* ---- the thread ---- */
 
 enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3,
-       RC_BROWSER = 4 /* the person is in their browser; wait for them, then connect again */ };
+       RC_BROWSER = 4, /* the person is in their browser; wait for them, then connect again */
+       /* The workspace PUBLISHED a fingerprint and the daemon presented something
+        * else (ARCH-10). Distinct from CERT_CHANGED: nothing changed and there is
+        * nothing to re-trust -- this is the first connection, refused because the
+        * certificate is not the one the workspace says is its own. */
+       RC_CERT_UNPUBLISHED = 5 };
 
 /* TOFU pinning defends against a network man-in-the-middle substituting the
  * server's certificate. A loopback connection never leaves the host, so there is
@@ -2152,7 +2161,19 @@ static int run_connection(oc_net *n, int reconnecting,
      * oc_clients in one process (the headless test) set up TLS concurrently; safe
      * because the vendored mbedTLS is built with MBEDTLS_THREADING. */
     int enforce_pin = cs && cs->have_pin && !is_loopback(n->host);
-    if (oc_tls_client_init(&cli, enforce_pin ? cs->pin : NULL) != 0 ||
+    /* No pin yet, but the workspace published one: check the FIRST connection
+     * against it (ARCH-10). That connection is the one TOFU cannot defend, and
+     * checking it is the only reason publishing a fingerprint is worth doing. A
+     * loopback daemon is exempt for the reason the pin itself is. */
+    /* No loopback exemption, unlike the TOFU pin above. That exemption exists
+     * because trusting an unknown certificate is only dangerous where something
+     * can sit in the path, and nothing sits inside the host. A PUBLISHED
+     * fingerprint is a different thing: the workspace stated which certificate
+     * is its own, so presenting another one is wrong wherever it happens, and a
+     * rule with no exception is one nobody has to reason about. */
+    int use_published = !enforce_pin && n->have_published_pin;
+    const unsigned char *want = enforce_pin ? cs->pin : use_published ? n->published_pin : NULL;
+    if (oc_tls_client_init(&cli, want) != 0 ||
         oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
     }
@@ -2177,6 +2198,7 @@ static int run_connection(oc_net *n, int reconnecting,
          * certificate changed (TOFU mismatch) — report that distinctly, not as a
          * generic "unreachable". */
         if (enforce_pin && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_CHANGED;
+        else if (use_published && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_UNPUBLISHED;
         goto drop;
     }
 
@@ -3135,6 +3157,12 @@ static void *net_thread(void *arg) {
         /* Distinguish "unreachable" from "login failed" (REQ-011): a drop before
          * ever serving, without a fatal auth reject, is a connectivity problem. */
         if (served) reach_notified = 0;
+        else if (rc == RC_CERT_UNPUBLISHED && !reach_notified) {
+            push_err(n->to_ui, "this workspace publishes the certificate its server should "
+                               "present, and the server presented a different one — the "
+                               "connection was refused");
+            reach_notified = 1;
+        }
         else if (rc == RC_CERT_CHANGED && !reach_notified) {
             push_err(n->to_ui, "the server's security certificate has changed since you "
                                "last connected — if unexpected this may be a security risk; "
@@ -3241,9 +3269,19 @@ oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port
 oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port, const char *token,
                           const char *store_path, oc_secret *secret, int pin_only,
                           oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_verified(workspace_key, host, port, token, store_path, secret,
+                                 pin_only, NULL, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int port,
+                              const char *token, const char *store_path, oc_secret *secret,
+                              int pin_only, const unsigned char *published_pin,
+                              oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
+    if (published_pin) { memcpy(n->published_pin, published_pin, OC_TLS_FINGERPRINT_LEN);
+                         n->have_published_pin = 1; }
     n->pin_only = pin_only;
     snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
     n->port = port;

@@ -1620,8 +1620,11 @@ static int run_login(const char *initial_workspace, const char *initial_user,
         char key[288];
         if (oc_workspace_key(f.workspace, oc_default_suffix(), key, sizeof key) != 0)
             snprintf(key, sizeof key, "%s:%d", f.ep.host, f.ep.port);
-        oc_client *cl = oc_client_start_opts(key, f.ep.host, f.ep.port, cred,
-                                             store_path, secret, f.remember);
+        /* With the fingerprint the workspace published, if it did (ARCH-10): the
+         * first connection is checked against it instead of trusted blind. */
+        oc_client *cl = oc_client_start_verified(key, f.ep.host, f.ep.port, cred,
+                                                 store_path, secret, f.remember,
+                                                 f.ep.fingerprint);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         char why[200] = "";
         int res = await_auth(cl, f.ep.host, why, sizeof why);
@@ -1678,7 +1681,8 @@ static int open_workspace(const char *key, const char *label, const char *user) 
     }
 
     if (have_stored_token(g_store_path, key, host, port, g_secret)) {
-        oc_client *cl = oc_client_start_named(key, host, port, "", g_store_path, g_secret);
+        oc_client *cl = oc_client_start_verified(key, host, port, "", g_store_path, g_secret,
+                                                 1, ep.fingerprint);
         if (!cl) return -1;
         char why[200] = "";
         if (await_auth(cl, host, why, sizeof why) != AUTH_R_OK) {         /* token stale/rejected */
@@ -1750,6 +1754,7 @@ int main(int argc, char **argv) {
      * distinctly from connect/auth failure (REQ-011). */
     char host[256] = ""; int port = 0; const char *cred = NULL;
     char key0[288] = "";                       /* the first workspace's store key */
+    char published_fp[96] = "";                /* what `.well-known` named, if anything */
     int direct = 0;
     const char *prefill = "";
 
@@ -1769,6 +1774,10 @@ int main(int argc, char **argv) {
         if (st == OC_RESOLVE_BAD_METADATA) { fprintf(stderr, "openchime: workspace '%s' publishes discovery metadata that is not valid\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;
+        /* Out of the block with the address it belongs to: the connection is
+         * opened further down, and the published fingerprint (ARCH-10) has to
+         * reach it. */
+        snprintf(published_fp, sizeof published_fp, "%s", ep.fingerprint);
         if (oc_workspace_key(inst, oc_default_suffix(), key0, sizeof key0) != 0)
             snprintf(key0, sizeof key0, "%s:%d", host, port);
         if (cli_cred && cli_cred[0])                               { cred = cli_cred; direct = 1; }
@@ -1787,7 +1796,8 @@ int main(int argc, char **argv) {
     /* The first session. Everything after this point works through g_ws, so the
      * command line is just one more way to open a workspace. */
     if (direct) {
-        oc_client *c0 = oc_client_start_named(key0, host, port, cred, store_path, secret);
+        oc_client *c0 = oc_client_start_verified(key0, host, port, cred, store_path, secret,
+                                                 1, published_fp);
         if (!c0) { tb_shutdown(); oc_secret_free(secret); fprintf(stderr, "failed to start client\n"); return 1; }
         ws_session *w = &g_ws[0];
         memset(w, 0, sizeof *w);
