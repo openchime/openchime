@@ -4,6 +4,8 @@
 
 #include "resolve.h"
 
+#include "wellknown.h"
+
 #include <stdlib.h>   /* getenv */
 #include "sock.h"      /* oc_sock_startup: getaddrinfo needs WSAStartup on Windows */
 
@@ -236,10 +238,21 @@ oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpo
     if (srv_lookup(domain, out->host, sizeof out->host, &out->port) == 0)
         return OC_RESOLVE_OK;
 
-    /* Fallback: the domain itself, at the standard port. */
+    /* Fallback: the domain itself, at the standard port -- and the optional
+     * `.well-known` document, which is the other half of REQ-010 and the only
+     * thing that can move the port off 443 once SRV has said nothing. Asked for
+     * only here, because SRV outranks it (ARCH-54) and answering first makes the
+     * question moot. */
     if (host_resolves(domain)) {
         snprintf(out->host, sizeof out->host, "%s", domain);
-        out->port = 443;
+        out->port = 443;                     /* OC_DEFAULT_PORT, as host_resolves uses */
+        oc_wellknown wk;
+        int wkr = oc_wellknown_fetch(domain, getenv("OPENCHIME_WELLKNOWN_CA_BUNDLE"), &wk);
+        if (wkr == OC_WK_MALFORMED) return OC_RESOLVE_BAD_METADATA;
+        if (wkr == OC_WK_OK) {
+            if (wk.port) out->port = wk.port;
+            snprintf(out->fingerprint, sizeof out->fingerprint, "%s", wk.fingerprint);
+        }
         return OC_RESOLVE_OK;
     }
     return OC_RESOLVE_NOT_FOUND;   /* the org name simply doesn't exist (REQ-011) */
