@@ -80,7 +80,10 @@ where one exists.
   resolution *service* involved in any deployment model (ARCH-14/76). A
   workspace given as a full domain (e.g. `chat.acme.com`) — the stand-alone
   case, and the federated case where the operator keeps their own DNS — has
-  resolved via SRV records plus optional `.well-known` metadata; a workspace
+  resolved via SRV records plus optional `.well-known` metadata — the document
+  being `https://<domain>/.well-known/openchime`, a flat JSON object, fetched
+  with a verified certificate chain or not at all (ARCH-10/14), carrying a
+  `port` and optionally the daemon's certificate fingerprint; a workspace
   given as a bare name (e.g. `acme`) — a hosted tenant, or a federated
   self-hoster who took a vanity name under the service suffix — has had the
   service's known DNS suffix appended client-side (`acme` →
@@ -90,7 +93,8 @@ where one exists.
   email has been used only to drive the OIDC login (REQ-020), not to derive
   the workspace.
 - **REQ-011.** Resolution failure (the workspace name does not resolve in DNS,
-  no SRV record, malformed `.well-known` metadata) has produced a distinct,
+  no SRV record, malformed `.well-known` metadata — a document served where one
+  belongs that is not this one, told apart from no document at all) has produced a distinct,
   user-facing error rather than being conflated with an authentication or
   network failure, since the user has needed to know which of "this org
   doesn't exist," "the org is unreachable," and "your login failed" applies.
