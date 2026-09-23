@@ -41,7 +41,7 @@ opaque payloads** rather than mixing them. The media framing makes this visible
 (`daemon/audio.h`):
 
 ```
-client  → sidecar :  token(16) ‖ seq(u16 BE) ‖ payload
+client  → sidecar :  token ‖ seq(u16 BE) ‖ payload
 sidecar → client  :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
 ```
 
@@ -274,6 +274,33 @@ relayed from the new one: its packets stop counting, the relay's silence sweep
 drops it and says so, and it rejoins with `CALL_JOIN`, which issues a fresh token
 over the authenticated TCP connection.
 
+**Reaching the relay.** The relay binds its UDP port on every address, IPv6 and
+IPv4 on one socket, as the protocol port does. It answers each participant
+**from the address that participant's packets arrived at**, not whichever one
+the kernel would choose for the reply: a host with several addresses otherwise
+answers from the wrong one, and the client's NAT, or a hosting platform's UDP
+edge, discards it. Fly is the case that needs it — public UDP arrives at a
+`fly-global-services` address, and a reply from the machine's own is dropped —
+and the daemon needs no setting for it. A datagram is at most **1,300 bytes**
+either way: Fly documents about that much, and 1,380 was the most measured
+through it. The client sends to the relay over IPv4, at the address its
+workspace's host name resolves to and the port `CALL_JOINED` names, since the
+hosting platform carries UDP on IPv4 alone.
+
+Behind a front door that forwards UDP for many workspaces from one address, the
+relay is reached at the door's port rather than its own, and the door has to
+tell workspaces apart by the packet alone. `OPENCHIME_AUDIO_ADVERTISE_PORT`
+names the port `CALL_JOINED` gives out, and `OPENCHIME_AUDIO_TOKEN_PREFIX` puts
+up to 16 fixed bytes in front of every token's 16 random ones, for the door to
+route by (CONFIG.md). Both are off by default, and a daemon reached directly
+behaves as it always has. The token is opaque to the client, which holds up to
+32 bytes, so neither needs a client that knows about it.
+
+The daemon advertises `calls` when its relay is running, not when clients can
+reach it: nothing on the host can tell whether a firewall or platform in front
+of it passes the relay's port. A deployment has to expose that port, pinned with
+`OPENCHIME_AUDIO_PORT`, as it exposes the protocol port.
+
 **Receive.** Demultiplex on `sender_user_id`; drop a packet whose SFrame KID is
 not a key that sender gave, that fails authentication, or that the replay window
 has seen; route audio to that sender's jitter buffer by frame number, and a
@@ -447,5 +474,6 @@ sidesteps echo entirely while held.
 - **Recording.** There is no call recording. It has obvious compliance weight
   (REQ-252), and a recording would have to be made by a
   participant, since nothing else can hear the call (ARCH-113).
-- **IPv6.** The relay listens on IPv4 only, and a client reaches it at the
-  address its TCP connection resolved to.
+- **IPv6.** The relay listens on IPv6 as well as IPv4, but a client sends to it
+  over IPv4 only (§4), so a client with no IPv4 path to the workspace can sign in
+  and cannot be heard.

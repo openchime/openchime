@@ -75,14 +75,18 @@ static void audio_kill(void) {
     g_audio_side = -1;
 }
 
-/* token(16) + seq(u16 BE) + payload -> the relay. */
+/* token + seq(u16 BE) + payload -> the relay. */
+static void udp_send_audio_n(int fd, const struct sockaddr_in *to, const uint8_t *tok, size_t tlen,
+                             uint16_t seq, const char *payload) {
+    uint8_t pkt[128]; size_t pl = payload ? strlen(payload) : 0;
+    memcpy(pkt, tok, tlen);
+    pkt[tlen] = (uint8_t)(seq >> 8); pkt[tlen + 1] = (uint8_t)seq;
+    if (pl) memcpy(pkt + tlen + 2, payload, pl);
+    sendto(fd, pkt, tlen + 2 + pl, 0, (const struct sockaddr *)to, sizeof *to);
+}
 static void udp_send_audio(int fd, const struct sockaddr_in *to, const uint8_t *tok,
                            uint16_t seq, const char *payload) {
-    uint8_t pkt[128]; size_t pl = payload ? strlen(payload) : 0;
-    memcpy(pkt, tok, OC_AUDIO_TOKEN_LEN);
-    pkt[16] = (uint8_t)(seq >> 8); pkt[17] = (uint8_t)seq;
-    if (pl) memcpy(pkt + OC_AUDIO_C2S_HDR, payload, pl);
-    sendto(fd, pkt, OC_AUDIO_C2S_HDR + pl, 0, (const struct sockaddr *)to, sizeof *to);
+    udp_send_audio_n(fd, to, tok, OC_AUDIO_TOKEN_RAND, seq, payload);
 }
 /* Receive a forwarded datagram: sender(u64) seq(u16) payload. -1 on timeout. */
 static int udp_recv_audio(int fd, uint64_t *sender, uint16_t *seq, char *out, size_t cap) {
@@ -2697,20 +2701,20 @@ static void test_call_sidecar_restart(int port, const uint8_t *pin, uint16_t aud
     CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
 
     oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; oc_call_part parts[32];
-    uint8_t atok[OC_AUDIO_TOKEN_LEN], btok[OC_AUDIO_TOKEN_LEN];
+    uint8_t atok[OC_AUDIO_TOKEN_RAND], btok[OC_AUDIO_TOKEN_RAND];
     oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
     oc_call_joined jd;
 
     oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
-    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
     oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
-    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
 
     struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
@@ -2783,7 +2787,7 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
 
     oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; oc_call_part parts[32];
-    uint8_t atok[OC_AUDIO_TOKEN_LEN], btok[OC_AUDIO_TOKEN_LEN];
+    uint8_t atok[OC_AUDIO_TOKEN_RAND], btok[OC_AUDIO_TOKEN_RAND];
 
     /* alice joins -> CALL_JOINED with the real UDP port + a 16-byte token. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -2792,16 +2796,16 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
     oc_call_joined jd; CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
-    CHECK(jd.udp_port == audio_port && jd.token.len == OC_AUDIO_TOKEN_LEN);
-    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    CHECK(jd.udp_port == audio_port && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
 
     /* bob joins -> his own token; alice gets a roster update. */
     oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
-    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
 
     struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
@@ -2828,10 +2832,10 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
      * revoked, so nothing sent with it is relayed any more. */
     CHECK(call_join(&a, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0) == 0);
     CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
-    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
-    uint8_t atok2[OC_AUDIO_TOKEN_LEN];
-    memcpy(atok2, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
-    CHECK(memcmp(atok2, atok, OC_AUDIO_TOKEN_LEN) != 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_RAND);
+    uint8_t atok2[OC_AUDIO_TOKEN_RAND];
+    memcpy(atok2, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
+    CHECK(memcmp(atok2, atok, OC_AUDIO_TOKEN_RAND) != 0);
     udp_send_audio(sa, &relay, atok, 8, "old");
     usleep(80000);
     CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) < 0);
@@ -2863,6 +2867,101 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     close(sa); close(sb);
     client_close(&a);
     client_close(&b);
+}
+
+/* A daemon behind a front door (AUDIO.md §4): CALL_JOINED names the port the
+ * door forwards from, not the one the relay bound, and every token leads with
+ * the routing prefix -- and the relay, which is told each token whole, relays
+ * and sweeps by them as by any other. Its own loop, since both are read from the
+ * environment at startup. */
+static void test_call_routed(int port, uint16_t audio_port) {
+    setenv("OPENCHIME_AUDIO_TOKEN_PREFIX", "0a0b0c", 1);
+    setenv("OPENCHIME_AUDIO_ADVERTISE_PORT", "40001", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    unlink("build/itest_routed.db"); unlink("build/itest_routed.db-wal"); unlink("build/itest_routed.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_routed.db");
+    CHECK(dbw2 != NULL);
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER,  2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw2, "bob",   "pw-bob",   OC_ROLE_MEMBER, 2048) != 0);
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    client a, b;
+    CHECK(client_open(&a, port, pin2) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin2) == 0); CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    enum { TLEN = 3 + OC_AUDIO_TOKEN_RAND };
+    static const uint8_t PREFIX[3] = { 0x0a, 0x0b, 0x0c };
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_joined jd;
+    uint8_t atok[TLEN], btok[TLEN];
+    CHECK(call_join(&a, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    CHECK(jd.udp_port == 40001 && jd.token.len == TLEN && memcmp(jd.token.ptr, PREFIX, 3) == 0);
+    if (jd.token.len == TLEN) memcpy(atok, jd.token.ptr, TLEN);
+    CHECK(call_join(&b, OC_DEFAULT_CHANNEL, 0xB2, NULL, 0) == 0);
+    CHECK(read_type(&b, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    CHECK(jd.udp_port == 40001 && jd.token.len == TLEN && memcmp(jd.token.ptr, PREFIX, 3) == 0);
+    if (jd.token.len == TLEN) memcpy(btok, jd.token.ptr, TLEN);
+    CHECK(memcmp(atok + 3, btok + 3, OC_AUDIO_TOKEN_RAND) != 0);
+
+    /* The door is not in this test: packets go to the port the relay bound. */
+    struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
+    relay.sin_family = AF_INET; relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = htons(audio_port);
+    int sa = mk_udp_client(), sb = mk_udp_client();
+    uint64_t sender; uint16_t seq; char body[64];
+    int n = -1;
+    for (int i = 0; i < 10 && n != 6; i++) {
+        udp_send_audio_n(sb, &relay, btok, TLEN, 0, NULL);
+        udp_send_audio_n(sa, &relay, atok, TLEN, 5, "routed");
+        while ((n = udp_recv_audio(sb, &sender, &seq, body, sizeof body)) == 0) {}
+    }
+    CHECK(n == 6 && sender == ua && seq == 5 && memcmp(body, "routed", 6) == 0);
+
+    /* alice rejoins: the revoke the daemon sends names her old token whole, so
+     * nothing sent with it is relayed any more, and the new one is. (The relay's
+     * GONE is read by the main loop, which holds none of these connections;
+     * test_audio sees a prefixed token come back whole in one.) */
+    CHECK(call_join(&a, OC_DEFAULT_CHANNEL, 0xA1, NULL, 0) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == TLEN);
+    uint8_t atok2[TLEN];
+    if (jd.token.len == TLEN) memcpy(atok2, jd.token.ptr, TLEN);
+    usleep(100000);
+    while (udp_recv_audio(sb, &sender, &seq, body, sizeof body) >= 0) {}
+    udp_send_audio_n(sa, &relay, atok, TLEN, 6, "old");
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) < 0);
+    n = -1;
+    for (int i = 0; i < 10 && n != 3; i++) {
+        udp_send_audio_n(sa, &relay, atok2, TLEN, 7, "new");
+        while ((n = udp_recv_audio(sb, &sender, &seq, body, sizeof body)) == 0) {}
+    }
+    CHECK(n == 3 && sender == ua && seq == 7 && memcmp(body, "new", 3) == 0);
+
+    (void)ub;
+    close(sa); close(sb);
+    client_close(&a);
+    client_close(&b);
+    arg2.stop = 1;
+    pthread_join(th2, NULL);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    /* Put the shared configuration back: the main loop reads it too. */
+    unsetenv("OPENCHIME_AUDIO_TOKEN_PREFIX");
+    unsetenv("OPENCHIME_AUDIO_ADVERTISE_PORT");
+    char cfgerr[128];
+    oc_config_load(cfgerr, sizeof cfgerr);
+    unlink("build/itest_routed.db"); unlink("build/itest_routed.db-wal"); unlink("build/itest_routed.db-shm");
 }
 
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
@@ -3606,6 +3705,7 @@ int run_netloop_tests(void) {
         test_call_vertical(arg.port, pin);
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
+        test_call_routed(arg.port + 126, audio_port);
         test_call_sidecar_restart(arg.port, pin, audio_port);   /* last call test: leaves calls refused */
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);

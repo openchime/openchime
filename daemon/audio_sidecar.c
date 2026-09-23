@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,16 +21,27 @@
 
 typedef struct {
     int      used;
-    uint8_t  token[OC_AUDIO_TOKEN_LEN];
+    uint8_t  token[OC_AUDIO_TOKEN_MAX];
+    size_t   token_len;
     uint64_t call_id;
     uint64_t user_id;
-    struct sockaddr_in addr;   /* learned from the first UDP packet */
+    struct sockaddr_storage addr;   /* learned from the first UDP packet */
+    socklen_t addr_len;
     int      addr_known;
+    /* The address that first packet was sent TO, which every packet to this
+     * participant is sent FROM. A host can have several, and a reply from any
+     * other is one the client's NAT, or a platform's UDP edge, discards: Fly
+     * delivers public UDP to a `fly-global-services` address and drops a reply
+     * from the machine's own. */
+    struct in6_pktinfo local6;
+    struct in_pktinfo  local4;
+    int      local_known;
     uint64_t last_seen_ms;
 } participant;
 
 static participant g_parts[OC_AUDIO_MAX_PARTS];
 static uint64_t g_silence_ms = OC_AUDIO_SILENCE_MS;
+static int g_family;   /* the UDP socket's, which decides the control messages */
 
 void oc_audio_sidecar_set_silence_ms(uint64_t ms) { g_silence_ms = ms ? ms : OC_AUDIO_SILENCE_MS; }
 
@@ -45,30 +57,40 @@ static void wr_u64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8 * i));
 }
 
-static participant *find_by_token(const uint8_t *token) {
+/* The participant whose token is `token` exactly (IPC), or leads `pkt` (UDP:
+ * the token is followed by at least a seq). */
+static participant *find_by_token(const uint8_t *token, size_t len) {
     for (int i = 0; i < OC_AUDIO_MAX_PARTS; i++)
-        if (g_parts[i].used && memcmp(g_parts[i].token, token, OC_AUDIO_TOKEN_LEN) == 0)
+        if (g_parts[i].used && g_parts[i].token_len == len && memcmp(g_parts[i].token, token, len) == 0)
+            return &g_parts[i];
+    return NULL;
+}
+static participant *find_by_packet(const uint8_t *pkt, size_t n) {
+    for (int i = 0; i < OC_AUDIO_MAX_PARTS; i++)
+        if (g_parts[i].used && n >= g_parts[i].token_len + 2 &&
+            memcmp(g_parts[i].token, pkt, g_parts[i].token_len) == 0)
             return &g_parts[i];
     return NULL;
 }
 
-static void authorize(uint64_t call_id, uint64_t user_id, const uint8_t *token) {
-    participant *e = find_by_token(token);
+static void authorize(uint64_t call_id, uint64_t user_id, const uint8_t *token, size_t len) {
+    participant *e = find_by_token(token, len);
     if (!e) {
         for (int i = 0; i < OC_AUDIO_MAX_PARTS; i++)
             if (!g_parts[i].used) { e = &g_parts[i]; break; }
         if (!e) return;   /* table full */
         memset(e, 0, sizeof *e);
         e->used = 1;
-        memcpy(e->token, token, OC_AUDIO_TOKEN_LEN);
+        memcpy(e->token, token, len);
+        e->token_len = len;
     }
     e->call_id = call_id;
     e->user_id = user_id;
     e->last_seen_ms = now_ms();
 }
 
-static void revoke_token(const uint8_t *token) {
-    participant *e = find_by_token(token);
+static void revoke_token(const uint8_t *token, size_t len) {
+    participant *e = find_by_token(token, len);
     if (e) e->used = 0;
 }
 
@@ -78,10 +100,10 @@ static void apply_ipc(const uint8_t *msg, size_t len) {
     if (len < 1) return;
     uint8_t type = msg[0];
     const uint8_t *b = msg + 1; size_t n = len - 1;
-    if (type == OC_AUDIO_IPC_AUTHORIZE && n == 16 + OC_AUDIO_TOKEN_LEN) {
-        authorize(rd_u64(b), rd_u64(b + 8), b + 16);
-    } else if (type == OC_AUDIO_IPC_REVOKE && n == OC_AUDIO_TOKEN_LEN) {
-        revoke_token(b);
+    if (type == OC_AUDIO_IPC_AUTHORIZE && n >= 16 + OC_AUDIO_TOKEN_RAND && n - 16 <= OC_AUDIO_TOKEN_MAX) {
+        authorize(rd_u64(b), rd_u64(b + 8), b + 16, n - 16);
+    } else if (type == OC_AUDIO_IPC_REVOKE && n > 0 && n <= OC_AUDIO_TOKEN_MAX) {
+        revoke_token(b, n);
     }
 }
 
@@ -109,16 +131,72 @@ static int on_ipc(int ipc_fd, uint8_t *buf, size_t *have, size_t cap) {
 
 /* --- UDP: relay one datagram to the sender's call-mates ------------------- */
 
+static int same_peer(const participant *e, const struct sockaddr_storage *src, socklen_t sl) {
+    if (e->addr_len != sl || e->addr.ss_family != src->ss_family) return 0;
+    if (src->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const void *)&e->addr, *b = (const void *)src;
+        return a->sin6_port == b->sin6_port &&
+               memcmp(&a->sin6_addr, &b->sin6_addr, sizeof a->sin6_addr) == 0;
+    }
+    const struct sockaddr_in *a = (const void *)&e->addr, *b = (const void *)src;
+    return a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr;
+}
+
+/* Send `len` bytes to `to` from the address its packets arrive at. */
+static void send_to(int udp_fd, const participant *to, const uint8_t *buf, size_t len) {
+    struct iovec iov = { (void *)buf, len };
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_name = (void *)&to->addr;
+    mh.msg_namelen = to->addr_len;
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    union { struct cmsghdr h; uint8_t b[CMSG_SPACE(sizeof(struct in6_pktinfo))]; } ctl;
+    if (to->local_known) {
+        memset(&ctl, 0, sizeof ctl);
+        mh.msg_control = ctl.b;
+        struct cmsghdr *cm = &ctl.h;
+        if (g_family == AF_INET6) {
+            /* On a dual-stack socket this carries an IPv4-mapped address for an
+             * IPv4 peer, which Linux applies as the IPv4 source. The interface
+             * is left to routing; only the address is pinned. */
+            struct in6_pktinfo pi = to->local6;
+            pi.ipi6_ifindex = 0;
+            mh.msg_controllen = CMSG_SPACE(sizeof pi);
+            cm->cmsg_level = IPPROTO_IPV6; cm->cmsg_type = IPV6_PKTINFO;
+            cm->cmsg_len = CMSG_LEN(sizeof pi);
+            memcpy(CMSG_DATA(cm), &pi, sizeof pi);
+        } else {
+            struct in_pktinfo pi;
+            memset(&pi, 0, sizeof pi);
+            pi.ipi_spec_dst = to->local4.ipi_addr;
+            mh.msg_controllen = CMSG_SPACE(sizeof pi);
+            cm->cmsg_level = IPPROTO_IP; cm->cmsg_type = IP_PKTINFO;
+            cm->cmsg_len = CMSG_LEN(sizeof pi);
+            memcpy(CMSG_DATA(cm), &pi, sizeof pi);
+        }
+    }
+    sendmsg(udp_fd, &mh, 0);
+}
+
 /* Returns 0 once the socket is drained. */
 static int on_udp(int udp_fd) {
     uint8_t pkt[OC_AUDIO_MAX_PACKET];
-    struct sockaddr_in src; socklen_t sl = sizeof src;
-    ssize_t n = recvfrom(udp_fd, pkt, sizeof pkt, 0, (struct sockaddr *)&src, &sl);
+    struct sockaddr_storage src;
+    struct iovec iov = { pkt, sizeof pkt };
+    union { struct cmsghdr h; uint8_t b[CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+                                        CMSG_SPACE(sizeof(struct in_pktinfo))]; } ctl;
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_name = &src; mh.msg_namelen = sizeof src;
+    mh.msg_iov = &iov; mh.msg_iovlen = 1;
+    mh.msg_control = ctl.b; mh.msg_controllen = sizeof ctl.b;
+    ssize_t n = recvmsg(udp_fd, &mh, 0);
     if (n < 0) return 0;
-    if (n < (ssize_t)OC_AUDIO_C2S_HDR) return 1; /* too short to be a valid packet */
+    socklen_t sl = mh.msg_namelen;
 
-    participant *me = find_by_token(pkt);        /* token is the first 16 bytes */
-    if (!me) return 1;                           /* unknown/revoked token -> ignore */
+    participant *me = find_by_packet(pkt, (size_t)n);   /* token leads the packet */
+    if (!me) return 1;                           /* unknown/revoked token, or too short */
     /* The address is bound on first use and never re-learned. The token is not a
      * secret on the wire: it leads every packet in the clear,
      * so re-learning the return address from whichever packet arrived last let
@@ -131,18 +209,29 @@ static int on_udp(int udp_fd) {
      * the silence sweep drops them, and they rejoin with CALL_JOIN, which issues
      * a fresh token over the authenticated TCP connection (REQ-152). */
     if (!me->addr_known) {
-        me->addr = src;
+        memcpy(&me->addr, &src, sl);
+        me->addr_len = sl;
         me->addr_known = 1;
-    } else if (me->addr.sin_addr.s_addr != src.sin_addr.s_addr || me->addr.sin_port != src.sin_port) {
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+            if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_PKTINFO) {
+                memcpy(&me->local6, CMSG_DATA(cm), sizeof me->local6);
+                me->local_known = 1;
+            } else if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO) {
+                memcpy(&me->local4, CMSG_DATA(cm), sizeof me->local4);
+                me->local_known = 1;
+            }
+        }
+    } else if (!same_peer(me, &src, sl)) {
         return 1;
     }
     me->last_seen_ms = now_ms();
 
-    const uint8_t *seq = pkt + OC_AUDIO_TOKEN_LEN;         /* 2 bytes */
-    const uint8_t *payload = pkt + OC_AUDIO_C2S_HDR;
-    size_t plen = (size_t)n - OC_AUDIO_C2S_HDR;
+    const uint8_t *seq = pkt + me->token_len;               /* 2 bytes */
+    const uint8_t *payload = seq + 2;
+    size_t plen = (size_t)n - me->token_len - 2;
 
-    /* Build the forwarded datagram: sender_user_id + seq + payload. */
+    /* Build the forwarded datagram: sender_user_id + seq + payload. It is never
+     * longer than what came in, since a token is longer than a user id. */
     uint8_t out[OC_AUDIO_MAX_PACKET];
     wr_u64(out, me->user_id);
     out[8] = seq[0]; out[9] = seq[1];
@@ -152,7 +241,7 @@ static int on_udp(int udp_fd) {
     for (int i = 0; i < OC_AUDIO_MAX_PARTS; i++) {
         participant *e = &g_parts[i];
         if (!e->used || e == me || e->call_id != me->call_id || !e->addr_known) continue;
-        sendto(udp_fd, out, olen, 0, (struct sockaddr *)&e->addr, sizeof e->addr);
+        send_to(udp_fd, e, out, olen);
     }
     return 1;
 }
@@ -165,13 +254,13 @@ static void sweep_silent(int ipc_fd) {
     for (int i = 0; i < OC_AUDIO_MAX_PARTS; i++)
         if (g_parts[i].used && now - g_parts[i].last_seen_ms > g_silence_ms) {
             g_parts[i].used = 0;
-            uint8_t m[5 + OC_AUDIO_TOKEN_LEN];
-            uint32_t mlen = 1 + OC_AUDIO_TOKEN_LEN;
+            uint8_t m[5 + OC_AUDIO_TOKEN_MAX];
+            uint32_t mlen = (uint32_t)(1 + g_parts[i].token_len);
             m[0] = (uint8_t)(mlen >> 24); m[1] = (uint8_t)(mlen >> 16);
             m[2] = (uint8_t)(mlen >> 8);  m[3] = (uint8_t)mlen;
             m[4] = OC_AUDIO_IPC_GONE;
-            memcpy(m + 5, g_parts[i].token, OC_AUDIO_TOKEN_LEN);
-            ssize_t n = write(ipc_fd, m, sizeof m); (void)n;
+            memcpy(m + 5, g_parts[i].token, g_parts[i].token_len);
+            ssize_t n = write(ipc_fd, m, 4 + mlen); (void)n;
         }
 }
 
@@ -187,6 +276,12 @@ int oc_audio_sidecar_run(int ipc_fd, int udp_fd, volatile sig_atomic_t *stop) {
     int bufsz = 4 << 20;
     setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz);
     setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz);
+    /* Learn the address each packet was sent to, so the answer comes from it. */
+    struct sockaddr_storage self; socklen_t self_len = sizeof self;
+    g_family = getsockname(udp_fd, (struct sockaddr *)&self, &self_len) == 0 ? self.ss_family : AF_INET;
+    int on = 1;
+    if (g_family == AF_INET6) setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof on);
+    else setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &on, sizeof on);
     int ep = epoll_create1(0);
     if (ep < 0) return -1;
     struct epoll_event ev;

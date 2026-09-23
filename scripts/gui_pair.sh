@@ -101,9 +101,8 @@ up)
     # silently and both clients came up as the same person.
     #
     # Naming the host differently instead does NOT work, and it is worth
-    # recording why: "localhost" resolves to ::1 on Windows and the daemon is
-    # IPv4, and no other 127.x address reaches it at all, because the daemon
-    # runs under WSL and WSL forwards only 127.0.0.1.
+    # recording why: no 127.x address but 127.0.0.1 reaches it at all, because
+    # the daemon runs under WSL and WSL forwards only 127.0.0.1.
     powershell.exe -NoProfile -Command "cmdkey /delete:openchime:${host}:${PORT}" \
       >/dev/null 2>&1 || true
 

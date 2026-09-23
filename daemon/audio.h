@@ -11,27 +11,37 @@
  * ciphertext whose keys only the participants' devices hold (ARCH-113). The daemon drives it over a Unix-domain
  * socket (authorize/revoke tokens); clients speak to it directly over UDP. */
 
-/* Per-join bearer token that identifies (call, participant) to the sidecar. */
-#define OC_AUDIO_TOKEN_LEN   16u
+/* Per-join bearer token that identifies (call, participant) to the sidecar:
+ * OPENCHIME_AUDIO_TOKEN_PREFIX, the same for every token this daemon issues and
+ * there for a front door to route by, then OC_AUDIO_TOKEN_RAND random bytes.
+ * Every token one daemon issues has the one length; the sidecar takes it from
+ * AUTHORIZE. A client holds up to OC_AUDIO_TOKEN_MAX. */
+#define OC_AUDIO_TOKEN_RAND   16u
+#define OC_AUDIO_PREFIX_MAX   16u
+#define OC_AUDIO_TOKEN_MAX    (OC_AUDIO_PREFIX_MAX + OC_AUDIO_TOKEN_RAND)
 
 /* IPC framing, both ways: u32 length (of type+payload, big-endian) then a u8
- * type then the payload.
+ * type then the payload. A token is the rest of the message after its fixed
+ * fields.
  *   daemon -> sidecar
- *     AUTHORIZE : call_id(u64) user_id(u64) token(16)  -- register a participant
- *     REVOKE    : token(16)                            -- drop a participant
+ *     AUTHORIZE : call_id(u64) user_id(u64) token  -- register a participant
+ *     REVOKE    : token                            -- drop a participant
  *   sidecar -> daemon
- *     GONE      : token(16)   -- the silence sweep dropped this participant, so
- *                                the daemon takes it out of the call too */
+ *     GONE      : token   -- the silence sweep dropped this participant, so the
+ *                            daemon takes it out of the call too */
 enum { OC_AUDIO_IPC_AUTHORIZE = 1, OC_AUDIO_IPC_REVOKE = 2, OC_AUDIO_IPC_GONE = 3 };
 
 /* UDP wire format.
- *   client -> sidecar : token(16) seq(u16 BE) payload...
+ *   client -> sidecar : token seq(u16 BE) payload...
  *   sidecar -> client : sender_user_id(u64 BE) seq(u16 BE) payload...
  * A client sends an initial packet (empty payload allowed) so the sidecar learns
- * its UDP source address before anyone speaks to it. */
-#define OC_AUDIO_C2S_HDR   (OC_AUDIO_TOKEN_LEN + 2u)   /* token + seq */
+ * its UDP source address before anyone speaks to it. The sidecar answers each
+ * participant from the address that participant's packets arrived at, which on a
+ * host with several is not the one the kernel would pick. */
 #define OC_AUDIO_S2C_HDR   (8u + 2u)                   /* sender id + seq */
-#define OC_AUDIO_MAX_PACKET 1400u                      /* one UDP datagram, sub-MTU */
+/* One UDP datagram. 1,300 bytes: what a hosting platform's UDP path is
+ * documented to carry, below the 1,380 measured through one (AUDIO.md §4). */
+#define OC_AUDIO_MAX_PACKET 1300u
 
 /* Drop a participant that has sent no UDP packet in this long (REQ-152 media-side
  * mirror; the daemon also revokes on TCP disconnect), and report it GONE. A client
