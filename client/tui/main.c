@@ -1412,6 +1412,7 @@ static int form_probe(login_form *f, char *inl, size_t cap) {
     oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
     if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, cap, "invalid workspace '%s'", f->workspace); return 0; }
     if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found — does not resolve in DNS", f->workspace); return 0; }
+    if (st == OC_RESOLVE_BAD_METADATA) { snprintf(inl, cap, "'%s' publishes discovery metadata that is not valid", f->workspace); return 0; }
     int n = oc_net_probe(f->ep.domain, f->ep.host, f->ep.port, f->src, (int)(sizeof f->src / sizeof f->src[0]));
     if (n == OC_PROBE_VERSION) { snprintf(inl, cap, "this app and that server are different versions"); return 0; }
     if (n <= 0)                { snprintf(inl, cap, "could not reach %.120s", f->ep.host); return 0; }
@@ -1765,6 +1766,7 @@ int main(int argc, char **argv) {
         oc_resolve_status st = oc_resolve(inst, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
         if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found — it does not resolve in DNS\n", inst); return 3; }
+        if (st == OC_RESOLVE_BAD_METADATA) { fprintf(stderr, "openchime: workspace '%s' publishes discovery metadata that is not valid\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;
         if (oc_workspace_key(inst, oc_default_suffix(), key0, sizeof key0) != 0)

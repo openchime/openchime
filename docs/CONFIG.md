@@ -119,6 +119,7 @@ fail, bounded and silent.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENCHIME_UNFURL_CA_BUNDLE` | *(system)* | CA bundle for the fetcher's HTTPS client — the fourth CA consumer beside S3, enrollment and push (ARCH-10). |
+| `OPENCHIME_WELLKNOWN_CA_BUNDLE` | *(system)* | Client. CA bundle for the `.well-known` discovery fetch (REQ-010, ARCH-10). Unset probes the usual system locations, which exist on Linux and the BSDs; Windows has none, so a client there consults the metadata only when this names a bundle. Without one the fetch is refused rather than made unverified, and resolution falls back to 443. |
 
 ## Audio
 
