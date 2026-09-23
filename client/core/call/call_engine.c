@@ -28,7 +28,10 @@
 #define RETIRE_MS    5000      /* an old key is kept this long after its successor is used */
 #define MAX_PEERS    32
 #define MAX_RXKEYS   (MAX_PEERS * 3)
-#define PACKET_MAX   1400
+/* The relay's ceiling (AUDIO.md §4): what a hosting platform's UDP path carries.
+ * A token is the relay's to choose, up to TOKEN_MAX, and opaque here. */
+#define PACKET_MAX   1300
+#define TOKEN_MAX    32
 #define SPEAK_LEVEL  900       /* peak above which a frame is someone talking */
 #define SPEAK_HOLD   300
 #define S2C_HDR      10        /* sender(u64) seq(u16): the relay's framing (AUDIO.md §1.1) */
@@ -36,6 +39,11 @@
  * every second while muted, inside the encryption, so the others can show it
  * and the daemon cannot see it. */
 #define MUTED_HOLD   2500
+
+/* The largest packet there is -- a shared screen's fragment, sealed, behind the
+ * longest token -- fits, or send_raw would drop every one of them. */
+_Static_assert(TOKEN_MAX + 2 + OC_SFRAME_OVERHEAD + OC_SHARE_MAX_PT <= PACKET_MAX,
+               "a share fragment must fit one relay packet");
 
 static void nap(int ms) {
 #ifdef _WIN32
@@ -85,7 +93,7 @@ struct oc_call_engine {
     oc_thread_t th_io, th_cap, th_play;
     int         sock;
     struct sockaddr_in relay;
-    uint8_t     token[32];
+    uint8_t     token[TOKEN_MAX];
     size_t      token_len;
     uint64_t    self_user;
     uint8_t     slot;
@@ -779,7 +787,7 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     oc_sock_startup();
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;                  /* the relay is IPv4 (AUDIO.md §4) */
+    hints.ai_family = AF_INET;                  /* UDP is reached over IPv4 (AUDIO.md §4) */
     hints.ai_socktype = SOCK_DGRAM;
     if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
     memcpy(&e->relay, res->ai_addr, sizeof e->relay);

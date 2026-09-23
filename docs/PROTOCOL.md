@@ -2117,9 +2117,12 @@ that has exited and could not be restarted refuses the join with
 u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
 started_at: u64, n: u16, n × participant }`, where a participant is `{ user_id:
 u64, slot: u8, device_key: 32 bytes, codecs: u8 }` — the joiner's private media endpoint
-(the relay's `udp_port` and a 16-byte bearer `token`), its slot, and the call as
-it stands. The client then speaks UDP directly to the relay:
-`token(16) ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
+(the relay's `udp_port` and a bearer `token`), its slot, and the call as
+it stands. The token is opaque to the client and 16 to 32 bytes long: 16 random
+bytes behind the daemon's `OPENCHIME_AUDIO_TOKEN_PREFIX`, if one is set, and
+`udp_port` is `OPENCHIME_AUDIO_ADVERTISE_PORT` where that is set (AUDIO.md §4).
+The client then speaks UDP directly to the relay, over IPv4, at the host it
+connected to: `token ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
 payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
 ciphertext (CALLS.md §5.4); an empty one is a keep-alive.
 

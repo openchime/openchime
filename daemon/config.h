@@ -46,6 +46,12 @@ typedef struct {
     /* Paths + ports. */
     const char *db_path, *tls_cert, *tls_key;
     int health_port, proto_port, audio_port;
+    /* The audio relay as clients reach it, where that differs from the socket
+     * (AUDIO.md §4): the UDP port CALL_JOINED names (0: the bound one), and the
+     * bytes that lead every relay token so a front door can route by them. */
+    int audio_advertise_port;
+    uint8_t audio_token_prefix[16];
+    size_t  audio_token_prefix_len;
 
     /* Limits / tuning. */
     int      max_users;             /* 0 = unlimited */

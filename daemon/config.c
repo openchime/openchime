@@ -4,6 +4,7 @@
 #include "proxyproto.h"
 #include "protocol.h"   /* OC_MAX_ATTACHMENT_SIZE */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,38 @@ int oc_config_load(char *err, size_t errcap) {
     c->health_port = env_int("OPENCHIME_HEALTH_PORT", NULL, 8080);
     c->proto_port  = env_int("OPENCHIME_PROTO_PORT",  NULL, 8443);
     c->audio_port  = env_int("OPENCHIME_AUDIO_PORT",  NULL, 0);   /* 0 = ephemeral */
+    if (c->audio_port < 0 || c->audio_port > 65535) {
+        snprintf(err, errcap, "OPENCHIME_AUDIO_PORT=%d is not a port", c->audio_port);
+        return -1;
+    }
+    /* Off unless set, so a daemon that is reached directly advertises exactly
+     * what it bound, as it always has. A value that cannot be read stops the
+     * boot: read wrongly, every call starts and nobody hears anything. */
+    c->audio_advertise_port = env_int("OPENCHIME_AUDIO_ADVERTISE_PORT", NULL, 0);
+    if (c->audio_advertise_port < 0 || c->audio_advertise_port > 65535) {
+        snprintf(err, errcap, "OPENCHIME_AUDIO_ADVERTISE_PORT=%d is not a port",
+                 c->audio_advertise_port);
+        return -1;
+    }
+    {
+        const char *hex = getenv("OPENCHIME_AUDIO_TOKEN_PREFIX");
+        size_t n = hex ? strlen(hex) : 0;
+        if (n % 2 || n / 2 > sizeof c->audio_token_prefix) {
+            snprintf(err, errcap, "OPENCHIME_AUDIO_TOKEN_PREFIX must be an even number of hex "
+                     "digits, at most %zu bytes", sizeof c->audio_token_prefix);
+            return -1;
+        }
+        for (size_t i = 0; i < n; i += 2) {
+            unsigned v;
+            if (!isxdigit((unsigned char)hex[i]) || !isxdigit((unsigned char)hex[i + 1]) ||
+                sscanf(hex + i, "%2x", &v) != 1) {
+                snprintf(err, errcap, "OPENCHIME_AUDIO_TOKEN_PREFIX='%s' is not hex", hex);
+                return -1;
+            }
+            c->audio_token_prefix[i / 2] = (uint8_t)v;
+        }
+        c->audio_token_prefix_len = n / 2;
+    }
 
     /* Limits / tuning. */
     c->max_users       = env_int("OPENCHIME_MAX_USERS", NULL, 0);

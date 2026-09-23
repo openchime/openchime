@@ -15,6 +15,7 @@
 #include "config.h"
 #include "dbwriter.h"
 #include "enroll.h"
+#include "listen.h"
 #include "netloop.h"
 #include "push.h"
 #include "unfurl.h"
@@ -29,6 +30,7 @@
 #endif
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -160,19 +162,14 @@ static int path_is(const char *req, size_t len, const char *want) {
 
 static void *health_thread(void *arg) {
     int port = *(int *)arg;
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("openchimed: healthz socket"); return NULL; }
-    int yes = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
-        listen(listen_fd, 16) < 0) {
-        perror("openchimed: healthz bind/listen");
+    const char *op = "socket";
+    int listen_fd = oc_listen_bind(SOCK_STREAM, port, &op);
+    if (listen_fd < 0) {
+        fprintf(stderr, "openchimed: healthz %s: %s\n", op, strerror(errno));
+        return NULL;
+    }
+    if (listen(listen_fd, 16) < 0) {
+        perror("openchimed: healthz listen");
         close(listen_fd);
         return NULL;
     }
@@ -622,14 +619,14 @@ int main(int argc, char **argv) {
      * its IPC end (EOF); a fork failure just disables media (calls still form). */
     {
         int uport = cfg->audio_port;   /* 0 = ephemeral */
-        int udp = socket(AF_INET, SOCK_DGRAM, 0);
-        struct sockaddr_in ua; memset(&ua, 0, sizeof ua);
-        ua.sin_family = AF_INET; ua.sin_addr.s_addr = htonl(INADDR_ANY);
-        ua.sin_port = htons((uint16_t)uport);
-        if (udp >= 0 && bind(udp, (struct sockaddr *)&ua, sizeof ua) == 0) {
-            socklen_t sl = sizeof ua; getsockname(udp, (struct sockaddr *)&ua, &sl);
+        const char *op = "socket";
+        int udp = oc_listen_bind(SOCK_DGRAM, uport, &op);
+        if (udp >= 0) {
+            struct sockaddr_storage ua; socklen_t sl = sizeof ua;
+            getsockname(udp, (struct sockaddr *)&ua, &sl);
             g_audio_udp = udp;
-            g_audio_port = ntohs(ua.sin_port);
+            g_audio_port = ntohs(ua.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&ua)->sin6_port
+                                                         : ((struct sockaddr_in *)&ua)->sin_port);
             struct rlimit rl;
             if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
                 g_audio_maxfd = rl.rlim_cur > 65536 ? 65536 : (long)rl.rlim_cur;
@@ -638,7 +635,10 @@ int main(int argc, char **argv) {
                 oc_netloop_set_audio(ipc, g_audio_port);
                 oc_netloop_set_audio_respawn(audio_sidecar_spawn, NULL);
             }
-        } else if (udp >= 0) { close(udp); }
+        } else {
+            fprintf(stderr, "openchimed: audio relay %s on UDP :%d: %s; calls are off\n",
+                    op, uport, strerror(errno));
+        }
     }
 
     /* Serve the binary protocol until a shutdown signal. */

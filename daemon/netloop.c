@@ -24,6 +24,7 @@
 #include "http.h"
 #include "protocol.h"
 #include "ratelimit.h"
+#include "listen.h"
 #include "proxyproto.h"
 
 #include <mbedtls/sha256.h>
@@ -609,7 +610,7 @@ static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
 typedef struct {
     uint64_t user_id, conn_id;
     uint8_t  slot;
-    uint8_t  token[OC_AUDIO_TOKEN_LEN];
+    uint8_t  token[OC_AUDIO_TOKEN_MAX];   /* audio_token_len() of it */
     uint8_t  device_key[OC_CALL_DEVICE_KEY_LEN];
     uint8_t  codecs;               /* the video codecs it can decode (ARCH-87) */
 } call_part;
@@ -737,16 +738,28 @@ static void audio_ipc_send(uint8_t type, const uint8_t *payload, size_t plen) {
     ssize_t n = write(g_audio_ipc, buf, 5 + plen); (void)n;   /* best-effort */
 }
 
+/* Every token this daemon issues: OPENCHIME_AUDIO_TOKEN_PREFIX, then random. */
+static size_t audio_token_len(void) {
+    return oc_config_get()->audio_token_prefix_len + OC_AUDIO_TOKEN_RAND;
+}
+
+/* The UDP port CALL_JOINED names: the one a front door forwards from, where it
+ * is not the one bound. */
+static uint16_t audio_advertised_port(void) {
+    int adv = oc_config_get()->audio_advertise_port;
+    return adv > 0 ? (uint16_t)adv : g_audio_udp_port;
+}
+
 static void audio_authorize(uint64_t call_id, uint64_t user_id, const uint8_t *token) {
-    uint8_t p[16 + OC_AUDIO_TOKEN_LEN];
+    uint8_t p[16 + OC_AUDIO_TOKEN_MAX];
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(call_id >> (56 - 8 * i));
     for (int i = 0; i < 8; i++) p[8 + i] = (uint8_t)(user_id >> (56 - 8 * i));
-    memcpy(p + 16, token, OC_AUDIO_TOKEN_LEN);
-    audio_ipc_send(OC_AUDIO_IPC_AUTHORIZE, p, sizeof p);
+    memcpy(p + 16, token, audio_token_len());
+    audio_ipc_send(OC_AUDIO_IPC_AUTHORIZE, p, 16 + audio_token_len());
 }
 
 static void audio_revoke(const uint8_t *token) {
-    audio_ipc_send(OC_AUDIO_IPC_REVOKE, token, OC_AUDIO_TOKEN_LEN);
+    audio_ipc_send(OC_AUDIO_IPC_REVOKE, token, audio_token_len());
 }
 
 /* The sidecar's IPC socket lost its other end: the sidecar has exited. Restart
@@ -819,7 +832,7 @@ static void audio_ipc_readable(int ep, conn **conns) {
             if (mlen == 0 || mlen > sizeof buf - 4) { off = have; break; }   /* bad framing: drop */
             if (have - off - 4 < mlen) break;
             const uint8_t *m = buf + off + 4;
-            if (m[0] == OC_AUDIO_IPC_GONE && mlen == 1 + OC_AUDIO_TOKEN_LEN)
+            if (m[0] == OC_AUDIO_IPC_GONE && mlen == 1 + audio_token_len())
                 call_drop_token(ep, conns, m + 1);
             off += 4 + mlen;
         }
@@ -1040,7 +1053,7 @@ static void call_drop_token(int ep, conn **conns, const uint8_t *token) {
         call_t *c = &g_calls[i];
         if (!c->channel_id) continue;
         for (int k = 0; k < c->n; k++)
-            if (memcmp(c->parts[k].token, token, OC_AUDIO_TOKEN_LEN) == 0) {
+            if (memcmp(c->parts[k].token, token, audio_token_len()) == 0) {
                 call_drop(ep, conns, c, k);
                 return;
             }
@@ -5001,8 +5014,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             break;
         }
         call_take_members(c, r);
-        uint8_t token[OC_AUDIO_TOKEN_LEN];
-        if (oc_rand_bytes(token, sizeof token) != 0) {
+        uint8_t token[OC_AUDIO_TOKEN_MAX];
+        const oc_config *acfg = oc_config_get();
+        memcpy(token, acfg->audio_token_prefix, acfg->audio_token_prefix_len);
+        if (oc_rand_bytes(token + acfg->audio_token_prefix_len, OC_AUDIO_TOKEN_RAND) != 0) {
             if (starting) { c->channel_id = 0; free(c->members); c->members = NULL; }
             else if (c->n == 0) call_finish(ep, conns, c);
             send_call_error(ep, jc, OC_ERR_INTERNAL, "no randomness");
@@ -5013,7 +5028,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         pt->user_id = jc->user_id;
         pt->conn_id = jc->conn_id;
         pt->slot = call_free_slot(c);
-        memcpy(pt->token, token, sizeof token);
+        memcpy(pt->token, token, audio_token_len());
         memcpy(pt->device_key, r->call_key, OC_CALL_DEVICE_KEY_LEN);
         pt->codecs = r->call_codecs;
         c->n++;
@@ -5039,7 +5054,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         audio_authorize(c->channel_id, pt->user_id, token);
         oc_call_part parts[OC_MAX_CALL_PARTICIPANTS];
         call_fill_parts(c, parts);
-        oc_call_joined jd = { c->channel_id, c->call_id, g_audio_udp_port, { token, OC_AUDIO_TOKEN_LEN },
+        oc_call_joined jd = { c->channel_id, c->call_id, audio_advertised_port(), { token, audio_token_len() },
                               pt->slot, c->epoch, c->starter, c->started_at, (uint16_t)c->n, parts };
         uint8_t buf[2048];
         oc_wbuf jw; oc_wbuf_init(&jw, buf, sizeof buf);
@@ -5556,23 +5571,19 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
     if (!conns) { NETLOOP_FAIL("allocating the connection table"); return -1; }
 
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) { NETLOOP_FAIL("socket"); free(conns); return -1; }
-    int yes = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-    /* Named separately: "bind" on the proto port is the one an operator can act
-     * on — the port is taken, or is privileged and the unit lacks
-     * CAP_NET_BIND_SERVICE (ARCH-54) — and lumping three calls under one
-     * message would hide which. */
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        fprintf(stderr, "openchimed: cannot start: bind port %d: %s\n",
-                port, strerror(errno));
-        close(lfd); free(conns); return -1;
+    /* IPv6 and IPv4 on the one socket (listen.h). Named separately: "bind" on
+     * the proto port is the one an operator can act on — the port is taken, or
+     * is privileged and the unit lacks CAP_NET_BIND_SERVICE (ARCH-54) — and
+     * lumping three calls under one message would hide which. */
+    const char *op = "socket";
+    int lfd = oc_listen_bind(SOCK_STREAM, port, &op);
+    if (lfd < 0) {
+        if (strcmp(op, "bind") == 0)
+            fprintf(stderr, "openchimed: cannot start: bind port %d: %s\n",
+                    port, strerror(errno));
+        else
+            NETLOOP_FAIL(op);
+        free(conns); return -1;
     }
     if (listen(lfd, 128) < 0) {
         NETLOOP_FAIL("listen"); close(lfd); free(conns); return -1;
@@ -5756,11 +5767,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
                     /* Peer IP (for the accept throttle + per-source auth limit). */
                     char src[46] = {0};
-                    if (ss.ss_family == AF_INET) {
-                        inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, src, sizeof src);
-                    } else if (ss.ss_family == AF_INET6) {
-                        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, src, sizeof src);
-                    }
+                    oc_listen_peer_text(&ss, src, sizeof src);
                     /* A trusted forwarder speaks for somebody else, and says who in a
                      * header: the cap is applied once that is read, to the client
                      * it names rather than to the forwarder. */

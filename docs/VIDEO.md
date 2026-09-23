@@ -114,7 +114,7 @@ key exchange.
 
 An encoded frame is split into fragments of at most **1100 bytes**, each its own
 packet: with the 14-byte header, the SFrame overhead and the relay's framing, a
-packet stays under the relay's 1400-byte datagram. A frame of up to 1024
+packet stays under the relay's 1300-byte datagram, behind a token of up to 32 bytes. A frame of up to 1024
 fragments (1.1 MB) can be sent; `flags` bit 0 marks a keyframe. Frames and
 fragments are numbered **inside the encryption**, so the relay's unauthenticated
 16-bit `seq` is not used, as it is not for audio. Frame numbers carry on across a
