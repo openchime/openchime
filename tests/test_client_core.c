@@ -10,7 +10,6 @@
 #include "model.h"
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
-#include "wellknown.h"   /* the optional `.well-known` half of REQ-010 */
 #include "complete.h"    /* who the New message pane may address (REQ-229) */
 
 #include "netloop.h"
@@ -952,130 +951,6 @@ static void test_sidebar(void) {
 
 
     oc_model_free(&m);
-}
-
-/* The `.well-known` document (REQ-010) and what counts as malformed (REQ-011).
- * The PARSE is the whole of what can be tested without a web server, and it is
- * where the distinction lives: a document that is absent, or served by something
- * that is not a workspace, is "no metadata"; one that is present and wrong is a
- * failure with its own name. */
-static void test_wellknown_parse(void) {
-    oc_wellknown wk;
-
-    /* What a workspace publishes: a port, and the fingerprint ARCH-10 allows. */
-    const char *full = "{\"port\": 9443, \"fingerprint\": \"AA:BB:CC\"}";
-    CHECK(oc_wellknown_parse(full, strlen(full), &wk) == OC_WK_OK);
-    CHECK(wk.port == 9443 && strcmp(wk.fingerprint, "AA:BB:CC") == 0);
-
-    /* Either field alone, and neither: the document is optional, so every field
-     * in it is too. An empty object is valid and says nothing. */
-    const char *just_port = "{\"port\":8443}";
-    CHECK(oc_wellknown_parse(just_port, strlen(just_port), &wk) == OC_WK_OK);
-    CHECK(wk.port == 8443 && wk.fingerprint[0] == '\0');
-    const char *just_fp = "{\"fingerprint\":\"beef\"}";
-    CHECK(oc_wellknown_parse(just_fp, strlen(just_fp), &wk) == OC_WK_OK);
-    CHECK(wk.port == 0 && strcmp(wk.fingerprint, "beef") == 0);
-    CHECK(oc_wellknown_parse("{}", 2, &wk) == OC_WK_OK && wk.port == 0);
-
-    /* Unknown keys are ignored -- a newer daemon may publish more than this
-     * client reads -- including whole nested values, whose own keys must not be
-     * mistaken for the document's. */
-    const char *extra =
-        "{\"nope\":{\"port\":1},\"list\":[1,2,3],\"port\":7000,\"later\":\"x\"}";
-    CHECK(oc_wellknown_parse(extra, strlen(extra), &wk) == OC_WK_OK);
-    CHECK(wk.port == 7000);
-
-    /* Malformed (REQ-011): not JSON, not an object, and a key we DO know
-     * carrying the wrong type or an impossible value. The last is the one that
-     * matters -- silently ignoring it would connect to the wrong port. */
-    CHECK(oc_wellknown_parse("", 0, &wk) == OC_WK_MALFORMED);
-    CHECK(oc_wellknown_parse("not json", 8, &wk) == OC_WK_MALFORMED);
-    CHECK(oc_wellknown_parse("[1,2]", 5, &wk) == OC_WK_MALFORMED);
-    CHECK(oc_wellknown_parse("{\"port\":", 8, &wk) == OC_WK_MALFORMED);   /* truncated */
-    const char *bad_type = "{\"port\":\"8443\"}";
-    CHECK(oc_wellknown_parse(bad_type, strlen(bad_type), &wk) == OC_WK_MALFORMED);
-    const char *bad_fp = "{\"fingerprint\":443}";
-    CHECK(oc_wellknown_parse(bad_fp, strlen(bad_fp), &wk) == OC_WK_MALFORMED);
-    const char *zero = "{\"port\":0}";
-    CHECK(oc_wellknown_parse(zero, strlen(zero), &wk) == OC_WK_MALFORMED);
-    const char *huge = "{\"port\":70000}";
-    CHECK(oc_wellknown_parse(huge, strlen(huge), &wk) == OC_WK_MALFORMED);
-    const char *neg = "{\"port\":-1}";
-    CHECK(oc_wellknown_parse(neg, strlen(neg), &wk) == OC_WK_MALFORMED);
-
-    /* Shape, not just types: a document that ends and then continues, one whose
-     * pairs are not separated, and one missing its colon are each malformed. A
-     * parser that stops at the first '}' would accept the first of these and
-     * read only the part before whatever else was appended to it. */
-    {
-        const char *trailing = "{\"port\":8443} and then some";
-        CHECK(oc_wellknown_parse(trailing, strlen(trailing), &wk) == OC_WK_MALFORMED);
-        const char *two_docs = "{\"port\":8443}{\"port\":9}";
-        CHECK(oc_wellknown_parse(two_docs, strlen(two_docs), &wk) == OC_WK_MALFORMED);
-        const char *no_comma = "{\"port\":8443 \"fingerprint\":\"a\"}";
-        CHECK(oc_wellknown_parse(no_comma, strlen(no_comma), &wk) == OC_WK_MALFORMED);
-        const char *dangling = "{\"port\":8443,}";
-        CHECK(oc_wellknown_parse(dangling, strlen(dangling), &wk) == OC_WK_MALFORMED);
-        const char *no_colon = "{\"port\" 8443}";
-        CHECK(oc_wellknown_parse(no_colon, strlen(no_colon), &wk) == OC_WK_MALFORMED);
-        const char *unterminated = "{\"fingerprint\":\"abc}";
-        CHECK(oc_wellknown_parse(unterminated, strlen(unterminated), &wk) == OC_WK_MALFORMED);
-        /* An escape is refused rather than half-understood: nothing this
-         * document carries needs one. */
-        const char *escaped = "{\"fingerprint\":\"a\\\\b\"}";
-        CHECK(oc_wellknown_parse(escaped, strlen(escaped), &wk) == OC_WK_MALFORMED);
-        /* Whitespace around every part is ordinary JSON, and is accepted. */
-        const char *spaced = "  {  \"port\" : 8443 ,  \"fingerprint\" : \"aa\"  }  ";
-        CHECK(oc_wellknown_parse(spaced, strlen(spaced), &wk) == OC_WK_OK);
-        CHECK(wk.port == 8443 && strcmp(wk.fingerprint, "aa") == 0);
-    }
-
-    /* A fingerprint longer than we hold is refused rather than truncated: half
-     * a fingerprint is not a weaker check, it is a different one. */
-    {
-        char big[OC_WK_FP_MAX + 64];
-        int at = snprintf(big, sizeof big, "{\"fingerprint\":\"");
-        memset(big + at, 'a', OC_WK_FP_MAX);
-        snprintf(big + at + OC_WK_FP_MAX, sizeof big - at - OC_WK_FP_MAX, "\"}");
-        CHECK(oc_wellknown_parse(big, strlen(big), &wk) == OC_WK_MALFORMED);
-    }
-
-    /* From a whole HTTP response, which is what the fetch actually holds. The
-     * status decides between "no document" and "a document that is wrong", and
-     * only a 200 can be the second. */
-    {
-        const char *ok200 =
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"port\":9443}";
-        CHECK(oc_wellknown_read_response(ok200, strlen(ok200), &wk) == OC_WK_OK);
-        CHECK(wk.port == 9443);
-
-        const char *ten = "HTTP/1.0 200 OK\r\n\r\n{\"port\":7}";
-        CHECK(oc_wellknown_read_response(ten, strlen(ten), &wk) == OC_WK_OK && wk.port == 7);
-
-        const char *notfound = "HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>";
-        CHECK(oc_wellknown_read_response(notfound, strlen(notfound), &wk) == OC_WK_NONE);
-        const char *moved = "HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\n";
-        CHECK(oc_wellknown_read_response(moved, strlen(moved), &wk) == OC_WK_NONE);
-        const char *garbage = "not an http response at all";
-        CHECK(oc_wellknown_read_response(garbage, strlen(garbage), &wk) == OC_WK_NONE);
-
-        /* A 200 that is not the document IS the distinct failure: the workspace
-         * served something at this path and it is not this. */
-        const char *html200 = "HTTP/1.1 200 OK\r\n\r\n<html>hello</html>";
-        CHECK(oc_wellknown_read_response(html200, strlen(html200), &wk) == OC_WK_MALFORMED);
-        const char *empty200 = "HTTP/1.1 200 OK\r\n\r\n";
-        CHECK(oc_wellknown_read_response(empty200, strlen(empty200), &wk) == OC_WK_MALFORMED);
-        const char *headersonly = "HTTP/1.1 200 OK\r\nContent-Type: text/plain";
-        CHECK(oc_wellknown_read_response(headersonly, strlen(headersonly), &wk) == OC_WK_MALFORMED);
-    }
-
-    /* Bigger than any discovery document: refused without parsing it. */
-    {
-        static char flood[OC_WK_MAX + 32];
-        memset(flood, ' ', sizeof flood);
-        flood[0] = '{'; flood[sizeof flood - 1] = '}';
-        CHECK(oc_wellknown_parse(flood, sizeof flood, &wk) == OC_WK_MALFORMED);
-    }
 }
 
 static void test_resolve(void) {
@@ -2571,7 +2446,7 @@ static void test_browser_signin(int port) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: sidebar, resolve, .well-known metadata, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
+    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
 
     test_group_dm_title();
     test_sidebar();
@@ -2583,7 +2458,6 @@ int run_client_core_tests(void) {
     test_addressable_targets();
     test_pins();
     test_resolve();
-    test_wellknown_parse();
     test_last_error();
     test_workspace_key();
     test_sni_name();

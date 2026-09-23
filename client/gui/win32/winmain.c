@@ -22715,12 +22715,6 @@ static void signin_submit(HWND hwnd) {
         if (st == OC_RESOLVE_BAD_WORKSPACE) {
             snprintf(g_si_err, sizeof g_si_err, "invalid workspace '%s'", g_si_ws); goto redraw;
         }
-        if (st == OC_RESOLVE_BAD_METADATA) {
-            /* It exists and it answered; what it published is wrong. Saying "not
-             * found" here sends an operator to their DNS, which is fine. */
-            snprintf(g_si_err, sizeof g_si_err,
-                     "'%s' publishes discovery metadata that is not valid", g_si_ws); goto redraw;
-        }
         if (st != OC_RESOLVE_OK) {
             snprintf(g_si_err, sizeof g_si_err,
                      "'%s' not found — does not resolve in DNS", g_si_ws); goto redraw;
