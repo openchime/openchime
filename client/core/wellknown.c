@@ -165,6 +165,26 @@ int oc_wellknown_read_response(const char *resp, size_t len, oc_wellknown *out) 
     return oc_wellknown_parse(body, blen, out);
 }
 
+int oc_wellknown_fingerprint_bytes(const char *hex, unsigned char out[32]) {
+    if (!hex || !out) return -1;
+    int n = 0;
+    int hi = -1;
+    for (const char *p = hex; *p; p++) {
+        if (*p == ':' || *p == ' ') continue;       /* the separators people paste */
+        int v;
+        if (*p >= '0' && *p <= '9') v = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') v = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') v = *p - 'A' + 10;
+        else return -1;                             /* not hex at all */
+        if (hi < 0) { hi = v; continue; }
+        if (n >= 32) return -1;                     /* longer than a SHA-256 */
+        out[n++] = (unsigned char)((hi << 4) | v);
+        hi = -1;
+    }
+    if (hi >= 0) return -1;                         /* an odd digit left over */
+    return n == 32 ? 0 : -1;
+}
+
 /* --- fetching ------------------------------------------------------------ */
 
 static int wk_dial(const char *host, int port, int timeout_ms) {

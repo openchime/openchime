@@ -2245,6 +2245,7 @@ static rectf g_si_invite_link;
 static rectf g_si_cancel;      /* overlay sign-in: back to the live workspace */
 static char  g_si_ws[256];        /* the workspace string as typed */
 static char  g_si_host[256];      /* resolved host (step 1 output) */
+static char  g_si_fp[96];         /* ... and the fingerprint it published, if any */
 static int   g_si_port;
 static char  g_si_err[192];       /* inline error under the active field */
 static int   g_si_remember = 1;   /* gates whether the session token is persisted */
@@ -22493,7 +22494,9 @@ static int connect_start(const char *ws, const char *cred) {
     char key[288]; ws_key(ws, key, sizeof key);
     snprintf(g_cur_ws, sizeof g_cur_ws, "%s", key);
     snprintf(g_cred, sizeof g_cred, "%s", cred);
-    g_client = oc_client_start_named(key, g_host, g_port, g_cred, store_path(), g_secret);
+    /* With the fingerprint the workspace published, if it did (ARCH-10). */
+    g_client = oc_client_start_verified(key, g_host, g_port, g_cred, store_path(), g_secret,
+                                        1, ep.fingerprint);
     g_clients_started++;
 
     ws_register();
@@ -22583,6 +22586,10 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
     signin_begin(hwnd, ws, user);
     snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
     g_si_port = ep.port;
+    /* Kept with the address it belongs to: the sign-in resolves in step 1 and
+     * connects in a later step, and the published fingerprint (ARCH-10) has to
+     * survive the gap. */
+    snprintf(g_si_fp, sizeof g_si_fp, "%s", ep.fingerprint);
     /* Step 1 is skipped, so its question is asked here: a workspace that takes no
      * passwords goes to the browser, not to a password form it cannot use. An
      * unreachable one falls through to the form, which reports it on submit. */
@@ -22759,8 +22766,8 @@ static void signin_submit(HWND hwnd) {
     snprintf(g_cred, sizeof g_cred, "%s:%s", user, pass);
     /* "Remember me" off means leave no trace: passing a NULL store path keeps
      * the session token out of the store entirely (the TUI's mechanism). */
-    g_si_client = oc_client_start_opts(g_cur_ws, g_host, g_port, g_cred,
-                                       store_path(), g_secret, g_si_remember);
+    g_si_client = oc_client_start_verified(g_cur_ws, g_host, g_port, g_cred,
+                                           store_path(), g_secret, g_si_remember, g_si_fp);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
     /* Signup: with an invite in hand this connection redeems it instead
      * of authenticating — one step that creates the account and signs in — so
@@ -22784,8 +22791,8 @@ static void signin_start_browser(HWND hwnd) {
     g_port = g_si_port;
     ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
     g_cred[0] = '\0';
-    g_si_client = oc_client_start_opts(g_cur_ws, g_host, g_port, "",
-                                       store_path(), g_secret, g_si_remember);
+    g_si_client = oc_client_start_verified(g_cur_ws, g_host, g_port, "",
+                                           store_path(), g_secret, g_si_remember, g_si_fp);
     if (!g_si_client) {
         snprintf(g_si_err, sizeof g_si_err, "could not start the client");
         InvalidateRect(hwnd, NULL, FALSE);

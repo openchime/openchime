@@ -81,4 +81,10 @@ int oc_wellknown_read_response(const char *resp, size_t len, oc_wellknown *out);
  * its own deadline, because a sign-in waits on it. */
 int oc_wellknown_fetch(const char *domain, const char *ca_bundle, oc_wellknown *out);
 
+/* The fingerprint as BYTES: 32 of them, from 64 hex digits, with or without the
+ * colons people paste between them. Returns 0 on success, -1 if it is not that
+ * -- and a fingerprint that cannot be read is not a weaker check, so the caller
+ * treats it as no fingerprint at all rather than as a pin it half-understood. */
+int oc_wellknown_fingerprint_bytes(const char *hex, unsigned char out[32]);
+
 #endif /* OC_WELLKNOWN_H */
