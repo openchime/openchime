@@ -53,6 +53,10 @@ typedef struct {
     volatile int requests;
     uint8_t      obj[1024 * 1024];
     size_t       obj_len;
+    /* While `gate` is set, a PUT is read whole and then NOT answered until it is
+     * cleared: the daemon's commit waits on the reply, so the upload cannot
+     * finish. `held` counts the PUTs that have reached the gate. */
+    volatile int gate, held;
 } slow_s3;
 
 static slow_s3 g_s3;
@@ -122,6 +126,10 @@ static void *slow_s3_thread(void *arg) {
                 got += (size_t)n;
             }
             f->obj_len = got;
+            if (f->gate) {
+                f->held++;
+                while (f->gate && !f->stop) ms_sleep(2);
+            }
             const char *ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all_fd(fd, ok, strlen(ok));
         } else if (strcmp(method, "GET") == 0) {
@@ -414,6 +422,46 @@ int run_slow_blob_tests(void) {
      * the comparison proved nothing. Several slow segments inside the window
      * means the loop had real blocking work available to absorb — and didn't. */
     CHECK(segs_during >= 3);
+
+    /* Cancelling a post of files (REQ-140), by construction rather than by
+     * timing. With the gate shut, an upload that has sent its last byte waits on
+     * the backend's reply to its commit, so it cannot finish however long this
+     * takes — cancelling it then is cancelling a RUNNING upload. It also holds the
+     * connection's one transfer slot, so a post queued behind it cannot start —
+     * cancelling that is cancelling a QUEUED one. Neither posts anything; the post
+     * queued after both does, once the gate opens. Bob sees posts in the order
+     * they were made, so seeing the last one means he would already have seen
+     * either of the others had it gone. */
+    {
+        CHECK(SB_WAIT(alice, ({ const oc_xfer_state *d = oc_model_xfer(m, aid); d && d->phase != 0; }), 30000));
+        const char *pa = "build/itest_slowblob_post_a.txt", *pb = "build/itest_slowblob_post_b.txt",
+                   *pc = "build/itest_slowblob_post_c.txt";
+        const char *files[3] = { pa, pb, pc };
+        for (int i = 0; i < 3; i++) {
+            FILE *f = fopen(files[i], "wb");
+            CHECK(f != NULL);
+            if (f) { fprintf(f, "post %d\n", i); fclose(f); }
+        }
+        g_s3.held = 0;
+        g_s3.gate = 1;
+        uint64_t ta = oc_client_post_files(alice, ch, 0, &pa, 1, "running, then cancelled");
+        CHECK(ta != 0);
+        CHECK(SB_WAIT(alice, g_s3.held == 1, 10000));
+        uint64_t tb = oc_client_post_files(alice, ch, 0, &pb, 1, "queued, then cancelled");
+        uint64_t tc = oc_client_post_files(alice, ch, 0, &pc, 1, "queued after both");
+        CHECK(tb != 0 && tc != 0);
+        oc_client_cancel_transfer(alice, tb);
+        oc_client_cancel_transfer(alice, ta);
+        CHECK(SB_WAIT(alice, ({ const oc_xfer_state *x = oc_model_xfer(m, ta); x && x->phase == 2; }), 5000));
+        CHECK(g_s3.held == 1);                  /* nothing else reached the backend */
+        g_s3.gate = 0;
+        CHECK(SB_WAIT(alice, ({ const oc_xfer_state *x = oc_model_xfer(m, tc); x && x->phase == 1; }), 10000));
+        CHECK(SB_WAIT(bob, has_body(m, "queued after both"), 8000));
+        CHECK(oc_model_xfer(oc_client_model(alice), tb) == NULL);   /* it never started */
+        CHECK(!has_body(oc_client_model(bob), "running, then cancelled"));
+        CHECK(!has_body(oc_client_model(bob), "queued, then cancelled"));
+        for (int i = 0; i < 3; i++) unlink(files[i]);
+    }
 
 done:
     if (alice) oc_client_stop(alice);

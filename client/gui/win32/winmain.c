@@ -263,8 +263,13 @@ static float composer_tb(void) { return composer_toolbar_on() ? COMPOSER_TB : 0.
  * could drift apart independently. One name, one number, and the row now lines
  * up with the field: same inset, same edge. */
 #define COMPOSER_GUTTER COMPOSER_PAD
+/* The upload tray: the files waiting to go with the next message, and those on
+ * their way, as a row of chips at the top of the box. Its height is a question
+ * for the same reason the toolbar's is. */
+static float composer_tray(void);              /* fwd */
+static int   ftray_waiting(void);              /* fwd: files wait for Send here */
 static float composer_chrome(void) {
-    return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_GAP +
+    return COMPOSER_MT + composer_tray() + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_GAP +
            COMPOSER_ACTIONS + COMPOSER_MB;
 }
 #define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_GAP + \
@@ -1548,15 +1553,8 @@ static HICON badge_icon(int count) {
  * for WIC. The description string carries the number for a screen reader,
  * since the overlay's pixels cannot. */
 static HRESULT g_taskbar_hr;    /* the failing step's answer; see test_dump */
-static void taskbar_badge_apply(HWND hwnd, int count) {
-    /* A failed apply is retried, but not at tick rate: the caller re-enters
-     * every ~30ms while the count disagrees with what was applied, and
-     * rebuilding a DIB, a font and an icon 33 times a second is the wrong
-     * response to the low-GDI condition that most likely caused the miss. */
-    static ULONGLONG backoff;
-    if (backoff && GetTickCount64() < backoff) return;
-    backoff = 0;
-    if (g_taskbar_dead) return;
+static ITaskbarList3 *taskbar_obj(void) {
+    if (g_taskbar_dead) return NULL;
     if (!g_taskbar) {
         g_taskbar_hr = CoCreateInstance(&OC_CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
                                         &OC_IID_ITaskbarList3, (void **)&g_taskbar);
@@ -1565,9 +1563,37 @@ static void taskbar_badge_apply(HWND hwnd, int count) {
         if (FAILED(g_taskbar_hr) || !g_taskbar) {
             if (g_taskbar) { ITaskbarList3_Release(g_taskbar); g_taskbar = NULL; }
             g_taskbar_dead = 1;         /* no ITaskbarList3: live without a badge */
-            return;
+            return NULL;
         }
     }
+    return g_taskbar;
+}
+
+/* Uploads on their way fill the taskbar button, so a long one can be watched
+ * from another window; none clears it. Applied only when the figure moves. */
+static void ftray_taskbar(HWND hwnd, uint64_t done, uint64_t total) {
+    static uint64_t shown_done = UINT64_MAX, shown_total = UINT64_MAX;
+    uint64_t d = total ? done * 1000 / total : 0, t = total ? 1000 : 0;
+    if (d == shown_done && t == shown_total) return;
+    ITaskbarList3 *tb = taskbar_obj();
+    if (!tb) return;
+    if (!t) ITaskbarList3_SetProgressState(tb, hwnd, TBPF_NOPROGRESS);
+    else {
+        if (shown_total != 1000) ITaskbarList3_SetProgressState(tb, hwnd, TBPF_NORMAL);
+        ITaskbarList3_SetProgressValue(tb, hwnd, d, t);
+    }
+    shown_done = d; shown_total = t;
+}
+
+static void taskbar_badge_apply(HWND hwnd, int count) {
+    /* A failed apply is retried, but not at tick rate: the caller re-enters
+     * every ~30ms while the count disagrees with what was applied, and
+     * rebuilding a DIB, a font and an icon 33 times a second is the wrong
+     * response to the low-GDI condition that most likely caused the miss. */
+    static ULONGLONG backoff;
+    if (backoff && GetTickCount64() < backoff) return;
+    backoff = 0;
+    if (!taskbar_obj()) return;
     HICON ic = NULL;
     WCHAR alt[24] = L"";
     if (count > 0) {
@@ -1656,6 +1682,7 @@ static rectf g_mic_btn, g_freetalk_btn;
 static oc_dictate *g_dict;
 static oc_client  *g_dict_client;         /* the client the session sends through */
 static void dict_forget(oc_client *c);    /* fwd: before a client is stopped */
+static void ftray_forget(oc_client *cl);   /* fwd: ...and its upload tray */
 #define VM_MAX_BTNS    12
 static rectf        g_vm_card, g_vm_seek, g_vm_close, g_vm_vbox;
 static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
@@ -7627,13 +7654,14 @@ static int file_kind(const char *mime) {
 /* A coloured badge per family, the way every file browser worth using does it:
  * the extension is the fastest thing to scan for, so give it colour and a shape
  * rather than making every row the same grey page glyph. */
-static void file_badge(gfx *rt, const oc_file_view *f, rectf r) {
-    const char *ext = strrchr(f->filename, '.');
+static void file_badge_named(gfx *rt, const char *filename, const char *mime, uint8_t media_kind,
+                             int reclaimed, rectf r) {
+    const char *ext = strrchr(filename, '.');
     char tag[6] = "FILE";
     uint32_t col = 0x5B6270;                       /* generic */
-    if (f->media_kind == OC_MEDIA_VIDEO_MESSAGE ||
-        strncmp(f->mime, "video/", 6) == 0)          { col = 0xE0701A; snprintf(tag, sizeof tag, "VID"); }
-    else if (mime_is_image(f->mime))                { col = 0x8B5CF6; snprintf(tag, sizeof tag, "IMG"); }
+    if (media_kind == OC_MEDIA_VIDEO_MESSAGE ||
+        strncmp(mime, "video/", 6) == 0)             { col = 0xE0701A; snprintf(tag, sizeof tag, "VID"); }
+    else if (mime_is_image(mime))                   { col = 0x8B5CF6; snprintf(tag, sizeof tag, "IMG"); }
     else if (ext && !_stricmp(ext, ".pdf"))       { col = 0xD64545; snprintf(tag, sizeof tag, "PDF"); }
     else if (ext && (!_stricmp(ext, ".doc") || !_stricmp(ext, ".docx")))
                                                     { col = 0x2B5CE6; snprintf(tag, sizeof tag, "DOC"); }
@@ -7642,11 +7670,14 @@ static void file_badge(gfx *rt, const oc_file_view *f, rectf r) {
     else if (ext && (!_stricmp(ext, ".zip") || !_stricmp(ext, ".gz") || !_stricmp(ext, ".7z")))
                                                     { col = 0xB2802E; snprintf(tag, sizeof tag, "ZIP"); }
     else if (ext && !_stricmp(ext, ".txt"))       { col = 0x4B7A9B; snprintf(tag, sizeof tag, "TXT"); }
-    if (f->reclaimed) col = OC_COL_FAINT;
+    if (reclaimed) col = OC_COL_FAINT;
     fill_round(rt, r, OC_R_CONTROL, col);
     g_meta->align = ST_ALIGN_CENTER;
     draw_text(rt, tag, g_meta, rf(r.left, r.top + 2, r.right, r.bottom), 0xFFFFFF);
     g_meta->align = ST_ALIGN_LEFT;
+}
+static void file_badge(gfx *rt, const oc_file_view *f, rectf r) {
+    file_badge_named(rt, f->filename, f->mime, f->media_kind, f->reclaimed, r);
 }
 
 /* Case-insensitive substring, for the name box. */
@@ -10960,7 +10991,7 @@ static void composer_geom(float bx0, float bx1, float h,
                           rectf *box, rectf *field, float *act_y) {
     float by0 = h - g_composer_h + COMPOSER_MT, by1 = h - COMPOSER_MB;
     float atop = by1 - COMPOSER_PAD - COMPOSER_ACTIONS;   /* the row of buttons */
-    float ty   = by0 + composer_tb() + COMPOSER_PAD;      /* under the toolbar */
+    float ty   = by0 + composer_tray() + composer_tb() + COMPOSER_PAD;   /* under the tray and toolbar */
     float inner = composer_inner_h(), lh = ed_line_h();
     float texth = inner > lh ? inner : lh;
     if (ty + texth > atop - COMPOSER_GAP) texth = atop - COMPOSER_GAP - ty;
@@ -10982,7 +11013,7 @@ static int composer_ready(void) {
     const oc_model *cm = model();
     const oc_channel *cc = cm && g_sel ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
     if (cc && cc->archived) return 0;
-    return ed_len() > 0;
+    return ed_len() > 0 || (!g_edit_msg && ftray_waiting());
 }
 
 static int dict_offered(void);        /* fwd: voice input can start here */
@@ -11004,6 +11035,417 @@ static void dict_draw_btn(gfx *rt, rectf r, int icon, int live, uint32_t live_co
     draw_lucide(rt, icon, composer_glyph(r), ink);
 }
 
+/* ---- the upload tray (REQ-140) ----
+ * A file you pick, drop or paste waits here as a chip until Send, which posts it
+ * with whatever you typed as ONE message (oc_client_post_files). Nothing moves
+ * before Send: removing a chip costs nothing, and the message goes to the
+ * conversation you send it in rather than the one you were in when you chose the
+ * file. After Send each chip carries its file's progress, read by tag from the
+ * model every frame, and leaves once the message is out. A failure or a cancel
+ * puts the files back as they were, and the text with them. */
+#define FTRAY_H       UIS(60.0f)     /* the chip row at the top of the box */
+#define FTRAY_CHIP_W  UIS(220.0f)    /* at most; they narrow to fit before any is hidden */
+#define FTRAY_CHIP_MIN UIS(150.0f)
+#define FTRAY_CHIP_H  UIS(46.0f)
+#define FTRAY_DONE_MS 700            /* a finished chip lingers this long, green */
+enum { FTRAY_MAX = OC_MAX_ATTACH };
+static void thumb_decode(uint64_t id, const uint8_t *data, size_t len);   /* fwd */
+static void ed_changed(HWND hwnd);                                         /* fwd */
+typedef struct {
+    char      path[1024];
+    char      name[128];
+    uint64_t  size;
+    oc_client *cl;          /* the workspace it was added in */
+    uint64_t  cid;          /* ...and the conversation */
+    uint64_t  thumb;        /* its key in the thumbnail cache, when it is an image */
+    uint64_t  tag;          /* 0 while it waits for Send; then the post carrying it */
+    uint8_t   ix;           /* its place in that post */
+    uint8_t   failed;       /* the last try stopped at this file */
+    float     shown;        /* the bar as drawn, easing toward the real fraction */
+    ULONGLONG done_at;
+    rectf     r, x;         /* the chip, and its remove / cancel button */
+} ftray_chip;
+static ftray_chip g_ftray[FTRAY_MAX];
+static int       g_n_ftray;
+static int       g_ftray_more;       /* chips past the box's width, summarised */
+static float     g_ftray_laid;       /* the tray height the composer was last fitted to */
+/* A post's text, kept until it lands so a failure or a cancel can give it back. */
+static struct { oc_client *cl; uint64_t tag, cid, root; char *text; } g_ftray_posts[FTRAY_MAX];
+static int       g_n_ftray_posts;
+
+/* Is chip `c` in the conversation on screen? */
+static int ftray_here(const ftray_chip *c) { return c->cl == g_client && c->cid == g_sel && g_sel; }
+static int ftray_waiting(void) {
+    for (int i = 0; i < g_n_ftray; i++) if (ftray_here(&g_ftray[i]) && !g_ftray[i].tag) return 1;
+    return 0;
+}
+static int ftray_count(void) {
+    int n = 0;
+    for (int i = 0; i < g_n_ftray; i++) if (ftray_here(&g_ftray[i])) n++;
+    return n;
+}
+static float composer_tray(void) {
+    return g_view != VIEW_NEWMSG && ftray_count() ? FTRAY_H : 0.0f;
+}
+
+/* What the badge needs to know, from the name: a local file has no declared type. */
+static const char *ftray_mime(const char *name) {
+    const char *e = strrchr(name, '.');
+    if (!e) return "";
+    if (!_stricmp(e, ".png")) return "image/png";
+    if (!_stricmp(e, ".jpg") || !_stricmp(e, ".jpeg")) return "image/jpeg";
+    if (!_stricmp(e, ".gif")) return "image/gif";
+    if (!_stricmp(e, ".bmp")) return "image/bmp";
+    if (!_stricmp(e, ".webp")) return "image/webp";
+    if (!_stricmp(e, ".mp4") || !_stricmp(e, ".webm") || !_stricmp(e, ".mov")) return "video/mp4";
+    return "";
+}
+
+static void ftray_changed(HWND hwnd) {
+    if (composer_tray() != g_ftray_laid) { g_ftray_laid = composer_tray(); composer_refit(hwnd); layout_composer(hwnd); }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Add a local file (UTF-8 path) to the tray of the open conversation. */
+static void ftray_add(HWND hwnd, const char *path) {
+    if (!g_client || !g_sel || !path || !path[0]) return;
+    if (g_n_ftray == FTRAY_MAX) {
+        char t[80];
+        snprintf(t, sizeof t, "A message can carry %u files at most.", (unsigned)FTRAY_MAX);
+        toast_push(t, 1);
+        return;
+    }
+    WCHAR wp[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, MAX_PATH)) return;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(wp, GetFileExInfoStandard, &fa) ||
+        (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        toast_push("That is not a file that can be attached.", 1);
+        return;
+    }
+    uint64_t size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    const char *base = path;
+    for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+    if (size > OC_MAX_ATTACHMENT_SIZE) {
+        char t[200], lim[32];
+        human_bytes(OC_MAX_ATTACHMENT_SIZE, lim, sizeof lim);
+        snprintf(t, sizeof t, "%.120s is larger than a message can carry (%s).", base, lim);
+        toast_push(t, 1);
+        return;
+    }
+    ftray_chip *c = &g_ftray[g_n_ftray];
+    memset(c, 0, sizeof *c);
+    snprintf(c->path, sizeof c->path, "%s", path);
+    snprintf(c->name, sizeof c->name, "%s", base);
+    c->size = size;
+    c->cl = g_client;
+    c->cid = g_sel;
+    /* An image shows itself. Read once, decoded into the same cache the
+     * transcript's thumbnails use, under a key no attachment id can take. */
+    if (mime_is_image(ftray_mime(base)) && size && size <= 8u * 1024u * 1024u) {
+        static uint64_t seq;
+        FILE *f = _wfopen(wp, L"rb");
+        uint8_t *d = f ? malloc((size_t)size) : NULL;
+        if (d && fread(d, 1, (size_t)size, f) == size) {
+            c->thumb = (1ull << 62) | ++seq;
+            thumb_decode(c->thumb, d, (size_t)size);
+        }
+        free(d);
+        if (f) fclose(f);
+    }
+    g_n_ftray++;
+    ftray_changed(hwnd);
+}
+
+static void ftray_drop(int i) {
+    if (i < 0 || i >= g_n_ftray) return;
+    memmove(&g_ftray[i], &g_ftray[i + 1], (size_t)(g_n_ftray - i - 1) * sizeof g_ftray[0]);
+    g_n_ftray--;
+}
+
+static int ftray_post_ix(oc_client *cl, uint64_t tag) {
+    for (int i = 0; i < g_n_ftray_posts; i++)
+        if (g_ftray_posts[i].cl == cl && g_ftray_posts[i].tag == tag) return i;
+    return -1;
+}
+static void ftray_post_forget(int i) {
+    if (i < 0) return;
+    free(g_ftray_posts[i].text);
+    memmove(&g_ftray_posts[i], &g_ftray_posts[i + 1], (size_t)(g_n_ftray_posts - i - 1) * sizeof g_ftray_posts[0]);
+    g_n_ftray_posts--;
+}
+
+/* Post the waiting files of the open conversation with `text` (may be empty),
+ * into the thread when one is open. Returns 1 if it went. */
+static int ftray_post(const char *text) {
+    const oc_model *m = model();
+    if (!g_client || !g_sel || !m || g_n_ftray_posts == FTRAY_MAX) return 0;
+    const char *paths[FTRAY_MAX];
+    int ix[FTRAY_MAX], n = 0;
+    for (int i = 0; i < g_n_ftray; i++)
+        if (ftray_here(&g_ftray[i]) && !g_ftray[i].tag) { ix[n] = i; paths[n++] = g_ftray[i].path; }
+    if (!n) return 0;
+    uint64_t cid = m->thread_open ? m->thread_channel : g_sel;
+    uint64_t root = m->thread_open ? m->thread_parent : 0;
+    uint64_t tag = oc_client_post_files(g_client, cid, root, paths, (size_t)n, text);
+    if (!tag) { toast_push("Those files could not be sent.", 1); return 0; }
+    for (int k = 0; k < n; k++) {
+        ftray_chip *c = &g_ftray[ix[k]];
+        c->tag = tag; c->ix = (uint8_t)k; c->failed = 0; c->shown = 0; c->done_at = 0;
+    }
+    g_ftray_posts[g_n_ftray_posts].cl = g_client;
+    g_ftray_posts[g_n_ftray_posts].tag = tag;
+    g_ftray_posts[g_n_ftray_posts].cid = cid;
+    g_ftray_posts[g_n_ftray_posts].root = root;
+    g_ftray_posts[g_n_ftray_posts].text = strdup(text ? text : "");
+    g_n_ftray_posts++;
+    return 1;
+}
+
+/* A post that did not go: its files wait again, the one it stopped at marked,
+ * and its text comes back — into the box if you are looking at an empty one,
+ * otherwise as that conversation's draft, unless it already has one. */
+static void ftray_unpost(HWND hwnd, oc_client *cl, uint64_t tag, int failed_ix) {
+    for (int i = 0; i < g_n_ftray; i++)
+        if (g_ftray[i].cl == cl && g_ftray[i].tag == tag) {
+            g_ftray[i].failed = failed_ix >= 0 && g_ftray[i].ix == failed_ix;
+            g_ftray[i].tag = 0; g_ftray[i].shown = 0; g_ftray[i].done_at = 0;
+        }
+    int p = ftray_post_ix(cl, tag);
+    if (p < 0) return;
+    const char *t = g_ftray_posts[p].text;
+    if (t && t[0]) {
+        const oc_model *m = oc_client_model(cl);
+        if (cl == g_client && g_ftray_posts[p].cid == g_sel && ed_len() == 0) {
+            WCHAR *w = NULL;
+            int wl = MultiByteToWideChar(CP_UTF8, 0, t, -1, NULL, 0);
+            if (wl > 0 && (w = malloc((size_t)wl * sizeof(WCHAR))) != NULL) {
+                MultiByteToWideChar(CP_UTF8, 0, t, -1, w, wl);
+                ed_set(w);
+                ed_changed(hwnd);
+                free(w);
+            }
+        } else if (m) {
+            const char *had = oc_model_draft(m, g_ftray_posts[p].cid, g_ftray_posts[p].root);
+            if (!had || !had[0]) {
+                oc_client_set_draft(cl, g_ftray_posts[p].cid, g_ftray_posts[p].root, t);
+                oc_model_draft_local((oc_model *)m, g_ftray_posts[p].cid, g_ftray_posts[p].root, t);
+            }
+        }
+    }
+    ftray_post_forget(p);
+}
+
+/* The chip's × : a waiting file leaves the tray; a file on its way cancels its
+ * whole post, since a message is posted whole or not at all, and the rest of
+ * that post's files wait again. */
+static void ftray_remove(HWND hwnd, int i) {
+    if (i < 0 || i >= g_n_ftray) return;
+    uint64_t tag = g_ftray[i].tag;
+    oc_client *cl = g_ftray[i].cl;
+    if (tag && !g_ftray[i].done_at) {
+        oc_client_cancel_transfer(cl, tag);
+        ftray_drop(i);
+        ftray_unpost(hwnd, cl, tag, -1);
+    } else if (!tag) {
+        ftray_drop(i);
+    }
+    ftray_changed(hwnd);
+}
+
+/* A post's state, for one of its chips: 0 waiting its turn, 1 moving, 2 sent. */
+static int ftray_state(const oc_model *m, const ftray_chip *c, float *frac) {
+    const oc_xfer_state *st = oc_model_xfer(m, c->tag);
+    *frac = 0;
+    if (!st) return 0;
+    if (st->phase == 1) { *frac = 1; return 2; }
+    if (c->ix < st->file) { *frac = 1; return 1; }
+    if (c->ix > st->file) return 0;
+    if (st->total) *frac = (float)((double)st->done / (double)st->total);
+    return 1;
+}
+
+static void ftray_taskbar(HWND hwnd, uint64_t done, uint64_t total);   /* fwd */
+
+/* Once a frame: follow each post by its tag, ease the bars, retire what landed,
+ * and give back what failed. */
+static void ftray_tick(HWND hwnd) {
+    int moving = 0;
+    ULONGLONG now = GetTickCount64();
+    /* What failed first, since giving a post back changes the chips. */
+    for (int i = 0; i < g_n_ftray; i++) {
+        ftray_chip *c = &g_ftray[i];
+        if (!c->tag || c->done_at) continue;
+        const oc_xfer_state *st = oc_model_xfer(oc_client_model(c->cl), c->tag);
+        if (st && st->phase == 2) { ftray_unpost(hwnd, c->cl, c->tag, st->file); i = -1; moving = 1; }
+    }
+    uint64_t sum_done = 0, sum_total = 0;
+    for (int i = 0; i < g_n_ftray; i++) {
+        ftray_chip *c = &g_ftray[i];
+        if (!c->tag) continue;
+        float target;
+        if (ftray_state(oc_client_model(c->cl), c, &target) == 2 && !c->done_at) c->done_at = now;
+        float d = target - c->shown;
+        c->shown = (d > -0.002f && d < 0.002f) ? target : c->shown + d * 0.22f;
+        sum_total += c->size;
+        sum_done += (uint64_t)((double)c->size * (double)target);
+        moving = 1;
+    }
+    for (int i = 0; i < g_n_ftray;) {
+        if (g_ftray[i].done_at && now - g_ftray[i].done_at > FTRAY_DONE_MS) {
+            ftray_post_forget(ftray_post_ix(g_ftray[i].cl, g_ftray[i].tag));
+            ftray_drop(i);
+            moving = 1;
+        } else i++;
+    }
+    ftray_taskbar(hwnd, sum_done, sum_total);
+    if (composer_tray() != g_ftray_laid) { g_ftray_laid = composer_tray(); composer_refit(hwnd); layout_composer(hwnd); moving = 1; }
+    if (moving) InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* A workspace going away takes its chips and posts with it. */
+static void ftray_forget(oc_client *cl) {
+    for (int i = 0; i < g_n_ftray;) if (g_ftray[i].cl == cl) ftray_drop(i); else i++;
+    for (int i = 0; i < g_n_ftray_posts;) if (g_ftray_posts[i].cl == cl) ftray_post_forget(i); else i++;
+}
+
+/* `s` shortened with an ellipsis to fit `w`. */
+static void ftray_fit(const char *s, fmtw *fmt, float w, char *out, size_t cap) {
+    snprintf(out, cap, "%s", s);
+    if (text_width(out, fmt) <= w) return;
+    size_t n = strlen(out);
+    while (n > 0) {
+        do n--; while (n > 0 && ((unsigned char)out[n] & 0xC0) == 0x80);
+        if (n + 4 > cap) continue;
+        memcpy(out + n, "\xE2\x80\xA6", 4);
+        if (text_width(out, fmt) <= w) return;
+    }
+}
+
+static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
+    const oc_model *m = model();
+    ULONGLONG now = GetTickCount64();
+    float x = bx0 + COMPOSER_PAD, y = by0 + (FTRAY_H - FTRAY_CHIP_H) / 2 + UIS(2);
+    float right = bx1 - COMPOSER_PAD, gap = UIS(8);
+    int shown = 0, total = 0, here = ftray_count();
+    float cw = here ? (right - x - gap * (float)(here - 1)) / (float)here : FTRAY_CHIP_W;
+    if (cw > FTRAY_CHIP_W) cw = FTRAY_CHIP_W;
+    if (cw < FTRAY_CHIP_MIN) cw = FTRAY_CHIP_MIN;
+    for (int i = 0; i < g_n_ftray; i++) {
+        ftray_chip *c = &g_ftray[i];
+        c->r = c->x = rf(0, 0, 0, 0);
+        if (!ftray_here(c)) continue;
+        total++;
+        /* Room for this chip, and for the "+N" pill if any are left after it. */
+        float need = cw + (total < here ? UIS(52) : 0);
+        if (x + need > right + 0.5f && shown) continue;
+        shown++;
+        rectf r = rf(x, y, x + cw, y + FTRAY_CHIP_H);
+        if (r.right > right) r.right = right;
+        c->r = r;
+        x = r.right + gap;
+        float frac = 0;
+        int st = c->tag && m ? ftray_state(m, c, &frac) : -1;   /* -1 waiting for Send */
+        int done = c->done_at != 0;
+        fill_round(rt, r, OC_R_CONTROL, OC_COL_BASE);
+        stroke_round(rt, r, OC_R_CONTROL, c->failed ? OC_COL_DANGER : done ? OC_COL_ONLINE : OC_COL_BORDER,
+                     c->failed || done ? 1.5f : 1.0f);
+
+        /* The picture, or the type badge the Files view uses. */
+        float pic = FTRAY_CHIP_H - UIS(12);
+        rectf pr = rf(r.left + UIS(6), r.top + UIS(6), r.left + UIS(6) + pic, r.top + UIS(6) + pic);
+        UINT iw = 0, ih = 0;
+        gfx_tex *tex = c->thumb ? thumb_get(rt, c->thumb, &iw, &ih) : NULL;
+        if (tex) {
+            gfx_tex_draw(rt, tex, gr(pr), OC_R_CONTROL, 1.0f);
+            stroke_round(rt, pr, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        } else {
+            file_badge_named(rt, c->name, ftray_mime(c->name), 0, 0, pr);
+        }
+        if (done) {
+            /* A green disc with a tick, over the picture. */
+            float cx = (pr.left + pr.right) / 2, cy = (pr.top + pr.bottom) / 2, rr = pic * 0.32f;
+            float a = (float)(now - c->done_at) / 150.0f; if (a > 1) a = 1;
+            gfx_ellipse(rt, cx, cy, rr, rr, OC_COL_ONLINE, a);
+            gfx_line(rt, cx - rr * 0.45f, cy + rr * 0.02f, cx - rr * 0.1f, cy + rr * 0.38f, 2.0f, 0xFFFFFF, a);
+            gfx_line(rt, cx - rr * 0.1f, cy + rr * 0.38f, cx + rr * 0.5f, cy - rr * 0.35f, 2.0f, 0xFFFFFF, a);
+        }
+
+        /* Name, and what is happening to it. */
+        float tx = pr.right + UIS(8), tr = r.right - UIS(26);
+        char line[160];
+        ftray_fit(c->name, g_meta, tr - tx, line, sizeof line);
+        draw_text(rt, line, g_meta, rf(tx, r.top + UIS(5), tr, r.top + UIS(22)), OC_COL_TEXT);
+        char sz[32], sub[96];
+        human_bytes(c->size, sz, sizeof sz);
+        uint32_t subc = OC_COL_MUTED;
+        if (c->failed)       { snprintf(sub, sizeof sub, "Not sent \xC2\xB7 Send to try again"); subc = OC_COL_DANGER; }
+        else if (done)       snprintf(sub, sizeof sub, "Sent");
+        else if (st == 0)    snprintf(sub, sizeof sub, "Waiting\xE2\x80\xA6");
+        else if (st == 1 && frac >= 1.0f) snprintf(sub, sizeof sub, "Uploaded \xC2\xB7 %s", sz);
+        else if (st == 1) {
+            char dn[32];
+            human_bytes((uint64_t)((double)c->size * frac), dn, sizeof dn);
+            snprintf(sub, sizeof sub, "%d%% \xC2\xB7 %s of %s", (int)(frac * 100.0f + 0.5f), dn, sz);
+        } else snprintf(sub, sizeof sub, "%s", sz);
+        ftray_fit(sub, g_meta, r.right - UIS(8) - tx, line, sizeof line);
+        draw_text(rt, line, g_meta, rf(tx, r.top + UIS(21), r.right - UIS(8), r.top + UIS(38)), subc);
+
+        /* The bar: a pill that eases toward the real figure, with a soft light
+         * sweeping along what is filled while the file is moving. */
+        if (c->tag) {
+            rectf track = rf(tx, r.bottom - UIS(8), r.right - UIS(10), r.bottom - UIS(4));
+            float rad = (track.bottom - track.top) / 2;
+            fill_round_a(rt, track, rad, OC_COL_BORDER, st == 0 ? 0.35f + 0.25f * (float)sin((double)now / 300.0) : 1.0f);
+            float fw = (track.right - track.left) * c->shown;
+            if (fw > rad * 2 || (fw > 0 && done)) {
+                rectf fill_r = rf(track.left, track.top, track.left + (fw > rad * 2 ? fw : rad * 2), track.bottom);
+                fill_round(rt, fill_r, rad, done ? OC_COL_ONLINE : OC_COL_ACCENT);
+                if (st == 1 && !done) {
+                    float span = fill_r.right - fill_r.left, sw = UIS(28);
+                    float ph = (float)(now % 1200) / 1200.0f;
+                    float sx = fill_r.left - sw + (span + sw) * ph;
+                    gfx_clip_push(rt, gr(fill_r));
+                    gfx_fill_round(rt, gr(rf(sx, fill_r.top, sx + sw, fill_r.bottom)), rad, 0xFFFFFF, 0.35f);
+                    gfx_clip_pop(rt);
+                }
+            }
+        }
+
+        /* × : remove, or cancel the post it is in. Nothing to press once sent. */
+        if (!done) {
+            float xs = UIS(18);
+            rectf xb = rf(r.right - xs - UIS(4), r.top + UIS(4), r.right - UIS(4), r.top + UIS(4) + xs);
+            c->x = xb;
+            int hov = !pointer_blocked() && in_rect(xb, (float)g_mouse_x, (float)g_mouse_y);
+            if (hov) fill_round(rt, xb, xs / 2, OC_COL_HOVER);
+            float cx = (xb.left + xb.right) / 2, cy = (xb.top + xb.bottom) / 2, d = xs * 0.2f;
+            uint32_t ink = hov ? OC_COL_TEXT : OC_COL_MUTED;
+            gfx_line(rt, cx - d, cy - d, cx + d, cy + d, 1.6f, ink, 1.0f);
+            gfx_line(rt, cx - d, cy + d, cx + d, cy - d, 1.6f, ink, 1.0f);
+        }
+    }
+    g_ftray_more = total - shown;
+    if (g_ftray_more > 0) {
+        char more[16];
+        snprintf(more, sizeof more, "+%d", g_ftray_more);
+        rectf mr = rf(x, y + (FTRAY_CHIP_H - UIS(24)) / 2, x + UIS(44), y + (FTRAY_CHIP_H + UIS(24)) / 2);
+        fill_round(rt, mr, UIS(12), OC_COL_HOVER);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, more, g_meta, rf(mr.left, mr.top + UIS(3), mr.right, mr.bottom), OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+    }
+}
+
+/* A press on a chip's × . Returns 1 if it took the click. */
+static int ftray_click(HWND hwnd, float x, float y) {
+    for (int i = 0; i < g_n_ftray; i++)
+        if (ftray_here(&g_ftray[i]) && in_rect(g_ftray[i].x, x, y)) { ftray_remove(hwnd, i); return 1; }
+    for (int i = 0; i < g_n_ftray; i++)
+        if (ftray_here(&g_ftray[i]) && in_rect(g_ftray[i].r, x, y)) return 1;   /* the chip is not a hole */
+    return 0;
+}
+
 static void draw_composer(gfx *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -11017,7 +11459,8 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
     fill_round(rt, rf(bx0, by0, bx1, by1), OC_R_CONTROL, OC_COL_INPUT);
     stroke_round(rt, rf(bx0, by0, bx1, by1), OC_R_CONTROL, OC_COL_BORDER, 1.0f);
 
-    if (composer_toolbar_on()) draw_fmt_toolbar(rt, bx0, by0, bx1);
+    if (composer_tray() > 0) ftray_draw(rt, bx0, by0, bx1);
+    if (composer_toolbar_on()) draw_fmt_toolbar(rt, bx0, by0 + composer_tray(), bx1);
     else { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
 
     /* The ACTION ROW, along the bottom of the box under the text — Slack's
@@ -11262,7 +11705,7 @@ static void confirm_run(HWND hwnd) {
             g_forget_after_logout = 1;      /* delete the entry once it lands */
         } else {
             if (live) {                     /* a background one: stop it here */
-                dict_forget(g_wss[slot].client);
+                dict_forget(g_wss[slot].client); ftray_forget(g_wss[slot].client);
                 oc_client_stop(g_wss[slot].client);
                 for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
                 g_n_wss--;
@@ -17144,7 +17587,8 @@ enum {
     AT_FUPLOAD,       /* the Files view's Upload button */
     AT_FCHAN,         /* payload: channel id, or 0 for "All files" */
     AT_FILEROW,       /* payload: file id — open it */
-    AT_VOICE          /* payload: 0 = the microphone (talk / stop), 1 = free talk on/off */
+    AT_VOICE,         /* payload: 0 = the microphone (talk / stop), 1 = free talk on/off */
+    AT_FTRAY          /* payload: upload-tray chip index — remove it, or cancel its post */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -17425,6 +17869,21 @@ static void a11y_publish_scene(const oc_model *m) {
         acc_push(items, &n, OC_ACC_BUTTON, "vm.dismiss", "Close", g_vm_close, ATOK(AT_VIDEO, VMC_CLOSE));
     }
     if (main_is_conversation()) {
+        /* Each chip in the upload tray, as the button its × is, named for the
+         * file and for what pressing it would do — and, while it moves, how far
+         * it has got, which is the part a screen reader cannot otherwise see. */
+        for (int i = 0; i < g_n_ftray; i++) {
+            const ftray_chip *c = &g_ftray[i];
+            if (!ftray_here(c) || c->x.right <= c->x.left) continue;
+            char aid[32], nm[200];
+            snprintf(aid, sizeof aid, "composer.file.%d", i);
+            float frac = 0;
+            int st = c->tag ? ftray_state(model(), c, &frac) : -1;
+            if (!c->tag)       snprintf(nm, sizeof nm, "Remove %s%s", c->name, c->failed ? " (not sent)" : "");
+            else if (st == 1)  snprintf(nm, sizeof nm, "Cancel sending %s, %d%%", c->name, (int)(frac * 100.0f + 0.5f));
+            else               snprintf(nm, sizeof nm, "Cancel sending %s, waiting", c->name);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, nm, c->x, ATOK(AT_FTRAY, i));
+        }
         acc_push(items, &n, OC_ACC_BUTTON, "composer.attach", "Attach a file",
                  g_attach_btn, ATOK(AT_MENU, 7));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.video", "Record a video message",
@@ -17899,8 +18358,11 @@ static void composer_send(void) {
             return;
         }
     }
+    /* Files waiting in the tray go with the text, as one message; the text may
+     * then be empty. An edit changes text only, so the tray waits it out. */
+    int files = !g_edit_msg && ftray_waiting();
     int wlen = ed_len();
-    if (wlen <= 0) return;
+    if (wlen <= 0 && !files) return;
     WCHAR *w = (WCHAR *)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
     if (!w) return;
     ed_get(w, wlen + 1);
@@ -17911,7 +18373,10 @@ static void composer_send(void) {
         /* Drop a trailing newline the RichEdit may append; skip empty/whitespace. */
         int nonspace = 0;
         for (char *p = b; *p; p++) if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') { nonspace = 1; break; }
-        if (nonspace) {
+        if (files) {
+            if (!ftray_post(nonspace ? b : "")) { free(b); free(w); return; }
+            g_scroll = 0;
+        } else if (nonspace) {
             const oc_model *mm = model();
             if (g_edit_msg)
                 oc_client_edit(g_client, g_sel, g_edit_msg, b);
@@ -20027,21 +20492,33 @@ static void download_attachment(HWND hwnd, const oc_attachment *a) {
 }
 
 
-/* Pick a local file and upload it to the selected channel. */
+/* Pick local files for the selected conversation's upload tray. Several at once:
+ * the dialog then answers with the folder, then each name, each NUL-ended. */
 static void upload_file(HWND hwnd) {
     crumb("upload_file");
     if (!g_client || !g_sel) return;
-    WCHAR file[MAX_PATH]; file[0] = 0;
+    static WCHAR file[32 * MAX_PATH];
+    file[0] = 0;
     OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
     ofn.lStructSize = sizeof ofn;
     ofn.hwndOwner = hwnd;
     ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&ofn)) {
-        char path[1024];
-        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
-        oc_client_upload(g_client, g_sel, path);
+    ofn.nMaxFile = sizeof file / sizeof file[0];
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | OFN_ALLOWMULTISELECT;
+    if (!GetOpenFileNameW(&ofn)) return;
+    const WCHAR *first = file, *next = file + wcslen(file) + 1;
+    WCHAR full[MAX_PATH];
+    char path[1024];
+    if (!*next) {                                  /* one file: the whole path */
+        WideCharToMultiByte(CP_UTF8, 0, first, -1, path, sizeof path, NULL, NULL);
+        ftray_add(hwnd, path);
+        return;
+    }
+    for (; *next; next += wcslen(next) + 1) {
+        if (_snwprintf(full, MAX_PATH, L"%ls\\%ls", first, next) < 0) continue;
+        full[MAX_PATH - 1] = 0;
+        WideCharToMultiByte(CP_UTF8, 0, full, -1, path, sizeof path, NULL, NULL);
+        ftray_add(hwnd, path);
     }
 }
 
@@ -21681,6 +22158,7 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         return 1;
     }
+    if (ftray_click(hwnd, x, y)) return 1;
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     if (in_rect(g_video_btn, x, y)) { vm_command(hwnd, VMC_OPEN); return 1; }
     /* Hold the microphone to talk: the press opens it, the release closes it.
@@ -22564,6 +23042,7 @@ static void reset_session(void) {
         g_n_notify_hw = 0;      /* slot indices just shifted */
         listen_drop_player();     /* the player borrows bytes the core is about to free */
         dict_forget(g_client);
+        ftray_forget(g_client);
         oc_client_stop(g_client);
         g_client = NULL;
     }
@@ -25459,6 +25938,24 @@ static void test_dump(const char *path) {
                 (unsigned long long)(fm2 ? fm2->filelist_channel : 0),
                 g_file_more_btn.left, g_file_more_btn.top, g_file_more_btn.right, g_file_more_btn.bottom);
     }
+    /* The upload tray: its chips here, everything it holds, the posts still
+     * owed their text, and each chip's state as the tick reads it. */
+    {
+        const oc_model *tm = model();
+        fprintf(f, "ftray here=%d all=%d posts=%d height=%.0f more=%d\n",
+                ftray_count(), g_n_ftray, g_n_ftray_posts, composer_tray(), g_ftray_more);
+        for (int i = 0; i < g_n_ftray; i++) {
+            const ftray_chip *c = &g_ftray[i];
+            float frac = 0;
+            int st = c->tag && tm ? ftray_state(tm, c, &frac) : -1;
+            fprintf(f, "  fchip %d name=\"%s\" here=%d pic=%d tag=%llu ix=%d state=%d pct=%d shown=%.2f failed=%d done=%d "
+                       "r=%.0f,%.0f,%.0f,%.0f x=%.0f,%.0f,%.0f,%.0f\n",
+                    i, c->name, ftray_here(c), c->thumb && thumb_get(NULL, c->thumb, NULL, NULL) != NULL,
+                    (unsigned long long)c->tag, c->ix, st,
+                    (int)(frac * 100.0f + 0.5f), c->shown, c->failed, c->done_at != 0,
+                    c->r.left, c->r.top, c->r.right, c->r.bottom, c->x.left, c->x.top, c->x.right, c->x.bottom);
+        }
+    }
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
@@ -26176,6 +26673,12 @@ static void test_poll(HWND hwnd) {
                          MAKEWPARAM(0xF5, EN_CHANGE), (LPARAM)g_dir_edit);
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "attach")) {
+        /* Into the upload tray, as picking the file would: the dialog cannot be
+         * driven, the tray can. */
+        int had = g_n_ftray;
+        ftray_add(hwnd, arg);
+        test_ack(g_n_ftray > had ? "ok" : "err");
     } else if (!strcmp(verb, "upload")) {
         /* Bypass the file dialog so an attachment can be posted from the harness. */
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
@@ -26378,7 +26881,7 @@ static void test_poll(HWND hwnd) {
          * dismiss reliably. Same code path the button takes after OK. */
         int slot = ws_find(arg);
         if (slot >= 0 && g_wss[slot].client && slot != g_ws_active) {
-            dict_forget(g_wss[slot].client);
+            dict_forget(g_wss[slot].client); ftray_forget(g_wss[slot].client);
             oc_client_stop(g_wss[slot].client);
             for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
             g_n_wss--;
@@ -26977,12 +27480,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
         UINT nf = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+        /* Into the conversation's tray, which has to be on screen to be seen. */
+        if (nf && g_client && g_sel && g_view != VIEW_HOME) { g_view = VIEW_HOME; layout_composer(hwnd); }
         for (UINT i = 0; i < nf && g_client && g_sel; i++) {
             WCHAR wf[MAX_PATH];
             if (DragQueryFileW(drop, i, wf, MAX_PATH)) {
                 char path[1024];
                 WideCharToMultiByte(CP_UTF8, 0, wf, -1, path, sizeof path, NULL, NULL);
-                oc_client_upload(g_client, g_sel, path);
+                ftray_add(hwnd, path);
             }
         }
         DragFinish(drop);
@@ -27032,6 +27537,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
+            ftray_tick(hwnd);        /* uploads in the composer's tray */
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
             /* The call view's duration, levels and speaking rings move without
@@ -28472,6 +28978,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
         case AT_FMORE: if (g_client) oc_client_list_files_more(g_client); break;
+        case AT_FTRAY: ftray_remove(hwnd, (int)arg); break;
         case AT_HOVERREACT:
             if ((int)arg < g_n_hrx && g_hrx_mid && g_client)
                 oc_client_react(g_client, g_sel, g_hrx_mid, g_hrx[arg].emoji,

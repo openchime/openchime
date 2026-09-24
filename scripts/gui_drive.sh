@@ -14,7 +14,8 @@
 #           formnext <v1>|<v2>|... (arm the next modal form) |
 #           search [query] | find <text> | key [ctrl+|alt+|shift+]<key> |
 #           keyup <key> | mousedown x y | mouseup x y |
-#           dictate ptt-down|ptt-up|free-on|free-off
+#           dictate ptt-down|ptt-up|free-on|free-off |
+#           attach <winpath> (into the message box's upload tray)
 #
 # `shot <name>` and `dump <name>` take a bare name; every other path is a
 # Windows path.

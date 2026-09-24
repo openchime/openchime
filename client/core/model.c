@@ -819,6 +819,35 @@ static void msg_add_attach(oc_msg *msg, const oc_ev *e) {
 
 /* Attach an attachment to the message with `message_id`, searching every channel
  * buffer and the open thread's replies (message ids are globally unique). */
+/* Keep a transfer's latest notice under its tag. Slots are in order of first
+ * notice, so a full table gives up its oldest finished transfer, and only when
+ * every one is still running, its oldest. */
+static void note_xfer(oc_model *m, const oc_ev *e) {
+    if (!e->xfer_tag) return;
+    size_t n = sizeof m->xfers / sizeof m->xfers[0], i;
+    for (i = 0; i < n && m->xfers[i].tag && m->xfers[i].tag != e->xfer_tag; i++) {}
+    if (i == n) {
+        size_t gone = 0;
+        while (gone < n && m->xfers[gone].phase == 0) gone++;
+        if (gone == n) gone = 0;
+        memmove(&m->xfers[gone], &m->xfers[gone + 1], (n - gone - 1) * sizeof m->xfers[0]);
+        i = n - 1;
+    }
+    oc_xfer_state *x = &m->xfers[i];
+    x->tag = e->xfer_tag;
+    x->done = e->xfer_done;
+    x->total = e->xfer_total;
+    x->phase = e->op;
+    x->file = e->xfer_file;
+}
+
+const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag) {
+    if (!m || !tag) return NULL;
+    for (size_t i = 0; i < sizeof m->xfers / sizeof m->xfers[0] && m->xfers[i].tag; i++)
+        if (m->xfers[i].tag == tag) return &m->xfers[i];
+    return NULL;
+}
+
 static void attach_to_msg(oc_model *m, const oc_ev *e) {
     uint64_t message_id = e->message_id;
     for (size_t ci = 0; ci < m->n_channels; ci++)
@@ -2014,6 +2043,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->xfer_done = e->xfer_done;
         m->xfer_total = e->xfer_total;
         m->xfer_phase = e->op;
+        note_xfer(m, e);
         break;
     case OC_EV_MEDIA_POSTED:
         m->media_posted_tag = e->xfer_tag;

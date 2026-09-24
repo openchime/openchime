@@ -539,6 +539,15 @@ Two implementation notes worth keeping, both learned by getting it wrong first:
   measured client's sends makes the two barely overlap, and the measurement
   becomes a no-op that passes either way.
 
+The same endpoint has a **gate**, which proves cancelling a post of files
+(REQ-140) by construction rather than by timing. While it is shut, a PUT is read
+whole and not answered, and the daemon's commit waits on that answer — so an
+upload that has sent its last byte cannot finish, however long the test takes.
+Cancelling it then is cancelling a running upload; a post queued behind it
+cannot start, since it holds the connection's one transfer slot, so cancelling
+that is cancelling a queued one. Neither posts, and the post queued after both
+does once the gate opens. Making the cancel a no-op fails the run.
+
 ### Maintenance-pass overhead (ARCH-78)
 
 Running the storage maintenance pass every 200 ms — 25× more often than the
@@ -965,6 +974,25 @@ the button then goes, there being no more. It reads the dump's `files` line:
 The paging underneath is proven without a screen in `test_client_core.c`, which
 asks the daemon for pages of two and checks the second continues from the first
 rather than repeating it. Not in CI, for the smoke's reason.
+
+## Reading the uploads harness
+
+`scripts/gui_uploads.sh` drives the Win32 message box's upload tray (REQ-140)
+against its own fixture daemon (port 9630). It attaches files through the
+`attach` verb — the file dialog cannot be driven, the tray can — and asserts
+that they wait as chips, an image with its picture, each chip's button published
+to assistive technology, with nothing uploaded; that a chip's × takes it out;
+that Send posts what is left and the text as ONE message and the tray empties;
+and that a file that cannot be read stops the post, the chip coming back marked
+and the text back in the box, with nothing posted — shown by the next message
+being the last. It reads the dump's `ftray` line (`here=`, `all=`, `posts=`,
+`height=`) and one `fchip` line per chip (`pic=`, `state=` -1 waiting for Send,
+0 queued, 1 moving; `failed=`, `done=`, and the `x=` button's rect). Its last
+step sends a large file so the bars can be seen moving in `uploads_moving`; that
+shot asserts nothing, since when a local upload finishes is not something to
+test against. The core underneath — one message, its files in order, a thread,
+a failure — is proven in `test_client_core.c`, and cancelling in
+`itest_slow_blob.c`. Not in CI, for the smoke's reason.
 
 ## Reading the members harness
 
