@@ -76,6 +76,10 @@ typedef struct {
     /* Outbound push emitter (ARCH-85). */
     struct { const char *url, *ca_bundle; } push;
 
+    /* Invitation mail through central (REQ-280, ARCH-85): OPENCHIME_INVITE_MAIL,
+     * off unless "on". Needs an active enrollment as well. */
+    int invite_mail;
+
     /* Link unfurls (REQ-222, ARCH-105). Always on — there is no switch.
      * `allow_private` disables the SSRF gate and exists only for tests. */
     struct { const char *ca_bundle; int allow_private; } unfurl;

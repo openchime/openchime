@@ -11980,6 +11980,13 @@ static const oc_modal_spec *modal_current(void);
  * a paragraph and its shape without the card outgrowing a small window. */
 #define FORM_MULTI_H (UIS(22.0f) * 5.0f + UIS(8.0f))
 
+/* The room a text field's hint takes below its box: its wrapped height, and
+ * never less than the one line every hint was given before it wrapped. */
+static float form_hint_h(const char *hint, float w) {
+    float h = text_height(hint, g_meta_w, w) + UIS(3.0f);
+    return h > UIS(20.0f) ? h : UIS(20.0f);
+}
+
 static float form_rowh(const oc_field *f, float w) {
     if (f->kind == FF_CHECK)  return UIS(34);
     if (f->kind == FF_CHOICE) {
@@ -12002,9 +12009,12 @@ static float form_rowh(const oc_field *f, float w) {
         }
         return UIS(24.0f) + (float)rows * UIS(34.0f) + UIS(2.0f);
     }
+    /* A hint wraps, and its row grows by the lines it takes: one cut to a
+     * single line lost the half of a sentence that said what to do. */
+    float hint = (f->hint && f->hint[0]) ? form_hint_h(f->hint, w) : 0;
     if (f->kind == FF_MULTILINE)
-        return UIS(22.0f) + FORM_MULTI_H + ((f->hint && f->hint[0]) ? UIS(26.0f) : UIS(6.0f));
-    return (f->hint && f->hint[0]) ? UIS(74.0f) : UIS(54.0f);
+        return UIS(22.0f) + FORM_MULTI_H + (hint > 0 ? hint + UIS(6.0f) : UIS(6.0f));
+    return UIS(54.0f) + hint;
 }
 
 static void draw_form(gfx *rt, rectf body) {
@@ -12127,7 +12137,9 @@ static void draw_form(gfx *rt, rectf body) {
             stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
             if (f->hint && f->hint[0])
-                draw_text(rt, f->hint, g_meta, rf(body.left, box.bottom + 3, body.right, box.bottom + 23),
+                draw_text(rt, f->hint, g_meta_w,
+                          rf(body.left, box.bottom + 3, body.right,
+                             box.bottom + 3 + form_hint_h(f->hint, body.right - body.left)),
                           OC_COL_FAINT);
         }
         y += rh;
@@ -23570,6 +23582,28 @@ static void show_secret(HWND owner, const char *title, const char *what,
     form_dialog(owner, title, f, 1);
 }
 
+/* The invitation, once INVITE_CREATED lands: the whole text to send the invited
+ * person -- workspace, how to sign in, expiry -- in a field that can be selected
+ * from, and already on the clipboard, as show_secret does for a bare token. The
+ * clipboard gets CRLF line ends, which is what a Windows paste target expects. */
+static void show_invitation(HWND owner, const oc_model *m) {
+    oc_field f[1] = { { FF_MULTILINE, "Invitation \u2014 copied to your clipboard", "", "" } };
+    if (!oc_model_invitation_text(m, g_cur_ws, f[0].value, sizeof f[0].value)) return;
+    char crlf[2 * sizeof f[0].value]; size_t o = 0;
+    for (const char *q = f[0].value; *q && o + 2 < sizeof crlf; q++) {
+        if (*q == '\n') crlf[o++] = '\r';
+        crlf[o++] = *q;
+    }
+    crlf[o] = '\0';
+    copy_to_clipboard(owner, crlf);
+    f[0].hint = m->invite_email[0]
+        ? "Send it to the person you invited. Nothing else is needed: signing in as that "
+          "address uses the invitation."
+        : "Send it to the person you invited. The token works once and is not shown again "
+          "\u2014 make a new invite if it is lost.";
+    form_dialog(owner, m->invite_email[0] ? "Invitation created" : "Invite created", f, 1);
+}
+
 /* text_prompt() is gone: every flow that used it now has a form
  * describing its actual shape. */
 
@@ -23577,6 +23611,48 @@ static void show_secret(HWND owner, const char *title, const char *what,
 
 static int g_logging_out;
 static int g_await_invite;      /* show the minted invite token once it arrives */
+
+/* "Invite people": by address where the workspace signs people in through a
+ * provider, by one-time token where it has password accounts, and either where
+ * it has both -- a workspace refuses the kind it cannot redeem. */
+static void invite_people(HWND hwnd, uint8_t role) {
+    const oc_model *m = model();
+    if (!g_client || !m) return;
+    int by_addr = oc_model_offers_browser(m), by_token = oc_model_offers_local(m);
+    if (!by_addr) {   /* passwords only: a token is the one kind of invite there is */
+        oc_client_invite(g_client, role, NULL);
+        g_await_invite = 1;
+        return;
+    }
+    const char *prov = oc_model_signin_provider(m);
+    char hint[320];
+    snprintf(hint, sizeof hint,
+             "The invitation is bound to this address, which must be able to sign in with %s.%s",
+             prov[0] ? prov : "this workspace's sign-in provider",
+             by_token ? " Leave it empty to make a one-time invite token for a password "
+                        "account instead." : "");
+    oc_field f[1] = { { FF_TEXT, "Email address", hint, "" } };
+    if (!form_dialog(hwnd, role == OC_ROLE_ADMIN ? "Invite people as admin" : "Invite people",
+                     f, 1)) return;
+    {   /* checked as it will be sent: without the spaces a paste brings along */
+        char *v = f[0].value, *b = v;
+        while (*b == ' ' || *b == '\t') b++;
+        size_t n = strlen(b);
+        while (n && (b[n - 1] == ' ' || b[n - 1] == '\t' || b[n - 1] == '\r' || b[n - 1] == '\n')) n--;
+        memmove(v, b, n);
+        v[n] = '\0';
+    }
+    if (!f[0].value[0] && !by_token) {
+        toast_push("An email address is needed to invite someone here.", 1);
+        return;
+    }
+    if (f[0].value[0] && !oc_email_plausible(f[0].value)) {
+        toast_push("That does not look like an email address.", 1);
+        return;
+    }
+    oc_client_invite(g_client, role, f[0].value);
+    g_await_invite = 1;
+}
 
 static float menu_total_height(void) {
     float t = 12 + (g_menu_headerblock ? 66 : 0);
@@ -24969,8 +25045,8 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         else if (strcmp(f[1].value, f[2].value))   toast_push("The new passwords do not match.", 1);
         else                                       oc_client_change_password(g_client, f[0].value, f[1].value);
         break; }
-    case 40: oc_client_invite_user(g_client, OC_ROLE_MEMBER); g_await_invite = 1; break;
-    case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
+    case 40: invite_people(hwnd, OC_ROLE_MEMBER); break;
+    case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
     case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
     case 74:  /* Threads (REQ-062), the same destination the shelf row opens.
@@ -28234,10 +28310,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
-            if (g_await_invite && m->invite_token[0]) {   /* show the minted token once */
+            if (g_await_invite && m->invite_token[0]) {   /* show the invitation once */
                 g_await_invite = 0;
-                show_secret(hwnd, "Invite created", "Invite token", m->invite_token,
-                            "Share it once. It is not shown again \u2014 mint a new invite if you lose it.");
+                show_invitation(hwnd, m);
             }
             if (g_await_webhook && m->webhook_token[0]) {  /* show the minted webhook token once */
                 g_await_webhook = 0;

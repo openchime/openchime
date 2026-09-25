@@ -287,6 +287,13 @@ void oc_client_change_password(oc_client *c, const char *old_pw, const char *new
  * model), or remove/disable a user. Each folds a USER_UPDATED into the roster. */
 void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role);
 void oc_client_invite_user(oc_client *c, uint8_t role);
+/* Invite someone: bound to `email` when it is given -- spent by that address's
+ * first verified sign-in through the workspace's provider, no token to hand over
+ * -- or, with NULL/"", a bearer token for a new local account. The answer is an
+ * INVITE_CREATED; oc_model_invitation_text then words what to send the invited
+ * person. Offer an address where oc_model_offers_browser holds and a token where
+ * oc_model_offers_local does: a workspace refuses the other. */
+void oc_client_invite(oc_client *c, uint8_t role, const char *email);
 void oc_client_remove_user(oc_client *c, uint64_t user_id);
 
 /* Incoming-webhook management (REQ-170). Open the webhook overlay for a channel

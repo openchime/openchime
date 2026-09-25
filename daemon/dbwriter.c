@@ -419,6 +419,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->unf_url);
     free(r->unf_title);
     free(r->unf_descr);
+    free(r->invite_email);
     for (size_t i = 0; i < r->n_plist; i++) { free(r->plist[i].body); free(r->plist[i].attach_name); }
     free(r->plist);
     free(r->cmlist);
@@ -535,6 +536,64 @@ static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
     sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
     sqlite3_step(st);
     sqlite3_finalize(st);
+}
+
+/* At most `max` bytes of `s`, cut back to a UTF-8 boundary. */
+static int utf8_prefix_len(const char *s, int max) {
+    int n = (int)strlen(s);
+    if (n <= max) return n;
+    n = max;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    return n;
+}
+
+/* A managed workspace's welcome in #general, written the one time the channel
+ * is created: the existing topic and description columns, nothing authored and
+ * nobody posing as the workspace. A #general that exists already -- made by an
+ * earlier boot, or edited since -- is not touched. */
+static oc_dbres *process_welcome_general(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_OK;
+    const char *name = (j->ch_name && j->ch_name[0]) ? j->ch_name : NULL;
+    int nl = name ? utf8_prefix_len(name, 64) : 0;
+    char topic[OC_MAX_TOPIC + 1], descr[OC_MAX_DESCRIPTION + 1];
+    if (name) {
+        snprintf(topic, sizeof topic, "Everyone in %.*s is here. Say hello.", nl, name);
+        snprintf(descr, sizeof descr,
+                 "Welcome to %.*s. Everyone who joins the workspace is a member of #general, "
+                 "so it is the place for news and questions meant for all. Invite people "
+                 "from the workspace menu, and start a channel for each team or topic.",
+                 nl, name);
+    } else {
+        snprintf(topic, sizeof topic, "Everyone in the workspace is here. Say hello.");
+        snprintf(descr, sizeof descr,
+                 "Welcome. Everyone who joins the workspace is a member of #general, so it "
+                 "is the place for news and questions meant for all. Invite people from the "
+                 "workspace menu, and start a channel for each team or topic.");
+    }
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO channels(id,kind,name,is_public,created_at_ms) "
+        "VALUES(?, 'channel', 'general', 1, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, OC_DEFAULT_CHANNEL);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    int created = rc == SQLITE_DONE && sqlite3_changes(db) == 1;
+    if (created) {
+        sqlite3_prepare_v2(db, "UPDATE channels SET topic=?, description=? WHERE id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_text(st, 1, topic, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, descr, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, OC_DEFAULT_CHANNEL);
+        created = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, created ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+    r->channel_id = created ? OC_DEFAULT_CHANNEL : 0;
+    return r;
 }
 
 /* True when adding a NEW user `subject` would exceed the cap (CP-7,
@@ -1287,11 +1346,14 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
 /* Mint an invite for `role`: random token to the caller, only its SHA-256 +
  * expiry stored. `created_by` is the issuing user (0 -> NULL, e.g. a first-run
  * setup token with no issuer). Returns 0 and fills token/expiry, or -1. */
+/* `hash_out` (may be NULL) receives the SHA-256 the row is keyed by. */
 static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const char *email,
-                           uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
+                           uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out,
+                           uint8_t hash_out[OC_SHA256_LEN]) {
     uint8_t hash[OC_SHA256_LEN];
     if (oc_rand_bytes(token, OC_INVITE_TOKEN_LEN) != 0 ||
         oc_sha256(token, OC_INVITE_TOKEN_LEN, hash) != 0) return -1;
+    if (hash_out) memcpy(hash_out, hash, sizeof hash);
     uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -1314,10 +1376,28 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
 
 static int mint_invite(sqlite3 *db, uint64_t created_by, uint8_t role,
                        uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
-    return mint_invite_for(db, created_by, role, NULL, token, expiry_out);
+    return mint_invite_for(db, created_by, role, NULL, token, expiry_out, NULL);
 }
 
-static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
+/* The id an invitation is reported to central under (ARCH-85's invitation
+ * mail): 16 bytes of SHA-256 over a label and the row's key, as lowercase hex.
+ * Derived rather than stored, so every retry of one report names the same
+ * invitation and the table needs no column for it. The key is the hash of a
+ * token nobody holds -- an address-bound invite hands out no token -- and the
+ * label keeps the id from being that hash. */
+static void invite_report_id(const uint8_t hash[OC_SHA256_LEN], char out[33]) {
+    static const char LABEL[] = "openchime-invite-id-v1|";
+    uint8_t buf[sizeof LABEL - 1 + OC_SHA256_LEN], id[OC_SHA256_LEN];
+    memcpy(buf, LABEL, sizeof LABEL - 1);
+    memcpy(buf + sizeof LABEL - 1, hash, OC_SHA256_LEN);
+    if (oc_sha256(buf, sizeof buf, id) != 0) { out[0] = '\0'; return; }
+    static const char HEX[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) { out[2 * i] = HEX[id[i] >> 4]; out[2 * i + 1] = HEX[id[i] & 15]; }
+    out[32] = '\0';
+}
+
+static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
@@ -1335,14 +1415,28 @@ static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
      * address it is spent by that address's verified sign-in (AUTH.md §8.4), and
      * the token that comes back is zeros — there is nothing to hand anybody. */
     const char *email = (j->email && j->email[0]) ? j->email : NULL;
-    if (email && (!strchr(email, '@') || strlen(email) > 254)) {
+    if (email && !oc_email_plausible(email)) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-    uint8_t token[OC_INVITE_TOKEN_LEN]; uint64_t expiry = 0;
-    if (mint_invite_for(db, j->user_id, want, email, token, &expiry) != 0) {
+    /* Only a provider's verified sign-in spends an address-bound invite. Where no
+     * such source is on, nothing could ever redeem it, and minting it anyway would
+     * hand the inviter a row that sits there until it expires. */
+    if (email && !(w->auth_methods & OC_AUTH_OIDC)) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE; return r;
+    }
+    uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN]; uint64_t expiry = 0;
+    if (mint_invite_for(db, j->user_id, want, email, token, &expiry, hash) != 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
-    if (email) memset(token, 0, sizeof token);
+    if (email) {
+        memset(token, 0, sizeof token);
+        /* What the invitation mail report needs (ARCH-85): the address as it was
+         * stored, and an id that stays the same for this invite. */
+        invite_report_id(hash, r->invite_id);
+        r->invite_email = strdup(email);
+        for (char *p = r->invite_email; p && *p; p++)
+            if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    }
     audit_actor(db, OC_AUDIT_ADMIN, "user.invite", j->user_id, 0,
                 u8_to_role(j->role), 1, email);
     r->type = OC_RES_INVITE_OK;
@@ -1550,6 +1644,7 @@ static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
+    if (j->enroll_quiet) { free(r); return NULL; }   /* push_result ignores NULL */
     if (rc == SQLITE_DONE) r->type = OC_RES_OK;
     else { r->err_code = OC_ERR_INTERNAL; }
     return r;
@@ -7128,7 +7223,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
-    if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
+    if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w, j);
     if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
     if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);
     if (j->type == OC_JOB_LIST_SCHEDULED)    return process_list_scheduled(w->db, j);
@@ -7153,6 +7248,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
     if (j->type == OC_JOB_LOAD_ENROLLMENT)  return process_load_enrollment(w->db, j);
     if (j->type == OC_JOB_STORE_ENROLLMENT) return process_store_enrollment(w->db, j);
+    if (j->type == OC_JOB_WELCOME_GENERAL)  return process_welcome_general(w->db, j);
     if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
     if (j->type == OC_JOB_ATTACH_MEDIA_SET) return process_attach_media_set(w->db, j);
@@ -7837,6 +7933,37 @@ int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const 
             int ok = (r->type == OC_RES_OK);
             oc_dbres_free(r);
             return ok;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem, const char *audience) {
+    if (!privkey_pem || !audience) return;
+    oc_job *j = oc_job_new(OC_JOB_STORE_ENROLLMENT, 0);
+    if (!j) return;
+    j->enroll_privkey  = strdup(privkey_pem);
+    j->enroll_audience = strdup(audience);
+    j->enroll_active   = 1;
+    j->enroll_quiet    = 1;
+    if (!j->enroll_privkey || !j->enroll_audience) { job_free(j); return; }
+    oc_dbwriter_submit(w, j);
+}
+
+int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name) {
+    if (deployment_mode != OC_DEPLOY_MANAGED) return 0;   /* self-hosted: #general as ever */
+    oc_job *j = oc_job_new(OC_JOB_WELCOME_GENERAL, 0);
+    if (!j) return 0;
+    j->ch_name = strdup(workspace_name ? workspace_name : "");
+    if (!j->ch_name) { job_free(j); return 0; }
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int wrote = r->type == OC_RES_OK && r->channel_id == OC_DEFAULT_CHANNEL;
+            oc_dbres_free(r);
+            return wrote;
         }
         usleep(1000);
     }

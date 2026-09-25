@@ -317,9 +317,19 @@ model; translate input to intents }, stop.
     — updates live); "Change password" rotates your local password (the server
     verifies the old one, and a wrong one shows an error).
   - **admin / user management** — a member menu's "Make admin/Make member/Remove"
-    (or the launcher's "Invite a user", which mints a tenant token shown once atop
-    the roster) manage users (REQ-030/033, owner/admin only; a `USER_UPDATED`
-    folds each change into the roster).
+    and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
+    only; a `USER_UPDATED` folds each change into the roster). "Invite a user"
+    asks for an email address where the workspace offers a browser sign-in — the
+    invitation is bound to it, and the prompt says the address must be able to
+    sign in with the workspace's provider, by name where the workspace's browser
+    sources say which (`oc_model_signin_provider`: a source id `google` is
+    Google, `microsoft` Microsoft) — and, where it also has password accounts, a
+    blank address mints a one-time token instead; a workspace with password
+    accounts only mints the token without asking. Anything that is not an
+    address (`oc_email_plausible`) keeps the prompt open and says so. The
+    invitation text
+    (`oc_model_invitation_text`: the workspace, how to sign in, the expiry) is
+    printed atop the roster, which opens on it.
   - **webhook management** — the channel menu's "Webhooks" overlays the focused
     channel's incoming webhooks; "Create webhook" mints one (the 32-byte token is
     shown once atop the overlay, like an invite) — REQ-170, CREATE/LIST_WEBHOOK.
@@ -368,7 +378,17 @@ model; translate input to intents }, stop.
   **workspace** (invites, notifications, mark all read, shortcuts, storage/audit,
   reconnect, sign out everywhere), **profile** (status, away, pause
   notifications, Profile, Preferences, sign out), and **New** (channel, DM,
-  group message, upload, search, jump to, browse, section, custom emoji). **Each
+  group message, upload, search, jump to, browse, section, custom emoji).
+  **Invite people** (as member or as admin) asks for an email address where the
+  workspace offers a browser sign-in, saying the address must be able to sign in
+  with the workspace's provider — by name where the workspace's sources say which,
+  as the TUI does — and refusing, in a toast, anything that is not an address;
+  where it also has password accounts the address
+  may be left empty for a one-time token, and where it has password accounts only
+  the token is minted without asking. The answer opens the invitation — the
+  workspace address as typed, how to sign in (the provider and the invited
+  address, or the token) and the expiry — in a selectable field, already on the
+  clipboard, as a one-time secret is shown. **Each
   destination has one door in the visible chrome**: an item is not repeated in a
   second menu a click away, and an icon does not open a menu something beside it
   already opens. Right of the rail sits the channel column (header with the

@@ -8,6 +8,7 @@
 
 #include "protocol.h"   /* OC_PRESENCE_OFFLINE */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -661,6 +662,119 @@ void oc_model_sessions_begin(oc_model *m) {
     oc_model_close_sessions(m);
     m->sessions_open = 1;
     m->sessions_loading = 1;
+}
+
+int oc_model_offers_local(const oc_model *m) {
+    return !m->signin_kinds || (m->signin_kinds & (1u << OC_SOURCE_LOCAL)) != 0;
+}
+
+int oc_model_offers_browser(const oc_model *m) {
+    return !m->signin_kinds ||
+           (m->signin_kinds & ((1u << OC_SOURCE_RELAY) | (1u << OC_SOURCE_OIDC))) != 0;
+}
+
+const char *oc_signin_provider_name(const char *id, size_t len) {
+    static const struct { const char *id, *name; } KNOWN[] = {
+        { "google", "Google" }, { "microsoft", "Microsoft" },
+    };
+    if (!id) return NULL;
+    for (size_t k = 0; k < sizeof KNOWN / sizeof KNOWN[0]; k++) {
+        size_t kl = strlen(KNOWN[k].id);
+        if (len != kl) continue;
+        size_t i = 0;
+        while (i < kl && tolower((unsigned char)id[i]) == KNOWN[k].id[i]) i++;
+        if (i == kl) return KNOWN[k].name;
+    }
+    return NULL;
+}
+
+const char *oc_model_signin_provider(const oc_model *m) {
+    return m->signin_provider;
+}
+
+/* Name the provider only when every browser source names one: a source that
+ * does not (the relay, which offers several) leaves the choice unknown. */
+static void set_signin_provider(oc_model *m, const char *ids) {
+    char out[sizeof m->signin_provider] = "";
+    size_t n = 0;
+    for (const char *p = ids ? ids : ""; *p; ) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len) {
+            const char *name = oc_signin_provider_name(p, len);
+            if (!name) { out[0] = '\0'; n = 0; break; }
+            if (!strstr(out, name)) {
+                int w = snprintf(out + n, sizeof out - n, "%s%s", n ? " or " : "", name);
+                if (w < 0 || (size_t)w >= sizeof out - n) { out[0] = '\0'; n = 0; break; }
+                n += (size_t)w;
+            }
+        }
+        p += len;
+        if (*p == '\n') p++;
+    }
+    snprintf(m->signin_provider, sizeof m->signin_provider, "%s", out);
+}
+
+void oc_model_invite_asked(oc_model *m, const char *email) {
+    snprintf(m->invite_asked_email, sizeof m->invite_asked_email, "%s", email ? email : "");
+    /* The last invitation is spent the moment another is asked for: a frontend
+     * waiting for the answer must not take the old one for it. */
+    m->invite_token[0] = '\0';
+    m->invite_email[0] = '\0';
+}
+
+size_t oc_model_invitation_text(const oc_model *m, const char *address, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!m->invite_token[0]) return 0;
+    const char *name = m->workspace_name[0] ? m->workspace_name : NULL;
+    const char *addr = address && address[0] ? address : NULL;
+    char expires[40] = "";
+    if (m->invite_expires) {
+        time_t t = (time_t)(m->invite_expires / 1000u);
+        struct tm tv;
+#ifdef _WIN32
+        int ok = gmtime_s(&tv, &t) == 0;
+#else
+        int ok = gmtime_r(&t, &tv) != NULL;
+#endif
+        if (ok) strftime(expires, sizeof expires, "%Y-%m-%d %H:%M UTC", &tv);
+    }
+    const char *role = m->invite_role == OC_ROLE_OWNER ? "owner"
+                     : m->invite_role == OC_ROLE_ADMIN ? "admin" : "member";
+    int n;
+    if (m->invite_email[0]) {
+        n = snprintf(out, cap,
+            "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
+            "\n"
+            "Workspace: %s\n"
+            "Sign in: open the workspace in the OpenChime app, continue in your browser, and "
+            "sign in as %s. That address must be able to sign in with %s.\n"
+            "%s%s%s",
+            name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+            m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
+            addr ? addr : "(the address you were given)",
+            m->invite_email,
+            m->signin_provider[0] ? m->signin_provider : "this workspace's sign-in provider",
+            expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
+    } else {
+        n = snprintf(out, cap,
+            "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
+            "\n"
+            "Workspace: %s\n"
+            "Sign in: open the workspace in the OpenChime app, choose to create an account "
+            "with an invite, and enter this invite token with the username and password you "
+            "want. It works once.\n"
+            "Invite token: %s\n"
+            "%s%s%s",
+            name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+            m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
+            addr ? addr : "(the address you were given)",
+            m->invite_token,
+            expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
+    }
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (size_t)n < cap ? (size_t)n : cap - 1;
 }
 
 void oc_model_invites_begin(oc_model *m) {
@@ -1968,12 +2082,24 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(m->invite_token, sizeof m->invite_token, "%s", e->body ? e->body : "");
         m->invite_role = e->op;
         m->invite_expires = e->server_time;
+        /* INVITE_CREATED answers the invite asked for last; one bound to an
+         * address comes back with a token of zeros, which is nothing to share. */
+        snprintf(m->invite_email, sizeof m->invite_email, "%s", m->invite_asked_email);
+        m->invite_asked_email[0] = '\0';
         {
-            char buf[160];
-            snprintf(buf, sizeof buf, "invite (%s): %s",
-                     e->op == OC_ROLE_ADMIN ? "admin" : "member", m->invite_token);
+            char buf[sizeof m->status];
+            if (m->invite_email[0])
+                snprintf(buf, sizeof buf, "invitation for %.100s (%s) created", m->invite_email,
+                         e->op == OC_ROLE_ADMIN ? "admin" : "member");
+            else
+                snprintf(buf, sizeof buf, "invite (%s): %s",
+                         e->op == OC_ROLE_ADMIN ? "admin" : "member", m->invite_token);
             set_status(m, buf);
         }
+        break;
+    case OC_EV_SIGNIN_SOURCES:
+        m->signin_kinds = e->count;
+        set_signin_provider(m, e->body);
         break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);

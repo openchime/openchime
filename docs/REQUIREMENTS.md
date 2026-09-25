@@ -237,6 +237,14 @@ where one exists.
   member from the tenant. Channel-level invite/remove for private channels
   has been available to any existing member of that channel, not gated to
   admins. Both gates have been enforced in the DB-writer handlers (ARCH-60).
+  An invitation has been by **email address** where the workspace signs people in
+  through a provider — bound to the address and spent by its first verified
+  sign-in — and by **one-time token** where it has local accounts; the client has
+  offered each only where the workspace can redeem it, and the daemon has refused
+  an address-bound invite where no source could ever spend it. In every
+  deployment model the inviter has been shown the invitation as **copyable
+  text**: the workspace address, how to sign in (the provider and the invited
+  address, or the token) and when it expires.
 - **REQ-034.** Each channel has carried an optional human-set **topic/
   description** — a short line shown in the channel header — set by a channel
   member. It is metadata on the channel, distinct from the channel name.
@@ -997,10 +1005,18 @@ where one exists.
   Slack's **saved custom views** are not adopted: they are a way to cope with a
   filter set larger than this one.
 - **REQ-280.** *(Excluded by decision)* **Email notifications have not been provided, in any deployment
-  model.** No digest, no "you were mentioned" mail, no unread summary — no
-  notification email of any kind. (The one outbound-mail path contemplated
-  anywhere in the product is REQ-276's opt-in compliance journaling, which is an
-  operator-configured compliance export, not a notification.) Two reasons, both deliberate. **Operationally**, it
+  model; the one message mailed to a person has been an invitation, which central
+  has delivered for an enrolled workspace that turned invitation mail on
+  (`OPENCHIME_INVITE_MAIL`, ARCH-85).** No digest, no "you were mentioned" mail,
+  no unread summary — no notification email of any kind, and no mail sent by the
+  daemon itself. (The outbound-mail paths in the product are that invitation,
+  sent by central, and REQ-276's opt-in compliance journaling, which is an
+  operator-configured compliance export, not a notification.) The invitation
+  meets both reasons below: no self-hoster runs a mail relay for it, since
+  central sends it, and it carries no message content — only the invited address,
+  for a workspace whose name and address central already holds, and central keeps
+  nothing once it is sent. Everywhere else an invitation is the copyable text the
+  inviter's client shows (REQ-033). Two reasons, both deliberate. **Operationally**, it
   would oblige every self-hoster to run or rent a mail relay and inherit
   deliverability, bounce, and unsubscribe handling — a second delivery system
   with its own failure modes, for a product whose entire delivery story is

@@ -108,6 +108,24 @@ static int mk_udp_client(void) {
     return fd;
 }
 
+/* The ready hook (netloop.h): when it runs, the listener must already take
+ * connections -- a managed box claims its binding from it, and central reads
+ * the claim as a workspace that is up. */
+static int g_ready_calls, g_ready_connected, g_ready_port;
+static void on_ready(void *ctx) {
+    (void)ctx;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons((uint16_t)g_ready_port);
+    /* The loop has not served a cycle yet, so this is the kernel's backlog
+     * accepting it: which is what "the listener is bound" means. */
+    g_ready_connected = fd >= 0 && connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0;
+    if (fd >= 0) close(fd);
+    oc_netloop_set_ready(NULL, NULL);   /* the other loops in this suite are not asked */
+    __atomic_add_fetch(&g_ready_calls, 1, __ATOMIC_RELEASE);
+}
+
 static void *loop_thread(void *p) {
     struct loop_arg *a = (struct loop_arg *)p;
     /* The daemon loads config once in main() before serving; here the test is the
@@ -3083,6 +3101,20 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
     for (size_t ti = 0; ti < ic.token.len; ti++)
         CHECK((token[ti] >= '0' && token[ti] <= '9') || (token[ti] >= 'a' && token[ti] <= 'f'));
 
+    /* This workspace signs people in with passwords only, so an invite bound to
+     * an address could never be spent: it is refused, the connection lives on,
+     * and the reason says what to do instead. */
+    {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_invite_user ie = { OC_ROLE_MEMBER, oc_slice_str("lee@partner.example") };
+        CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &ie) == OC_OK);
+        CHECK(send_frame(&owner, buf, w.len) == 0);
+        CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+        oc_error er;
+        CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_INVITE_UNREDEEMABLE &&
+              !er.fatal && er.message.len > 0);
+    }
+
     /* A fresh client redeems the invite: pre-auth account creation -> AUTH_OK. */
     client nh;
     CHECK(client_open(&nh, port, pin) == 0);
@@ -3676,8 +3708,12 @@ int run_netloop_tests(void) {
     arg.srv = &srv;
     arg.dbw = dbw;
     arg.stop = 0;
+    g_ready_port = arg.port;
+    oc_netloop_set_ready(on_ready, NULL);
     pthread_t th;
     CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
+    for (int i = 0; i < 500 && !__atomic_load_n(&g_ready_calls, __ATOMIC_ACQUIRE); i++) usleep(10000);
+    CHECK(__atomic_load_n(&g_ready_calls, __ATOMIC_ACQUIRE) == 1 && g_ready_connected);
 
     if (failures == 0) {
         test_version_reject(arg.port, pin);

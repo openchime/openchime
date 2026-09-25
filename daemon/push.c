@@ -241,22 +241,23 @@ static long conn_read(push_conn *c, void *buf, size_t cap) {
     return (n < 0) ? -1 : (long)n;
 }
 
-/* POST the signed notify body to /api/machine/push/notify. Adds the three CP-12
- * headers. Reads the whole response (Connection: close) and de-chunks a
+/* POST a signed body to `path` (e.g. /api/machine/push/notify). Adds the three
+ * CP-12 headers. Reads the whole response (Connection: close) and de-chunks a
  * Transfer-Encoding: chunked reply (Kestrel uses it for dynamic JSON). */
-static int post_notify(push_ctx *ctx, const char *audience, long ts, const char *sig,
-                       const char *body, int *status, char *resp, size_t resp_cap, size_t *resp_len) {
+static int post_signed(push_ctx *ctx, const char *path, const char *audience, long ts,
+                       const char *sig, const char *body, int *status,
+                       char *resp, size_t resp_cap, size_t *resp_len) {
     push_conn c;
     if (conn_open(&c, ctx) != 0) return -1;
 
     char head[1024];
     size_t blen = strlen(body);
     int n = snprintf(head, sizeof head,
-        "POST /api/machine/push/notify HTTP/1.1\r\nHost: %s\r\n"
+        "POST %s HTTP/1.1\r\nHost: %s\r\n"
         "Content-Type: application/json\r\n"
         "X-OpenChime-Audience: %s\r\nX-OpenChime-Timestamp: %ld\r\nX-OpenChime-Signature: %s\r\n"
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-        ctx->endpoint, audience, ts, sig, blen);
+        path, ctx->endpoint, audience, ts, sig, blen);
     if (n < 0 || n >= (int)sizeof head ||
         conn_write(&c, head, (size_t)n) != 0 || conn_write(&c, body, blen) != 0) {
         conn_close(&c);
@@ -313,6 +314,39 @@ static int post_notify(push_ctx *ctx, const char *audience, long ts, const char 
     resp[out] = '\0';
     *resp_len = out;
     return 0;
+}
+
+/* --- a signed request, for the other emitters ------------------------------ */
+
+struct oc_machine_http { push_ctx ctx; };
+
+oc_machine_http *oc_machine_http_open(const char *url, const char *ca_bundle) {
+    if (!url || !*url) return NULL;
+    oc_machine_http *h = calloc(1, sizeof *h);
+    if (!h) return NULL;
+    if (parse_url(url, &h->ctx) != 0 ||
+        (h->ctx.use_tls && oc_tls_client_init_ca(&h->ctx.tls, ca_bundle) != 0)) {
+        free(h);
+        return NULL;
+    }
+    return h;
+}
+
+int oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,
+                         const char *privkey_pem, const char *body, int *status) {
+    if (!h || !path || !audience || !privkey_pem || !body || !status) return -1;
+    long ts = (long)time(NULL);
+    char sig[512];
+    if (oc_push_sign(privkey_pem, audience, body, ts, sig, sizeof sig) != 0) return -1;
+    char resp[1024];
+    size_t rlen = 0;
+    return post_signed(&h->ctx, path, audience, ts, sig, body, status, resp, sizeof resp, &rlen);
+}
+
+void oc_machine_http_close(oc_machine_http *h) {
+    if (!h) return;
+    if (h->ctx.use_tls) oc_tls_client_free(&h->ctx.tls);
+    free(h);
 }
 
 /* --- exposed helpers ------------------------------------------------------- */
@@ -612,7 +646,8 @@ static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
     int status = 0;
     char resp[8192];
     size_t rlen = 0;
-    if (post_notify(&p->ctx, p->audience, ts, sig, body, &status, resp, sizeof resp, &rlen) == 0 &&
+    if (post_signed(&p->ctx, "/api/machine/push/notify", p->audience, ts, sig, body,
+                    &status, resp, sizeof resp, &rlen) == 0 &&
         status == 200) {
         json_stale_tokens(resp, rlen, prune_cb, p);
     }

@@ -9,6 +9,7 @@
 #include "blobstore.h"
 #include "config.h"
 #include "push.h"
+#include "invite_mail.h"
 #include "unfurl.h"
 #include "url.h"
 #include "xferpool.h"
@@ -682,11 +683,31 @@ void oc_netloop_set_audio_respawn(int (*respawn)(void *ctx), void *ctx) {
     g_audio_respawn_ctx = ctx;
 }
 
-/* Outbound push emitter (ARCH-85), NULL = push disabled. Set before the loop. */
+/* Outbound push emitter (ARCH-85), NULL = push disabled. A managed box starts
+ * it once its binding is claimed, which happens while the loop already serves
+ * (oc_netloop_set_ready), so it is published and read atomically. */
 static oc_push *g_push;
+/* The invitation mail report (invite_mail.h), NULL = off; published like push. */
+static oc_invite_mail *g_invite_mail;
 
 void oc_netloop_set_push(struct oc_push *push) {
-    g_push = push;
+    __atomic_store_n(&g_push, push, __ATOMIC_RELEASE);
+}
+
+void oc_netloop_set_invite_mail(struct oc_invite_mail *m) {
+    __atomic_store_n(&g_invite_mail, m, __ATOMIC_RELEASE);
+}
+
+static oc_push *cur_push(void) { return __atomic_load_n(&g_push, __ATOMIC_ACQUIRE); }
+
+/* Called once, when the listener takes connections and the loop is about to
+ * serve its first cycle. */
+static void (*g_ready)(void *ctx);
+static void  *g_ready_ctx;
+
+void oc_netloop_set_ready(void (*ready)(void *ctx), void *ctx) {
+    g_ready = ready;
+    g_ready_ctx = ctx;
 }
 
 /* Link-unfurl worker (REQ-222, ARCH-105), NULL = unfurls disabled. */
@@ -1071,7 +1092,7 @@ static void send_call_error(int ep, conn *c, uint16_t code, const char *msg) {
  * their notification settings allow it, treated as a mention (ARCH-103). The
  * desktop's toast comes from CALL_STATE, decided by the client that shows it. */
 static void call_push_invites(const call_t *c, const uint64_t *uids, int n, uint64_t inviter) {
-    for (int i = 0; i < n; i++) oc_push_notify_call(g_push, c->channel_id, inviter, uids[i]);
+    for (int i = 0; i < n; i++) oc_push_notify_call(cur_push(), c->channel_id, inviter, uids[i]);
 }
 
 /* Add the invitees in `uids` -- already known to be able to read the
@@ -3448,7 +3469,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                         send_bytes(ep, conns, fd, g_enc, flen);
                 }
             }
-            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id, 0);
+            oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
              * result later, or never. */
@@ -3704,6 +3725,11 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         break;
     }
     case OC_RES_INVITE_OK: {
+        /* The invite is committed; its mail is reported whether or not the
+         * inviter is still connected, and never holds up the reply. */
+        if (r->invite_email && r->invite_id[0])
+            oc_invite_mail_report(__atomic_load_n(&g_invite_mail, __ATOMIC_ACQUIRE),
+                                  r->invite_id, r->invite_email, r->session_expiry / 1000u);
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         char tokhex[2 * OC_INVITE_TOKEN_LEN + 1];
@@ -3721,7 +3747,11 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("admin op rejected") };
+        const char *why = r->err_code == OC_ERR_INVITE_UNREDEEMABLE
+            ? "this workspace signs nobody in by email address, so an invitation to one "
+              "could never be used; invite with a token instead"
+            : "admin op rejected";
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str(why) };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4055,7 +4085,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
              * thread's PARTICIPANTS and not merely whoever the channel level
              * would have caught. Fire-and-forget beside the send path's own
              * call, and a no-op when push is unconfigured. */
-            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id,
+            oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id,
                            r->parent_id);
             /* A reply's URLs unfurl like any other body's (REQ-222). */
             unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
@@ -5745,6 +5775,11 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     }
 
     fprintf(stderr, "netloop: listening on :%d\n", port);
+
+    /* The listener takes connections and nothing is left to set up: this is the
+     * moment a workspace can say it is up (a managed box claims its binding
+     * here). Queued connections are served by the first cycle below. */
+    if (g_ready) g_ready(g_ready_ctx);
 
     struct epoll_event events[64];
     while (!*stop) {

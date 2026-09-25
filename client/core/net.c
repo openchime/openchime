@@ -2333,6 +2333,32 @@ static int run_connection(oc_net *n, int reconnecting,
         if (hdr.msg_type != OC_MSG_AUTH_CHALLENGE) goto drop;
         oc_auth_challenge ch;
         if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto drop;
+        /* What the workspace offers, for the frontend to shape what it asks for
+         * (an invitation by address needs a browser source; a token, local). */
+        {
+            uint32_t kinds = 0;
+            /* The browser sources' ids too, one per line: an id that names a
+             * provider lets the invite prompt say which one. */
+            char ids[OC_MAX_SOURCES * 65] = "";
+            size_t il = 0;
+            for (uint8_t i = 0; i < ch.n_sources; i++) {
+                const oc_auth_source *s = &ch.sources[i];
+                if (s->kind < 32) kinds |= 1u << s->kind;
+                if ((s->kind == OC_SOURCE_RELAY || s->kind == OC_SOURCE_OIDC) &&
+                    s->id.len && s->id.len <= 64 && il + s->id.len + 1 < sizeof ids) {
+                    memcpy(ids + il, s->id.ptr, s->id.len);
+                    il += s->id.len;
+                    ids[il++] = '\n';
+                    ids[il] = '\0';
+                }
+            }
+            oc_ev *se = oc_ev_new(OC_EV_SIGNIN_SOURCES);
+            if (se) {
+                se->count = kinds;
+                se->body = strdup(ids);
+                oc_queue_push(n->to_ui, se);
+            }
+        }
 
         /* Which way in. A stored session needs no source. A password goes to the
          * local source. With no password given, the first browser source offered is
@@ -2918,8 +2944,9 @@ static int run_connection(oc_net *n, int reconnecting,
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_INVITE_USER) {
-                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_invite_user iu = { c->op, { NULL, 0 } };   /* op = role */
+                uint8_t buf[320]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* op = role; body = the address, or none for a bearer token */
+                oc_invite_user iu = { c->op, c->body ? oc_slice_str(c->body) : (oc_slice){ NULL, 0 } };
                 if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

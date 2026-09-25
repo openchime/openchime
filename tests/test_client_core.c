@@ -369,6 +369,105 @@ static void test_capabilities(void) {
     oc_model_free(&m);
 }
 
+/* Invitations in the model (REQ-033): which kind a workspace can redeem, from
+ * its sign-in sources, and the text an INVITE_CREATED becomes -- by address, or
+ * with the token -- with the workspace, how to sign in and the expiry. */
+static void invite_created(oc_model *m, const char *token, uint8_t role, uint64_t expires_ms) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_INVITE;
+    e.op = role;
+    e.server_time = expires_ms;
+    e.body = strdup(token);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_invitation_text(void) {
+    oc_model m; oc_model_init(&m);
+    char text[1024];
+    /* Nothing said yet: both kinds are offered, and there is nothing to word. */
+    CHECK(oc_model_offers_local(&m) && oc_model_offers_browser(&m));
+    CHECK(oc_model_invitation_text(&m, "acme.example", text, sizeof text) == 0 && text[0] == '\0');
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_SIGNIN_SOURCES;
+    e.count = 1u << OC_SOURCE_RELAY;                  /* hosted: the relay alone */
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_offers_browser(&m) && !oc_model_offers_local(&m));
+    e.count = (1u << OC_SOURCE_LOCAL) | (1u << OC_SOURCE_RELAY);
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_offers_browser(&m) && oc_model_offers_local(&m));
+    e.count = 1u << OC_SOURCE_LOCAL;
+    oc_model_apply(&m, &e);
+    CHECK(!oc_model_offers_browser(&m) && oc_model_offers_local(&m));
+
+    snprintf(m.workspace_name, sizeof m.workspace_name, "Acme");
+    /* By address: the token that comes back is zeros and is never shown. */
+    oc_model_invite_asked(&m, "lee@partner.example");
+    char zeros[2 * OC_INVITE_TOKEN_LEN + 1];
+    memset(zeros, '0', 2 * OC_INVITE_TOKEN_LEN); zeros[2 * OC_INVITE_TOKEN_LEN] = '\0';
+    invite_created(&m, zeros, OC_ROLE_MEMBER, 1760000000000ull);   /* 2025-10-09 08:53 UTC */
+    CHECK(strcmp(m.invite_email, "lee@partner.example") == 0 && m.invite_asked_email[0] == '\0');
+    size_t n = oc_model_invitation_text(&m, "acme.example", text, sizeof text);
+    CHECK(n > 0 && n == strlen(text));
+    CHECK(strstr(text, "Acme") && strstr(text, "Workspace: acme.example\n"));
+    CHECK(strstr(text, "sign in as lee@partner.example") && strstr(text, "sign-in provider"));
+    CHECK(strstr(text, "Expires: 2025-10-09 08:53 UTC\n"));
+    CHECK(!strstr(text, zeros) && !strstr(text, "Invite token"));
+    CHECK(oc_model_signin_provider(&m)[0] == '\0');
+
+    /* A source id that names a provider is said as that provider; any other --
+     * the relay's own, an operator's connection -- keeps the wording generic. */
+    CHECK(strcmp(oc_signin_provider_name("google", 6), "Google") == 0);
+    CHECK(strcmp(oc_signin_provider_name("Microsoft", 9), "Microsoft") == 0);
+    CHECK(oc_signin_provider_name("relay", 5) == NULL);
+    CHECK(oc_signin_provider_name("googlex", 7) == NULL);
+    CHECK(oc_signin_provider_name("google\n", 6) != NULL);   /* the length is what counts */
+    CHECK(oc_signin_provider_name("goog", 4) == NULL && oc_signin_provider_name(NULL, 0) == NULL);
+    e.count = 1u << OC_SOURCE_OIDC;
+    e.body = strdup("google\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    CHECK(strcmp(oc_model_signin_provider(&m), "Google") == 0);
+    CHECK(oc_model_invitation_text(&m, "acme.example", text, sizeof text) > 0);
+    CHECK(strstr(text, "must be able to sign in with Google.\n") && !strstr(text, "sign-in provider"));
+    e.body = strdup("google\nmicrosoft\nGoogle\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    CHECK(strcmp(oc_model_signin_provider(&m), "Google or Microsoft") == 0);
+    /* One source that does not say is enough to leave the provider unsaid. */
+    e.body = strdup("google\nrelay\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    CHECK(oc_model_signin_provider(&m)[0] == '\0');
+    CHECK(oc_model_invitation_text(&m, "acme.example", text, sizeof text) > 0 &&
+          strstr(text, "this workspace's sign-in provider"));
+    e.body = strdup("google\n");
+    oc_model_apply(&m, &e);
+    free(e.body); e.body = NULL;
+    e.body = NULL;                                     /* a challenge with no browser source */
+    e.count = 1u << OC_SOURCE_LOCAL;
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_signin_provider(&m)[0] == '\0');
+
+    /* Asking again forgets the last: a frontend waiting for the answer cannot
+     * take the old invitation for it. */
+    oc_model_invite_asked(&m, NULL);
+    CHECK(m.invite_token[0] == '\0' && oc_model_invitation_text(&m, "acme.example", text, sizeof text) == 0);
+    /* A token: the one thing that must be in the text is the token itself. */
+    invite_created(&m, "0a1b2c3d", OC_ROLE_ADMIN, 1760000000000ull);
+    CHECK(m.invite_email[0] == '\0');
+    CHECK(oc_model_invitation_text(&m, "acme.example", text, sizeof text) > 0);
+    CHECK(strstr(text, "Invite token: 0a1b2c3d\n") && strstr(text, "an admin") &&
+          strstr(text, "Workspace: acme.example") && strstr(text, "Expires: "));
+    /* Cut to fit, never overrun. */
+    char small[24];
+    CHECK(oc_model_invitation_text(&m, "acme.example", small, sizeof small) == sizeof small - 1);
+    oc_model_free(&m);
+}
+
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
  * and the standalone pins overlay, which is fed by its own frames because a
  * pinned message is usually outside loaded history. */
@@ -2746,6 +2845,7 @@ int run_client_core_tests(void) {
     test_thread_notices();
     test_unread_counts_what_notifies();
     test_capabilities();
+    test_invitation_text();
     test_addressable_targets();
     test_pins();
     test_resolve();
@@ -3591,6 +3691,22 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
         oc_client_invite_user(a, OC_ROLE_MEMBER);
         CHECK(WAIT_FOR(a, m->invite_token[0] != '\0' && m->invite_role == OC_ROLE_MEMBER));
+        {
+            /* This daemon has password accounts and no provider, and its
+             * AUTH_CHALLENGE said so. */
+            const oc_model *am = oc_client_model(a);
+            CHECK(oc_model_offers_local(am) && !oc_model_offers_browser(am));
+            char text[1024];
+            CHECK(oc_model_invitation_text(am, "127.0.0.1", text, sizeof text) > 0 &&
+                  strstr(text, am->invite_token) != NULL);
+            /* The address goes on the wire as INVITE_USER's email -- trimmed of
+             * what a paste brings -- and this daemon, which nothing could redeem
+             * it at, refuses it in words. */
+            uint32_t seq = am->error_seq;
+            oc_client_invite(a, OC_ROLE_MEMBER, "  lee@partner.example \n");
+            CHECK(WAIT_FOR(a, m->error_seq != seq && strstr(m->last_error, "email address") != NULL));
+            CHECK(am->invite_token[0] == '\0');
+        }
         oc_client_remove_user(a, erikid);
         CHECK(WAIT_FOR(a, member_disabled(m, erikid) == 1));
 

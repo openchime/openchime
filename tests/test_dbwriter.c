@@ -3,6 +3,8 @@
  * list) exercised directly through the job queue — no network involved.
  * Includes the code under test directly; links sqlite + pthread. */
 
+#include "auth.h"       /* oc_sha256, to re-derive an invitation's id */
+#include "config.h"     /* OC_DEPLOY_* */
 #include "dbwriter.h"
 #include "migrate.h"
 #include "notify.h"   /* the badge asks the same rule a toast does */
@@ -5792,9 +5794,167 @@ static void test_max_users(void) {
     cleanup_db(path);
 }
 
+/* An invite bound to an address (AUTH.md §8.4) is refused where no sign-in
+ * source could ever spend it, and otherwise carries what the invitation mail
+ * report needs: the address as stored and an id derived from the row. */
+static oc_dbres *invite_email(oc_dbwriter *w, uint64_t actor, const char *email) {
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 99);
+    j->user_id = actor; j->role = OC_ROLE_MEMBER;
+    if (email) oc_job_set_email(j, email, strlen(email));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static int is_lower_hex32(const char *s) {
+    if (strlen(s) != 32) return 0;
+    for (const char *p = s; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return 0;
+    return 1;
+}
+
+static void test_invite_by_address(void) {
+    const char *path = "build/test_dbwriter_invite_addr.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t owner = reg(w, "ia-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner != 0);
+
+    /* Local accounts only: nothing here signs anyone in by address. */
+    oc_dbres *r = invite_email(w, owner, "lee@partner.example");
+    CHECK(r && r->type == OC_RES_INVITE_ERR && r->err_code == OC_ERR_INVITE_UNREDEEMABLE);
+    oc_dbres_free(r);
+    /* A token is still what this workspace hands out, and it names no address. */
+    r = invite_email(w, owner, NULL);
+    CHECK(r && r->type == OC_RES_INVITE_OK && r->invite_id[0] == '\0' && r->invite_email == NULL);
+    oc_dbres_free(r);
+
+    /* With a provider source on, the same invite is made. */
+    CHECK(oc_dbwriter_configure_oidc(w, "https://issuer.example", "ws_test", "unused", "") == 0);
+    /* Only for an address: "bad@" is not one, and would be mailed to nobody. */
+    r = invite_email(w, owner, "bad@");
+    CHECK(r && r->type == OC_RES_INVITE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = invite_email(w, owner, "Lee@Partner.Example");
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    char first[33] = "";
+    if (r) {
+        CHECK(is_lower_hex32(r->invite_id));
+        CHECK(r->invite_email && strcmp(r->invite_email, "lee@partner.example") == 0);
+        snprintf(first, sizeof first, "%s", r->invite_id);
+    }
+    oc_dbres_free(r);
+    /* Another invitation, even to the same address, is another id. */
+    r = invite_email(w, owner, "lee@partner.example");
+    CHECK(r && r->type == OC_RES_INVITE_OK && is_lower_hex32(r->invite_id) &&
+          strcmp(r->invite_id, first) != 0);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    /* The id is the row's, not a moment's: re-derived from what is stored, it is
+     * the same, which is what lets every retry of one report name one invite. */
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "SELECT token_hash FROM invites WHERE email IS NOT NULL "
+                                 "ORDER BY rowid LIMIT 1;", -1, &st, NULL) == SQLITE_OK);
+    int have_row = st && sqlite3_step(st) == SQLITE_ROW &&
+                   sqlite3_column_bytes(st, 0) == OC_SHA256_LEN;
+    CHECK(have_row);
+    if (have_row) {
+        static const char LABEL[] = "openchime-invite-id-v1|";
+        uint8_t buf[sizeof LABEL - 1 + OC_SHA256_LEN], id[OC_SHA256_LEN];
+        memcpy(buf, LABEL, sizeof LABEL - 1);
+        memcpy(buf + sizeof LABEL - 1, sqlite3_column_blob(st, 0), OC_SHA256_LEN);
+        CHECK(oc_sha256(buf, sizeof buf, id) == 0);
+        char hex[33];
+        for (int i = 0; i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
+        CHECK(strcmp(hex, first) == 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    cleanup_db(path);
+}
+
+/* #general's welcome on a managed workspace: topic and description, written the
+ * one time the channel is made, and on no other deployment. */
+static int general_text(const char *path, char *topic, size_t tcap, char *descr, size_t dcap) {
+    topic[0] = descr[0] = '\0';
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) { sqlite3_close(db); return -1; }
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db, "SELECT COALESCE(topic,''), COALESCE(description,'') "
+                               "FROM channels WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(topic, tcap, "%s", (const char *)sqlite3_column_text(st, 0));
+        snprintf(descr, dcap, "%s", (const char *)sqlite3_column_text(st, 1));
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return found;
+}
+
+static void test_welcome_general(void) {
+    const char *path = "build/test_dbwriter_welcome.db";
+    char topic[512], descr[2048];
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    /* Self-hosted, either kind: nothing is made, nothing is written. */
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_STANDALONE, "Acme") == 0);
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_FEDERATED, "Acme") == 0);
+    CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 0);
+    /* Managed, first boot: #general exists with its welcome. */
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "Acme") == 1);
+    CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 1);
+    CHECK(strstr(topic, "Acme") != NULL && strlen(topic) <= OC_MAX_TOPIC);
+    CHECK(strstr(descr, "Welcome to Acme") != NULL && strlen(descr) <= OC_MAX_DESCRIPTION);
+    /* Every later boot leaves it alone, including a topic someone has cleared. */
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        CHECK(sqlite3_exec(db, "UPDATE channels SET topic='' WHERE id=1;", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "Acme") == 0);
+    CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 1 && topic[0] == '\0');
+    /* The first member joins the channel the welcome made, as ever. */
+    CHECK(reg(w, "wg-owner", "pw", OC_ROLE_OWNER) != 0);
+    oc_dbwriter_stop(w);
+
+    /* An existing #general -- a workspace from before, or made bare by its first
+     * account -- is not given a welcome after the fact. */
+    cleanup_db(path);
+    w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    CHECK(reg(w, "wg-first", "pw", OC_ROLE_OWNER) != 0);
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "") == 0);
+    CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 1 &&
+          topic[0] == '\0' && descr[0] == '\0');
+    oc_dbwriter_stop(w);
+
+    /* No name configured: the welcome still reads, naming none. */
+    cleanup_db(path);
+    w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    CHECK(oc_dbwriter_welcome_general(w, OC_DEPLOY_MANAGED, "") == 1);
+    CHECK(general_text(path, topic, sizeof topic, descr, sizeof descr) == 1 &&
+          strstr(descr, "Welcome.") == descr);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_start_migrates_and_stops();
+    test_invite_by_address();
+    test_welcome_general();
     test_auth_and_send();
     test_oidc_auth();
     test_oidc_join_rules();
