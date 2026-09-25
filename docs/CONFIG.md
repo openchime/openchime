@@ -207,4 +207,7 @@ UDP silence sweep, which a test shortens with `oc_audio_sidecar_set_silence_ms`)
 and, in the clients, `OPENCHIME_TEST_AUDIO`, `OPENCHIME_TEST_MIC` and
 `OPENCHIME_TEST_TONE` — the synthetic audio devices, what the synthetic
 microphone speaks, and its tone (440 Hz unless set), which `scripts/gui_calls.sh`
-gives each of its two clients so either can tell whom it hears.
+gives each of its two clients so either can tell whom it hears — and
+`OPENCHIME_TEST_MIC_LEAD_MS`, how long from opening the synthetic microphone
+stays silent before its tone starts, so that the screen-recording test's echo
+canceller hears the room before the narrator speaks, as it does with speech.
