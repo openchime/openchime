@@ -34,6 +34,7 @@ int run_netloop_tests(void);
 int run_client_core_tests(void);
 int run_enroll_tests(void);
 int run_push_tests(void);
+int run_invite_mail_tests(void);
 int run_mention_tests(void);
 int run_searchq_tests(void);
 int run_richtext_tests(void);
@@ -202,6 +203,7 @@ int main(void) {
     total += SUITE(run_client_core_tests);
     total += SUITE(run_enroll_tests);
     total += SUITE(run_push_tests);
+    total += SUITE(run_invite_mail_tests);
     total += SUITE(run_mention_tests);
     total += SUITE(run_searchq_tests);
     total += SUITE(run_richtext_tests);

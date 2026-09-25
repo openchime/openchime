@@ -851,10 +851,31 @@ void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role) {
 }
 
 void oc_client_invite_user(oc_client *c, uint8_t role) {
+    oc_client_invite(c, role, NULL);
+}
+
+void oc_client_invite(oc_client *c, uint8_t role, const char *email) {
     if (!c) return;
+    /* An address is sent as typed, trimmed of the spaces a paste brings along;
+     * the daemon lower-cases and checks it. */
+    char addr[256] = "";
+    if (email) {
+        while (*email == ' ' || *email == '\t') email++;
+        size_t n = strlen(email);
+        while (n && (email[n - 1] == ' ' || email[n - 1] == '\t' ||
+                     email[n - 1] == '\r' || email[n - 1] == '\n')) n--;
+        if (n >= sizeof addr) return;   /* longer than any address */
+        memcpy(addr, email, n);
+        addr[n] = '\0';
+    }
     oc_cmd *cmd = oc_cmd_new(OC_CMD_INVITE_USER);
     if (!cmd) return;
     cmd->op = role;
+    if (addr[0]) {
+        cmd->body = strdup(addr);
+        if (!cmd->body) { oc_cmd_free(cmd); return; }
+    }
+    oc_model_invite_asked(&c->model, addr);
     oc_queue_push(&c->cmds, cmd);
 }
 

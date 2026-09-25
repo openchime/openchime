@@ -178,6 +178,20 @@ int oc_config_load(char *err, size_t errcap) {
     c->push.url       = env_or2("OPENCHIME_PUSH_URL",       "OC_PUSH_URL",       NULL);
     c->push.ca_bundle = env_or2("OPENCHIME_PUSH_CA_BUNDLE", "OC_PUSH_CA_BUNDLE", NULL);
 
+    /* Invitation mail (REQ-280's carve-out): whether each invite bound to an
+     * address is reported to central for it to mail. Off unless asked for, and a
+     * value that is neither word stops the boot rather than guessing which the
+     * operator meant. */
+    {
+        const char *im = env_or2("OPENCHIME_INVITE_MAIL", NULL, "off");
+        if      (strcmp(im, "on") == 0)  c->invite_mail = 1;
+        else if (strcmp(im, "off") == 0) c->invite_mail = 0;
+        else {
+            snprintf(err, errcap, "OPENCHIME_INVITE_MAIL='%s' is invalid (want on|off)", im);
+            return -1;
+        }
+    }
+
     /* Link unfurls (REQ-222, ARCH-105). Always on — no switch. An air-gapped
      * box needs none: its fetches simply fail, bounded and silent. */
     c->unfurl.ca_bundle     = env_or2("OPENCHIME_UNFURL_CA_BUNDLE", NULL, NULL);

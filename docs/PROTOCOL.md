@@ -691,7 +691,10 @@ client learns of the new channel immediately.
 
 Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
 every user joins at authentication, so the messaging path always has a channel
-to deliver to.
+to deliver to. On a managed deployment (`OPENCHIME_DEPLOYMENT_MODE=managed`) the
+daemon creates it at its first boot with a welcome in its topic and description —
+the ordinary columns, nothing authored, no system user; a `general` that already
+exists is never rewritten, and a self-hosted daemon creates it bare.
 
 ### 5.7a Changing a channel: topic, rename, archive (REQ-034/035/036, ARCH-93)
 
@@ -795,7 +798,16 @@ only (only an owner may invite at admin/owner role). With `email` empty it mints
 single-use invite token for a **new** local account. With `email` set the invite
 is bound to that address instead (AUTH.md §8.4): it is spent by that address's
 first verified sign-in through a provider, no token can redeem it, and the
-`token` that comes back is 32 zero bytes. Either way the reply is
+`token` that comes back is 32 zero bytes. The `email` must have the shape of an
+address — one `@`, a local part of at most 64 bytes with no spaces, controls or
+list separators, a domain of two or more dot-separated labels, 254 bytes in all
+(`oc_email_plausible`, which clients share) — or the invite is refused with
+`FORBIDDEN`. An invite bound to an address needs a
+source that could spend it: where the deployment offers no provider sign-in, it is
+refused with the non-fatal `ERROR INVITE_UNREDEEMABLE` (3031), whose message says
+to invite with a token instead. A client reads which kinds are possible from
+`AUTH_CHALLENGE`: a `local` source redeems a token, a browser source an address.
+Either way the reply is
 **`INVITE_CREATED` (server → client), msg_type `0x0046`**:
 
 | Field        | Type  | Notes                                                       |
@@ -828,7 +840,7 @@ author. The actor is acked with `USER_UPDATED` (`disabled=1`); the removed user'
 live connections receive the same notice and are then dropped.
 
 `SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
-(`FORBIDDEN`, `LAST_OWNER`, `INTERNAL_ERROR`); a `REDEEM_INVITE` failure is fatal
+(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL_ERROR`); a `REDEEM_INVITE` failure is fatal
 (the connection never authenticated).
 
 ### 5.9 Reactions (REQ-070, REQ-071)
@@ -2411,6 +2423,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past `OPENCHIME_CALL_MAX` (§5.17, REQ-305). |
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
 | `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`). |
+| `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in (§5.8). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which

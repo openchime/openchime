@@ -899,6 +899,30 @@ static void test_admin_frames(void) {
         CHECK(slice_eq_str(out.email, "pat@acme.example"));
     }
     {
+        /* What an invite can be bound to: the daemon refuses anything else, and
+         * a client asks the same question before it sends. */
+        static const char *const GOOD[] = { "pat@acme.example", "Pat.O+x@mail.acme.co.uk",
+                                            "a@b.io", "l\xc3\xa9" "a@caf\xc3\xa9" ".example" };
+        static const char *const BAD[] = { "", "bad@", "@acme.example", "pat", "pat@acme",
+                                           "pat@@acme.example", "pat@acme..example",
+                                           "pat@.acme.example", "pat@acme.example.",
+                                           "p at@acme.example", "pat@acme example.com",
+                                           "<pat@acme.example>", "a,b@acme.example",
+                                           "pat@acme_example.com" };
+        for (size_t i = 0; i < sizeof GOOD / sizeof GOOD[0]; i++) CHECK(oc_email_plausible(GOOD[i]));
+        for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) CHECK(!oc_email_plausible(BAD[i]));
+        CHECK(!oc_email_plausible(NULL));
+        char longest[300];
+        memset(longest, 'a', 64); longest[64] = '@';
+        memset(longest + 65, 'b', 185); memcpy(longest + 250, ".com", 5);  /* 254 bytes */
+        CHECK(strlen(longest) == 254 && oc_email_plausible(longest));
+        memcpy(longest + 250, ".comm", 6);
+        CHECK(!oc_email_plausible(longest));                              /* 255 */
+        char local65[80];
+        memset(local65, 'a', 65); memcpy(local65 + 65, "@acme.example", 14);
+        CHECK(!oc_email_plausible(local65));
+    }
+    {
         oc_remove_user in = { 42 };
         ROUNDTRIP(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REMOVE_USER, h, p);
         oc_remove_user out;

@@ -2,8 +2,8 @@
  * registry and the notify decision; this worker turns a freshly-sent message into
  * a contentless notification batch and POSTs it to the control-plane push gateway
  * (CP-13) over CA-verified HTTPS, signed with the enrollment key (CP-12). Central
- * never dials the daemon (ARCH-56); this is the one daemon->central outbound
- * runtime channel. Recipient selection runs on the worker's own read-only SQLite
+ * never dials the daemon (ARCH-56); the invitation mail report (invite_mail.h)
+ * is the other daemon->central runtime channel, and rides this one's transport. Recipient selection runs on the worker's own read-only SQLite
  * connection, off the net/writer hot path (ARCH-66). See docs/AUTH.md / PUSH.
  */
 #ifndef OPENCHIME_PUSH_H
@@ -37,6 +37,19 @@ void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
 void oc_push_notify_call(oc_push *p, uint64_t channel_id, uint64_t inviter, uint64_t invitee);
 
 void oc_push_stop(oc_push *p);
+
+/* One signed request to central, for the emitters beside this one (the
+ * invitation mail report, invite_mail.h): the same transport and the same CP-12
+ * signing as a push batch. `url` is the scheme and authority to talk to
+ * ("https://central.example[:port]"); anything after the authority is ignored.
+ * Blocking, so call it from a worker, never the net loop. */
+typedef struct oc_machine_http oc_machine_http;
+oc_machine_http *oc_machine_http_open(const char *url, const char *ca_bundle);
+/* POST `body` (JSON) to `path`, signed with the enrollment key. Returns 0 with
+ * the HTTP status in *status, or -1 when no HTTP answer came back at all. */
+int  oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,
+                          const char *privkey_pem, const char *body, int *status);
+void oc_machine_http_close(oc_machine_http *h);
 
 /* ---- exposed for testing ---- */
 

@@ -206,7 +206,11 @@ enum {
     OC_EV_CALL_ERROR,
     /* CHANNEL_DESCRIPTION (REQ-034): channel_id + description in body ("" = none).
      * The answer to a fetch and the announcement of a change are one frame. */
-    OC_EV_CHANNEL_DESCRIPTION
+    OC_EV_CHANNEL_DESCRIPTION,
+    /* How this workspace signs people in, from the AUTH_CHALLENGE of every
+     * connection: `count` holds one bit per source kind, 1u << OC_SOURCE_*, and
+     * body the ids of its browser sources, each ended by "\n". */
+    OC_EV_SIGNIN_SOURCES
 };
 
 typedef struct {
@@ -356,7 +360,7 @@ enum {
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
     OC_CMD_AUDIT_QUERY,     /* page the audit log (owner/admin): message_id = before_ms */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
-    OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
+    OC_CMD_INVITE_USER,     /* invite: op = role, body = the address it is bound to (NULL = a token) */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */

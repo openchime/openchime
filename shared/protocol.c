@@ -2982,6 +2982,40 @@ oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m) {
     return r_done(p);
 }
 
+int oc_email_plausible(const char *s) {
+    if (!s) return 0;
+    size_t n = strlen(s);
+    const char *at = strchr(s, '@');
+    if (n > 254 || !at || strchr(at + 1, '@')) return 0;
+    size_t local = (size_t)(at - s);
+    if (local == 0 || local > 64) return 0;
+    for (const char *q = s; q < at; q++) {
+        unsigned char c = (unsigned char)*q;
+        if (c <= 0x20 || c == 0x7f || c == '<' || c == '>' || c == ',' || c == ';' ||
+            c == '"' || c == '(' || c == ')' || c == '[' || c == ']' || c == '\\')
+            return 0;
+    }
+    /* The domain: labels of letters, digits and hyphens (bytes past ASCII for an
+     * internationalised name), none empty, and more than one of them. */
+    const char *d = at + 1;
+    size_t label = 0, labels = 0;
+    for (const char *q = d; ; q++) {
+        unsigned char c = (unsigned char)*q;
+        if (c == '.' || c == '\0') {
+            if (label == 0) return 0;
+            labels++;
+            label = 0;
+            if (c == '\0') break;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c >= 0x80))
+            return 0;
+        label++;
+    }
+    return labels >= 2;
+}
+
 oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m) {
     m->role = oc_r_u8(p);
     m->email = oc_r_str(p);

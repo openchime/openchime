@@ -510,6 +510,7 @@ typedef enum {
     OC_ERR_CALL_FULL           = 3028, /* the call is at OPENCHIME_CALL_MAX (REQ-305) */
     OC_ERR_NOT_CALL_STARTER    = 3029, /* only the call's starter may end it for everyone (REQ-301) */
     OC_ERR_NOT_IN_CALL         = 3030, /* no such call, or the sender is not in it */
+    OC_ERR_INVITE_UNREDEEMABLE = 3031, /* an invite bound to an address, where no sign-in source here could spend it */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -1320,6 +1321,12 @@ typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 /* `email` binds the invite to an address, consumed at that address's first
  * verified sign-in (AUTH.md §8.4); empty mints a bearer token for a local account. */
 typedef struct { uint8_t role; oc_slice email; } oc_invite_user;
+/* Whether `s` has the shape of an address an invite can be bound to: one "@",
+ * a local part of 1-64 bytes with no spaces, controls or list separators, and a
+ * domain of dot-separated labels (at least two, none empty). 254 bytes at most.
+ * The daemon refuses INVITE_USER with any other email; a client asks first, so
+ * the person hears it before anything is sent. */
+int oc_email_plausible(const char *s);
 typedef struct { uint64_t user_id; } oc_remove_user;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;

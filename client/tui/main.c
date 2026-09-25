@@ -171,6 +171,52 @@ static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int
     } while (off < len);
 }
 
+/* wrap_push, breaking between words: for prose a person reads and copies out,
+ * where a word cut in two is a word mistyped. A word longer than a row is cut. */
+static void wrap_words_push(rows_t *r, const char *text, uintattr_t fg, int width, int indent) {
+    const char *p = text;
+    int first = 1;
+    while (*p) {
+        /* A word that fits a row only without the indent (a token, an address)
+         * gets the row whole, rather than being cut in two. */
+        int wlen = 0;
+        for (const char *q = p; *q && *q != ' '; ) {
+            int32_t cp;
+            utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)q, -1, &cp);
+            if (n <= 0) break;
+            wlen += tk_cp_width(cp); q += n;
+        }
+        int ind = (!first && wlen > width - indent && wlen <= width) ? 0 : (first ? 0 : indent);
+        int avail = width - ind;
+        if (avail < 8) avail = 8;
+        /* The longest run of whole words that fits `avail` columns. */
+        const char *q = p, *fit = NULL;
+        int used = 0;
+        while (*q) {
+            int32_t cp;
+            utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)q, -1, &cp);
+            if (n <= 0) break;
+            int w = tk_cp_width(cp);
+            if (used + w > avail) break;
+            used += w; q += n;
+            if (*q == ' ' || *q == '\0') fit = q;
+        }
+        const char *end = (*q && fit) ? fit : q;
+        if (end == p) break;                  /* no progress — stop */
+        size_t blen = (size_t)(end - p);
+        char *row = malloc((size_t)ind + blen + 1);
+        if (!row) return;
+        size_t o = 0;
+        for (int i = 0; i < ind; i++) row[o++] = ' ';
+        memcpy(row + o, p, blen); o += blen;
+        row[o] = '\0';
+        rows_push(r, row, fg);
+        first = 0;
+        p = end;
+        while (*p == ' ') p++;
+    }
+}
+
 /* Forward decl: resolve a display name for a message's author. */
 static const char *name_for(const oc_channel *ch, uint64_t uid);
 
@@ -340,20 +386,29 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
+static const char *active_address(void);   /* the workspace as the person typed it */
+
 /* Build the rows for the roster overlay: each member with a presence dot,
  * colored by presence, plus a role tag. */
 static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
-    (void)width;
     char line[200];
     snprintf(line, sizeof line, "%zu member%s", m->n_users, m->n_users == 1 ? "" : "s");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
-    /* Surface the last-minted invite token (shown once) at the top of the roster. */
+    /* The last invitation made (shown this session only), whole, at the top of
+     * the roster: the text to send the invited person, line by line. */
     if (m->invite_token[0]) {
-        snprintf(line, sizeof line, "invite (%s): %s",
-                 m->invite_role == OC_ROLE_ADMIN ? "admin" : "member", m->invite_token);
-        char *iv = malloc(strlen(line) + 1);
-        if (iv) { strcpy(iv, line); rows_push(r, iv, TB_MAGENTA | TB_BOLD); }
+        char text[1024];
+        if (oc_model_invitation_text(m, active_address(), text, sizeof text)) {
+            for (char *ln = text; ln && *ln; ) {
+                char *nl = strchr(ln, '\n');
+                if (nl) *nl = '\0';
+                if (*ln) wrap_words_push(r, ln, TB_MAGENTA | TB_BOLD, width, 2);
+                ln = nl ? nl + 1 : NULL;
+            }
+            char *blank = malloc(1);
+            if (blank) { blank[0] = '\0'; rows_push(r, blank, TB_DEFAULT); }
+        }
     }
     for (size_t i = 0; i < m->n_users; i++) {
         const oc_member *u = &m->users[i];
@@ -499,6 +554,37 @@ static int        g_active = 0;       /* index into g_ws */
 static const char *active_label(void) {
     return (g_nws && g_active < g_nws && g_ws[g_active].label[0])
          ? g_ws[g_active].label : "—";
+}
+
+static const char *active_address(void) {
+    return (g_nws && g_active < g_nws) ? g_ws[g_active].label : "";
+}
+
+/* The address as typed, without the spaces a paste brings along. */
+static void invite_trim(const char *v, char *out, size_t cap) {
+    while (*v == ' ' || *v == '\t') v++;
+    size_t n = strlen(v);
+    while (n && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r' || v[n - 1] == '\n')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, v, n);
+    out[n] = '\0';
+}
+
+/* "Invite a user": where the workspace signs people in through a provider, word
+ * the prompt's two lines of explanation -- which provider, when the workspace
+ * says, and whether a blank asks for a token -- and answer 1; where it has
+ * password accounts only, ask for a token straight away and answer 0. */
+static int invite_prompt(oc_client *cl, char *note, size_t cap, const char **note2) {
+    const oc_model *im = oc_client_model(cl);
+    if (!oc_model_offers_browser(im)) {
+        oc_client_invite_user(cl, OC_ROLE_MEMBER);
+        return 0;
+    }
+    const char *prov = oc_model_signin_provider(im);
+    snprintf(note, cap, "It must be able to sign in with %s.",
+             prov[0] ? prov : "this workspace's provider");
+    *note2 = oc_model_offers_local(im) ? "Leave it blank for a one-time invite token instead." : "";
+    return 1;
 }
 
 /* Total unread across a workspace's channels — what the switcher badges. */
@@ -1858,7 +1944,11 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW, PROMPT_INVITE };
+    int await_invite = 0;   /* open the roster on the invitation once it is made */
+    /* The invite prompt's explanation, which names the provider, and what was
+     * wrong with the last answer ("" when nothing was). */
+    char invite_note[128] = ""; const char *invite_note2 = ""; const char *invite_err = "";
     int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
     char pw_old[128] = "";                 /* stashed between the two password prompts */
     tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
@@ -1871,6 +1961,12 @@ int main(int argc, char **argv) {
         /* Tick EVERY workspace, not just the visible one: a background session
          * has to keep receiving so its unread count is live in the switcher
          * (REQ-014). Only the active session is rendered, below. */
+        /* The invitation just made: show it where it is printed, the roster. */
+        if (await_invite && g_nws && g_active < g_nws &&
+            oc_client_model(g_ws[g_active].cl)->invite_token[0]) {
+            await_invite = 0;
+            oc_client_toggle_roster(g_ws[g_active].cl, 1);
+        }
         for (int i = 0; i < g_nws; i++) {
             oc_client_tick(g_ws[i].cl);
             /* Each session pulls its own synced settings bucket once per
@@ -1959,7 +2055,16 @@ int main(int argc, char **argv) {
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 34, mh, act_title);
             tk_list_draw(&action_menu, in);
         }
-        if (prompt_kind) {
+        if (prompt_kind == PROMPT_INVITE) {
+            /* The input, what was wrong with the last answer, and the two lines
+             * that say what the address has to be. */
+            const tk_theme *pth = tk_theme_active();
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 66, 6, prompt_title);
+            tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
+            if (invite_err[0]) tk_text(in.x, in.y + 1, in.x + in.w, invite_err, TB_RED | TB_BOLD, pth->bg);
+            tk_text(in.x, in.y + 2, in.x + in.w, invite_note, pth->muted, pth->bg);
+            tk_text(in.x, in.y + 3, in.x + in.w, invite_note2, pth->muted, pth->bg);
+        } else if (prompt_kind) {
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 46, 3, prompt_title);
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
         }
@@ -2103,6 +2208,24 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_INVITE) {
+                    /* An address where the workspace signs people in through a
+                     * provider; blank for a token, where it has password accounts.
+                     * Anything else keeps the prompt open and says why. */
+                    const oc_model *im = oc_client_model(cl);
+                    char addr[256];
+                    invite_trim(v, addr, sizeof addr);
+                    if (!addr[0] && !oc_model_offers_local(im)) {
+                        prompt_kind = PROMPT_INVITE;
+                        invite_err = "An email address is needed to invite someone here.";
+                    } else if (addr[0] && !oc_email_plausible(addr)) {
+                        prompt_kind = PROMPT_INVITE;
+                        invite_err = "That does not look like an email address.";
+                    } else {
+                        oc_client_invite(cl, OC_ROLE_MEMBER, addr);
+                        await_invite = 1;
+                    }
+                }
                 else if (k == PROMPT_UPLOAD && *v) {
                     const oc_model *pm = oc_client_model(cl);
                     if (focus < pm->n_channels) oc_client_upload(cl, pm->channels[focus].channel_id, v);
@@ -2157,7 +2280,14 @@ int main(int argc, char **argv) {
                 else if (id == ACT_PREFS)   oc_client_toggle_prefs(cl, 1);
                 else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
                 else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
-                else if (id == ACT_INVITE)  oc_client_invite_user(cl, OC_ROLE_MEMBER);
+                else if (id == ACT_INVITE)  {
+                    if (invite_prompt(cl, invite_note, sizeof invite_note, &invite_note2)) {
+                        prompt_kind = PROMPT_INVITE;
+                        prompt_title = "Invite by email";
+                        invite_err = "";
+                        tk_input_init(&prompt_input, 0, "name@example.com");
+                    } else await_invite = 1;
+                }
                 else if (id == ACT_PROFILE) profile_open = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
@@ -2221,7 +2351,14 @@ int main(int argc, char **argv) {
                     else if (id == ACT_PREFS)   { oc_client_toggle_prefs(cl, 1); }
                     else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
                     else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
-                    else if (id == ACT_INVITE)  oc_client_invite_user(cl, OC_ROLE_MEMBER);
+                    else if (id == ACT_INVITE)  {
+                        if (invite_prompt(cl, invite_note, sizeof invite_note, &invite_note2)) {
+                            prompt_kind = PROMPT_INVITE;
+                            prompt_title = "Invite by email";
+                            invite_err = "";
+                            tk_input_init(&prompt_input, 0, "name@example.com");
+                        } else await_invite = 1;
+                    }
                     else if (id == ACT_PROFILE) profile_open = 1;
                     else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                     else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }

@@ -519,6 +519,16 @@ typedef struct {
     char      invite_token[96];
     uint8_t   invite_role;
     uint64_t  invite_expires;
+    /* The address the last invite is bound to ("" for a bearer token), and the
+     * one asked for but not answered yet: INVITE_CREATED does not repeat it. */
+    char      invite_email[256];
+    char      invite_asked_email[256];
+    /* How the workspace signs people in, from AUTH_CHALLENGE: one bit per
+     * source kind, 1u << OC_SOURCE_*. 0 until a connection has said. */
+    uint32_t  signin_kinds;
+    /* The provider its browser sources name, for people ("Google", "Google or
+     * Microsoft"); "" where any of them names none a client knows. */
+    char      signin_provider[64];
     /* The incoming-webhook overlay (REQ-170): the channel it lists, its webhooks,
      * and the last-minted token (shown once, empty until a WEBHOOK_INFO arrives).
      * weblist_open is 0 when no such overlay is open. */
@@ -956,6 +966,29 @@ void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
 /* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
 uint64_t    oc_model_user_id(const oc_model *m, const char *name);
+
+/* Invitations (REQ-033). Whether the workspace offers a local account source
+ * (a bearer-token invite can be redeemed) and a browser source (an invite bound
+ * to an address can). Both answer 1 before any connection has said. */
+int oc_model_offers_local(const oc_model *m);
+int oc_model_offers_browser(const oc_model *m);
+/* A sign-in source's id as the provider it names, for people: "google" is
+ * "Google", "microsoft" is "Microsoft" (any case). NULL for any other id --
+ * the relay's own, or an operator's connection -- whose provider it does not say. */
+const char *oc_signin_provider_name(const char *id, size_t len);
+/* The provider the workspace's browser sources name, as the invite prompt and
+ * the invitation say it ("must be able to sign in with Google"); "" when it is
+ * not known, and the wording stays generic. */
+const char *oc_model_signin_provider(const oc_model *m);
+/* Note the address an invite is being asked for ("" or NULL for a token), so the
+ * INVITE_CREATED that answers it is read as that invitation. */
+void oc_model_invite_asked(oc_model *m, const char *email);
+/* The invitation to hand the invited person, for the last INVITE_CREATED: the
+ * workspace's name and `address` (what people type to reach it), how to sign in
+ * -- the provider and the invited address, or the token for a local account --
+ * and when it expires. Plain text, lines ended by "\n". Returns the length
+ * written (truncated to fit `cap`), 0 when there is no invite to describe. */
+size_t oc_model_invitation_text(const oc_model *m, const char *address, char *out, size_t cap);
 
 /* Workspace facts (WORKSPACE_INFO). deployment mode name: "standalone" /
  * "federated" / "managed". workspace_name is "" until a name is configured. */

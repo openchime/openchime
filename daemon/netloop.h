@@ -40,10 +40,23 @@ void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port);
 void oc_netloop_set_audio_respawn(int (*respawn)(void *ctx), void *ctx);
 
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
- * contentless notify decision to it for offline mobile delivery. Call before
- * oc_netloop_run; NULL (the default) disables push. */
+ * contentless notify decision to it for offline mobile delivery. NULL (the
+ * default) disables push. May be called while the loop runs: a managed box
+ * starts push once it has claimed its binding. */
 struct oc_push;
 void oc_netloop_set_push(struct oc_push *push);
+
+/* Wire the invitation mail report (invite_mail.h). When set, a committed invite
+ * bound to an address is reported to central for its mail. NULL (the default)
+ * reports nothing. May be called while the loop runs. */
+struct oc_invite_mail;
+void oc_netloop_set_invite_mail(struct oc_invite_mail *m);
+
+/* Called once, on the loop's thread, when the listener is bound and taking
+ * connections and the loop is about to serve: the moment a workspace is up. It
+ * must return promptly -- anything slow belongs on a thread it starts. NULL (the
+ * default) calls nothing. Call before oc_netloop_run. */
+void oc_netloop_set_ready(void (*ready)(void *ctx), void *ctx);
 
 /* Wire the link-unfurl worker (REQ-222, ARCH-105). When set, a committed SEND
  * or EDIT has its URLs extracted and queued for fetching, and a stored unfurl

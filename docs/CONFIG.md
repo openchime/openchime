@@ -39,7 +39,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_TLS_KEY` | `/data/key.pem` | Private key for the above. |
 | `OPENCHIME_MAX_CONNS_PER_IP` | `256` | Accept-loop cap on concurrent connections from one source IP. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(none)* | Addresses and CIDR blocks, comma-separated, of TCP forwarders in front of the daemon. A connection from one must begin with a **PROXY protocol v2** header, read before TLS, and the client address it names is what the per-address connection cap and the sign-in limiter count; a trusted peer that sends none is closed. Nobody else's header is read. A list the daemon cannot parse stops the boot. |
-| `OPENCHIME_DEPLOYMENT_MODE` | `standalone` | `standalone` \| `federated` \| `managed` — reported to clients in `WORKSPACE_INFO` (ARCH-76). Does **not** by itself enable federated services; those are gated on their own URLs. |
+| `OPENCHIME_DEPLOYMENT_MODE` | `standalone` | `standalone` \| `federated` \| `managed` — reported to clients in `WORKSPACE_INFO` (ARCH-76). Does **not** by itself enable federated services; those are gated on their own URLs. On `managed`, the first boot creates `#general` with a welcome topic and description (PROTOCOL.md §5.7). |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | Human-readable workspace name, reported in `WORKSPACE_INFO`. |
 
 ## Authentication
@@ -94,8 +94,8 @@ Local-backend concerns; with external S3 only the database grows locally.
 
 ## Federated services (ARCH-84/85)
 
-Both are **outbound only** — the daemon calls central, central never dials a
-daemon (ARCH-56). Each is independently declinable; declining all of them is
+All of them are **outbound only** — the daemon calls central, central never dials
+a daemon (ARCH-56). Each is independently declinable; declining all of them is
 exactly the self-hosted stand-alone model (ARCH-76).
 
 | Variable | Default | Meaning |
@@ -104,9 +104,10 @@ exactly the self-hosted stand-alone model (ARCH-76).
 | `OPENCHIME_ENROLL_CODE_FILE` *(alias)* | *(none)* | Also write the `oce1.` code to this path, so orchestration can pick it up instead of scraping stderr. |
 | `OPENCHIME_ENROLL_WAIT_SECS` *(alias)* | `0` | Seconds to wait for the operator to reserve the code before giving up for this boot. A managed box claiming with a ticket waits 120 when this is unset. |
 | `OPENCHIME_ENROLL_TICKET` | *(none)* | A managed box's one-time ticket (AUTH.md §8.7). With it and `OPENCHIME_OIDC_AUDIENCE` set, the daemon adopts that audience, generates its key, and claims the binding at `OPENCHIME_ENROLL_URL` instead of printing a code. |
-| `OPENCHIME_ENROLL_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the enrollment HTTPS client. |
+| `OPENCHIME_ENROLL_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the enrollment HTTPS client, which the invitation mail report shares. |
 | `OPENCHIME_PUSH_URL` *(alias)* | *(none)* | Push-gateway base URL. Push requires **both** this and an active enrollment, which is why it is absent in stand-alone deployments (ARCH-16/85). |
 | `OPENCHIME_PUSH_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the push HTTPS client. |
+| `OPENCHIME_INVITE_MAIL` | `off` | `on` \| `off`. With `on` and an active enrollment, each invite bound to an email address is reported to central at the origin of `OPENCHIME_ENROLL_URL` (`/api/machine/invite/notify`, signed with the enrollment key), and central mails the invited person one fixed invitation (REQ-280, ARCH-85). The report is sent off the hot path and never fails the invite; a refusal is final, and an unreachable or failing central is retried a few times. Any other value stops the boot. Off, or without an enrollment, the invitation is the copyable text the inviter's client shows. |
 
 ## Link unfurls (REQ-222, ARCH-105)
 

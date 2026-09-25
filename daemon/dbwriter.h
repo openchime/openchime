@@ -196,7 +196,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * A write, and on the writer for the same reason CLIENT_ACK is. */
        OC_JOB_MARK_ALL_READ = 105,
        /* A channel's long-form description (REQ-034). A read, on the reader. */
-       OC_JOB_GET_CHANNEL_DESCRIPTION = 106 };
+       OC_JOB_GET_CHANNEL_DESCRIPTION = 106,
+       /* A managed workspace's first boot: create #general with a welcome
+        * topic and description (ch_name carries the workspace's name). Write,
+        * setup-time only. */
+       OC_JOB_WELCOME_GENERAL = 107 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -243,6 +247,7 @@ typedef struct oc_job {
     char          *enroll_privkey;   /* heap */
     char          *enroll_audience;  /* heap */
     int            enroll_active;
+    int            enroll_quiet;     /* fire and forget: no result comes back */
 
     /* REGISTER/UNREGISTER/PRUNE_DEVICE_TOKEN (ARCH-85). */
     char          *device_token;     /* heap */
@@ -807,6 +812,10 @@ typedef struct oc_dbres {
 
     /* Admin ops (REQ-033). USER_UPDATED carries user_id (above) + role + disabled.
      * INVITE_OK reuses session_token/session_expiry/role for the minted invite. */
+    /* INVITE_OK for an invite bound to an address: the id and address the
+     * invitation mail report carries (ARCH-85). Empty/NULL for a bearer invite. */
+    char            invite_id[33];
+    char           *invite_email;   /* heap */
     uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
     oc_user_row    *ulist;          /* USER_LIST: heap array */
     size_t          n_ulist;
@@ -1073,6 +1082,18 @@ int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char 
  * success. */
 int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out);
 int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const char *audience, int active);
+/* Record the binding as active, fire and forget: no result comes back, so this
+ * may run while the net loop consumes results (a managed box claims its binding
+ * once it is serving). */
+void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem, const char *audience);
+
+/* A managed workspace's welcome: no message, no system user. With
+ * `deployment_mode` OC_DEPLOY_MANAGED (config.h), the first time #general is made
+ * it is made with a welcome topic and description naming `workspace_name` (""
+ * names none); any other mode does nothing at all. A #general that already
+ * exists is left as it is, so this runs on every boot. Returns 1 when it wrote
+ * the welcome, 0 otherwise. Setup-time only. */
+int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name);
 
 /* Register a push device token (ARCH-85): submits + blocks for the ack; returns 1
  * on success, 0 on a bad platform/empty token. */

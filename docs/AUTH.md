@@ -538,6 +538,12 @@ An identity that matches no rule joins only through an **invite bound to its
 address** — tenant data an owner or admin creates (`INVITE_USER` carrying an
 email), consumed at that address's first verified sign-in, setting the role.
 Otherwise the answer is `AUTH_NOT_ALLOWED`, audited with the provider and tenant.
+Only a provider sign-in spends such an invite, so where no provider source is on
+the daemon refuses to make one (`INVITE_UNREDEEMABLE`) rather than store a row
+nothing could redeem. What the inviter sends the invited person is the invitation
+text their client shows — the workspace, the provider and the address, the
+expiry — or, for an enrolled workspace with `OPENCHIME_INVITE_MAIL=on`, a message
+central mails (ARCH-85).
 A known identity signs in without consulting the rules, unless disabled; the seat
 cap is unchanged.
 
@@ -597,16 +603,26 @@ binding: the ticket, its public key, and a signature over
 `openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`,
 the key hashed as its SubjectPublicKeyInfo DER, posted to `<enroll url>/claim` as
 `{audienceId, ticket, publicKey, signature}` — the ticket base64url, the key and the
-DER signature base64. The daemon retries while central cannot be reached, for a
+DER signature base64. The claim is made once the daemon is serving — its protocol
+listener bound and its loop about to serve — because central reads an activated
+binding as a workspace that is up; the push emitter and invitation mail start when
+it succeeds. The daemon retries while central cannot be reached, for a
 bounded time, and not at all once the ticket is refused; a box that already holds
 a different audience refuses to start rather than become a second workspace.
 Central checks the ticket — single use, short-lived — and the signature, stores
 the public key and activates. The ticket is the authorization the operator's
 paste is in the self-hosted flow; the private key still never leaves the box.
 
-Requests the daemon signs afterwards name what they are for: the canonical string
-is `openchime-machine-v2|<aud>|<unix_ts>|<METHOD>|<path>|<sha256hex(body)>`,
-so a signed request cannot be replayed at a second endpoint.
+Requests the daemon makes afterwards — push batches and invitation reports — are
+each signed on their own with the same key. The canonical string is
+`openchime-machine-v1|<aud>|<unix_ts>|<sha256hex(body)>`, the body hash the
+lowercase hex SHA-256 of the exact request body; the signature is ASN.1-DER
+ECDSA P-256 over the SHA-256 of that string, base64. The request carries it in
+three headers — `X-OpenChime-Audience`, `X-OpenChime-Timestamp` (unix seconds)
+and `X-OpenChime-Signature`. Central verifies it against the stored public key,
+refuses a timestamp more than 300 seconds from its own clock, and requires the
+binding to be active. The string names neither the method nor the path, so the
+freshness window is what bounds a replay.
 
 ### 8.8 Configuration
 

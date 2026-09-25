@@ -15,6 +15,7 @@
 #include "config.h"
 #include "dbwriter.h"
 #include "enroll.h"
+#include "invite_mail.h"
 #include "listen.h"
 #include "netloop.h"
 #include "push.h"
@@ -141,7 +142,7 @@ static const char LANDING_BODY[] =
     "<p>An OpenChime workspace is running here.</p>\n"
     "<p>This address speaks the OpenChime protocol, not the web &mdash; "
     "open it in an OpenChime client to sign in.</p>\n"
-    "<p><a href=\"https://github.com/danheskett/openchime\">openchime</a></p>\n"
+    "<p><a href=\"https://github.com/openchime/openchime\">openchime</a></p>\n"
     "</main>\n"
     "</body>\n"
     "</html>\n";
@@ -238,6 +239,101 @@ static int audio_sidecar_spawn(void *ctx) {
     if (pid < 0) { close(sv[0]); return -1; }
     fprintf(stderr, "openchimed: audio sidecar pid %d, UDP :%u\n", (int)pid, g_audio_port);
     return sv[0];
+}
+
+/* --- the federated services, once the binding is active (ARCH-85) --------- */
+
+/* What runs on the enrollment: the push emitter and the invitation mail report.
+ * Both start once the binding is active -- before the loop when it already was,
+ * or, on a managed box's first boot, from the claim thread the moment central
+ * activates the binding, which happens only once the daemon is serving. */
+typedef struct {
+    oc_dbwriter    *db;
+    const oc_config *cfg;
+    char           *privkey, *audience;   /* owned */
+    const char     *ticket;               /* a managed claim still to make, or NULL */
+    pthread_t       claim;
+    int             claiming;
+    oc_push        *push;
+    oc_invite_mail *invite_mail;
+} fed_services;
+
+static void start_federated(fed_services *f) {
+    const oc_config *cfg = f->cfg;
+    /* Push (ARCH-85): only with OC_PUSH_URL pointing at the control-plane push
+     * gateway. It signs with the enrollment key and delivers offline mobile
+     * notifications; absent in self-hosted stand-alone. */
+    if (cfg->push.url && *cfg->push.url) {
+        f->push = oc_push_start(cfg->db_path, f->db, cfg->push.url, cfg->push.ca_bundle,
+                                f->audience, f->privkey);
+        if (f->push) {
+            oc_netloop_set_push(f->push);
+            fprintf(stderr, "openchimed: push emitter enabled (audience=%s)\n", f->audience);
+        } else {
+            fprintf(stderr, "openchimed: push emitter failed to start\n");
+        }
+    }
+    /* Invitation mail (REQ-280): each invite bound to an address is reported to
+     * central at the origin the box enrolled with. */
+    if (cfg->invite_mail) {
+        f->invite_mail = oc_invite_mail_start(cfg->enroll.url, cfg->enroll.ca_bundle,
+                                              f->audience, f->privkey);
+        if (f->invite_mail) {
+            oc_netloop_set_invite_mail(f->invite_mail);
+            fprintf(stderr, "openchimed: invitation mail on (audience=%s)\n", f->audience);
+        } else {
+            fprintf(stderr, "openchimed: invitation mail failed to start\n");
+        }
+    }
+}
+
+/* Sleep up to `secs`, returning early (non-zero) once shutdown is asked for. */
+static int nap(unsigned secs) {
+    for (unsigned i = 0; i < secs * 10 && !g_stop; i++) usleep(100000);
+    return g_stop != 0;
+}
+
+/* A managed box's claim (AUTH.md §8.7), made once the daemon is serving: central
+ * reads an activated binding as a workspace that is up, so the claim waits until
+ * that is true. Bounded in time -- central may still be coming up, or briefly
+ * busy -- and a refused ticket is not retried, since it will be refused again. */
+static void *claim_thread(void *arg) {
+    fed_services *f = arg;
+    const oc_config *cfg = f->cfg;
+    int wait_secs = cfg->enroll.wait_secs > 0 ? cfg->enroll.wait_secs : 120;
+    time_t deadline = time(NULL) + wait_secs;
+    unsigned pause = 2;
+    while (!g_stop) {
+        oc_enroll_result er = oc_enroll_claim(cfg->enroll.url, cfg->enroll.ca_bundle,
+                                              f->audience, f->privkey, f->ticket);
+        if (er == OC_ENROLL_ACTIVE) {
+            oc_dbwriter_note_enrollment_active(f->db, f->privkey, f->audience);
+            fprintf(stderr, "openchimed: binding claimed (audience=%s)\n", f->audience);
+            start_federated(f);
+            break;
+        }
+        if (er == OC_ENROLL_FAILED) {
+            fprintf(stderr, "openchimed: the enrollment ticket was refused; this box is "
+                            "not bound and nobody can sign in through the relay\n");
+            break;
+        }
+        if (time(NULL) >= deadline) {
+            fprintf(stderr, "openchimed: could not reach central to claim the binding; "
+                            "retrying on next boot\n");
+            break;
+        }
+        if (nap(pause)) break;
+        if (pause < 16) pause *= 2;
+    }
+    return NULL;
+}
+
+/* The net loop's ready hook: the listener takes connections, so claim now. */
+static void on_serving(void *ctx) {
+    fed_services *f = ctx;
+    if (!f->ticket || f->claiming) return;
+    if (pthread_create(&f->claim, NULL, claim_thread, f) == 0) f->claiming = 1;
+    else fprintf(stderr, "openchimed: could not start the enrollment claim\n");
 }
 
 /* Stamped by the build (-DOC_VERSION=...). A source build that sets nothing
@@ -355,6 +451,12 @@ int main(int argc, char **argv) {
      * (self-hosted). Injected into managed-box config at provision time. */
     oc_dbwriter_set_max_users(db, cfg->max_users);
 
+    /* A managed workspace's first boot opens with a welcome in #general: its
+     * topic and description, nothing authored. Before the accounts below, which
+     * would otherwise create the channel bare; a later boot finds it made. */
+    if (oc_dbwriter_welcome_general(db, (int)cfg->deployment_mode, cfg->workspace_name))
+        fprintf(stderr, "openchimed: #general created with its welcome\n");
+
     /* Optionally provision local accounts before serving (AUTH.md §2). */
     bootstrap_users(db, cfg->bootstrap_users);
 
@@ -369,7 +471,8 @@ int main(int argc, char **argv) {
     /* A managed box (AUTH.md §8.7): central minted the audience and started this
      * box with it and a one-time ticket. Exactly one party mints an audience, so
      * this path generates a key and nothing else — and a stored audience that is
-     * not the one it was started with stops the boot rather than being replaced. */
+     * not the one it was started with stops the boot rather than being replaced.
+     * The claim itself waits until the daemon is serving (on_serving). */
     const char *ticket = cfg->enroll.ticket;
     int managed_claim = enroll_url && *enroll_url && ticket && *ticket &&
                         cfg->oidc.audience && *cfg->oidc.audience;
@@ -390,35 +493,6 @@ int main(int argc, char **argv) {
             }
             enroll_privkey = strdup(pk);
             enroll_audience = strdup(cfg->oidc.audience);
-        }
-        /* Claim, for a bounded time: central may still be coming up, or briefly
-         * busy. A refused ticket is not retried — it will be refused again. */
-        if (!enroll_active) {
-            int wait_secs = cfg->enroll.wait_secs > 0 ? cfg->enroll.wait_secs : 120;
-            time_t deadline = time(NULL) + wait_secs;
-            unsigned pause = 2;
-            for (;;) {
-                oc_enroll_result er = oc_enroll_claim(enroll_url, cfg->enroll.ca_bundle,
-                                                      enroll_audience, enroll_privkey, ticket);
-                if (er == OC_ENROLL_ACTIVE) {
-                    oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
-                    enroll_active = 1;
-                    fprintf(stderr, "openchimed: binding claimed (audience=%s)\n", enroll_audience);
-                    break;
-                }
-                if (er == OC_ENROLL_FAILED) {
-                    fprintf(stderr, "openchimed: the enrollment ticket was refused; this box is "
-                                    "not bound and nobody can sign in through the relay\n");
-                    break;
-                }
-                if (time(NULL) >= deadline) {
-                    fprintf(stderr, "openchimed: could not reach central to claim the binding; "
-                                    "retrying on next boot\n");
-                    break;
-                }
-                sleep(pause);
-                if (pause < 16) pause *= 2;
-            }
         }
     } else if (enroll_url && *enroll_url) {
         if (!oc_dbwriter_load_enrollment(db, &enroll_privkey, &enroll_audience, &enroll_active)) {
@@ -538,22 +612,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
 
-    /* Outbound push emitter (ARCH-85). Only when the box is enrolled (holds an
-     * active audience + key) and OC_PUSH_URL points at the control-plane push
-     * gateway. It signs with the enrollment key and delivers offline mobile
-     * notifications; absent in self-hosted stand-alone. */
-    oc_push *push = NULL;
-    const char *push_url = cfg->push.url;
-    if (enroll_active && enroll_audience && enroll_privkey && push_url && *push_url) {
-        push = oc_push_start(db_path, db, push_url, cfg->push.ca_bundle,
-                             enroll_audience, enroll_privkey);
-        if (push) {
-            oc_netloop_set_push(push);
-            fprintf(stderr, "openchimed: push emitter enabled (audience=%s)\n", enroll_audience);
-        } else {
-            fprintf(stderr, "openchimed: push emitter failed to start\n");
-        }
+    /* The federated services on the enrollment (ARCH-85): started now when the
+     * binding is already active, or by the claim once the daemon serves. A box
+     * that is not enrolled has neither. */
+    fed_services fed;
+    memset(&fed, 0, sizeof fed);
+    fed.db = db;
+    fed.cfg = cfg;
+    fed.privkey = enroll_privkey;
+    fed.audience = enroll_audience;
+    enroll_privkey = enroll_audience = NULL;   /* fed owns them now */
+    if (fed.privkey && fed.audience) {
+        if (enroll_active) start_federated(&fed);
+        else if (managed_claim) fed.ticket = ticket;
     }
+    if (cfg->invite_mail && !enroll_active && !fed.ticket)
+        fprintf(stderr, "openchimed: OPENCHIME_INVITE_MAIL is on, but this workspace has no "
+                        "active enrollment; invitations are shared by copying them\n");
+    oc_netloop_set_ready(on_serving, &fed);
 
     /* Link unfurls (REQ-222, ARCH-105): always on, no switch. The worker
      * fetches previews off the hot path; its SSRF gate is what makes
@@ -561,9 +637,6 @@ int main(int argc, char **argv) {
     oc_unfurler *unfurler = oc_unfurler_start(db, cfg->unfurl.ca_bundle, cfg->unfurl.allow_private);
     if (unfurler) oc_netloop_set_unfurler(unfurler);
     else fprintf(stderr, "openchimed: unfurl worker failed to start\n");
-
-    free(enroll_privkey);
-    free(enroll_audience);
 
     /* First-run bootstrap (REQ-024, local mode only): if there is no owner yet
      * and none was provisioned via OC_BOOTSTRAP_USERS, mint a one-time owner
@@ -645,8 +718,17 @@ int main(int argc, char **argv) {
     int served = oc_netloop_run(proto_port, &tls, db, &g_stop);
 
     /* Tear down either way — a daemon that could not start still holds a
-     * database handle, a TLS context and two worker threads. */
-    oc_push_stop(push);
+     * database handle, a TLS context and two worker threads. A claim still
+     * trying sees the stop flag and ends; the emitters it may have started go
+     * with the rest. */
+    g_stop = 1;
+    if (fed.claiming) pthread_join(fed.claim, NULL);
+    oc_netloop_set_push(NULL);
+    oc_netloop_set_invite_mail(NULL);
+    oc_push_stop(fed.push);
+    oc_invite_mail_stop(fed.invite_mail);
+    free(fed.privkey);
+    free(fed.audience);
     oc_unfurler_stop(unfurler);
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);
