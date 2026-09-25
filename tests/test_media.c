@@ -757,6 +757,10 @@ static void test_screen_recording(void) {
     /* The microphone hears the computer's sound back, 20 ms late at half strength:
      * a room, on a machine with speakers. */
     setenv("OPENCHIME_TEST_MIC_ECHO", "1", 1);
+    /* ...and the narrator draws breath before speaking, as a person does: a
+     * second from when the microphone opens, so the recording, which starts a
+     * frame or so later, opens on the computer's sound alone. See below. */
+    setenv("OPENCHIME_TEST_MIC_LEAD_MS", "1000", 1);
 
     for (int corner = OC_CORNER_BR; corner <= OC_CORNER_TL; corner++) {
         oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "screen:synthetic",
@@ -810,25 +814,40 @@ static void test_screen_recording(void) {
         } else {
             CHECK(0);
         }
-        /* Sound, with the narrator talking over the computer the whole time:
-         * both are in the mix, and the voice is there. Only that is asserted.
-         * A steady tone talking without a pause over another steady tone is the
-         * canceller's worst case, and what it does to the recording there varies
-         * from run to run -- measured over twelve recordings, the voice kept
-         * 73-97% and the computer's sound came out at 0.74-1.39 of its level
-         * (1.26 is no canceller at all), and a loaded machine has taken it to
-         * 0.57. So the computer's floor asks only that it is plainly in the mix,
-         * not how much of it survived. What it does with speech, which pauses,
-         * is the ERLE harness's to say (tests/test_voice.c), deterministically;
-         * the echo-only case below is what shows it is wired in. */
+        /* Sound: the computer's once, the voice whole, over the last second, with
+         * the narrator talking over the computer throughout it.
+         *
+         * The canceller learns the room from the computer's sound heard back
+         * while nobody speaks, then holds what it learned through the talking.
+         * Made to learn it UNDER the talking instead -- the narrator speaking
+         * from the first sample, which is what this test once did -- it settles
+         * wherever a steady tone over another steady tone happens to leave it:
+         * the same signals through the same canceller, offline, gave the
+         * computer's sound 0.64-1.57 of its level over 1440 starting phases,
+         * past 1.26 (no canceller at all) now and then, and past any bound worth
+         * asserting 0.35% of the time. With a pause first, the same sweep gave
+         * 1.001-1.002 from a pause of a fifth of a second. Speech pauses, so the
+         * pause is what a recording gets; the narrator takes one here too, and the
+         * computer's sound must then come out once, the voice whole.
+         *
+         * The pause runs from when the microphone opens, not from when the
+         * recording starts (the recorder reads and discards it until then), so
+         * that the voice starts after the recording does is checked rather than
+         * assumed: a host stalled for most of a second before the first frame
+         * would break it, and this says so instead of a level out of range. */
         size_t n = 0;
         int16_t *pcm = decode_audio(res.video, &info, &n);
         if (pcm && n > 48000) {
+            size_t onset = 0;
+            while (onset + 960 <= n && tone_amp(pcm + onset, 960, 440) < 8000 * 0.5) onset += 960;
+            printf("  corner %d: the narrator starts %zu ms in\n", corner, onset / 48);
+            CHECK(onset >= 48000 / 5);                /* a fifth of a second of the room first */
             const int16_t *tail = pcm + n - 48000;
+            CHECK(onset <= (size_t)(tail - pcm));     /* ...and talks through the last second */
             double a440 = tone_amp(tail, 48000, 440), a660 = tone_amp(tail, 48000, 660);
             printf("  corner %d: 440 Hz %.0f (mic 8000), 660 Hz %.0f (computer 6000)\n", corner, a440, a660);
-            CHECK(a440 > 8000 * 0.6 && a440 < 8000 * 1.1);
-            CHECK(a660 > 6000 * 0.25 && a660 < 6000 * 1.5);
+            CHECK(a440 > 8000 * 0.9 && a440 < 8000 * 1.1);
+            CHECK(a660 > 6000 * 0.9 && a660 < 6000 * 1.1);
         } else {
             CHECK(0);
         }
@@ -841,6 +860,7 @@ static void test_screen_recording(void) {
      * the speakers. Cancelled, the computer's sound is in the recording once, at
      * its own level; uncancelled it would be about 1.26 times that (the echo is
      * half strength, 20 ms late). */
+    unsetenv("OPENCHIME_TEST_MIC_LEAD_MS");
     setenv("OPENCHIME_TEST_MIC_ECHO", "only", 1);
     setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "5000", 1);
     {

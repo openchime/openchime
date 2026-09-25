@@ -192,6 +192,9 @@ struct oc_audio_dev {
      * OPENCHIME_TEST_MIC names a WAV (played once, then silence). */
     int16_t      *syn_clip;
     size_t        syn_clip_n;
+    /* Synthetic capture: the tone is silent for this many frames from open
+     * (OPENCHIME_TEST_MIC_LEAD_MS), while an echo is still heard. */
+    uint64_t      syn_lead;
     int           loopback;           /* capture of what the output device plays */
     int           ref_slot;           /* playback: its far-end reference slot, or -1 */
     int           owns_mic;           /* capture: holds g_capture_open */
@@ -393,6 +396,11 @@ static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rat
     if (use_synthetic()) {
         d->synthetic = 1;
         if (capture && !loopback) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
+        if (capture && !loopback) {
+            const char *lead = getenv("OPENCHIME_TEST_MIC_LEAD_MS");
+            int ms = lead && *lead ? atoi(lead) : 0;
+            if (ms > 0) d->syn_lead = (uint64_t)ms * (uint64_t)rate / 1000;
+        }
         d->syn_start_us = oc_media_clock_us();
         atomic_store(&d->base_us, d->syn_start_us);
         *err = OC_AUDIO_OK;
@@ -499,7 +507,8 @@ static void synthetic_catch_up(oc_audio_dev *d) {
                 double hz = mic_tone_hz();
                 for (size_t i = 0; i < n; i++) {
                     double t = (double)(d->syn_frames + i) / d->rate;
-                    double v = echo == 2 ? 0.0 : 8000.0 * __builtin_sin(2.0 * 3.141592653589793 * hz * t);
+                    int talking = echo != 2 && d->syn_frames + i >= d->syn_lead;
+                    double v = talking ? 8000.0 * __builtin_sin(2.0 * 3.141592653589793 * hz * t) : 0.0;
                     /* The speakers heard back 20 ms later at half strength. */
                     if (echo) v += 0.5 * syn_loop_value(((double)d->syn_start_us + (double)(d->syn_frames + i) * 1e6 / d->rate) / 1e6 - 0.020);
                     if (v > 32767) v = 32767;
