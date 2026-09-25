@@ -283,6 +283,13 @@ static uint8_t *take_fetched(oc_client *cl, uint64_t aid, size_t *len) {
     return NULL;
 }
 
+static const oc_msg *channel_msg_by_body(const oc_model *m, uint64_t cid, const char *body) {
+    const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
+    for (size_t j = 0; ch && j < ch->n_msgs; j++)
+        if (ch->msgs[j].body && strcmp(ch->msgs[j].body, body) == 0) return &ch->msgs[j];
+    return NULL;
+}
+
 static uint64_t channel_attach(const oc_model *m, uint64_t cid, char *fn_out,
                                size_t fncap, uint64_t *size_out) {
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -1146,6 +1153,44 @@ static void test_resolve(void) {
     char host[256]; int port = 0;
     CHECK(oc_srv_parse(SRV_ANSWER, (int)sizeof SRV_ANSWER, host, sizeof host, &port) == 0);
     CHECK(strcmp(host, "srv.acme.com") == 0 && port == 8443);
+}
+
+/* The transfer table keeps each tag's latest notice, in place, so what finished
+ * between two frames is still there to read. A full table gives up its oldest
+ * finished transfer before any running one, and only when all are running, its
+ * oldest. */
+static void test_xfer_table(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_XFER;
+    e.xfer_tag = 7; e.op = 0; e.xfer_done = 10; e.xfer_total = 100; e.xfer_file = 1;
+    oc_model_apply(&m, &e);
+    e.xfer_tag = 8; e.op = 0; e.xfer_done = 5; e.xfer_total = 50; e.xfer_file = 0;
+    oc_model_apply(&m, &e);
+    e.xfer_tag = 7; e.op = 1; e.xfer_done = 100; e.xfer_total = 100; e.xfer_file = 2;
+    oc_model_apply(&m, &e);
+    const oc_xfer_state *x = oc_model_xfer(&m, 7);
+    CHECK(x && x->phase == 1 && x->done == 100 && x->total == 100 && x->file == 2);
+    CHECK(m.xfer_tag == 7);                               /* the last notice, as before */
+    x = oc_model_xfer(&m, 8);
+    CHECK(x && x->phase == 0 && x->done == 5);
+    CHECK(oc_model_xfer(&m, 9) == NULL && oc_model_xfer(&m, 0) == NULL);
+    e.xfer_tag = 0; oc_model_apply(&m, &e);               /* no tag, no entry */
+    CHECK(oc_model_xfer(&m, 0) == NULL);
+
+    /* Fill it: 7 (finished) and 8 (running) are the two oldest. */
+    for (uint64_t t = 100; t < 100 + OC_MODEL_XFERS - 2; t++) {
+        e.xfer_tag = t; e.op = 0; oc_model_apply(&m, &e);
+    }
+    CHECK(oc_model_xfer(&m, 7) && oc_model_xfer(&m, 100 + OC_MODEL_XFERS - 3));
+    e.xfer_tag = 500; e.op = 0; oc_model_apply(&m, &e);   /* the finished one goes */
+    CHECK(oc_model_xfer(&m, 7) == NULL && oc_model_xfer(&m, 8) && oc_model_xfer(&m, 500));
+    e.xfer_tag = 501; e.op = 0; oc_model_apply(&m, &e);   /* all running: the oldest goes */
+    CHECK(oc_model_xfer(&m, 8) == NULL && oc_model_xfer(&m, 100) && oc_model_xfer(&m, 501));
+    e.xfer_tag = 100; e.op = 2; oc_model_apply(&m, &e);   /* a failure is finished too */
+    e.xfer_tag = 502; e.op = 0; oc_model_apply(&m, &e);
+    CHECK(oc_model_xfer(&m, 100) == NULL && oc_model_xfer(&m, 101) && oc_model_xfer(&m, 502));
+    oc_model_free(&m);
 }
 
 /* The model's sticky last_error (the login flow reads it to tell auth-fail from
@@ -2706,6 +2751,7 @@ int run_client_core_tests(void) {
     test_resolve();
     test_wellknown_parse();
     test_last_error();
+    test_xfer_table();
     test_workspace_key();
     test_sni_name();
     test_store_adopt();
@@ -3282,6 +3328,69 @@ int run_client_core_tests(void) {
                 }
             }
             free(video); free(poster); free(vcopy); free(pcopy);
+        }
+
+        /* several files and a line of text as ONE message (REQ-140): the files go
+         * up in order and one message carries them all, in that order, with the
+         * text. The same into a thread. A file that cannot be read posts nothing.
+         * Every outcome is readable by tag afterwards, however quickly it came and
+         * went. Cancelling is proved in itest_slow_blob.c, where a gated backend
+         * makes "still running" and "still queued" hold by construction. */
+        {
+            const char *fp3[3] = { "build/itest_core_pf0.txt", "build/itest_core_pf1.bin",
+                                   "build/itest_core_pf2.txt" };
+            const size_t fsz[3] = { 10, 200000, 1 };   /* the middle one spans chunks */
+            for (int k = 0; k < 3; k++) {
+                FILE *f = fopen(fp3[k], "wb");
+                CHECK(f != NULL);
+                if (f) { for (size_t i2 = 0; i2 < fsz[k]; i2++) fputc('a' + k, f); fclose(f); }
+            }
+            uint64_t tag = oc_client_post_files(a, 1, 0, fp3, 3, "three files");
+            CHECK(tag != 0);
+            CHECK(WAIT_FOR(a, ({ const oc_xfer_state *xs = oc_model_xfer(m, tag); xs && xs->phase == 1; })));
+            const oc_xfer_state *xs = oc_model_xfer(oc_client_model(a), tag);
+            CHECK(xs && xs->file == 2 && xs->done == 1 && xs->total == 1);
+            CHECK(WAIT_FOR(b, channel_has_body(m, 1, "three files")));
+            const oc_msg *pm = channel_msg_by_body(oc_client_model(b), 1, "three files");
+            CHECK(pm && pm->n_attach == 3);
+            if (pm && pm->n_attach == 3) {
+                CHECK(strcmp(pm->attach[0].filename, "itest_core_pf0.txt") == 0 && pm->attach[0].size == 10);
+                CHECK(strcmp(pm->attach[1].filename, "itest_core_pf1.bin") == 0 && pm->attach[1].size == 200000);
+                CHECK(strcmp(pm->attach[2].filename, "itest_core_pf2.txt") == 0 && pm->attach[2].size == 1);
+            }
+
+            /* Into a thread: the root gains a reply, and the channel no message. */
+            if (pm) {
+                uint64_t root = pm->message_id;
+                uint64_t rt = oc_client_post_files(a, 1, root, fp3, 1, "one in the thread");
+                CHECK(rt != 0);
+                CHECK(WAIT_FOR(a, ({ const oc_xfer_state *r = oc_model_xfer(m, rt); r && r->phase == 1; })));
+                CHECK(WAIT_FOR(b, ({ const oc_msg *r = channel_msg_by_body(m, 1, "three files");
+                                     r && r->reply_count == 1; })));
+                CHECK(!channel_has_body(oc_client_model(b), 1, "one in the thread"));
+            }
+
+            /* A file missing from the middle: a failure, and no message. */
+            const char *bad[3] = { fp3[0], "build/itest_core_pf_missing.txt", fp3[2] };
+            uint64_t bt = oc_client_post_files(a, 1, 0, bad, 3, "never posted");
+            CHECK(WAIT_FOR(a, ({ const oc_xfer_state *r = oc_model_xfer(m, bt); r && r->phase == 2; })));
+            CHECK(oc_model_xfer(oc_client_model(a), bt)->file == 1);
+
+            /* Messages arrive in the order they were sent, so once erik has the
+             * next one he would already have the failed post, had it gone. */
+            oc_client_send(a, 1, "after the failed post");
+            CHECK(WAIT_FOR(b, channel_has_body(m, 1, "after the failed post")));
+            CHECK(!channel_has_body(oc_client_model(b), 1, "never posted"));
+
+            /* No more than the wire carries, and nothing empty. */
+            const char *many[OC_MAX_ATTACH + 1];
+            for (size_t i2 = 0; i2 <= OC_MAX_ATTACH; i2++) many[i2] = fp3[0];
+            CHECK(oc_client_post_files(a, 1, 0, many, OC_MAX_ATTACH + 1, "") == 0);
+            CHECK(oc_client_post_files(a, 1, 0, many, 0, "") == 0);
+            const char *blank[1] = { "" };
+            CHECK(oc_client_post_files(a, 1, 0, blank, 1, "") == 0);
+
+            for (int k = 0; k < 3; k++) unlink(fp3[k]);
         }
 
         /* incoming webhooks (REQ-170): dana mints a webhook on channel 1 — the

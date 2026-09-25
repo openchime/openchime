@@ -27,5 +27,6 @@ void oc_cmd_free(oc_cmd *c) {
     free(c->body2);
     free(c->blob);
     free(c->blob2);
+    for (int i = 0; i < c->n_paths; i++) free(c->paths[i]);
     free(c);
 }

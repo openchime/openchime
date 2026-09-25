@@ -109,6 +109,18 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   queued one or aborts the running one. A fetch already queued for the same
   attachment is not queued twice. The queue outlives a connection: the job
   running when the link drops goes back to the front and starts over.
+  `oc_client_post_files` is one job for up to `OC_MAX_ATTACH` files and a line of
+  text: it uploads the files in order and then sends ONE message carrying the
+  text and all of them, to a channel or into a thread; a file that cannot be
+  read, an upload the daemon refuses, or a cancel posts nothing, and a restart
+  after a lost link starts from the first file (what an earlier connection
+  finished was never posted, and the daemon reclaims it). Its progress names
+  the file moving. An upload's progress counts what the daemon has
+  acknowledged — it acknowledges a chunk once it is written (ARCH-69) — not
+  what has merely been sent. The model keeps each recent transfer's latest
+  notice by tag (`oc_model_xfer`), because a frame drains every event before it
+  draws: a small file that finished between two frames would otherwise never be
+  seen to finish.
 - **Video messages** (`client/core/media/`, ARCH-110). The media library —
   capture, the audio device layer, VP9 and Opus, the restricted MP4 writer and
   reader, the recorder and the player — is kept out of `CORE_SRC`, so a frontend
@@ -959,6 +971,21 @@ set. Consequences worth knowing before touching it:
   length again, because it is in the layout and not in the text.
 - **Anything that replaces `g_body` must call `ed_invalidate_layout()`** (see
   `scale_apply`). A stale layout is not visibly broken, which is worse than broken.
+- **Files wait in the box until Send** (REQ-140). The attach button, the file
+  picker (several at once), dropping files on the window and the Files view's
+  Upload all put chips in a tray at the top of the box — an image shows itself,
+  anything else the Files view's type badge — and nothing moves until Send,
+  which posts them with the text as one message (`oc_client_post_files`) into
+  the conversation, or the thread, it is sent in. A chip's × removes it; once
+  sending, it cancels that whole post, since a message goes whole or not at all,
+  and the rest of its files wait again. Each chip then shows its file's
+  progress, read by tag every tick, as a bar that eases toward the real figure
+  with a light sweeping along it; the taskbar button fills with the total. A
+  failure puts the files back, the one it stopped at marked, and the text back
+  in the box — or, if you have moved on, into that conversation's draft. The
+  tray height is part of `composer_chrome()`, so the box and the field agree
+  about it, and a chip belongs to its workspace's client as well as its
+  conversation. An edit changes text only; the tray waits it out.
 - **Rich mode carries a typing-intent layer** — pending styles and continuation
   across whitespace — described with the dialect in
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor

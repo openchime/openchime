@@ -1091,14 +1091,38 @@ void oc_client_set_profile(oc_client *c, const char *full_name, const char *titl
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
-    if (!c || !channel_id || !path || !path[0]) return;
+uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
+    if (!c || !channel_id || !path || !path[0]) return 0;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
-    if (!cmd) return;
+    if (!cmd) return 0;
     cmd->xfer_tag = next_xfer_tag();
     cmd->channel_id = channel_id;
     cmd->body = strdup(path);
+    uint64_t tag = cmd->xfer_tag;
     oc_queue_push(&c->cmds, cmd);
+    return tag;
+}
+
+uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const char *const *paths, size_t n_paths, const char *text) {
+    if (!c || !channel_id || !paths || n_paths == 0 || n_paths > OC_MAX_ATTACH) return 0;
+    for (size_t i = 0; i < n_paths; i++)
+        if (!paths[i] || !paths[i][0]) return 0;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_POST_FILES);
+    if (!cmd) return 0;
+    cmd->xfer_tag = next_xfer_tag();
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup(text ? text : "");
+    for (size_t i = 0; i < n_paths; i++) {
+        cmd->paths[i] = strdup(paths[i]);
+        if (!cmd->paths[i]) { oc_cmd_free(cmd); return 0; }
+        cmd->n_paths++;
+    }
+    if (!cmd->body) { oc_cmd_free(cmd); return 0; }
+    uint64_t tag = cmd->xfer_tag;
+    oc_queue_push(&c->cmds, cmd);
+    return tag;
 }
 
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path) {

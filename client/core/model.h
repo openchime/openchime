@@ -329,6 +329,12 @@ typedef struct {
  * creation, in webhook_token). */
 typedef struct { uint64_t webhook_id; char label[64]; uint8_t disabled; } oc_webhook_view;
 
+/* One transfer's latest notice (0 tag = an empty slot): bytes moved of the
+ * total, the phase (0 running, 1 done, 2 failed) and, for a job that posts
+ * several files, which file is moving. */
+#define OC_MODEL_XFERS 32
+typedef struct { uint64_t tag, done, total; uint8_t phase, file; } oc_xfer_state;
+
 typedef struct {
     bool     connected;
     bool     authed;
@@ -561,6 +567,11 @@ typedef struct {
     /* The transfer running now (0 tag = none), for a progress bar or ring. */
     uint64_t xfer_tag, xfer_done, xfer_total;
     uint8_t  xfer_phase;             /* the last notice: 0 running, 1 done, 2 failed */
+    /* The latest notice for each recent transfer, by tag. The fields above keep
+     * only the last one, and a frame drains every event before it draws, so a
+     * small file that finished between two frames would never be seen to finish.
+     * A frontend that follows its own transfers reads them here. */
+    oc_xfer_state xfers[OC_MODEL_XFERS];
     /* The last video message this client sent (REQ-162): its queue tag. */
     uint64_t media_posted_tag;
 
@@ -924,6 +935,10 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
  * to the workspace rather than the channel. */
 size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
                                    oc_thread_notice *out, size_t max);
+
+/* The latest notice for transfer `tag`, or NULL once it has aged out of the
+ * table (the oldest go first, finished ones before any still running). */
+const oc_xfer_state *oc_model_xfer(const oc_model *m, uint64_t tag);
 
 /* Calls (REQ-301-305). The Calls section's entry for a conversation, or NULL. */
 const oc_call_view *oc_model_call_in(const oc_model *m, uint64_t channel_id);

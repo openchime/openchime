@@ -41,6 +41,8 @@ typedef struct {
     oc_cmd   *active;          /* the job running now, or NULL */
     uint8_t   vstage;          /* POST_VIDEO: 0 poster, 1 video, 2 ATTACH_MEDIA_SET sent */
     uint64_t  vposter, vvideo; /* POST_VIDEO: the two finished uploads */
+    uint8_t   ffile;           /* POST_FILES: the file uploading now */
+    uint64_t  fids[OC_MAX_ATTACH]; /* POST_FILES: the finished uploads, in order */
     uint64_t  progress_ms;     /* when the last progress tick went out */
 } oc_xqueue;
 
@@ -380,9 +382,21 @@ static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
     if (!e) return;
     e->op = phase;
     e->body = msg ? strdup(msg) : NULL;
-    if (ctx->xq && ctx->xq->active) e->xfer_tag = ctx->xq->active->xfer_tag;
-    e->xfer_done = ctx->xfer->done;
-    e->xfer_total = ctx->xfer->total;
+    if (ctx->xq && ctx->xq->active) {
+        e->xfer_tag = ctx->xq->active->xfer_tag;
+        if (ctx->xq->active->type == OC_CMD_POST_FILES) e->xfer_file = ctx->xq->ffile;
+    }
+    /* An upload counts what the server has acknowledged, which it does once a
+     * chunk is written (ARCH-69), not what has merely left for it: a window of
+     * chunks in flight would otherwise read as progress nobody has made. */
+    oc_xfer *x = ctx->xfer;
+    uint64_t done = x->done;
+    if (x->mode == 1) {
+        uint64_t acked = (uint64_t)x->acked_seq * x->chunk;
+        done = phase == 1 ? x->total : acked < x->total ? acked : x->total;
+    }
+    e->xfer_done = done;
+    e->xfer_total = x->total;
     oc_queue_push(ctx->to_ui, e);
 }
 
@@ -636,23 +650,44 @@ static void begin_voice_preview(disp_ctx *ctx, const char *voice_id) {
         xfer_reset(x);
 }
 
+/* Open a local file to upload and measure it. On failure the notice has gone
+ * and NULL comes back. */
+static FILE *open_upload(disp_ctx *ctx, const char *path, uint64_t *size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { xfer_notice(ctx, 2, "upload: cannot open file"); return NULL; }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); xfer_notice(ctx, 2, "upload: not a regular file"); return NULL; }
+    long sz = ftell(fp);
+    if (sz < 0 || (unsigned long long)sz > OC_MAX_ATTACHMENT_SIZE) {
+        fclose(fp); xfer_notice(ctx, 2, "upload: file too large"); return NULL;
+    }
+    rewind(fp);
+    *size = (uint64_t)sz;
+    return fp;
+}
+
+/* POST_FILES: start uploading the file `ffile` names. */
+static void files_next(disp_ctx *ctx) {
+    oc_cmd *c = ctx->xq->active;
+    uint64_t sz = 0;
+    FILE *fp = open_upload(ctx, c->paths[ctx->xq->ffile], &sz);
+    if (!fp) return;
+    const char *name = path_basename(c->paths[ctx->xq->ffile]);
+    ctx->xfer->fp = fp;
+    begin_upload(ctx, c->channel_id, name, mime_for(name), NULL, sz, 4);
+}
+
 /* Start the active job. Whatever leaves the transfer idle has already finished,
  * with its notice sent; xq_pump then retires it. */
 static void xq_start(disp_ctx *ctx) {
     oc_cmd *c = ctx->xq->active;
     oc_xfer *x = ctx->xfer;
     if (c->type == OC_CMD_UPLOAD) {
-        FILE *fp = fopen(c->body, "rb");
-        if (!fp) { xfer_notice(ctx, 2, "upload: cannot open file"); return; }
-        if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); xfer_notice(ctx, 2, "upload: not a regular file"); return; }
-        long sz = ftell(fp);
-        if (sz < 0 || (unsigned long long)sz > OC_MAX_ATTACHMENT_SIZE) {
-            fclose(fp); xfer_notice(ctx, 2, "upload: file too large"); return;
-        }
-        rewind(fp);
+        uint64_t sz = 0;
+        FILE *fp = open_upload(ctx, c->body, &sz);
+        if (!fp) return;
         const char *name = path_basename(c->body);
         x->fp = fp;
-        begin_upload(ctx, c->channel_id, name, mime_for(name), NULL, (uint64_t)sz,
+        begin_upload(ctx, c->channel_id, name, mime_for(name), NULL, sz,
                      (uint8_t)(c->op == 1 ? 1 : c->op == 2 ? 2 : 0));
         if (x->mode && x->purpose == 2 && c->body2) snprintf(x->ename, sizeof x->ename, "%s", c->body2);
     } else if (c->type == OC_CMD_FETCH) {
@@ -668,6 +703,12 @@ static void xq_start(disp_ctx *ctx) {
         begin_listen(ctx, c->message_id);
     } else if (c->type == OC_CMD_VOICE_PREVIEW) {
         begin_voice_preview(ctx, c->body);
+    } else if (c->type == OC_CMD_POST_FILES) {
+        /* From the first file every time, a restart after a lost link included:
+         * what an earlier connection finished was never posted, and the daemon
+         * reclaims an upload no message took (ARCH-77). */
+        ctx->xq->ffile = 0;
+        files_next(ctx);
     } else if (c->type == OC_CMD_POST_VIDEO) {
         ctx->xq->vstage = 0; ctx->xq->vposter = ctx->xq->vvideo = 0;
         char pname[128];
@@ -1549,6 +1590,49 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     }
                     continue;
                 }
+                if (x->purpose == 4) {
+                    /* One of several files for one message: the next file, or,
+                     * after the last, the message carrying them all. */
+                    oc_xqueue *q = ctx->xq;
+                    oc_cmd *job = q->active;
+                    q->fids[q->ffile] = x->id;
+                    if (q->ffile + 1 < job->n_paths) {
+                        xfer_reset(x);
+                        q->ffile++;
+                        files_next(ctx);
+                        continue;
+                    }
+                    static uint8_t pf[OC_MAX_FRAME_SIZE];
+                    oc_wbuf pw; oc_wbuf_init(&pw, pf, sizeof pf);
+                    oc_result pr;
+                    if (job->message_id) {
+                        oc_send_reply sr; memset(&sr, 0, sizeof sr);
+                        sr.channel_id = job->channel_id; sr.parent_id = job->message_id;
+                        gen_idem(sr.idem);
+                        sr.body = oc_slice_str(job->body ? job->body : "");
+                        sr.n_attach = job->n_paths;
+                        memcpy(sr.attach_ids, q->fids, job->n_paths * sizeof q->fids[0]);
+                        pr = oc_encode_send_reply(&pw, OC_PROTOCOL_VERSION, &sr);
+                    } else {
+                        oc_send sd; memset(&sd, 0, sizeof sd);
+                        sd.channel_id = job->channel_id;
+                        gen_idem(sd.idem);
+                        sd.body = oc_slice_str(job->body ? job->body : "");
+                        sd.n_attach = job->n_paths;
+                        memcpy(sd.attach_ids, q->fids, job->n_paths * sizeof q->fids[0]);
+                        pr = oc_encode_send(&pw, OC_PROTOCOL_VERSION, &sd);
+                    }
+                    if (pr == OC_OK && write_all(ctx->conn, ctx->fd, pf, pw.len, ctx->stop) == 0) {
+                        char msg[64];
+                        snprintf(msg, sizeof msg, "posted %u file%s", (unsigned)job->n_paths,
+                                 job->n_paths == 1 ? "" : "s");
+                        xfer_notice(ctx, 1, msg);
+                    } else {
+                        xfer_notice(ctx, 2, "files: could not send the message");
+                    }
+                    xfer_reset(x);
+                    continue;
+                }
                 if (x->purpose == 2) {
                     /* A custom emoji (REQ-072): claim the finished upload by name,
                      * and post nothing — the same shape as an avatar. */
@@ -2008,6 +2092,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     (ctx && (ctx->xfer->mode == 4 || ctx->xfer->mode == 5) &&
                      (err.code == OC_ERR_NOT_RENDERABLE || err.code == OC_ERR_TTS_UNAVAILABLE ||
                       err.code == OC_ERR_FORBIDDEN || err.code == OC_ERR_UNKNOWN_MESSAGE));
+                /* An upload the daemon gave up on is a failure for its job, which
+                 * a frontend following the tag must see. The status line above
+                 * already says why, so the notice carries no text of its own. */
+                if (ctx && ctx->xfer->mode == 1 && about_transfer) xfer_notice(ctx, 2, NULL);
                 if (ctx && ctx->xfer->mode == 3 && about_transfer)
                     xfer_notice(ctx, 2, err.code == OC_ERR_MEDIA_TOO_LARGE
                                         ? "video message: larger than this server accepts"
@@ -2976,6 +3064,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_LISTEN_FETCH || (c->type == OC_CMD_VOICE_PREVIEW && c->body) ||
                 (c->type == OC_CMD_UPLOAD && c->body) || c->type == OC_CMD_FETCH ||
+                (c->type == OC_CMD_POST_FILES && c->n_paths) ||
                 (c->type == OC_CMD_DOWNLOAD && c->body) ||
                 (c->type == OC_CMD_POST_VIDEO && c->blob && c->blob2)) {
                 xq_add(&n->xq, c);             /* owned by the queue now */

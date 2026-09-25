@@ -392,8 +392,16 @@ size_t oc_client_call_notify_take(oc_client *c, int quiet, int paused,
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by
- * id to `dest_path`. Progress + completion arrive as OC_EV_XFER status lines. */
-void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
+ * id to `dest_path`. Progress + completion arrive as OC_EV_XFER status lines.
+ * The upload returns its tag, or 0 if nothing was queued. */
+uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
+/* Post up to OC_MAX_ATTACH local files and `text` (may be empty) as ONE
+ * message, to `channel_id` or, with a `thread_root`, into that thread. The files
+ * upload in order, then the message goes; progress names the file moving
+ * (oc_model_xfer's `file`), and one failure or a cancel posts nothing. Returns
+ * the tag, or 0 if nothing was queued. */
+uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const char *const *paths, size_t n_paths, const char *text);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
 
 /* Fetch an attachment INTO MEMORY: the bytes arrive as an

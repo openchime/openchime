@@ -287,6 +287,7 @@ typedef struct {
     /* XFER / MEDIA_POSTED: which queued transfer (the tag its command carried),
      * and bytes moved of the total. */
     uint64_t xfer_tag, xfer_done, xfer_total;
+    uint8_t  xfer_file;   /* XFER: which file of a POST_FILES job is moving (0 otherwise) */
     oc_call_view *call;   /* heap; the CALL_* events */
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
 } oc_ev;
@@ -395,6 +396,10 @@ enum {
      * MP4, blob2 = the poster JPEG, media_*.
      * Uploads both, sends ATTACH_MEDIA_SET, then SEND or SEND_REPLY. */
     OC_CMD_POST_VIDEO,
+    /* Post files as ONE message (REQ-140): paths = the local files, body = the
+     * text (may be empty), message_id = a thread root or 0. Uploads each in
+     * turn, then one SEND or SEND_REPLY carrying the text and every file. */
+    OC_CMD_POST_FILES,
     OC_CMD_CANCEL_TRANSFER, /* xfer_tag: drop it from the queue, or abort it if running */
     /* Fetch one message's speech (ARCH-111): message_id. Queued with the other
      * transfers, so it never overlaps a download. */
@@ -453,6 +458,9 @@ typedef struct {
     size_t   blob_len, blob2_len;
     uint32_t duration_ms;
     uint16_t media_w, media_h;
+    /* POST_FILES: heap paths, one per file, capped by the wire's attachment list. */
+    char    *paths[OC_MAX_ATTACH];
+    uint8_t  n_paths;
     /* CALL_JOIN / CALL_INVITE: the people asked. Inline, capped by the wire. */
     uint64_t uids[OC_MAX_CALL_INVITES];
     uint16_t n_uids;
