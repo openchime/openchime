@@ -264,8 +264,7 @@ static void start_federated(fed_services *f) {
      * gateway. It signs with the enrollment key and delivers offline mobile
      * notifications; absent in self-hosted stand-alone. */
     if (cfg->push.url && *cfg->push.url) {
-        f->push = oc_push_start(cfg->db_path, f->db, cfg->push.url, cfg->push.ca_bundle,
-                                f->audience, f->privkey);
+        f->push = oc_push_start(cfg->db_path, f->db, cfg->push.url, f->audience, f->privkey);
         if (f->push) {
             oc_netloop_set_push(f->push);
             fprintf(stderr, "openchimed: push emitter enabled (audience=%s)\n", f->audience);
@@ -276,8 +275,7 @@ static void start_federated(fed_services *f) {
     /* Invitation mail (REQ-280): each invite bound to an address is reported to
      * central at the origin the box enrolled with. */
     if (cfg->invite_mail) {
-        f->invite_mail = oc_invite_mail_start(cfg->enroll.url, cfg->enroll.ca_bundle,
-                                              f->audience, f->privkey);
+        f->invite_mail = oc_invite_mail_start(cfg->enroll.url, f->audience, f->privkey);
         if (f->invite_mail) {
             oc_netloop_set_invite_mail(f->invite_mail);
             fprintf(stderr, "openchimed: invitation mail on (audience=%s)\n", f->audience);
@@ -304,8 +302,8 @@ static void *claim_thread(void *arg) {
     time_t deadline = time(NULL) + wait_secs;
     unsigned pause = 2;
     while (!g_stop) {
-        oc_enroll_result er = oc_enroll_claim(cfg->enroll.url, cfg->enroll.ca_bundle,
-                                              f->audience, f->privkey, f->ticket);
+        oc_enroll_result er = oc_enroll_claim(cfg->enroll.url, f->audience, f->privkey,
+                                              f->ticket);
         if (er == OC_ENROLL_ACTIVE) {
             oc_dbwriter_note_enrollment_active(f->db, f->privkey, f->audience);
             fprintf(stderr, "openchimed: binding claimed (audience=%s)\n", f->audience);
@@ -525,8 +523,8 @@ int main(int argc, char **argv) {
         if (enroll_audience && enroll_privkey && !enroll_active) {
             time_t deadline = time(NULL) + wait_secs;
             for (;;) {
-                oc_enroll_result er = oc_enroll_activate(enroll_url, cfg->enroll.ca_bundle,
-                                                         enroll_audience, enroll_privkey);
+                oc_enroll_result er = oc_enroll_activate(enroll_url, enroll_audience,
+                                                         enroll_privkey);
                 if (er == OC_ENROLL_ACTIVE) {
                     oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
                     enroll_active = 1;
@@ -634,7 +632,7 @@ int main(int argc, char **argv) {
     /* Link unfurls (REQ-222, ARCH-105): always on, no switch. The worker
      * fetches previews off the hot path; its SSRF gate is what makes
      * user-supplied destinations safe to dial at all. */
-    oc_unfurler *unfurler = oc_unfurler_start(db, cfg->unfurl.ca_bundle, cfg->unfurl.allow_private);
+    oc_unfurler *unfurler = oc_unfurler_start(db, cfg->unfurl.allow_private);
     if (unfurler) oc_netloop_set_unfurler(unfurler);
     else fprintf(stderr, "openchimed: unfurl worker failed to start\n");
 

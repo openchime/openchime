@@ -27,12 +27,11 @@
 
 typedef struct oc_unfurler oc_unfurler;
 
-/* Start the worker. `dbw` receives the completed fetches; `ca_bundle` NULL uses
- * the system store; `allow_private` disables the SSRF gate and exists ONLY so a
- * test can fetch from a loopback fixture (OPENCHIME_UNFURL_ALLOW_PRIVATE) —
- * never set it in a deployment. Returns NULL on failure. */
-oc_unfurler *oc_unfurler_start(oc_dbwriter *dbw, const char *ca_bundle,
-                               int allow_private);
+/* Start the worker. `dbw` receives the completed fetches; `allow_private`
+ * disables the SSRF gate and exists ONLY so a test can fetch from a loopback
+ * fixture (OPENCHIME_UNFURL_ALLOW_PRIVATE) — never set it in a deployment.
+ * Returns NULL on failure. */
+oc_unfurler *oc_unfurler_start(oc_dbwriter *dbw, int allow_private);
 
 /* Queue one URL of one message for fetching. Non-blocking; drops silently when
  * the queue is full (an unfurl is best-effort, a message is not). `url` need

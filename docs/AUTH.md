@@ -313,7 +313,7 @@ that many seconds before serving (default 0 = one attempt, retry next boot), so 
 can come up already-Active once the operator reserves the code.
 
 **The daemon's push emitter (ARCH-85).** An enrolled box additionally set with
-`OPENCHIME_PUSH_URL` (the control-plane push gateway; `OPENCHIME_PUSH_CA_BUNDLE` optional) delivers
+`OPENCHIME_PUSH_URL` (the control-plane push gateway) delivers
 mobile push (REQ-132/133). The daemon owns a device-token registry
 (`REGISTER_DEVICE_TOKEN`); a committed SEND drives an off-hot-path worker that selects
 recipients (members − author, level=ALL, not in DND, holding a token), signs a

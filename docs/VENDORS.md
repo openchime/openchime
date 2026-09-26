@@ -16,7 +16,8 @@ are four ways a dependency enters the build; each row below says which:
 **License posture:** our own code is AGPL-3.0-or-later throughout
 ([LICENSING.md](../LICENSING.md)); every *third-party* component linked into the
 shipping **daemon** and **TUI** is permissive — MIT, Apache-2.0, Public Domain,
-or (for the *optional, dynamically linked* libsecret/glib) LGPL-2.1-or-later. No
+or (for the *optional, dynamically linked* libsecret/glib) LGPL-2.1-or-later —
+except Mozilla's CA roots, which are data under MPL-2.0, a file-level copyleft. No
 third-party GPL/AGPL code is linked into any shipped binary, and every one of
 these is compatible with the AGPL.
 
@@ -36,6 +37,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a standalone C library) | Voice input in the Win32 client (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
+| **Mozilla CA roots** | curl's extract, dated (see `scripts/update_ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, the control plane, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 
 **Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
@@ -227,8 +229,8 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | **Alpine Linux** | `3.20` | Build + runtime base of the published image | mixed (base OS) | https://alpinelinux.org |
 
 One image, and it is an **output** rather than a tool: the OCI image published to
-GHCR for the hosted model (ARCH-20/76). Runtime Alpine packages:
-`ca-certificates`.
+GHCR for the hosted model (ARCH-20/76). It adds no Alpine packages: the daemon
+links everything it needs, CA roots included.
 
 The project runs no containers for development or testing (ARCH-36), so this
 table holds exactly one row. The sole image reference in the repo is the

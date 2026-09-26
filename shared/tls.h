@@ -49,7 +49,7 @@ typedef struct {
  *   - **No verification** (`oc_tls_client_init` with `pin == NULL`): any
  *     certificate is accepted. Only for callers that pin out-of-band.
  *   - **CA-chain verification** (`oc_tls_client_init_ca`): an ordinary public
- *     PKI check against a CA bundle, plus hostname verification. Used where the
+ *     PKI check against built-in roots, plus hostname verification. Used where the
  *     daemon is a *client of someone else's public service* — an S3-compatible
  *     object store (ARCH-70) — which is the opposite trust relationship from
  *     ARCH-10's: there is no fingerprint to pin, the provider rotates certs
@@ -89,14 +89,21 @@ int  oc_tls_client_init(oc_tls_client *c, const uint8_t *pin);
  * the daemon should route to its HTTP handler (ARCH-32/54). */
 int  oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, const char **alpn);
 
-/* Initialize a client that verifies the peer against a **CA bundle** with
+/* Initialize a client that verifies the peer against **CA roots** with
  * hostname checking (MBEDTLS_SSL_VERIFY_REQUIRED), for talking to a public
- * HTTPS service rather than to an OpenChime daemon. `ca_bundle` is a PEM file
- * or directory; NULL probes the usual system locations. No ALPN is offered.
- * The caller MUST call oc_tls_conn_set_hostname() before the handshake, or the
- * hostname is not checked. Returns 0 on success, negative on failure (including
- * "no CA bundle found", which is fatal rather than a silent downgrade). */
-int  oc_tls_client_init_ca(oc_tls_client *c, const char *ca_bundle);
+ * HTTPS service rather than to an OpenChime daemon. The roots are Mozilla's,
+ * built into the binary, plus any set by oc_tls_set_extra_ca; the host's store
+ * is never read. No ALPN is offered. The caller MUST call
+ * oc_tls_conn_set_hostname() before the handshake, or the hostname is not
+ * checked. Returns 0 on success, negative on failure. */
+int  oc_tls_client_init_ca(oc_tls_client *c);
+
+/* Add the roots in the PEM file at `path` to those every later
+ * oc_tls_client_init_ca trusts: for a self-hosted service behind a private CA.
+ * They are added, never substituted. The file is read now, and every
+ * certificate in it must parse. NULL or "" clears. Not thread-safe: call before
+ * any client is set up. Returns 0, or -1 with the previous extra roots cleared. */
+int  oc_tls_set_extra_ca(const char *path);
 void oc_tls_client_free(oc_tls_client *c);
 
 /* Set up a connection object. `endpoint` is MBEDTLS_SSL_IS_SERVER or

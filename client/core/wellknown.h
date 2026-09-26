@@ -17,17 +17,17 @@
  *     only thing it could mean.
  *   - **JSON**, an object of scalars, because the project already speaks it on
  *     its other HTTP surfaces and vendors a parser for them.
- *   - **CA-verified**, and refused rather than downgraded when no trust anchor
- *     is available. This is the one that deserves the argument: ARCH-10 keeps
- *     the client off CA trust for the DAEMON connection, which is pinned
- *     (TOFU). That is a statement about the daemon's self-signed certificate,
- *     not about an ordinary web server at the tenant's domain, and it cannot be
- *     stretched to cover this: a document that may carry the fingerprint a
- *     client is about to pin is worth nothing if anyone on the path may write
- *     it. So the fetch verifies a chain, and where there is no bundle to verify
- *     against, there is no metadata — the resolution falls back to 443 exactly
- *     as it does today. The feature is optional in the requirement, and this is
- *     what optional means in practice.
+ *   - **CA-verified**, against the roots built into the client (tls.h), and
+ *     refused rather than downgraded when the chain does not reach one. This
+ *     is the one that deserves the argument: ARCH-10 keeps the client off CA
+ *     trust for the DAEMON connection, which is pinned (TOFU). That is a
+ *     statement about the daemon's self-signed certificate, not about an
+ *     ordinary web server at the tenant's domain, and it cannot be stretched
+ *     to cover this: a document that may carry the fingerprint a client is
+ *     about to pin is worth nothing if anyone on the path may write it. So the
+ *     fetch verifies a chain, and where it does not verify, there is no
+ *     metadata — the resolution falls back to 443. The feature is optional in
+ *     the requirement, and this is what optional means in practice.
  *
  * A document that is present but not what it claims to be is a DISTINCT failure
  * (REQ-011: "malformed `.well-known` metadata"), told apart from "there is no
@@ -75,11 +75,10 @@ int oc_wellknown_parse(const char *doc, size_t len, oc_wellknown *out);
  * edge cases. */
 int oc_wellknown_read_response(const char *resp, size_t len, oc_wellknown *out);
 
-/* Fetch and parse `https://<domain>/.well-known/openchime`. `ca_bundle` is a
- * file or directory of trust anchors, or NULL to probe the usual system
- * locations; with neither, the answer is OC_WK_NONE. Blocking, and bounded by
- * its own deadline, because a sign-in waits on it. */
-int oc_wellknown_fetch(const char *domain, const char *ca_bundle, oc_wellknown *out);
+/* Fetch and parse `https://<domain>/.well-known/openchime`. The server must
+ * present a chain to the built-in roots (tls.h), or the answer is OC_WK_NONE.
+ * Blocking, and bounded by its own deadline, because a sign-in waits on it. */
+int oc_wellknown_fetch(const char *domain, oc_wellknown *out);
 
 /* The fingerprint as BYTES: 32 of them, from 64 hex digits, with or without the
  * colons people paste between them. Returns 0 on success, -1 if it is not that

@@ -320,12 +320,12 @@ static int post_signed(push_ctx *ctx, const char *path, const char *audience, lo
 
 struct oc_machine_http { push_ctx ctx; };
 
-oc_machine_http *oc_machine_http_open(const char *url, const char *ca_bundle) {
+oc_machine_http *oc_machine_http_open(const char *url) {
     if (!url || !*url) return NULL;
     oc_machine_http *h = calloc(1, sizeof *h);
     if (!h) return NULL;
     if (parse_url(url, &h->ctx) != 0 ||
-        (h->ctx.use_tls && oc_tls_client_init_ca(&h->ctx.tls, ca_bundle) != 0)) {
+        (h->ctx.use_tls && oc_tls_client_init_ca(&h->ctx.tls) != 0)) {
         free(h);
         return NULL;
     }
@@ -673,8 +673,8 @@ static void *worker(void *arg) {
 }
 
 oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
-                       const char *push_url, const char *ca_bundle,
-                       const char *audience, const char *privkey_pem) {
+                       const char *push_url, const char *audience,
+                       const char *privkey_pem) {
     if (!db_path || !dbw || !push_url || !*push_url || !audience || !privkey_pem) return NULL;
 
     oc_push *p = calloc(1, sizeof *p);
@@ -685,7 +685,7 @@ oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
     if (!p->audience || !p->privkey) goto fail;
 
     if (parse_url(push_url, &p->ctx) != 0) goto fail;
-    if (p->ctx.use_tls && oc_tls_client_init_ca(&p->ctx.tls, ca_bundle) != 0) goto fail;
+    if (p->ctx.use_tls && oc_tls_client_init_ca(&p->ctx.tls) != 0) goto fail;
 
     if (sqlite3_open_v2(db_path, &p->rdb, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) goto fail_tls;
 

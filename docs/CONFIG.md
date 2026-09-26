@@ -1,10 +1,13 @@
 # OpenChime — Daemon Configuration Reference
 
-Every environment variable the daemon reads. **There is no configuration file**
-(ARCH-26): the daemon is configured entirely from its process environment, read
-once at startup into a single `oc_config` singleton (`daemon/config.c`). The one
-file the loader opens is the OIDC public-key PEM named by
-`OPENCHIME_OIDC_PUBKEY_FILE`.
+Everything that controls how the daemon runs: every environment variable it
+reads, then the state in its database that governs it, the SQLite settings it
+fixes in code, its command line and its build switches. **There is no
+configuration file** (ARCH-26): the daemon is configured entirely from its
+process environment, read once at startup into a single `oc_config` singleton
+(`daemon/config.c`). The two files the loader opens are PEM files the
+environment names: the OIDC public keys (`OPENCHIME_OIDC_PUBKEY_FILE`) and any
+extra CA roots (`OPENCHIME_EXTRA_CA`).
 
 Under systemd this is an `Environment=` / `EnvironmentFile=` block (ARCH-20);
 in the container image it is the container environment (ARCH-4). Nothing here is
@@ -52,8 +55,22 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_OIDC_ISSUER` *(alias)* | *(none)* | Expected `iss` on the relay-issued ES256 JWT. |
 | `OPENCHIME_OIDC_AUDIENCE` *(alias)* | *(none)* | Expected `aud`. Normally left unset — the enrolled audience from the `enrollment` table wins (ARCH-84). |
 | `OPENCHIME_OIDC_PUBKEY` *(alias)* | *(none)* | Central's pinned ES256 public keys, inline PEM — one block, or several during a rotation; a token's `kid` chooses among them. |
-| `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | The same, read from a file. **The only file the config loader reads.** |
+| `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | The same, read from a file. |
 | `OPENCHIME_OIDC_ALLOW` | *(none)* | Who may join by OIDC: a comma-separated list of `owner:<email>`, `tenant:google:<hosted domain>`, `tenant:microsoft:<tenant id>` and `domain:<domain>` rules (AUTH.md §8.4). Empty admits nobody new; a rule the daemon does not understand stops the boot. |
+
+## Outbound TLS
+
+Every HTTPS connection the daemon makes — to S3, to the control plane for
+enrollment, push and invitation mail, and to a linked page for its preview —
+verifies the server against **Mozilla's trusted roots, built into the binary**
+(ARCH-10). The host's CA store is never read, so what the daemon trusts is the
+same on every distribution and in a container with no `ca-certificates`. The
+roots are refreshed with each release ([TLS.md](./TLS.md)). The clients verify
+their `.well-known` discovery fetch against the same built-in roots.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCHIME_EXTRA_CA` | *(none)* | A PEM file of further root certificates to trust **as well as** the built-in ones, never instead of them — for a self-hosted service behind a private CA, such as an S3-compatible store. Read at startup: a file that is missing, empty, or holds any certificate that does not parse stops the boot. |
 
 ## Attachments and blob storage
 
@@ -73,7 +90,6 @@ present the S3 backend is used, otherwise the local filesystem is** (ARCH-70).
 | `OPENCHIME_S3_ACCESS_KEY` | *(none)* | SigV4 access key. |
 | `OPENCHIME_S3_SECRET_KEY` | *(none)* | SigV4 secret key. |
 | `OPENCHIME_S3_REGION` | `us-east-1` | SigV4 region. |
-| `OPENCHIME_S3_CA_BUNDLE` | *(system)* | CA bundle for the S3 TLS client — the one place OpenChime consults a CA store (ARCH-10/70). |
 
 ## Storage pressure and maintenance (ARCH-77/78)
 
@@ -104,9 +120,7 @@ exactly the self-hosted stand-alone model (ARCH-76).
 | `OPENCHIME_ENROLL_CODE_FILE` *(alias)* | *(none)* | Also write the `oce1.` code to this path, so orchestration can pick it up instead of scraping stderr. |
 | `OPENCHIME_ENROLL_WAIT_SECS` *(alias)* | `0` | Seconds to wait for the operator to reserve the code before giving up for this boot. A managed box claiming with a ticket waits 120 when this is unset. |
 | `OPENCHIME_ENROLL_TICKET` | *(none)* | A managed box's one-time ticket (AUTH.md §8.7). With it and `OPENCHIME_OIDC_AUDIENCE` set, the daemon adopts that audience, generates its key, and claims the binding at `OPENCHIME_ENROLL_URL` instead of printing a code. |
-| `OPENCHIME_ENROLL_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the enrollment HTTPS client, which the invitation mail report shares. |
 | `OPENCHIME_PUSH_URL` *(alias)* | *(none)* | Push-gateway base URL. Push requires **both** this and an active enrollment, which is why it is absent in stand-alone deployments (ARCH-16/85). |
-| `OPENCHIME_PUSH_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the push HTTPS client. |
 | `OPENCHIME_INVITE_MAIL` | `off` | `on` \| `off`. With `on` and an active enrollment, each invite bound to an email address is reported to central at the origin of `OPENCHIME_ENROLL_URL` (`/api/machine/invite/notify`, signed with the enrollment key), and central mails the invited person one fixed invitation (REQ-280, ARCH-85). The report is sent off the hot path and never fails the invite; a refusal is final, and an unreachable or failing central is retried a few times. Any other value stops the boot. Off, or without an enrollment, the invitation is the copyable text the inviter's client shows. |
 
 ## Link unfurls (REQ-222, ARCH-105)
@@ -116,11 +130,6 @@ SSRF gate (no loopback, private, link-local, CGNAT, multicast or reserved
 destination — checked on every resolved address and re-checked per redirect)
 and is capped in bytes, redirects and time; an air-gapped box's fetches simply
 fail, bounded and silent.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_UNFURL_CA_BUNDLE` | *(system)* | CA bundle for the fetcher's HTTPS client — the fourth CA consumer beside S3, enrollment and push (ARCH-10). |
-| `OPENCHIME_WELLKNOWN_CA_BUNDLE` | *(system)* | Client. CA bundle for the `.well-known` discovery fetch (REQ-010, ARCH-10). Unset probes the usual system locations, which exist on Linux and the BSDs; Windows has none, so a client there consults the metadata only when this names a bundle. Without one the fetch is refused rather than made unverified, and resolution falls back to 443. |
 
 ## Audio
 
@@ -175,6 +184,67 @@ the ~45 MB of recognizer files stay on disk until the first segment. Recognizing
 takes about a tenth of the time the speech lasted, on one core; peak memory is
 about 175 MB for a short sentence, 190 MB for six seconds and 360 MB for twenty.
 No audio is kept: a segment is freed once answered.
+
+---
+
+## Database-held state
+
+None of this is set by an operator directly; the daemon writes it and reads it
+back at startup, and it outranks the environment where the two overlap. Full
+column detail is in [SCHEMA.md](./SCHEMA.md).
+
+| Where | Written | What it controls |
+|---|---|---|
+| `schema_version` | By the migrator, one row per applied migration | Which migrations have run. At each boot every migration above the highest row is applied in its own transaction; a failure rolls that one back and stops the boot (ARCH-27). |
+| `server_identity` (one row) | On the first run that generates a TLS identity | The daemon's certificate and private key. When present it is written over `OPENCHIME_TLS_CERT` / `OPENCHIME_TLS_KEY` at startup, so a restored database keeps the fingerprint clients pinned (ARCH-10/66b). |
+| `enrollment` (one row) | When `OPENCHIME_ENROLL_URL` first takes effect | The enrollment key, the audience and `pending` / `active`. The stored audience outranks `OPENCHIME_OIDC_AUDIENCE`, and push and invitation mail need `active` (ARCH-84/85). |
+| `invites` with no `created_by` | At boot, in `local` auth mode, while no owner exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). |
+| `users.role` | By owners and admins | `owner` / `admin` / `member` — who may administer the workspace (ARCH-60). |
+| `users.disabled` | By member removal | A removed member cannot sign in and does not count against `OPENCHIME_MAX_USERS` (CP-7). |
+| `webhooks` | By owners and admins | Incoming webhooks and the channel each posts to (REQ-170). |
+| `custom_emoji` | By members | The workspace's own emoji (REQ-072). |
+
+Each person's preferences are also stored here and steer what the daemon sends
+them: notification level and mute per channel (`notification_prefs`), the default
+level, schedule, pause and time zone (`users.notify_default`, `dnd_mode`,
+`allow_start_min` / `allow_end_min`, `dnd_until_ms`, `tz_offset_min`,
+`notify_schedule`), keywords and priority people (`notify_keywords`,
+`priority_people`), thread follows (`thread_follows`), the voice they are read in
+(`users.voice_id`) and each client's synced settings (`client_settings`).
+
+## SQLite settings
+
+Fixed in code (`daemon/dbwriter.c`); nothing in the environment changes them.
+
+| Setting | Value | Why |
+|---|---|---|
+| `journal_mode` | `WAL` | Readers run beside the single writer without blocking it (ARCH-2/66). |
+| `foreign_keys` | `ON` | The schema's references and cascades are enforced. |
+| `query_only` (read connection) | `1` | Queries go through a second connection that cannot write (ARCH-66). |
+| `busy_timeout` (read connection) | 5000 ms | How long a read waits on a lock before failing. |
+
+## Command line
+
+Configuration never comes from arguments; these are the only ones the daemon
+accepts, and any other stops it with exit status 2.
+
+| Argument | What it does |
+|---|---|
+| `--version`, `-V` | Prints the version and protocol version, then exits. |
+| `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to an MP4 at OUT with the built-in model, then exits. Only in a build with read-aloud. |
+| `--tts-manifest DIR` | Writes the manifest for the read-aloud data in DIR, then exits. Only in a build with read-aloud. |
+| `--stt-hear IN.wav` | Prints the text recognized in a 16-bit mono WAV, then exits. Only in a build with voice input. |
+| `--stt-manifest DIR` | Writes the manifest for the recognizer data in DIR, then exits. Only in a build with voice input. |
+
+## Build switches
+
+`make` variables, fixed into the binary.
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `TTS` | `1` | `0` builds without read-aloud; `OPENCHIME_TTS*` then have no effect. |
+| `STT` | `1` | `0` builds without voice input; `OPENCHIME_STT*` then have no effect. |
+| `OC_VERSION` | *(unset: `dev`)* | The release number `--version` prints; the release workflow sets it (ARCH-20). |
 
 ---
 

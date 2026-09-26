@@ -247,7 +247,7 @@ oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpo
         snprintf(out->host, sizeof out->host, "%s", domain);
         out->port = 443;                     /* OC_DEFAULT_PORT, as host_resolves uses */
         oc_wellknown wk;
-        int wkr = oc_wellknown_fetch(domain, getenv("OPENCHIME_WELLKNOWN_CA_BUNDLE"), &wk);
+        int wkr = oc_wellknown_fetch(domain, &wk);
         if (wkr == OC_WK_MALFORMED) return OC_RESOLVE_BAD_METADATA;
         if (wkr == OC_WK_OK) {
             if (wk.port) out->port = wk.port;

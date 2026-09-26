@@ -18,16 +18,15 @@
 typedef struct oc_invite_mail oc_invite_mail;
 
 /* Start the emitter. `enroll_url` is OPENCHIME_ENROLL_URL (only its origin is
- * used); `ca_bundle` is the enrollment's CA bundle (NULL probes the system's).
- * audience + privkey_pem are the enrollment identity (copied). NULL on failure. */
-oc_invite_mail *oc_invite_mail_start(const char *enroll_url, const char *ca_bundle,
-                                     const char *audience, const char *privkey_pem);
+ * used); audience + privkey_pem are the enrollment identity (copied). NULL on
+ * failure. */
+oc_invite_mail *oc_invite_mail_start(const char *enroll_url, const char *audience,
+                                     const char *privkey_pem);
 
 /* The same, waiting `backoff_ms` before the first retry (doubling after), for a
  * test that cannot wait seconds. */
-oc_invite_mail *oc_invite_mail_start_backoff(const char *enroll_url, const char *ca_bundle,
-                                             const char *audience, const char *privkey_pem,
-                                             unsigned backoff_ms);
+oc_invite_mail *oc_invite_mail_start_backoff(const char *enroll_url, const char *audience,
+                                             const char *privkey_pem, unsigned backoff_ms);
 
 /* Queue one report. Fire and forget; never blocks the caller (the net loop). A
  * no-op when m is NULL or an argument is missing. `invite_id` is 32 lowercase

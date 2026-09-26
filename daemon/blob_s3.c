@@ -110,9 +110,8 @@ static void *s3_open(const char *cfg) {
         snprintf(s->port, sizeof s->port, "%s", s->use_tls ? "443" : "80");
     }
 
-    if (s->use_tls && oc_tls_client_init_ca(&s->tls, getenv("OPENCHIME_S3_CA_BUNDLE")) != 0) {
-        fprintf(stderr, "openchimed: S3 endpoint is HTTPS but no CA bundle could be "
-                        "loaded; install ca-certificates or set OPENCHIME_S3_CA_BUNDLE\n");
+    if (s->use_tls && oc_tls_client_init_ca(&s->tls) != 0) {
+        fprintf(stderr, "openchimed: S3 endpoint is HTTPS but its TLS client could not be set up\n");
         free(s);
         return NULL;
     }

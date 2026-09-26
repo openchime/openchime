@@ -481,12 +481,11 @@ done:
     return rc;
 }
 
-oc_enroll_result oc_enroll_claim(const char *central_url, const char *ca_bundle,
-                                 const char *audience, const char *privkey_pem,
-                                 const char *ticket_b64url) {
+oc_enroll_result oc_enroll_claim(const char *central_url, const char *audience,
+                                 const char *privkey_pem, const char *ticket_b64url) {
     enroll_ctx ctx;
     if (parse_url(central_url, &ctx) != 0) return OC_ENROLL_FAILED;
-    if (ctx.use_tls && oc_tls_client_init_ca(&ctx.tls, ca_bundle) != 0) return OC_ENROLL_FAILED;
+    if (ctx.use_tls && oc_tls_client_init_ca(&ctx.tls) != 0) return OC_ENROLL_FAILED;
 
     oc_enroll_result result = OC_ENROLL_FAILED;
     char pub[512], sig[256], body[1400];
@@ -513,11 +512,11 @@ done:
     return result;
 }
 
-oc_enroll_result oc_enroll_activate(const char *central_url, const char *ca_bundle,
-                                    const char *audience, const char *privkey_pem) {
+oc_enroll_result oc_enroll_activate(const char *central_url, const char *audience,
+                                    const char *privkey_pem) {
     enroll_ctx ctx;
     if (parse_url(central_url, &ctx) != 0) return OC_ENROLL_FAILED;
-    if (ctx.use_tls && oc_tls_client_init_ca(&ctx.tls, ca_bundle) != 0) return OC_ENROLL_FAILED;
+    if (ctx.use_tls && oc_tls_client_init_ca(&ctx.tls) != 0) return OC_ENROLL_FAILED;
 
     oc_enroll_result result = OC_ENROLL_FAILED;
 

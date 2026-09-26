@@ -36,15 +36,11 @@ Summary:        OpenChime chat daemon
 
 # The daemon's own code and the components it links. RPM expects one field, so
 # all are named: mbedTLS and the Kitten voice model (Apache-2.0), jsmn and ONNX
-# Runtime (MIT), and the CMUdict-derived pronunciation data (BSD, two clauses).
-License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause
+# Runtime (MIT), the CMUdict-derived pronunciation data (BSD, two clauses), and
+# Mozilla's CA roots (MPL-2.0).
+License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause AND MPL-2.0
 URL:            https://openchime.io
 BuildArch:      %{_target_cpu}
-
-# Needed only for outbound TLS -- federated enrollment, push, and S3-backed
-# attachments. A stand-alone deployment with local blob storage genuinely runs
-# without it, so this is not a hard requirement.
-Recommends:     ca-certificates
 
 %description
 The OpenChime server: a single-binary chat daemon holding one tenant's messages

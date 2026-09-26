@@ -3,6 +3,7 @@
 #include "config.h"
 #include "proxyproto.h"
 #include "protocol.h"   /* OC_MAX_ATTACHMENT_SIZE */
+#include "tls.h"        /* oc_tls_set_extra_ca */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -150,6 +151,15 @@ int oc_config_load(char *err, size_t errcap) {
         }
         oc_trusted_proxies_free(t);
     }
+    /* Roots trusted beside the built-in ones, for a self-hosted service behind a
+     * private CA. Read and checked now, so a file that is missing or that does
+     * not parse stops the boot instead of failing each connection later. */
+    c->extra_ca = getenv("OPENCHIME_EXTRA_CA");
+    if (oc_tls_set_extra_ca(c->extra_ca) != 0) {
+        snprintf(err, errcap, "OPENCHIME_EXTRA_CA='%s' is not a readable file of "
+                              "PEM certificates", c->extra_ca);
+        return -1;
+    }
     c->blob_dir = env_or2("OPENCHIME_BLOB_DIR", NULL, "/data/blobs");
 
     /* Storage-pressure policy (reuse the storage-domain env parser + clamps). */
@@ -170,13 +180,11 @@ int oc_config_load(char *err, size_t errcap) {
     /* Federated enrollment (CP-8). */
     c->enroll.url       = env_or2("OPENCHIME_ENROLL_URL",       "OC_ENROLL_URL",       NULL);
     c->enroll.code_file = env_or2("OPENCHIME_ENROLL_CODE_FILE", "OC_ENROLL_CODE_FILE", NULL);
-    c->enroll.ca_bundle = env_or2("OPENCHIME_ENROLL_CA_BUNDLE", "OC_ENROLL_CA_BUNDLE", NULL);
     c->enroll.wait_secs = env_int("OPENCHIME_ENROLL_WAIT_SECS", "OC_ENROLL_WAIT_SECS", 0);
     c->enroll.ticket    = getenv("OPENCHIME_ENROLL_TICKET");
 
     /* Outbound push emitter (ARCH-85). */
-    c->push.url       = env_or2("OPENCHIME_PUSH_URL",       "OC_PUSH_URL",       NULL);
-    c->push.ca_bundle = env_or2("OPENCHIME_PUSH_CA_BUNDLE", "OC_PUSH_CA_BUNDLE", NULL);
+    c->push.url = env_or2("OPENCHIME_PUSH_URL", "OC_PUSH_URL", NULL);
 
     /* Invitation mail (REQ-280's carve-out): whether each invite bound to an
      * address is reported to central for it to mail. Off unless asked for, and a
@@ -194,7 +202,6 @@ int oc_config_load(char *err, size_t errcap) {
 
     /* Link unfurls (REQ-222, ARCH-105). Always on — no switch. An air-gapped
      * box needs none: its fetches simply fail, bounded and silent. */
-    c->unfurl.ca_bundle     = env_or2("OPENCHIME_UNFURL_CA_BUNDLE", NULL, NULL);
     c->unfurl.allow_private = env_int("OPENCHIME_UNFURL_ALLOW_PRIVATE", NULL, 0);
 
     /* Read-aloud (ARCH-111). The model is in the binary, so the only reason to

@@ -135,16 +135,15 @@ static void *worker(void *arg) {
     return NULL;
 }
 
-oc_invite_mail *oc_invite_mail_start_backoff(const char *enroll_url, const char *ca_bundle,
-                                             const char *audience, const char *privkey_pem,
-                                             unsigned backoff_ms) {
+oc_invite_mail *oc_invite_mail_start_backoff(const char *enroll_url, const char *audience,
+                                             const char *privkey_pem, unsigned backoff_ms) {
     if (!enroll_url || !*enroll_url || !audience || !privkey_pem) return NULL;
     oc_invite_mail *m = calloc(1, sizeof *m);
     if (!m) return NULL;
     m->backoff_ms = backoff_ms ? backoff_ms : 1;
     m->audience = strdup(audience);
     m->privkey  = strdup(privkey_pem);
-    m->http     = oc_machine_http_open(enroll_url, ca_bundle);
+    m->http     = oc_machine_http_open(enroll_url);
     if (!m->audience || !m->privkey || !m->http) goto fail;
 
     pthread_condattr_t ca;
@@ -167,9 +166,9 @@ fail:
     return NULL;
 }
 
-oc_invite_mail *oc_invite_mail_start(const char *enroll_url, const char *ca_bundle,
-                                     const char *audience, const char *privkey_pem) {
-    return oc_invite_mail_start_backoff(enroll_url, ca_bundle, audience, privkey_pem, 2000);
+oc_invite_mail *oc_invite_mail_start(const char *enroll_url, const char *audience,
+                                     const char *privkey_pem) {
+    return oc_invite_mail_start_backoff(enroll_url, audience, privkey_pem, 2000);
 }
 
 void oc_invite_mail_report(oc_invite_mail *m, const char *invite_id, const char *email,

@@ -20,6 +20,7 @@ dist/
 !/third_party/stb/
 !/third_party/sqlite-3.53.4/
 !/third_party/libfvad/
+!/third_party/ca-roots/
 *.o
 *.db
 *.db-shm

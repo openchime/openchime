@@ -80,7 +80,6 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: Danny Heskett <dan@danheskett.com>
 Installed-Size: ${size_kb}
-Recommends: ca-certificates
 Homepage: https://openchime.io
 Description: OpenChime chat daemon
  The OpenChime server: a single-binary chat daemon holding one tenant's

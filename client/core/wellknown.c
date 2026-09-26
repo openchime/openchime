@@ -221,14 +221,14 @@ static int wk_pump(int fd, oc_tls_status st, uint64_t now, uint64_t deadline) {
     return 1;                                   /* call again */
 }
 
-int oc_wellknown_fetch(const char *domain, const char *ca_bundle, oc_wellknown *out) {
+int oc_wellknown_fetch(const char *domain, oc_wellknown *out) {
     if (!domain || !domain[0] || !out) return OC_WK_NONE;
     memset(out, 0, sizeof *out);
 
     oc_tls_client tls;
-    /* No anchors, no metadata. Refusing here rather than falling back to an
+    /* No verifier, no metadata. Refusing here rather than falling back to an
      * unverified fetch is the whole point (wellknown.h). */
-    if (oc_tls_client_init_ca(&tls, ca_bundle) != 0) return OC_WK_NONE;
+    if (oc_tls_client_init_ca(&tls) != 0) return OC_WK_NONE;
 
     int rc = OC_WK_NONE;
     int fd = wk_dial(domain, 443, WK_DEADLINE_MS);
