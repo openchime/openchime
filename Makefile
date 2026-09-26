@@ -77,7 +77,8 @@ BIN := openchimed
 # both the daemon and the client), daemon/ is the server, client/ is the app.
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c \
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c \
-              shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c
+              shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
+              third_party/ca-roots/ca_roots.c
 DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/audio_sidecar.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
@@ -377,9 +378,9 @@ build/bench_load: tests/bench_load.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBED
 # core still compiles on its own against the shared wire code.
 # Manual S3 smoke test (tests/manual/s3_smoke.c) -- NOT part of `make test`.
 # Needs live S3 credentials in the environment; see the header of that file.
-s3-smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c shared/tls.c $(MBEDTLS_A) | build
+s3-smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c \
-	    daemon/blob_s3.c daemon/sigv4.c shared/tls.c $(MBEDTLS_LIBS) -lpthread -o build/s3_smoke
+	    daemon/blob_s3.c daemon/sigv4.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o build/s3_smoke
 	@echo "built build/s3_smoke -- needs OPENCHIME_S3_* credentials to run"
 
 core: $(CORE_SRC) $(SHARED_SRC) $(wildcard client/core/*.h shared/*.h) $(MBEDTLS_A) | build

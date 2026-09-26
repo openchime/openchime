@@ -718,7 +718,7 @@ static void test_notify_roundtrip(void) {
     char url[64];
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
 
-    oc_push *p = oc_push_start(path, w, url, NULL, aud, pk);
+    oc_push *p = oc_push_start(path, w, url, aud, pk);
     CHECK(p != NULL);
     if (p) {
         oc_push_notify(p, 1, alice, 0, 0);   /* alice sent → bob should be notified */

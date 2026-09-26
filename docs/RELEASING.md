@@ -327,6 +327,16 @@ A tool the release downloads is pinned to a versioned asset with a known SHA-256
 never fetched from a mutable "latest" redirect — the same rule as
 `build_mbedtls.sh`, which refuses to fetch without one.
 
+## The CA roots are a snapshot
+
+The roots every outbound HTTPS connection trusts are compiled in
+(`third_party/ca-roots/ca_roots.c`, [TLS.md](./TLS.md)), so a root Mozilla
+removes stays trusted until a release carries the change. Before promoting, take
+the newest dated extract and its sum from https://curl.se/docs/caextract.html,
+set `CA_ROOTS_DATE` and `CA_ROOTS_SHA256` in `scripts/update_ca_roots.sh`, run it,
+and land the regenerated file on `staging` like any other change. Its diff is the
+list of roots added and removed.
+
 ## Secrets and variables
 
 | name | kind | required for |

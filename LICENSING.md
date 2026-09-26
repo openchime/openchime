@@ -39,13 +39,16 @@ GPL-3.0: modify and distribute a client, and the source travels with it.
 | Mbed TLS 3.6.2 | Apache-2.0 | TLS, SHA-256/PBKDF2, ES256 |
 | SDL3 | zlib | GUI windowing, input, 2D renderer |
 | jsmn | MIT | JSON tokenizer |
+| Mozilla CA roots | MPL-2.0 | the roots outbound HTTPS verifies against, as data |
 | termbox2 | MIT | TUI terminal layer |
 | utf8proc | MIT-like | Unicode handling |
 | lucide | ISC | icons |
 | SQLite | public domain | linked dynamically (`-lsqlite3`) |
 
-All are permissive and all are compatible with AGPL-3.0-or-later, so nothing in
-`third_party/` constrains the choice above. Two consequences worth stating:
+All are compatible with AGPL-3.0-or-later, so nothing in `third_party/`
+constrains the choice above. All are permissive but one: Mozilla's CA roots are
+MPL-2.0, whose copyleft reaches only the file itself, and which names the GNU
+licences as ones its files may be combined under. Two consequences worth stating:
 
 - Apache-2.0 is compatible with AGPL-3.0 but **not** with GPL-2.0 — while
   mbedTLS is linked, GPL-2.0 is not an available licence for this project.

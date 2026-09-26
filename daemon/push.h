@@ -23,8 +23,8 @@ typedef struct oc_push oc_push;
  * to prune stale tokens central reports. Returns NULL on failure or if push_url is
  * empty. audience + privkey_pem are the enrollment identity (copied). */
 oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
-                       const char *push_url, const char *ca_bundle,
-                       const char *audience, const char *privkey_pem);
+                       const char *push_url, const char *audience,
+                       const char *privkey_pem);
 
 /* Enqueue a notify decision for a just-committed message. Fire-and-forget; never
  * blocks the caller (the net loop). A no-op if p is NULL. */
@@ -44,7 +44,7 @@ void oc_push_stop(oc_push *p);
  * ("https://central.example[:port]"); anything after the authority is ignored.
  * Blocking, so call it from a worker, never the net loop. */
 typedef struct oc_machine_http oc_machine_http;
-oc_machine_http *oc_machine_http_open(const char *url, const char *ca_bundle);
+oc_machine_http *oc_machine_http_open(const char *url);
 /* POST `body` (JSON) to `path`, signed with the enrollment key. Returns 0 with
  * the HTTP status in *status, or -1 when no HTTP answer came back at all. */
 int  oc_machine_http_post(oc_machine_http *h, const char *path, const char *audience,

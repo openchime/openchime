@@ -600,15 +600,15 @@ static void *uf_worker(void *arg) {
     }
 }
 
-oc_unfurler *oc_unfurler_start(oc_dbwriter *dbw, const char *ca_bundle, int allow_private) {
+oc_unfurler *oc_unfurler_start(oc_dbwriter *dbw, int allow_private) {
     if (!dbw) return NULL;
     oc_unfurler *u = calloc(1, sizeof *u);
     if (!u) return NULL;
     u->dbw = dbw;
     u->allow_private = allow_private;
-    u->tls_ok = (oc_tls_client_init_ca(&u->tls, ca_bundle) == 0);
+    u->tls_ok = (oc_tls_client_init_ca(&u->tls) == 0);
     if (!u->tls_ok)
-        fprintf(stderr, "unfurl: CA store unavailable; https targets disabled\n");
+        fprintf(stderr, "unfurl: TLS client could not be set up; https targets disabled\n");
     pthread_mutex_init(&u->mu, NULL);
     pthread_cond_init(&u->cv, NULL);
     if (pthread_create(&u->th, NULL, uf_worker, u) != 0) {

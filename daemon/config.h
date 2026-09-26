@@ -58,6 +58,7 @@ typedef struct {
     int      xfer_workers;          /* clamped 1..16 */
     int      max_conns_per_ip;      /* 0 disables */
     const char *trusted_proxies;    /* peers whose PROXY v2 header is believed; NULL = none */
+    const char *extra_ca;           /* PEM roots added to the built-in ones; NULL = none */
     uint64_t max_attach_size;
     uint64_t max_video_size;        /* video message byte cap (REQ-164); <= max_attach_size */
     const char *blob_dir;
@@ -71,10 +72,10 @@ typedef struct {
     const char *bootstrap_users;
 
     /* Federated enrollment (CP-8). */
-    struct { const char *url, *code_file, *ca_bundle, *ticket; int wait_secs; } enroll;
+    struct { const char *url, *code_file, *ticket; int wait_secs; } enroll;
 
     /* Outbound push emitter (ARCH-85). */
-    struct { const char *url, *ca_bundle; } push;
+    struct { const char *url; } push;
 
     /* Invitation mail through central (REQ-280, ARCH-85): OPENCHIME_INVITE_MAIL,
      * off unless "on". Needs an active enrollment as well. */
@@ -82,7 +83,7 @@ typedef struct {
 
     /* Link unfurls (REQ-222, ARCH-105). Always on — there is no switch.
      * `allow_private` disables the SSRF gate and exists only for tests. */
-    struct { const char *ca_bundle; int allow_private; } unfurl;
+    struct { int allow_private; } unfurl;
 
     /* Read-aloud (REQ-291-295, ARCH-111). Built into the daemon and on by
      * default: there is nothing to install. `enabled` 0 turns it off, and a

@@ -208,7 +208,7 @@ static oc_enroll_result claim_against(int status, struct canned *c, const char *
     pthread_create(&th, NULL, canned_central, c);
     char url[96];
     snprintf(url, sizeof url, "http://127.0.0.1:%u/api/machine/enroll", (unsigned)ntohs(a.sin_port));
-    oc_enroll_result r = oc_enroll_claim(url, NULL, aud, pk, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc");
+    oc_enroll_result r = oc_enroll_claim(url, aud, pk, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc");
     pthread_join(th, NULL);
     close(c->listen_fd);
     return r;
@@ -230,7 +230,7 @@ static void test_claim_answers(void) {
     CHECK(claim_against(429, &c, pk, aud) == OC_ENROLL_PENDING);   /* busy: try again */
     CHECK(claim_against(503, &c, pk, aud) == OC_ENROLL_PENDING);
     /* Nobody there at all. */
-    CHECK(oc_enroll_claim("http://127.0.0.1:1/api/machine/enroll", NULL, aud, pk,
+    CHECK(oc_enroll_claim("http://127.0.0.1:1/api/machine/enroll", aud, pk,
                           "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc") == OC_ENROLL_PENDING);
 }
 

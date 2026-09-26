@@ -7,13 +7,17 @@
 
 #include "tls.h"
 #include "protocol.h"
+#include "config.h"
 #include "check.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <mbedtls/x509_crt.h>
 
 static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     for (;;) {
@@ -329,12 +333,213 @@ static void test_tls_alpn_demux(void) {
     CHECK(alpn_handshake(h2_only, sel, sizeof sel) == OC_TLS_ERROR);
 }
 
+/* --- CA verification: the built-in roots and OPENCHIME_EXTRA_CA ------------- */
+
+extern const char oc_ca_roots_pem[];
+extern const size_t oc_ca_roots_pem_size;
+
+/* Every root compiled in parses with the mbedTLS we ship. The loader tolerates a
+ * root it cannot read, so without this a refresh could drop one silently. */
+static void test_tls_builtin_roots_parse(void) {
+    size_t blocks = 0;
+    for (const char *p = oc_ca_roots_pem; (p = strstr(p, "-----BEGIN CERTIFICATE-----")); p++)
+        blocks++;
+    CHECK(blocks >= 100);
+
+    mbedtls_x509_crt roots;
+    mbedtls_x509_crt_init(&roots);
+    CHECK(mbedtls_x509_crt_parse(&roots, (const unsigned char *)oc_ca_roots_pem,
+                                 oc_ca_roots_pem_size) == 0);
+    size_t parsed = 0;
+    for (const mbedtls_x509_crt *c = &roots; c && c->raw.len; c = c->next) parsed++;
+    CHECK(parsed == blocks);
+    mbedtls_x509_crt_free(&roots);
+}
+
+/* A private CA and a server certificate it issued, as PEM files in `dir`. */
+struct private_pki {
+    char ca[128], cert[128], key[128];
+};
+
+static int write_file(const char *path, const char *text) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    int ok = fputs(text, f) >= 0;
+    return (fclose(f) == 0 && ok) ? 0 : -1;
+}
+
+/* Sign a P-256 certificate for `subject_key`, named `subject`, with the issuer's
+ * key and name, into `pem`. `is_ca` makes it a CA that may sign others. */
+static int mint(mbedtls_pk_context *subject_key, const char *subject,
+                mbedtls_pk_context *issuer_key, const char *issuer, int is_ca,
+                unsigned char serial, mbedtls_ctr_drbg_context *rng,
+                unsigned char *pem, size_t cap) {
+    mbedtls_x509write_cert w;
+    mbedtls_x509write_crt_init(&w);
+    int rc;
+    mbedtls_x509write_crt_set_subject_key(&w, subject_key);
+    mbedtls_x509write_crt_set_issuer_key(&w, issuer_key);
+    mbedtls_x509write_crt_set_version(&w, MBEDTLS_X509_CRT_VERSION_3);
+    mbedtls_x509write_crt_set_md_alg(&w, MBEDTLS_MD_SHA256);
+    if ((rc = mbedtls_x509write_crt_set_subject_name(&w, subject)) != 0 ||
+        (rc = mbedtls_x509write_crt_set_issuer_name(&w, issuer)) != 0 ||
+        (rc = mbedtls_x509write_crt_set_serial_raw(&w, &serial, 1)) != 0 ||
+        (rc = mbedtls_x509write_crt_set_validity(&w, "20200101000000", "20500101000000")) != 0 ||
+        (rc = mbedtls_x509write_crt_set_basic_constraints(&w, is_ca, -1)) != 0 ||
+        (is_ca && (rc = mbedtls_x509write_crt_set_key_usage(&w, MBEDTLS_X509_KU_KEY_CERT_SIGN)) != 0))
+        goto done;
+    rc = mbedtls_x509write_crt_pem(&w, pem, cap, mbedtls_ctr_drbg_random, rng);
+done:
+    mbedtls_x509write_crt_free(&w);
+    return rc;
+}
+
+static int make_private_pki(const char *dir, struct private_pki *out) {
+    mbedtls_entropy_context ent;
+    mbedtls_ctr_drbg_context rng;
+    mbedtls_pk_context ca_key, leaf_key;
+    mbedtls_entropy_init(&ent);
+    mbedtls_ctr_drbg_init(&rng);
+    mbedtls_pk_init(&ca_key);
+    mbedtls_pk_init(&leaf_key);
+    unsigned char ca_pem[4096], leaf_pem[4096], key_pem[2048];
+    int rc = -1;
+
+    if (mbedtls_ctr_drbg_seed(&rng, mbedtls_entropy_func, &ent, NULL, 0) != 0) goto done;
+    mbedtls_pk_context *keys[2] = { &ca_key, &leaf_key };
+    for (int i = 0; i < 2; i++)
+        if (mbedtls_pk_setup(keys[i], mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0 ||
+            mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(*keys[i]),
+                                mbedtls_ctr_drbg_random, &rng) != 0)
+            goto done;
+    if (mint(&ca_key, "CN=Private Test Root", &ca_key, "CN=Private Test Root", 1, 1,
+             &rng, ca_pem, sizeof ca_pem) != 0 ||
+        mint(&leaf_key, "CN=localhost", &ca_key, "CN=Private Test Root", 0, 2,
+             &rng, leaf_pem, sizeof leaf_pem) != 0 ||
+        mbedtls_pk_write_key_pem(&leaf_key, key_pem, sizeof key_pem) != 0)
+        goto done;
+
+    snprintf(out->ca, sizeof out->ca, "%s/ca.pem", dir);
+    snprintf(out->cert, sizeof out->cert, "%s/cert.pem", dir);
+    snprintf(out->key, sizeof out->key, "%s/key.pem", dir);
+    if (write_file(out->ca, (char *)ca_pem) == 0 &&
+        write_file(out->cert, (char *)leaf_pem) == 0 &&
+        write_file(out->key, (char *)key_pem) == 0)
+        rc = 0;
+done:
+    mbedtls_pk_free(&ca_key);
+    mbedtls_pk_free(&leaf_key);
+    mbedtls_ctr_drbg_free(&rng);
+    mbedtls_entropy_free(&ent);
+    return rc;
+}
+
+/* Handshake a CA-verifying client, expecting `host`, against a server presenting
+ * the private PKI's certificate. Returns the client's handshake status. */
+static oc_tls_status ca_handshake(const struct private_pki *pki, const char *host) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(lfd >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lfd, (struct sockaddr *)&addr, sizeof addr) == 0);
+    CHECK(listen(lfd, 1) == 0);
+    socklen_t alen = sizeof addr;
+    CHECK(getsockname(lfd, (struct sockaddr *)&addr, &alen) == 0);
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, pki->cert, pki->key) == 0);
+    pthread_t th;
+    struct server_arg arg = { lfd, &srv, 0 };
+    CHECK(pthread_create(&th, NULL, handshake_only_server, &arg) == 0);
+
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(cfd, (struct sockaddr *)&addr, sizeof addr) == 0);
+    oc_tls_client cli;
+    oc_tls_status st = OC_TLS_ERROR;
+    if (oc_tls_client_init_ca(&cli) == 0) {
+        oc_tls_conn c;
+        CHECK(oc_tls_conn_init(&c, &cli.conf, cfd) == 0);
+        CHECK(oc_tls_conn_set_hostname(&c, host) == 0);
+        st = handshake_blocking(&c);
+        oc_tls_conn_free(&c);
+    }
+    close(cfd);
+    pthread_join(th, NULL);
+    oc_tls_client_free(&cli);
+    oc_tls_server_free(&srv);
+    close(lfd);
+    return st;
+}
+
+static void test_tls_extra_ca(void) {
+    char dir[] = "/tmp/oc-extra-ca-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    struct private_pki pki;
+    CHECK(make_private_pki(dir, &pki) == 0);
+
+    /* The built-in roots alone do not reach a private CA: verification is real. */
+    CHECK(oc_tls_set_extra_ca(NULL) == 0);
+    CHECK(ca_handshake(&pki, "localhost") == OC_TLS_ERROR);
+
+    /* Added, the private root verifies its server... */
+    CHECK(oc_tls_set_extra_ca(pki.ca) == 0);
+    CHECK(ca_handshake(&pki, "localhost") == OC_TLS_OK);
+    /* ...under its own name only: the hostname is still checked. */
+    CHECK(ca_handshake(&pki, "wrong.example") == OC_TLS_ERROR);
+
+    /* A file that is missing, or is not certificates, is refused -- and a
+     * refusal leaves no extra roots behind, rather than the previous ones. */
+    char missing[160], junk[160], half[160];
+    snprintf(missing, sizeof missing, "%s/absent.pem", dir);
+    snprintf(junk, sizeof junk, "%s/junk.pem", dir);
+    snprintf(half, sizeof half, "%s/half.pem", dir);
+    CHECK(oc_tls_set_extra_ca(missing) == -1);
+    CHECK(ca_handshake(&pki, "localhost") == OC_TLS_ERROR);
+    CHECK(write_file(junk, "not a certificate\n") == 0);
+    CHECK(oc_tls_set_extra_ca(junk) == -1);
+    CHECK(write_file(junk, "") == 0);
+    CHECK(oc_tls_set_extra_ca(junk) == -1);
+
+    /* One good certificate beside one that does not parse is refused whole: the
+     * operator would otherwise trust less than they wrote. */
+    FILE *f = fopen(pki.ca, "r");
+    char ca_text[4096] = "";
+    size_t n = f ? fread(ca_text, 1, sizeof ca_text - 1, f) : 0;
+    if (f) fclose(f);
+    ca_text[n] = '\0';
+    char both[8192];
+    snprintf(both, sizeof both, "%s-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+             ca_text);
+    CHECK(write_file(half, both) == 0);
+    CHECK(oc_tls_set_extra_ca(half) == -1);
+
+    /* The daemon reads it at boot, and a file it cannot use stops the boot. */
+    char cfgerr[256] = "";
+    setenv("OPENCHIME_EXTRA_CA", missing, 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == -1);
+    CHECK(strstr(cfgerr, "OPENCHIME_EXTRA_CA") != NULL);
+    setenv("OPENCHIME_EXTRA_CA", pki.ca, 1);
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(ca_handshake(&pki, "localhost") == OC_TLS_OK);
+    unsetenv("OPENCHIME_EXTRA_CA");
+    CHECK(oc_config_load(cfgerr, sizeof cfgerr) == 0);
+    CHECK(ca_handshake(&pki, "localhost") == OC_TLS_ERROR);
+
+    unlink(pki.ca); unlink(pki.cert); unlink(pki.key); unlink(junk); unlink(half);
+    rmdir(dir);
+}
+
 int run_tls_tests(void) {
     printf("itest_tls: self-signed cert generation, TOFU-pinned handshake,\n");
-    printf("           byte round-trip, pin-mismatch rejection, ALPN demux\n");
+    printf("           byte round-trip, pin-mismatch rejection, ALPN demux,\n");
+    printf("           built-in CA roots, OPENCHIME_EXTRA_CA\n");
     test_tls_handshake_and_echo();
     test_tls_pin_mismatch();
     test_tls_sni_does_not_replace_the_pin();
     test_tls_alpn_demux();
+    test_tls_builtin_roots_parse();
+    test_tls_extra_ca();
     return failures;
 }

@@ -186,7 +186,7 @@ static int run_report(fake_central *f, const int *statuses, int n, const char *p
     /* The enrollment URL's path is not where the report goes: its origin is. */
     char url[96];
     snprintf(url, sizeof url, "http://127.0.0.1:%d/api/machine/enroll", port);
-    oc_invite_mail *m = oc_invite_mail_start_backoff(url, NULL, aud, pk, 20);
+    oc_invite_mail *m = oc_invite_mail_start_backoff(url, aud, pk, 20);
     CHECK(m != NULL);
     oc_invite_mail_report(m, ID, "lee@partner.example", 1760000000ull);
     pthread_join(th, NULL);          /* central has gone a second without a request */

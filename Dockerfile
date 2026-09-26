@@ -27,11 +27,9 @@ RUN make TTS=0 STT=0 OC_VERSION="$OC_VERSION"
 
 FROM alpine:3.20
 
-# No `sqlite` CLI: the daemon creates and migrates its own database, and the
-# entrypoint no longer seeds one. ca-certificates is for the daemon's *outbound*
-# TLS only -- enrollment, push and S3 -- never for its own listener, which is
-# self-signed and pinned by the client (ARCH-10).
-RUN apk add --no-cache ca-certificates
+# No packages at all. No `sqlite` CLI: the daemon creates and migrates its own
+# database, and the entrypoint no longer seeds one. No ca-certificates: the CA
+# roots its outbound TLS verifies against are compiled in (ARCH-10).
 
 COPY --from=build /src/openchimed /usr/local/bin/openchimed
 COPY entrypoint.sh /entrypoint.sh

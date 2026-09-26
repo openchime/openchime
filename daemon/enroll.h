@@ -38,10 +38,10 @@ typedef enum {
 } oc_enroll_result;
 
 /* Run the outbound challenge/confirm against central to activate the binding.
- * central_url is e.g. "https://central.example[:port]"; ca_bundle may be NULL to
- * probe the system CA locations. Returns an oc_enroll_result. */
-oc_enroll_result oc_enroll_activate(const char *central_url, const char *ca_bundle,
-                                    const char *audience, const char *privkey_pem);
+ * central_url is e.g. "https://central.example[:port]"; HTTPS is verified against
+ * the built-in roots (tls.h). Returns an oc_enroll_result. */
+oc_enroll_result oc_enroll_activate(const char *central_url, const char *audience,
+                                    const char *privkey_pem);
 
 /* A managed box's claim (AUTH.md §8.7). `ticket_b64url` is the one-time ticket
  * the box was started with. Writes the SubjectPublicKeyInfo DER and the ASN.1 DER
@@ -55,8 +55,7 @@ int oc_enroll_sign_claim(const char *privkey_pem, const char *audience, const ch
  * activated it; FAILED when it refused the ticket (spent, expired, or not this
  * workspace's — retrying cannot help); PENDING when central could not be reached
  * or was busy, which is worth another try. */
-oc_enroll_result oc_enroll_claim(const char *central_url, const char *ca_bundle,
-                                 const char *audience, const char *privkey_pem,
-                                 const char *ticket_b64url);
+oc_enroll_result oc_enroll_claim(const char *central_url, const char *audience,
+                                 const char *privkey_pem, const char *ticket_b64url);
 
 #endif /* OPENCHIME_ENROLL_H */

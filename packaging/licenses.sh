@@ -65,6 +65,9 @@ in full here, as those licences require.
   Mbed TLS 3.6.2   Apache-2.0   TLS transport, TOFU certificate handling,
                                 SHA-256/PBKDF2, ES256 verification
   jsmn             MIT          JSON tokenizer (OIDC and webhook payloads)
+  Mozilla CA roots MPL-2.0      the root certificates outbound HTTPS verifies
+                                against, embedded as data; the source form is
+                                third_party/ca-roots in the repository above
 HEADER
 
 if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
@@ -97,6 +100,7 @@ emit "openchimed -- GNU Affero General Public License v3.0 or later" "${root}/LI
 
 emit "Mbed TLS 3.6.2 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
 emit "jsmn -- MIT License" "${root}/third_party/jsmn/LICENSE"
+emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
 if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
