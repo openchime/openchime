@@ -84,6 +84,18 @@ authority.
   per-account, so many users behind one NAT are tolerated while an account-spray
   from a single IP is still stopped; a successful login clears the account
   counter but not the source counter.
+- **Where the derivation runs:** not on the database writer. The writer checks
+  the limiters, a reader fetches the stored credential and its version, a
+  two-thread auth pool derives and compares, and the writer finishes the
+  sign-in — session, audit — only if the credential still carries that version
+  (SCHEMA.md migration 0047). Every write of a password takes a new version from
+  a counter that only rises, so a password changed meanwhile, or an account
+  removed and its id given to another, fails the sign-in (ARCH-5). A burst of
+  sign-ins therefore does not hold up everyone's sends. Changing a password
+  goes the same way — the pool checks the old password and derives the new one,
+  and the writer stores the new one only if the credential still carries the
+  version the old one was checked against; a change that lost that race is
+  refused, and the password is whatever the change that won it set.
   The per-source counter stands in front of **every** source: a refused relay
   token and a wrong session token count against the address they came from, the
   check runs before any signature work, and a refused relay sign-in is audited as

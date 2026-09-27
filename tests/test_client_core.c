@@ -1955,18 +1955,12 @@ static void test_addressable_targets(void) {
 }
 
 /* ---- calls end to end (REQ-150, REQ-301-305, ARCH-113) -------------------------
- * A relay on a thread, as itest_netloop runs one, and a TAP in front of it: a UDP
+ * The daemon's relay, and a TAP in front of it: a UDP
  * forwarder the daemon advertises as the relay's port, with an upstream socket per
  * client so the relay still tells the clients apart. What passes through it is
  * what anyone on the network -- or the relay itself -- would see. */
 
-static struct { int ipc, udp; volatile sig_atomic_t stop; } g_relay;
-static pthread_t g_relay_th;
-static void *relay_thread(void *p) {
-    (void)p;
-    oc_audio_sidecar_run(g_relay.ipc, g_relay.udp, &g_relay.stop);
-    return NULL;
-}
+static struct { int udp; } g_relay;   /* the socket the daemon's relay runs on */
 
 #define TAP_CLIENTS 8
 #define TAP_KEEP    4000
@@ -1981,6 +1975,7 @@ static struct {
     int      n_seen, bad_header;
     int      big;                            /* payloads over 1000 bytes: a shared screen's */
     volatile int drop_pm;                    /* client -> relay packets lost, per mille */
+    volatile int block;                      /* every packet lost, both ways: UDP is blocked */
     unsigned rng;
     volatile int stop;
 } g_tap;
@@ -1999,7 +1994,7 @@ static void *tap_thread(void *p) {
     relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     relay.sin_port = htons(g_tap.relay_port);
     uint8_t buf[2048];
-    while (!g_tap.stop) {
+    while (!__atomic_load_n(&g_tap.stop, __ATOMIC_ACQUIRE)) {
         /* Only the sockets polled are looked at afterwards: a client first seen
          * in this pass has no revents yet, and reading one anyway is a blocking
          * recv on an empty socket. Every recv is non-blocking all the same. */
@@ -2032,8 +2027,10 @@ static void *tap_thread(void *p) {
                         if (n > 1000) g_tap.big++;
                         pthread_mutex_unlock(&g_tap.mu);
                     }
+                    if (__atomic_load_n(&g_tap.block, __ATOMIC_ACQUIRE)) continue;
                     g_tap.rng = g_tap.rng * 1664525u + 1013904223u;
-                    if (n > 18 && g_tap.drop_pm && (int)((g_tap.rng >> 8) % 1000) < g_tap.drop_pm) continue;
+                    int drop = __atomic_load_n(&g_tap.drop_pm, __ATOMIC_ACQUIRE);
+                    if (n > 18 && drop && (int)((g_tap.rng >> 8) % 1000) < drop) continue;
                     sendto(g_tap.cl[k].up, buf, (size_t)n, 0, (struct sockaddr *)&relay, sizeof relay);
                 }
             }
@@ -2041,7 +2038,7 @@ static void *tap_thread(void *p) {
         for (int i = 0; i < polled; i++)
             if (pf[1 + i].revents & POLLIN) {
                 ssize_t n = recv(g_tap.cl[i].up, buf, sizeof buf, MSG_DONTWAIT);
-                if (n > 0) sendto(g_tap.front, buf, (size_t)n, 0, (struct sockaddr *)&g_tap.cl[i].from, sizeof g_tap.cl[i].from);
+                if (n > 0 && !__atomic_load_n(&g_tap.block, __ATOMIC_ACQUIRE)) sendto(g_tap.front, buf, (size_t)n, 0, (struct sockaddr *)&g_tap.cl[i].from, sizeof g_tap.cl[i].from);
             }
     }
     return NULL;
@@ -2156,10 +2153,10 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_call_engine_stats(eb, &st);
     uint32_t nacks0 = st.view_nacks;
     int got0 = wb.frames;
-    g_tap.drop_pm = 100;
+    __atomic_store_n(&g_tap.drop_pm, 100, __ATOMIC_RELEASE);
     uint64_t until = mono_ms() + 4000;
     CALL_WAIT(5000, ({ watch(eb, &wb); mono_ms() > until; }));
-    g_tap.drop_pm = 0;
+    __atomic_store_n(&g_tap.drop_pm, 0, __ATOMIC_RELEASE);
     oc_call_engine_stats(eb, &st);
     oc_call_stats sa; oc_call_engine_stats(ea, &sa);
     printf("  at 10%% loss for 4 s: erik has %d more frames, %u NACKs, dana resent %u, %u PLIs, %u given up;"
@@ -2352,6 +2349,57 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_call_engine_free(ec);
 }
 
+/* A network that passes no UDP (PROTOCOL.md §5.17): with the tap dropping every
+ * datagram both ways, each engine finds within seconds that the relay does not
+ * answer and sends by the connection instead, and each hears the other's tone as
+ * well as over UDP. When UDP comes back, the next probe finds it and both return
+ * to it, still hearing each other. */
+static void test_calls_tcp(oc_client *a, oc_client *b) {
+    oc_client *c = NULL;
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts ob = { NULL, NULL, 0, tone_source, tone_sink, &tb };
+    oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob);
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(b, oc_call_engine_media(), eb);
+    const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
+    oc_call_stats sa, sb;
+
+    __atomic_store_n(&g_tap.block, 1, __ATOMIC_RELEASE);
+    oc_client_call_start(a, 1, NULL, 0);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
+    oc_client_call_join(b, 1);
+    CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
+                           sa.transport == 1 && sb.transport == 1)));
+    /* As clear as over UDP: the level it was sent at, less what Opus and the
+     * limiter take, which frames lost to the connection would not reach. */
+    CHECK(CALL_WAIT(8000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
+    printf("  UDP blocked: both by the connection; dana hears 660 Hz at %.0f, erik 440 Hz at %.0f\n",
+           heard(&ta, 1), heard(&tb, 0));
+    CHECK(heard(&ta, 0) < 300 && heard(&tb, 1) < 300);
+    oc_call_engine_stats(ea, &sa);
+    CHECK(sa.n_peers == 1 && sa.peers[0].lost == 0 && sa.peers[0].late == 0);
+    if (sa.n_peers) printf("  by the connection, dana from erik: %u packets, %u lost, %u late, jitter target %d ms\n",
+                           sa.peers[0].packets, sa.peers[0].lost, sa.peers[0].late, sa.target_ms);
+
+    __atomic_store_n(&g_tap.block, 0, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(15000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
+                            sa.transport == 0 && sb.transport == 0)));
+    CHECK(CALL_WAIT(6000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
+    printf("  UDP back: both on it again; dana hears 660 Hz at %.0f, erik 440 Hz at %.0f\n",
+           heard(&ta, 1), heard(&tb, 0));
+
+    oc_client_call_leave(b, 1);
+    oc_client_call_leave(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mb->in_call));
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(b, NULL, NULL);
+    oc_call_engine_free(ea);
+    oc_call_engine_free(eb);
+}
+
 /* The device key (ARCH-113): made once and kept beside the token, the same one
  * read back, a version 2 entry upgraded in place, and forgotten with the
  * session. */
@@ -2530,7 +2578,7 @@ static void test_big_channel_list(int port) {
         oc_client_stop(c);
     }
 
-    arg.stop = 1;
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
@@ -2618,7 +2666,7 @@ static void test_published_fingerprint(int port) {
         }
     }
 
-    arg.stop = 1;
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
@@ -2826,7 +2874,7 @@ static void test_browser_signin(int port) {
         oc_client_stop(c);
     }
 
-    arg.stop = 1;
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
@@ -2903,8 +2951,6 @@ int run_client_core_tests(void) {
 
     /* A relay, and the tap in front of it that the daemon advertises (calls). */
     {
-        int sv[2];
-        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
         g_relay.udp = socket(AF_INET, SOCK_DGRAM, 0);
         g_tap.front = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in ra; memset(&ra, 0, sizeof ra);
@@ -2916,11 +2962,8 @@ int run_client_core_tests(void) {
         l = sizeof ta; getsockname(g_tap.front, (struct sockaddr *)&ta, &l);
         g_tap.relay_port = ntohs(ra.sin_port);
         pthread_mutex_init(&g_tap.mu, NULL);
-        g_relay.ipc = sv[1];
-        g_relay.stop = 0;
-        CHECK(pthread_create(&g_relay_th, NULL, relay_thread, NULL) == 0);
         CHECK(pthread_create(&g_tap_th, NULL, tap_thread, NULL) == 0);
-        oc_netloop_set_audio(sv[0], ntohs(ta.sin_port));
+        oc_netloop_set_audio(g_relay.udp, ntohs(ta.sin_port));
     }
 
     struct core_loop_arg arg;
@@ -3686,6 +3729,7 @@ int run_client_core_tests(void) {
         }
 
         test_calls_e2e(a, b, arg.port);
+        test_calls_tcp(a, b);
 
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
@@ -3852,7 +3896,7 @@ int run_client_core_tests(void) {
 
             /* Bounce the daemon: the client's connection drops and it begins
              * reconnecting with backoff while the listener is down. */
-            arg.stop = 1;
+            __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
             pthread_join(th, NULL);
             arg.stop = 0;
             CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
@@ -3959,7 +4003,7 @@ int run_client_core_tests(void) {
             CHECK(o1 != NULL);
             if (o1) {
                 CHECK(WAIT_FOR(o1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
-                arg.stop = 1;
+                __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
                 pthread_join(th, NULL);
                 CHECK(WAIT_FOR(o1, !m->connected));
                 oc_client_send(o1, 1, "queued while offline");   /* -> in-memory outbox */
@@ -3979,12 +4023,10 @@ int run_client_core_tests(void) {
         if (b) oc_client_stop(b);
     }
 
-    arg.stop = 1;
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     oc_netloop_set_audio(-1, 0);
-    g_relay.stop = 1;
-    pthread_join(g_relay_th, NULL);
-    g_tap.stop = 1;
+    __atomic_store_n(&g_tap.stop, 1, __ATOMIC_RELEASE);
     pthread_join(g_tap_th, NULL);
     close(g_relay.udp);
     close(g_tap.front);

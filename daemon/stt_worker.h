@@ -40,8 +40,10 @@ void oc_stt_worker_stop(oc_stt_worker *w);
 /* Readable whenever a result is waiting. */
 int oc_stt_worker_eventfd(oc_stt_worker *w);
 
-/* Queue a segment. Takes ownership of `pcm` (malloc'd) whether it succeeds or
- * not. Returns 0, or -1 if the queue is full. */
+/* Queue a segment. `pcm` holds its `samples` as the wire carried them, 16-bit
+ * little-endian; the worker puts them in host order before hearing them, so the
+ * net loop only copies bytes. Takes ownership of `pcm` (malloc'd) whether it
+ * succeeds or not. Returns 0, or -1 if the queue is full. */
 int oc_stt_worker_submit(oc_stt_worker *w, uint64_t req_id, int16_t *pcm, size_t samples);
 
 /* The next finished segment into `out`: 1 if there was one, 0 if none. */

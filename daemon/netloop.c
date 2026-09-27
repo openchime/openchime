@@ -27,6 +27,10 @@
 #include "ratelimit.h"
 #include "listen.h"
 #include "proxyproto.h"
+#include "idmap.h"
+#include "srccount.h"
+#include "relay.h"
+#include "ioloop.h"
 
 #include <mbedtls/sha256.h>
 
@@ -57,6 +61,32 @@
  * client's buffer is near-empty. */
 #define OC_MAX_OUT_BUFFER    (1u << 20)   /* 1 MiB */
 
+/* A reconnect backfill is replayed a slice at a time rather than in one go
+ * (ARCH-46): up to OC_BF_SLICE frames per turn, and only while less than
+ * OC_BF_SOFT is waiting to be written, so five hundred messages to a slow reader
+ * neither stall the loop nor fill the output cap and cost the connection. While
+ * one is replaying, every other frame for that connection waits behind it, in
+ * order, bounded by the output cap: the replay is ascending and complete before
+ * anything newer (PROTOCOL.md §6), exactly as when it went out at once. A client
+ * may have a few requests queued; more than OC_BF_QUEUE closes it. */
+#define OC_BF_SLICE          64
+
+/* The rest of a turn's bounds (ARCH-22). At most OC_IO_BUDGET events from the
+ * I/O threads, OC_RESULT_BUDGET database results and OC_XFER_BUDGET transfer
+ * completions are handled per turn, the rest on the next, so a burst of any of
+ * them cannot keep the loop from the others. (A connection's reads are bounded
+ * on its I/O thread, ioloop.c.) */
+#define OC_IO_BUDGET         512
+#define OC_IO_THREADS        2
+#define OC_RESULT_BUDGET     256
+#define OC_XFER_BUDGET       64
+/* Call media datagrams relayed per turn. A second of a ten-person call with a
+ * screen share at its ceiling is ~800 packets in; this is a sixth of that, so
+ * the relay keeps up with a turn every few milliseconds and never holds one. */
+#define OC_RELAY_BUDGET      128
+#define OC_BF_SOFT           (256u * 1024u)
+#define OC_BF_QUEUE          8
+
 /* Per-connection message-send rate limit (REQ-190): a fixed window bounds how
  * fast one authenticated client can create messages (SEND / SEND_REPLY), which
  * the broadcast fan-out would otherwise amplify to every channel member. Excess
@@ -65,9 +95,26 @@
 #define OC_SEND_RATE_MAX       30u
 #define OC_SEND_RATE_WINDOW_MS 3000u
 
-/* CONN_PROXY: a trusted forwarder's connection, whose PROXY v2 header is read off
- * the socket before TLS is allowed to see a byte (proxyproto.h). */
-typedef enum { CONN_PROXY, CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
+/* The other frames that fan out, bounded the same way, each by what a person
+ * could plausibly do. A presence change is always RECORDED; only its broadcast
+ * waits past the limit, and then carries whatever the state is by the time it
+ * goes, so the last word always reaches everyone. An excess typing signal is
+ * dropped -- the next one says the same. An excess reaction or call frame is
+ * refused with SEND_RATE_LIMITED. Leaving, declining and ending a call are not
+ * limited: each changes the caller's own state once, and refusing one would
+ * strand them in a call. */
+#define OC_PRESENCE_RATE_MAX   5u
+#define OC_PRESENCE_RATE_MS    10000u
+#define OC_TYPING_RATE_MAX     3u
+#define OC_TYPING_RATE_MS      2000u
+#define OC_REACT_RATE_MAX      30u
+#define OC_REACT_RATE_MS       10000u
+#define OC_CALL_RATE_MAX       60u
+#define OC_CALL_RATE_MS        10000u
+
+/* CONN_OPENING: handed to an I/O thread, which is reading any PROXY v2 header
+ * and doing the handshake; ESTABLISHED once it reports the connection open. */
+typedef enum { CONN_OPENING, CONN_ESTABLISHED } conn_state;
 
 /* Attachment transfer state (REQ-140/141, ARCH-69). A connection carries at most
  * one transfer at a time. Uploads stream client->blob (net-thread writes to the
@@ -101,8 +148,7 @@ typedef struct {
     uint64_t         received;        /* upload: bytes streamed so far */
     uint32_t         next_seq;        /* next expected (upload) / next sent (download) */
     oc_blob_writer  *bw;              /* upload sink */
-    mbedtls_sha256_context sha;       /* upload: running digest */
-    int              sha_init;        /* sha context needs freeing */
+    mbedtls_sha256_context *sha;      /* upload: running digest; with the write job while one is out */
     uint8_t          digest[32];      /* upload: final digest, echoed in UPLOAD_OK */
     oc_blob_reader  *br;              /* download source */
     uint64_t         remaining;       /* download: bytes still to send */
@@ -122,11 +168,9 @@ typedef struct {
     uint32_t         audio_duration_ms;
 } conn_xfer;
 
-typedef struct {
+typedef struct conn_s {
     int          fd;
     uint64_t     conn_id;
-    oc_tls_conn  tls;
-    oc_framebuf  fb;
     conn_state   state;
     int          did_hello;
     /* The version this session negotiated, from WELCOME. Every post-handshake
@@ -143,6 +187,8 @@ typedef struct {
     uint32_t     events;    /* current epoll interest */
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
+    struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl;
+    int          presence_deferred;   /* a broadcast is owed once presence_rl allows it */
     uint64_t     audio_win_start;/* the same, for read-aloud requests (ARCH-111) */
     uint32_t     audio_count;
     /* Voice input (ARCH-112): the segment being uploaded, one at a time, and
@@ -183,41 +229,64 @@ typedef struct {
     uint8_t      dnd_announced;
     conn_xfer    xfer;           /* in-flight attachment transfer, if any */
     /* HTTP mode (ARCH-32/54): a connection that did not negotiate the oc/1 ALPN
-     * is a webhook/HTTP client, not a binary-protocol peer. `hin` accumulates the
-     * request; `http_pending` marks it as awaiting a webhook-post result. */
+     * is a webhook/HTTP client, not a binary-protocol peer; its I/O thread parses
+     * the request. `http_pending` marks it as awaiting a webhook-post result. */
     int          http;
-    uint8_t     *hin;
-    size_t       hlen, hcap;
     int          http_pending;
+    /* The indexes (below): where this connection sits in the live list, its
+     * neighbours among its user's connections once authenticated, and the last
+     * fan-out that reached it, so a member listed twice is written to once. */
+    size_t       live_idx;
+    int          src_counted;     /* counted in the per-source index under `source` */
+    struct conn_s *u_next, *u_prev;
+    int          u_linked;
+    uint64_t     fan_gen;
+    /* The wire is the I/O thread's (ioloop.h). What the loop keeps: how many
+     * bytes it has handed over to be written and how many the thread has
+     * reported written, whose difference is what is still waiting; whether it
+     * has asked the thread to stop reading; and frames that arrived while the
+     * drain was paused behind a blob job, oldest first, with the one being
+     * handled, whose payload views point into it. */
+    uint64_t     sent_total, written_total;
+    int          read_paused;
+    oc_io_event *fq_head, *fq_tail, *fq_cur;
+    /* Backfill being replayed (OC_BF_SLICE): its results, oldest first, the
+     * head part-sent at bf_phase/bf_i; and, while any is, the bytes of every
+     * other frame for this connection, held in order behind it. */
+    oc_dbres    *bf[OC_BF_QUEUE];
+    int          bf_n, bf_pumping;
+    size_t       bf_phase, bf_i;
+    uint8_t     *dq;
+    size_t       dq_len, dq_cap;
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
  * buffer is safe and avoids per-send allocation (bodies can be ~64KB). */
-static uint8_t g_enc[OC_MAX_FRAME_SIZE];
+static __thread uint8_t *g_enc;   /* OC_MAX_FRAME_SIZE, the loop's own (see below) */
 /* A SECOND such buffer, for the one frame that differs per recipient: a thread
  * reply carries whether the peer being written to is in the thread (REQ-061), so
  * the fan-out holds both encodings at once and sends whichever matches. Two
  * buffers rather than an encode per member, because the field is a boolean. */
-static uint8_t g_enc_participant[OC_MAX_FRAME_SIZE];
+static __thread uint8_t *g_enc_participant;
 /* Scheduled-send sweep state (REQ-224, ARCH-102). `more` is set by the result
  * path when a send arrives with no connection behind it — that is one the sweep
  * fired, and there may be another right behind it. */
-static uint64_t g_last_sched_ms;
-static int      g_sched_more;
-static uint64_t g_next_conn_id = 1;
+static __thread uint64_t g_last_sched_ms;
+static __thread int      g_sched_more;
+static __thread uint64_t g_next_conn_id = 1;
 
 /* Attachment blob store + the upload size cap (ARCH-70). Set once at the top of
  * oc_netloop_run; the loop is single-threaded so file-scope state is safe, as
  * with g_enc/g_next_conn_id. */
-static oc_blobstore *g_blobs;
-static oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
+static __thread oc_blobstore *g_blobs;
+static __thread oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
 #ifdef OC_TTS
 /* Read-aloud (ARCH-111): the render worker and the engine it runs. The engine is
  * injected before the loop starts (a daemon built with read-aloud passes the
  * voice model; a test passes a stub), and the worker exists only when the
  * operator left the feature on. */
 static const oc_tts_engine *g_tts_engine;
-static oc_tts_worker       *g_tts;
+static __thread oc_tts_worker       *g_tts;
 /* Renders in flight, so two listeners asking for the same message at the same
  * moment cost one render: the first submits, the rest wait on the same handle. */
 typedef struct tts_wait {
@@ -225,8 +294,17 @@ typedef struct tts_wait {
     uint64_t         conn_id, message_id;
     struct tts_wait *next;
 } tts_wait;
-static tts_wait *g_tts_waits;
-static uint64_t  g_tts_req_seq;
+static __thread tts_wait *g_tts_waits;
+static __thread uint64_t  g_tts_req_seq;
+/* Renderings just finished, whose rows are on their way to the database. The
+ * blob is already written when the worker reports, but the row that says so
+ * commits a little later, and a listener asking in between -- the same one
+ * pressing Play again, or the next -- would miss it and pay for a second
+ * render. So the last few are remembered here and served from until then. */
+#define OC_TTS_FRESH 16
+static __thread struct { int used; uint8_t handle[32]; char key[OC_TTS_KEY_MAX]; uint64_t bytes; uint32_t duration_ms; }
+    g_tts_fresh[OC_TTS_FRESH];
+static __thread unsigned g_tts_fresh_next;
 static void tts_drop_waiters(uint64_t conn_id);
 #endif
 #ifdef OC_STT
@@ -236,7 +314,7 @@ static void tts_drop_waiters(uint64_t conn_id);
  * list holds it through those stages, in the order segments arrived, which is the
  * order every stage answers in. */
 static const oc_stt_engine *g_stt_engine;
-static oc_stt_worker       *g_stt;
+static __thread oc_stt_worker       *g_stt;
 enum { STT_AT_PREP, STT_AT_WORKER, STT_AT_POST };
 typedef struct stt_pend {
     uint64_t         req, conn_id;
@@ -252,8 +330,8 @@ typedef struct stt_pend {
     int              stage;
     struct stt_pend *next;
 } stt_pend;
-static stt_pend *g_stt_pend;
-static uint64_t  g_stt_req_seq;
+static __thread stt_pend *g_stt_pend;
+static __thread uint64_t  g_stt_req_seq;
 /* Segments one connection may have waiting to be answered. */
 #define OC_STT_WAIT_MAX 4
 static void stt_drop_conn(uint64_t conn_id);
@@ -261,17 +339,17 @@ static void stt_drop_conn(uint64_t conn_id);
 /* Storage maintenance (ARCH-78): policy, the last free-space sample, and when
  * the pass last ran. The sample is refreshed by the pass and read by the upload
  * admission check, so a refusal never costs a statvfs on the hot path. */
-static oc_storage_policy g_spol;
-static oc_storage_stats  g_sstat;
-static uint64_t          g_last_maint_ms;
-static char              g_blob_dir[1024];
-static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
-static uint64_t      g_max_video  = OC_MAX_VIDEO_MESSAGE_SIZE;   /* REQ-164 */
+static __thread oc_storage_policy g_spol;
+static __thread oc_storage_stats  g_sstat;
+static __thread uint64_t          g_last_maint_ms;
+static __thread char              g_blob_dir[1024];
+static __thread uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+static __thread uint64_t      g_max_video  = OC_MAX_VIDEO_MESSAGE_SIZE;   /* REQ-164 */
 
 /* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
  * fixed window keyed by the token, so one noisy integration can't flood a
  * channel. Created in oc_netloop_run. */
-static oc_ratelimit *g_webhook_rl;
+static __thread oc_ratelimit *g_webhook_rl;
 #define OC_WEBHOOK_RATE_MAX     60u
 #define OC_WEBHOOK_RATE_WINDOW  60000u
 
@@ -303,7 +381,7 @@ static void xfer_reset(conn_xfer *x) {
     }
     x->bw = NULL;
     x->br = NULL;
-    if (x->sha_init) { mbedtls_sha256_free(&x->sha); x->sha_init = 0; }
+    if (x->sha) { mbedtls_sha256_free(x->sha); free(x->sha); x->sha = NULL; }
     free(x->dl_filename);
     free(x->dl_mime);
 
@@ -324,6 +402,86 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* --- Turn statistics (netloop.h) ------------------------------------------ */
+
+static oc_netloop_stats g_stats;
+
+static uint64_t mono_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* Four buckets to each doubling: the octave from the highest set bit, the
+ * quarter from the two bits below it. 0 and 1 µs share bucket 0. */
+static unsigned hist_bucket(uint64_t us) {
+    if (us < 2) return 0;
+    unsigned oct = 63u - (unsigned)__builtin_clzll(us);
+    unsigned quarter = (unsigned)((us >> (oct >= 2 ? oct - 2 : 0)) & 3u);
+    if (oct < 2) quarter = (unsigned)((us << (2 - oct)) & 3u);
+    unsigned b = oct * 4u + quarter;
+    return b < OC_NETLOOP_HIST_BUCKETS ? b : OC_NETLOOP_HIST_BUCKETS - 1;
+}
+
+/* The smallest duration that lands in the bucket above `b`. */
+static uint64_t hist_upper_us(unsigned b) {
+    unsigned oct = (b + 1) / 4, quarter = (b + 1) % 4;
+    if (oct >= 63) return UINT64_MAX;
+    return (4ull + quarter) << oct >> 2;
+}
+
+static void stats_turn(uint64_t us) {
+    __atomic_add_fetch(&g_stats.turns, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_stats.turn_hist[hist_bucket(us)], 1, __ATOMIC_RELAXED);
+    uint64_t mx = __atomic_load_n(&g_stats.turn_max_us, __ATOMIC_RELAXED);
+    if (us > mx) __atomic_store_n(&g_stats.turn_max_us, us, __ATOMIC_RELAXED);
+}
+
+void oc_netloop_stats_get(oc_netloop_stats *out) {
+    out->turns       = __atomic_load_n(&g_stats.turns, __ATOMIC_RELAXED);
+    out->turn_max_us = __atomic_load_n(&g_stats.turn_max_us, __ATOMIC_RELAXED);
+    out->results     = __atomic_load_n(&g_stats.results, __ATOMIC_RELAXED);
+    out->bytes_read  = __atomic_load_n(&g_stats.bytes_read, __ATOMIC_RELAXED);
+    out->turn_read_max = __atomic_load_n(&g_stats.turn_read_max, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < OC_NETLOOP_HIST_BUCKETS; i++)
+        out->turn_hist[i] = __atomic_load_n(&g_stats.turn_hist[i], __ATOMIC_RELAXED);
+}
+
+void oc_netloop_stats_note_read(uint64_t bytes, uint64_t conn_id) {
+    (void)conn_id;
+    __atomic_add_fetch(&g_stats.bytes_read, bytes, __ATOMIC_RELAXED);
+    uint64_t mx = __atomic_load_n(&g_stats.turn_read_max, __ATOMIC_RELAXED);
+    while (bytes > mx &&
+           !__atomic_compare_exchange_n(&g_stats.turn_read_max, &mx, bytes, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+void oc_netloop_stats_reset(void) {
+    __atomic_store_n(&g_stats.turns, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_stats.turn_max_us, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_stats.results, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_stats.bytes_read, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_stats.turn_read_max, 0, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < OC_NETLOOP_HIST_BUCKETS; i++)
+        __atomic_store_n(&g_stats.turn_hist[i], 0, __ATOMIC_RELAXED);
+}
+
+uint64_t oc_netloop_stats_pct_us(const oc_netloop_stats *s, double pct) {
+    uint64_t total = 0;
+    for (unsigned i = 0; i < OC_NETLOOP_HIST_BUCKETS; i++) total += s->turn_hist[i];
+    if (!total) return 0;
+    uint64_t want = (uint64_t)((double)total * pct / 100.0 + 0.5);
+    if (want < 1) want = 1;
+    uint64_t seen = 0;
+    for (unsigned i = 0; i < OC_NETLOOP_HIST_BUCKETS; i++) {
+        seen += s->turn_hist[i];
+        if (seen >= want) {
+            uint64_t up = hist_upper_us(i);
+            return up > s->turn_max_us && s->turn_max_us ? s->turn_max_us : up;
+        }
+    }
+    return s->turn_max_us;
 }
 
 static int set_nonblock(int fd) {
@@ -351,18 +509,43 @@ static int send_rate_ok(conn *c) {
     return c->send_count <= OC_SEND_RATE_MAX;
 }
 
+/* One more event in a fixed window: 1 within `max` per `window_ms`, else 0. */
+static int win_ok(struct rate_win *w, uint32_t max, uint32_t window_ms) {
+    uint64_t now = now_ms();
+    if (now - w->start >= window_ms) { w->start = now; w->count = 0; }
+    return ++w->count <= max;
+}
+
 /* --- Outgoing buffer ---------------------------------------------------- */
 
+/* A frame for a connection whose backfill is still replaying: held behind it. */
+static int defer_append(conn *c, const uint8_t *buf, size_t len) {
+    if (c->dq_len + len > OC_MAX_OUT_BUFFER) return -1;
+    if (c->dq_len + len > c->dq_cap) {
+        size_t ncap = c->dq_cap ? c->dq_cap : 4096;
+        while (ncap < c->dq_len + len) ncap *= 2;
+        uint8_t *g = realloc(c->dq, ncap);
+        if (!g) return -1;
+        c->dq = g;
+        c->dq_cap = ncap;
+    }
+    memcpy(c->dq + c->dq_len, buf, len);
+    c->dq_len += len;
+    return 0;
+}
+
 static int out_append(conn *c, const uint8_t *buf, size_t len) {
+    if ((c->bf_n || c->dq_len) && !c->bf_pumping) return defer_append(c, buf, len);
     if (c->out_sent > 0) {                       /* drop the already-sent prefix */
         size_t rem = c->out_len - c->out_sent;
         if (rem) memmove(c->out, c->out + c->out_sent, rem);
         c->out_len = rem;
         c->out_sent = 0;
     }
-    /* Bound the backlog: a stuck/malicious reader can't grow this without limit.
-     * Over the cap, fail — send_bytes/flush_out then drop the connection. */
-    if (c->out_len + len > OC_MAX_OUT_BUFFER) return -1;
+    /* Bound the backlog -- what is staged here and what waits on the I/O thread
+     * together: a stuck or malicious reader cannot grow it without limit. Over
+     * the cap, fail; send_bytes then drops the connection. */
+    if (c->out_len + len + (c->sent_total - c->written_total) > OC_MAX_OUT_BUFFER) return -1;
     if (c->out_len + len > c->out_cap) {
         size_t ncap = c->out_cap ? c->out_cap : 2048;
         while (ncap < c->out_len + len) ncap *= 2;
@@ -376,48 +559,142 @@ static int out_append(conn *c, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-/* Returns 1 if fully flushed, 0 if it would block, -1 on error. */
+/* --- Indexes (ARCH-22) ----------------------------------------------------
+ *
+ * The connection table is indexed by file descriptor, which is what an epoll
+ * event names. Everything else used to be found by walking all of its slots:
+ * a connection by its id for every result, a user's connections for presence
+ * and do-not-disturb, a conversation's members for every fan-out -- each a pass
+ * over OC_NETLOOP_MAX_FD whether ten people were connected or four thousand.
+ * These three answer the same questions in time proportional to the answer.
+ *
+ *   by id      conn_id -> connection. Ids are never reused, so a result for a
+ *              connection that has gone finds nothing rather than a stranger.
+ *   by user    user_id -> that user's authenticated connections, a list
+ *              threaded through the connections themselves; linked at AUTH_OK,
+ *              unlinked at close.
+ *   by source  peer address -> how many connections it holds, for the per-address
+ *              cap; counted from accept (or from the forwarder's header) to close.
+ *   live       every connection, in a dense array. A close leaves a hole rather
+ *              than moving another connection into it, so a walk that closes a
+ *              connection part-way sees every other one exactly once; the holes
+ *              are closed up between turns, when nothing is walking.
+ *
+ * Each belongs to the loop that built it, and a loop is a thread: the test
+ * suites run a second loop beside the first, so these are per thread rather
+ * than per process. */
+static __thread oc_idmap g_by_id;
+static __thread oc_idmap g_by_user;
+static __thread conn   **g_live;
+static __thread size_t   g_nlive;
+#define OC_LIVE_CAP (2 * OC_NETLOOP_MAX_FD)
+static __thread uint64_t g_fan_gen;
+
+static __thread oc_srccount g_by_src;
+
+/* Connections from `src`: a lookup, not a walk. An empty address is nobody's. */
+static int conns_from_ip(conn **conns, const char *src) {
+    (void)conns;
+    return oc_srccount_get(&g_by_src, src);
+}
+
+/* Sized at twice the most connections the loop holds, so an increment always
+ * finds room (srccount.h). */
+static void src_count_add(conn *c) {
+    if (c->src_counted || !c->source[0]) return;
+    if (oc_srccount_inc(&g_by_src, c->source) > 0) c->src_counted = 1;
+}
+
+static void src_count_del(conn *c) {
+    if (!c->src_counted) return;
+    oc_srccount_dec(&g_by_src, c->source);
+    c->src_counted = 0;
+}
+static __thread int       g_presence_deferred;   /* some connection owes a broadcast */
+
+static void live_compact(void) {
+    size_t k = 0;
+    for (size_t i = 0; i < g_nlive; i++)
+        if (g_live[i]) { g_live[k] = g_live[i]; g_live[k]->live_idx = k; k++; }
+    g_nlive = k;
+}
+
+/* Called only from accept, never inside a walk, which is what makes compacting
+ * here safe. There are at most OC_NETLOOP_MAX_FD connections, so a compacted
+ * list always has room. */
+static int index_add(conn *c) {
+    if (g_nlive == OC_LIVE_CAP) live_compact();
+    if (g_nlive == OC_LIVE_CAP || oc_idmap_put(&g_by_id, c->conn_id, c) != 0) return -1;
+    c->live_idx = g_nlive;
+    g_live[g_nlive++] = c;
+    src_count_add(c);
+    return 0;
+}
+
+static conn *user_head(uint64_t uid) { return oc_idmap_get(&g_by_user, uid); }
+
+static void user_unlink(conn *c) {
+    if (!c->u_linked) return;
+    if (c->u_prev) c->u_prev->u_next = c->u_next;
+    else if (c->u_next) oc_idmap_put(&g_by_user, c->user_id, c->u_next);
+    else oc_idmap_del(&g_by_user, c->user_id);
+    if (c->u_next) c->u_next->u_prev = c->u_prev;
+    c->u_next = c->u_prev = NULL;
+    c->u_linked = 0;
+}
+
+static void user_link(conn *c) {
+    if (c->u_linked) return;
+    conn *head = user_head(c->user_id);
+    c->u_prev = NULL;
+    c->u_next = head;
+    if (head) head->u_prev = c;
+    if (oc_idmap_put(&g_by_user, c->user_id, c) != 0) {   /* cannot happen: fewer users than slots */
+        if (head) head->u_prev = NULL;
+        c->u_next = NULL;
+        return;
+    }
+    c->u_linked = 1;
+}
+
+static void index_remove(conn *c) {
+    src_count_del(c);
+    user_unlink(c);
+    oc_idmap_del(&g_by_id, c->conn_id);
+    if (c->live_idx < g_nlive && g_live[c->live_idx] == c) g_live[c->live_idx] = NULL;
+}
+
+static __thread oc_ioloop *g_io;                 /* this loop's I/O threads */
+
+/* Hand what is staged to the connection's I/O thread, which writes it in order
+ * after everything handed before. 1, or -1 if it could not be handed over. */
 static int flush_out(conn *c) {
-    while (c->out_sent < c->out_len) {
-        size_t n = 0;
-        oc_tls_status st = oc_tls_write(&c->tls, c->out + c->out_sent,
-                                        c->out_len - c->out_sent, &n);
-        if (st == OC_TLS_OK)         { c->out_sent += n; continue; }
-        if (st == OC_TLS_WANT_WRITE || st == OC_TLS_WANT_READ) return 0;
-        return -1;
+    size_t n = c->out_len - c->out_sent;
+    if (n) {
+        if (oc_ioloop_send(g_io, c->conn_id, c->fd, c->out + c->out_sent, n, 0) != 0) return -1;
+        c->sent_total += n;
     }
     c->out_len = c->out_sent = 0;
     return 1;
 }
 
-/* --- epoll interest ----------------------------------------------------- */
-
-static void conn_set_events(int ep, conn *c, uint32_t events) {
-    if (events == c->events) return;
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof ev);
-    ev.events = events;
-    ev.data.fd = c->fd;
-    epoll_ctl(ep, EPOLL_CTL_MOD, c->fd, &ev);
-    c->events = events;
+/* Bytes waiting to be written: staged here, and with the I/O thread. */
+static size_t pending_out(const conn *c) {
+    return (c->out_len - c->out_sent) + (size_t)(c->sent_total - c->written_total);
 }
 
+/* Reading follows the drain: while a blob job is in flight the connection is
+ * not read, so a client cannot outrun the store (ARCH-69). The I/O thread is
+ * told when that changes. */
 static void update_interest(int ep, conn *c) {
-    uint32_t ev = EPOLLIN;
-    /* Pending output, or an active download with bytes still to stream, both need
-     * writability. epoll here is level-triggered, so keeping EPOLLOUT set while a
-     * download has bytes left drives the pump each time the socket is writable and
-     * naturally stalls when its buffer fills (backpressure, ARCH-69). */
-    if (c->out_len > c->out_sent ||
-        (c->xfer.state == XFER_DOWN_ACTIVE && c->xfer.remaining > 0))
-        ev |= EPOLLOUT;
-    /* Blob job in flight: stop reading this connection so a client streaming
-     * faster than the store can absorb is throttled by TCP itself, and so no
-     * further push can overflow the frame buffer while the drain is paused
-     * (ARCH-69). */
-    if (c->xfer.in_flight) ev &= ~(uint32_t)EPOLLIN;
-    conn_set_events(ep, c, ev);
+    (void)ep;
+    int want = c->xfer.in_flight ? 1 : 0;
+    if (want == c->read_paused || c->state != CONN_ESTABLISHED) return;
+    oc_ioloop_pause(g_io, c->conn_id, c->fd, want);
+    c->read_paused = want;
 }
+
+static int backfill_pump(conn *c);
 
 /* Broadcast that a user has gone offline if the just-closed connection was their
  * last one (REQ-120). Defined below; declared here for conn_close. */
@@ -429,13 +706,45 @@ static void call_conn_closed(int ep, conn **conns, uint64_t conn_id);
  * here for the call roster helpers. */
 static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len);
 
+/* Write `buf` to every connection of every listed member except `except_uid`
+ * (0: nobody excepted), each connection once however often its user is listed.
+ * A write that fails closes that connection; the walk takes its successor first,
+ * and a close frees only the connection it closes. */
+static void fanout_members(int ep, conn **conns, const uint64_t *m, size_t n,
+                           uint64_t except_uid, const uint8_t *buf, size_t len) {
+    uint64_t gen = ++g_fan_gen;
+    for (size_t i = 0; i < n; i++) {
+        if (except_uid && m[i] == except_uid) continue;
+        for (conn *c = user_head(m[i]), *next; c; c = next) {
+            next = c->u_next;
+            if (c->fan_gen == gen) continue;
+            c->fan_gen = gen;
+            send_bytes(ep, conns, c->fd, buf, len);
+        }
+    }
+}
+
+/* Write `buf` to every connection `uid` holds but the one `except_conn` names. */
+static void send_to_user(int ep, conn **conns, uint64_t uid, uint64_t except_conn,
+                         const uint8_t *buf, size_t len) {
+    for (conn *c = user_head(uid), *next; c; c = next) {
+        next = c->u_next;
+        if (c->conn_id != except_conn) send_bytes(ep, conns, c->fd, buf, len);
+    }
+}
+
+/* Write `buf` to every authenticated connection. */
+static void send_to_all_authed(int ep, conn **conns, const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < g_nlive; i++)
+        if (g_live[i] && g_live[i]->authed) send_bytes(ep, conns, g_live[i]->fd, buf, len);
+}
+
 static void conn_close(int ep, conn **conns, int fd) {
     conn *c = conns[fd];
     if (!c) return;
     uint64_t uid = c->user_id;
     uint64_t cid = c->conn_id;
     int was_authed = c->authed;
-    epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
     xfer_reset(&c->xfer);
 #ifdef OC_TTS
     tts_drop_waiters(cid);
@@ -444,11 +753,14 @@ static void conn_close(int ep, conn **conns, int fd) {
     free(c->stt_up.pcm);
     stt_drop_conn(cid);
 #endif
-    oc_tls_conn_free(&c->tls);
-    oc_framebuf_free(&c->fb);
+    index_remove(c);
+    for (int i = 0; i < c->bf_n; i++) oc_dbres_free(c->bf[i]);
+    free(c->dq);
+    flush_out(c);   /* what was staged goes, if the socket takes it now */
+    oc_ioloop_close(g_io, c->conn_id, fd);
+    for (oc_io_event *e = c->fq_head, *n; e; e = n) { n = e->next; oc_io_event_free(e); }
+    oc_io_event_free(c->fq_cur);
     free(c->out);
-    free(c->hin);
-    close(fd);
     free(c);
     conns[fd] = NULL;
     if (was_authed) presence_offline_if_gone(ep, conns, uid);
@@ -456,32 +768,22 @@ static void conn_close(int ep, conn **conns, int fd) {
 }
 
 static conn *find_by_id(conn **conns, uint64_t id) {
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
-        if (conns[fd] && conns[fd]->conn_id == id) return conns[fd];
-    return NULL;
+    (void)conns;
+    return oc_idmap_get(&g_by_id, id);
 }
 
 /* Count live connections from a peer IP (for the accept throttle). */
-static int conns_from_ip(conn **conns, const char *src) {
-    if (!src[0]) return 0;
-    int n = 0;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
-        if (conns[fd] && strcmp(conns[fd]->source, src) == 0) n++;
-    return n;
-}
 
 /* --- Presence (REQ-120, in-memory net-thread state, ARCH-67) ------------ */
 
 /* A user's aggregate presence across their connections: online if any is online,
  * away if all connected are away, offline if none are connected. */
 static uint8_t presence_of(conn **conns, uint64_t uid) {
+    (void)conns;
     uint8_t st = OC_PRESENCE_OFFLINE;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-        conn *c = conns[fd];
-        if (c && c->authed && c->user_id == uid) {
-            if (c->presence == OC_PRESENCE_ONLINE) return OC_PRESENCE_ONLINE;
-            st = OC_PRESENCE_AWAY;
-        }
+    for (conn *c = user_head(uid); c; c = c->u_next) {
+        if (c->presence == OC_PRESENCE_ONLINE) return OC_PRESENCE_ONLINE;
+        st = OC_PRESENCE_AWAY;
     }
     return st;
 }
@@ -512,10 +814,9 @@ static void presence_send(int ep, conn *c, const uint8_t *buf, size_t len) {
  * the first authenticated one answers for all of them. */
 static int dnd_of(conn **conns, uint64_t uid) {
     uint64_t now = (uint64_t)time(NULL) * 1000ull;
+    (void)conns;
     int paused = 0, quiet = 0, seen = 0;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-        conn *c = conns[fd];
-        if (!c || !c->authed || c->user_id != uid) continue;
+    for (conn *c = user_head(uid); c; c = c->u_next) {
         if (c->dnd_until_ms > now) paused = 1;
         if (seen) continue;
         seen = 1;
@@ -550,13 +851,12 @@ static int dnd_of(conn **conns, uint64_t uid) {
  * otherwise gated to one pass a minute (see expire_snoozes), which is right for
  * the clock but far too slow for a person: setting quiet hours on one device
  * should reach everybody else's roster now, not on the next minute boundary. */
-static int g_dnd_dirty;
+static __thread int g_dnd_dirty;
 
 static void cache_schedule(conn **conns, uint64_t uid, const oc_dbres *r) {
+    (void)conns;
     g_dnd_dirty = 1;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-        conn *c = conns[fd];
-        if (!c || !c->authed || c->user_id != uid) continue;
+    for (conn *c = user_head(uid); c; c = c->u_next) {
         c->sc_mode          = r->sc_mode;
         c->sc_tz_offset_min = r->sc_tz_offset_min;
         c->sc_start_min     = r->sc_start_min;
@@ -588,12 +888,12 @@ static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t statu
      * this is the one place that can honestly answer "what do other people
      * currently believe" — updating it at the tick alone would make an ordinary
      * presence change look like a DND change on the next turn. */
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
-        if (conns[fd] && conns[fd]->authed && conns[fd]->user_id == uid)
-            conns[fd]->dnd_announced = dnd;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
-        if (conns[fd] && conns[fd]->authed && conns[fd]->user_id != uid)
-            presence_send(ep, conns[fd], buf, len);
+    (void)conns;
+    for (conn *c = user_head(uid); c; c = c->u_next) c->dnd_announced = dnd;
+    for (size_t i = 0; i < g_nlive; i++) {
+        conn *c = g_live[i];
+        if (c && c->authed && c->user_id != uid) presence_send(ep, c, buf, len);
+    }
 }
 
 static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
@@ -633,54 +933,34 @@ typedef struct {
     uint64_t  sharer_conn;         /* the participant sharing a screen, 0 for none; one
                                     * at a time (REQ-161) */
 } call_t;
-static call_t   g_calls[OC_MAX_CALLS];
-static uint64_t g_next_call_id;
+static __thread call_t  *g_calls;   /* OC_MAX_CALLS, the loop's own */
+static __thread uint64_t g_next_call_id;
 /* The writer, for the one job a call raises with no frame behind it: the
  * missed-call line when a call ends, which can happen as a connection closes. */
-static oc_dbwriter *g_call_dbw;
+static __thread oc_dbwriter *g_call_dbw;
 
-/* Audio sidecar (ARCH-31): the IPC socket to it and the UDP port it listens on,
- * set by oc_netloop_set_audio before the loop runs. ipc_fd < 0 => no sidecar
- * (calls still form, but with no media endpoint). */
-static int      g_audio_ipc = -1;
+/* Call media (REQ-150/151, ARCH-18/73): the UDP socket the relay runs on and
+ * the port it is bound to, set by oc_netloop_set_audio before the loop runs;
+ * udp_fd < 0 means no media endpoint, and calls are refused. The relay itself is
+ * the loop's (relay.h), created when the loop starts, and the loop TAKES the
+ * socket for its life and gives it back when it stops, so two loops in one
+ * process never read one socket -- each would drop the other's participants'
+ * packets as unknown. The silence interval is a test's knob, set from any thread
+ * and applied on the loop's next tick. */
+static int      g_audio_udp = -1;
 static uint16_t g_audio_udp_port;
+static uint64_t g_relay_silence_ms;
+static __thread oc_relay *g_relay;
+static __thread int       g_loop_udp = -1;       /* the socket this loop took */
+static __thread uint16_t  g_loop_udp_port;
 
-/* Supervision (REQ-150). The sidecar is a separate process, and nothing used to
- * notice when it went away: calls kept forming and every joiner was handed the
- * UDP port of a process that no longer existed, with nothing in the log to say
- * so. Now its exit is seen, it is restarted, and if it will not stay up, calls
- * are refused openly. A death within OC_AUDIO_FAST_DEATH_MS of starting counts as
- * a fast one; OC_AUDIO_MAX_FAST_DEATHS in a row stops the restarting, so a
- * sidecar that cannot start does not become a fork loop. */
-#define OC_AUDIO_FAST_DEATH_MS   10000
-#define OC_AUDIO_MAX_FAST_DEATHS 5
-static int    (*g_audio_respawn)(void *ctx);
-static void    *g_audio_respawn_ctx;
-static int      g_audio_down;          /* exited and not coming back: refuse calls */
-static int      g_audio_fast_deaths;
-static uint64_t g_audio_started_ms;
-
-/* The IPC socket is read until it would block (the sidecar's GONE reports), so
- * this end must never block: a second read on an empty blocking socket would
- * stop the whole net loop. */
-static void audio_ipc_nonblock(int fd) {
-    if (fd < 0) return;
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+void oc_netloop_set_audio(int udp_fd, uint16_t udp_port) {
+    __atomic_store_n(&g_audio_udp_port, udp_port, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_audio_udp, udp_fd, __ATOMIC_RELEASE);
 }
 
-void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port) {
-    audio_ipc_nonblock(ipc_fd);
-    g_audio_ipc = ipc_fd;
-    g_audio_udp_port = udp_port;
-    g_audio_down = 0;
-    g_audio_fast_deaths = 0;
-    g_audio_started_ms = now_ms();
-}
-
-void oc_netloop_set_audio_respawn(int (*respawn)(void *ctx), void *ctx) {
-    g_audio_respawn = respawn;
-    g_audio_respawn_ctx = ctx;
+void oc_netloop_set_relay_silence_ms(uint64_t ms) {
+    __atomic_store_n(&g_relay_silence_ms, ms, __ATOMIC_RELAXED);
 }
 
 /* Outbound push emitter (ARCH-85), NULL = push disabled. A managed box starts
@@ -746,20 +1026,6 @@ static void unfurl_enqueue(const uint8_t *body, size_t len,
                           (const char *)body + sp[i].start, sp[i].len);
 }
 
-/* Send one length-prefixed IPC message (type + payload) to the sidecar. */
-static void audio_ipc_send(uint8_t type, const uint8_t *payload, size_t plen) {
-    if (g_audio_ipc < 0) return;
-    uint8_t buf[64];
-    if (5 + plen > sizeof buf) return;
-    uint32_t mlen = (uint32_t)(1 + plen);
-    buf[0] = (uint8_t)(mlen >> 24); buf[1] = (uint8_t)(mlen >> 16);
-    buf[2] = (uint8_t)(mlen >> 8);  buf[3] = (uint8_t)mlen;
-    buf[4] = type;
-    memcpy(buf + 5, payload, plen);
-    ssize_t n = write(g_audio_ipc, buf, 5 + plen); (void)n;   /* best-effort */
-}
-
-/* Every token this daemon issues: OPENCHIME_AUDIO_TOKEN_PREFIX, then random. */
 static size_t audio_token_len(void) {
     return oc_config_get()->audio_token_prefix_len + OC_AUDIO_TOKEN_RAND;
 }
@@ -768,99 +1034,46 @@ static size_t audio_token_len(void) {
  * is not the one bound. */
 static uint16_t audio_advertised_port(void) {
     int adv = oc_config_get()->audio_advertise_port;
-    return adv > 0 ? (uint16_t)adv : g_audio_udp_port;
+    return adv > 0 ? (uint16_t)adv : g_loop_udp_port;
 }
 
-static void audio_authorize(uint64_t call_id, uint64_t user_id, const uint8_t *token) {
-    uint8_t p[16 + OC_AUDIO_TOKEN_MAX];
-    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(call_id >> (56 - 8 * i));
-    for (int i = 0; i < 8; i++) p[8 + i] = (uint8_t)(user_id >> (56 - 8 * i));
-    memcpy(p + 16, token, audio_token_len());
-    audio_ipc_send(OC_AUDIO_IPC_AUTHORIZE, p, 16 + audio_token_len());
+static void audio_authorize(uint64_t call_id, uint64_t user_id, uint64_t conn_id,
+                            const uint8_t *token) {
+    oc_relay_authorize(g_relay, call_id, user_id, conn_id, token, audio_token_len());
 }
 
 static void audio_revoke(const uint8_t *token) {
-    audio_ipc_send(OC_AUDIO_IPC_REVOKE, token, audio_token_len());
+    oc_relay_revoke(g_relay, token, audio_token_len());
 }
 
-/* The sidecar's IPC socket lost its other end: the sidecar has exited. Restart
- * it if we can, and tell the new one about every participant already in a call --
- * their tokens were in the old one's table, which died with it, and without this
- * every live call goes silent. Their UDP addresses are learned again from their
- * next packets. */
-static void audio_sidecar_lost(int ep) {
-    epoll_ctl(ep, EPOLL_CTL_DEL, g_audio_ipc, NULL);
-    close(g_audio_ipc);
-    g_audio_ipc = -1;
-
-    uint64_t now = now_ms();
-    if (now - g_audio_started_ms < OC_AUDIO_FAST_DEATH_MS) g_audio_fast_deaths++;
-    else g_audio_fast_deaths = 0;
-
-    if (!g_audio_respawn || g_audio_fast_deaths >= OC_AUDIO_MAX_FAST_DEATHS) {
-        g_audio_down = 1;
-        fprintf(stderr, "netloop: audio sidecar exited%s; calls are refused from now on\n",
-                g_audio_respawn ? " repeatedly on starting" : " and nothing restarts it");
-        return;
-    }
-    int fd = g_audio_respawn(g_audio_respawn_ctx);
-    if (fd < 0) {
-        g_audio_down = 1;
-        fprintf(stderr, "netloop: audio sidecar exited and could not be restarted; calls are refused from now on\n");
-        return;
-    }
-    audio_ipc_nonblock(fd);
-    g_audio_ipc = fd;
-    g_audio_started_ms = now;
-    struct epoll_event aev;
-    memset(&aev, 0, sizeof aev);
-    aev.events = EPOLLIN; aev.data.fd = g_audio_ipc;
-    epoll_ctl(ep, EPOLL_CTL_ADD, g_audio_ipc, &aev);
-
-    int n = 0;
-    for (int i = 0; i < OC_MAX_CALLS; i++) {
-        if (!g_calls[i].channel_id) continue;
-        for (int k = 0; k < g_calls[i].n; k++, n++)
-            audio_authorize(g_calls[i].channel_id, g_calls[i].parts[k].user_id, g_calls[i].parts[k].token);
-    }
-    fprintf(stderr, "netloop: audio sidecar exited and was restarted; %d participant%s re-authorized\n",
-            n, n == 1 ? "" : "s");
-}
-
-static void call_conn_closed(int ep, conn **conns, uint64_t conn_id);
 static void call_drop_token(int ep, conn **conns, const uint8_t *token);
 
-/* The sidecar's IPC socket is readable: either the sidecar wrote -- a GONE
- * report, a participant its silence sweep dropped -- or it exited. GONE takes the
- * participant out of the call as a leave would, so the roster says who can
- * actually be heard and the rest rekey (CALLS.md §4). */
-static void audio_ipc_readable(int ep, conn **conns) {
-    static uint8_t buf[4096];
-    static size_t have;
-    for (;;) {
-        ssize_t n = read(g_audio_ipc, buf + have, sizeof buf - have);
-        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-            have = 0;
-            audio_sidecar_lost(ep);
-            return;
-        }
-        if (n < 0) break;
-        have += (size_t)n;
-        size_t off = 0;
-        while (have - off >= 4) {
-            uint32_t mlen = ((uint32_t)buf[off] << 24) | ((uint32_t)buf[off + 1] << 16) |
-                            ((uint32_t)buf[off + 2] << 8) | buf[off + 3];
-            if (mlen == 0 || mlen > sizeof buf - 4) { off = have; break; }   /* bad framing: drop */
-            if (have - off - 4 < mlen) break;
-            const uint8_t *m = buf + off + 4;
-            if (m[0] == OC_AUDIO_IPC_GONE && mlen == 1 + audio_token_len())
-                call_drop_token(ep, conns, m + 1);
-            off += 4 + mlen;
-        }
-        if (off) { memmove(buf, buf + off, have - off); have -= off; }
-        if (have == sizeof buf) have = 0;
-        if (g_audio_ipc < 0) return;
-    }
+/* The relay swept a participant for silence: take them out of the call as a
+ * leave would, so the roster says who can actually be heard and the rest rekey
+ * (CALLS.md §4). */
+typedef struct { int ep; conn **conns; } relay_ctx;
+static __thread relay_ctx g_relay_ctx;
+static void relay_gone(void *ctx, const uint8_t *token, size_t len) {
+    relay_ctx *rc = ctx;
+    if (len == audio_token_len()) call_drop_token(rc->ep, rc->conns, token);
+}
+
+/* Media for a participant on the connection transport (relay.h), as CALL_MEDIA.
+ * Media never costs a connection: with more than OC_MEDIA_SOFT already waiting
+ * to be written it is dropped, and the loss is recovered as UDP loss is -- by
+ * the audio's FEC and concealment, and a screen share's resend and keyframe
+ * requests (AUDIO.md §4, VIDEO.md §5). */
+#define OC_MEDIA_SOFT (256u * 1024u)
+static void relay_tcp_send(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq,
+                           const uint8_t *ct, size_t len) {
+    relay_ctx *rc = ctx;
+    conn *c = find_by_id(rc->conns, conn_id);
+    if (!c || pending_out(c) >= OC_MEDIA_SOFT) return;
+    uint8_t buf[OC_AUDIO_MAX_PACKET + 64];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_media_pkt m = { sender, seq, { ct, len } };
+    if (oc_encode_call_media_down(&w, OC_PROTOCOL_VERSION, &m) != OC_OK) return;
+    if (out_append(c, buf, w.len) == 0) flush_out(c);
 }
 
 static int in_members(uint64_t uid, const uint64_t *m, size_t n);
@@ -972,22 +1185,34 @@ static size_t call_encode_state(const call_t *c, int ended, uint8_t *buf, size_t
     return oc_encode_call_state(&w, OC_PROTOCOL_VERSION, &st) == OC_OK ? w.len : 0;
 }
 
-/* CALL_STATE to the call's audience (REQ-303). Encoded into a buffer of its own
- * and the recipients found first, so a send that drops a connection -- and so
- * perhaps changes the call -- cannot disturb either. */
+/* Send `buf` to every connection of the users `uids` names that has not had it
+ * in this round (`gen`). */
+static void call_send_users(int ep, const uint64_t *uids, size_t n, uint64_t gen,
+                            const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < n; i++)
+        for (conn *pc = user_head(uids[i]); pc; pc = pc->u_next) {
+            if (pc->fan_gen == gen) continue;
+            pc->fan_gen = gen;
+            call_send(ep, pc, buf, len);
+        }
+}
+
+/* CALL_STATE to the call's audience (REQ-303): the conversation's members, its
+ * invitees and its participants, found through the user index rather than by
+ * walking every connection, each connection once. A call send never closes a
+ * connection (an over-full one misses the frame), so nothing it does can
+ * change the lists or the call while they are walked. */
 static void call_send_state(int ep, conn **conns, const call_t *c, int ended) {
+    (void)conns;
     uint8_t buf[1024];
     size_t len = call_encode_state(c, ended, buf, sizeof buf);
     if (!len) return;
-    static uint64_t cids[OC_NETLOOP_MAX_FD];   /* the net thread's alone; never re-entered */
-    int nc = 0;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
-        if (conns[fd] && conns[fd]->authed && call_audience(c, conns[fd]->user_id))
-            cids[nc++] = conns[fd]->conn_id;
-    for (int i = 0; i < nc; i++) {
-        conn *pc = find_by_id(conns, cids[i]);
-        if (pc) call_send(ep, pc, buf, len);
-    }
+    uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
+    for (int k = 0; k < c->n; k++) parts[k] = c->parts[k].user_id;
+    uint64_t gen = ++g_fan_gen;
+    call_send_users(ep, c->members, c->n_members, gen, buf, len);
+    call_send_users(ep, c->invited, (size_t)c->n_inv, gen, buf, len);
+    call_send_users(ep, parts, (size_t)c->n, gen, buf, len);
 }
 
 static void call_fill_parts(const call_t *c, oc_call_part *out) {
@@ -1116,14 +1341,6 @@ static int call_add_invites(call_t *c, const uint64_t *uids, size_t n, uint64_t 
 
 static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
     for (size_t i = 0; i < n; i++) if (m[i] == uid) return 1;
-    return 0;
-}
-
-/* in_members, but reporting WHERE — a thread reply carries a per-recipient byte
- * (ARCH-104) held in an array parallel to the audience, so the fan-out needs the
- * index and not merely the membership. */
-static int member_index(uint64_t uid, const uint64_t *m, size_t n, size_t *out) {
-    for (size_t i = 0; i < n; i++) if (m[i] == uid) { *out = i; return 1; }
     return 0;
 }
 
@@ -1319,6 +1536,17 @@ too_long:
 /* Queue a non-fatal SEND_RATE_LIMITED error echoing the offending idempotency
  * token (so the client can correlate the dropped send). Returns out_append's
  * result: 0 keep the connection, -1 (buffer full) -> caller closes. */
+/* SEND_RATE_LIMITED for a frame that is not a send: `context` is the id it
+ * named (big-endian, as EDIT_ERR carries one), 0 for none. */
+static int reject_rate(conn *c, uint64_t id, const char *why) {
+    uint8_t tmp[96], ctxb[8]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(id >> (56 - 8 * i));
+    oc_slice ctx = { ctxb, id ? 8u : 0u };
+    oc_error e = { OC_ERR_SEND_RATE_LIMITED, 0, ctx, oc_slice_str(why) };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
 static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
     oc_slice ctx = { idem, OC_IDEM_LEN };
@@ -1482,8 +1710,9 @@ static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
 static void download_pump(conn *c) {
     conn_xfer *x = &c->xfer;
     if (x->state != XFER_DOWN_ACTIVE || x->in_flight) return;
+    if (c->bf_n || c->dq_len) return;   /* after the backfill, in order (OC_BF_SLICE) */
     if (x->remaining == 0) {
-        oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf w; oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (x->audio) {
             oc_audio_end ae = { x->audio_message_id };
             oc_encode_audio_end(&w, OC_PROTOCOL_VERSION, &ae);
@@ -1501,7 +1730,7 @@ static void download_pump(conn *c) {
         x->state = XFER_NONE;
         return;
     }
-    if ((c->out_len - c->out_sent) >= OC_DOWNLOAD_SOFT_CAP) return;  /* resume on drain */
+    if (pending_out(c) >= OC_DOWNLOAD_SOFT_CAP) return;  /* resumed by WRITTEN */
     size_t want = x->remaining < OC_ATTACH_CHUNK_SIZE ? (size_t)x->remaining : OC_ATTACH_CHUNK_SIZE;
     oc_xfer_job *j = oc_xfer_job_new(OC_XFER_READ, c->conn_id);
     if (!j) return;
@@ -1527,9 +1756,13 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
          * stop reading (update_interest drops EPOLLIN). The completion handler
          * calls back in here. */
         if (c->xfer.in_flight) return 0;
-        int r = oc_framebuf_next(&c->fb, &frame, &flen);
-        if (r == 0) return 0;
-        if (r < 0)  return -1;
+        if (!c->fq_head) return 0;
+        oc_io_event_free(c->fq_cur);          /* the previous frame is done with */
+        c->fq_cur = c->fq_head;
+        c->fq_head = c->fq_cur->next;
+        if (!c->fq_head) c->fq_tail = NULL;
+        c->fq_cur->next = NULL;
+        frame = c->fq_cur->data; flen = c->fq_cur->len;
 
         oc_header hdr; oc_rbuf p;
         if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
@@ -1769,6 +2002,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_REACT) {
             oc_react rc;
             if (oc_decode_react(&p, &rc) != OC_OK) return -1;
+            if (!win_ok(&c->react_rl, OC_REACT_RATE_MAX, OC_REACT_RATE_MS)) {
+                if (reject_rate(c, rc.message_id, "reaction rate exceeded") != 0) return -1;
+                continue;
+            }
             oc_job *j = oc_job_new(OC_JOB_REACT, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -1943,12 +2180,19 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_set_presence(&p, &sp) != OC_OK) return -1;
             /* Only online/away are settable while connected (REQ-120). */
             c->presence = (sp.status == OC_PRESENCE_AWAY) ? OC_PRESENCE_AWAY : OC_PRESENCE_ONLINE;
-            broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
+            if (win_ok(&c->presence_rl, OC_PRESENCE_RATE_MAX, OC_PRESENCE_RATE_MS)) {
+                c->presence_deferred = 0;
+                broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
+            } else {
+                c->presence_deferred = 1;
+                g_presence_deferred = 1;
+            }
             continue;
         }
         if (hdr.msg_type == OC_MSG_TYPING) {
             oc_typing t;
             if (oc_decode_typing(&p, &t) != OC_OK) return -1;
+            if (!win_ok(&c->typing_rl, OC_TYPING_RATE_MAX, OC_TYPING_RATE_MS)) continue;
             oc_job *j = oc_job_new(OC_JOB_TYPING, c->conn_id);   /* read job -> members */
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -2502,6 +2746,12 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if ((hdr.msg_type == OC_MSG_CALL_JOIN || hdr.msg_type == OC_MSG_CALL_INVITE ||
+             hdr.msg_type == OC_MSG_CALL_SHARE || hdr.msg_type == OC_MSG_CALL_KEY) &&
+            !win_ok(&c->call_rl, OC_CALL_RATE_MAX, OC_CALL_RATE_MS)) {
+            if (reject_rate(c, 0, "call signalling rate exceeded") != 0) return -1;
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CALL_JOIN || hdr.msg_type == OC_MSG_CALL_INVITE) {
             /* Both ask the reader the same question (REQ-301/302): may the actor
              * read the conversation, and which of the named users may. The call
@@ -2563,6 +2813,16 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             else if (cc->starter != c->user_id) send_call_error(ep, c, OC_ERR_NOT_CALL_STARTER,
                                                                 "only the starter can end the call");
             else call_finish(ep, conns, cc);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_MEDIA) {
+            /* Media over the connection, when UDP cannot reach the relay: the
+             * relay forwards it as it would a datagram (relay.h). Not rate
+             * limited beyond what the relay does -- it goes only to the
+             * sender's call, and a call is capped. */
+            oc_call_media_pkt cm;
+            if (oc_decode_call_media_up(&p, &cm) != OC_OK) return -1;
+            if (g_relay) oc_relay_from_tcp(g_relay, c->conn_id, cm.seq, cm.ct.ptr, cm.ct.len);
             continue;
         }
         if (hdr.msg_type == OC_MSG_CALL_SHARE) {
@@ -2699,6 +2959,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (!wj->data) { oc_xfer_job_free(wj); return -1; }
                 memcpy(wj->data, uc.data.ptr, uc.data.len);
             }
+            wj->sha = x->sha;   /* the worker hashes what it stores; back with the result */
+            x->sha = NULL;
             x->in_flight = 1;
             oc_xferpool_submit(g_xfers, wj);
             /* Stop draining here. Frames already buffered stay buffered, and
@@ -2716,8 +2978,12 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (send_transfer_error(c, ue.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
                 continue;
             }
-            mbedtls_sha256_finish(&x->sha, x->digest);
-            mbedtls_sha256_free(&x->sha); x->sha_init = 0;
+            if (!x->sha) {   /* a write failed, and took the digest with it */
+                if (send_transfer_error(c, ue.attachment_id, OC_ERR_INTERNAL) != 0) return -1;
+                continue;
+            }
+            mbedtls_sha256_finish(x->sha, x->digest);
+            mbedtls_sha256_free(x->sha); free(x->sha); x->sha = NULL;
             /* Committing can be a full request/response against S3, so it goes
              * to the pool; the ATTACH_FINALIZE job is submitted when it lands.
              * Reaching here means no write is in flight: the read pause above
@@ -2807,8 +3073,9 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (stt_refuse(c, sc.segment_id, OC_ERR_TRANSFER_PROTOCOL, "bad chunk") != 0) return -1;
                 continue;
             }
-            for (size_t i = 0; i < sc.data.len / 2; i++)
-                c->stt_up.pcm[c->stt_up.got + i] = (int16_t)(uint16_t)(sc.data.ptr[2 * i] | sc.data.ptr[2 * i + 1] << 8);
+            /* The bytes as they came, little-endian; the worker orders them
+             * (stt_worker.h). */
+            memcpy(c->stt_up.pcm + c->stt_up.got, sc.data.ptr, sc.data.len);
             c->stt_up.got += (uint32_t)(sc.data.len / 2);
             c->stt_up.next_seq++;
 #endif
@@ -2979,10 +3246,6 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
 
 /* --- HTTP / incoming webhooks (ARCH-32, REQ-170) ------------------------ */
 
-/* Total request bytes we'll buffer for an HTTP connection: a full body plus
- * generous header headroom. Beyond this the request is refused (413). */
-#define OC_HTTP_MAX_REQUEST (OC_MAX_BODY_SIZE + 16384u)
-
 static int hexval(char ch) {
     if (ch >= '0' && ch <= '9') return ch - '0';
     if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
@@ -3080,56 +3343,70 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     return 0;
 }
 
-/* Read for an HTTP (non-oc/1) connection: accumulate the request, parse, dispatch.
- * Returns 0 to keep, -1 to close. */
-static int on_http_readable(conn *c, oc_dbwriter *dbw) {
-    for (;;) {
-        uint8_t chunk[OC_READ_CHUNK];
-        size_t n = 0;
-        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
-        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
-        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
-        if (c->http_pending) continue;              /* already dispatched; drain quietly */
-        if (c->hlen + n > OC_HTTP_MAX_REQUEST) {
-            http_reply(c, 413, "Payload Too Large", "text/plain", "too large\n", 10);
-            return -1;
-        }
-        if (c->hlen + n > c->hcap) {
-            size_t nc = c->hcap ? c->hcap : 4096;
-            while (nc < c->hlen + n) nc *= 2;
-            uint8_t *g = realloc(c->hin, nc);
-            if (!g) return -1;
-            c->hin = g; c->hcap = nc;
-        }
-        memcpy(c->hin + c->hlen, chunk, n);
-        c->hlen += n;
-
-        oc_http_req req;
-        int pr = oc_http_parse((const char *)c->hin, c->hlen, OC_MAX_BODY_SIZE, &req);
-        if (pr < 0) { http_reply(c, 400, "Bad Request", "text/plain", "bad request\n", 12); return -1; }
-        if (pr == 0) continue;                      /* need more bytes */
-        return on_http_request(c, &req, dbw);       /* complete request */
+/* An HTTP (non-oc/1) connection's request, parsed by its I/O thread, or the
+ * status it is refused with. Returns 0 to keep, -1 to close. */
+static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
+    if (c->http_pending) return 0;              /* one request per connection */
+    if (e->http_status == 413) {
+        http_reply(c, 413, "Payload Too Large", "text/plain", "too large\n", 10);
+        return -1;
     }
+    if (e->http_status) { http_reply(c, 400, "Bad Request", "text/plain", "bad request\n", 12); return -1; }
+    const char *d = (const char *)e->data;
+    oc_http_req req = { d, e->method_len, d + e->method_len, e->path_len,
+                        d + e->method_len + e->path_len, e->body_len, e->is_json };
+    return on_http_request(c, &req, dbw);
 }
 
-/* Read, reassemble, and dispatch. Returns 0 to keep, -1 to close. */
-static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
-    if (c->http) return on_http_readable(c, dbw);
-    for (;;) {
-        uint8_t chunk[OC_READ_CHUNK];
-        size_t n = 0;
-        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
-        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
-        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
-        if (oc_framebuf_push(&c->fb, chunk, n) != 0) return -1;
-        if (drain_frames(ep, conns, c, dbw) < 0) return -1;
-        /* A blob job went in flight, so the drain is paused. Stop reading here
-         * too: dropping EPOLLIN only governs the next epoll wakeup, and this
-         * loop would otherwise keep pushing frames nobody is draining until the
-         * frame buffer overflows (framebuf.h sizes it for drain-after-push).
-         * The completion handler resumes both. */
-        if (c->xfer.in_flight) return 0;
+/* One event from the I/O threads (ioloop.h). */
+static void on_io_event(int ep, conn **conns, oc_dbwriter *dbw, oc_io_event *e, int max_per_ip) {
+    conn *c = find_by_id(conns, e->conn_id);
+    if (!c || c->fd != e->fd) { oc_io_event_free(e); return; }   /* closed meanwhile */
+    int fd = c->fd;
+    switch (e->kind) {
+    case OC_IO_SOURCE:
+        /* A forwarder's connection is counted against the client its header
+         * named, itself included, before any handshake is spent on it. */
+        if (e->source[0]) {
+            src_count_del(c);
+            memcpy(c->source, e->source, sizeof c->source);
+            src_count_add(c);
+        }
+        oc_io_event_free(e);
+        if (max_per_ip > 0 && conns_from_ip(conns, c->source) > max_per_ip) conn_close(ep, conns, fd);
+        else oc_ioloop_proceed(g_io, c->conn_id, fd);
+        return;
+    case OC_IO_OPENED:
+        c->state = CONN_ESTABLISHED;
+        c->http = e->http;
+        oc_io_event_free(e);
+        return;
+    case OC_IO_FRAME:
+        if (c->http) { oc_io_event_free(e); return; }
+        if (c->fq_tail) c->fq_tail->next = e; else c->fq_head = e;
+        c->fq_tail = e;
+        if (drain_frames(ep, conns, c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); return; }
+        break;
+    case OC_IO_HTTP_REQ: {
+        int rc = c->http ? on_http_req(c, e, dbw) : 0;
+        oc_io_event_free(e);
+        if (rc < 0) { flush_out(c); conn_close(ep, conns, fd); return; }
+        break;
     }
+    case OC_IO_WRITTEN:
+        if (e->written > c->written_total) c->written_total = e->written;
+        oc_io_event_free(e);
+        download_pump(c);   /* refill an active download as the socket drains */
+        if (backfill_pump(c) < 0) { conn_close(ep, conns, fd); return; }
+        break;
+    case OC_IO_CLOSED:
+        oc_io_event_free(e);
+        conn_close(ep, conns, fd);
+        return;
+    }
+    if (!conns[fd]) return;
+    if (flush_out(c) < 0) { conn_close(ep, conns, fd); return; }
+    update_interest(ep, c);
 }
 
 /* --- Result delivery (from the DB-writer thread) ------------------------ */
@@ -3147,7 +3424,7 @@ static stt_pend *stt_posting(uint64_t conn_id, const uint8_t idem[OC_IDEM_SIZE])
 
 static void stt_send_text(int ep, conn **conns, conn *c, uint32_t segment_id, uint64_t message_id, const char *text) {
     oc_wbuf w;
-    oc_wbuf_init(&w, g_enc, sizeof g_enc);
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
     oc_stt_text t = { segment_id, message_id, oc_slice_str(text ? text : "") };
     if (oc_encode_stt_text(&w, OC_PROTOCOL_VERSION, &t) == OC_OK)
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3244,15 +3521,17 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_AUTH_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
+        user_unlink(c);   /* a second sign-in on one connection moves it */
         c->authed = 1;
         c->user_id = r->user_id;
+        user_link(c);
         c->session_id = r->session_id;   /* REQ-182 */
         c->presence = OC_PRESENCE_ONLINE;
         c->dnd_until_ms = r->snooze_until_ms;   /* REQ-278, already expiry-checked */
         cache_schedule(conns, r->user_id, r);   /* REQ-136, the other DND half */
         int fd = c->fd;
         uint64_t uid = r->user_id;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         /* Fresh auth carries the session token; a session re-auth omits it
          * (PROTOCOL.md §4.3). */
         oc_slice tok = r->has_session_token
@@ -3267,7 +3546,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * so the client can render a branded header instead of a bare host. */
         {
             const oc_config *cfg = oc_config_get();
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_workspace_info wi = { (uint8_t)cfg->deployment_mode,
                                      (uint32_t)(cfg->max_users > 0 ? cfg->max_users : 0),
                                      oc_slice_str(cfg->workspace_name ? cfg->workspace_name : ""),
@@ -3284,7 +3563,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * read-aloud is running -- built in, turned on, and its voice data found
          * and verified; "stt" exactly when voice input is, on the same terms. */
         {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_capabilities caps;
             memset(&caps, 0, sizeof caps);
 #ifdef OC_TTS
@@ -3294,7 +3573,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (g_stt && g_stt_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_STT);
 #endif
             /* Calls, whenever the relay is up to carry them (REQ-150). */
-            if (g_audio_ipc >= 0 && !g_audio_down) caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS);
+            if (g_relay) {
+                caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS);
+                caps.names[caps.count++] = oc_slice_str(OC_CAP_CALLS_TCP);
+            }
             oc_encode_capabilities(&w, OC_PROTOCOL_VERSION, &caps);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the CAPABILITIES write */
@@ -3326,7 +3608,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 }
             }
 #endif
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_tts_info(&w, OC_PROTOCOL_VERSION, &ti);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the TTS_INFO write */
@@ -3344,7 +3626,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 si.max_segment_ms = (uint32_t)oc_config_get()->stt.max_secs * 1000u;
             }
 #endif
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_stt_info(&w, OC_PROTOCOL_VERSION, &si);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the STT_INFO write */
@@ -3375,28 +3657,25 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* Presence (REQ-120): send the new client a snapshot of who is currently
          * online/away, then — if this is the user's first connection — announce
          * them online to everyone. */
-        for (int f = 0; f < OC_NETLOOP_MAX_FD; f++) {
-            conn *v = conns[f];
-            if (!v || !v->authed || v->user_id == uid) continue;
-            int first = 1;
-            for (int g = 0; g < f; g++)
-                if (conns[g] && conns[g]->authed && conns[g]->user_id == v->user_id) { first = 0; break; }
-            if (!first) continue;
+        for (size_t li = 0; li < g_nlive && conns[fd]; li++) {
+            conn *v = g_live[li];
+            /* Once per user: their first connection in the index speaks for all. */
+            if (!v || !v->authed || v->user_id == uid || user_head(v->user_id) != v) continue;
             uint8_t pbuf[32]; size_t plen = 0;
             encode_presence(pbuf, sizeof pbuf, &plen, v->user_id, presence_of(conns, v->user_id),
                             dnd_of(conns, v->user_id));
             presence_send(ep, conns[fd], pbuf, plen);
         }
         int others = 0;
-        for (int f = 0; f < OC_NETLOOP_MAX_FD; f++)
-            if (conns[f] && conns[f]->authed && conns[f]->user_id == uid && conns[f] != conns[fd]) { others = 1; break; }
+        for (conn *o = user_head(uid); o; o = o->u_next)
+            if (o != conns[fd]) { others = 1; break; }
         if (!others) broadcast_presence(ep, conns, uid, OC_PRESENCE_ONLINE);
         break;
     }
     case OC_RES_AUTH_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 1, { NULL, 0 }, oc_slice_str("auth failed") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3416,7 +3695,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (r->conn_id == 0) g_sched_more = 1;
         conn *sender = find_by_id(conns, r->conn_id);
         if (sender) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_send_ack ack;
             memcpy(ack.idem, r->idem, OC_IDEM_LEN);
             ack.channel_id = r->channel_id;
@@ -3429,24 +3708,20 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
              * — this is a consequence, not a failure — and to nobody else,
              * because it is about their action rather than the conversation. */
             if (r->unres.count && !r->duplicate) {
-                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
                 if (oc_encode_mention_unresolved(&w, OC_PROTOCOL_VERSION, &r->unres) == OC_OK)
                     send_bytes(ep, conns, sender->fd, g_enc, w.len);
             }
         }
         if (!r->duplicate) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { r->body, r->body_len };
             oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
             broadcast_set_attach(&b, r->attach, r->n_attach);
             b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             size_t blen = w.len;
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *c = conns[fd];
-                if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                    send_bytes(ep, conns, fd, g_enc, blen);
-            }
+            fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
             /* Offline mobile delivery (ARCH-85): hand the notify decision to the
              * push emitter — members minus author, level/DND-gated, off this
              * thread. Fire-and-forget; a no-op when push is unconfigured. */
@@ -3454,7 +3729,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
              * BROADCAST it describes (REQ-057). One entry at most here; the
              * array is shared with the replay so both read the same rows. */
             for (size_t i = 0; i < r->n_rfwd; i++) {
-                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
                 oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
                                   r->rfwd[i].src_channel, r->rfwd[i].src_message,
                                   r->rfwd[i].src_author,
@@ -3463,11 +3738,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                                   oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
                 if (oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) != OC_OK) break;
                 size_t flen = w.len;
-                for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                    conn *c = conns[fd];
-                    if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                        send_bytes(ep, conns, fd, g_enc, flen);
-                }
+                fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, flen);
             }
             oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
@@ -3486,7 +3757,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
 #ifdef OC_STT
         if (stt_post_failed(ep, conns, c, r)) break;
 #endif
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice ctx = { r->idem, OC_IDEM_LEN };
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -3497,7 +3768,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_DEVICE_TOKEN_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_device_token_ack ack = { (uint8_t)(r->type == OC_RES_DEVICE_TOKEN_OK ? 1 : 0), r->err_code };
         oc_encode_device_token_ack(&w, OC_PROTOCOL_VERSION, &ack);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3506,16 +3777,12 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_EDIT_OK: {
         /* Fan the edit out to every connected member (including the editor, whose
          * frame doubles as the confirmation) — same shape as a BROADCAST. */
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_msg_edited m = { r->message_id, r->channel_id, r->author_id, r->server_time, body };
         oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &m);
         size_t blen = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, blen);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         /* The writer dropped the old body's unfurls; re-fetch for the new one
          * (REQ-222). The store step re-validates presence, so a URL the edit
          * removed cannot come back. */
@@ -3523,15 +3790,11 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         break;
     }
     case OC_RES_DELETE_OK: {
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_msg_deleted m = { r->message_id, r->channel_id, r->author_id, r->user_id, r->server_time };
         oc_encode_msg_deleted(&w, OC_PROTOCOL_VERSION, &m);
         size_t blen = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, blen);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         break;
     }
     case OC_RES_EDIT_ERR:
@@ -3542,7 +3805,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         uint8_t ctx[8];
         for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice cs = { ctx, sizeof ctx };
         oc_error e = { r->err_code, 0, cs, oc_slice_str("edit/delete rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -3574,7 +3837,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         uint64_t actor = c ? c->user_id : 0;
         if (c) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_channel_info ci; CHINFO(ci, r->ch_peer, r->ch_joined);
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3582,31 +3845,22 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* An UPDATE_CHANNEL (ARCH-93) changes what EVERY member's sidebar should
          * say, so its CHANNEL_INFO fans out rather than only acking the actor. */
         if (r->ch_fanout) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_channel_info ci; CHINFO(ci, 0, 1);
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             size_t len = w.len;
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *t = conns[fd];
-                if (t && t->authed && t->user_id != actor &&
-                    in_members(t->user_id, r->members, r->n_members))
-                    send_bytes(ep, conns, fd, g_enc, len);
-            }
+            fanout_members(ep, conns, r->members, r->n_members, actor, g_enc, len);
         }
         /* Push the (now-member) channel to the target: an INVITE (regular channel)
          * or the peer of a new DM. For a DM the peer, from the target's view, is
          * the actor. */
         if (r->push_user_id) {
             uint64_t push_peer = (r->ch_kind == OC_CHANNEL_KIND_DM) ? actor : 0;
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_channel_info ci; CHINFO(ci, push_peer, 1);
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             size_t len = w.len;
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *t = conns[fd];
-                if (t && t->authed && t->user_id == r->push_user_id)
-                    send_bytes(ep, conns, fd, g_enc, len);
-            }
+            send_to_user(ep, conns, r->push_user_id, 0, g_enc, len);
         }
         break;
     }
@@ -3615,7 +3869,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         uint8_t ctx[8];
         for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->channel_id >> (56 - 8 * i));
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice cs = { ctx, sizeof ctx };
         /* Name the actual problem. "channel op rejected" told a user nothing
          * they could act on, and REQ-263 is about failures being legible. */
@@ -3678,7 +3932,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             size_t fit = want;
             oc_result er;
             for (;;) {
-                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
                 oc_channel_list cl = { (uint16_t)fit, ents };
                 er = oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &cl);
                 if (er == OC_OK || fit <= 1) break;
@@ -3717,7 +3971,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
             ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
         }
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_user_list ul = { (uint16_t)n, ents };
         oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &ul);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3736,7 +3990,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         hex_encode(r->session_token, OC_INVITE_TOKEN_LEN, tokhex);
         oc_slice tok = { (const uint8_t *)tokhex, strlen(tokhex) };
         oc_invite_created ic = { tok, r->role, r->session_expiry };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &ic);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -3746,7 +4000,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_USER_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         const char *why = r->err_code == OC_ERR_INVITE_UNREDEEMABLE
             ? "this workspace signs nobody in by email address, so an invitation to one "
               "could never be used; invite with a token instead"
@@ -3760,49 +4014,40 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* Ack the actor and push the new role to the affected user's live conns
          * (so their client updates its capabilities immediately). */
         oc_user_updated m = { r->user_id, r->role, 0 };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
         size_t len = w.len;
         conn *actor = find_by_id(conns, r->conn_id);
         if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *t = conns[fd];
-            if (t && t->authed && t->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, len);
         break;
     }
     case OC_RES_USER_UPDATED: {
         /* Removal (disabled=1): ack the actor, notify the removed user's live
          * connections, then drop them (they cannot re-authenticate). */
         oc_user_updated m = { r->user_id, r->role, r->disabled };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
         size_t len = w.len;
         conn *actor = find_by_id(conns, r->conn_id);
         if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *t = conns[fd];
-            if (t && t->authed && t->user_id == r->user_id) {
-                send_bytes(ep, conns, fd, g_enc, len);
-                if (r->disabled && conns[fd]) conn_close(ep, conns, fd);
-            }
+        for (conn *t = user_head(r->user_id), *next; t; t = next) {
+            next = t->u_next;
+            int tfd = t->fd;
+            send_bytes(ep, conns, tfd, g_enc, len);
+            if (r->disabled && conns[tfd]) conn_close(ep, conns, tfd);
         }
         break;
     }
     case OC_RES_REACTION_OK: {
         /* Fan the reaction change out to every connected member (REQ-070/071). */
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_reaction_updated m = { r->message_id, r->channel_id, r->user_id,
                                   oc_slice_str(r->emoji ? r->emoji : ""),
                                   r->react_op, r->react_count };
         oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &m);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, len);
         break;
     }
     case OC_RES_REACTION_ERR: {
@@ -3810,7 +4055,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         uint8_t ctx[8];
         for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice cs = { ctx, sizeof ctx };
         oc_error e = { r->err_code, 0, cs, oc_slice_str("reaction rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -3827,7 +4072,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             ents[i].emoji = oc_slice_str(r->rlist[i].emoji ? r->rlist[i].emoji : "");
             ents[i].user_id = r->rlist[i].user_id;
         }
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_reactions rr = { r->message_id, (uint16_t)n, ents };
         oc_encode_reactions(&w, OC_PROTOCOL_VERSION, &rr);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3837,16 +4082,12 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_PIN_OK: {
         /* A pin is channel state, so every connected member learns of it —
          * the same fan-out shape as a reaction (REQ-230). */
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_pin_updated m = { r->message_id, r->channel_id, r->user_id,
                              r->pin_op, r->pinned_at };
         oc_encode_pin_updated(&w, OC_PROTOCOL_VERSION, &m);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, len);
         break;
     }
     case OC_RES_PIN_ERR: {
@@ -3854,7 +4095,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         uint8_t ctx[8];
         for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice cs = { ctx, sizeof ctx };
         oc_error e = { r->err_code, 0, cs, oc_slice_str("pin rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -3868,7 +4109,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         for (size_t i = 0; i < r->n_plist && conns[c->fd]; i++) {
             const oc_pin_row *pr = &r->plist[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_pinned_msg pm = { pr->message_id, r->channel_id, pr->author_id,
                                  pr->created_at_ms, pr->pinned_by, pr->pinned_at,
                                  oc_slice_str(pr->body ? pr->body : ""),
@@ -3877,7 +4118,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (!conns[c->fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_pins term = { r->channel_id, (uint32_t)r->n_plist };
         oc_encode_pins(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3886,7 +4127,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_MEDIA_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_attach_media_ok mo = { r->attachment_id };
         oc_encode_attach_media_ok(&w, OC_PROTOCOL_VERSION, &mo);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3897,7 +4138,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * and nothing about this refusal touches the connection's transfer. */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice none = { NULL, 0 };
         oc_error e = { r->err_code, 0, none, oc_slice_str("video message refused") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -3909,7 +4150,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * a personal bookmark to. */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_saved_updated su = { r->message_id, r->save_op, r->saved_at };
         oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3920,7 +4161,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         for (size_t i = 0; i < r->n_slist && conns[c->fd]; i++) {
             const oc_saved_row *sr = &r->slist[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_saved_msg sm = { sr->message_id, sr->channel_id, sr->author_id,
                                 sr->created_at, sr->saved_at,
                                 oc_slice_str(sr->body ? sr->body : ""),
@@ -3929,7 +4170,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (!conns[c->fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_saved term = { (uint32_t)r->n_slist };
         oc_encode_saved(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3940,7 +4181,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         for (size_t i = 0; i < r->n_alist && conns[c->fd]; i++) {
             const oc_activity_row *ar = &r->alist[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_activity_entry ae = { ar->kind, ar->message_id, ar->channel_id,
                                      ar->actor_id, ar->at,
                                      oc_slice_str(ar->text ? ar->text : "") };
@@ -3948,7 +4189,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (!conns[c->fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_activity term = { (uint32_t)r->n_alist, r->activity_seen };
         oc_encode_activity(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3958,14 +4199,14 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         for (size_t i = 0; i < r->n_cmlist && conns[c->fd]; i++) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_member_entry me = { r->channel_id, r->cmlist[i].user_id,
                                    r->cmlist[i].role, r->cmlist[i].joined_at };
             oc_encode_member_entry(&w, OC_PROTOCOL_VERSION, &me);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (!conns[c->fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_members term = { r->channel_id, (uint32_t)r->n_cmlist };
         oc_encode_members(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3976,7 +4217,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         for (size_t i = 0; i < r->n_flist && conns[c->fd]; i++) {
             const oc_file_row *fr = &r->flist[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_file_entry fe = { fr->id, fr->channel_id, fr->message_id, fr->uploader_id,
                                  fr->size, fr->created_at, fr->reclaimed,
                                  oc_slice_str(fr->filename ? fr->filename : ""),
@@ -3986,7 +4227,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (!conns[c->fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_files term = { r->channel_id, (uint32_t)r->n_flist, r->flist_more };
         oc_encode_files(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -3999,23 +4240,18 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         uint64_t actor = c ? c->user_id : 0;
         oc_channel_description cd = {
             r->channel_id, { r->body, r->body ? r->body_len : 0 } };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         if (oc_encode_channel_description(&w, OC_PROTOCOL_VERSION, &cd) != OC_OK) break;
         size_t len = w.len;
         if (c) send_bytes(ep, conns, c->fd, g_enc, len);
         if (r->ch_fanout)
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *t = conns[fd];
-                if (t && t->authed && t->user_id != actor &&
-                    in_members(t->user_id, r->members, r->n_members))
-                    send_bytes(ep, conns, fd, g_enc, len);
-            }
+            fanout_members(ep, conns, r->members, r->n_members, actor, g_enc, len);
         break;
     }
     case OC_RES_LIST_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice none = { NULL, 0 };
         oc_error e = { r->err_code, 0, none, oc_slice_str("listing refused") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -4030,7 +4266,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (r->conn_id == 0) g_sched_more = 1;
         conn *sender = find_by_id(conns, r->conn_id);
         if (sender) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_send_ack ack;
             memcpy(ack.idem, r->idem, OC_IDEM_LEN);
             ack.channel_id = r->channel_id;
@@ -4058,28 +4294,29 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                                    .body        = body };
             tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
 
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             size_t out_len = w.len;
 
             oc_wbuf pw;
-            oc_wbuf_init(&pw, g_enc_participant, sizeof g_enc_participant);
+            oc_wbuf_init(&pw, g_enc_participant, OC_MAX_FRAME_SIZE);
             tr.participant = 1;
             oc_encode_thread_reply(&pw, OC_PROTOCOL_VERSION, &tr);
             size_t in_len = pw.len;
 
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *c = conns[fd];
-                if (!c || !c->authed) continue;
-                size_t idx = 0;
-                if (!member_index(c->user_id, r->members, r->n_members, &idx)) continue;
-                /* No flags means the participation lookup could not allocate:
-                 * treat everyone as outside the thread, so the failure costs a
-                 * toast rather than inventing one. */
-                int in_thread = r->member_participant && r->member_participant[idx];
-                if (in_thread) send_bytes(ep, conns, fd, g_enc_participant, in_len);
-                else           send_bytes(ep, conns, fd, g_enc,   out_len);
-            }
+            uint64_t gen = ++g_fan_gen;
+            for (size_t idx = 0; idx < r->n_members; idx++)
+                for (conn *c = user_head(r->members[idx]), *next; c; c = next) {
+                    next = c->u_next;
+                    if (c->fan_gen == gen) continue;
+                    c->fan_gen = gen;
+                    /* No flags means the participation lookup could not
+                     * allocate: treat everyone as outside the thread, so the
+                     * failure costs a toast rather than inventing one. */
+                    int in_thread = r->member_participant && r->member_participant[idx];
+                    if (in_thread) send_bytes(ep, conns, c->fd, g_enc_participant, in_len);
+                    else           send_bytes(ep, conns, c->fd, g_enc,   out_len);
+                }
             /* And the notify decision, which a reply never produced at all
              * (REQ-061): the root goes with it, so the emitter can notify the
              * thread's PARTICIPANTS and not merely whoever the channel level
@@ -4101,7 +4338,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
 #ifdef OC_STT
         if (stt_post_failed(ep, conns, c, r)) break;
 #endif
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice ctx = { r->idem, OC_IDEM_LEN };
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("reply rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -4114,7 +4351,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (r->err_code) {
             uint8_t ctx[8];
             for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->parent_id >> (56 - 8 * i));
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice cs = { ctx, sizeof ctx };
             oc_error e = { r->err_code, 0, cs, oc_slice_str("thread unavailable") };
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -4133,7 +4370,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         int in_thread = r->list_participant;
         for (size_t i = 0; i < r->n_thread && conns[fd]; i++) {
             oc_replay_msg *m = &r->thread[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_slice body = { m->body, m->body_len };
             oc_thread_reply tr = { .message_id  = m->message_id,
                                    .channel_id  = m->channel_id,
@@ -4148,7 +4385,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
         if (!conns[fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_thread th = { r->parent_id, (uint32_t)r->n_thread, r->truncated };
         oc_encode_thread(&w, OC_PROTOCOL_VERSION, &th);
         send_bytes(ep, conns, fd, g_enc, w.len);
@@ -4168,7 +4405,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             ents[i].snippet.ptr = r->search[i].body;
             ents[i].snippet.len = r->search[i].body_len;
         }
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_search_results sr = { (uint16_t)n, ents, r->truncated };
         oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &sr);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4178,16 +4415,11 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_TYPING: {
         /* Relay to every connected member except the typer (REQ-121). Members is
          * empty if the typer couldn't read the channel, so nothing leaks. */
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_typing_update tu = { r->channel_id, r->author_id };
         oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &tu);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id != r->author_id &&
-                in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, r->author_id, g_enc, len);
         break;
     }
     case OC_RES_ATTACH_CREATED: {
@@ -4227,7 +4459,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (x->state != XFER_UP_AWAIT_FINAL) break;
         int fd = c->fd;
         oc_upload_ok ok = { x->attachment_id, r->att_size, { x->digest, 32 } };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_upload_ok(&w, OC_PROTOCOL_VERSION, &ok);
         xfer_reset(x);
         send_bytes(ep, conns, fd, g_enc, w.len);
@@ -4305,6 +4537,12 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (audio_open_blob(ep, conns, c, r->tts_blob_key, r->tts_bytes) != 0) break;
             break;
         }
+        for (int k = 0; k < OC_TTS_FRESH; k++)
+            if (g_tts_fresh[k].used && memcmp(g_tts_fresh[k].handle, r->tts_handle, 32) == 0) {
+                x->audio_duration_ms = g_tts_fresh[k].duration_ms;
+                audio_open_blob(ep, conns, c, g_tts_fresh[k].key, g_tts_fresh[k].bytes);
+                goto tts_meta_done;
+            }
         if (!g_tts) { send_transfer_error(c, r->message_id, OC_ERR_TTS_UNAVAILABLE); break; }
         /* Not rendered yet. If the same handle is already being rendered for
          * somebody else, wait on it rather than paying for it twice. */
@@ -4325,6 +4563,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         wait->next = g_tts_waits;
         g_tts_waits = wait;
         x->state = XFER_AUDIO_AWAIT_RENDER;
+    tts_meta_done:
         break;
     }
     case OC_RES_TTS_ERR: {
@@ -4388,7 +4627,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         ss.reserve_bytes  = g_spol.reserve_bytes;
         ss.evict_enabled  = (uint8_t)g_spol.evict_enabled;
         ss.under_pressure = (uint8_t)oc_storage_under_pressure(&g_sstat, &g_spol);
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_storage_status(&w, OC_PROTOCOL_VERSION, &ss);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4411,7 +4650,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             ents[n].detail     = oc_slice_str(a->detail ? a->detail : "");
         }
         oc_audit_page pg = { n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_audit_page(&w, OC_PROTOCOL_VERSION, &pg);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4419,7 +4658,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_AUDIT_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("audit query denied") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4428,7 +4667,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_STORAGE_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("storage status denied") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4473,24 +4712,20 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         hex_encode(r->session_token, OC_SESSION_TOKEN_LEN, whhex);
         oc_webhook_info wi = { r->message_id, r->channel_id,
                                { (const uint8_t *)whhex, strlen(whhex) } };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_webhook_info(&w, OC_PROTOCOL_VERSION, &wi);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_WEBHOOK_POSTED: {
         /* Fan the posted message out to connected members (like SEND_OK)... */
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
         b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *m = conns[fd];
-            if (m && m->authed && in_members(m->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, blen);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         /* ...then 200 the webhook sender and close its HTTP connection. */
         conn *hc = find_by_id(conns, r->conn_id);
         if (hc) {
@@ -4521,7 +4756,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             conn_close(ep, conns, c->fd);
         } else {
             /* CREATE_WEBHOOK failure on a binary client -> ERROR frame. */
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("webhook error") };
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4541,14 +4776,11 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             n++;
         }
         oc_emoji_list el = { n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_emoji_list(&w, OC_PROTOCOL_VERSION, &el);
         size_t len = w.len;
         if (r->ch_fanout) {
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *t = conns[fd];
-                if (t && t->authed) send_bytes(ep, conns, fd, g_enc, len);
-            }
+            send_to_all_authed(ep, conns, g_enc, len);
         } else {
             conn *c = find_by_id(conns, r->conn_id);
             if (c) send_bytes(ep, conns, c->fd, g_enc, len);
@@ -4562,7 +4794,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         uint16_t n = 0;
         for (size_t i = 0; i < r->n_sessions && n < OC_MAX_SESSIONS; i++) ents[n++] = r->sessions[i];
         oc_session_list sl = { n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_session_list(&w, OC_PROTOCOL_VERSION, &sl);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4574,7 +4806,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         uint16_t n = 0;
         for (size_t i = 0; i < r->n_fchans && n < OC_MAX_FILE_CHANNELS; i++) ents[n++] = r->fchans[i];
         oc_file_channels fc = { n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_file_channels(&w, OC_PROTOCOL_VERSION, &fc);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4598,7 +4830,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         pi.pronouns       = oc_slice_str(r->pf_pronouns ? r->pf_pronouns : "");
         pi.voice_id       = oc_slice_str(r->pf_voice_id ? r->pf_voice_id : "");
         pi.phone          = oc_slice_str(r->pf_phone ? r->pf_phone : "");
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4610,7 +4842,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         uint16_t n = 0;
         for (size_t i = 0; i < r->n_invites && n < OC_MAX_INVITES; i++) ents[n++] = r->invites[i];
         oc_invite_list il = { n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_invite_list(&w, OC_PROTOCOL_VERSION, &il);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4618,7 +4850,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_INVITE_REVOKED: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         /* The ack carries the id so a client can drop that row without re-listing. */
         oc_revoke_invite rv = { r->message_id };
         oc_encode_invite_revoked(&w, OC_PROTOCOL_VERSION, &rv);
@@ -4638,7 +4870,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             n++;
         }
         oc_webhook_list wl = { n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_webhook_list(&w, OC_PROTOCOL_VERSION, &wl);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4647,7 +4879,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         oc_webhook_deleted wd = { r->message_id };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_webhook_deleted(&w, OC_PROTOCOL_VERSION, &wd);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
@@ -4655,7 +4887,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_NOTIFY_PREFS: {
         /* Sync the settings snapshot to *all* of the user's connections, so a
          * change on one device updates the others (REQ-130/131). */
-        static oc_notify_pref_entry ents[OC_MAX_NOTIFY_PREFS];
+        static __thread oc_notify_pref_entry ents[OC_MAX_NOTIFY_PREFS];
         uint16_t n = 0;
         for (size_t i = 0; i < r->n_nprefs && n < OC_MAX_NOTIFY_PREFS; i++) {
             ents[n].channel_id = r->nprefs[i].channel_id;
@@ -4670,14 +4902,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         np.notify_default = r->np_default;        /* REQ-134 */
         np.count          = n;
         np.entries        = ents;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &np);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, len);
         /* The rest of the user's notification state travels with it, each in its
          * own frame — NOTIFY_PREFS ends in a repeated list, so a field added to
          * its fixed part would shift every entry after the first. One request
@@ -4686,13 +4914,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
             oc_snooze sn = { r->snooze_until_ms };
             oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *c = conns[fd];
-                if (c && c->authed && c->user_id == r->user_id) {
-                    c->dnd_until_ms = r->snooze_until_ms;
-                    send_bytes(ep, conns, fd, sbuf, sw.len);
-                }
-            }
+            for (conn *c = user_head(r->user_id); c; c = c->u_next)
+                c->dnd_until_ms = r->snooze_until_ms;
+            send_to_user(ep, conns, r->user_id, 0, sbuf, sw.len);
         }
         {
             /* The schedule rides the same answer, and into the net thread's own
@@ -4700,27 +4924,19 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             cache_schedule(conns, r->user_id, r);
             oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min,
                                r->sc_end_min, r->sc_n_days, r->sc_days };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &sc);
             size_t sl = w.len;
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *c = conns[fd];
-                if (c && c->authed && c->user_id == r->user_id)
-                    send_bytes(ep, conns, fd, g_enc, sl);
-            }
+            send_to_user(ep, conns, r->user_id, 0, g_enc, sl);
         }
         {
             oc_slice terms[OC_MAX_KEYWORDS];
             for (uint8_t i = 0; i < r->al_n_terms; i++) terms[i] = oc_slice_str(r->al_terms[i]);
             oc_alert_prefs ap = { r->al_n_terms, terms, r->al_n_people, r->al_people };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &ap);
             size_t al = w.len;
-            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-                conn *c = conns[fd];
-                if (c && c->authed && c->user_id == r->user_id)
-                    send_bytes(ep, conns, fd, g_enc, al);
-            }
+            send_to_user(ep, conns, r->user_id, 0, g_enc, al);
         }
         break;
     }
@@ -4729,7 +4945,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) return;
         for (size_t i = 0; i < r->n_threads && conns[c->fd]; i++) {
             const oc_thread_row *t = &r->threads[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
                                      t->root_at, t->last_reply_at, t->reply_count,
                                      t->unread, t->following,
@@ -4738,7 +4954,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (!conns[c->fd]) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_threads term = { (uint32_t)r->n_threads };
         oc_encode_threads(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4749,18 +4965,14 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * follow or a read mark is a fact about them, not about this device. */
         if (!r->n_threads) break;
         const oc_thread_row *t = &r->threads[0];
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
                                  t->root_at, t->last_reply_at, t->reply_count,
                                  t->unread, t->following,
                                  oc_slice_str(t->preview ? t->preview : "") };
         oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, len);
         break;
     }
     case OC_RES_SCHEDULE: {
@@ -4769,13 +4981,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * to "when am I quiet", which is the thing REQ-136 exists to prevent. */
         oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min, r->sc_end_min,
                            r->sc_n_days, r->sc_days };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &sc);
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, w.len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
         /* And into the net thread's own copy, which is what other people's DND
          * badge is computed from. The tick below announces the change. */
         cache_schedule(conns, r->user_id, r);
@@ -4785,13 +4993,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_slice terms[OC_MAX_KEYWORDS];
         for (uint8_t i = 0; i < r->al_n_terms; i++) terms[i] = oc_slice_str(r->al_terms[i]);
         oc_alert_prefs ap = { r->al_n_terms, terms, r->al_n_people, r->al_people };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &ap);
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, w.len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
         break;
     }
     case OC_RES_SNOOZE: {
@@ -4802,20 +5006,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
         oc_snooze sn = { r->snooze_until_ms };
         oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id) {
-                c->dnd_until_ms = r->snooze_until_ms;
-                send_bytes(ep, conns, fd, sbuf, sw.len);
-            }
-        }
+        for (conn *c = user_head(r->user_id); c; c = c->u_next)
+            c->dnd_until_ms = r->snooze_until_ms;
+        send_to_user(ep, conns, r->user_id, 0, sbuf, sw.len);
         broadcast_presence(ep, conns, r->user_id, presence_of(conns, r->user_id));
         break;
     }
     case OC_RES_NOTIFY_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("notify pref error") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4829,14 +5029,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                             r->sched.send_at_ms, r->sched.created_ms, r->sched.state,
                             oc_slice_str(r->sched.fail_reason ? r->sched.fail_reason : ""),
                             oc_slice_str(r->sched.body ? r->sched.body : "") };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_scheduled(&w, OC_PROTOCOL_VERSION, &sc);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, len);
         break;
     }
     case OC_RES_SCHEDULED_LIST: {
@@ -4848,13 +5044,13 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                                 r->scheds[i].created_ms, r->scheds[i].state,
                                 oc_slice_str(r->scheds[i].fail_reason ? r->scheds[i].fail_reason : ""),
                                 oc_slice_str(r->scheds[i].body ? r->scheds[i].body : "") };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             if (oc_encode_scheduled(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
                 send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (conns[c->fd]) {
             oc_scheduled_list term = { (uint16_t)r->n_scheds };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_scheduled_list(&w, OC_PROTOCOL_VERSION, &term);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -4873,14 +5069,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                        r->draft.updated_ms,
                        oc_slice_str(r->draft.recipients ? r->draft.recipients : ""),
                        oc_slice_str(r->draft.body ? r->draft.body : "") };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id && c->conn_id != r->conn_id)
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_user(ep, conns, r->user_id, r->conn_id, g_enc, len);
         break;
     }
     case OC_RES_DRAFTS: {
@@ -4893,13 +5085,13 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                            r->drafts[i].thread_root, r->drafts[i].updated_ms,
                            oc_slice_str(r->drafts[i].recipients ? r->drafts[i].recipients : ""),
                            oc_slice_str(r->drafts[i].body ? r->drafts[i].body : "") };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             if (oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d) == OC_OK)
                 send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
         if (conns[c->fd]) {
             oc_drafts term = { (uint16_t)r->n_drafts };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_drafts(&w, OC_PROTOCOL_VERSION, &term);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -4909,7 +5101,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* Sync the bucket snapshot to *all* of the user's connections, so a change
          * on one device reaches the others; each client folds it only if the
          * client_type matches its own (per-frontend buckets). */
-        static oc_client_setting_entry ents[OC_MAX_CLIENT_SETTINGS];
+        static __thread oc_client_setting_entry ents[OC_MAX_CLIENT_SETTINGS];
         uint16_t n = 0;
         for (size_t i = 0; i < r->n_cslist && n < OC_MAX_CLIENT_SETTINGS; i++) {
             ents[n].key = oc_slice_str(r->cslist[i].key ? r->cslist[i].key : "");
@@ -4917,14 +5109,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             n++;
         }
         oc_client_settings cst = { oc_slice_str(r->cs_client_type ? r->cs_client_type : ""), n, ents };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_client_settings(&w, OC_PROTOCOL_VERSION, &cst);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id == r->user_id)
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_user(ep, conns, r->user_id, 0, g_enc, len);
         break;
     }
     case OC_RES_PROFILE_UPDATED: {
@@ -4932,19 +5120,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * rosters update; the originator reads it as its own ack (a password change
          * echoes the unchanged name, which is a harmless roster no-op). */
         oc_profile_updated pu = { r->user_id, oc_slice_str(r->profile_name ? r->profile_name : "") };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_profile_updated(&w, OC_PROTOCOL_VERSION, &pu);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed) send_bytes(ep, conns, fd, g_enc, len);
-        }
+        send_to_all_authed(ep, conns, g_enc, len);
         break;
     }
     case OC_RES_PROFILE_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("profile update rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
@@ -4955,20 +5140,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * advanced their read cursor, and backfill the acker with the others'
          * current cursors so opening a channel shows who has already read it. */
         oc_read_cursor rc = { r->channel_id, r->user_id, r->message_id };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rc);
         size_t len = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && c->user_id != r->user_id &&
-                in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, len);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, r->user_id, g_enc, len);
         conn *ac = find_by_id(conns, r->conn_id);
         if (ac) {
             for (size_t i = 0; i < r->n_rcur; i++) {
                 oc_read_cursor rb = { r->channel_id, r->rcur[i].user_id, r->rcur[i].message_id };
-                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
                 oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rb);
                 send_bytes(ep, conns, ac->fd, g_enc, w.len);
             }
@@ -4995,9 +5175,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             call_push_invites(c, added, na, jc->user_id);
             break;
         }
-        if (g_audio_down) {
-            /* No relay, and none coming back: say so, rather than hand the
-             * joiner a UDP port that nothing is listening on. */
+        if (!g_relay) {
+            /* No media endpoint: say so, rather than hand the joiner a UDP port
+             * that nothing is listening on. */
             send_call_error(ep, jc, OC_ERR_CALL_UNAVAILABLE, "calls are unavailable");
             break;
         }
@@ -5080,8 +5260,8 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 if (na < 0) na = 0;
             }
         }
-        /* Register the participant + token with the media sidecar (ARCH-31). */
-        audio_authorize(c->channel_id, pt->user_id, token);
+        /* Register the participant + token with the relay (ARCH-31). */
+        audio_authorize(c->call_id, pt->user_id, pt->conn_id, token);
         oc_call_part parts[OC_MAX_CALL_PARTICIPANTS];
         call_fill_parts(c, parts);
         oc_call_joined jd = { c->channel_id, c->call_id, audio_advertised_port(), { token, audio_token_len() },
@@ -5105,120 +5285,115 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
          * conversation's connected members -- with its kind. It notifies nobody:
          * the invitation already did. */
         if (r->err_code) break;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_slice body = { r->body, r->body_len };
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, OC_MSG_KIND_CALL,
                            body, 0, {{0}}, {0} };
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *m = conns[fd];
-            if (m && m->authed && in_members(m->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, blen);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         break;
     }
     case OC_RES_UNFURL_STORED: {
         /* Fan the stored preview to every connected member (REQ-222). The same
          * shape as an edit fan-out; there is no requester to ack — the job was
          * the unfurl worker's. */
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_unfurl uf = { r->message_id, r->channel_id,
                          oc_slice_str(r->unf_url ? r->unf_url : ""),
                          oc_slice_str(r->unf_title ? r->unf_title : ""),
                          oc_slice_str(r->unf_descr ? r->unf_descr : "") };
         oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
         size_t blen = w.len;
-        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-            conn *c = conns[fd];
-            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                send_bytes(ep, conns, fd, g_enc, blen);
-        }
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         break;
     }
-    case OC_RES_BACKFILL_OK: {
-        conn *c = find_by_id(conns, r->conn_id);
-        if (!c) return;
-        int fd = c->fd;
-        /* Replay each missed top-level message as a BROADCAST, ascending id.
-         * A message with thread replies is followed by a THREAD_META so the
-         * client can show its reply count without opening the thread (REQ-060). */
-        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+    default: break;
+    }
+}
+
+/* --- Backfill replay (OC_BF_SLICE) ------------------------------------------
+ *
+ * The frames a BACKFILL_OK becomes, one at a time, in the order they always
+ * went: each missed message as a BROADCAST (and a THREAD_META after one with
+ * replies, REQ-060), then the pins, this user's saved marks, the reactions, the
+ * link previews and the forwards for them -- a BROADCAST carries none of those,
+ * so a replay without them loses each on reload -- then BACKFILL_DONE. */
+enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_REACT, BF_UNFURL, BF_FWD, BF_DONE, BF_END };
+
+/* Encode the head result's next frame into g_enc: its length, or 0 when the
+ * result has no frames left. */
+static size_t backfill_next(conn *c) {
+    oc_dbres *r = c->bf[0];
+    oc_wbuf w;
+    for (;;) {
+        size_t i = c->bf_i;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        switch (c->bf_phase) {
+        case BF_MSG: {
+            if (i >= r->n_replay) { c->bf_phase = BF_PIN; c->bf_i = 0; continue; }
             oc_replay_msg *m = &r->replay[i];
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { m->body, m->body_len };
             oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, m->kind, body, 0, {{0}}, {0} };
             broadcast_set_attach(&b, m->attach, m->n_attach);
             b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
-            send_bytes(ep, conns, fd, g_enc, w.len);
-            if (m->reply_count > 0 && conns[fd]) {
-                oc_wbuf_init(&w, g_enc, sizeof g_enc);
-                oc_thread_meta tm = { m->message_id, m->reply_count, m->last_reply_at };
-                oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm);
-                send_bytes(ep, conns, fd, g_enc, w.len);
-            }
+            c->bf_phase = BF_META;
+            return w.len;
         }
-        /* Pin state for what we just replayed, for the same reason as the
-         * reactions below: a BROADCAST has no field for it, so without this a
-         * reload silently loses every pin (REQ-230). */
-        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+        case BF_META: {
+            oc_replay_msg *m = &r->replay[i];
+            c->bf_phase = BF_MSG; c->bf_i = i + 1;
+            if (m->reply_count <= 0) continue;
+            oc_thread_meta tm = { m->message_id, m->reply_count, m->last_reply_at };
+            oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm);
+            return w.len;
+        }
+        case BF_PIN: {
+            if (i >= r->n_replay) { c->bf_phase = BF_SAVED; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
             if (!r->replay[i].pinned_by && !r->replay[i].pinned_at) continue;
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_pin_updated pu = { r->replay[i].message_id, r->replay[i].channel_id,
                                   r->replay[i].pinned_by, OC_PIN_ADD,
                                   r->replay[i].pinned_at };
             oc_encode_pin_updated(&w, OC_PROTOCOL_VERSION, &pu);
-            send_bytes(ep, conns, fd, g_enc, w.len);
+            return w.len;
         }
-
-        /* And this user's saved-for-later marks, for the same reason again — but
-         * note the difference: a pin is a channel-wide fact and this is private,
-         * so it goes only down THIS connection and is keyed to the requester
-         * (REQ-231). Without it, a reload showed nothing bookmarked until the
-         * Later view was opened. */
-        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+        case BF_SAVED: {
+            /* Private (REQ-231): only down this connection, keyed to the requester. */
+            if (i >= r->n_replay) { c->bf_phase = BF_REACT; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
             if (!r->replay[i].saved) continue;
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_saved_updated su = { r->replay[i].message_id, OC_SAVE_ADD,
                                     r->replay[i].saved_at };
             oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
-            send_bytes(ep, conns, fd, g_enc, w.len);
+            return w.len;
         }
-
-        /* Then the reaction state for those messages. A BROADCAST carries none,
-         * so without this every reaction vanished on reload. op=ADD with the
-         * aggregate count reconstructs the chip; user_id is the requester when
-         * they reacted, which is what marks the chip as theirs. */
-        for (size_t i = 0; i < r->n_rreact && conns[fd]; i++) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        case BF_REACT: {
+            /* op=ADD with the aggregate count reconstructs the chip; user_id is
+             * the requester when they reacted, which marks the chip as theirs. */
+            if (i >= r->n_rreact) { c->bf_phase = BF_UNFURL; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
             oc_reaction_updated ru = { r->rreact[i].message_id, r->rreact[i].channel_id,
                                        r->rreact[i].user_id,
                                        oc_slice_str(r->rreact[i].emoji ? r->rreact[i].emoji : ""),
                                        OC_REACT_ADD, r->rreact[i].count };
             oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &ru);
-            send_bytes(ep, conns, fd, g_enc, w.len);
+            return w.len;
         }
-
-        /* And the link previews (REQ-222), for the same reason once more: an
-         * unfurl travels on its own frame, so a replay that omitted it would
-         * silently lose every preview on reload. */
-        for (size_t i = 0; i < r->n_runfurl && conns[fd]; i++) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        case BF_UNFURL: {
+            if (i >= r->n_runfurl) { c->bf_phase = BF_FWD; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
             oc_unfurl uf = { r->runfurl[i].message_id, r->runfurl[i].channel_id,
                              oc_slice_str(r->runfurl[i].url ? r->runfurl[i].url : ""),
                              oc_slice_str(r->runfurl[i].title ? r->runfurl[i].title : ""),
                              oc_slice_str(r->runfurl[i].descr ? r->runfurl[i].descr : "") };
             oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
-            send_bytes(ep, conns, fd, g_enc, w.len);
+            return w.len;
         }
-
-        /* And what each replayed forward points at (REQ-057) — the reference
-         * rides its own frame, so a replay without this loses the attribution
-         * the moment the client reloads, which is exactly what the reaction,
-         * pin and unfurl replays above each exist to prevent. */
-        for (size_t i = 0; i < r->n_rfwd && conns[fd]; i++) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        case BF_FWD: {
+            if (i >= r->n_rfwd) { c->bf_phase = BF_DONE; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
             oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
                               r->rfwd[i].src_channel, r->rfwd[i].src_message,
                               r->rfwd[i].src_author,
@@ -5226,17 +5401,64 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                               r->rfwd[i].n_attach,
                               oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
             oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw);
-            send_bytes(ep, conns, fd, g_enc, w.len);
+            return w.len;
         }
-        if (!conns[fd]) return;
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_backfill_done done = { r->high_water, r->truncated };
-        oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &done);
-        send_bytes(ep, conns, fd, g_enc, w.len);
-        break;
+        case BF_DONE: {
+            c->bf_phase = BF_END;
+            oc_backfill_done done = { r->high_water, r->truncated };
+            oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &done);
+            return w.len;
+        }
+        default:
+            return 0;
+        }
     }
-    default: break;
+}
+
+/* Move the replay on by a slice: frames while little is waiting to be written,
+ * then, once every queued replay is out, the frames that waited behind them, by
+ * the same measure. -1 when the output cap is reached (the caller closes). */
+static int backfill_pump(conn *c) {
+    if (!c->bf_n && !c->dq_len) return 0;
+    c->bf_pumping = 1;
+    int rc = 0;
+    for (int frames = 0; c->bf_n && frames < OC_BF_SLICE; ) {
+        if (pending_out(c) >= OC_BF_SOFT) goto out;
+        size_t len = backfill_next(c);
+        if (!len) {
+            oc_dbres_free(c->bf[0]);
+            memmove(&c->bf[0], &c->bf[1], (size_t)(c->bf_n - 1) * sizeof c->bf[0]);
+            c->bf_n--;
+            c->bf_phase = BF_MSG; c->bf_i = 0;
+            continue;
+        }
+        if (out_append(c, g_enc, len) != 0) { rc = -1; goto out; }
+        frames++;
     }
+    if (!c->bf_n && c->dq_len) {
+        size_t pending = pending_out(c);
+        size_t room = pending < OC_BF_SOFT ? OC_BF_SOFT - pending : 0;
+        size_t n = c->dq_len < room ? c->dq_len : room;
+        if (n) {
+            if (out_append(c, c->dq, n) != 0) { rc = -1; goto out; }
+            memmove(c->dq, c->dq + n, c->dq_len - n);
+            c->dq_len -= n;
+        }
+    }
+out:
+    c->bf_pumping = 0;
+    return rc;
+}
+
+/* A BACKFILL_OK arrives: the connection takes the result and starts replaying
+ * it. The result is freed here whatever happens to the connection. */
+static void backfill_accept(int ep, conn **conns, oc_dbres *r) {
+    conn *c = find_by_id(conns, r->conn_id);
+    if (!c) { oc_dbres_free(r); return; }
+    if (c->bf_n == OC_BF_QUEUE) { oc_dbres_free(r); conn_close(ep, conns, c->fd); return; }
+    c->bf[c->bf_n++] = r;
+    if (backfill_pump(c) < 0 || flush_out(c) < 0) { conn_close(ep, conns, c->fd); return; }
+    update_interest(ep, c);
 }
 
 /* --- Main loop ---------------------------------------------------------- */
@@ -5265,12 +5487,11 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
  *
  * Raised again immediately whenever one fires, so a backlog drains at queue
  * speed rather than one per tick — the flag is set by the result path below. */
-static uint64_t g_last_sched_ms;
-static int      g_sched_more;
 /* Overridable for tests, exactly as OPENCHIME_MAINT_INTERVAL_MS is: a suite
  * that has to wait fifteen real seconds to see a scheduled message fire is one
  * nobody runs. Floored so a bad value cannot busy-loop the writer. */
-static uint64_t sched_tick_ms(void) {
+static __thread uint64_t g_sched_tick_ms;   /* read once, when the loop starts */
+static uint64_t sched_tick_ms_env(void) {
     const char *e = getenv("OPENCHIME_SCHED_TICK_MS");
     if (e && *e) {
         unsigned long long v = strtoull(e, NULL, 10);
@@ -5278,6 +5499,7 @@ static uint64_t sched_tick_ms(void) {
     }
     return 15000u;
 }
+static uint64_t sched_tick_ms(void) { return g_sched_tick_ms; }
 
 static void maybe_fire_scheduled(oc_dbwriter *dbw) {
     uint64_t now = now_ms();
@@ -5300,15 +5522,30 @@ static void maybe_fire_scheduled(oc_dbwriter *dbw) {
  * So: clear lapsed stamps, then re-announce any user whose DND answer differs
  * from what they were last announced as. Comparing rather than announcing every
  * tick is what keeps a quiet box quiet — this runs on every epoll turn. */
+/* Presence broadcasts held past OC_PRESENCE_RATE_MAX, sent once the window
+ * allows, carrying the state as it is by then. */
+static void flush_deferred_presence(int ep, conn **conns) {
+    if (!g_presence_deferred) return;
+    g_presence_deferred = 0;
+    uint64_t now = now_ms();
+    for (size_t i = 0; i < g_nlive; i++) {
+        conn *c = g_live[i];
+        if (!c || !c->presence_deferred) continue;
+        if (now - c->presence_rl.start < OC_PRESENCE_RATE_MS) { g_presence_deferred = 1; continue; }
+        c->presence_rl.start = now;
+        c->presence_rl.count = 1;
+        c->presence_deferred = 0;
+        broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
+    }
+}
+
 static void expire_snoozes(int ep, conn **conns) {
     uint64_t now = (uint64_t)time(NULL) * 1000ull;
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-        conn *c = conns[fd];
+    for (size_t i = 0; i < g_nlive; i++) {
+        conn *c = g_live[i];
         if (!c || !c->authed || !c->dnd_until_ms || c->dnd_until_ms > now) continue;
-        uint64_t uid = c->user_id;
-        for (int g = 0; g < OC_NETLOOP_MAX_FD; g++)      /* every connection they hold */
-            if (conns[g] && conns[g]->authed && conns[g]->user_id == uid)
-                conns[g]->dnd_until_ms = 0;
+        for (conn *u = user_head(c->user_id); u; u = u->u_next)   /* every connection they hold */
+            u->dnd_until_ms = 0;
         g_dnd_dirty = 1;
     }
 
@@ -5326,14 +5563,14 @@ static void expire_snoozes(int ep, conn **conns) {
      *   a PERSON, which sets the dirty flag, because waiting up to a minute to
      *   tell everyone you just turned quiet hours on would be a visible lag.
      */
-    static uint64_t last_min;
+    static __thread uint64_t last_min;
     uint64_t this_min = now / 60000ull;
     if (!g_dnd_dirty && this_min == last_min) return;
     last_min = this_min;
     g_dnd_dirty = 0;
 
-    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
-        conn *c = conns[fd];
+    for (size_t i = 0; i < g_nlive; i++) {
+        conn *c = g_live[i];
         if (!c || !c->authed) continue;
         if ((uint8_t)dnd_of(conns, c->user_id) == c->dnd_announced) continue;
         /* broadcast_presence stamps every connection this user holds, so they
@@ -5381,6 +5618,14 @@ static void deliver_tts_results(int ep, conn **conns, oc_dbwriter *dbw) {
                 sj->tts_bytes = res.bytes;
                 sj->tts_duration_ms = res.duration_ms;
                 oc_dbwriter_submit(dbw, sj);
+            }
+            if (strlen(res.key) < sizeof g_tts_fresh[0].key) {
+                unsigned k = g_tts_fresh_next++ % OC_TTS_FRESH;
+                g_tts_fresh[k].used = 1;
+                memcpy(g_tts_fresh[k].handle, res.handle, 32);
+                snprintf(g_tts_fresh[k].key, sizeof g_tts_fresh[k].key, "%s", res.key);
+                g_tts_fresh[k].bytes = res.bytes;
+                g_tts_fresh[k].duration_ms = res.duration_ms;
             }
         } else if (res.status == OC_TTS_FAILED) {
             fprintf(stderr, "tts: render failed: %s\n", res.reason);
@@ -5471,13 +5716,17 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             break;
         }
         x->bw = j->bw;
-        mbedtls_sha256_init(&x->sha);
-        mbedtls_sha256_starts(&x->sha, 0);
-        x->sha_init = 1;
+        if (!(x->sha = malloc(sizeof *x->sha))) {
+            xfer_reset(x);   /* aborts the writer: no job is out */
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        mbedtls_sha256_init(x->sha);
+        mbedtls_sha256_starts(x->sha, 0);
         x->state = XFER_UP_ACTIVE;
         {
             oc_upload_ready rd = { x->attachment_id, OC_ATTACH_CHUNK_SIZE, OC_UPLOAD_WINDOW };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &rd);
             if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
         }
@@ -5488,14 +5737,14 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
             break;
         }
-        /* Hash here, not at submit time: completions arrive in submission order
-         * (one job per transfer in flight), so this matches what was stored. */
-        if (j->len) mbedtls_sha256_update(&x->sha, j->data, j->len);
+        /* The worker hashed what it stored; the digest comes back here. */
+        x->sha = j->sha;
+        j->sha = NULL;
         x->received += j->len;
         x->next_seq++;
         {
             oc_upload_ack ack = { x->attachment_id, x->next_seq };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &ack);
             if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
         }
@@ -5531,7 +5780,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
         x->state = XFER_DOWN_ACTIVE;
         if (x->audio) {
             oc_audio_info ai = { x->audio_message_id, x->audio_duration_ms, x->remaining };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_audio_info(&w, OC_PROTOCOL_VERSION, &ai);
             if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
             download_pump(c);
@@ -5542,7 +5791,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
                                     oc_slice_str(x->dl_filename ? x->dl_filename : ""),
                                     oc_slice_str(x->dl_mime ? x->dl_mime : ""),
                                     x->remaining, { x->dl_sha, 32 } };
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &di);
             if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
         }
@@ -5555,7 +5804,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             break;
         }
         {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             if (x->audio) {
                 oc_audio_chunk ac = { x->audio_message_id, x->next_seq, { j->data, j->len } };
                 oc_encode_audio_chunk(&w, OC_PROTOCOL_VERSION, &ac);
@@ -5596,10 +5845,36 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
 #define NETLOOP_FAIL(op) \
     fprintf(stderr, "openchimed: cannot start: %s: %s\n", (op), strerror(errno))
 
+static void loop_state_free(conn **conns) {
+    free(conns);
+    free(g_enc); g_enc = NULL;
+    free(g_enc_participant); g_enc_participant = NULL;
+    free(g_calls); g_calls = NULL;
+}
+
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop) {
     conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
-    if (!conns) { NETLOOP_FAIL("allocating the connection table"); return -1; }
+    /* The loop's own state (ARCH-22): a process may run more than one loop --
+     * the test suites do -- and each has its own calls, encoders and timers. */
+    g_enc = malloc(OC_MAX_FRAME_SIZE);
+    g_enc_participant = malloc(OC_MAX_FRAME_SIZE);
+    g_calls = calloc(OC_MAX_CALLS, sizeof *g_calls);
+    g_sched_tick_ms = sched_tick_ms_env();
+    g_last_sched_ms = 0; g_sched_more = 0; g_next_conn_id = 1; g_next_call_id = 0;
+    g_last_maint_ms = 0; g_dnd_dirty = 0;
+#ifdef OC_TTS
+    g_tts_waits = NULL;
+#endif
+#ifdef OC_STT
+    g_stt_pend = NULL;
+#endif
+    if (!conns || !g_enc || !g_enc_participant || !g_calls) {
+        NETLOOP_FAIL("allocating the connection table");
+        free(conns); free(g_enc); free(g_enc_participant); free(g_calls);
+        g_enc = g_enc_participant = NULL; g_calls = NULL;
+        return -1;
+    }
 
     /* IPv6 and IPv4 on the one socket (listen.h). Named separately: "bind" on
      * the proto port is the one an operator can act on — the port is taken, or
@@ -5613,18 +5888,18 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     port, strerror(errno));
         else
             NETLOOP_FAIL(op);
-        free(conns); return -1;
+        loop_state_free(conns); return -1;
     }
     if (listen(lfd, 128) < 0) {
-        NETLOOP_FAIL("listen"); close(lfd); free(conns); return -1;
+        NETLOOP_FAIL("listen"); close(lfd); loop_state_free(conns); return -1;
     }
     if (set_nonblock(lfd) < 0) {
         NETLOOP_FAIL("setting the listening socket non-blocking");
-        close(lfd); free(conns); return -1;
+        close(lfd); loop_state_free(conns); return -1;
     }
 
     int ep = epoll_create1(0);
-    if (ep < 0) { NETLOOP_FAIL("epoll_create1"); close(lfd); free(conns); return -1; }
+    if (ep < 0) { NETLOOP_FAIL("epoll_create1"); close(lfd); loop_state_free(conns); return -1; }
     int evfd = oc_dbwriter_eventfd(dbw);
     g_call_dbw = dbw;
 
@@ -5641,7 +5916,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
              * daemon runs outside a container (CONFIG.md). */
             fprintf(stderr, "openchimed: cannot start: opening the blob store "
                             "at \"%s\": %s\n", bd ? bd : "(unset)", strerror(errno));
-            close(ep); close(lfd); free(conns); return -1;
+            close(ep); close(lfd); loop_state_free(conns); return -1;
         }
         g_max_attach = cfg->max_attach_size;
         g_max_video  = cfg->max_video_size;
@@ -5666,7 +5941,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             fprintf(stderr, "openchimed: cannot start: starting %d transfer "
                             "worker(s): %s\n", nw, strerror(errno));
             oc_blobstore_close(g_blobs); g_blobs = NULL;
-            close(ep); close(lfd); free(conns); return -1;
+            close(ep); close(lfd); loop_state_free(conns); return -1;
         }
     }
 
@@ -5695,6 +5970,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     }
 #endif
 #ifdef OC_TTS
+    memset(g_tts_fresh, 0, sizeof g_tts_fresh);   /* another loop's store is not this one's */
     /* Read-aloud's render worker (ARCH-111), beside the transfer pool because it
      * writes to the same store. No engine (a daemon built without read-aloud) or
      * an operator who turned it off means no worker, and TTS_INFO then says the
@@ -5768,28 +6044,72 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     ev.events = EPOLLIN; ev.data.fd = xfd;
     epoll_ctl(ep, EPOLL_CTL_ADD, xfd, &ev);
 
-    /* The audio sidecar's IPC socket, watched only for its closing (REQ-150). */
-    if (g_audio_ipc >= 0) {
-        ev.events = EPOLLIN; ev.data.fd = g_audio_ipc;
-        epoll_ctl(ep, EPOLL_CTL_ADD, g_audio_ipc, &ev);
+    /* Call media: the relay, on this loop (relay.h). A socket it cannot run on
+     * leaves calls refused, which is said once, here. */
+    g_relay = NULL;
+    g_relay_ctx = (relay_ctx){ ep, conns };
+    g_loop_udp_port = __atomic_load_n(&g_audio_udp_port, __ATOMIC_RELAXED);
+    g_loop_udp = __atomic_exchange_n(&g_audio_udp, -1, __ATOMIC_ACQ_REL);
+    if (g_loop_udp >= 0) {
+        oc_relay_hooks rh = { relay_gone, relay_tcp_send };
+        g_relay = oc_relay_open(g_loop_udp, &rh, &g_relay_ctx);
+        if (g_relay) {
+            ev.events = EPOLLIN; ev.data.fd = g_loop_udp;
+            epoll_ctl(ep, EPOLL_CTL_ADD, g_loop_udp, &ev);
+        } else {
+            fprintf(stderr, "netloop: the call relay could not start; calls are off\n");
+        }
     }
 
-    fprintf(stderr, "netloop: listening on :%d\n", port);
+    /* The indexes. Twice the connections the table can hold, so neither map
+     * passes half full (idmap.h); a user needs a connection to be in the
+     * second. A failure here unwinds through the ordinary shutdown below. */
+    g_live = calloc(OC_LIVE_CAP, sizeof *g_live);
+    g_nlive = 0;
+    int indexed = g_live && oc_idmap_init(&g_by_id, 2 * OC_NETLOOP_MAX_FD) == 0 &&
+                  oc_idmap_init(&g_by_user, 2 * OC_NETLOOP_MAX_FD) == 0 && oc_srccount_init(&g_by_src, 2 * OC_NETLOOP_MAX_FD) == 0;
+    if (!indexed) NETLOOP_FAIL("allocating the connection indexes");
+    /* The I/O threads (ARCH-22): every accepted socket is theirs from here. */
+    g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted) : NULL;
+    int iofd = -1;
+    if (indexed && !g_io) { NETLOOP_FAIL("starting the I/O threads"); indexed = 0; }
+    if (g_io) {
+        iofd = oc_ioloop_eventfd(g_io);
+        struct epoll_event iev; memset(&iev, 0, sizeof iev);
+        iev.events = EPOLLIN; iev.data.fd = iofd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, iofd, &iev);
+    }
+    else fprintf(stderr, "netloop: listening on :%d\n", port);
 
     /* The listener takes connections and nothing is left to set up: this is the
      * moment a workspace can say it is up (a managed box claims its binding
      * here). Queued connections are served by the first cycle below. */
-    if (g_ready) g_ready(g_ready_ctx);
+    if (indexed && g_ready) g_ready(g_ready_ctx);
 
     struct epoll_event events[64];
-    while (!*stop) {
-        int nfds = epoll_wait(ep, events, 64, 500);
+    uint64_t turn_start = 0;
+    int db_more = 0, xfer_more = 0;   /* results left over from a bounded drain */
+    int relay_more = 0;               /* datagrams left over from a bounded relay */
+    int io_more = 0;                  /* I/O events left over from a bounded drain */
+    uint64_t last_sweep = 0;
+    while (indexed && !__atomic_load_n(stop, __ATOMIC_ACQUIRE)) {
+        if (turn_start) stats_turn(mono_us() - turn_start);
+        live_compact();   /* between turns: nothing is walking the list */
+        /* Work carried over from the last turn is not waited for. */
+        int nfds = epoll_wait(ep, events, 64, (db_more || xfer_more || relay_more || io_more) ? 0 : 500);
+        turn_start = mono_us();
         /* Every tick, timeout included — a quiet box must still be maintained. */
         maybe_run_maintenance(dbw);
         maybe_fire_scheduled(dbw);
         expire_snoozes(ep, conns);
+        flush_deferred_presence(ep, conns);
+        if (g_relay) {
+            uint64_t sm = __atomic_load_n(&g_relay_silence_ms, __ATOMIC_RELAXED);
+            oc_relay_set_silence_ms(g_relay, sm);
+            uint64_t t = now_ms();
+            if (t - last_sweep >= 500) { last_sweep = t; oc_relay_sweep(g_relay); }
+        }
         if (nfds < 0) { if (errno == EINTR) continue; break; }
-
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
 
@@ -5813,39 +6133,37 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                         continue;
                     }
                     conn *c = calloc(1, sizeof *c);
-                    if (!c || oc_framebuf_init(&c->fb) != 0 ||
-                        oc_tls_conn_init(&c->tls, &tls->conf, cfd) != 0) {
-                        if (c) { oc_framebuf_free(&c->fb); free(c); }
-                        close(cfd);
-                        continue;
-                    }
+                    if (!c) { close(cfd); continue; }
                     c->fd = cfd;
                     memcpy(c->source, src, sizeof c->source);
                     c->conn_id = g_next_conn_id++;
-                    c->state = via_proxy ? CONN_PROXY : CONN_HANDSHAKE;
+                    c->state = CONN_OPENING;
+                    if (index_add(c) != 0) { free(c); close(cfd); continue; }
+                    if (oc_ioloop_adopt(g_io, cfd, c->conn_id, src, via_proxy) != 0) {
+                        index_remove(c); free(c); close(cfd);
+                        continue;
+                    }
                     conns[cfd] = c;
-                    struct epoll_event cev;
-                    memset(&cev, 0, sizeof cev);
-                    cev.events = EPOLLIN; cev.data.fd = cfd;
-                    epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &cev);
-                    c->events = EPOLLIN;
                 }
                 continue;
             }
 
-            if (g_audio_ipc >= 0 && fd == g_audio_ipc) {
-                audio_ipc_readable(ep, conns);
+            if (fd == iofd) {
+                uint64_t cnt;
+                while (read(iofd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                io_more = 1;   /* handled after the events, OC_IO_BUDGET at a time */
+                continue;
+            }
+
+            if (g_relay && fd == g_loop_udp) {
+                relay_more = 1;   /* relayed after the events, OC_RELAY_BUDGET at a time */
                 continue;
             }
 
             if (fd == evfd) {
                 uint64_t cnt;
                 while (read(evfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
-                oc_dbres *r;
-                while ((r = oc_dbwriter_next_result(dbw)) != NULL) {
-                    deliver_result(ep, conns, dbw, r);
-                    oc_dbres_free(r);
-                }
+                db_more = 1;   /* delivered after the events, OC_RESULT_BUDGET at a time */
                 continue;
             }
 
@@ -5868,61 +6186,51 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             if (fd == xfd) {
                 uint64_t cnt;
                 while (read(xfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
-                oc_xfer_job *xj;
-                while ((xj = oc_xferpool_next_result(g_xfers)) != NULL) {
-                    deliver_xfer_result(ep, conns, dbw, xj);
-                    oc_xfer_job_free(xj);
-                }
+                xfer_more = 1;
                 continue;
             }
 
-            conn *c = conns[fd];
-            if (!c) continue;
+        }
 
-            if (c->state == CONN_PROXY) {
-                /* Peek, so that nothing is taken from the socket until the whole
-                 * header is there; then take exactly the header, and TLS starts on
-                 * the byte after it. A trusted peer that sends anything else is
-                 * closed: it is misconfigured, and guessing would mean either
-                 * trusting a header that is not one or feeding one to TLS. */
-                uint8_t hdr[OC_PROXY_V2_MAX];
-                ssize_t got = recv(fd, hdr, sizeof hdr, MSG_PEEK);
-                if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
-                if (got <= 0) { conn_close(ep, conns, fd); continue; }
-                char real[46];
-                long hl = oc_proxy_v2_parse(hdr, (size_t)got, real);
-                if (hl == 0) continue;                       /* not all here yet */
-                if (hl < 0 || recv(fd, hdr, (size_t)hl, 0) != hl) { conn_close(ep, conns, fd); continue; }
-                if (real[0]) memcpy(c->source, real, sizeof c->source);
-                /* Counted among the others from that address — itself included. */
-                if (max_per_ip > 0 && conns_from_ip(conns, c->source) > max_per_ip) {
-                    conn_close(ep, conns, fd);
-                    continue;
-                }
-                c->state = CONN_HANDSHAKE;
+        /* The I/O threads' events, bounded: frames, written reports, opens and
+         * closes, in the order each connection produced them. */
+        if (io_more) {
+            int k = 0;
+            oc_io_event *e = NULL;
+            while (k < OC_IO_BUDGET && (e = oc_ioloop_next(g_io)) != NULL) {
+                k++;
+                on_io_event(ep, conns, dbw, e, max_per_ip);
             }
+            io_more = k == OC_IO_BUDGET;
+        }
 
-            if (c->state == CONN_HANDSHAKE) {
-                oc_tls_status st = oc_tls_handshake(&c->tls);
-                if (st == OC_TLS_OK) {
-                    c->state = CONN_ESTABLISHED;
-                    /* ALPN demux (ARCH-54): a peer that didn't negotiate oc/1 is an
-                     * HTTP/webhook client, routed to the HTTP handler (ARCH-32). */
-                    const char *alpn = oc_tls_alpn_selected(&c->tls);
-                    c->http = (!alpn || strcmp(alpn, OC_ALPN_PROTO) != 0);
-                }
-                else if (st == OC_TLS_WANT_READ)  { conn_set_events(ep, c, EPOLLIN);  continue; }
-                else if (st == OC_TLS_WANT_WRITE) { conn_set_events(ep, c, EPOLLOUT); continue; }
-                else { conn_close(ep, conns, fd); continue; }
-                /* fall through: drain any app data mbedTLS already buffered */
-            }
+        /* Call media, bounded like everything else, so a burst of it cannot keep
+         * the turn from ending: what is left is relayed next turn, first. */
+        if (relay_more) relay_more = oc_relay_on_readable(g_relay, OC_RELAY_BUDGET);
 
-            if (c->state == CONN_ESTABLISHED) {
-                if (on_readable(ep, conns, c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); continue; }
+        /* Results, bounded: what is left waits for the next turn, which then does
+         * not sleep (db_more / xfer_more). */
+        if (db_more) {
+            int k = 0;
+            oc_dbres *r = NULL;
+            while (k < OC_RESULT_BUDGET && (r = oc_dbwriter_next_result(dbw)) != NULL) {
+                k++;
+                __atomic_add_fetch(&g_stats.results, 1, __ATOMIC_RELAXED);
+                if (r->type == OC_RES_BACKFILL_OK) { backfill_accept(ep, conns, r); continue; }
+                deliver_result(ep, conns, dbw, r);
+                oc_dbres_free(r);
             }
-            download_pump(c);   /* refill an active download as the socket drains */
-            if (flush_out(c) < 0) { conn_close(ep, conns, fd); continue; }
-            update_interest(ep, c);
+            db_more = k == OC_RESULT_BUDGET;
+        }
+        if (xfer_more) {
+            int k = 0;
+            oc_xfer_job *xj = NULL;
+            while (k < OC_XFER_BUDGET && (xj = oc_xferpool_next_result(g_xfers)) != NULL) {
+                k++;
+                deliver_xfer_result(ep, conns, dbw, xj);
+                oc_xfer_job_free(xj);
+            }
+            xfer_more = k == OC_XFER_BUDGET;
         }
     }
 
@@ -5950,9 +6258,22 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_ratelimit_free(g_webhook_rl);
     g_webhook_rl = NULL;
     oc_trusted_proxies_free(trusted);
+    oc_relay_close(g_relay);
+    g_relay = NULL;
+    if (g_loop_udp >= 0) {   /* give the socket back, unless another was set meanwhile */
+        int none = -1;
+        __atomic_compare_exchange_n(&g_audio_udp, &none, g_loop_udp, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        g_loop_udp = -1;
+    }
     close(ep);
     close(lfd);
-    free(conns);
+    loop_state_free(conns);
+    free(g_live); g_live = NULL; g_nlive = 0;
+    oc_ioloop_stop(g_io);   /* after the closes above: it closes their sockets */
+    g_io = NULL;
+    oc_idmap_free(&g_by_id);
+    oc_idmap_free(&g_by_user);
+    oc_srccount_free(&g_by_src);
     fprintf(stderr, "netloop: stopped\n");
-    return 0;
+    return indexed ? 0 : -1;
 }

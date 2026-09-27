@@ -61,8 +61,8 @@ struct oc_net {
      * thread for the UI thread to read (obox_publish). One per oc_net: a global
      * made every signed-in workspace report whichever thread published last. */
     atomic_int    obox_pending;
-    volatile int  stop;
-    volatile int  reconnect_now;   /* set by oc_net_reconnect: cut short the backoff */
+    atomic_int    stop;
+    atomic_int    reconnect_now;   /* set by oc_net_reconnect: cut short the backoff */
     char          host[256];
     int           port;
     char         *token;
@@ -81,7 +81,7 @@ struct oc_net {
     char          verifier[OC_SIGNIN_VERIFIER_LEN + 1];
     char          source_id[64];
     char         *oidc_token;
-    volatile int  signin_cancel;
+    atomic_int    signin_cancel;
     char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
     char          client_type[32]; /* synced-settings bucket id (default "tui") */
@@ -90,6 +90,7 @@ struct oc_net {
     oc_xqueue     xq;
     oc_stt_sent   stt;           /* voice-input segments awaiting an answer */
     oc_callsig    calls;         /* the call this device is in, and its keys (ARCH-113) */
+    oc_tls_session resume;       /* the daemon's last ticket: a reconnect resumes (ARCH-22) */
 };
 
 /* ---- the offline outbox, in memory (REQ-102, ARCH-88) ----------------------
@@ -227,7 +228,7 @@ static void wait_io(int fd, oc_tls_status st, int timeout_ms) {
 }
 
 /* Drive a TLS handshake to completion. Returns 0 on success, -1 on error. */
-static int do_handshake(oc_tls_conn *c, int fd, volatile int *stop) {
+static int do_handshake(oc_tls_conn *c, int fd, atomic_int *stop) {
     for (;;) {
         if (*stop) return -1;
         oc_tls_status st = oc_tls_handshake(c);
@@ -238,7 +239,7 @@ static int do_handshake(oc_tls_conn *c, int fd, volatile int *stop) {
 }
 
 /* Write all bytes, waiting on the socket as needed. 0 ok, -1 error. */
-static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, volatile int *stop) {
+static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, atomic_int *stop) {
     size_t sent = 0;
     while (sent < len) {
         if (*stop) return -1;
@@ -253,7 +254,7 @@ static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, vol
 
 /* Encode + write one SEND with a caller-chosen idempotency token (so a resend
  * from the outbox reuses it and the daemon dedups). */
-static void send_message(oc_tls_conn *c, int fd, volatile int *stop,
+static void send_message(oc_tls_conn *c, int fd, atomic_int *stop,
                          uint64_t channel_id, const uint8_t idem[OC_IDEM_SIZE],
                          const char *body, uint64_t src_channel, uint64_t src_message) {
     uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
@@ -272,7 +273,7 @@ static void send_message(oc_tls_conn *c, int fd, volatile int *stop,
 
 /* Block until one full frame is read (used only during handshake/auth). */
 static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
-                    oc_rbuf *payload, volatile int *stop) {
+                    oc_rbuf *payload, atomic_int *stop) {
     for (;;) {
         if (*stop) return -1;
         const uint8_t *frame; size_t flen;
@@ -356,7 +357,7 @@ typedef struct {
     oc_queue    *to_ui;
     oc_tls_conn *conn;
     int          fd;
-    volatile int *stop;
+    atomic_int *stop;
     oc_xfer     *xfer;
     oc_hwtab    *hw;
     oc_store    *store;      /* token/pin persistence (NULL = none) */
@@ -369,6 +370,9 @@ typedef struct {
     oc_callsig  *calls;
     const char  *host;        /* where the relay is, for a call (CALLS.md §4) */
 } disp_ctx;
+
+/* The call engine queued media for the connection: end this thread's wait. */
+static void net_wake(void *w) { oc_wake_signal((oc_wake *)w); }
 
 /* How the call module writes a frame: on this connection, like everything else. */
 static int ctx_write(void *wctx, const uint8_t *buf, size_t len) {
@@ -587,7 +591,7 @@ static void stt_where(disp_ctx *ctx, uint32_t id, oc_ev *e) {
 /* Send one whole segment: STT_BEGIN, the samples in frames that stay under the
  * size limit, STT_END. Written straight out, not queued behind a transfer: the
  * speaker is waiting on it. Returns 0 or -1 if the connection failed. */
-static int send_stt_segment(oc_tls_conn *conn, int fd, volatile int *stop, oc_stt_sent *t, const oc_cmd *c) {
+static int send_stt_segment(oc_tls_conn *conn, int fd, atomic_int *stop, oc_stt_sent *t, const oc_cmd *c) {
     static uint8_t buf[OC_MAX_FRAME_SIZE];
     oc_wbuf w;
     uint32_t id = (uint32_t)c->xfer_tag;
@@ -1832,6 +1836,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_CAPABILITIES) {
             oc_capabilities caps;
             if (oc_decode_capabilities(&p, &caps) != OC_OK) return -1;
+            if (ctx->calls) {
+                ctx->calls->tcp_ok = 0;
+                for (uint8_t i = 0; i < caps.count; i++)
+                    if (caps.names[i].len == strlen(OC_CAP_CALLS_TCP) &&
+                        memcmp(caps.names[i].ptr, OC_CAP_CALLS_TCP, caps.names[i].len) == 0)
+                        ctx->calls->tcp_ok = 1;
+            }
             char joined[256] = "";
             size_t used = 0;
             for (uint8_t i = 0; i < caps.count; i++) {
@@ -2191,7 +2202,7 @@ int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_so
             oc_tls_conn_set_hostname(&conn, sni);
     }
     oc_framebuf_init(&fb);
-    volatile int stop = 0;
+    atomic_int stop = 0;
     int rc = OC_PROBE_UNREACHABLE;
     if (do_handshake(&conn, fd, &stop) != 0) goto done;
     {
@@ -2237,6 +2248,7 @@ static int run_connection(oc_net *n, int reconnecting,
                           oc_hwtab *hw, int *served, conn_store *cs) {
     int rc = RC_LOST;
     *served = 0;
+    oc_wake wake = { -1, -1 };   /* opened for serving (below); closed at drop */
 
     int fd = dial(n->host, n->port);
     if (fd < 0) return RC_LOST;
@@ -2265,6 +2277,10 @@ static int run_connection(oc_net *n, int reconnecting,
         oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
     }
+    /* Resume the last session if the daemon still takes its ticket: a reconnect
+     * then skips the certificate and signature of a full handshake. The ticket
+     * came from a connection that passed the same pin check. */
+    oc_tls_conn_resume(&conn, &n->resume);
     /* Name the workspace in the handshake (SNI): a shared front door reads it to
      * find the workspace's daemon, without terminating anything. It is the
      * workspace's own domain — its key — even when an SRV record sent this
@@ -2287,6 +2303,7 @@ static int run_connection(oc_net *n, int reconnecting,
          * generic "unreachable". */
         if (enforce_pin && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_CHANGED;
         else if (use_published && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_UNPUBLISHED;
+        oc_tls_session_free(&n->resume);   /* the next attempt starts from nothing */
         goto drop;
     }
 
@@ -2582,7 +2599,14 @@ static int run_connection(oc_net *n, int reconnecting,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
                      cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
                      &n->calls, n->host };
+    /* Call media on the connection (PROTOCOL.md §5.17) is queued by the call
+     * engine's threads, which wake this one to write it rather than leave it
+     * for the next 50 ms poll. Without a wake it still goes, at that pace. */
+    if (oc_wake_open(&wake) == 0) oc_callsig_set_wake(&n->calls, net_wake, &wake);
     while (!n->stop) {
+        /* Media first in each turn, ahead of an upload's chunks or a voice
+         * segment: it is the one thing here that is late if it waits. */
+        oc_callsig_pump(&n->calls, ctx_write, &ctx);
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
             if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); rc = RC_STOP; goto drop; }
@@ -3144,7 +3168,13 @@ static int run_connection(oc_net *n, int reconnecting,
          * so after the first read the rest sits decrypted inside TLS, where the
          * socket poll cannot see it. Polling alone waited 50 ms per read on data
          * already here — invisible for a message, minutes for a video. */
-        if (oc_tls_pending(&conn) > 0 || oc_poll(fd, 0, 50) > 0) {
+        int ready = oc_tls_pending(&conn) > 0;
+        if (!ready) {
+            int pr = wake.rd >= 0 ? oc_poll_wake(fd, 0, &wake, 50) : (oc_poll(fd, 0, 50) > 0);
+            if (pr > 0 && (pr & 2)) oc_wake_drain(&wake);   /* media queued: the top of the loop writes it */
+            ready = pr > 0 && (pr & 1);
+        }
+        if (ready) {
             uint8_t buf[4096]; size_t rn = 0;
             oc_tls_status st = oc_tls_read(&conn, buf, sizeof buf, &rn);
             if (st == OC_TLS_OK) {
@@ -3159,6 +3189,8 @@ static int run_connection(oc_net *n, int reconnecting,
 drop:
     /* The daemon takes a closed connection out of its call (REQ-152); so does
      * this side, at once, rather than leave the audio running to nobody. */
+    oc_callsig_set_wake(&n->calls, NULL, NULL);   /* no call engine thread touches it after this */
+    oc_wake_close(&wake);
     oc_callsig_lost(&n->calls, n->to_ui);
     xfer_reset(&xfer);   /* close any half-done transfer file */
     xq_requeue_active(&n->xq);
@@ -3408,8 +3440,10 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
     n->to_ui = to_ui;
     n->from_ui = from_ui;
     oc_callsig_init(&n->calls);
+    oc_tls_session_init(&n->resume);
     if (oc_thread_create(&n->thread, net_thread, n) != 0) {
         oc_callsig_destroy(&n->calls);
+        oc_tls_session_free(&n->resume);
         free(n->token); free(n->invite); free(n->store_path); free(n); return NULL;
     }
     return n;
@@ -3445,6 +3479,7 @@ void oc_net_stop(oc_net *n) {
     for (size_t i = 0; i < n->xq.n; i++) oc_cmd_free(n->xq.q[i]);
     free(n->xq.q);
     oc_callsig_destroy(&n->calls);
+    oc_tls_session_free(&n->resume);
     signin_forget(n);
     free(n->token);
     free(n->store_path);

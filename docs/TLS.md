@@ -134,16 +134,43 @@ that a bad file is refused and leaves no extra roots behind.
 
 ## Non-blocking integration
 
-`shared/tls.c` is written for the epoll event loop (ARCH-22): custom BIO callbacks
+TLS runs on the daemon's I/O threads (`daemon/ioloop.c`, ARCH-22), never on the
+event loop: each connection belongs to one I/O thread for its life, so its
+`mbedtls_ssl_context` is used by one thread only, while the server configuration
+is shared read-only and its random generator is mbedTLS's thread-safe one
+(`MBEDTLS_THREADING_C`). The loop sees plaintext frames.
+
+`shared/tls.c` is written for an epoll loop: custom BIO callbacks
 translate socket `EAGAIN` into `MBEDTLS_ERR_SSL_WANT_READ/WRITE`, and
 `oc_tls_handshake` / `oc_tls_read` / `oc_tls_write` surface those as
 `OC_TLS_WANT_READ` / `OC_TLS_WANT_WRITE` for the caller to re-arm epoll interest.
 A `recv()` of 0 (EOF) is returned to mbedTLS as a connection error rather than 0,
 which would otherwise spin its input loop forever.
 
+## Session resumption
+
+The daemon issues **session tickets** (`mbedtls_ssl_ticket`): after a full
+handshake it gives the client a ticket, sealed with AES-256-GCM under a key the
+daemon makes at start and keeps only in memory, valid for a day
+(`OC_TLS_TICKET_LIFETIME_S`). A client keeps the last ticket for its workspace
+(`oc_tls_conn_resume`) and offers it when it reconnects; the daemon opens it and
+resumes the session, skipping the certificate exchange and the signature a full
+handshake costs, which is most of what a reconnect storm spends. A ticket the
+daemon cannot open — it has restarted since, or the ticket has expired — costs
+nothing: the handshake is simply a full one. The ticket context locks for itself,
+so the I/O threads share it. The daemon counts resumptions in
+`oc_tls_server.resumed`.
+
+A resumed session carries no certificate, so the pin is not checked again; it was
+checked on the connection the ticket came from, and only the daemon holding the
+ticket key can resume it. A client whose pin check fails forgets its ticket, so
+the next attempt is a full, pinned handshake.
+
 ## Testing
 
 `tests/itest_tls.c` (run by `make test`) is hermetic: it stands up a loopback
 TLS server that generates a self-signed cert, connects a client that pins the
 server's fingerprint, round-trips a byte through the tunnel, and asserts that a
-**wrong** pin makes the handshake fail.
+**wrong** pin makes the handshake fail. It also resumes a session with the
+ticket the first connection was given, and checks that a restarted server —
+a new ticket key — falls back to a full handshake that still succeeds.

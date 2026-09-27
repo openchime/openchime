@@ -1393,6 +1393,21 @@ static void test_call_frames(void) {
         oc_call_share out;
         CHECK(oc_decode_call_share(&p, &out) == OC_OK && out.channel_id == 7 && out.on == 1);
     }
+    {
+        /* CALL_MEDIA both ways: up carries no sender, down carries the relay's. */
+        static const uint8_t ct[] = { 1, 2, 3, 4, 5, 6, 7 };
+        oc_call_media_pkt in = { 0, 0xBEEF, { ct, sizeof ct } };
+        ROUNDTRIP(oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
+        oc_call_media_pkt out;
+        CHECK(oc_decode_call_media_up(&p, &out) == OC_OK && out.sender == 0 && out.seq == 0xBEEF);
+        CHECK(out.ct.len == sizeof ct && memcmp(out.ct.ptr, ct, sizeof ct) == 0);
+    }
+    {
+        oc_call_media_pkt in = { 42, 7, { NULL, 0 } };   /* a keepalive */
+        ROUNDTRIP(oc_encode_call_media_down(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_MEDIA, h, p);
+        oc_call_media_pkt out;
+        CHECK(oc_decode_call_media_down(&p, &out) == OC_OK && out.sender == 42 && out.seq == 7 && out.ct.len == 0);
+    }
 }
 
 static void test_webhook_frames(void) {

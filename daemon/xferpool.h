@@ -45,6 +45,7 @@
 #ifndef OC_XFERPOOL_H
 #define OC_XFERPOOL_H
 
+#include <mbedtls/sha256.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -75,6 +76,12 @@ typedef struct oc_xfer_job {
      * is reused before the worker runs). READ: the buffer the worker fills. */
     uint8_t   *data;
     size_t     len;            /* WRITE: byte count. READ: capacity in, count out. */
+
+    /* WRITE: the transfer's running digest, updated by the worker with the bytes
+     * it stored (NULL: none kept). Like the handle below, it belongs to the job
+     * while the job is out and goes back to the transfer in the result, so it is
+     * reachable from one place at a time; oc_xfer_job_free frees one still here. */
+    mbedtls_sha256_context *sha;
 
     /* The handle this job operates on, and which it hands back in the result. */
     oc_blob_writer *bw;

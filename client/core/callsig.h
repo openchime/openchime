@@ -49,7 +49,21 @@ typedef struct {
     void (*sharer)(void *ctx, uint64_t user);
     /* The video codecs it can decode, OC_CALL_CODEC_* bits, told on joining. */
     uint8_t codecs;
+    /* The connection transport (PROTOCOL.md §5.17), for when UDP cannot reach
+     * the relay. Before start, the core hands the engine `send` -- which queues
+     * one packet ({seq, ciphertext}) to go out as CALL_MEDIA, from any thread,
+     * never blocking -- or NULL when the daemon offers no such transport. The
+     * core hands the engine every CALL_MEDIA that comes back through `rx_tcp`.
+     * Either may be NULL in an engine that has no use for them. */
+    void (*tcp)(void *ctx, int (*send)(void *sctx, uint16_t seq, const uint8_t *ct, size_t len),
+                void *sctx);
+    void (*rx_tcp)(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len);
 } oc_call_media;
+
+/* Packets queued for the connection, oldest first; past OC_CALLSIG_TCPQ the
+ * oldest is dropped, as a UDP one would be. */
+#define OC_CALLSIG_TCPQ  64
+#define OC_CALLSIG_TCPMAX 1300
 
 /* Sends one encoded frame on the connection; 0 on success. */
 typedef int (*oc_callsig_write)(void *wctx, const uint8_t *buf, size_t len);
@@ -69,11 +83,21 @@ typedef struct {
     uint16_t n;
     oc_call_part parts[OC_MAX_CALL_PARTICIPANTS];
     char     host[256];
+
+    int      tcp_ok;               /* the daemon offers calls-tcp (CAPABILITIES) */
+    oc_mutex_t tq_mu;              /* guards the queue: filled by the engine's threads */
+    struct { uint16_t seq, len; uint8_t ct[OC_CALLSIG_TCPMAX]; } tq[OC_CALLSIG_TCPQ];
+    int      tq_head, tq_n;
+    void   (*wake)(void *wctx);    /* ends the connection thread's wait: a packet is queued */
+    void    *wake_ctx;
 } oc_callsig;
 
 void oc_callsig_init(oc_callsig *cs);
 void oc_callsig_destroy(oc_callsig *cs);
 void oc_callsig_set_media(oc_callsig *cs, const oc_call_media *media, void *ctx);
+/* What the connection thread gives the queue to wake it with (NULL: nothing).
+ * Once this returns with NULL, `wake` is not called again. */
+void oc_callsig_set_wake(oc_callsig *cs, void (*wake)(void *wctx), void *wctx);
 
 /* The info HPKE binds a sealed key to (CALLS.md §5.3); `out` holds
  * OC_CALLSIG_INFO_LEN bytes. Exposed for the tests. */
@@ -93,5 +117,10 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
 
 /* The connection dropped: the daemon took this device out of any call. */
 void oc_callsig_lost(oc_callsig *cs, oc_queue *to_ui);
+
+/* Write the media packets the engine queued for the connection, as CALL_MEDIA.
+ * The network thread calls it at the top of every turn, and is woken to (see
+ * oc_callsig_set_wake) when a packet is queued. Returns 0. */
+int oc_callsig_pump(oc_callsig *cs, oc_callsig_write write, void *wctx);
 
 #endif /* OC_CALLSIG_H */

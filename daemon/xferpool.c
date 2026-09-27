@@ -38,6 +38,7 @@ void oc_xfer_job_free(oc_xfer_job *j) {
     if (!j) return;
     free(j->key);
     free(j->data);
+    if (j->sha) { mbedtls_sha256_free(j->sha); free(j->sha); }
     free(j);
 }
 
@@ -71,6 +72,9 @@ static void run_job(oc_blobstore *bs, oc_xfer_job *j) {
         break;
     case OC_XFER_WRITE:
         j->rc = oc_blob_put_chunk(j->bw, j->data, j->len);
+        /* The digest covers exactly what was stored, in order: one write per
+         * transfer is out at a time, and the context travels with it. */
+        if (j->rc == 0 && j->sha && j->len) mbedtls_sha256_update(j->sha, j->data, j->len);
         break;
     case OC_XFER_COMMIT:
         j->rc = oc_blob_put_commit(j->bw);

@@ -24,6 +24,17 @@
 #define FRAME        OC_VOICE_FRAME
 #define KBPS         24
 #define KEEPALIVE_MS 5000
+/* The transport (PROTOCOL.md §5.17, AUDIO.md §4). A call starts on UDP and
+ * probes every PROBE_MS until the relay answers -- its keepalive echo, or anyone
+ * speaking; with no answer within UDP_WAIT_MS, and the daemon offering the
+ * connection transport, the engine sends by the connection instead. It does the
+ * same if UDP goes quiet mid-call for UDP_LOST_MS, over two keepalive echoes.
+ * On the connection it still probes UDP every TCP_PROBE_MS, and the first
+ * datagram back moves it to UDP again. */
+#define PROBE_MS     1000
+#define UDP_WAIT_MS  3000
+#define UDP_LOST_MS  12000
+#define TCP_PROBE_MS 10000
 #define GRACE_MS     1000      /* a new key is used this long after it is made */
 #define RETIRE_MS    5000      /* an old key is kept this long after its successor is used */
 #define MAX_PEERS    32
@@ -115,7 +126,15 @@ struct oc_call_engine {
     atomic_int  muted, ptt, ns, reopen_mic, reopen_spk;
     atomic_int  mic_level, speaking, mic_error, spk_error, loss_pct;
     atomic_uint sent, keepalives;
-    int64_t     last_send;
+    atomic_llong last_send;   /* written by every sender, read by the I/O thread */
+
+    /* The connection transport: how to hand a packet to it (NULL when the
+     * daemon offers none), whether sending goes that way now, and when the
+     * relay was last heard over UDP. */
+    int       (*tcp_send)(void *sctx, uint16_t seq, const uint8_t *ct, size_t len);
+    void       *tcp_ctx;
+    atomic_int  on_tcp;
+    int64_t     started_ms, udp_heard_ms, last_probe_ms;
 
     /* Screen sharing (REQ-161, VIDEO.md). share_mu guards all of it and is taken
      * before mu, never after. */
@@ -152,15 +171,38 @@ static void m_tx_key(void *ctx, uint32_t epoch, uint8_t slot, const uint8_t key[
 static void m_rx_key(void *ctx, uint64_t user, uint8_t slot, uint32_t epoch, const uint8_t key[OC_CALL_KEY_LEN]);
 static void m_stop(void *ctx);
 static void m_sharer(void *ctx, uint64_t user);
+static void m_tcp(void *ctx, int (*send)(void *, uint16_t, const uint8_t *, size_t), void *sctx);
+static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len);
 
-static const oc_call_media MEDIA = { m_start, m_roster, m_tx_key, m_rx_key, m_stop, m_sharer, OC_CALL_CODEC_VP9 };
+static const oc_call_media MEDIA = { m_start, m_roster, m_tx_key, m_rx_key, m_stop, m_sharer, OC_CALL_CODEC_VP9,
+                                     m_tcp, m_rx_tcp };
 const oc_call_media *oc_call_engine_media(void) { return &MEDIA; }
 
 static uint64_t kid_of(uint32_t epoch, uint8_t slot) { return ((uint64_t)epoch << 8) | slot; }
 
 /* --- sending -------------------------------------------------------------------- */
 
+/* One datagram to the relay, by UDP whatever the transport: a probe. */
+static void send_udp(oc_call_engine *e, const uint8_t *payload, size_t len) {
+    uint8_t pkt[PACKET_MAX];
+    if (e->token_len + 2 + len > sizeof pkt) return;
+    memcpy(pkt, e->token, e->token_len);
+    pkt[e->token_len] = (uint8_t)(e->seq >> 8);
+    pkt[e->token_len + 1] = (uint8_t)e->seq;
+    e->seq++;
+    if (len) memcpy(pkt + e->token_len + 2, payload, len);
+    sendto(e->sock, (const char *)pkt, (int)(e->token_len + 2 + len), 0,
+           (const struct sockaddr *)&e->relay, sizeof e->relay);
+}
+
+/* One packet to the relay, by the transport in use. Called with mu held: the
+ * sequence number and last_send are the call's, shared by every sender. */
 static void send_raw(oc_call_engine *e, const uint8_t *payload, size_t len) {
+    if (atomic_load(&e->on_tcp) && e->tcp_send) {
+        e->tcp_send(e->tcp_ctx, e->seq++, payload, len);
+        e->last_send = now_ms();
+        return;
+    }
     uint8_t pkt[PACKET_MAX];
     if (e->token_len + 2 + len > sizeof pkt) return;
     memcpy(pkt, e->token, e->token_len);
@@ -176,7 +218,9 @@ static void send_raw(oc_call_engine *e, const uint8_t *payload, size_t len) {
 /* A keep-alive is an empty payload: the relay needs only the token to know the
  * sender is still there, and an empty packet says nothing to anyone. */
 static void send_keepalive(oc_call_engine *e) {
+    oc_mutex_lock(&e->mu);
     send_raw(e, NULL, 0);
+    oc_mutex_unlock(&e->mu);
     atomic_fetch_add(&e->keepalives, 1);
 }
 
@@ -305,15 +349,38 @@ static void *io_main(void *arg) {
     uint8_t pkt[PACKET_MAX + 64];
     int64_t last_sweep = now_ms();
     send_keepalive(e);          /* the relay learns this address before anyone speaks */
+    e->last_probe_ms = now_ms();
     while (!atomic_load(&e->stop)) {
         if (oc_poll(e->sock, 0, 20) > 0) {
             for (;;) {
                 int n = (int)recv(e->sock, (char *)pkt, (int)sizeof pkt, 0);
                 if (n <= 0) break;
+                /* Anything from the relay, its keepalive echo included, says
+                 * UDP gets through both ways. */
+                e->udp_heard_ms = now_ms();
+                if (atomic_exchange(&e->on_tcp, 0)) e->last_send = 0;   /* back on UDP: say so now */
                 on_packet(e, pkt, (size_t)n);
             }
         }
         int64_t t = now_ms();
+        int tcp = atomic_load(&e->on_tcp);
+        if (!tcp && e->tcp_send) {
+            int64_t since = e->udp_heard_ms ? e->udp_heard_ms : e->started_ms;
+            if (t - since >= (e->udp_heard_ms ? UDP_LOST_MS : UDP_WAIT_MS)) {
+                atomic_store(&e->on_tcp, 1);
+                e->last_send = 0;   /* the first keepalive by the connection goes now */
+                tcp = 1;
+            }
+        }
+        if (!e->udp_heard_ms && !tcp && t - e->last_probe_ms >= PROBE_MS) {
+            e->last_probe_ms = t;
+            send_keepalive(e);
+        } else if (tcp && t - e->last_probe_ms >= TCP_PROBE_MS) {
+            e->last_probe_ms = t;
+            oc_mutex_lock(&e->mu);
+            send_udp(e, NULL, 0);
+            oc_mutex_unlock(&e->mu);
+        }
         if (t - e->last_send >= KEEPALIVE_MS) send_keepalive(e);
         if (t - last_sweep >= 1000) {
             last_sweep = t;
@@ -810,6 +877,9 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     oc_mutex_unlock(&e->share_mu);
     e->seq = 0;
     e->last_send = 0;
+    e->started_ms = now_ms();
+    e->udp_heard_ms = 0;
+    atomic_store(&e->on_tcp, 0);
     atomic_store(&e->stop, 0);
     atomic_store(&e->sent, 0);
     atomic_store(&e->keepalives, 0);
@@ -828,6 +898,25 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     }
     e->active = 1;
     return 0;
+}
+
+static void m_tcp(void *ctx, int (*send)(void *, uint16_t, const uint8_t *, size_t), void *sctx) {
+    oc_call_engine *e = ctx;
+    oc_mutex_lock(&e->mu);
+    e->tcp_send = send;
+    e->tcp_ctx = sctx;
+    oc_mutex_unlock(&e->mu);
+}
+
+/* A packet the relay sent by the connection: the same bytes a datagram carries. */
+static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len) {
+    oc_call_engine *e = ctx;
+    uint8_t pkt[PACKET_MAX + S2C_HDR];
+    if (len + S2C_HDR > sizeof pkt) return;
+    for (int i = 0; i < 8; i++) pkt[i] = (uint8_t)(sender >> (56 - 8 * i));
+    pkt[8] = (uint8_t)(seq >> 8); pkt[9] = (uint8_t)seq;
+    if (len) memcpy(pkt + S2C_HDR, ct, len);
+    on_packet(e, pkt, S2C_HDR + len);
 }
 
 static void m_roster(void *ctx, uint32_t epoch, const oc_call_part *parts, int n) {
@@ -1080,6 +1169,7 @@ void oc_call_engine_stats(oc_call_engine *e, oc_call_stats *out) {
     out->mic_level = atomic_load(&e->mic_level);
     out->sent = atomic_load(&e->sent);
     out->keepalives = atomic_load(&e->keepalives);
+    out->transport = atomic_load(&e->on_tcp) ? 1 : 0;
     out->loss_pct = atomic_load(&e->loss_pct);
     oc_mutex_lock(&e->share_mu);
     out->sharer = e->sharer;

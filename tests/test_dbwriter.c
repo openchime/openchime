@@ -55,7 +55,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 46);
+    CHECK(oc_schema_version(db) == 47);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -5950,9 +5950,221 @@ static void test_welcome_general(void) {
     cleanup_db(path);
 }
 
+/* --- The auth pool and the readers (ARCH-5/66) ---------------------------------- */
+
+static uint64_t pool_mono_us(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static oc_dbres *wait_result_ms(oc_dbwriter *w, int ms) {
+    for (int i = 0; i < ms / 2; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) return r;
+        usleep(2000);
+    }
+    return NULL;
+}
+
+static void submit_local_auth(oc_dbwriter *w, uint64_t conn_id, const char *user, const char *pass) {
+    uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
+    j->method = OC_AUTH_LOCAL;
+    oc_job_set_token(j, cbuf, cw.len);
+    oc_dbwriter_submit(w, j);
+}
+
+static void submit_change(oc_dbwriter *w, uint64_t conn, uint64_t uid, const char *oldpw, const char *newpw) {
+    oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, conn);
+    j->user_id = uid;
+    j->pf_old_pw = strdup(oldpw);
+    j->pf_new_pw = strdup(newpw);
+    oc_dbwriter_submit(w, j);
+}
+
+/* Changing a password goes through the auth pool as a sign-in does (AUTH.md
+ * §2): the new one works and the old one no longer does; a wrong old password
+ * is refused; a change held on the pool does not hold the writer, so a send
+ * commits meanwhile; and of two changes checked against the same credential,
+ * the one stored second finds it changed and is refused. */
+static void test_change_password(void) {
+    const char *path = "build/test_dbwriter_chpw.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t u = reg(w, "chg", "pw-one", OC_ROLE_MEMBER);
+    CHECK(u != 0 && auth_local(w, 10, "chg", "pw-one", NULL, NULL) == u);
+
+    submit_change(w, 11, u, "pw-one", "pw-two");
+    oc_dbres *r = wait_result_ms(w, 60000);
+    CHECK(r && r->conn_id == 11 && r->type != OC_RES_PROFILE_ERR);
+    oc_dbres_free(r);
+    CHECK(auth_local(w, 12, "chg", "pw-two", NULL, NULL) == u);
+    CHECK(auth_local(w, 13, "chg", "pw-one", NULL, NULL) == 0);
+
+    submit_change(w, 14, u, "not-it", "pw-three");
+    r = wait_result_ms(w, 60000);
+    CHECK(r && r->conn_id == 14 && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Held on the pool, the change leaves the writer free. */
+    oc_dbwriter_hold_auth(w, 1);
+    submit_change(w, 15, u, "pw-two", "pw-three");
+    int queued = 0;
+    for (int i = 0; i < 500 && !queued; i++) {
+        queued = oc_dbwriter_auth_waiting(w) == 1;
+        if (!queued) usleep(10000);
+    }
+    CHECK(queued);
+    oc_job *sj = oc_job_new(OC_JOB_SEND, 16);
+    sj->user_id = u; sj->channel_id = 1;
+    memset(sj->idem, 0x6C, OC_IDEM_LEN);
+    oc_job_set_body(sj, "while it changes", 16);
+    oc_dbwriter_submit(w, sj);
+    r = wait_result_ms(w, 60000);
+    CHECK(r && r->conn_id == 16 && r->type == OC_RES_SEND_OK);
+    oc_dbres_free(r);
+    oc_dbwriter_hold_auth(w, 0);
+    r = wait_result_ms(w, 60000);
+    CHECK(r && r->conn_id == 15 && r->type != OC_RES_PROFILE_ERR);
+    oc_dbres_free(r);
+
+    /* Two changes from the same password, both checked before either is stored:
+     * exactly one lands, and the password is the one it set. */
+    oc_dbwriter_hold_auth(w, 1);
+    submit_change(w, 17, u, "pw-three", "pw-four");
+    submit_change(w, 18, u, "pw-three", "pw-five");
+    queued = 0;
+    for (int i = 0; i < 500 && !queued; i++) {
+        queued = oc_dbwriter_auth_waiting(w) == 2;
+        if (!queued) usleep(10000);
+    }
+    CHECK(queued);
+    oc_dbwriter_hold_auth(w, 0);
+    int won = 0, lost = 0; uint64_t winner = 0;
+    for (int k = 0; k < 2; k++) {
+        r = wait_result_ms(w, 60000);
+        if (r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN) lost++;
+        else if (r) { won++; winner = r->conn_id; }
+        oc_dbres_free(r);
+    }
+    CHECK(won == 1 && lost == 1);
+    CHECK(auth_local(w, 19, "chg", winner == 17 ? "pw-four" : "pw-five", NULL, NULL) == u);
+    CHECK(auth_local(w, 20, "chg", winner == 17 ? "pw-five" : "pw-four", NULL, NULL) == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A burst of password sign-ins -- each a deliberately slow key derivation -- is
+ * worked off the writer, so someone else's message is committed while they are
+ * still being checked rather than after all of them. And a password changed
+ * while its old value is being checked refuses the sign-in: the writer finishes
+ * one only if the credential that was checked is still, by its version, the
+ * stored one. */
+static void test_auth_pool(void) {
+    const char *path = "build/test_dbwriter_pool.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    /* Slow enough that twenty of them take a while on two threads, and the one
+     * send stands out against them. */
+    uint64_t slow = oc_dbwriter_register_local(w, "slow", "pw-slow", OC_ROLE_MEMBER, 200000);
+    uint64_t fast = reg(w, "fast", "pw-fast", OC_ROLE_MEMBER);
+    CHECK(slow && fast);
+    CHECK(auth_local(w, 50, "fast", "pw-fast", NULL, NULL) == fast);   /* joins #general */
+
+    uint64_t t0 = pool_mono_us();
+    for (uint64_t c = 100; c < 120; c++) submit_local_auth(w, c, "slow", "pw-slow");
+    oc_job *sj = oc_job_new(OC_JOB_SEND, 200);
+    sj->user_id = fast; sj->channel_id = 1;
+    memset(sj->idem, 0x5A, OC_IDEM_LEN);
+    oc_job_set_body(sj, "while they sign in", 18);
+    oc_dbwriter_submit(w, sj);
+    uint64_t t_send = 0, t_auth = 0;
+    int auth_ok = 0;
+    for (int got = 0; got < 21; got++) {
+        oc_dbres *r = wait_result_ms(w, 60000);
+        if (!r) break;
+        for (oc_dbres *x = r; x; x = x->next) {
+            if (x->type == OC_RES_SEND_OK && x->conn_id == 200 && !t_send) t_send = pool_mono_us() - t0;
+            if (x->type == OC_RES_AUTH_OK && x->conn_id >= 100 && x->conn_id < 120) { auth_ok++; t_auth = pool_mono_us() - t0; }
+        }
+        oc_dbres_free(r);
+    }
+    CHECK(auth_ok == 20);
+    CHECK(t_send > 0 && t_send * 3 < t_auth);
+    printf("  twenty slow sign-ins done at %.0f ms; a send between them committed at %.0f ms\n",
+           t_auth / 1000.0, t_send / 1000.0);
+
+    /* The race, arranged rather than hoped for: with the pool held, a
+     * sign-in's credential is fetched and its check waits; the stored
+     * credential is then rewritten -- the same password, a new version, as any
+     * write of it would leave it -- and then the check runs. The sign-in is
+     * refused. The same without the rewrite is accepted, so what refuses it is
+     * the version. (A change through the daemon waits on the same pool; the
+     * race between changes is test_change_password's.) */
+    for (int change = 0; change < 2; change++) {
+        uint64_t conn = 300 + (uint64_t)change;
+        oc_dbwriter_hold_auth(w, 1);
+        submit_local_auth(w, conn, "fast", "pw-fast");
+        int queued = 0;
+        for (int i = 0; i < 500 && !queued; i++) {
+            queued = oc_dbwriter_auth_waiting(w) == 1;
+            if (!queued) usleep(10000);
+        }
+        CHECK(queued);
+        if (change) {
+            sqlite3 *db = NULL;
+            CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+            sqlite3_busy_timeout(db, 5000);
+            char sql[256];
+            snprintf(sql, sizeof sql,
+                     "UPDATE credential_version_seq SET next = next + 1 WHERE id = 1;"
+                     "UPDATE local_credentials SET version = (SELECT next - 1 FROM credential_version_seq) "
+                     "WHERE user_id = %llu;", (unsigned long long)fast);
+            CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+            sqlite3_close(db);
+        }
+        oc_dbwriter_hold_auth(w, 0);
+        oc_dbres *r = wait_result_ms(w, 60000);
+        CHECK(r && r->conn_id == conn);
+        CHECK(r && r->type == (change ? OC_RES_AUTH_ERR : OC_RES_AUTH_OK));
+        oc_dbres_free(r);
+    }
+
+    /* One connection's reads, with three readers, come back in the order asked:
+     * sixty lookups of attachments that do not exist, each answer naming its id,
+     * interleaved with another connection's. */
+    for (uint64_t k = 0; k < 60; k++) {
+        oc_job *j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 400);
+        j->user_id = fast; j->attachment_id = 1000 + k;
+        oc_dbwriter_submit(w, j);
+        oc_job *o = oc_job_new(OC_JOB_ATTACH_LOOKUP, 401 + k % 5);
+        o->user_id = fast; o->attachment_id = 5000 + k;
+        oc_dbwriter_submit(w, o);
+    }
+    uint64_t next = 1000; int in_order = 1, seen = 0;
+    for (int got = 0; got < 120; got++) {
+        oc_dbres *x = wait_result_ms(w, 5000);
+        if (!x) break;
+        if (x->conn_id == 400) { if (x->attachment_id != next) in_order = 0; next++; seen++; }
+        oc_dbres_free(x);
+    }
+    CHECK(seen == 60 && in_order);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_start_migrates_and_stops();
+    test_auth_pool();
+    test_change_password();
     test_invite_by_address();
     test_welcome_general();
     test_auth_and_send();

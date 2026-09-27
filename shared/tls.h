@@ -21,6 +21,7 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ticket.h>
 #include <mbedtls/x509_crt.h>
 
 #define OC_TLS_FINGERPRINT_LEN 32 /* SHA-256 of the certificate DER */
@@ -33,13 +34,22 @@ typedef enum {
     OC_TLS_ERROR     = -1
 } oc_tls_status;
 
-/* Server-side TLS state: RNG, the daemon's cert+key, and the shared config. */
+/* How long a session ticket the daemon issues can be used to resume. Its key
+ * is made at start, so a restart ends every ticket issued before it. */
+#define OC_TLS_TICKET_LIFETIME_S 86400
+
+/* Server-side TLS state: RNG, the daemon's cert+key, the shared config, and the
+ * key its session tickets are sealed with. A client that returns with one
+ * resumes the session without the certificate exchange and signature a full
+ * handshake costs; `resumed` counts those (read with __atomic loads). */
 typedef struct {
     mbedtls_entropy_context  entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_pk_context       key;
     mbedtls_x509_crt         cert;
     mbedtls_ssl_config       conf;
+    mbedtls_ssl_ticket_context ticket;
+    unsigned long            resumed;
 } oc_tls_server;
 
 /* Client-side TLS state, with three mutually exclusive trust modes:
@@ -65,10 +75,18 @@ typedef struct {
     int                      ca_mode;
 } oc_tls_client;
 
+/* A session a client can resume: kept from a connection the daemon gave a
+ * ticket on, offered on the next. */
+typedef struct {
+    mbedtls_ssl_session s;
+    int                 have;
+} oc_tls_session;
+
 /* One TLS connection over an already-connected, non-blocking socket `fd`. */
 typedef struct {
     mbedtls_ssl_context ssl;
     int                 fd;
+    oc_tls_session     *keep;    /* client: where a ticket the server gives goes */
 } oc_tls_conn;
 
 /* Load the cert+key from the given PEM paths, generating a self-signed pair
@@ -113,6 +131,15 @@ int  oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd);
  * the certificate's name actually get checked. Call before the handshake. */
 int  oc_tls_conn_set_hostname(oc_tls_conn *c, const char *host);
 void oc_tls_conn_free(oc_tls_conn *c);
+
+void oc_tls_session_init(oc_tls_session *s);
+/* Forget it: the next connection does a full handshake. */
+void oc_tls_session_free(oc_tls_session *s);
+/* Client, before the handshake: offer `s` if it holds a session, and keep in it
+ * any ticket the server gives on this connection. `s` must outlive `c`. A
+ * session the server no longer accepts costs nothing: the handshake is a full
+ * one. Returns 0. */
+int  oc_tls_conn_resume(oc_tls_conn *c, oc_tls_session *s);
 
 /* Drive the handshake / I/O. Each returns an oc_tls_status; on OK, read/write
  * set *n to the byte count transferred. WANT_READ/WANT_WRITE mean re-arm epoll

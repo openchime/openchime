@@ -1663,6 +1663,21 @@ oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_call_media_up(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_MEDIA);
+    oc_w_u16(w, m->seq);
+    oc_w_bytes(w, m->ct);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_MEDIA);
+    oc_w_u64(w, m->sender);
+    oc_w_u16(w, m->seq);
+    oc_w_bytes(w, m->ct);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m, uint64_t *invite, uint16_t cap) {
     m->channel_id = oc_r_u64(p);
     r_raw(p, m->device_key, OC_CALL_DEVICE_KEY_LEN);
@@ -1765,6 +1780,20 @@ oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m) {
 oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m) {
     m->channel_id = oc_r_u64(p);
     m->on = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_media_up(oc_rbuf *p, oc_call_media_pkt *m) {
+    m->sender = 0;
+    m->seq = oc_r_u16(p);
+    m->ct = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m) {
+    m->sender = oc_r_u64(p);
+    m->seq = oc_r_u16(p);
+    m->ct = oc_r_bytes(p);
     return r_done(p);
 }
 

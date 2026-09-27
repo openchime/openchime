@@ -135,7 +135,7 @@ fail, bounded and silent.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_AUDIO_PORT` | `0` (ephemeral) | UDP port for the forked audio-relay sidecar (ARCH-28/73). **`0` means the kernel picks a free port, not that audio is off** — the daemon binds the socket, reads the assigned port back with `getsockname`, forks the sidecar unconditionally, and advertises that port in `CALL_JOINED`. Setting a value pins the port. The relay forwards opaque payloads — SFrame ciphertext (ARCH-113) — and the daemon never decodes a codec. A client behind NAT reaches it over UDP, so the port has to be reachable as the protocol port is: a deployment that forwards ports, as a container platform does, pins it here and exposes it. The relay binds every address, IPv6 and IPv4, and answers from the address each client sent to (AUDIO.md §4). |
+| `OPENCHIME_AUDIO_PORT` | `0` (ephemeral) | UDP port for the call relay, which runs in the daemon's event loop (ARCH-18/73). **`0` means the kernel picks a free port, not that audio is off** — the daemon binds the socket, reads the assigned port back with `getsockname`, runs the relay on it in its event loop, and advertises that port in `CALL_JOINED`. Setting a value pins the port. The relay forwards opaque payloads — SFrame ciphertext (ARCH-113) — and the daemon never decodes a codec. A client behind NAT reaches it over UDP, so the port has to be reachable as the protocol port is: a deployment that forwards ports, as a container platform does, pins it here and exposes it. The relay binds every address, IPv6 and IPv4, and answers from the address each client sent to (AUDIO.md §4). |
 | `OPENCHIME_AUDIO_ADVERTISE_PORT` | *(the bound port)* | The UDP port `CALL_JOINED` tells clients to send to, where it is not the one the relay bound: a front door forwarding UDP from its own port (AUDIO.md §4). Unset, the bound port is advertised. Not a port 0–65535 stops the boot. |
 | `OPENCHIME_AUDIO_TOKEN_PREFIX` | *(none)* | Hex, up to 16 bytes, put in front of every relay token's 16 random bytes so a front door serving many workspaces can tell whose a packet is (AUDIO.md §4). The token leads every packet in the clear, so the prefix is not a secret and must not be one. Odd-length, non-hex or longer than 16 bytes stops the boot. |
 | `OPENCHIME_CALL_MAX` | `10` | The most people in one call (REQ-305), clamped to 2–32 and announced to clients on `WORKSPACE_INFO`. Every participant receives and mixes every other's stream (AUDIO.md §1.1), so this bounds each client's download and decoding as well as the relay's fan-out. |
@@ -273,8 +273,8 @@ deployment configuration: `OPENCHIME_UNFURL_ALLOW_PRIVATE` (disables the unfurl
 fetcher's SSRF gate so a test can fetch a loopback fixture — never set it in a
 deployment), `OC_FUZZ_RANDOM_ITERS` / `OC_FUZZ_FRAMED_ITERS` (fuzz
 depth, defaults 30000 / 15000), `OC_NETLOOP_MAX_FD` (4096, a compile-time
-constant, **not** an environment variable), `OC_AUDIO_SILENCE_MS` (sidecar
-UDP silence sweep, which a test shortens with `oc_audio_sidecar_set_silence_ms`),
+constant, **not** an environment variable), `OC_AUDIO_SILENCE_MS` (the relay's
+UDP silence sweep, which a test shortens with `oc_netloop_set_relay_silence_ms`),
 and, in the clients, `OPENCHIME_TEST_AUDIO`, `OPENCHIME_TEST_MIC` and
 `OPENCHIME_TEST_TONE` — the synthetic audio devices, what the synthetic
 microphone speaks, and its tone (440 Hz unless set), which `scripts/gui_calls.sh`

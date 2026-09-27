@@ -106,6 +106,11 @@ static void *run(void *arg) {
         if (!engine) {
             snprintf(n->r.reason, sizeof n->r.reason, "opening the engine: %.120s", err);
         } else {
+            /* Wire order to host order, in place: sample i is read from the two
+             * bytes it is then written over. */
+            const uint8_t *le = (const uint8_t *)j->pcm;
+            for (size_t i = 0; i < j->samples; i++)
+                j->pcm[i] = (int16_t)(uint16_t)(le[2 * i] | le[2 * i + 1] << 8);
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
             int rc = w->engine->hear(engine, j->pcm, j->samples, &n->r.text, err, sizeof err);

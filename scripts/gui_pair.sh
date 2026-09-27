@@ -66,6 +66,7 @@ up)
         OPENCHIME_WORKSPACE_NAME="Acme HQ" \
         OPENCHIME_BOOTSTRAP_USERS="${OC_PAIR_USERS:-alice:pw:owner,bob:pw:member}" \
         OPENCHIME_CALL_MAX="${OC_PAIR_CALL_MAX:-10}" \
+        ${OC_PAIR_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_PAIR_ADVERTISE_PORT"} \
         OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
         setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &
     disown

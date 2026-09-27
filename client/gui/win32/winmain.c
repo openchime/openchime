@@ -15178,6 +15178,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     const char *hint = st.mic_error ? "The microphone could not be opened: you can listen, but not be heard."
                      : st.speaker_error ? "The speaker could not be opened."
                      : GetTickCount64() < g_share_err_until ? "Sharing stopped: what was shared went away, or Windows refused it."
+                     : st.transport ? "This network blocks the call's own route, so its audio is going through the server connection."
                      : muted ? "Muted. Hold Ctrl+Shift+Space to talk; Ctrl+Shift+M to unmute."
                      : "Ctrl+Shift+M mutes. Hold Ctrl+Shift+Space to talk while muted.";
     draw_text(rt, hint, g_meta, rf(body.left + 24, row1 - UIS(26), body.right - 24, row1 - 4),
@@ -25609,14 +25610,15 @@ static void test_dump(const char *path) {
         if (g_call_engine) oc_call_engine_stats(g_call_engine, &cs);
         fprintf(f, "call in=%d ch=%llu id=%llu epoch=%u starter=%llu parts=%u invited=%u pending=%llu"
                    " err=%u err_seq=%u view=%llu engine=%d active=%d muted=%d ptt=%d speaking=%d"
-                   " mic_level=%d sent=%u keepalives=%u tx_epoch=%u loss=%d target_ms=%d mic_err=%d spk_err=%d"
+                   " mic_level=%d sent=%u keepalives=%u transport=%s tx_epoch=%u loss=%d target_ms=%d mic_err=%d spk_err=%d"
                    " ns=%d cap=%u self=%llu slot=%u inview=%d hdr=%.0f,%.0f,%.0f,%.0f strip=%.0f,%.0f,%.0f,%.0f"
                    " stripmute=%.0f,%.0f,%.0f,%.0f stripleave=%.0f,%.0f,%.0f,%.0f\n",
                 m->in_call, (unsigned long long)m->call.channel_id, (unsigned long long)m->call.call_id,
                 m->call.epoch, (unsigned long long)m->call.starter, (unsigned)m->call.n_parts,
                 (unsigned)m->call.n_invited, (unsigned long long)m->call_pending, (unsigned)m->call_error,
                 m->call_error_seq, (unsigned long long)g_call_view_ch, g_call_engine != NULL, cs.active,
-                cs.muted, cs.ptt, cs.speaking, cs.mic_level, cs.sent, cs.keepalives, cs.epoch, cs.loss_pct,
+                cs.muted, cs.ptt, cs.speaking, cs.mic_level, cs.sent, cs.keepalives,
+                cs.transport ? "tcp" : "udp", cs.epoch, cs.loss_pct,
                 cs.target_ms, cs.mic_error, cs.speaker_error, g_call_ns, (unsigned)m->call_max,
                 (unsigned long long)cs.self_user, (unsigned)cs.slot, g_view == VIEW_CALL,
                 g_call_hdr_btn.left, g_call_hdr_btn.top, g_call_hdr_btn.right, g_call_hdr_btn.bottom,

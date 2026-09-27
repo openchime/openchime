@@ -127,11 +127,13 @@ relay is up to carry them, so a client shows no call control a daemon cannot bac
 anywhere. It is not searchable, not read aloud and never notifies. ARCH-90 excludes system
 messages; this is the one kind it admits.
 
-**The relay** (ARCH-31) is unchanged: it forwards opaque payloads tagged with the sender and
-never decodes them — audio, a shared screen and the viewers' requests alike. What it
-forwards is ciphertext. When its silence sweep drops a
-participant it tells the daemon, which removes them from the call so the roster stays
-honest.
+**The relay** runs in the daemon's event loop (ARCH-18/31): it forwards opaque payloads
+tagged with the sender and never decodes them — audio, a shared screen and the viewers'
+requests alike. What it forwards is ciphertext. When its silence sweep drops a participant
+the loop removes them from the call so the roster stays honest. A participant whose
+network passes no UDP carries the same packets over its connection (`CALL_MEDIA`, offered
+as `calls-tcp`; PROTOCOL.md §5.17, AUDIO.md §4), and the relay forwards between the two
+transports; nothing about the encryption changes, since the packets are the same.
 
 ## 5. End-to-end encryption
 
