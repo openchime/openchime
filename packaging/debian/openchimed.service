@@ -58,9 +58,9 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-# AF_UNIX is not optional: the daemon forks an audio relay sidecar (ARCH-28) and
-# talks to it over a Unix socket pair. AF_INET/AF_INET6 cover the listeners and
-# the sidecar's UDP socket.
+# AF_INET/AF_INET6 cover the listeners and the call relay's UDP socket. AF_UNIX
+# is the C library's: name lookups for S3 and the control plane reach the
+# system's resolver and name-service daemons over a Unix socket.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 Restart=on-failure

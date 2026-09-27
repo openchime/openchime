@@ -9,6 +9,7 @@
 #define OC_SIGNIN_H
 
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #define OC_SIGNIN_VERIFIER_LEN  43   /* base64url of 32 random bytes */
@@ -44,7 +45,7 @@ typedef enum {
  * into `query`. Requests for any other path or method are answered 404 and
  * ignored, so a port scanner or a second tab ends nothing. `cancel` (may be
  * NULL) is polled; set it non-zero from another thread to stop. */
-oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const volatile int *cancel,
+oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const atomic_int *cancel,
                                     char *query, size_t qcap);
 
 void oc_loopback_close(oc_loopback *lb);

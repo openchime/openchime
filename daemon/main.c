@@ -35,7 +35,6 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -205,42 +204,6 @@ static void *health_thread(void *arg) {
     return NULL;
 }
 
-/* The audio sidecar (ARCH-28/31/73). The daemon keeps the bound UDP socket for
- * its whole life, so a restarted sidecar relays on the same port every
- * CALL_JOINED has already advertised. */
-static int   g_audio_udp = -1;
-static unsigned g_audio_port;
-static long  g_audio_maxfd = 1024;
-
-/* Fork a sidecar on g_audio_udp; returns the daemon's end of its IPC socket, or
- * -1. Used at startup and again by the net loop whenever the sidecar exits.
- *
- * Two constraints on the child, both because this runs in a process that already
- * has threads and, on a restart, live connections:
- *
- * - It closes every descriptor it inherited except its two. Mid-flight those
- *   include every client connection, and a sidecar holding one would stop that
- *   connection from ever closing when the daemon closes it.
- * - It runs only oc_audio_sidecar_run, which must stay free of anything unsafe
- *   after fork() in a threaded process -- no allocation, no stdio. Another thread
- *   may have held the allocator's lock at the moment of the fork, and the child
- *   would wait on it for ever. */
-static int audio_sidecar_spawn(void *ctx) {
-    (void)ctx;
-    int sv[2];
-    if (g_audio_udp < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
-    pid_t pid = fork();
-    if (pid == 0) {
-        for (long fd = 3; fd < g_audio_maxfd; fd++)
-            if (fd != sv[1] && fd != g_audio_udp) close((int)fd);
-        _exit(oc_audio_sidecar_run(sv[1], g_audio_udp, &g_stop));
-    }
-    close(sv[1]);
-    if (pid < 0) { close(sv[0]); return -1; }
-    fprintf(stderr, "openchimed: audio sidecar pid %d, UDP :%u\n", (int)pid, g_audio_port);
-    return sv[0];
-}
-
 /* --- the federated services, once the binding is active (ARCH-85) --------- */
 
 /* What runs on the enrollment: the push emitter and the invitation mail report.
@@ -376,10 +339,6 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    /* The only child the daemon has is the audio sidecar, and nothing needs its
-     * exit status: the net loop learns of its exit from its IPC socket. So let
-     * the kernel reap it, and no exited sidecar is ever left as a zombie. */
-    signal(SIGCHLD, SIG_IGN);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
 
     fprintf(stderr, "openchimed: version %s (protocol %u)\n", OC_VERSION,
@@ -684,36 +643,30 @@ int main(int argc, char **argv) {
     pthread_create(&hz, NULL, health_thread, &health_port);
     pthread_detach(hz);
 
-    /* Fork the audio relay sidecar (REQ-150/151, ARCH-28/31): bind its UDP
-     * socket here (so we learn the port to advertise), pair a Unix socket for
-     * IPC, and fork. The child runs the relay and exits when this daemon closes
-     * its IPC end (EOF); a fork failure just disables media (calls still form). */
+    /* Call media (REQ-150/151, ARCH-18/73): bind the relay's UDP socket here, so
+     * the port to advertise is known, and hand it to the net loop, whose relay
+     * runs on it. A socket that cannot be bound leaves calls refused. */
+    int audio_udp = -1;
     {
         int uport = cfg->audio_port;   /* 0 = ephemeral */
         const char *op = "socket";
-        int udp = oc_listen_bind(SOCK_DGRAM, uport, &op);
-        if (udp >= 0) {
+        audio_udp = oc_listen_bind(SOCK_DGRAM, uport, &op);
+        if (audio_udp >= 0) {
             struct sockaddr_storage ua; socklen_t sl = sizeof ua;
-            getsockname(udp, (struct sockaddr *)&ua, &sl);
-            g_audio_udp = udp;
-            g_audio_port = ntohs(ua.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&ua)->sin6_port
-                                                         : ((struct sockaddr_in *)&ua)->sin_port);
-            struct rlimit rl;
-            if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
-                g_audio_maxfd = rl.rlim_cur > 65536 ? 65536 : (long)rl.rlim_cur;
-            int ipc = audio_sidecar_spawn(NULL);
-            if (ipc >= 0) {
-                oc_netloop_set_audio(ipc, g_audio_port);
-                oc_netloop_set_audio_respawn(audio_sidecar_spawn, NULL);
-            }
+            getsockname(audio_udp, (struct sockaddr *)&ua, &sl);
+            unsigned aport = ntohs(ua.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&ua)->sin6_port
+                                                           : ((struct sockaddr_in *)&ua)->sin_port);
+            oc_netloop_set_audio(audio_udp, (uint16_t)aport);
+            fprintf(stderr, "openchimed: call relay on UDP :%u\n", aport);
         } else {
-            fprintf(stderr, "openchimed: audio relay %s on UDP :%d: %s; calls are off\n",
+            fprintf(stderr, "openchimed: call relay %s on UDP :%d: %s; calls are off\n",
                     op, uport, strerror(errno));
         }
     }
 
     /* Serve the binary protocol until a shutdown signal. */
     int served = oc_netloop_run(proto_port, &tls, db, &g_stop);
+    if (audio_udp >= 0) close(audio_udp);
 
     /* Tear down either way — a daemon that could not start still holds a
      * database handle, a TLS context and two worker threads. A claim still

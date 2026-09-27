@@ -134,6 +134,22 @@ done:
 
 /* --- Server ------------------------------------------------------------- */
 
+/* The ticket callbacks share one context (mbedtls_ssl_conf_session_tickets_cb):
+ * the server, whose ticket key seals a ticket and opens one a client offers --
+ * counted when it resumes a session. */
+static int ticket_write(void *p, const mbedtls_ssl_session *session, unsigned char *start,
+                        const unsigned char *end, size_t *tlen, uint32_t *lifetime) {
+    oc_tls_server *s = p;
+    return mbedtls_ssl_ticket_write(&s->ticket, session, start, end, tlen, lifetime);
+}
+
+static int ticket_parse(void *p, mbedtls_ssl_session *session, unsigned char *buf, size_t len) {
+    oc_tls_server *s = p;
+    int rc = mbedtls_ssl_ticket_parse(&s->ticket, session, buf, len);
+    if (rc == 0) __atomic_add_fetch(&s->resumed, 1, __ATOMIC_RELAXED);
+    return rc;
+}
+
 int oc_tls_server_init(oc_tls_server *s, const char *cert_path, const char *key_path) {
     int rc;
     static const char *pers = "openchimed-tls-server";
@@ -143,6 +159,8 @@ int oc_tls_server_init(oc_tls_server *s, const char *cert_path, const char *key_
     mbedtls_pk_init(&s->key);
     mbedtls_x509_crt_init(&s->cert);
     mbedtls_ssl_config_init(&s->conf);
+    mbedtls_ssl_ticket_init(&s->ticket);
+    s->resumed = 0;
 
     if ((rc = mbedtls_ctr_drbg_seed(&s->ctr_drbg, mbedtls_entropy_func, &s->entropy,
                                     (const unsigned char *)pers, strlen(pers))) != 0)
@@ -172,10 +190,17 @@ int oc_tls_server_init(oc_tls_server *s, const char *cert_path, const char *key_
         return rc;
     if ((rc = mbedtls_ssl_conf_alpn_protocols(&s->conf, oc_tls_alpn_server)) != 0)
         return rc;
+    /* Session tickets (ARCH-22): the key is the daemon's and lives only in
+     * memory; the ticket context locks for itself, so the I/O threads share it. */
+    if ((rc = mbedtls_ssl_ticket_setup(&s->ticket, mbedtls_ctr_drbg_random, &s->ctr_drbg,
+                                       MBEDTLS_CIPHER_AES_256_GCM, OC_TLS_TICKET_LIFETIME_S)) != 0)
+        return rc;
+    mbedtls_ssl_conf_session_tickets_cb(&s->conf, ticket_write, ticket_parse, s);
     return 0;
 }
 
 void oc_tls_server_free(oc_tls_server *s) {
+    mbedtls_ssl_ticket_free(&s->ticket);
     mbedtls_ssl_config_free(&s->conf);
     mbedtls_x509_crt_free(&s->cert);
     mbedtls_pk_free(&s->key);
@@ -237,6 +262,11 @@ int oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, const char **alp
      * offering nothing) for the HTTP handler. */
     if (alpn && (rc = mbedtls_ssl_conf_alpn_protocols(&c->conf, alpn)) != 0)
         return rc;
+    /* Hear about the tickets a TLS 1.3 server sends after the handshake, so a
+     * connection that keeps them (oc_tls_conn_resume) can; one that does not
+     * lets them go (oc_tls_read). */
+    mbedtls_ssl_conf_tls13_enable_signal_new_session_tickets(
+        &c->conf, MBEDTLS_SSL_TLS1_3_SIGNAL_NEW_SESSION_TICKETS_ENABLED);
     return 0;
 }
 
@@ -321,6 +351,7 @@ int oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd) {
     int rc;
     mbedtls_ssl_init(&c->ssl);
     c->fd = fd;
+    c->keep = NULL;
     if ((rc = mbedtls_ssl_setup(&c->ssl, conf)) != 0) return rc;
     mbedtls_ssl_set_bio(&c->ssl, &c->fd, bio_send, bio_recv, NULL);
     return 0;
@@ -334,6 +365,31 @@ void oc_tls_conn_free(oc_tls_conn *c) {
     mbedtls_ssl_free(&c->ssl);
 }
 
+void oc_tls_session_init(oc_tls_session *s) {
+    mbedtls_ssl_session_init(&s->s);
+    s->have = 0;
+}
+
+void oc_tls_session_free(oc_tls_session *s) {
+    mbedtls_ssl_session_free(&s->s);
+    mbedtls_ssl_session_init(&s->s);
+    s->have = 0;
+}
+
+int oc_tls_conn_resume(oc_tls_conn *c, oc_tls_session *s) {
+    c->keep = s;
+    if (s->have && mbedtls_ssl_set_session(&c->ssl, &s->s) != 0) oc_tls_session_free(s);
+    return 0;
+}
+
+/* The server gave a ticket: keep it where the connection was told to, if
+ * anywhere. The caller then goes on with what it was doing (ssl.h). */
+static void take_ticket(oc_tls_conn *c) {
+    if (!c->keep) return;
+    oc_tls_session_free(c->keep);
+    c->keep->have = mbedtls_ssl_get_session(&c->ssl, &c->keep->s) == 0;
+}
+
 int oc_tls_conn_cert_rejected(const oc_tls_conn *c) {
     uint32_t vr = mbedtls_ssl_get_verify_result(&c->ssl);
     vr &= ~(uint32_t)MBEDTLS_X509_BADCERT_SKIP_VERIFY;
@@ -341,7 +397,9 @@ int oc_tls_conn_cert_rejected(const oc_tls_conn *c) {
 }
 
 oc_tls_status oc_tls_handshake(oc_tls_conn *c) {
-    int rc = mbedtls_ssl_handshake(&c->ssl);
+    int rc;
+    while ((rc = mbedtls_ssl_handshake(&c->ssl)) == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
+        take_ticket(c);
     if (rc != 0) return status_of(rc);
     /* Handshake completed at the TLS layer. Enforce the client-side peer
      * verification result: a pinned client leaves real flag bits set on a
@@ -355,7 +413,18 @@ oc_tls_status oc_tls_handshake(oc_tls_conn *c) {
 }
 
 oc_tls_status oc_tls_read(oc_tls_conn *c, void *buf, size_t len, size_t *n) {
-    int rc = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, len);
+    /* A TLS 1.3 ticket arrives after the handshake. Reading its record answers
+     * WANT_READ with the record held back and its processing still to run, and
+     * the next call signals the ticket. The record is already read, so waiting
+     * on the socket here would wait for nothing: while TLS holds data it has
+     * not processed, go straight on (a few rounds at most). */
+    int rc;
+    for (int rounds = 0;; rounds++) {
+        rc = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, len);
+        if (rc == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) { take_ticket(c); continue; }
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ && rounds < 8 && mbedtls_ssl_check_pending(&c->ssl)) continue;
+        break;
+    }
     if (rc > 0) { *n = (size_t)rc; return OC_TLS_OK; }
     if (rc == 0) return OC_TLS_CLOSED;
     return status_of(rc);
@@ -366,7 +435,9 @@ size_t oc_tls_pending(const oc_tls_conn *c) {
 }
 
 oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *n) {
-    int rc = mbedtls_ssl_write(&c->ssl, (const unsigned char *)buf, len);
+    int rc;
+    while ((rc = mbedtls_ssl_write(&c->ssl, (const unsigned char *)buf, len)) == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
+        take_ticket(c);
     if (rc >= 0) { *n = (size_t)rc; return OC_TLS_OK; }
     return status_of(rc);
 }

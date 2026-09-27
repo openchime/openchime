@@ -8,12 +8,12 @@ ARCH-113), REQUIREMENTS.md (§6.2, REQ-150–152, REQ-301–306), PROTOCOL.md (�
 and CLIENT.md.
 
 **This document is audio only.** **Screenshare is [VIDEO.md](./VIDEO.md)**
-(REQ-161, ARCH-86/87) — it rides this same call, sidecar, and UDP path, and
+(REQ-161, ARCH-86/87) — it rides this same call, relay, and UDP path, and
 builds on the media transport, jitter buffer and device layer of §§2–4. Camera
 video remains out of scope (REQ-160).
 
 **Two halves.** The daemon's signaling, its ephemeral call state and
-the forked UDP relay (`daemon/audio_sidecar.c`); the client's signaling and keys
+the UDP relay, which runs in the daemon's event loop (`daemon/relay.c`); the client's signaling and keys
 in the core (`client/core/callsig.c`, on the network thread); and the media
 engine (`client/core/call/`): capture through the echo canceller and speexdsp's
 preprocessor, Opus, SFrame, the relay socket, a jitter buffer and decoder per
@@ -36,13 +36,13 @@ added.
 
 ### 1.1 The server is an SFU — it never mixes
 
-ARCH-18/73 forbid the server from decoding Opus, so the sidecar **forwards
+ARCH-18/73 forbid the server from decoding Opus, so the relay **forwards
 opaque payloads** rather than mixing them. The media framing makes this visible
 (`daemon/audio.h`):
 
 ```
-client  → sidecar :  token ‖ seq(u16 BE) ‖ payload
-sidecar → client  :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
+client → relay :  token ‖ seq(u16 BE) ‖ payload
+relay  → client :  sender_user_id(u64 BE) ‖ seq(u16 BE) ‖ payload
 ```
 
 The payload is an SFrame ciphertext (CALLS.md §5.4) — a typed plaintext: the
@@ -70,15 +70,16 @@ Already done, server-side: the SFU relay, roster maintenance and fan-out,
 per-join tokens, authorization via the ordinary channel-read gate, participant
 drop on TCP disconnect, and the media-side silence timeout. NAT traversal also
 falls out of the existing design — the client sends an initial packet (empty
-payload allowed) so the sidecar learns its UDP source address, which creates the
-outbound mapping.
+payload allowed) so the relay learns its UDP source address, which creates the
+outbound mapping. An empty payload — a keepalive — is answered to its sender
+alone, so a client knows the relay can hear it.
 
 ---
 
 ## 2. Pipeline shape
 
 ```
-          ┌──────────────── network (UDP, to/from sidecar) ────────────────┐
+          ┌──────────────── network (UDP, to/from relay) ──────────────────┐
           │                                                               │
    ┌──────┴──────┐                                                 ┌──────┴──────┐
    │ Opus encode │ ← AEC-cleaned capture                mixed PCM →│ Opus decode │ × N
@@ -262,7 +263,8 @@ type, the frame number and the Opus packet, encrypted as one SFrame (CALLS.md §
 `token ‖ seq` to the relay. A muted client sends no audio, only, once a second,
 an encrypted packet saying it is muted; and every client sends an empty
 **keep-alive** at least every 5 s, so the relay's 20 s silence sweep takes only
-the vanished and never someone quiet.
+the vanished and never someone quiet. The relay answers a keep-alive to its sender alone,
+so a client hears back from the relay even when nobody else is in the call.
 
 **The return address is bound on first use.** The relay learns where to send a
 participant's audio from the first datagram carrying their token, and after that
@@ -298,8 +300,24 @@ behaves as it always has. The token is opaque to the client, which holds up to
 
 The daemon advertises `calls` when its relay is running, not when clients can
 reach it: nothing on the host can tell whether a firewall or platform in front
-of it passes the relay's port. A deployment has to expose that port, pinned with
+of it passes the relay's port. A deployment should expose that port, pinned with
 `OPENCHIME_AUDIO_PORT`, as it exposes the protocol port.
+
+**When UDP does not get through.** The daemon also advertises `calls-tcp`, and a
+client whose network passes no UDP to the relay sends and receives its media over
+its connection instead (`CALL_MEDIA`, PROTOCOL.md §5.17). A call starts on UDP,
+sending a keepalive every second until the relay answers — its echo of the
+keepalive, or anyone speaking. With no answer in 3 s, or none for 12 s mid-call,
+the engine moves to the connection; there it still sends a UDP keepalive every
+10 s, and the first datagram back moves it to UDP again. The relay forwards each
+participant's packets to each other participant by that participant's own
+transport. While media goes by the connection, the call engine's threads queue
+each packet (64 at most, the oldest dropped) and wake the network thread, which
+writes queued media first in each turn, ahead of an upload's chunks or a voice
+segment. The call view says when audio is going through the server connection.
+Over TCP a lost segment holds up the ones behind it, which the jitter buffer
+absorbs up to its 240 ms ceiling; on a lossy network the call is less clear than
+over UDP, and on an ordinary one the same.
 
 **Receive.** Demultiplex on `sender_user_id`; drop a packet whose SFrame KID is
 not a key that sender gave, that fails authentication, or that the replay window
@@ -456,7 +474,7 @@ switch.
 | Engine: capture, preprocessor, SFrame, socket, jitter buffers, mixer | `client/core/call/` |
 | HPKE and SFrame | `shared/e2e_hpke.c`, `shared/e2e_sframe.c` |
 | Call state, invitations, keys forwarded, missed calls | `daemon/netloop.c`, `daemon/dbwriter.c` |
-| Relay | `daemon/audio_sidecar.c` |
+| Relay | `daemon/relay.c`, driven by `daemon/netloop.c` |
 | Calls section, call view, strip, toasts, keys | `client/gui/win32/winmain.c` |
 
 ## 8. TUI surface

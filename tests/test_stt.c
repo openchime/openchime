@@ -131,7 +131,11 @@ static const oc_stt_engine STUB = {
 
 static int16_t *seg(int16_t first) {
     int16_t *p = calloc(160, sizeof *p);
-    if (p) p[0] = first;
+    if (p) {   /* as the wire carries it: little-endian */
+        uint8_t *b = (uint8_t *)p;
+        b[0] = (uint8_t)((uint16_t)first & 0xFF);
+        b[1] = (uint8_t)((uint16_t)first >> 8);
+    }
     return p;
 }
 

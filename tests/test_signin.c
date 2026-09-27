@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -52,7 +53,7 @@ static void *browser_thread(void *arg) {
     return NULL;
 }
 
-static volatile int g_cancel;
+static atomic_int g_cancel;
 static void *cancel_thread(void *arg) { (void)arg; usleep(150000); g_cancel = 1; return NULL; }
 
 int run_signin_tests(void) {

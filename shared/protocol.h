@@ -337,6 +337,7 @@ typedef enum {
     OC_MSG_CALL_KEY         = 0x00A8, /* C->S, a participant's media key sealed to each other (ARCH-113) */
     OC_MSG_CALL_KEY_FOR     = 0x00A9, /* S->C, one sealed media key, from its sender */
     OC_MSG_CALL_SHARE       = 0x00AA, /* C->S, start or stop sharing a screen in the call (REQ-161) */
+    OC_MSG_CALL_MEDIA       = 0x00AB, /* both ways: a media packet over the connection, when UDP cannot reach the relay */
     OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
     OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
     OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
@@ -1238,6 +1239,12 @@ typedef struct { uint64_t channel_id; uint64_t call_id; uint64_t starter; uint64
 /* Start (on = 1) or stop sharing a screen. One sharer at a time: a start takes
  * over from whoever was sharing (REQ-161). */
 typedef struct { uint64_t channel_id; uint8_t on; } oc_call_share;
+/* CALL_MEDIA (PROTOCOL.md §5.17): the relay's UDP datagram, carried over the
+ * connection instead. Client to server it is {seq, ct} -- no token: the
+ * connection is authenticated and in one call -- and server to client
+ * {sender, seq, ct}, the fields the relay puts in front of a UDP one. An empty
+ * `ct` is a keepalive, answered to its sender alone. */
+typedef struct { uint64_t sender; uint16_t seq; oc_slice ct; } oc_call_media_pkt;
 /* A media key sealed to each recipient (HPKE enc ‖ ciphertext, opaque to the
  * daemon). */
 typedef struct { uint64_t recipient; oc_slice sealed; } oc_call_key_entry;
@@ -1277,6 +1284,7 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_TTS "tts"   /* read a conversation aloud (REQ-291) */
 #define OC_CAP_STT "stt"   /* speak a message and have it land as text */
 #define OC_CAP_CALLS "calls" /* talk in a call (REQ-150, REQ-301) */
+#define OC_CAP_CALLS_TCP "calls-tcp" /* call media over the connection (CALL_MEDIA) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 typedef struct { uint64_t message_id; } oc_audio_get;
 /* Hear voice `voice_id` (an id TTS_INFO listed) say TTS_INFO's preview sentence.
@@ -1559,6 +1567,8 @@ oc_result oc_encode_call_state(oc_wbuf *w, uint16_t version, const oc_call_state
 oc_result oc_encode_call_key(oc_wbuf *w, uint16_t version, const oc_call_key *m);
 oc_result oc_encode_call_key_for(oc_wbuf *w, uint16_t version, const oc_call_key_for *m);
 oc_result oc_encode_call_share(oc_wbuf *w, uint16_t version, const oc_call_share *m);
+oc_result oc_encode_call_media_up(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m);
+oc_result oc_encode_call_media_down(oc_wbuf *w, uint16_t version, const oc_call_media_pkt *m);
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
 oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
 oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
@@ -1740,6 +1750,8 @@ oc_result oc_decode_call_state(oc_rbuf *p, oc_call_state *m, uint64_t *parts, ui
 oc_result oc_decode_call_key(oc_rbuf *p, oc_call_key *m, oc_call_key_entry *entries, uint16_t cap);
 oc_result oc_decode_call_key_for(oc_rbuf *p, oc_call_key_for *m);
 oc_result oc_decode_call_share(oc_rbuf *p, oc_call_share *m);
+oc_result oc_decode_call_media_up(oc_rbuf *p, oc_call_media_pkt *m);
+oc_result oc_decode_call_media_down(oc_rbuf *p, oc_call_media_pkt *m);
 oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
 oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
 oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);

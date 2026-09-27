@@ -75,7 +75,7 @@ attachments proxied to object storage with per-channel file
 and member listings, incoming webhooks, an audit log, and reconnect backfill. The
 daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
 **enrolls** with it for federated deployments (ARCH-84). **Calls** are relayed by a
-UDP sidecar that never decodes them and are encrypted end to end between the
+UDP relay in the daemon that never decodes them and are encrypted end to end between the
 participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDIO.md)).
 
 ## Install the daemon

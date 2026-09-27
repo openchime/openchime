@@ -859,6 +859,10 @@ unique — a repeat add is a no-op, so a reaction is toggled, never stacked
 | `emoji`      | str  | 1..32 bytes (fits multi-codepoint sequences).            |
 | `op`         | u8   | `1` add, `0` remove.                                     |
 
+A connection's reactions are limited to 30 per 10 seconds; one past the limit is
+refused with a non-fatal `SEND_RATE_LIMITED` carrying the `message_id`
+(big-endian) in `context`.
+
 On success the daemon fans a **`REACTION_UPDATED` (server → client), msg_type
 `0x0029`** out to every connected member of the channel:
 
@@ -1273,6 +1277,10 @@ client marks *this connection* online (`1`) or away (`2`); `offline` is not
 settable (it is implied by disconnect). The server recomputes the user's
 aggregate status — **online** if any of their connections is active, **away** if
 all are away, **offline** once the last closes — and, if it changed, broadcasts.
+A connection's broadcasts are limited to 5 per 10 seconds. The change itself is
+always recorded; a broadcast past the limit is sent once the window allows,
+carrying the status as it stands by then, so the last one always reaches
+everybody.
 
 **`PRESENCE_UPDATE` (server → client), msg_type `0x0071`** `{ user_id: u64,
 status: u8, dnd: u8 }` — sent tenant-wide to every *other* authenticated
@@ -1305,7 +1313,8 @@ comparing rather than re-announcing keeps an idle deployment silent.
 caller signals they are composing in `channel_id`. The server resolves the
 channel's members (on the read connection, ARCH-66) and, if the caller has access,
 relays to the other connected members only — private-channel and DM typing never
-leaks to non-members.
+leaks to non-members. A connection's signals past 3 per 2 seconds are dropped
+without reply; the next says the same.
 
 **`TYPING_UPDATE` (server → client), msg_type `0x007F`** `{ channel_id: u64,
 user_id: u64 }` — delivered to each connected member of `channel_id` except the
@@ -2096,14 +2105,20 @@ needed no protocol-version bump; a peer that does not know it never expects it.
 
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
-Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over a
-separate UDP sidecar (ARCH-31), forked at daemon startup and handed each
-participant's token over its IPC socket, and a call is *set up* over this TCP
+Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
+the daemon's relay, which runs in its event loop and is handed each
+participant's token as they join, and a call is *set up* over this TCP
 protocol. A conversation has **at most one call**; a call has an id of its own
 (`call_id`), so a later call in the same conversation is a different one. Calls
 are **ephemeral net-thread state** (like presence, ARCH-67): no DB rows, and a
 daemon restart ends them. [CALLS.md](./CALLS.md) is the design, including the
 end-to-end encryption this section carries the keys for.
+
+`CALL_JOIN`, `CALL_INVITE`, `CALL_SHARE` and `CALL_KEY` together are limited to
+60 per 10 seconds per connection; one past the limit is refused with a non-fatal
+`SEND_RATE_LIMITED`. `CALL_LEAVE`, `CALL_DECLINE` and `CALL_END` are not limited:
+each changes the caller's own state once, and refusing one would strand them in
+the call.
 
 A **participant** is a user on one connection, with a **slot** (0-255, the low
 byte of every SFrame KID it sends under) and its **device key** (an X25519
@@ -2189,8 +2204,9 @@ conversation, authored by the starter, body "Missed call" — an ordinary
 `BROADCAST` with `kind = 1` (§5.3).
 
 **Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE`, on TCP
-disconnect, and when the relay's silence sweep drops it (it reports the token
-GONE over IPC; a client keeps alive every 5 s, so only the vanished are swept).
+disconnect, and when the relay's silence sweep drops it (the relay runs in the
+daemon's event loop, which takes the participant out as a leave would; a client
+keeps alive every 5 s, so only the vanished are swept).
 Each drop is a new epoch for the rest, who rekey. The dropped user rejoins with
 `CALL_JOIN`.
 
@@ -2201,6 +2217,28 @@ call**: a start takes over from whoever was sharing, who learns it from the
 nothing. Not a participant: `ERROR NOT_IN_CALL`. A sharer who leaves,
 disconnects, is swept by the relay or rejoins is no longer the sharer. Each
 change is a `CALL_STATE`.
+
+**`CALL_MEDIA` (both ways), `0x00AB`** — call media over this connection, for a
+participant whose network passes no UDP to the relay. Offered when the daemon
+names `calls-tcp` in `CAPABILITIES`; a client does not send it otherwise. The
+frame carries exactly what a relay datagram carries, without the token (the
+connection is authenticated and in one call):
+
+| Direction | Payload |
+|---|---|
+| C → S | `{ seq: u16, ct: bytes }` |
+| S → C | `{ sender: u64, seq: u16, ct: bytes }` |
+
+A participant is on whichever transport its latest packet came by — a
+`CALL_MEDIA` puts it on the connection, a datagram puts it back on UDP — and the
+relay forwards each packet to each other participant by that participant's own
+transport, so one call can hold both. An empty `ct` is a keepalive, answered to
+its sender alone, on the transport it came by. Media never costs a connection: a
+`CALL_MEDIA` for a connection with more than 256 KiB already waiting to be written
+is dropped, and the loss is recovered as UDP loss is (FEC and concealment for
+audio, resends and keyframes for a share). A client probes UDP first, and falls
+back when the relay does not answer (AUDIO.md §4). Adding the frame changes no
+existing layout, so the protocol version does not move.
 
 **Screen sharing on the wire (ARCH-86/87).** The share rides this call and relay
 unchanged: its packets are the same SFrame ciphertexts on the same UDP path, and
@@ -2274,6 +2312,15 @@ In response, the server streams ordinary `BROADCAST` frames (§5.3) for every
 message with `message_id > after_message_id` in each requested channel, in
 ascending `message_id` order per channel, then sends a single `BACKFILL_DONE`
 to mark the catch-up complete.
+
+The replay goes out a slice at a time, as the connection drains, and **nothing
+else is written to that connection until it is complete**: a `BROADCAST` of a
+new message, a presence change or any other frame raised while a replay is in
+progress follows its `BACKFILL_DONE`, in the order it was raised. So the replay
+stays ascending and whole, and a client's cumulative `CLIENT_ACK` never covers
+an id it has not yet been sent. A connection that stops reading while frames
+wait behind a replay is closed once those pass the output cap, as it would be
+without one.
 
 The replay also carries the **reaction state** of the messages it sends: after
 the `BROADCAST` frames, the server emits one `REACTION_UPDATED` (§5) per
@@ -2396,7 +2443,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
-| `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection send rate exceeded (REQ-190).                   |
+| `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection rate exceeded (REQ-190): sends; also reactions (§5.9) and call signalling (§5.17). |
 | `3005` | `FORBIDDEN`           | admin/msg  | no    | The actor may not perform the action — role (ARCH-60, §6) or not the message's author (§5.5/5.6). |
 | `3006` | `LAST_OWNER`          | admin      | no    | Would remove or demote the tenant's last owner (REQ-030).      |
 | `3007` | `UNKNOWN_MESSAGE`     | messaging  | no    | `EDIT`/`DELETE` names a message not in the channel, or already tombstoned (§5.5/5.6). |
@@ -2584,6 +2631,7 @@ this table cannot silently gain a shared value.
 | `0x00A8` | `CALL_KEY` | C → S | a participant's media key, sealed to each other participant (ARCH-113) |
 | `0x00A9` | `CALL_KEY_FOR` | S → C | one sealed media key, from its sender |
 | `0x00AA` | `CALL_SHARE` | C → S | start or stop sharing a screen in the call; a start takes over (REQ-161) |
+| `0x00AB` | `CALL_MEDIA` | both | call media over the connection when UDP cannot reach the relay (`calls-tcp`) |
 | `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
 | `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
 | `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |

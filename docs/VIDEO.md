@@ -38,7 +38,11 @@ cost is the bitrate ceiling (§6).
 **The relay never decodes anything.** It forwards opaque payloads tagged with the
 sender (`daemon/audio.h`), and a share's packets relay exactly as audio's do. So
 screenshare needs **no server-side codec and no change to the relay's framing or
-forwarding** (ARCH-86); the daemon stays free of libvpx as it is of libopus.
+forwarding** (ARCH-86); the daemon stays free of libvpx as it is of libopus. A
+participant whose network passes no UDP sends and receives the share over its
+connection, as its audio (`CALL_MEDIA`, AUDIO.md §4), and nothing about the share
+changes: a packet the daemon drops rather than let a backed-up connection grow is
+recovered by the same resend and keyframe requests as a lost datagram.
 
 The same property has a hard consequence:
 

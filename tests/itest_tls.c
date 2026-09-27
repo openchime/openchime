@@ -124,6 +124,81 @@ static void test_tls_handshake_and_echo(void) {
     close(lfd);
 }
 
+/* One pinned client connection to `addr`: handshake, and a message round trip
+ * (which is when a TLS 1.3 client hears its ticket). `sess` is offered and
+ * keeps what the server gives. The client's result. */
+static int resume_round_trip(const struct sockaddr_in *addr, const uint8_t *pin, oc_tls_session *sess) {
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(cfd, (const struct sockaddr *)addr, sizeof *addr) != 0) { close(cfd); return -1; }
+    oc_tls_client cli;
+    oc_tls_conn c;
+    int ok = oc_tls_client_init(&cli, pin) == 0 && oc_tls_conn_init(&c, &cli.conf, cfd) == 0 &&
+             oc_tls_conn_resume(&c, sess) == 0 && handshake_blocking(&c) == OC_TLS_OK;
+    const char *msg = "again";
+    size_t n = 0;
+    char got[32];
+    ok = ok && oc_tls_write(&c, msg, 5, &n) == OC_TLS_OK && n == 5 &&
+         oc_tls_read(&c, got, sizeof got, &n) == OC_TLS_OK && n == 5 && memcmp(got, msg, 5) == 0;
+    oc_tls_conn_free(&c);
+    oc_tls_client_free(&cli);
+    close(cfd);
+    return ok ? 0 : -1;
+}
+
+/* Session resumption (ARCH-22): the first connection is a full handshake and
+ * leaves the client a ticket; the second offers it and the server resumes the
+ * session; a server that has restarted -- a new ticket key -- cannot open the
+ * ticket and does a full handshake instead, which still succeeds. */
+static void test_tls_resumption(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int yes = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lfd, (struct sockaddr *)&addr, sizeof addr) == 0);
+    CHECK(listen(lfd, 4) == 0);
+    socklen_t alen = sizeof addr;
+    getsockname(lfd, (struct sockaddr *)&addr, &alen);
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    uint8_t fp[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv, fp) == 0);
+    oc_tls_session sess;
+    oc_tls_session_init(&sess);
+
+    for (int round = 0; round < 2; round++) {
+        pthread_t th;
+        struct server_arg arg = { lfd, &srv, 0 };
+        CHECK(pthread_create(&th, NULL, server_thread, &arg) == 0);
+        CHECK(resume_round_trip(&addr, fp, &sess) == 0);
+        pthread_join(th, NULL);
+        CHECK(arg.ok == 1);
+        CHECK(sess.have);                                   /* a ticket, each time */
+        CHECK(__atomic_load_n(&srv.resumed, __ATOMIC_RELAXED) == (unsigned long)round);
+    }
+    oc_tls_server_free(&srv);
+
+    /* Restarted: same certificate, new ticket key. */
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    {
+        uint8_t fp2[OC_TLS_FINGERPRINT_LEN];
+        CHECK(oc_tls_server_fingerprint(&srv, fp2) == 0);
+        pthread_t th;
+        struct server_arg arg = { lfd, &srv, 0 };
+        CHECK(pthread_create(&th, NULL, server_thread, &arg) == 0);
+        CHECK(resume_round_trip(&addr, fp2, &sess) == 0);
+        pthread_join(th, NULL);
+        CHECK(arg.ok == 1);
+        CHECK(__atomic_load_n(&srv.resumed, __ATOMIC_RELAXED) == 0);
+    }
+    oc_tls_session_free(&sess);
+    oc_tls_server_free(&srv);
+    close(lfd);
+}
+
 /* A wrong pin must make the handshake fail (no silent trust). */
 static void test_tls_pin_mismatch(void) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -534,8 +609,9 @@ static void test_tls_extra_ca(void) {
 int run_tls_tests(void) {
     printf("itest_tls: self-signed cert generation, TOFU-pinned handshake,\n");
     printf("           byte round-trip, pin-mismatch rejection, ALPN demux,\n");
-    printf("           built-in CA roots, OPENCHIME_EXTRA_CA\n");
+    printf("           built-in CA roots, OPENCHIME_EXTRA_CA, session resumption\n");
     test_tls_handshake_and_echo();
+    test_tls_resumption();
     test_tls_pin_mismatch();
     test_tls_sni_does_not_replace_the_pin();
     test_tls_alpn_demux();

@@ -168,7 +168,7 @@ static int serve_one(int fd, const char *path, char *query, size_t qcap) {
     return 1;
 }
 
-oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const volatile int *cancel,
+oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const atomic_int *cancel,
                                     char *query, size_t qcap) {
     if (!lb || !query || qcap == 0) return OC_LOOPBACK_ERROR;
     query[0] = '\0';

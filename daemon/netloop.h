@@ -14,6 +14,7 @@
 #define OPENCHIME_NETLOOP_H
 
 #include <signal.h>
+#include <stdint.h>
 
 #include "dbwriter.h"
 #include "tls.h"
@@ -25,19 +26,17 @@
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop);
 
-/* Wire the audio relay sidecar (REQ-150, ARCH-31): the IPC socket to it and the
- * UDP port it listens on. Call before oc_netloop_run. With ipc_fd < 0 (the
- * default) calls still form but carry no media endpoint. */
-void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port);
+/* Wire call media (REQ-150, ARCH-18/73): the bound UDP socket the loop's relay
+ * runs on (relay.h), and the port it is bound to. The caller keeps the socket.
+ * A loop takes it when it starts and gives it back when it stops, so set it
+ * before oc_netloop_run; a second loop started meanwhile finds none. With
+ * udp_fd < 0 (the default) there is no media endpoint and calls are refused. */
+void oc_netloop_set_audio(int udp_fd, uint16_t udp_port);
 
-/* How to bring the audio sidecar back when it exits: `respawn` starts a new one
- * on the same UDP port and returns the net loop's end of its IPC socket, or -1.
- * The net loop notices the exit (EOF on the IPC socket), restarts it, and
- * re-authorizes everyone already in a call. If it dies again within seconds of
- * starting, repeatedly, or `respawn` fails, calls are refused from then on
- * rather than handed a dead port. NULL (the default): an exited sidecar is not
- * restarted, and calls are refused. Call before oc_netloop_run. */
-void oc_netloop_set_audio_respawn(int (*respawn)(void *ctx), void *ctx);
+/* Drop a call participant after `ms` without a packet rather than
+ * OC_AUDIO_SILENCE_MS (0 restores it); a test's knob, so a sweep can be seen
+ * without waiting twenty seconds. Any thread; applied on the loop's next tick. */
+void oc_netloop_set_relay_silence_ms(uint64_t ms);
 
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
  * contentless notify decision to it for offline mobile delivery. NULL (the
@@ -78,5 +77,31 @@ void oc_netloop_set_tts(const struct oc_tts_engine *engine);
  * voice input and refuses STT_BEGIN with STT_UNAVAILABLE. */
 struct oc_stt_engine;
 void oc_netloop_set_stt(const struct oc_stt_engine *engine);
+
+/* What the loop's turns cost, for the load harness and the tests that hold the
+ * loop to a bound. A turn is the work between one epoll_wait returning and the
+ * next being called; waiting is not counted. Durations go into a histogram of
+ * OC_NETLOOP_HIST_BUCKETS buckets, four to each doubling of microseconds, so a
+ * percentile is known to within a quarter-octave. Counted by the loop with
+ * relaxed atomics and read from any thread; a snapshot taken while the loop runs
+ * may be a turn out of step between fields, which no reader relies on. */
+#define OC_NETLOOP_HIST_BUCKETS 96
+typedef struct {
+    uint64_t turns;
+    uint64_t turn_max_us;
+    uint64_t turn_hist[OC_NETLOOP_HIST_BUCKETS];
+    uint64_t results;      /* database results delivered */
+    uint64_t bytes_read;   /* plaintext read from clients */
+    uint64_t turn_read_max;/* the most plaintext read in any one turn */
+} oc_netloop_stats;
+
+void oc_netloop_stats_get(oc_netloop_stats *out);
+/* For the I/O threads (ioloop.h): `bytes` of plaintext read from one connection
+ * in one turn of its thread. */
+void oc_netloop_stats_note_read(uint64_t bytes, uint64_t conn_id);
+void oc_netloop_stats_reset(void);
+/* The turn duration, in microseconds, at or below which `pct` percent of the
+ * snapshot's turns fall: the upper edge of the bucket that holds it. */
+uint64_t oc_netloop_stats_pct_us(const oc_netloop_stats *s, double pct);
 
 #endif /* OPENCHIME_NETLOOP_H */

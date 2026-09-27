@@ -83,6 +83,7 @@ typedef struct {
     int      speaking;          /* this device's voice is going out */
     int      mic_level;         /* peak of the last frame captured, 0-32767 */
     uint32_t sent, keepalives;
+    int      transport;         /* 0 UDP, 1 the connection (UDP cannot reach the relay) */
     uint32_t epoch;             /* of the key being sent with, 0 = none yet */
     int      loss_pct;          /* the loss told to the encoder */
     int      target_ms;         /* the largest jitter-buffer target */

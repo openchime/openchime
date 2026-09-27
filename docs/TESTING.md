@@ -223,13 +223,15 @@ paying four minutes of unrelated suites per attempt:
 
 - `OC_TEST_ONLY=audio,media` runs only the suites whose names contain those;
 - `OC_TEST_REPEAT=20` runs the selection that many times.
+- `make test-tsan` runs the same suite under ThreadSanitizer (address
+  randomization off, `tests/tsan.supp` for the one test-only reconfiguration);
+  CI runs it on every push. A data race between our threads fails it.
 
 Unset, nothing changes. A repeated suite runs **in one process**, so a suite that
 leaves a fixture switched must put it back or the second round fails somewhere
-that has nothing to do with the cause: `itest_netloop` sets a flag that makes the
-audio sidecar refuse to start, to prove a join is refused openly when the relay
-cannot be brought back, and while it stayed set the second round died at
-`adaemon >= 0` in the suite's *setup*.
+that has nothing to do with the cause: a suite that swaps the loop's call relay
+socket, as `itest_netloop`'s routed-call test does, must hand it back, or the next
+round's loop starts without one.
 
 ### 2.3 Determinism rules
 
@@ -390,8 +392,10 @@ Jobs:
 Everything runs non-interactively and communicates pass/fail purely through
 exit codes, so no scenario depends on a human reading output.
 
-**Audio.** `tests/test_audio.c` covers the **relay sidecar** — forwarding, call
-isolation, and `REVOKE`. Echo cancellation is measured by the ERLE harness in
+**Audio.** `tests/test_audio.c` covers the **call relay** (`daemon/relay.c`),
+driving it directly as the event loop does — forwarding, call isolation, the
+address binding, revoke, the keepalive echo, a full call's fan-out and the
+silence sweep. Echo cancellation is measured by the ERLE harness in
 `tests/test_voice.c` (AUDIO.md §6.4): a synthetic room
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
@@ -559,10 +563,62 @@ Running the storage maintenance pass every 200 ms — 25× more often than the
 | KB per connection | 55–57 | 52–65 |
 | Round-trip latency | unchanged | unchanged |
 
+### The event loop's turns (`make bench-loop`, ARCH-22)
+
+`tests/bench_loop.c` runs the daemon in-process — writer, readers, auth pool, the
+event loop with its I/O threads and call relay — and drives it with real TLS
+clients on loopback through six loads: **chat** (100 connected, one posting 5/s),
+**fanout** (100 connected, ten posting 2/s to all of them), **storm** (100 clients
+connecting and signing in at once), **backfill** (20 clients each replaying 500
+messages), **call** (ten on the relay at 50 audio packets/s, one sharing a screen
+at ~300/s, beside 40 chatting) and **call-tcp** (the same with five of the ten on
+the connection transport). For each it prints the loop's turn percentiles
+(`oc_netloop_stats`) beside what the clients measured. Not part of `make test`.
+
+Measured on a 12-core WSL2 host, three runs of each, before the loop work and
+after it (a turn is the work between one `epoll_wait` returning and the next):
+
+| Load | Worst turn p99, before | Worst turn max, before | p99, after | max, after |
+|---|---|---|---|---|
+| chat | 6–16 ms | 18–43 ms | 0.1 ms | 0.8–1.8 ms |
+| fanout | 3–5 ms | 15–25 ms | 0.1 ms | 0.5–1.8 ms |
+| storm | 20–65 ms | 69–123 ms | 0.1 ms | 0.2–2.5 ms |
+| backfill | 4–20 ms | 4–20 ms | 0.6–0.9 ms | 0.8–1.0 ms |
+| call (relay now in the loop) | 4–7 ms | 4–7 ms | 1.3–1.5 ms | 2.1–2.6 ms |
+| call-tcp (five of ten by the connection) | — | — | 0.5 ms | 1.2–1.4 ms |
+
+The turn is short now because handshakes and encryption are on the I/O threads,
+nothing is found by scanning the connection table, and a backfill is replayed a
+slice at a time; the storm's worst turn was a hundred handshakes on the loop.
+
+**Call media.** Relayed in the loop, audio's forwarding latency is the same as
+it was from the separate process: p99 0.9–1.4 ms, against 1.3–2.0 ms before, and
+video's 0.5–0.9 ms. With five of ten on the connection transport it is 1.2 ms.
+
+**Memory** (`Scripts/bench.sh 50 100 200`, read-aloud and voice input off —
+`OPENCHIME_TTS_DATA_DIR` and `OPENCHIME_STT_DATA_DIR` pointed at nothing — since
+rendering the voice auditions at start loads a model of about 190 MB, which
+drowns every other figure):
+
+| | before | after |
+|---|---|---|
+| Idle daemon RSS | 7.4 MB | 8.4 MB |
+| KB per connection (50 / 100 / 200) | 52 / 70 / 55 | 66 / 71 / 64 |
+
+The megabyte is the I/O threads and the auth pool, fixed whatever the load. The
+script's latency line reports `sends=0` on both builds: its measurement does not
+run, and the round trip is taken from `bench_loop` above instead.
+
+**Client latency is the noisy measure on this host.** SEND→SEND_ACK and
+SEND→BROADCAST are 4–7 ms at p50 throughout, but their p99 swings from 10 ms to
+several hundred between identical runs while the host is loaded — and swung the
+same way for the build before the I/O threads, run alternately with the one after.
+The loop's own turn is the figure to compare.
+
 ### Harness conventions worth knowing
 
-- `bench_load`'s read timeout is 180 s, so the serialized PBKDF2 auth ramp
-  (~2 logins/sec, ≈500 ms each) is never the limit — a burst of N clients takes
+- `bench_load`'s read timeout is 180 s, so the PBKDF2 auth ramp
+  (a few logins/sec, ≈500 ms each) is never the limit — a burst of N clients takes
   N/2 seconds to drain, and a short timeout would count slow-but-fine clients
   as connection failures.
 - `Scripts/bench.sh` prints the whole result line, `connections_ok=` included —
@@ -571,13 +627,15 @@ Running the storage maintenance pass every 200 ms — 25× more often than the
 - The memory table reports **requested vs connected** and divides by the
   connections that actually established.
 
-**The real constraint** is that connection setup is bounded at
-~2/sec by design (REQ-191 wants PBKDF2 expensive). A server restart with a few
-hundred clients reconnecting takes minutes to fully re-authenticate them, and
-session-token reconnect (ARCH-58) — which skips PBKDF2 entirely — is what makes
-that tolerable in practice. Worth remembering before quoting a connection-count
+**The real constraint** is that password sign-in is bounded by design (REQ-191
+wants PBKDF2 expensive): at ≈500 ms a derivation on the two-thread auth pool
+(ARCH-5), about four a second. The pool keeps a burst of them off the writer, so
+everyone else's sends go on meanwhile, but a server restart with a few hundred
+clients signing in by password would still take a minute or two; session-token
+reconnect (ARCH-58), which skips PBKDF2 entirely, is what makes a restart
+tolerable in practice. Worth remembering before quoting a connection-count
 capacity number: the daemon *holds* thousands of connections, but *establishes*
-them at two per second.
+password sign-ins at a few per second.
 
 ---
 
@@ -1062,6 +1120,14 @@ and `callevents`. The `call` verb drives it: `call start|join|open|leave|end|dec
 [ch]`, `call mute|unmute|ptt-down|ptt-up`, `call ns on|off`, `call invite <uid...>`,
 `call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
 Not in CI, for the smoke's reason.
+
+`scripts/gui_calls_tcp.sh` is the same pair (port 9630) with UDP that goes
+nowhere: the daemon advertises the relay at a port nothing answers on
+(`OC_PAIR_ADVERTISE_PORT`, which `gui_pair.sh` passes as
+`OPENCHIME_AUDIO_ADVERTISE_PORT`). It asserts that each client finds within
+seconds that the relay does not answer, moves to the connection transport — the
+dump's `call` line says `transport=tcp` — and hears the other's tone
+(PROTOCOL.md §5.17, AUDIO.md §4).
 
 ## Reading the voice harness
 

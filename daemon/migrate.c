@@ -997,6 +997,21 @@ static const char MIGRATION_0046[] =
      * would make a large workspace's list stop fitting. */
     "ALTER TABLE channels ADD COLUMN description TEXT;";
 
+static const char MIGRATION_0047[] =
+    /* A credential's VERSION (AUTH.md §2): a sign-in checks a password on the
+     * auth pool, away from the writer, and the session is minted only if the
+     * credential it checked is still the stored one. A version answers that, and
+     * it is drawn from one counter that only rises, so no credential written
+     * later -- a changed password, or an account deleted and another given its
+     * id -- can ever carry a version seen before. Rows until now are 0, which no
+     * later write is given. */
+    "ALTER TABLE local_credentials ADD COLUMN version INTEGER NOT NULL DEFAULT 0;"
+    "CREATE TABLE credential_version_seq ("
+    "  id   INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  next INTEGER NOT NULL"
+    ");"
+    "INSERT INTO credential_version_seq(id, next) VALUES (1, 1);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1044,6 +1059,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 44, MIGRATION_0044 },
     { 45, MIGRATION_0045 },
     { 46, MIGRATION_0046 },
+    { 47, MIGRATION_0047 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

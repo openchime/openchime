@@ -11,6 +11,7 @@
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
 #include "dbwriter.h"
+#include "e2e_hpke.h"
 
 #include "config.h"   /* the page size a files listing answers with (REQ-143) */
 #include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
@@ -18,6 +19,7 @@
 #include "migrate.h"
 #include "protocol.h"
 #include "auth.h"
+#include "authpool.h"
 #include "joinrules.h"
 #include "jwt.h"
 #include "ratelimit.h"
@@ -34,21 +36,39 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Read-only query workers (ARCH-66), each with its own connection to the WAL
+ * database. A connection's read jobs all go to one of them -- the one its id
+ * picks -- so they complete in the order they were submitted, as they did when
+ * there was one; jobs with no connection go round in turn. */
+#define OC_DB_READERS 3
+#define OC_AUTH_THREADS 2
+
+typedef struct {
+    struct oc_dbwriter *w;
+    sqlite3        *rdb;
+    pthread_t       th;
+    int             started;
+    pthread_cond_t  cv;                       /* wakes this reader */
+    oc_job         *head, *tail;              /* net -> this reader */
+} db_reader;
+
 struct oc_dbwriter {
     sqlite3        *db;                       /* the single write connection (ARCH-5) */
-    sqlite3        *rdb;                      /* read-only connection for query jobs (ARCH-66) */
     pthread_t       thread;                   /* writer */
-    pthread_t       reader;                   /* read-only query worker */
     pthread_mutex_t mu;
     pthread_cond_t  cv;                       /* wakes the writer */
-    pthread_cond_t  read_cv;                  /* wakes the reader */
     oc_job         *jobs_head, *jobs_tail;    /* net -> writer (write jobs) */
-    oc_job         *rjobs_head, *rjobs_tail;  /* net -> reader (read-only jobs) */
-    oc_dbres      *res_head,  *res_tail;     /* writer|reader -> net */
+    db_reader       readers[OC_DB_READERS];
+    unsigned        next_reader;              /* for jobs no connection owns */
+    oc_dbres      *res_head,  *res_tail;     /* writer|readers -> net */
+    /* The auth pool (AUTH.md §2): a password's key derivation -- deliberately
+     * the slowest thing a sign-in does -- runs here, so a burst of sign-ins
+     * does not hold the writer, and with it everyone's sends. */
+    oc_authpool    *auth;
+    int             auth_deferred;           /* writer-only: the job went on to a reader */
     int             evfd;                    /* signals results ready */
     int             stop;
     int             started;
-    int             reader_started;
 
     /* Auth config (set before serving; read only on the writer thread). */
     uint8_t         auth_methods;            /* advertised in AUTH_CHALLENGE */
@@ -618,6 +638,19 @@ static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int 
 /* Create a local account: `local:<username>` user + PBKDF2 credential (AUTH.md
  * §2). Idempotent — INSERT OR IGNORE means re-running bootstrap never clobbers
  * an existing password. Returns the user id, or 0 on error. */
+/* The next credential version (migration 0047): taken inside the caller's
+ * transaction, so a write that rolls back gives it back. 0 on failure. */
+static uint64_t next_credential_version(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    uint64_t v = 0;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE credential_version_seq SET next = next + 1 WHERE id = 1 RETURNING next - 1;",
+            -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        v = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
 static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
                                const char *password, size_t plen,
                                uint8_t role, uint32_t iterations) {
@@ -652,13 +685,20 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
     if (uid == 0) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return 0; }
 
     sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO local_credentials(user_id,salt,iterations,hash,updated_at_ms) "
-        "VALUES(?,?,?,?,?);", -1, &st, NULL);
+        "INSERT OR IGNORE INTO local_credentials(user_id,salt,iterations,hash,updated_at_ms,version) "
+        "VALUES(?,?,?,?,?,?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     sqlite3_bind_blob(st, 2, salt, sizeof salt, SQLITE_STATIC);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)iterations);
     sqlite3_bind_blob(st, 4, hash, sizeof hash, SQLITE_STATIC);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
+    uint64_t version = next_credential_version(db);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)version);
+    if (version == 0) {   /* 0 is what rows before the version carry: never given */
+        sqlite3_finalize(st);
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return 0;
+    }
     sqlite3_step(st);
     sqlite3_finalize(st);
 
@@ -667,40 +707,83 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
     return uid;
 }
 
-/* Verify a local username+password against local_credentials, constant-time on
- * the hash. Returns user id + role on success, 0 otherwise. */
-static uint64_t verify_local(sqlite3 *db, const char *username, size_t ulen,
-                             const char *password, size_t plen, uint8_t *role_out) {
+/* A local account's stored credential and its version (migration 0047), for the
+ * auth pool to check a password against. 1 found, 0 no such account (or no
+ * password). */
+static int local_credential(sqlite3 *db, const char *username, size_t ulen, uint64_t *uid,
+                            uint8_t *salt, size_t salt_cap, size_t *slen, uint32_t *iters,
+                            uint8_t stored[OC_PW_HASH_LEN], uint64_t *version) {
     char subject[256];
     size_t sublen = local_subject(subject, sizeof subject, username, ulen);
     if (sublen == 0) return 0;
-
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT u.id, u.role, c.salt, c.iterations, c.hash FROM users u "
+        "SELECT u.id, c.salt, c.iterations, c.hash, c.version FROM users u "
         "JOIN local_credentials c ON c.user_id = u.id WHERE u.subject = ?;", -1, &st, NULL);
     sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
-
-    uint64_t uid = 0; uint8_t role = OC_ROLE_MEMBER; int ok = 0;
+    int found = 0;
     if (sqlite3_step(st) == SQLITE_ROW) {
-        uint64_t cand = (uint64_t)sqlite3_column_int64(st, 0);
-        uint8_t  crole = role_to_u8((const char *)sqlite3_column_text(st, 1));
-        const void *salt = sqlite3_column_blob(st, 2);
-        int slen = sqlite3_column_bytes(st, 2);
-        uint32_t iters = (uint32_t)sqlite3_column_int64(st, 3);
-        const void *stored = sqlite3_column_blob(st, 4);
-        int hlen = sqlite3_column_bytes(st, 4);
-        uint8_t derived[OC_PW_HASH_LEN];
-        if (salt && stored && hlen == (int)OC_PW_HASH_LEN &&
-            oc_pw_derive(password, plen, salt, (size_t)slen, iters, derived) == 0 &&
-            oc_ct_eq(derived, stored, OC_PW_HASH_LEN)) {
-            ok = 1; uid = cand; role = crole;
+        const void *sb = sqlite3_column_blob(st, 1);
+        int sl = sqlite3_column_bytes(st, 1);
+        const void *hb = sqlite3_column_blob(st, 3);
+        int hl = sqlite3_column_bytes(st, 3);
+        if (sb && hb && sl > 0 && (size_t)sl <= salt_cap && hl == (int)OC_PW_HASH_LEN) {
+            *uid = (uint64_t)sqlite3_column_int64(st, 0);
+            memcpy(salt, sb, (size_t)sl);
+            *slen = (size_t)sl;
+            *iters = (uint32_t)sqlite3_column_int64(st, 2);
+            memcpy(stored, hb, OC_PW_HASH_LEN);
+            *version = (uint64_t)sqlite3_column_int64(st, 4);
+            found = 1;
         }
     }
     sqlite3_finalize(st);
-    if (!ok) return 0;
-    if (role_out) *role_out = role;
-    return uid;
+    return found;
+}
+
+/* User `uid`'s stored credential and its version, for a password change. 1
+ * found, 0 none (an account with no password). */
+static int credential_of(sqlite3 *db, uint64_t uid, uint8_t *salt, size_t salt_cap, size_t *slen,
+                         uint32_t *iters, uint8_t stored[OC_PW_HASH_LEN], uint64_t *version) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT salt, iterations, hash, version FROM local_credentials WHERE user_id = ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const void *sb = sqlite3_column_blob(st, 0);
+        int sl = sqlite3_column_bytes(st, 0);
+        const void *hb = sqlite3_column_blob(st, 2);
+        if (sb && hb && sl > 0 && (size_t)sl <= salt_cap && sqlite3_column_bytes(st, 2) == (int)OC_PW_HASH_LEN) {
+            memcpy(salt, sb, (size_t)sl);
+            *slen = (size_t)sl;
+            *iters = (uint32_t)sqlite3_column_int64(st, 1);
+            memcpy(stored, hb, OC_PW_HASH_LEN);
+            *version = (uint64_t)sqlite3_column_int64(st, 3);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Is `version` still user `uid`'s stored credential? A password changed, or the
+ * account went, between the reader's fetch and now: then it is not. Versions
+ * are never given twice (migration 0047), so a match is the same credential. */
+static int credential_current(sqlite3 *db, uint64_t uid, uint64_t version, uint8_t *role_out) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT u.role FROM local_credentials c JOIN users u ON u.id = c.user_id "
+        "WHERE c.user_id = ? AND c.version = ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)version);
+    int same = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        same = 1;
+        if (role_out) *role_out = role_to_u8((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    return same;
 }
 
 /* Mint a session: random 32-byte token to the caller, only its SHA-256 stored
@@ -1027,6 +1110,8 @@ static oc_dbres *oidc_refuse(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint1
 
 /* Prove identity (local password, an OIDC ES256 JWT, or an existing session
  * token) and converge on a daemon-issued session (AUTH.md §4). */
+static void submit_to_reader(oc_dbwriter *w, oc_job *j);
+
 static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
@@ -1055,8 +1140,8 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         acct[al] = '\0';
         int has_src = j->source[0] != '\0';
         uint64_t now = dbw_now_ms();
-        if (oc_ratelimit_blocked(w->auth_rl, acct, now) ||
-            (has_src && oc_ratelimit_blocked(w->source_rl, j->source, now))) {
+        if (j->auth_stage == OC_AUTH_STAGE_NEW && (oc_ratelimit_blocked(w->auth_rl, acct, now) ||
+            (has_src && oc_ratelimit_blocked(w->source_rl, j->source, now)))) {
             /* Throttled attempts are dropped SILENTLY and are deliberately not
              * audited (REQ-251b). Logging them would hand an attacker the very
              * amplification the limiter exists to remove: one packet, one row.
@@ -1064,8 +1149,18 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
              * and the limiter caps those at 5/min/account and 20/min/source. */
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
         }
-        uid = verify_local(db, (const char *)user.ptr, user.len,
-                           (const char *)pass.ptr, pass.len, &role);
+        if (j->auth_stage == OC_AUTH_STAGE_NEW) {
+            /* On to a reader for the credential, then the pool for the
+             * derivation; the same job comes back here, CHECKED. */
+            ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
+            submit_to_reader(w, (oc_job *)j);
+            w->auth_deferred = 1;
+            free(r);
+            return NULL;
+        }
+        /* Back from the pool: the password matched the credential it was
+         * checked against, and that is still the stored one. */
+        uid = j->auth_ok == 1 && credential_current(db, j->auth_uid, j->auth_version, &role) ? j->auth_uid : 0;
         if (uid == 0) {
             oc_ratelimit_record(w->auth_rl, acct, now);
             if (has_src) oc_ratelimit_record(w->source_rl, j->source, now);
@@ -6830,48 +6925,43 @@ static oc_dbres *process_set_display_name(sqlite3 *db, const oc_job *j) {
     return profile_ok(j, strdup(name));
 }
 
-/* Rotate your local password: verify the old one (constant-time), then store a
- * fresh PBKDF2 salt+hash. A non-local (OIDC) account, or a wrong old password,
- * is FORBIDDEN. On success the self ack echoes the unchanged display name. Write. */
-static oc_dbres *process_change_password(sqlite3 *db, const oc_job *j) {
-    const char *oldpw = j->pf_old_pw ? j->pf_old_pw : "";
+/* Change your local password (AUTH.md §2). Like a sign-in, it passes through a
+ * reader, which fetches the credential and its version, and the auth pool, which
+ * checks the old password and derives the new one; it comes back here CHECKED.
+ * The new one is stored only if the credential is still the version the old one
+ * was checked against -- one statement, so no other change can land between
+ * the test and the write. A non-local (OIDC) account, a wrong old password, or a
+ * change that another beat to it is FORBIDDEN. On success the self ack echoes
+ * the unchanged display name. Write. */
+static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     const char *newpw = j->pf_new_pw ? j->pf_new_pw : "";
     if (newpw[0] == '\0') return profile_err(j, OC_ERR_FORBIDDEN);
-
+    if (j->auth_stage == OC_AUTH_STAGE_NEW) {
+        ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
+        submit_to_reader(w, (oc_job *)j);
+        w->auth_deferred = 1;
+        return NULL;
+    }
+    if (j->auth_ok != 1) return profile_err(j, OC_ERR_FORBIDDEN);
+    if (!j->pw_derived) return profile_err(j, OC_ERR_INTERNAL);
+    uint64_t version = next_credential_version(db);
+    if (!version) return profile_err(j, OC_ERR_INTERNAL);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT salt, iterations, hash FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
-    int ok = 0;
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        const void *salt = sqlite3_column_blob(st, 0);
-        int slen = sqlite3_column_bytes(st, 0);
-        uint32_t iters = (uint32_t)sqlite3_column_int64(st, 1);
-        const void *stored = sqlite3_column_blob(st, 2);
-        int hlen = sqlite3_column_bytes(st, 2);
-        uint8_t derived[OC_PW_HASH_LEN];
-        if (salt && stored && hlen == (int)OC_PW_HASH_LEN &&
-            oc_pw_derive(oldpw, strlen(oldpw), salt, (size_t)slen, iters, derived) == 0 &&
-            oc_ct_eq(derived, stored, OC_PW_HASH_LEN)) ok = 1;
-    }
-    sqlite3_finalize(st);
-    if (!ok) return profile_err(j, OC_ERR_FORBIDDEN);
-
-    uint8_t salt[OC_PW_SALT_LEN], hash[OC_PW_HASH_LEN];
-    if (oc_rand_bytes(salt, sizeof salt) != 0 ||
-        oc_pw_derive(newpw, strlen(newpw), salt, sizeof salt, OC_PW_ITERATIONS, hash) != 0)
-        return profile_err(j, OC_ERR_INTERNAL);
-    sqlite3_prepare_v2(db,
-        "UPDATE local_credentials SET salt=?, iterations=?, hash=?, updated_at_ms=? WHERE user_id=?;",
-        -1, &st, NULL);
-    sqlite3_bind_blob (st, 1, salt, sizeof salt, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_PW_ITERATIONS);
-    sqlite3_bind_blob (st, 3, hash, sizeof hash, SQLITE_TRANSIENT);
+        "UPDATE local_credentials SET salt=?, iterations=?, hash=?, updated_at_ms=?, version=? "
+        "WHERE user_id=? AND version=?;", -1, &st, NULL);
+    sqlite3_bind_blob (st, 1, j->pw_salt, OC_PW_SALT_LEN, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->pw_iters);
+    sqlite3_bind_blob (st, 3, j->pw_hash, OC_PW_HASH_LEN, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
-    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)version);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)j->auth_version);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return profile_err(j, OC_ERR_INTERNAL);
+    if (sqlite3_changes(db) != 1) return profile_err(j, OC_ERR_FORBIDDEN);   /* changed meanwhile */
     /* Never the password itself — only that it changed (ARCH-79). */
     audit_actor(db, OC_AUDIT_ACCOUNT, "password.change", j->user_id, 0, NULL, 1, NULL);
     return profile_ok(j, lookup_display_name(db, j->user_id));
@@ -7279,7 +7369,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_PRUNE_DEVICE_TOKEN)      return process_prune_device_token(w->db, j);
     if (j->type == OC_JOB_SET_CLIENT_SETTING) return process_set_client_setting(w->db, j);
     if (j->type == OC_JOB_SET_DISPLAY_NAME)   return process_set_display_name(w->db, j);
-    if (j->type == OC_JOB_CHANGE_PASSWORD)    return process_change_password(w->db, j);
+    if (j->type == OC_JOB_CHANGE_PASSWORD)    return process_change_password(w, j);
     if (j->type == OC_JOB_STORAGE_MAINT)      return process_storage_maint(w->db, j);
     return NULL;
 }
@@ -7649,40 +7739,130 @@ static void *writer_loop(void *arg) {
         if (!w->jobs_head) w->jobs_tail = NULL;
         pthread_mutex_unlock(&w->mu);
 
+        w->auth_deferred = 0;
         oc_dbres *r = process_write(w, j);
-        job_free(j);
+        if (!w->auth_deferred) job_free(j);   /* else the auth pool has it (process_auth) */
         push_result(w, r);
         maybe_prune_idem(w);
     }
     return NULL;
 }
 
+static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j);
+
 static void *reader_loop(void *arg) {
-    oc_dbwriter *w = (oc_dbwriter *)arg;
+    db_reader *rd = (db_reader *)arg;
+    oc_dbwriter *w = rd->w;
     for (;;) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->rjobs_head)
-            pthread_cond_wait(&w->read_cv, &w->mu);
-        if (w->stop && !w->rjobs_head) { pthread_mutex_unlock(&w->mu); break; }
-        oc_job *j = w->rjobs_head;
-        w->rjobs_head = j->next;
-        if (!w->rjobs_head) w->rjobs_tail = NULL;
+        while (!w->stop && !rd->head)
+            pthread_cond_wait(&rd->cv, &w->mu);
+        if (w->stop && !rd->head) { pthread_mutex_unlock(&w->mu); break; }
+        oc_job *j = rd->head;
+        rd->head = j->next;
+        if (!rd->head) rd->tail = NULL;
         pthread_mutex_unlock(&w->mu);
 
-        oc_dbres *r = process_read(w->rdb, j);
+        if (j->type == OC_JOB_AUTH || j->type == OC_JOB_CHANGE_PASSWORD) {
+            auth_read_credential(w, rd->rdb, j);   /* a password's credential (process_auth) */
+            continue;
+        }
+        oc_dbres *r = process_read(rd->rdb, j);
         job_free(j);
         push_result(w, r);
     }
     return NULL;
 }
 
+/* The auth pool is done with a check: the job goes back to the writer to be
+ * finished, CHECKED. A check never made (the pool is stopping) ends here. */
+static void auth_checked(oc_auth_check *chk, void *ctx) {
+    oc_dbwriter *w = ctx;
+    oc_job *j = chk->owner;
+    int ok = chk->ok;
+    if (chk->derived) {   /* a password change: the new password's key */
+        memcpy(j->pw_salt, chk->new_salt, OC_PW_SALT_LEN);
+        memcpy(j->pw_hash, chk->new_hash, OC_PW_HASH_LEN);
+        j->pw_iters = chk->new_iters;
+        j->pw_derived = 1;
+    }
+    oc_e2e_wipe(chk, sizeof *chk);
+    free(chk);
+    if (ok < 0) { job_free(j); return; }
+    j->auth_ok = ok;
+    j->auth_stage = OC_AUTH_STAGE_CHECKED;
+    oc_dbwriter_submit(w, j);
+}
+
+/* A reader's part of a password sign-in or change: fetch the credential and its
+ * version -- by the name signed in with, or for a change by the account -- and
+ * hand the check to the pool; a change also gets a fresh salt for the new
+ * password. No account, or no memory, goes straight back to the writer as a
+ * failed check. */
+static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
+    oc_auth_check *chk = calloc(1, sizeof *chk);
+    uint64_t uid = 0, version = 0;
+    int found = 0;
+    if (chk && j->type == OC_JOB_CHANGE_PASSWORD) {
+        found = j->pf_old_pw && j->pf_new_pw &&
+                credential_of(rdb, j->user_id, chk->salt, sizeof chk->salt, &chk->slen, &chk->iters,
+                              chk->stored, &version) &&
+                oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0;
+        if (found) {
+            uid = j->user_id;
+            chk->password = j->pf_old_pw;               /* in the job, which outlives the check */
+            chk->pwlen = strlen(j->pf_old_pw);
+            chk->new_password = j->pf_new_pw;
+            chk->new_pwlen = strlen(j->pf_new_pw);
+            chk->new_iters = OC_PW_ITERATIONS;
+        }
+    } else if (chk) {
+        oc_slice cred = { (const uint8_t *)j->token, j->token_len }, user, pass;
+        found = oc_parse_local_credential(cred, &user, &pass) == OC_OK &&
+                local_credential(rdb, (const char *)user.ptr, user.len, &uid, chk->salt, sizeof chk->salt,
+                                 &chk->slen, &chk->iters, chk->stored, &version);
+        if (found) {
+            chk->password = (const char *)pass.ptr;     /* in j->token, which outlives the check */
+            chk->pwlen = pass.len;
+        }
+    }
+    if (found) {
+        j->auth_uid = uid;
+        j->auth_version = version;
+        chk->owner = j;
+        oc_authpool_submit(w->auth, chk);
+        return;
+    }
+    free(chk);
+    j->auth_ok = 0;
+    j->auth_stage = OC_AUTH_STAGE_CHECKED;
+    oc_dbwriter_submit(w, j);
+}
+
+/* Queue `j` on the reader its connection uses, whatever its type. */
+static void submit_to_reader(oc_dbwriter *w, oc_job *j) {
+    pthread_mutex_lock(&w->mu);
+    j->next = NULL;
+    db_reader *rd = &w->readers[j->conn_id ? j->conn_id % OC_DB_READERS
+                                           : w->next_reader++ % OC_DB_READERS];
+    if (rd->tail) rd->tail->next = j; else rd->head = j;
+    rd->tail = j;
+    pthread_cond_signal(&rd->cv);
+    pthread_mutex_unlock(&w->mu);
+}
+
+void oc_dbwriter_hold_auth(oc_dbwriter *w, int on) { oc_authpool_hold(w->auth, on); }
+size_t oc_dbwriter_auth_waiting(oc_dbwriter *w) { return oc_authpool_waiting(w->auth); }
+
 void oc_dbwriter_submit(oc_dbwriter *w, oc_job *j) {
     pthread_mutex_lock(&w->mu);
     j->next = NULL;
-    if (is_read_job(j->type)) {                 /* route to the reader (ARCH-66) */
-        if (w->rjobs_tail) w->rjobs_tail->next = j; else w->rjobs_head = j;
-        w->rjobs_tail = j;
-        pthread_cond_signal(&w->read_cv);
+    if (is_read_job(j->type)) {                 /* route to a reader (ARCH-66) */
+        db_reader *rd = &w->readers[j->conn_id ? j->conn_id % OC_DB_READERS
+                                               : w->next_reader++ % OC_DB_READERS];
+        if (rd->tail) rd->tail->next = j; else rd->head = j;
+        rd->tail = j;
+        pthread_cond_signal(&rd->cv);
     } else {
         if (w->jobs_tail) w->jobs_tail->next = j; else w->jobs_head = j;
         w->jobs_tail = j;
@@ -8004,47 +8184,55 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (w->evfd < 0) { fprintf(stderr, "dbwriter: eventfd failed\n"); goto fail; }
 
-    /* Read-only connection for query jobs (ARCH-66): the same WAL file, opened
-     * query_only so it can never write. WAL lets it read concurrently with the
-     * writer without blocking it. */
-    if (sqlite3_open(path, &w->rdb) != SQLITE_OK) {
-        fprintf(stderr, "dbwriter: open read conn failed: %s\n", sqlite3_errmsg(w->rdb));
-        goto fail;
+    /* Read-only connections for query jobs (ARCH-66): the same WAL file, opened
+     * query_only so they can never write. WAL lets them read concurrently with
+     * the writer, and with each other, without blocking it. */
+    for (int i = 0; i < OC_DB_READERS; i++) {
+        db_reader *rd = &w->readers[i];
+        rd->w = w;
+        if (sqlite3_open(path, &rd->rdb) != SQLITE_OK) {
+            fprintf(stderr, "dbwriter: open read conn failed: %s\n", sqlite3_errmsg(rd->rdb));
+            goto fail;
+        }
+        sqlite3_busy_timeout(rd->rdb, 5000);
+        sqlite3_exec(rd->rdb, "PRAGMA query_only=1;", NULL, NULL, NULL);
     }
-    sqlite3_busy_timeout(w->rdb, 5000);
-    sqlite3_exec(w->rdb, "PRAGMA query_only=1;", NULL, NULL, NULL);
 
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cv, NULL);
-    pthread_cond_init(&w->read_cv, NULL);
+    for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_init(&w->readers[i].cv, NULL);
     if (pthread_create(&w->thread, NULL, writer_loop, w) != 0) {
         fprintf(stderr, "dbwriter: writer thread create failed\n");
-        pthread_mutex_destroy(&w->mu);
-        pthread_cond_destroy(&w->cv);
-        pthread_cond_destroy(&w->read_cv);
-        goto fail;
+        goto fail_threads;
     }
     w->started = 1;
-    if (pthread_create(&w->reader, NULL, reader_loop, w) != 0) {
-        fprintf(stderr, "dbwriter: reader thread create failed\n");
-        pthread_mutex_lock(&w->mu);
-        w->stop = 1;
-        pthread_cond_signal(&w->cv);
-        pthread_cond_signal(&w->read_cv);
-        pthread_mutex_unlock(&w->mu);
-        pthread_join(w->thread, NULL);
-        pthread_mutex_destroy(&w->mu);
-        pthread_cond_destroy(&w->cv);
-        pthread_cond_destroy(&w->read_cv);
-        w->started = 0;
-        goto fail;
+    for (int i = 0; i < OC_DB_READERS; i++) {
+        if (pthread_create(&w->readers[i].th, NULL, reader_loop, &w->readers[i]) != 0) {
+            fprintf(stderr, "dbwriter: reader thread create failed\n");
+            goto fail_threads;
+        }
+        w->readers[i].started = 1;
     }
-    w->reader_started = 1;
+    if (!(w->auth = oc_authpool_start(OC_AUTH_THREADS, auth_checked, w))) {
+        fprintf(stderr, "dbwriter: auth pool start failed\n");
+        goto fail_threads;
+    }
     return w;
 
+fail_threads:
+    pthread_mutex_lock(&w->mu);
+    w->stop = 1;
+    pthread_cond_signal(&w->cv);
+    for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_signal(&w->readers[i].cv);
+    pthread_mutex_unlock(&w->mu);
+    if (w->started) pthread_join(w->thread, NULL);
+    for (int i = 0; i < OC_DB_READERS; i++) if (w->readers[i].started) pthread_join(w->readers[i].th, NULL);
+    pthread_mutex_destroy(&w->mu);
+    pthread_cond_destroy(&w->cv);
+    for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_destroy(&w->readers[i].cv);
 fail:
     if (w->evfd >= 0) close(w->evfd);
-    sqlite3_close(w->rdb);
+    for (int i = 0; i < OC_DB_READERS; i++) sqlite3_close(w->readers[i].rdb);
     sqlite3_close(w->db);
     free(w);
     return NULL;
@@ -8056,16 +8244,22 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
         pthread_mutex_lock(&w->mu);
         w->stop = 1;
         pthread_cond_signal(&w->cv);
-        pthread_cond_signal(&w->read_cv);
+        for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_signal(&w->readers[i].cv);
         pthread_mutex_unlock(&w->mu);
+        /* Readers first, since one may hand the pool a check; then the pool,
+         * whose finished checks go to the writer's queue; then the writer. What
+         * reaches the queue after the writer has gone is freed below. */
+        for (int i = 0; i < OC_DB_READERS; i++) if (w->readers[i].started) pthread_join(w->readers[i].th, NULL);
+        oc_authpool_stop(w->auth);
+        w->auth = NULL;
         pthread_join(w->thread, NULL);
-        if (w->reader_started) pthread_join(w->reader, NULL);
         pthread_mutex_destroy(&w->mu);
         pthread_cond_destroy(&w->cv);
-        pthread_cond_destroy(&w->read_cv);
+        for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_destroy(&w->readers[i].cv);
     }
     for (oc_job *j = w->jobs_head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
-    for (oc_job *j = w->rjobs_head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
+    for (int i = 0; i < OC_DB_READERS; i++)
+        for (oc_job *j = w->readers[i].head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
     free(w->oidc_issuer); free(w->oidc_audience);
     free(w->oidc_pubkey_pem); free(w->relay_origin);
@@ -8074,7 +8268,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);
     if (w->evfd >= 0) close(w->evfd);
-    sqlite3_close(w->rdb);
+    for (int i = 0; i < OC_DB_READERS; i++) sqlite3_close(w->readers[i].rdb);
     sqlite3_close(w->db);
     free(w);
 }

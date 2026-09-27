@@ -32,6 +32,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,14 +50,14 @@ typedef struct {
     int          listen_fd;
     int          port;
     pthread_t    th;
-    volatile int stop;
-    volatile int requests;
+    atomic_int   stop;          /* these are shared with the test thread */
+    atomic_int   requests;
     uint8_t      obj[1024 * 1024];
-    size_t       obj_len;
+    atomic_size_t obj_len;
     /* While `gate` is set, a PUT is read whole and then NOT answered until it is
      * cleared: the daemon's commit waits on the reply, so the upload cannot
      * finish. `held` counts the PUTs that have reached the gate. */
-    volatile int gate, held;
+    atomic_int   gate, held;
 } slow_s3;
 
 static slow_s3 g_s3;
@@ -235,7 +236,7 @@ static void sb_wait_port(int port) {
  * slow backend while bob is measured. Ticking her between bob's sends (the
  * obvious shortcut) would make the two barely overlap and the measurement
  * meaningless. */
-static volatile int g_alice_run;
+static atomic_int g_alice_run;
 static oc_client   *g_alice;
 
 static void *alice_thread(void *unused) {
@@ -466,7 +467,7 @@ int run_slow_blob_tests(void) {
 done:
     if (alice) oc_client_stop(alice);
     if (bob) oc_client_stop(bob);
-    arg.stop = 1;
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);

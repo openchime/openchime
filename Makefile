@@ -79,7 +79,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/audio_sidecar.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
@@ -100,7 +100,7 @@ INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_INC)
 APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
-TEST_SRC  := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c,$(wildcard tests/*.c))
+TEST_SRC  := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c,$(wildcard tests/*.c))
 TEST_BIN  := build/tests
 
 # --- Client app-core (ARCH-74) ------------------------------------------------
@@ -195,7 +195,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test check-opcodes check-refs check-release-cc core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
+.PHONY: all run test test-tsan check-opcodes check-refs check-release-cc core tui bench bench-loop clean s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
 
 all: $(BIN)
 
@@ -346,6 +346,21 @@ $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOIC
 	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
 	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
+# The same test binary under ThreadSanitizer, for the code that shares memory
+# between threads: the event loop and its I/O threads, the writer and readers,
+# the worker pools, the client's call engine. The vendored libraries are not
+# instrumented, so a race inside one is not seen; one between our threads is.
+# OC_TEST_ONLY narrows it as it does `make test`.
+TSAN_BIN := build/tests-tsan
+# Run with address randomization off (setarch -R): ThreadSanitizer maps its
+# shadow memory at fixed addresses, and the randomization of recent kernels
+# places the binary where that shadow has to go ("unexpected memory mapping").
+test-tsan: $(TSAN_BIN)
+	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
+$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) | build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
 # uses Docker anywhere, and the script was deleted rather than reimplemented. The
@@ -372,6 +387,14 @@ bench: build/bench_load
 build/bench_load: tests/bench_load.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O2 -Ishared -I$(MBEDTLS_INC) \
 	    tests/bench_load.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
+
+# Event-loop load harness: the daemon in-process, driven by loopback clients,
+# printing the net loop's turn percentiles beside client latency. Optimised like
+# the daemon, so the numbers are the daemon's; not part of `make test`.
+bench-loop: build/bench_loop
+build/bench_loop: tests/bench_loop.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O) | build
+	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) \
+	    tests/bench_loop.c $(APP_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
 
 # Standalone compile check for the client app-core (no frontend, no main). The
 # headless test binary (make test) is the real coverage; this just proves the

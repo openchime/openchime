@@ -85,7 +85,7 @@ existing TLS connection — 32 KB per second of speech.
   talk, or when nothing was said). Segments are answered and posted in the order
   sent; the client may send the next while earlier ones are still being recognized.
 
-Not the UDP sidecar (a lost packet is a silently missing word) and not Opus (a codec
+Not the UDP call relay (a lost packet is a silently missing word) and not Opus (a codec
 in the client and a lossy input to the recognizer).
 
 ## 6. Recognition in the daemon
@@ -119,7 +119,8 @@ daemon holds 0.1 MB more with voice input built in than without it.
   against a decoder repeating itself.
 - **A worker of its own** beside the render worker: a bounded queue, an eventfd back
   to the net loop, one intra-op thread, the session opened on first use and released
-  when idle.
+  when idle. The loop only copies a segment's bytes as they arrive; the worker puts
+  the little-endian samples in host order before hearing them.
 - **Its own data directory and manifest** — `OPENCHIME_STT_DATA_DIR`, else
   `/usr/share/openchime/stt`, else `stt/` beside the executable — so missing data
   turns voice input off without touching read-aloud. `make STT=0` builds without it.

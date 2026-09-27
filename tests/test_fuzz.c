@@ -116,6 +116,8 @@ static void decode_all(const uint8_t *buf, size_t len) {
       rc = oc_decode_call_key(&p, &ck, ke, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_call_key_for ckf; D(oc_decode_call_key_for(&p, &ckf));
     oc_call_share csh; D(oc_decode_call_share(&p, &csh));
+    oc_call_media_pkt cmu; D(oc_decode_call_media_up(&p, &cmu));
+    oc_call_media_pkt cmd; D(oc_decode_call_media_down(&p, &cmd));
     oc_list_files lfz; D(oc_decode_list_files(&p, &lfz));
     oc_file_entry fez; D(oc_decode_file_entry(&p, &fez));
     oc_files fsz;      D(oc_decode_files(&p, &fsz));

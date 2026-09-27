@@ -205,6 +205,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
 
+/* Where a password sign-in is on its way (see auth_stage below). */
+#define OC_AUTH_STAGE_NEW     0   /* as submitted: the writer checks the limiter */
+#define OC_AUTH_STAGE_READ    1   /* a reader fetches the credential */
+#define OC_AUTH_STAGE_CHECKED 2   /* back from the auth pool: the writer finishes */
+
 typedef struct oc_job {
     struct oc_job *next;
     int            type;
@@ -218,6 +223,19 @@ typedef struct oc_job {
     char           source[46];/* peer IP string, for per-source rate limiting ("" if none) */
     char          *proof;     /* heap; the verifier a browser sign-in carries (AUTH.md §8.2) */
     size_t         proof_len;
+    /* A password sign-in's path (AUTH.md §2): the writer checks the limiter, a
+     * reader fetches the credential and its version, the auth pool checks the
+     * password, and the writer mints the session if that version is still the
+     * stored one. The stage says which of these the job is at. */
+    int            auth_stage;              /* OC_AUTH_STAGE_* */
+    int            auth_ok;                 /* CHECKED: the password matched */
+    uint64_t       auth_uid;                /* CHECKED: whose credential it was */
+    uint64_t       auth_version;            /* CHECKED: which version of it */
+    /* A password change, CHECKED: the new password's key, derived on the pool. */
+    int            pw_derived;
+    uint32_t       pw_iters;
+    uint8_t        pw_salt[16];             /* OC_PW_SALT_LEN */
+    uint8_t        pw_hash[32];             /* OC_PW_HASH_LEN */
     char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
 
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
@@ -1063,6 +1081,12 @@ int     oc_job_set_register(oc_job *j, const char *username, const char *passwor
 uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
                                     const char *password, uint8_t role,
                                     uint32_t iterations);
+
+/* The auth pool's hold and its count of waiting checks (authpool.h): a test's
+ * knob, for putting a password change between a sign-in's fetch of the
+ * credential and its check of the password. */
+void   oc_dbwriter_hold_auth(oc_dbwriter *w, int on);
+size_t oc_dbwriter_auth_waiting(oc_dbwriter *w);
 
 /* First-run bootstrap (REQ-024): if the tenant has no owner, mint a one-time
  * owner invite and return its raw token in `token_out` (returns 1); returns 0

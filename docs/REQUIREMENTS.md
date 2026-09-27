@@ -1181,9 +1181,9 @@ where one exists.
   peer-to-peer or ICE negotiation path has existed (ARCH-18).
 - **REQ-151.** Audio has been encoded with Opus by the client — 16 kHz, in-band
   FEC and DTX, through the echo canceller and noise suppression — and relayed
-  over an isolated UDP sidecar process, kept out of the daemon's TCP event loop
-  so a call cannot starve message delivery on the same tenant (ARCH-18). The
-  daemon never touches the codec (ARCH-28/31/73).
+  over UDP by the daemon, in a bounded share of each turn of its event loop, so
+  a call cannot starve message delivery on the same tenant and messaging cannot
+  hold up a call (ARCH-18/22). The daemon never touches the codec (ARCH-73).
 - **REQ-152.** A participant's connection loss during a call has not ended the
   call for the others; the daemon has kept relaying for them and has let the
   disconnected participant rejoin. A `CALL_LEAVE`, a TCP disconnect or the
@@ -1433,9 +1433,10 @@ where one exists.
 
 - **REQ-180.** Every client-daemon connection has been encrypted in transit;
   the system has offered no unencrypted TCP fallback (ARCH-6, ARCH-10). A call's
-  audio, which travels over UDP beside that connection, has been encrypted end to
-  end between the participants' devices, so neither the network nor the daemon
-  can hear it (REQ-306, ARCH-113).
+  audio, which travels over UDP beside that connection — or through it, when the
+  network passes no UDP to the relay — has been encrypted end to end between the
+  participants' devices, so neither the network nor the daemon can hear it
+  (REQ-306, ARCH-113).
 - **REQ-181.** A session has been the daemon's own to control: after a
   successful auth (REQ-023) the daemon has minted an opaque session token with a
   daemon-set expiry, recorded in a local `sessions` table (ARCH-58), rather than

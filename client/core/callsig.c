@@ -3,6 +3,7 @@
 #include "callsig.h"
 
 #include "e2e_hpke.h"
+#include "model.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,11 +12,59 @@
 void oc_callsig_init(oc_callsig *cs) {
     memset(cs, 0, sizeof *cs);
     oc_mutex_init(&cs->mu);
+    oc_mutex_init(&cs->tq_mu);
 }
 
 void oc_callsig_destroy(oc_callsig *cs) {
     oc_e2e_wipe(cs->sk, sizeof cs->sk);
     oc_mutex_destroy(&cs->mu);
+    oc_mutex_destroy(&cs->tq_mu);
+}
+
+/* The engine's way onto the connection: queue one packet, dropping the oldest
+ * when full, and wake the connection thread to write it. Any thread; never
+ * blocks on the connection. The wake is called under the queue's lock, so one
+ * cleared by oc_callsig_set_wake is never called after. */
+static int tcp_enqueue(void *sctx, uint16_t seq, const uint8_t *ct, size_t len) {
+    oc_callsig *cs = sctx;
+    if (len > OC_CALLSIG_TCPMAX) return -1;
+    oc_mutex_lock(&cs->tq_mu);
+    if (cs->tq_n == OC_CALLSIG_TCPQ) { cs->tq_head = (cs->tq_head + 1) % OC_CALLSIG_TCPQ; cs->tq_n--; }
+    int k = (cs->tq_head + cs->tq_n) % OC_CALLSIG_TCPQ;
+    cs->tq[k].seq = seq;
+    cs->tq[k].len = (uint16_t)len;
+    if (len) memcpy(cs->tq[k].ct, ct, len);
+    cs->tq_n++;
+    if (cs->wake) cs->wake(cs->wake_ctx);
+    oc_mutex_unlock(&cs->tq_mu);
+    return 0;
+}
+
+void oc_callsig_set_wake(oc_callsig *cs, void (*wake)(void *wctx), void *wctx) {
+    oc_mutex_lock(&cs->tq_mu);
+    cs->wake = wake;
+    cs->wake_ctx = wctx;
+    oc_mutex_unlock(&cs->tq_mu);
+}
+
+int oc_callsig_pump(oc_callsig *cs, oc_callsig_write write, void *wctx) {
+    for (;;) {
+        uint8_t ct[OC_CALLSIG_TCPMAX];
+        uint16_t seq, len;
+        oc_mutex_lock(&cs->tq_mu);
+        if (!cs->tq_n) { oc_mutex_unlock(&cs->tq_mu); break; }
+        seq = cs->tq[cs->tq_head].seq;
+        len = cs->tq[cs->tq_head].len;
+        memcpy(ct, cs->tq[cs->tq_head].ct, len);
+        cs->tq_head = (cs->tq_head + 1) % OC_CALLSIG_TCPQ;
+        cs->tq_n--;
+        oc_mutex_unlock(&cs->tq_mu);
+        uint8_t buf[OC_CALLSIG_TCPMAX + 32];
+        oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_call_media_pkt m = { 0, seq, { ct, len } };
+        if (oc_encode_call_media_up(&w, OC_PROTOCOL_VERSION, &m) == OC_OK) write(wctx, buf, w.len);
+    }
+    return 0;
 }
 
 void oc_callsig_set_media(oc_callsig *cs, const oc_call_media *media, void *ctx) {
@@ -204,6 +253,7 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
         cs->self_user = me >= 0 ? cs->parts[me].user_id : 0;
         snprintf(cs->host, sizeof cs->host, "%s", host ? host : "");
         oc_mutex_lock(&cs->mu);
+        if (cs->media && cs->media->tcp) cs->media->tcp(cs->mctx, cs->tcp_ok ? tcp_enqueue : NULL, cs);
         int started = cs->media && cs->media->start &&
                       cs->media->start(cs->mctx, cs->host, jd.udp_port, jd.token.ptr, jd.token.len,
                                        cs->self_user, cs->slot) == 0;
@@ -220,6 +270,15 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
         }
         media_roster(cs);
         rekey(cs, write, wctx);
+        return 1;
+    }
+    case OC_MSG_CALL_MEDIA: {
+        oc_call_media_pkt m;
+        if (oc_decode_call_media_down(p, &m) != OC_OK) return -1;
+        oc_mutex_lock(&cs->mu);
+        if (cs->in_call && cs->media && cs->media->rx_tcp)
+            cs->media->rx_tcp(cs->mctx, m.sender, m.seq, m.ct.ptr, m.ct.len);
+        oc_mutex_unlock(&cs->mu);
         return 1;
     }
     case OC_MSG_CALL_ROSTER: {

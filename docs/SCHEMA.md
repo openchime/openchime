@@ -236,6 +236,7 @@ Only local users have a row. PBKDF2-HMAC-SHA256; never a plaintext password.
 | `iterations`  | INTEGER | PBKDF2 iteration count (recorded so it can be raised).  |
 | `hash`        | BLOB    | the derived key.                                        |
 | `updated_at_ms`| INTEGER |                                                        |
+| `version`     | INTEGER | `NOT NULL DEFAULT 0` — from `credential_version_seq`, new on every write (migration 0047). |
 
 ### `invites`  — local-mode account creation (ARCH-59, REQ-033)
 An owner/admin issues an invite; the invitee sets a password by presenting it.
@@ -1158,6 +1159,21 @@ channel, and text this long on each entry is what would make a large workspace's
 list stop fitting the frame; the description is fetched with
 `GET_CHANNEL_DESCRIPTION` when a conversation's About is opened, and pushed to
 members as `CHANNEL_DESCRIPTION` when it changes (PROTOCOL.md).
+
+## 3al. Migration 0047 — a credential's version (AUTH.md §2)
+
+`local_credentials.version` (INTEGER, `NOT NULL DEFAULT 0`) and
+`credential_version_seq`, one row (`id` 1) holding the next version to give out.
+Every write of a credential -- an account's first password, a changed one --
+takes `next` and moves it up by one in the same transaction, so versions only
+rise and none is ever given twice. Rows written before this migration are 0,
+which the counter never gives.
+
+A password sign-in reads the credential and its version on a reader, checks the
+password on the auth pool, and mints the session on the writer only if the row
+for that user still carries that version. A password changed in between, or an
+account removed (and its id given to another), fails the sign-in rather than
+letting a password that was right a moment ago open the account as it is now.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
