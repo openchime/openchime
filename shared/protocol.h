@@ -434,6 +434,27 @@ typedef enum {
     OC_MSG_STT_CHUNK        = 0x00E5, /* C->S, a slice of its samples */
     OC_MSG_STT_END          = 0x00E6, /* C->S, the whole segment is sent */
     OC_MSG_STT_TEXT         = 0x00E7, /* S->C, what was said, and the message it became */
+    /* User groups (REQ-307-309, ARCH-114): a named set of people with an
+     * @handle. Owners and admins manage them; everyone sees them, since a
+     * composer offers them and a profile lists them. A channel can take a group
+     * as a member -- by reference, so the group's later changes follow. */
+    OC_MSG_LIST_GROUPS          = 0x00E8, /* C->S, every group, as GROUP_INFO frames then GROUPS_END */
+    OC_MSG_CREATE_GROUP         = 0x00E9, /* C->S, owner/admin */
+    OC_MSG_UPDATE_GROUP         = 0x00EA, /* C->S, owner/admin: handle, name, description */
+    OC_MSG_DELETE_GROUP         = 0x00EB, /* C->S, owner/admin */
+    OC_MSG_GROUP_ADD_MEMBERS    = 0x00EC, /* C->S, owner/admin */
+    OC_MSG_GROUP_REMOVE_MEMBERS = 0x00ED, /* C->S, owner/admin */
+    OC_MSG_GROUP_INFO           = 0x00EE, /* S->C, one group whole: listed, and pushed to all on a change */
+    OC_MSG_GROUP_DELETED        = 0x00EF, /* S->C, pushed to all */
+    OC_MSG_GROUPS_END           = 0x00F0, /* S->C, terminator of a LIST_GROUPS answer */
+    OC_MSG_CHANNEL_ADD_GROUP    = 0x00F1, /* C->S, any member of the channel */
+    OC_MSG_CHANNEL_REMOVE_GROUP = 0x00F2, /* C->S, any member of the channel */
+    OC_MSG_CHANNEL_GROUPS       = 0x00F3, /* S->C, the groups a channel has, beside its CHANNEL_INFO */
+    OC_MSG_CHANNEL_VIA_GROUP    = 0x00F4, /* S->C, after a LIST_MEMBERS answer: who is in only through a group */
+    /* S->C, to the SENDER ONLY, right after MENTION_UNRESOLVED when a message
+     * reached fewer people than it named -- a group larger than the notice's
+     * eight names: how many it could not reach in all (REQ-308). */
+    OC_MSG_MENTION_UNRESOLVED_MORE = 0x00F5,
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -512,6 +533,10 @@ typedef enum {
     OC_ERR_NOT_CALL_STARTER    = 3029, /* only the call's starter may end it for everyone (REQ-301) */
     OC_ERR_NOT_IN_CALL         = 3030, /* no such call, or the sender is not in it */
     OC_ERR_INVITE_UNREDEEMABLE = 3031, /* an invite bound to an address, where no sign-in source here could spend it */
+    OC_ERR_GROUP_HANDLE_TAKEN  = 3032, /* a group, a person or a broadcast already answers to that @name (REQ-307) */
+    OC_ERR_UNKNOWN_GROUP       = 3033, /* no such group */
+    OC_ERR_MEMBER_VIA_GROUP    = 3034, /* in the channel through a group: leaving or removing them alone cannot (REQ-309) */
+    OC_ERR_INVALID_GROUP       = 3035, /* a handle, name or description out of bounds, or a group or channel at its cap */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -1018,6 +1043,28 @@ typedef struct { oc_slice full_name; oc_slice title; oc_slice pronouns;
  * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
  * store all keep working. 0 clears the avatar. */
 typedef struct { uint64_t attachment_id; } oc_set_avatar;
+/* User groups (REQ-307-309). A handle is what `@` names: the mention scanner's
+ * characters ([A-Za-z0-9._-]), not beginning with a digit, compared without
+ * case. The caps keep the whole group in one frame. */
+#define OC_GROUP_HANDLE_MAX   48u
+#define OC_GROUP_NAME_MAX     80u
+#define OC_GROUP_DESC_MAX     500u
+#define OC_MAX_GROUP_MEMBERS  1024u   /* people in one group */
+#define OC_MAX_GROUP_OP       256u    /* people added or removed by one frame */
+#define OC_MAX_GROUPS         256u    /* groups in a workspace */
+#define OC_MAX_CHANNEL_GROUPS 32u     /* groups one channel can have */
+typedef struct { oc_slice handle; oc_slice name; oc_slice description; } oc_create_group;
+typedef struct { uint64_t group_id; oc_slice handle; oc_slice name; oc_slice description; } oc_update_group;
+typedef struct { uint64_t group_id; } oc_group_ref;               /* DELETE_GROUP, GROUP_DELETED */
+typedef struct { uint64_t group_id; uint16_t count; uint64_t user_ids[OC_MAX_GROUP_OP]; } oc_group_members_op;
+typedef struct { uint64_t group_id; oc_slice handle; oc_slice name; oc_slice description;
+                 uint64_t created_by; uint16_t count; const uint64_t *members; } oc_group_info;
+typedef struct { uint16_t count; } oc_groups_end;
+typedef struct { uint64_t channel_id; uint64_t group_id; } oc_channel_group_op;
+typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *group_ids; } oc_channel_groups;
+/* The members a channel has only through a group (REQ-309); capped like a member list. */
+typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *user_ids; } oc_channel_via_group;
+typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t total; } oc_mention_unresolved_more;
 typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_group_dm;
 /* Custom emoji (REQ-072). The image is an attachment id for the same reason an
  * avatar is: the store already handles upload, caps, dedup and reclamation. The
@@ -1467,6 +1514,20 @@ oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate
 oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m);
 oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m);
 oc_result oc_encode_open_group_dm(oc_wbuf *w, uint16_t version, const oc_open_group_dm *m);
+oc_result oc_encode_list_groups(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_create_group(oc_wbuf *w, uint16_t version, const oc_create_group *m);
+oc_result oc_encode_update_group(oc_wbuf *w, uint16_t version, const oc_update_group *m);
+oc_result oc_encode_delete_group(oc_wbuf *w, uint16_t version, const oc_group_ref *m);
+/* `type` is OC_MSG_GROUP_ADD_MEMBERS or OC_MSG_GROUP_REMOVE_MEMBERS. */
+oc_result oc_encode_group_members_op(oc_wbuf *w, uint16_t version, uint16_t type, const oc_group_members_op *m);
+oc_result oc_encode_group_info(oc_wbuf *w, uint16_t version, const oc_group_info *m);
+oc_result oc_encode_group_deleted(oc_wbuf *w, uint16_t version, const oc_group_ref *m);
+oc_result oc_encode_groups_end(oc_wbuf *w, uint16_t version, const oc_groups_end *m);
+/* `type` is OC_MSG_CHANNEL_ADD_GROUP or OC_MSG_CHANNEL_REMOVE_GROUP. */
+oc_result oc_encode_channel_group_op(oc_wbuf *w, uint16_t version, uint16_t type, const oc_channel_group_op *m);
+oc_result oc_encode_channel_groups(oc_wbuf *w, uint16_t version, const oc_channel_groups *m);
+oc_result oc_encode_channel_via_group(oc_wbuf *w, uint16_t version, const oc_channel_via_group *m);
+oc_result oc_encode_mention_unresolved_more(oc_wbuf *w, uint16_t version, const oc_mention_unresolved_more *m);
 oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m);
 oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m);
 oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version);
@@ -1474,6 +1535,19 @@ oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
 oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m);
 oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m);
+oc_result oc_decode_list_groups(oc_rbuf *p);
+oc_result oc_decode_create_group(oc_rbuf *p, oc_create_group *m);
+oc_result oc_decode_update_group(oc_rbuf *p, oc_update_group *m);
+oc_result oc_decode_group_ref(oc_rbuf *p, oc_group_ref *m);
+oc_result oc_decode_group_members_op(oc_rbuf *p, oc_group_members_op *m);
+/* `members` receives up to `cap` ids; more than `cap` is malformed. */
+oc_result oc_decode_group_info(oc_rbuf *p, oc_group_info *m, uint64_t *members, uint16_t cap);
+oc_result oc_decode_groups_end(oc_rbuf *p, oc_groups_end *m);
+oc_result oc_decode_channel_group_op(oc_rbuf *p, oc_channel_group_op *m);
+oc_result oc_decode_channel_groups(oc_rbuf *p, oc_channel_groups *m, uint64_t *group_ids, uint16_t cap);
+/* `user_ids` receives up to `cap`; more is malformed. */
+oc_result oc_decode_channel_via_group(oc_rbuf *p, oc_channel_via_group *m, uint64_t *user_ids, uint16_t cap);
+oc_result oc_decode_mention_unresolved_more(oc_rbuf *p, oc_mention_unresolved_more *m);
 oc_result oc_decode_add_emoji(oc_rbuf *p, oc_add_emoji *m);
 oc_result oc_decode_delete_emoji(oc_rbuf *p, oc_delete_emoji *m);
 oc_result oc_decode_list_emoji(oc_rbuf *p);

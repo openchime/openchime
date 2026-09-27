@@ -1012,6 +1012,50 @@ static const char MIGRATION_0047[] =
     ");"
     "INSERT INTO credential_version_seq(id, next) VALUES (1, 1);";
 
+static const char MIGRATION_0048[] =
+    /* User groups (REQ-307-309, ARCH-114): a named set of people with an
+     * @handle, which a message can mention and a channel can take as a member.
+     *
+     * A group in a channel is a REFERENCE: the channel records the group, and
+     * its members are in the channel through it for as long as both hold. What
+     * every query already reads -- channel_members -- stays the effective
+     * membership, kept equal to "added directly, or in a group the channel
+     * has" by one function (membership_sync), so no access check, fan-out or
+     * push query needs to know groups exist. `direct` is the first half of that
+     * rule; every row until now was added directly.
+     *
+     * A handle is compared without case, like a channel name. The rule that it
+     * is nobody's display name either is the writer's to keep (it spans two
+     * tables). A mention that came from a group is one row per member it
+     * reached, with the group beside it, so the push, badge and feed queries
+     * count it exactly as a personal mention. */
+    "ALTER TABLE channel_members ADD COLUMN direct INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0,1));"
+    "CREATE TABLE user_groups ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  handle        TEXT NOT NULL,"
+    "  name          TEXT NOT NULL,"
+    "  description   TEXT,"
+    "  created_by    INTEGER REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE UNIQUE INDEX idx_user_groups_handle ON user_groups(lower(handle));"
+    "CREATE TABLE user_group_members ("
+    "  group_id    INTEGER NOT NULL REFERENCES user_groups(id),"
+    "  user_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  added_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (group_id, user_id)"
+    ");"
+    "CREATE INDEX idx_user_group_members_user ON user_group_members(user_id);"
+    "CREATE TABLE channel_groups ("
+    "  channel_id  INTEGER NOT NULL REFERENCES channels(id),"
+    "  group_id    INTEGER NOT NULL REFERENCES user_groups(id),"
+    "  added_by    INTEGER REFERENCES users(id),"
+    "  added_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (channel_id, group_id)"
+    ");"
+    "CREATE INDEX idx_channel_groups_group ON channel_groups(group_id);"
+    "ALTER TABLE mentions ADD COLUMN group_id INTEGER REFERENCES user_groups(id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1060,6 +1104,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 45, MIGRATION_0045 },
     { 46, MIGRATION_0046 },
     { 47, MIGRATION_0047 },
+    { 48, MIGRATION_0048 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

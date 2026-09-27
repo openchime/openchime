@@ -54,6 +54,16 @@ typedef struct {
     uint64_t sharer;      /* who is sharing a screen, 0 for nobody (REQ-161) */
 } oc_call_view;
 
+/* One user group (REQ-307), whole, as a GROUP_INFO says it. */
+typedef struct {
+    uint64_t  id, created_by;
+    char      handle[OC_GROUP_HANDLE_MAX + 1];
+    char      name[OC_GROUP_NAME_MAX + 1];
+    char      description[OC_GROUP_DESC_MAX + 1];
+    uint16_t  n_members;
+    uint64_t  members[OC_MAX_GROUP_MEMBERS];
+} oc_group_view;
+
 /* net thread -> UI thread */
 enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
@@ -207,6 +217,19 @@ enum {
     /* CHANNEL_DESCRIPTION (REQ-034): channel_id + description in body ("" = none).
      * The answer to a fetch and the announcement of a change are one frame. */
     OC_EV_CHANNEL_DESCRIPTION,
+    /* User groups (REQ-307-309). GROUP carries `group` whole; GROUP_DELETED names
+     * message_id; GROUPS_END closes a list (count); CHANNEL_GROUPS gives a
+     * channel's groups in `groups`/`n_groups`. */
+    OC_EV_GROUP,
+    OC_EV_GROUP_DELETED,
+    OC_EV_GROUPS_END,
+    OC_EV_CHANNEL_GROUPS,
+    /* After a member list: who is in the channel only through a group
+     * (REQ-309), in `ids`/`n_ids`. */
+    OC_EV_CHANNEL_VIA_GROUP,
+    /* After MENTION_UNRESOLVED: how many the message could not reach in all
+     * (count), beyond the names it listed (REQ-308). */
+    OC_EV_MENTION_UNRESOLVED_MORE,
     /* How this workspace signs people in, from the AUTH_CHALLENGE of every
      * connection: `count` holds one bit per source kind, 1u << OC_SOURCE_*, and
      * body the ids of its browser sources, each ended by "\n". */
@@ -293,6 +316,11 @@ typedef struct {
     uint64_t xfer_tag, xfer_done, xfer_total;
     uint8_t  xfer_file;   /* XFER: which file of a POST_FILES job is moving (0 otherwise) */
     oc_call_view *call;   /* heap; the CALL_* events */
+    oc_group_view *group; /* heap; OC_EV_GROUP */
+    uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* CHANNEL_GROUPS */
+    uint16_t n_groups;
+    uint64_t *ids;        /* heap; CHANNEL_VIA_GROUP */
+    size_t    n_ids;
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
 } oc_ev;
 
@@ -425,6 +453,18 @@ enum {
     OC_CMD_CALL_DECLINE,
     OC_CMD_CALL_END,
     OC_CMD_CALL_SHARE,
+    /* User groups (REQ-307-309). CREATE/UPDATE: body = handle, body2 = name,
+     * body3 = description, message_id = the group (UPDATE); DELETE: message_id;
+     * ADD/REMOVE_MEMBERS: message_id + uids; CHANNEL_ADD/REMOVE_GROUP:
+     * channel_id + message_id = the group. */
+    OC_CMD_LIST_GROUPS,
+    OC_CMD_CREATE_GROUP,
+    OC_CMD_UPDATE_GROUP,
+    OC_CMD_DELETE_GROUP,
+    OC_CMD_GROUP_ADD_MEMBERS,
+    OC_CMD_GROUP_REMOVE_MEMBERS,
+    OC_CMD_CHANNEL_ADD_GROUP,
+    OC_CMD_CHANNEL_REMOVE_GROUP,
     OC_CMD_QUIT
 };
 
@@ -436,6 +476,7 @@ typedef struct {
     uint64_t server_time;  /* SCHEDULE: when to send (ms) */
     char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
     char    *body2;        /* heap; SET_SETTING value, else NULL */
+    char    *body3;        /* heap; CREATE/UPDATE_GROUP description, else NULL */
     /* SEND: what this message forwards (REQ-057), 0/0 when it forwards nothing. */
     uint64_t src_channel, src_message;
     /* OPEN_GROUP_DM (REQ-056): the other participants. Inline, because the wire

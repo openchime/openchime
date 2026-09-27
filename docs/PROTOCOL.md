@@ -2029,6 +2029,87 @@ session and revoke it (REQ-182). Rotating a webhook mints a new token and return
 it once, on the same terms as creation: only the SHA-256 is stored, so a token
 cannot be re-shown.
 
+### 5.16k User groups (REQ-307-309, ARCH-114)
+
+A **group** is a named set of people with an `@handle`. Owners and admins manage
+groups; everyone signed in sees them, since a composer offers them and a profile
+lists them. A handle uses the mention scanner's characters (`[A-Za-z0-9._-]`), is
+1–48 long, does not start with a digit or `.`, `-` or `_`, and is compared without
+case. It shares one namespace with display names and the broadcast words: a group
+cannot take `here`, `channel`, `everyone` or anyone's display name, and a person
+cannot rename themselves to a group's handle (`GROUP_HANDLE_TAKEN`). A group holds
+people only, at most 1024; a workspace holds at most 256 groups.
+
+**`LIST_GROUPS` (C → S), `0x00E8`** — Ask for every group. The answer is one `GROUP_INFO` per group, then `GROUPS_END`. A group the answer does not name no longer exists. A client need not ask at sign-in: the daemon follows a session's first `USER_LIST` with the same answer, unasked.
+
+    (empty)
+
+**`CREATE_GROUP` (C → S), `0x00E9`** — Owner/admin. Answered, and announced to everyone, with the new group's `GROUP_INFO`.
+
+    handle (str), name (str), description (str)
+
+**`UPDATE_GROUP` (C → S), `0x00EA`** — Owner/admin: a group's handle, name and description, whole.
+
+    group_id (u64), handle (str), name (str), description (str)
+
+**`DELETE_GROUP` (C → S), `0x00EB`** — Owner/admin. The group leaves every channel it was in, and takes with it the membership it gave. Announced to everyone as `GROUP_DELETED`.
+
+    group_id (u64)
+
+**`GROUP_ADD_MEMBERS` (C → S), `0x00EC`** / **`GROUP_REMOVE_MEMBERS` (C → S), `0x00ED`** — Owner/admin: people in or out, at most 256 per frame. Each person added gains every channel the group is in. Each person removed loses those channels they are in only through it. An id that is nobody, or somebody removed from the workspace, is ignored.
+
+    group_id (u64), count (u16), then count x { user_id (u64) }
+
+**`GROUP_INFO` (S → C), `0x00EE`** — One group, whole. It is a list entry, and it is pushed to everyone signed in on any change.
+
+    group_id (u64), handle (str), name (str), description (str), created_by (u64), count (u16), then count x { user_id (u64) }
+
+**`GROUP_DELETED` (S → C), `0x00EF`** — Pushed to everyone signed in.
+
+    group_id (u64)
+
+**`GROUPS_END` (S → C), `0x00F0`** — Terminator of a `LIST_GROUPS` answer.
+
+    count (u16)
+
+**`CHANNEL_ADD_GROUP` (C → S), `0x00F1`** / **`CHANNEL_REMOVE_GROUP` (C → S), `0x00F2`** — Any member of the channel (not a DM), as with inviting a person. At most 32 groups per channel. The group's members are in the channel through it: added to the group later, they are in; taken out, they are out, unless they were also added directly. Answered like `INVITE_TO_CHANNEL`: the channel's `CHANNEL_INFO` to the actor, then its `CHANNEL_GROUPS`.
+
+    channel_id (u64), group_id (u64)
+
+**`CHANNEL_GROUPS` (S → C), `0x00F3`** — The groups a channel has.
+- Sent right after every `CHANNEL_INFO` of a channel (not a DM), to the same people, none included.
+- Sent after the channel list, for each channel.
+- Sent to every member when the channel's groups change.
+
+**`CHANNEL_VIA_GROUP` (S → C), `0x00F4`** — Sent right after the `MEMBERS` terminator of every `LIST_MEMBERS` answer. It names the channel's members who are in it **only** through a group, which are the ones leave and remove refuse.
+
+    channel_id (u64), count (u16), then count x { user_id (u64) }
+
+**`MENTION_UNRESOLVED_MORE` (S → C), `0x00F5`** — To the sender only, right after `MENTION_UNRESOLVED`, when a message could not reach more people than that notice lists (a group larger than its eight names). It gives the total.
+
+    channel_id (u64), message_id (u64), total (u16)
+
+    channel_id (u64), count (u16), then count x { group_id (u64) }
+
+**Who gains or loses a channel by any of these** is told as an invitee and a
+leaver are:
+- A person who gained a channel gets its `CHANNEL_INFO` (joined 1) and its `CHANNEL_GROUPS`.
+- A person who lost one gets its `CHANNEL_INFO` with joined 0. So does someone removed with `REMOVE_FROM_CHANNEL`.
+
+**Leaving and removing.** Leave and remove clear someone's direct membership,
+and a group the channel has keeps them in. Someone in a channel **only** through a
+group cannot leave it, and cannot be removed from it alone. `LEAVE_CHANNEL` and
+`REMOVE_FROM_CHANNEL` are refused with `MEMBER_VIA_GROUP`. They leave when they
+leave the group, or when the group leaves the channel.
+
+**`@handle` in a message** reaches every member of the group who can read the
+channel, each under their own notification level, schedule and pause, as a
+personal mention does. Members who cannot read it are listed to the sender in
+`MENTION_UNRESOLVED` (§5.16g), up to its eight names, followed by
+`MENTION_UNRESOLVED_MORE` with the total when there are more. A handle wins a clash
+with a person's name. Only an identity provider's name at first sign-in can make
+one.
+
 ### 5.16i Threads across channels
 
 Delivers REQ-062 (ARCH-104). Participation is **derived** — you are in a thread
@@ -2471,6 +2552,10 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
 | `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`). |
 | `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in (§5.8). |
+| `3032` | `GROUP_HANDLE_TAKEN`  | groups     | no    | A group, a person or a broadcast word already answers to that `@name`: a create, an update, or a rename (`SET_DISPLAY_NAME`) (§5.16k). |
+| `3033` | `UNKNOWN_GROUP`       | groups     | no    | No such group. |
+| `3034` | `MEMBER_VIA_GROUP`    | groups     | no    | `LEAVE_CHANNEL` or `REMOVE_FROM_CHANNEL` for someone in the channel only through a group (§5.16k). |
+| `3035` | `INVALID_GROUP`       | groups     | no    | A handle, name or description out of bounds, or a group, a workspace or a channel at its cap (§5.16k). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -2676,6 +2761,20 @@ this table cannot silently gain a shared value.
 | `0x00E5` | `STT_CHUNK` | C → S | a slice of its samples |
 | `0x00E6` | `STT_END` | C → S | the whole segment is sent |
 | `0x00E7` | `STT_TEXT` | S → C | what was said, and the message it was posted as (REQ-297) |
+| `0x00E8` | `LIST_GROUPS` | C → S | every user group (REQ-307) |
+| `0x00E9` | `CREATE_GROUP` | C → S | owner/admin |
+| `0x00EA` | `UPDATE_GROUP` | C → S | owner/admin |
+| `0x00EB` | `DELETE_GROUP` | C → S | owner/admin |
+| `0x00EC` | `GROUP_ADD_MEMBERS` | C → S | owner/admin |
+| `0x00ED` | `GROUP_REMOVE_MEMBERS` | C → S | owner/admin |
+| `0x00EE` | `GROUP_INFO` | S → C | one group, whole; pushed to all on a change |
+| `0x00EF` | `GROUP_DELETED` | S → C | pushed to all |
+| `0x00F0` | `GROUPS_END` | S → C | terminator of a LIST_GROUPS answer |
+| `0x00F1` | `CHANNEL_ADD_GROUP` | C → S | give a channel a group (REQ-309) |
+| `0x00F2` | `CHANNEL_REMOVE_GROUP` | C → S | take it away |
+| `0x00F3` | `CHANNEL_GROUPS` | S → C | the groups a channel has |
+| `0x00F4` | `CHANNEL_VIA_GROUP` | S → C | after a member list: who is in only through a group |
+| `0x00F5` | `MENTION_UNRESOLVED_MORE` | S → C | how many a message could not reach in all (REQ-308) |
 
 ## 10. Connection state machine
 

@@ -330,6 +330,18 @@ void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n);
 /* Custom emoji (REQ-072). `add` claims an image the caller already uploaded, as an
  * avatar does; the daemon answers with the whole catalogue and fans it to everyone,
  * because an emoji only half the workspace knows about is one they cannot use. */
+/* User groups (REQ-307-309). Owners and admins create, change and delete groups
+ * and change who is in them; the daemon refuses anyone else, and pushes every
+ * change to everyone. Any member of a channel may give it a group, or take one
+ * away: its members are then in the channel through it. */
+void oc_client_list_groups(oc_client *c);
+void oc_client_create_group(oc_client *c, const char *handle, const char *name, const char *description);
+void oc_client_update_group(oc_client *c, uint64_t group_id, const char *handle, const char *name,
+                            const char *description);
+void oc_client_delete_group(oc_client *c, uint64_t group_id);
+void oc_client_group_members(oc_client *c, uint64_t group_id, int add, const uint64_t *user_ids, int n);
+void oc_client_channel_group(oc_client *c, uint64_t channel_id, uint64_t group_id, int add);
+
 void oc_client_list_emoji(oc_client *c);
 void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id);
 void oc_client_delete_emoji(oc_client *c, const char *name);

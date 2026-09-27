@@ -1128,6 +1128,15 @@ size_t oc_complete(const oc_model *m, const char *text,
 
     if (tok[0] == '@') {
         if (kind) *kind = OC_AC_MENTION;
+        /* Groups (REQ-308) beside people, marked as groups: a handle reaches
+         * everyone in it, which is not what naming a person does. */
+        for (size_t i = 0; i < m->n_groups && n < max; i++)
+            if (ci_prefix(m->groups[i]->handle, tok + 1)) {
+                snprintf(out[n].repl, sizeof out[n].repl, "@%s", m->groups[i]->handle);
+                snprintf(out[n].disp, sizeof out[n].disp, "%.40s  (group, %u)", m->groups[i]->handle,
+                         (unsigned)m->groups[i]->n_members);
+                n++;
+            }
         for (size_t i = 0; i < m->n_users && n < max; i++)
             if (m->users[i].name[0] && ci_prefix(m->users[i].name, tok + 1)) {
                 snprintf(out[n].repl, sizeof out[n].repl, "@%s", m->users[i].name);

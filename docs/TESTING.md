@@ -1129,6 +1129,29 @@ seconds that the relay does not answer, moves to the connection transport — th
 dump's `call` line says `transport=tcp` — and hears the other's tone
 (PROTOCOL.md §5.17, AUDIO.md §4).
 
+`scripts/gui_groups.sh` drives user groups (REQ-307–309) on a pair of its own
+(port 9640, clients reaching the daemon at the WSL address; carol and u1–u9 exist without clients).
+- Alice makes `@crew` in Admin → Groups through the tab's own buttons (the `grpbtn` verb presses them, `formnext` fills their forms).
+- She adds carol and bob with the people picker (`grppick <query>` types into it through the real key path and presses Enter): `car` finds carol, `#gen` offers nothing and adds nobody, and one Add puts both in.
+- She gives `@crew` to a private channel from the channel menu (`chmenu 8`).
+- Bob, never invited, is in the channel through the group, and a message naming `@crew` names him.
+- His Leave is refused, with the daemon's reason.
+- In alice's members pane (the window widened so the pane is drawn), bob's Remove says why it cannot, and he stays. The group row's Remove asks first, and confirmed, takes bob out and leaves carol, who is also in directly. The pane's Add group puts the group back, and a direct member's Remove takes out that member and nobody else.
+- New message's To field, which shares the picker, still takes a channel, replaces it with people, and refuses a ninth person, saying so. Opening a group's people afterwards gives an empty picker of the group's own, alice can add herself, and New message's recipients and text are still there on return.
+- Taken out of the group, bob is out of the channel and told.
+
+The dump's `groups` and `chgroups` lines carry the groups, the open channel's, whether this user is in it through one, and whether its newest message names them. `grppick` carries the picker's owner, focus, chips and matches; `memgrp` the pane's group buttons, group-row Removes and the hovered row's Remove; `memrow` names each row's person.
+
+`gui_pair.sh`'s command directories are per port (`ocpair-<port>-a`, `-b`), so two pairs up at once never read each other's commands.
+
+The daemon side is in `make test`:
+- `test_dbwriter` covers the rules, membership by reference, `@group`, and the invariant. The invariant is a random sequence of every membership operation checked against a reference model after each step.
+- `itest_netloop` runs the same over the wire.
+- `test_push` checks that a group mention pushes to its member only.
+- `test_client_core` covers the client model and autocomplete.
+
+Each guard was shown to fail with the change it guards reverted.
+
 ## Reading the voice harness
 
 `scripts/gui_voice.sh` drives voice input in the Win32 client end to end against

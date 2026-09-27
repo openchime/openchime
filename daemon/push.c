@@ -411,7 +411,7 @@ static int collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * message): muted, quiet and paused still silence it. */
             "       ( ?6 <> 0 OR "
             "       EXISTS(SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
-            "               AND (  (mn.user_id = cm.user_id AND mn.kind = 0) "
+            "               AND (  (mn.user_id = cm.user_id AND mn.kind IN (0,5)) "
             "                   OR mn.kind IN (1,2,3) )) ), "
             /* KEYWORD_HIT, separately: REQ-135 makes it part of the MENTIONS
              * level rather than a switch of its own, and it is always personal

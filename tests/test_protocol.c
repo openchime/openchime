@@ -1410,6 +1410,107 @@ static void test_call_frames(void) {
     }
 }
 
+/* User groups (REQ-307-309): every frame round-trips, and a list longer than
+ * its cap is malformed rather than truncated. */
+static void test_group_frames(void) {
+    {
+        ROUNDTRIP(oc_encode_list_groups(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_GROUPS, h, p);
+        CHECK(oc_decode_list_groups(&p) == OC_OK);
+    }
+    {
+        oc_create_group in = { oc_slice_str("design"), oc_slice_str("Design"), oc_slice_str("the pixel people") };
+        ROUNDTRIP(oc_encode_create_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_GROUP, h, p);
+        oc_create_group out;
+        CHECK(oc_decode_create_group(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.handle, "design") && slice_eq_str(out.name, "Design") &&
+              slice_eq_str(out.description, "the pixel people"));
+    }
+    {
+        oc_update_group in = { 7, oc_slice_str("ux"), oc_slice_str("UX"), oc_slice_str("") };
+        ROUNDTRIP(oc_encode_update_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPDATE_GROUP, h, p);
+        oc_update_group out;
+        CHECK(oc_decode_update_group(&p, &out) == OC_OK);
+        CHECK(out.group_id == 7 && slice_eq_str(out.handle, "ux") && out.description.len == 0);
+    }
+    {
+        oc_group_ref in = { 7 };
+        ROUNDTRIP(oc_encode_delete_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE_GROUP, h, p);
+        oc_group_ref out;
+        CHECK(oc_decode_group_ref(&p, &out) == OC_OK && out.group_id == 7);
+    }
+    {
+        oc_group_ref in = { 8 };
+        ROUNDTRIP(oc_encode_group_deleted(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GROUP_DELETED, h, p);
+        oc_group_ref out;
+        CHECK(oc_decode_group_ref(&p, &out) == OC_OK && out.group_id == 8);
+    }
+    {
+        static oc_group_members_op in, out;
+        in.group_id = 7; in.count = 3; in.user_ids[0] = 1; in.user_ids[1] = 2; in.user_ids[2] = 99;
+        ROUNDTRIP(oc_encode_group_members_op(&w, OC_PROTOCOL_VERSION, OC_MSG_GROUP_REMOVE_MEMBERS, &in),
+                  OC_MSG_GROUP_REMOVE_MEMBERS, h, p);
+        CHECK(oc_decode_group_members_op(&p, &out) == OC_OK);
+        CHECK(out.group_id == 7 && out.count == 3 && out.user_ids[2] == 99);
+    }
+    {
+        uint64_t mem[3] = { 4, 5, 6 };
+        oc_group_info in = { 7, oc_slice_str("design"), oc_slice_str("Design"), oc_slice_str("d"), 1, 3, mem };
+        ROUNDTRIP(oc_encode_group_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GROUP_INFO, h, p);
+        uint64_t got[4]; oc_group_info out;
+        CHECK(oc_decode_group_info(&p, &out, got, 4) == OC_OK);
+        CHECK(out.group_id == 7 && out.created_by == 1 && out.count == 3 && out.members[1] == 5 &&
+              slice_eq_str(out.handle, "design"));
+        /* More members than the reader holds: refused, not cut short. */
+        oc_rbuf p2; oc_header h2;
+        CHECK(oc_parse_frame(frame, w.len, &h2, &p2) == OC_OK);
+        CHECK(oc_decode_group_info(&p2, &out, got, 2) == OC_E_MALFORMED);
+    }
+    {
+        oc_groups_end in = { 12 };
+        ROUNDTRIP(oc_encode_groups_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_GROUPS_END, h, p);
+        oc_groups_end out;
+        CHECK(oc_decode_groups_end(&p, &out) == OC_OK && out.count == 12);
+    }
+    {
+        oc_channel_group_op in = { 3, 7 };
+        ROUNDTRIP(oc_encode_channel_group_op(&w, OC_PROTOCOL_VERSION, OC_MSG_CHANNEL_ADD_GROUP, &in),
+                  OC_MSG_CHANNEL_ADD_GROUP, h, p);
+        oc_channel_group_op out;
+        CHECK(oc_decode_channel_group_op(&p, &out) == OC_OK && out.channel_id == 3 && out.group_id == 7);
+    }
+    {
+        uint64_t ids[2] = { 7, 9 };
+        oc_channel_groups in = { 3, 2, ids };
+        ROUNDTRIP(oc_encode_channel_groups(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_GROUPS, h, p);
+        uint64_t got[OC_MAX_CHANNEL_GROUPS]; oc_channel_groups out;
+        CHECK(oc_decode_channel_groups(&p, &out, got, OC_MAX_CHANNEL_GROUPS) == OC_OK);
+        CHECK(out.channel_id == 3 && out.count == 2 && out.group_ids[1] == 9);
+    }
+    {
+        uint64_t ids[2] = { 4, 6 };
+        oc_channel_via_group in = { 3, 2, ids };
+        ROUNDTRIP(oc_encode_channel_via_group(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_VIA_GROUP, h, p);
+        uint64_t got[4]; oc_channel_via_group out;
+        CHECK(oc_decode_channel_via_group(&p, &out, got, 4) == OC_OK);
+        CHECK(out.channel_id == 3 && out.count == 2 && out.user_ids[1] == 6);
+        oc_rbuf p2; oc_header h2;
+        CHECK(oc_parse_frame(frame, w.len, &h2, &p2) == OC_OK);
+        CHECK(oc_decode_channel_via_group(&p2, &out, got, 1) == OC_E_MALFORMED);
+    }
+    {
+        oc_mention_unresolved_more in = { 3, 99, 10 };
+        ROUNDTRIP(oc_encode_mention_unresolved_more(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MENTION_UNRESOLVED_MORE, h, p);
+        oc_mention_unresolved_more out;
+        CHECK(oc_decode_mention_unresolved_more(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 3 && out.message_id == 99 && out.total == 10);
+    }
+    {   /* The encoders refuse a type that is not theirs. */
+        uint8_t buf[64]; oc_wbuf w2; oc_wbuf_init(&w2, buf, sizeof buf);
+        oc_channel_group_op op = { 1, 2 };
+        CHECK(oc_encode_channel_group_op(&w2, OC_PROTOCOL_VERSION, OC_MSG_SEND, &op) == OC_E_MALFORMED);
+    }
+}
+
 static void test_webhook_frames(void) {
     {
         oc_create_webhook in = { 9, oc_slice_str("github") };
@@ -2057,6 +2158,7 @@ int run_protocol_tests(void) {
     test_attachment_frames();
     test_file_frames();
     test_webhook_frames();
+    test_group_frames();
     test_notify_frames();
     test_draft_frames();
     test_client_settings_frames();

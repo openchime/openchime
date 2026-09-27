@@ -255,6 +255,29 @@ static void test_collect(void) {
     for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
     CHECK(!saw_d);
 
+    /* A group mention (REQ-308) is a row per member reached, kind 5: his row
+     * reaches him as a personal mention does, and someone else's row of the
+     * same group mention does not. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[320];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                 " VALUES(4244,1,%llu,5,0,5,1), (4245,1,%llu,5,0,5,1);",
+                 (unsigned long long)dave, (unsigned long long)bob);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 4244, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    saw_d = 0;
+    for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+    CHECK(saw_d);
+    n = oc_push_collect(rdb, 1, alice, 4245, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    saw_d = 0;
+    for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+    CHECK(!saw_d);
+
     /* A broadcast reaches him without naming him; carol stays muted, because
      * NONE outranks a broadcast. */
     {

@@ -1822,6 +1822,13 @@ static int      g_selecting;    /* left button held, dragging a selection */
  * profile, which is how the profile pane kept appearing unbidden. */
 static struct { rectf r; uint64_t uid; } g_memrows[256];
 static int g_n_memrows;
+/* Groups in the pane (REQ-309): their rows, each row's Remove, and the Add
+ * group / Remove group buttons under the header. A member row's Remove shows
+ * while the row is hovered, and is kept here while it is drawn. */
+static struct { rectf r, rm; uint64_t gid; } g_memgrprows[32];
+static int g_n_memgrprows;
+static rectf g_mem_grp_add, g_mem_grp_rm;
+static struct { rectf rm; uint64_t uid; } g_memrm;
 /* The members pane scrolls (REQ-031): a channel roster runs to 500, the pane
  * holds about twenty, and the rest used to be unreachable -- the list simply
  * stopped drawing at the bottom edge. `g_mem_max` is how far it can go, computed
@@ -1865,7 +1872,9 @@ static uint64_t g_confirm_root;     /* CONF_DRAFT_DELETE: the draft's thread roo
 /* What a themed confirmation (confirm_open) will do if confirmed. */
 enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
-       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE };
+       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
+       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE };
+static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 
 static char     g_confirm_title[80];
 static char     g_confirm_body[320];
@@ -1874,6 +1883,24 @@ static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
 
 static struct { rectf r; uint64_t id; } g_invrows[64];   /* Revoke buttons */
 static int g_n_invrows;
+/* Admin > Groups (REQ-307): the group whose members are open (0 = the list),
+ * and the buttons drawn this frame. */
+enum { GRP_ACT_MEMBERS = 1, GRP_ACT_RENAME, GRP_ACT_DELETE, GRP_ACT_REMOVE };
+static uint64_t g_grp_sel;
+static rectf    g_grp_new_btn, g_grp_back_btn, g_grp_add_btn;
+/* Add people is the target picker (REQ-229), hosted here as well as in New
+ * message. One set of state serves both, so it says whose it is: the group's
+ * member view is only drawn while the group holds it. */
+enum { TGT_HOST_NEWMSG = 0, TGT_HOST_GROUP };
+static int      g_tgt_host;
+static int      g_grp_pick_focus;   /* the picker has the keys */
+static void     grp_pick_arm(void);
+static void     grp_pick_close(void);
+static int      grp_pick_commit(void);
+static int      grp_pick_click(int x, int y);
+static int      grp_pick_chosen(void);
+static struct { rectf r; uint64_t id; int act; } g_grpacts[128];
+static int g_n_grpacts;
 static struct { rectf r; uint64_t wid; int act; int disabled; } g_webacts[48];
 static int g_n_webacts;
 static struct { float top, bot; uint64_t wid; } g_webrows[64];
@@ -2385,6 +2412,25 @@ static void toast_push(const char *text, int danger) {
 
 /* Expire elapsed toasts, and turn a *new* model error into one. Called each tick
  * before painting (the tick repaints unconditionally, so nothing is returned). */
+/* The open channel's roster follows its groups (REQ-309): a group given or
+ * taken, or someone added to or removed from one of them, changes who is in it,
+ * and nothing else asks for the list again. A signature of the channel's groups
+ * and their sizes, compared each tick. */
+static void groups_roster_tick(const oc_model *m) {
+    static uint64_t last_ch, last_sig;
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    uint64_t sig = 1469598103934665603ull;
+    for (uint16_t i = 0; c && i < c->n_groups; i++) {
+        const oc_group_view *g = oc_model_group(m, c->groups[i]);
+        sig = (sig ^ c->groups[i]) * 1099511628211ull;
+        sig = (sig ^ (g ? g->n_members : 0)) * 1099511628211ull;
+    }
+    if (g_sel == last_ch && sig != last_sig && m->chanmem_channel == g_sel && g_client)
+        oc_client_list_members(g_client, g_sel);
+    last_ch = g_sel;
+    last_sig = sig;
+}
+
 static void toast_tick(const oc_model *m) {
     ULONGLONG now = GetTickCount64();
     for (int i = g_n_toast - 1; i >= 0; i--)
@@ -5869,10 +5915,9 @@ static void draw_msglist(gfx *rt, const oc_model *m,
              * coloured word alone is easy to scroll past. Same scanner as the
              * notification, so the two always agree about what counted. */
             if (capture && !msgs[first + i].deleted && msgs[first + i].body) {
-                const char *me = oc_model_user_name(m, m->user_id);
+                /* By name, or by a group this user is in (REQ-308). */
                 if (msgs[first + i].author_id != m->user_id &&
-                    oc_mention_targets(msgs[first + i].body,
-                                       strlen(msgs[first + i].body), me)) {
+                    oc_model_mentions_me(m, msgs[first + i].body, strlen(msgs[first + i].body))) {
                     rectf mr = rf(reg.left, y, reg.right, y + heights[i]);
                     gfx_fill(rt, gr(mr), OC_COL_ACCENT, 0.10f);
                     fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
@@ -6023,7 +6068,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -8584,9 +8629,24 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
                       OC_COL_FAINT);
             y += 24; any = 1;
         }
-        if (!any)
+        if (!any) {
             draw_text(rt, "No title, timezone or status set.", g_meta_w,
                       rf(reg.left + 16, y + 6, reg.right - 16, y + 46), OC_COL_FAINT);
+            y += 44;
+        }
+        /* The groups they are in (REQ-307): what an @handle of theirs reaches. */
+        char gl[256] = "";
+        size_t used = 0;
+        for (size_t i = 0; i < m->n_groups && used < sizeof gl - 1; i++)
+            if (oc_model_in_group(m->groups[i], g_profile_uid)) {
+                int w = snprintf(gl + used, sizeof gl - used, "%s@%s", used ? "  " : "", m->groups[i]->handle);
+                if (w < 0) break;
+                used += (size_t)w;
+            }
+        if (gl[0]) {
+            draw_text(rt, "GROUPS", g_meta, rf(reg.left + 16, y + 6, reg.right - 16, y + 24), OC_COL_FAINT);
+            draw_text(rt, gl, g_meta_w, rf(reg.left + 16, y + 24, reg.right - 16, y + 64), OC_COL_MUTED);
+        }
     }
 }
 
@@ -9111,6 +9171,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Invite people as admin",  41 },
     { "Storage usage",           60 },
     { "Audit log",               61 },
+    { "Manage groups",           87 },
     { "Toggle unreads only in the sidebar", 85 },
     { "Reconnect now",           2  },
     { "Add a workspace",         80 },
@@ -9803,6 +9864,26 @@ static int profile_open(uint64_t uid) {
 static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg);
 static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg);
 
+/* Every hit-box the members pane draws, forgotten together: a pane not drawn
+ * this frame must not take a click where its buttons were. */
+static void mem_hits_clear(void) {
+    g_n_memrows = 0;
+    g_n_memgrprows = 0;
+    g_mem_grp_add = g_mem_grp_rm = g_memrm.rm = rf(0, 0, 0, 0);
+    g_memrm.uid = 0;
+}
+
+/* A small button in the members pane: Add group, Remove group, and a row's
+ * Remove. Dimmed is drawn but does nothing of its own -- the click says why. */
+static void mem_button(gfx *rt, rectf b, const char *label, int danger, int dimmed) {
+    int hot = !dimmed && in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_SIDEBAR);
+    stroke_round(rt, b, OC_R_CONTROL, dimmed ? OC_COL_BORDER : danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, b, dimmed ? OC_COL_FAINT : danger ? OC_COL_DANGER : OC_COL_TEXT);
+    g_meta->align = ST_ALIGN_LEFT;
+}
+
 static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
     float x0 = W - MEMBERS_W;
     fill(rt, rf(x0, 0, W, H), OC_COL_SIDEBAR);
@@ -9839,11 +9920,11 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         const char *pn = g_profile_uid ? oc_model_user_name((oc_model *)m, g_profile_uid) : NULL;
         if (!pn || !pn[0]) rp_pop();
     }
-    if (g_rp_mode == RP_PROFILE)  { g_n_memrows = 0; draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
-    if (g_rp_mode == RP_REACTORS) { g_n_memrows = 0; draw_reactors_list(rt, m, rf(x0, 40, W, H)); return; }
+    if (g_rp_mode == RP_PROFILE)  { mem_hits_clear(); draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
+    if (g_rp_mode == RP_REACTORS) { mem_hits_clear(); draw_reactors_list(rt, m, rf(x0, 40, W, H)); return; }
 
     float y = 40;
-    g_n_memrows = 0;
+    mem_hits_clear();
     /* This channel's members (REQ-031) — NOT the tenant roster, which is what
      * this pane used to list. With two users the two are the same set, which is
      * exactly why the bug survived: in any real workspace it showed people who
@@ -9858,19 +9939,61 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
      * arrives after the pane opens and shrinks when somebody leaves, and a clamp
      * that only ran on the wheel would leave the pane scrolled past its end with
      * nothing in it. */
-    float view = H - 40;
-    float content = (float)m->n_chanmem * ROW_H;
+    /* The channel's groups (REQ-309) head the list, one row each: the people
+     * they bring are listed below with everyone else, marked. Add group and
+     * Remove group sit above them, as the channel menu's items do. */
+    const oc_channel *mch = oc_model_channel((oc_model *)m, g_sel);
+    int named = mch && mch->kind != OC_CHANNEL_KIND_DM;
+    uint16_t n_cg = mch ? mch->n_groups : 0;
+    float top = 40;
+    if (named) {
+        float bw = (W - x0 - 40) / 2;
+        g_mem_grp_add = rf(x0 + 16, 44, x0 + 16 + bw, 70);
+        mem_button(rt, g_mem_grp_add, "Add group", 0, 0);
+        if (n_cg) {
+            g_mem_grp_rm = rf(x0 + 24 + bw, 44, x0 + 24 + 2 * bw, 70);
+            mem_button(rt, g_mem_grp_rm, "Remove group", 0, 0);
+        }
+        top = 76;
+    }
+    y = top;
+    float view = H - top;
+    float content = (float)(m->n_chanmem + n_cg) * ROW_H;
     g_mem_max = content > view ? content - view : 0;
     if (g_mem_scroll > g_mem_max) g_mem_scroll = g_mem_max;
     if (g_mem_scroll < 0) g_mem_scroll = 0;
     y -= g_mem_scroll;
     /* Clipped to the body, so a row scrolled half under the header is cut off by
      * it rather than drawn over it. */
-    gfx_clip_push(rt, gr(rf(x0, 40, W, H)));
+    gfx_clip_push(rt, gr(rf(x0, top, W, H)));
+    for (uint16_t gi = 0; gi < n_cg; gi++) {
+        const oc_group_view *cgv = oc_model_group(m, mch->groups[gi]);
+        if (cgv && y + ROW_H > top && y < H) {
+            draw_lucide(rt, OC_ICON_USER, rf(x0 + 16, y + ROW_H / 2 - 7, x0 + 30, y + ROW_H / 2 + 7), OC_COL_MUTED);
+            /* Remove at the row's end, the count to its left. */
+            rectf rm = rf(W - 76, y + 4, W - 14, y + ROW_H - 4);
+            char gl[96];
+            snprintf(gl, sizeof gl, "@%s", cgv->handle);
+            draw_text(rt, gl, g_ui, rf(x0 + 34, y, rm.left - 4, y + ROW_H), OC_COL_TEXT);
+            char gn[32];
+            snprintf(gn, sizeof gn, "%u %s", (unsigned)cgv->n_members, cgv->n_members == 1 ? "person" : "people");
+            g_meta->align = ST_ALIGN_RIGHT;
+            draw_text(rt, gn, g_meta, rf(x0 + 34, y, rm.left - 6, y + ROW_H), OC_COL_FAINT);
+            g_meta->align = ST_ALIGN_LEFT;
+            mem_button(rt, rm, "Remove", 1, 0);
+            if (g_n_memgrprows < (int)(sizeof g_memgrprows / sizeof g_memgrprows[0])) {
+                g_memgrprows[g_n_memgrprows].r = rf(x0, y < top ? top : y, W, y + ROW_H);
+                g_memgrprows[g_n_memgrprows].rm = y < top ? rf(0, 0, 0, 0) : rm;
+                g_memgrprows[g_n_memgrprows].gid = cgv->id;
+                g_n_memgrprows++;
+            }
+        }
+        y += ROW_H;
+    }
     for (size_t i = 0; i < m->n_chanmem; i++) {
         const oc_chan_member *cm = &m->chanmem[i];
         if (y > H) break;
-        if (y + ROW_H <= 40) { y += ROW_H; continue; }   /* scrolled above the header */
+        if (y + ROW_H <= top) { y += ROW_H; continue; }   /* scrolled above the header */
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
         /* A member row opens the profile — say so on the way in, as every other
          * clickable row in the app does. */
@@ -9920,10 +10043,28 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                               OC_COL_FAINT);
             }
         }
+        /* In through a group (REQ-309): said, since it is why they cannot be
+         * removed from the channel alone. Hovered, the row offers Remove in the
+         * label's place -- dimmed for such a member, and a click says why. */
+        {
+            const oc_group_view *vg = oc_model_group(m, oc_model_via_group(m, g_sel, cm->user_id));
+            int can_rm = named && cm->user_id != m->user_id && g_mem_hover == cm->user_id && y >= top;
+            if (can_rm) {
+                rectf rm = rf(W - 76, y + 4, W - 14, y + ROW_H - 4);
+                mem_button(rt, rm, "Remove", !vg, !!vg);
+                g_memrm.rm = rm; g_memrm.uid = cm->user_id;
+            } else if (vg) {
+                char via[64];
+                snprintf(via, sizeof via, "via @%.40s", vg->handle);
+                g_meta->align = ST_ALIGN_RIGHT;
+                draw_text(rt, via, g_meta, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_FAINT);
+                g_meta->align = ST_ALIGN_LEFT;
+            }
+        }
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
             /* Clipped to the body: a row half under the header must not take a
              * click aimed at the header. */
-            g_memrows[g_n_memrows].r = rf(x0, y < 40 ? 40 : y, W, y + ROW_H);
+            g_memrows[g_n_memrows].r = rf(x0, y < top ? top : y, W, y + ROW_H);
             g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
         }
         y += ROW_H;
@@ -9934,8 +10075,8 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
     if (g_mem_max > 0.5f) {
         float track = view - 8, thumb = view / (view + g_mem_max) * track;
         if (thumb < 30) thumb = 30;
-        float top = 44 + (g_mem_scroll / g_mem_max) * (track - thumb);
-        fill_round(rt, rf(W - 10, top, W - 4, top + thumb), OC_R_PILL, OC_COL_FAINT);
+        float ty = top + 4 + (g_mem_scroll / g_mem_max) * (track - thumb);
+        fill_round(rt, rf(W - 10, ty, W - 4, ty + thumb), OC_R_PILL, OC_COL_FAINT);
     }
 }
 
@@ -11670,6 +11811,7 @@ static uint64_t g_mention_add[9];
 static int      g_n_mention_add;
 static uint64_t g_mention_cid;
 static uint32_t g_unresolved_seen;
+static uint32_t g_unresolved_total_seen;   /* REQ-308: the total that followed it */
 
 static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
                          const char *body, const char *ok_label) {
@@ -11687,6 +11829,13 @@ static void confirm_run(HWND hwnd) {
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    case CONF_GROUP_DELETE:
+        oc_client_delete_group(g_client, g_confirm_id);
+        if (g_grp_sel == g_confirm_id) g_grp_sel = 0;
+        break;
+    case CONF_CHANNEL_GROUP_REMOVE:
+        oc_client_channel_group(g_client, g_confirm_cid, g_confirm_id, 0);
+        break;
     case CONF_MENTION_ADD:
         for (int i = 0; i < g_n_mention_add; i++)
             oc_client_channel_invite(g_client, g_mention_cid, g_mention_add[i]);
@@ -11726,6 +11875,60 @@ static void confirm_run(HWND hwnd) {
     default: break;
     }
     g_confirm_act = CONF_NONE; g_confirm_id = 0;
+}
+
+/* Why someone cannot be taken out of a channel on their own (REQ-309): one
+ * text, for the channel menu and the members pane alike. */
+static void via_group_reason(char *buf, size_t cap, const char *name, const char *handle) {
+    snprintf(buf, cap, "%s is in this channel through @%s. Take them out of the "
+             "group, or the group off the channel.", name, handle);
+}
+
+/* Taking a group off a channel can take many people with it, so it is asked
+ * first -- from the pane's row and the menu alike. */
+static void channel_group_remove_ask(HWND hwnd, const oc_model *m, uint64_t cid, uint64_t gid) {
+    const oc_group_view *g = oc_model_group(m, gid);
+    const oc_channel *c = oc_model_channel((oc_model *)m, cid);
+    if (!g || !c) return;
+    char where[96] = "", title[80], body[240];
+    channel_label(m, c, where, sizeof where);
+    snprintf(title, sizeof title, "Take @%.24s off %.40s?", g->handle, where);
+    snprintf(body, sizeof body, "Anyone in %s only through @%s leaves it.", where, g->handle);
+    confirm_open(hwnd, CONF_CHANNEL_GROUP_REMOVE, gid, title, body, "Remove");
+    g_confirm_cid = cid;
+}
+
+/* Add a group to a channel, or take one off: a choice of those it does not
+ * have, or of those it does. The channel menu and the members pane both come
+ * here. */
+static void channel_group_pick(HWND hwnd, const oc_model *m, uint64_t cid, int add) {
+    const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
+    if (!ch) return;
+    uint64_t ids[64]; int n = 0;
+    char opts[1024] = "";
+    size_t used = 0;
+    for (size_t i = 0; i < m->n_groups && n < 64; i++) {
+        int has = 0;
+        for (uint16_t k = 0; k < ch->n_groups; k++) if (ch->groups[k] == m->groups[i]->id) has = 1;
+        if (has != !add) continue;
+        int w = snprintf(opts + used, sizeof opts - used, "%s@%s", n ? "|" : "", m->groups[i]->handle);
+        if (w < 0 || (size_t)w >= sizeof opts - used) break;
+        used += (size_t)w;
+        ids[n++] = m->groups[i]->id;
+    }
+    if (!n) {
+        toast_push(add ? (m->n_groups ? "This channel already has every group."
+                                      : "There are no groups yet. An admin makes them in Admin > Groups.")
+                       : "This channel has no groups.", 0);
+        return;
+    }
+    oc_field f[1] = { { FF_SELECT, "Group", opts, "0" } };
+    if (!form_dialog(hwnd, add ? "Add a group to this channel" : "Remove a group from this channel", f, 1))
+        return;
+    int pick = atoi(f[0].value);
+    if (pick < 0 || pick >= n) return;
+    if (add) oc_client_channel_group(g_client, cid, ids[pick], 1);
+    else     channel_group_remove_ask(hwnd, m, cid, ids[pick]);
 }
 
 static void draw_confirm(gfx *rt, rectf body) {
@@ -13205,17 +13408,19 @@ static int shell_visible(void) {
  * promised they were. */
 /* adds Invites: the `invites` table has always held role and expiry, and
  * nothing could see them, so a minted invite was write-only. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_COUNT };
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
 static void admin_select(int t) {
     g_adm_tab = t;
+    grp_pick_close();
     if (!g_client) return;
     /* Ask on entry: these are point-in-time reports, and a stale one is worse
      * than a moment's wait. */
     if (t == ADM_STORAGE)      { oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); }
     else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
+    else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
     else                       { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
 }
 
@@ -13288,6 +13493,168 @@ static void draw_invites(gfx *rt, const oc_model *m, rectf body) {
     ovl_end(rt, body);
 }
 
+/* A small bordered button, recorded for the click handler. */
+static void grp_button(gfx *rt, rectf b, const char *label, int danger, uint64_t id, int act) {
+    int hot = in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+    stroke_round(rt, b, OC_R_CONTROL, danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, b, danger ? OC_COL_DANGER : OC_COL_TEXT);
+    g_meta->align = ST_ALIGN_LEFT;
+    if (act && g_n_grpacts < (int)(sizeof g_grpacts / sizeof g_grpacts[0])) {
+        g_grpacts[g_n_grpacts].r = b;
+        g_grpacts[g_n_grpacts].id = id;
+        g_grpacts[g_n_grpacts].act = act;
+        g_n_grpacts++;
+    }
+}
+
+static float tgt_draw(gfx *rt, rectf box, int focused);
+static void  tgt_list_draw(gfx *rt, const oc_model *m, float top, float bottom, int focused);
+
+/* User groups (REQ-307): every group with its people, and New, Rename and
+ * Delete; one group open shows its members, with Add people and Remove. */
+static void draw_groups(gfx *rt, const oc_model *m, rectf body) {
+    g_n_grpacts = 0;
+    g_grp_new_btn = g_grp_back_btn = g_grp_add_btn = rf(0, 0, 0, 0);
+    const oc_group_view *sel = g_grp_sel ? oc_model_group(m, g_grp_sel) : NULL;
+    /* Deleted meanwhile, or the picker taken by New message since: either way
+     * the member view has nothing to stand on, so back to the list. */
+    if (g_grp_sel && (!sel || g_tgt_host != TGT_HOST_GROUP)) { grp_pick_close(); g_grp_sel = 0; sel = NULL; }
+    rectf bar = rf(body.left + 20, body.top + 8, body.right - 20, body.top + 36);
+    if (!sel) {
+        draw_text(rt, "A group is a set of people one @handle reaches. Give one to a channel "
+                      "and everyone in it is in the channel.",
+                  g_meta, rf(bar.left, bar.top, bar.right - 140, bar.bottom), OC_COL_FAINT);
+        g_grp_new_btn = rf(bar.right - 120, bar.top, bar.right, bar.bottom);
+        grp_button(rt, g_grp_new_btn, "New group", 0, 0, 0);
+    } else {
+        g_grp_back_btn = rf(bar.left, bar.top, bar.left + 110, bar.bottom);
+        grp_button(rt, g_grp_back_btn, "← All groups", 0, 0, 0);
+        char head[200];
+        snprintf(head, sizeof head, "@%s  ·  %s", sel->handle, sel->name);
+        draw_text(rt, head, g_ui, rf(bar.left + 124, bar.top, bar.right, bar.bottom), OC_COL_TEXT);
+    }
+    body.top += 44;
+    /* Add people: the picker, and Add to its right, dimmed until someone is
+     * chosen. The list it drops floats over the members, so it is drawn last. */
+    float pick_bottom = 0;
+    if (sel) {
+        float ph = tgt_draw(rt, rf(bar.left, body.top, bar.right - 108, body.top + UIS(38)), g_grp_pick_focus);
+        g_grp_add_btn = rf(bar.right - 96, body.top, bar.right, body.top + UIS(38));
+        int can = grp_pick_chosen() > 0, hot = can && in_rect(g_grp_add_btn, g_mouse_x, g_mouse_y);
+        fill_round(rt, g_grp_add_btn, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, g_grp_add_btn, OC_R_CONTROL, can ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Add", g_meta, g_grp_add_btn, can ? OC_COL_TEXT : OC_COL_FAINT);
+        g_meta->align = ST_ALIGN_LEFT;
+        pick_bottom = body.top + ph;
+        body.top += ph + 8;
+    }
+    float rowh = UIS(44);
+    ovl_use(OVL_GROUPS);
+    if (!sel) {
+        if (m->n_groups == 0) { overlay_empty(rt, body, "No groups yet."); return; }
+        float y = ovl_begin(rt, body, (float)m->n_groups * rowh + 8);
+        for (size_t i = 0; i < m->n_groups; i++) {
+            const oc_group_view *g = m->groups[i];
+            if (y + rowh < body.top) { y += rowh; continue; }
+            if (y > body.bottom) break;
+            char head[200], sub[200];
+            snprintf(head, sizeof head, "@%s", g->handle);
+            draw_text(rt, head, g_ui, rf(body.left + 20, y + 2, body.right - 330, y + 22), OC_COL_TEXT);
+            snprintf(sub, sizeof sub, "%s  ·  %u %s", g->name, (unsigned)g->n_members,
+                     g->n_members == 1 ? "person" : "people");
+            draw_text(rt, sub, g_meta, rf(body.left + 20, y + 20, body.right - 330, y + 40), OC_COL_FAINT);
+            grp_button(rt, rf(body.right - 316, y + 8, body.right - 216, y + 34), "People", 0, g->id, GRP_ACT_MEMBERS);
+            grp_button(rt, rf(body.right - 208, y + 8, body.right - 124, y + 34), "Edit", 0, g->id, GRP_ACT_RENAME);
+            grp_button(rt, rf(body.right - 116, y + 8, body.right - 20, y + 34), "Delete", 1, g->id, GRP_ACT_DELETE);
+            fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+            y += rowh;
+        }
+        ovl_end(rt, body);
+        return;
+    }
+    if (sel->n_members == 0) {
+        overlay_empty(rt, body, "Nobody in this group yet. Add people.");
+        tgt_list_draw(rt, m, pick_bottom, body.bottom, g_grp_pick_focus);
+        return;
+    }
+    float y = ovl_begin(rt, body, (float)sel->n_members * rowh + 8);
+    for (uint16_t i = 0; i < sel->n_members; i++) {
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        const char *nm = oc_model_user_name((oc_model *)m, sel->members[i]);
+        draw_text(rt, nm && nm[0] ? nm : "(unknown)", g_ui,
+                  rf(body.left + 20, y + 10, body.right - 130, y + 34), OC_COL_TEXT);
+        grp_button(rt, rf(body.right - 116, y + 8, body.right - 20, y + 34), "Remove", 1,
+                   sel->members[i], GRP_ACT_REMOVE);
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    ovl_end(rt, body);
+    tgt_list_draw(rt, m, pick_bottom, body.bottom, g_grp_pick_focus);
+}
+
+/* The three texts of a group, asked for in one form. 1 if confirmed. */
+static int group_form(HWND hwnd, const char *title, char *handle, char *name, char *desc) {
+    oc_field f[3] = {
+        { FF_TEXT, "Handle", "What @ names: letters, digits, . _ -", "" },
+        { FF_TEXT, "Name", "Shown beside the handle", "" },
+        { FF_MULTILINE, "Description", "Optional", "" },
+    };
+    snprintf(f[0].value, sizeof f[0].value, "%s", handle);
+    snprintf(f[1].value, sizeof f[1].value, "%s", name);
+    snprintf(f[2].value, sizeof f[2].value, "%s", desc);
+    if (!form_dialog(hwnd, title, f, 3) || !f[0].value[0]) return 0;
+    const char *h = f[0].value[0] == '@' ? f[0].value + 1 : f[0].value;
+    snprintf(handle, OC_GROUP_HANDLE_MAX + 1, "%s", h);
+    snprintf(name, OC_GROUP_NAME_MAX + 1, "%s", f[1].value);
+    snprintf(desc, OC_GROUP_DESC_MAX + 1, "%s", f[2].value);
+    return 1;
+}
+
+/* A click in Admin > Groups. 1 if it was one. */
+static int groups_click(HWND hwnd, const oc_model *m, int x, int y) {
+    if (in_rect(g_grp_new_btn, x, y)) {
+        char h[OC_GROUP_HANDLE_MAX + 1] = "", n[OC_GROUP_NAME_MAX + 1] = "", d[OC_GROUP_DESC_MAX + 1] = "";
+        if (group_form(hwnd, "New group", h, n, d)) oc_client_create_group(g_client, h, n, d);
+        return 1;
+    }
+    if (in_rect(g_grp_back_btn, x, y)) { grp_pick_close(); g_grp_sel = 0; return 1; }
+    /* Add people: its list floats over the member rows, so it is asked first. */
+    if (grp_pick_click(x, y)) return 1;
+    for (int i = 0; i < g_n_grpacts; i++) {
+        if (!in_rect(g_grpacts[i].r, x, y)) continue;
+        const oc_group_view *g = oc_model_group(m, g_grpacts[i].act == GRP_ACT_REMOVE ? g_grp_sel : g_grpacts[i].id);
+        if (!g) return 1;
+        switch (g_grpacts[i].act) {
+        case GRP_ACT_MEMBERS: grp_pick_arm(); g_grp_sel = g->id; break;
+        case GRP_ACT_RENAME: {
+            char h[OC_GROUP_HANDLE_MAX + 1], n[OC_GROUP_NAME_MAX + 1], d[OC_GROUP_DESC_MAX + 1];
+            snprintf(h, sizeof h, "%s", g->handle);
+            snprintf(n, sizeof n, "%s", g->name);
+            snprintf(d, sizeof d, "%s", g->description);
+            uint64_t gid = g->id;
+            if (group_form(hwnd, "Edit group", h, n, d)) oc_client_update_group(g_client, gid, h, n, d);
+            break;
+        }
+        case GRP_ACT_DELETE: {
+            char body[240];
+            snprintf(body, sizeof body, "@%s leaves every channel it is in, and so does everyone who "
+                     "was in those channels only through it.", g->handle);
+            confirm_open(hwnd, CONF_GROUP_DELETE, g->id, "Delete group?", body, "Delete");
+            break;
+        }
+        case GRP_ACT_REMOVE:
+            oc_client_group_members(g_client, g->id, 0, &g_grpacts[i].id, 1);
+            break;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
     draw_text(rt, "Admin", g_display, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
@@ -13300,6 +13667,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Storage",   OC_ICON_FILE },
         { "Audit log", OC_ICON_SETTINGS },
         { "Invites",   OC_ICON_USER },
+        { "Groups",    OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     for (int i = 0; i < ADM_COUNT; i++) {
@@ -13321,6 +13689,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     }
     if (g_adm_tab == ADM_STORAGE)     draw_storage(rt, m, body, 1);
     else if (g_adm_tab == ADM_INVITES) draw_invites(rt, m, body);
+    else if (g_adm_tab == ADM_GROUPS)  draw_groups(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -14105,7 +14474,8 @@ static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
  * Its data comes from oc_complete_targets() in the shared core, so the TUI gets
  * the same answers when its turn comes — the reason the ranking lives there and
  * not here. */
-enum { TGT_MAX = 12, TGT_CHIPS_MAX = 8 };
+/* A message goes to at most 8 people; a group takes up to 32 at a time. */
+enum { TGT_MAX = 12, TGT_CHIPS_MAX = 32, TGT_MSG_CHIPS = 8, TGT_GROUP_CHIPS = 32 };
 static struct { uint64_t id; int is_channel; char name[80]; } g_tgt_chip[TGT_CHIPS_MAX];
 static int   g_n_tgt_chip;
 static tfield g_tgt_q;
@@ -14126,11 +14496,54 @@ static void tgt_clear(void) {
 /* The recipients are half of an unaddressed draft, so changing them makes it
  * unsaved -- only typing used to, which meant choosing three people and leaving
  * saved nothing at all. */
-static void tgt_touch(void) { g_draft_dirty = 1; g_draft_touch_ms = GetTickCount64(); }
+static void tgt_touch(void) {
+    if (g_tgt_host != TGT_HOST_NEWMSG) return;     /* a group's picker has no draft */
+    g_draft_dirty = 1; g_draft_touch_ms = GetTickCount64();
+}
+
+/* Whether `s` holds `needle`, ignoring case; an empty needle is in anything. */
+static int tgt_ci_has(const char *s, const char *needle) {
+    if (!needle[0]) return 1;
+    if (!s) return 0;
+    size_t nl = strlen(needle);
+    for (; *s; s++) {
+        size_t i = 0;
+        while (i < nl && s[i] && tolower((unsigned char)s[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
 
 static void tgt_rebuild(void) {
     const oc_model *m = model();
-    g_n_tgt = m ? (int)oc_complete_targets(m, g_tgt_q.buf, g_tgt, TGT_MAX) : 0;
+    if (g_tgt_host == TGT_HOST_GROUP) {
+        /* People only, and none already in the group: '@' is the query's own
+         * way of saying people, so the ranking is the one New message uses. */
+        char q[sizeof g_tgt_q.buf + 2];
+        snprintf(q, sizeof q, "@%s", g_tgt_q.buf[0] == '@' ? g_tgt_q.buf + 1 : g_tgt_q.buf);
+        oc_target all[TGT_MAX * 4];
+        int n = m ? (int)oc_complete_targets(m, q, all, TGT_MAX * 4) : 0;
+        const oc_group_view *gv = m ? oc_model_group(m, g_grp_sel) : NULL;
+        g_n_tgt = 0;
+        /* The shared list never offers yourself -- nobody messages themselves --
+         * but an admin may well belong to the group they run, so here you are
+         * offered like anyone else. */
+        const oc_member *me = NULL;
+        for (size_t k = 0; m && k < m->n_users; k++)
+            if (m->users[k].user_id == m->user_id) { me = &m->users[k]; break; }
+        if (me && me->name[0] && !(gv && oc_model_in_group(gv, me->user_id)) &&
+            (tgt_ci_has(me->name, q + 1) || tgt_ci_has(me->full_name, q + 1))) {
+            g_tgt[g_n_tgt].id = me->user_id; g_tgt[g_n_tgt].is_channel = 0;
+            snprintf(g_tgt[g_n_tgt].name, sizeof g_tgt[0].name, "%s", me->name);
+            snprintf(g_tgt[g_n_tgt].sub, sizeof g_tgt[0].sub, "you");
+            g_n_tgt++;
+        }
+        for (int i = 0; i < n && g_n_tgt < TGT_MAX; i++)
+            if (!all[i].is_channel && !(gv && oc_model_in_group(gv, all[i].id)))
+                g_tgt[g_n_tgt++] = all[i];
+    } else {
+        g_n_tgt = m ? (int)oc_complete_targets(m, g_tgt_q.buf, g_tgt, TGT_MAX) : 0;
+    }
     /* Anything already chosen drops out of the list: offering it again is an
      * invitation to a duplicate the control would then have to refuse. */
     for (int i = 0; i < g_n_tgt; ) {
@@ -14146,10 +14559,11 @@ static void tgt_rebuild(void) {
 
 static void tgt_accept(int i) {
     if (i < 0 || i >= g_n_tgt) return;
-    if (g_n_tgt_chip >= TGT_CHIPS_MAX) {
+    int group = (g_tgt_host == TGT_HOST_GROUP);
+    if (g_n_tgt_chip >= (group ? TGT_GROUP_CHIPS : TGT_MSG_CHIPS)) {
         /* A control that refuses in silence reads as a broken one: the ninth
          * Enter did nothing and said nothing about why. */
-        toast_push("A message goes to at most 8 people.", 0);
+        toast_push(group ? "Add at most 32 people at a time." : "A message goes to at most 8 people.", 0);
         return;
     }
     /* A CHANNEL is a whole destination on its own: mixing "#general and @bob"
@@ -14234,7 +14648,8 @@ static int tgt_char(WCHAR ch) {
  * — the chip got shorter as its label got bigger. */
 static float tgt_draw(gfx *rt, rectf box, int focused) {
     const float ipad = UIS(8), gap = UIS(6), rowh = UIS(26);
-    float labelw = text_width("To:", g_ui_b) + UIS(8);
+    const char *lab = g_tgt_host == TGT_HOST_GROUP ? "Add:" : "To:";
+    float labelw = text_width(lab, g_ui_b) + UIS(8);
     float x0 = box.left + UIS(12) + labelw;
     float right = box.right - UIS(12);
     float qmin = UIS(90);                 /* the query keeps a usable width */
@@ -14266,7 +14681,7 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
     stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
     /* Label, chips and query share ONE centre line per row: every format here is
      * centred in its rect, and the rects are the rows themselves. */
-    draw_text(rt, "To:", g_ui_b, rf(box.left + UIS(12), box.top + ipad, x0, box.top + ipad + rowh),
+    draw_text(rt, lab, g_ui_b, rf(box.left + UIS(12), box.top + ipad, x0, box.top + ipad + rowh),
               OC_INK_ON(TH_MUTED, TH_INPUT));
 
     for (int i = 0; i < g_n_tgt_chip; i++) {
@@ -14293,7 +14708,8 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
     if (g_tgt_q.len || focused)
         tf_draw(rt, &g_tgt_q, g_ui, qrow, g_tgt_qx, OC_INK_ON(TH_TEXT, TH_INPUT), focused);
     if (!g_tgt_q.len && !g_n_tgt_chip)
-        draw_text(rt, "#a-channel, or somebody", g_ui,
+        draw_text(rt, g_tgt_host == TGT_HOST_GROUP ? "Name, full name or title"
+                                                   : "#a-channel, or somebody", g_ui,
                   rf(g_tgt_qx + UIS(4), qrow.top, right, qrow.bottom),
                   OC_INK_ON(TH_FAINT, TH_INPUT));
     return h;
@@ -14359,6 +14775,67 @@ static void tgt_list_draw(gfx *rt, const oc_model *m, float top, float bottom, i
         g_tgt_rows[i] = row;
         y += rowh;
     }
+}
+
+/* The group's picker: armed when a group's members are opened, and let go
+ * when they close. Taking it from New message writes that pane's draft first,
+ * as every other way out of the pane does. */
+static void grp_pick_arm(void) {
+    nm_editor_release();
+    tgt_clear();
+    g_tgt_host = TGT_HOST_GROUP;
+    g_grp_pick_focus = 0;
+}
+
+static void grp_pick_close(void) {
+    if (g_tgt_host == TGT_HOST_GROUP) tgt_clear();
+    g_grp_pick_focus = 0;
+}
+
+static int grp_pick_chosen(void) { return g_tgt_host == TGT_HOST_GROUP ? g_n_tgt_chip : 0; }
+
+/* Add the chosen people. 1 if there was anyone to add. */
+static int grp_pick_commit(void) {
+    if (g_tgt_host != TGT_HOST_GROUP || !g_grp_sel || !g_n_tgt_chip) return 0;
+    uint64_t ids[TGT_CHIPS_MAX];
+    int n = 0;
+    for (int i = 0; i < g_n_tgt_chip; i++) if (!g_tgt_chip[i].is_channel) ids[n++] = g_tgt_chip[i].id;
+    if (n) oc_client_group_members(g_client, g_grp_sel, 1, ids, n);
+    tgt_clear();
+    tgt_rebuild();
+    return 1;
+}
+
+/* A click on the group's picker, its list or its Add. 1 if it was one. */
+static int grp_pick_click(int x, int y) {
+    if (!g_grp_sel || g_tgt_host != TGT_HOST_GROUP) return 0;
+    if (g_grp_pick_focus)
+        for (int i = 0; i < g_n_tgt; i++)
+            if (in_rect(g_tgt_rows[i], x, y)) { tgt_accept(i); return 1; }
+    for (int i = 0; i < g_n_tgt_chip; i++)
+        if (in_rect(g_tgt_chip_x[i], x, y)) {
+            for (int k = i; k + 1 < g_n_tgt_chip; k++) g_tgt_chip[k] = g_tgt_chip[k + 1];
+            g_n_tgt_chip--; tgt_rebuild(); return 1;
+        }
+    if (in_rect(g_tgt_box, x, y)) {
+        g_grp_pick_focus = 1;
+        g_tgt_q.caret = g_tgt_q.anchor = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)x);
+        g_tgt_blink = GetTickCount64();
+        tgt_rebuild();
+        return 1;
+    }
+    if (in_rect(g_grp_add_btn, x, y)) {
+        if (!grp_pick_commit()) toast_push("Choose who to add first.", 0);
+        return 1;
+    }
+    /* A click anywhere else lets go of the keys; one on the open list's
+     * background is only that, as clicking off any popover is. */
+    if (g_grp_pick_focus) {
+        int listed = in_rect(g_tgt_list, x, y);
+        g_grp_pick_focus = 0;
+        if (listed) return 1;
+    }
+    return 0;
 }
 
 /* ---- New message (REQ-229) -------------------------------------------------
@@ -14539,6 +15016,7 @@ static void nm_editor_release(void) {
  * remembering, unaided, who it had been for. */
 static void newmsg_restore(void) {
     const oc_model *m = model();
+    g_tgt_host = TGT_HOST_NEWMSG;     /* every way into the pane comes through here */
     const char *d = m ? oc_model_draft(m, 0, 0) : NULL;
     if (d && d[0]) {
         WCHAR w[DRAFT_TEXT_MAX];
@@ -14552,7 +15030,7 @@ static void newmsg_restore(void) {
         uint64_t id = strtoull(p, NULL, 10);
         const char *comma = strchr(p, ',');
         p = comma ? comma + 1 : NULL;
-        if (!id || g_n_tgt_chip >= TGT_CHIPS_MAX) continue;
+        if (!id || g_n_tgt_chip >= TGT_MSG_CHIPS) continue;
         /* A chip is a name, and the name comes from the roster now rather than
          * from the draft: somebody renamed since you wrote it should appear as
          * they are, and somebody who has since been removed should not appear at
@@ -14840,6 +15318,31 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
     char filter[80];
     snprintf(filter, sizeof filter, "%s", g_dir_filter);
     for (char *c = filter; *c; c++) *c = (char)tolower((unsigned char)*c);
+
+    /* The groups (REQ-307), above the people: what each @handle reaches, by
+     * its size. Filtered by the same search, on the handle. */
+    {
+        char gl[512] = "";
+        size_t used = 0;
+        for (size_t i = 0; i < m->n_groups && used < sizeof gl - 1; i++) {
+            const oc_group_view *g = m->groups[i];
+            char lh[OC_GROUP_HANDLE_MAX + 1];
+            snprintf(lh, sizeof lh, "%s", g->handle);
+            for (char *c = lh; *c; c++) *c = (char)tolower((unsigned char)*c);
+            if (filter[0] && !strstr(lh, filter)) continue;
+            int w = snprintf(gl + used, sizeof gl - used, "%s@%s (%u)", used ? "   " : "", g->handle,
+                             (unsigned)g->n_members);
+            if (w < 0) break;
+            used += (size_t)w;
+        }
+        if (gl[0]) {
+            draw_text(rt, "GROUPS", g_meta, rf(body.left + 24, body.top, body.right - 24, body.top + 18),
+                      OC_COL_FAINT);
+            draw_text(rt, gl, g_meta_w, rf(body.left + 24, body.top + 18, body.right - 24, body.top + 56),
+                      OC_COL_MUTED);
+            body.top += 60;
+        }
+    }
 
     const float ROWH2 = UIS(56.0f);
     size_t shown = 0;
@@ -15763,7 +16266,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         if (!picker_floats())
             draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
-        else g_n_memrows = 0;
+        else mem_hits_clear();
     } else {
         g_n_ac = 0;
         /* A modal's picker belongs to the modal, not the composer, and the
@@ -15815,7 +16318,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
-        g_n_memrows = 0;
+        mem_hits_clear();
     }
     draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
@@ -16811,7 +17314,9 @@ static st_layout *ed_layout(float w) {
             size_t nm = oc_mention_scan(u8, bytes, mm, OC_MENTION_MAX);
             if (nm > OC_MENTION_MAX) nm = OC_MENTION_MAX;
             for (size_t i = 0; i < nm; i++) {
-                if (mm[i].kind == OC_MENTION_USER && !oc_model_user_id(m, mm[i].name)) continue;
+                /* A person, or a group's handle (REQ-308): both resolve. */
+                if (mm[i].kind == OC_MENTION_USER && !oc_model_user_id(m, mm[i].name) &&
+                    !oc_model_group_by_handle(m, mm[i].name)) continue;
                 st_range_color(g_ed_layout, mm[i].start, mm[i].len, OC_COL_ACCENT, 1.0f);
                 st_range_weight(g_ed_layout, mm[i].start, mm[i].len, 600);
             }
@@ -17026,7 +17531,15 @@ static int ed_caret_for_typing(void) {
 }
 
 /* A printable character. Returns 1 when consumed. */
+static int grp_pick_has_keys(void) {
+    return g_view == VIEW_ADMIN && g_adm_tab == ADM_GROUPS && g_grp_sel &&
+           g_tgt_host == TGT_HOST_GROUP && g_grp_pick_focus;
+}
+
 static int ed_char(HWND hwnd, WCHAR ch) {
+    /* The group's Add people field keeps every character while it has the
+     * keys: the composer is off screen, and must not collect them. */
+    if (grp_pick_has_keys()) { tgt_char(ch); InvalidateRect(hwnd, NULL, FALSE); return 1; }
     if (g_view == VIEW_NEWMSG && g_nm_to_focus && tgt_char(ch)) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 1;
@@ -17099,6 +17612,17 @@ static int ed_char(HWND hwnd, WCHAR ch) {
 
 /* A virtual key. Returns 1 when consumed. */
 static int ed_key(HWND hwnd, WPARAM vk) {
+    /* Admin > Groups' Add people: the field's keys are the picker's, as in New
+     * message. What it declines -- Enter with nothing to pick, Escape on an
+     * empty query, Tab -- adds the chosen people or lets go. */
+    if (grp_pick_has_keys()) {
+        if (!tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) {
+            if (vk == VK_RETURN && !g_tgt_q.len) grp_pick_commit();   /* not on a query that matched nobody */
+            else if (vk == VK_ESCAPE || vk == VK_TAB) g_grp_pick_focus = 0;
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
     /* In the New Message pane the To: field owns the keys until you leave it
      * (REQ-229): Enter there accepts a name rather than sending half a message
      * to nobody. */
@@ -17572,6 +18096,10 @@ enum {
     AT_NMBODY,        /* New message: the message box */
     AT_NMCHIP,        /* New message: remove one recipient */
     AT_NMPICK,        /* New message: accept one match */
+    AT_GRPTO,         /* Admin > Groups: the Add people field */
+    AT_GRPCHIP,       /* Admin > Groups: drop one chosen person */
+    AT_GRPPICK,       /* Admin > Groups: accept one match */
+    AT_GRPADD,        /* Admin > Groups: add the chosen people */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
     AT_HOVERREACT,    /* payload: quick-reaction index on the hovered message */
@@ -17931,6 +18459,35 @@ static void a11y_publish_scene(const oc_model *m) {
             acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_NAME[i], g_fmt_btn[i],
                      ATOK(AT_FMT, i));
         }
+    }
+
+    /* Admin > Groups' Add people: the same control as New message's To field,
+     * named for what it does here. */
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_GROUPS && g_grp_sel && g_tgt_host == TGT_HOST_GROUP) {
+        const oc_model *am = model();
+        const oc_group_view *gv = am ? oc_model_group(am, g_grp_sel) : NULL;
+        char nm[OC_ACC_NAME_MAX];
+        size_t used = (size_t)snprintf(nm, sizeof nm, "Add people to @%s:", gv ? gv->handle : "");
+        for (int i = 0; i < g_n_tgt_chip && used + 24 < sizeof nm; i++)
+            used += (size_t)snprintf(nm + used, sizeof nm - used, " @%s", g_tgt_chip[i].name);
+        if (!g_n_tgt_chip) snprintf(nm + used, sizeof nm - used, " nobody chosen yet");
+        for (int i = 0; i < g_n_tgt_chip && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX], label[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "groups.add.chosen.%d", i);
+            snprintf(label, sizeof label, "Remove %s", g_tgt_chip[i].name);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, label, g_tgt_chip_x[i], ATOK(AT_GRPCHIP, i));
+        }
+        acc_push(items, &n, OC_ACC_COMPOSER, "groups.add.people", nm, g_tgt_box, ATOK(AT_GRPTO, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "groups.add.commit",
+                 g_n_tgt_chip ? "Add" : "Add, nobody chosen yet", g_grp_add_btn, ATOK(AT_GRPADD, 0));
+        g_acc_layer = 1;
+        for (int i = 0; i < g_n_tgt && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "groups.add.match.%d", i);
+            if (g_tgt_rows[i].right <= g_tgt_rows[i].left) continue;
+            acc_push(items, &n, OC_ACC_BUTTON, aid, g_tgt[i].name, g_tgt_rows[i], ATOK(AT_GRPPICK, i));
+        }
+        g_acc_layer = 0;
     }
 
     if (g_view == VIEW_NEWMSG) {
@@ -20718,6 +21275,26 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
     g_n_mi = 0;
     mi_item(2, "View profile");
     if (!self) mi_item(1, "Message");
+    /* Out of the open channel (REQ-309), as the pane's row offers -- or, for
+     * someone a group keeps in, why not, as Leave does for yourself. */
+    uint64_t chan = 0;
+    {
+        const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
+        if (!self && c && c->kind != OC_CHANNEL_KIND_DM && m->chanmem_channel == g_sel)
+            for (size_t i = 0; i < m->n_chanmem; i++)
+                if (m->chanmem[i].user_id == uid) { chan = g_sel; break; }
+        if (chan) {
+            const oc_group_view *vg = oc_model_group(m, oc_model_via_group(m, chan, uid));
+            mi_sep();
+            if (vg) {
+                char sec[96];
+                snprintf(sec, sizeof sec, "IN THROUGH @%.40s \xE2\x80\x94 CAN'T BE REMOVED ALONE", vg->handle);
+                mi_section(sec);
+            } else {
+                mi_item_d(14, "Remove from channel");
+            }
+        }
+    }
     if (me >= OC_ROLE_ADMIN && !self) {
         /* The role submenu is FLATTENED into a checked section: the custom
          * menu has no submenus, and "set role" is a three-way choice where showing
@@ -20740,7 +21317,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
         mi_item_d(13, "Remove from workspace");
     }
     g_menu = MENU_MEMBER; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 236;
-    g_menu_target = uid; g_menu_target2 = 0;
+    g_menu_target = uid; g_menu_target2 = chan;
     g_menu_x = cx; g_menu_y = cy;
     {
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
@@ -20762,6 +21339,7 @@ static void member_menu_run(HWND hwnd, int cmd) {
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
     case 13: oc_client_remove_user(g_client, uid); break;
+    case 14: if (g_menu_target2) oc_client_channel_kick(g_client, g_menu_target2, uid); break;
     default: break;
     }
 }
@@ -21434,6 +22012,9 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     /* Revoke, in the Admin > Invites tab. Confirmed: the invite stops
      * working immediately and cannot be un-revoked, only re-minted. */
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_GROUPS && model() && self_role(model()) >= OC_ROLE_ADMIN &&
+        groups_click(hwnd, model(), x, y))
+        return 1;
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -22312,6 +22893,32 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_show_members && in_rect(g_rp_back, x, y))  { rp_pop(); return 1; }
     if (g_show_members && in_rect(g_rp_close, x, y)) {
         rp_pop(); g_show_members = 0; layout_composer(hwnd); return 1;
+    }
+    /* The pane's group actions and Removes (REQ-309), before the rows they sit
+     * on: a click on a row's Remove is not a click to open the profile. */
+    {
+        const oc_model *pm = model();
+        if (pm && g_show_members) {
+            if (in_rect(g_mem_grp_add, x, y)) { channel_group_pick(hwnd, pm, g_sel, 1); return 1; }
+            if (in_rect(g_mem_grp_rm, x, y))  { channel_group_pick(hwnd, pm, g_sel, 0); return 1; }
+            for (int i = 0; i < g_n_memgrprows; i++)
+                if (in_rect(g_memgrprows[i].rm, x, y)) {
+                    channel_group_remove_ask(hwnd, pm, g_sel, g_memgrprows[i].gid);
+                    return 1;
+                }
+            if (g_memrm.uid && in_rect(g_memrm.rm, x, y)) {
+                const oc_group_view *vg = oc_model_group(pm, oc_model_via_group(pm, g_sel, g_memrm.uid));
+                if (vg) {
+                    char why[200];
+                    const char *nm = oc_model_user_name((oc_model *)pm, g_memrm.uid);
+                    via_group_reason(why, sizeof why, nm && nm[0] ? nm : "They", vg->handle);
+                    toast_push(why, 1);
+                } else {
+                    oc_client_channel_kick(g_client, g_sel, g_memrm.uid);
+                }
+                return 1;
+            }
+        }
     }
     /* Members-pane rows: click opens the person's profile, which is
      * where "Message" now lives. Jumping straight into a DM made viewing someone
@@ -23733,7 +24340,8 @@ static void open_ws_menu(HWND hwnd) {
     mi_item(71, "Notifications");
     mi_item(73, "Mark all as read");
     mi_item(72, "Keyboard shortcuts");
-    if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log"); }
+    if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log");
+                 mi_item(87, "Groups"); }
     mi_sep();
     mi_item(2, "Reconnect now");
     /* Plain "Sign out" is the profile menu's, like Preferences above; this menu
@@ -25050,6 +25658,11 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
     case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
+    case 87:   /* Admin > Groups (REQ-307) */
+        close_overlays();
+        g_view = VIEW_ADMIN; layout_composer(hwnd);
+        admin_select(ADM_GROUPS);
+        break;
     case 74:  /* Threads (REQ-062), the same destination the shelf row opens.
                * 51/52 belong to the profile menu's status items — the dispatch
                * space is shared, which is exactly the collision the context
@@ -25239,10 +25852,24 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
              * client, so a private channel could be created but never populated. */
             mi_item(6, "Add someone");
             mi_item(7, "Remove someone");
+            /* Groups (REQ-309): a group's people are in the channel through it. */
+            mi_item(8, "Add a group");
+            if (c->n_groups) mi_item(9, "Remove a group");
             mi_sep();
             mi_item(4, "Webhooks");
             mi_item(5, "Create webhook");
-            mi_item_d(3, "Leave channel");
+            /* In through a group, a leave would change nothing -- the daemon
+             * refuses it -- so say why instead, with Mute above as the way to
+             * quiet it. */
+            uint64_t via = oc_model_via_group(m, cid, m->user_id);
+            const oc_group_view *vg = via ? oc_model_group(m, via) : NULL;
+            if (vg) {
+                char why[72];
+                snprintf(why, sizeof why, "IN THROUGH @%.40s — MUTE INSTEAD", vg->handle);
+                mi_section(why);
+            } else {
+                mi_item_d(3, "Leave channel");
+            }
         }
     }
     g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 244;
@@ -25350,10 +25977,22 @@ static void channel_menu_run(HWND hwnd, int cmd) {
             !f[0].value[0]) break;
         uint64_t uid = oc_model_user_id(m, f[0].value);
         if (!uid) { toast_push("No such user in this workspace.", 1); break; }
+        if (!add) {
+            /* A group keeps them in (REQ-309): removing them alone cannot. */
+            const oc_group_view *vg = oc_model_group(m, oc_model_via_group(m, cid, uid));
+            if (vg) {
+                char why[200];
+                via_group_reason(why, sizeof why, f[0].value, vg->handle);
+                toast_push(why, 1);
+                break;
+            }
+        }
         if (add) oc_client_channel_invite(g_client, cid, uid);
         else     oc_client_channel_kick(g_client, cid, uid);
         break;
     }
+    case 8:
+    case 9: channel_group_pick(hwnd, m, cid, cmd == 8); break;
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
@@ -25574,6 +26213,44 @@ static void test_dump(const char *path) {
     for (size_t i = 0; i < m->n_users && i < 32; i++)
         fprintf(f, "%s%s", i ? "," : "", m->users[i].name);
     fprintf(f, "%s\"\n", m->n_users > 32 ? ",…" : "");
+    /* User groups (REQ-307-309): each with its size, the open channel's, whether
+     * this user is in it through one (so cannot leave), and whether its newest
+     * message names this user -- by name or by a group. */
+    fprintf(f, "groups n=%u", (unsigned)m->n_groups);
+    for (size_t i = 0; i < m->n_groups && i < 32; i++)
+        fprintf(f, " @%s:%u", m->groups[i]->handle, (unsigned)m->groups[i]->n_members);
+    fprintf(f, "\n");
+    /* The shared picker: whose it is, whether it has the keys, what is chosen
+     * and what is offered. */
+    fprintf(f, "grppick host=%d focus=%d sel=%llu chips=\"", g_tgt_host, g_grp_pick_focus,
+            (unsigned long long)g_grp_sel);
+    for (int i = 0; i < g_n_tgt_chip; i++)
+        fprintf(f, "%s%s%s", i ? "," : "", g_tgt_chip[i].is_channel ? "#" : "", g_tgt_chip[i].name);
+    fprintf(f, "\" matches=\"");
+    for (int i = 0; i < g_n_tgt; i++)
+        fprintf(f, "%s%s%s", i ? "," : "", g_tgt[i].is_channel ? "#" : "", g_tgt[i].name);
+    fprintf(f, "\"\n");
+    /* The members pane's group buttons, group rows' Removes and the hovered
+     * row's Remove, in DIPs as `click` takes them (0 0 0 0 when not drawn). */
+    fprintf(f, "memgrp add=%.0f,%.0f,%.0f,%.0f rm=%.0f,%.0f,%.0f,%.0f memrm=%llu:%.0f,%.0f,%.0f,%.0f rows=",
+            g_mem_grp_add.left, g_mem_grp_add.top, g_mem_grp_add.right, g_mem_grp_add.bottom,
+            g_mem_grp_rm.left, g_mem_grp_rm.top, g_mem_grp_rm.right, g_mem_grp_rm.bottom,
+            (unsigned long long)g_memrm.uid, g_memrm.rm.left, g_memrm.rm.top, g_memrm.rm.right, g_memrm.rm.bottom);
+    for (int i = 0; i < g_n_memgrprows; i++)
+        fprintf(f, "%s%llu:%.0f,%.0f,%.0f,%.0f", i ? ";" : "", (unsigned long long)g_memgrprows[i].gid,
+                g_memgrprows[i].rm.left, g_memgrprows[i].rm.top, g_memgrprows[i].rm.right, g_memgrprows[i].rm.bottom);
+    fprintf(f, "\n");
+    {
+        const oc_channel *gc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        const oc_group_view *vg = gc ? oc_model_group(m, oc_model_via_group(m, g_sel, m->user_id)) : NULL;
+        int named = 0;
+        if (gc && gc->n_msgs && gc->msgs[gc->n_msgs - 1].body)
+            named = oc_model_mentions_me(m, gc->msgs[gc->n_msgs - 1].body, strlen(gc->msgs[gc->n_msgs - 1].body));
+        fprintf(f, "chgroups sel=%llu n=%u", (unsigned long long)g_sel, gc ? (unsigned)gc->n_groups : 0u);
+        for (uint16_t i = 0; gc && i < gc->n_groups; i++) fprintf(f, " %llu", (unsigned long long)gc->groups[i]);
+        fprintf(f, " via=\"%s\" last_names_me=%d joined=%d\n", vg ? vg->handle : "", named,
+                gc ? (int)gc->joined : -1);
+    }
     {
         const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         if (dc) for (size_t i = 0; i < dc->n_msgs; i++)
@@ -25766,8 +26443,10 @@ static void test_dump(const char *path) {
     fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
             m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
     for (int i = 0; i < g_n_memrows; i++)
-        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f\n", (unsigned long long)g_memrows[i].uid,
-                g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom);
+        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\"\n", (unsigned long long)g_memrows[i].uid,
+                g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom,
+                m && oc_model_user_name((oc_model *)m, g_memrows[i].uid)
+                    ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "");
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
@@ -27089,6 +27768,41 @@ static void test_poll(HWND hwnd) {
             if (!up) test_ack("err");
             else { oc_client_upload_emoji(g_client, up, nm, pth); test_ack("ok"); }
         }
+    } else if (!strcmp(verb, "grpbtn")) {
+        /* REQ-307. `grpbtn new|back|add|<n>` presses a button in Admin > Groups
+         * through the same handler a click reaches: the n-th action button, or a
+         * named one. Seed its form first with `formnext`; the ack goes first,
+         * as for `form`, since the form runs its own loop. */
+        rectf r = !strcmp(arg, "new") ? g_grp_new_btn : !strcmp(arg, "back") ? g_grp_back_btn
+                : !strcmp(arg, "add") ? g_grp_add_btn
+                : (atoi(arg) >= 0 && atoi(arg) < g_n_grpacts) ? g_grpacts[atoi(arg)].r : rf(0, 0, 0, 0);
+        test_ack(r.right > r.left ? "ok" : "err");
+        if (r.right > r.left && model())
+            groups_click(hwnd, model(), (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
+    } else if (!strcmp(verb, "grppick")) {
+        /* `grppick <query> [row]`: Admin > Groups' Add people, through the real
+         * key paths -- the field takes the keys, the query is typed a character
+         * at a time, Down moves to the row (0 = the first), Enter accepts it. An
+         * empty query is `grppick -`. Enter again with nothing typed adds. */
+        char q[128] = ""; int row = 0;
+        sscanf(arg, "%127s %d", q, &row);
+        if (!g_grp_sel || g_tgt_host != TGT_HOST_GROUP) { test_ack("err"); }
+        else {
+            g_grp_pick_focus = 1; tgt_rebuild();
+            if (strcmp(q, "-")) {
+                WCHAR w[128]; to_w(q, w, 128);
+                for (int i = 0; w[i]; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
+            }
+            for (int i = 0; i < row; i++) SendMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
+            SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+            test_ack("ok");
+        }
+    } else if (!strcmp(verb, "chmenu")) {
+        /* `chmenu <cmd>` runs a channel-menu command on the open channel, as
+         * choosing it from the channel's context menu does (REQ-309: 8 add a
+         * group, 9 remove one). Ack first: some open a form. */
+        test_ack(g_sel ? "ok" : "err");
+        if (g_sel) { g_menu_target = g_sel; channel_menu_run(hwnd, atoi(arg)); }
     } else if (!strcmp(verb, "emoji_del")) {
         oc_client_delete_emoji(g_client, arg); test_ack("ok");
     } else if (!strcmp(verb, "groupdm")) {
@@ -27487,6 +28201,70 @@ static void cursor_want(int kind) {
     current = kind;
 }
 
+/* The notice for a message that named people it could not reach (REQ-287),
+ * with "and N more" when a group named more than the notice lists (REQ-308).
+ * `update`: the total arrived after the notice opened, so an open notice's text
+ * is brought up to it rather than a second one opened. */
+static void unresolved_notice(HWND hwnd, const oc_model *m, int update) {
+    char names[256];
+    int listed = m->unresolved.n_peers;
+    if (m->unresolved.total > listed)
+        snprintf(names, sizeof names, "%s and %u more", m->unresolved.names,
+                 (unsigned)(m->unresolved.total - listed));
+    else
+        snprintf(names, sizeof names, "%s", m->unresolved.names);
+    const oc_channel *uc = oc_model_channel((oc_model *)m, m->unresolved.channel_id);
+    const char *where = (uc && uc->name && uc->name[0]) ? uc->name : "this conversation";
+    int several = m->unresolved.n_peers > 1;
+    char body[512];
+    if (m->unresolved.can_add) {
+        g_n_mention_add = m->unresolved.n_peers > 9 ? 9 : m->unresolved.n_peers;
+        for (int i = 0; i < g_n_mention_add; i++)
+            g_mention_add[i] = m->unresolved.peers[i];
+        g_mention_cid = m->unresolved.channel_id;
+        /* A private channel is not a louder version of a public one:
+         * adding somebody hands them everything ever said here. That
+         * is the same disclosure REQ-036a spells out for making a
+         * channel public, and it is said before the click, not after. */
+        /* "them" reads correctly for one person or several, so the
+         * only thing that varies is the verb. */
+        if (m->unresolved.is_private)
+            snprintf(body, sizeof body,
+                     "%s %s not in #%s, so they were not notified.\n\n"
+                     "Adding them to this private channel gives them its "
+                     "full history — everything already said here.",
+                     names, several ? "are" : "is", where);
+        else
+            /* Public: since REQ-288 they DO get the mention, in their
+             * activity feed. Saying "not notified" here would be the
+             * same false confirmation this notice exists to fix, just
+             * pointing the other way — so it offers membership, which
+             * is the thing they still do not have. */
+            snprintf(body, sizeof body,
+                     "%s %s not in #%s.\n\n"
+                     "The mention will reach %s — anyone here can read "
+                     "this channel — but %s will not see what comes next "
+                     "unless you add %s.",
+                     names, several ? "are" : "is", where,
+                     "them", "they", "them");
+        if (update) {   /* the notice is up: its text grows to the total, in place */
+            if (g_confirm_open && g_confirm_act == CONF_MENTION_ADD)
+                snprintf(g_confirm_body, sizeof g_confirm_body, "%s", body);
+            return;
+        }
+        confirm_open(hwnd, CONF_MENTION_ADD, 0,
+                     "Not in this channel", body, "Add them");
+    } else {
+        /* Nothing to offer — a DM has nobody to add and an archived
+         * channel takes no writes — so say what happened rather than
+         * dangling an action that would fail. */
+        char t[256];
+        snprintf(t, sizeof t, "%s %s not in this conversation.",
+                 names, several ? "are" : "is");
+        toast_push(t, 1);   /* a toast cannot grow: an update says it again, whole */
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     /* Explorer restarted: its new taskbar has no overlay and the old COM proxy
      * points at the dead shell. Drop both; the next tick re-applies the badge. */
@@ -27692,57 +28470,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            if (m) groups_roster_tick(m);
             /* You named somebody who is not in this channel (REQ-287). Driven off
              * `seq` rather than a changed name: mention the same absent colleague
              * in two messages and the second must not be swallowed as a repeat of
              * the first — the same rule `error_seq` exists for. */
             if (m && m->unresolved.seq != g_unresolved_seen) {
                 g_unresolved_seen = m->unresolved.seq;
-                const oc_channel *uc = oc_model_channel((oc_model *)m, m->unresolved.channel_id);
-                const char *where = (uc && uc->name && uc->name[0]) ? uc->name : "this conversation";
-                int several = m->unresolved.n_peers > 1;
-                char body[512];
-                if (m->unresolved.can_add) {
-                    g_n_mention_add = m->unresolved.n_peers > 9 ? 9 : m->unresolved.n_peers;
-                    for (int i = 0; i < g_n_mention_add; i++)
-                        g_mention_add[i] = m->unresolved.peers[i];
-                    g_mention_cid = m->unresolved.channel_id;
-                    /* A private channel is not a louder version of a public one:
-                     * adding somebody hands them everything ever said here. That
-                     * is the same disclosure REQ-036a spells out for making a
-                     * channel public, and it is said before the click, not after. */
-                    /* "them" reads correctly for one person or several, so the
-                     * only thing that varies is the verb. */
-                    if (m->unresolved.is_private)
-                        snprintf(body, sizeof body,
-                                 "%s %s not in #%s, so they were not notified.\n\n"
-                                 "Adding them to this private channel gives them its "
-                                 "full history — everything already said here.",
-                                 m->unresolved.names, several ? "are" : "is", where);
-                    else
-                        /* Public: since REQ-288 they DO get the mention, in their
-                         * activity feed. Saying "not notified" here would be the
-                         * same false confirmation this notice exists to fix, just
-                         * pointing the other way — so it offers membership, which
-                         * is the thing they still do not have. */
-                        snprintf(body, sizeof body,
-                                 "%s %s not in #%s.\n\n"
-                                 "The mention will reach %s — anyone here can read "
-                                 "this channel — but %s will not see what comes next "
-                                 "unless you add %s.",
-                                 m->unresolved.names, several ? "are" : "is", where,
-                                 "them", "they", "them");
-                    confirm_open(hwnd, CONF_MENTION_ADD, 0,
-                                 "Not in this channel", body, "Add them");
-                } else {
-                    /* Nothing to offer — a DM has nobody to add and an archived
-                     * channel takes no writes — so say what happened rather than
-                     * dangling an action that would fail. */
-                    char t[256];
-                    snprintf(t, sizeof t, "%s %s not in this conversation.",
-                             m->unresolved.names, several ? "are" : "is");
-                    toast_push(t, 1);
-                }
+                g_unresolved_total_seen = m->unresolved.total_seq;
+                unresolved_notice(hwnd, m, 0);
+            } else if (m && m->unresolved.total_seq != g_unresolved_total_seen) {
+                g_unresolved_total_seen = m->unresolved.total_seq;
+                unresolved_notice(hwnd, m, 1);
             }
             /* A DM we asked for has arrived — select it. Picking someone should
              * land you IN the conversation, not back at the list with a new row
@@ -29047,6 +29786,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case AT_NMPICK:    tgt_accept((int)arg); break;
+        case AT_GRPTO:     if (g_tgt_host == TGT_HOST_GROUP) { g_grp_pick_focus = 1; tgt_rebuild(); } break;
+        case AT_GRPCHIP:
+            if (g_tgt_host == TGT_HOST_GROUP && (int)arg < g_n_tgt_chip) {
+                for (int k = (int)arg; k + 1 < g_n_tgt_chip; k++) g_tgt_chip[k] = g_tgt_chip[k + 1];
+                g_n_tgt_chip--; tgt_rebuild();
+            }
+            break;
+        case AT_GRPPICK:   if (g_tgt_host == TGT_HOST_GROUP) tgt_accept((int)arg); break;
+        case AT_GRPADD:    grp_pick_commit(); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_VOICE:
             if (arg == 1) dict_freetalk_toggle(hwnd);
