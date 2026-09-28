@@ -1820,7 +1820,9 @@ static int      g_selecting;    /* left button held, dragging a selection */
 /* Members-pane row hit-boxes. The full rect, not just top/bot: testing y alone
  * made every click at that height — right across the transcript — open a
  * profile, which is how the profile pane kept appearing unbidden. */
-static struct { rectf r; uint64_t uid; } g_memrows[256];
+/* `rm` is the row's Remove while one is shown (hovered, or in MEM_REMOVING), and
+ * `via` whether it is dimmed because a group keeps them in. */
+static struct { rectf r; uint64_t uid; rectf rm; int via; } g_memrows[256];
 static int g_n_memrows;
 /* Groups in the pane (REQ-309): their rows, each row's Remove, and the Add
  * group / Remove group buttons under the header. A member row's Remove shows
@@ -1828,6 +1830,9 @@ static int g_n_memrows;
 static struct { rectf r, rm; uint64_t gid; } g_memgrprows[32];
 static int g_n_memgrprows;
 static rectf g_mem_grp_add, g_mem_grp_rm;
+/* Add people / Remove people under the header, and the picker's Add while it
+ * is open (Add people reads Cancel meanwhile). */
+static rectf g_mem_ppl_add, g_mem_ppl_rm, g_mem_pick_add;
 static struct { rectf rm; uint64_t uid; } g_memrm;
 /* The members pane scrolls (REQ-031): a channel roster runs to 500, the pane
  * holds about twenty, and the rest used to be unreachable -- the list simply
@@ -1891,7 +1896,7 @@ static rectf    g_grp_new_btn, g_grp_back_btn, g_grp_add_btn;
 /* Add people is the target picker (REQ-229), hosted here as well as in New
  * message. One set of state serves both, so it says whose it is: the group's
  * member view is only drawn while the group holds it. */
-enum { TGT_HOST_NEWMSG = 0, TGT_HOST_GROUP };
+enum { TGT_HOST_NEWMSG = 0, TGT_HOST_GROUP, TGT_HOST_CHANNEL };
 static int      g_tgt_host;
 static int      g_grp_pick_focus;   /* the picker has the keys */
 static void     grp_pick_arm(void);
@@ -1899,6 +1904,21 @@ static void     grp_pick_close(void);
 static int      grp_pick_commit(void);
 static int      grp_pick_click(int x, int y);
 static int      grp_pick_chosen(void);
+/* The members pane's own modes (REQ-031): adding people with the picker, which
+ * is then the channel's (TGT_HOST_CHANNEL), or removing them, with Remove on
+ * every row. Both belong to the channel they were started for and end when
+ * another is shown. */
+enum { MEM_NORMAL = 0, MEM_ADDING, MEM_REMOVING };
+static int      g_mem_mode;
+static uint64_t g_mem_mode_cid;
+static int      g_chan_pick_focus;  /* the channel's picker has the keys */
+static void     mem_mode_set(int mode, uint64_t cid);
+static int      tgt_n_chosen(void);
+static float tgt_draw(gfx *rt, rectf box, int focused);
+static void  tgt_list_draw(gfx *rt, const oc_model *m, float top, float bottom, int focused);
+static int      chan_pick_live(void);
+static int      chan_pick_commit(void);
+static int      chan_pick_click(int x, int y);
 static struct { rectf r; uint64_t id; int act; } g_grpacts[128];
 static int g_n_grpacts;
 static struct { rectf r; uint64_t wid; int act; int disabled; } g_webacts[48];
@@ -2414,12 +2434,15 @@ static void toast_push(const char *text, int danger) {
  * before painting (the tick repaints unconditionally, so nothing is returned). */
 /* The open channel's roster follows its groups (REQ-309): a group given or
  * taken, or someone added to or removed from one of them, changes who is in it,
- * and nothing else asks for the list again. A signature of the channel's groups
- * and their sizes, compared each tick. */
+ * and nothing else asks for the list again. So does every CHANNEL_INFO for the
+ * channel (info_seq): an invite or a removal is answered with one, and a pane
+ * that did not ask again kept listing the channel as it was. A signature of the
+ * three, compared each tick. */
 static void groups_roster_tick(const oc_model *m) {
     static uint64_t last_ch, last_sig;
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     uint64_t sig = 1469598103934665603ull;
+    if (c) sig = (sig ^ c->info_seq) * 1099511628211ull;
     for (uint16_t i = 0; c && i < c->n_groups; i++) {
         const oc_group_view *g = oc_model_group(m, c->groups[i]);
         sig = (sig ^ c->groups[i]) * 1099511628211ull;
@@ -9870,6 +9893,7 @@ static void mem_hits_clear(void) {
     g_n_memrows = 0;
     g_n_memgrprows = 0;
     g_mem_grp_add = g_mem_grp_rm = g_memrm.rm = rf(0, 0, 0, 0);
+    g_mem_ppl_add = g_mem_ppl_rm = g_mem_pick_add = rf(0, 0, 0, 0);
     g_memrm.uid = 0;
 }
 
@@ -9940,21 +9964,41 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
      * that only ran on the wheel would leave the pane scrolled past its end with
      * nothing in it. */
     /* The channel's groups (REQ-309) head the list, one row each: the people
-     * they bring are listed below with everyone else, marked. Add group and
-     * Remove group sit above them, as the channel menu's items do. */
+     * they bring are listed below with everyone else, marked. Above them, the
+     * channel menu's four items as buttons: Add people and Remove people, Add
+     * group and Remove group. */
     const oc_channel *mch = oc_model_channel((oc_model *)m, g_sel);
     int named = mch && mch->kind != OC_CHANNEL_KIND_DM;
     uint16_t n_cg = mch ? mch->n_groups : 0;
-    float top = 40;
+    /* A mode is the channel's it was started for, and adding is the picker's
+     * while the picker is the channel's: New message taking it back ends it. */
+    if (g_mem_mode && (g_mem_mode_cid != g_sel || !named ||
+                       (g_mem_mode == MEM_ADDING && g_tgt_host != TGT_HOST_CHANNEL)))
+        mem_mode_set(MEM_NORMAL, 0);
+    float top = 40, pick_bottom = 0;
     if (named) {
         float bw = (W - x0 - 40) / 2;
-        g_mem_grp_add = rf(x0 + 16, 44, x0 + 16 + bw, 70);
+        g_mem_ppl_add = rf(x0 + 16, 44, x0 + 16 + bw, 70);
+        mem_button(rt, g_mem_ppl_add, g_mem_mode == MEM_ADDING ? "Cancel" : "Add people", 0, 0);
+        g_mem_ppl_rm = rf(x0 + 24 + bw, 44, x0 + 24 + 2 * bw, 70);
+        mem_button(rt, g_mem_ppl_rm, g_mem_mode == MEM_REMOVING ? "Done" : "Remove people", 0, 0);
+        g_mem_grp_add = rf(x0 + 16, 76, x0 + 16 + bw, 102);
         mem_button(rt, g_mem_grp_add, "Add group", 0, 0);
         if (n_cg) {
-            g_mem_grp_rm = rf(x0 + 24 + bw, 44, x0 + 24 + 2 * bw, 70);
+            g_mem_grp_rm = rf(x0 + 24 + bw, 76, x0 + 24 + 2 * bw, 102);
             mem_button(rt, g_mem_grp_rm, "Remove group", 0, 0);
         }
-        top = 76;
+        top = 108;
+        /* Adding: the people picker (REQ-229), the full width of the pane, and
+         * Add under it, dimmed until someone is chosen. Its list floats over the
+         * roster, so it is drawn after it. */
+        if (g_mem_mode == MEM_ADDING) {
+            float ph = tgt_draw(rt, rf(x0 + 16, top, W - 16, top + UIS(38)), g_chan_pick_focus);
+            pick_bottom = top + ph;
+            g_mem_pick_add = rf(x0 + 16, pick_bottom + 6, x0 + 16 + bw, pick_bottom + 32);
+            mem_button(rt, g_mem_pick_add, "Add", 0, tgt_n_chosen() == 0);
+            top = pick_bottom + 38;
+        }
     }
     y = top;
     float view = H - top;
@@ -10046,13 +10090,18 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         /* In through a group (REQ-309): said, since it is why they cannot be
          * removed from the channel alone. Hovered, the row offers Remove in the
          * label's place -- dimmed for such a member, and a click says why. */
+        /* Removing: every row but yours offers it, not only the hovered one. */
+        rectf row_rm = rf(0, 0, 0, 0);
+        int row_via = 0;
         {
             const oc_group_view *vg = oc_model_group(m, oc_model_via_group(m, g_sel, cm->user_id));
-            int can_rm = named && cm->user_id != m->user_id && g_mem_hover == cm->user_id && y >= top;
+            int can_rm = named && cm->user_id != m->user_id && y >= top &&
+                         (g_mem_mode == MEM_REMOVING || g_mem_hover == cm->user_id);
             if (can_rm) {
                 rectf rm = rf(W - 76, y + 4, W - 14, y + ROW_H - 4);
                 mem_button(rt, rm, "Remove", !vg, !!vg);
-                g_memrm.rm = rm; g_memrm.uid = cm->user_id;
+                row_rm = rm; row_via = !!vg;
+                if (g_mem_hover == cm->user_id) { g_memrm.rm = rm; g_memrm.uid = cm->user_id; }
             } else if (vg) {
                 char via[64];
                 snprintf(via, sizeof via, "via @%.40s", vg->handle);
@@ -10065,11 +10114,15 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
             /* Clipped to the body: a row half under the header must not take a
              * click aimed at the header. */
             g_memrows[g_n_memrows].r = rf(x0, y < top ? top : y, W, y + ROW_H);
-            g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
+            g_memrows[g_n_memrows].uid = cm->user_id;
+            g_memrows[g_n_memrows].rm = row_rm;
+            g_memrows[g_n_memrows].via = row_via;
+            g_n_memrows++;
         }
         y += ROW_H;
     }
     gfx_clip_pop(rt);
+    if (g_mem_mode == MEM_ADDING) tgt_list_draw(rt, m, pick_bottom, H, g_chan_pick_focus);
     /* A thumb, in the style the overlay panes use: without one there is nothing
      * on screen to say the list continues. */
     if (g_mem_max > 0.5f) {
@@ -13509,8 +13562,6 @@ static void grp_button(gfx *rt, rectf b, const char *label, int danger, uint64_t
     }
 }
 
-static float tgt_draw(gfx *rt, rectf box, int focused);
-static void  tgt_list_draw(gfx *rt, const oc_model *m, float top, float bottom, int focused);
 
 /* User groups (REQ-307): every group with its people, and New, Rename and
  * Delete; one group open shows its members, with Add people and Remove. */
@@ -14516,7 +14567,23 @@ static int tgt_ci_has(const char *s, const char *needle) {
 
 static void tgt_rebuild(void) {
     const oc_model *m = model();
-    if (g_tgt_host == TGT_HOST_GROUP) {
+    if (g_tgt_host == TGT_HOST_CHANNEL) {
+        /* People only, and none already in the channel -- which is what its
+         * roster says, so nobody is offered who is there already, directly or
+         * through a group. You are always a member, and the shared list leaves
+         * you out anyway. */
+        char q[sizeof g_tgt_q.buf + 2];
+        snprintf(q, sizeof q, "@%s", g_tgt_q.buf[0] == '@' ? g_tgt_q.buf + 1 : g_tgt_q.buf);
+        oc_target all[TGT_MAX * 4];
+        int n = m ? (int)oc_complete_targets(m, q, all, TGT_MAX * 4) : 0;
+        g_n_tgt = 0;
+        for (int i = 0; i < n && g_n_tgt < TGT_MAX; i++) {
+            int in = 0;
+            for (size_t k = 0; m && m->chanmem_channel == g_mem_mode_cid && k < m->n_chanmem; k++)
+                if (m->chanmem[k].user_id == all[i].id) { in = 1; break; }
+            if (!all[i].is_channel && !in) g_tgt[g_n_tgt++] = all[i];
+        }
+    } else if (g_tgt_host == TGT_HOST_GROUP) {
         /* People only, and none already in the group: '@' is the query's own
          * way of saying people, so the ranking is the one New message uses. */
         char q[sizeof g_tgt_q.buf + 2];
@@ -14559,7 +14626,7 @@ static void tgt_rebuild(void) {
 
 static void tgt_accept(int i) {
     if (i < 0 || i >= g_n_tgt) return;
-    int group = (g_tgt_host == TGT_HOST_GROUP);
+    int group = (g_tgt_host != TGT_HOST_NEWMSG);   /* a group's or a channel's: people, added */
     if (g_n_tgt_chip >= (group ? TGT_GROUP_CHIPS : TGT_MSG_CHIPS)) {
         /* A control that refuses in silence reads as a broken one: the ninth
          * Enter did nothing and said nothing about why. */
@@ -14648,7 +14715,7 @@ static int tgt_char(WCHAR ch) {
  * — the chip got shorter as its label got bigger. */
 static float tgt_draw(gfx *rt, rectf box, int focused) {
     const float ipad = UIS(8), gap = UIS(6), rowh = UIS(26);
-    const char *lab = g_tgt_host == TGT_HOST_GROUP ? "Add:" : "To:";
+    const char *lab = g_tgt_host != TGT_HOST_NEWMSG ? "Add:" : "To:";
     float labelw = text_width(lab, g_ui_b) + UIS(8);
     float x0 = box.left + UIS(12) + labelw;
     float right = box.right - UIS(12);
@@ -14708,7 +14775,7 @@ static float tgt_draw(gfx *rt, rectf box, int focused) {
     if (g_tgt_q.len || focused)
         tf_draw(rt, &g_tgt_q, g_ui, qrow, g_tgt_qx, OC_INK_ON(TH_TEXT, TH_INPUT), focused);
     if (!g_tgt_q.len && !g_n_tgt_chip)
-        draw_text(rt, g_tgt_host == TGT_HOST_GROUP ? "Name, full name or title"
+        draw_text(rt, g_tgt_host != TGT_HOST_NEWMSG ? "Name, full name or title"
                                                    : "#a-channel, or somebody", g_ui,
                   rf(g_tgt_qx + UIS(4), qrow.top, right, qrow.bottom),
                   OC_INK_ON(TH_FAINT, TH_INPUT));
@@ -14793,6 +14860,7 @@ static void grp_pick_close(void) {
 }
 
 static int grp_pick_chosen(void) { return g_tgt_host == TGT_HOST_GROUP ? g_n_tgt_chip : 0; }
+static int tgt_n_chosen(void) { return g_n_tgt_chip; }
 
 /* Add the chosen people. 1 if there was anyone to add. */
 static int grp_pick_commit(void) {
@@ -14833,6 +14901,68 @@ static int grp_pick_click(int x, int y) {
     if (g_grp_pick_focus) {
         int listed = in_rect(g_tgt_list, x, y);
         g_grp_pick_focus = 0;
+        if (listed) return 1;
+    }
+    return 0;
+}
+
+/* The members pane's modes. Adding takes the picker for the channel, as a
+ * group's people view does for the group, writing New message's draft first;
+ * leaving the mode lets it go. */
+static void mem_mode_set(int mode, uint64_t cid) {
+    if (g_mem_mode == MEM_ADDING && g_tgt_host == TGT_HOST_CHANNEL) tgt_clear();
+    g_chan_pick_focus = 0;
+    g_mem_mode = cid ? mode : MEM_NORMAL;
+    g_mem_mode_cid = cid;
+    if (g_mem_mode == MEM_ADDING) {
+        nm_editor_release();
+        tgt_clear();
+        g_tgt_host = TGT_HOST_CHANNEL;
+        g_chan_pick_focus = 1;
+        tgt_rebuild();
+    }
+}
+
+/* The channel's picker is on screen and still the channel's. */
+static int chan_pick_live(void) {
+    return g_mem_mode == MEM_ADDING && g_tgt_host == TGT_HOST_CHANNEL &&
+           g_mem_mode_cid && g_mem_mode_cid == g_sel && g_show_members && g_rp_mode == RP_MEMBERS;
+}
+
+/* Invite the chosen people, and close the picker. 1 if there was anyone. */
+static int chan_pick_commit(void) {
+    if (!chan_pick_live() || !g_n_tgt_chip) return 0;
+    for (int i = 0; i < g_n_tgt_chip; i++)
+        if (!g_tgt_chip[i].is_channel) oc_client_channel_invite(g_client, g_mem_mode_cid, g_tgt_chip[i].id);
+    mem_mode_set(MEM_NORMAL, 0);
+    return 1;
+}
+
+/* A click on the channel's picker, its list, or its Add. */
+static int chan_pick_click(int x, int y) {
+    if (!chan_pick_live()) return 0;
+    if (g_chan_pick_focus)
+        for (int i = 0; i < g_n_tgt; i++)
+            if (in_rect(g_tgt_rows[i], x, y)) { tgt_accept(i); return 1; }
+    for (int i = 0; i < g_n_tgt_chip; i++)
+        if (in_rect(g_tgt_chip_x[i], x, y)) {
+            for (int k = i; k + 1 < g_n_tgt_chip; k++) g_tgt_chip[k] = g_tgt_chip[k + 1];
+            g_n_tgt_chip--; tgt_rebuild(); return 1;
+        }
+    if (in_rect(g_tgt_box, x, y)) {
+        g_chan_pick_focus = 1;
+        g_tgt_q.caret = g_tgt_q.anchor = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)x);
+        g_tgt_blink = GetTickCount64();
+        tgt_rebuild();
+        return 1;
+    }
+    if (in_rect(g_mem_pick_add, x, y)) {
+        if (!chan_pick_commit()) toast_push("Choose who to add first.", 0);
+        return 1;
+    }
+    if (g_chan_pick_focus) {
+        int listed = in_rect(g_tgt_list, x, y);
+        g_chan_pick_focus = 0;
         if (listed) return 1;
     }
     return 0;
@@ -17539,7 +17669,9 @@ static int grp_pick_has_keys(void) {
 static int ed_char(HWND hwnd, WCHAR ch) {
     /* The group's Add people field keeps every character while it has the
      * keys: the composer is off screen, and must not collect them. */
-    if (grp_pick_has_keys()) { tgt_char(ch); InvalidateRect(hwnd, NULL, FALSE); return 1; }
+    if (grp_pick_has_keys() || (chan_pick_live() && g_chan_pick_focus)) {
+        tgt_char(ch); InvalidateRect(hwnd, NULL, FALSE); return 1;
+    }
     if (g_view == VIEW_NEWMSG && g_nm_to_focus && tgt_char(ch)) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 1;
@@ -17619,6 +17751,17 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         if (!tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) {
             if (vk == VK_RETURN && !g_tgt_q.len) grp_pick_commit();   /* not on a query that matched nobody */
             else if (vk == VK_ESCAPE || vk == VK_TAB) g_grp_pick_focus = 0;
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    /* The members pane's Add people, the same way: Enter on an empty query
+     * invites the chosen, Escape on one closes the picker, Tab lets go. */
+    if (chan_pick_live() && g_chan_pick_focus) {
+        if (!tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) {
+            if (vk == VK_RETURN && !g_tgt_q.len) chan_pick_commit();
+            else if (vk == VK_ESCAPE) mem_mode_set(MEM_NORMAL, 0);
+            else if (vk == VK_TAB) g_chan_pick_focus = 0;
         }
         InvalidateRect(hwnd, NULL, FALSE);
         return 1;
@@ -18096,10 +18239,10 @@ enum {
     AT_NMBODY,        /* New message: the message box */
     AT_NMCHIP,        /* New message: remove one recipient */
     AT_NMPICK,        /* New message: accept one match */
-    AT_GRPTO,         /* Admin > Groups: the Add people field */
-    AT_GRPCHIP,       /* Admin > Groups: drop one chosen person */
-    AT_GRPPICK,       /* Admin > Groups: accept one match */
-    AT_GRPADD,        /* Admin > Groups: add the chosen people */
+    AT_GRPTO,         /* Add people (a group's, or the members pane's): the field */
+    AT_GRPCHIP,       /* ... drop one chosen person */
+    AT_GRPPICK,       /* ... accept one match */
+    AT_GRPADD,        /* ... add the chosen people */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
     AT_HOVERREACT,    /* payload: quick-reaction index on the hovered message */
@@ -18484,6 +18627,36 @@ static void a11y_publish_scene(const oc_model *m) {
         for (int i = 0; i < g_n_tgt && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX];
             snprintf(aid, sizeof aid, "groups.add.match.%d", i);
+            if (g_tgt_rows[i].right <= g_tgt_rows[i].left) continue;
+            acc_push(items, &n, OC_ACC_BUTTON, aid, g_tgt[i].name, g_tgt_rows[i], ATOK(AT_GRPPICK, i));
+        }
+        g_acc_layer = 0;
+    }
+
+    /* The members pane's Add people: the same control, named for the channel. */
+    if (chan_pick_live()) {
+        const oc_model *cm = model();
+        const oc_channel *cc = cm ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
+        char where[96] = "";
+        if (cc) channel_label(cm, cc, where, sizeof where);
+        char nm[OC_ACC_NAME_MAX];
+        size_t used = (size_t)snprintf(nm, sizeof nm, "Add people to %s:", where);
+        for (int i = 0; i < g_n_tgt_chip && used + 24 < sizeof nm; i++)
+            used += (size_t)snprintf(nm + used, sizeof nm - used, " @%s", g_tgt_chip[i].name);
+        if (!g_n_tgt_chip) snprintf(nm + used, sizeof nm - used, " nobody chosen yet");
+        for (int i = 0; i < g_n_tgt_chip && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX], label[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "members.add.chosen.%d", i);
+            snprintf(label, sizeof label, "Remove %s", g_tgt_chip[i].name);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, label, g_tgt_chip_x[i], ATOK(AT_GRPCHIP, i));
+        }
+        acc_push(items, &n, OC_ACC_COMPOSER, "members.add.people", nm, g_tgt_box, ATOK(AT_GRPTO, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "members.add.commit",
+                 g_n_tgt_chip ? "Add" : "Add, nobody chosen yet", g_mem_pick_add, ATOK(AT_GRPADD, 0));
+        g_acc_layer = 1;
+        for (int i = 0; i < g_n_tgt && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "members.add.match.%d", i);
             if (g_tgt_rows[i].right <= g_tgt_rows[i].left) continue;
             acc_push(items, &n, OC_ACC_BUTTON, aid, g_tgt[i].name, g_tgt_rows[i], ATOK(AT_GRPPICK, i));
         }
@@ -22899,6 +23072,16 @@ static int on_click(HWND hwnd, int x, int y) {
     {
         const oc_model *pm = model();
         if (pm && g_show_members) {
+            /* The picker first: its list floats over the rows below. */
+            if (chan_pick_click(x, y)) return 1;
+            if (in_rect(g_mem_ppl_add, x, y)) {
+                mem_mode_set(g_mem_mode == MEM_ADDING ? MEM_NORMAL : MEM_ADDING, g_sel);
+                return 1;
+            }
+            if (in_rect(g_mem_ppl_rm, x, y)) {
+                mem_mode_set(g_mem_mode == MEM_REMOVING ? MEM_NORMAL : MEM_REMOVING, g_sel);
+                return 1;
+            }
             if (in_rect(g_mem_grp_add, x, y)) { channel_group_pick(hwnd, pm, g_sel, 1); return 1; }
             if (in_rect(g_mem_grp_rm, x, y))  { channel_group_pick(hwnd, pm, g_sel, 0); return 1; }
             for (int i = 0; i < g_n_memgrprows; i++)
@@ -22906,15 +23089,18 @@ static int on_click(HWND hwnd, int x, int y) {
                     channel_group_remove_ask(hwnd, pm, g_sel, g_memgrprows[i].gid);
                     return 1;
                 }
-            if (g_memrm.uid && in_rect(g_memrm.rm, x, y)) {
-                const oc_group_view *vg = oc_model_group(pm, oc_model_via_group(pm, g_sel, g_memrm.uid));
+            /* A row's Remove: the hovered row's, or any row's while removing. */
+            for (int i = 0; i < g_n_memrows; i++) {
+                if (!in_rect(g_memrows[i].rm, x, y)) continue;
+                uint64_t uid = g_memrows[i].uid;
+                const oc_group_view *vg = oc_model_group(pm, oc_model_via_group(pm, g_sel, uid));
                 if (vg) {
                     char why[200];
-                    const char *nm = oc_model_user_name((oc_model *)pm, g_memrm.uid);
+                    const char *nm = oc_model_user_name((oc_model *)pm, uid);
                     via_group_reason(why, sizeof why, nm && nm[0] ? nm : "They", vg->handle);
                     toast_push(why, 1);
                 } else {
-                    oc_client_channel_kick(g_client, g_sel, g_memrm.uid);
+                    oc_client_channel_kick(g_client, g_sel, uid);
                 }
                 return 1;
             }
@@ -25968,29 +26154,24 @@ static void channel_menu_run(HWND hwnd, int cmd) {
         break;
     }
     case 6:
-    case 7: {
-        int add = (cmd == 6);
-        oc_field f[1] = { { FF_TEXT, "Username",
-                            add ? "Who to add to this channel."
-                                : "Who to remove from this channel.", "" } };
-        if (!form_dialog(hwnd, add ? "Add to channel" : "Remove from channel", f, 1) ||
-            !f[0].value[0]) break;
-        uint64_t uid = oc_model_user_id(m, f[0].value);
-        if (!uid) { toast_push("No such user in this workspace.", 1); break; }
-        if (!add) {
-            /* A group keeps them in (REQ-309): removing them alone cannot. */
-            const oc_group_view *vg = oc_model_group(m, oc_model_via_group(m, cid, uid));
-            if (vg) {
-                char why[200];
-                via_group_reason(why, sizeof why, f[0].value, vg->handle);
-                toast_push(why, 1);
-                break;
-            }
+    case 7:
+        /* In the channel's members pane, where its people are: Add someone
+         * opens the people picker there (REQ-229), which offers only who is not
+         * in it yet; Remove someone puts Remove on every row, dimmed with the
+         * reason for anyone a group keeps in (REQ-309). A typed name matched
+         * exactly used to stand in for both. */
+        if (cid != g_sel) select_channel(cid);
+        if (!transcript_shell()) g_view = VIEW_HOME;
+        rp_push(RP_MEMBERS);
+        mem_mode_set(cmd == 6 ? MEM_ADDING : MEM_REMOVING, cid);
+        layout_composer(hwnd);
+        {   /* The pane yields to the conversation in a narrow window; say so
+             * rather than seem to do nothing. */
+            RECT rc; GetClientRect(hwnd, &rc);
+            if (members_w(DIPF(rc.right)) <= 0)
+                toast_push("Widen the window to show the channel's members.", 0);
         }
-        if (add) oc_client_channel_invite(g_client, cid, uid);
-        else     oc_client_channel_kick(g_client, cid, uid);
         break;
-    }
     case 8:
     case 9: channel_group_pick(hwnd, m, cid, cmd == 8); break;
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
@@ -26222,8 +26403,8 @@ static void test_dump(const char *path) {
     fprintf(f, "\n");
     /* The shared picker: whose it is, whether it has the keys, what is chosen
      * and what is offered. */
-    fprintf(f, "grppick host=%d focus=%d sel=%llu chips=\"", g_tgt_host, g_grp_pick_focus,
-            (unsigned long long)g_grp_sel);
+    fprintf(f, "grppick host=%d focus=%d chanfocus=%d memmode=%d sel=%llu chips=\"", g_tgt_host,
+            g_grp_pick_focus, g_chan_pick_focus, g_mem_mode, (unsigned long long)g_grp_sel);
     for (int i = 0; i < g_n_tgt_chip; i++)
         fprintf(f, "%s%s%s", i ? "," : "", g_tgt_chip[i].is_channel ? "#" : "", g_tgt_chip[i].name);
     fprintf(f, "\" matches=\"");
@@ -26240,6 +26421,11 @@ static void test_dump(const char *path) {
         fprintf(f, "%s%llu:%.0f,%.0f,%.0f,%.0f", i ? ";" : "", (unsigned long long)g_memgrprows[i].gid,
                 g_memgrprows[i].rm.left, g_memgrprows[i].rm.top, g_memgrprows[i].rm.right, g_memgrprows[i].rm.bottom);
     fprintf(f, "\n");
+    /* Add people / Remove people, and the picker's Add while it is open. */
+    fprintf(f, "memppl add=%.0f,%.0f,%.0f,%.0f rm=%.0f,%.0f,%.0f,%.0f pickadd=%.0f,%.0f,%.0f,%.0f\n",
+            g_mem_ppl_add.left, g_mem_ppl_add.top, g_mem_ppl_add.right, g_mem_ppl_add.bottom,
+            g_mem_ppl_rm.left, g_mem_ppl_rm.top, g_mem_ppl_rm.right, g_mem_ppl_rm.bottom,
+            g_mem_pick_add.left, g_mem_pick_add.top, g_mem_pick_add.right, g_mem_pick_add.bottom);
     {
         const oc_channel *gc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         const oc_group_view *vg = gc ? oc_model_group(m, oc_model_via_group(m, g_sel, m->user_id)) : NULL;
@@ -26443,10 +26629,13 @@ static void test_dump(const char *path) {
     fprintf(f, "members n=%zu rows=%d scroll=%.0f max=%.0f\n",
             m ? m->n_chanmem : (size_t)0, g_n_memrows, g_mem_scroll, g_mem_max);
     for (int i = 0; i < g_n_memrows; i++)
-        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\"\n", (unsigned long long)g_memrows[i].uid,
+        fprintf(f, "memrow uid=%llu r=%.0f,%.0f,%.0f,%.0f name=\"%s\" rm=%.0f,%.0f,%.0f,%.0f via=%d\n",
+                (unsigned long long)g_memrows[i].uid,
                 g_memrows[i].r.left, g_memrows[i].r.top, g_memrows[i].r.right, g_memrows[i].r.bottom,
                 m && oc_model_user_name((oc_model *)m, g_memrows[i].uid)
-                    ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "");
+                    ? oc_model_user_name((oc_model *)m, g_memrows[i].uid) : "",
+                g_memrows[i].rm.left, g_memrows[i].rm.top, g_memrows[i].rm.right, g_memrows[i].rm.bottom,
+                g_memrows[i].via);
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
@@ -27780,15 +27969,18 @@ static void test_poll(HWND hwnd) {
         if (r.right > r.left && model())
             groups_click(hwnd, model(), (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
     } else if (!strcmp(verb, "grppick")) {
-        /* `grppick <query> [row]`: Admin > Groups' Add people, through the real
-         * key paths -- the field takes the keys, the query is typed a character
-         * at a time, Down moves to the row (0 = the first), Enter accepts it. An
-         * empty query is `grppick -`. Enter again with nothing typed adds. */
+        /* `grppick <query> [row]`: Add people -- Admin > Groups', or the members
+         * pane's, whichever is open -- through the real key paths: the field
+         * takes the keys, the query is typed a character at a time, Down moves
+         * to the row (0 = the first), Enter accepts it. An empty query is
+         * `grppick -`. Enter again with nothing typed adds. */
         char q[128] = ""; int row = 0;
         sscanf(arg, "%127s %d", q, &row);
-        if (!g_grp_sel || g_tgt_host != TGT_HOST_GROUP) { test_ack("err"); }
+        int grp = g_grp_sel && g_tgt_host == TGT_HOST_GROUP, chan = chan_pick_live();
+        if (!grp && !chan) { test_ack("err"); }
         else {
-            g_grp_pick_focus = 1; tgt_rebuild();
+            if (grp) g_grp_pick_focus = 1; else g_chan_pick_focus = 1;
+            tgt_rebuild();
             if (strcmp(q, "-")) {
                 WCHAR w[128]; to_w(q, w, 128);
                 for (int i = 0; w[i]; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
@@ -29336,6 +29528,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDOWN: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        /* The members pane's picker keeps the keys only while the pointer stays
+         * with it: a click anywhere else lets them go -- here, ahead of the
+         * composer, which takes its clicks before on_click ever sees them, so
+         * what was typed after clicking into it went to the picker. */
+        if (g_chan_pick_focus && !in_rect(g_tgt_box, (float)mx, (float)my) &&
+            !in_rect(g_tgt_list, (float)mx, (float)my))
+            g_chan_pick_focus = 0;
         /* A THIRD click on the same spot takes the paragraph — the whole field,
          * or the whole message. Windows has no triple-click message; every app
          * that offers one counts it, and this is that count: the click after a
@@ -29786,15 +29985,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case AT_NMPICK:    tgt_accept((int)arg); break;
-        case AT_GRPTO:     if (g_tgt_host == TGT_HOST_GROUP) { g_grp_pick_focus = 1; tgt_rebuild(); } break;
+        case AT_GRPTO:
+            if (g_tgt_host == TGT_HOST_GROUP)        { g_grp_pick_focus = 1; tgt_rebuild(); }
+            else if (g_tgt_host == TGT_HOST_CHANNEL) { g_chan_pick_focus = 1; tgt_rebuild(); }
+            break;
         case AT_GRPCHIP:
-            if (g_tgt_host == TGT_HOST_GROUP && (int)arg < g_n_tgt_chip) {
+            if (g_tgt_host != TGT_HOST_NEWMSG && (int)arg < g_n_tgt_chip) {
                 for (int k = (int)arg; k + 1 < g_n_tgt_chip; k++) g_tgt_chip[k] = g_tgt_chip[k + 1];
                 g_n_tgt_chip--; tgt_rebuild();
             }
             break;
-        case AT_GRPPICK:   if (g_tgt_host == TGT_HOST_GROUP) tgt_accept((int)arg); break;
-        case AT_GRPADD:    grp_pick_commit(); break;
+        case AT_GRPPICK:   if (g_tgt_host != TGT_HOST_NEWMSG) tgt_accept((int)arg); break;
+        case AT_GRPADD:    if (g_tgt_host == TGT_HOST_CHANNEL) chan_pick_commit(); else grp_pick_commit(); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_VOICE:
             if (arg == 1) dict_freetalk_toggle(hwnd);

@@ -1449,6 +1449,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_CHANNEL: {
         oc_channel *c = channel_ensure(m, e->channel_id);
         if (c) {
+            c->info_seq++;
             c->joined = e->status;
             c->kind = e->op;                     /* channel vs DM */
             c->is_public = e->is_public;         /* public vs private (REQ-031) */

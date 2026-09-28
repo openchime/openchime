@@ -761,6 +761,34 @@ static void test_new_channel_takes_the_default_level(void) {
     oc_model_free(&m);
 }
 
+/* Every CHANNEL_INFO for a channel moves its info_seq, and one for another
+ * channel does not: an invite or a removal is answered with nothing else, so it
+ * is what an open roster watches to know it should ask again. */
+static void test_channel_info_seq(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 50; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 50);
+    CHECK(c != NULL);
+    uint32_t first = c ? c->info_seq : 0;
+    CHECK(first != 0);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 51; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("other");
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 50);
+    CHECK(c && c->info_seq == first);                   /* another channel's */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 50; e.status = 1; e.op = OC_CHANNEL_KIND;
+    oc_model_apply(&m, &e);                              /* the same state again */
+    c = oc_model_channel(&m, 50);
+    CHECK(c && c->info_seq == first + 1);
+    oc_model_free(&m);
+}
+
 /* The client's half of the one notify decision (ARCH-89, ARCH-103).
  *
  * oc_model_notify_scan gathers the inputs and asks oc_notify_decide, the same
@@ -2992,6 +3020,7 @@ int run_client_core_tests(void) {
     test_groups_model();
     test_sidebar();
     test_new_channel_takes_the_default_level();
+    test_channel_info_seq();
     test_notify_scan();
     test_thread_notices();
     test_unread_counts_what_notifies();
