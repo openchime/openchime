@@ -13,6 +13,8 @@ COPY daemon ./daemon
 # mbedTLS, which scripts/build_mbedtls.sh downloads during `make` — so it must
 # be copied from the build context.
 COPY third_party/jsmn ./third_party/jsmn
+# picohttpparser (daemon/http.c) is vendored the same way.
+COPY third_party/picohttpparser ./third_party/picohttpparser
 # SQLite is compiled into the daemon from its vendored amalgamation, which is
 # likewise only in the build context.
 COPY third_party/sqlite-3.53.4 ./third_party/sqlite-3.53.4

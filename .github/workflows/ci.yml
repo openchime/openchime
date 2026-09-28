@@ -215,8 +215,8 @@ jobs:
       # Start, assert, stop -- all in ONE step, deliberately. A backgrounded
       # daemon does not survive the end of the step that launched it: the runner
       # tears down the step's process tree, so splitting this across steps gets
-      # a daemon that reports "healthz listening on :8080" and then "shutdown
-      # complete" before the next step can curl it. Measured, not guessed.
+      # a daemon that starts and then reports "shutdown complete" before the
+      # next step can curl it. Measured, not guessed.
       - name: End-to-end (healthz, then the protocol vertical over TLS)
         env:
           # What docker-compose.yml used to set for the daemon service, plus the
@@ -225,11 +225,8 @@ jobs:
           # EVERY path default points into /data, which exists in the image and
           # nowhere else. Compose therefore never had to set them. The blob
           # directory is the one that bites: oc_blobstore_open("/data/blobs")
-          # fails on a runner, oc_netloop_run returns -1 without printing
-          # anything, and the daemon exits 0 having logged "healthz listening on
-          # :8080" — so it looks like a healthy daemon that mysteriously will not
-          # answer. Diagnosed by reproducing it locally; the silent-failure
-          # defect underneath it is tracked separately.
+          # fails on a runner and the daemon exits saying so. /healthz is served
+          # by the loop (ARCH-25), so such a daemon never answers it.
           #
           # The bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form
           # compose used is a deprecated alias and the daemon warns about it.

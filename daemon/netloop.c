@@ -960,6 +960,13 @@ void oc_netloop_set_audio(int udp_fd, uint16_t udp_port) {
     __atomic_store_n(&g_audio_udp, udp_fd, __ATOMIC_RELEASE);
 }
 
+/* The plaintext health port (ARCH-25), -1 for none. Read when a loop starts. */
+static int g_health_port = -1;
+
+void oc_netloop_set_health_port(int port) {
+    __atomic_store_n(&g_health_port, port, __ATOMIC_RELAXED);
+}
+
 void oc_netloop_set_relay_silence_ms(uint64_t ms) {
     __atomic_store_n(&g_relay_silence_ms, ms, __ATOMIC_RELAXED);
 }
@@ -3356,34 +3363,82 @@ static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outca
     return (int)(hexlen / 2);
 }
 
-/* Queue an HTTP/1.1 response (Connection: close) into the output buffer. */
-static void http_reply(conn *c, int status, const char *reason,
-                       const char *ctype, const char *body, size_t blen) {
-    char hdr[256];
-    int n = snprintf(hdr, sizeof hdr,
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n",
-        status, reason, ctype, blen);
-    if (n < 0 || n >= (int)sizeof hdr) return;
-    out_append(c, (const uint8_t *)hdr, (size_t)n);
+/* Queue an HTTP/1.1 response (Connection: close) into the output buffer, in the
+ * shape every answer of the stack has (http.h). */
+static void http_reply(conn *c, int status, const char *ctype, const char *body, size_t blen) {
+    char hdr[OC_HTTP_HEAD_MAX];
+    size_t n = oc_http_head(hdr, sizeof hdr, status, ctype, blen);
+    if (!n) return;
+    out_append(c, (const uint8_t *)hdr, n);
     if (body && blen) out_append(c, (const uint8_t *)body, blen);
 }
 
-/* Dispatch one fully-parsed HTTP request. The only route is
- * POST /webhook/<hex-token>; everything else gets a terminal status. Returns 0
- * to keep the connection (a webhook post is awaiting its result) or -1 to close
- * (a response has been queued). */
+/* The sites the I/O threads serve (http.h, ARCH-32). On the TLS port, to a peer
+ * that did not negotiate oc/1: the incoming webhook, which touches workspace
+ * state and so is the loop's. On the health port (ARCH-25): `/healthz`, and the
+ * landing page for every other path, both answered on the I/O thread. */
+#define WEBHOOK_PREFIX "/webhook/"
+static const oc_http_route TLS_ROUTES[] = {
+    { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0 },
+};
+static const oc_http_site TLS_SITE = { TLS_ROUTES, sizeof TLS_ROUTES / sizeof TLS_ROUTES[0], NULL };
+
+/* A workspace address is a perfectly natural thing to paste into a browser, so
+ * every non-/healthz path on the health port answers with this instead of a
+ * bare 404: enough to confirm "yes, an OpenChime workspace lives here, you need
+ * a client", and nothing more. It deliberately leaks no workspace identity, user
+ * list, or version -- an unauthenticated stranger learns only that the daemon is
+ * running. Static and self-contained (no external fetches). */
+static const char LANDING_BODY[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    "<title>OpenChime</title>\n"
+    "<style>\n"
+    "body{background:#14161a;color:#d8dee9;font:16px/1.6 ui-sans-serif,system-ui,"
+    "-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;"
+    "justify-content:center;min-height:100vh;margin:0}\n"
+    "main{max-width:32rem;padding:2rem;text-align:center}\n"
+    "h1{font-size:1.5rem;font-weight:600;margin:0 0 .5rem}\n"
+    "p{margin:.5rem 0;color:#9aa5b1}\n"
+    "a{color:#88c0d0}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<main>\n"
+    "<h1>OpenChime</h1>\n"
+    "<p>An OpenChime workspace is running here.</p>\n"
+    "<p>This address speaks the OpenChime protocol, not the web &mdash; "
+    "open it in an OpenChime client to sign in.</p>\n"
+    "<p><a href=\"https://github.com/openchime/openchime\">openchime</a></p>\n"
+    "</main>\n"
+    "</body>\n"
+    "</html>\n";
+
+/* Any method, as the health responder always answered; a body is read and
+ * ignored, up to a small limit. */
+#define HEALTH_MAX_BODY 4096u
+static const oc_http_route HEALTH_ROUTES[] = {
+    { NULL, "/healthz", 0, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/plain", "OK", 2 },
+};
+static const oc_http_route HEALTH_LANDING = {
+    NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8",
+    LANDING_BODY, sizeof LANDING_BODY - 1
+};
+static const oc_http_site HEALTH_SITE = {
+    HEALTH_ROUTES, sizeof HEALTH_ROUTES / sizeof HEALTH_ROUTES[0], &HEALTH_LANDING
+};
+
+/* Dispatch one webhook post, routed here by the I/O thread (POST under
+ * WEBHOOK_PREFIX). Returns 0 to keep the connection (the post is awaiting its
+ * result) or -1 to close (a response has been queued). */
 static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
-    if (req->method_len != 4 || memcmp(req->method, "POST", 4) != 0) {
-        http_reply(c, 405, "Method Not Allowed", "text/plain", "method not allowed\n", 19);
-        return -1;
-    }
-    static const char PFX[] = "/webhook/";
+    static const char PFX[] = WEBHOOK_PREFIX;
     size_t pfx = sizeof PFX - 1;
     if (req->path_len <= pfx || memcmp(req->path, PFX, pfx) != 0) {
-        http_reply(c, 404, "Not Found", "text/plain", "not found\n", 10);
+        http_reply(c, 404, "text/plain", "not found\n", 10);
         return -1;
     }
     const char *tokhex = req->path + pfx;
@@ -3393,12 +3448,12 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
 
     uint8_t token[OC_SESSION_TOKEN_LEN];
     if (hex_decode(tokhex, tokhexlen, token, sizeof token) != (int)sizeof token) {
-        http_reply(c, 404, "Not Found", "text/plain", "not found\n", 10);
+        http_reply(c, 404, "text/plain", "not found\n", 10);
         return -1;
     }
     const char *text = NULL; size_t tlen = 0;
     if (!oc_http_webhook_text(req, &text, &tlen) || tlen == 0) {
-        http_reply(c, 400, "Bad Request", "text/plain", "empty message\n", 14);
+        http_reply(c, 400, "text/plain", "empty message\n", 14);
         return -1;
     }
     if (tlen > OC_MAX_BODY_SIZE) tlen = OC_MAX_BODY_SIZE;
@@ -3408,7 +3463,7 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     memcpy(key, tokhex, klen); key[klen] = '\0';
     uint64_t now = now_ms();
     if (g_webhook_rl && oc_ratelimit_blocked(g_webhook_rl, key, now)) {
-        http_reply(c, 429, "Too Many Requests", "text/plain", "rate limited\n", 13);
+        http_reply(c, 429, "text/plain", "rate limited\n", 13);
         return -1;
     }
     if (g_webhook_rl) oc_ratelimit_record(g_webhook_rl, key, now);
@@ -3416,7 +3471,7 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     oc_job *j = oc_job_new(OC_JOB_WEBHOOK_POST, c->conn_id);
     if (!j || oc_job_set_token(j, token, sizeof token) != 0 ||
         oc_job_set_body(j, text, tlen) != 0) {
-        http_reply(c, 500, "Internal Server Error", "text/plain", "error\n", 6);
+        http_reply(c, 500, "text/plain", "error\n", 6);
         return -1;
     }
     oc_dbwriter_submit(dbw, j);
@@ -3424,18 +3479,17 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     return 0;
 }
 
-/* An HTTP (non-oc/1) connection's request, parsed by its I/O thread, or the
- * status it is refused with. Returns 0 to keep, -1 to close. */
+/* An HTTP connection's request for a loop route, parsed and routed by its I/O
+ * thread; every refusal was answered there. Returns 0 to keep, -1 to close. */
 static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     if (c->http_pending) return 0;              /* one request per connection */
-    if (e->http_status == 413) {
-        http_reply(c, 413, "Payload Too Large", "text/plain", "too large\n", 10);
-        return -1;
-    }
-    if (e->http_status) { http_reply(c, 400, "Bad Request", "text/plain", "bad request\n", 12); return -1; }
     const char *d = (const char *)e->data;
-    oc_http_req req = { d, e->method_len, d + e->method_len, e->path_len,
-                        d + e->method_len + e->path_len, e->body_len, e->is_json };
+    oc_http_req req;
+    memset(&req, 0, sizeof req);
+    req.method = d;                               req.method_len = e->method_len;
+    req.path   = d + e->method_len;               req.path_len   = e->path_len;
+    req.body   = d + e->method_len + e->path_len; req.body_len   = e->body_len;
+    req.is_json = e->is_json;
     return on_http_request(c, &req, dbw);
 }
 
@@ -4909,7 +4963,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             char jb[64];
             int jn = snprintf(jb, sizeof jb, "{\"ok\":true,\"message_id\":%llu}\n",
                               (unsigned long long)r->message_id);
-            http_reply(hc, 200, "OK", "application/json", jb, jn > 0 ? (size_t)jn : 0);
+            http_reply(hc, 200, "application/json", jb, jn > 0 ? (size_t)jn : 0);
             flush_out(hc);
             conn_close(ep, conns, hc->fd);
         }
@@ -4919,16 +4973,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         if (c->http) {
-            int status = 404; const char *reason = "Not Found"; const char *msg = "unknown webhook\n";
-            if (r->err_code == OC_ERR_INTERNAL) { status = 500; reason = "Internal Server Error"; msg = "error\n"; }
+            int status = 404; const char *msg = "unknown webhook\n";
+            if (r->err_code == OC_ERR_INTERNAL) { status = 500; msg = "error\n"; }
             /* 403, not 404: the token is real and the sender is entitled to use
              * it — the CHANNEL is read-only (REQ-035). Answering "not found"
              * would tell an integration its token had been revoked, which is a
              * different problem with a different fix. */
             else if (r->err_code == OC_ERR_CHANNEL_ARCHIVED) {
-                status = 403; reason = "Forbidden"; msg = "channel is archived\n";
+                status = 403; msg = "channel is archived\n";
             }
-            http_reply(c, status, reason, "text/plain", msg, strlen(msg));
+            http_reply(c, status, "text/plain", msg, strlen(msg));
             flush_out(c);
             conn_close(ep, conns, c->fd);
         } else {
@@ -6059,6 +6113,47 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
     if (conns[fd]) update_interest(ep, c);
 }
 
+/* Take every connection waiting on a listener and hand each to the I/O threads:
+ * the TLS port's, or the plaintext health port's (`plain`, ARCH-25). Both are
+ * counted against their source under the same per-address cap. */
+static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxies *trusted,
+                       int max_per_ip) {
+    for (;;) {
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof ss;
+        int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
+        if (cfd < 0) break;
+        if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
+        /* Peer IP (for the accept throttle + per-source auth limit). */
+        char src[46] = {0};
+        oc_listen_peer_text(&ss, src, sizeof src);
+        /* A trusted forwarder speaks for somebody else, and says who in a
+         * header: the cap is applied once that is read, to the client
+         * it names rather than to the forwarder. The health port reads no
+         * header: an orchestrator probes it directly. */
+        int via_proxy = !plain && oc_trusted_proxies_match(trusted, &ss);
+        /* Throttle a single IP before spending a conn/TLS context on it. */
+        if (!via_proxy && max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
+            close(cfd);
+            continue;
+        }
+        conn *c = calloc(1, sizeof *c);
+        if (!c) { close(cfd); continue; }
+        c->fd = cfd;
+        memcpy(c->source, src, sizeof c->source);
+        c->conn_id = g_next_conn_id++;
+        c->state = CONN_OPENING;
+        if (index_add(c) != 0) { free(c); close(cfd); continue; }
+        int rc = plain ? oc_ioloop_adopt_plain(g_io, cfd, c->conn_id, src)
+                       : oc_ioloop_adopt(g_io, cfd, c->conn_id, src, via_proxy);
+        if (rc != 0) {
+            index_remove(c); free(c); close(cfd);
+            continue;
+        }
+        conns[cfd] = c;
+    }
+}
+
 /* Every startup failure says what failed and why, on stderr (ARCH-53), before
  * returning. A daemon that cannot serve used to be indistinguishable from one
  * that was asked to stop: six bare `return -1`s, and the last thing in the
@@ -6255,10 +6350,38 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * the empty list and nobody is trusted. */
     oc_trusted_proxies *trusted = oc_trusted_proxies_parse(oc_config_get()->trusted_proxies, NULL, 0);
 
+    /* The plaintext health port (ARCH-25), served by the same HTTP stack on the
+     * same I/O threads. It answers only while this loop serves: a daemon that
+     * cannot start never reports healthy. One that will not bind is said and
+     * is not fatal -- the workspace serves without its probe, as it always has. */
+    int hfd = -1;
+    int hport = __atomic_load_n(&g_health_port, __ATOMIC_RELAXED);
+    if (hport >= 0) {
+        const char *hop = "socket";
+        hfd = oc_listen_bind(SOCK_STREAM, hport, &hop);
+        if (hfd >= 0) {
+            hop = NULL;
+            if (listen(hfd, 16) < 0)          hop = "listen";
+            else if (set_nonblock(hfd) < 0)   hop = "setting non-blocking";
+        }
+        if (hop) {
+            fprintf(stderr, "openchimed: healthz %s: %s\n", hop, strerror(errno));
+            if (hfd >= 0) close(hfd);
+            hfd = -1;
+        } else {
+            fprintf(stderr, "openchimed: healthz listening on :%d\n", hport);
+        }
+    }
+
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
     ev.events = EPOLLIN; ev.data.fd = lfd;
     epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
+    if (hfd >= 0) {
+        memset(&ev, 0, sizeof ev);
+        ev.events = EPOLLIN; ev.data.fd = hfd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, hfd, &ev);
+    }
     memset(&ev, 0, sizeof ev);
     ev.events = EPOLLIN; ev.data.fd = evfd;
     epoll_ctl(ep, EPOLL_CTL_ADD, evfd, &ev);
@@ -6293,7 +6416,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                   oc_idmap_init(&g_by_user, 2 * OC_NETLOOP_MAX_FD) == 0 && oc_srccount_init(&g_by_src, 2 * OC_NETLOOP_MAX_FD) == 0;
     if (!indexed) NETLOOP_FAIL("allocating the connection indexes");
     /* The I/O threads (ARCH-22): every accepted socket is theirs from here. */
-    g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted) : NULL;
+    g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted, &TLS_SITE, &HEALTH_SITE) : NULL;
     int iofd = -1;
     if (indexed && !g_io) { NETLOOP_FAIL("starting the I/O threads"); indexed = 0; }
     if (g_io) {
@@ -6336,38 +6459,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
 
-            if (fd == lfd) {
-                for (;;) {
-                    struct sockaddr_storage ss;
-                    socklen_t sl = sizeof ss;
-                    int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
-                    if (cfd < 0) break;
-                    if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
-                    /* Peer IP (for the accept throttle + per-source auth limit). */
-                    char src[46] = {0};
-                    oc_listen_peer_text(&ss, src, sizeof src);
-                    /* A trusted forwarder speaks for somebody else, and says who in a
-                     * header: the cap is applied once that is read, to the client
-                     * it names rather than to the forwarder. */
-                    int via_proxy = oc_trusted_proxies_match(trusted, &ss);
-                    /* Throttle a single IP before spending a conn/TLS context on it. */
-                    if (!via_proxy && max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
-                        close(cfd);
-                        continue;
-                    }
-                    conn *c = calloc(1, sizeof *c);
-                    if (!c) { close(cfd); continue; }
-                    c->fd = cfd;
-                    memcpy(c->source, src, sizeof c->source);
-                    c->conn_id = g_next_conn_id++;
-                    c->state = CONN_OPENING;
-                    if (index_add(c) != 0) { free(c); close(cfd); continue; }
-                    if (oc_ioloop_adopt(g_io, cfd, c->conn_id, src, via_proxy) != 0) {
-                        index_remove(c); free(c); close(cfd);
-                        continue;
-                    }
-                    conns[cfd] = c;
-                }
+            if (fd == lfd || (hfd >= 0 && fd == hfd)) {
+                accept_all(fd, fd == hfd, conns, trusted, max_per_ip);
                 continue;
             }
 
@@ -6490,6 +6583,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     }
     close(ep);
     close(lfd);
+    if (hfd >= 0) close(hfd);
     loop_state_free(conns);
     free(g_live); g_live = NULL; g_nlive = 0;
     oc_ioloop_stop(g_io);   /* after the closes above: it closes their sockets */

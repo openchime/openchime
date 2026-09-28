@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* One connection is read for at most this much per turn of its thread, and is
@@ -45,13 +46,17 @@ typedef struct {
     size_t      rb_left;
     uint64_t    rb_turn;
     int         resume;          /* on the resume list */
+    int         plain;           /* no TLS: the health port's (ARCH-25) */
     char       *hin;             /* HTTP: the request so far */
     size_t      hlen, hcap;
-    int         http_done;       /* HTTP: its request (or refusal) is reported */
+    const oc_http_route *route;  /* HTTP: its route, once the head is read */
+    size_t      need;            /* HTTP: head + body, once the head is read */
+    uint64_t    deadline;        /* HTTP: when an unfinished request is answered 408 */
+    int         http_done;       /* HTTP: answered, or reported to the loop */
     oc_io_event *closed_ev;      /* CLOSED, made at adoption so reporting it cannot fail */
 } io_conn;
 
-enum { C_ADOPT, C_SEND, C_PAUSE, C_PROCEED, C_CLOSE };
+enum { C_ADOPT, C_ADOPT_PLAIN, C_SEND, C_PAUSE, C_PROCEED, C_CLOSE };
 typedef struct io_cmd {
     int      kind;
     uint64_t conn_id;
@@ -75,6 +80,7 @@ typedef struct {
     uint64_t   *resume;          /* conn ids whose budget ran out */
     size_t      nresume;
     uint64_t    turn;
+    uint64_t    next_sweep;      /* when unfinished HTTP requests are next checked */
     int         stop;
 } io_thread;
 
@@ -83,10 +89,28 @@ struct oc_ioloop {
     io_thread  *t;
     oc_tls_server *tls;
     const oc_trusted_proxies *trusted;
+    const oc_http_site *tls_site, *plain_site;
     pthread_mutex_t emu;
     oc_io_event *eh, *et;
     int         efd;
 };
+
+static uint64_t g_http_timeout_ms;   /* 0: OC_HTTP_REQUEST_TIMEOUT_MS */
+
+void oc_ioloop_set_http_timeout_ms(uint64_t ms) {
+    __atomic_store_n(&g_http_timeout_ms, ms, __ATOMIC_RELAXED);
+}
+
+static uint64_t http_timeout_ms(void) {
+    uint64_t ms = __atomic_load_n(&g_http_timeout_ms, __ATOMIC_RELAXED);
+    return ms ? ms : OC_HTTP_REQUEST_TIMEOUT_MS;
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 /* --- events to the loop ----------------------------------------------------- */
 
@@ -163,6 +187,13 @@ int oc_ioloop_adopt(oc_ioloop *io, int fd, uint64_t conn_id, const char *source,
     return cmd_post(io, c);
 }
 
+int oc_ioloop_adopt_plain(oc_ioloop *io, int fd, uint64_t conn_id, const char *source) {
+    io_cmd *c = cmd_new(C_ADOPT_PLAIN, conn_id, fd, 0);
+    if (!c) return -1;
+    snprintf(c->source, sizeof c->source, "%s", source ? source : "");
+    return cmd_post(io, c);
+}
+
 int oc_ioloop_send(oc_ioloop *io, uint64_t conn_id, int fd, const uint8_t *buf, size_t len,
                    int close_after) {
     io_cmd *c = cmd_new(C_SEND, conn_id, fd, len);
@@ -223,47 +254,107 @@ static int post_or_finish(io_thread *t, io_conn *c, oc_io_event *e) {
     return 0;
 }
 
-/* An HTTP connection's plaintext (ARCH-32): gathered until the request is whole,
- * then parsed here and reported once, as the parts the loop dispatches on; a
- * request too large or malformed is reported as the status it is refused with.
- * After that, what the peer sends is read and dropped. */
+/* The connection's bytes, through TLS or, on the health port, straight off the
+ * socket -- in TLS's terms either way, so the callers need not care which. */
+static oc_tls_status conn_read(io_conn *c, uint8_t *buf, size_t cap, size_t *n) {
+    if (!c->plain) return oc_tls_read(&c->tls, buf, cap, n);
+    *n = 0;
+    ssize_t r = recv(c->fd, buf, cap, 0);
+    if (r > 0) { *n = (size_t)r; return OC_TLS_OK; }
+    if (r == 0) return OC_TLS_CLOSED;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return OC_TLS_WANT_READ;
+    return OC_TLS_ERROR;
+}
+
+static oc_tls_status conn_write(io_conn *c, const uint8_t *buf, size_t len, size_t *n) {
+    if (!c->plain) return oc_tls_write(&c->tls, buf, len, n);
+    *n = 0;
+    ssize_t r = send(c->fd, buf, len, MSG_NOSIGNAL);
+    if (r >= 0) { *n = (size_t)r; return OC_TLS_OK; }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return OC_TLS_WANT_WRITE;
+    return OC_TLS_ERROR;
+}
+
+static void flush(io_thread *t, io_conn *c);   /* below */
+
+/* Answer an HTTP connection here and finish it once the answer is written: a
+ * route that touches no state, or a refusal. Nothing more is read from it. */
+static void http_answer(io_thread *t, io_conn *c, int status, const char *ctype,
+                        const char *body, size_t blen) {
+    c->http_done = 1;
+    c->deadline = 0;
+    free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;
+    char head[OC_HTTP_HEAD_MAX];
+    size_t hl = oc_http_head(head, sizeof head, status, ctype, blen);
+    io_chunk *k = hl ? malloc(sizeof *k + hl + blen) : NULL;
+    if (!k) { finish(t, c); return; }
+    k->next = NULL; k->len = hl + blen; k->off = 0;
+    memcpy(k->data, head, hl);
+    if (blen) memcpy(k->data + hl, body, blen);
+    if (c->ot) c->ot->next = k; else c->oh = k;
+    c->ot = k;
+    c->queued += k->len;
+    c->close_after = 1;
+    flush(t, c);
+}
+
+static void http_refuse(io_thread *t, io_conn *c, int status) {
+    size_t blen = 0;
+    const char *b = oc_http_error_body(status, &blen);
+    http_answer(t, c, status, "text/plain", b, blen);
+}
+
+/* An HTTP connection's plaintext (ARCH-32): gathered until the head is whole,
+ * then routed against its listener's site -- refused at once when no route
+ * takes it or its declared body is over the route's limit, so nothing more is
+ * buffered for it -- then gathered to the end of its body. A static route is
+ * answered here; a loop route is reported as the parts the loop dispatches on.
+ * What the peer sends after its request is not read. */
 static void http_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n) {
     if (c->http_done) return;
-    int status = 0;
-    oc_http_req req;
-    if (c->hlen + n > OC_HTTP_MAX_REQUEST) status = 413;
-    else {
-        if (c->hlen + n > c->hcap) {
-            size_t nc = c->hcap ? c->hcap : 4096;
-            while (nc < c->hlen + n) nc *= 2;
-            char *g = realloc(c->hin, nc);
-            if (!g) { finish(t, c); return; }
-            c->hin = g; c->hcap = nc;
-        }
-        memcpy(c->hin + c->hlen, chunk, n);
-        c->hlen += n;
-        int pr = oc_http_parse(c->hin, c->hlen, OC_MAX_BODY_SIZE, &req);
-        if (pr == 0) return;                          /* not all here yet */
-        if (pr < 0) status = 400;
+    if (c->route && n > c->need - c->hlen) n = c->need - c->hlen;
+    if (c->hlen + n > c->hcap) {
+        size_t nc = c->hcap ? c->hcap : 4096;
+        while (nc < c->hlen + n) nc *= 2;
+        char *g = realloc(c->hin, nc);
+        if (!g) { finish(t, c); return; }
+        c->hin = g; c->hcap = nc;
     }
+    memcpy(c->hin + c->hlen, chunk, n);
+    c->hlen += n;
+
+    oc_http_req req;
+    if (!c->route) {
+        int pr = oc_http_parse_head(c->hin, c->hlen, &req);
+        if (pr == 0) return;                          /* not all here yet */
+        if (pr < 0) { http_refuse(t, c, 400); return; }
+        int status = 404;
+        const oc_http_route *rt = oc_http_route_find(c->plain ? t->io->plain_site : t->io->tls_site,
+                                                     &req, &status);
+        if (!rt) { http_refuse(t, c, status); return; }
+        if (req.content_length > rt->max_body) { http_refuse(t, c, 413); return; }
+        c->route = rt;
+        c->need = req.head_len + req.content_length;
+    }
+    if (c->hlen < c->need) return;                    /* the body is still coming */
+
+    const oc_http_route *rt = c->route;
+    if (oc_http_parse(c->hin, c->hlen, rt->max_body, &req) != 1) { http_refuse(t, c, 400); return; }
+    if (rt->kind == OC_HTTP_STATIC) { http_answer(t, c, 200, rt->ctype, rt->body, rt->body_len); return; }
+
     c->http_done = 1;
-    oc_io_event *e;
-    if (status) {
-        e = ev_new(OC_IO_HTTP_REQ, c, NULL, 0);
-        if (e) e->http_status = status;
-    } else {
-        size_t len = req.method_len + req.path_len + req.body_len;
-        e = calloc(1, sizeof *e);
-        if (e && len && !(e->data = malloc(len))) { free(e); e = NULL; }
-        if (e) {
-            e->kind = OC_IO_HTTP_REQ; e->conn_id = c->conn_id; e->fd = c->fd;
-            memcpy(e->data, req.method, req.method_len);
-            memcpy(e->data + req.method_len, req.path, req.path_len);
-            memcpy(e->data + req.method_len + req.path_len, req.body, req.body_len);
-            e->len = len;
-            e->method_len = req.method_len; e->path_len = req.path_len; e->body_len = req.body_len;
-            e->is_json = req.is_json;
-        }
+    c->deadline = 0;
+    size_t len = req.method_len + req.path_len + req.body_len;
+    oc_io_event *e = calloc(1, sizeof *e);
+    if (e && len && !(e->data = malloc(len))) { free(e); e = NULL; }
+    if (e) {
+        e->kind = OC_IO_HTTP_REQ; e->conn_id = c->conn_id; e->fd = c->fd;
+        memcpy(e->data, req.method, req.method_len);
+        memcpy(e->data + req.method_len, req.path, req.path_len);
+        if (req.body_len) memcpy(e->data + req.method_len + req.path_len, req.body, req.body_len);
+        e->len = len;
+        e->method_len = req.method_len; e->path_len = req.path_len; e->body_len = req.body_len;
+        e->is_json = req.is_json;
     }
     free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;
     post_or_finish(t, c, e);
@@ -282,7 +373,7 @@ static void flush(io_thread *t, io_conn *c) {
     while (c->oh) {
         io_chunk *k = c->oh;
         size_t n = 0;
-        oc_tls_status st = oc_tls_write(&c->tls, k->data + k->off, k->len - k->off, &n);
+        oc_tls_status st = conn_write(c, k->data + k->off, k->len - k->off, &n);
         if (st == OC_TLS_WANT_WRITE || st == OC_TLS_WANT_READ) break;
         if (st != OC_TLS_OK) { finish(t, c); return; }
         k->off += n; c->queued -= n; c->written += n;
@@ -308,7 +399,7 @@ static void read_some(io_thread *t, io_conn *c) {
         }
         uint8_t chunk[OC_READ_CHUNK];
         size_t n = 0;
-        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
+        oc_tls_status st = conn_read(c, chunk, sizeof chunk, &n);
         if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) break;
         if (st != OC_TLS_OK || !n) { finish(t, c); break; }
         got_turn += n;
@@ -368,6 +459,7 @@ static void service(io_thread *t, io_conn *c, uint32_t events) {
          * client -- a webhook sender (ARCH-32). */
         const char *alpn = oc_tls_alpn_selected(&c->tls);
         c->http = !alpn || strcmp(alpn, OC_ALPN_PROTO) != 0;
+        if (c->http) c->deadline = mono_ms() + http_timeout_ms();
         oc_io_event *e = ev_new(OC_IO_OPENED, c, NULL, 0);
         if (e) { e->http = c->http; memcpy(e->source, c->source, sizeof e->source); }
         ev_post(t->io, e);
@@ -381,7 +473,7 @@ static void service(io_thread *t, io_conn *c, uint32_t events) {
 static void conn_free(io_thread *t, io_conn *c) {
     if (c->events) epoll_ctl(t->ep, EPOLL_CTL_DEL, c->fd, NULL);
     for (io_chunk *k = c->oh, *n; k; k = n) { n = k->next; free(k); }
-    oc_tls_conn_free(&c->tls);
+    if (!c->plain) oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
     free(c->hin);
     oc_io_event_free(c->closed_ev);
@@ -393,7 +485,7 @@ static void conn_free(io_thread *t, io_conn *c) {
 static void apply(io_thread *t, io_cmd *m) {
     if (m->fd < 0 || m->fd >= IO_MAX_FD) return;
     io_conn *c = t->conns[m->fd];
-    if (m->kind == C_ADOPT) {
+    if (m->kind == C_ADOPT || m->kind == C_ADOPT_PLAIN) {
         if (c) return;   /* cannot happen: a descriptor is adopted once until closed */
         c = calloc(1, sizeof *c);
         if (c) { c->fd = m->fd; c->conn_id = m->conn_id; }
@@ -408,14 +500,23 @@ static void apply(io_thread *t, io_cmd *m) {
             return;
         }
         snprintf(c->source, sizeof c->source, "%s", m->source);
-        c->state = m->flag ? S_PROXY : S_HANDSHAKE;
+        c->plain = m->kind == C_ADOPT_PLAIN;
+        c->state = c->plain ? S_OPEN : m->flag ? S_PROXY : S_HANDSHAKE;
         t->conns[m->fd] = c;
         int one = 1;
         setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         if (oc_framebuf_init(&c->fb) != 0 ||
-            oc_tls_conn_init(&c->tls, &t->io->tls->conf, c->fd) != 0) {
+            (!c->plain && oc_tls_conn_init(&c->tls, &t->io->tls->conf, c->fd) != 0)) {
             finish(t, c);
             return;
+        }
+        if (c->plain) {
+            /* Nothing to negotiate: open, and HTTP, from the first byte. */
+            c->http = 1;
+            c->deadline = mono_ms() + http_timeout_ms();
+            oc_io_event *e = ev_new(OC_IO_OPENED, c, NULL, 0);
+            if (e) { e->http = 1; memcpy(e->source, c->source, sizeof e->source); }
+            ev_post(t->io, e);
         }
         set_events(t, c);
         return;
@@ -479,6 +580,21 @@ static io_conn *find_conn(io_thread *t, uint64_t conn_id) {
     return NULL;
 }
 
+/* An HTTP request not whole by its deadline is answered 408: a peer that
+ * connects and sends nothing, or dribbles, must not hold a connection. */
+static void sweep_http(io_thread *t) {
+    uint64_t now = mono_ms();
+    if (now < t->next_sweep) return;
+    t->next_sweep = now + 250;
+    for (int fd = 0; fd < IO_MAX_FD; fd++) {
+        io_conn *c = t->conns[fd];
+        if (!c || !c->http || c->http_done || c->state != S_OPEN || !c->deadline || now < c->deadline)
+            continue;
+        http_refuse(t, c, 408);
+        set_events(t, c);
+    }
+}
+
 static void *io_main(void *p) {
     io_thread *t = p;
     struct epoll_event evs[64];
@@ -506,17 +622,21 @@ static void *io_main(void *p) {
             service(t, c, EPOLLIN);
         }
         free(ids);
+        sweep_http(t);
     }
     return NULL;
 }
 
-oc_ioloop *oc_ioloop_start(int nthreads, oc_tls_server *tls, const oc_trusted_proxies *trusted) {
+oc_ioloop *oc_ioloop_start(int nthreads, oc_tls_server *tls, const oc_trusted_proxies *trusted,
+                           const oc_http_site *tls_site, const oc_http_site *plain_site) {
     if (nthreads < 1) nthreads = 1;
     oc_ioloop *io = calloc(1, sizeof *io);
     if (!io) return NULL;
     io->n = nthreads;
     io->tls = tls;
     io->trusted = trusted;
+    io->tls_site = tls_site;
+    io->plain_site = plain_site;
     pthread_mutex_init(&io->emu, NULL);
     io->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     io->t = calloc((size_t)nthreads, sizeof *io->t);
@@ -553,7 +673,8 @@ void oc_ioloop_stop(oc_ioloop *io) {
         }
         for (io_cmd *m = t->ch, *n; m; m = n) {
             n = m->next;
-            if (m->kind == C_ADOPT && (!t->conns || !t->conns[m->fd])) close(m->fd);
+            if ((m->kind == C_ADOPT || m->kind == C_ADOPT_PLAIN) && (!t->conns || !t->conns[m->fd]))
+                close(m->fd);
             free(m);
         }
         for (int fd = 0; t->conns && fd < IO_MAX_FD; fd++)

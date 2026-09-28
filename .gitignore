@@ -13,6 +13,7 @@ dist/
 # re-inclusion below is possible.)
 /third_party/*
 !/third_party/jsmn/
+!/third_party/picohttpparser/
 !/third_party/termbox2/
 !/third_party/utf8proc/
 !/third_party/lucide/

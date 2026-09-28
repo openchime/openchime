@@ -136,6 +136,20 @@ framework, and OpenChime follows suit.
 - **Idempotency + dedup** (ARCH-44/45) — a repeated `(channel, token)` returns
   the original id without a second insert; the client high-water mark
   suppresses a `message_id` at or below the mark.
+- **The HTTP stack** (ARCH-32, `tests/test_http.c` and `tests/test_ioloop.c`) —
+  parsing over picohttpparser: request line, headers, body framing, partial
+  input, and what is refused (a chunked body, two `Content-Length`s that
+  disagree, a length that is not a number, a head over 8 KiB or 32 headers); the
+  router (exact and prefix paths, the query ignored, `404`, `405`, a fallback, a
+  named path beating the fallback); the response writer. Through the real I/O
+  threads: a request for the loop's route sent in pieces is reported once,
+  whole; a static route and every refusal (`400`, `404`, `405`, `413` before the
+  body is sent, `408`) are answered on the I/O thread and never reported; a
+  second request on the connection gets nothing; a plaintext socket is served
+  its own site. Each guard — the timeout sweep, the per-listener site, the body
+  limit, the chunked refusal, the one-request cut, the `405`, the per-address
+  cap on the health port, the disagreeing lengths, the head cap — was shown to
+  fail its test when reverted.
 - **Video message media** (`tests/test_media.c`, ARCH-110) — the MP4 writer
   and reader round-trip and the reader survives a mutation fuzz; VP9 and Opus
   round-trip against quality floors; the recorder runs against the synthetic
@@ -357,6 +371,13 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **Slow-backend isolation:** a download crawling through a deliberately slow S3
   endpoint does not stall message round-trips (ARCH-69,
   [TESTING.md §5](./TESTING.md)).
+- **The HTTP stack over the wire** (`test_http_stack`, ARCH-25/32): on a loop
+  with a health port, `/healthz` answers `OK` and every other path the landing
+  page, in plaintext; on the TLS port an HTTP client gets `404` and `405` where
+  nothing is served; a client that stalls on either port is answered `408`; the
+  health port counts against the same per-address cap as the TLS port; and once
+  the loop stops nothing answers the health port. The webhook post itself is
+  `test_webhook_vertical`, unchanged.
 
 ---
 

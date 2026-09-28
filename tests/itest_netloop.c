@@ -8,6 +8,7 @@
 #include "audio.h"
 #include "config.h"
 #include "dbwriter.h"
+#include "ioloop.h"
 #include "framebuf.h"
 #include "protocol.h"
 #include "tls.h"
@@ -170,6 +171,10 @@ static int http_client_open(client *c, int port, const uint8_t *pin) {
         usleep(20000);
     }
     if (c->fd < 0) return -1;
+    {
+        struct timeval tv = { 20, 0 };   /* the suite's read deadline, as client_open's */
+        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
     if (oc_tls_client_init_ex(&c->cli, pin, http_alpn) != 0) return -1;
     if (oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) return -1;
     if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
@@ -177,12 +182,17 @@ static int http_client_open(client *c, int port, const uint8_t *pin) {
     return 0;
 }
 
-/* Read the full HTTP response (until the server closes) into `buf`. */
+/* Read the full HTTP response (until the server closes) into `buf` -- or what
+ * came within twenty seconds, the suite's read deadline, so an answer that never
+ * comes fails the check instead of hanging the suite. */
 static size_t http_read_response(client *c, char *buf, size_t cap) {
     size_t total = 0;
+    struct timeval t0, t; gettimeofday(&t0, NULL);
     while (total < cap - 1) {
         size_t n = 0;
         oc_tls_status st = oc_tls_read(&c->conn, (uint8_t *)buf + total, cap - 1 - total, &n);
+        gettimeofday(&t, NULL);
+        if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_usec - t0.tv_usec) / 1000 > 20000) break;
         if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
         if (n == 0) break;                 /* closed */
         total += n;
@@ -4169,6 +4179,156 @@ static void test_conn_throttle(int port) {
     unlink("build/itest_throttle.db-shm");
 }
 
+/* A plaintext connection to `port`, retried while the loop comes up; -1 if none. */
+static int plain_connect(int port) {
+    struct sockaddr_in addr; memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    for (int i = 0; i < 200; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
+            struct timeval tv = { 5, 0 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            return fd;
+        }
+        close(fd);
+        usleep(20000);
+    }
+    return -1;
+}
+
+static size_t plain_read_all(int fd, char *buf, size_t cap) {
+    size_t got = 0;
+    while (got + 1 < cap) {
+        ssize_t r = recv(fd, buf + got, cap - 1 - got, 0);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    buf[got] = 0;
+    return got;
+}
+
+/* Send `req` on a fresh plaintext connection and read the answer to its close. */
+static size_t plain_exchange(int port, const char *req, char *buf, size_t cap) {
+    buf[0] = 0;
+    int fd = plain_connect(port);
+    if (fd < 0) return 0;
+    size_t n = 0;
+    if (send(fd, req, strlen(req), 0) == (ssize_t)strlen(req)) n = plain_read_all(fd, buf, cap);
+    close(fd);
+    return n;
+}
+
+/* The HTTP stack over the wire (ARCH-32, ARCH-25), on a loop of its own with a
+ * health port and a cap of two connections per address:
+ *   - /healthz answers OK and every other path the landing page, in plaintext,
+ *     served by the loop's I/O threads;
+ *   - on the TLS port an HTTP client gets 404 for a path nothing names and 405
+ *     for the webhook under the wrong method (the post itself is
+ *     test_webhook_vertical, unchanged);
+ *   - a client that stalls is answered 408 on either port;
+ *   - the health port counts against the same per-address cap as the TLS port;
+ *   - and it is the loop's: once the loop stops, nothing answers it. */
+static void test_http_stack(int port, int hport) {
+    setenv("OPENCHIME_MAX_CONNS_PER_IP", "2", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_http.db");
+    CHECK(dbw2 != NULL);
+
+    oc_netloop_set_health_port(hport);
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    static char resp[8192];
+    CHECK(plain_exchange(hport, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof resp) > 0);
+    oc_netloop_set_health_port(-1);   /* read at start: this loop has it, no later one */
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nOK") &&
+          strstr(resp, "Content-Type: text/plain\r\n"));
+    CHECK(plain_exchange(hport, "GET /healthz?probe=1 HTTP/1.0\r\n\r\n", resp, sizeof resp) > 0);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nOK"));
+    CHECK(plain_exchange(hport, "GET / HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 &&
+          strstr(resp, "text/html") && strstr(resp, "An OpenChime workspace is running here."));
+    CHECK(plain_exchange(hport, "POST /anything/else HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi",
+                         resp, sizeof resp) > 0);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace"));
+    CHECK(plain_exchange(hport, "NOT HTTP\r\n\r\n", resp, sizeof resp) > 0);
+    CHECK(strncmp(resp, "HTTP/1.1 400 ", 13) == 0);
+
+    /* The TLS port's HTTP side: what it does not serve, it refuses there. */
+    client h;
+    CHECK(http_client_open(&h, port, pin2) == 0);
+    const char *r1 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(write_all(&h.conn, (const uint8_t *)r1, strlen(r1)) == 0);
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 404 ", 13) == 0);
+    client_close(&h);
+    CHECK(http_client_open(&h, port, pin2) == 0);
+    const char *r2 = "GET /webhook/00 HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(write_all(&h.conn, (const uint8_t *)r2, strlen(r2)) == 0);
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 405 ", 13) == 0);
+    client_close(&h);
+
+    /* A client that stalls is answered 408 and let go, on either port. */
+    oc_ioloop_set_http_timeout_ms(300);
+    int fd = plain_connect(hport);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(send(fd, "GET /hea", 8, 0) == 8);
+        plain_read_all(fd, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
+        close(fd);
+    }
+    CHECK(http_client_open(&h, port, pin2) == 0);           /* sends nothing at all */
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
+    client_close(&h);
+    oc_ioloop_set_http_timeout_ms(0);
+
+    /* One cap for both ports: two idle health connections from loopback fill
+     * it, so a third on either port is closed unanswered. */
+    usleep(200000);                                       /* the closes above are counted out */
+    int a = plain_connect(hport), b = plain_connect(hport);
+    CHECK(a >= 0 && b >= 0);
+    usleep(100000);
+    int c3 = plain_connect(hport);
+    CHECK(c3 >= 0);
+    if (c3 >= 0) {
+        (void)send(c3, "GET /healthz HTTP/1.1\r\n\r\n", 26, 0);
+        CHECK(plain_read_all(c3, resp, sizeof resp) == 0);   /* closed at accept, nothing said */
+        close(c3);
+    }
+    client t;
+    int over = client_open(&t, port, pin2);
+    CHECK(over != 0);
+    if (over == 0) client_close(&t);
+    if (a >= 0) close(a);
+    if (b >= 0) close(b);
+
+    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th2, NULL);
+    /* The health port was the loop's: with the loop gone, nobody answers it. */
+    {
+        int g = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = htons((uint16_t)hport);
+        CHECK(connect(g, (struct sockaddr *)&sa, sizeof sa) != 0);
+        close(g);
+    }
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unsetenv("OPENCHIME_MAX_CONNS_PER_IP");
+    unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
+}
+
 /* Send AUTH_BEGIN; on AUTH_REDIRECT copy the URL out and return 0, on ERROR
  * return its code, else -1. */
 static int auth_begin(client *c, const char *source, const char *redirect, const char *challenge,
@@ -4415,6 +4575,7 @@ int run_netloop_tests(void) {
         test_groups_unasked(arg.port, pin);
         test_logout_closes(arg.port, pin);
         test_conn_throttle(arg.port + 123);
+        test_http_stack(arg.port + 128, arg.port + 129);
         test_auth_begin(arg.port + 124);
         test_proxy_header(arg.port + 125);
     }

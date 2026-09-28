@@ -26,6 +26,11 @@
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop);
 
+/* Serve the plaintext health port (ARCH-25) beside the TLS port: `/healthz`
+ * and the landing page, through the same HTTP stack. -1 (the default) serves
+ * none. Call before oc_netloop_run. */
+void oc_netloop_set_health_port(int port);
+
 /* Wire call media (REQ-150, ARCH-18/73): the bound UDP socket the loop's relay
  * runs on (relay.h), and the port it is bound to. The caller keeps the socket.
  * A loop takes it when it starts and gives it back when it stops, so set it

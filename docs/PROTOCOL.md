@@ -68,8 +68,8 @@ high port (8443) to avoid needing privilege — a deploy-time override, never a
 value a client assumes.
 
 **ALPN demultiplexing.** Port 443 is shared between this binary protocol and the
-daemon's HTTP/1.1 surface (incoming webhooks, ARCH-32/34; the health check,
-ARCH-25) by **ALPN** negotiated during the TLS handshake:
+daemon's HTTP/1.1 surface (incoming webhooks, ARCH-32/34) by **ALPN** negotiated
+during the TLS handshake:
 
 - The client **MUST** offer ALPN **`oc/1`** (`OC_ALPN_PROTO`). The daemon
   selects it and routes the connection to the binary-protocol handler.
@@ -90,14 +90,18 @@ ARCH-25) by **ALPN** negotiated during the TLS handshake:
    webhook sender (HTTP) ──────────────▶└──────┬────────┘
                                     yes  │      │  no
                                          ▼      ▼
-                              binary protocol   HTTP/1.1 (webhooks, /healthz)
+                              binary protocol   HTTP/1.1 (webhooks)
                               (this document)   (ARCH-32/34)
 ```
 
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
-protocol; one that does not is read by the HTTP/1.1 handler, which serves
-`POST /webhook/<token>` (§5.15) and nothing else on this port — `/healthz` and
-the landing page are on the separate plaintext health port (ARCH-25).
+protocol; one that does not is read by the daemon's HTTP/1.1 stack (ARCH-32),
+which serves `POST /webhook/<token>` (§5.15) and nothing else on this port: any
+other path is `404`, and the webhook path under another method `405`.
+`/healthz` and the landing page are on the separate plaintext health port
+(ARCH-25), served by the same stack. Either port takes **one request per
+connection**, answered with `Connection: close`; a request not whole within 10
+seconds is answered `408`; a chunked body (`Transfer-Encoding`) is refused `400`.
 
 The `oc` version suffix (`/1`) tracks the transport-framing generation, distinct from the
 per-frame `version` field in §2.
@@ -1496,11 +1500,11 @@ webhook's **label as a display-name override** (the `author_name` field on
 `BROADCAST`, so the post shows as e.g. "GitHub CI") — delivered to the channel's
 members as an ordinary `BROADCAST` (§5.3) and included in backfill.
 Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty or bad
-body, **including a declared `Content-Length` over `MAX_BODY_SIZE`** — the parser
-rejects it before the handler sees it), `403` (the channel is archived and
-therefore read-only, REQ-035), `404` (unknown or disabled token), `405`
-(non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
-16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
+body, or a malformed request); `403` (the channel is archived and therefore
+read-only, REQ-035); `404` (unknown or disabled token); `405` (non-POST); `408`
+(the request did not arrive whole within 10 seconds); `413` (a declared
+`Content-Length` over `MAX_BODY_SIZE`, refused as soon as the headers are read,
+before the body is); `429` (per-token rate limit, 60/min).
 
 
 ### 5.14b Read-aloud (REQ-291–295, ARCH-111)
