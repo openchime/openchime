@@ -25,7 +25,8 @@ drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
 replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile;
-**0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row.
+**0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row;
+**0048** (§3am) user groups, and membership through them.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1174,6 +1175,43 @@ password on the auth pool, and mints the session on the writer only if the row
 for that user still carries that version. A password changed in between, or an
 account removed (and its id given to another), fails the sign-in rather than
 letting a password that was right a moment ago open the account as it is now.
+
+## 3am. Migration 0048 — user groups, and membership through them (REQ-307-309, ARCH-114)
+
+```sql
+ALTER TABLE channel_members ADD COLUMN direct INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0,1));
+CREATE TABLE user_groups (id INTEGER PRIMARY KEY, handle TEXT NOT NULL, name TEXT NOT NULL,
+                          description TEXT, created_by INTEGER, created_at_ms INTEGER NOT NULL);
+CREATE UNIQUE INDEX idx_user_groups_handle ON user_groups(lower(handle));
+CREATE TABLE user_group_members (group_id, user_id, added_at_ms, PRIMARY KEY (group_id, user_id));
+CREATE TABLE channel_groups (channel_id, group_id, added_by, added_at_ms, PRIMARY KEY (channel_id, group_id));
+ALTER TABLE mentions ADD COLUMN group_id INTEGER;
+```
+
+A group in a channel is a **reference**. The channel records the group
+(`channel_groups`), and the group's members are in the channel through it for as
+long as both hold.
+
+`channel_members` stays the **effective** membership, which every access check,
+fan-out, push and badge query reads. A row exists exactly when the person was
+added directly (`direct = 1`), or is in a group the channel has. One function in
+the writer, `membership_sync`, is the only code that writes or deletes a row, and
+it writes that rule. So no sequence of joins, leaves, group edits and attachments
+can leave a row the rule would not. A row that stays keeps its `joined_at_ms`.
+Every row before this migration was added directly.
+
+A handle is unique without case (`lower(handle)`). The rule that it is also nobody's display name and no broadcast word spans two tables, so the writer keeps it.
+
+A mention of a group is **one `mentions` row per member it reached**, with
+`kind = 5` and the group in `group_id`, so every query that counts a personal
+mention counts it too:
+- the push decision: `kind IN (0,5)`;
+- the badge: `kind IN (0,4,5)`;
+- the activity feed: the row is mine, or a broadcast.
+
+Rows are resolved at send time, so who is in the group later changes later
+mentions, not this one. Deleting a group sets its rows' `group_id` to NULL and
+keeps the rows.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

@@ -233,6 +233,7 @@ typedef struct conn_s {
      * the request. `http_pending` marks it as awaiting a webhook-post result. */
     int          http;
     int          http_pending;
+    int          groups_sent;    /* this session's groups have followed its user list (REQ-307) */
     /* The indexes (below): where this connection sits in the live list, its
      * neighbours among its user's connections once authenticated, and the last
      * fan-out that reached it, so a member listed twice is written to once. */
@@ -1965,6 +1966,16 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             oc_dbwriter_submit(dbw, j);
+            /* At sign-in the groups follow the user list, unasked (REQ-307):
+             * a read on the reader this connection's reads go to, which takes
+             * them in order, so they come after USER_LIST. Once a session. */
+            if (!c->groups_sent) {
+                oc_job *g = oc_job_new(OC_JOB_LIST_GROUPS, c->conn_id);
+                if (!g) return -1;
+                g->user_id = c->user_id;
+                oc_dbwriter_submit(dbw, g);
+                c->groups_sent = 1;
+            }
             continue;
         }
         if (hdr.msg_type == OC_MSG_SET_ROLE) {
@@ -2324,6 +2335,76 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->ch_name = de.name.len ? strndup((const char *)de.name.ptr, de.name.len) : strdup("");
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        /* User groups (REQ-307-309). Who may is the writer's to decide: owners
+         * and admins manage groups, any member of a channel gives it one. */
+        if (hdr.msg_type == OC_MSG_LIST_GROUPS) {
+            if (oc_decode_list_groups(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_GROUPS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CREATE_GROUP || hdr.msg_type == OC_MSG_UPDATE_GROUP) {
+            oc_update_group ug; memset(&ug, 0, sizeof ug);
+            if (hdr.msg_type == OC_MSG_CREATE_GROUP) {
+                oc_create_group cg;
+                if (oc_decode_create_group(&p, &cg) != OC_OK) return -1;
+                ug.handle = cg.handle; ug.name = cg.name; ug.description = cg.description;
+            } else if (oc_decode_update_group(&p, &ug) != OC_OK) return -1;
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_CREATE_GROUP ? OC_JOB_CREATE_GROUP : OC_JOB_UPDATE_GROUP,
+                                   c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->group_id = ug.group_id;
+            j->grp_handle = strndup((const char *)ug.handle.ptr, ug.handle.len);
+            j->grp_name = strndup((const char *)ug.name.ptr, ug.name.len);
+            j->grp_desc = strndup((const char *)ug.description.ptr, ug.description.len);
+            if (!j->grp_handle || !j->grp_name || !j->grp_desc) { oc_job_free(j); return -1; }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE_GROUP) {
+            oc_group_ref gr;
+            if (oc_decode_group_ref(&p, &gr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE_GROUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->group_id = gr.group_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_GROUP_ADD_MEMBERS || hdr.msg_type == OC_MSG_GROUP_REMOVE_MEMBERS) {
+            static __thread oc_group_members_op gm;
+            if (oc_decode_group_members_op(&p, &gm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_GROUP_ADD_MEMBERS ? OC_JOB_GROUP_ADD_MEMBERS
+                                                                             : OC_JOB_GROUP_REMOVE_MEMBERS,
+                                   c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->group_id = gm.group_id;
+            if (gm.count) {
+                j->grp_uids = malloc(gm.count * sizeof *j->grp_uids);
+                if (!j->grp_uids) { oc_job_free(j); return -1; }
+                memcpy(j->grp_uids, gm.user_ids, gm.count * sizeof *j->grp_uids);
+                j->n_grp_uids = gm.count;
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CHANNEL_ADD_GROUP || hdr.msg_type == OC_MSG_CHANNEL_REMOVE_GROUP) {
+            oc_channel_group_op cg;
+            if (oc_decode_channel_group_op(&p, &cg) != OC_OK) return -1;
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_CHANNEL_ADD_GROUP ? OC_JOB_CHANNEL_ADD_GROUP
+                                                                             : OC_JOB_CHANNEL_REMOVE_GROUP,
+                                   c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = cg.channel_id;
+            j->group_id = cg.group_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -3514,6 +3595,56 @@ static void deliver_stt_results(int ep, conn **conns, oc_dbwriter *dbw) {
 }
 #endif
 
+/* A channel's groups (REQ-309), as the frame that goes beside its CHANNEL_INFO,
+ * into `buf`. 0 if it could not be encoded. */
+static size_t encode_channel_groups(uint8_t *buf, size_t cap, uint64_t channel_id,
+                                    const uint64_t *groups, uint16_t n) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_channel_groups cg = { channel_id, n, groups };
+    return oc_encode_channel_groups(&w, OC_PROTOCOL_VERSION, &cg) == OC_OK ? w.len : 0;
+}
+
+/* Who gained or lost a channel by a change (REQ-309), told: a channel whose
+ * groups changed tells every member which it now has; each person who gained
+ * one gets it as an invitee does, with its groups; each who lost one is told it
+ * is no longer theirs, which their sidebar folds as a leave. */
+static void deliver_membership(int ep, conn **conns, const oc_dbres *r) {
+    uint8_t gbuf[16 + 8 * OC_MAX_CHANNEL_GROUPS];
+    for (size_t i = 0; i < r->n_mchan; i++) {
+        const oc_chan_brief *b = &r->mchan[i];
+        if (!b->groups_changed || b->kind != OC_CHANNEL_KIND) continue;
+        size_t gl = encode_channel_groups(gbuf, sizeof gbuf, b->channel_id, b->groups, b->n_groups);
+        if (gl) fanout_members(ep, conns, b->members, b->n_members, 0, gbuf, gl);
+    }
+    for (size_t k = 0; k < r->n_mchg; k++) {
+        const oc_memb_change *mc = &r->mchg[k];
+        const oc_chan_brief *b = NULL;
+        for (size_t i = 0; i < r->n_mchan; i++) if (r->mchan[i].channel_id == mc->channel_id) b = &r->mchan[i];
+        if (!b) continue;
+        oc_channel_info ci; memset(&ci, 0, sizeof ci);
+        ci.channel_id = b->channel_id; ci.kind = b->kind;
+        ci.name = oc_slice_str(b->name ? b->name : "");
+        ci.is_public = b->is_public; ci.joined = mc->joined; ci.created_at = b->created_at;
+        ci.topic = oc_slice_str(b->topic ? b->topic : ""); ci.archived = b->archived;
+        oc_wbuf w; oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci) != OC_OK) continue;
+        send_to_user(ep, conns, mc->user_id, 0, g_enc, w.len);
+        if (mc->joined) {
+            size_t gl = encode_channel_groups(gbuf, sizeof gbuf, b->channel_id, b->groups, b->n_groups);
+            if (gl) send_to_user(ep, conns, mc->user_id, 0, gbuf, gl);
+        }
+    }
+}
+
+/* One group, whole, into g_enc; its length, or 0. */
+static size_t encode_group(const oc_group_row *g) {
+    oc_group_info gi = { g->id, oc_slice_str(g->handle ? g->handle : ""), oc_slice_str(g->name ? g->name : ""),
+                         oc_slice_str(g->description ? g->description : ""), g->created_by,
+                         g->n_members, g->members };
+    oc_wbuf w; oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    return oc_encode_group_info(&w, OC_PROTOCOL_VERSION, &gi) == OC_OK ? w.len : 0;
+}
+
 static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
     (void)dbw;
     oc_wbuf w;
@@ -3711,6 +3842,13 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
                 if (oc_encode_mention_unresolved(&w, OC_PROTOCOL_VERSION, &r->unres) == OC_OK)
                     send_bytes(ep, conns, sender->fd, g_enc, w.len);
+                /* More than the notice names (a group, REQ-308): how many in all. */
+                if (r->unres_total > r->unres.count && find_by_id(conns, r->conn_id)) {
+                    oc_mention_unresolved_more um = { r->unres.channel_id, r->unres.message_id, r->unres_total };
+                    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                    if (oc_encode_mention_unresolved_more(&w, OC_PROTOCOL_VERSION, &um) == OC_OK)
+                        send_bytes(ep, conns, sender->fd, g_enc, w.len);
+                }
             }
         }
         if (!r->duplicate) {
@@ -3862,6 +4000,19 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             size_t len = w.len;
             send_to_user(ep, conns, r->push_user_id, 0, g_enc, len);
         }
+        /* A channel's groups go beside its CHANNEL_INFO, to the same people
+         * (REQ-309), none included, so a client never holds one without the
+         * other. */
+        if (r->ch_kind == OC_CHANNEL_KIND) {
+            uint8_t gbuf[16 + 8 * OC_MAX_CHANNEL_GROUPS];
+            size_t gl = encode_channel_groups(gbuf, sizeof gbuf, r->channel_id, r->ch_groups, r->n_ch_groups);
+            if (gl) {
+                if (c && find_by_id(conns, r->conn_id)) send_bytes(ep, conns, c->fd, gbuf, gl);
+                if (r->ch_fanout) fanout_members(ep, conns, r->members, r->n_members, actor, gbuf, gl);
+                if (r->push_user_id) send_to_user(ep, conns, r->push_user_id, 0, gbuf, gl);
+            }
+        }
+        deliver_membership(ep, conns, r);
         break;
     }
     case OC_RES_CHANNEL_ERR: {
@@ -3879,6 +4030,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
           : r->err_code == OC_ERR_UNKNOWN_CHANNEL  ? "no such channel"
           : r->err_code == OC_ERR_NOT_A_MEMBER     ? "you are not a member of that channel"
           : r->err_code == OC_ERR_FORBIDDEN        ? "you do not have permission to do that"
+          : r->err_code == OC_ERR_MEMBER_VIA_GROUP ? "in this channel through a group: that group keeps them in"
+          : r->err_code == OC_ERR_UNKNOWN_GROUP    ? "no such group"
+          : r->err_code == OC_ERR_INVALID_GROUP    ? "this channel already has as many groups as it can"
           :                                          "channel op rejected";
         oc_error e = { r->err_code, 0, cs, oc_slice_str(why) };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
@@ -3948,6 +4102,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             at += fit;
         } while (at < total);
         free(ents);
+        /* And each channel's groups (REQ-309), none included, as beside every
+         * CHANNEL_INFO. */
+        for (size_t k = 0; k < r->n_chlist && find_by_id(conns, r->conn_id); k++) {
+            if (r->chlist[k].kind != OC_CHANNEL_KIND) continue;
+            uint8_t gbuf[16 + 8 * OC_MAX_CHANNEL_GROUPS];
+            size_t gl = encode_channel_groups(gbuf, sizeof gbuf, r->chlist[k].channel_id,
+                                              r->chlist[k].groups, r->chlist[k].n_groups);
+            if (gl) send_bytes(ep, conns, c->fd, gbuf, gl);
+        }
         break;
     }
     case OC_RES_USER_LIST: {
@@ -4210,6 +4373,20 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_members term = { r->channel_id, (uint32_t)r->n_cmlist };
         oc_encode_members(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        /* Then who is in only through a group (REQ-309): whom leave and remove
+         * refuse, and whom the roster marks. */
+        if (!conns[c->fd]) break;
+        {
+            uint64_t *via = r->n_cmlist ? malloc(r->n_cmlist * sizeof *via) : NULL;
+            uint16_t nv = 0;
+            for (size_t i = 0; via && i < r->n_cmlist; i++)
+                if (r->cmlist[i].only_via_group) via[nv++] = r->cmlist[i].user_id;
+            oc_channel_via_group cv = { r->channel_id, nv, via };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_channel_via_group(&w, OC_PROTOCOL_VERSION, &cv) == OC_OK)
+                send_bytes(ep, conns, c->fd, g_enc, w.len);
+            free(via);
+        }
         break;
     }
     case OC_RES_FILE_LIST: {
@@ -4761,6 +4938,52 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
+        break;
+    }
+    case OC_RES_GROUP_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        uint16_t sent = 0;
+        for (size_t i = 0; i < r->n_groups && find_by_id(conns, r->conn_id); i++) {
+            size_t len = encode_group(&r->groups[i]);
+            if (len) { send_bytes(ep, conns, c->fd, g_enc, len); sent++; }
+        }
+        if (!find_by_id(conns, r->conn_id)) break;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_groups_end ge = { sent };
+        if (oc_encode_groups_end(&w, OC_PROTOCOL_VERSION, &ge) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_GROUP_CHANGED:
+    case OC_RES_GROUP_DELETED: {
+        /* Everyone sees every group (REQ-307): a composer offers them and a
+         * profile lists them. Then who gained or lost a channel by it. */
+        size_t len = 0;
+        if (r->type == OC_RES_GROUP_CHANGED) {
+            if (r->n_groups) len = encode_group(&r->groups[0]);
+        } else {
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_group_ref gr = { r->group_id };
+            if (oc_encode_group_deleted(&w, OC_PROTOCOL_VERSION, &gr) == OC_OK) len = w.len;
+        }
+        if (len) send_to_all_authed(ep, conns, g_enc, len);
+        deliver_membership(ep, conns, r);
+        break;
+    }
+    case OC_RES_GROUP_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->group_id >> (56 - 8 * i));
+        const char *why =
+            r->err_code == OC_ERR_FORBIDDEN          ? "only owners and admins manage groups"
+          : r->err_code == OC_ERR_UNKNOWN_GROUP      ? "no such group"
+          : r->err_code == OC_ERR_GROUP_HANDLE_TAKEN ? "something already answers to that @name"
+          : r->err_code == OC_ERR_INVALID_GROUP      ? "that group is not valid, or is at its limit"
+          :                                            "group op rejected";
+        oc_error e = { r->err_code, 0, { ctx, sizeof ctx }, oc_slice_str(why) };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_EMOJI_LIST: {

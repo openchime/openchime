@@ -567,6 +567,108 @@ static void test_pins(void) {
 /* A GROUP DM is titled by everyone in it, the reader included (REQ-056). This
  * went untested, and the title quietly disagreed with both the member pane and
  * the participant count beside it: a three-person group read "bob, carol". */
+/* A GROUP event as the net thread makes one: the group, owned by the event. */
+static void apply_group(oc_model *m, uint64_t id, const char *handle, const uint64_t *mem, uint16_t n) {
+    oc_ev e; memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUP;
+    e.group = calloc(1, sizeof *e.group);
+    e.group->id = id;
+    snprintf(e.group->handle, sizeof e.group->handle, "%s", handle);
+    snprintf(e.group->name, sizeof e.group->name, "%s", handle);
+    for (uint16_t i = 0; i < n; i++) e.group->members[i] = mem[i];
+    e.group->n_members = n;
+    oc_model_apply(m, &e);
+    free(e.group);   /* NULL once the model took it */
+}
+
+/* User groups in the client (REQ-307-309): the model keeps them and each
+ * channel's; a member of a group a channel has is in it through that group;
+ * @group names everyone in it, for the toast; the composer offers groups; a
+ * deleted group leaves every channel; and a list forgets what it did not
+ * mention. */
+static void test_groups_model(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob");   oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 0; e.body = strdup("vault"); e.server_time = 10;
+    oc_model_apply(&m, &e);
+
+    uint64_t crew[1] = { 1 }, ops[1] = { 2 };
+    apply_group(&m, 7, "crew", crew, 1);
+    apply_group(&m, 8, "ops", ops, 1);
+    CHECK(m.n_groups == 2 && oc_model_group_by_handle(&m, "CREW") == oc_model_group(&m, 7));
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL_GROUPS; e.channel_id = 10; e.n_groups = 1; e.groups[0] = 7;
+    oc_model_apply(&m, &e);
+    /* "Only through a group" is the daemon's to say, after a member list: until
+     * then the model does not know whether alice was also added directly. */
+    CHECK(oc_model_via_group(&m, 10, 1) == 0);
+    oc_model_chanmem_begin(&m, 10);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL_VIA_GROUP; e.channel_id = 10;
+    e.ids = malloc(sizeof *e.ids); e.ids[0] = 1; e.n_ids = 1;
+    oc_model_apply(&m, &e);
+    free(e.ids);   /* NULL once the model took it */
+    CHECK(oc_model_only_via_group(&m, 10, 1) && oc_model_via_group(&m, 10, 1) == 7);
+    CHECK(!oc_model_only_via_group(&m, 10, 2) && oc_model_via_group(&m, 10, 2) == 0);
+    CHECK(!oc_model_only_via_group(&m, 11, 1));   /* another channel: not known */
+
+    oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c != NULL);
+    if (!c) { oc_model_free(&m); return; }
+    c->notify_level = OC_NOTIFY_MENTIONS;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+    e.server_time = 100; e.body = strdup("@ops only"); oc_model_apply(&m, &e);
+    int men = 0, kw = 0, vip = 0;
+    CHECK(oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip) == NULL);   /* not alice's group */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 2; e.author_id = 2;
+    e.server_time = 200; e.body = strdup("@Crew standup"); oc_model_apply(&m, &e);
+    const oc_msg *pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick && pick->message_id == 2 && men == 1);
+
+    oc_completion comp[8]; int start = 0, kind = 0;
+    size_t nc = oc_complete(&m, "hey @cr", comp, 8, &start, &kind);
+    CHECK(nc >= 1 && kind == OC_AC_MENTION && strcmp(comp[0].repl, "@crew") == 0);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUP_DELETED; e.message_id = 7;
+    oc_model_apply(&m, &e);
+    CHECK(oc_model_group(&m, 7) == NULL && c->n_groups == 0 && oc_model_via_group(&m, 10, 1) == 0);
+
+    /* The total that follows a notice (REQ-308): kept for that message only. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MENTION_UNRESOLVED; e.channel_id = 10; e.message_id = 5; e.n_peers = 1; e.peers[0] = 2;
+    e.body = strdup("bob"); oc_model_apply(&m, &e); free(e.body);
+    uint32_t ts = m.unresolved.total_seq;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MENTION_UNRESOLVED_MORE; e.channel_id = 10; e.message_id = 4; e.count = 20;
+    oc_model_apply(&m, &e);
+    CHECK(m.unresolved.total == 0 && m.unresolved.total_seq == ts);   /* another message */
+    e.message_id = 5;
+    oc_model_apply(&m, &e);
+    CHECK(m.unresolved.total == 20 && m.unresolved.total_seq == ts + 1);
+
+    /* A list: ops was deleted while away, so a list that names only a new one
+     * leaves only that one. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUPS_END; oc_model_apply(&m, &e);    /* the list at sign-in: ops, seen */
+    CHECK(m.n_groups == 1);
+    apply_group(&m, 9, "design", crew, 1);                 /* the next list names design only */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_GROUPS_END; oc_model_apply(&m, &e);
+    CHECK(m.n_groups == 1 && oc_model_group(&m, 9) != NULL && oc_model_group(&m, 8) == NULL);
+    oc_model_free(&m);
+}
+
 static void test_group_dm_title(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;                                  /* signed in as alice */
@@ -2887,6 +2989,7 @@ int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, .well-known metadata, a published fingerprint, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
 
     test_group_dm_title();
+    test_groups_model();
     test_sidebar();
     test_new_channel_takes_the_default_level();
     test_notify_scan();

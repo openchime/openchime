@@ -27,9 +27,11 @@ DEV="${OC_PAIR_DIR:-/tmp/openchime-pair}"
 PIDS="$DEV/pids"
 
 # One command channel per client, or they read each other's commands and answer
-# for the wrong window — which looks exactly like a client ignoring you.
-WIN_A='C:\Windows\Temp\ocpair-a'; LIN_A='/mnt/c/Windows/Temp/ocpair-a'
-WIN_B='C:\Windows\Temp\ocpair-b'; LIN_B='/mnt/c/Windows/Temp/ocpair-b'
+# for the wrong window — which looks exactly like a client ignoring you. Per
+# PORT too: two pairs up at once (one to play with, one under test) otherwise
+# share a channel, and each alice runs the other's commands.
+WIN_A="C:\\Windows\\Temp\\ocpair-$PORT-a"; LIN_A="/mnt/c/Windows/Temp/ocpair-$PORT-a"
+WIN_B="C:\\Windows\\Temp\\ocpair-$PORT-b"; LIN_B="/mnt/c/Windows/Temp/ocpair-$PORT-b"
 
 drive() {  # drive <lin-dir> <win-dir> <cmd...>
   local dir="$1" wdir="$2"; shift 2

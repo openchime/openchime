@@ -55,7 +55,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 47);
+    CHECK(oc_schema_version(db) == 48);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -5975,6 +5975,394 @@ static void submit_local_auth(oc_dbwriter *w, uint64_t conn_id, const char *user
     oc_dbwriter_submit(w, j);
 }
 
+/* --- User groups (REQ-307-309) --------------------------------------------- */
+
+static oc_dbres *grp_job(oc_dbwriter *w, int type, uint64_t actor, uint64_t gid,
+                         const char *handle, const char *name, const char *desc) {
+    oc_job *j = oc_job_new(type, 700);
+    j->user_id = actor; j->group_id = gid;
+    if (handle) j->grp_handle = strdup(handle);
+    if (name) j->grp_name = strdup(name);
+    if (desc) j->grp_desc = strdup(desc);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static uint64_t grp_create(oc_dbwriter *w, uint64_t actor, const char *handle) {
+    oc_dbres *r = grp_job(w, OC_JOB_CREATE_GROUP, actor, 0, handle, handle, "");
+    uint64_t id = (r && r->type == OC_RES_GROUP_CHANGED && r->n_groups == 1) ? r->groups[0].id : 0;
+    oc_dbres_free(r);
+    return id;
+}
+
+static oc_dbres *grp_members(oc_dbwriter *w, uint64_t actor, uint64_t gid, int add,
+                             const uint64_t *uids, uint16_t n) {
+    oc_job *j = oc_job_new(add ? OC_JOB_GROUP_ADD_MEMBERS : OC_JOB_GROUP_REMOVE_MEMBERS, 701);
+    j->user_id = actor; j->group_id = gid;
+    j->grp_uids = malloc(n * sizeof *j->grp_uids);
+    memcpy(j->grp_uids, uids, n * sizeof *j->grp_uids);
+    j->n_grp_uids = n;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *chan_group(oc_dbwriter *w, uint64_t actor, uint64_t ch, uint64_t gid, int add) {
+    oc_job *j = oc_job_new(add ? OC_JOB_CHANNEL_ADD_GROUP : OC_JOB_CHANNEL_REMOVE_GROUP, 702);
+    j->user_id = actor; j->channel_id = ch; j->group_id = gid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *chan_member_op(oc_dbwriter *w, int type, uint64_t actor, uint64_t ch, uint64_t target) {
+    oc_job *j = oc_job_new(type, 703);
+    j->user_id = actor; j->channel_id = ch; j->target_user_id = target;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* channel_members as stored: -1 no row, else its `direct`. */
+static int stored_member(const char *path, uint64_t ch, uint64_t uid) {
+    sqlite3 *raw = NULL;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -2;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw, "SELECT direct FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)uid);
+    int v = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    return v;
+}
+
+static int has_change(const oc_dbres *r, uint64_t ch, uint64_t uid, int joined) {
+    for (size_t i = 0; r && i < r->n_mchg; i++)
+        if (r->mchg[i].channel_id == ch && r->mchg[i].user_id == uid && r->mchg[i].joined == joined) return 1;
+    return 0;
+}
+
+/* Managing groups: owners and admins only; handles follow the rule (what `@`
+ * can name, and one namespace with people and the broadcast words, without
+ * case); a rename cannot take a group's handle; everything is audited. */
+static void test_groups_manage(void) {
+    const char *path = "build/test_dbwriter_groups.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    uint64_t mem = reg(w, "member", "pw", OC_ROLE_MEMBER);
+    CHECK(own && mem);
+
+    oc_dbres *r = grp_job(w, OC_JOB_CREATE_GROUP, mem, 0, "design", "Design", "");
+    CHECK(r && r->type == OC_RES_GROUP_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    uint64_t g = grp_create(w, own, "design");
+    CHECK(g != 0);
+    static const char *const BAD[] = { "", "9lives", ".dot", "has space", "a@b",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" /* 49 */ };
+    for (size_t i = 0; i < sizeof BAD / sizeof *BAD; i++) {
+        r = grp_job(w, OC_JOB_CREATE_GROUP, own, 0, BAD[i], "x", "");
+        CHECK(r && r->type == OC_RES_GROUP_ERR && r->err_code == OC_ERR_INVALID_GROUP);
+        oc_dbres_free(r);
+    }
+    static const char *const TAKEN[] = { "DESIGN", "here", "Channel", "everyone", "Member" };
+    for (size_t i = 0; i < sizeof TAKEN / sizeof *TAKEN; i++) {
+        r = grp_job(w, OC_JOB_CREATE_GROUP, own, 0, TAKEN[i], "x", "");
+        CHECK(r && r->type == OC_RES_GROUP_ERR && r->err_code == OC_ERR_GROUP_HANDLE_TAKEN);
+        oc_dbres_free(r);
+    }
+    /* A person cannot rename themselves to a group's handle. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_DISPLAY_NAME, 704);
+        j->user_id = mem; j->pf_name = strdup("Design");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->err_code == OC_ERR_GROUP_HANDLE_TAKEN);
+        oc_dbres_free(r);
+    }
+    /* Update: its own handle is not a clash; another's is. */
+    uint64_t g2 = grp_create(w, own, "ops");
+    r = grp_job(w, OC_JOB_UPDATE_GROUP, own, g, "design", "The design team", "pixels");
+    CHECK(r && r->type == OC_RES_GROUP_CHANGED && r->n_groups == 1 &&
+          strcmp(r->groups[0].name, "The design team") == 0);
+    oc_dbres_free(r);
+    r = grp_job(w, OC_JOB_UPDATE_GROUP, own, g, "Ops", "x", "");
+    CHECK(r && r->type == OC_RES_GROUP_ERR && r->err_code == OC_ERR_GROUP_HANDLE_TAKEN);
+    oc_dbres_free(r);
+    r = grp_job(w, OC_JOB_UPDATE_GROUP, own, 9999, "zz", "x", "");
+    CHECK(r && r->type == OC_RES_GROUP_ERR && r->err_code == OC_ERR_UNKNOWN_GROUP);
+    oc_dbres_free(r);
+    /* Members: added, listed, removed; a stranger's id is ignored. */
+    uint64_t add[3] = { own, mem, 424242 };
+    r = grp_members(w, own, g, 1, add, 3);
+    CHECK(r && r->type == OC_RES_GROUP_CHANGED && r->n_groups == 1 && r->groups[0].n_members == 2);
+    oc_dbres_free(r);
+    r = grp_members(w, mem, g, 0, add, 1);
+    CHECK(r && r->type == OC_RES_GROUP_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    {
+        oc_job *j = oc_job_new(OC_JOB_LIST_GROUPS, 705);
+        j->user_id = mem;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_GROUP_LIST && r->n_groups == 2);
+        CHECK(r && r->n_groups == 2 && strcmp(r->groups[0].handle, "design") == 0 && r->groups[0].n_members == 2);
+        oc_dbres_free(r);
+    }
+    r = grp_job(w, OC_JOB_DELETE_GROUP, own, g2, NULL, NULL, NULL);
+    CHECK(r && r->type == OC_RES_GROUP_DELETED && r->group_id == g2);
+    oc_dbres_free(r);
+    /* Audited. */
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'group.%';", -1, &st, NULL);
+    CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) >= 5);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A group in a channel is a reference (REQ-309): its members are in the channel
+ * through it, and follow it -- added to the group, in; taken out, out, unless
+ * added directly too. Leave and remove refuse someone a group keeps in. Every
+ * change says who gained or lost the channel. */
+static void test_groups_membership(void) {
+    const char *path = "build/test_dbwriter_gmemb.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    uint64_t a = reg(w, "ann", "pw", OC_ROLE_MEMBER), b = reg(w, "ben", "pw", OC_ROLE_MEMBER);
+    uint64_t c = reg(w, "cat", "pw", OC_ROLE_MEMBER);
+    oc_dbres *r = create_channel(w, own, "vault", 0);
+    uint64_t ch = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    CHECK(ch != 0);
+    uint64_t g = grp_create(w, own, "crew");
+    uint64_t ab[2] = { a, b };
+    oc_dbres_free(grp_members(w, own, g, 1, ab, 2));
+
+    r = chan_group(w, own, ch, g, 1);                     /* attach */
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->n_ch_groups == 1 && r->ch_groups[0] == g);
+    CHECK(has_change(r, ch, a, 1) && has_change(r, ch, b, 1) && r->n_mchg == 2);
+    CHECK(r && r->n_mchan == 1 && r->mchan[0].groups_changed && r->mchan[0].n_groups == 1);
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, a) == 0 && stored_member(path, ch, b) == 0);
+    CHECK(stored_member(path, ch, own) == 1);
+
+    uint64_t cc[1] = { c };
+    r = grp_members(w, own, g, 1, cc, 1);                  /* c into the group: into the channel */
+    CHECK(r && has_change(r, ch, c, 1));
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, c) == 0);
+
+    r = chan_member_op(w, OC_JOB_INVITE_CHANNEL, own, ch, b);   /* b direct too */
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, b) == 1);
+
+    r = chan_member_op(w, OC_JOB_LEAVE_CHANNEL, a, ch, 0);      /* a: in only through the group */
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_MEMBER_VIA_GROUP);
+    oc_dbres_free(r);
+    /* b is direct AND in the group: removing him clears the direct half, and
+     * the group keeps him in -- not refused, and not a loss. */
+    r = chan_member_op(w, OC_JOB_REMOVE_CHANNEL, own, ch, b);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && !has_change(r, ch, b, 0));
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, b) == 0);
+    /* c joins directly too, then leaves: the same -- in through the group still. */
+    oc_dbres_free(chan_member_op(w, OC_JOB_INVITE_CHANNEL, own, ch, c));
+    CHECK(stored_member(path, ch, c) == 1);
+    r = chan_member_op(w, OC_JOB_LEAVE_CHANNEL, c, ch, 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, c) == 0);
+    /* Now only the group keeps c in: a second leave is refused. */
+    r = chan_member_op(w, OC_JOB_LEAVE_CHANNEL, c, ch, 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_MEMBER_VIA_GROUP);
+    oc_dbres_free(r);
+
+    uint64_t aa[1] = { a };
+    r = grp_members(w, own, g, 0, aa, 1);                  /* a out of the group: out of the channel */
+    CHECK(r && has_change(r, ch, a, 0));
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, a) == -1);
+
+    oc_dbres_free(chan_member_op(w, OC_JOB_INVITE_CHANNEL, own, ch, b));   /* b direct again */
+    r = chan_group(w, own, ch, g, 0);                     /* detach: b stays (direct), c goes */
+    CHECK(r && r->n_ch_groups == 0 && has_change(r, ch, c, 0) && !has_change(r, ch, b, 0));
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, b) == 1 && stored_member(path, ch, c) == -1);
+
+    /* A direct remove now works, and the removed person is told. */
+    r = chan_member_op(w, OC_JOB_REMOVE_CHANNEL, own, ch, b);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && has_change(r, ch, b, 0));
+    oc_dbres_free(r);
+
+    /* Deleting a group takes its membership with it. */
+    oc_dbres_free(chan_group(w, own, ch, g, 1));
+    CHECK(stored_member(path, ch, c) == 0);
+    r = grp_job(w, OC_JOB_DELETE_GROUP, own, g, NULL, NULL, NULL);
+    CHECK(r && r->type == OC_RES_GROUP_DELETED && has_change(r, ch, c, 0));
+    oc_dbres_free(r);
+    CHECK(stored_member(path, ch, c) == -1);
+
+    /* Not a member of the channel: cannot give it a group. A DM takes none. */
+    uint64_t g3 = grp_create(w, own, "crew3");
+    r = chan_group(w, a, ch, g3, 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* The rule, held by construction: after any sequence of every operation that
+ * touches membership, channel_members is exactly "added directly, or in a group
+ * the channel has", with `direct` matching -- checked against a reference model
+ * through a long random run over three channels, six people and three groups. */
+static void test_groups_invariant(void) {
+    const char *path = "build/test_dbwriter_ginv.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    enum { NC = 3, NU = 6, NG = 3, OPS = 600 };
+    uint64_t own = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    uint64_t u[NU], ch[NC], g[NG];
+    for (int i = 0; i < NU; i++) { char n[16]; snprintf(n, sizeof n, "p%d", i); u[i] = reg(w, n, "pw", OC_ROLE_MEMBER); }
+    for (int i = 0; i < NC; i++) {
+        char n[16]; snprintf(n, sizeof n, "inv%d", i);
+        oc_dbres *r = create_channel(w, own, n, (uint8_t)(i == 0));
+        ch[i] = r ? r->channel_id : 0;
+        oc_dbres_free(r);
+    }
+    for (int i = 0; i < NG; i++) { char n[16]; snprintf(n, sizeof n, "grp%d", i); g[i] = grp_create(w, own, n); }
+    int direct[NC][NU] = {{0}}, attached[NC][NG] = {{0}}, in_group[NG][NU] = {{0}};
+    srand(4290);
+    int bad = 0;
+    for (int op = 0; op < OPS && !bad; op++) {
+        int c = rand() % NC, p = rand() % NU, q = rand() % NG, kind = rand() % 7;
+        oc_dbres *r = NULL;
+        switch (kind) {
+        case 0: r = chan_member_op(w, OC_JOB_INVITE_CHANNEL, own, ch[c], u[p]); direct[c][p] = 1; break;
+        case 1: r = chan_member_op(w, OC_JOB_REMOVE_CHANNEL, own, ch[c], u[p]); direct[c][p] = 0; break;
+        case 2: r = chan_group(w, own, ch[c], g[q], 1); attached[c][q] = 1; break;
+        case 3: r = chan_group(w, own, ch[c], g[q], 0); attached[c][q] = 0; break;
+        case 4: r = grp_members(w, own, g[q], 1, &u[p], 1); in_group[q][p] = 1; break;
+        case 5: r = grp_members(w, own, g[q], 0, &u[p], 1); in_group[q][p] = 0; break;
+        case 6: r = chan_member_op(w, OC_JOB_LEAVE_CHANNEL, u[p], ch[c], 0); direct[c][p] = 0; break;
+        }
+        if (!r) { bad = 1; break; }
+        oc_dbres_free(r);
+        for (int cc = 0; cc < NC && !bad; cc++)
+            for (int pp = 0; pp < NU && !bad; pp++) {
+                int v = 0;
+                for (int k = 0; k < NG; k++) v |= attached[cc][k] && in_group[k][pp];
+                int want = direct[cc][pp] ? 1 : (v ? 0 : -1);
+                int got = stored_member(path, ch[cc], u[pp]);
+                if (got != want) {
+                    printf("  groups invariant: op %d kind %d: channel %d person %d stored %d, rule says %d\n",
+                           op, kind, cc, pp, got, want);
+                    bad = 1;
+                }
+            }
+    }
+    CHECK(!bad);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* @group (REQ-308): one mention row per member who can read the channel, kind
+ * GROUP, with the group beside it; members who cannot are told to the sender;
+ * later changes to the group change later mentions, not this one; the feed
+ * shows it to its members and to nobody else; a handle wins a clash with a
+ * person's name. */
+static void test_groups_mentions(void) {
+    const char *path = "build/test_dbwriter_gment.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+    uint64_t own = reg(w, "owner", "pw", OC_ROLE_OWNER);
+    uint64_t a = reg(w, "ann", "pw", OC_ROLE_MEMBER), b = reg(w, "ben", "pw", OC_ROLE_MEMBER);
+    uint64_t c = reg(w, "cat", "pw", OC_ROLE_MEMBER);
+    uint64_t g = grp_create(w, own, "design");
+    uint64_t ab[2] = { a, b };
+    oc_dbres_free(grp_members(w, own, g, 1, ab, 2));
+    oc_dbres *r = create_channel(w, own, "studio", 0);   /* private: only owner */
+    uint64_t ch = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    oc_dbres_free(chan_member_op(w, OC_JOB_INVITE_CHANNEL, own, ch, a));
+
+    oc_job *j = oc_job_new(OC_JOB_SEND, 710);
+    j->user_id = own; j->channel_id = ch;
+    memset(j->idem, 0x31, OC_IDEM_LEN);
+    oc_job_set_body(j, "hey @design look", 16);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    uint64_t mid = r ? r->message_id : 0;
+    CHECK(r && r->unres.count == 1 && r->unres.who[0].user_id == b);   /* ben cannot read it */
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, mid, a, OC_MENTION_GROUP) == 1);
+    CHECK(mention_rows(path, mid, b, -1) == 0);
+    CHECK(mention_rows(path, mid, 0, OC_MENTION_USER) == 0);
+
+    /* A group larger than the notice's eight names, none of them in the
+     * channel: eight listed, and the total beside them. */
+    {
+        uint64_t big[10];
+        for (int k = 0; k < 10; k++) { char nm[16]; snprintf(nm, sizeof nm, "b%d", k); big[k] = reg(w, nm, "pw", OC_ROLE_MEMBER); }
+        uint64_t gb = grp_create(w, own, "bigcrew");
+        oc_dbres_free(grp_members(w, own, gb, 1, big, 10));
+        oc_job *jb = oc_job_new(OC_JOB_SEND, 711);
+        jb->user_id = own; jb->channel_id = ch;
+        memset(jb->idem, 0x34, OC_IDEM_LEN);
+        oc_job_set_body(jb, "@bigcrew see this", 17);
+        oc_dbwriter_submit(w, jb);
+        oc_dbres *rb = wait_result(w);
+        CHECK(rb && rb->type == OC_RES_SEND_OK && rb->unres.count == OC_UNRESOLVED_MAX && rb->unres_total == 10);
+        oc_dbres_free(rb);
+    }
+
+    /* In #general (public), ben is reached too, and a later member is not. */
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0x32, sizeof idem);
+    uint64_t m2 = send_msg(w, own, idem, "@Design standup");
+    CHECK(mention_rows(path, m2, a, OC_MENTION_GROUP) == 1 && mention_rows(path, m2, b, OC_MENTION_GROUP) == 1);
+    uint64_t cc[1] = { c };
+    oc_dbres_free(grp_members(w, own, g, 1, cc, 1));
+    CHECK(mention_rows(path, m2, c, -1) == 0);
+
+    /* The feed: ann sees it; cat, not mentioned, does not. */
+    r = list_activity(w, a);
+    int saw = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].kind == OC_ACT_MENTION && r->alist[i].message_id == m2) saw = 1;
+    CHECK(saw);
+    oc_dbres_free(r);
+    r = list_activity(w, c);
+    saw = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].kind == OC_ACT_MENTION && r->alist[i].message_id == m2) saw = 1;
+    CHECK(!saw);
+    oc_dbres_free(r);
+
+    /* A clash only an identity provider could make: the group wins. */
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    char sql[128];
+    snprintf(sql, sizeof sql, "UPDATE users SET display_name='design' WHERE id=%llu;", (unsigned long long)c);
+    CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+    memset(idem, 0x33, sizeof idem);
+    uint64_t m3 = send_msg(w, own, idem, "@design again");
+    CHECK(mention_rows(path, m3, 0, OC_MENTION_USER) == 0 && mention_rows(path, m3, 0, OC_MENTION_GROUP) == 3);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void submit_change(oc_dbwriter *w, uint64_t conn, uint64_t uid, const char *oldpw, const char *newpw) {
     oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, conn);
     j->user_id = uid;
@@ -6165,6 +6553,10 @@ int run_dbwriter_tests(void) {
     test_start_migrates_and_stops();
     test_auth_pool();
     test_change_password();
+    test_groups_manage();
+    test_groups_membership();
+    test_groups_invariant();
+    test_groups_mentions();
     test_invite_by_address();
     test_welcome_general();
     test_auth_and_send();

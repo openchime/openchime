@@ -989,6 +989,64 @@ void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* User groups (REQ-307-309). */
+void oc_client_list_groups(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_GROUPS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+static void group_text_cmd(oc_client *c, int type, uint64_t group_id, const char *handle,
+                           const char *name, const char *description) {
+    if (!c || !handle || !handle[0]) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->message_id = group_id;
+    cmd->body = strdup(handle);
+    cmd->body2 = strdup(name && name[0] ? name : handle);
+    cmd->body3 = strdup(description ? description : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_create_group(oc_client *c, const char *handle, const char *name, const char *description) {
+    group_text_cmd(c, OC_CMD_CREATE_GROUP, 0, handle, name, description);
+}
+
+void oc_client_update_group(oc_client *c, uint64_t group_id, const char *handle, const char *name,
+                            const char *description) {
+    if (!group_id) return;
+    group_text_cmd(c, OC_CMD_UPDATE_GROUP, group_id, handle, name, description);
+}
+
+void oc_client_delete_group(oc_client *c, uint64_t group_id) {
+    if (!c || !group_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE_GROUP);
+    if (!cmd) return;
+    cmd->message_id = group_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* More than a command holds goes as several. */
+void oc_client_group_members(oc_client *c, uint64_t group_id, int add, const uint64_t *user_ids, int n) {
+    if (!c || !group_id || !user_ids) return;
+    for (int at = 0; at < n; ) {
+        oc_cmd *cmd = oc_cmd_new(add ? OC_CMD_GROUP_ADD_MEMBERS : OC_CMD_GROUP_REMOVE_MEMBERS);
+        if (!cmd) return;
+        cmd->message_id = group_id;
+        while (at < n && cmd->n_uids < OC_MAX_CALL_INVITES) cmd->uids[cmd->n_uids++] = user_ids[at++];
+        oc_queue_push(&c->cmds, cmd);
+    }
+}
+
+void oc_client_channel_group(oc_client *c, uint64_t channel_id, uint64_t group_id, int add) {
+    if (!c || !channel_id || !group_id) return;
+    oc_cmd *cmd = oc_cmd_new(add ? OC_CMD_CHANNEL_ADD_GROUP : OC_CMD_CHANNEL_REMOVE_GROUP);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = group_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* Custom emoji (REQ-072). */
 void oc_client_list_emoji(oc_client *c) {
     if (!c) return;

@@ -189,6 +189,10 @@ typedef struct {
      * member has read in this channel. Advance-only; drives "seen by …". */
     oc_read_cursor_view *readers;
     size_t   n_readers, cap_readers;
+    /* The groups this channel has (REQ-309): their members are in it through
+     * them. From CHANNEL_GROUPS; a deleted group is taken out here too. */
+    uint64_t groups[OC_MAX_CHANNEL_GROUPS];
+    uint16_t n_groups;
 } oc_channel;
 
 /* `dnd` is a SECOND AXIS beside status, not a status value (REQ-122): a person
@@ -442,6 +446,10 @@ typedef struct {
     uint8_t   chanmem_loading;
     oc_chan_member *chanmem;
     size_t    n_chanmem, cap_chanmem;
+    /* Of those, who is in only through a group (REQ-309): CHANNEL_VIA_GROUP,
+     * after the list. Owned; replaced whole. */
+    uint64_t *chanmem_via;
+    size_t    n_chanmem_via;
     uint8_t   filelist_open, filelist_loading;
     uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
     oc_file_view *files;
@@ -492,6 +500,12 @@ typedef struct {
     /* The custom-emoji catalogue (REQ-072). */
     oc_custom_emoji *cemoji;
     size_t    n_cemoji, cap_cemoji;
+    /* The workspace's user groups (REQ-307), each owned here. A list answer is
+     * the whole truth: what it did not mention by its end is gone. */
+    oc_group_view **groups;
+    uint64_t *group_gen;           /* per group: the list it was last seen in */
+    size_t    n_groups, cap_groups;
+    uint64_t  groups_gen;
     uint8_t   prefs_open;
     /* The recurring SCHEDULE (REQ-136): `dnd_mode` is OC_DND_*, and the window
      * is the hours notifications are ALLOWED — the opposite sense from the quiet
@@ -618,6 +632,11 @@ typedef struct {
         uint8_t  is_private;   /* adding discloses the channel's history */
         char     names[192];   /* comma-joined, ready to show */
         uint32_t seq;
+        /* Everyone it could not reach, when more than the names listed (a
+         * group, REQ-308): 0 until MENTION_UNRESOLVED_MORE says, which bumps
+         * `total_seq` -- it arrives just after the notice it belongs to. */
+        uint16_t total;
+        uint32_t total_seq;
     } unresolved;
 
     /* Calls (REQ-150, REQ-301-305, CALLS.md). `calls` is the Calls section: every
@@ -648,6 +667,21 @@ void oc_model_apply(oc_model *m, oc_ev *e);
 
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
+
+/* User groups (REQ-307-309). A group by id or by @handle (without case), or
+ * NULL; whether a person is in it; and, for someone in the channel ONLY through
+ * a group (oc_model_only_via_group), the first of its groups that has them --
+ * 0 otherwise. */
+const oc_group_view *oc_model_group(const oc_model *m, uint64_t group_id);
+/* Is `user_id` in `channel_id` only through a group? Known for the channel whose
+ * member list is loaded (CHANNEL_VIA_GROUP follows it); 0 for any other. */
+int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
+const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle);
+int      oc_model_in_group(const oc_group_view *g, uint64_t user_id);
+uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id);
+/* Does `body` mention this user -- by their name, or by a group they are in
+ * (REQ-308)? What a toast and a highlight ask. */
+int      oc_model_mentions_me(const oc_model *m, const char *body, size_t len);
 
 /* ---- the sidebar (6) --------------------------------------------------
  * Grouping, filtering, sorting and collapse are IDENTICAL in every frontend, so

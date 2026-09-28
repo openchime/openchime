@@ -28,7 +28,12 @@ enum {
      * '@' to find — but it shares the mentions table and the notify path,
      * because REQ-135 puts keywords inside the *mentions* level and surfaces a
      * hit in the activity feed as a mention. One kind, not a fourth mechanism. */
-    OC_MENTION_KEYWORD
+    OC_MENTION_KEYWORD,
+    /* A GROUP's handle (REQ-308). Never produced by oc_mention_scan either --
+     * the scanner cannot tell a group from a person -- but written by the
+     * daemon, one row per member it reached, so everything that counts a
+     * personal mention counts it the same way. */
+    OC_MENTION_GROUP
 };
 
 #define OC_MENTION_NAME_MAX 64

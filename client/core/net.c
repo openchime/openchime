@@ -1433,6 +1433,61 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_SNOOZE);
                 if (e) { e->server_time = sn.until_ms; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_GROUP_INFO) {
+            /* User groups (REQ-307): one, whole -- listed or pushed on a change. */
+            oc_ev *e = oc_ev_new(OC_EV_GROUP);
+            oc_group_view *g = e ? calloc(1, sizeof *g) : NULL;
+            if (!e || !g) { oc_ev_free(e); free(g); return 0; }
+            oc_group_info gi;
+            if (oc_decode_group_info(&p, &gi, g->members, OC_MAX_GROUP_MEMBERS) != OC_OK) {
+                oc_ev_free(e); free(g); return -1;
+            }
+            g->id = gi.group_id; g->created_by = gi.created_by; g->n_members = gi.count;
+            snprintf(g->handle, sizeof g->handle, "%.*s", (int)gi.handle.len, (const char *)gi.handle.ptr);
+            snprintf(g->name, sizeof g->name, "%.*s", (int)gi.name.len, (const char *)gi.name.ptr);
+            snprintf(g->description, sizeof g->description, "%.*s", (int)gi.description.len,
+                     (const char *)gi.description.ptr);
+            e->group = g;
+            e->message_id = g->id;
+            oc_queue_push(to_ui, e);
+        } else if (hdr.msg_type == OC_MSG_GROUP_DELETED) {
+            oc_group_ref gr;
+            if (oc_decode_group_ref(&p, &gr) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_GROUP_DELETED);
+            if (e) { e->message_id = gr.group_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_GROUPS_END) {
+            oc_groups_end ge;
+            if (oc_decode_groups_end(&p, &ge) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_GROUPS_END);
+            if (e) { e->count = ge.count; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_GROUPS) {
+            oc_ev *e = oc_ev_new(OC_EV_CHANNEL_GROUPS);
+            if (!e) return 0;
+            oc_channel_groups cg;
+            if (oc_decode_channel_groups(&p, &cg, e->groups, OC_MAX_CHANNEL_GROUPS) != OC_OK) {
+                oc_ev_free(e); return -1;
+            }
+            e->channel_id = cg.channel_id;
+            e->n_groups = cg.count;
+            oc_queue_push(to_ui, e);
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_VIA_GROUP) {
+            oc_ev *e = oc_ev_new(OC_EV_CHANNEL_VIA_GROUP);
+            uint64_t *ids = e ? calloc(OC_MAX_MEMBER_LIST, sizeof *ids) : NULL;
+            if (!e || !ids) { oc_ev_free(e); free(ids); return 0; }
+            oc_channel_via_group cv;
+            if (oc_decode_channel_via_group(&p, &cv, ids, OC_MAX_MEMBER_LIST) != OC_OK) {
+                oc_ev_free(e); free(ids); return -1;
+            }
+            e->channel_id = cv.channel_id;
+            e->ids = ids;
+            e->n_ids = cv.count;
+            oc_queue_push(to_ui, e);
+        } else if (hdr.msg_type == OC_MSG_MENTION_UNRESOLVED_MORE) {
+            oc_mention_unresolved_more um;
+            if (oc_decode_mention_unresolved_more(&p, &um) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_MENTION_UNRESOLVED_MORE);
+            if (e) { e->channel_id = um.channel_id; e->message_id = um.message_id; e->count = um.total;
+                     oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_EMOJI_LIST) {
             oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
             if (oc_decode_emoji_list(&p, ee, OC_MAX_CUSTOM_EMOJI, &count) != OC_OK) return -1;
@@ -2538,6 +2593,7 @@ static int run_connection(oc_net *n, int reconnecting,
         oc_wbuf_init(&lw, lb, sizeof lb);
         if (oc_encode_list_users(&lw, OC_PROTOCOL_VERSION) == OC_OK)
             (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        /* The workspace's groups (REQ-307) follow the user list unasked. */
         /* And this user's drafts (REQ-223). On connect, not on demand: the
          * sidebar marks conversations holding one, so the answer has to be
          * there before anything is drawn — and it is a small list. */
@@ -3079,6 +3135,56 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_delete_emoji de = { oc_slice_str(c->body) };
                 if (oc_encode_delete_emoji(&w, OC_PROTOCOL_VERSION, &de) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            /* User groups (REQ-307-309). */
+            if (c->type == OC_CMD_LIST_GROUPS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_groups(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if ((c->type == OC_CMD_CREATE_GROUP || c->type == OC_CMD_UPDATE_GROUP) && c->body) {
+                uint8_t buf[OC_GROUP_HANDLE_MAX + OC_GROUP_NAME_MAX + OC_GROUP_DESC_MAX + 64];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_update_group ug = { c->message_id, oc_slice_str(c->body), oc_slice_str(c->body2 ? c->body2 : ""),
+                                       oc_slice_str(c->body3 ? c->body3 : "") };
+                oc_result er;
+                if (c->type == OC_CMD_CREATE_GROUP) {
+                    oc_create_group cg = { ug.handle, ug.name, ug.description };
+                    er = oc_encode_create_group(&w, OC_PROTOCOL_VERSION, &cg);
+                } else {
+                    er = oc_encode_update_group(&w, OC_PROTOCOL_VERSION, &ug);
+                }
+                if (er == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE_GROUP) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_group_ref gr = { c->message_id };
+                if (oc_encode_delete_group(&w, OC_PROTOCOL_VERSION, &gr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_GROUP_ADD_MEMBERS || c->type == OC_CMD_GROUP_REMOVE_MEMBERS) {
+                oc_group_members_op *gm = calloc(1, sizeof *gm);   /* 2 KB of ids: not the stack's */
+                uint8_t buf[32 + 8 * OC_MAX_CALL_INVITES]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (gm) {
+                    gm->group_id = c->message_id;
+                    gm->count = c->n_uids;
+                    for (uint16_t i = 0; i < c->n_uids; i++) gm->user_ids[i] = c->uids[i];
+                    if (oc_encode_group_members_op(&w, OC_PROTOCOL_VERSION,
+                                                   c->type == OC_CMD_GROUP_ADD_MEMBERS ? OC_MSG_GROUP_ADD_MEMBERS
+                                                                                       : OC_MSG_GROUP_REMOVE_MEMBERS,
+                                                   gm) == OC_OK)
+                        (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                    free(gm);
+                }
+            }
+            if (c->type == OC_CMD_CHANNEL_ADD_GROUP || c->type == OC_CMD_CHANNEL_REMOVE_GROUP) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_channel_group_op op = { c->channel_id, c->message_id };
+                if (oc_encode_channel_group_op(&w, OC_PROTOCOL_VERSION,
+                                               c->type == OC_CMD_CHANNEL_ADD_GROUP ? OC_MSG_CHANNEL_ADD_GROUP
+                                                                                   : OC_MSG_CHANNEL_REMOVE_GROUP,
+                                               &op) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_OPEN_GROUP_DM) {

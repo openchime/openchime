@@ -238,7 +238,10 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_CAPABILITIES &&
             hdr->msg_type != OC_MSG_TTS_INFO &&
             hdr->msg_type != OC_MSG_STT_INFO &&
-            hdr->msg_type != OC_MSG_CALL_STATE)
+            hdr->msg_type != OC_MSG_CALL_STATE &&
+            hdr->msg_type != OC_MSG_CHANNEL_GROUPS &&  /* beside every CHANNEL_INFO (REQ-309) */
+            hdr->msg_type != OC_MSG_GROUP_INFO &&      /* the groups, unasked after a sign-in's */
+            hdr->msg_type != OC_MSG_GROUPS_END)        /*   user list (REQ-307) */
             return 0;
     }
 }
@@ -3739,6 +3742,186 @@ static void test_login_bound(int port, const uint8_t *pin) {
     for (int i = 0; i < N; i++) client_close(&crowd[i]);
 }
 
+static uint64_t g_crowd_ids[100];   /* u000..u099, registered at setup */
+
+/* The next GROUP_INFO for `handle`, its id; 0 if none came. */
+static uint64_t read_group_info(client *c, const char *handle, uint16_t *n_members) {
+    for (int i = 0; i < 64; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_type(c, OC_MSG_GROUP_INFO, &hdr, &p) != 0) return 0;
+        uint64_t mem[OC_MAX_GROUP_MEMBERS]; oc_group_info gi;
+        if (oc_decode_group_info(&p, &gi, mem, OC_MAX_GROUP_MEMBERS) != OC_OK) return 0;
+        if (gi.handle.len == strlen(handle) && memcmp(gi.handle.ptr, handle, gi.handle.len) == 0) {
+            if (n_members) *n_members = gi.count;
+            return gi.group_id;
+        }
+    }
+    return 0;
+}
+
+/* The next CHANNEL_INFO for `ch`: its joined flag, or -1. */
+static int read_chinfo_joined(client *c, uint64_t ch) {
+    for (int i = 0; i < 64; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_type(c, OC_MSG_CHANNEL_INFO, &hdr, &p) != 0) return -1;
+        oc_channel_info ci;
+        if (oc_decode_channel_info(&p, &ci) == OC_OK && ci.channel_id == ch) return ci.joined;
+    }
+    return -1;
+}
+
+/* Beside every CHANNEL_INFO of a channel goes its CHANNEL_GROUPS, none
+ * included (REQ-309); and the groups come to a client at sign-in after its user
+ * list, unasked (REQ-307). */
+static void test_groups_unasked(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    oc_header hdr; oc_rbuf p;
+    uint8_t buf[128]; oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_users(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_USER_LIST, &hdr, &p) == 0);
+    CHECK(read_type(&a, OC_MSG_GROUPS_END, &hdr, &p) == 0);      /* never asked for */
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cc = { oc_slice_str("nogroups"), 1 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    int saw = 0;
+    for (int i = 0; i < 16 && !saw; i++) {
+        if (read_frame_raw(&a, &hdr, &p) != 0) break;
+        if (hdr.msg_type != OC_MSG_CHANNEL_GROUPS) continue;
+        uint64_t gids[OC_MAX_CHANNEL_GROUPS]; oc_channel_groups cg;
+        CHECK(oc_decode_channel_groups(&p, &cg, gids, OC_MAX_CHANNEL_GROUPS) == OC_OK);
+        CHECK(cg.channel_id == ci.channel_id && cg.count == 0);
+        saw = 1;
+    }
+    CHECK(saw);
+    client_close(&a);
+}
+
+/* User groups over the wire (REQ-307-309): an admin creates one and everyone
+ * hears of it; a member may not; a group given to a private channel brings its
+ * member in -- told with the channel and its groups -- who can then post there,
+ * cannot leave it, and is told the channel is gone when taken out of the group.
+ * Carol plays the member here. */
+static void test_groups_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "carol", "pw", &ub) == 0);   /* bob was removed by test_admin_vertical */
+    oc_header hdr; oc_rbuf p;
+    uint8_t buf[512]; oc_wbuf w;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_group cg = { oc_slice_str("wirecrew"), oc_slice_str("Wire crew"), oc_slice_str("") };
+    CHECK(oc_encode_create_group(&w, OC_PROTOCOL_VERSION, &cg) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    uint16_t code = 0;
+    CHECK(read_error(&b, &code) == 0 && code == OC_ERR_FORBIDDEN);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint64_t g = read_group_info(&a, "wirecrew", NULL);
+    CHECK(g != 0 && read_group_info(&b, "wirecrew", NULL) == g);          /* everyone hears */
+
+    static oc_group_members_op op;
+    op.group_id = g; op.count = 1; op.user_ids[0] = ub;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_group_members_op(&w, OC_PROTOCOL_VERSION, OC_MSG_GROUP_ADD_MEMBERS, &op) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint16_t nm = 0;
+    CHECK(read_group_info(&b, "wirecrew", &nm) == g && nm == 1);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cc = { oc_slice_str("crewroom"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t ch = ci.channel_id;
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_group_op cgo = { ch, g };
+    CHECK(oc_encode_channel_group_op(&w, OC_PROTOCOL_VERSION, OC_MSG_CHANNEL_ADD_GROUP, &cgo) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_chinfo_joined(&b, ch) == 1);                               /* bob is in, and told */
+    CHECK(read_type(&b, OC_MSG_CHANNEL_GROUPS, &hdr, &p) == 0);
+    uint64_t gids[OC_MAX_CHANNEL_GROUPS]; oc_channel_groups cgs;
+    CHECK(oc_decode_channel_groups(&p, &cgs, gids, OC_MAX_CHANNEL_GROUPS) == OC_OK);
+    CHECK(cgs.channel_id == ch && cgs.count == 1 && cgs.group_ids[0] == g);
+
+    /* Alice's member list says carol is in only through the group. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_members lm = { ch };
+    CHECK(oc_encode_list_members(&w, OC_PROTOCOL_VERSION, &lm) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_CHANNEL_VIA_GROUP, &hdr, &p) == 0);
+    {
+        uint64_t vids[OC_MAX_MEMBER_LIST]; oc_channel_via_group cv;
+        CHECK(oc_decode_channel_via_group(&p, &cv, vids, OC_MAX_MEMBER_LIST) == OC_OK);
+        CHECK(cv.channel_id == ch && cv.count == 1 && cv.user_ids[0] == ub);
+    }
+
+    /* He can post there, and alice hears it; an @group reaches him. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send sm; memset(&sm, 0, sizeof sm);
+    sm.channel_id = ch; memset(sm.idem, 0x47, OC_IDEM_SIZE);
+    sm.body = oc_slice_str("in via @wirecrew");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK && bc.channel_id == ch && bc.author_id == ub);
+
+    /* A group larger than the notice's eight names, none of them in the
+     * channel: the notice names eight, and the total follows it (REQ-308). */
+    {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_create_group cb = { oc_slice_str("wirecrowd"), oc_slice_str("Crowd"), oc_slice_str("") };
+        CHECK(oc_encode_create_group(&w, OC_PROTOCOL_VERSION, &cb) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        uint64_t gb = read_group_info(&a, "wirecrowd", NULL);
+        CHECK(gb != 0);
+        static oc_group_members_op bop;
+        bop.group_id = gb; bop.count = 10;
+        for (int k = 0; k < 10; k++) bop.user_ids[k] = g_crowd_ids[k];
+        uint8_t big[256]; oc_wbuf bw; oc_wbuf_init(&bw, big, sizeof big);
+        CHECK(oc_encode_group_members_op(&bw, OC_PROTOCOL_VERSION, OC_MSG_GROUP_ADD_MEMBERS, &bop) == OC_OK);
+        CHECK(send_frame(&a, big, bw.len) == 0);
+        uint16_t nb = 0;
+        CHECK(read_group_info(&a, "wirecrowd", &nb) == gb && nb == 10);
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send sb; memset(&sb, 0, sizeof sb);
+        sb.channel_id = ch; memset(sb.idem, 0x48, OC_IDEM_SIZE);
+        sb.body = oc_slice_str("heads up @wirecrowd");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sb) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_MENTION_UNRESOLVED, &hdr, &p) == 0);
+        oc_mention_unresolved mu; CHECK(oc_decode_mention_unresolved(&p, &mu) == OC_OK && mu.count == 8);
+        CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_MENTION_UNRESOLVED_MORE);
+        oc_mention_unresolved_more um;
+        CHECK(oc_decode_mention_unresolved_more(&p, &um) == OC_OK && um.total == 10 &&
+              um.message_id == mu.message_id);
+    }
+
+    /* He cannot leave: the group keeps him in. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_ref lc = { ch };
+    CHECK(oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &lc) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    CHECK(read_error(&b, &code) == 0 && code == OC_ERR_MEMBER_VIA_GROUP);
+
+    /* Out of the group: out of the channel, and told. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_group_members_op(&w, OC_PROTOCOL_VERSION, OC_MSG_GROUP_REMOVE_MEMBERS, &op) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_chinfo_joined(&b, ch) == 0);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_group_ref gr = { g };
+    CHECK(oc_encode_delete_group(&w, OC_PROTOCOL_VERSION, &gr) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_GROUP_DELETED, &hdr, &p) == 0);
+    oc_group_ref gd; CHECK(oc_decode_group_ref(&p, &gd) == OC_OK && gd.group_id == g);
+    client_close(&b);
+    client_close(&a);
+}
+
 /* LOGOUT over the wire: the daemon revokes the session and drops the
  * connection (REQ-182). */
 static void test_logout_closes(int port, const uint8_t *pin) {
@@ -4171,9 +4354,10 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "bf-reader", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "carol",     "pw",       OC_ROLE_MEMBER, 2048) != 0);
     uint64_t flooder = oc_dbwriter_register_local(dbw, "flooder", "pw", OC_ROLE_MEMBER, 2048);
-    for (int i = 0; i < 100; i++) {   /* a crowd, for test_login_bound */
+    for (int i = 0; i < 100; i++) {   /* a crowd, for test_login_bound and the groups tests */
         char un[16]; snprintf(un, sizeof un, "u%03d", i);
-        CHECK(oc_dbwriter_register_local(dbw, un, "pw", OC_ROLE_MEMBER, 2048) != 0);
+        g_crowd_ids[i] = oc_dbwriter_register_local(dbw, un, "pw", OC_ROLE_MEMBER, 2048);
+        CHECK(g_crowd_ids[i] != 0);
     }
     CHECK(flooder != 0);
 
@@ -4227,6 +4411,8 @@ int run_netloop_tests(void) {
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
+        test_groups_vertical(arg.port, pin);
+        test_groups_unasked(arg.port, pin);
         test_logout_closes(arg.port, pin);
         test_conn_throttle(arg.port + 123);
         test_auth_begin(arg.port + 124);

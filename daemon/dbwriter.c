@@ -274,6 +274,7 @@ static void job_free(oc_job *j) {
     free(j->unf_title);
     free(j->unf_descr);
     free(j->call_uids);
+    free(j->grp_handle); free(j->grp_name); free(j->grp_desc); free(j->grp_uids);
     free(j);
 }
 
@@ -409,6 +410,10 @@ static void fill_replay_forwards(sqlite3 *db, oc_dbres *r) {
         append_forward(db, r, r->replay[i].message_id, r->replay[i].channel_id);
 }
 
+static void group_row_free(oc_group_row *g);
+
+void oc_job_free(oc_job *j) { job_free(j); }
+
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
@@ -453,6 +458,11 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->flist);
     free(r->ch_name);
     free(r->ch_topic);
+    for (size_t i = 0; i < r->n_groups; i++) group_row_free(&r->groups[i]);
+    free(r->groups);
+    for (size_t i = 0; i < r->n_mchan; i++) { free(r->mchan[i].name); free(r->mchan[i].topic); free(r->mchan[i].members); }
+    free(r->mchan);
+    free(r->mchg);
     for (size_t i = 0; i < r->n_chlist; i++) { free(r->chlist[i].name); free(r->chlist[i].topic); free(r->chlist[i].preview); }
     free(r->chlist);
     for (size_t i = 0; i < r->n_ulist; i++) {
@@ -538,6 +548,9 @@ static size_t local_subject(char *buf, size_t cap, const char *username, size_t 
     return ulen + 6;
 }
 
+static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, int direct);
+static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out);
+
 static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -548,14 +561,7 @@ static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
     sqlite3_step(st);
     sqlite3_finalize(st);
 
-    sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO channel_members(channel_id,user_id,joined_at_ms) "
-        "VALUES(?, ?, ?);", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, OC_DEFAULT_CHANNEL);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
-    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
-    sqlite3_step(st);
-    sqlite3_finalize(st);
+    membership_sync(db, OC_DEFAULT_CHANNEL, user_id, 1);
 }
 
 /* At most `max` bytes of `s`, cut back to a UTF-8 boundary. */
@@ -1800,9 +1806,17 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
         "  (SELECT channel_id FROM channel_members WHERE user_id=?1);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     /* Now the ordinary channel memberships (the DM rows went with their channels,
-     * but any stragglers are swept here too). */
-    sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE user_id=?;", -1, &st, NULL);
+     * but any stragglers are swept here too): out of every group first, so the
+     * rule leaves them in no channel at all. */
+    sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    {
+        size_t nch = 0;
+        uint64_t *chans = ids_of(db, "SELECT channel_id FROM channel_members WHERE user_id=?1;",
+                                 j->target_user_id, &nch);
+        for (size_t c = 0; c < nch; c++) membership_sync(db, chans[c], j->target_user_id, 0);
+        free(chans);
+    }
     sqlite3_prepare_v2(db,
         "DELETE FROM channel_members WHERE channel_id NOT IN (SELECT id FROM channels);",
         -1, &st, NULL);
@@ -1940,16 +1954,496 @@ static int named_channel_exists(sqlite3 *db, uint64_t channel_id, uint8_t *is_pu
     return found;
 }
 
+/* Added directly: joined, invited, created, posted into, a DM. */
 static void add_membership(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    membership_sync(db, channel_id, user_id, 1);
+}
+
+/* --- Membership, and user groups (REQ-307-309, ARCH-114) ----------------------
+ *
+ * channel_members is a channel's EFFECTIVE membership: what every access check,
+ * fan-out, push and badge query reads. A row exists exactly when the person was
+ * added directly (`direct`), or is in a group the channel has (channel_groups).
+ * membership_sync is the one place a row is written or deleted, and it writes
+ * that rule, so no sequence of joins, leaves, group edits and attachments can
+ * leave a row the rule would not. */
+
+/* Is `user_id` in a group that `channel_id` has? */
+static int member_via_group(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO channel_members(channel_id,user_id,joined_at_ms) "
-        "VALUES(?,?,?);", -1, &st, NULL);
+        "SELECT 1 FROM channel_groups cg JOIN user_group_members gm ON gm.group_id = cg.group_id "
+        "WHERE cg.channel_id = ?1 AND gm.user_id = ?2 LIMIT 1;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
-    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
-    sqlite3_step(st);
+    int via = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
+    return via;
+}
+
+/* In the channel only through a group: a row, not added directly, which a
+ * group the channel has accounts for. What leave and remove refuse (REQ-309). */
+static int member_only_via_group(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    int only = 0;
+    sqlite3_prepare_v2(db, "SELECT direct FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    if (sqlite3_step(st) == SQLITE_ROW) only = sqlite3_column_int(st, 0) == 0;
+    sqlite3_finalize(st);
+    return only && member_via_group(db, channel_id, user_id);
+}
+
+/* Set the direct half of (channel, user) -- 1 added, 0 not, -1 as it is -- and
+ * make the row what the rule says. +1 if the person gained the channel, -1 if
+ * they lost it, 0 if their membership did not change. A row that stays keeps
+ * the time its person joined. */
+static int membership_sync(sqlite3 *db, uint64_t channel_id, uint64_t user_id, int direct) {
+    sqlite3_stmt *st = NULL;
+    int exists = 0, cur_direct = 0;
+    sqlite3_prepare_v2(db, "SELECT direct FROM channel_members WHERE channel_id=? AND user_id=?;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    if (sqlite3_step(st) == SQLITE_ROW) { exists = 1; cur_direct = sqlite3_column_int(st, 0); }
+    sqlite3_finalize(st);
+    int want_direct = direct < 0 ? (exists && cur_direct) : direct;
+    int want = want_direct || member_via_group(db, channel_id, user_id);
+    if (want && !exists) {
+        sqlite3_prepare_v2(db,
+            "INSERT INTO channel_members(channel_id,user_id,joined_at_ms,direct) VALUES(?,?,?,?);",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_int(st, 4, want_direct);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return 1;
+    }
+    if (want && cur_direct != want_direct) {
+        sqlite3_prepare_v2(db, "UPDATE channel_members SET direct=? WHERE channel_id=? AND user_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int(st, 1, want_direct);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)user_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return 0;
+    }
+    if (!want && exists) {
+        sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return -1;
+    }
+    return 0;
+}
+
+/* The ids a query returns in its first column, into a heap array. */
+static uint64_t *ids_of(sqlite3 *db, const char *sql, uint64_t a, size_t *n_out) {
+    sqlite3_stmt *st = NULL;
+    *n_out = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return NULL;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)a);
+    size_t cap = 16, n = 0;
+    uint64_t *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; uint64_t *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        arr[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    *n_out = n;
+    return arr;
+}
+
+/* A channel's groups, in the order they were added. */
+static uint16_t channel_group_ids(sqlite3 *db, uint64_t channel_id, uint64_t *out, uint16_t cap) {
+    sqlite3_stmt *st = NULL;
+    uint16_t n = 0;
+    sqlite3_prepare_v2(db, "SELECT group_id FROM channel_groups WHERE channel_id=? "
+                           "ORDER BY added_at_ms, group_id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    while (sqlite3_step(st) == SQLITE_ROW && n < cap) out[n++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Note that `user_id` gained (joined) or lost `channel_id`, and carry the
+ * channel's brief once, loaded after the whole change so it says how things
+ * stand. `groups_changed` marks a channel whose groups themselves changed. */
+static void note_change(sqlite3 *db, oc_dbres *r, uint64_t channel_id, uint64_t user_id, int joined) {
+    if (user_id) {
+        oc_memb_change *g = realloc(r->mchg, (r->n_mchg + 1) * sizeof *g);
+        if (!g) return;
+        r->mchg = g;
+        r->mchg[r->n_mchg++] = (oc_memb_change){ channel_id, user_id, (uint8_t)(joined ? 1 : 0) };
+    }
+    for (size_t i = 0; i < r->n_mchan; i++) if (r->mchan[i].channel_id == channel_id) return;
+    oc_chan_brief *b = realloc(r->mchan, (r->n_mchan + 1) * sizeof *b);
+    if (!b) return;
+    r->mchan = b;
+    memset(&r->mchan[r->n_mchan], 0, sizeof r->mchan[r->n_mchan]);
+    r->mchan[r->n_mchan++].channel_id = channel_id;
+    (void)db;
+}
+
+/* Fill every noted channel's brief: its CHANNEL_INFO fields, its groups and its
+ * members as they now are. Called once, at the end of a change. */
+static void fill_briefs(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_mchan; i++) {
+        oc_chan_brief *b = &r->mchan[i];
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms "
+                               "FROM channels WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)b->channel_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *kn = sqlite3_column_text(st, 0);
+            const unsigned char *nm = sqlite3_column_text(st, 1);
+            const unsigned char *tp = sqlite3_column_text(st, 4);
+            b->kind = (kn && strcmp((const char *)kn, "dm") == 0) ? OC_CHANNEL_KIND_DM : OC_CHANNEL_KIND;
+            b->name = strdup(nm ? (const char *)nm : "");
+            b->is_public = (uint8_t)(sqlite3_column_int(st, 2) != 0);
+            b->created_at = (uint64_t)sqlite3_column_int64(st, 3);
+            b->topic = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
+            b->archived = (uint8_t)(sqlite3_column_type(st, 5) != SQLITE_NULL);
+        }
+        sqlite3_finalize(st);
+        b->n_groups = channel_group_ids(db, b->channel_id, b->groups, OC_MAX_CHANNEL_GROUPS);
+        b->members = ids_of(db, "SELECT user_id FROM channel_members WHERE channel_id=?1;",
+                            b->channel_id, &b->n_members);
+    }
+}
+
+/* One group, whole, into `g`. 1 found, 0 not. */
+static int load_group(sqlite3 *db, uint64_t group_id, oc_group_row *g) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    memset(g, 0, sizeof *g);
+    sqlite3_prepare_v2(db, "SELECT handle, name, description, created_by FROM user_groups WHERE id=?;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)group_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(st, 0), *n = sqlite3_column_text(st, 1),
+                            *d = sqlite3_column_text(st, 2);
+        g->id = group_id;
+        g->handle = strdup(h ? (const char *)h : "");
+        g->name = strdup(n ? (const char *)n : "");
+        g->description = strdup(d ? (const char *)d : "");
+        g->created_by = (uint64_t)sqlite3_column_int64(st, 3);
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    if (!found) return 0;
+    size_t n = 0;
+    g->members = ids_of(db, "SELECT gm.user_id FROM user_group_members gm JOIN users u ON u.id = gm.user_id "
+                            "WHERE gm.group_id=?1 AND u.disabled = 0 ORDER BY gm.added_at_ms, gm.user_id;",
+                        group_id, &n);
+    g->n_members = (uint16_t)(n > OC_MAX_GROUP_MEMBERS ? OC_MAX_GROUP_MEMBERS : n);
+    return 1;
+}
+
+static void group_row_free(oc_group_row *g) {
+    free(g->handle); free(g->name); free(g->description); free(g->members);
+}
+
+/* A handle is what `@` names (the mention scanner's characters), 1..48 long,
+ * not beginning with a digit or a dot. */
+static int group_handle_valid(const char *h, size_t n) {
+    if (n == 0 || n > OC_GROUP_HANDLE_MAX) return 0;
+    if ((h[0] >= '0' && h[0] <= '9') || h[0] == '.' || h[0] == '-' || h[0] == '_') return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = h[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-')) return 0;
+    }
+    return 1;
+}
+
+/* Does something else already answer to @`name`: a broadcast word, another
+ * group (not `except_group`), or -- with `people` -- a person's display name?
+ * Compared without case, as mentions are. */
+static int name_taken(sqlite3 *db, const char *name, uint64_t except_group, int people) {
+    static const char *const RESERVED[] = { "here", "channel", "everyone" };
+    for (size_t i = 0; i < sizeof RESERVED / sizeof *RESERVED; i++)
+        if (strcasecmp(name, RESERVED[i]) == 0) return 1;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM user_groups WHERE lower(handle) = lower(?1) AND id <> ?2 LIMIT 1;",
+                       -1, &st, NULL);
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)except_group);
+    int taken = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    if (taken || !people) return taken;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE lower(display_name) = lower(?1) LIMIT 1;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    taken = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return taken;
+}
+
+/* A group with this handle, or 0. */
+static uint64_t group_by_handle(sqlite3 *db, const char *handle) {
+    sqlite3_stmt *st = NULL;
+    uint64_t id = 0;
+    sqlite3_prepare_v2(db, "SELECT id FROM user_groups WHERE lower(handle) = lower(?1);", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, handle, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) id = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return id;
+}
+
+static int group_exists(sqlite3 *db, uint64_t group_id) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM user_groups WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)group_id);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
+static oc_dbres *group_err(const oc_job *j, uint16_t code) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_GROUP_ERR;
+    r->err_code = code;
+    r->group_id = j->group_id;
+    return r;
+}
+
+/* The group, whole, as the one a CHANGED result carries. */
+static oc_dbres *group_changed(sqlite3 *db, const oc_job *j, uint64_t group_id, oc_dbres *r) {
+    if (!r && !(r = calloc(1, sizeof *r))) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_GROUP_CHANGED;
+    r->groups = calloc(1, sizeof *r->groups);
+    if (r->groups && load_group(db, group_id, &r->groups[0])) r->n_groups = 1;
+    fill_briefs(db, r);
+    return r;
+}
+
+/* Owners and admins manage groups (REQ-307). */
+static int may_manage_groups(sqlite3 *db, uint64_t actor) {
+    return get_role(db, actor) >= OC_ROLE_ADMIN && !user_disabled(db, actor);
+}
+
+/* Every group, whole, ordered by handle. A read. */
+static oc_dbres *process_list_groups(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_GROUP_LIST;
+    size_t n = 0;
+    uint64_t *ids = ids_of(db, "SELECT id FROM user_groups WHERE ?1 = ?1 ORDER BY lower(handle);", 0, &n);
+    if (n > OC_MAX_GROUPS) n = OC_MAX_GROUPS;
+    r->groups = n ? calloc(n, sizeof *r->groups) : NULL;
+    for (size_t i = 0; r->groups && i < n; i++)
+        if (load_group(db, ids[i], &r->groups[r->n_groups])) r->n_groups++;
+    free(ids);
+    return r;
+}
+
+/* The text of a group, as a CREATE or UPDATE gave it: in bounds, or the error. */
+static uint16_t group_text_check(sqlite3 *db, const oc_job *j, uint64_t except_group) {
+    const char *h = j->grp_handle ? j->grp_handle : "";
+    const char *nm = j->grp_name ? j->grp_name : "";
+    const char *d = j->grp_desc ? j->grp_desc : "";
+    if (!group_handle_valid(h, strlen(h)) || strlen(nm) == 0 || strlen(nm) > OC_GROUP_NAME_MAX ||
+        strlen(d) > OC_GROUP_DESC_MAX) return OC_ERR_INVALID_GROUP;
+    if (name_taken(db, h, except_group, 1)) return OC_ERR_GROUP_HANDLE_TAKEN;
+    return 0;
+}
+
+static oc_dbres *process_create_group(sqlite3 *db, const oc_job *j) {
+    if (!may_manage_groups(db, j->user_id)) return group_err(j, OC_ERR_FORBIDDEN);
+    uint16_t bad = group_text_check(db, j, 0);
+    if (bad) return group_err(j, bad);
+    size_t have = 0;
+    free(ids_of(db, "SELECT id FROM user_groups WHERE ?1 = ?1;", 0, &have));
+    if (have >= OC_MAX_GROUPS) return group_err(j, OC_ERR_INVALID_GROUP);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "INSERT INTO user_groups(handle,name,description,created_by,created_at_ms) "
+                           "VALUES(?,?,?,?,?);", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, j->grp_handle, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, j->grp_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, j->grp_desc ? j->grp_desc : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return group_err(j, OC_ERR_GROUP_HANDLE_TAKEN);   /* the unique index */
+    uint64_t gid = (uint64_t)sqlite3_last_insert_rowid(db);
+    audit_actor(db, OC_AUDIT_ADMIN, "group.create", j->user_id, 0, j->grp_handle, 1, NULL);
+    return group_changed(db, j, gid, NULL);
+}
+
+static oc_dbres *process_update_group(sqlite3 *db, const oc_job *j) {
+    if (!may_manage_groups(db, j->user_id)) return group_err(j, OC_ERR_FORBIDDEN);
+    if (!group_exists(db, j->group_id)) return group_err(j, OC_ERR_UNKNOWN_GROUP);
+    uint16_t bad = group_text_check(db, j, j->group_id);
+    if (bad) return group_err(j, bad);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE user_groups SET handle=?, name=?, description=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, j->grp_handle, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, j->grp_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, j->grp_desc ? j->grp_desc : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->group_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return group_err(j, OC_ERR_GROUP_HANDLE_TAKEN);
+    audit_actor(db, OC_AUDIT_ADMIN, "group.update", j->user_id, 0, j->grp_handle, 1, NULL);
+    return group_changed(db, j, j->group_id, NULL);
+}
+
+/* Deleting a group takes it out of every channel it was in, and out of the
+ * membership it gave, in one transaction. Past mentions keep their people and
+ * lose only the reference to a group that no longer exists. */
+static oc_dbres *process_delete_group(sqlite3 *db, const oc_job *j) {
+    if (!may_manage_groups(db, j->user_id)) return group_err(j, OC_ERR_FORBIDDEN);
+    if (!group_exists(db, j->group_id)) return group_err(j, OC_ERR_UNKNOWN_GROUP);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_GROUP_DELETED;
+    r->group_id = j->group_id;
+    size_t nch = 0, nu = 0;
+    uint64_t *chans = ids_of(db, "SELECT channel_id FROM channel_groups WHERE group_id=?1;", j->group_id, &nch);
+    uint64_t *users = ids_of(db, "SELECT user_id FROM user_group_members WHERE group_id=?1;", j->group_id, &nu);
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    static const char *const DEL[] = {
+        "DELETE FROM channel_groups WHERE group_id=?;",
+        "DELETE FROM user_group_members WHERE group_id=?;",
+        "UPDATE mentions SET group_id = NULL WHERE group_id=?;",
+        "DELETE FROM user_groups WHERE id=?;",
+    };
+    for (size_t k = 0; k < sizeof DEL / sizeof *DEL; k++) {
+        sqlite3_prepare_v2(db, DEL[k], -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->group_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    for (size_t c = 0; c < nch; c++) {
+        note_change(db, r, chans[c], 0, 0);
+        r->mchan[r->n_mchan - 1].groups_changed = 1;
+        for (size_t u = 0; u < nu; u++)
+            if (membership_sync(db, chans[c], users[u], -1) < 0) note_change(db, r, chans[c], users[u], 0);
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    free(chans); free(users);
+    audit_actor(db, OC_AUDIT_ADMIN, "group.delete", j->user_id, 0, NULL, 1, NULL);
+    fill_briefs(db, r);
+    return r;
+}
+
+/* Add or remove people. Each one added gains every channel the group is in,
+ * and each one removed loses those it has only through it. */
+static oc_dbres *process_group_members(sqlite3 *db, const oc_job *j, int add) {
+    if (!may_manage_groups(db, j->user_id)) return group_err(j, OC_ERR_FORBIDDEN);
+    if (!group_exists(db, j->group_id)) return group_err(j, OC_ERR_UNKNOWN_GROUP);
+    if (add) {
+        size_t have = 0;
+        free(ids_of(db, "SELECT user_id FROM user_group_members WHERE group_id=?1;", j->group_id, &have));
+        if (have + j->n_grp_uids > OC_MAX_GROUP_MEMBERS) return group_err(j, OC_ERR_INVALID_GROUP);
+    }
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    size_t nch = 0;
+    uint64_t *chans = ids_of(db, "SELECT channel_id FROM channel_groups WHERE group_id=?1;", j->group_id, &nch);
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    for (uint16_t i = 0; i < j->n_grp_uids; i++) {
+        uint64_t uid = j->grp_uids[i];
+        sqlite3_stmt *st = NULL;
+        if (add) {
+            if (user_disabled(db, uid)) continue;
+            uint8_t role;
+            if (!user_role(db, uid, &role)) continue;          /* no such person: nothing to add */
+            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_group_members(group_id,user_id,added_at_ms) "
+                                   "VALUES(?,?,?);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        } else {
+            sqlite3_prepare_v2(db, "DELETE FROM user_group_members WHERE group_id=? AND user_id=?;", -1, &st, NULL);
+        }
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->group_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)uid);
+        sqlite3_step(st);
+        int changed = sqlite3_changes(db) > 0;
+        sqlite3_finalize(st);
+        if (!changed) continue;
+        audit_actor(db, OC_AUDIT_ADMIN, add ? "group.member.add" : "group.member.remove", j->user_id, uid,
+                    NULL, 1, NULL);
+        for (size_t c = 0; c < nch; c++) {
+            int d = membership_sync(db, chans[c], uid, -1);
+            if (d) note_change(db, r, chans[c], uid, d > 0);
+        }
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    free(chans);
+    return group_changed(db, j, j->group_id, r);
+}
+
+/* Give a channel a group, or take it away (REQ-309): any member of the channel
+ * may, as any member may invite a person. Answered as an INVITE is -- the
+ * channel's state to the actor -- with who gained or lost it by the change. */
+static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, oc_dbres *r);
+
+static oc_dbres *process_channel_group(sqlite3 *db, const oc_job *j, int add) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (!named_channel_exists(db, j->channel_id, NULL)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    if (!group_exists(db, j->group_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_GROUP; return r;
+    }
+    uint64_t have[OC_MAX_CHANNEL_GROUPS];
+    uint16_t nh = channel_group_ids(db, j->channel_id, have, OC_MAX_CHANNEL_GROUPS);
+    int already = 0;
+    for (uint16_t i = 0; i < nh; i++) if (have[i] == j->group_id) already = 1;
+    if (add && !already && nh >= OC_MAX_CHANNEL_GROUPS) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_GROUP; return r;
+    }
+    size_t nu = 0;
+    uint64_t *users = ids_of(db, "SELECT user_id FROM user_group_members WHERE group_id=?1;", j->group_id, &nu);
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (add) {
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channel_groups(channel_id,group_id,added_by,added_at_ms) "
+                               "VALUES(?,?,?,?);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    } else {
+        sqlite3_prepare_v2(db, "DELETE FROM channel_groups WHERE channel_id=? AND group_id=?;", -1, &st, NULL);
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->group_id);
+    sqlite3_step(st);
+    int changed = sqlite3_changes(db) > 0;
+    sqlite3_finalize(st);
+    if (changed) {
+        note_change(db, r, j->channel_id, 0, 0);
+        r->mchan[r->n_mchan - 1].groups_changed = 1;
+        for (size_t u = 0; u < nu; u++) {
+            int d = membership_sync(db, j->channel_id, users[u], -1);
+            if (d) note_change(db, r, j->channel_id, users[u], d > 0);
+        }
+    }
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    free(users);
+    if (changed)
+        audit_actor(db, OC_AUDIT_ADMIN, add ? "channel.group.add" : "channel.group.remove", j->user_id, 0,
+                    NULL, 1, NULL);
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    fill_briefs(db, r);
+    return r;
 }
 
 /* May the user read (backfill) this channel? Public channels are open to any
@@ -2114,9 +2608,25 @@ static void fill_unresolved_context(sqlite3 *db, uint64_t channel_id,
     sqlite3_finalize(ci);
 }
 
+/* Everyone a message named but could not reach, distinct: the notice lists
+ * eight, and a group can name more (REQ-308). */
+typedef struct { uint64_t *ids; size_t n, cap; } unreached_set;
+
+static void unreached_add(unreached_set *u, uint64_t id) {
+    for (size_t i = 0; i < u->n; i++) if (u->ids[i] == id) return;
+    if (u->n == u->cap) {
+        size_t cap = u->cap ? u->cap * 2 : 16;
+        uint64_t *g = realloc(u->ids, cap * sizeof *g);
+        if (!g) return;
+        u->ids = g; u->cap = cap;
+    }
+    u->ids[u->n++] = id;
+}
+
 static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                            const void *body, size_t body_len, uint64_t ts,
-                           oc_mention_unresolved *unres) {
+                           oc_mention_unresolved *unres, uint16_t *unres_total) {
+    unreached_set unreached = { NULL, 0, 0 };
     if (!body || !body_len) return;
     oc_mention m[OC_MENTION_MAX];
     size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);
@@ -2153,6 +2663,61 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
 
     for (size_t i = 0; i < n; i++) {
         int64_t uid = 0;
+        /* A group's handle first (REQ-308): it wins a clash with a person's
+         * name, which only an identity provider's name at first sign-in can
+         * make. Each member it reaches gets a row of their own, as a personal
+         * mention would, resolved now: who is in the group later changes later
+         * mentions, not this one. Who it cannot reach is told to the sender as
+         * a person not in the channel is (REQ-287), and in a public channel
+         * still gets the mention (REQ-288). */
+        uint64_t gid = m[i].kind == OC_MENTION_USER ? group_by_handle(db, m[i].name) : 0;
+        if (gid) {
+            oc_group_row g;
+            if (!load_group(db, gid, &g)) continue;
+            sqlite3_stmt *gi = NULL;
+            sqlite3_prepare_v2(db,
+                "INSERT INTO mentions(message_id, channel_id, user_id, kind, span_start, span_len, "
+                "                     created_at_ms, group_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);",
+                -1, &gi, NULL);
+            for (uint16_t k = 0; gi && k < g.n_members; k++) {
+                uint64_t who = g.members[k];
+                int in = is_member(db, channel_id, who);
+                if (!in) {
+                    unreached_add(&unreached, who);
+                    if (unres && unres->count < OC_UNRESOLVED_MAX) {
+                        int dup = 0;
+                        for (uint16_t q = 0; q < unres->count; q++)
+                            if (unres->who[q].user_id == who) { dup = 1; break; }
+                        if (!dup) {
+                            sqlite3_stmt *nq = NULL;
+                            sqlite3_prepare_v2(db, "SELECT display_name FROM users WHERE id=?;", -1, &nq, NULL);
+                            sqlite3_bind_int64(nq, 1, (sqlite3_int64)who);
+                            const unsigned char *dn = sqlite3_step(nq) == SQLITE_ROW ? sqlite3_column_text(nq, 0) : NULL;
+                            unres->who[unres->count].user_id = who;
+                            snprintf(unres->who[unres->count].name, sizeof unres->who[unres->count].name,
+                                     "%.*s", (int)(sizeof unres->who[unres->count].name - 1),
+                                     dn ? (const char *)dn : "");
+                            unres->count++;
+                            sqlite3_finalize(nq);
+                        }
+                    }
+                    if (!chan_public) continue;
+                }
+                sqlite3_reset(gi);
+                sqlite3_bind_int64(gi, 1, (sqlite3_int64)mid);
+                sqlite3_bind_int64(gi, 2, (sqlite3_int64)channel_id);
+                sqlite3_bind_int64(gi, 3, (sqlite3_int64)who);
+                sqlite3_bind_int(gi, 4, (int)OC_MENTION_GROUP);
+                sqlite3_bind_int64(gi, 5, (sqlite3_int64)m[i].start);
+                sqlite3_bind_int64(gi, 6, (sqlite3_int64)m[i].len);
+                sqlite3_bind_int64(gi, 7, (sqlite3_int64)ts);
+                sqlite3_bind_int64(gi, 8, (sqlite3_int64)gid);
+                sqlite3_step(gi);
+            }
+            sqlite3_finalize(gi);
+            group_row_free(&g);
+            continue;
+        }
         if (m[i].kind == OC_MENTION_USER) {
             /* Match the display name case-insensitively among this channel's
              * members. Membership is asked first regardless of channel kind,
@@ -2181,6 +2746,7 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                     sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
                     if (sqlite3_step(w) == SQLITE_ROW) {
                         outsider = (uint64_t)sqlite3_column_int64(w, 0);
+                        unreached_add(&unreached, outsider);
                         if (unres && unres->count < OC_UNRESOLVED_MAX) {
                             int dup = 0;
                             for (uint16_t k = 0; k < unres->count; k++)
@@ -2229,6 +2795,8 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
         sqlite3_step(ins);
     }
     sqlite3_finalize(ins);
+    if (unres_total) *unres_total = (uint16_t)(unreached.n > 65535 ? 65535 : unreached.n);
+    free(unreached.ids);
 }
 
 /* Link the caller's pending attachments to message `mid` (REQ-140). An id links
@@ -2408,7 +2976,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
      * (REQ-287); the message itself is stored either way. */
     r->unres.channel_id = j->channel_id;
     r->unres.message_id = mid;
-    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres);
+    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres, &r->unres_total);
     store_keyword_hits(db, mid, j->channel_id, j->user_id, j->body, j->body_len, ts);
     fill_unresolved_context(db, j->channel_id, &r->unres);
 
@@ -2682,6 +3250,7 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     }
     sqlite3_finalize(st);
     if (found) r->ch_joined = (uint8_t)(is_member(db, channel_id, actor) ? 1 : 0);
+    if (found) r->n_ch_groups = channel_group_ids(db, channel_id, r->ch_groups, OC_MAX_CHANNEL_GROUPS);
     /* A DM with more than two participants is a GROUP DM (REQ-056) — the same
      * `kind`, distinguished by its participant set, which is what a DM's identity
      * has always been. Load them so the client can name it. */
@@ -2941,7 +3510,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "                          WHERE np.user_id=?1 AND np.channel_id=c.id), "
         "                        (SELECT u2.notify_default FROM users u2 WHERE u2.id=?1)) = 1 "
         "               AND EXISTS(SELECT 1 FROM mentions mn WHERE mn.message_id=x.id "
-        "                           AND ((mn.user_id=?1 AND mn.kind IN (0,4)) "
+        "                           AND ((mn.user_id=?1 AND mn.kind IN (0,4,5)) "
         "                                OR mn.kind IN (1,2,3))) ) ) ), "
         /* A DM has no name; the client titles it by its peer, so send that too —
          * otherwise a cache-less client shows "direct message" until it opens one. */
@@ -3019,6 +3588,12 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         }
     }
 
+    /* Each channel's groups (REQ-309), so a client knows at sign-in which of
+     * its channels it is in through a group. */
+    for (size_t i = 0; i < n; i++)
+        if (arr[i].kind == OC_CHANNEL_KIND)
+            arr[i].n_groups = channel_group_ids(db, arr[i].channel_id, arr[i].groups, OC_MAX_CHANNEL_GROUPS);
+
     r->chlist = arr;
     r->n_chlist = n;
     return r;
@@ -3053,13 +3628,14 @@ static oc_dbres *process_leave_channel(sqlite3 *db, const oc_job *j) {
     if (!named_channel_exists(db, j->channel_id, NULL)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
     }
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
-    sqlite3_step(st);
-    sqlite3_finalize(st);
+    /* In only through a group, a leave would change nothing: the group keeps
+     * them in. Refused, so the client can say why and offer a mute (REQ-309).
+     * Added directly as well, the leave clears the direct half, and the group
+     * keeps them in. */
+    if (member_only_via_group(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_MEMBER_VIA_GROUP; return r;
+    }
+    membership_sync(db, j->channel_id, j->user_id, 0);
 
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);   /* ch_joined now 0 */
@@ -3105,20 +3681,23 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     if (!is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
-    sqlite3_step(st);
-    sqlite3_finalize(st);
-    /* REQ-251's moderation family names this explicitly: removing a member from
-     * a channel, alongside a moderator deleting another user's message. */
-    audit_actor(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id,
-                j->target_user_id, NULL, 1, NULL);
+    /* In only through a group, they cannot be removed alone: the group would
+     * keep them in (REQ-309). Take them out of the group, or the group off.
+     * Added directly as well, the remove clears the direct half. */
+    if (member_only_via_group(db, j->channel_id, j->target_user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_MEMBER_VIA_GROUP; return r;
+    }
+    if (membership_sync(db, j->channel_id, j->target_user_id, 0) < 0) {
+        /* REQ-251's moderation family names this explicitly: removing a member
+         * from a channel, alongside a moderator deleting another user's message. */
+        audit_actor(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id,
+                    j->target_user_id, NULL, 1, NULL);
+        note_change(db, r, j->channel_id, j->target_user_id, 0);   /* they are told */
+    }
 
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
+    fill_briefs(db, r);
     return r;
 }
 
@@ -3471,7 +4050,11 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT cm.user_id, cm.joined_at_ms, u.role FROM channel_members cm "
+        "SELECT cm.user_id, cm.joined_at_ms, u.role, "
+        "       cm.direct = 0 AND EXISTS(SELECT 1 FROM channel_groups cg "
+        "           JOIN user_group_members gm ON gm.group_id = cg.group_id "
+        "           WHERE cg.channel_id = cm.channel_id AND gm.user_id = cm.user_id) "
+        "  FROM channel_members cm "
         "  JOIN users u ON u.id = cm.user_id "
         " WHERE cm.channel_id=? AND u.disabled=0 "
         " ORDER BY cm.joined_at_ms LIMIT ?;", -1, &st, NULL);
@@ -3484,6 +4067,7 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
         arr[n].user_id   = (uint64_t)sqlite3_column_int64(st, 0);
         arr[n].joined_at = (uint64_t)sqlite3_column_int64(st, 1);
         arr[n].role      = role_to_u8((const char *)sqlite3_column_text(st, 2));
+        arr[n].only_via_group = (uint8_t)(sqlite3_column_int(st, 3) != 0);
         n++;
     }
     sqlite3_finalize(st);
@@ -3842,7 +4426,11 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "         m.author_id AS actor_id, m.created_at_ms AS at, "
         "         substr(COALESCE(m.body,''),1,?2) AS text "
         "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
-        "   WHERE (mn.user_id = ?1 OR mn.kind <> 0) AND m.author_id <> ?1 "
+        /* Mine -- by name, keyword or group (0, 4, 5) -- or a broadcast
+         * (1, 2, 3), named as push.c names them: `kind <> 0` also let in
+         * somebody else's keyword hit, and would let in somebody else's row
+         * of a group mention. */
+        "   WHERE (mn.user_id = ?1 OR mn.kind IN (1,2,3)) AND m.author_id <> ?1 "
         "     AND m.deleted_at_ms IS NULL "
         /* Membership OR a public channel (REQ-288). This gate is where a mention
          * of a non-member actually lands: store_mentions can record the row, but
@@ -4216,7 +4804,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
      * them nowhere at all. */
     r->unres.channel_id = j->channel_id;
     r->unres.message_id = mid;
-    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres);
+    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres, &r->unres_total);
     /* Keywords fire in THREADS (REQ-135), which is a deliberate divergence:
      * Slack's help says keywords in thread messages never notify, and a thread
      * is where the substantive discussion usually is — the worst place to go
@@ -6915,6 +7503,9 @@ static oc_dbres *process_set_display_name(sqlite3 *db, const oc_job *j) {
     const char *name = j->pf_name ? j->pf_name : "";
     size_t nlen = strlen(name);
     if (nlen == 0 || nlen > OC_MAX_DISPLAY_NAME) return profile_err(j, OC_ERR_FORBIDDEN);
+    /* A group's handle is not a name a person can take: @name has to mean one
+     * thing (REQ-307). */
+    if (group_by_handle(db, name)) return profile_err(j, OC_ERR_GROUP_HANDLE_TAKEN);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db, "UPDATE users SET display_name=? WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_text (st, 1, name, (int)nlen, SQLITE_TRANSIENT);
@@ -7253,7 +7844,7 @@ static int is_read_job(int type) {
            type == OC_JOB_STORAGE_STATUS ||
            type == OC_JOB_AUDIT_QUERY ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
-           type == OC_JOB_STT_PREP;
+           type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -7283,6 +7874,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_FILE_CHANNELS) return process_list_file_channels(rdb, j);
     if (j->type == OC_JOB_LIST_SESSIONS)  return process_list_sessions(rdb, j);
     if (j->type == OC_JOB_LIST_EMOJI)     return process_list_emoji(rdb, j);
+    if (j->type == OC_JOB_LIST_GROUPS)    return process_list_groups(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
@@ -7313,6 +7905,13 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
+    if (j->type == OC_JOB_CREATE_GROUP)   return process_create_group(w->db, j);
+    if (j->type == OC_JOB_UPDATE_GROUP)   return process_update_group(w->db, j);
+    if (j->type == OC_JOB_DELETE_GROUP)   return process_delete_group(w->db, j);
+    if (j->type == OC_JOB_GROUP_ADD_MEMBERS)    return process_group_members(w->db, j, 1);
+    if (j->type == OC_JOB_GROUP_REMOVE_MEMBERS) return process_group_members(w->db, j, 0);
+    if (j->type == OC_JOB_CHANNEL_ADD_GROUP)    return process_channel_group(w->db, j, 1);
+    if (j->type == OC_JOB_CHANNEL_REMOVE_GROUP) return process_channel_group(w->db, j, 0);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w, j);
     if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
     if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);

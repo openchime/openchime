@@ -403,6 +403,17 @@ model; translate input to intents }, stop.
   Threads, People, Admin and Preferences are full surfaces**,
   answering REQ-139, REQ-143, REQ-231, REQ-223/224/228, REQ-062,
   REQ-289 and REQ-261.
+
+  **User groups (REQ-307–309)** appear in these places:
+  - **Admin → Groups** lists every group with its handle, name and size. New, Edit and Delete (confirmed) act on a group, and **People** opens its members, with Remove on each. Add people above them is the target picker New message uses (REQ-229), limited to people, yourself included, and to those not yet in the group. Up to 32 can be chosen, and Add (or Enter on an empty query) adds them in one go. The two uses share one picker, which belongs to one of them at a time: opening a group's people takes it, and New message's recipients stay in its draft.
+  - A channel's menu gains **Add a group** and **Remove a group**, each a pick from the groups it lacks or has. The members pane has the same two as buttons under its header.
+  - The members pane heads the roster with the channel's groups. Each group row has a Remove, which asks first, since everyone in the channel only through that group leaves with it; the menu's Remove a group asks the same way.
+  - A hovered member row offers Remove, and the member menu offers Remove from channel. Someone in only through a group is marked "via @handle"; their Remove is dimmed and says why when clicked, and the member menu shows the reason in its place.
+  - For a user in the open channel only through a group, the channel menu replaces Leave with the reason, and Mute is the way to quiet it. Remove someone who is in only through a group says why instead of sending. For a channel whose roster is not loaded, Leave is offered, and the daemon's refusal says why.
+  - The notice for a message that could not reach everyone it named adds "and N more" when a group named more than it lists.
+  - The composer offers groups beside people after `@`, and colours a group's handle as it does a name.
+  - A message naming a group I am in tints and toasts as one naming me.
+  - People lists the groups above the roster, and a profile card lists a person's groups.
 - **Linux GUI:** the **same portable client** (ARCH-80) — the shared
   app layer over SDL3, with a FreeType/fontconfig text backend and a small
   native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit

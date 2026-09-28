@@ -1684,6 +1684,30 @@ only REQ-212/213/214 apply.*
   gates: mention resolution, the activity-feed query (where it actually lands —
   without that the row is stored and nobody ever sees it), and push, which is
   left alone on purpose.
+- **REQ-307.** A workspace has had **user groups**: a named set of people with an
+  `@handle` — `@design`, `@oncall`. Owners and admins have created, renamed and
+  deleted them and chosen who is in them; everyone has seen them, in the
+  composer, the directory and on a person's profile. A handle has been one
+  namespace with people's names and the broadcast words: no group has taken a
+  name someone answers to, and nobody has renamed themselves to a group's handle.
+  A group has held people, not other groups.
+- **REQ-308.** **`@group`** in a message has reached every member of the group
+  who can read the channel, each under their own notification level, schedule
+  and pause — one decision per person, the one a personal mention gets (REQ-281,
+  ARCH-103) — highlighted for them and found in their activity feed as a
+  mention. It has been resolved when sent: who joins the group later is not
+  reached by what was said before. Members who cannot read the channel have
+  been told to the sender, as a person not in the channel is (REQ-287), with
+  the total when there were more than the notice names.
+- **REQ-309.** A channel has been able to take a **group as a member**, by
+  reference: its members have been in the channel through it, following the
+  group — added to it, in; taken out, out, unless also added directly. Any member
+  of the channel has been able to give it a group or take one away, as any
+  member can invite a person. Leaving and being removed have cleared a direct
+  membership, and a group has kept its members in; someone in a channel only
+  through a group has not been able to leave it, or be removed from it, alone:
+  the client has said why and offered a mute. Everyone who gained or lost a channel this way has been told
+  at once.
 - **REQ-222.** A URL in a message has been **unfurled** into a preview
   (title, description, thumbnail) fetched from the linked page. The fetch has been
   performed **server-side by the daemon or an isolated helper** — never by pushing

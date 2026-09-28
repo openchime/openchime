@@ -200,7 +200,18 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* A managed workspace's first boot: create #general with a welcome
         * topic and description (ch_name carries the workspace's name). Write,
         * setup-time only. */
-       OC_JOB_WELCOME_GENERAL = 107 };
+       OC_JOB_WELCOME_GENERAL = 107,
+       /* User groups (REQ-307-309, ARCH-114). LIST is a read; the rest write.
+        * The group's text rides grp_handle/grp_name/grp_desc, its id group_id,
+        * the people grp_uids; a channel op names channel_id and group_id. */
+       OC_JOB_LIST_GROUPS = 108,
+       OC_JOB_CREATE_GROUP = 109,
+       OC_JOB_UPDATE_GROUP = 110,
+       OC_JOB_DELETE_GROUP = 111,
+       OC_JOB_GROUP_ADD_MEMBERS = 112,
+       OC_JOB_GROUP_REMOVE_MEMBERS = 113,
+       OC_JOB_CHANNEL_ADD_GROUP = 114,
+       OC_JOB_CHANNEL_REMOVE_GROUP = 115 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -255,6 +266,11 @@ typedef struct oc_job {
 
     /* CREATE_CHANNEL */
     char          *ch_name;    /* heap */
+    /* User groups (REQ-307-309). */
+    uint64_t       group_id;
+    char          *grp_handle, *grp_name, *grp_desc;   /* heap */
+    uint64_t      *grp_uids;                            /* heap */
+    uint16_t       n_grp_uids;
     uint8_t        ch_is_public;
 
     /* STORE_IDENTITY (persist the TLS cert+key PEM) */
@@ -529,7 +545,39 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* A channel's description: the answer to a fetch (to the asker only) and,
         * with ch_fanout, the announcement of a change (to every member). The
         * text rides `body`/`body_len`. */
-       OC_RES_CHANNEL_DESCRIPTION = 95 };
+       OC_RES_CHANNEL_DESCRIPTION = 95,
+       /* User groups (REQ-307-309). LIST answers the asker with `groups`;
+        * CHANGED and DELETED are pushed to everyone signed in (groups[0], or
+        * group_id), with `mchan`/`mchg` saying who gained or lost a channel by
+        * it; ERR answers the actor with err_code. */
+       OC_RES_GROUP_LIST = 96,
+       OC_RES_GROUP_CHANGED = 97,
+       OC_RES_GROUP_DELETED = 98,
+       OC_RES_GROUP_ERR = 99 };
+
+/* One user group (REQ-307). Heap strings and member array. */
+typedef struct oc_group_row {
+    uint64_t  id, created_by;
+    char     *handle, *name, *description;
+    uint64_t *members;
+    uint16_t  n_members;
+} oc_group_row;
+
+/* A channel whose membership a change touched (REQ-309): what a CHANNEL_INFO
+ * says of it, the groups it has, and its members after the change. */
+typedef struct oc_chan_brief {
+    uint64_t  channel_id, created_at;
+    uint8_t   kind, is_public, archived;
+    uint8_t   groups_changed;   /* its groups changed: tell every member */
+    char     *name, *topic;     /* heap */
+    uint64_t  groups[OC_MAX_CHANNEL_GROUPS];
+    uint16_t  n_groups;
+    uint64_t *members;          /* heap */
+    size_t    n_members;
+} oc_chan_brief;
+
+/* One person who gained (joined=1) or lost a channel. */
+typedef struct { uint64_t channel_id, user_id; uint8_t joined; } oc_memb_change;
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */
@@ -564,7 +612,8 @@ typedef struct {
 } oc_activity_row;
 
 /* One row of a channel's member roster (REQ-031). */
-typedef struct { uint64_t user_id, joined_at; uint8_t role; } oc_chanmem_row;
+/* `only_via_group`: in the channel only through a group (REQ-309). */
+typedef struct { uint64_t user_id, joined_at; uint8_t role; uint8_t only_via_group; } oc_chanmem_row;
 
 /* One shared file (REQ-143, ARCH-91). */
 typedef struct {
@@ -610,6 +659,8 @@ typedef struct {
     uint16_t n_peers;
     char    *preview;       /* heap; newest top-level body, truncated */
     uint64_t preview_author;
+    uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* the channel's groups (REQ-309) */
+    uint16_t n_groups;
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
@@ -765,6 +816,7 @@ typedef struct oc_dbres {
     /* SEND_OK: names that are people here but not in this channel (REQ-287).
      * count == 0 for the overwhelming majority of sends. */
     oc_mention_unresolved unres;
+    uint16_t       unres_total;     /* everyone it could not reach, beyond unres's eight (REQ-308) */
     size_t         n_attach;
     char          *author_name;  /* heap; SEND_OK/WEBHOOK_POSTED override name, else NULL */
 
@@ -823,6 +875,19 @@ typedef struct oc_dbres {
     uint64_t       ch_peers[9];
     uint16_t       n_ch_peers;
     uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
+    /* CHANNEL_INFO: the channel's groups (REQ-309), sent beside it. */
+    uint64_t       ch_groups[OC_MAX_CHANNEL_GROUPS];
+    uint16_t       n_ch_groups;
+
+    /* User groups (REQ-307-309): the groups a LIST or a change carries, and who
+     * gained or lost which channel by a change (heap arrays). */
+    oc_group_row   *groups;
+    size_t          n_groups;
+    uint64_t        group_id;       /* GROUP_DELETED */
+    oc_chan_brief  *mchan;
+    size_t          n_mchan;
+    oc_memb_change *mchg;
+    size_t          n_mchg;
 
     /* CHANNEL_LIST */
     oc_channel_row *chlist;         /* heap array */
@@ -1067,6 +1132,8 @@ void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
 /* Allocate a zeroed job of `type` for `conn_id`. Fill in the type's fields
  * (oc_job_set_token / oc_job_set_body copy into heap) then submit. */
 oc_job *oc_job_new(int type, uint64_t conn_id);
+/* Free a job that was never submitted, and what it holds. */
+void    oc_job_free(oc_job *j);
 int     oc_job_set_token(oc_job *j, const void *tok, size_t len);
 int     oc_job_set_proof(oc_job *j, const void *proof, size_t len);
 int     oc_job_set_email(oc_job *j, const void *email, size_t len);

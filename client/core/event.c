@@ -13,6 +13,8 @@ void oc_ev_free(oc_ev *e) {
     free(e->topic);
     free(e->preview);
     free(e->call);
+    free(e->group);
+    free(e->ids);
     free(e);
 }
 
@@ -25,6 +27,7 @@ void oc_cmd_free(oc_cmd *c) {
     if (!c) return;
     free(c->body);
     free(c->body2);
+    free(c->body3);
     free(c->blob);
     free(c->blob2);
     for (int i = 0; i < c->n_paths; i++) free(c->paths[i]);

@@ -167,6 +167,10 @@ void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap) {
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->chanmem_via);
+    for (size_t i = 0; i < m->n_groups; i++) free(m->groups[i]);
+    free(m->groups);
+    free(m->group_gen);
     free(m->listen_ready);
     free(m->preview_ready);
     for (uint8_t i = 0; i < m->n_stt_words; i++) free(m->stt_words[i].text);
@@ -546,6 +550,7 @@ void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id) {
 
 void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id) {
     m->n_chanmem = 0;                 /* keep the allocation, drop the rows */
+    m->n_chanmem_via = 0;
     m->chanmem_channel = channel_id;
     m->chanmem_loading = 1;
 }
@@ -1021,6 +1026,97 @@ size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
     return n;
 }
 
+/* --- user groups (REQ-307-309) --------------------------------------------- */
+
+const oc_group_view *oc_model_group(const oc_model *m, uint64_t group_id) {
+    for (size_t i = 0; m && i < m->n_groups; i++) if (m->groups[i]->id == group_id) return m->groups[i];
+    return NULL;
+}
+
+/* ASCII without case: a handle is ASCII (REQ-307). */
+static int handle_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+
+const oc_group_view *oc_model_group_by_handle(const oc_model *m, const char *handle) {
+    for (size_t i = 0; m && handle && i < m->n_groups; i++)
+        if (handle_eq(m->groups[i]->handle, handle)) return m->groups[i];
+    return NULL;
+}
+
+int oc_model_in_group(const oc_group_view *g, uint64_t user_id) {
+    for (uint16_t i = 0; g && i < g->n_members; i++) if (g->members[i] == user_id) return 1;
+    return 0;
+}
+
+int oc_model_only_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id) {
+    if (!m || channel_id != m->chanmem_channel) return 0;
+    for (size_t i = 0; i < m->n_chanmem_via; i++) if (m->chanmem_via[i] == user_id) return 1;
+    return 0;
+}
+
+uint64_t oc_model_via_group(const oc_model *m, uint64_t channel_id, uint64_t user_id) {
+    if (!oc_model_only_via_group(m, channel_id, user_id)) return 0;
+    const oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    for (uint16_t i = 0; c && i < c->n_groups; i++)
+        if (oc_model_in_group(oc_model_group(m, c->groups[i]), user_id)) return c->groups[i];
+    return 0;
+}
+
+int oc_model_mentions_me(const oc_model *m, const char *body, size_t len) {
+    if (!m || !body) return 0;
+    if (oc_mention_targets(body, len, oc_model_user_name(m, m->user_id))) return 1;
+    for (size_t i = 0; i < m->n_groups; i++)
+        if (oc_model_in_group(m->groups[i], m->user_id) && oc_mention_targets(body, len, m->groups[i]->handle))
+            return 1;
+    return 0;
+}
+
+/* Take a GROUP event's group into the model, replacing the one with its id. */
+static void group_upsert(oc_model *m, oc_ev *e) {
+    oc_group_view *g = e->group;
+    if (!g) return;
+    for (size_t i = 0; i < m->n_groups; i++)
+        if (m->groups[i]->id == g->id) {
+            free(m->groups[i]);
+            m->groups[i] = g; m->group_gen[i] = m->groups_gen;
+            e->group = NULL;
+            return;
+        }
+    if (m->n_groups == m->cap_groups) {
+        size_t cap = m->cap_groups ? m->cap_groups * 2 : 16;
+        oc_group_view **ng = realloc(m->groups, cap * sizeof *ng);
+        if (!ng) return;
+        m->groups = ng;
+        uint64_t *gg = realloc(m->group_gen, cap * sizeof *gg);
+        if (!gg) return;
+        m->group_gen = gg;
+        m->cap_groups = cap;
+    }
+    m->groups[m->n_groups] = g;
+    m->group_gen[m->n_groups++] = m->groups_gen;
+    e->group = NULL;
+}
+
+/* A group is gone: out of the list, and out of every channel that had it. */
+static void group_drop(oc_model *m, uint64_t group_id) {
+    for (size_t i = 0; i < m->n_groups; i++)
+        if (m->groups[i]->id == group_id) {
+            free(m->groups[i]);
+            m->groups[i] = m->groups[m->n_groups - 1];
+            m->group_gen[i] = m->group_gen[m->n_groups - 1];
+            m->n_groups--;
+            break;
+        }
+    for (size_t c = 0; c < m->n_channels; c++) {
+        oc_channel *ch = &m->channels[c];
+        for (uint16_t k = 0; k < ch->n_groups; k++)
+            if (ch->groups[k] == group_id) { ch->groups[k] = ch->groups[--ch->n_groups]; break; }
+    }
+}
+
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id) {
     for (size_t i = 0; i < m->n_channels; i++)
         if (m->channels[i].channel_id == channel_id) return &m->channels[i];
@@ -1162,7 +1258,6 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
     if (vip)         *vip         = 0;
     if (!m || !c) return NULL;
 
-    const char *me = oc_model_user_name(m, m->user_id);
     const oc_msg *pick = NULL;
     for (size_t i = 0; i < c->n_msgs; i++) {
         const oc_msg *msg = &c->msgs[i];
@@ -1178,7 +1273,7 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         int men = 0, kw = 0;
         if (msg->body) {
             size_t blen = strlen(msg->body);
-            men = oc_mention_targets(msg->body, blen, me);
+            men = oc_model_mentions_me(m, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
         int is_vip = oc_model_is_priority(m, msg->author_id);
@@ -1217,8 +1312,7 @@ static void notice_push(oc_model *m, const oc_ev *e) {
     n->author_id  = e->author_id;
     if (e->body) {
         size_t blen = strlen(e->body);
-        const char *me = oc_model_user_name(m, m->user_id);
-        n->mentioned   = (uint8_t)(oc_mention_targets(e->body, blen, me) != 0);
+        n->mentioned   = (uint8_t)(oc_model_mentions_me(m, e->body, blen) != 0);
         n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
         snprintf(n->body, sizeof n->body, "%s", e->body);
     }
@@ -1423,7 +1517,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             int men = 0, kw = 0;
             if (msg->body) {
                 size_t blen = strlen(msg->body);
-                men = oc_mention_targets(msg->body, blen, oc_model_user_name(m, m->user_id));
+                men = oc_model_mentions_me(m, msg->body, blen);
                 kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
             }
             if (e->message_id > c->read_marker &&
@@ -1972,6 +2066,39 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) { c->notify_level = e->op; c->muted = e->status; }
         break;
     }
+    case OC_EV_GROUP:
+        group_upsert(m, e);
+        break;
+    case OC_EV_GROUP_DELETED:
+        group_drop(m, e->message_id);
+        break;
+    case OC_EV_GROUPS_END:
+        /* A list is the whole truth: a group it did not mention was deleted
+         * while this client was away. */
+        for (size_t i = 0; i < m->n_groups; )
+            if (m->group_gen[i] != m->groups_gen) group_drop(m, m->groups[i]->id);
+            else i++;
+        m->groups_gen++;
+        break;
+    case OC_EV_CHANNEL_VIA_GROUP:
+        if (e->channel_id != m->chanmem_channel) break;   /* a list since replaced */
+        free(m->chanmem_via);
+        m->chanmem_via = e->ids;
+        m->n_chanmem_via = e->n_ids;
+        e->ids = NULL;
+        break;
+    case OC_EV_MENTION_UNRESOLVED_MORE:
+        if (e->message_id != m->unresolved.message_id) break;
+        m->unresolved.total = (uint16_t)e->count;
+        m->unresolved.total_seq++;
+        break;
+    case OC_EV_CHANNEL_GROUPS: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (!c) break;
+        c->n_groups = e->n_groups > OC_MAX_CHANNEL_GROUPS ? OC_MAX_CHANNEL_GROUPS : e->n_groups;
+        memcpy(c->groups, e->groups, c->n_groups * sizeof c->groups[0]);
+        break;
+    }
     case OC_EV_EMOJI_BEGIN:
         m->n_cemoji = 0;                      /* the server's catalogue is the truth */
         break;
@@ -2234,6 +2361,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * message must not be swallowed as a repeat of the first. */
         m->unresolved.channel_id = e->channel_id;
         m->unresolved.message_id = e->message_id;
+        m->unresolved.total      = 0;
         m->unresolved.can_add    = (uint8_t)(e->status & 1);
         m->unresolved.is_private = (uint8_t)((e->status & 2) ? 1 : 0);
         m->unresolved.n_peers    = e->n_peers > 9 ? 9 : e->n_peers;

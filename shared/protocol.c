@@ -3499,6 +3499,189 @@ oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m) {
     return r_done(p);
 }
 
+/* User groups (REQ-307-309). */
+oc_result oc_encode_list_groups(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_GROUPS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_list_groups(oc_rbuf *p) { return r_done(p); }
+
+oc_result oc_encode_create_group(oc_wbuf *w, uint16_t version, const oc_create_group *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_GROUP);
+    oc_w_str(w, m->handle);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->description);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_create_group(oc_rbuf *p, oc_create_group *m) {
+    m->handle = oc_r_str(p);
+    m->name = oc_r_str(p);
+    m->description = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_update_group(oc_wbuf *w, uint16_t version, const oc_update_group *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPDATE_GROUP);
+    oc_w_u64(w, m->group_id);
+    oc_w_str(w, m->handle);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->description);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_update_group(oc_rbuf *p, oc_update_group *m) {
+    m->group_id = oc_r_u64(p);
+    m->handle = oc_r_str(p);
+    m->name = oc_r_str(p);
+    m->description = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_delete_group(oc_wbuf *w, uint16_t version, const oc_group_ref *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DELETE_GROUP);
+    oc_w_u64(w, m->group_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_group_deleted(oc_wbuf *w, uint16_t version, const oc_group_ref *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_GROUP_DELETED);
+    oc_w_u64(w, m->group_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_group_ref(oc_rbuf *p, oc_group_ref *m) {
+    m->group_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_group_members_op(oc_wbuf *w, uint16_t version, uint16_t type,
+                                     const oc_group_members_op *m) {
+    if (type != OC_MSG_GROUP_ADD_MEMBERS && type != OC_MSG_GROUP_REMOVE_MEMBERS) return OC_E_MALFORMED;
+    if (m->count > OC_MAX_GROUP_OP) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->group_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->user_ids[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_group_members_op(oc_rbuf *p, oc_group_members_op *m) {
+    m->group_id = oc_r_u64(p);
+    uint16_t n = oc_r_u16(p);
+    if (n > OC_MAX_GROUP_OP) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint16_t i = 0; i < n; i++) m->user_ids[i] = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_group_info(oc_wbuf *w, uint16_t version, const oc_group_info *m) {
+    if (m->count > OC_MAX_GROUP_MEMBERS) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, OC_MSG_GROUP_INFO);
+    oc_w_u64(w, m->group_id);
+    oc_w_str(w, m->handle);
+    oc_w_str(w, m->name);
+    oc_w_str(w, m->description);
+    oc_w_u64(w, m->created_by);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->members[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_group_info(oc_rbuf *p, oc_group_info *m, uint64_t *members, uint16_t cap) {
+    m->group_id = oc_r_u64(p);
+    m->handle = oc_r_str(p);
+    m->name = oc_r_str(p);
+    m->description = oc_r_str(p);
+    m->created_by = oc_r_u64(p);
+    uint16_t n = oc_r_u16(p);
+    if (n > cap || n > OC_MAX_GROUP_MEMBERS) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint16_t i = 0; i < n; i++) members[i] = oc_r_u64(p);
+    m->members = members;
+    return r_done(p);
+}
+
+oc_result oc_encode_groups_end(oc_wbuf *w, uint16_t version, const oc_groups_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_GROUPS_END);
+    oc_w_u16(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_groups_end(oc_rbuf *p, oc_groups_end *m) {
+    m->count = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_channel_group_op(oc_wbuf *w, uint16_t version, uint16_t type,
+                                     const oc_channel_group_op *m) {
+    if (type != OC_MSG_CHANNEL_ADD_GROUP && type != OC_MSG_CHANNEL_REMOVE_GROUP) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->group_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_channel_group_op(oc_rbuf *p, oc_channel_group_op *m) {
+    m->channel_id = oc_r_u64(p);
+    m->group_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_channel_groups(oc_wbuf *w, uint16_t version, const oc_channel_groups *m) {
+    if (m->count > OC_MAX_CHANNEL_GROUPS) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_GROUPS);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->group_ids[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_channel_groups(oc_rbuf *p, oc_channel_groups *m, uint64_t *group_ids, uint16_t cap) {
+    m->channel_id = oc_r_u64(p);
+    uint16_t n = oc_r_u16(p);
+    if (n > cap || n > OC_MAX_CHANNEL_GROUPS) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint16_t i = 0; i < n; i++) group_ids[i] = oc_r_u64(p);
+    m->group_ids = group_ids;
+    return r_done(p);
+}
+
+oc_result oc_encode_channel_via_group(oc_wbuf *w, uint16_t version, const oc_channel_via_group *m) {
+    if (m->count > OC_MAX_MEMBER_LIST) return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_VIA_GROUP);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->user_ids[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_channel_via_group(oc_rbuf *p, oc_channel_via_group *m, uint64_t *user_ids, uint16_t cap) {
+    m->channel_id = oc_r_u64(p);
+    uint16_t n = oc_r_u16(p);
+    if (n > cap || n > OC_MAX_MEMBER_LIST) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint16_t i = 0; i < n; i++) user_ids[i] = oc_r_u64(p);
+    m->user_ids = user_ids;
+    return r_done(p);
+}
+
+oc_result oc_encode_mention_unresolved_more(oc_wbuf *w, uint16_t version, const oc_mention_unresolved_more *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MENTION_UNRESOLVED_MORE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_u16(w, m->total);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_mention_unresolved_more(oc_rbuf *p, oc_mention_unresolved_more *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->total = oc_r_u16(p);
+    return r_done(p);
+}
+
 /* Custom emoji (REQ-072). */
 oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_ADD_EMOJI);
