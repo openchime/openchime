@@ -450,7 +450,8 @@ TOFU pin, and the book fields (typed address, account, last-used). Because there
 is one credential per workspace, **enumerating the credential store is the
 workspace book** (`oc_secret_each`), and "forget" is a single delete. **The
 entry is keyed by the workspace as named** (`oc_workspace_key`: its domain,
-lowercased, with the port only if one was typed) — not by the address resolution
+lowercased, with the port only if one was typed; an IPv6 address in its
+canonical spelling, bracketed) — not by the address resolution
 produced, which is an answer and can change: an SRV record moves, two names share a
 front door, and the pin and the session belong to the name a person trusted. An
 entry an earlier client filed under `host:port`, or under whatever was typed, is
@@ -580,7 +581,16 @@ the domain's A record at 443. A resolution failure is a distinct status, so the
 TUI tells "workspace not found" apart from "could not reach the server" (connect)
 and "auth failed" (login). The TUI accepts `<workspace>` (resolved) or a raw
 `<host> <port>` (dev/local); an explicit `:port` on the workspace
-(`chat.acme.com:9000`) pins the port and skips SRV.
+(`chat.acme.com:9000`) pins the port and skips SRV. **An IP address is dialled
+as typed** — `192.0.2.7`, `192.0.2.7:8443`, `[2001:db8::7]`,
+`[2001:db8::7]:8443`, or a bare `2001:db8::7` — at the port given or 443, with
+no SRV query, no DNS lookup and no `.well-known` request, so a client on an
+air-gapped network contacts its daemon and nothing else. The address is kept in
+one spelling (`inet_ntop`'s), which is also its credential-store key, and text
+that shows a host and port (`oc_hostport`) brackets an IPv6 one. Loopback
+(`oc_addr_is_loopback`) is `127.0.0.0/8`, `::1` in any spelling, an
+IPv4-mapped `127.x` and `localhost`. The Win32 sign-in form's advanced mode
+takes a bracketed IPv6 address as an address, as it does an IPv4 one.
 
 **The local login box (REQ-020 local mode).** With no credential and no
 stored session token, the TUI shows a modal **Sign in** dialog — workspace /

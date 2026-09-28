@@ -40,8 +40,8 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_HEALTH_PORT` | `8080` | Plaintext `/healthz` + landing-page port (ARCH-25). |
 | `OPENCHIME_TLS_CERT` | `/data/cert.pem` | Self-signed certificate path. Generated on first run; also persisted in the DB so the TOFU pin survives a restore (ARCH-10/66b). |
 | `OPENCHIME_TLS_KEY` | `/data/key.pem` | Private key for the above. |
-| `OPENCHIME_MAX_CONNS_PER_IP` | `256` | Accept-loop cap on concurrent connections from one source IP. |
-| `OPENCHIME_TRUSTED_PROXIES` | *(none)* | Addresses and CIDR blocks, comma-separated, of TCP forwarders in front of the daemon. A connection from one must begin with a **PROXY protocol v2** header, read before TLS, and the client address it names is what the per-address connection cap and the sign-in limiter count; a trusted peer that sends none is closed. Nobody else's header is read. A list the daemon cannot parse stops the boot. |
+| `OPENCHIME_MAX_CONNS_PER_IP` | `256` | Accept-loop cap on concurrent connections from one source: an IPv4 address, or an IPv6 **/64** — one host can take a whole /64, so counting its addresses one by one would cap nothing. The sign-in limiter counts sources the same way, and an IPv4-mapped IPv6 address counts as its IPv4 address. |
+| `OPENCHIME_TRUSTED_PROXIES` | *(none)* | Addresses and CIDR blocks, IPv4 or IPv6, comma-separated, of TCP forwarders in front of the daemon. A connection from one must begin with a **PROXY protocol v2** header, read before TLS, and the client address it names is what the per-address connection cap and the sign-in limiter count; a trusted peer that sends none is closed. Nobody else's header is read. A list the daemon cannot parse stops the boot. |
 | `OPENCHIME_DEPLOYMENT_MODE` | `standalone` | `standalone` \| `federated` \| `managed` — reported to clients in `WORKSPACE_INFO` (ARCH-76). Does **not** by itself enable federated services; those are gated on their own URLs. On `managed`, the first boot creates `#general` with a welcome topic and description (PROTOCOL.md §5.7). |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | Human-readable workspace name, reported in `WORKSPACE_INFO`. |
 
@@ -85,7 +85,7 @@ present the S3 backend is used, otherwise the local filesystem is** (ARCH-70).
 | `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` | `OC_MAX_VIDEO_MESSAGE_SIZE` (160 MiB) | Byte ceiling on a video message (REQ-164), checked by `ATTACH_MEDIA_SET`; clamped to the attachment ceiling. This, not the duration, is what bounds one: the daemon links no codec, so the length a client reports is shown, not verified. |
 | `OPENCHIME_FILE_PAGE` | `OC_MAX_FILE_LIST` (200) | Rows in one page of a `LIST_FILES` answer (PROTOCOL.md §5.9b), clamped to 1–200. The client asks for the next page with the cursor the last row gives it, so this changes how many arrive at a time, not how many can be browsed. Mainly for tests, which want a page small enough to reach a second one. |
 | `OPENCHIME_XFER_WORKERS` | `2` | Transfer-pool worker threads; blob I/O runs here, never on the net loop (ARCH-69). |
-| `OPENCHIME_S3_ENDPOINT` | *(none)* | S3-compatible endpoint. An `https://` scheme (or any non-443 port with `http://`) selects the transport; HTTPS is CA-verified with hostname checking. |
+| `OPENCHIME_S3_ENDPOINT` | *(none)* | S3-compatible endpoint. An `https://` scheme (or any non-443 port with `http://`) selects the transport; HTTPS is CA-verified with hostname checking. The host may be an IPv6 address in brackets (`https://[2001:db8::5]:9000`); an endpoint given as an address is verified against the certificate's IP-address names, and no SNI is sent. |
 | `OPENCHIME_S3_BUCKET` | *(none)* | Bucket name (path-style addressing). |
 | `OPENCHIME_S3_ACCESS_KEY` | *(none)* | SigV4 access key. |
 | `OPENCHIME_S3_SECRET_KEY` | *(none)* | SigV4 secret key. |
@@ -112,7 +112,9 @@ Local-backend concerns; with external S3 only the database grows locally.
 
 All of them are **outbound only** — the daemon calls central, central never dials
 a daemon (ARCH-56). Each is independently declinable; declining all of them is
-exactly the self-hosted stand-alone model (ARCH-76).
+exactly the self-hosted stand-alone model (ARCH-76). Every URL below may name
+its host as an IPv6 address in brackets (`https://[2001:db8::9]:8443/`); each
+connection tries the host's addresses in turn, at most 3 s apiece.
 
 | Variable | Default | Meaning |
 |---|---|---|

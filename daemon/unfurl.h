@@ -48,6 +48,11 @@ void oc_unfurler_stop(oc_unfurler *u);
  * ranges, in both families (a v4-mapped v6 address is judged as its v4). */
 int oc_unfurl_addr_public(const struct sockaddr *sa);
 
+/* The host and port a link would be fetched from -- the host without the
+ * brackets an IPv6 address wears in a URL -- or -1 for a link the fetcher does
+ * not take (not http/https, no host, a malformed authority). */
+int oc_unfurl_url_target(const char *url, char *host, size_t hcap, char *port, size_t pcap);
+
 /* Scan a fetched HTML buffer for og:title / og:description, falling back to
  * <title> and <meta name="description">. Decodes the basic entities, collapses
  * whitespace, and truncates on a UTF-8 boundary. Returns 0 when a non-empty

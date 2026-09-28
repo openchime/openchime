@@ -103,7 +103,8 @@ struct oc_call_engine {
     atomic_int  stop;
     oc_thread_t th_io, th_cap, th_play;
     int         sock;
-    struct sockaddr_in relay;
+    struct sockaddr_storage relay;   /* IPv4 or IPv6 (oc_call_relay_addr) */
+    int         relay_len;
     uint8_t     token[TOKEN_MAX];
     size_t      token_len;
     uint64_t    self_user;
@@ -184,6 +185,7 @@ static uint64_t kid_of(uint32_t epoch, uint8_t slot) { return ((uint64_t)epoch <
 
 /* One datagram to the relay, by UDP whatever the transport: a probe. */
 static void send_udp(oc_call_engine *e, const uint8_t *payload, size_t len) {
+    if (e->sock < 0) return;                     /* no UDP at all: the call is on TCP */
     uint8_t pkt[PACKET_MAX];
     if (e->token_len + 2 + len > sizeof pkt) return;
     memcpy(pkt, e->token, e->token_len);
@@ -192,7 +194,7 @@ static void send_udp(oc_call_engine *e, const uint8_t *payload, size_t len) {
     e->seq++;
     if (len) memcpy(pkt + e->token_len + 2, payload, len);
     sendto(e->sock, (const char *)pkt, (int)(e->token_len + 2 + len), 0,
-           (const struct sockaddr *)&e->relay, sizeof e->relay);
+           (const struct sockaddr *)&e->relay, e->relay_len);
 }
 
 /* One packet to the relay, by the transport in use. Called with mu held: the
@@ -203,6 +205,7 @@ static void send_raw(oc_call_engine *e, const uint8_t *payload, size_t len) {
         e->last_send = now_ms();
         return;
     }
+    if (e->sock < 0) return;
     uint8_t pkt[PACKET_MAX];
     if (e->token_len + 2 + len > sizeof pkt) return;
     memcpy(pkt, e->token, e->token_len);
@@ -211,7 +214,7 @@ static void send_raw(oc_call_engine *e, const uint8_t *payload, size_t len) {
     e->seq++;
     if (len) memcpy(pkt + e->token_len + 2, payload, len);
     sendto(e->sock, (const char *)pkt, (int)(e->token_len + 2 + len), 0,
-           (const struct sockaddr *)&e->relay, sizeof e->relay);
+           (const struct sockaddr *)&e->relay, e->relay_len);
     e->last_send = now_ms();
 }
 
@@ -239,7 +242,7 @@ static int send_pt(oc_call_engine *e, const uint8_t *pt, size_t n) {
         e->tx_ctr = 0;
         memset(&e->tx_next, 0, sizeof e->tx_next);
     }
-    int ok = e->tx.ready && e->sock >= 0 &&
+    int ok = e->tx.ready && (e->sock >= 0 || atomic_load(&e->on_tcp)) &&
              oc_sframe_encrypt(&e->tx, e->tx_ctr, NULL, 0, pt, n, ct, sizeof ct, &ctlen) == 0;
     if (ok) e->tx_ctr++;
     if (ok) send_raw(e, ct, ctlen);
@@ -344,6 +347,26 @@ static void on_packet(oc_call_engine *e, const uint8_t *pkt, size_t n) {
     }
 }
 
+int oc_call_relay_addr(const char *host, uint16_t port, struct sockaddr_storage *ss, int *len) {
+    if (!host || !host[0] || !ss || !len || !port) return -1;
+    static const int families[2] = { AF_INET, AF_INET6 };
+    for (int f = 0; f < 2; f++) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = families[f];
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) continue;
+        memset(ss, 0, sizeof *ss);
+        memcpy(ss, res->ai_addr, res->ai_addrlen);
+        *len = (int)res->ai_addrlen;
+        freeaddrinfo(res);
+        if (ss->ss_family == AF_INET6) ((struct sockaddr_in6 *)ss)->sin6_port = htons(port);
+        else                           ((struct sockaddr_in *)ss)->sin_port = htons(port);
+        return 0;
+    }
+    return -1;
+}
+
 static void *io_main(void *arg) {
     oc_call_engine *e = arg;
     uint8_t pkt[PACKET_MAX + 64];
@@ -351,7 +374,8 @@ static void *io_main(void *arg) {
     send_keepalive(e);          /* the relay learns this address before anyone speaks */
     e->last_probe_ms = now_ms();
     while (!atomic_load(&e->stop)) {
-        if (oc_poll(e->sock, 0, 20) > 0) {
+        if (e->sock < 0) nap(20);                /* TCP only: nothing to poll */
+        else if (oc_poll(e->sock, 0, 20) > 0) {
             for (;;) {
                 int n = (int)recv(e->sock, (char *)pkt, (int)sizeof pkt, 0);
                 if (n <= 0) break;
@@ -852,21 +876,22 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     if (!host || !token || token_len == 0 || token_len > sizeof e->token || !port) return -1;
 
     oc_sock_startup();
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;                  /* UDP is reached over IPv4 (AUDIO.md §4) */
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
-    memcpy(&e->relay, res->ai_addr, sizeof e->relay);
-    freeaddrinfo(res);
-    e->relay.sin_port = htons(port);
-    int s = (int)socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return -1;
-    oc_sock_setnonblock(s);
-    /* Room for a shared screen's keyframe, which comes as one burst. */
-    int bufsz = 4 << 20;
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsz, sizeof bufsz);
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsz, sizeof bufsz);
+    /* UDP to the relay, IPv4 first and IPv6 when that is what the host is. With
+     * no UDP at all -- no address of either family, or no socket -- the call
+     * goes by the connection instead, when the client offers that, rather than
+     * not at all. */
+    int s = -1;
+    if (oc_call_relay_addr(host, port, &e->relay, &e->relay_len) == 0) {
+        s = (int)socket(e->relay.ss_family, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            oc_sock_setnonblock(s);
+            /* Room for a shared screen's keyframe, which comes as one burst. */
+            int bufsz = 4 << 20;
+            setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsz, sizeof bufsz);
+            setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsz, sizeof bufsz);
+        }
+    }
+    if (s < 0 && !e->tcp_send) return -1;
     e->sock = s;
     memcpy(e->token, token, token_len);
     e->token_len = token_len;
@@ -879,7 +904,7 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     e->last_send = 0;
     e->started_ms = now_ms();
     e->udp_heard_ms = 0;
-    atomic_store(&e->on_tcp, 0);
+    atomic_store(&e->on_tcp, s < 0);             /* no UDP: on the connection from the start */
     atomic_store(&e->stop, 0);
     atomic_store(&e->sent, 0);
     atomic_store(&e->keepalives, 0);

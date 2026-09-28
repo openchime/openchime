@@ -24,6 +24,7 @@
 #include "jwt.h"
 #include "ratelimit.h"
 #include "roles.h"
+#include "srccount.h"   /* oc_source_key */
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -1099,6 +1100,15 @@ static const char *jwt_reason(oc_jwt_result jr) {
     }
 }
 
+/* The sign-in limiter counts a source by oc_source_key -- an IPv6 client by its
+ * /64 -- while the audit keeps the address itself. One writer thread, so one
+ * static buffer is enough. */
+static const char *src_key(const char *source) {
+    static char k[OC_SRC_LEN];
+    oc_source_key(source, k, sizeof k);
+    return k;
+}
+
 /* A refused OIDC sign-in: counted against its source and written down, exactly
  * as a wrong password is (REQ-191, REQ-251). Never the token — only why it was
  * refused and where it came from. Bounded by the limiter: a throttled attempt
@@ -1106,7 +1116,7 @@ static const char *jwt_reason(oc_jwt_result jr) {
 static oc_dbres *oidc_refuse(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint16_t code,
                              const char *action, const char *who, const char *reason) {
     char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 96];
-    if (j->source[0]) oc_ratelimit_record(w->source_rl, j->source, dbw_now_ms());
+    if (j->source[0]) oc_ratelimit_record(w->source_rl, src_key(j->source), dbw_now_ms());
     snprintf(detail, sizeof detail, "%s%s%s", reason, j->source[0] ? " from=" : "", j->source);
     audit_log(w->db, OC_AUDIT_SECURITY, action, 0, NULL, 0, who, 0, detail);
     r->type = OC_RES_AUTH_ERR;
@@ -1147,7 +1157,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         int has_src = j->source[0] != '\0';
         uint64_t now = dbw_now_ms();
         if (j->auth_stage == OC_AUTH_STAGE_NEW && (oc_ratelimit_blocked(w->auth_rl, acct, now) ||
-            (has_src && oc_ratelimit_blocked(w->source_rl, j->source, now)))) {
+            (has_src && oc_ratelimit_blocked(w->source_rl, src_key(j->source), now)))) {
             /* Throttled attempts are dropped SILENTLY and are deliberately not
              * audited (REQ-251b). Logging them would hand an attacker the very
              * amplification the limiter exists to remove: one packet, one row.
@@ -1169,7 +1179,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         uid = j->auth_ok == 1 && credential_current(db, j->auth_uid, j->auth_version, &role) ? j->auth_uid : 0;
         if (uid == 0) {
             oc_ratelimit_record(w->auth_rl, acct, now);
-            if (has_src) oc_ratelimit_record(w->source_rl, j->source, now);
+            if (has_src) oc_ratelimit_record(w->source_rl, src_key(j->source), now);
             /* The attempted username and source, never the attempted password
              * (ARCH-79). Bounded by the limiter above — a throttled attempt has
              * already returned — so a spray yields a handful of rows per window
@@ -1188,7 +1198,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         /* The per-source limiter stands in front of every source, and in front of
          * the signature work as it stands in front of PBKDF2. Throttled attempts
          * are dropped silently and unaudited, for the reason given above. */
-        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, j->source, dbw_now_ms())) {
+        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms())) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
         }
         oc_jwt_claims claims;
@@ -1265,13 +1275,13 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     } else if (j->method == OC_AUTH_SESSION) {
         /* A session token is 32 random bytes, so guessing one is hopeless — but the
          * limiter is per source, and a source hammering any door is the same source. */
-        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, j->source, dbw_now_ms())) {
+        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms())) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
         }
         uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp,
                              &sess_id);
         fresh = 0;
-        if (uid == 0 && j->source[0]) oc_ratelimit_record(w->source_rl, j->source, dbw_now_ms());
+        if (uid == 0 && j->source[0]) oc_ratelimit_record(w->source_rl, src_key(j->source), dbw_now_ms());
     } else {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
     }

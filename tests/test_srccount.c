@@ -49,7 +49,8 @@ static void test_random_against_reference(void) {
     static char names[R][OC_SRC_LEN];
     static int count[R];
     memset(count, 0, sizeof count);
-    for (int k = 0; k < R; k++) snprintf(names[k], sizeof names[k], "2001:db8::%x", k * 7919);
+    /* Each in its own /64: an IPv6 source is counted by its /64 (oc_source_key). */
+    for (int k = 0; k < R; k++) snprintf(names[k], sizeof names[k], "2001:db8:%x::1", k * 7919);
     size_t n = 0;
     srand(4422);
     int bad = 0;
@@ -73,9 +74,43 @@ static void test_random_against_reference(void) {
     oc_srccount_free(&m);
 }
 
+/* The key a source is counted under: IPv4 as it is, IPv6 by its /64 -- one host
+ * can vary its address across a /64 -- and an IPv4-mapped address as its IPv4
+ * address, so a client has one key however it arrived. */
+static void test_source_key(void) {
+    static const struct { const char *in, *want; } T[] = {
+        { "10.0.0.1",                    "10.0.0.1" },
+        { "2001:db8:1:2:aaaa::1",        "2001:db8:1:2::/64" },
+        { "2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::/64" },
+        { "2001:db8:1:3::1",             "2001:db8:1:3::/64" },
+        { "::ffff:192.0.2.7",            "192.0.2.7" },
+        { "::1",                         "::/64" },
+        { "not-an-address",              "not-an-address" },
+        { "",                            "" },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        char k[OC_SRC_LEN];
+        oc_source_key(T[i].in, k, sizeof k);
+        if (strcmp(k, T[i].want) != 0) printf("  key(%s) = %s, want %s\n", T[i].in, k, T[i].want);
+        CHECK(strcmp(k, T[i].want) == 0);
+    }
+    /* In the map: two addresses in one /64 are one source; another /64 is not. */
+    oc_srccount m;
+    CHECK(oc_srccount_init(&m, 8) == 0);
+    CHECK(oc_srccount_inc(&m, "2001:db8:1:2::a") == 1);
+    CHECK(oc_srccount_inc(&m, "2001:db8:1:2::b") == 2);
+    CHECK(oc_srccount_get(&m, "2001:db8:1:2::c") == 2);
+    CHECK(oc_srccount_get(&m, "2001:db8:1:3::a") == 0);
+    CHECK(oc_srccount_inc(&m, "::ffff:10.0.0.9") == 1 && oc_srccount_get(&m, "10.0.0.9") == 1);
+    oc_srccount_dec(&m, "2001:db8:1:2::a");
+    CHECK(oc_srccount_get(&m, "2001:db8:1:2::b") == 1);
+    oc_srccount_free(&m);
+}
+
 int run_srccount_tests(void) {
-    printf("test_srccount: count up and down, the half-full bound, and a random run against a reference\n");
+    printf("test_srccount: count up and down, the half-full bound, a random run against a reference, keys by /64\n");
     test_basics();
+    test_source_key();
     test_random_against_reference();
     return failures;
 }

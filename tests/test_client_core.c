@@ -1347,6 +1347,80 @@ static void test_wellknown_parse(void) {
     }
 }
 
+/* An address is used as given, before anything else: IPv4 or IPv6, bracketed
+ * or bare, with or without a port -- and none of them makes an SRV query, a DNS
+ * lookup or a `.well-known` request, which is what an air-gapped network needs.
+ * Counted (oc_resolve_counts), not inferred. */
+static void test_resolve_literals(void) {
+    static const struct { const char *typed, *host, *domain; int port; } OK[] = {
+        { "10.0.0.5",                  "10.0.0.5",        "10.0.0.5",          443 },
+        { "10.0.0.5:9640",             "10.0.0.5",        "10.0.0.5",         9640 },
+        { "https://10.0.0.5:9640/x",   "10.0.0.5",        "10.0.0.5",         9640 },
+        { "[2001:DB8::10]",            "2001:db8::10",    "[2001:db8::10]",    443 },
+        { "[2001:db8::10]:9640",       "2001:db8::10",    "[2001:db8::10]",   9640 },
+        { "2001:db8::10",              "2001:db8::10",    "[2001:db8::10]",    443 },
+        { "::1",                       "::1",             "[::1]",             443 },
+        { "[::1]:9000",                "::1",             "[::1]",            9000 },
+        { "[0:0:0:0:0:0:0:1]:9000",    "::1",             "[::1]",            9000 },
+        { "fe80::1%eth0",              "fe80::1%eth0",    "[fe80::1%eth0]",    443 },
+        { "[fe80::1%eth0]:9000",       "fe80::1%eth0",    "[fe80::1%eth0]",   9000 },
+        { "openchime://[::1]:9443/c",  "::1",             "[::1]",            9443 },
+    };
+    for (size_t i = 0; i < sizeof OK / sizeof OK[0]; i++) {
+        unsigned srv0, dns0, wk0, srv1, dns1, wk1;
+        oc_resolve_counts(&srv0, &dns0, &wk0);
+        oc_endpoint ep; memset(&ep, 0, sizeof ep);
+        oc_resolve_status st = oc_resolve(OK[i].typed, "openchime.test", &ep);
+        oc_resolve_counts(&srv1, &dns1, &wk1);
+        int ok = st == OC_RESOLVE_OK && strcmp(ep.host, OK[i].host) == 0 &&
+                 strcmp(ep.domain, OK[i].domain) == 0 && ep.port == OK[i].port;
+        if (!ok) printf("  resolve(%s) = %d host=%s domain=%s port=%d\n", OK[i].typed, (int)st,
+                        ep.host, ep.domain, ep.port);
+        CHECK(ok);
+        /* Nothing asked of anyone but the address itself. */
+        CHECK(srv1 == srv0 && dns1 == dns0 && wk1 == wk0);
+    }
+    /* Malformed addresses are refused, never guessed at or suffixed. */
+    static const char *const BAD[] = {
+        "[::1", "[::1]x", "[::1]:0", "[::1]:99999", "[::1]:", "[10.0.0.5]", "[]",
+        "10.0.0.5:0", "10.0.0.5:99999", "fe80::1%", "[chat.acme.com]",
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        oc_endpoint ep;
+        oc_resolve_status st = oc_resolve(BAD[i], "openchime.test", &ep);
+        if (st != OC_RESOLVE_BAD_WORKSPACE) printf("  resolve(%s) = %d, want BAD_WORKSPACE\n", BAD[i], (int)st);
+        CHECK(st == OC_RESOLVE_BAD_WORKSPACE);
+    }
+    /* A name is still a name: counted as looked up, so the counters count. */
+    unsigned dns0, dns1;
+    oc_resolve_counts(NULL, &dns0, NULL);
+    oc_endpoint ep;
+    (void)oc_resolve("localhost:9", NULL, &ep);
+    oc_resolve_counts(NULL, &dns1, NULL);
+    CHECK(dns1 == dns0 + 1);
+
+    /* host:port as text: IPv6 bracketed, everything else exactly as it was. */
+    static const struct { const char *host; int port; const char *want; } HP[] = {
+        { "10.0.0.5", 9640, "10.0.0.5:9640" }, { "chat.acme.com", 443, "chat.acme.com:443" },
+        { "2001:db8::10", 9640, "[2001:db8::10]:9640" }, { "::1", 1, "[::1]:1" },
+    };
+    for (size_t i = 0; i < sizeof HP / sizeof HP[0]; i++) {
+        char out[64];
+        CHECK(oc_hostport(HP[i].host, HP[i].port, out, sizeof out) == 0 && strcmp(out, HP[i].want) == 0);
+    }
+    /* This machine, in any spelling. */
+    static const struct { const char *h; int lo; } LB[] = {
+        { "localhost", 1 }, { "LocalHost", 1 }, { "127.0.0.1", 1 }, { "127.5.6.7", 1 },
+        { "::1", 1 }, { "[::1]", 1 }, { "0:0:0:0:0:0:0:1", 1 }, { "::ffff:127.0.0.1", 1 },
+        { "10.0.0.5", 0 }, { "::2", 0 }, { "::ffff:10.0.0.1", 0 }, { "localhost.acme.com", 0 },
+        { "128.0.0.1", 0 }, { "", 0 },
+    };
+    for (size_t i = 0; i < sizeof LB / sizeof LB[0]; i++) {
+        if (oc_addr_is_loopback(LB[i].h) != LB[i].lo) printf("  loopback(%s) != %d\n", LB[i].h, LB[i].lo);
+        CHECK(oc_addr_is_loopback(LB[i].h) == LB[i].lo);
+    }
+}
+
 static void test_resolve(void) {
     char d[256];
     /* Bare name gets the suffix; a dotted name passes through; no suffix = as-is. */
@@ -1686,6 +1760,14 @@ static void test_workspace_key(void) {
         { "LocalHost:9443",               "localhost:9443" },
         { "acme:0",                       "acme.openchime.test" },    /* not a port */
         { "acme:99999",                   "acme.openchime.test" },
+        /* An address is its own key, in one spelling: IPv6 in brackets, so a
+         * port after it is not read as part of it (the air-gapped case). */
+        { "10.0.0.5",                     "10.0.0.5" },
+        { "[2001:DB8:0:0::10]:9640",      "[2001:db8::10]:9640" },
+        { "[2001:db8::10]:9640",          "[2001:db8::10]:9640" },
+        { "2001:db8::10",                 "[2001:db8::10]" },
+        { "[::1]",                        "[::1]" },
+        { "openchime://[::1]:9443/x",     "[::1]:9443" },
     };
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
         char key[288] = "";
@@ -2092,14 +2174,14 @@ static void test_addressable_targets(void) {
 
 static struct { int udp; } g_relay;   /* the socket the daemon's relay runs on */
 
-#define TAP_CLIENTS 8
+#define TAP_CLIENTS 16
 #define TAP_KEEP    4000
 typedef struct { uint64_t kid; uint8_t b0; size_t len; uint64_t t_ms; } tap_pkt;
 static struct {
     int      front;                          /* where the clients send */
     uint16_t relay_port;
-    struct { struct sockaddr_in from; int up; } cl[TAP_CLIENTS];
-    int      n_cl;
+    struct { struct sockaddr_in6 from; int up; } cl[TAP_CLIENTS];   /* IPv4 arrives mapped */
+    int      n_cl, n_v6;                     /* clients seen; of them, over IPv6 itself */
     pthread_mutex_t mu;
     tap_pkt  seen[TAP_KEEP];                 /* client -> relay payloads that carried audio */
     int      n_seen, bad_header;
@@ -2135,15 +2217,16 @@ static void *tap_thread(void *p) {
         for (int i = 0; i < polled; i++) { pf[1 + i].fd = g_tap.cl[i].up; pf[1 + i].events = POLLIN; }
         if (poll(pf, (nfds_t)(1 + polled), 50) <= 0) continue;
         if (pf[0].revents & POLLIN) {
-            struct sockaddr_in from; socklen_t fl = sizeof from;
+            struct sockaddr_in6 from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(g_tap.front, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
             if (n > 0) {
                 int k = 0;
-                while (k < g_tap.n_cl && (g_tap.cl[k].from.sin_port != from.sin_port ||
-                                          g_tap.cl[k].from.sin_addr.s_addr != from.sin_addr.s_addr)) k++;
+                while (k < g_tap.n_cl && (g_tap.cl[k].from.sin6_port != from.sin6_port ||
+                                          memcmp(&g_tap.cl[k].from.sin6_addr, &from.sin6_addr, 16) != 0)) k++;
                 if (k == g_tap.n_cl && k < TAP_CLIENTS) {
                     g_tap.cl[k].from = from;
                     g_tap.cl[k].up = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (!IN6_IS_ADDR_V4MAPPED(&from.sin6_addr)) g_tap.n_v6++;
                     g_tap.n_cl++;
                 }
                 if (k < g_tap.n_cl) {
@@ -2327,6 +2410,76 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     unsetenv("OPENCHIME_TEST_CAPTURE");
 }
 
+/* End to end over IPv6: an address typed as `[::1]:<port>` resolves with
+ * nothing asked of anyone, and the client signs in and sends over it -- the
+ * daemon listens on both families on one socket. Said and skipped on a host
+ * with no IPv6 loopback. */
+static void test_ipv6_e2e(int port) {
+    int probe = (int)socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
+    a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback;
+    int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&a6, sizeof a6) == 0;
+    if (probe >= 0) close(probe);
+    if (!have6) { printf("  (no IPv6 loopback on this host: the IPv6 end to end is skipped)\n"); return; }
+
+    char typed[32]; snprintf(typed, sizeof typed, "[::1]:%d", port);
+    unsigned srv0, dns0, wk0, srv1, dns1, wk1;
+    oc_resolve_counts(&srv0, &dns0, &wk0);
+    oc_endpoint ep; memset(&ep, 0, sizeof ep);
+    CHECK(oc_resolve(typed, NULL, &ep) == OC_RESOLVE_OK && strcmp(ep.host, "::1") == 0 && ep.port == port);
+    oc_resolve_counts(&srv1, &dns1, &wk1);
+    CHECK(srv1 == srv0 && dns1 == dns0 && wk1 == wk0);
+
+    oc_client *c = oc_client_start(ep.host, ep.port, "faye:pw-faye");
+    CHECK(c != NULL);
+    if (!c) return;
+    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+    oc_client_send(c, 1, "hello over IPv6");
+    CHECK(WAIT_FOR(c, channel_has_body(m, 1, "hello over IPv6")));
+    oc_client_stop(c);
+}
+
+/* The call engine's relay address: IPv4 first, IPv6 when that is all there is
+ * (AUDIO.md §4). And with no UDP at all, a call goes by the connection instead
+ * of not at all -- it used to leave. */
+static int tcp_fallback_calls;
+static int count_tcp(void *ctx, uint16_t seq, const uint8_t *ct, size_t len) {
+    (void)ctx; (void)seq; (void)ct; (void)len;
+    __atomic_add_fetch(&tcp_fallback_calls, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+static void test_call_relay_family(void) {
+    struct sockaddr_storage ss; int len = 0;
+    CHECK(oc_call_relay_addr("127.0.0.1", 9000, &ss, &len) == 0 && ss.ss_family == AF_INET &&
+          ntohs(((struct sockaddr_in *)&ss)->sin_port) == 9000);
+    CHECK(oc_call_relay_addr("localhost", 9000, &ss, &len) == 0 && ss.ss_family == AF_INET);
+    CHECK(oc_call_relay_addr("::1", 9001, &ss, &len) == 0 && ss.ss_family == AF_INET6 &&
+          ntohs(((struct sockaddr_in6 *)&ss)->sin6_port) == 9001 && len == (int)sizeof(struct sockaddr_in6));
+    CHECK(oc_call_relay_addr("2001:db8::10", 9002, &ss, &len) == 0 && ss.ss_family == AF_INET6);
+    CHECK(oc_call_relay_addr("", 9000, &ss, &len) != 0);
+
+    /* No address for the relay at all: with the connection offered, the call
+     * starts on it; without, it does not start. */
+    tone_io tio = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts o = { NULL, NULL, 0, tone_source, tone_sink, &tio };
+    oc_call_engine *e = oc_call_engine_new(&o);
+    CHECK(e != NULL);
+    if (!e) return;
+    const oc_call_media *md = oc_call_engine_media();
+    static const uint8_t tok[16] = { 1 };
+    CHECK(md->start(e, "no-such-relay.invalid", 9000, tok, sizeof tok, 7, 1) != 0);
+    md->tcp(e, count_tcp, NULL);
+    CHECK(md->start(e, "no-such-relay.invalid", 9000, tok, sizeof tok, 7, 1) == 0);
+    oc_call_stats st; memset(&st, 0, sizeof st);
+    oc_call_engine_stats(e, &st);
+    CHECK(st.transport == 1);                              /* on the connection */
+    int waited = 0;
+    while (__atomic_load_n(&tcp_fallback_calls, __ATOMIC_RELAXED) == 0 && waited < 3000) { usleep(20000); waited += 20; }
+    CHECK(__atomic_load_n(&tcp_fallback_calls, __ATOMIC_RELAXED) > 0);   /* keepalives went by it */
+    md->stop(e);
+    oc_call_engine_free(e);
+}
+
 static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
     tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
@@ -2476,6 +2629,52 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_client_stop(c);
     oc_call_engine_free(ea);
     oc_call_engine_free(eb);
+    oc_call_engine_free(ec);
+}
+
+/* A call over IPv6 (AUDIO.md §4): faye signs in by [::1], so her engine sends
+ * to the relay at ::1 -- IPv6 being all that address has -- and she and dana,
+ * on 127.0.0.1, hear each other through it over UDP. */
+static void test_calls_ipv6(oc_client *a, int port) {
+    oc_client *b = a;                                    /* CALL_WAIT ticks a, b and c */
+    int probe = (int)socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
+    a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback;
+    int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&a6, sizeof a6) == 0;
+    if (probe >= 0) close(probe);
+    if (!have6) { printf("  (no IPv6 loopback on this host: the IPv6 call is skipped)\n"); return; }
+
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
+    oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
+    oc_client *c = oc_client_start("::1", port, "faye:pw-faye");
+    CHECK(c != NULL);
+    if (!c) { oc_call_engine_free(ea); oc_call_engine_free(ec); return; }
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(c, oc_call_engine_media(), ec);
+    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+    const oc_model *ma = oc_client_model(a), *mc = oc_client_model(c);
+    int v6_before = __atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE);
+
+    oc_client_call_start(a, 1, NULL, 0);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && mc->call.n_parts == 2 && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(8000, heard(&ta, 2) > 4800 && heard(&tc, 0) > 4800));
+    printf("  over IPv6: dana hears 880 Hz at %.0f, faye hears 440 Hz at %.0f\n", heard(&ta, 2), heard(&tc, 0));
+    oc_call_stats st;
+    oc_call_engine_stats(ec, &st);
+    CHECK(st.active && st.transport == 0);                 /* UDP, not the connection */
+    CHECK(__atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE) > v6_before);   /* and it came over IPv6 */
+
+    oc_client_call_end(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mc->in_call && !calls_in(ma, 1)));
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(c, NULL, NULL);
+    oc_client_stop(c);
+    oc_call_engine_free(ea);
     oc_call_engine_free(ec);
 }
 
@@ -3029,6 +3228,7 @@ int run_client_core_tests(void) {
     test_addressable_targets();
     test_pins();
     test_resolve();
+    test_resolve_literals();
     test_wellknown_parse();
     test_last_error();
     test_xfer_table();
@@ -3084,10 +3284,15 @@ int run_client_core_tests(void) {
     /* A relay, and the tap in front of it that the daemon advertises (calls). */
     {
         g_relay.udp = socket(AF_INET, SOCK_DGRAM, 0);
-        g_tap.front = socket(AF_INET, SOCK_DGRAM, 0);
+        /* The tap takes both families on one socket, as the daemon's relay does,
+         * so a client that reaches it over IPv6 is relayed too. */
+        g_tap.front = socket(AF_INET6, SOCK_DGRAM, 0);
+        int v6only = 0;
+        CHECK(setsockopt(g_tap.front, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only) == 0);
         struct sockaddr_in ra; memset(&ra, 0, sizeof ra);
         ra.sin_family = AF_INET; ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        struct sockaddr_in ta = ra;
+        struct sockaddr_in6 ta; memset(&ta, 0, sizeof ta);
+        ta.sin6_family = AF_INET6; ta.sin6_addr = in6addr_any;
         CHECK(bind(g_relay.udp, (struct sockaddr *)&ra, sizeof ra) == 0);
         CHECK(bind(g_tap.front, (struct sockaddr *)&ta, sizeof ta) == 0);
         socklen_t l = sizeof ra; getsockname(g_relay.udp, (struct sockaddr *)&ra, &l);
@@ -3095,7 +3300,7 @@ int run_client_core_tests(void) {
         g_tap.relay_port = ntohs(ra.sin_port);
         pthread_mutex_init(&g_tap.mu, NULL);
         CHECK(pthread_create(&g_tap_th, NULL, tap_thread, NULL) == 0);
-        oc_netloop_set_audio(g_relay.udp, ntohs(ta.sin_port));
+        oc_netloop_set_audio(g_relay.udp, ntohs(ta.sin6_port));
     }
 
     struct core_loop_arg arg;
@@ -3860,8 +4065,11 @@ int run_client_core_tests(void) {
             unsetenv("OPENCHIME_TEST_AUDIO");
         }
 
+        test_ipv6_e2e(arg.port);
+        test_call_relay_family();
         test_calls_e2e(a, b, arg.port);
         test_calls_tcp(a, b);
+        test_calls_ipv6(a, arg.port);
 
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));

@@ -188,24 +188,10 @@ int oc_wellknown_fingerprint_bytes(const char *hex, unsigned char out[32]) {
 /* --- fetching ------------------------------------------------------------ */
 
 static int wk_dial(const char *host, int port, int timeout_ms) {
-    oc_sock_startup();
-    char portstr[16];
-    snprintf(portstr, sizeof portstr, "%d", port);
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
-    int fd = -1;
-    for (struct addrinfo *a = res; a; a = a->ai_next) {
-        fd = (int)socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, a->ai_addr, (int)a->ai_addrlen) == 0) break;
-        oc_closesock(fd); fd = -1;
-    }
-    freeaddrinfo(res);
+    /* Each address bounded (sock.h), and never longer than the fetch itself. */
+    int per = timeout_ms > 0 && timeout_ms < OC_CONNECT_PER_ADDR_MS ? timeout_ms : OC_CONNECT_PER_ADDR_MS;
+    int fd = oc_connect_any(host, port, per);
     if (fd >= 0) oc_sock_setnonblock(fd);
-    (void)timeout_ms;
     return fd;
 }
 

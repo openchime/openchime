@@ -15,6 +15,8 @@
 
 #define JSMN_HEADER   /* declarations only; the impl lives in daemon/jwt.c's TU */
 #include "jsmn.h"
+#include "sock.h"   /* oc_connect_any */
+#include "url.h"    /* oc_url_authority, oc_url_hostheader */
 
 #include <netdb.h>
 #include <stdint.h>
@@ -141,37 +143,20 @@ static int parse_url(const char *url, enroll_ctx *ctx) {
     else if (strncmp(p, "http://", 7) == 0) { p += 7; ctx->use_tls = 0; snprintf(ctx->port, sizeof ctx->port, "80"); }
     else return -1;
 
-    char hostport[256];
-    size_t i = 0;
-    while (*p && *p != '/' && i < sizeof hostport - 1) hostport[i++] = *p++;
-    hostport[i] = '\0';
-    if (i == 0) return -1;
-
-    char *colon = strchr(hostport, ':');
-    if (colon) { *colon = '\0'; snprintf(ctx->port, sizeof ctx->port, "%s", colon + 1); }
-    snprintf(ctx->host, sizeof ctx->host, "%s", hostport);
+    /* host, host:port, [v6] or [v6]:port (url.h); the Host header brackets v6. */
+    size_t i = strcspn(p, "/");
+    if (oc_url_authority(p, i, ctx->host, sizeof ctx->host, ctx->port, sizeof ctx->port) != 0) return -1;
 
     int is_default = (ctx->use_tls && strcmp(ctx->port, "443") == 0) ||
                      (!ctx->use_tls && strcmp(ctx->port, "80") == 0);
-    if (is_default) snprintf(ctx->endpoint, sizeof ctx->endpoint, "%s", ctx->host);
-    else snprintf(ctx->endpoint, sizeof ctx->endpoint, "%s:%s", ctx->host, ctx->port);
+    if (oc_url_hostheader(ctx->host, is_default ? NULL : ctx->port,
+                          ctx->endpoint, sizeof ctx->endpoint) != 0) return -1;
     return 0;
 }
 
 static int tcp_connect(const enroll_ctx *ctx) {
-    struct addrinfo hints, *res = NULL, *rp;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(ctx->host, ctx->port, &hints, &res) != 0) return -1;
-    int fd = -1;
-    for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
+    /* Each address bounded (sock.h): a dead IPv6 route costs seconds, not minutes. */
+    int fd = oc_connect_any(ctx->host, atoi(ctx->port), OC_CONNECT_PER_ADDR_MS);
     if (fd >= 0) {
         struct timeval tv = { 30, 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);

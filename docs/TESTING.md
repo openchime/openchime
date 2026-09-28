@@ -216,6 +216,32 @@ framework, and OpenChime follows suit.
   numbers, the relay seeing only SFrame; 10% loss at the tap costs NACKs and
   resends, not the picture; faye joins late and has a picture within seconds;
   erik takes over, stopping dana's; erik stops and the picture goes.
+- **IPv6 and address literals** (ARCH-14/54) — `test_client_core`: every
+  literal form (`192.0.2.7`, `:port`, `[v6]`, `[v6]:port`, a bare v6, a zone)
+  resolves to its canonical host and port with **the SRV, DNS and `.well-known`
+  counters (`oc_resolve_counts`) unmoved**, malformed forms are refused, keys fold
+  spellings, and `oc_hostport` and `oc_addr_is_loopback` hold to their tables; a
+  client resolves `[::1]:<port>`, signs in and sends over IPv6 with nothing else
+  looked up; the call engine picks the relay's family IPv4 first and IPv6 when
+  that is all there is, starts on the connection when it has no UDP, and dana, on
+  `127.0.0.1`, and faye, signed in by `[::1]`, hear each other over UDP through a
+  dual-stack tap that sees faye arrive over IPv6. `test_sock`: a connect to a
+  listener whose accept queue is full gives up at its bound, and a name moves on
+  to the address that answers. `test_url`: `[v6]:port` authorities and the
+  bracketed Host header. `test_push`, `test_enroll` and `test_blob_s3` each run
+  their fake server on `[::1]` too. `itest_tls`: a certificate naming
+  `127.0.0.1` passes for that address, with no SNI sent, and fails for `::1` and
+  for a certificate with no IP-address name, while a host name still goes as SNI.
+  `test_unfurl`: each IPv6 block the SSRF gate refuses, the embedded IPv4 of a
+  6to4 or IPv4-compatible address judged, public controls let through.
+  `test_srccount`, `test_dbwriter` and `itest_netloop`: an IPv6 source counts by
+  its /64 — sign-in attempts sprayed across one /64 share a limit, and `::1`
+  meets the per-address cap on its own key while `127.0.0.1` holds its own.
+  `test_proxyproto`: an IPv4-mapped PROXY source is written as its IPv4 address.
+  `test_signin`: the loopback listener, with IPv4 refused, binds `[::1]` and
+  redirects there. The literal check, the bracket parsing, the /64 key, the 6to4
+  judgement, the IPv4-first order, the connect bound and the IP-address name
+  check were each shown to fail their test when reverted.
 - **Rate limiter** (REQ-190/191) and the **connection state machine**
   ([PROTOCOL.md](./PROTOCOL.md) §10) — legal transitions accepted, illegal
   frames rejected with the expected reason code.

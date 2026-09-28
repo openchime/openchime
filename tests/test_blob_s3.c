@@ -32,6 +32,7 @@
 typedef struct {
     int      listen_fd;
     int      port;
+    int      v6;         /* listening on [::1] rather than 127.0.0.1 */
     pthread_t th;
     volatile int stop;
 
@@ -162,36 +163,43 @@ static void *fake_thread(void *arg) {
     return NULL;
 }
 
-static int fake_start(fake_s3 *f) {
+/* The loopback of `v6`'s family, at `port` (0: the kernel picks). */
+static socklen_t loop_addr(struct sockaddr_storage *a, int v6, int port) {
+    memset(a, 0, sizeof *a);
+    if (v6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)a;
+        a6->sin6_family = AF_INET6; a6->sin6_addr = in6addr_loopback; a6->sin6_port = htons((uint16_t)port);
+        return sizeof *a6;
+    }
+    struct sockaddr_in *a4 = (struct sockaddr_in *)a;
+    a4->sin_family = AF_INET; a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK); a4->sin_port = htons((uint16_t)port);
+    return sizeof *a4;
+}
+
+static int fake_start(fake_s3 *f, int v6) {
     memset(f, 0, sizeof *f);
-    f->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    f->v6 = v6;
+    f->listen_fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     if (f->listen_fd < 0) return -1;
     int yes = 1;
     setsockopt(f->listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = 0;                                  /* ephemeral: no port clash */
-    if (bind(f->listen_fd, (struct sockaddr *)&a, sizeof a) != 0) return -1;
+    struct sockaddr_storage a;
+    socklen_t al = loop_addr(&a, v6, 0);             /* ephemeral: no port clash */
+    if (bind(f->listen_fd, (struct sockaddr *)&a, al) != 0) { close(f->listen_fd); return -1; }
     if (listen(f->listen_fd, 8) != 0) return -1;
-    socklen_t al = sizeof a;
     if (getsockname(f->listen_fd, (struct sockaddr *)&a, &al) != 0) return -1;
-    f->port = ntohs(a.sin_port);
+    f->port = v6 ? ntohs(((struct sockaddr_in6 *)&a)->sin6_port) : ntohs(((struct sockaddr_in *)&a)->sin_port);
     return pthread_create(&f->th, NULL, fake_thread, f) == 0 ? 0 : -1;
 }
 
 static void fake_stop(fake_s3 *f) {
     f->stop = 1;
     /* Poke the accept() so the thread notices the stop flag. */
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(f->v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     if (fd >= 0) {
-        struct sockaddr_in a;
-        memset(&a, 0, sizeof a);
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        a.sin_port = htons((uint16_t)f->port);
-        if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) { /* handled */ }
+        struct sockaddr_storage a;
+        socklen_t al = loop_addr(&a, f->v6, f->port);
+        if (connect(fd, (struct sockaddr *)&a, al) == 0) { /* handled */ }
         close(fd);
     }
     pthread_join(f->th, NULL);
@@ -204,7 +212,7 @@ static void set_env_for(const fake_s3 *f) {
     char ep[64];
     /* Explicit http:// keeps this plaintext: a bare host would now default to
      * HTTPS, which is the right production default but untestable hermetically. */
-    snprintf(ep, sizeof ep, "http://127.0.0.1:%d", f->port);
+    snprintf(ep, sizeof ep, f->v6 ? "http://[::1]:%d" : "http://127.0.0.1:%d", f->port);
     setenv("OPENCHIME_S3_ENDPOINT", ep, 1);
     setenv("OPENCHIME_S3_BUCKET", "testbucket", 1);
     setenv("OPENCHIME_S3_ACCESS_KEY", "AKIDEXAMPLE", 1);
@@ -269,7 +277,7 @@ int run_blob_s3_tests(void) {
            "sizes, SigV4 header shape, delete, 404, config selection\n");
 
     fake_s3 *f = &g_fake;
-    CHECK(fake_start(f) == 0);
+    CHECK(fake_start(f, 0) == 0);
     if (f->port == 0) return failures;
     set_env_for(f);
 
@@ -339,6 +347,23 @@ int run_blob_s3_tests(void) {
     CHECK(oc_blobstore_open("build/oc-blob-fs-test") == NULL);
     clear_env();
 
+    fake_stop(f);
+
+    /* An endpoint at an IPv6 address, in brackets: split into host and
+     * port, reached over IPv6, and signed and sent with its brackets. */
+    if (fake_start(f, 1) != 0) {
+        printf("  (no IPv6 loopback on this host: the [::1] endpoint is skipped)\n");
+        return failures;
+    }
+    set_env_for(f);
+    oc_blobstore *bs6 = oc_blobstore_open("/tmp/oc-blob-s3-unused");
+    CHECK(bs6 != NULL);
+    if (bs6) {
+        round_trip(bs6, f, "cccc0001", 5000, 4096);
+        CHECK(f->saw_request == 1);
+        oc_blobstore_close(bs6);
+    }
+    clear_env();
     fake_stop(f);
     return failures;
 }

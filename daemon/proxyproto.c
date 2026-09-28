@@ -134,7 +134,13 @@ long oc_proxy_v2_parse(const uint8_t *buf, size_t len, char src[46]) {
     if (fam == 0x11) {                          /* TCP over IPv4: src, dst, ports */
         if (body < 12 || !inet_ntop(AF_INET, buf + 16, src, 46)) return -1;
     } else if (fam == 0x21) {                   /* TCP over IPv6 */
-        if (body < 36 || !inet_ntop(AF_INET6, buf + 16, src, 46)) return -1;
+        if (body < 36) return -1;
+        /* An IPv4-mapped source is written as the IPv4 address, as a direct
+         * connection's is (oc_listen_peer_text), so one client has one key. */
+        static const uint8_t mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
+        if (memcmp(buf + 16, mapped, 12) == 0) {
+            if (!inet_ntop(AF_INET, buf + 28, src, 46)) return -1;
+        } else if (!inet_ntop(AF_INET6, buf + 16, src, 46)) return -1;
     } else {
         return -1;                              /* UDP, UNIX, unspecified: not a client of ours */
     }

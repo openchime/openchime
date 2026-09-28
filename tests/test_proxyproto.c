@@ -62,6 +62,10 @@ int run_proxyproto_tests(void) {
     inet_pton(AF_INET6, "2001:db8::1", h + 32);
     memset(h + 48, 0, 4);
     CHECK(oc_proxy_v2_parse(h, 52, src) == 52 && strcmp(src, "2001:db8::7") == 0);
+    /* An IPv4-mapped source is the IPv4 client it is, written as a direct
+     * connection's is, so one client has one key however it arrived. */
+    inet_pton(AF_INET6, "::ffff:203.0.113.7", h + 16);
+    CHECK(oc_proxy_v2_parse(h, 52, src) == 52 && strcmp(src, "203.0.113.7") == 0);
 
     /* LOCAL — the forwarder's own health check: consumed, and names nobody. */
     memcpy(h, SIG, 12); h[12] = 0x20; h[13] = 0x00; h[14] = 0; h[15] = 0;

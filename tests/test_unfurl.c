@@ -69,6 +69,42 @@ static int test_ssrf_gate(void) {
     CHECK(!v6("fe80::1"));            /* link-local                         */
     CHECK(!v6("ff02::1"));            /* multicast                          */
     CHECK(!v6("2001:db8::1"));        /* documentation                      */
+    /* The IPv6 special-purpose blocks that carry, tunnel or reserve. */
+    CHECK(!v6("::7f00:1"));           /* ::/96 IPv4-compatible 127.0.0.1    */
+    CHECK(!v6("::a00:1"));            /* ::/96 IPv4-compatible 10.0.0.1     */
+    CHECK(v6("::808:808"));           /* ::/96 around a public v4: its v4   */
+    CHECK(!v6("::ffff:0:a00:1"));     /* SIIT, IPv4-translated: refused     */
+    CHECK(!v6("2002:7f00:1::1"));     /* 6to4 around 127.0.0.1              */
+    CHECK(!v6("2002:c0a8:101::1"));   /* 6to4 around 192.168.1.1            */
+    CHECK(v6("2002:808:808::1"));     /* 6to4 around a public v4            */
+    CHECK(!v6("2001::1"));            /* Teredo, a tunnel                   */
+    CHECK(!v6("2001:2::1"));          /* benchmarking                       */
+    CHECK(!v6("2001:10::1"));         /* ORCHID                             */
+    CHECK(!v6("2001:20::1"));         /* ORCHIDv2                           */
+    CHECK(!v6("2001:1ff::1"));        /* the rest of 2001::/23              */
+    CHECK(v6("2001:200::1"));         /* just above it: a real allocation   */
+    CHECK(!v6("100::1"));             /* discard-only                       */
+    CHECK(v6("100:0:0:1::1"));        /* just past the /64                  */
+    CHECK(!v6("3fff::1"));            /* documentation (RFC 9637)           */
+    CHECK(!v6("5f00::1"));            /* SRv6 SIDs                          */
+    CHECK(!v6("64:ff9b:1::1"));       /* local-use NAT64                    */
+
+    /* A link to an IPv6 address is taken (it used to be refused outright) and
+     * then meets the gate like any resolved address. */
+    {
+        char host[256], port[16];
+        CHECK(oc_unfurl_url_target("https://[2001:db8::1]:8443/x", host, sizeof host, port, sizeof port) == 0 &&
+              strcmp(host, "2001:db8::1") == 0 && strcmp(port, "8443") == 0);
+        CHECK(!v6(host));                                   /* documentation space */
+        CHECK(oc_unfurl_url_target("https://[2606:4700::1111]/", host, sizeof host, port, sizeof port) == 0 &&
+              strcmp(host, "2606:4700::1111") == 0 && strcmp(port, "443") == 0);
+        CHECK(v6(host));                                    /* public: through the gate */
+        CHECK(oc_unfurl_url_target("http://example.com:8080/a?b", host, sizeof host, port, sizeof port) == 0 &&
+              strcmp(host, "example.com") == 0 && strcmp(port, "8080") == 0);
+        CHECK(oc_unfurl_url_target("https://2001:db8::1/", host, sizeof host, port, sizeof port) != 0);
+        CHECK(oc_unfurl_url_target("https://[2001:db8::1/", host, sizeof host, port, sizeof port) != 0);
+        CHECK(oc_unfurl_url_target("ftp://example.com/", host, sizeof host, port, sizeof port) != 0);
+    }
 
     /* A family the gate cannot judge is one it does not pass. */
     {

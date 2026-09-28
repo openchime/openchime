@@ -5,6 +5,8 @@
  * the client must agree on (mention.c, searchq.c, notify.c). */
 
 #include "url.h"
+#include <stdio.h>
+#include <string.h>
 
 static int u_space(char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'; }
 static int u_delim(char ch) { return ch == '*' || ch == '_' || ch == '~' || ch == '`'; }
@@ -120,4 +122,47 @@ size_t oc_url_extract(const char *b, size_t len, oc_url_span *out, size_t max) {
         i++;
     }
     return n;
+}
+
+int oc_url_authority(const char *auth, size_t len, char *host, size_t hcap, char *port, size_t pcap) {
+    if (!auth || !host || !port || hcap == 0 || pcap == 0) return -1;
+    const char *e = auth + len;
+    const char *h = auth, *he, *pp = NULL;
+    if (len && *auth == '[') {                       /* [v6] or [v6]:port */
+        const char *rb = memchr(auth, ']', len);
+        if (!rb || rb == auth + 1) return -1;
+        h = auth + 1; he = rb;
+        if (rb + 1 < e) {
+            if (rb[1] != ':') return -1;             /* junk after the bracket */
+            pp = rb + 2;
+        }
+    } else {
+        const char *c = memchr(auth, ':', len);
+        if (c && memchr(c + 1, ':', (size_t)(e - c - 1))) return -1;   /* a bare v6 needs brackets */
+        he = c ? c : e;
+        if (c) pp = c + 1;
+    }
+    size_t hn = (size_t)(he - h);
+    if (hn == 0 || hn >= hcap) return -1;
+    memcpy(host, h, hn); host[hn] = '\0';
+    if (pp) {
+        size_t pn = (size_t)(e - pp);
+        if (pn == 0 || pn >= pcap || pn > 5) return -1;
+        long v = 0;
+        for (size_t k = 0; k < pn; k++) {
+            if (pp[k] < '0' || pp[k] > '9') return -1;
+            v = v * 10 + (pp[k] - '0');
+        }
+        if (v < 1 || v > 65535) return -1;
+        memcpy(port, pp, pn); port[pn] = '\0';
+    }
+    return 0;
+}
+
+int oc_url_hostheader(const char *host, const char *port, char *out, size_t cap) {
+    if (!host || !out || cap == 0) return -1;
+    int v6 = strchr(host, ':') != NULL;
+    int n = (port && *port) ? snprintf(out, cap, v6 ? "[%s]:%s" : "%s:%s", host, port)
+                            : snprintf(out, cap, v6 ? "[%s]" : "%s", host);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
 }

@@ -32,6 +32,9 @@ typedef struct oc_loopback oc_loopback;
  * secret is per attempt: another local process that finds the port still cannot
  * hand this listener an answer. NULL on failure. */
 oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap);
+/* A test's knob: open the listener on IPv6 loopback, as a host without IPv4
+ * loopback does (the redirect is then http://[::1]:<port>/...). */
+void oc_loopback_force_v6(int on);
 
 typedef enum {
     OC_LOOPBACK_OK        = 0,

@@ -168,7 +168,7 @@ it over on.
 
 1. The client opens a browser at **central's** `/oidc/authorize`, naming the
    target **workspace** and its own `redirect_uri` — a loopback `127.0.0.1` URI
-   on desktop (RFC 8252), or a configured `https` destination.
+   on desktop (RFC 8252), or `[::1]` on a host with no IPv4 loopback, or a configured `https` destination.
 2. **Central validates that `redirect_uri` before the user authenticates**,
    against an allowlist: loopback per RFC 8252, or exact-match https. Doing it
    at authorize rather than at callback is the point — an unvalidated

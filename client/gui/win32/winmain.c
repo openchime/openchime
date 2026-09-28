@@ -4130,7 +4130,7 @@ static void draw_menu(gfx *rt) {
         draw_text(rt, init, g_avatar, av, 0xFFFFFF);
         /* Three rows, 18px apart and non-overlapping (they used to collide). */
         draw_text(rt, nm, g_title, rf(x + 60, cy + 8, panel.right - 12, cy + 26), OC_COL_TEXT);
-        char hostline[288]; snprintf(hostline, sizeof hostline, "%s:%d", g_host, g_port);
+        char hostline[288]; oc_hostport(g_host, g_port, hostline, sizeof hostline);
         draw_text(rt, hostline, g_meta, rf(x + 60, cy + 26, panel.right - 12, cy + 43), OC_COL_MUTED);
         char mode[64]; ws_mode_line(m, mode, sizeof mode);
         draw_text(rt, mode, g_meta, rf(x + 60, cy + 42, panel.right - 12, cy + 59), OC_COL_FAINT);
@@ -10238,7 +10238,7 @@ static void draw_signin(gfx *rt, float W, float H) {
          * it says something the heading does not (a NAMED workspace resolving to
          * a host). "Sign in to 127.0.0.1:8443" over "127.0.0.1:8443" was the same
          * string twice. */
-        char sub[300]; snprintf(sub, sizeof sub, "%s:%d", g_si_host, g_si_port);
+        char sub[300]; oc_hostport(g_si_host, g_si_port, sub, sizeof sub);
         /* A browser sign-in asks for no credentials here, so it does not say so. */
         draw_text(rt, strcmp(head + 11, sub) ? sub
                       : (g_si_connecting && g_si_browser) ? "" : "Enter your credentials",
@@ -21477,10 +21477,13 @@ static void msg_menu_run(HWND hwnd, int cmd) {
          * a name would rot the moment it was (ARCH-96). The port belongs in it when
          * it is not the default — g_host holds the host alone. */
         char linkhost[288], link[360];
+        /* An IPv6 host goes in brackets, with or without a port, or its own
+         * colons would read as one (resolve.h). */
+        const char *lh = g_host[0] ? g_host : "workspace";
         if (g_port && g_port != OC_DEFAULT_PORT)
-            snprintf(linkhost, sizeof linkhost, "%s:%d", g_host[0] ? g_host : "workspace", g_port);
+            oc_hostport(lh, g_port, linkhost, sizeof linkhost);
         else
-            snprintf(linkhost, sizeof linkhost, "%s", g_host[0] ? g_host : "workspace");
+            snprintf(linkhost, sizeof linkhost, strchr(lh, ':') ? "[%s]" : "%s", lh);
         snprintf(link, sizeof link, "openchime://%s/c/%llu/m/%llu", linkhost,
                  (unsigned long long)chan, (unsigned long long)mid);
         copy_to_clipboard(hwnd, link);
@@ -21782,8 +21785,8 @@ static int permalink_follow(HWND hwnd, const char *text) {
     /* A different workspace is a real case and we do not guess: switching would
      * drop what you are reading, and we may not even hold that workspace. */
     char self[288];
-    if (g_port && g_port != OC_DEFAULT_PORT) snprintf(self, sizeof self, "%s:%d", g_host, g_port);
-    else                                     snprintf(self, sizeof self, "%s", g_host);
+    if (g_port && g_port != OC_DEFAULT_PORT) oc_hostport(g_host, g_port, self, sizeof self);
+    else snprintf(self, sizeof self, strchr(g_host, ':') ? "[%s]" : "%s", g_host);
     /* Compared against the same string the copy path builds, so the two halves
      * cannot disagree about whether a port is part of the identity. A bare host is
      * accepted too: a link written before the port was included is still ours. */
@@ -23607,7 +23610,7 @@ static void ws_key(const char *ws, char *out, size_t cap) {
 static void ws_adopt(oc_store *s, const char *key, const char *typed, const oc_endpoint *ep) {
     if (typed && typed[0]) oc_store_adopt(s, key, typed);
     if (ep) {
-        char inst[288]; snprintf(inst, sizeof inst, "%s:%d", ep->host, ep->port);
+        char inst[288]; oc_hostport(ep->host, ep->port, inst, sizeof inst);
         oc_store_adopt(s, key, inst);
     }
 }
@@ -24015,9 +24018,10 @@ static void signin_begin(HWND hwnd, const char *ws, const char *user) {
     g_view = VIEW_SIGNIN;
     g_si_step = 1; g_si_connecting = 0; g_si_err[0] = '\0';
     snprintf(g_si_ws, sizeof g_si_ws, "%s", ws ? ws : "");
-    /* A remembered "chat.acme.com" or "127.0.0.1:8443" is a self-hosted address,
-     * so open on the field that can actually hold it. */
-    g_si_advanced = (g_si_ws[0] && (strchr(g_si_ws, '.') || strchr(g_si_ws, ':'))) ? 1 : 0;
+    /* A remembered "chat.acme.com", "127.0.0.1:8443" or "[::1]:8443" is a
+     * self-hosted address, so open on the field that can actually hold it. */
+    g_si_advanced = (g_si_ws[0] && (strchr(g_si_ws, '.') || strchr(g_si_ws, ':') ||
+                                    strchr(g_si_ws, '['))) ? 1 : 0;
     if (g_si_e_ws)
         SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE,
                      (LPARAM)(g_si_advanced ? L"chat.example.com or host:port" : L"your-workspace"));

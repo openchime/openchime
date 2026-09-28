@@ -352,13 +352,50 @@ int oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd) {
     mbedtls_ssl_init(&c->ssl);
     c->fd = fd;
     c->keep = NULL;
+    c->expect_ip_len = 0;
     if ((rc = mbedtls_ssl_setup(&c->ssl, conf)) != 0) return rc;
     mbedtls_ssl_set_bio(&c->ssl, &c->fd, bio_send, bio_recv, NULL);
     return 0;
 }
 
 int oc_tls_conn_set_hostname(oc_tls_conn *c, const char *host) {
+    c->expect_ip_len = 0;
+    if (host) {
+        /* An address, bracketed or not, is matched against the certificate's
+         * iPAddress SANs after the handshake rather than sent as SNI, which
+         * RFC 6066 reserves for host names (mbedTLS would send it as given). */
+        char a[64];
+        size_t n = strlen(host);
+        if (n >= 2 && host[0] == '[' && host[n - 1] == ']') { host++; n -= 2; }
+        if (n < sizeof a) {
+            memcpy(a, host, n); a[n] = '\0';
+            size_t ipn = mbedtls_x509_crt_parse_cn_inet_pton(a, c->expect_ip);
+            if (ipn == 4 || ipn == 16) {
+                c->expect_ip_len = ipn;
+                return mbedtls_ssl_set_hostname(&c->ssl, NULL);
+            }
+        }
+    }
     return mbedtls_ssl_set_hostname(&c->ssl, host);
+}
+
+/* Does the peer's certificate name `c->expect_ip` among its iPAddress SANs? */
+static int peer_names_ip(oc_tls_conn *c) {
+    const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&c->ssl);
+    if (!peer) return 0;
+    int found = 0;
+    for (const mbedtls_x509_sequence *seq = &peer->subject_alt_names; seq && !found; seq = seq->next) {
+        if (!seq->buf.p) continue;
+        mbedtls_x509_subject_alternative_name san;
+        memset(&san, 0, sizeof san);
+        if (mbedtls_x509_parse_subject_alt_name(&seq->buf, &san) != 0) continue;
+        if (san.type == MBEDTLS_X509_SAN_IP_ADDRESS &&
+            san.san.unstructured_name.len == c->expect_ip_len &&
+            memcmp(san.san.unstructured_name.p, c->expect_ip, c->expect_ip_len) == 0)
+            found = 1;
+        mbedtls_x509_free_subject_alt_name(&san);
+    }
+    return found;
 }
 
 void oc_tls_conn_free(oc_tls_conn *c) {
@@ -409,6 +446,9 @@ oc_tls_status oc_tls_handshake(oc_tls_conn *c) {
     uint32_t vr = mbedtls_ssl_get_verify_result(&c->ssl);
     vr &= ~(uint32_t)MBEDTLS_X509_BADCERT_SKIP_VERIFY;
     if (vr != 0) return OC_TLS_ERROR;
+    /* An address set as the expected name: the chain was verified above; the
+     * certificate must also name the address (oc_tls_conn_set_hostname). */
+    if (c->expect_ip_len && !peer_names_ip(c)) return OC_TLS_ERROR;
     return OC_TLS_OK;
 }
 

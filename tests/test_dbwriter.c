@@ -1168,6 +1168,17 @@ static void test_source_rate_limit(void) {
     /* The same account from a different IP still succeeds. */
     CHECK(auth_local_from(w, 61, "target", "right-pw", "198.51.100.7") == 0);
 
+    /* IPv6 by its /64: a spray spread across one /64's addresses is one
+     * source, and is stopped as one; another /64 is someone else. */
+    for (int i = 0; i < 20; i++) {
+        char u[32], a[64];
+        snprintf(u, sizeof u, "spray6-%d", i);
+        snprintf(a, sizeof a, "2001:db8:5:6::%x", i + 1);           /* a new address each time */
+        CHECK(auth_local_from(w, 62, u, "x", a) == OC_ERR_AUTH_INVALID_TOKEN);
+    }
+    CHECK(auth_local_from(w, 62, "target", "right-pw", "2001:db8:5:6:ffff::9") == OC_ERR_AUTH_RATE_LIMITED);
+    CHECK(auth_local_from(w, 63, "target", "right-pw", "2001:db8:5:7::1") == 0);
+
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }

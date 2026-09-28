@@ -203,22 +203,9 @@ static void gen_idem(uint8_t out[OC_IDEM_SIZE]) {
 }
 
 static int dial(const char *host, int port) {
-    oc_sock_startup();
-    char portstr[16];
-    snprintf(portstr, sizeof portstr, "%d", port);
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
-    int fd = -1;
-    for (struct addrinfo *a = res; a; a = a->ai_next) {
-        fd = (int)socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, a->ai_addr, (int)a->ai_addrlen) == 0) break;
-        oc_closesock(fd); fd = -1;
-    }
-    freeaddrinfo(res);
+    /* Each address a bounded few seconds, in the system's order (sock.h), so a
+     * dead IPv6 route does not hold the connection for the kernel's minutes. */
+    int fd = oc_connect_any(host, port, OC_CONNECT_PER_ADDR_MS);
     if (fd >= 0) oc_sock_setnonblock(fd);
     return fd;
 }
@@ -2200,10 +2187,8 @@ enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3,
  * no MITM vector and pinning it only causes false alarms across local daemon
  * restarts (each fresh daemon self-signs a new cert). So we do not enforce the
  * pin for loopback — matching how tools skip TLS verification for localhost. */
-static int is_loopback(const char *host) {
-    return strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0 ||
-           strcmp(host, "localhost") == 0;
-}
+/* This machine, in any spelling (resolve.h). */
+static int is_loopback(const char *host) { return oc_addr_is_loopback(host); }
 
 /* The daemon builds the authorize URL (AUTH.md §8.1), and the client opens it only
  * over https — or plain http to loopback, which is a developer's relay. */
@@ -3372,7 +3357,7 @@ static void *net_thread(void *arg) {
     conn_store cs; memset(&cs, 0, sizeof cs);
     char workspace[288];
     char legacy[288];
-    snprintf(legacy, sizeof legacy, "%s:%d", n->host, n->port);
+    oc_hostport(n->host, n->port, legacy, sizeof legacy);
     /* Filed under the workspace the person named, not the address resolution
      * produced for it (oc_workspace_key). */
     snprintf(workspace, sizeof workspace, "%s", n->ws_key[0] ? n->ws_key : legacy);
