@@ -6438,6 +6438,9 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     int relay_more = 0;               /* datagrams left over from a bounded relay */
     int io_more = 0;                  /* I/O events left over from a bounded drain */
     uint64_t last_sweep = 0;
+    /* While it serves, this thread is the loop's: a blob operation run on it
+     * is counted, and ARCH-69 says there are none (blobstore.h). */
+    oc_blobstore_mark_loop_thread(1);
     while (indexed && !__atomic_load_n(stop, __ATOMIC_ACQUIRE)) {
         if (turn_start) stats_turn(mono_us() - turn_start);
         live_compact();   /* between turns: nothing is walking the list */
@@ -6550,6 +6553,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         }
     }
 
+    oc_blobstore_mark_loop_thread(0);   /* shutdown may abort transfers here */
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
         if (conns[fd]) conn_close(ep, conns, fd);
     /* Stop the workers before the store they borrow; this also drains any

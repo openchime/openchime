@@ -547,7 +547,19 @@ client's message round-trips while another client's download crawls through it.
 bob round-trip: idle median 57ms | during slow-download median 52ms, max 62ms
 backend 120 ms/op, 3 slow segment(s) served DURING the measurement
   (= 360 ms of backend stall the loop did not absorb)
+blob operations on the loop thread during the transfer: 0
 ```
+
+**The claim is checked by count, not by timing.** The loop marks its own thread
+while it serves, and the blob store counts every operation that runs on a marked
+thread (`oc_blobstore_loop_ops`). The test requires that count not to move while
+the slow transfer streams: zero blob operations on the loop, whatever the
+runner's load. A single blob call added to the loop's download path makes it
+count dozens and fail. The round-trips are kept as a coarse check on the
+**median** only (during < idle + half a backend stall). Single samples are left
+alone: they are at the mercy of the runner's scheduler, and a check that allowed
+one spike in nine failed a sanitizer run on CI whose median had *fallen* during
+the transfer.
 
 **The test discriminates.** Reverting `download_pump` to read inline
 on the epoll thread (the behaviour ARCH-69 forbids) makes the run **time out entirely** —

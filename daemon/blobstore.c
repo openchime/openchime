@@ -216,7 +216,20 @@ void oc_blobstore_close(oc_blobstore *bs) {
     free(bs);
 }
 
+/* The event loop's thread, as the loop marks it, and how many blob operations
+ * have run on one (blobstore.h). */
+static __thread int g_on_loop;
+static uint64_t     g_loop_ops;
+
+void oc_blobstore_mark_loop_thread(int on) { g_on_loop = on; }
+uint64_t oc_blobstore_loop_ops(void) { return __atomic_load_n(&g_loop_ops, __ATOMIC_RELAXED); }
+
+static void note_op(void) {
+    if (g_on_loop) __atomic_add_fetch(&g_loop_ops, 1, __ATOMIC_RELAXED);
+}
+
 oc_blob_writer *oc_blob_put_begin(oc_blobstore *bs, const char *key, uint64_t size_hint) {
+    note_op();
     if (!bs) return NULL;
     void *w = bs->be->put_begin(bs->store, key, size_hint);
     if (!w) return NULL;
@@ -228,10 +241,12 @@ oc_blob_writer *oc_blob_put_begin(oc_blobstore *bs, const char *key, uint64_t si
 }
 
 int oc_blob_put_chunk(oc_blob_writer *w, const void *data, size_t len) {
+    note_op();
     return (w && w->be) ? w->be->put_chunk(w->w, data, len) : -1;
 }
 
 int oc_blob_put_commit(oc_blob_writer *w) {
+    note_op();
     if (!w) return -1;
     int rc = w->be->put_commit(w->w);
     free(w);
@@ -239,12 +254,14 @@ int oc_blob_put_commit(oc_blob_writer *w) {
 }
 
 void oc_blob_put_abort(oc_blob_writer *w) {
+    note_op();
     if (!w) return;
     w->be->put_abort(w->w);
     free(w);
 }
 
 oc_blob_reader *oc_blob_get_begin(oc_blobstore *bs, const char *key, uint64_t *size_out) {
+    note_op();
     if (!bs) return NULL;
     void *r = bs->be->get_begin(bs->store, key, size_out);
     if (!r) return NULL;
@@ -256,15 +273,18 @@ oc_blob_reader *oc_blob_get_begin(oc_blobstore *bs, const char *key, uint64_t *s
 }
 
 long oc_blob_get_chunk(oc_blob_reader *r, void *buf, size_t cap) {
+    note_op();
     return (r && r->be) ? r->be->get_chunk(r->r, buf, cap) : -1;
 }
 
 void oc_blob_get_close(oc_blob_reader *r) {
+    note_op();
     if (!r) return;
     r->be->get_close(r->r);
     free(r);
 }
 
 int oc_blob_delete(oc_blobstore *bs, const char *key) {
+    note_op();
     return (bs && bs->be) ? bs->be->del(bs->store, key) : -1;
 }
