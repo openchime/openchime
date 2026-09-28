@@ -1825,7 +1825,7 @@ static int      g_selecting;    /* left button held, dragging a selection */
 /* Members-pane row hit-boxes. The full rect, not just top/bot: testing y alone
  * made every click at that height — right across the transcript — open a
  * profile, which is how the profile pane kept appearing unbidden. */
-/* `rm` is the row's Remove while one is shown (hovered, or in MEM_REMOVING), and
+/* `rm` is the row's Remove while one is shown (the hovered row's), and
  * `via` whether it is dimmed because a group keeps them in. */
 static struct { rectf r; uint64_t uid; rectf rm; int via; } g_memrows[256];
 static int g_n_memrows;
@@ -1834,10 +1834,8 @@ static int g_n_memrows;
  * while the row is hovered, and is kept here while it is drawn. */
 static struct { rectf r, rm; uint64_t gid; } g_memgrprows[32];
 static int g_n_memgrprows;
-static rectf g_mem_grp_add, g_mem_grp_rm;
-/* Add people / Remove people under the header, and the picker's Add while it
- * is open (Add people reads Cancel meanwhile). */
-static rectf g_mem_ppl_add, g_mem_ppl_rm, g_mem_pick_add;
+/* The picker's Add and Cancel, while it is open. */
+static rectf g_mem_pick_add, g_mem_pick_cancel;
 static struct { rectf rm; uint64_t uid; } g_memrm;
 /* The members pane scrolls (REQ-031): a channel roster runs to 500, the pane
  * holds about twenty, and the rest used to be unreachable -- the list simply
@@ -1909,11 +1907,10 @@ static void     grp_pick_close(void);
 static int      grp_pick_commit(void);
 static int      grp_pick_click(int x, int y);
 static int      grp_pick_chosen(void);
-/* The members pane's own modes (REQ-031): adding people with the picker, which
- * is then the channel's (TGT_HOST_CHANNEL), or removing them, with Remove on
- * every row. Both belong to the channel they were started for and end when
- * another is shown. */
-enum { MEM_NORMAL = 0, MEM_ADDING, MEM_REMOVING };
+/* The members pane's one mode (REQ-031): adding people with the picker, which
+ * is then the channel's (TGT_HOST_CHANNEL). It belongs to the channel it was
+ * started for and ends when another is shown. */
+enum { MEM_NORMAL = 0, MEM_ADDING };
 static int      g_mem_mode;
 static uint64_t g_mem_mode_cid;
 static int      g_chan_pick_focus;  /* the channel's picker has the keys */
@@ -2010,6 +2007,17 @@ static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
 static rectf g_members_btn;       /* header toggle hit-box */
+/* Add people, beside the member count (REQ-031): opens the members pane with
+ * the people picker. Not in DMs. */
+static rectf g_addppl_btn;
+/* The pane's GROUPS subheading's + (REQ-309): add a group to the channel. */
+static rectf g_grp_plus;
+/* Tooltips for those two icon-only buttons, drawn BELOW them -- the header is
+ * at the top of the window, where the toolbar's above-the-button tips would
+ * have no room -- on the toolbar's dwell. 0 none, 1 Add people, 2 Add a group. */
+static int         g_chtip = 0;
+static ULONGLONG   g_chtip_since;
+static int         g_chtip_shown;
 enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
 /* The Drafts pane's own tabs (REQ-228), Slack's three. Numbered separately from
  * the channel tabs above: they share a drawing routine, not a meaning. */
@@ -8936,6 +8944,7 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         right_used += text_width(ulbl, g_meta) + UIS(22) + UIS(12);
     }
     if (c && oc_model_calls_available(m)) right_used += UIS(58);     /* the call button */
+    if (c && c->kind != OC_CHANNEL_KIND_DM) right_used += UIS(42);  /* Add people */
     float title_r = x0 + w - right_used - UIS(12);
     if (title_r < x0 + UIS(80)) title_r = x0 + UIS(80);   /* never nothing at all */
 
@@ -8963,11 +8972,26 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
                                       g_memchip.right, g_memchip.bottom), mcol);
     g_members_btn = rf(0, 0, 0, 0);   /* superseded by the chip */
 
+    float statr = g_memchip.left - 12;
+    /* Add people, beside the count it changes: the members pane opens with the
+     * people picker. A DM takes no one. */
+    if (c && c->kind != OC_CHANNEL_KIND_DM) {
+        g_addppl_btn = rf(statr - UIS(30), 13, statr, HEADER_H - 13);
+        int hot = in_rect(g_addppl_btn, g_mouse_x, g_mouse_y);
+        if (hot) fill_round(rt, g_addppl_btn, OC_R_CONTROL, OC_COL_HOVER);
+        stroke_round(rt, g_addppl_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        float ic = UIS(18), cx = (g_addppl_btn.left + g_addppl_btn.right) / 2,
+              cy = (g_addppl_btn.top + g_addppl_btn.bottom) / 2;
+        draw_lucide(rt, OC_ICON_USER_PLUS, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
+                    hot ? OC_COL_TEXT : OC_COL_MUTED);
+        statr = g_addppl_btn.left - 12;
+    } else {
+        g_addppl_btn = rf(0, 0, 0, 0);
+    }
     /* Talking mode (REQ-291): one button, and it means "read this conversation to
      * me from now on". Shown only where the daemon speaks (REQ-295), so a client
      * against a daemon without read-aloud has no dead control. Lit while it is
      * on, with what is still waiting to be read. */
-    float statr = g_memchip.left - 12;
     /* Calls (REQ-301): start one here, or -- lit, with how many are in it --
      * go to the one going on. Only where the daemon carries calls. */
     if (m && oc_model_calls_available(m) && c) {
@@ -9906,8 +9930,8 @@ static void draw_reactors_list(gfx *rt, const oc_model *m, rectf reg);
 static void mem_hits_clear(void) {
     g_n_memrows = 0;
     g_n_memgrprows = 0;
-    g_mem_grp_add = g_mem_grp_rm = g_memrm.rm = rf(0, 0, 0, 0);
-    g_mem_ppl_add = g_mem_ppl_rm = g_mem_pick_add = rf(0, 0, 0, 0);
+    g_memrm.rm = g_grp_plus = rf(0, 0, 0, 0);
+    g_mem_pick_add = g_mem_pick_cancel = rf(0, 0, 0, 0);
     g_memrm.uid = 0;
 }
 
@@ -9977,10 +10001,11 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
      * arrives after the pane opens and shrinks when somebody leaves, and a clamp
      * that only ran on the wheel would leave the pane scrolled past its end with
      * nothing in it. */
-    /* The channel's groups (REQ-309) head the list, one row each: the people
-     * they bring are listed below with everyone else, marked. Above them, the
-     * channel menu's four items as buttons: Add people and Remove people, Add
-     * group and Remove group. */
+    /* The channel's groups (REQ-309) head the list, under a GROUPS subheading
+     * whose + adds one, one row each with its own Remove; the people they bring
+     * are listed below with everyone else, marked. Every action is beside what
+     * it acts on: Add people is in the header, beside the count; a person's
+     * Remove is on their row. */
     const oc_channel *mch = oc_model_channel((oc_model *)m, g_sel);
     int named = mch && mch->kind != OC_CHANNEL_KIND_DM;
     uint16_t n_cg = mch ? mch->n_groups : 0;
@@ -9990,29 +10015,33 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                        (g_mem_mode == MEM_ADDING && g_tgt_host != TGT_HOST_CHANNEL)))
         mem_mode_set(MEM_NORMAL, 0);
     float top = 40, pick_bottom = 0;
-    if (named) {
+    g_grp_plus = rf(0, 0, 0, 0);
+    /* Adding: the people picker (REQ-229), the full width of the pane, with Add
+     * (dimmed until someone is chosen) and Cancel under it. Its list floats over
+     * the roster, so it is drawn after it. */
+    if (named && g_mem_mode == MEM_ADDING) {
         float bw = (W - x0 - 40) / 2;
-        g_mem_ppl_add = rf(x0 + 16, 44, x0 + 16 + bw, 70);
-        mem_button(rt, g_mem_ppl_add, g_mem_mode == MEM_ADDING ? "Cancel" : "Add people", 0, 0);
-        g_mem_ppl_rm = rf(x0 + 24 + bw, 44, x0 + 24 + 2 * bw, 70);
-        mem_button(rt, g_mem_ppl_rm, g_mem_mode == MEM_REMOVING ? "Done" : "Remove people", 0, 0);
-        g_mem_grp_add = rf(x0 + 16, 76, x0 + 16 + bw, 102);
-        mem_button(rt, g_mem_grp_add, "Add group", 0, 0);
-        if (n_cg) {
-            g_mem_grp_rm = rf(x0 + 24 + bw, 76, x0 + 24 + 2 * bw, 102);
-            mem_button(rt, g_mem_grp_rm, "Remove group", 0, 0);
-        }
-        top = 108;
-        /* Adding: the people picker (REQ-229), the full width of the pane, and
-         * Add under it, dimmed until someone is chosen. Its list floats over the
-         * roster, so it is drawn after it. */
-        if (g_mem_mode == MEM_ADDING) {
-            float ph = tgt_draw(rt, rf(x0 + 16, top, W - 16, top + UIS(38)), g_chan_pick_focus);
-            pick_bottom = top + ph;
-            g_mem_pick_add = rf(x0 + 16, pick_bottom + 6, x0 + 16 + bw, pick_bottom + 32);
-            mem_button(rt, g_mem_pick_add, "Add", 0, tgt_n_chosen() == 0);
-            top = pick_bottom + 38;
-        }
+        float ph = tgt_draw(rt, rf(x0 + 16, top + 4, W - 16, top + 4 + UIS(38)), g_chan_pick_focus);
+        pick_bottom = top + 4 + ph;
+        g_mem_pick_add = rf(x0 + 16, pick_bottom + 6, x0 + 16 + bw, pick_bottom + 32);
+        mem_button(rt, g_mem_pick_add, "Add", 0, tgt_n_chosen() == 0);
+        g_mem_pick_cancel = rf(x0 + 24 + bw, pick_bottom + 6, x0 + 24 + 2 * bw, pick_bottom + 32);
+        mem_button(rt, g_mem_pick_cancel, "Cancel", 0, 0);
+        top = pick_bottom + 38;
+    }
+    /* GROUPS, quiet like the pane's own title, and its + at the right. */
+    float grp_head = 0;
+    if (named) {
+        grp_head = UIS(26);
+        draw_text(rt, "GROUPS", g_meta, rf(x0 + 16, top, W - 44, top + grp_head), OC_COL_FAINT);
+        g_grp_plus = rf(W - 38, top + (grp_head - UIS(22)) / 2, W - 16, top + (grp_head + UIS(22)) / 2);
+        int hot = in_rect(g_grp_plus, g_mouse_x, g_mouse_y);
+        if (hot) fill_round(rt, g_grp_plus, OC_R_CONTROL, OC_COL_HOVER);
+        float ic = UIS(14), cx = (g_grp_plus.left + g_grp_plus.right) / 2,
+              cy = (g_grp_plus.top + g_grp_plus.bottom) / 2;
+        draw_lucide(rt, OC_ICON_PLUS, rf(cx - ic / 2, cy - ic / 2, cx + ic / 2, cy + ic / 2),
+                    hot ? OC_COL_TEXT : OC_COL_MUTED);
+        top += grp_head;
     }
     y = top;
     float view = H - top;
@@ -10104,13 +10133,11 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         /* In through a group (REQ-309): said, since it is why they cannot be
          * removed from the channel alone. Hovered, the row offers Remove in the
          * label's place -- dimmed for such a member, and a click says why. */
-        /* Removing: every row but yours offers it, not only the hovered one. */
         rectf row_rm = rf(0, 0, 0, 0);
         int row_via = 0;
         {
             const oc_group_view *vg = oc_model_group(m, oc_model_via_group(m, g_sel, cm->user_id));
-            int can_rm = named && cm->user_id != m->user_id && y >= top &&
-                         (g_mem_mode == MEM_REMOVING || g_mem_hover == cm->user_id);
+            int can_rm = named && cm->user_id != m->user_id && y >= top && g_mem_hover == cm->user_id;
             if (can_rm) {
                 rectf rm = rf(W - 76, y + 4, W - 14, y + ROW_H - 4);
                 mem_button(rt, rm, "Remove", !vg, !!vg);
@@ -11133,6 +11160,19 @@ static void draw_tip(gfx *rt, rectf b, const char *name, const char *chord, floa
     draw_text(rt, name, g_meta, rf(tip.left + 12, tip.top, tip.right, tip.bottom), 0xFFFFFF);
     if (cw > 0)
         draw_text(rt, chord, g_meta, rf(tip.left + 12 + nw + 10, tip.top, tip.right, tip.bottom), 0xA8ADB4);
+}
+
+/* draw_tip's twin for a button at the top of the window: the tip hangs below
+ * it, clamped to the window's width. */
+static void draw_tip_below(gfx *rt, rectf b, const char *name, float lim0, float lim1) {
+    float tw = text_width(name, g_meta) + 24, th = 26.0f;
+    float tx = (b.left + b.right) / 2 - tw / 2;
+    if (tx + tw > lim1 - 4) tx = lim1 - 4 - tw;
+    if (tx < lim0 + 4) tx = lim0 + 4;
+    rectf tip = rf(tx, b.bottom + 6, tx + tw, b.bottom + 6 + th);
+    fill_round(rt, rf(tip.left + 1, tip.top + 2, tip.right + 1, tip.bottom + 2), OC_R_CONTROL, OC_COL_RAIL);
+    fill_round_a(rt, tip, OC_R_CONTROL, 0x000000, 0.82f);
+    draw_text(rt, name, g_meta, rf(tip.left + 12, tip.top, tip.right, tip.bottom), 0xFFFFFF);
 }
 
 /* The action row's tooltip, if the pointer has rested on one of `first`..`last`. */
@@ -14942,7 +14982,7 @@ static int chan_pick_commit(void) {
     return 1;
 }
 
-/* A click on the channel's picker, its list, or its Add. */
+/* A click on the channel's picker, its list, or its Add or Cancel. */
 static int chan_pick_click(int x, int y) {
     if (!chan_pick_live()) return 0;
     if (g_chan_pick_focus)
@@ -14964,12 +15004,30 @@ static int chan_pick_click(int x, int y) {
         if (!chan_pick_commit()) toast_push("Choose who to add first.", 0);
         return 1;
     }
+    if (in_rect(g_mem_pick_cancel, x, y)) { mem_mode_set(MEM_NORMAL, 0); return 1; }
     if (g_chan_pick_focus) {
         int listed = in_rect(g_tgt_list, x, y);
         g_chan_pick_focus = 0;
         if (listed) return 1;
     }
     return 0;
+}
+
+/* Open channel `cid`'s members pane (REQ-031), with the people picker when
+ * `adding`: the header's Add people and the channel menu's Add someone and
+ * Remove someone all come here, the last without the picker -- a person's
+ * Remove is on their row. */
+static void members_open(HWND hwnd, uint64_t cid, int adding) {
+    if (cid != g_sel) select_channel(cid);
+    if (!transcript_shell()) g_view = VIEW_HOME;
+    rp_push(RP_MEMBERS);
+    mem_mode_set(adding ? MEM_ADDING : MEM_NORMAL, cid);
+    layout_composer(hwnd);
+    /* The pane yields to the conversation in a narrow window; say so rather
+     * than seem to do nothing. */
+    RECT rc; GetClientRect(hwnd, &rc);
+    if (members_w(DIPF(rc.right)) <= 0)
+        toast_push("Widen the window to show the channel's members.", 0);
 }
 
 /* ---- New message (REQ-229) -------------------------------------------------
@@ -16397,6 +16455,12 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else mem_hits_clear();
+        /* The header's and the pane's icon-only buttons' names, over both. */
+        if (g_chtip && GetTickCount64() - g_chtip_since >= FMT_TIP_MS) {
+            rectf tb = g_chtip == 1 ? g_addppl_btn : g_grp_plus;
+            if (tb.right > tb.left)
+                draw_tip_below(rt, tb, g_chtip == 1 ? "Add people" : "Add a group", 0, W);
+        }
     } else {
         g_n_ac = 0;
         /* A modal's picker belongs to the modal, not the composer, and the
@@ -18243,6 +18307,8 @@ enum {
     AT_GRPCHIP,       /* ... drop one chosen person */
     AT_GRPPICK,       /* ... accept one match */
     AT_GRPADD,        /* ... add the chosen people */
+    AT_ADDPPL,        /* the header's Add people */
+    AT_GRPPLUS,       /* the members pane's Add a group */
     AT_DTAB,          /* payload: drafts tab index */
     AT_REACTCHIP,     /* payload: who-reacted chip index — add or take back yours */
     AT_HOVERREACT,    /* payload: quick-reaction index on the hovered message */
@@ -18496,6 +18562,11 @@ static void a11y_publish_scene(const oc_model *m) {
     }
     if (g_calls_plus.right > g_calls_plus.left && n < OC_ACC_MAX)
         acc_push(items, &n, OC_ACC_BUTTON, "sidebar.calls.new", "Start a call", g_calls_plus, ATOK(AT_MENU, CC_PLUS));
+    /* The two icon-only membership buttons, named as their tooltips are. */
+    if (g_addppl_btn.right > g_addppl_btn.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "header.addpeople", "Add people", g_addppl_btn, ATOK(AT_ADDPPL, 0));
+    if (g_grp_plus.right > g_grp_plus.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "members.groups.add", "Add a group", g_grp_plus, ATOK(AT_GRPPLUS, 0));
     for (int i = 0; i < g_n_call_rows && n < OC_ACC_MAX; i++) {
         const oc_call_view *cv = oc_model_call_in(m, g_call_rows[i].ch);
         char aid[OC_ACC_AID_MAX], nm[160], lbl[96];
@@ -22743,6 +22814,11 @@ static int on_click(HWND hwnd, int x, int y) {
         listen_set(hwnd, on ? 0 : 1);
         return 1;
     }
+    /* Add people, beside the count: the pane, with the people picker. */
+    if (in_rect(g_addppl_btn, x, y) && g_sel) {
+        members_open(hwnd, g_sel, 1);
+        return 1;
+    }
     /* The member chip toggles the roster pane. */
     if (in_rect(g_memchip, x, y)) {
         g_show_members = !g_show_members;
@@ -23096,16 +23172,7 @@ static int on_click(HWND hwnd, int x, int y) {
         if (pm && g_show_members) {
             /* The picker first: its list floats over the rows below. */
             if (chan_pick_click(x, y)) return 1;
-            if (in_rect(g_mem_ppl_add, x, y)) {
-                mem_mode_set(g_mem_mode == MEM_ADDING ? MEM_NORMAL : MEM_ADDING, g_sel);
-                return 1;
-            }
-            if (in_rect(g_mem_ppl_rm, x, y)) {
-                mem_mode_set(g_mem_mode == MEM_REMOVING ? MEM_NORMAL : MEM_REMOVING, g_sel);
-                return 1;
-            }
-            if (in_rect(g_mem_grp_add, x, y)) { channel_group_pick(hwnd, pm, g_sel, 1); return 1; }
-            if (in_rect(g_mem_grp_rm, x, y))  { channel_group_pick(hwnd, pm, g_sel, 0); return 1; }
+            if (in_rect(g_grp_plus, x, y)) { channel_group_pick(hwnd, pm, g_sel, 1); return 1; }
             for (int i = 0; i < g_n_memgrprows; i++)
                 if (in_rect(g_memgrprows[i].rm, x, y)) {
                     channel_group_remove_ask(hwnd, pm, g_sel, g_memgrprows[i].gid);
@@ -26195,20 +26262,10 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     case 7:
         /* In the channel's members pane, where its people are: Add someone
          * opens the people picker there (REQ-229), which offers only who is not
-         * in it yet; Remove someone puts Remove on every row, dimmed with the
-         * reason for anyone a group keeps in (REQ-309). A typed name matched
-         * exactly used to stand in for both. */
-        if (cid != g_sel) select_channel(cid);
-        if (!transcript_shell()) g_view = VIEW_HOME;
-        rp_push(RP_MEMBERS);
-        mem_mode_set(cmd == 6 ? MEM_ADDING : MEM_REMOVING, cid);
-        layout_composer(hwnd);
-        {   /* The pane yields to the conversation in a narrow window; say so
-             * rather than seem to do nothing. */
-            RECT rc; GetClientRect(hwnd, &rc);
-            if (members_w(DIPF(rc.right)) <= 0)
-                toast_push("Widen the window to show the channel's members.", 0);
-        }
+         * in it yet; Remove someone opens the roster, where each person's
+         * Remove is on their row, dimmed with the reason for anyone a group
+         * keeps in (REQ-309). */
+        members_open(hwnd, cid, cmd == 6);
         break;
     case 8:
     case 9: channel_group_pick(hwnd, m, cid, cmd == 8); break;
@@ -26451,19 +26508,20 @@ static void test_dump(const char *path) {
     fprintf(f, "\"\n");
     /* The members pane's group buttons, group rows' Removes and the hovered
      * row's Remove, in DIPs as `click` takes them (0 0 0 0 when not drawn). */
-    fprintf(f, "memgrp add=%.0f,%.0f,%.0f,%.0f rm=%.0f,%.0f,%.0f,%.0f memrm=%llu:%.0f,%.0f,%.0f,%.0f rows=",
-            g_mem_grp_add.left, g_mem_grp_add.top, g_mem_grp_add.right, g_mem_grp_add.bottom,
-            g_mem_grp_rm.left, g_mem_grp_rm.top, g_mem_grp_rm.right, g_mem_grp_rm.bottom,
+    fprintf(f, "memgrp plus=%.0f,%.0f,%.0f,%.0f memrm=%llu:%.0f,%.0f,%.0f,%.0f rows=",
+            g_grp_plus.left, g_grp_plus.top, g_grp_plus.right, g_grp_plus.bottom,
             (unsigned long long)g_memrm.uid, g_memrm.rm.left, g_memrm.rm.top, g_memrm.rm.right, g_memrm.rm.bottom);
     for (int i = 0; i < g_n_memgrprows; i++)
         fprintf(f, "%s%llu:%.0f,%.0f,%.0f,%.0f", i ? ";" : "", (unsigned long long)g_memgrprows[i].gid,
                 g_memgrprows[i].rm.left, g_memgrprows[i].rm.top, g_memgrprows[i].rm.right, g_memgrprows[i].rm.bottom);
     fprintf(f, "\n");
-    /* Add people / Remove people, and the picker's Add while it is open. */
-    fprintf(f, "memppl add=%.0f,%.0f,%.0f,%.0f rm=%.0f,%.0f,%.0f,%.0f pickadd=%.0f,%.0f,%.0f,%.0f\n",
-            g_mem_ppl_add.left, g_mem_ppl_add.top, g_mem_ppl_add.right, g_mem_ppl_add.bottom,
-            g_mem_ppl_rm.left, g_mem_ppl_rm.top, g_mem_ppl_rm.right, g_mem_ppl_rm.bottom,
-            g_mem_pick_add.left, g_mem_pick_add.top, g_mem_pick_add.right, g_mem_pick_add.bottom);
+    /* The header's Add people, the picker's Add and Cancel while it is open, and
+     * which icon's tooltip is up (0 none, 1 Add people, 2 Add a group). */
+    fprintf(f, "memppl add=%.0f,%.0f,%.0f,%.0f pickadd=%.0f,%.0f,%.0f,%.0f pickcancel=%.0f,%.0f,%.0f,%.0f tip=%d\n",
+            g_addppl_btn.left, g_addppl_btn.top, g_addppl_btn.right, g_addppl_btn.bottom,
+            g_mem_pick_add.left, g_mem_pick_add.top, g_mem_pick_add.right, g_mem_pick_add.bottom,
+            g_mem_pick_cancel.left, g_mem_pick_cancel.top, g_mem_pick_cancel.right, g_mem_pick_cancel.bottom,
+            g_chtip && GetTickCount64() - g_chtip_since >= FMT_TIP_MS ? g_chtip : 0);
     {
         const oc_channel *gc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         const oc_group_view *vg = gc ? oc_model_group(m, oc_model_via_group(m, g_sel, m->user_id)) : NULL;
@@ -28630,6 +28688,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_act_tip_shown = 1;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            if (g_chtip && !g_chtip_shown && GetTickCount64() - g_chtip_since >= FMT_TIP_MS) {
+                g_chtip_shown = 1;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             /* Poll the attempt's outcome HERE, not only in the g_client-gated
              * block below: signing in from the signed-out state has no g_client,
              * and gating the poll on one left that sign-in on "Signing in…"
@@ -29685,6 +29747,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
             }
         }
+        {   /* Add people and Add a group: which one the pointer rests on, for
+             * its tooltip, and the hover each draws. */
+            int ch = 0;
+            if (!pointer_blocked()) {
+                if (in_rect(g_addppl_btn, (float)mx, (float)my)) ch = 1;
+                else if (in_rect(g_grp_plus, (float)mx, (float)my)) ch = 2;
+            }
+            if (ch != g_chtip) {
+                g_chtip = ch;
+                g_chtip_since = GetTickCount64();
+                g_chtip_shown = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
         {   /* The action rows' tooltips: which button the pointer rests on, on
              * the toolbar's dwell. Every drawn one is asked, both panes', since
              * an undrawn one has an empty rect. */
@@ -30064,6 +30140,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case AT_GRPPICK:   if (g_tgt_host != TGT_HOST_NEWMSG) tgt_accept((int)arg); break;
         case AT_GRPADD:    if (g_tgt_host == TGT_HOST_CHANNEL) chan_pick_commit(); else grp_pick_commit(); break;
+        case AT_ADDPPL:    if (g_sel) members_open(hwnd, g_sel, 1); break;
+        case AT_GRPPLUS:   if (g_sel && model()) channel_group_pick(hwnd, model(), g_sel, 1); break;
         case AT_VIDEO:     vm_command(hwnd, (int)arg); break;
         case AT_VOICE:
             if (arg == 1) dict_freetalk_toggle(hwnd);

@@ -165,29 +165,42 @@ check "carol, in directly too, stays" waitfor a 10 carol_stays
 
 say "== the pane's Add group puts it back; a direct member's Remove takes them out"
 "$PAIR" a formnext '0' >/dev/null
-click_rect a "$(field a 'memgrp ' add)"
+click_rect a "$(field a 'memgrp ' plus)"               # the GROUPS subheading's +
 has_group() { line a 'chgroups ' | grep -Eq ' n=1 '; }
 check "Add group gives the channel @crew again" waitfor a 10 has_group
 check "and bob is back in" waitfor b 10 b_in
-click_rect a "$(field a 'memppl ' add)"               # the pane's Add people
+click_rect a "$(field a 'memppl ' add)"               # the header's Add people
 "$PAIR" a grppick u1 >/dev/null
 "$PAIR" a grppick u2 >/dev/null
 "$PAIR" a grppick - >/dev/null                         # both in one Add
 u1_in() { [ -n "$(memrow_of u1)" ] && [ -n "$(memrow_of u2)" ]; }
 check "the pane's Add people adds two at once" waitfor a 10 u1_in
 
-say "== Remove someone: Remove on every row, dimmed for bob"
+say "== Remove someone: the roster, where each person's Remove is on their row"
 "$PAIR" a chmenu 7 >/dev/null                          # Remove someone
-removing() { [ "$(field a 'grppick ' memmode)" = 2 ] && [ -n "$(rm_of u1)" ] && [ -n "$(rm_of u2)" ] &&
-             [ -n "$(rm_of bob)" ] && [ "$(via_of bob)" = 1 ] && [ "$(via_of u1)" = 0 ] && [ -z "$(rm_of alice)" ]; }
-check "every row but alice's offers Remove, bob's dimmed" waitfor a 5 removing
-"$PAIR" a shot channel_removing >/dev/null
+roster() { [ "$(field a 'grppick ' memmode)" = 0 ] && [ -n "$(memrow_of u1)" ] && [ -z "$(field a 'memppl ' pickadd | tr -d '0,')" ]; }
+check "it opens the roster, with no mode and no picker" waitfor a 5 roster
+r="$(memrow_of u1)"; IFS=, read -r l t rr bb <<< "$r"
+"$PAIR" a move $(( (l + rr) / 2 )) $(( (t + bb) / 2 )) >/dev/null
+u1_rm() { [ -n "$(rm_of u1)" ] && [ "$(via_of u1)" = 0 ] && [ -z "$(rm_of u2)" ]; }
+check "hovered, u1's row alone offers Remove" waitfor a 5 u1_rm
 click_rect a "$(rm_of u1)"
 u1_out() { [ -z "$(memrow_of u1)" ] && [ -n "$(memrow_of u2)" ] && [ -n "$(memrow_of bob)" ]; }
 check "u1's Remove takes u1 out, and nobody else" waitfor a 10 u1_out
-click_rect a "$(field a 'memppl ' rm)"                 # Done
-done_rm() { [ "$(field a 'grppick ' memmode)" = 0 ] && [ -z "$(rm_of u2)" ]; }
-check "Done ends it" waitfor a 5 done_rm
+
+say "== no rows of buttons; the two icons are named on hover"
+flat() { [ -n "$(field a 'memgrp ' plus | tr -d '0,')" ] && [ -n "$(field a 'memppl ' add | tr -d '0,')" ]; }
+check "the header has Add people and GROUPS has its +" waitfor a 5 flat
+"$PAIR" a shot channel_pane_flat >/dev/null
+hover_on() { local l t rr bb; IFS=, read -r l t rr bb <<< "$1"; "$PAIR" a move $(( (l + rr) / 2 )) $(( (t + bb) / 2 )) >/dev/null; }
+hover_on "$(field a 'memppl ' add)"; sleep 0.8
+tip_ppl() { [ "$(field a 'memppl ' tip)" = 1 ]; }
+check "resting on the header's icon shows \"Add people\"" waitfor a 5 tip_ppl
+"$PAIR" a shot channel_tip_addpeople >/dev/null
+hover_on "$(field a 'memgrp ' plus)"; sleep 0.8
+tip_grp() { [ "$(field a 'memppl ' tip)" = 2 ]; }
+check "resting on the + shows \"Add a group\"" waitfor a 5 tip_grp
+"$PAIR" a move 5 500 >/dev/null
 
 say "== a click in the composer takes the keys back from the picker"
 click_rect a "$(field a 'memppl ' add)"               # the picker, with the keys
@@ -198,7 +211,7 @@ click_rect a "$(line a 'ed len=' | grep -o 'box=[0-9,.-]*' | cut -d= -f2)"
 composer_has() { [ "$(field a 'ed len=' len)" = 2 ] && [ "$(field a 'grppick ' chanfocus)" = 0 ]; }
 check "what is typed next goes to the composer, not the picker" waitfor a 5 composer_has
 "$PAIR" a type '' >/dev/null
-click_rect a "$(field a 'memppl ' add)"               # Cancel
+click_rect a "$(field a 'memppl ' pickcancel)"        # Cancel
 
 say "== New message still takes a channel, and stops at 8 people"
 "$PAIR" a view newmsg >/dev/null
