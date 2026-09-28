@@ -6,9 +6,11 @@
  * that output held by a reader that stops is reported written once it drains;
  * that close_after closes after the last byte; that a peer's close is reported
  * once and the socket kept until the loop closes it; and that a command for a
- * connection already closed is ignored; and that an HTTP connection's request
- * is parsed there, sent in pieces or all at once, and reported once, or refused
- * with the status that fits. */
+ * connection already closed is ignored. And HTTP (ARCH-32): a request for a
+ * loop route is parsed there, sent in pieces or at once, and reported once; a
+ * static route is answered there; every refusal -- 400, 404, 405, 408, 413 --
+ * is answered there and never reported; one request per connection; and a
+ * plaintext socket (the health port, ARCH-25) is served its own site. */
 
 #include "ioloop.h"
 #include "framebuf.h"
@@ -154,12 +156,113 @@ static int open_conn(oc_ioloop *io, int lfd, uint16_t port, uint64_t id, tclient
 static const char *oc1_alpn[] = { OC_ALPN_PROTO, NULL };
 static const char *http_alpn[] = { OC_ALPN_HTTP11, NULL };
 
+/* The sites the HTTP checks are served: on TLS a loop route and a static one,
+ * with a small body limit so 413 is cheap to reach; in plaintext a health route
+ * and a fallback for everything else. */
+static const oc_http_route T_ROUTES[] = {
+    { "POST", "/webhook/", 1, OC_HTTP_LOOP, 64, NULL, NULL, 0 },
+    { "GET",  "/static",   0, OC_HTTP_STATIC, 0, "text/plain", "hello", 5 },
+};
+static const oc_http_site T_SITE = { T_ROUTES, 2, NULL };
+static const oc_http_route P_ROUTES[] = {
+    { NULL, "/healthz", 0, OC_HTTP_STATIC, 16, "text/plain", "OK", 2 },
+};
+static const oc_http_route P_FALLBACK = { NULL, "/", 1, OC_HTTP_STATIC, 16, "text/html", "<p>here</p>", 11 };
+static const oc_http_site P_SITE = { P_ROUTES, 1, &P_FALLBACK };
+
+/* Everything the peer sends until it closes, as a string -- or what came within
+ * five seconds, so an answer that never comes fails the check instead of
+ * hanging the suite. */
+static size_t tread_all(tclient *c, char *buf, size_t cap) {
+    size_t got = 0;
+    struct timeval t0, t; gettimeofday(&t0, NULL);
+    while (got + 1 < cap) {
+        size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->conn, (uint8_t *)buf + got, cap - 1 - got, &n);
+        gettimeofday(&t, NULL);
+        if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_usec - t0.tv_usec) / 1000 > 5000) break;
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
+        if (st != OC_TLS_OK || !n) break;
+        got += n;
+    }
+    buf[got] = 0;
+    return got;
+}
+
+static size_t plain_read_all(int fd, char *buf, size_t cap) {
+    size_t got = 0;
+    while (got + 1 < cap) {
+        ssize_t r = recv(fd, buf + got, cap - 1 - got, 0);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    buf[got] = 0;
+    return got;
+}
+
+static int count_of(const char *hay, const char *needle) {
+    int n = 0;
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + 1, needle)) n++;
+    return n;
+}
+
+/* Send `req` on a fresh HTTP connection `id` and return what comes back, having
+ * seen the connection answered on its I/O thread: finished (CLOSED) with no
+ * request reported, then closed here as the loop would. */
+static int http_exchange(oc_ioloop *io, int lfd, uint16_t port, uint64_t id,
+                         const char *req, size_t rl, char *resp, size_t cap) {
+    tclient w; int wfd = -1, whttp = -1;
+    if (open_conn(io, lfd, port, id, &w, http_alpn, &wfd, &whttp) != 0 || whttp != 1) return -1;
+    int ok = twrite(&w, (const uint8_t *)req, rl) == 0;
+    oc_io_event *e = wait_event(io, 3000);
+    int reported = 0, closed = 0;
+    while (e) {
+        if (e->kind == OC_IO_HTTP_REQ) reported = 1;
+        if (e->kind == OC_IO_CLOSED && e->conn_id == id) closed = 1;
+        oc_io_event_free(e);
+        if (closed) break;
+        e = wait_event(io, 3000);
+    }
+    oc_ioloop_close(io, id, wfd);
+    tread_all(&w, resp, cap);
+    tclient_close(&w);
+    return ok && closed && !reported ? 0 : -1;
+}
+
+/* A plaintext connection, accepted here and adopted as the health port's. */
+static int plain_open(oc_ioloop *io, int lfd, uint16_t port, uint64_t id, int *cfd, int *sfd) {
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
+    *cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(*cfd, (struct sockaddr *)&a, sizeof a) != 0) return -1;
+    struct timeval tv = { 5, 0 };
+    setsockopt(*cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    *sfd = accept(lfd, NULL, NULL);
+    if (*sfd < 0) return -1;
+    int fl = fcntl(*sfd, F_GETFL, 0);
+    if (fl < 0 || fcntl(*sfd, F_SETFL, fl | O_NONBLOCK) != 0) return -1;
+    if (oc_ioloop_adopt_plain(io, *sfd, id, "127.0.0.1") != 0) return -1;
+    oc_io_event *e = wait_kind(io, OC_IO_OPENED, 3000);
+    int ok = e && e->conn_id == id && e->http == 1;
+    oc_io_event_free(e);
+    return ok ? 0 : -1;
+}
+
+/* Wait for connection `id`'s CLOSED, then close it as the loop would. */
+static int finished(oc_ioloop *io, uint64_t id, int sfd, int ms) {
+    oc_io_event *e = wait_kind(io, OC_IO_CLOSED, ms);
+    int ok = e && e->conn_id == id;
+    oc_io_event_free(e);
+    oc_ioloop_close(io, id, sfd);
+    return ok;
+}
+
 int run_ioloop_tests(void) {
     printf("test_ioloop: I/O threads -- the negotiated protocol, frames in order both ways, "
            "pause, written reports, close_after, a peer's close, stale commands\n");
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
-    oc_ioloop *io = oc_ioloop_start(2, &srv, NULL);
+    oc_ioloop *io = oc_ioloop_start(2, &srv, NULL, &T_SITE, &P_SITE);
     CHECK(io != NULL);
     if (!io) return failures;
 
@@ -289,8 +392,9 @@ int run_ioloop_tests(void) {
         usleep(50000);
     }
 
-    /* HTTP, parsed on the I/O thread (ARCH-32): a POST sent a few bytes at a
-     * time is reported once, whole, as its parts; what follows it is dropped. */
+    /* HTTP, parsed on the I/O thread (ARCH-32): a POST for the loop's route, sent
+     * a few bytes at a time, is reported once, whole, as its parts; the request
+     * after it is not read. */
     {
         tclient w; int wfd = -1, whttp = -1;
         CHECK(open_conn(io, lfd, port, 21, &w, http_alpn, &wfd, &whttp) == 0 && whttp == 1);
@@ -302,50 +406,113 @@ int run_ioloop_tests(void) {
             CHECK(twrite(&w, (const uint8_t *)req + off, n) == 0);
             usleep(2000);
         }
-        CHECK(twrite(&w, (const uint8_t *)"GET / HTTP/1.1\r\n\r\n", 18) == 0);
         oc_io_event *e = wait_kind(io, OC_IO_HTTP_REQ, 3000);
-        CHECK(e && e->conn_id == 21 && e->http_status == 0 && e->is_json);
+        CHECK(e && e->conn_id == 21 && e->is_json);
         if (e) {
             CHECK(e->method_len == 4 && memcmp(e->data, "POST", 4) == 0);
             CHECK(e->path_len == 12 && memcmp(e->data + 4, "/webhook/abc", 12) == 0);
             CHECK(e->body_len == 13 && memcmp(e->data + 16, "{\"text\":\"hi\"}", 13) == 0);
         }
         oc_io_event_free(e);
+        /* The same request again, while the first is the loop's: it is not a
+         * second request, and nothing more is reported. */
+        CHECK(twrite(&w, (const uint8_t *)req, rl) == 0);
         e = wait_kind(io, OC_IO_HTTP_REQ, 300);
         CHECK(e == NULL);                                    /* one request, one report */
         oc_io_event_free(e);
         oc_ioloop_close(io, 21, wfd);
         tclient_close(&w);
     }
-    /* Malformed -- a request line with no method and path -- is refused 400;
-     * so is a header block that never ends, once it passes the parser's 8 KiB. */
+    /* A static route is answered on the I/O thread, and the loop hears only
+     * that the connection finished. So is every refusal, each with its status:
+     * a path nothing names, a known path under the wrong method, a declared body
+     * over the route's limit (before the body is sent), a malformed request
+     * line, a head that never ends, a chunked body. */
     {
+        static char resp[8192];
+        const char *r200 = "GET /static?x=1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 30, r200, strlen(r200), resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nhello") &&
+              strstr(resp, "Connection: close\r\n") && strstr(resp, "Content-Length: 5\r\n"));
+
+        const char *r404 = "GET /nope HTTP/1.1\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 31, r404, strlen(r404), resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 404 ", 13) == 0);
+
+        const char *r405 = "GET /webhook/abc HTTP/1.1\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 32, r405, strlen(r405), resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 405 ", 13) == 0);
+
+        const char *r413 = "POST /webhook/abc HTTP/1.1\r\nContent-Length: 65\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 33, r413, strlen(r413), resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 413 ", 13) == 0);
+
+        const char *r400 = "GARBAGE\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 34, r400, strlen(r400), resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 400 ", 13) == 0);
+
+        static char big[OC_HTTP_MAX_HEAD + 64];
+        int hl = snprintf(big, sizeof big, "GET /static HTTP/1.1\r\nX-Pad: ");
+        memset(big + hl, 'x', sizeof big - (size_t)hl);
+        CHECK(http_exchange(io, lfd, port, 35, big, sizeof big, resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 400 ", 13) == 0);
+
+        const char *rte = "POST /webhook/abc HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 36, rte, strlen(rte), resp, sizeof resp) == 0);
+        CHECK(strncmp(resp, "HTTP/1.1 400 ", 13) == 0);
+
+        /* One request per connection: the second, sent with the first, gets
+         * nothing. */
+        const char *two = "GET /static HTTP/1.1\r\n\r\nGET /static HTTP/1.1\r\n\r\n";
+        CHECK(http_exchange(io, lfd, port, 37, two, strlen(two), resp, sizeof resp) == 0);
+        CHECK(count_of(resp, "HTTP/1.1 ") == 1);
+    }
+    /* A request that does not arrive whole in time is answered 408, and one
+     * that never starts is too: neither holds its connection. */
+    {
+        oc_ioloop_set_http_timeout_ms(300);
+        static char resp[4096];
         tclient w; int wfd = -1, whttp = -1;
-        CHECK(open_conn(io, lfd, port, 22, &w, http_alpn, &wfd, &whttp) == 0);
-        CHECK(twrite(&w, (const uint8_t *)"GARBAGE\r\n\r\n", 11) == 0);
-        oc_io_event *e = wait_kind(io, OC_IO_HTTP_REQ, 3000);
-        CHECK(e && e->conn_id == 22 && e->http_status == 400);
-        oc_io_event_free(e);
-        oc_ioloop_close(io, 22, wfd);
+        CHECK(open_conn(io, lfd, port, 40, &w, http_alpn, &wfd, &whttp) == 0);
+        CHECK(twrite(&w, (const uint8_t *)"GET /sta", 8) == 0);
+        struct timeval t0, t1; gettimeofday(&t0, NULL);
+        CHECK(finished(io, 40, wfd, 3000));
+        gettimeofday(&t1, NULL);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000;
+        CHECK(ms < 2000);
+        tread_all(&w, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
         tclient_close(&w);
 
-        CHECK(open_conn(io, lfd, port, 23, &w, http_alpn, &wfd, &whttp) == 0);
-        char head[128];
-        int hl = snprintf(head, sizeof head, "POST /webhook/abc HTTP/1.1\r\nX-Pad: ");
-        CHECK(twrite(&w, (const uint8_t *)head, (size_t)hl) == 0);
-        static uint8_t junk[16384];
-        memset(junk, 'x', sizeof junk);
-        e = NULL;
-        for (size_t sent = 0; sent <= OC_HTTP_MAX_REQUEST && !e; sent += sizeof junk) {
-            if (twrite(&w, junk, sizeof junk) != 0) break;
-            e = oc_ioloop_next(io);
-            while (e && e->kind != OC_IO_HTTP_REQ) { oc_io_event_free(e); e = oc_ioloop_next(io); }
-        }
-        if (!e) e = wait_kind(io, OC_IO_HTTP_REQ, 3000);
-        CHECK(e && e->conn_id == 23 && e->http_status == 400);
-        oc_io_event_free(e);
-        oc_ioloop_close(io, 23, wfd);
-        tclient_close(&w);
+        int cfd = -1, sfd = -1;
+        CHECK(plain_open(io, lfd, port, 41, &cfd, &sfd) == 0);   /* sends nothing */
+        CHECK(finished(io, 41, sfd, 3000));
+        plain_read_all(cfd, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
+        close(cfd);
+        oc_ioloop_set_http_timeout_ms(0);
+    }
+    /* Plaintext, as the health port is: OPENED at once as HTTP, served its own
+     * site -- its route, and its fallback for any other path -- and the TLS
+     * site's routes are not its. */
+    {
+        static char resp[4096];
+        int cfd = -1, sfd = -1;
+        CHECK(plain_open(io, lfd, port, 50, &cfd, &sfd) == 0);
+        const char *hz = "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+        CHECK(send(cfd, hz, strlen(hz), 0) == (ssize_t)strlen(hz));
+        CHECK(finished(io, 50, sfd, 3000));
+        plain_read_all(cfd, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nOK"));
+        close(cfd);
+
+        CHECK(plain_open(io, lfd, port, 51, &cfd, &sfd) == 0);
+        const char *st = "GET /static HTTP/1.1\r\n\r\n";
+        CHECK(send(cfd, st, strlen(st), 0) == (ssize_t)strlen(st));
+        CHECK(finished(io, 51, sfd, 3000));
+        plain_read_all(cfd, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "<p>here</p>"));
+        close(cfd);
     }
 
     oc_ioloop_stop(io);
