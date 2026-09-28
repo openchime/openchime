@@ -1173,6 +1173,24 @@ The daemon side is in `make test`:
 
 Each guard was shown to fail with the change it guards reverted.
 
+## Reading the search-box harness
+
+`scripts/gui_search_boxes.sh` checks the six search boxes (CLIENT.md, "The six
+search boxes are one control") on a pair of its own (port 9660; only alice is
+driven). At the default text size, the largest, and 200% DPI it opens each box in
+turn — the sidebar's find box, search messages, Files, People, Jump to and the
+emoji picker — and reads its `searchbox` line from the dump:
+
+- `uifont=1`, and the face is Segoe UI or Segoe UI Variable Text;
+- `lf`, the font height, is at least 14 DIP at that DPI (the stock dialog font
+  these boxes used to wear is 11 px at every DPI);
+- the EDIT is exactly `lh`, the font's line height, lies inside its chrome, and
+  is centred in it to a pixel;
+- and all six share one font height.
+
+The checks were shown to fail with one box put back on the stock font, and with
+the EDIT given a fixed height again.
+
 ## Reading the voice harness
 
 `scripts/gui_voice.sh` drives voice input in the Win32 client end to end against

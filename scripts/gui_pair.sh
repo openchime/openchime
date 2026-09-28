@@ -147,7 +147,7 @@ up)
   { read -r pa; read -r pb; } < "$PIDS" || true
   for pair in "${pa:-} 40" "${pb:-} 980"; do
     set -- $pair
-    [ -n "${1:-}" ] || continue
+    [ -n "${2:-}" ] || continue   # no pid recorded: only the x is left
     powershell.exe -NoProfile -Command "
       \$sig='[DllImport(\"user32.dll\")] public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int t,bool r);'
       \$t=Add-Type -MemberDefinition \$sig -Name W -Namespace N -PassThru
