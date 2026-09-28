@@ -1170,14 +1170,15 @@ dump's `call` line says `transport=tcp` — and hears the other's tone
 - She gives `@crew` to the channel from the channel menu (`chmenu 8`).
 - Bob, never invited, is in the channel through the group, and a message naming `@crew` names him.
 - His Leave is refused, with the daemon's reason.
-- In alice's members pane, bob's Remove (hovered) says why it cannot, and he stays. The picker does not offer bob, who is in already, and Escape closes it. The group row's Remove asks first, and confirmed, takes bob out and leaves carol, who is also in directly. The pane's Add group puts the group back, and its Add people invites u1 and u2 in one go.
-- Remove someone (`chmenu 7`) puts Remove on every row but alice's, bob's dimmed; u1's takes out u1 and nobody else, and Done ends it.
+- In alice's members pane, bob's Remove (hovered) says why it cannot, and he stays. The picker does not offer bob, who is in already, and Escape closes it. The group row's Remove asks first, and confirmed, takes bob out and leaves carol, who is also in directly. The pane's Add group puts the group back, and the header's Add people invites u1 and u2 in one go.
+- Remove someone (`chmenu 7`) opens the roster with no mode and no picker; hovered, u1's row alone offers Remove, and it takes out u1 and nobody else.
+- The pane has no rows of buttons: the header carries Add people and GROUPS its +, and resting on each shows its tooltip ("Add people", "Add a group").
 - With the picker open, a click in the composer takes the keys: what is typed next is in the composer, not the picker.
-- Each of these was shown to fail with its guard reverted: the roster ignoring `info_seq`, the picker offering current members, Remove only on the hovered row, and the picker keeping the keys after a click elsewhere.
+- Each of these was shown to fail with its guard reverted: the roster ignoring `info_seq`, the picker offering current members, and the picker keeping the keys after a click elsewhere.
 - New message's To field, which shares the picker, still takes a channel, replaces it with people, and refuses a ninth person, saying so. Opening a group's people afterwards gives an empty picker of the group's own, alice can add herself, and New message's recipients and text are still there on return.
 - Taken out of the group, bob is out of the channel and told.
 
-The dump's `groups` and `chgroups` lines carry the groups, the open channel's, whether this user is in it through one, and whether its newest message names them. `grppick` carries the picker's owner (`host` 1 a group's, 2 the members pane's), focus, the pane's mode (`memmode` 1 adding, 2 removing), chips and matches, and the verb drives whichever of the two is open; `memgrp` the pane's group buttons, group-row Removes and the hovered row's Remove; `memppl` Add people, Remove people and the picker's Add; `memrow` names each row's person, with its Remove when shown and whether that is dimmed (`via`).
+The dump's `groups` and `chgroups` lines carry the groups, the open channel's, whether this user is in it through one, and whether its newest message names them. `grppick` carries the picker's owner (`host` 1 a group's, 2 the members pane's), focus, whether the pane is adding (`memmode` 1), chips and matches, and the verb drives whichever of the two is open; `memgrp` the GROUPS subheading's + (`plus`), group-row Removes and the hovered row's Remove; `memppl` the header's Add people, the picker's Add and Cancel, and which icon's tooltip is up (`tip`); `memrow` names each row's person, with its Remove when shown and whether that is dimmed (`via`).
 
 `gui_pair.sh`'s command directories are per port (`ocpair-<port>-a`, `-b`), so two pairs up at once never read each other's commands.
 
