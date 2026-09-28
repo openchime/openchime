@@ -44,4 +44,12 @@ void oc_blob_get_close(oc_blob_reader *r);
 /* Remove a blob. Returns 0 on success or if it was already absent, <0 on error. */
 int oc_blob_delete(oc_blobstore *bs, const char *key);
 
+/* ARCH-69, checked rather than inferred: blob I/O never runs on the event loop.
+ * A loop marks its own thread (on at start, off at exit); every operation above
+ * that runs on a marked thread is counted, process-wide. The loop only opens
+ * and closes the store, so while it serves the count should not move -- a test
+ * reads it before and after a slow transfer and requires no change. */
+void     oc_blobstore_mark_loop_thread(int on);
+uint64_t oc_blobstore_loop_ops(void);
+
 #endif /* OC_BLOBSTORE_H */

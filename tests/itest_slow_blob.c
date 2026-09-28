@@ -23,6 +23,7 @@
 #include "client.h"
 #include "model.h"
 #include "netloop.h"
+#include "blobstore.h"
 #include "config.h"
 #include "dbwriter.h"
 #include "protocol.h"
@@ -375,6 +376,7 @@ int run_slow_blob_tests(void) {
     pthread_t alice_th;
     CHECK(pthread_create(&alice_th, NULL, alice_thread, NULL) == 0);
     int segs_before = g_s3.requests;
+    uint64_t loop_ops_before = oc_blobstore_loop_ops();
 
     /* While that grinds through the slow backend, time bob's round-trips. */
     uint64_t during[9];
@@ -388,6 +390,7 @@ int run_slow_blob_tests(void) {
         if (ok) during[n_during++] = now_ms_local() - t0;
     }
     int segs_during = g_s3.requests - segs_before;
+    uint64_t loop_ops_during = oc_blobstore_loop_ops() - loop_ops_before;
     g_alice_run = 0;
     pthread_join(alice_th, NULL);
     CHECK(n_during > 0);
@@ -403,21 +406,20 @@ int run_slow_blob_tests(void) {
            (unsigned long long)during_max,
            SLOW_MS, segs_during, segs_during * SLOW_MS);
 
-    /* THE ASSERTION, stated against the measured baseline rather than an
-     * absolute guess. If blob I/O were inline on the epoll thread, a round-trip
-     * landing mid-chunk would absorb a whole SLOW_MS stall, so bob's numbers
-     * would rise by at least that. Allowing baseline + SLOW_MS/2 is generous and
-     * still fails loudly for an inline implementation. */
+    /* THE ASSERTION, by construction: not one blob operation ran on the event
+     * loop's thread while the slow transfer streamed (blobstore.h). Counted,
+     * not timed -- a count of zero does not depend on how loaded the runner is,
+     * and a single operation moved onto the loop makes it non-zero. */
+    printf("  blob operations on the loop thread during the transfer: %llu\n",
+           (unsigned long long)loop_ops_during);
+    CHECK(loop_ops_during == 0);
+    /* And the effect, coarsely: with blob I/O inline, a round-trip landing
+     * mid-chunk would absorb a whole SLOW_MS stall and bob's median would rise
+     * by at least that. baseline + SLOW_MS/2 is generous, so this is a sanity
+     * check on the median, never on single samples: one sample is at the mercy
+     * of the runner's scheduler, which is how a spike count here failed a
+     * sanitizer run whose median had FALLEN during the transfer. */
     CHECK(during_median < base_median + (uint64_t)SLOW_MS / 2);
-    /* No round-trip should swallow a full backend stall. Counted across all
-     * samples (not just the max) with a one-sample tolerance: an inline blob
-     * implementation would stall *many* round-trips landing mid-chunk, so it
-     * still fails loudly — but a single scheduler hiccup on a loaded CI runner,
-     * which spikes one sample without any blob-I/O blocking, no longer does. */
-    int over_stall = 0;
-    for (int i = 0; i < n_during; i++)
-        if (during[i] >= base_median + (uint64_t)SLOW_MS) over_stall++;
-    CHECK(over_stall <= 1);
 
     /* The upload must have been genuinely in flight while bob was measured, or
      * the comparison proved nothing. Several slow segments inside the window
