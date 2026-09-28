@@ -155,6 +155,9 @@ typedef struct {
     char    *description;  /* heap; NULL = none, or not yet known */
     uint8_t  description_known;
     uint8_t  archived;     /* read-only; hidden from the default list (REQ-035) */
+    uint32_t info_seq;     /* bumped by every CHANNEL_INFO for it: a roster on screen
+                            * asks again when it moves, since an invite or a removal
+                            * is answered with one and nothing else says so */
     uint64_t created_at;   /* from CHANNEL_INFO; shown in the About surface */
     /* The newest message, for a scannable list. Seeded by CHANNEL_LIST and kept
      * live by BROADCAST — otherwise it would be right only at connect. */
