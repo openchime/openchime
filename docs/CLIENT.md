@@ -659,6 +659,34 @@ not a child's visibility. Every other flag is still an `IsWindowVisible`:
 natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
 ```
 
+**The six search boxes are one control.** Find a conversation, search messages,
+search files, search people, Jump to (Ctrl+K) and search emoji are each a native
+EDIT over chrome the client draws, and all six are built the same way:
+
+- **The app's text.** Each wears `form_font()` — the UI family at `FONT_UI`
+  times the text scale, the font the form fields use — never the stock dialog
+  font, which is a fixed 11 px face that ignores the DPI and the text size.
+  `search_fonts_sync()`, on the paint path, hands every box the new font when a
+  text-size or DPI change rebuilds it. `form_font()` keeps the previous font
+  alive until the rebuild after, so no box is ever left holding a deleted one,
+  and returns none before the text engine exists, since it asks the engine which
+  family is installed.
+- **One shape.** `search_box_draw()` draws the chrome — `SEARCH_BOX_H` tall,
+  following the text scale, with the glyph centred — and `search_edit_place()`
+  puts the EDIT after the glyph, exactly the font's line height, centred top to
+  bottom. What sits below a box is measured from its bottom.
+
+The dump reports each box so this is checked rather than looked at, in device
+pixels (`uifont` is whether it wears `form_font()`):
+
+```
+searchbox find made=1 vis=1 uifont=1 lf=-14 face="Segoe UI Variable Text" lh=19 edit=112,67,224,86 box=80,62,234,92
+```
+
+`scripts/gui_search_boxes.sh` opens each box at the default text size, the
+largest, and 200% DPI, and checks the font, the face, the line height, the
+centring, and that all six share one size.
+
 A new gated child (the Files view's "Search files" box, `g_ffind`, is the
 model) is gated on the view it belongs to — never on a predicate that merely
 happens to be true there — and checked across all views from the dump before it

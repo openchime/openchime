@@ -525,6 +525,11 @@ static char       g_form_last[320];
  * changes, which is why form_font() is a function and not a one-shot global. */
 static HFONT      g_form_font;
 static float      g_form_font_scale;
+/* The font before the last rebuild, kept until the next one: an EDIT is handed
+ * the new font right after a rebuild, and deleting the old one first would leave
+ * it drawing with a dead handle in between. */
+static HFONT      g_form_font_prev;
+static int        g_form_font_lh;       /* its line height, in device pixels */
 static int        g_form_done, g_form_result;         /* the nested loop's exit */
 static char       g_form_title[128];
 static oc_field  *g_form_f;                           /* the CALLER's array */
@@ -3127,6 +3132,25 @@ static void draw_lucide(gfx *rt, int id, rectf box, uint32_t rgb) {
     gfx_icon(rt, id, gr(box), 2.0f, rgb, 1.0f);
 }
 
+/* ---- search boxes ------------------------------------------------------------
+ * Six of them -- find a conversation, search messages, files, people, Jump to
+ * and emoji -- and each is a native EDIT over chrome drawn here. They are one
+ * control: the same height, the same glyph in the same place, and the same text,
+ * the UI face at the UI size (form_font()), so none is smaller or stranger than
+ * the text around it. The box follows the text scale; the EDIT is exactly the
+ * font's line height and sits centred in it (search_edit_place()). */
+#define SEARCH_BOX_H UIS(30.0f)
+static void search_edit_place(HWND e, rectf box);   /* fwd -- beside layout_find */
+static void search_fonts_sync(void);                /* fwd */
+
+static void search_box_draw(gfx *rt, rectf box, uint32_t fill) {
+    fill_round(rt, box, OC_R_CONTROL, fill);
+    stroke_round(rt, box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+    float ic = UIS(16.0f), top = box.top + (box.bottom - box.top - ic) / 2.0f;
+    draw_lucide(rt, OC_ICON_SEARCH, rf(box.left + UIS(9), top, box.left + UIS(9) + ic, top + ic),
+                OC_COL_MUTED);
+}
+
 /* ---- Direct2D / DirectWrite setup ---------------------------------------- */
 
 static fmtw *mk_fmt_s(const char *family, float size, int wt,
@@ -4616,11 +4640,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
     /* The container and the native EDIT inside it are derived from the same
      * numbers (find_box()), because two hand-kept copies is how the white box
      * ended up floating half out of its own border at large text. */
-    rectf fb = find_box();
-    fill_round(rt, fb, OC_R_CONTROL, OC_COL_INPUT);
-    stroke_round(rt, fb, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    draw_lucide(rt, OC_ICON_SEARCH, rf(fb.left + UIS(8), fb.top + UIS(7),
-                                       fb.left + UIS(24), fb.top + UIS(23)), OC_COL_MUTED);
+    search_box_draw(rt, find_box(), OC_COL_INPUT);
     /* Unreads only: one chip, lit while on. Beside the find box because both
      * answer the same question — which conversations should this list show. */
     g_sb_unread_chip = unread_chip_box();
@@ -6155,12 +6175,9 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
     /* The query box lives IN the overlay, so refining a search never
      * closes and reopens it. The native EDIT is placed over this chrome by
      * layout_search(). */
-    g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 42);
-    fill_round(rt, g_srch_box, OC_R_CONTROL, OC_COL_INPUT);
-    stroke_round(rt, g_srch_box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    draw_lucide(rt, OC_ICON_SEARCH, rf(g_srch_box.left + 8, g_srch_box.top + 8,
-                                       g_srch_box.left + 24, g_srch_box.top + 24), OC_COL_MUTED);
-    body.top += 52;
+    g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 10 + SEARCH_BOX_H);
+    search_box_draw(rt, g_srch_box, OC_COL_INPUT);
+    body.top = g_srch_box.bottom + 10;
 
     /* A count line, so "5 results" and "no matches" are told apart at a glance. */
     char count[96];
@@ -7851,13 +7868,9 @@ static float draw_file_filters(gfx *rt, rectf body, int full) {
     if (full) {
         /* Name search: a rounded container with the glyph, the native EDIT
          * placed over it by layout_files_find(). */
-        g_file_search_box = rf(body.left + 20, y, body.right - 20, y + 32);
-        fill_round(rt, g_file_search_box, OC_R_CONTROL, OC_COL_INPUT);
-        stroke_round(rt, g_file_search_box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        draw_lucide(rt, OC_ICON_SEARCH,
-                    rf(g_file_search_box.left + 9, y + 8, g_file_search_box.left + 25, y + 24),
-                    OC_COL_MUTED);
-        y += 44;
+        g_file_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
+        search_box_draw(rt, g_file_search_box, OC_COL_INPUT);
+        y = g_file_search_box.bottom + 12;
     } else {
         g_file_search_box = rf(0, 0, 0, 0);
     }
@@ -9235,6 +9248,9 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     /* The mode label needs its own band, or it collides with the first row — which
      * it did. Panel height and row origin both account for it. */
     float hint_h = g_fwd_mid ? 18.0f : 0.0f;
+    /* Everything below the search box is measured from its bottom, since the box
+     * follows the text scale. */
+    float pb = 12 + SEARCH_BOX_H;
     /* THE PANEL STAYS INSIDE THE WINDOW. Its height was the row count times a
      * scaled row height plus its chrome, with nothing bounding it, so at large
      * text sizes it grew past the bottom of the window and its lower rows were
@@ -9246,7 +9262,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
      * few would let Enter accept something never shown. */
     int vis = nh;
     {
-        float chrome = 58 + hint_h + 10;
+        float chrome = pb + 12 + hint_h + 10;
         float room = H - py - 16 - chrome;
         int fits = (int)(room / rowh);
         if (fits < 1) fits = 1;
@@ -9257,23 +9273,21 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     if (pfirst > nh - vis) pfirst = nh - vis;
     if (pfirst < 0) pfirst = 0;
 
-    float ph = 58 + hint_h + (nh ? vis * rowh : rowh) + 10;
+    float ph = pb + 12 + hint_h + (nh ? vis * rowh : rowh) + 10;
     g_pal_panel = rf(px, py, px + pw, py + ph);
     fill_round(rt, rf(px + 3, py + 5, px + pw + 3, py + ph + 5), OC_R_OVERLAY, 0x000000);
     fill_round(rt, g_pal_panel, OC_R_OVERLAY, OC_COL_INPUT);
     stroke_round(rt, g_pal_panel, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
 
-    g_pal_box = rf(px + 12, py + 12, px + pw - 12, py + 46);
-    fill_round(rt, g_pal_box, OC_R_CONTROL, OC_COL_BASE);
+    g_pal_box = rf(px + 12, py + 12, px + pw - 12, py + pb);
+    search_box_draw(rt, g_pal_box, OC_COL_BASE);
     /* Name the mode: the same panel means two things now, and a picker that does
      * not say which is a trap. */
     if (g_fwd_mid)
         draw_text(rt, "Forward to", g_meta,
-                  rf(px + 16, py + 50, px + pw - 12, py + 68), OC_COL_ACCENT);
-    draw_lucide(rt, OC_ICON_SEARCH, rf(g_pal_box.left + 9, g_pal_box.top + 9,
-                                       g_pal_box.left + 25, g_pal_box.top + 25), OC_COL_MUTED);
+                  rf(px + 16, py + pb + 4, px + pw - 12, py + pb + 22), OC_COL_ACCENT);
 
-    float y = py + 54 + hint_h;
+    float y = py + pb + 8 + hint_h;
     if (nh == 0) {
         draw_text(rt, g_fwd_mid ? "No matching conversation to forward to."
                                 : "No matching action or conversation.", g_ui,
@@ -10373,7 +10387,7 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     float tone_w = UIS(24.0f), tone_h = UIS(22.0f);
     float hdr_pad = UIS(6.0f);
     float box_top = py + hdr_pad + tone_h + UIS(4.0f);
-    float box_bot = box_top + UIS(30.0f);
+    float box_bot = box_top + SEARCH_BOX_H;
     float tones_w = tone_w * OC_SKIN_COUNT;
     float title_r = px + pw - 14 - tones_w - 8;
     /* When there is not room for both, the TITLE goes. The swatches are a
@@ -10391,16 +10405,7 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
                   OC_COL_TEXT);
 
     g_pick_box = rf(px + 12, box_top, px + pw - 12, box_bot);
-    fill_round(rt, g_pick_box, OC_R_CONTROL, OC_COL_BASE);
-    stroke_round(rt, g_pick_box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    {   /* Centred in the box it sits in, so it follows the box rather than a
-         * pair of offsets that were right at one scale. */
-        float ic = (g_pick_box.bottom - g_pick_box.top - 16.0f) / 2.0f;
-        draw_lucide(rt, OC_ICON_SEARCH,
-                    rf(g_pick_box.left + 8, g_pick_box.top + ic,
-                       g_pick_box.left + 24, g_pick_box.top + ic + 16),
-                    OC_COL_MUTED);
-    }
+    search_box_draw(rt, g_pick_box, OC_COL_BASE);
 
     char q[64] = "";
     if (g_pick_edit) {
@@ -13255,6 +13260,7 @@ static void layout_natives(HWND hwnd) {
         RECT rc0; GetClientRect(hwnd, &rc0);
         shell_scale_update(DIPF(rc0.right), DIPF(rc0.bottom));
     }
+    search_fonts_sync();       /* before anything is placed by its line height */
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
     layout_files_find(hwnd);
@@ -13265,8 +13271,7 @@ static void layout_natives(HWND hwnd) {
         /* The palette is itself the cover, so it does not consult `covered`. */
         if (g_pal_open) {
             ShowWindow(g_pal_edit, SW_SHOW);
-            MoveWindow(g_pal_edit, PX(g_pal_box.left + 32), PX(g_pal_box.top + 8),
-                       PX(g_pal_box.right - g_pal_box.left - 44), PX(20), TRUE);
+            search_edit_place(g_pal_edit, g_pal_box);
         } else {
             ShowWindow(g_pal_edit, SW_HIDE);
         }
@@ -13298,8 +13303,7 @@ static void layout_natives(HWND hwnd) {
          * allowed to float above a card (the time-picker rule). */
         if (g_pick_open && (!covered || picker_floats())) {
             ShowWindow(g_pick_edit, SW_SHOW);
-            MoveWindow(g_pick_edit, PX(g_pick_box.left + 30), PX(g_pick_box.top + 6),
-                       PX(g_pick_box.right - g_pick_box.left - 40), PX(18), TRUE);
+            search_edit_place(g_pick_edit, g_pick_box);
         } else {
             ShowWindow(g_pick_edit, SW_HIDE);
         }
@@ -15307,13 +15311,9 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
      * search is built. Reserving the space without painting the box left an
      * unframed EDIT on a white pane: reported visible by the harness and
      * invisible to a person, which is the worst of both. */
-    g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 40);
-    fill_round(rt, g_dir_search_box, OC_R_CONTROL, OC_COL_INPUT);
-    stroke_round(rt, g_dir_search_box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    draw_lucide(rt, OC_ICON_SEARCH,
-                rf(g_dir_search_box.left + 9, g_dir_search_box.top + 8,
-                   g_dir_search_box.left + 25, g_dir_search_box.top + 24), OC_COL_MUTED);
-    body.top += 52;
+    g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 8 + SEARCH_BOX_H);
+    search_box_draw(rt, g_dir_search_box, OC_COL_INPUT);
+    body.top = g_dir_search_box.bottom + 12;
 
     char filter[80];
     snprintf(filter, sizeof filter, "%s", g_dir_filter);
@@ -19180,11 +19180,34 @@ static void layout_composer(HWND hwnd) {
 #define UNREAD_CHIP_W UIS(70)
 static rectf find_box(void) {
     return rf(RAIL_W + UIS(10), HEADER_H + UIS(6),
-              RAIL_W + SIDEBAR_W - UIS(10) - UNREAD_CHIP_W - UIS(6), HEADER_H + UIS(36));
+              RAIL_W + SIDEBAR_W - UIS(10) - UNREAD_CHIP_W - UIS(6), HEADER_H + UIS(6) + SEARCH_BOX_H);
 }
 static rectf unread_chip_box(void) {
     return rf(RAIL_W + SIDEBAR_W - UIS(10) - UNREAD_CHIP_W, HEADER_H + UIS(6),
               RAIL_W + SIDEBAR_W - UIS(10), HEADER_H + UIS(36));
+}
+
+/* Place a search box's EDIT in the chrome search_box_draw() drew: after the
+ * glyph, the font's line height tall, centred top to bottom. */
+static void search_edit_place(HWND e, rectf box) {
+    form_font();                                   /* the line height is its */
+    int lh = g_form_font_lh > 0 ? g_form_font_lh : PX(UIS(18.0f));
+    int x = PX(box.left + UIS(32.0f)), r = PX(box.right - UIS(10.0f));
+    int top = PX(box.top) + (PX(box.bottom) - PX(box.top) - lh) / 2;
+    MoveWindow(e, x, top, r > x ? r - x : 1, lh, TRUE);
+}
+
+/* Every search box on the current font. Called from the paint path, so a text
+ * size or DPI change reaches them on the next frame; only a changed font is
+ * sent, as WM_SETFONT repaints the control. */
+static void search_fonts_sync(void) {
+    static HFONT applied;
+    HFONT f = form_font();
+    if (!f || f == applied) return;
+    HWND boxes[] = { g_find, g_srch, g_ffind, g_dir_edit, g_pal_edit, g_pick_edit };
+    for (size_t i = 0; i < sizeof boxes / sizeof boxes[0]; i++)
+        if (boxes[i]) SendMessageW(boxes[i], WM_SETFONT, (WPARAM)f, TRUE);
+    applied = f;
 }
 
 static void layout_find(HWND hwnd) {
@@ -19215,15 +19238,17 @@ static void layout_find(HWND hwnd) {
      * the chrome this box sits in while the cache said nothing had happened, so
      * the control stayed at its old place — a bare white rectangle floating over
      * the sidebar. */
-    if (want == shown && laid_at_dpi == g_dpi && laid_at_scale == g_text_scale) return;
+    /* And the font's line height, which sizes the EDIT: the box is first placed
+     * before there is a font, and the font arriving changes nothing above. */
+    static int laid_at_lh = -1;
+    if (want == shown && laid_at_dpi == g_dpi && laid_at_scale == g_text_scale &&
+        laid_at_lh == g_form_font_lh) return;
     shown = want;
     laid_at_dpi = g_dpi;
     laid_at_scale = g_text_scale;
+    laid_at_lh = g_form_font_lh;
     if (!want) { ShowWindow(g_find, SW_HIDE); return; }
-    rectf fb = find_box();
-    int x = (int)(fb.left + UIS(28)), r = (int)(fb.right - UIS(8));
-    int top = (int)(fb.top + UIS(7)), hgt = (int)UIS(16);
-    MoveWindow(g_find, PX(x), PX(top), PX(r - x), PX(hgt), TRUE);
+    search_edit_place(g_find, find_box());
     ShowWindow(g_find, SW_SHOW);
 }
 
@@ -19257,8 +19282,7 @@ static void layout_files_find(HWND hwnd) {
     int want = (g_view == VIEW_FILES) && !window_is_covered() &&
                g_file_search_box.right > g_file_search_box.left;
     if (!want) { ShowWindow(g_ffind, SW_HIDE); return; }
-    MoveWindow(g_ffind, PX(g_file_search_box.left + 30), PX(g_file_search_box.top + 7),
-               PX(g_file_search_box.right - g_file_search_box.left - 42), PX(18), TRUE);
+    search_edit_place(g_ffind, g_file_search_box);
     ShowWindow(g_ffind, SW_SHOW);
 }
 
@@ -19271,7 +19295,7 @@ static void dir_find_create(HWND parent) {
         WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
         (HMENU)(INT_PTR)0xF5, GetModuleHandleW(NULL), NULL);
     if (!g_dir_edit) return;
-    SendMessageW(g_dir_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_dir_edit, WM_SETFONT, (WPARAM)form_font(), TRUE);
     SendMessageW(g_dir_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search people");
 }
 
@@ -19284,8 +19308,7 @@ static void layout_dir_find(HWND hwnd) {
      * control's border — g_dir_search_box is only valid after a paint, which is
      * why this runs from the paint path too. */
     if (g_dir_search_box.right <= g_dir_search_box.left) { ShowWindow(g_dir_edit, SW_HIDE); return; }
-    MoveWindow(g_dir_edit, PX(g_dir_search_box.left + 30), PX(g_dir_search_box.top + 7),
-               PX(g_dir_search_box.right - g_dir_search_box.left - 42), PX(18), TRUE);
+    search_edit_place(g_dir_edit, g_dir_search_box);
     ShowWindow(g_dir_edit, SW_SHOW);
 }
 
@@ -19294,7 +19317,7 @@ static void files_find_create(HWND parent) {
         WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
         (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
     if (!g_ffind) return;
-    SendMessageW(g_ffind, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_ffind, WM_SETFONT, (WPARAM)form_font(), TRUE);
     SendMessageW(g_ffind, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search files");
 }
 
@@ -19303,7 +19326,7 @@ static void find_create(HWND parent) {
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
         (HMENU)(INT_PTR)0xF1, GetModuleHandleW(NULL), NULL);
     if (!g_find) return;
-    SendMessageW(g_find, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_find, WM_SETFONT, (WPARAM)form_font(), TRUE);
     SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation");
     g_find_oldproc = (WNDPROC)SetWindowLongPtrW(g_find, GWLP_WNDPROC, (LONG_PTR)find_proc);
     layout_find(parent);
@@ -19335,8 +19358,7 @@ static void layout_search(HWND hwnd) {
     }
     (void)hwnd;
     ShowWindow(g_srch, SW_SHOW);
-    MoveWindow(g_srch, PX(g_srch_box.left + 30), PX(g_srch_box.top + 8),
-               PX(g_srch_box.right - g_srch_box.left - 40), PX(20), TRUE);
+    search_edit_place(g_srch, g_srch_box);
 }
 
 /* Enter submits the query; Escape closes the overlay. An EDIT swallows both, so
@@ -19349,7 +19371,7 @@ static void search_create(HWND parent) {
         WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
         (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
     if (!g_srch) return;
-    SendMessageW(g_srch, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_srch, WM_SETFONT, (WPARAM)form_font(), TRUE);
     SendMessageW(g_srch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search messages");
     g_srch_prev = (WNDPROC)SetWindowLongPtrW(g_srch, GWLP_WNDPROC, (LONG_PTR)srch_proc);
 }
@@ -20931,7 +20953,7 @@ static void dpi_set(HWND hwnd, UINT dpi) {
     /* Rasters carry the old scale; the next paint's scene_scale_apply() bumps
      * the text generation and the caches rebuild lazily. Thumbnails are
      * content images drawn in DIPs — they survive as they are. */
-    if (g_form_font) { DeleteObject(g_form_font); g_form_font = NULL; g_form_font_scale = -1; }
+    g_form_font_scale = -1;   /* rebuilt at the new DPI by the next form_font() */
     layout_natives(hwnd);
     layout_signin(hwnd);
     InvalidateRect(hwnd, NULL, TRUE);
@@ -23980,7 +24002,12 @@ static void lg_set_font(HWND w) {
 
 static HFONT form_font(void) {
     if (g_form_font && g_form_font_scale == g_text_scale) return g_form_font;
-    if (g_form_font) DeleteObject(g_form_font);
+    /* The family is chosen by asking the text engine what is installed, and the
+     * native boxes are made before it is: until then there is no font, and the
+     * first paint hands them one (search_fonts_sync()). */
+    if (!g_st) return NULL;
+    if (g_form_font_prev) DeleteObject(g_form_font_prev);
+    g_form_font_prev = g_form_font;
     g_form_font_scale = g_text_scale;
     g_form_font = CreateFontW(-PX(FONT_UI * g_text_scale), 0, 0, 0, FW_NORMAL, 0, 0, 0,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -23989,6 +24016,17 @@ static HFONT form_font(void) {
                                * of the same decision is ui_family(). */
                               st_dwrite_family_present(g_st, "Segoe UI Variable Text")
                                   ? L"Segoe UI Variable Text" : L"Segoe UI");
+    /* Its line height, which a single-line EDIT needs to be exactly: shorter and
+     * the descenders are cut, taller and the text rides high in its box. */
+    g_form_font_lh = PX(FONT_UI * g_text_scale * 1.35f);
+    HDC dc = GetDC(NULL);
+    if (dc && g_form_font) {
+        HGDIOBJ was = SelectObject(dc, g_form_font);
+        TEXTMETRICW tm;
+        if (GetTextMetricsW(dc, &tm)) g_form_font_lh = (int)tm.tmHeight;
+        SelectObject(dc, was);
+    }
+    if (dc) ReleaseDC(NULL, dc);
     return g_form_font;
 }
 
@@ -26731,6 +26769,35 @@ static void test_dump(const char *path) {
             g_pal_edit && IsWindowVisible(g_pal_edit),
             g_si_e_ws && IsWindowVisible(g_si_e_ws),
             sidebar_kind(), main_is_conversation(), window_is_covered());
+    /* The search boxes: whether each wears the UI font (form_font()), that
+     * font's height and face, and where its EDIT sits against the chrome drawn
+     * for it -- all in device pixels -- so "one control, the app's text, centred"
+     * is a check rather than a look at a picture. */
+    {
+        struct { const char *name; HWND w; rectf box; } sb[] = {
+            { "find",  g_find,      find_box() },
+            { "srch",  g_srch,      g_srch_box },
+            { "files", g_ffind,     g_file_search_box },
+            { "people", g_dir_edit, g_dir_search_box },
+            { "pal",   g_pal_edit,  g_pal_box },
+            { "pick",  g_pick_edit, g_pick_box },
+        };
+        HFONT uf = form_font();
+        for (size_t i = 0; i < sizeof sb / sizeof sb[0]; i++) {
+            if (!sb[i].w) { fprintf(f, "searchbox %s made=0\n", sb[i].name); continue; }
+            HFONT hf = (HFONT)SendMessageW(sb[i].w, WM_GETFONT, 0, 0);
+            LOGFONTW lf; memset(&lf, 0, sizeof lf);
+            if (hf) GetObjectW(hf, sizeof lf, &lf);
+            char face[64]; WideCharToMultiByte(CP_UTF8, 0, lf.lfFaceName, -1, face, sizeof face, NULL, NULL);
+            RECT er; GetWindowRect(sb[i].w, &er);
+            MapWindowPoints(NULL, g_main_hwnd, (POINT *)&er, 2);
+            fprintf(f, "searchbox %s made=1 vis=%d uifont=%d lf=%ld face=\"%s\" lh=%d "
+                       "edit=%ld,%ld,%ld,%ld box=%d,%d,%d,%d\n",
+                    sb[i].name, IsWindowVisible(sb[i].w) ? 1 : 0, hf == uf, (long)lf.lfHeight, face,
+                    g_form_font_lh, (long)er.left, (long)er.top, (long)er.right, (long)er.bottom,
+                    PX(sb[i].box.left), PX(sb[i].box.top), PX(sb[i].box.right), PX(sb[i].box.bottom));
+        }
+    }
     /* Hit-box geometry, because a hit test that silently matches nothing looks
      * exactly like a hit test that is never called. */
     /* The composer cue is painted by the native RichEdit, so `shot` cannot see
@@ -28287,7 +28354,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pal_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF4, GetModuleHandleW(NULL), NULL);
         if (g_pal_edit) {
-            SendMessageW(g_pal_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessageW(g_pal_edit, WM_SETFONT, (WPARAM)form_font(), TRUE);
             SendMessageW(g_pal_edit, EM_SETCUEBANNER, TRUE,
                          (LPARAM)L"Run an action or jump to a conversation");
             g_pal_prev = (WNDPROC)SetWindowLongPtrW(g_pal_edit, GWLP_WNDPROC, (LONG_PTR)pal_proc);
@@ -28295,7 +28362,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pick_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF3, GetModuleHandleW(NULL), NULL);
         if (g_pick_edit) {
-            SendMessageW(g_pick_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessageW(g_pick_edit, WM_SETFONT, (WPARAM)form_font(), TRUE);
             SendMessageW(g_pick_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search emoji");
             g_pick_prev = (WNDPROC)SetWindowLongPtrW(g_pick_edit, GWLP_WNDPROC, (LONG_PTR)pick_proc);
         }
