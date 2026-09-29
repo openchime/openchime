@@ -19,25 +19,40 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   it: `feature/oc-<issue number>-<short-kebab-description>`, cut from a clean,
   current `staging`. The repo's `/oc-feature-start` command runs the preflight
   (clean tree, `staging` in sync with origin, no branch already carrying the
-  issue) and refuses rather than repairs.
+  issue), refuses rather than repairs, and makes one fresh build on the new
+  branch.
 - **Land by pull request to `staging`,** squashed to a **single** house-format
   commit whose subject names the issue. The issue **closes when its release
   ships**: the release reads the issue from each shipped commit's subject and
   closes it with a comment naming the release. A merge does not close it — merged
   is not shipped. The PR body stays **empty**: the issue and the commit already
-  say everything. `/oc-feature-pr` runs the sequence: tests
-  clean with zero warnings, squash, push (`--force-with-lease` after a squash
-  is the one acceptable force-push, and only ever on a `feature/*` branch),
-  raise the PR.
-- **Gate merges on CI.** Merge only when every check on the pull request is
-  green, with a **squash merge** — no merge commits, history stays linear.
-  Delete the branch, local and remote, after.
+  say everything. `/oc-feature-finish` runs the sequence (below).
+- **CI gates the merge.** Staging's branch protection requires every CI job and
+  the two policy checks to pass on the pull request before it can merge. Merge
+  with a **squash merge** — no merge commits, history stays linear. Delete the
+  branch, local and remote, after.
 - **Docs-only changes go straight to `staging`**, without a pull request, and
   reach `main` with the next promotion (they skip the build jobs via
   `paths-ignore`; the attribution guard runs on every push regardless).
 - **Sign off every commit** (`git commit -s`) — the DCO applies to every path
   into the tree, including a cherry-pick.
 - **One logical change per branch.**
+
+## Before a pull request — the minimal set
+
+Locally, and in about 3 minutes, a pull request needs exactly this, which
+`/oc-feature-finish` runs:
+
+1. `make && make test` — zero warnings, every suite passing.
+2. `scripts/check_pr.sh "<title>"` — the title's format and length.
+3. One commit, signed off, no body; pushed; the pull request raised into
+   `staging` with an empty body.
+
+That is all. **The thread sanitizer, the release compiler, the Windows builds
+and the end-to-end run are CI's**, on the pull request, and staging will not merge
+until they pass; running them locally as well repeats the gate and costs the
+time the gate exists to save. Run one locally only to chase a failure CI
+reported, and then only for what failed (`OC_TEST_ONLY=<suite> make test-tsan`).
 
 ## Commits
 
@@ -74,23 +89,32 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 
 ## CI
 
-- **`build`** — native gcc build + `make test` (unit + in-process integration,
-  including the headless client app-core test), plus the two source checks:
-  `make check-opcodes` (no two message types share an opcode) and
-  `make check-refs` (no file cites an issue by number).
-- **`integration`** — the daemon end-to-end, started natively on the runner
-  (health check + the protocol vertical over TLS). There is no local equivalent
-  of this job, and the published image is tested by nothing
-  (docs/TESTING.md §3.2).
-- **`core`** — standalone compile check of the client app-core (ARCH-74).
-- **`second-compiler`** — `make CC=clang test`, so a gcc-only assumption fails here.
-- **`windows`** — cross-compiles the Windows TUI + GUI (`make windows-tui windows-gui`).
-- **`guard`** — the job in the separate [`attribution-guard`](../.github/workflows/attribution-guard.yml)
-  workflow. Unlike the five above it has **no `paths-ignore`**, so it runs on
-  every push including docs-only ones — which is the point, since the thing it
-  rejects lives in commit messages and author lines. A promotion refuses a
-  staging commit it has not passed on.
-- Docs-only pushes skip the build jobs (`paths-ignore: ['**.md', ...]`).
+`ci.yml` runs on every pull request into `staging` and every push to `staging`,
+and is the gate `promote.yml` and `release.yml` call. It checks nothing twice:
+each test suite runs once, one clang compile serves as both the release-compiler
+and the second-compiler check, and what the release checks itself is left to the
+release. Every vendored library is cached by the script that builds it, and
+staging's runs save the caches pull requests restore. Three jobs, on three
+machines at once:
+
+- **`build`** — builds the daemon; checks it links only libc and libm; starts
+  it and drives it over TLS with the e2e client; compiles every Linux
+  translation unit with the release's clang under `-Werror`
+  (`check-release-cc`); runs the suites that start no threads
+  (`make test-rest`, with `check-opcodes` and `check-refs`).
+- **`thread-sanitizer`** — the suites that start threads, under
+  ThreadSanitizer (`make test-tsan`); their only run in CI.
+- **`windows`** — cross-compiles the Windows TUI + GUI.
+- **`pr policy`** and **`guard`** — the pull request's title and body, and the
+  attribution guard ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
+  The guard has **no `paths-ignore`**, so it runs on every push including
+  docs-only ones, since what it rejects lives in commit messages and author
+  lines. A promotion refuses a staging commit it has not passed on.
+
+**All five are required checks on `staging`.** Docs-only pushes skip the build
+jobs (`paths-ignore: ['**.md', ...]`), which is why docs go straight to
+`staging` rather than through a pull request that would wait on checks that
+never run.
 
 See [TESTING.md](./TESTING.md) for the full test strategy.
 

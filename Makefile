@@ -47,6 +47,12 @@ LDFLAGS ?= -lpthread -lm   # -lm: SQLite FTS5 ranking (bm25) calls log()
 SQLITE_DIR  := third_party/sqlite-3.53.4
 SQLITE_INC  := -I$(SQLITE_DIR)
 SQLITE_O    := build/sqlite3.o
+
+# The compiler the build/ outputs were made with. Without it `make CC=clang test`
+# after a gcc build finds build/tests up to date and runs the gcc binary; with it,
+# a different $(CC) rebuilds what it compiles. Rewritten only when $(CC) changes,
+# so an unchanged compiler rebuilds nothing.
+CC_STAMP    := build/.cc
 # FTS5 is required, not tuning. THREADSAFE=1 is the system library's own default,
 # so vendoring changes no concurrency semantics -- three threads hold their own
 # connections (dbwriter's writer and reader, and push). The omissions are things
@@ -57,7 +63,7 @@ SQLITE_DEFS := -DSQLITE_ENABLE_FTS5 -DSQLITE_THREADSAFE=1 -DHAVE_USLEEP=1 \
                -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 \
                -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_SHARED_CACHE
 
-$(SQLITE_O): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h | build
+$(SQLITE_O): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h $(CC_STAMP) | build
 	$(CC) $(filter-out $(WARN_CFLAGS),$(CFLAGS)) -w $(SQLITE_DEFS) -c $< -o $@
 
 # Release identity (ARCH-20). The release workflow passes the release number it
@@ -195,7 +201,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test test-tsan check-opcodes check-refs check-release-cc core tui bench bench-loop clean s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
+.PHONY: all run test test-rest test-tsan check-opcodes check-refs check-release-cc core tui bench bench-loop clean distclean FORCE s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
 
 all: $(BIN)
 
@@ -269,7 +275,7 @@ TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynam
 ORT_LIBS  := $(ORT_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SQLITE_O)
+$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SQLITE_O) $(CC_STAMP)
 	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(ORT_LIBS) $(LDFLAGS)
 
 # The data directory, and its manifest written by the daemon just built -- so the
@@ -326,15 +332,41 @@ check-refs:
 # the release is the wrong place to learn it. `RELEASE_CC` is what release.yml
 # compiles with.
 RELEASE_CC ?= /opt/zig/zig cc -target x86_64-linux-gnu.2.34
-check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS)
+#
+# The same compiler over everything else CI builds for Linux -- the client
+# app-core, its media, voice and call code, and the tests, with the test
+# binary's flags -- so this one clang pass is the tree's second-compiler check
+# as well: -Werror makes any warning clang raises and gcc does not fatal.
+RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
+                       $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC)
+check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
 	@for f in $(SRC) $(TTS_SRC) $(STT_SRC); do \
 	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -c -o /dev/null $$f || exit 1; \
-	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC)) sources clean"
+	done
+	@for f in $(RELEASE_CC_TEST_SRC); do \
+	  $(RELEASE_CC) $(CFLAGS) $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) \
+	    -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -c -o /dev/null $$f || exit 1; \
+	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI.
 test: check-opcodes check-refs $(TEST_BIN)
 	./$(TEST_BIN)
+
+# The suites whose code runs threads -- the loop and its I/O threads, the
+# writer and readers, the worker pools, the client, the recorder and player.
+# CI runs these under ThreadSanitizer (`make test-tsan`) and the rest plainly
+# (`make test-rest`), so every suite runs once there, never twice. A suite with
+# no thread cannot race, and instrumenting it only makes it slower.
+comma := ,
+TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_ioloop_tests \
+             run_authpool_tests run_xferpool_tests run_slow_blob_tests run_storage_tests \
+             run_blob_s3_tests run_media_tests run_video_media_tests run_tts_worker_tests \
+             run_stt_tests run_push_tests run_invite_mail_tests run_enroll_tests \
+             run_tls_tests run_signin_tests
+TSAN_SUITES := $(subst $(eval) ,$(comma),$(strip $(TSAN_LIST)))
+test-rest: check-opcodes check-refs $(TEST_BIN)
+	OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
 
 # theme.c is GUI source and is compiled in anyway: it is colour arithmetic with
 # one Windows call behind an #ifdef, and the contrast guarantee it carries has to
@@ -342,7 +374,7 @@ test: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) | build
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
 	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
 	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
@@ -356,15 +388,16 @@ TSAN_BIN := build/tests-tsan
 # shadow memory at fixed addresses, and the randomization of recent kernels
 # places the binary where that shadow has to go ("unexpected memory mapping").
 test-tsan: $(TSAN_BIN)
+	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
-$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) | build
+$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 \
 	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
 # uses Docker anywhere, and the script was deleted rather than reimplemented. The
-# two assertions it made now live in the `integration` job of
+# two assertions it made now live in the `build` job of
 # .github/workflows/ci.yml, against a natively-run daemon. `make build/e2e_client`
 # still builds the client that job drives, if you want to point it at a daemon of
 # your own. See docs/TESTING.md §3.
@@ -583,6 +616,17 @@ build/tts_pack: $(TTSKIT_SRC) ttskit/tts_pack.c $(wildcard ttskit/*.h) | build
 build:
 	mkdir -p build
 
+$(CC_STAMP): FORCE | build
+	@echo '$(CC)' | cmp -s - $@ || echo '$(CC)' > $@
+FORCE:
+
+# Everything built, except the speech models under build/kitten and
+# build/moonshine: they are downloads, not builds, and cost minutes to fetch
+# again. `distclean` removes those too.
 clean:
+	rm -f $(BIN)
+	find build -mindepth 1 -maxdepth 1 ! -name kitten ! -name moonshine -exec rm -rf {} + 2>/dev/null || true
+
+distclean:
 	rm -f $(BIN)
 	rm -rf build

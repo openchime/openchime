@@ -706,13 +706,11 @@ is shown to anybody.
 
 ## Check CI after pushing
 
-Both workflows run on every push. `ci`'s integration job drives a natively-run
-daemon end to end over a real socket, and it is the only thing that proves the
-wire actually works — the unit suite links the shared modules directly and never
-performs a handshake. A green local `make test` is therefore not a substitute
-for reading the run: the class of fault it cannot see (a client and daemon
-disagreeing about the wire) is exactly the class only the end-to-end run
-catches. Push, then check.
+`ci` runs on the pull request, and staging will not merge it until every job
+passes. Its `build` job starts the daemon binary it built and drives it over TLS
+with the e2e client — the one check of the shipped `main()` — and its
+thread-sanitizer job runs the threaded suites instrumented, which a local `make
+test` does not. Read the run's result before asking for a merge.
 
 ## Shortcuts belong in the message loop, not a window proc
 

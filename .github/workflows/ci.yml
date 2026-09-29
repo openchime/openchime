@@ -1,19 +1,22 @@
 name: ci
 
-# Runs on every branch push except main (so the branch gate is real — see
-# CONTRIBUTING.md), and is called by promote.yml and release.yml. Six jobs:
-#   - build:       native gcc build of the daemon, plus unit tests (make test),
-#                  which include the headless client app-core test.
-#   - integration: the daemon end-to-end, run natively on the runner — health
-#                  check plus the protocol vertical over TLS. This used to drive
-#                  the deployed image on a Docker Compose stack; the project no
-#                  longer uses Docker anywhere, in CI or locally, so the same two
-#                  assertions run against the binary the job builds.
-#   - core:        standalone compile check of the client app-core (ARCH-74).
-#   - second-compiler: `make CC=clang test`, so a gcc-only assumption fails.
-#   - thread-sanitizer: `make test-tsan`, so a data race between threads fails.
-#   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
+# Runs on every pull request into staging and every push to staging -- the
+# checks staging's branch protection requires before a merge -- and is called by
+# promote.yml and release.yml as their gate. Three jobs, on three machines at
+# once, and nothing checked twice:
+#   - build:       the daemon built and started for real (health check plus the
+#                  protocol vertical over TLS), static linking, every Linux
+#                  translation unit through the release's clang (the second
+#                  compiler), and the suites that run no threads.
+#   - thread-sanitizer: the suites whose code runs threads, under
+#                  ThreadSanitizer -- their one run in CI.
+#   - windows:     mingw cross-compile of the Windows front-ends (TUI + the
 #                  SDL3/sdltext GUI, ARCH-80/106/107). Build breaks only.
+#
+# Each suite runs once: the threaded ones under the sanitizer, the rest plainly
+# (the Makefile's TSAN_SUITES). Every vendored library is cached by the script
+# that builds it. What the release checks itself -- read-aloud and voice input
+# on the stripped binary and the installed package -- is not repeated here.
 #
 # There is deliberately no GUI job. scripts/gui_smoke.sh needs a Windows host for
 # the client and a Linux one for the epoll-based daemon at the same time, which no
@@ -24,17 +27,22 @@ name: ci
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
 on:
-  push:
-    # Not main: it reaches CI through release.yml's workflow_call, and running it
-    # standalone as well puts two runs in the same concurrency group, so one cancels
-    # the other. Same fix as openchime-saas/ci.yml.
-    branches-ignore: [main]
+  # A pull request into staging, where its results are the required checks; and
+  # the push that lands on staging, whose run saves the caches every pull request
+  # then restores (a cache is visible to a pull request from its base branch, not
+  # from another feature branch). Not main: it reaches CI through release.yml's
+  # workflow_call, and running it standalone as well puts two runs in the same
+  # concurrency group, so one cancels the other.
+  pull_request:
+    branches: [staging]
     paths-ignore:
       - '**.md'
       - '.gitignore'
-  # No pull_request trigger. It existed for pull requests into main, and main takes
-  # none: it moves only by promotion. A pull request into staging is checked by the
-  # push to its feature branch above, which is the same commit.
+  push:
+    branches: [staging]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
   # Lets the release workflow gate on these exact jobs rather than re-implement
   # them. A release that ran a weaker suite than CI would be worse than no gate,
   # because it would look like one. Same arrangement the control-plane repo's
@@ -72,11 +80,9 @@ jobs:
           sudo apt-get update
           # bzip2 for the vendored mbedTLS
           # tarball that `make test` builds via scripts/build_mbedtls.sh; nasm
-          # for libvpx's assembly (scripts/build_libvpx.sh). ffmpeg only for
-          # ffprobe, which the media tests run over a recorded file as an
-          # independent validator -- nothing links it. gdb so that a test binary
-          # that crashes prints every thread's stack (tests/main.c).
-          sudo apt-get install -y --no-install-recommends bzip2 nasm ffmpeg gdb
+          # for libvpx's assembly (scripts/build_libvpx.sh). gdb so that a test
+          # binary that crashes prints every thread's stack (tests/main.c).
+          sudo apt-get install -y --no-install-recommends bzip2 nasm gdb
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes), the converted voice model, and
       # voice input's recognizer files (ARCH-112). All are pure functions of the
@@ -90,146 +96,35 @@ jobs:
             build/kitten
             build/moonshine
           key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c', 'scripts/build_moonshine.sh') }}
-      - name: Build daemon
-        run: make
-      - name: Read-aloud and voice input are built in and link statically
+      # The vendored native libraries: each script builds only what is missing,
+      # so a hit skips the download and the build. Keyed by the scripts, which pin
+      # the versions and checksums, and by the compiler that builds them.
+      - name: Restore the vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+          key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
+      - name: Build the daemon and the e2e client
+        run: make && make build/e2e_client
+      # Only the C runtime may be dynamic. ONNX Runtime, its C++ runtime,
+      # mbedTLS, libopus and SQLite are all inside the binary, so anything else
+      # appearing here is a dependency that crept back in.
+      - name: The daemon links statically
         run: |
-          set -euo pipefail
-          ./openchimed --tts-say expr-voice-2-f "The build renders speech." /tmp/check.wav
-          # The recognizer hears what read-aloud said: each checks the other by
-          # its words, not by its exit status.
-          heard="$(./openchimed --stt-hear /tmp/check.wav)"
-          echo "heard: $heard"
-          if ! printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'the build renders speech'; then
-            echo "::error::voice input did not hear what read-aloud said"; exit 1
-          fi
-          # Only the C runtime may be dynamic. ONNX Runtime, its C++ runtime,
-          # mbedTLS, libopus and SQLite are all inside the binary, so anything
-          # else appearing here is a dependency that crept back in.
           ldd openchimed
           if ldd openchimed | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
             echo "::error::openchimed has a dynamic dependency beyond libc and libm"; exit 1
           fi
-      # `make TTS=0 STT=0` is a supported build that nothing else exercises, and
-      # the default build hides what it lacks: anything the speech libraries
-      # happen to put on the link line -- `-lm` was one, needed by SQLite's FTS5
-      # ranking -- is silently supplied to the default and missing without. So
-      # build it, and start it far enough to answer its health check.
-      - name: The daemon also builds and starts without read-aloud or voice input
-        run: |
-          set -euo pipefail
-          make TTS=0 STT=0 BIN=build/openchimed-notts
-          if ldd build/openchimed-notts | grep -vE 'linux-vdso|libc\.so|libm\.so|ld-linux'; then
-            echo "::error::the TTS=0 STT=0 daemon has a dynamic dependency beyond libc and libm"; exit 1
-          fi
-          d="$RUNNER_TEMP/notts"; mkdir -p "$d/blobs"
-          OPENCHIME_DB_PATH="$d/oc.db" OPENCHIME_BLOB_DIR="$d/blobs" \
-          OPENCHIME_TLS_CERT="$d/cert.pem" OPENCHIME_TLS_KEY="$d/key.pem" \
-          OPENCHIME_HEALTH_PORT=8181 OPENCHIME_PROTO_PORT=8543 \
-            build/openchimed-notts > "$d/log" 2>&1 &
-          pid=$!
-          ok=
-          for _ in $(seq 1 30); do
-            if curl -sf http://localhost:8181/healthz >/dev/null; then ok=1; break; fi
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 1
-          done
-          kill "$pid" 2>/dev/null || true
-          if [ -z "$ok" ]; then echo "::error::the TTS=0 STT=0 daemon did not become healthy"; cat "$d/log"; exit 1; fi
-      # The release compiles the daemon with zig's clang against glibc 2.34, and a
-      # newer clang refuses things this runner's accepts: a declaration after a
-      # label (a C23 extension) passed every job here and broke a release. So
-      # the daemon's sources go through that exact compiler, pinned as release.yml
-      # pins it, with the release's flags.
-      - name: The daemon compiles with the release's compiler
-        env:
-          ZIG_VERSION: '0.13.0'
-          ZIG_SHA: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
-          echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c -
-          sudo mkdir -p /opt/zig && sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          make check-release-cc
-      # Also a prerequisite of `make test`; named here so a duplicate opcode
-      # fails as itself rather than inside the test step.
-      - name: Check opcode uniqueness
-        run: make check-opcodes
-      - name: No file cites an issue by number
-        run: make check-refs
-      - name: Run unit tests
-        run: make test
-
-  integration:
-    name: end-to-end (native daemon)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install deps
-        run: |
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update
-          # bzip2 for the vendored mbedTLS tarball that the e2e client builds.
-          sudo apt-get install -y --no-install-recommends bzip2
-
-      # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
-      # static from source (about 20 minutes), the converted voice model, and
-      # voice input's recognizer files (ARCH-112). All are pure functions of the
-      # files in the key, so a hit skips the build and a change to any of them
-      # rebuilds. The timeout allows for a miss.
-      - name: Restore the speech engine and models
-        uses: actions/cache@v6
-        with:
-          path: |
-            third_party/onnxruntime-1.30.0
-            build/kitten
-            build/moonshine
-          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c', 'scripts/build_moonshine.sh') }}
-
-      - name: Build the daemon and the e2e client
-        run: make && make build/e2e_client
-
-      # These two assertions used to live in Scripts/test-integration.sh, which
-      # brought up the Docker Compose stack and drove the *deployed image* as a
-      # black box. The stack is gone, so they run against the binary this job
-      # just built. The assertions are unchanged; what they run against is not.
-      #
-      # Understand what that costs: the image published to GHCR is no longer
-      # exercised by any test, here or in the release. The daemon's behaviour is
-      # covered, its packaging into an image is not. ARCH-48 records the trade.
-      # Start, assert, stop -- all in ONE step, deliberately. A backgrounded
-      # daemon does not survive the end of the step that launched it: the runner
-      # tears down the step's process tree, so splitting this across steps gets
-      # a daemon that starts and then reports "shutdown complete" before the
-      # next step can curl it. Measured, not guessed.
+      # The built binary, started from its environment as a deployment starts
+      # it: the one thing the in-process suites cannot show, since they link the
+      # daemon's code without its main(). Start, assert, stop in ONE step -- a
+      # backgrounded daemon does not outlive the step that launched it.
       - name: End-to-end (healthz, then the protocol vertical over TLS)
         env:
-          # What docker-compose.yml used to set for the daemon service, plus the
-          # paths the image supplied implicitly and a bare runner does not.
-          #
-          # EVERY path default points into /data, which exists in the image and
-          # nowhere else. Compose therefore never had to set them. The blob
-          # directory is the one that bites: oc_blobstore_open("/data/blobs")
-          # fails on a runner and the daemon exits saying so. /healthz is served
-          # by the loop (ARCH-25), so such a daemon never answers it.
-          #
-          # The bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form
-          # compose used is a deprecated alias and the daemon warns about it.
           OPENCHIME_DB_PATH: ${{ runner.temp }}/itest/openchime.db
           OPENCHIME_BLOB_DIR: ${{ runner.temp }}/itest/blobs
           OPENCHIME_TLS_CERT: ${{ runner.temp }}/itest/cert.pem
@@ -239,106 +134,55 @@ jobs:
           OPENCHIME_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
         run: |
           set -euo pipefail
-          # The daemon creates its database and its certificate, but not the
-          # directories holding them -- the image's entrypoint does that (ARCH-39).
           mkdir -p "${{ runner.temp }}/itest/blobs"
           log="${{ runner.temp }}/daemon.log"
           ./openchimed >"$log" 2>&1 &
           dpid=$!
           trap 'kill "$dpid" 2>/dev/null || true' EXIT
-
           ok=
           for _ in $(seq 1 60); do
             if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then ok=1; break; fi
-            # A daemon that died is never going to answer; fail now with its log
-            # rather than after two more minutes of polling a dead port.
             kill -0 "$dpid" 2>/dev/null || break
-            sleep 2
+            sleep 1
           done
-          if [ -z "$ok" ]; then
-            echo "::error::daemon did not become healthy"
-            cat "$log"
-            exit 1
-          fi
-          echo "[itest] 1/2 healthz OK"
-
+          if [ -z "$ok" ]; then echo "::error::daemon did not become healthy"; cat "$log"; exit 1; fi
           ./build/e2e_client 127.0.0.1 8443
-          echo "[itest] 2/2 protocol vertical OK"
-          echo "[itest] ALL INTEGRATION CHECKS PASSED"
-          cat "$log"
-
-  core:
-    name: client app-core (compile check)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      # The client app-core (ARCH-74) is frontend-agnostic C linking the shared
-      # wire code; `make core` proves it compiles standalone. Its behaviour is
-      # driven end-to-end by the headless test in the build job's `make test`
-      # (tests/test_client_core.c). bzip2 for the vendored mbedTLS tarball.
-      - name: Install build deps
-        run: |
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bzip2
-      - name: Compile the app-core
-        run: make core
-
-  # The tree is -Werror (see the Makefile), and a warning gate is only worth
-  # what the compilers behind it see. Every other job here compiles with the
-  # runner's gcc; the RELEASE compiles every package with `zig cc`, which is
-  # Clang, and the two disagree about what is worth warning on. Release 7 found
-  # that out the expensive way -- a C11 typedef repetition that gcc accepts
-  # without a word is fatal under Clang, so the tree was green on every push and
-  # unbuildable on the one path that ships.
-  #
-  # Clang rather than zig: it is the same front end and the same diagnostics,
-  # one apt package instead of a pinned toolchain download, and what is being
-  # checked is which warnings fire, not which libc is linked. `make test` builds
-  # the widest set of translation units in the tree, so it is the one that
-  # exercises the most.
-  second-compiler:
-    name: second compiler (clang)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install build deps
+      # The release compiles with zig's clang against glibc 2.34, and a newer
+      # clang refuses things gcc accepts: a C11 typedef repetition and a
+      # declaration after a label each passed gcc and broke a release. Every
+      # Linux translation unit -- the daemon's, the client's and the tests' --
+      # goes through that exact compiler under -Werror, which is the tree's
+      # second-compiler check too. Zig is cached under the home directory.
+      - name: Restore the release's compiler
+        uses: actions/cache@v6
+        with:
+          path: ~/zig
+          key: zig-0.13.0-linux-x86_64
+      - name: Everything compiles with the release's compiler
+        env:
+          ZIG_VERSION: '0.13.0'
+          ZIG_SHA: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
         run: |
           set -euo pipefail
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bzip2 clang nasm
-      - name: Build and test with clang
-        run: make CC=clang test
-      - name: Compile the app-core with clang
-        run: make CC=clang core
+          if [ ! -x "$HOME/zig/zig" ]; then
+            curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+            echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c -
+            mkdir -p "$HOME/zig" && tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          fi
+          make check-release-cc RELEASE_CC="$HOME/zig/zig cc -target x86_64-linux-gnu.2.34"
+      # The suites that run no threads; the others run under the sanitizer in
+      # its own job. check-opcodes and check-refs are its prerequisites.
+      - name: Run the suites the sanitizer does not
+        run: make test-rest
 
   thread-sanitizer:
     name: thread sanitizer
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
-    # readers and the auth pool, the worker pools -- and so is the client's call
-    # engine. `make test-tsan` runs the whole suite under ThreadSanitizer, and a
-    # data race between our threads fails it (Makefile, tests/tsan.supp).
+    # readers and the auth pool, the worker pools -- and so are the client, its
+    # call engine and its recorder. `make test-tsan` runs the suites whose code
+    # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
+    # race between our threads fails it (tests/tsan.supp). This is those
+    # suites' only run in CI.
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -352,7 +196,22 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bzip2 nasm
+          # ffmpeg only for ffprobe, which the media suite runs over a recorded
+          # file as an independent validator -- nothing links it. gdb so that a
+          # crash prints every thread's stack (tests/main.c).
+          sudo apt-get install -y --no-install-recommends bzip2 nasm ffmpeg gdb
+      # The vendored native libraries: each script builds only what is missing,
+      # so a hit skips the download and the build. Keyed by the scripts, which pin
+      # the versions and checksums, and by the compiler that builds them.
+      - name: Restore the vendored libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2
+            third_party/libvpx-1.17.0
+            third_party/opus-1.6.1
+            third_party/speexdsp-1.2.1
+          key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
       - name: Test under ThreadSanitizer
         run: make test-tsan
 
@@ -391,6 +250,18 @@ jobs:
           # scripts/build_sdl3_windows.sh). Nothing of ours compiles as C++.
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 bzip2 curl nasm
+      # The cross-built libraries and SDL3, cached like the native ones: each
+      # script builds only what is missing.
+      - name: Restore the vendored Windows libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mbedtls-3.6.2-win
+            third_party/libvpx-1.17.0-win
+            third_party/opus-1.6.1-win
+            third_party/speexdsp-1.2.1-win
+            third_party/sdl3-3.4.14-win
+          key: vendor-win-ubuntu-24.04-${{ hashFiles('scripts/build_mbedtls_windows.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_sdl3_windows.sh') }}
       - name: Cross-build the vendored Windows mbedTLS
         run: scripts/build_mbedtls_windows.sh
       # libvpx and libopus for the Win32 client's video messages (ARCH-110).
@@ -403,7 +274,6 @@ jobs:
         run: scripts/build_sdl3_windows.sh
       # Both Windows front-ends share the app-core + shared wire code; a clean
       # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
-      # builds under mingw. The gfx test program compiles the oc_gfx layer
-      # (ARCH-107) against the static SDL3.
+      # builds under mingw.
       - name: Compile the Windows front-ends
-        run: make windows-tui windows-gui windows-sdltext-test windows-gfx-test
+        run: make windows-tui windows-gui
