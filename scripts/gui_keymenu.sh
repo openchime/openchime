@@ -16,7 +16,9 @@
 #     is highlighted -- proven by its EFFECT, not by the menu closing: "Copy link"
 #     puts a link to THAT message on the clipboard, pasted back to be read;
 #   - Esc closes the menu, and Esc again takes the keyboard off the row;
-#   - with no message focused, Shift+F10 opens the conversation's own menu.
+#   - with no message focused, Shift+F10 opens the conversation's own menu;
+#   - "Unread from here" moves the "New" line to that message at once (REQ-235),
+#     without the conversation having to be opened again.
 #
 # Its own daemon on its own port.
 set -uo pipefail
@@ -34,6 +36,7 @@ export OC_DEV_WS="${OC_DEV_WS:-Keymenu Fixture}"
 MENU_MSG=6            # the enum's value, as the dump prints it
 MENU_CHANNEL=8
 CMD_COPY_LINK=105     # "Copy link" -- its effect can be read back
+CMD_UNREAD=107        # "Unread from here"
 
 # Every key press, with its ACK CHECKED. gui_drive exits non-zero when the client
 # did not answer within ten seconds, and a dropped verb that nobody notices
@@ -173,6 +176,30 @@ check "Esc closes it" waitfor 5 closed
 check "the keyboard is still on the message" focused
 k esc
 check "Esc again takes it off the row" waitfor 5 nofocus
+
+say "== \"Unread from here\" shows where reading resumes"
+k ctrl+down
+k ctrl+up
+on_older() { [ "$(kb mid)" = "$older" ]; }
+check "...the one before the newest ($older)" waitfor 5 on_older
+k shift+f10
+check "its menu opens" waitfor 5 msg_menu
+found=0
+for _ in $(seq 1 30); do
+  [ "$(kb menuhovercmd)" = "$CMD_UNREAD" ] && { found=1; break; }
+  k down
+done
+check "the menu offers \"Unread from here\"" [ "$found" = 1 ]
+k enter
+check "choosing it closes the menu" waitfor 5 closed
+marked() { snap; grep -qi 'toast\[[0-9]\].*[Mm]arked unread' "$D"; }
+check "...and says so" waitfor 5 marked
+# The divider sits after the message before this one: the "from" is that
+# earlier message's id -- set now, in the open conversation.
+from_ok() { local f; f="$(top unread_from)"; [ -n "$f" ] && [ "$f" -gt 0 ] && [ "$f" -lt "$older" ]; }
+check "the \"New\" line moves to this message at once" waitfor 5 from_ok
+"$DRIVE" shot keymenu_unread >/dev/null
+k esc
 
 say "== with no message focused, it is the conversation's menu"
 k shift+f10

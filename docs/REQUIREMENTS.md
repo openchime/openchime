@@ -1852,7 +1852,10 @@ only REQ-212/213/214 apply.*
   as unread**, moving their read marker back so the conversation re-surfaces as
   unread for later attention, without altering anyone else's state. This has been
   a per-user adjustment of the read cursor the daemon already maintains
-  (REQ-090/095, `CLIENT_ACK`).
+  (REQ-090/095, `CLIENT_ACK`). It has taken effect at once and on every device
+  the user is signed in on: the badge has counted again from the marked message,
+  the new-message divider (REQ-236) has moved there, and staying in the
+  conversation has not read it again until the user left and came back.
 - **REQ-236.** A client has shown a **new-message divider** marking where unread
   messages begin in a conversation, and offered **jump-to-unread** (and moving
   between unread conversations by keyboard), so a returning user has found the

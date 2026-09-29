@@ -6204,10 +6204,10 @@ static oc_dbres *process_set_read_cursor(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
                              r->user_id = j->user_id; return r; }
-    /* Answer with the channel list so the client's unread badge is recomputed by the
-     * SERVER rather than guessed locally — the count is a query over messages, and
-     * two implementations of it would drift. */
-    r->type = OC_RES_READ_CURSOR;
+    /* Told to the reader's own connections, once this commit has landed: each
+     * device resets its position, and one asking for the channel list after this
+     * reads the new cursor rather than racing it. */
+    r->type = OC_RES_OWN_READ_CURSOR;
     r->user_id = j->user_id;
     r->message_id = j->message_id;
     return r;

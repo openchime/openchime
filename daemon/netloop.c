@@ -5432,6 +5432,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         }
         break;
     }
+    case OC_RES_OWN_READ_CURSOR: {
+        /* Mark unread (REQ-235): every device of the reader, the one that asked
+         * included, learns its new position. */
+        oc_read_cursor rc = { r->channel_id, r->user_id, r->message_id };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rc);
+        send_to_user(ep, conns, r->user_id, 0, g_enc, w.len);
+        break;
+    }
     case OC_RES_CALL_AUTH: {
         conn *jc = find_by_id(conns, r->conn_id);
         if (!jc || !jc->authed) break;

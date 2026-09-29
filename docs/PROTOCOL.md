@@ -510,7 +510,10 @@ members and backfills the acker with those members' current cursors.
 u64 }` — `user_id` has read `channel_id` up to `message_id`. A client folds these
 per-channel (advance-only) and renders "seen by …" on the last message for every
 member whose cursor has reached it. A duplicate/stale ack (no advance) fans
-nothing, so idle re-acks are silent.
+nothing, so idle re-acks are silent. One naming the receiving user is that
+user's own position moved by `SET_READ_CURSOR` (REQ-235), from this device or
+another: the client puts its read position there, backwards included, and counts
+its unread badge again.
 
 **`GET_CHANNEL_DESCRIPTION` (C → S), `0x008C`** `{ channel_id: u64 }` and
 **`CHANNEL_DESCRIPTION` (S → C), `0x008D`** `{ channel_id: u64, description:
@@ -1840,9 +1843,11 @@ client always folds a complete picture rather than a delta.
 
 `SET_READ_CURSOR` is deliberately **not** `CLIENT_ACK`: the ack path upserts
 `MAX(existing, new)` so a replayed ack can never rewind anyone, and mark-unread
-needs to move the cursor *backwards*. It replies with `READ_CURSOR` frames — the
-actor's new position to the channel's other members, and every other member's
-position back to the actor (REQ-090's seen-by).
+needs to move the cursor *backwards*. Once the new cursor is written, the daemon
+sends a `READ_CURSOR` naming the actor to every connection the actor holds, the
+one that asked included, so each of their devices moves to the new position and
+counts its badge again. The channel's other members are not told: seen-by says a
+member has seen a message, and that stays true.
 
 `SNOOZE` is **self-only**. Other people learn *that* someone is not to be
 disturbed, through the DND byte on `PRESENCE_UPDATE`, and never

@@ -86,7 +86,11 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   state, the channel/DM list, a per-channel message buffer (with the ARCH-45
   high-water dedup mark) carrying per-message reaction aggregates and
   edited/deleted flags, roster/presence, an ephemeral (expiring) typing table,
-  and per-channel unread + read-marker counts. `oc_model_apply` folds one `oc_ev`
+  and per-channel unread + read-marker counts. The read marker only advances on
+  reading, and moves back only by marking unread (`oc_client_set_read_cursor`,
+  REQ-235), which sets it at once and recounts the badge by the notify rule, and
+  again when the daemon's `READ_CURSOR` naming this user arrives -- so another
+  device's mark-unread lands here too. `oc_model_apply` folds one `oc_ev`
   into that state. A frontend owns an `oc_model`, drains events each tick, applies
   them, and renders — the "read events at frame start" shape, fed by the net
   thread. Single-threaded on the frontend, so no locking.
@@ -197,7 +201,9 @@ model; translate input to intents }, stop.
   the arrow keys move a highlighted selection (there are no `j`/`k`
   bindings), Esc returns to the composer. On the Messages
   panel, Enter opens an action menu (Reply in thread / Add reaction / Download /
-  Edit / Delete / Who reacted); single-key accelerators act directly: `t`
+  Edit / Delete / Who reacted / Mark unread from here -- which holds off the
+  keep-the-open-conversation-read step until focus moves, or the next frame
+  would read it again); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
   composer), `x` (or `d`) delete, `w` who-reacted. On Members, Enter opens a
   member menu (Message / Make admin / Make member / Remove); `n` starts a new

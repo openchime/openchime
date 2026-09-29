@@ -553,7 +553,13 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_GROUP_LIST = 96,
        OC_RES_GROUP_CHANGED = 97,
        OC_RES_GROUP_DELETED = 98,
-       OC_RES_GROUP_ERR = 99 };
+       OC_RES_GROUP_ERR = 99,
+       /* Mark unread (REQ-235): the reader's own cursor moved, backwards as
+        * likely as forwards. Sent to every connection of user_id as a
+        * READ_CURSOR naming them, so each of their devices resets its count; the
+        * channel's other members are not told -- having seen a message stays
+        * true. */
+       OC_RES_OWN_READ_CURSOR = 100 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {

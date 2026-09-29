@@ -2024,6 +2024,43 @@ static void test_thread_notices(void) {
 /* What a channel's badge counts (REQ-284): the messages that would have
  * NOTIFIED, with the schedule and the pause left out. */
 static void test_unread_counts_what_notifies(void) {
+    {   /* Mark unread (REQ-235): the position goes back to a message, and what
+         * lies past it counts again by the same rule -- my own and a deleted one
+         * not. The daemon's READ_CURSOR naming ME moves it either way (another
+         * device did it); naming someone else is only seen-by. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_ALL;
+        oc_ev e;
+        const uint64_t authors[5] = { 2, 2, 1, 2, 2 };
+        for (int i = 1; i <= 5; i++) {
+            memset(&e, 0, sizeof e);
+            e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = (uint64_t)i * 10;
+            e.author_id = authors[i - 1]; e.server_time = 100 + i; e.body = strdup("words");
+            oc_model_apply(&m, &e);
+        }
+        oc_model_mark_read(&m, 10);
+        CHECK(channel_unread(&m, 10) == 0);
+        c = oc_model_channel(&m, 10);
+        if (c) c->msgs[4].deleted = 1;               /* message 50 is gone */
+        oc_model_set_read_marker(&m, 10, 10);         /* unread from 20 */
+        CHECK(channel_unread(&m, 10) == 2);           /* 20 and 40: not mine (30), not 50 */
+        c = oc_model_channel(&m, 10);
+        CHECK(c && c->read_marker == 10);
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_READ_CURSOR; e.channel_id = 10; e.user_id = 1; e.message_id = 0;
+        oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 3);           /* all of it: 10, 20, 40 */
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_READ_CURSOR; e.channel_id = 10; e.user_id = 2; e.message_id = 0;
+        oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 3);           /* someone else's cursor: no change */
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_READ_CURSOR; e.channel_id = 10; e.user_id = 1; e.message_id = 50;
+        oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);           /* read again elsewhere */
+        oc_model_free(&m);
+    }
     {   /* On MENTIONS, only the one that names me. Before REQ-284 this counted
          * every message and the daemon counted something else again. */
         oc_model m; notice_fixture(&m);
@@ -3418,6 +3455,27 @@ int run_client_core_tests(void) {
         {
             uint64_t seen[8];
             CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid2, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
+        }
+
+        /* Mark unread (REQ-235) reaches every device of the reader: erik on a
+         * second connection has read everything too, and when the first marks
+         * the conversation unread, the second's badge comes back. */
+        {
+            oc_client *b2 = oc_client_start("127.0.0.1", arg.port, "erik:pw-erik");
+            CHECK(b2 != NULL);
+            if (b2) {
+                CHECK(WAIT_FOR(b2, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                oc_client_backfill(b2, 1);
+                CHECK(WAIT_FOR(b2, ({ const oc_channel *bc = oc_model_channel((oc_model *)m, 1);
+                                      bc && bc->n_msgs > 0; })));
+                oc_client_mark_read(b2, 1);
+                CHECK(channel_unread(oc_client_model(b2), 1) == 0);
+                oc_client_set_read_cursor(b, 1, 0);
+                CHECK(channel_unread(oc_client_model(b), 1) > 0);        /* at once, here */
+                CHECK(WAIT_FOR(b2, channel_unread(m, 1) > 0));            /* and there */
+                oc_client_mark_read(b, 1);                              /* as it was */
+                oc_client_stop(b2);
+            }
         }
 
         /* A channel's description (REQ-034) is not on the channel list, so it is

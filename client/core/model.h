@@ -823,6 +823,9 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
 /* Clear a channel's unread count and advance its read marker to high_water. */
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
+/* Put this user's read position in a channel at `message_id`, backwards included
+ * (mark unread, REQ-235), and recount its unread badge from the loaded messages. */
+void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message_id);
 
 /* Begin/end viewing a thread. open clears any previously-loaded replies. */
 void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id);

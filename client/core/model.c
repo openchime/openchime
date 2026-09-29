@@ -1130,6 +1130,34 @@ void oc_model_mark_read(oc_model *m, uint64_t channel_id) {
     c->unread = 0;
 }
 
+/* Mark unread (REQ-235): put this user's position in `channel_id` at
+ * `message_id`, backwards as readily as forwards, and count again what lies past
+ * it -- the loaded messages from others that would have notified, by the rule
+ * the live count and the daemon's use. History is loaded newest-first and
+ * contiguous, so everything after a message on screen is in hand. */
+void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message_id) {
+    oc_channel *c = oc_model_channel(m, channel_id);
+    if (!c) return;
+    c->read_marker = message_id;
+    int n = 0;
+    for (size_t i = 0; i < c->n_msgs; i++) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->message_id <= message_id || msg->deleted) continue;
+        int men = 0, kw = 0;
+        if (msg->body) {
+            size_t blen = strlen(msg->body);
+            men = oc_model_mentions_me(m, msg->body, blen);
+            kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+        }
+        if (oc_notify_decide(msg->author_id == m->user_id, c->muted,
+                             oc_model_is_priority(m, msg->author_id),
+                             c->notify_level, men, kw, 0, 0, 0))
+            n++;
+    }
+    c->unread = n;
+    c->srv_unread = (uint32_t)n;
+}
+
 static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
     oc_channel *c = oc_model_channel(m, channel_id);
     if (c) return c;
@@ -2190,7 +2218,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (e->user_id == m->user_id) set_status(m, "profile updated");
         break;
     case OC_EV_READ_CURSOR: {
-        /* Seen-by (REQ-090): a member read `channel_id` up to `message_id`. */
+        /* Seen-by (REQ-090): a member read `channel_id` up to `message_id`. Our
+         * own name on it is the daemon moving THIS user's position (REQ-235, mark
+         * unread, from this device or another): it goes where it says, backwards
+         * included, and the count follows. */
+        if (e->user_id == m->user_id) { oc_model_set_read_marker(m, e->channel_id, e->message_id); break; }
         oc_channel *c = oc_model_channel(m, e->channel_id);
         if (c) reader_advance(c, e->user_id, e->message_id);
         break;

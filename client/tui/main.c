@@ -750,7 +750,7 @@ typedef oc_completion ac_cand;
  * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
  * commands. One generic menu holds {label,id} items; the SELECT handler
  * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
-enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD,
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD, ACT_UNREAD,
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
        /* channel menu */
        ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
@@ -773,7 +773,12 @@ static void menu_build_msg(int own, int deleted, int has_attach) {
     if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
     if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
     g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
+    g_menu[g_nmenu++] = (menuitem){ "Mark unread from here", ACT_UNREAD };
 }
+/* The conversation marked unread (REQ-235) and still in focus: the loop's
+ * keep-it-read step leaves it alone until focus moves, or it would read it again
+ * on the next frame. */
+static uint64_t g_hold_unread;
 static void menu_build_member(int is_self) {
     g_nmenu = 0;
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Message",     ACT_DM };
@@ -2042,8 +2047,8 @@ int main(int argc, char **argv) {
         if (focus < m->n_channels) {
             uint64_t cid = m->channels[focus].channel_id;
             oc_client_backfill(cl, cid);
-            oc_client_mark_read(cl, cid);
-            if (cid != last_focus_cid) { scroll = 0; msg_sel = -1; last_focus_cid = cid; }
+            if (cid != last_focus_cid) { scroll = 0; msg_sel = -1; last_focus_cid = cid; g_hold_unread = 0; }
+            if (cid != g_hold_unread) oc_client_mark_read(cl, cid);
         }
 
         /* One present per frame: render() and the overlays all draw into the back
@@ -2307,6 +2312,18 @@ int main(int argc, char **argv) {
                     int id = g_menu[ai].id;
                     if      (id == ACT_THREAD)      oc_client_open_thread(cl, act_cid, act_mid);
                     else if (id == ACT_REACTORS)    oc_client_list_reactions(cl, act_cid, act_mid);
+                    else if (id == ACT_UNREAD) {
+                        /* The cursor names the last message READ, so this one is
+                         * unread from the one before it; 0 when it is the first. */
+                        const oc_channel *uc = oc_model_channel((oc_model *)oc_client_model(cl), act_cid);
+                        uint64_t prev = 0;
+                        if (uc) for (size_t k = 0; k < uc->n_msgs; k++) {
+                            if (uc->msgs[k].message_id == act_mid) break;
+                            prev = uc->msgs[k].message_id;
+                        }
+                        oc_client_set_read_cursor(cl, act_cid, prev);
+                        g_hold_unread = act_cid;
+                    }
                     else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
                     else if (id == ACT_DM)          { oc_client_open_dm(cl, act_uid); panel = 0; }
                     else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);

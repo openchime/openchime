@@ -1108,6 +1108,9 @@ void oc_client_set_avatar(oc_client *c, uint64_t attachment_id) {
  * only ever advance the cursor. */
 void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     if (!c || !channel_id) return;
+    /* At once here, so the badge and the divider need not wait for the round
+     * trip; the daemon's READ_CURSOR repeats it on every device of this user. */
+    oc_model_set_read_marker(&c->model, channel_id, message_id);
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_READ_CURSOR);
     if (!cmd) return;
     cmd->channel_id = channel_id;

@@ -1160,9 +1160,11 @@ every row so nothing it asserts can be the mouse's doing. It covers Ctrl+Down an
 Ctrl+Up putting the keyboard on a message and moving between them; Shift+F10
 opening that message's actions with an item already highlighted; the arrows moving
 the highlight and **Enter running the highlighted item**; Esc closing the menu and
-Esc again taking the keyboard off the row; and Shift+F10 with nothing focused
-opening the conversation's own menu. It reads the dump's `kbfocus mid= menuhover=
-menuhovercmd= subhover= subopen=` line and `menu=`.
+Esc again taking the keyboard off the row; "Unread from here" on the middle
+message moving the "New" line to it at once (REQ-235), read from the dump's
+`unread_from=`; and Shift+F10 with nothing focused opening the conversation's own
+menu. It reads the dump's `kbfocus mid= menuhover= menuhovercmd= subhover=
+subopen=` line and `menu=`.
 
 **Enter is proven by effect, and the effect is read back.** The harness walks to
 "Copy link", presses Enter, then pastes into the composer and requires the
