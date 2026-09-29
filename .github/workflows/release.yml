@@ -119,20 +119,25 @@ jobs:
       DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
       DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
       DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+      DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+      DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
       REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
       TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
       TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
       TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
       DRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-      # As in `publish`, which is where this value is defined and explained.
+      # As in `publish`, which is where these values are defined and explained.
       DIST_BASE_URL: https://openchime.io/dist
+      DIST_VERIFY_URL: https://staging.openchime.io/dist
     steps:
       - name: required credentials
         run: |
           set -u
           missing=""
           for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT \
-                   DIST_BUCKET REPO_SIGNING_KEY; do
+                   DIST_BUCKET DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY \
+                   DIST_STAGING_BUCKET REPO_SIGNING_KEY; do
             eval "val=\${$v:-}"
             [ -n "$val" ] || missing="$missing $v"
           done
@@ -185,8 +190,8 @@ jobs:
           echo "::error::missing release credentials:$missing"
           exit 1
 
-      # The published base is a URL somebody else serves: the control plane
-      # reads the bucket and exposes it at DIST_BASE_URL. Nothing in this
+      # The repository is verified at DIST_VERIFY_URL, a URL somebody else
+      # serves: the control plane reads the bucket and exposes it there. Nothing in this
       # repository can make that true, and it has not been true for three
       # releases -- so this REPORTS and never fails.
       #
@@ -203,16 +208,16 @@ jobs:
         if: ${{ !inputs.skip_repo_smoke }}
         run: |
           set -u
-          if curl -fsI --max-time 20 "$DIST_BASE_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
-            echo "published base URL serves: $DIST_BASE_URL"
-            echo "Published base URL (\`$DIST_BASE_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
+          if curl -fsI --max-time 20 "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
+            echo "verification URL serves: $DIST_VERIFY_URL"
+            echo "Verification URL (\`$DIST_VERIFY_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::$DIST_BASE_URL does not serve the archive keyring -- \
+            echo "::warning::$DIST_VERIFY_URL does not serve the archive keyring -- \
           the repositories will publish, and the terminal smoke job will fail. \
           The release itself still completes."
             {
               echo
-              echo "**Published base URL (\`$DIST_BASE_URL\`): NOT serving.**"
+              echo "**Verification URL (\`$DIST_VERIFY_URL\`): NOT serving.**"
               echo
               echo "The repositories will publish and the release will complete;"
               echo "the terminal \`smoke\` job will fail. Serving \`/dist\` is the"
@@ -974,6 +979,13 @@ jobs:
       DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
       DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
       DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      # Every release is published to both of the control plane's environments:
+      # the bucket above is production's, this one staging's, and the repository
+      # is verified through staging's /dist (DIST_VERIFY_URL). Both are built from
+      # the one pool read from production's bucket, so the two stay identical.
+      DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+      DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+      DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
       # Endpoint and bucket are variables, not secrets: neither is confidential,
       # and a masked bucket name turns every rclone log line into asterisks.
       #
@@ -1088,7 +1100,8 @@ jobs:
       - name: Configure rclone for object storage
         run: |
           set -euo pipefail
-          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET; do
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET \
+                   DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY DIST_STAGING_BUCKET; do
             [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
           done
           mkdir -p ~/.config/rclone
@@ -1101,6 +1114,14 @@ jobs:
           provider = Other
           access_key_id = ${DIST_S3_ACCESS_KEY}
           secret_access_key = ${DIST_S3_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+
+          [dist-staging]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_STAGING_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_STAGING_SECRET_KEY}
           endpoint = ${DIST_S3_ENDPOINT}
           region = auto
           EOF
@@ -1120,7 +1141,7 @@ jobs:
           # so every existing installation's `apt-get update` saw a repository
           # containing one version. The old objects survive; the index naming them
           # does not.
-          # COUNTED, not probed. `rclone lsjson` exits 0 on a prefix that does not
+          # COUNTED, not probed. A listing exits 0 on a prefix that does not
           # exist -- it reports an empty listing rather than an error -- so testing
           # its exit status called every bucket "existing" and the guard below then
           # refused a genuinely first publish.
@@ -1133,7 +1154,7 @@ jobs:
             echo "::notice::no existing apt objects in ${DIST_BUCKET}; treating as first publish"
           fi
 
-          # lsjson proves the prefix is reachable, not that the copy completed, so
+          # A listing proves the prefix is reachable, not that the copy completed, so
           # this is a second and independent witness: the tag count is what the pool
           # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
           pool_count=$(find repo/apt -name '*.deb' | wc -l)
@@ -1205,7 +1226,7 @@ jobs:
           # containing one version. The old objects survive; the index naming them
           # does not.
           # COUNTED, not probed -- the same correction the apt step carries, and
-          # for the same reason: `rclone lsjson` exits 0 on a prefix that does
+          # for the same reason: a listing exits 0 on a prefix that does
           # not exist, reporting an empty listing rather than an error. Testing
           # its exit status called every bucket "existing", so the guard below
           # refused a genuinely first publish. Fixing one of the two copies and
@@ -1220,7 +1241,7 @@ jobs:
             echo "::notice::no existing rpm objects in ${DIST_BUCKET}; treating as first publish"
           fi
 
-          # lsjson proves the prefix is reachable, not that the copy completed, so
+          # A listing proves the prefix is reachable, not that the copy completed, so
           # this is a second and independent witness: the tag count is what the pool
           # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
           pool_count=$(find repo/rpm -name '*.rpm' | wc -l)
@@ -1279,6 +1300,13 @@ jobs:
           gpgkey=${DIST_BASE_URL}/openchime-archive-keyring.asc
           EOF
           rclone copy repo/meta "dist:${DIST_BUCKET}/" --fast-list
+
+      - name: Publish the same repositories to staging's bucket
+        run: |
+          set -euo pipefail
+          rclone copy repo/apt  "dist-staging:${DIST_STAGING_BUCKET}/apt" --fast-list
+          rclone copy repo/rpm  "dist-staging:${DIST_STAGING_BUCKET}/rpm" --fast-list
+          rclone copy repo/meta "dist-staging:${DIST_STAGING_BUCKET}/" --fast-list
 
       - name: Tag the release and attach the tarballs
         env:
@@ -1389,8 +1417,10 @@ jobs:
     env:
       # The published base, as in `publish` -- which is where this value is
       # defined and explained. Repeated rather than shared because a job cannot
-      # read another job's env.
+      # read another job's env. The repository is installed from DIST_VERIFY_URL,
+      # which serves the same packages as DIST_BASE_URL.
       DIST_BASE_URL: https://openchime.io/dist
+      DIST_VERIFY_URL: https://staging.openchime.io/dist
       VERSION: ${{ needs.version.outputs.number }}
     steps:
       - name: Smoke the published apt repository
@@ -1401,9 +1431,9 @@ jobs:
         if: ${{ !inputs.skip_repo_smoke }}
         run: |
           set -euo pipefail
-          sudo curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
+          sudo curl -fsSL "$DIST_VERIFY_URL/openchime-archive-keyring.gpg" \
             -o /usr/share/keyrings/openchime-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
+          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_VERIFY_URL/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
           # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
@@ -1436,8 +1466,8 @@ jobs:
       # to support, so this also exercises the oldest supported RHEL.
       #
       # The whole point is to consume the repository the way an operator does:
-      # over HTTPS from DIST_BASE_URL, with the published key and the published
-      # .repo file, on a machine that has never seen this project.
+      # over HTTPS, with the published key and the published .repo file, on a
+      # machine that has never seen this project.
       - name: Smoke the published dnf repository
         if: ${{ !inputs.skip_repo_smoke }}
         run: |
@@ -1445,9 +1475,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends podman
           podman run --rm rockylinux:9 bash -euo pipefail -c "
-            curl -fsSL '${DIST_BASE_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
+            curl -fsSL '${DIST_VERIFY_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
             rpm --import /tmp/oc.asc
-            curl -fsSL '${DIST_BASE_URL}/openchime.repo' -o /etc/yum.repos.d/openchime.repo
+            curl -fsSL '${DIST_VERIFY_URL}/openchime.repo' -o /etc/yum.repos.d/openchime.repo
+            # The published file names DIST_BASE_URL; read it from where it is verified.
+            sed -i 's|${DIST_BASE_URL}|${DIST_VERIFY_URL}|g' /etc/yum.repos.d/openchime.repo
             dnf install -y openchimed
             openchimed --version
           "
