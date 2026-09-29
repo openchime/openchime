@@ -24,6 +24,7 @@ int run_speakable_tests(void) {
     CHECK(said("run `make test` first", "run make test first"));
     CHECK(said("before\n```\nint x = 1;\nint y = 2;\nreturn x;\n```\nafter", "before. Code block, 3 lines. after"));
     CHECK(said("see https://www.github.com/openchime/openchime/pull/285 for it", "see github.com for it"));
+    CHECK(said("read [the release notes](https://example.com/notes) today", "read the release notes today"));
     CHECK(said("thanks @dana and @fox", "thanks Dana Scully and fox"));
     CHECK(said("@here standup in 5", "everyone here standup in 5"));
     CHECK(said("@channel heads up", "everyone heads up"));

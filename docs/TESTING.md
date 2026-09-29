@@ -1035,6 +1035,17 @@ captures its screens as black; a window is captured either way. `gui_drive.sh
 launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
 
+## Reading the links harness
+
+`scripts/gui_links.sh` drives links in the transcript (REQ-220, MARKDOWN.md §4)
+against its own fixture daemon (port 9650). It sends a labelled link and a bare
+address, then asserts that hovering the label reports the real address, marked
+labelled, in the dump's `link hover= labelled=` line; that clicking it opens the
+confirmation naming that address (`confirm open= act= url=`) rather than the
+browser, and Esc dismisses it; and that hovering the bare address reports it,
+unlabelled. Nothing is ever opened: the bare link is only hovered and the
+confirmation is always dismissed.
+
 ## Reading the reactions harness
 
 `scripts/gui_reactions.sh` drives the who-reacted pane (REQ-070/071) over

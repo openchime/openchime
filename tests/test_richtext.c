@@ -251,6 +251,73 @@ static void test_autolink(void) {
     }
 }
 
+/* The address a labelled link's label opens, as a string ("" when none). */
+static const char *target_of(const char *body, const char *label) {
+    static char out[256];
+    const char *p = strstr(body, label);
+    size_t n = scan(body), i, off, tl;
+    out[0] = 0;
+    if (!p) return out;
+    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    for (i = 0; i < n; i++)
+        if (g_sp[i].style == OC_RT_LABELLED && g_sp[i].start == (size_t)(p - body) &&
+            g_sp[i].len == strlen(label) &&
+            oc_rt_target(body, strlen(body), &g_sp[i], &off, &tl) && tl < sizeof out) {
+            memcpy(out, body + off, tl); out[tl] = 0;
+        }
+    return out;
+}
+
+static void test_labelled_links(void) {
+    const char *b = "read [the guide](https://example.com/guide) first";
+    CHECK(span_over(b, "the guide", OC_RT_LABELLED));
+    CHECK(span_over(b, "[", OC_RT_LABELLED | OC_RT_DELIM));
+    CHECK(span_over(b, "](https://example.com/guide)", OC_RT_LABELLED | OC_RT_DELIM));
+    CHECK(strcmp(target_of(b, "the guide"), "https://example.com/guide") == 0);
+    CHECK(scan(b) == 3);                          /* open, label, close: no bare LINK */
+    CHECK(content_spans(b, OC_RT_LINK) == 0);
+
+    /* The address follows the autolink rules exactly: a bracket it owns is kept,
+     * and the one that closes the link is not part of it. */
+    b = "[Foo](https://en.wikipedia.org/wiki/Foo_(bar))";
+    CHECK(strcmp(target_of(b, "Foo"), "https://en.wikipedia.org/wiki/Foo_(bar)") == 0);
+
+    /* Emphasis inside the label; the label beside ordinary markup. */
+    CHECK(span_over("[*bold* label](https://a.com)", "bold", OC_RT_BOLD));
+    CHECK(span_over("*see [x](https://a.com/a_b)*", "see [x](https://a.com/a_b)", OC_RT_BOLD));
+
+    /* Only http(s): anything else is literal text, as a bare one would be. */
+    CHECK(content_spans("[click](javascript:alert(1))", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[f](file:///etc/passwd)", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[m](mailto:a@b.com)", OC_RT_LABELLED) == 0);
+
+    /* Not quite a link: literal, and a bare address inside still autolinks. */
+    CHECK(content_spans("[x] (https://a.com)", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[](https://a.com)", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[x](https://a.com", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[x](https://a.com).", OC_RT_LABELLED) == 1);
+    CHECK(content_spans("[x](https://a.com. )", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[a [b] c](https://a.com)", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("[x\ny](https://a.com)", OC_RT_LABELLED) == 0);
+    CHECK(span_over("[x](https://a.com", "https://a.com", OC_RT_LINK));
+
+    /* Code suppresses it. */
+    CHECK(content_spans("`[x](https://a.com)`", OC_RT_LABELLED) == 0);
+    CHECK(content_spans("```\n[x](https://a.com)\n```", OC_RT_LABELLED) == 0);
+
+    /* A label that reads as another address still gets a label span; the
+     * frontend's job is to show where it really goes (MARKDOWN.md §4). */
+    b = "[https://bank.com](https://evil.example)";
+    CHECK(strcmp(target_of(b, "https://bank.com"), "https://evil.example") == 0);
+
+    /* Only a label span has a target. */
+    {
+        oc_rt_span sp = { 0, 3, OC_RT_LINK };
+        size_t o, l;
+        CHECK(!oc_rt_target("abc", 3, &sp, &o, &l));
+    }
+}
+
 static void test_truncation(void) {
     /* Like the mention scanner: the count may exceed `max` so a caller can tell
      * it was truncated, and nothing is written past the bound. */
@@ -271,8 +338,9 @@ int run_richtext_tests(void) {
     test_nesting();
     test_offsets_are_source_bytes();
     test_autolink();
+    test_labelled_links();
     test_truncation();
-    printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, "
+    printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, labelled links, "
            "quotes and lists, nesting, byte offsets, autolinking, truncation\n");
     return failures;
 }

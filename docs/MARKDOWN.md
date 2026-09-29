@@ -23,7 +23,8 @@ construct shows its source legibly.
 | Blockquote | `> quoted` | At the start of a line. |
 | Bulleted list | `- item` | At the start of a line. **Not Slack** — see §4. |
 | Ordered list | `1. item` | At the start of a line. **Not Slack** — see §4. |
-| Link | `https://example.com` | Not typed as markup: a bare `http`/`https` address is **autolinked**. There is no syntax for a labelled link — see §4. |
+| Link | `https://example.com` | Not typed as markup: a bare `http`/`https` address is **autolinked**. |
+| Labelled link | `[label](https://example.com)` | Text that links to an address. The reader always sees the address before it opens — see §4. |
 
 Emphasis nests (`*bold with _italic_ inside*`); code does not — everything inside
 a code span or block is literal, including other delimiters.
@@ -112,11 +113,19 @@ ordinary characters and a URL is ordinary text.
 **A URL needs no construct — it autolinks.** A bare `http://` or `https://`
 address yields one `OC_RT_LINK` span over exactly the address, with **no
 delimiter span**, because there is no markup around it to hide: the address is
-its own label. This is why there is no authoring syntax to go with it. Slack's
-`<url|label>` is declined above, and a Markdown `[label](url)` form was
-considered and not taken — a link whose visible text can say anything while it
-points elsewhere is the shape every phishing message wants, and in a chat client
-the address IS the trustworthy part. Pasting a URL is what people do anyway.
+its own label. Slack's `<url|label>` is declined above.
+
+**A labelled link is Markdown's `[label](url)`, and it never opens unseen.**
+The label is one line, non-empty, with no brackets of its own, and may carry
+emphasis; the address follows every autolink rule — `http` or `https` only, the
+same end — and is closed by the `)`. It yields an `OC_RT_LABELLED` span over the
+label and delimiter spans over the `[` and the `](address)`; `oc_rt_target` hands
+a frontend the address. Anything short of that is literal text, in which a bare
+address still autolinks. Because a label can say anything while the link points
+elsewhere — the shape every phishing message wants — the address stays the
+trustworthy part: a frontend shows it on hover and asks before opening a
+labelled link, naming its host and the full address (§6). A bare address needs
+no such step; it is its own label.
 
 **Only `http` and `https`.** A link span is what a frontend hands to the
 operating system, so this list is the set of things a message can ask a reader's
@@ -160,8 +169,9 @@ and an underline is indistinguishable from a link in most renderings.
 - **No tables, headings, images or HTML.** A chat message is a paragraph, not a
   document. Headings in a 400-character message are noise; tables need a column
   model no terminal can honour; images are attachments (REQ-140/142).
-- **No link *titles* or reference-style links.** Both exist to make long-form
-  prose readable and neither survives a chat transcript.
+- **No link *titles*, reference-style links, or images.** Titles and references
+  exist to make long-form prose readable and neither survives a chat transcript;
+  an image is an attachment.
 - **The TUI renders the same structure without proportional styling** (REQ-220):
   bold and italic become terminal attributes, code blocks are shown in band. It
   is not exempt from formatting the way it is exempt from images (ARCH-75).
@@ -215,7 +225,12 @@ business:
   so dragging a selection that starts inside a URL still selects rather than
   launching a browser; sliding off before letting go cancels, as everywhere else.
   `ShellExecuteW` re-checks the scheme even though the parser already guaranteed
-  it, because that call is the dangerous end.
+  it, because that call is the dangerous end. **A labelled link** wears the same
+  accent and underline over its label, with the `](address)` hidden in the
+  transcript but shown faint in the composer, so its author sees where it goes.
+  Hovering one shows its real address in a tip beside the pointer, and a click
+  opens a confirmation — "This link goes to *host*", the full address, and Open
+  link — rather than the browser.
 - **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
   since a terminal has no proportional styling to lean on. Markup shown as
   source stays legible, which the dialect guarantees.

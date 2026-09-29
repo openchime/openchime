@@ -915,6 +915,8 @@ static uint64_t g_kb_mid;
  * launch a browser instead, and copying a URL is the second most common thing
  * anyone does with one. */
 static char g_link_hover[1024];
+static int  g_link_hover_lab;       /* the link under the pointer is labelled */
+static int  g_link_hover_x, g_link_hover_y;
 static char g_link_down[1024];
 /* The same pair for a #channel reference, which opens a conversation rather
  * than a browser but answers the pointer identically: hand cursor on hover,
@@ -1881,7 +1883,8 @@ static uint64_t g_confirm_root;     /* CONF_DRAFT_DELETE: the draft's thread roo
 enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
        CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
-       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE };
+       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN };
+static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 
 static char     g_confirm_title[80];
@@ -3606,7 +3609,8 @@ static int pos_in_link(const char *u8, size_t blen, size_t pos) {
     size_t n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
     if (n > OC_RT_MAX) n = OC_RT_MAX;
     for (size_t i = 0; i < n; i++)
-        if ((sp[i].style & OC_RT_LINK) && pos >= sp[i].start && pos < sp[i].start + sp[i].len)
+        if ((sp[i].style & (OC_RT_LINK | OC_RT_LABELLED)) && pos >= sp[i].start &&
+            pos < sp[i].start + sp[i].len)
             return 1;
     return 0;
 }
@@ -5085,7 +5089,7 @@ static const char *rt_mono_family(void) { return "Consolas"; }
  * scanner returns are applied as they are, with no offset transcoding to get
  * subtly wrong. `dim_delims` asks for block markers to be dimmed; inline
  * delimiters are always collapsed (st_range_hide). */
-static void apply_richtext(st_layout *lay, const char *u8, size_t blen) {
+static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int editing) {
     oc_rt_span sp[OC_RT_MAX];
     size_t n, i;
     if (!lay || !u8 || !blen) return;
@@ -5095,14 +5099,18 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen) {
         uint16_t st = sp[i].style;
         size_t at = sp[i].start, len = sp[i].len;
         if (st & OC_RT_DELIM) {
-            int block = (st & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) != 0;
+            /* A labelled link's `](address)` stays in view while it is being
+             * written -- the author sees where it goes -- and is hidden once
+             * sent, where hovering shows it instead (MARKDOWN.md §4). */
+            int block = (st & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) != 0 ||
+                        (editing && (st & OC_RT_LABELLED));
             if (!block) st_range_hide(lay, at, len);
             else        st_range_color(lay, at, len, OC_COL_FAINT, 1.0f);
             continue;
         }
         /* A link is accent + underline (REQ-220): colour alone is not an
          * affordance for a reader who cannot distinguish it. */
-        if (st & OC_RT_LINK) {
+        if (st & (OC_RT_LINK | OC_RT_LABELLED)) {
             st_range_color(lay, at, len, OC_COL_ACCENT, 1.0f);
             st_range_underline(lay, at, len, true);
         }
@@ -5214,7 +5222,7 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     if (!msg->deleted) {
         /* Formatting first (REQ-220), so a @mention inside *bold* still ends
          * up with the accent rather than the delimiter's faint colour. */
-        apply_richtext(lay, b, blen);
+        apply_richtext(lay, b, blen, 0);
         /* @mentions (REQ-221) — the daemon's own scanner, byte offsets. */
         oc_mention mm[OC_MENTION_MAX];
         size_t nm = oc_mention_scan(b, blen, mm, OC_MENTION_MAX);
@@ -11961,6 +11969,8 @@ static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
     modal_enter(hwnd, &g_confirm_open);
 }
 
+static void link_open(const char *url);   /* fwd */
+
 static void confirm_run(HWND hwnd) {
     (void)hwnd;
     switch (g_confirm_act) {
@@ -11968,6 +11978,12 @@ static void confirm_run(HWND hwnd) {
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    case CONF_LINK_OPEN: {
+        char u[sizeof g_confirm_url];
+        memcpy(u, g_confirm_url, sizeof u);
+        link_open(u);
+        break;
+    }
     case CONF_GROUP_DELETE:
         oc_client_delete_group(g_client, g_confirm_id);
         if (g_grp_sel == g_confirm_id) g_grp_sel = 0;
@@ -16496,6 +16512,15 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else mem_hits_clear();
+        /* A labelled link's real address, beside the pointer (MARKDOWN.md §4). */
+        if (g_link_hover_lab && g_link_hover[0]) {
+            char shown[96];
+            size_t ul = strlen(g_link_hover);
+            if (ul > 80) snprintf(shown, sizeof shown, "%.77s...", g_link_hover);
+            else         snprintf(shown, sizeof shown, "%s", g_link_hover);
+            float px = (float)g_link_hover_x, py = (float)g_link_hover_y - 8.0f;
+            draw_tip(rt, rf(px, py, px, py), shown, NULL, 0, W);
+        }
         /* The header's and the pane's icon-only buttons' names, over both. */
         if (g_chtip && GetTickCount64() - g_chtip_since >= FMT_TIP_MS) {
             rectf tb = g_chtip == 1 ? g_addppl_btn : g_grp_plus;
@@ -16786,6 +16811,7 @@ static void ed_hidden_build(void) {
         unsigned char kind = ED_H_CLOSE;
         if (!(sp[i].style & OC_RT_DELIM)) continue;
         if (sp[i].style & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) continue;
+        if (sp[i].style & OC_RT_LABELLED) continue;   /* the address stays in view */
         /* The opener is the delimiter the parser emits immediately before the
          * content it opens — see the emit order in richtext.c's scan_inline. A
          * lone DELIM with no content after it is an escape's backslash, which
@@ -17538,7 +17564,7 @@ static st_layout *ed_layout(float w) {
      * transcript styles, over the same bytes. Plain mode shows the markup as
      * written and restyles nothing. */
     if (g_pref_richtext)
-        apply_richtext(g_ed_layout, u8, bytes);
+        apply_richtext(g_ed_layout, u8, bytes, 1);
     /* Mark the @mentions AS YOU TYPE, through the daemon's own scanner, and
      * only the ones that RESOLVE — lighting up "@al" mid-word would promise a
      * notification that is not going to happen. */
@@ -23477,6 +23503,17 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
     n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
     if (n > OC_RT_MAX) n = OC_RT_MAX;
     for (i = 0; i < n; i++) {
+        size_t off, tl;
+        if (sp[i].style == OC_RT_LABELLED && pos >= sp[i].start && pos < sp[i].start + sp[i].len &&
+            oc_rt_target(u8, blen, &sp[i], &off, &tl)) {
+            /* A labelled link: what it OPENS is the address, not the label. */
+            if (out && cap) {
+                size_t nb = tl < cap - 1 ? tl : cap - 1;
+                memcpy(out, u8 + off, nb);
+                out[nb] = 0;
+            }
+            return 2;
+        }
         if (!(sp[i].style & OC_RT_LINK)) continue;
         if (pos >= sp[i].start && pos < sp[i].start + sp[i].len) {
             if (out && cap) {
@@ -23536,7 +23573,8 @@ static uint64_t chanref_under(int x, int y) {
     return r < 0 ? 0 : chanref_at(r, x, y);
 }
 
-/* The link under the pointer anywhere in the transcript, or 0. */
+/* The link under the pointer anywhere in the transcript: 1 for a bare address,
+ * 2 for a labelled link (its address in `out`), or 0. */
 static int link_under(int x, int y, char *out, size_t cap) {
     int r;
     if (out && cap) out[0] = 0;
@@ -23554,9 +23592,27 @@ static int link_under(int x, int y, char *out, size_t cap) {
 static void link_open(const char *url) {
     WCHAR w[1024];
     if (!url || !url[0]) return;
+    g_confirm_url[0] = 0;
     if (_strnicmp(url, "http://", 7) && _strnicmp(url, "https://", 8)) return;
     if (to_w(url, w, 1024) < 1) return;
     ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* A labelled link's text can say anything while it points elsewhere, which is
+ * the shape a phishing message takes (MARKDOWN.md §4). So one is opened only
+ * after saying where it goes: its host, then the full address, and a choice. A
+ * bare address needs none of this -- it is its own label. */
+static void link_open_labelled(HWND hwnd, const char *url) {
+    if (!url || !url[0]) return;
+    if (_strnicmp(url, "http://", 7) && _strnicmp(url, "https://", 8)) return;
+    snprintf(g_confirm_url, sizeof g_confirm_url, "%s", url);
+    const char *h = strstr(url, "://");
+    h = h ? h + 3 : url;
+    size_t hl = strcspn(h, "/?#:");
+    char body[320];
+    snprintf(body, sizeof body, "This link goes to %.*s.\n\n%.200s%s", (int)(hl < 120 ? hl : 120), h,
+             url, strlen(url) > 200 ? "..." : "");
+    confirm_open(hwnd, CONF_LINK_OPEN, 0, "Open this link?", body, "Open link");
 }
 
 static int selection_start(HWND hwnd, int x, int y) {
@@ -27621,8 +27677,9 @@ static void test_dump(const char *path) {
                 dc ? dc->description_known : 0,
                 dc && dc->description ? strlen(dc->description) : (size_t)0);
     }
-    fprintf(f, "link hover=\"%s\" chan=%llu\n", g_link_hover,
+    fprintf(f, "link hover=\"%s\" labelled=%d chan=%llu\n", g_link_hover, g_link_hover_lab,
             (unsigned long long)g_chan_hover);
+    fprintf(f, "confirm open=%d act=%d url=\"%s\"\n", g_confirm_open, g_confirm_act, g_confirm_url);
     fprintf(f, "tsel has=%d a=%llu:%u f=%llu:%u\n", g_has_sel,
             (unsigned long long)g_sel_a_mid, g_sel_a_pos,
             (unsigned long long)g_sel_f_mid, g_sel_f_pos);
@@ -30003,7 +30060,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char u[sizeof g_link_hover];
             int had = g_link_hover[0] != 0 || g_chan_hover != 0;
             uint64_t ch;
-            if (!link_under(mx, my, u, sizeof u)) u[0] = 0;
+            int kind = link_under(mx, my, u, sizeof u);
+            if (!kind) u[0] = 0;
+            /* A labelled link shows its real address beside the pointer, which
+             * follows it, so where it goes is never a secret (MARKDOWN.md §4). */
+            if ((kind == 2) != g_link_hover_lab ||
+                (kind == 2 && (mx != g_link_hover_x || my != g_link_hover_y)))
+                InvalidateRect(hwnd, NULL, FALSE);
+            g_link_hover_lab = kind == 2;
+            g_link_hover_x = mx; g_link_hover_y = my;
             /* One or the other, never both: a reference cannot sit inside a URL,
              * and asking for the cheaper answer only when the first says no
              * keeps the common move (over ordinary text) to one scan. */
@@ -30172,8 +30237,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * sliding off the link before letting go. */
             if (!g_has_sel && g_link_down[0]) {
                 char up[sizeof g_link_down];
-                if (link_under(mx, my, up, sizeof up) && !strcmp(up, g_link_down))
-                    link_open(g_link_down);
+                int kind = link_under(mx, my, up, sizeof up);
+                if (kind && !strcmp(up, g_link_down)) {
+                    if (kind == 2) link_open_labelled(hwnd, g_link_down);
+                    else           link_open(g_link_down);
+                }
             } else if (!g_has_sel && g_chan_down) {
                 if (chanref_under(mx, my) == g_chan_down) select_channel(g_chan_down);
             }
