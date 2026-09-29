@@ -1184,21 +1184,44 @@ uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
 
 uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               const char *const *paths, size_t n_paths, const char *text) {
-    if (!c || !channel_id || !paths || n_paths == 0 || n_paths > OC_MAX_ATTACH) return 0;
-    for (size_t i = 0; i < n_paths; i++)
-        if (!paths[i] || !paths[i][0]) return 0;
+    if (!paths || n_paths == 0 || n_paths > OC_MAX_ATTACH) return 0;
+    oc_post_item items[OC_MAX_ATTACH];
+    memset(items, 0, sizeof items);
+    for (size_t i = 0; i < n_paths; i++) items[i].path = paths[i];
+    return oc_client_post_items(c, channel_id, thread_root, items, n_paths, text);
+}
+
+uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const oc_post_item *items, size_t n_items, const char *text) {
+    if (!c || !channel_id || !items || n_items == 0 || n_items > OC_MAX_ATTACH) return 0;
+    for (size_t i = 0; i < n_items; i++) {
+        const oc_post_item *it = &items[i];
+        int file = it->path && it->path[0];
+        int mem = it->data && it->len && it->name && it->name[0];
+        if (file == mem) return 0;                   /* exactly one of the two */
+        if (mem && it->len > OC_MAX_ATTACHMENT_SIZE) return 0;
+    }
     oc_cmd *cmd = oc_cmd_new(OC_CMD_POST_FILES);
     if (!cmd) return 0;
     cmd->xfer_tag = next_xfer_tag();
     cmd->channel_id = channel_id;
     cmd->message_id = thread_root;
     cmd->body = strdup(text ? text : "");
-    for (size_t i = 0; i < n_paths; i++) {
-        cmd->paths[i] = strdup(paths[i]);
-        if (!cmd->paths[i]) { oc_cmd_free(cmd); return 0; }
-        cmd->n_paths++;
-    }
     if (!cmd->body) { oc_cmd_free(cmd); return 0; }
+    for (size_t i = 0; i < n_items; i++) {
+        const oc_post_item *it = &items[i];
+        if (it->data) {
+            cmd->paths[i] = strdup(it->name);
+            cmd->mem[i] = malloc(it->len);
+            if (cmd->mem[i]) { memcpy(cmd->mem[i], it->data, it->len); cmd->mem_len[i] = it->len; }
+            cmd->n_paths++;
+            if (!cmd->paths[i] || !cmd->mem[i]) { oc_cmd_free(cmd); return 0; }
+        } else {
+            cmd->paths[i] = strdup(it->path);
+            cmd->n_paths++;
+            if (!cmd->paths[i]) { oc_cmd_free(cmd); return 0; }
+        }
+    }
     uint64_t tag = cmd->xfer_tag;
     oc_queue_push(&c->cmds, cmd);
     return tag;

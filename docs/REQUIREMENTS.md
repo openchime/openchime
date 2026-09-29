@@ -1137,7 +1137,10 @@ where one exists.
   blob lands in object storage behind a swappable adapter (ARCH-70) while only a
   pointer + metadata row is stored in SQLite (SCHEMA.md migration 0009). An
   attachment is published by referencing it from a message, so it rides the one
-  message model through delivery, backfill, threads, and DMs.
+  message model through delivery, backfill, threads, and DMs. A file has been
+  attachable by picking it, dropping it on the window, or **pasting** it: copied
+  files paste as themselves, and an image copied from any other program pastes as
+  an image, with nothing written to disk on the way.
 - **REQ-141.** An attachment has remained retrievable by any user authorized
   to read the message it is attached to (REQ-031), and by no one else, for
   as long as the message itself exists — **except where storage pressure forced
@@ -2220,7 +2223,8 @@ feature.*
 
 - **REQ-270.** *(Excluded by decision)* **GIF/Giphy and sticker pickers** have not been a first-party
   feature. In the reference products these are app-provided; an integration
-  (REQ-172) could add one. Out of scope for the core client.
+  (REQ-172) could add one. Out of scope for the core client. A GIF copied from
+  anywhere has been sendable all the same, by pasting it (REQ-140).
 - **REQ-271.** *(Excluded by decision)* **Canvas / collaborative documents** (in-workspace rich documents
   with embedded media and comments) have not been supported — a document-editing
   product adjacent to chat, out of scope for a messaging system.

@@ -428,7 +428,8 @@ enum {
      * MP4, blob2 = the poster JPEG, media_*.
      * Uploads both, sends ATTACH_MEDIA_SET, then SEND or SEND_REPLY. */
     OC_CMD_POST_VIDEO,
-    /* Post files as ONE message (REQ-140): paths = the local files, body = the
+    /* Post files as ONE message (REQ-140): paths = the local files (or, with
+     * mem, the names of in-memory items), body = the
      * text (may be empty), message_id = a thread root or 0. Uploads each in
      * turn, then one SEND or SEND_REPLY carrying the text and every file. */
     OC_CMD_POST_FILES,
@@ -503,8 +504,13 @@ typedef struct {
     size_t   blob_len, blob2_len;
     uint32_t duration_ms;
     uint16_t media_w, media_h;
-    /* POST_FILES: heap paths, one per file, capped by the wire's attachment list. */
+    /* POST_FILES: one entry per file, capped by the wire's attachment list. An
+     * entry is a local file's heap path, or -- where mem[i] is set -- the name an
+     * in-memory item uploads under, with mem[i]/mem_len[i] its owned bytes (a
+     * pasted image: nothing written to disk, ARCH-88). */
     char    *paths[OC_MAX_ATTACH];
+    uint8_t *mem[OC_MAX_ATTACH];
+    size_t   mem_len[OC_MAX_ATTACH];
     uint8_t  n_paths;
     /* CALL_JOIN / CALL_INVITE: the people asked. Inline, capped by the wire. */
     uint64_t uids[OC_MAX_CALL_INVITES];
