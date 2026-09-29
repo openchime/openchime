@@ -2478,6 +2478,9 @@ static int run_connection(oc_net *n, int reconnecting,
                 push_err(n->to_ui, "the server sent a sign-in address this app will not open");
                 rc = RC_FATAL; goto drop;
             }
+            /* Cleared before the address is shown, not when the wait begins: a
+             * Cancel pressed the moment the browser opens must not be undone. */
+            n->signin_cancel = 0;
             oc_ev *e = oc_ev_new(OC_EV_AUTH_BROWSER);
             if (e) { e->body = strdup(url); oc_queue_push(n->to_ui, e); }
             rc = RC_BROWSER;
@@ -3423,7 +3426,6 @@ static void *net_thread(void *arg) {
         if (rc == RC_BROWSER) {
             /* The person is in their browser. Five minutes, or until they cancel. */
             char query[8192], tok[8192];
-            n->signin_cancel = 0;
             oc_loopback_result lr = OC_LOOPBACK_ERROR;
             for (int waited = 0; waited < 300 && !n->stop; waited++) {
                 lr = oc_loopback_wait(n->loopback, 1000, &n->signin_cancel, query, sizeof query);

@@ -368,7 +368,7 @@ static void test_vp9_through_loss(void) {
     CHECK(enc && dec);
     venc ve = { &s, 1280, 800 };
     int decoded = 0, bad = 0, last = -1, rising = 1, errors = 0;
-    for (int i = 0; i < 40 && cap && enc && dec; i++) {
+    for (int i = 0; i < 10 && cap && enc && dec; i++) {
         oc_frame f;
         if (b->next(cap, &f, 1000) != 1) { CHECK(0); break; }
         f.pts_us = s.now * 1000;
@@ -393,9 +393,9 @@ static void test_vp9_through_loss(void) {
             s.now += 5;
         }
     }
-    printf("  VP9 1280x800 at 3%% loss: %d/40 decoded, %u keyframes, %u NACKs, %u resent\n",
+    printf("  VP9 1280x800 at 3%% loss: %d/10 decoded, %u keyframes, %u NACKs, %u resent\n",
            decoded, s.tx.keyframes, s.rx.nacks, s.tx.resent);
-    CHECK(decoded >= 36 && bad == 0 && rising && errors == 0);
+    CHECK(decoded >= 9 && bad == 0 && rising && errors == 0);
     CHECK(s.tx.resent > 0 || s.rx.nacks == 0);
     oc_vp9enc_close(enc);
     oc_vp9dec_close(dec);

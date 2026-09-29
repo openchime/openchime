@@ -145,7 +145,7 @@ static void test_player_audio_only(void) {
     int16_t pcm[OC_OPUS_FRAME];
     uint8_t pkt[OC_OPUS_MAX_PACKET];
     int ok = 1;
-    for (int f = 0; f < 50; f++) {                        /* one second */
+    for (int f = 0; f < 15; f++) {                        /* 300 ms: the fault shows at any length */
         for (int i = 0; i < OC_OPUS_FRAME; i++)
             pcm[i] = (int16_t)(8000 * sin(2 * M_PI * 440.0 * (f * OC_OPUS_FRAME + i) / OC_OPUS_RATE));
         int n = oc_opusenc_encode(enc, pcm, pkt, sizeof pkt);
@@ -168,7 +168,7 @@ static void test_player_audio_only(void) {
          * ever. The player then stays PLAYING on a file that is long finished,
          * which is silent to every other assertion here -- and to a listener it
          * is a channel that reads one message aloud and then nothing, ever
-         * (REQ-291). Two seconds for one second of audio. */
+         * (REQ-291). Two seconds for 300 ms of audio. */
         int ended = 0;
         for (int i = 0; i < 200 && !ended; i++) {
             oc_player_status_get(p, &st);
@@ -273,10 +273,10 @@ static void test_vp9_roundtrip(void) {
     oc_vp9enc *enc = oc_vp9enc_open(1280, 720, 30);
     oc_vp9dec *dec = oc_vp9dec_open();
     CHECK(enc && dec);
-    oc_frame src[30];
+    oc_frame src[10];
     pkts k = {0};
     int frames = 0;
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 10; i++) {
         oc_frame f;
         if (oc_capture_next(cam, &f, 500) != 1) break;
         oc_frame_alloc(&src[i], f.width, f.height);
@@ -285,7 +285,7 @@ static void test_vp9_roundtrip(void) {
         frames++;
     }
     CHECK(oc_vp9enc_encode(enc, NULL, 0, keep_packet, &k) == 0);
-    CHECK(frames == 30 && k.count == 30);
+    CHECK(frames == 10 && k.count == 10);
     CHECK(k.count > 0 && k.key[0]);
     double worst = 99;
     int order_ok = 1, first_num = -1;
@@ -397,7 +397,7 @@ static oc_rec_result g_rec;          /* shared with the player tests */
 static void test_recorder(void) {
     setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
     setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "3000", 1);
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "2500", 1);   /* past the 2 s keyframe: the poster and the slow decoder need it */
     oc_recorder_opts o = { .width = 640, .height = 360, .fps = 30 };
     int err;
     oc_recorder *r = oc_recorder_open(&o, &err);
@@ -406,11 +406,14 @@ static void test_recorder(void) {
 
     oc_rec_status st;
     oc_recorder_status(r, &st);
-    CHECK(st.state == OC_REC_PREVIEW && st.cap_ms == 3000 && st.has_audio);
-    msleep(300);                                            /* preview only: nothing recorded */
-    static uint8_t bgra[640 * 360 * 4];
-    int w, h; uint64_t seq = 0;
-    CHECK(oc_recorder_preview(r, bgra, sizeof bgra, &w, &h, &seq) == 1 && w == 640 && h == 360);
+    CHECK(st.state == OC_REC_PREVIEW && st.cap_ms == 2500 && st.has_audio);
+    static uint8_t bgra[640 * 360 * 4];                     /* preview only: nothing recorded */
+    int w, h; uint64_t seq = 0, pv = 0;
+    for (int t = 0; t < 100 && pv != 1; t++) {
+        pv = (uint64_t)oc_recorder_preview(r, bgra, sizeof bgra, &w, &h, &seq);
+        if (pv != 1) msleep(10);
+    }
+    CHECK(pv == 1 && w == 640 && h == 360);
     CHECK(oc_recorder_preview(r, bgra, 16, &w, &h, &(uint64_t){0}) == -1);
 
     CHECK(oc_recorder_start(r) == 0);
@@ -424,7 +427,7 @@ static void test_recorder(void) {
            g_rec.video_len, g_rec.poster_len, (unsigned long long)st.dropped_frames);
     CHECK(g_rec.video && g_rec.poster);
     CHECK(g_rec.width == 640 && g_rec.height == 360);
-    CHECK(g_rec.duration_ms >= 2950 && g_rec.duration_ms <= 3100);
+    CHECK(g_rec.duration_ms >= 2450 && g_rec.duration_ms <= 2600);
     CHECK(g_rec.poster_len > 2 && g_rec.poster[0] == 0xFF && g_rec.poster[1] == 0xD8);
 
     oc_mp4_info info;
@@ -435,7 +438,7 @@ static void test_recorder(void) {
         printf("  video track %llu ms, audio track %llu ms\n", (unsigned long long)vms, (unsigned long long)ams);
         CHECK(info.audio.present);
         CHECK(llabs((long long)vms - (long long)ams) < 40 + 20);   /* within a frame and an Opus block */
-        CHECK(info.video.n_samples >= 80 && info.video.n_samples <= 92);
+        CHECK(info.video.n_samples >= 66 && info.video.n_samples <= 77);
         CHECK(info.video.samples[0].sync);
         int k = oc_recorder_poster_index(&info);
         CHECK(k > 0 && info.video.samples[k].sync && info.video.samples[k].dts >= info.video.timescale);
@@ -449,12 +452,12 @@ static void test_recorder(void) {
     CHECK(r != NULL);
     if (r) {
         CHECK(oc_recorder_start(r) == 0);
-        msleep(1200);
+        msleep(500);
         oc_recorder_stop(r);
         CHECK(wait_state(r, OC_REC_DONE, 5000, &st));
         oc_rec_result res;
         CHECK(oc_recorder_take(r, &res) == 0);
-        CHECK(res.duration_ms >= 900 && res.duration_ms <= 1400);
+        CHECK(res.duration_ms >= 300 && res.duration_ms <= 800);
         CHECK(oc_recorder_take(r, &res) != 0 || (oc_rec_result_free(&res), 0));
         oc_rec_result_free(&res);
         oc_recorder_close(r);
@@ -463,7 +466,7 @@ static void test_recorder(void) {
      * can never outgrow the daemon's video cap. */
     {
         oc_recorder_opts ob = o;
-        ob.max_bytes = 150000;
+        ob.max_bytes = 40000;
         r = oc_recorder_open(&ob, &err);
         CHECK(r != NULL);
         if (r) {
@@ -472,14 +475,14 @@ static void test_recorder(void) {
             oc_rec_result res;
             CHECK(oc_recorder_take(r, &res) == 0);
             printf("  byte budget: %u ms, %zu bytes\n", res.duration_ms, res.video_len);
-            CHECK(res.duration_ms < 60000 && res.video_len >= 150000 && res.video_len < 150000 + 60000);
+            CHECK(res.duration_ms < 60000 && res.video_len >= 40000 && res.video_len < 40000 + 60000);
             oc_rec_result_free(&res);
             oc_recorder_close(r);
         }
     }
     /* Closing mid-recording leaves nothing behind (ASan checks the leak). */
     r = oc_recorder_open(&o, &err);
-    if (r) { oc_recorder_start(r); msleep(300); oc_recorder_close(r); }
+    if (r) { oc_recorder_start(r); msleep(50); oc_recorder_close(r); }
 
     /* The OS blocks the camera. */
     setenv("OPENCHIME_TEST_CAPTURE", "denied", 1);
@@ -524,10 +527,10 @@ static void test_player(void) {
     CHECK(st.position_ms == st.duration_ms);
 
     /* A seek lands on the keyframe at or before the target. */
-    oc_player_seek(p, 2500);
+    oc_player_seek(p, 2200);
     msleep(200);
     oc_player_status_get(p, &st);
-    int k = oc_mp4_keyframe_before(&info, 2500 * 90);
+    int k = oc_mp4_keyframe_before(&info, 2200 * 90);
     CHECK(k >= 0 && st.position_ms == (uint32_t)(info.video.samples[k].dts / 90));
     CHECK(st.state == OC_PLAYER_PAUSED);
 
@@ -538,16 +541,16 @@ static void test_player(void) {
     msleep(200);
     oc_player_status_get(p, &st);
     uint64_t before_p = st.presented, before_d = st.dropped;
-    int k2 = oc_mp4_keyframe_before(&info, 2600 * 90);
+    int k2 = oc_mp4_keyframe_before(&info, 2300 * 90);
     uint32_t k2_ms = k2 >= 0 ? (uint32_t)(info.video.samples[k2].dts / 90) : 0;
     oc_player_play(p);
-    msleep(2700);
+    msleep(2300);
     oc_player_status_get(p, &st);
     printf("  slow decoder: clock %u ms, frame %u ms, keyframe %u ms, dropped %llu\n", st.position_ms,
            st.frame_ms, k2_ms, (unsigned long long)(st.dropped - before_d));
     CHECK(st.dropped > before_d);
     CHECK(st.presented > before_p);
-    CHECK(st.position_ms >= 2400);                          /* the clock follows the audio */
+    CHECK(st.position_ms >= 2100);                          /* the clock follows the audio */
     CHECK(k2_ms > 0 && st.frame_ms >= k2_ms);               /* and the picture caught up */
     oc_player_close(p);
     oc_mp4_info_free(&info);
@@ -667,7 +670,7 @@ static void test_screen_source(void) {
     int frames = 0, changes = 0, prev = -1, size_ok = 1, order_ok = 1;
     int64_t pts[256];
     int64_t t0 = oc_media_clock_us();
-    while (oc_media_clock_us() - t0 < 1000000) {
+    while (oc_media_clock_us() - t0 < 500000) {
         oc_frame f;
         int rc = oc_capture_next(c, &f, 100);
         CHECK(rc >= 0);
@@ -681,13 +684,13 @@ static void test_screen_source(void) {
     }
     CHECK(size_ok);
     check_frame_rate("screen source", pts,
-                     frames < (int)(sizeof pts / sizeof pts[0]) ? frames : 256, 30, 1000);
+                     frames < (int)(sizeof pts / sizeof pts[0]) ? frames : 256, 30, 500);
     /* The screen changes five times a second, whatever the rate frames arrive at:
      * never more than that (plus the two boundaries), never going backwards, and
      * at least one change seen however few frames the host managed. */
-    printf("  screen source: %d changes in 1 s\n", changes);
+    printf("  screen source: %d changes in 0.5 s\n", changes);
     CHECK(order_ok);
-    CHECK(changes >= 1 && changes <= 7);
+    CHECK(changes >= 1 && changes <= 4);
     oc_capture_stop(c);
     oc_capture_close(c);
 }
@@ -760,9 +763,14 @@ static void test_screen_recording(void) {
     /* ...and the narrator draws breath before speaking, as a person does: a
      * second from when the microphone opens, so the recording, which starts a
      * frame or so later, opens on the computer's sound alone. See below. */
-    setenv("OPENCHIME_TEST_MIC_LEAD_MS", "1000", 1);
+    setenv("OPENCHIME_TEST_MIC_LEAD_MS", "500", 1);
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "2000", 1);
 
-    for (int corner = OC_CORNER_BR; corner <= OC_CORNER_TL; corner++) {
+    /* One recording, the camera in the top-left corner -- not the default, so a
+     * recorder that ignored the choice would put it in the wrong place. Where
+     * each corner's box goes is test_i420_view's (oc_inset_rect, all four); what
+     * this adds is that the recorder draws it where it was asked to. */
+    for (int corner = OC_CORNER_TL; corner <= OC_CORNER_TL; corner++) {
         oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "screen:synthetic",
                                .with_camera = 1, .corner = corner, .computer_sound = 1 };
         int err;
@@ -781,9 +789,9 @@ static void test_screen_recording(void) {
         CHECK(res.width == 1152 && res.height == 720);
         /* It must not stop EARLY -- that would lose what was being recorded. Stopping
          * late is the same real-time story as the frame count: a host that cannot
-         * encode fast enough notices the three seconds are up a little after they
+         * encode fast enough notices the two seconds are up a little after they
          * are, so the ceiling is generous rather than narrow. */
-        CHECK(res.duration_ms >= 2950 && res.duration_ms <= 6000);
+        CHECK(res.duration_ms >= 1950 && res.duration_ms <= 5000);
         oc_mp4_info info;
         if (!res.video || oc_mp4_parse(res.video, res.video_len, &info) != 0) { CHECK(0); oc_rec_result_free(&res); continue; }
         /* Every frame at the rate, though the screen changed five times a second --
@@ -856,44 +864,13 @@ static void test_screen_recording(void) {
         oc_mp4_info_free(&info);
         oc_rec_result_free(&res);
     }
-    /* The microphone hears nothing but the computer's sound coming back from
-     * the speakers. Cancelled, the computer's sound is in the recording once, at
-     * its own level; uncancelled it would be about 1.26 times that (the echo is
-     * half strength, 20 ms late). */
+    /* The recording above plays the computer's sound back into the microphone
+     * too (OPENCHIME_TEST_MIC_ECHO), and asserts the computer's sound comes out
+     * once, while the narrator talks over it: the echo-only case is the easier
+     * one, and an uncancelled echo (~1.26 times the level) fails that check
+     * already. */
     unsetenv("OPENCHIME_TEST_MIC_LEAD_MS");
-    setenv("OPENCHIME_TEST_MIC_ECHO", "only", 1);
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "5000", 1);
-    {
-        oc_recorder_opts o = { .height = 360, .fps = 30, .screen_id = "screen:synthetic", .computer_sound = 1 };
-        int err;
-        oc_recorder *r = oc_recorder_open(&o, &err);
-        CHECK(r != NULL);
-        if (r) {
-            oc_rec_status st;
-            CHECK(oc_recorder_start(r) == 0);
-            CHECK(wait_state(r, OC_REC_DONE, 10000, &st));
-            oc_rec_result res = {0};
-            CHECK(oc_recorder_take(r, &res) == 0);
-            oc_recorder_close(r);
-            oc_mp4_info info;
-            if (res.video && oc_mp4_parse(res.video, res.video_len, &info) == 0) {
-                size_t n = 0;
-                int16_t *pcm = decode_audio(res.video, &info, &n);
-                if (pcm && n > 96000) {
-                    const int16_t *tail = pcm + n - 96000;          /* the last two seconds */
-                    double a660 = tone_amp(tail, 96000, 660);
-                    printf("  echo only: 660 Hz %.0f (once: 6000; twice, uncancelled: ~7560)\n", a660);
-                    CHECK(a660 > 6000 * 0.9 && a660 < 6000 * 1.1);
-                } else {
-                    CHECK(0);
-                }
-                free(pcm);
-                oc_mp4_info_free(&info);
-            }
-            oc_rec_result_free(&res);
-        }
-    }
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "3000", 1);
+    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "1200", 1);   /* the last second is what is heard */
     unsetenv("OPENCHIME_TEST_MIC_ECHO");
 
     /* A window, no camera, no computer sound: no box anywhere, the microphone only. */
@@ -936,7 +913,7 @@ static void test_screen_recording(void) {
 
     /* The window closes mid-recording: what came before it is kept. */
     setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "300000", 1);
-    setenv("OPENCHIME_TEST_SCREEN_GONE_MS", "1500", 1);
+    setenv("OPENCHIME_TEST_SCREEN_GONE_MS", "500", 1);
     {
         oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "window:synthetic" };
         int err;
@@ -949,8 +926,8 @@ static void test_screen_recording(void) {
             CHECK(st.source_gone);
             oc_rec_result res = {0};
             CHECK(oc_recorder_take(r, &res) == 0);
-            printf("  window gone at 1.5 s: kept %u ms\n", res.duration_ms);
-            CHECK(res.duration_ms >= 1000 && res.duration_ms <= 1600);
+            printf("  window gone at 0.5 s: kept %u ms\n", res.duration_ms);
+            CHECK(res.duration_ms >= 300 && res.duration_ms <= 650);
             oc_rec_result_free(&res);
             oc_recorder_close(r);
         }

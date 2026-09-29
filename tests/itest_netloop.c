@@ -15,6 +15,7 @@
 #include "tts_render.h"
 #include "stt_render.h"
 #include "check.h"
+#include "sqlite3.h"
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -58,12 +59,17 @@ static int udp_recv_audio(int fd, uint64_t *sender, uint16_t *seq, char *out, si
     memcpy(out, pkt + OC_AUDIO_S2C_HDR, pl);
     return (int)pl;
 }
+static void udp_timeout(int fd, int ms) {
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+}
+
 static int mk_udp_client(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct timeval tv = { 1, 0 };   /* 1 s — generous ceiling for the audio relay
-                                     * round-trip under CI load (loopback UDP
-                                     * doesn't drop). */
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    udp_timeout(fd, 1000);   /* 1 s -- a generous ceiling for the audio relay
+                              * round-trip under CI load (loopback UDP doesn't
+                              * drop); a read waits this long only when nothing
+                              * comes, which a check here never expects */
     return fd;
 }
 
@@ -93,6 +99,19 @@ static void *loop_thread(void *p) {
     oc_config_load(cfgerr, sizeof cfgerr);
     oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
     return NULL;
+}
+
+/* Stop a loop and wait for it. The loop looks at its flag between turns, and an
+ * idle one takes a turn only every half second, so a connection to its port
+ * wakes it now rather than whenever that comes round. */
+static void stop_loop(struct loop_arg *a, pthread_t th) {
+    __atomic_store_n(&a->stop, 1, __ATOMIC_RELEASE);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons((uint16_t)a->port);
+    if (fd >= 0) { (void)connect(fd, (struct sockaddr *)&sa, sizeof sa); close(fd); }
+    pthread_join(th, NULL);
 }
 
 /* A connected + TLS-handshaked client. */
@@ -360,137 +379,6 @@ static void test_version_reject(int port, const uint8_t *pin) {
     client_close(&d);
 }
 
-static void test_message_vertical(int port, const uint8_t *pin) {
-    client a, b;
-    CHECK(client_open(&a, port, pin) == 0);
-    CHECK(client_open(&b, port, pin) == 0);
-    CHECK(do_handshake(&a) == 0);
-    CHECK(do_handshake(&b) == 0);
-
-    uint64_t ua = 0, ub = 0;
-    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
-    CHECK(ua != 0 && ub != 0 && ua != ub);
-
-    /* alice sends to the default channel. */
-    uint8_t idem[OC_IDEM_SIZE];
-    memset(idem, 0x7E, sizeof idem);
-    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s = {0};
-    s.channel_id = 1;
-    memcpy(s.idem, idem, OC_IDEM_SIZE);
-    s.body = oc_slice_str("hello everyone");
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
-    CHECK(write_all(&a.conn, buf, w.len) == 0);
-
-    /* alice receives SEND_ACK then the BROADCAST (order not guaranteed between
-     * the two, but both must arrive); read two frames and classify. */
-    uint64_t acked_id = 0, bcast_id_a = 0;
-    for (int i = 0; i < 2; i++) {
-        oc_header hdr; oc_rbuf p;
-        CHECK(read_frame(&a, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_SEND_ACK) {
-            oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
-            CHECK(memcmp(ack.idem, idem, OC_IDEM_SIZE) == 0);
-            acked_id = ack.message_id;
-        } else if (hdr.msg_type == OC_MSG_BROADCAST) {
-            oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
-            CHECK(bc.author_id == ua);
-            CHECK(bc.body.len == 14 && memcmp(bc.body.ptr, "hello everyone", 14) == 0);
-            bcast_id_a = bc.message_id;
-        } else {
-            CHECK(0 /* unexpected frame to sender */);
-        }
-    }
-    CHECK(acked_id != 0 && acked_id == bcast_id_a);
-
-    /* bob receives the same BROADCAST. */
-    oc_header hdr; oc_rbuf p;
-    CHECK(read_frame(&b, &hdr, &p) == 0);
-    CHECK(hdr.msg_type == OC_MSG_BROADCAST);
-    oc_broadcast bcb;
-    CHECK(oc_decode_broadcast(&p, &bcb) == OC_OK);
-    CHECK(bcb.message_id == acked_id);
-    CHECK(bcb.author_id == ua);
-    CHECK(bcb.body.len == 14 && memcmp(bcb.body.ptr, "hello everyone", 14) == 0);
-
-    client_close(&a);
-    client_close(&b);
-}
-
-/* A reconnecting client backfills messages it missed (REQ-101). */
-static void test_backfill_reconnect(int port, const uint8_t *pin) {
-    /* A sends a distinctive message and learns its id. */
-    client a;
-    CHECK(client_open(&a, port, pin) == 0);
-    CHECK(do_handshake(&a) == 0);
-    uint64_t ua = 0;
-    CHECK(do_auth(&a, "bf-sender", "pw", &ua) == 0);
-
-    uint8_t idem[OC_IDEM_SIZE];
-    memset(idem, 0x5C, sizeof idem);
-    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s = {0};
-    s.channel_id = 1;
-    memcpy(s.idem, idem, OC_IDEM_SIZE);
-    s.body = oc_slice_str("backfill me");
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
-    CHECK(write_all(&a.conn, buf, w.len) == 0);
-
-    uint64_t mx = 0;
-    for (int i = 0; i < 2; i++) {          /* SEND_ACK + own BROADCAST */
-        oc_header hdr; oc_rbuf p;
-        CHECK(read_frame(&a, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_SEND_ACK) {
-            oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
-            mx = ack.message_id;
-        }
-    }
-    CHECK(mx != 0);
-
-    /* A fresh connection (a reconnect) authenticates and backfills from 0. */
-    client c;
-    CHECK(client_open(&c, port, pin) == 0);
-    CHECK(do_handshake(&c) == 0);
-    uint64_t uc = 0;
-    CHECK(do_auth(&c, "bf-reader", "pw", &uc) == 0);
-
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_cursor cur = { 1, 0 };
-    oc_backfill_request req = { 1, &cur };
-    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
-    CHECK(write_all(&c.conn, buf, w.len) == 0);
-
-    /* Replayed BROADCASTs (ascending id) then a BACKFILL_DONE; mx must appear. */
-    int saw_mx = 0;
-    uint64_t hw = 0, prev = 0;
-    for (int i = 0; i < 1000; i++) {
-        oc_header hdr; oc_rbuf p;
-        CHECK(read_frame(&c, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_BROADCAST) {
-            oc_broadcast b; CHECK(oc_decode_broadcast(&p, &b) == OC_OK);
-            CHECK(b.message_id > prev);     /* ascending order */
-            prev = b.message_id;
-            if (b.message_id == mx) {
-                saw_mx = 1;
-                CHECK(b.body.len == 11 && memcmp(b.body.ptr, "backfill me", 11) == 0);
-            }
-        } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) {
-            oc_backfill_done d; CHECK(oc_decode_backfill_done(&p, &d) == OC_OK);
-            hw = d.high_water;
-            break;
-        } else {
-            CHECK(0 /* unexpected frame during backfill */);
-            break;
-        }
-    }
-    CHECK(saw_mx == 1);
-    CHECK(hw >= mx);
-
-    client_close(&a);
-    client_close(&c);
-}
-
 /* Edit + delete over the wire (REQ-032/051/052): the author edits, the fan-out
  * reaches every member, an owner moderator-deletes another user's message, and a
  * follow-up edit on the tombstone is refused with a non-fatal ERROR. */
@@ -660,86 +548,6 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     client_close(&cc);
 }
 
-/* Emoji reactions over the wire (REQ-070/071): two members react to a message,
- * each REACT fans a REACTION_UPDATED with the running aggregate to every member,
- * LIST_REACTIONS returns the reactor rows, and a remove toggles the count down. */
-static void test_reactions_vertical(int port, const uint8_t *pin) {
-    client a, b;
-    CHECK(client_open(&a, port, pin) == 0);
-    CHECK(client_open(&b, port, pin) == 0);
-    CHECK(do_handshake(&a) == 0);
-    CHECK(do_handshake(&b) == 0);
-    uint64_t ua = 0, ub = 0;
-    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
-
-    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
-
-    /* alice posts; learn the id, drain both members' BROADCAST. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s = {0}; s.channel_id = 1; memset(s.idem, 0x5B, OC_IDEM_SIZE);
-    s.body = oc_slice_str("react to this");
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    uint64_t mid = 0;
-    for (int i = 0; i < 2; i++) {
-        CHECK(read_frame(&a, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); mid = ack.message_id; }
-    }
-    CHECK(mid != 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
-
-    /* alice adds :+1: -> both members receive REACTION_UPDATED, count 1. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_react rc = { 1, mid, oc_slice_str(":+1:"), OC_REACT_ADD };
-    CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    for (int who = 0; who < 2; who++) {
-        client *cc = who ? &a : &b;
-        CHECK(read_frame(cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTION_UPDATED);
-        oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
-        CHECK(ru.message_id == mid && ru.user_id == ua && ru.op == OC_REACT_ADD && ru.count == 1);
-        CHECK(ru.emoji.len == 4 && memcmp(ru.emoji.ptr, ":+1:", 4) == 0);
-    }
-
-    /* bob adds the same emoji -> count 2 for both. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_react rc2 = { 1, mid, oc_slice_str(":+1:"), OC_REACT_ADD };
-    CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc2) == OC_OK);
-    CHECK(send_frame(&b, buf, w.len) == 0);
-    for (int who = 0; who < 2; who++) {
-        client *cc = who ? &a : &b;
-        CHECK(read_frame(cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTION_UPDATED);
-        oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
-        CHECK(ru.count == 2 && ru.user_id == ub);
-    }
-
-    /* LIST_REACTIONS returns both reactor rows. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_list_reactions lr = { 1, mid };
-    CHECK(oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &lr) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTIONS);
-    oc_reaction_entry ents[8]; uint16_t n = 0; uint64_t lmid = 0;
-    CHECK(oc_decode_reactions(&p, ents, 8, &n, &lmid) == OC_OK);
-    CHECK(lmid == mid && n == 2);
-
-    /* bob toggles off -> count 1. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_react rc3 = { 1, mid, oc_slice_str(":+1:"), OC_REACT_REMOVE };
-    CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc3) == OC_OK);
-    CHECK(send_frame(&b, buf, w.len) == 0);
-    for (int who = 0; who < 2; who++) {
-        client *cc = who ? &a : &b;
-        CHECK(read_frame(cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTION_UPDATED);
-        oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
-        CHECK(ru.op == OC_REACT_REMOVE && ru.count == 1);
-    }
-
-    client_close(&a);
-    client_close(&b);
-}
-
 /* Threads over the wire (REQ-060): a reply is delivered as THREAD_REPLY (never a
  * BROADCAST in the main scroll), LIST_THREAD streams the replies + a THREAD
  * terminator, and a reconnect backfill carries a THREAD_META for the parent. */
@@ -855,80 +663,6 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     client_close(&b);
     client_close(&c);
     client_close(&d);
-}
-
-/* Full-text search over the wire (REQ-080): a member searches and gets matching
- * messages as snippets, and a private channel's messages never surface to a
- * non-member (the member-scoping security property, REQ-031). */
-static void test_search_vertical(int port, const uint8_t *pin) {
-    client a, b;
-    CHECK(client_open(&a, port, pin) == 0);
-    CHECK(client_open(&b, port, pin) == 0);
-    CHECK(do_handshake(&a) == 0);
-    CHECK(do_handshake(&b) == 0);
-    uint64_t ua = 0, ub = 0;
-    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
-
-    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
-
-    /* alice posts a distinctive message to the shared channel. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s = {0}; s.channel_id = 1; memset(s.idem, 0x91, OC_IDEM_SIZE);
-    s.body = oc_slice_str("orbital laser schematics");
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    uint64_t m1 = 0;
-    for (int i = 0; i < 2; i++) {
-        CHECK(read_frame(&a, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); m1 = ack.message_id; }
-    }
-    CHECK(m1 != 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
-
-    /* bob searches and finds it, with the right ids and a non-empty snippet. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_search sq = { .query = oc_slice_str("orbital"), .limit = 10 };
-    CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) == OC_OK);
-    CHECK(send_frame(&b, buf, w.len) == 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
-    oc_search_result_entry se[8]; uint16_t n = 0;
-    CHECK(oc_decode_search_results(&p, se, 8, &n, NULL) == OC_OK);
-    CHECK(n == 1 && se[0].message_id == m1 && se[0].channel_id == 1 && se[0].author_id == ua);
-    CHECK(se[0].snippet.len > 0);
-
-    /* alice creates a private channel and posts to it. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_create_channel cch = { oc_slice_str("bunker"), 0 };
-    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
-    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
-    uint64_t cid = ci.channel_id;
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s2 = {0}; s2.channel_id = cid; memset(s2.idem, 0x92, OC_IDEM_SIZE);
-    s2.body = oc_slice_str("nuclear launch codes");
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    for (int i = 0; i < 2; i++) { CHECK(read_frame(&a, &hdr, &p) == 0); }   /* ACK + BROADCAST */
-
-    /* bob (not a member of the private channel) cannot find it. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_search sq2 = { .query = oc_slice_str("nuclear"), .limit = 10 };
-    CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
-    CHECK(send_frame(&b, buf, w.len) == 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
-    CHECK(oc_decode_search_results(&p, se, 8, &n, NULL) == OC_OK && n == 0);
-
-    /* alice, a member, does find it. */
-    oc_wbuf_init(&w, buf, sizeof buf);
-    CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
-    CHECK(send_frame(&a, buf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
-    CHECK(oc_decode_search_results(&p, se, 8, &n, NULL) == OC_OK && n == 1 && se[0].channel_id == cid);
-
-    client_close(&a);
-    client_close(&b);
 }
 
 /* Presence + typing over the wire (REQ-120/121): a connecting user is announced
@@ -1195,41 +929,6 @@ static void test_presence_dnd(int port, const uint8_t *pin) {
 
     client_close(&a);
     client_close(&b);
-}
-
-/* Issue DOWNLOAD_BEGIN for `aid` and reassemble the streamed blob into `out`
- * (bounded by `cap`), verifying DOWNLOAD_INFO's digest matches `expect_sha` and
- * that chunk sequence numbers are contiguous. Returns the bytes received. */
-static size_t download_attachment(client *c, uint64_t aid, uint8_t *out, size_t cap,
-                                  const uint8_t expect_sha[32]) {
-    uint8_t hb[64]; oc_wbuf w; oc_wbuf_init(&w, hb, sizeof hb);
-    oc_download_begin dlb = { aid };
-    CHECK(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &dlb) == OC_OK);
-    CHECK(send_frame(c, hb, w.len) == 0);
-
-    oc_header hdr; oc_rbuf p;
-    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DOWNLOAD_INFO);
-    oc_download_info di; CHECK(oc_decode_download_info(&p, &di) == OC_OK);
-    CHECK(di.attachment_id == aid && di.total_size <= cap);
-    if (expect_sha) CHECK(di.sha256.len == 32 && memcmp(di.sha256.ptr, expect_sha, 32) == 0);
-
-    size_t off = 0; uint32_t exp = 0;
-    for (;;) {
-        CHECK(read_frame(c, &hdr, &p) == 0);
-        if (hdr.msg_type == OC_MSG_DOWNLOAD_CHUNK) {
-            oc_download_chunk dc; CHECK(oc_decode_download_chunk(&p, &dc) == OC_OK);
-            CHECK(dc.attachment_id == aid && dc.seq == exp && off + dc.data.len <= cap);
-            memcpy(out + off, dc.data.ptr, dc.data.len);   /* copy before the next read */
-            off += dc.data.len; exp++;
-        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_END) {
-            oc_download_end de; CHECK(oc_decode_download_end(&p, &de) == OC_OK && de.attachment_id == aid);
-            break;
-        } else {
-            CHECK(0 && "unexpected frame during download");
-        }
-    }
-    CHECK(off == di.total_size);
-    return off;
 }
 
 /* Disconnecting mid-upload (ARCH-69). The dangerous shape once blob I/O moved
@@ -1948,8 +1647,7 @@ static void test_voice_input_absent(int port, int by_env) {
     CHECK(acked);
     client_close(&a);
 
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
+    stop_loop(&arg2, th2);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     if (by_env) unsetenv("OPENCHIME_STT");
@@ -1957,226 +1655,6 @@ static void test_voice_input_absent(int port, int by_env) {
     unlink("build/itest_stt_off.db");
     unlink("build/itest_stt_off.db-wal");
     unlink("build/itest_stt_off.db-shm");
-}
-
-/* Attachments over the wire (REQ-140/141, ARCH-69). A multi-chunk blob is
- * uploaded and streamed back byte-for-byte; a second user retrieves the same
- * blob from a shared channel; and a non-member is refused a private one — all
- * proxied through the daemon, with access control on the message-channel gate. */
-static void test_attachments_vertical(int port, const uint8_t *pin) {
-    client a;
-    CHECK(client_open(&a, port, pin) == 0);
-    CHECK(do_handshake(&a) == 0);
-    uint64_t ua = 0; CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-
-    oc_header hdr; oc_rbuf p;
-    uint8_t *fbuf = malloc(OC_MAX_FRAME_SIZE);   /* one chunk frame can be ~64 KiB */
-    CHECK(fbuf != NULL);
-    oc_wbuf w;
-
-    /* A ~150 KiB payload spans several chunks (exercises the pump + windowing). */
-    const size_t total = 150000;
-    uint8_t *payload = malloc(total);
-    CHECK(payload != NULL);
-    for (size_t i = 0; i < total; i++) payload[i] = (uint8_t)(i * 31u + 7u);
-
-    uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0xA1, sizeof idem);
-
-    /* UPLOAD_BEGIN on the public default channel. */
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_begin ub = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("data.bin"), oc_slice_str("application/octet-stream"), total };
-    memcpy(ub.idem, idem, OC_IDEM_SIZE);
-    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
-    oc_upload_ready urd; CHECK(oc_decode_upload_ready(&p, &urd) == OC_OK);
-    uint64_t aid = urd.attachment_id;
-    CHECK(aid != 0 && urd.chunk_size > 0 && urd.chunk_size <= OC_ATTACH_CHUNK_SIZE);
-
-    /* Stream the payload, acked chunk by chunk. */
-    uint32_t seq = 0; size_t off = 0;
-    while (off < total) {
-        size_t n = total - off; if (n > urd.chunk_size) n = urd.chunk_size;
-        oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-        oc_upload_chunk uc = { aid, seq, { payload + off, n } };
-        CHECK(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK);
-        CHECK(send_frame(&a, fbuf, w.len) == 0);
-        CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_ACK);
-        oc_upload_ack uak; CHECK(oc_decode_upload_ack(&p, &uak) == OC_OK);
-        CHECK(uak.attachment_id == aid && uak.acked_through == seq + 1);
-        off += n; seq++;
-    }
-
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_end ue = { aid };
-    CHECK(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_OK);
-    oc_upload_ok uok; CHECK(oc_decode_upload_ok(&p, &uok) == OC_OK);
-    CHECK(uok.attachment_id == aid && uok.size == total && uok.sha256.len == 32);
-    uint8_t digest[32]; memcpy(digest, uok.sha256.ptr, 32);
-
-    /* Download it back and reassemble; bytes and digest must match. */
-    uint8_t *got = malloc(total); CHECK(got != NULL);
-    size_t glen = download_attachment(&a, aid, got, total, digest);
-    CHECK(glen == total && memcmp(got, payload, total) == 0);
-
-    /* A second user in the same (public) channel retrieves the same blob. */
-    client b;
-    CHECK(client_open(&b, port, pin) == 0);
-    CHECK(do_handshake(&b) == 0);
-    uint64_t ubid = 0; CHECK(do_auth(&b, "bob", "pw-bob", &ubid) == 0);
-    memset(got, 0, total);
-    glen = download_attachment(&b, aid, got, total, digest);
-    CHECK(glen == total && memcmp(got, payload, total) == 0);
-
-    /* Linking (REQ-140): alice references the attachment in a SEND to the shared
-     * channel; bob receives the BROADCAST with the attachment metadata inline. */
-    uint8_t midem[OC_IDEM_SIZE]; memset(midem, 0xC3, sizeof midem);
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_send sm = {0};
-    sm.channel_id = OC_DEFAULT_CHANNEL; memcpy(sm.idem, midem, OC_IDEM_SIZE);
-    sm.body = oc_slice_str("here's the file");
-    sm.n_attach = 1; sm.attach_ids[0] = aid;
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
-    oc_broadcast bcast; CHECK(oc_decode_broadcast(&p, &bcast) == OC_OK);
-    CHECK(bcast.n_attach == 1 && bcast.attach[0].id == aid && bcast.attach[0].size == total);
-    CHECK(bcast.attach[0].filename.len == 8 && memcmp(bcast.attach[0].filename.ptr, "data.bin", 8) == 0);
-    /* Drain alice's own SEND_ACK + BROADCAST so her stream is clean for the next step. */
-    for (int i = 0; i < 2; i++) { CHECK(read_frame(&a, &hdr, &p) == 0); }
-
-    /* Access control (REQ-141): an attachment on a private channel alice creates
-     * is refused to bob, a non-member. */
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_create_channel cc = { oc_slice_str("vault"), 0 };
-    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
-    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
-    uint64_t priv = ci.channel_id;
-
-    const char *small = "secret bytes";
-    size_t slen = strlen(small);
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_begin ub2 = { priv, {0}, oc_slice_str("s.txt"), oc_slice_str("text/plain"), slen };
-    memset(ub2.idem, 0xB2, OC_IDEM_SIZE);
-    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub2) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
-    CHECK(oc_decode_upload_ready(&p, &urd) == OC_OK);
-    uint64_t paid = urd.attachment_id;
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_chunk uc2 = { paid, 0, { (const uint8_t *)small, slen } };
-    CHECK(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc2) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_ACK);
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_end ue2 = { paid };
-    CHECK(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue2) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_OK);
-
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_download_begin dlb = { paid };
-    CHECK(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &dlb) == OC_OK);
-    CHECK(send_frame(&b, fbuf, w.len) == 0);
-    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
-    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK);
-    CHECK(er.code == OC_ERR_FORBIDDEN);
-
-    free(payload); free(got); free(fbuf);
-    client_close(&a);
-    client_close(&b);
-}
-
-/* One small upload in a single chunk; returns the attachment id, or 0. */
-static uint64_t upload_small(client *c, uint8_t *fbuf, uint64_t ch, uint8_t idem_byte,
-                             const char *name, const char *mime, const uint8_t *data, size_t len) {
-    oc_header hdr; oc_rbuf p; oc_wbuf w;
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_begin ub = { ch, {0}, oc_slice_str(name), oc_slice_str(mime), len };
-    memset(ub.idem, idem_byte, OC_IDEM_SIZE);
-    if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) != OC_OK || send_frame(c, fbuf, w.len) != 0) return 0;
-    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_UPLOAD_READY) return 0;
-    oc_upload_ready urd;
-    if (oc_decode_upload_ready(&p, &urd) != OC_OK) return 0;
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_chunk uc = { urd.attachment_id, 0, { data, len } };
-    if (oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) != OC_OK || send_frame(c, fbuf, w.len) != 0) return 0;
-    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_UPLOAD_ACK) return 0;
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_upload_end ue = { urd.attachment_id };
-    if (oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) != OC_OK || send_frame(c, fbuf, w.len) != 0) return 0;
-    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_UPLOAD_OK) return 0;
-    return urd.attachment_id;
-}
-
-/* A video message over the wire (REQ-162/165, ARCH-110): poster and video
- * upload as ordinary attachments, ATTACH_MEDIA_SET is refused for a bad poster
- * and accepted for a good one, and the member who receives the SEND sees the
- * media fields inline and can fetch the poster. */
-static void test_video_message_vertical(int port, const uint8_t *pin) {
-    client a, b;
-    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
-    uint64_t ua = 0; CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
-    uint64_t ub = 0; CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
-    oc_header hdr; oc_rbuf p; oc_wbuf w;
-    uint8_t *fbuf = malloc(OC_MAX_FRAME_SIZE);
-    CHECK(fbuf != NULL);
-    if (!fbuf) return;
-
-    uint8_t jpeg[600], mp4[4000];
-    for (size_t i = 0; i < sizeof jpeg; i++) jpeg[i] = (uint8_t)(i * 7u);
-    for (size_t i = 0; i < sizeof mp4; i++) mp4[i] = (uint8_t)(i * 13u);
-    uint64_t poster = upload_small(&a, fbuf, OC_DEFAULT_CHANNEL, 0xD1, "poster.jpg", "image/jpeg", jpeg, sizeof jpeg);
-    uint64_t video  = upload_small(&a, fbuf, OC_DEFAULT_CHANNEL, 0xD2, "Video message.mp4", "video/mp4", mp4, sizeof mp4);
-    CHECK(poster && video);
-
-    /* The video named as its own poster: refused with an ordinary ERROR. */
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_attach_media_set ms = { video, OC_MEDIA_VIDEO_MESSAGE, 12345, 1280, 720, video };
-    CHECK(oc_encode_attach_media_set(&w, OC_PROTOCOL_VERSION, &ms) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
-    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_MEDIA_INVALID);
-
-    ms.poster_id = poster;
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    CHECK(oc_encode_attach_media_set(&w, OC_PROTOCOL_VERSION, &ms) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ATTACH_MEDIA_OK);
-    oc_attach_media_ok mo; CHECK(oc_decode_attach_media_ok(&p, &mo) == OC_OK && mo.attachment_id == video);
-
-    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
-    oc_send sm = {0};
-    sm.channel_id = OC_DEFAULT_CHANNEL; memset(sm.idem, 0xD3, OC_IDEM_SIZE);
-    sm.body = oc_slice_str("a quick update");
-    sm.n_attach = 1; sm.attach_ids[0] = video;
-    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
-    CHECK(send_frame(&a, fbuf, w.len) == 0);
-    int got = 0;
-    for (int i = 0; i < 8 && !got; i++) {
-        if (read_frame(&b, &hdr, &p) != 0) break;
-        if (hdr.msg_type != OC_MSG_BROADCAST) continue;
-        oc_broadcast bc;
-        CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
-        got = 1;
-        CHECK(bc.n_attach == 1 && bc.attach[0].id == video);
-        CHECK(bc.attach[0].media_kind == OC_MEDIA_VIDEO_MESSAGE && bc.attach[0].duration_ms == 12345);
-        CHECK(bc.attach[0].width == 1280 && bc.attach[0].height == 720 && bc.attach[0].poster_id == poster);
-    }
-    CHECK(got);
-    uint8_t back[sizeof jpeg];
-    CHECK(download_attachment(&b, poster, back, sizeof back, NULL) == sizeof jpeg);
-    CHECK(memcmp(back, jpeg, sizeof jpeg) == 0);
-
-    free(fbuf);
-    client_close(&a);
-    client_close(&b);
 }
 
 /* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
@@ -2741,42 +2219,7 @@ static void test_call_share(int port, const uint8_t *pin) {
 /* Full audio path (REQ-150/151): two participants join a call, each gets a UDP
  * endpoint + bearer token in CALL_JOINED, and one participant's audio is relayed
  * to the other by the relay, tagged with the sender's user id. */
-/* A daemon with no media endpoint -- its UDP socket could not be bound --
- * does not offer calls, and a join is refused openly with CALL_UNAVAILABLE
- * rather than being handed a port nothing listens on. */
-static void test_call_no_relay(int port) {
-    /* The main loop holds the suite's socket, so this one starts with none. */
-    oc_tls_server srv2;
-    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
-    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
-    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-    unlink("build/itest_norelay.db"); unlink("build/itest_norelay.db-wal"); unlink("build/itest_norelay.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_norelay.db");
-    CHECK(dbw2 != NULL);
-    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
-    struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
-    pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
-
-    client a;
-    CHECK(client_open(&a, port, pin2) == 0); CHECK(do_handshake(&a) == 0);
-    uint64_t ua = 0;
-    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w;
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
-    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&a, buf, w.len) == 0);
-    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
-    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_CALL_UNAVAILABLE);
-    client_close(&a);
-
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
-    oc_dbwriter_stop(dbw2);
-    oc_tls_server_free(&srv2);
-    unlink("build/itest_norelay.db"); unlink("build/itest_norelay.db-wal"); unlink("build/itest_norelay.db-shm");
-}
+static void set_read_timeout(client *c, int ms);
 
 static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_port) {
     client a, b;
@@ -2813,18 +2256,16 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     relay.sin_port = htons(audio_port);
     int sa = mk_udp_client(), sb = mk_udp_client();
 
-    /* Each side sends a hello so the relay learns its UDP address. */
+    /* Each side sends a hello so the relay learns its UDP address, and each
+     * hears the keepalive echo of its own -- which says the relay has it. */
+    uint64_t sender; uint16_t seq; char body[64];
     udp_send_audio(sb, &relay, btok, 0, NULL);
+    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) >= 0);
     udp_send_audio(sa, &relay, atok, 0, NULL);
-    usleep(120000);
-    { char tmp[64]; uint64_t s; uint16_t sq;   /* discard any forwarded helloes */
-      while (udp_recv_audio(sa, &s, &sq, tmp, sizeof tmp) >= 0) {}
-      while (udp_recv_audio(sb, &s, &sq, tmp, sizeof tmp) >= 0) {} }
+    CHECK(udp_recv_audio(sa, &sender, &seq, body, sizeof body) >= 0);
 
     /* alice speaks -> bob receives it, tagged with alice's user id. */
     udp_send_audio(sa, &relay, atok, 7, "hey");
-    usleep(80000);
-    uint64_t sender; uint16_t seq; char body[64];
     int n = udp_recv_audio(sb, &sender, &seq, body, sizeof body);
     CHECK(n == 3 && sender == ua && seq == 7 && memcmp(body, "hey", 3) == 0);
 
@@ -2836,31 +2277,30 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     uint8_t atok2[OC_AUDIO_TOKEN_RAND];
     memcpy(atok2, jd.token.ptr, OC_AUDIO_TOKEN_RAND);
     CHECK(memcmp(atok2, atok, OC_AUDIO_TOKEN_RAND) != 0);
+    /* The old token, then the new, from one socket: the relay handles them in
+     * order, so if the old were relayed it would reach bob first. What bob
+     * receives first is the new one -- no wait for "nothing" needed. */
     udp_send_audio(sa, &relay, atok, 8, "old");
-    usleep(80000);
-    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) < 0);
     udp_send_audio(sa, &relay, atok2, 9, "new");
-    usleep(80000);
     n = udp_recv_audio(sb, &sender, &seq, body, sizeof body);
     CHECK(n == 3 && sender == ua && seq == 9 && memcmp(body, "new", 3) == 0);
 
     /* bob goes silent -- no keep-alive -- and the relay sweeps him: it reports
      * him GONE and the daemon takes him out of the call, so alice's roster says
      * who can actually be heard (CALLS.md §4). */
-    oc_netloop_set_relay_silence_ms(1200);
+    /* alice keeps talking (a keepalive every 100 ms) while bob says nothing,
+     * and alice's roster is watched between them until it holds her alone. */
+    oc_netloop_set_relay_silence_ms(300);
     oc_call_roster ro;
     int gone = 0;
-    for (int i = 0; i < 16 && !gone; i++) {
+    set_read_timeout(&a, 100);
+    for (int i = 0; i < 40 && !gone; i++) {
         udp_send_audio(sa, &relay, atok2, (uint16_t)(10 + i), NULL);
-        usleep(250000);
-        if (i >= 5) {
-            while (udp_recv_audio(sb, &sender, &seq, body, sizeof body) >= 0) {}
-        }
-    }
-    for (int i = 0; i < 4 && !gone; i++)
         if (read_type(&a, OC_MSG_CALL_ROSTER, &hdr, &p) == 0 &&
             oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 1 && parts[0].user_id == ua)
             gone = 1;
+    }
+    set_read_timeout(&a, 20000);
     CHECK(gone);
     oc_netloop_set_relay_silence_ms(0);
 
@@ -2967,7 +2407,11 @@ static void test_call_transports(int port, const uint8_t *pin, uint16_t audio_po
     udp_send_audio(sa, &relay, atok, 15, "tcp");
     n = tcp_media_down(&b, &s, &q, body, sizeof body);
     CHECK(n == 3 && s == ua && q == 15 && memcmp(body, "tcp", 3) == 0);
-    CHECK(udp_recv_audio(sbu, &s, &q, body, sizeof body) < 0);   /* not by datagram any more */
+    /* Not by datagram any more: a copy would have left with the one on the
+     * connection just read, so a short wait is a full one here. */
+    udp_timeout(sbu, 150);
+    CHECK(udp_recv_audio(sbu, &s, &q, body, sizeof body) < 0);
+    udp_timeout(sbu, 1000);
 
     /* carol stops reading. ~20 MB of media is sent her way: more than any
      * kernel buffer between her and the daemon holds, so most of it waits on the
@@ -3093,23 +2537,25 @@ static void test_call_routed(int port) {
     CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == TLEN);
     uint8_t atok2[TLEN];
     if (jd.token.len == TLEN) memcpy(atok2, jd.token.ptr, TLEN);
-    usleep(100000);
-    while (udp_recv_audio(sb, &sender, &seq, body, sizeof body) >= 0) {}
-    udp_send_audio_n(sa, &relay, atok, TLEN, 6, "old");
-    CHECK(udp_recv_audio(sb, &sender, &seq, body, sizeof body) < 0);
     n = -1;
     for (int i = 0; i < 10 && n != 3; i++) {
         udp_send_audio_n(sa, &relay, atok2, TLEN, 7, "new");
         while ((n = udp_recv_audio(sb, &sender, &seq, body, sizeof body)) == 0) {}
     }
     CHECK(n == 3 && sender == ua && seq == 7 && memcmp(body, "new", 3) == 0);
+    /* The new token is in use, so the rejoin is applied: the old one, then the
+     * new, from one socket -- if the old were still relayed it would reach bob
+     * first. */
+    udp_send_audio_n(sa, &relay, atok, TLEN, 6, "old");
+    udp_send_audio_n(sa, &relay, atok2, TLEN, 8, "new");
+    while ((n = udp_recv_audio(sb, &sender, &seq, body, sizeof body)) == 0) {}
+    CHECK(n == 3 && sender == ua && seq == 8 && memcmp(body, "new", 3) == 0);
 
     (void)ub;
     close(sa); close(sb);
     client_close(&a);
     client_close(&b);
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
+    stop_loop(&arg2, th2);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     /* Put the shared configuration back: the main loop reads it too. */
@@ -3363,23 +2809,37 @@ static void test_send_rate_limit(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
-/* Read frames from `c` until it has been quiet for its read timeout, counting
- * those of `type` (and, for an ERROR, only those with `code`). */
-static int count_until_quiet(client *c, uint16_t type, uint16_t code, uint64_t from_user,
-                             uint8_t *last_status) {
+/* Count the frames `c` receives of `type` (for an ERROR, only those with
+ * `code`; for presence and typing, only those about `from_user`).
+ *
+ * With `fence`, first ask the daemon for the channel list and stop at its
+ * answer: the loop answers a connection's requests in order, so every frame it
+ * queued for `c` before that request is read before the answer -- an exact end
+ * to the count, where waiting for a quiet second is only a guess that costs the
+ * second. Without, stop once `max` have been counted. -1 if the end never came
+ * (the read timed out). */
+static int count_frames(client *c, uint16_t type, uint16_t code, uint64_t from_user,
+                        uint8_t *last_status, int fence, int max) {
+    if (fence) {
+        uint8_t fb[64]; oc_wbuf w; oc_wbuf_init(&w, fb, sizeof fb);
+        if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) != OC_OK || send_frame(c, fb, w.len) != 0)
+            return -1;
+    }
     int n = 0;
     for (;;) {
         oc_header hdr; oc_rbuf p;
         const uint8_t *frame; size_t flen;
         int r = oc_framebuf_next(&c->fb, &frame, &flen);
-        if (r < 0) return n;
+        if (r < 0) return -1;
         if (r == 0) {
             uint8_t buf[4096]; size_t got = 0;
-            if (oc_tls_read(&c->conn, buf, sizeof buf, &got) != OC_TLS_OK || !got) return n;
-            if (oc_framebuf_push(&c->fb, buf, got) != 0) return n;
+            if (oc_tls_read(&c->conn, buf, sizeof buf, &got) != OC_TLS_OK || !got) return -1;
+            if (oc_framebuf_push(&c->fb, buf, got) != 0) return -1;
             continue;
         }
-        if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK || hdr.msg_type != type) continue;
+        if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) continue;
+        if (fence && hdr.msg_type == OC_MSG_CHANNEL_LIST) return n;
+        if (hdr.msg_type != type) continue;
         if (type == OC_MSG_ERROR) {
             oc_error e;
             if (oc_decode_error(&p, &e) == OC_OK && e.code == code) n++;
@@ -3395,10 +2855,14 @@ static int count_until_quiet(client *c, uint16_t type, uint16_t code, uint64_t f
         } else {
             n++;
         }
+        if (!fence && max && n >= max) return n;
     }
 }
 
-static void set_quiet_after(client *c, int ms) {
+/* Everything `c` has sent so far has been handled: its fence is answered. */
+static int fenced(client *c) { return count_frames(c, 0, 0, 0, NULL, 1, 0) == 0; }
+
+static void set_read_timeout(client *c, int ms) {
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 }
@@ -3414,9 +2878,12 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
     uint64_t ua = 0; CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
     CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
     uint64_t ub = 0; CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
-    set_quiet_after(&a, 1000); set_quiet_after(&b, 1000);
-    count_until_quiet(&a, 0, 0, 0, NULL);          /* the sign-in presence */
-    count_until_quiet(&b, 0, 0, 0, NULL);
+    /* Every count below ends at a fence, never at a timeout; the timeout only
+     * bounds a failure. The presence window is shortened so its last word does
+     * not cost ten seconds. */
+    set_read_timeout(&a, 5000); set_read_timeout(&b, 5000);
+    oc_netloop_set_presence_rate_ms(600);
+    CHECK(fenced(&a) && fenced(&b));               /* the sign-ins' presence, read past */
 
     uint8_t buf[128]; oc_wbuf w;
 
@@ -3427,7 +2894,8 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
         CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
         CHECK(send_frame(&b, buf, w.len) == 0);
     }
-    CHECK(count_until_quiet(&a, OC_MSG_TYPING_UPDATE, 0, ub, NULL) == 3);
+    CHECK(fenced(&b));                              /* bob's burst is handled... */
+    CHECK(count_frames(&a, OC_MSG_TYPING_UPDATE, 0, ub, NULL, 1, 0) == 3);   /* ...and alice has what it made */
 
     /* Presence: eight changes, away first and online last. Five go out now; the
      * last word follows once the window has passed, and it is ONLINE. */
@@ -3438,12 +2906,13 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
         CHECK(send_frame(&a, buf, w.len) == 0);
     }
     uint8_t st = 0;
-    CHECK(count_until_quiet(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st) == 5);
+    CHECK(fenced(&a));
+    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 5);
     CHECK(st == OC_PRESENCE_AWAY);
-    set_quiet_after(&b, 12000);
-    CHECK(count_until_quiet(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st) == 1);
+    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 0, 1) == 1);   /* the window passes */
     CHECK(st == OC_PRESENCE_ONLINE);
-    set_quiet_after(&b, 1000);
+    CHECK(count_frames(&b, OC_MSG_PRESENCE_UPDATE, 0, ua, &st, 1, 0) == 0);   /* and that was all */
+    oc_netloop_set_presence_rate_ms(0);
 
     /* Reactions: thirty-five in a burst, the last five refused. */
     for (int i = 0; i < 35; i++) {
@@ -3452,7 +2921,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
         CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK);
         CHECK(send_frame(&a, buf, w.len) == 0);
     }
-    CHECK(count_until_quiet(&a, OC_MSG_ERROR, OC_ERR_SEND_RATE_LIMITED, 0, NULL) == 5);
+    CHECK(count_frames(&a, OC_MSG_ERROR, OC_ERR_SEND_RATE_LIMITED, 0, NULL, 1, 0) == 5);
 
     /* Call signalling: sixty-five in a burst, the last five refused. */
     for (int i = 0; i < 65; i++) {
@@ -3461,7 +2930,7 @@ static void test_fanout_limits(int port, const uint8_t *pin) {
         CHECK(oc_encode_call_share(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK);
         CHECK(send_frame(&a, buf, w.len) == 0);
     }
-    CHECK(count_until_quiet(&a, OC_MSG_ERROR, OC_ERR_SEND_RATE_LIMITED, 0, NULL) == 5);
+    CHECK(count_frames(&a, OC_MSG_ERROR, OC_ERR_SEND_RATE_LIMITED, 0, NULL, 1, 0) == 5);
 
     /* The read budget: two megabytes of frames written as one burst are read a
      * budget's worth per turn, however fast they arrive. Typing frames, because
@@ -3510,6 +2979,27 @@ static void seed_messages(oc_dbwriter *dbw, uint64_t author, int n, size_t len, 
     }
 }
 
+/* Wait until `author` has `n` messages stored: the writer takes seeded sends
+ * asynchronously, and the loop owns its results, so the database is asked
+ * directly, read-only. */
+static int wait_messages_stored(uint64_t author, int n) {
+    int got = -1;
+    for (int i = 0; i < 1000 && got < n; i++) {
+        sqlite3 *rdb = NULL;
+        if (sqlite3_open_v2("build/itest_netloop.db", &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(rdb, "SELECT count(*) FROM messages WHERE author_id=?;", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(st, 1, (sqlite3_int64)author);
+                if (sqlite3_step(st) == SQLITE_ROW) got = sqlite3_column_int(st, 0);
+            }
+            sqlite3_finalize(st);
+            sqlite3_close(rdb);
+        }
+        if (got < n) usleep(10000);
+    }
+    return got >= n;
+}
+
 /* read_frame, but telling apart the two ways of getting nothing: 1 a frame,
  * 0 nothing within the socket's read timeout, -1 the daemon closed or the
  * stream broke. A test about the daemon dropping a connection must not count
@@ -3554,7 +3044,7 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
     /* ~28 MB: far more than any kernel buffer, so the daemon's own pacing is what
      * is being exercised, not TCP's. Bounded by OC_BACKFILL_MAX (500) on replay. */
     seed_messages(dbw, flooder, 480, 60000, 0xC7);
-    usleep(1500000);   /* let the writer persist them */
+    CHECK(wait_messages_stored(flooder, 480));
 
     client v;
     CHECK(client_open(&v, port, pin) == 0);
@@ -3605,7 +3095,15 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
         CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
         CHECK(write_all(&b.conn, buf, w.len) == 0);
     }
-    usleep(700000);    /* still silent: the daemon holds the rest */
+    /* bob's own copy says the daemon has taken the send and fanned it out:
+     * the live message is waiting behind the replay for the silent reader. */
+    {
+        oc_header hdr; oc_rbuf p; oc_broadcast bc; int mine = 0;
+        for (int i = 0; i < 64 && !mine; i++)
+            if (read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0 && oc_decode_broadcast(&p, &bc) == OC_OK &&
+                bc.body.len == 24 && memcmp(bc.body.ptr, "while you were replaying", 24) == 0) mine = 1;
+        CHECK(mine);
+    }
 
     for (int i = 0; i < 6000 && !live_after_done; i++) {
         oc_header hdr; oc_rbuf p;
@@ -3700,14 +3198,22 @@ static int wait_presence_of(client *c, uint64_t uid, uint8_t status) {
 
 /* The loop's worst turn since the last reset, once the turn under way now has
  * been counted: a turn is recorded when the next begins (netloop.h). */
-static uint64_t settled_turn_max(void) {
+static uint64_t settled_turn_max(client *poke) {
+    /* A turn's time is recorded when the next begins, and an idle loop begins
+     * one only every half second: so `poke` asks for the channel list, twice,
+     * and each answer is a turn -- cheap ones, far below what is measured. */
     oc_netloop_stats st;
     oc_netloop_stats_get(&st);
     uint64_t t0 = st.turns;
-    for (int i = 0; i < 300 && st.turns <= t0 + 1; i++) {
-        usleep(10000);
-        oc_netloop_stats_get(&st);
+    for (int k = 1; k <= 2; k++) {
+        uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK) (void)send_frame(poke, buf, w.len);
+        for (int i = 0; i < 300 && st.turns < t0 + (uint64_t)k; i++) {
+            usleep(1000);
+            oc_netloop_stats_get(&st);
+        }
     }
+    for (int i = 0; i < 300 && st.turns <= t0 + 1; i++) { usleep(10000); oc_netloop_stats_get(&st); }
     return st.turn_max_us;
 }
 
@@ -3740,7 +3246,7 @@ static void test_login_bound(int port, const uint8_t *pin) {
         oc_netloop_stats_reset();
         CHECK(send_frame(&crowd[0], buf, w.len) == 0);
         CHECK(wait_presence_of(&crowd[N - 1], uids[0], sp.status) == 0);
-        uint64_t m = settled_turn_max();
+        uint64_t m = settled_turn_max(&crowd[0]);
         if (m < presence_us) presence_us = m;
     }
     for (int r = 0; r < R; r++) {
@@ -3750,7 +3256,7 @@ static void test_login_bound(int port, const uint8_t *pin) {
         oc_netloop_stats_reset();
         CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
         CHECK(wait_presence_of(&crowd[N - 1], ub, OC_PRESENCE_ONLINE) == 0);
-        uint64_t m = settled_turn_max();
+        uint64_t m = settled_turn_max(&crowd[0]);
         if (m < login_us) login_us = m;
         client_close(&b);
         CHECK(wait_presence_of(&crowd[N - 1], ub, OC_PRESENCE_OFFLINE) == 0);   /* gone: the next is a first sign-in */
@@ -3941,26 +3447,6 @@ static void test_groups_vertical(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
-/* LOGOUT over the wire: the daemon revokes the session and drops the
- * connection (REQ-182). */
-static void test_logout_closes(int port, const uint8_t *pin) {
-    client a;
-    CHECK(client_open(&a, port, pin) == 0);
-    CHECK(do_handshake(&a) == 0);
-    uint64_t ua = 0;
-    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
-
-    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_logout lo = { OC_LOGOUT_ALL, { NULL, 0 } };
-    CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK);
-    CHECK(write_all(&a.conn, buf, w.len) == 0);
-
-    /* No reply frame — the server closes the connection after revoking. */
-    oc_header hdr; oc_rbuf p;
-    CHECK(read_frame(&a, &hdr, &p) != 0);
-    client_close(&a);
-}
-
 /* The two states where the specification promises UNEXPECTED_MSG_TYPE and the
  * daemon used to say nothing: a first frame that is not HELLO (socket closed
  * with nothing written) and a post-auth type no branch claims (ignored
@@ -4014,22 +3500,6 @@ static void test_unexpected_msg_type(int port, const uint8_t *pin) {
         CHECK(err.code == OC_ERR_UNEXPECTED_MSG_TYPE);
         CHECK(err.fatal == 1);
         CHECK(read_frame(&c, &hdr, &p) != 0);      /* fatal means closed */
-        client_close(&c);
-    }
-
-    /* --- a defined type still works --------------------------------------- */
-    {
-        client c;
-        CHECK(client_open(&c, port, pin) == 0);
-        CHECK(do_handshake(&c) == 0);
-        uint64_t uid = 0;
-        CHECK(do_auth(&c, "alice", "pw-alice", &uid) == 0);
-        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
-        CHECK(write_all(&c.conn, buf, w.len) == 0);
-        oc_header hdr; oc_rbuf p;
-        CHECK(read_frame(&c, &hdr, &p) == 0);
-        CHECK(hdr.msg_type == OC_MSG_CHANNEL_LIST);
         client_close(&c);
     }
 }
@@ -4129,31 +3599,18 @@ static void test_concurrent_load(int port, const uint8_t *pin) {
     for (int i = 0; i < N; i++) CHECK(args[i].ok == 1);
 }
 
-/* Per-IP connection throttle (robustness): a single source IP can hold at most
- * OPENCHIME_MAX_CONNS_PER_IP concurrent connections; the daemon closes excess
- * connections at accept, before spending a TLS context on them. Uses its own
- * loop so the tiny cap doesn't disturb the shared test loop. */
-static void test_conn_throttle(int port) {
-    setenv("OPENCHIME_MAX_CONNS_PER_IP", "2", 1);
-    oc_tls_server srv2;
-    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
-    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
-    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
-
-    unlink("build/itest_throttle.db");
-    unlink("build/itest_throttle.db-wal");
-    unlink("build/itest_throttle.db-shm");
-    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_throttle.db");
-    CHECK(dbw2 != NULL);
-
-    struct loop_arg arg2;
-    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
-    pthread_t th2;
-    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
-
+/* The per-address cap (OPENCHIME_MAX_CONNS_PER_IP, 2 here) on the TLS port, run
+ * in test_http_stack's loop: two in and the third refused at accept, a close
+ * giving its place back, and IPv6 counted by its /64 apart from 127.0.0.1. */
+static void throttle_checks(int port, const uint8_t *pin2) {
     /* Two connections from loopback are within the cap. */
     client a, b;
-    CHECK(client_open(&a, port, pin2) == 0);
+    int in = -1;                     /* once the health connections' closes are counted */
+    for (int i = 0; i < 100 && in != 0; i++) {
+        in = client_open(&a, port, pin2);
+        if (in != 0) usleep(20000);
+    }
+    CHECK(in == 0);
     CHECK(client_open(&b, port, pin2) == 0);
     /* The third is refused at accept — its TLS handshake never completes. */
     client c;
@@ -4201,15 +3658,8 @@ static void test_conn_throttle(int port) {
     client_close(&b);
     if (back == 0) client_close(&c);
 
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
-    oc_dbwriter_stop(dbw2);
-    oc_tls_server_free(&srv2);
-    unsetenv("OPENCHIME_MAX_CONNS_PER_IP");
-    unlink("build/itest_throttle.db");
-    unlink("build/itest_throttle.db-wal");
-    unlink("build/itest_throttle.db-shm");
 }
+
 
 /* A plaintext connection to `port`, retried while the loop comes up; -1 if none. */
 static int plain_connect(int port) {
@@ -4308,21 +3758,7 @@ static void test_http_stack(int port, int hport) {
     CHECK(strncmp(resp, "HTTP/1.1 405 ", 13) == 0);
     client_close(&h);
 
-    /* A client that stalls is answered 408 and let go, on either port. */
-    oc_ioloop_set_http_timeout_ms(300);
-    int fd = plain_connect(hport);
-    CHECK(fd >= 0);
-    if (fd >= 0) {
-        CHECK(send(fd, "GET /hea", 8, 0) == 8);
-        plain_read_all(fd, resp, sizeof resp);
-        CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
-        close(fd);
-    }
-    CHECK(http_client_open(&h, port, pin2) == 0);           /* sends nothing at all */
-    http_read_response(&h, resp, sizeof resp);
-    CHECK(strncmp(resp, "HTTP/1.1 408 ", 13) == 0);
-    client_close(&h);
-    oc_ioloop_set_http_timeout_ms(0);
+    /* A stalled request's 408 is test_ioloop's, on both kinds of socket. */
 
     /* One cap for both ports: two idle health connections from loopback fill
      * it, so a third on either port is closed unanswered. */
@@ -4343,9 +3779,9 @@ static void test_http_stack(int port, int hport) {
     if (over == 0) client_close(&t);
     if (a >= 0) close(a);
     if (b >= 0) close(b);
+    throttle_checks(port, pin2);
 
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
+    stop_loop(&arg2, th2);
     /* The health port was the loop's: with the loop gone, nobody answers it. */
     {
         int g = socket(AF_INET, SOCK_STREAM, 0);
@@ -4401,6 +3837,7 @@ static void test_auth_begin(int port) {
         "-----END PUBLIC KEY-----\n";
     CHECK(oc_dbwriter_configure_oidc(dbw2, "https://central.example", "ws_7f3a 9c/21", PEM,
                                      "https://central.example") == 0);
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
 
     struct loop_arg arg2;
     arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
@@ -4444,8 +3881,23 @@ static void test_auth_begin(int port) {
     CHECK(auth_begin(&c, "local", "http://127.0.0.1/cb", CH, url, sizeof url) == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
     client_close(&c);
 
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
+    /* A loop with no call relay -- the main loop holds the suite's audio socket,
+     * so this one has none -- answers a call with CALL_UNAVAILABLE. */
+    {
+        client a;
+        CHECK(client_open(&a, port, pin2) == 0); CHECK(do_handshake(&a) == 0);
+        uint64_t ua = 0;
+        CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+        oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_call_join cj = { OC_DEFAULT_CHANNEL, {0}, 0, NULL, OC_CALL_CODEC_VP9 };
+        CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK && send_frame(&a, buf, w.len) == 0);
+        CHECK(read_type(&a, OC_MSG_ERROR, &hdr, &p) == 0);
+        oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_CALL_UNAVAILABLE);
+        client_close(&a);
+    }
+
+    stop_loop(&arg2, th2);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
@@ -4495,8 +3947,7 @@ static void test_proxy_header(int port) {
     client_close(&a); client_close(&b); client_close(&d);
     if (third == 0) client_close(&c);
     if (bare == 0) client_close(&e);
-    __atomic_store_n(&arg2.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th2, NULL);
+    stop_loop(&arg2, th2);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unsetenv("OPENCHIME_TRUSTED_PROXIES");
@@ -4571,13 +4022,9 @@ int run_netloop_tests(void) {
         test_version_reject(arg.port, pin);
         test_frame_version_mismatch(arg.port, pin);
         test_unexpected_msg_type(arg.port, pin);
-        test_message_vertical(arg.port, pin);
-        test_backfill_reconnect(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
-        test_reactions_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
-        test_search_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
         test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
@@ -4586,8 +4033,6 @@ int run_netloop_tests(void) {
         test_read_aloud_vertical(arg.port, pin);
         test_voice_input_vertical(arg.port, pin);
         test_voice_input_rate(arg.port, pin);
-        test_attachments_vertical(arg.port, pin);
-        test_video_message_vertical(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
@@ -4597,7 +4042,6 @@ int run_netloop_tests(void) {
         test_call_udp_vertical(arg.port, pin, audio_port);
         test_call_transports(arg.port, pin, audio_port);
         test_call_routed(arg.port + 126);
-        test_call_no_relay(arg.port + 127);
         test_concurrent_load(arg.port, pin);
         test_login_bound(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
@@ -4605,15 +4049,12 @@ int run_netloop_tests(void) {
         test_admin_vertical(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
-        test_logout_closes(arg.port, pin);
-        test_conn_throttle(arg.port + 123);
         test_http_stack(arg.port + 128, arg.port + 129);
         test_auth_begin(arg.port + 124);
         test_proxy_header(arg.port + 125);
     }
 
-    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th, NULL);
+    stop_loop(&arg, th);
     unsetenv("OPENCHIME_CALL_MAX");
 
     if (failures == 0) {

@@ -971,6 +971,17 @@ void oc_netloop_set_relay_silence_ms(uint64_t ms) {
     __atomic_store_n(&g_relay_silence_ms, ms, __ATOMIC_RELAXED);
 }
 
+/* The presence-change window (OC_PRESENCE_RATE_MS), or a test's shorter one; 0
+ * restores the default. */
+static uint32_t g_presence_rate_ms;
+static uint32_t presence_rate_ms(void) {
+    uint32_t v = __atomic_load_n(&g_presence_rate_ms, __ATOMIC_RELAXED);
+    return v ? v : OC_PRESENCE_RATE_MS;
+}
+void oc_netloop_set_presence_rate_ms(uint32_t ms) {
+    __atomic_store_n(&g_presence_rate_ms, ms, __ATOMIC_RELAXED);
+}
+
 /* Outbound push emitter (ARCH-85), NULL = push disabled. A managed box starts
  * it once its binding is claimed, which happens while the loop already serves
  * (oc_netloop_set_ready), so it is published and read atomically. */
@@ -2198,7 +2209,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_set_presence(&p, &sp) != OC_OK) return -1;
             /* Only online/away are settable while connected (REQ-120). */
             c->presence = (sp.status == OC_PRESENCE_AWAY) ? OC_PRESENCE_AWAY : OC_PRESENCE_ONLINE;
-            if (win_ok(&c->presence_rl, OC_PRESENCE_RATE_MAX, OC_PRESENCE_RATE_MS)) {
+            if (win_ok(&c->presence_rl, OC_PRESENCE_RATE_MAX, presence_rate_ms())) {
                 c->presence_deferred = 0;
                 broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
             } else {
@@ -5817,7 +5828,7 @@ static void flush_deferred_presence(int ep, conn **conns) {
     for (size_t i = 0; i < g_nlive; i++) {
         conn *c = g_live[i];
         if (!c || !c->presence_deferred) continue;
-        if (now - c->presence_rl.start < OC_PRESENCE_RATE_MS) { g_presence_deferred = 1; continue; }
+        if (now - c->presence_rl.start < presence_rate_ms()) { g_presence_deferred = 1; continue; }
         c->presence_rl.start = now;
         c->presence_rl.count = 1;
         c->presence_deferred = 0;
@@ -6454,7 +6465,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         if (turn_start) stats_turn(mono_us() - turn_start);
         live_compact();   /* between turns: nothing is walking the list */
         /* Work carried over from the last turn is not waited for. */
-        int nfds = epoll_wait(ep, events, 64, (db_more || xfer_more || relay_more || io_more) ? 0 : 500);
+        /* A presence change a DND edit made waits for no timeout either: it is
+         * sent at the start of the next turn (expire_snoozes). */
+        int nfds = epoll_wait(ep, events, 64,
+                              (db_more || xfer_more || relay_more || io_more || g_dnd_dirty) ? 0 : 500);
         turn_start = mono_us();
         /* Every tick, timeout included — a quiet box must still be maintained. */
         maybe_run_maintenance(dbw);

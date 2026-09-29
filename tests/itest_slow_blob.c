@@ -343,10 +343,11 @@ int run_slow_blob_tests(void) {
             CHECK(blk != NULL);
             if (blk) {
                 memset(blk, 0xAB, 64 * 1024);
-                /* Must exceed the daemon's socket send buffer (~2.5 MB by
-                 * default) or every write completes into the kernel and
-                 * nothing ever blocks, no matter how slow the reader. */
-                for (int i = 0; i < 4; i++) fwrite(blk, 1, 64 * 1024, f);
+                /* 128 KB: the fake backend dribbles a download in 16 KB
+                 * segments, each a slow blob call (the stall is the backend's,
+                 * not a socket's), so this is eight of them -- enough to span
+                 * bob's measurement below, which needs three. */
+                for (int i = 0; i < 2; i++) fwrite(blk, 1, 64 * 1024, f);
                 free(blk);
             }
             fclose(f);

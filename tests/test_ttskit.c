@@ -72,8 +72,10 @@ static int sha256_is(const char *path, const char *want) {
 
 /* tests/data/ttskit_guess_ref.txt is Phonetisaurus's decoder (phonetisaurus-g2pfst,
  * best path) on 3,010 words with the model guesses.bin was packed from. Returns
- * how many of them the C decoder pronounces identically. */
-static int guess_agreement(int *total) {
+ * how many of those taken the C decoder pronounces identically: every `step`th
+ * word -- every tenth in `make test`, which spans the list's word lengths in a
+ * tenth of the time; every one with OC_TEST_FULL=1. */
+static int guess_agreement(int step, int *total) {
     tts_guesser g;
     char err[256];
     *total = 0;
@@ -81,11 +83,12 @@ static int guess_agreement(int *total) {
     FILE *f = fopen("tests/data/ttskit_guess_ref.txt", "r");
     if (!f) { tts_guesser_close(&g); return 0; }
     char line[512], out[256];
-    int same = 0;
+    int same = 0, k = 0;
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = '\0';
         char *tab = strchr(line, '\t');
         if (!tab) continue;
+        if (k++ % step) continue;
         *tab = '\0';
         (*total)++;
         tts_guess(&g, line, out, sizeof out);
@@ -214,9 +217,11 @@ int run_ttskit_tests(void) {
 
     /* The C decoder finds Phonetisaurus's best path. One word in the reference
      * ("doman") has two paths within rounding of each other; allow one in 1,000. */
-    int total, same = guess_agreement(&total);
-    CHECK(total == 3010);
-    CHECK(total > 0 && same * 1000 >= total * 999);
+    const char *full = getenv("OC_TEST_FULL");
+    int step = full && *full && strcmp(full, "0") ? 1 : 10;
+    int total, same = guess_agreement(step, &total);
+    CHECK(total == (3010 + step - 1) / step);
+    CHECK(total > 0 && (step == 1 ? same * 1000 >= total * 999 : same >= total - 1));
     if (same != total) printf("    guesser agrees on %d of %d words\n", same, total);
 
     /* Damaged files are refused, each in a directory of its own. */

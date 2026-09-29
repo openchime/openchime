@@ -274,7 +274,11 @@ static void test_erle(void) {
     quiet(near, &at, 5000);
     voiced(near, &at, 3000, 220, 4000);
     double corr = 0;
-    double erle_dt = run_aec(far, far, near, n, (size_t)RATE * 5 + 3200, n, &corr, &echo_dt);
+    /* In the converged case's room: the same far end through the same room is
+     * the same echo, so it is not made twice. */
+    echo_dt = echo_conv;
+    double erle_dt = echo_dt ? run_aec_core(&OC_PROCESSOR_SPEEX, RATE, 320, 0, far, echo_dt, near, n,
+                                            (size_t)RATE * 5 + 3200, n, &corr) : 0;
     printf("  double-talk: %.1f dB of echo removed, output correlates %.2f with the near-end voice\n", erle_dt, corr);
     CHECK(corr >= 0.8);
     CHECK(erle_dt >= 10.0);
@@ -287,7 +291,7 @@ static void test_erle(void) {
      * above, band-limited up to 48 kHz, so the numbers compare directly. */
     {
         int16_t *far48 = up3(far, n), *near48 = up3(near, n);
-        int16_t *conv48 = echo_conv ? up3(echo_conv, n) : NULL, *dt48 = echo_dt ? up3(echo_dt, n) : NULL;
+        int16_t *conv48 = echo_conv ? up3(echo_conv, n) : NULL, *dt48 = conv48;
         CHECK(far48 && near48 && conv48 && dt48);
         if (far48 && near48 && conv48 && dt48) {
             size_t n48 = 3 * n;
@@ -302,10 +306,9 @@ static void test_erle(void) {
             CHECK(c48 >= 0.8);
             CHECK(d48 >= 10.0);
         }
-        free(far48); free(near48); free(conv48); free(dt48);
+        free(far48); free(near48); free(conv48);   /* dt48 is conv48 */
     }
-    free(echo_conv);
-    free(echo_dt);
+    free(echo_conv);                               /* echo_dt is echo_conv */
 
     free(far);
     free(drifted);

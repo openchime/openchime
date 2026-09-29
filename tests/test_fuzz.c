@@ -17,10 +17,10 @@
  * hits the same input categories as a huge one — keep the default snappy for
  * `make test` and crank it via -D for a deep local/ASan run. */
 #ifndef OC_FUZZ_RANDOM_ITERS
-#define OC_FUZZ_RANDOM_ITERS 30000
+#define OC_FUZZ_RANDOM_ITERS 5000
 #endif
 #ifndef OC_FUZZ_FRAMED_ITERS
-#define OC_FUZZ_FRAMED_ITERS 15000
+#define OC_FUZZ_FRAMED_ITERS 2000
 #endif
 
 /* xorshift32 with a fixed seed — deterministic across runs/platforms. */

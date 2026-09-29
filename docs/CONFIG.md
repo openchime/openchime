@@ -274,9 +274,15 @@ Compile-time or test-harness values, listed so they are not mistaken for
 deployment configuration: `OPENCHIME_UNFURL_ALLOW_PRIVATE` (disables the unfurl
 fetcher's SSRF gate so a test can fetch a loopback fixture — never set it in a
 deployment), `OC_FUZZ_RANDOM_ITERS` / `OC_FUZZ_FRAMED_ITERS` (fuzz
-depth, defaults 30000 / 15000), `OC_NETLOOP_MAX_FD` (4096, a compile-time
+depth, defaults 5000 / 2000), `OC_NETLOOP_MAX_FD` (4096, a compile-time
 constant, **not** an environment variable), `OC_AUDIO_SILENCE_MS` (the relay's
 UDP silence sweep, which a test shortens with `oc_netloop_set_relay_silence_ms`),
+`OC_PRESENCE_RATE_MS` (the window a connection's presence changes are held to,
+which a test shortens with `oc_netloop_set_presence_rate_ms`),
+`OPENCHIME_TEST_CALL_TIMERS` (the call engine's transport timers,
+`probe:<ms>,udp_wait:<ms>,tcp_probe:<ms>`, so a test of falling back to the
+connection and back takes a second rather than fifteen), `OC_TEST_FULL` (the
+full pronunciation-guesser reference in `make test`, not a tenth of it),
 and, in the clients, `OPENCHIME_TEST_AUDIO`, `OPENCHIME_TEST_MIC` and
 `OPENCHIME_TEST_TONE` — the synthetic audio devices, what the synthetic
 microphone speaks, and its tone (440 Hz unless set), which `scripts/gui_calls.sh`

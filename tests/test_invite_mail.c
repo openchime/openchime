@@ -76,13 +76,14 @@ static void header_value(const char *req, const char *name, char *out, size_t ca
     out[n] = '\0';
 }
 
-/* Answer requests until none comes for a second: long enough for every retry
- * the test's short backoff makes, short enough to prove none follows. */
+/* Answer requests until none comes for a quarter second: longer than the
+ * widest gap the test's 5 ms backoff leaves between attempts (5 << 4 = 80 ms
+ * before a fifth retry, which must not come), short enough to cost little. */
 static void *fake_central_thread(void *arg) {
     fake_central *f = arg;
     while (f->seen < FAKE_MAX) {
         struct pollfd pfd = { f->fd, POLLIN, 0 };
-        if (poll(&pfd, 1, 1000) <= 0) break;
+        if (poll(&pfd, 1, 250) <= 0) break;
         int c = accept(f->fd, NULL, NULL);
         if (c < 0) break;
         char buf[4096];
@@ -186,7 +187,7 @@ static int run_report(fake_central *f, const int *statuses, int n, const char *p
     /* The enrollment URL's path is not where the report goes: its origin is. */
     char url[96];
     snprintf(url, sizeof url, "http://127.0.0.1:%d/api/machine/enroll", port);
-    oc_invite_mail *m = oc_invite_mail_start_backoff(url, aud, pk, 20);
+    oc_invite_mail *m = oc_invite_mail_start_backoff(url, aud, pk, 5);
     CHECK(m != NULL);
     oc_invite_mail_report(m, ID, "lee@partner.example", 1760000000ull);
     pthread_join(th, NULL);          /* central has gone a second without a request */
@@ -220,7 +221,8 @@ static void test_report(void) {
     }
 
     /* A refusal is final, whichever one: asked again, central says the same. */
-    static const int REFUSALS[] = { 400, 401, 404, 409, 429 };
+    /* One refusal of each kind; every code's disposition is test_disposition's. */
+    static const int REFUSALS[] = { 400, 429 };
     for (size_t i = 0; i < sizeof REFUSALS / sizeof REFUSALS[0]; i++)
         CHECK(run_report(f, &REFUSALS[i], 1, pk, aud) == 1);
 

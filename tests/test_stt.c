@@ -100,7 +100,7 @@ static void test_mentions(void) {
 
 static pthread_mutex_t stub_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  stub_cv = PTHREAD_COND_INITIALIZER;
-static int stub_hold, stub_opens, stub_closes;
+static int stub_hold, stub_held, stub_opens, stub_closes;   /* stub_held: waiting in hold */
 
 static void *stub_open(void *ctx, char *err, size_t cap) {
     (void)ctx; (void)err; (void)cap;
@@ -116,7 +116,11 @@ static void stub_close(void *e) {
 static int stub_hear(void *e, const int16_t *pcm, size_t n, char **text, char *err, size_t cap) {
     (void)e;
     pthread_mutex_lock(&stub_mu);
-    while (stub_hold) pthread_cond_wait(&stub_cv, &stub_mu);
+    while (stub_hold) {
+        if (!stub_held) { stub_held = 1; pthread_cond_broadcast(&stub_cv); }
+        pthread_cond_wait(&stub_cv, &stub_mu);
+    }
+    stub_held = 0;
     pthread_mutex_unlock(&stub_mu);
     if (n && pcm[0] == -1) { snprintf(err, cap, "stub says no"); return -1; }
     char buf[32];
@@ -153,7 +157,7 @@ static int wait_result(oc_stt_worker *w, oc_stt_result *r) {
 static void test_worker(void) {
     int failures_before = failures;
     stub_opens = stub_closes = 0;
-    oc_stt_worker *w = oc_stt_worker_start(&STUB, 2, 200);
+    oc_stt_worker *w = oc_stt_worker_start(&STUB, 2, 100);
     CHECK(w != NULL);
     CHECK(!oc_stt_worker_engine_open(w));                 /* nothing loaded until needed */
 
@@ -173,9 +177,15 @@ static void test_worker(void) {
 
     /* A full queue refuses rather than grows; the audio is freed either way. */
     pthread_mutex_lock(&stub_mu); stub_hold = 1; pthread_mutex_unlock(&stub_mu);
-    CHECK(oc_stt_worker_submit(w, 4, seg(4), 160) == 0);   /* taken by the worker, held */
-    struct timespec ts = { 0, 50 * 1000000L };
-    nanosleep(&ts, NULL);
+    CHECK(oc_stt_worker_submit(w, 4, seg(4), 160) == 0);   /* taken by the worker, held: */
+    pthread_mutex_lock(&stub_mu);                            /* ...waited for, not slept on */
+    for (int i = 0; i < 200 && !stub_held; i++) {
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += 10 * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&stub_cv, &stub_mu, &dl);
+    }
+    CHECK(stub_held);
+    pthread_mutex_unlock(&stub_mu);
     CHECK(oc_stt_worker_submit(w, 5, seg(5), 160) == 0);
     CHECK(oc_stt_worker_submit(w, 6, seg(6), 160) == 0);
     CHECK(oc_stt_worker_submit(w, 7, seg(7), 160) != 0);   /* two waiting already */

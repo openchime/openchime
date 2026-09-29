@@ -21,8 +21,8 @@ integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
 The black-box integration tier drives a natively-run daemon over a real socket
-(the `build` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (45k iterations by default —
-30k random + 15k framed; clean under
+(the `build` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (7k iterations by default —
+5k random + 2k framed, raised with `-D` for a deep run; clean under
 ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
 `Scripts/bench.sh`) round it out.
 
@@ -284,8 +284,28 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   determinism here comes from asserting relative facts rather than from
   scripting time. What *is* injectable is the interval a periodic job runs at
   (`oc_dbwriter_set_idem_retention`, `OPENCHIME_MAINT_INTERVAL_MS`,
-  `OPENCHIME_SCHED_TICK_MS`), which is what lets a suite compress a clock it
+  `OPENCHIME_SCHED_TICK_MS`, `oc_netloop_set_relay_silence_ms`,
+  `oc_netloop_set_presence_rate_ms`, `OPENCHIME_TEST_CALL_TIMERS`,
+  `OPENCHIME_TEST_VIDEO_CAP_MS`), which is what lets a suite compress a clock it
   cannot fake.
+- **A check that something does NOT happen never waits out a timeout to say
+  so.** It waits for something that must come *after* the thing it rules out,
+  and then looks: the daemon answers a connection's requests in order, so a
+  channel-list request is a fence behind which everything already queued for
+  that connection has arrived (`count_frames` in `itest_netloop.c`); the relay
+  handles one socket's datagrams in order, so a revoked token sent before a
+  valid one would reach the listener first; a queue plays in order, so what is
+  offered next shows what was queued before it. Where there is nothing to order
+  against, the wait is short and says why a short one is a full one (a relay
+  pumped on the test's own thread has already delivered). A negative check that
+  sits out a five-second read timeout costs five seconds on every run and
+  proves no more.
+- **A recording is as long as its checks need, not longer:** the shared one
+  crosses the 2 s keyframe the poster and the slow-decoder check need; the
+  screen recording is two seconds, enough for the narrator's pause and a
+  second of talking; a frame-rate check needs about fifteen frames.
+- **Every test's database starts as a copy of one migrated template**
+  (`start_db` in `test_dbwriter.c`) rather than migrating from nothing.
 - **A real-time rate is reported, not asserted narrowly.** Capture and recording
   run in real time, so how many frames a second of them yields is a property of
   the machine: a host that cannot encode 720p at 30 fps produces fewer frames,
@@ -311,7 +331,9 @@ Unit tests must be reproducible and independent of wall-clock or environment:
 
 ### 2.4 Which suites run where
 
-`make test` runs every suite, in one process, one after another. CI runs each
+`make test` runs every suite, in one process, one after another, in about a
+minute and a half; the longest are `client_core` (about 25 s), `netloop` (about
+20 s) and `media` (about 15 s), and most take under a second. CI runs each
 suite **once**, split by whether its code runs threads:
 
 - `make test-tsan` runs the suites whose code runs threads — the loop and its I/O
