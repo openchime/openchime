@@ -66,6 +66,17 @@ from the issue title — for the issue "The daemon exits 0, silently, when it
 cannot start", the branch is `feature/oc-144-daemon-exit-nonzero`. One logical
 change per branch.
 
+Then one fresh build on the new branch, so nothing left over from other work is
+linked into it:
+
+```
+make clean && make
+```
+
+`clean` keeps the downloaded speech models, so this is about half a minute. It
+is the only build this command runs: no tests, no sanitizer, no second compiler
+— CI runs those on the pull request.
+
 ## 4. Context before code
 
 Before writing anything, read what the issue touches:

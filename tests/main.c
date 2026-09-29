@@ -159,22 +159,36 @@ static void crash_report_install(void) {
  * minutes of unrelated suites per attempt. Unset, nothing changes. */
 static const char *g_only;
 
-static int suite_wanted(const char *name) {
-    if (!g_only || !*g_only) return 1;
-    for (const char *p = g_only; *p; ) {
+/* OC_TEST_EXCEPT is the opposite list: the suites NOT to run. CI's build job
+ * runs every suite its thread-sanitizer job does not (the Makefile's
+ * TSAN_SUITES), so each suite runs once in CI, not twice. */
+static const char *g_except;
+
+static int listed(const char *list, const char *name) {
+    for (const char *p = list; p && *p; ) {
         size_t n = strcspn(p, ",");
-        if (n && strstr(name, "") && memmem(name, strlen(name), p, n)) return 1;
+        if (n && memmem(name, strlen(name), p, n)) return 1;
         p += n + (p[n] == ',');
     }
     return 0;
 }
 
+static int suite_wanted(const char *name) {
+    if (g_except && *g_except && listed(g_except, name)) return 0;
+    return !g_only || !*g_only || listed(g_only, name);
+}
+
+/* The suites a run selected, so a filter that names nothing fails rather than
+ * passing empty. */
+static int g_ran;
+
 /* One suite, named first, so the output says what was running when it died. */
-#define SUITE(fn) (suite_wanted(#fn) ? (g_suite = #fn, fn()) : 0)
+#define SUITE(fn) (suite_wanted(#fn) ? (g_ran++, g_suite = #fn, fn()) : 0)
 
 int main(void) {
     crash_report_install();
     g_only = getenv("OC_TEST_ONLY");
+    g_except = getenv("OC_TEST_EXCEPT");
     const char *rep = getenv("OC_TEST_REPEAT");
     int rounds = rep && *rep ? atoi(rep) : 1;
     if (rounds < 1) rounds = 1;
@@ -233,6 +247,7 @@ int main(void) {
     total += SUITE(run_share_media_tests);
 
     }
+    if (g_ran == 0) { printf("\nFAILED: the selection names no suite\n"); return 1; }
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);
     return 1;

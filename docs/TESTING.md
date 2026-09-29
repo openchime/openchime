@@ -21,7 +21,7 @@ integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
 The black-box integration tier drives a natively-run daemon over a real socket
-(the `integration` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (45k iterations by default —
+(the `build` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (45k iterations by default —
 30k random + 15k framed; clean under
 ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
 `Scripts/bench.sh`) round it out.
@@ -259,13 +259,12 @@ on CI — every thread's stack. Then it raises the signal again, so the exit sta
 is the one it would have been.
 
 Two switches help hunt a crash that appears once in fifty runs, rather than
-paying four minutes of unrelated suites per attempt:
+paying for unrelated suites per attempt:
 
-- `OC_TEST_ONLY=audio,media` runs only the suites whose names contain those;
+- `OC_TEST_ONLY=audio,media` runs only the suites whose names contain those,
+  `OC_TEST_EXCEPT` all but those; a selection that names no suite fails rather
+  than passing empty;
 - `OC_TEST_REPEAT=20` runs the selection that many times.
-- `make test-tsan` runs the same suite under ThreadSanitizer (address
-  randomization off, `tests/tsan.supp` for the one test-only reconfiguration);
-  CI runs it on every push. A data race between our threads fails it.
 
 Unset, nothing changes. A repeated suite runs **in one process**, so a suite that
 leaves a fixture switched must put it back or the second round fails somewhere
@@ -310,6 +309,23 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   purely-logical suites (codec, framebuf, mention, richtext, searchq) touch
   nothing.
 
+### 2.4 Which suites run where
+
+`make test` runs every suite, in one process, one after another. CI runs each
+suite **once**, split by whether its code runs threads:
+
+- `make test-tsan` runs the suites whose code runs threads — the loop and its I/O
+  threads, the writer and readers, the worker pools, the client, the recorder and
+  player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
+  for the one test-only reconfiguration). The list is the Makefile's
+  `TSAN_SUITES`; a suite that starts a thread belongs on it.
+- `make test-rest` runs every other suite, plainly (`OC_TEST_EXCEPT` names the
+  suites to leave out). A suite with no thread cannot race, so instrumenting it
+  would only make it slower.
+
+Locally, `make test` is the one to run before a pull request; `make test-tsan` is
+for chasing a race CI reported, narrowed to the suite that raced.
+
 ---
 
 ## 3. Integration tier
@@ -325,7 +341,7 @@ source of truth for the frames means the integration tests also dogfood the
 codec the real client will ship.
 
 The test client lives under `tests/` (`tests/e2e_client.c`, the black-box client
-built as `build/e2e_client` and driven by CI's `integration` job). It speaks
+built as `build/e2e_client` and driven by CI's `build` job). It speaks
 `HELLO`/`WELCOME`, `AUTH_CHALLENGE`/`AUTH`/`AUTH_OK`, and
 `SEND`/`SEND_ACK`/`BROADCAST` — the auth-and-message vertical, and nothing
 further. `CLIENT_ACK`, backfill, version rejection and session revocation are
@@ -351,7 +367,7 @@ reached users. The daemon's own behaviour is covered by the assertions
 below and by the in-process suites.
 
 **There is no local runner.** The two assertions live inline in
-the `integration` job of `.github/workflows/ci.yml`.
+the `build` job of `.github/workflows/ci.yml`.
 `make build/e2e_client` builds the driver, so you can point it at a daemon
 you started yourself (`make run` starts one on `127.0.0.1:8443`).
 
@@ -365,7 +381,7 @@ in-process suites reach states a black-box client cannot drive.
 Note the scope of the claim: the black-box tier proves that the built *binary*
 works. Nothing proves the shipped *image* works (§3.2).
 
-**Black-box, against a natively-run daemon (the `integration` job in
+**Black-box, against a natively-run daemon (the `build` job in
 `.github/workflows/ci.yml`) — two checks:**
 
 - **Liveness:** `/healthz` returns `200 OK` (ARCH-25).
@@ -409,35 +425,39 @@ works. Nothing proves the shipped *image* works (§3.2).
 
 ## 4. Continuous integration
 
-CI is GitHub Actions (`.github/workflows/ci.yml`), mirroring openblocks'
-conventions. The `push` trigger runs on **every branch except `main`** — `main`
-moves only by promotion, and both `promote.yml` (on the staging commit being
-promoted) and `release.yml` (on `main`) run the suite through `workflow_call`, so
-a standalone push run would only cancel its twin in the same `concurrency` group
-— and skips doc-only changes via `paths-ignore`. Because `promote.yml` runs the
-suite itself, a docs-only staging tip is still tested before it is released.
-There is no `pull_request` trigger: a pull request into `staging` is the same
-commit its feature-branch push already ran.
+CI is GitHub Actions (`.github/workflows/ci.yml`). It runs on every **pull
+request into `staging`** and every **push to `staging`**, and `promote.yml` (on
+the staging commit being promoted) and `release.yml` (on `main`) run it through
+`workflow_call`, so a release is gated on exactly these jobs and a docs-only
+staging tip is still tested before it is released. Doc-only changes skip it
+(`paths-ignore`). Nothing is checked twice: each suite runs once (§2.4), one
+clang compile is both the release-compiler and the second-compiler check, and
+what the release checks itself is not repeated.
 
-Jobs:
+**Caching.** Every vendored library is cached by the script that builds it —
+mbedTLS, libvpx, Opus and speexdsp, their Windows builds and SDL3, zig, and the
+speech engine and models. Each build script builds only what is missing, so a
+hit skips its download and build. A pull request restores the caches its base
+branch's runs saved, which is why the push to `staging` runs too.
 
-- **`build`** — installs `libsqlite3-dev`, then runs `make` and `make test`.
-  Fast feedback on compile + unit tests.
-- **`integration`** — the daemon end-to-end, natively: build it and the e2e
-  client, start the daemon on the runner, wait for `/healthz`, then drive the
-  protocol vertical over TLS with the e2e client (§3.2 — the published image is
-  tested by nothing).
-- **`core`** — a standalone compile-check of the client app-core (ARCH-74).
-- **`second-compiler`** — `make CC=clang test`, so an assumption only gcc
-  accepts fails in CI rather than on someone's machine. The `build` job also
-  compiles the daemon's sources with the release's own compiler (`make
-  check-release-cc`: zig's clang, targeting the release's glibc), which is
-  stricter than either and was not checked before a release failed on it.
-- **`windows`** — the Windows cross-compile of the TUI and GUI
-  (`make windows-tui windows-gui`), so the ported client stays building.
+Jobs, on three machines at once:
 
-Everything runs non-interactively and communicates pass/fail purely through
-exit codes, so no scenario depends on a human reading output.
+- **`build`** — `make` and the e2e client; `ldd` (only libc and libm are
+  dynamic); the built daemon started from its environment, `/healthz`, then the
+  protocol vertical over TLS with the e2e client (§3.2 — the one thing the
+  in-process suites cannot show, since they link the daemon's code without its
+  `main()`; the published image is tested by nothing); every Linux translation
+  unit through the release's own compiler under `-Werror`
+  (`make check-release-cc`: zig's clang against the release's glibc — the
+  daemon's, the client's and the tests' sources); and `make test-rest`, whose
+  prerequisites are `check-opcodes` and `check-refs`.
+- **`thread-sanitizer`** — `make test-tsan` (§2.4).
+- **`windows`** — the Windows cross-compile of the TUI and GUI, so the ported
+  client stays building.
+
+The three, with the pull request's policy check and the attribution guard, are
+required checks on `staging`. Everything runs non-interactively and
+communicates pass/fail purely through exit codes.
 
 **Audio.** `tests/test_audio.c` covers the **call relay** (`daemon/relay.c`),
 driving it directly as the event loop does — forwarding, call isolation, the
@@ -447,12 +467,12 @@ silence sweep. Echo cancellation is measured by the ERLE harness in
 impulse response over a far-end signal, near-end speech mixed in, clock drift
 injected by resampling one side, and ERLE in dB asserted.
 
-**Speech.** The `build` job renders a sentence with read-aloud and requires
-`openchimed --stt-hear` to hear its words, so each speech feature checks the other
-by content; the release repeats it on the stripped binary and on the installed
-`.deb`. The same job builds `make TTS=0 STT=0` and starts it.
+**Speech.** The release renders a sentence with read-aloud and requires
+`openchimed --stt-hear` to hear its words, on the stripped binary and on the
+installed `.deb`, so each speech feature checks the other by content; the
+speech suites (`tts_worker`, `stt`, `ttskit`) run in CI.
 
-New unit-test binaries are added to the `build` job's `make test`.
+A new suite is one `SUITE(run_<name>_tests)` line in `tests/main.c`; if its code starts a thread it also goes on `TSAN_SUITES` in the Makefile, and CI runs it with no change here.
 
 ---
 
