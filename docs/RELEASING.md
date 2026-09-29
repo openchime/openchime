@@ -170,8 +170,9 @@ the index is built from one release, and the upload replaces
 `Release`/`InRelease` in the bucket. The old objects survive; the index naming
 them does not.
 
-So it is two independent checks: `rclone lsjson` proves the prefix is reachable,
-and the **tag count** is a second witness of what the pool should contain. An
+So it is two independent checks: counting the objects under the prefix proves it
+is reachable, and the **tag count** is a second witness of what the pool should
+contain. An
 empty pool with prior release tags is a hard stop.
 
 Verified against a real Tigris endpoint, four cases:
@@ -188,43 +189,34 @@ one-version index.
 
 ## Object storage
 
-Tigris, provisioned through Fly (`fly storage create`) and billed on the Fly
-account, so it is not a separate vendor relationship. It speaks S3; `rclone` is
-configured from four values:
+Tigris, provisioned through Fly and billed on the Fly account, so it is not a
+separate vendor relationship. Each environment of the control plane has its own
+package bucket in its own Fly organisation, and **every release publishes to
+both**: the repositories are built once, from the pool read from production's
+bucket, and uploaded to each, so the two stay identical.
 
 | name | kind | value |
 |---|---|---|
-| `DIST_S3_ACCESS_KEY` | secret | |
-| `DIST_S3_SECRET_KEY` | secret | |
 | `DIST_S3_ENDPOINT` | variable | `https://fly.storage.tigris.dev` |
-| `DIST_BUCKET` | variable | `openchime-dist-prod` |
+| `DIST_BUCKET` | variable | `openchime-packages-production` |
+| `DIST_S3_ACCESS_KEY` / `DIST_S3_SECRET_KEY` | secret | publishing key for `DIST_BUCKET` |
+| `DIST_STAGING_BUCKET` | variable | `openchime-packages-staging` |
+| `DIST_S3_STAGING_ACCESS_KEY` / `DIST_S3_STAGING_SECRET_KEY` | secret | publishing key for `DIST_STAGING_BUCKET` |
 
-**The control plane holds a different key, and a read-only one.** It serves the
-bucket at `openchime.io/dist` by reading it, with a pair scoped by IAM policy to
-`s3:GetObject` and `s3:ListBucket` on this bucket alone -- verified by what it
-cannot do: a `PutObject` returns `403`, as does a read of any other bucket in the
-organisation. The pair here is the write half and is not shared with it.
+**The operators' URL and the verification URL differ.** `DIST_BASE_URL`,
+`https://openchime.io/dist`, is written into `openchime.repo` and every
+operator's configuration, and is permanent. The release checks what it published
+at `DIST_VERIFY_URL`, `https://staging.openchime.io/dist`, which serves the same
+packages from the staging bucket; the dnf check reads the published `.repo` file
+and points it there.
 
-That key is issued through Tigris's IAM-compatible API at `iam.storage.dev`
-(`CreateAccessKey`, `CreatePolicy`, `AttachUserPolicy`), not through the console.
-`flyctl storage` has no key management -- create, list, status, update, destroy,
-and nothing else -- and `create` refuses a bucket that already exists, which is
-what makes the IAM API the only scriptable route.
-
-**Both sides sit in the `openchime` Fly organisation**, and must. A Tigris key is
-scoped to the organisation that owns the bucket, so a key issued elsewhere is
-refused with `403 AccessDenied`. Note what that does *not* mean: the caller's own
-organisation is irrelevant, and this workflow proves it every release by writing
-here from a GitHub-hosted runner that belongs to no Fly organisation at all.
-Authorization follows the key, never the caller.
-
-**The keys cannot be read back** from GitHub or Fly, and `destroy && create`
-would throw the repositories away. Rotation goes through Tigris's IAM API
-instead: `CreateAccessKey` for the replacement, set it in both places, then
-`DeleteAccessKey` on the old one. Two undocumented details, learned by doing it
--- a new key starts with **no** permissions rather than inheriting any, and
-`AttachUserPolicy` takes the access key **ID** as its `UserName`, not the
-friendly name, which otherwise fails with `Access key not found`.
+**Keys are issued by the control plane.** Its `deploy/storage-keys.sh` creates the
+buckets, issues each key through Tigris's IAM-compatible API at `iam.storage.dev`
+with a policy naming one bucket, and sets the secrets and variables above in this
+repository. The control plane reads each bucket with a different, read-only key.
+A new key starts with **no** permissions, and `AttachUserPolicy` takes the access
+key **ID** as its `UserName`; rotation is running that script again, then
+`DeleteAccessKey` on the old keys.
 
 ## The archive signing key
 
@@ -341,12 +333,13 @@ list of roots added and removed.
 
 | name | kind | required for |
 |---|---|---|
-| `DIST_S3_ACCESS_KEY` / `DIST_S3_SECRET_KEY` | secret | apt + dnf publish |
+| `DIST_S3_ACCESS_KEY` / `DIST_S3_SECRET_KEY` | secret | apt + dnf publish (production's bucket) |
+| `DIST_S3_STAGING_ACCESS_KEY` / `DIST_S3_STAGING_SECRET_KEY` | secret | apt + dnf publish (staging's bucket) |
 | `REPO_SIGNING_KEY` | secret | signing the indexes and packages |
 | `RELEASE_SSH_KEY` | secret, `release` environment | `promote.yml`'s fast-forward of `main`; the private half of the repository's write deploy key, the ruleset's one bypass actor |
 | `TRUSTED_SIGNING_ACCOUNT` / `_ENDPOINT` / `_PROFILE` | secret | Authenticode; **optional** |
 | `AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | secret | Authenticode signing auth; **optional** |
-| `DIST_S3_ENDPOINT` / `DIST_BUCKET` | variable | rclone configuration |
+| `DIST_S3_ENDPOINT` / `DIST_BUCKET` / `DIST_STAGING_BUCKET` | variable | rclone configuration |
 
 `GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image. It is passed
 to `buildah login` and `skopeo --creds`.
