@@ -61,6 +61,17 @@ hardcode: a client resolves the port with this precedence —
 2. a **`port` field in `.well-known` metadata**, if present;
 3. otherwise **`OC_DEFAULT_PORT` = 443**.
 
+**An address is not discovered.** A workspace typed as an IP address — IPv4
+(`192.0.2.7`, `192.0.2.7:8443`) or IPv6 in brackets (`[2001:db8::7]`,
+`[2001:db8::7]:8443`; a bare `2001:db8::7` is accepted too, without a port) —
+is dialled as typed, at the port given or 443. The client makes **no SRV query,
+no DNS lookup and no `.well-known` request** for it, so a client on an
+air-gapped network that is given its daemon's address contacts that daemon and
+nothing else. The address is kept in one spelling (`inet_ntop`'s), so
+`[2001:DB8:0::7]` and `[2001:db8::7]` are the same workspace, and no suffix is
+ever appended to it. A name is dialled on every address it has, IPv6 and IPv4,
+in the system's order, each given at most 3 s before the next is tried.
+
 The daemon *binds* a configurable port (`OPENCHIME_PROTO_PORT`). In production it
 binds 443 (self-hosted: the systemd unit grants `CAP_NET_BIND_SERVICE`, per
 ARCH-20; hosted: Fly maps external 443 → the container). Local/dev binds a

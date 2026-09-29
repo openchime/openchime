@@ -19,6 +19,8 @@
 #include <unistd.h>
 
 #include "tls.h"
+#include "sock.h"   /* oc_connect_addr: each address bounded */
+#include "url.h"    /* oc_url_authority, oc_url_hostheader */
 
 /* Bounds. All compile-time: nothing here has needed tuning yet, and a knob
  * nobody turns is a liability (the REQ-190 reasoning). */
@@ -61,16 +63,32 @@ int oc_unfurl_addr_public(const struct sockaddr *sa) {
         const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
         const uint8_t *b = s6->sin6_addr.s6_addr;
         static const uint8_t zeros[15] = { 0 };
-        /* :: and ::1 */
-        if (memcmp(b, zeros, 15) == 0 && (b[15] == 0 || b[15] == 1)) return 0;
-        /* ::ffff:a.b.c.d — judge the embedded v4. */
-        if (memcmp(b, zeros, 10) == 0 && b[10] == 0xff && b[11] == 0xff) {
-            uint32_t a = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
-                         ((uint32_t)b[14] << 8)  |  (uint32_t)b[15];
-            return v4_public(a);
-        }
-        /* 64:ff9b::/96 NAT64 — an indirection layer; refuse rather than guess. */
+        #define V4_AT(i) (((uint32_t)b[i] << 24) | ((uint32_t)b[(i) + 1] << 16) | \
+                          ((uint32_t)b[(i) + 2] << 8) | (uint32_t)b[(i) + 3])
+        /* ::ffff:a.b.c.d (IPv4-mapped) -- judge the embedded v4. */
+        if (memcmp(b, zeros, 10) == 0 && b[10] == 0xff && b[11] == 0xff) return v4_public(V4_AT(12));
+        /* ::/96 (IPv4-compatible, deprecated; :: and ::1 among it) -- judge the
+         * embedded v4, which for :: and ::1 is 0.0.0.x and so refused. */
+        if (memcmp(b, zeros, 12) == 0) return v4_public(V4_AT(12));
+        /* ::ffff:0:a.b.c.d (SIIT, IPv4-translated) -- an indirection layer. */
+        if (memcmp(b, zeros, 8) == 0 && b[8] == 0xff && b[9] == 0xff && b[10] == 0 && b[11] == 0)
+            return 0;
+        /* 2002::/16 (6to4) -- judge the v4 it carries in its next 32 bits. */
+        if (b[0] == 0x20 && b[1] == 0x02) return v4_public(V4_AT(2));
+        #undef V4_AT
+        /* 64:ff9b::/32 NAT64, local-use 64:ff9b:1::/48 included -- an
+         * indirection layer; refuse rather than guess. */
         if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b) return 0;
+        /* 100::/64 discard-only. */
+        if (b[0] == 0x01 && b[1] == 0x00 && memcmp(b + 2, zeros, 6) == 0) return 0;
+        /* 2001::/23, IANA's IETF protocol assignments: Teredo (2001::/32, a
+         * tunnel), benchmarking (2001:2::/48), ORCHID (2001:10::/28,
+         * 2001:20::/28) and the rest -- none of them a page to preview. */
+        if (b[0] == 0x20 && b[1] == 0x01 && (b[2] & 0xfe) == 0x00) return 0;
+        /* 3fff::/20 documentation (RFC 9637), beside 2001:db8::/32 below. */
+        if (b[0] == 0x3f && (b[1] & 0xf0) == 0xf0) return 0;
+        /* 5f00::/16 SRv6 SIDs. */
+        if (b[0] == 0x5f && b[1] == 0x00) return 0;
         if ((b[0] & 0xfe) == 0xfc) return 0;                 /* fc00::/7 ULA    */
         if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return 0; /* fe80::/10 link  */
         if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0) return 0; /* fec0::/10 site  */
@@ -296,28 +314,26 @@ static int uf_parse_url(const char *url, size_t len, uf_url *u) {
     else if (strncasecmp(p, "http://", 7) == 0) { p += 7; u->use_tls = 0; snprintf(u->port, sizeof u->port, "80"); }
     else return -1;
 
-    char hostport[256];
-    size_t i = 0;
-    while (*p && *p != '/' && *p != '?' && *p != '#' && i < sizeof hostport - 1) hostport[i++] = *p++;
-    hostport[i] = '\0';
-    if (i == 0) return -1;
-    /* A bracketed v6 literal is refused rather than parsed: rare in prose, and
-     * every hard case here is a case the gate must not get wrong. */
-    if (strchr(hostport, '[')) return -1;
-
-    char *colon = strchr(hostport, ':');
-    if (colon) {
-        *colon = '\0';
-        if (!colon[1]) return -1;
-        snprintf(u->port, sizeof u->port, "%s", colon + 1);
-    }
-    if (!hostport[0]) return -1;
-    snprintf(u->host, sizeof u->host, "%s", hostport);
+    /* host, host:port, [v6] or [v6]:port (url.h). An IPv6 address is judged by
+     * the same gate as any resolved address: it goes through getaddrinfo, and
+     * every result is checked before anything is dialled. */
+    size_t i = strcspn(p, "/?#");
+    if (i == 0 || oc_url_authority(p, i, u->host, sizeof u->host, u->port, sizeof u->port) != 0)
+        return -1;
+    p += i;
 
     const char *frag = strchr(p, '#');            /* a fragment never goes on the wire */
     size_t plen = frag ? (size_t)(frag - p) : strlen(p);
     if (plen == 0 || p[0] != '/') snprintf(u->path, sizeof u->path, "/%.*s", (int)plen, p);
     else snprintf(u->path, sizeof u->path, "%.*s", (int)plen, p);
+    return 0;
+}
+
+int oc_unfurl_url_target(const char *url, char *host, size_t hcap, char *port, size_t pcap) {
+    uf_url u;
+    if (!url || uf_parse_url(url, strlen(url), &u) != 0) return -1;
+    snprintf(host, hcap, "%s", u.host);
+    snprintf(port, pcap, "%s", u.port);
     return 0;
 }
 
@@ -336,14 +352,12 @@ static int uf_connect(const uf_url *u, int allow_private) {
             if (!oc_unfurl_addr_public(rp->ai_addr)) { freeaddrinfo(res); return -1; }
     }
     int fd = -1;
-    for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    for (rp = res; rp && fd < 0; rp = rp->ai_next) {
+        fd = oc_connect_addr(rp, OC_CONNECT_PER_ADDR_MS);   /* each address bounded */
         if (fd < 0) continue;
         struct timeval tv = { UF_IO_TIMEOUT_S, 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
     }
     freeaddrinfo(res);
     return fd;
@@ -486,14 +500,17 @@ static int uf_get(oc_unfurler *u, const char *url, size_t url_len,
         char req[UF_MAX_URL + 512];
         int is_default = (loc.use_tls && strcmp(loc.port, "443") == 0) ||
                          (!loc.use_tls && strcmp(loc.port, "80") == 0);
+        char hosthdr[300];
+        if (oc_url_hostheader(loc.host, is_default ? NULL : loc.port, hosthdr, sizeof hosthdr) != 0) {
+            uf_close(&c); return -1;
+        }
         int rn = snprintf(req, sizeof req,
                           "GET %s HTTP/1.0\r\n"
-                          "Host: %s%s%s\r\n"
+                          "Host: %s\r\n"
                           "User-Agent: openchimed-unfurl\r\n"
                           "Accept: text/html\r\n"
                           "Connection: close\r\n\r\n",
-                          loc.path, loc.host,
-                          is_default ? "" : ":", is_default ? "" : loc.port);
+                          loc.path, hosthdr);
         if (rn <= 0 || (size_t)rn >= sizeof req ||
             uf_write(&c, req, (size_t)rn, deadline) != 0) { uf_close(&c); return -1; }
 
@@ -523,9 +540,10 @@ static int uf_get(oc_unfurler *u, const char *url, size_t url_len,
             if (!have || hop == UF_MAX_REDIRECTS) return -1;
             if (where[0] == '/') {
                 /* Path-relative: same scheme, host and port. */
-                char abs[UF_MAX_URL];
-                int an = snprintf(abs, sizeof abs, "%s://%s:%s%s",
-                                  loc.use_tls ? "https" : "http", loc.host, loc.port, where);
+                char abs[UF_MAX_URL], auth[300];
+                if (oc_url_hostheader(loc.host, loc.port, auth, sizeof auth) != 0) return -1;
+                int an = snprintf(abs, sizeof abs, "%s://%s%s",
+                                  loc.use_tls ? "https" : "http", auth, where);
                 if (an <= 0 || (size_t)an >= sizeof abs) return -1;
                 memcpy(cur, abs, (size_t)an + 1);
             } else {

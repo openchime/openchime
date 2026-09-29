@@ -114,6 +114,42 @@ int run_signin_tests(void) {
         CHECK(st[0] == '\0');
     }
 
+    /* On a host with no IPv4 loopback the listener takes IPv6's, and says so in
+     * its redirect -- which the daemon accepts (PROTOCOL.md §4.2, `redirect_uri`). */
+    {
+        int probe = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 p6; memset(&p6, 0, sizeof p6);
+        p6.sin6_family = AF_INET6; p6.sin6_addr = in6addr_loopback;
+        int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&p6, sizeof p6) == 0;
+        if (probe >= 0) close(probe);
+        if (!have6) {
+            printf("  (no IPv6 loopback on this host: the [::1] listener is skipped)\n");
+        } else {
+            oc_loopback_force_v6(1);
+            char uri[128];
+            oc_loopback *lb = oc_loopback_open(uri, sizeof uri);
+            oc_loopback_force_v6(0);
+            CHECK(lb != NULL);
+            CHECK(strncmp(uri, "http://[::1]:", 13) == 0);
+            int port = atoi(uri + 13);
+            const char *path = strchr(uri + 13, '/');
+            CHECK(port > 0 && path && strncmp(path, "/cb/", 4) == 0);
+            if (lb && port > 0 && path) {
+                int fd = socket(AF_INET6, SOCK_STREAM, 0);
+                p6.sin6_port = htons((uint16_t)port);
+                CHECK(connect(fd, (struct sockaddr *)&p6, sizeof p6) == 0);
+                char req[256];
+                int rn = snprintf(req, sizeof req, "GET %s?token=v6 HTTP/1.1\r\nHost: [::1]\r\n\r\n", path);
+                ssize_t w = write(fd, req, (size_t)rn); (void)w;
+                char query[64];
+                CHECK(oc_loopback_wait(lb, 5000, NULL, query, sizeof query) == OC_LOOPBACK_OK);
+                CHECK(strcmp(query, "token=v6") == 0);
+                close(fd);
+            }
+            oc_loopback_close(lb);
+        }
+    }
+
     /* Two attempts never share a secret or, in practice, a port. */
     {
         char u1[128], u2[128];

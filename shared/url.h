@@ -32,4 +32,13 @@ typedef struct { size_t start, len; } oc_url_span;
  * more than `max`; the walk stops at the cap). */
 size_t oc_url_extract(const char *b, size_t len, oc_url_span *out, size_t max);
 
+/* The host and port of a URL's authority -- `host`, `host:port`, `[v6]` or
+ * `[v6]:port`, `len` bytes of it -- for the daemon's outbound HTTP (push,
+ * enrolment, invitation mail, S3, link previews). The host comes back without
+ * brackets, as getaddrinfo wants it; the port is left as the caller set it when
+ * none is given. 0, or -1 when the authority is malformed or does not fit. */
+int oc_url_authority(const char *auth, size_t len, char *host, size_t hcap, char *port, size_t pcap);
+/* A Host header's value: `host`, bracketed when it is an IPv6 address, then
+ * `:port` unless `port` is NULL or empty. 0, or -1 if it does not fit. */
+int oc_url_hostheader(const char *host, const char *port, char *out, size_t cap);
 #endif /* OC_URL_H */

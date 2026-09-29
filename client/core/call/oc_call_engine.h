@@ -27,6 +27,13 @@ typedef struct {
     void  *io_ctx;
 } oc_call_engine_opts;
 
+/* The relay's UDP address for a call to `host` (the daemon's host, as the
+ * connection reached it) on `port`: IPv4 first -- a hosting platform may carry
+ * UDP on IPv4 alone (AUDIO.md §4) -- and IPv6 when that is all the host has, as
+ * an IPv6 address has. 0 with `*ss`/`*len` filled, or -1. */
+struct sockaddr_storage;
+int oc_call_relay_addr(const char *host, uint16_t port, struct sockaddr_storage *ss, int *len);
+
 oc_call_engine *oc_call_engine_new(const oc_call_engine_opts *o);
 /* Stops whatever is running. Remove it from the client first
  * (oc_client_set_call_media(c, NULL, NULL)). */

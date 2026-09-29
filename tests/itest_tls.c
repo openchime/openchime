@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <mbedtls/x509_crt.h>
@@ -448,10 +449,19 @@ static int write_file(const char *path, const char *text) {
 static int mint(mbedtls_pk_context *subject_key, const char *subject,
                 mbedtls_pk_context *issuer_key, const char *issuer, int is_ca,
                 unsigned char serial, mbedtls_ctr_drbg_context *rng,
-                unsigned char *pem, size_t cap) {
+                unsigned char *pem, size_t cap, const unsigned char *ip4_san) {
     mbedtls_x509write_cert w;
     mbedtls_x509write_crt_init(&w);
     int rc;
+    /* An iPAddress subject alternative name, when asked for. */
+    mbedtls_x509_san_list san;
+    memset(&san, 0, sizeof san);
+    if (ip4_san) {
+        san.node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+        san.node.san.unstructured_name.p = (unsigned char *)ip4_san;
+        san.node.san.unstructured_name.len = 4;
+        if ((rc = mbedtls_x509write_crt_set_subject_alternative_name(&w, &san)) != 0) goto done;
+    }
     mbedtls_x509write_crt_set_subject_key(&w, subject_key);
     mbedtls_x509write_crt_set_issuer_key(&w, issuer_key);
     mbedtls_x509write_crt_set_version(&w, MBEDTLS_X509_CRT_VERSION_3);
@@ -469,7 +479,9 @@ done:
     return rc;
 }
 
-static int make_private_pki(const char *dir, struct private_pki *out) {
+/* `ip_san`: the leaf also names 127.0.0.1 as an iPAddress SAN. */
+static int make_private_pki_ip(const char *dir, struct private_pki *out, int ip_san) {
+    static const unsigned char LOOP4[4] = { 127, 0, 0, 1 };
     mbedtls_entropy_context ent;
     mbedtls_ctr_drbg_context rng;
     mbedtls_pk_context ca_key, leaf_key;
@@ -488,9 +500,9 @@ static int make_private_pki(const char *dir, struct private_pki *out) {
                                 mbedtls_ctr_drbg_random, &rng) != 0)
             goto done;
     if (mint(&ca_key, "CN=Private Test Root", &ca_key, "CN=Private Test Root", 1, 1,
-             &rng, ca_pem, sizeof ca_pem) != 0 ||
+             &rng, ca_pem, sizeof ca_pem, NULL) != 0 ||
         mint(&leaf_key, "CN=localhost", &ca_key, "CN=Private Test Root", 0, 2,
-             &rng, leaf_pem, sizeof leaf_pem) != 0 ||
+             &rng, leaf_pem, sizeof leaf_pem, ip_san ? LOOP4 : NULL) != 0 ||
         mbedtls_pk_write_key_pem(&leaf_key, key_pem, sizeof key_pem) != 0)
         goto done;
 
@@ -509,8 +521,13 @@ done:
     return rc;
 }
 
+static int make_private_pki(const char *dir, struct private_pki *out) {
+    return make_private_pki_ip(dir, out, 0);
+}
+
 /* Handshake a CA-verifying client, expecting `host`, against a server presenting
- * the private PKI's certificate. Returns the client's handshake status. */
+ * the private PKI's certificate. Returns the client's handshake status. The SNI
+ * the server was sent, if any, is left in g_seen_sni. */
 static oc_tls_status ca_handshake(const struct private_pki *pki, const char *host) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(lfd >= 0);
@@ -525,6 +542,8 @@ static oc_tls_status ca_handshake(const struct private_pki *pki, const char *hos
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, pki->cert, pki->key) == 0);
+    g_seen_sni[0] = '\0';
+    mbedtls_ssl_conf_sni(&srv.conf, seen_sni_cb, NULL);
     pthread_t th;
     struct server_arg arg = { lfd, &srv, 0 };
     CHECK(pthread_create(&th, NULL, handshake_only_server, &arg) == 0);
@@ -606,6 +625,36 @@ static void test_tls_extra_ca(void) {
     rmdir(dir);
 }
 
+/* An IP address as the expected name: never sent as SNI (RFC 6066 §3),
+ * and the certificate must name it as an iPAddress SAN -- mbedTLS would have
+ * sent the address as SNI as given. */
+static void test_tls_ip_literal(void) {
+    char dir[] = "/tmp/oc-ip-san-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    struct private_pki named, plain;
+    char d2[200];
+    snprintf(d2, sizeof d2, "%s/plain", dir);
+    CHECK(mkdir(d2, 0700) == 0);
+    CHECK(make_private_pki_ip(dir, &named, 1) == 0);
+    CHECK(make_private_pki_ip(d2, &plain, 0) == 0);
+
+    CHECK(oc_tls_set_extra_ca(named.ca) == 0);
+    CHECK(ca_handshake(&named, "127.0.0.1") == OC_TLS_OK);     /* the SAN names it */
+    CHECK(g_seen_sni[0] == '\0');                              /* and no SNI was sent */
+    CHECK(ca_handshake(&named, "::1") == OC_TLS_ERROR);         /* an address it does not name */
+    CHECK(ca_handshake(&named, "[::1]") == OC_TLS_ERROR);
+
+    CHECK(oc_tls_set_extra_ca(plain.ca) == 0);
+    CHECK(ca_handshake(&plain, "127.0.0.1") == OC_TLS_ERROR);   /* no iPAddress SAN at all */
+    CHECK(ca_handshake(&plain, "localhost") == OC_TLS_OK);      /* a name still works, */
+    CHECK(strcmp(g_seen_sni, "localhost") == 0);                /* and is still sent as SNI */
+    CHECK(oc_tls_set_extra_ca(NULL) == 0);
+
+    unlink(named.ca); unlink(named.cert); unlink(named.key);
+    unlink(plain.ca); unlink(plain.cert); unlink(plain.key);
+    rmdir(d2); rmdir(dir);
+}
+
 int run_tls_tests(void) {
     printf("itest_tls: self-signed cert generation, TOFU-pinned handshake,\n");
     printf("           byte round-trip, pin-mismatch rejection, ALPN demux,\n");
@@ -617,5 +666,6 @@ int run_tls_tests(void) {
     test_tls_alpn_demux();
     test_tls_builtin_roots_parse();
     test_tls_extra_ca();
+    test_tls_ip_literal();
     return failures;
 }

@@ -24,6 +24,8 @@
 #include "blob_backend.h"
 #include "sigv4.h"
 #include "tls.h"
+#include "sock.h"   /* oc_connect_any */
+#include "url.h"    /* oc_url_authority, oc_url_hostheader */
 
 #include <netdb.h>
 #include <stdio.h>
@@ -97,15 +99,14 @@ static void *s3_open(const char *cfg) {
     char *slash = strchr(s->endpoint, '/');
     if (slash) *slash = '\0';
 
-    const char *colon = strrchr(s->endpoint, ':');
-    if (colon) {
-        size_t hn = (size_t)(colon - s->endpoint);
-        if (hn >= sizeof s->host) { free(s); return NULL; }
-        memcpy(s->host, s->endpoint, hn); s->host[hn] = '\0';
-        snprintf(s->port, sizeof s->port, "%s", colon + 1);
+    /* host, host:port, [v6] or [v6]:port (url.h). The endpoint keeps its
+     * brackets: it is the Host header and what SigV4 signs. */
+    s->port[0] = '\0';
+    if (oc_url_authority(s->endpoint, strlen(s->endpoint), s->host, sizeof s->host,
+                         s->port, sizeof s->port) != 0) { free(s); return NULL; }
+    if (s->port[0]) {
         if (!explicit_scheme) s->use_tls = (strcmp(s->port, "443") == 0);
     } else {
-        snprintf(s->host, sizeof s->host, "%s", s->endpoint);
         if (!explicit_scheme) s->use_tls = 1;
         snprintf(s->port, sizeof s->port, "%s", s->use_tls ? "443" : "80");
     }
@@ -132,19 +133,8 @@ static void s3_close(void *store) {
 /* --- small blocking HTTP helpers ------------------------------------------ */
 
 static int tcp_connect(const s3_store *s) {
-    struct addrinfo hints, *res = NULL, *rp;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(s->host, s->port, &hints, &res) != 0) return -1;
-    int fd = -1;
-    for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
+    /* Each address bounded (sock.h): a dead IPv6 route costs seconds, not minutes. */
+    int fd = oc_connect_any(s->host, atoi(s->port), OC_CONNECT_PER_ADDR_MS);
     if (fd >= 0) {
         /* Bound every blocking op so a stuck/slow endpoint can't hang the caller
          * forever (the I/O is on the net thread until ARCH-69's worker lands). */

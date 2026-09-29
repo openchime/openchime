@@ -108,17 +108,26 @@ static oc_tls_status handshake_blocking(oc_tls_conn *c) {
 
 /* `prefix` (may be NULL) is written to the socket before TLS begins — what a TCP
  * forwarder's PROXY header is. */
+static int g_client_v6;   /* clients connect to ::1 instead of 127.0.0.1 */
+
 static int client_open_with(client *c, int port, const uint8_t *pin,
                             const uint8_t *prefix, size_t prefix_len) {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
+    socklen_t alen;
     memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons((uint16_t)port);
+    if (g_client_v6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addr;
+        a6->sin6_family = AF_INET6; a6->sin6_addr = in6addr_loopback; a6->sin6_port = htons((uint16_t)port);
+        alen = sizeof *a6;
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&addr;
+        a4->sin_family = AF_INET; a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK); a4->sin_port = htons((uint16_t)port);
+        alen = sizeof *a4;
+    }
     c->fd = -1;
     for (int i = 0; i < 200; i++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) { c->fd = fd; break; }
+        int fd = socket(addr.ss_family, SOCK_STREAM, 0);
+        if (connect(fd, (struct sockaddr *)&addr, alen) == 0) { c->fd = fd; break; }
         close(fd);
         usleep(20000);
     }
@@ -4165,6 +4174,29 @@ static void test_conn_throttle(int port) {
     int over = client_open(&d, port, pin2);
     CHECK(over != 0);
     if (over == 0) client_close(&d);
+
+    /* Over IPv6 the source is the /64, and ::1 is counted like any other
+     * address: two are in, the third is not -- while the two IPv4 connections
+     * still held count against 127.0.0.1, not against it. */
+    int probe = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 p6; memset(&p6, 0, sizeof p6);
+    p6.sin6_family = AF_INET6; p6.sin6_addr = in6addr_loopback;
+    int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&p6, sizeof p6) == 0;
+    if (probe >= 0) close(probe);
+    if (have6) {
+        g_client_v6 = 1;
+        client e, f, g;
+        CHECK(client_open(&e, port, pin2) == 0);
+        CHECK(client_open(&f, port, pin2) == 0);
+        int third = client_open(&g, port, pin2);
+        CHECK(third != 0);
+        if (third == 0) client_close(&g);
+        client_close(&e);
+        client_close(&f);
+        g_client_v6 = 0;
+    } else {
+        printf("  (no IPv6 loopback on this host: the IPv6 cap is not checked)\n");
+    }
 
     client_close(&b);
     if (back == 0) client_close(&c);

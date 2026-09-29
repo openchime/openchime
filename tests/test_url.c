@@ -117,8 +117,49 @@ static int test_extract(void) {
     return failures;
 }
 
+/* An authority's host and port, for the daemon's outbound HTTP: IPv6 in
+ * brackets comes back without them, a bare IPv6 is refused (its colons would be
+ * read as a port), and the Host header brackets IPv6 again. */
+static int test_authority(void) {
+    int failures = 0;
+    static const struct { const char *in; int ok; const char *host, *port; } T[] = {
+        { "push.example.com",         1, "push.example.com", "dflt" },
+        { "push.example.com:8443",    1, "push.example.com", "8443" },
+        { "10.0.0.5:9000",            1, "10.0.0.5",         "9000" },
+        { "[2001:db8::1]",            1, "2001:db8::1",      "dflt" },
+        { "[2001:db8::1]:8443",       1, "2001:db8::1",      "8443" },
+        { "[::1]:9000",               1, "::1",              "9000" },
+        { "2001:db8::1",              0, NULL, NULL },
+        { "[2001:db8::1",             0, NULL, NULL },
+        { "[2001:db8::1]x",           0, NULL, NULL },
+        { "[]:80",                    0, NULL, NULL },
+        { "host:",                    0, NULL, NULL },
+        { "host:0",                   0, NULL, NULL },
+        { "host:70000",               0, NULL, NULL },
+        { "host:8a",                  0, NULL, NULL },
+        { "",                         0, NULL, NULL },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        char host[64] = "", port[8] = "dflt";
+        int rc = oc_url_authority(T[i].in, strlen(T[i].in), host, sizeof host, port, sizeof port);
+        int ok = T[i].ok ? rc == 0 && strcmp(host, T[i].host) == 0 && strcmp(port, T[i].port) == 0
+                         : rc != 0;
+        if (!ok) printf("  authority(%s) = %d host=%s port=%s\n", T[i].in, rc, host, port);
+        CHECK(ok);
+    }
+    char out[64];
+    CHECK(oc_url_hostheader("2001:db8::1", "8443", out, sizeof out) == 0 && strcmp(out, "[2001:db8::1]:8443") == 0);
+    CHECK(oc_url_hostheader("::1", NULL, out, sizeof out) == 0 && strcmp(out, "[::1]") == 0);
+    CHECK(oc_url_hostheader("push.example.com", "", out, sizeof out) == 0 && strcmp(out, "push.example.com") == 0);
+    CHECK(oc_url_hostheader("10.0.0.5", "9000", out, sizeof out) == 0 && strcmp(out, "10.0.0.5:9000") == 0);
+    CHECK(oc_url_hostheader("a.example", "1", out, 4) != 0);
+    return failures;
+}
+
 int run_url_tests(void) {
     int failures = 0;
+    printf("url: authority\n");
+    failures += test_authority();
     printf("url: extent\n");
     failures += test_extent();
     printf("url: extract\n");

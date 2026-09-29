@@ -2,7 +2,9 @@
 
 #include "srccount.h"
 
+#include <arpa/inet.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,14 +36,34 @@ static size_t find(const oc_srccount *m, const char *src) {
     return i;
 }
 
+void oc_source_key(const char *addr, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!addr) return;
+    unsigned char b[16];
+    if (strchr(addr, ':') && inet_pton(AF_INET6, addr, b) == 1) {
+        static const unsigned char mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
+        if (memcmp(b, mapped, 12) == 0) { inet_ntop(AF_INET, b + 12, out, (socklen_t)cap); return; }
+        memset(b + 8, 0, 8);                     /* the /64 */
+        char a[INET6_ADDRSTRLEN];
+        if (inet_ntop(AF_INET6, b, a, sizeof a)) { snprintf(out, cap, "%s/64", a); return; }
+    }
+    snprintf(out, cap, "%s", addr);
+}
+
 int oc_srccount_get(const oc_srccount *m, const char *src) {
+    char key[OC_SRC_LEN];
+    oc_source_key(src, key, sizeof key); src = key;
     if (!src[0] || !m->cap) return 0;
     size_t i = find(m, src);
     return m->keys[i][0] ? m->counts[i] : 0;
 }
 
 int oc_srccount_inc(oc_srccount *m, const char *src) {
-    if (!src[0] || !m->cap || strlen(src) >= OC_SRC_LEN) return -1;
+    if (strlen(src) >= OC_SRC_LEN) return -1;
+    char key[OC_SRC_LEN];
+    oc_source_key(src, key, sizeof key); src = key;
+    if (!src[0] || !m->cap) return -1;
     size_t i = find(m, src);
     if (!m->keys[i][0]) {
         if (m->n >= m->cap / 2) return -1;
@@ -53,6 +75,8 @@ int oc_srccount_inc(oc_srccount *m, const char *src) {
 }
 
 void oc_srccount_dec(oc_srccount *m, const char *src) {
+    char key[OC_SRC_LEN];
+    oc_source_key(src, key, sizeof key); src = key;
     if (!src[0] || !m->cap) return;
     size_t mask = m->cap - 1, i = find(m, src);
     if (!m->keys[i][0]) return;

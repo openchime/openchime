@@ -285,9 +285,12 @@ edge, discards it. Fly is the case that needs it — public UDP arrives at a
 `fly-global-services` address, and a reply from the machine's own is dropped —
 and the daemon needs no setting for it. A datagram is at most **1,300 bytes**
 either way: Fly documents about that much, and 1,380 was the most measured
-through it. The client sends to the relay over IPv4, at the address its
-workspace's host name resolves to and the port `CALL_JOINED` names, since the
-hosting platform carries UDP on IPv4 alone.
+through it. The client sends to the relay at the address its workspace's host
+resolves to and the port `CALL_JOINED` names — over IPv4 when the host has an
+IPv4 address, since the hosting platform carries UDP on IPv4 alone, and over
+IPv6 when that is all it has, so a workspace typed as an IPv6 address or an
+IPv6-only name is reached over IPv6. A client that cannot open a UDP socket at
+all carries the call's audio over its TCP connection instead of leaving.
 
 Behind a front door that forwards UDP for many workspaces from one address, the
 relay is reached at the door's port rather than its own, and the door has to
@@ -492,6 +495,6 @@ sidesteps echo entirely while held.
 - **Recording.** There is no call recording. It has obvious compliance weight
   (REQ-252), and a recording would have to be made by a
   participant, since nothing else can hear the call (ARCH-113).
-- **IPv6.** The relay listens on IPv6 as well as IPv4, but a client sends to it
-  over IPv4 only (§4), so a client with no IPv4 path to the workspace can sign in
-  and cannot be heard.
+- **IPv6.** A client reaches the relay over IPv4 when the workspace's host has
+  an IPv4 address, even where IPv6 would also work (§4); a client whose only
+  path to such a host is IPv6 is not heard over UDP.

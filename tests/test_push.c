@@ -708,8 +708,17 @@ static void *fake_gw_thread(void *arg) {
     return NULL;
 }
 
-static void test_notify_roundtrip(void) {
-    const char *path = "build/test_push_rt.db";
+/* `v6`: the gateway at [::1], named in brackets in the URL. */
+static void test_notify_roundtrip(int v6) {
+    const char *path = v6 ? "build/test_push_rt6.db" : "build/test_push_rt.db";
+    if (v6) {
+        int probe = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 p6; memset(&p6, 0, sizeof p6);
+        p6.sin6_family = AF_INET6; p6.sin6_addr = in6addr_loopback;
+        int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&p6, sizeof p6) == 0;
+        if (probe >= 0) close(probe);
+        if (!have6) { printf("  (no IPv6 loopback on this host: the gateway at [::1] is skipped)\n"); return; }
+    }
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
     CHECK(w != NULL);
@@ -721,16 +730,22 @@ static void test_notify_roundtrip(void) {
     CHECK(oc_dbwriter_register_device_token(w, bob, OC_PUSH_APNS, "tok-bob-rt"));
 
     /* Bind a fake gateway on an ephemeral port. */
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int lfd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     CHECK(lfd >= 0);
     int one = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = 0;
-    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0);
+    struct sockaddr_storage ss; memset(&ss, 0, sizeof ss);
+    socklen_t sl;
+    if (v6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+        a6->sin6_family = AF_INET6; a6->sin6_addr = in6addr_loopback; sl = sizeof *a6;
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+        a4->sin_family = AF_INET; a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK); sl = sizeof *a4;
+    }
+    CHECK(bind(lfd, (struct sockaddr *)&ss, sl) == 0);
     CHECK(listen(lfd, 1) == 0);
-    socklen_t sl = sizeof sa;
-    getsockname(lfd, (struct sockaddr *)&sa, &sl);
-    int port = ntohs(sa.sin_port);
+    getsockname(lfd, (struct sockaddr *)&ss, &sl);
+    int port = v6 ? ntohs(((struct sockaddr_in6 *)&ss)->sin6_port) : ntohs(((struct sockaddr_in *)&ss)->sin_port);
 
     fake_gw gw = { lfd, 0, 0 };
     pthread_t th;
@@ -739,7 +754,7 @@ static void test_notify_roundtrip(void) {
     char pk[1024], aud[128];
     CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
     char url[64];
-    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(url, sizeof url, v6 ? "http://[::1]:%d" : "http://127.0.0.1:%d", port);
 
     oc_push *p = oc_push_start(path, w, url, aud, pk);
     CHECK(p != NULL);
@@ -1141,7 +1156,8 @@ int run_push_tests(void) {
     test_default_and_mute();
     test_keyword_is_not_a_broadcast();
     test_collect_matches_evaluator();
-    test_notify_roundtrip();
+    test_notify_roundtrip(0);
+    test_notify_roundtrip(1);
     test_call_invite();
     return failures;
 }

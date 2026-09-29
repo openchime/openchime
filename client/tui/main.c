@@ -1705,7 +1705,7 @@ static int run_login(const char *initial_workspace, const char *initial_user,
          * resolved to this time. */
         char key[288];
         if (oc_workspace_key(f.workspace, oc_default_suffix(), key, sizeof key) != 0)
-            snprintf(key, sizeof key, "%s:%d", f.ep.host, f.ep.port);
+            oc_hostport(f.ep.host, f.ep.port, key, sizeof key);
         /* With the fingerprint the workspace published, if it did (ARCH-10): the
          * first connection is checked against it instead of trusted blind. */
         oc_client *cl = oc_client_start_verified(key, f.ep.host, f.ep.port, cred,
@@ -1796,7 +1796,7 @@ static int have_stored_token(const char *store_path, const char *key, const char
     if (s) oc_store_set_secret(s, secret);   /* look in the keyring too */
     /* Under the workspace as named — and, for an entry from when the key was the
      * address, under that: the net thread moves it across on first use. */
-    char inst[288]; snprintf(inst, sizeof inst, "%s:%d", host, port);
+    char inst[288]; oc_hostport(host, port, inst, sizeof inst);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
     uint64_t now = (uint64_t)time(NULL) * 1000;
     int has = s ? (oc_store_load_session(s, key, tok, NULL, now) ||
@@ -1848,7 +1848,7 @@ int main(int argc, char **argv) {
         snprintf(host, sizeof host, "%s", argv[1]);
         port = atoi(argv[2]);
         cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
-        snprintf(key0, sizeof key0, "%s:%d", host, port);   /* an address IS its name here */
+        oc_hostport(host, port, key0, sizeof key0);   /* an address IS its name here */
         direct = 1;
     } else if (argc >= 2 || cfg.workspace[0]) {       /* workspace mode (arg or config default) */
         const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
@@ -1865,7 +1865,7 @@ int main(int argc, char **argv) {
          * reach it. */
         snprintf(published_fp, sizeof published_fp, "%s", ep.fingerprint);
         if (oc_workspace_key(inst, oc_default_suffix(), key0, sizeof key0) != 0)
-            snprintf(key0, sizeof key0, "%s:%d", host, port);
+            oc_hostport(host, port, key0, sizeof key0);
         if (cli_cred && cli_cred[0])                               { cred = cli_cred; direct = 1; }
         else if (have_stored_token(store_path, key0, host, port, secret)) { cred = "";      direct = 1; }  /* silent reconnect */
         else                                                       { prefill = inst; direct = 0; }  /* prompt */

@@ -64,9 +64,27 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
  * record. Exposed for testing with a canned answer (no live DNS). */
 int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostcap, int *port);
 
-/* Resolve a workspace to a daemon endpoint. `suffix` is the hosted-tier DNS
- * suffix for bare names (NULL/"" disables suffixing). See the header comment for
- * the SRV -> A fallback order and the distinct failure statuses. */
+/* `host:port` as text a person or a key reads: an IPv6 host in brackets
+ * (`[2001:db8::10]:9640`), anything else as `host:port`, byte-for-byte what it
+ * always was. 0, or -1 if it does not fit. */
+int oc_hostport(const char *host, int port, char *out, size_t cap);
+
+/* Is `host` this machine? `localhost`, IPv4 127.0.0.0/8, `::1` in any spelling
+ * (bracketed or not), and an IPv4-mapped 127.x. */
+int oc_addr_is_loopback(const char *host);
+
+/* How many SRV queries, DNS lookups and `.well-known` requests resolution has
+ * made, process-wide: a test hook, so "an address makes none" is counted rather
+ * than inferred (an address literal is used as given, see oc_resolve). */
+void oc_resolve_counts(unsigned *srv, unsigned *dns, unsigned *wellknown);
+
+/* Resolve a workspace to a daemon endpoint. An address -- IPv4, or IPv6 bare or
+ * in brackets, with or without `:port` -- is used as given, before anything
+ * else: no SRV query, no DNS, no `.well-known` request; its port, or 443. The
+ * host comes back in canonical form, IPv6 unbracketed; `domain` brackets it.
+ * `suffix` is the hosted-tier DNS suffix for bare names (NULL/"" disables
+ * suffixing). See the header comment for the SRV -> A fallback order for names,
+ * and the distinct failure statuses. */
 oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpoint *out);
 
 /* The key a workspace's credential entry is filed under: the workspace AS NAMED —

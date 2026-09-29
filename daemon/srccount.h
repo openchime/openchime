@@ -35,4 +35,12 @@ int  oc_srccount_inc(oc_srccount *m, const char *src);
 /* One fewer; at zero the address is removed. A missing address is not an error. */
 void oc_srccount_dec(oc_srccount *m, const char *src);
 
+/* The key a peer address is counted and rate-limited under (connection caps,
+ * sign-in limits): an IPv4 address as it is; an IPv6 address by its /64 --
+ * `2001:db8:1:2::/64` -- since one host is normally handed a whole /64 and could
+ * otherwise spread over it to escape any per-address limit; an IPv4-mapped IPv6
+ * address as the IPv4 address it is. Text that is not an address is copied as
+ * given. The map above applies it to every address it is handed. `out` holds
+ * OC_SRC_LEN. */
+void oc_source_key(const char *addr, char *out, size_t cap);
 #endif /* OPENCHIME_SRCCOUNT_H */

@@ -76,6 +76,37 @@ struct oc_loopback {
     char path[64];   /* "/cb/<secret>" */
 };
 
+/* A test's knob: skip IPv4 loopback, as a host without it would. */
+static int g_loopback_v6_only;
+void oc_loopback_force_v6(int on) { g_loopback_v6_only = on; }
+
+/* A listening socket on this machine's loopback in `family`, never the wildcard
+ * address, and the port it was given. -1 if the family has no loopback. */
+static int listen_loopback(int family, unsigned *port) {
+    int fd = (int)socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_storage a;
+    memset(&a, 0, sizeof a);
+    socklen_t alen;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&a;
+        a6->sin6_family = AF_INET6; a6->sin6_addr = in6addr_loopback;
+        alen = (socklen_t)sizeof *a6;
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&a;
+        a4->sin_family = AF_INET; a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        alen = (socklen_t)sizeof *a4;
+    }
+    if (bind(fd, (struct sockaddr *)&a, alen) != 0 || listen(fd, 4) != 0 ||
+        getsockname(fd, (struct sockaddr *)&a, &alen) != 0) {
+        oc_closesock(fd);
+        return -1;
+    }
+    *port = family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&a)->sin6_port)
+                               : ntohs(((struct sockaddr_in *)&a)->sin_port);
+    return fd;
+}
+
 oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap) {
     oc_sock_startup();
     uint8_t raw[18];
@@ -85,25 +116,17 @@ oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap) {
 
     oc_loopback *lb = calloc(1, sizeof *lb);
     if (!lb) return NULL;
-    lb->fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+    /* IPv4 loopback, which every host has; IPv6 loopback on one that does not.
+     * The daemon accepts either as a redirect (AUTH.md §8.1). */
+    unsigned port = 0;
+    int v6 = 0;
+    lb->fd = g_loopback_v6_only ? -1 : listen_loopback(AF_INET, &port);
+    if (lb->fd < 0) { lb->fd = listen_loopback(AF_INET6, &port); v6 = 1; }
     if (lb->fd < 0) { free(lb); return NULL; }
-
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* never the wildcard address */
-    a.sin_port = 0;
-    socklen_t alen = sizeof a;
-    if (bind(lb->fd, (struct sockaddr *)&a, sizeof a) != 0 ||
-        listen(lb->fd, 4) != 0 ||
-        getsockname(lb->fd, (struct sockaddr *)&a, &alen) != 0) {
-        oc_loopback_close(lb);
-        return NULL;
-    }
     oc_sock_setnonblock(lb->fd);
     snprintf(lb->path, sizeof lb->path, "/cb/%s", secret);
-    int n = snprintf(redirect_uri, cap, "http://127.0.0.1:%u%s",
-                     (unsigned)ntohs(a.sin_port), lb->path);
+    int n = snprintf(redirect_uri, cap, v6 ? "http://[::1]:%u%s" : "http://127.0.0.1:%u%s",
+                     port, lb->path);
     if (n < 0 || (size_t)n >= cap) { oc_loopback_close(lb); return NULL; }
     return lb;
 }

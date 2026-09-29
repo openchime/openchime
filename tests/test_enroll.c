@@ -193,25 +193,39 @@ static void *canned_central(void *arg) {
     return NULL;
 }
 
-static oc_enroll_result claim_against(int status, struct canned *c, const char *pk, const char *aud) {
+/* `v6`: central at [::1], named in brackets in the URL. */
+static oc_enroll_result claim_at(int status, struct canned *c, const char *pk, const char *aud, int v6) {
     memset(c, 0, sizeof *c);
     c->status = status;
-    c->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t al = sizeof a;
-    bind(c->listen_fd, (struct sockaddr *)&a, sizeof a);
+    c->listen_fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage ss; memset(&ss, 0, sizeof ss);
+    socklen_t al;
+    if (v6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+        a6->sin6_family = AF_INET6; a6->sin6_addr = in6addr_loopback; al = sizeof *a6;
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+        a4->sin_family = AF_INET; a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK); al = sizeof *a4;
+    }
+    if (c->listen_fd < 0 || bind(c->listen_fd, (struct sockaddr *)&ss, al) != 0) {
+        if (c->listen_fd >= 0) close(c->listen_fd);
+        return (oc_enroll_result)-1;                 /* this host has no such loopback */
+    }
     listen(c->listen_fd, 1);
-    getsockname(c->listen_fd, (struct sockaddr *)&a, &al);
+    getsockname(c->listen_fd, (struct sockaddr *)&ss, &al);
+    unsigned port = v6 ? ntohs(((struct sockaddr_in6 *)&ss)->sin6_port) : ntohs(((struct sockaddr_in *)&ss)->sin_port);
     pthread_t th;
     pthread_create(&th, NULL, canned_central, c);
     char url[96];
-    snprintf(url, sizeof url, "http://127.0.0.1:%u/api/machine/enroll", (unsigned)ntohs(a.sin_port));
+    snprintf(url, sizeof url, v6 ? "http://[::1]:%u/api/machine/enroll" : "http://127.0.0.1:%u/api/machine/enroll", port);
     oc_enroll_result r = oc_enroll_claim(url, aud, pk, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc");
     pthread_join(th, NULL);
     close(c->listen_fd);
     return r;
+}
+
+static oc_enroll_result claim_against(int status, struct canned *c, const char *pk, const char *aud) {
+    return claim_at(status, c, pk, aud, 0);
 }
 
 static void test_claim_answers(void) {
@@ -229,6 +243,15 @@ static void test_claim_answers(void) {
     CHECK(claim_against(400, &c, pk, aud) == OC_ENROLL_FAILED);
     CHECK(claim_against(429, &c, pk, aud) == OC_ENROLL_PENDING);   /* busy: try again */
     CHECK(claim_against(503, &c, pk, aud) == OC_ENROLL_PENDING);
+    /* Central at an IPv6 address, bracketed in its URL: reached, and asked with
+     * a bracketed Host header. */
+    oc_enroll_result r6 = claim_at(200, &c, pk, aud, 1);
+    if (r6 == (oc_enroll_result)-1) {
+        printf("  (no IPv6 loopback on this host: central at [::1] is skipped)\n");
+    } else {
+        CHECK(r6 == OC_ENROLL_ACTIVE);
+        CHECK(strstr(c.seen, "Host: [::1]:") != NULL);
+    }
     /* Nobody there at all. */
     CHECK(oc_enroll_claim("http://127.0.0.1:1/api/machine/enroll", aud, pk,
                           "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc") == OC_ENROLL_PENDING);

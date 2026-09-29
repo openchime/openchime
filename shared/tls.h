@@ -87,6 +87,11 @@ typedef struct {
     mbedtls_ssl_context ssl;
     int                 fd;
     oc_tls_session     *keep;    /* client: where a ticket the server gives goes */
+    /* client: an IP address the peer's certificate must name (an iPAddress SAN),
+     * checked after the handshake -- set by oc_tls_conn_set_hostname for an
+     * address, which is never sent as SNI (RFC 6066 §3). */
+    unsigned char       expect_ip[16];
+    size_t              expect_ip_len;
 } oc_tls_conn;
 
 /* Load the cert+key from the given PEM paths, generating a self-signed pair
@@ -128,7 +133,10 @@ void oc_tls_client_free(oc_tls_client *c);
  * MBEDTLS_SSL_IS_CLIENT and must match `conf`. Returns 0 on success. */
 int  oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd);
 /* Set the expected peer hostname: sends SNI and, under CA verification, makes
- * the certificate's name actually get checked. Call before the handshake. */
+ * the certificate's name actually get checked. Call before the handshake. An IP
+ * address (IPv4, or IPv6 with or without brackets) is not a hostname: it is sent
+ * as no SNI, and the handshake instead requires the certificate to name that
+ * address among its iPAddress subject alternative names. */
 int  oc_tls_conn_set_hostname(oc_tls_conn *c, const char *host);
 void oc_tls_conn_free(oc_tls_conn *c);
 
