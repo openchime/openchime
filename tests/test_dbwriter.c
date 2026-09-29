@@ -2316,16 +2316,49 @@ static void test_activity_unreads(void) {
     oc_dbres_free(r);
 
     /* Acking clears them: the cursor REQ-090 already maintains IS the read
-     * state, which is why this needed no new table. */
+     * state, which is why this needed no new table. The answer is for the
+     * reader's own devices (REQ-235), naming them and where they now stand. */
     {
         oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, 921);
         j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = m2;
         oc_dbwriter_submit(w, j);
-        oc_dbres_free(wait_result(w));
+        oc_dbres *sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_OWN_READ_CURSOR && sr->user_id == alice &&
+              sr->channel_id == OC_DEFAULT_CHANNEL && sr->message_id == m2);
+        oc_dbres_free(sr);
     }
     r = activity(w, alice, OC_ACTF_UNREADS);
     CHECK(r && r->n_alist == 0);
     oc_dbres_free(r);
+
+    /* Mark unread (REQ-235): the cursor goes BACK, which an ack never may, and
+     * what lies past it is unread again. 0 is the whole conversation. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, 923);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = m1;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_OWN_READ_CURSOR && sr->message_id == m1);
+        oc_dbres_free(sr);
+    }
+    r = activity(w, alice, OC_ACTF_UNREADS);
+    CHECK(r && r->n_alist == 1);
+    oc_dbres_free(r);
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, 924);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = 0;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = activity(w, alice, OC_ACTF_UNREADS);
+    CHECK(r && r->n_alist == 2);
+    oc_dbres_free(r);
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, 925);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = m2;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
 
     /* A channel is not a DM. */
     memset(idem, 0x94, sizeof idem);

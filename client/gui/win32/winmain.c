@@ -21669,12 +21669,19 @@ static void msg_menu_run(HWND hwnd, int cmd) {
             if (c->msgs[i].message_id == mid) break;
             prev = c->msgs[i].message_id;
         }
+        /* The core moves the position and recounts the badge at once, by the one
+         * notify rule the daemon counts with too (oc_notify_decide); the daemon then
+         * repeats it to this user's other devices. */
         oc_client_set_read_cursor(g_client, chan, prev);
-        /* Then ask the SERVER for the counts. The unread badge is a query over
-         * messages (process_list_channels computes it), and recomputing it here would
-         * be a second implementation of the same rule — the kind that drifts. One
-         * extra round trip buys a number that cannot disagree with the daemon's. */
-        oc_client_list_channels(g_client);
+        /* The conversation is on screen, so the "New" line and the jump pill show
+         * where reading resumes now, rather than after it is next opened. */
+        if (chan == g_sel) {
+            const oc_model *um = model();
+            const oc_channel *uc = um ? oc_model_channel((oc_model *)um, chan) : NULL;
+            g_unread_chan = chan;
+            g_unread_from = prev;
+            g_unread_count = uc ? uc->unread : 0;
+        }
         toast_push("Marked unread.", 0);
     } else if (cmd == 106) {
         /* The palette picks the destination: it already lists every conversation
