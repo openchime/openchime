@@ -34,9 +34,13 @@ static void pump(oc_relay *r, int fd) {
     if (poll(&pfd, 1, 200) > 0) while (oc_relay_on_readable(r, 64)) {}
 }
 
+/* The relay here is pumped on the test's own thread, so anything it forwards is
+ * on the receiving socket before the test reads: a read that finds nothing in
+ * 50 ms has found nothing, and a read that must find something finds it at
+ * once. */
 static int mk_client(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct timeval tv = { 0, 300000 };
+    struct timeval tv = { 0, 50000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     return fd;
 }
@@ -70,10 +74,7 @@ static int udp_recv(int fd, uint64_t *sender, uint16_t *seq, char *out, size_t c
 
 static void drain(int fd) {
     uint8_t b[256];
-    struct timeval quick = { 0, 20000 }, back = { 0, 300000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &quick, sizeof quick);
-    while (recv(fd, b, sizeof b, 0) >= 0) {}
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &back, sizeof back);
+    while (recv(fd, b, sizeof b, MSG_DONTWAIT) >= 0) {}
 }
 
 static struct { uint8_t t[OC_AUDIO_TOKEN_MAX]; size_t len; int n; } g_gone;
@@ -244,13 +245,13 @@ int run_audio_tests(void) {
 
     /* The sweep: B falls silent while A keeps talking; B is dropped and reported
      * whole, A is not. */
-    oc_relay_set_silence_ms(r, 300);
+    oc_relay_set_silence_ms(r, 60);
     g_gone.n = 0;
-    for (int i = 0; i < 8 && !g_gone.n; i++) {
+    for (int i = 0; i < 40 && !g_gone.n; i++) {
         udp_send(cA, &relay_addr, tA, (uint16_t)(80 + i), NULL);
         udp_send(cD, &relay_addr, tD, (uint16_t)(80 + i), NULL);
         pump(r, udp);
-        usleep(100000);
+        usleep(20000);
         oc_relay_sweep(r);
     }
     CHECK(g_gone.n == 1 && g_gone.len == 16 && memcmp(g_gone.t, tB, 16) == 0);
@@ -268,7 +269,7 @@ int run_audio_tests(void) {
 static int mk_connected(int family, const struct sockaddr *to, socklen_t tolen) {
     int fd = socket(family, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
-    struct timeval tv = { 0, 300000 };
+    struct timeval tv = { 0, 50000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (connect(fd, to, tolen) != 0) { close(fd); return -1; }
     return fd;

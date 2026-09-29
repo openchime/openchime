@@ -43,6 +43,11 @@ void oc_netloop_set_audio(int udp_fd, uint16_t udp_port);
  * without waiting twenty seconds. Any thread; applied on the loop's next tick. */
 void oc_netloop_set_relay_silence_ms(uint64_t ms);
 
+/* Hold a connection's presence changes to OC_PRESENCE_RATE_MAX per `ms` rather
+ * than per ten seconds (0 restores it); a test's knob, so the deferred last word
+ * can be seen without waiting out the window. Any thread. */
+void oc_netloop_set_presence_rate_ms(uint32_t ms);
+
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
  * contentless notify decision to it for offline mobile delivery. NULL (the
  * default) disables push. May be called while the loop runs: a managed box

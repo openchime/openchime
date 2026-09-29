@@ -95,6 +95,9 @@ typedef struct { uint64_t user; float gain; } volume;
 
 struct oc_call_engine {
     oc_call_engine_opts opts;
+    /* PROBE_MS, UDP_WAIT_MS and TCP_PROBE_MS for this engine: the defaults, or
+     * a test's shorter ones (call_timers). */
+    int         probe_ms, udp_wait_ms, tcp_probe_ms;
     char        mic_id[520], spk_id[520];
     oc_mutex_t  mu;
 
@@ -390,16 +393,16 @@ static void *io_main(void *arg) {
         int tcp = atomic_load(&e->on_tcp);
         if (!tcp && e->tcp_send) {
             int64_t since = e->udp_heard_ms ? e->udp_heard_ms : e->started_ms;
-            if (t - since >= (e->udp_heard_ms ? UDP_LOST_MS : UDP_WAIT_MS)) {
+            if (t - since >= (e->udp_heard_ms ? UDP_LOST_MS : e->udp_wait_ms)) {
                 atomic_store(&e->on_tcp, 1);
                 e->last_send = 0;   /* the first keepalive by the connection goes now */
                 tcp = 1;
             }
         }
-        if (!e->udp_heard_ms && !tcp && t - e->last_probe_ms >= PROBE_MS) {
+        if (!e->udp_heard_ms && !tcp && t - e->last_probe_ms >= e->probe_ms) {
             e->last_probe_ms = t;
             send_keepalive(e);
-        } else if (tcp && t - e->last_probe_ms >= TCP_PROBE_MS) {
+        } else if (tcp && t - e->last_probe_ms >= e->tcp_probe_ms) {
             e->last_probe_ms = t;
             oc_mutex_lock(&e->mu);
             send_udp(e, NULL, 0);
@@ -1040,9 +1043,28 @@ static void m_stop(void *ctx) {
 
 /* --- the frontend's calls ------------------------------------------------------- */
 
+/* The transport timers, shortened for a test: OPENCHIME_TEST_CALL_TIMERS is
+ * "probe:<ms>,udp_wait:<ms>,tcp_probe:<ms>", any subset, read once when an
+ * engine is made. Unset, the defaults above; a test of falling back to the
+ * connection and back then takes a second rather than fifteen. */
+static void call_timers(oc_call_engine *e) {
+    e->probe_ms = PROBE_MS; e->udp_wait_ms = UDP_WAIT_MS; e->tcp_probe_ms = TCP_PROBE_MS;
+    const char *v = getenv("OPENCHIME_TEST_CALL_TIMERS");
+    for (const char *p = v; p && *p; ) {
+        int *dst = !strncmp(p, "probe:", 6) ? &e->probe_ms :
+                   !strncmp(p, "udp_wait:", 9) ? &e->udp_wait_ms :
+                   !strncmp(p, "tcp_probe:", 10) ? &e->tcp_probe_ms : NULL;
+        const char *c = strchr(p, ':');
+        if (dst && c) { long ms = strtol(c + 1, NULL, 10); if (ms > 0 && ms <= 60000) *dst = (int)ms; }
+        p = strchr(p, ',');
+        if (p) p++;
+    }
+}
+
 oc_call_engine *oc_call_engine_new(const oc_call_engine_opts *o) {
     oc_call_engine *e = calloc(1, sizeof *e);
     if (!e) return NULL;
+    call_timers(e);
     if (o) e->opts = *o;
     e->opts.mic_id = e->opts.speaker_id = NULL;
     if (o && o->mic_id) snprintf(e->mic_id, sizeof e->mic_id, "%s", o->mic_id);

@@ -26,7 +26,8 @@ make && make test
 
 Read the full output, not the exit code. Zero warnings (the tree builds
 `-Werror`), zero failed checks, and the last line `OK: all suites passed`.
-Anything else: refuse, quote the failing output, stop.
+`make test` takes about a minute and a half. Anything else: refuse, quote the
+failing output, stop.
 
 ## 3. The title
 

@@ -311,10 +311,10 @@ int run_ioloop_tests(void) {
     /* Paused, nothing is delivered; resumed, it all is, in order. */
     {
         oc_ioloop_pause(io, 11, fd, 1);
-        usleep(100000);
+        usleep(20000);
         uint8_t f[64]; size_t fl;
         for (uint32_t i = 0; i < 5; i++) { fl = mk_frame(f, sizeof f, 500 + i, 0); CHECK(twrite(&c, f, fl) == 0); }
-        oc_io_event *e = wait_kind(io, OC_IO_FRAME, 300);
+        oc_io_event *e = wait_kind(io, OC_IO_FRAME, 100);
         CHECK(e == NULL);
         oc_io_event_free(e);
         oc_ioloop_pause(io, 11, fd, 0);
@@ -355,17 +355,25 @@ int run_ioloop_tests(void) {
         uint8_t f[64]; size_t fl = mk_frame(f, sizeof f, 1, 0);
         CHECK(oc_ioloop_send(io, 999, fd, f, fl, 0) == 0);   /* wrong id, live descriptor */
         oc_ioloop_pause(io, 999, fd, 1);
-        CHECK(tread_u32(&c) == -1);                          /* nothing reaches the client */
+        /* Then one for the connection that is there. Commands are taken in
+         * order, so had the stale send gone out it would be read first, and had
+         * the stale pause taken hold this would not arrive at all. */
+        fl = mk_frame(f, sizeof f, 7, 0);
+        CHECK(oc_ioloop_send(io, 11, fd, f, fl, 0) == 0);
+        CHECK(tread_u32(&c) == 7);
     }
 
     /* close_after: the reply, then the connection is finished and reported. */
     {
         const char *reply = "HTTP/1.1 204 No Content\r\n\r\n";
         CHECK(oc_ioloop_send(io, 12, hfd, (const uint8_t *)reply, strlen(reply), 1) == 0);
-        char got[128]; size_t gl = 0;
-        for (;;) {
+        /* The reply, read to its length: the socket stays open until the loop
+         * closes it below, so reading to the end would wait out the client's
+         * timeout for a close that has not been asked for yet. */
+        char got[128]; size_t gl = 0, want = strlen(reply);
+        while (gl < want) {
             size_t n = 0;
-            oc_tls_status st = oc_tls_read(&h.conn, got + gl, sizeof got - 1 - gl, &n);
+            oc_tls_status st = oc_tls_read(&h.conn, got + gl, want - gl, &n);
             if (st != OC_TLS_OK || !n) break;
             gl += n;
         }

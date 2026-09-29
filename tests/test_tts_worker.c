@@ -145,7 +145,7 @@ static void test_worker(void) {
     if (!bs) return;
     stub_opens = stub_closes = 0;
 
-    oc_tts_worker *w = oc_tts_worker_start(&STUB, bs, 2, 150);
+    oc_tts_worker *w = oc_tts_worker_start(&STUB, bs, 2, 100);
     CHECK(w != NULL);
     if (!w) { oc_blobstore_close(bs); return; }
     CHECK(!oc_tts_worker_engine_open(w) && count(&stub_opens) == 0);   /* nothing loaded until needed */

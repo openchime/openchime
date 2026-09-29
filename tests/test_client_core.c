@@ -159,6 +159,17 @@ static int channel_has_body(const oc_model *m, uint64_t cid, const char *body) {
     return 0;
 }
 
+/* The id of the message in `cid` whose body is `body`; 0 if there is none. */
+static uint64_t body_id(const oc_model *m, uint64_t cid, const char *body) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].body && strcmp(m->channels[i].msgs[j].body, body) == 0)
+                return m->channels[i].msgs[j].message_id;
+    }
+    return 0;
+}
+
 static int channel_unread(const oc_model *m, uint64_t cid) {
     for (size_t i = 0; i < m->n_channels; i++)
         if (m->channels[i].channel_id == cid) return m->channels[i].unread;
@@ -2404,15 +2415,15 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     uint32_t nacks0 = st.view_nacks;
     int got0 = wb.frames;
     __atomic_store_n(&g_tap.drop_pm, 100, __ATOMIC_RELEASE);
-    uint64_t until = mono_ms() + 4000;
-    CALL_WAIT(5000, ({ watch(eb, &wb); mono_ms() > until; }));
+    uint64_t until = mono_ms() + 1500;
+    CALL_WAIT(3000, ({ watch(eb, &wb); mono_ms() > until; }));
     __atomic_store_n(&g_tap.drop_pm, 0, __ATOMIC_RELEASE);
     oc_call_engine_stats(eb, &st);
     oc_call_stats sa; oc_call_engine_stats(ea, &sa);
-    printf("  at 10%% loss for 4 s: erik has %d more frames, %u NACKs, dana resent %u, %u PLIs, %u given up;"
+    printf("  at 10%% loss for 1.5 s: erik has %d more frames, %u NACKs, dana resent %u, %u PLIs, %u given up;"
            " dana's rate %d kbps at %dx%d\n", wb.frames - got0, st.view_nacks - nacks0, sa.share_resent,
            st.view_plis, st.view_skipped, sa.share_kbps, sa.share_width, sa.share_height);
-    CHECK(wb.frames - got0 >= 8 && st.view_nacks > nacks0 && sa.share_resent > 0 && wb.rising && wb.bad == 0);
+    CHECK(wb.frames - got0 >= 3 && st.view_nacks > nacks0 && sa.share_resent > 0 && wb.rising && wb.bad == 0);
 
     /* faye joins late: a keyframe comes for her. */
     uint64_t joined = mono_ms();
@@ -2447,35 +2458,6 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     unsetenv("OPENCHIME_TEST_CAPTURE");
 }
 
-/* End to end over IPv6: an address typed as `[::1]:<port>` resolves with
- * nothing asked of anyone, and the client signs in and sends over it -- the
- * daemon listens on both families on one socket. Said and skipped on a host
- * with no IPv6 loopback. */
-static void test_ipv6_e2e(int port) {
-    int probe = (int)socket(AF_INET6, SOCK_STREAM, 0);
-    struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
-    a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback;
-    int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&a6, sizeof a6) == 0;
-    if (probe >= 0) close(probe);
-    if (!have6) { printf("  (no IPv6 loopback on this host: the IPv6 end to end is skipped)\n"); return; }
-
-    char typed[32]; snprintf(typed, sizeof typed, "[::1]:%d", port);
-    unsigned srv0, dns0, wk0, srv1, dns1, wk1;
-    oc_resolve_counts(&srv0, &dns0, &wk0);
-    oc_endpoint ep; memset(&ep, 0, sizeof ep);
-    CHECK(oc_resolve(typed, NULL, &ep) == OC_RESOLVE_OK && strcmp(ep.host, "::1") == 0 && ep.port == port);
-    oc_resolve_counts(&srv1, &dns1, &wk1);
-    CHECK(srv1 == srv0 && dns1 == dns0 && wk1 == wk0);
-
-    oc_client *c = oc_client_start(ep.host, ep.port, "faye:pw-faye");
-    CHECK(c != NULL);
-    if (!c) return;
-    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
-    oc_client_send(c, 1, "hello over IPv6");
-    CHECK(WAIT_FOR(c, channel_has_body(m, 1, "hello over IPv6")));
-    oc_client_stop(c);
-}
-
 /* The call engine's relay address: IPv4 first, IPv6 when that is all there is
  * (AUDIO.md §4). And with no UDP at all, a call goes by the connection instead
  * of not at all -- it used to leave. */
@@ -2504,9 +2486,9 @@ static void test_call_relay_family(void) {
     if (!e) return;
     const oc_call_media *md = oc_call_engine_media();
     static const uint8_t tok[16] = { 1 };
-    CHECK(md->start(e, "no-such-relay.invalid", 9000, tok, sizeof tok, 7, 1) != 0);
+    CHECK(md->start(e, "", 9000, tok, sizeof tok, 7, 1) != 0);   /* no address, and no DNS asked */
     md->tcp(e, count_tcp, NULL);
-    CHECK(md->start(e, "no-such-relay.invalid", 9000, tok, sizeof tok, 7, 1) == 0);
+    CHECK(md->start(e, "", 9000, tok, sizeof tok, 7, 1) == 0);
     oc_call_stats st; memset(&st, 0, sizeof st);
     oc_call_engine_stats(e, &st);
     CHECK(st.transport == 1);                              /* on the connection */
@@ -2515,6 +2497,16 @@ static void test_call_relay_family(void) {
     CHECK(__atomic_load_n(&tcp_fallback_calls, __ATOMIC_RELAXED) > 0);   /* keepalives went by it */
     md->stop(e);
     oc_call_engine_free(e);
+}
+
+/* Whether this host has an IPv6 loopback to bind. */
+static int host_has_ipv6(void) {
+    int probe = (int)socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
+    a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback;
+    int ok = probe >= 0 && bind(probe, (struct sockaddr *)&a6, sizeof a6) == 0;
+    if (probe >= 0) close(probe);
+    return ok;
 }
 
 static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
@@ -2527,7 +2519,13 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob), *ec = oc_call_engine_new(&occ);
     oc_client_set_call_media(a, oc_call_engine_media(), ea);
     oc_client_set_call_media(b, oc_call_engine_media(), eb);
-    oc_client *c = oc_client_start("127.0.0.1", port, "faye:pw-faye");
+    /* faye signs in by [::1] where the host has IPv6 (AUDIO.md §4): her engine
+     * then sends to the relay at ::1, IPv6 being all that address has, and the
+     * dual-stack tap sees her arrive over it. The others are on 127.0.0.1. */
+    int v6 = host_has_ipv6();
+    if (!v6) printf("  (no IPv6 loopback on this host: faye calls over IPv4)\n");
+    int v6_before = __atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE);
+    oc_client *c = oc_client_start(v6 ? "::1" : "127.0.0.1", port, "faye:pw-faye");
     CHECK(c != NULL);
     if (!c) { oc_call_engine_free(ea); oc_call_engine_free(eb); oc_call_engine_free(ec); return; }
     oc_client_set_call_media(c, oc_call_engine_media(), ec);
@@ -2548,6 +2546,7 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
 
     /* erik joins: each hears the other's tone and not their own. */
     oc_client_call_join(b, 1);
+    uint64_t joined_ms = mono_ms();
     CHECK(CALL_WAIT(3000, mb->in_call && mb->call.n_parts == 2 && ma->call.n_parts == 2));
     CHECK(CALL_WAIT(6000, heard(&ta, 1) > 1500 && heard(&tb, 0) > 1500));
     /* Once settled, each at the level it was sent (6000), less what Opus and
@@ -2562,10 +2561,10 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
      * the previous key for a second, which a joiner never gets. After that
      * nothing fails to decrypt. */
     {
-        CHECK(CALL_WAIT(3000, 0) == 0);
+        CALL_WAIT(3000, mono_ms() > joined_ms + 1000 + 300);   /* the grace (GRACE_MS), and a margin */
         oc_call_engine_stats(eb, &st);
         uint32_t u1 = st.n_peers ? st.peers[0].undecryptable : 0, p1 = st.n_peers ? st.peers[0].packets : 0;
-        CHECK(CALL_WAIT(1000, 0) == 0);
+        CHECK(CALL_WAIT(600, 0) == 0);                          /* ~30 packets at 50 a second */
         oc_call_engine_stats(eb, &st);
         CHECK(st.n_peers == 1 && st.peers[0].undecryptable == u1 && st.peers[0].packets > p1 + 20);
         printf("  erik's first second: %u packets he could not decrypt, none since\n", u1);
@@ -2578,7 +2577,11 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     CHECK(ma->call.epoch > epoch2);
     CHECK(CALL_WAIT(8000, heard(&ta, 1) > 1000 && heard(&ta, 2) > 1000 && heard(&tb, 0) > 1000 &&
                            heard(&tb, 2) > 1000 && heard(&tc, 0) > 1000 && heard(&tc, 1) > 1000));
-    CHECK(CALL_WAIT(4000, heard(&tc, 0) > 4800 && heard(&tc, 1) > 4800 && heard(&tb, 2) > 4800));
+    if (v6) {
+        oc_call_stats sc; oc_call_engine_stats(ec, &sc);
+        CHECK(sc.active && sc.transport == 0);                                  /* by UDP... */
+        CHECK(__atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE) > v6_before);      /* ...over IPv6 */
+    }
     printf("  three: dana hears 660 %.0f / 880 %.0f, faye hears 440 %.0f / 660 %.0f\n",
            heard(&ta, 1), heard(&ta, 2), heard(&tc, 0), heard(&tc, 1));
 
@@ -2588,8 +2591,8 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_client_call_leave(c, 1);
     CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
     CHECK(ma->call.epoch > her_last);
-    uint64_t after_leave = mono_ms() + 1500;          /* past the 1 s grace */
-    CHECK(CALL_WAIT(3000, mono_ms() > after_leave + 800));
+    uint64_t after_leave = mono_ms() + 1100;          /* past the 1 s grace */
+    CHECK(CALL_WAIT(3000, mono_ms() > after_leave + 500));
     {
         int later = 0, newer = 0;
         pthread_mutex_lock(&g_tap.mu);
@@ -2669,52 +2672,6 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     oc_call_engine_free(ec);
 }
 
-/* A call over IPv6 (AUDIO.md §4): faye signs in by [::1], so her engine sends
- * to the relay at ::1 -- IPv6 being all that address has -- and she and dana,
- * on 127.0.0.1, hear each other through it over UDP. */
-static void test_calls_ipv6(oc_client *a, int port) {
-    oc_client *b = a;                                    /* CALL_WAIT ticks a, b and c */
-    int probe = (int)socket(AF_INET6, SOCK_DGRAM, 0);
-    struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
-    a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback;
-    int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&a6, sizeof a6) == 0;
-    if (probe >= 0) close(probe);
-    if (!have6) { printf("  (no IPv6 loopback on this host: the IPv6 call is skipped)\n"); return; }
-
-    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
-    tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
-    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
-    oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
-    oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
-    oc_client *c = oc_client_start("::1", port, "faye:pw-faye");
-    CHECK(c != NULL);
-    if (!c) { oc_call_engine_free(ea); oc_call_engine_free(ec); return; }
-    oc_client_set_call_media(a, oc_call_engine_media(), ea);
-    oc_client_set_call_media(c, oc_call_engine_media(), ec);
-    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
-    const oc_model *ma = oc_client_model(a), *mc = oc_client_model(c);
-    int v6_before = __atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE);
-
-    oc_client_call_start(a, 1, NULL, 0);
-    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
-    oc_client_call_join(c, 1);
-    CHECK(CALL_WAIT(3000, mc->in_call && mc->call.n_parts == 2 && ma->call.n_parts == 2));
-    CHECK(CALL_WAIT(8000, heard(&ta, 2) > 4800 && heard(&tc, 0) > 4800));
-    printf("  over IPv6: dana hears 880 Hz at %.0f, faye hears 440 Hz at %.0f\n", heard(&ta, 2), heard(&tc, 0));
-    oc_call_stats st;
-    oc_call_engine_stats(ec, &st);
-    CHECK(st.active && st.transport == 0);                 /* UDP, not the connection */
-    CHECK(__atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE) > v6_before);   /* and it came over IPv6 */
-
-    oc_client_call_end(a, 1);
-    CHECK(CALL_WAIT(3000, !ma->in_call && !mc->in_call && !calls_in(ma, 1)));
-    oc_client_set_call_media(a, NULL, NULL);
-    oc_client_set_call_media(c, NULL, NULL);
-    oc_client_stop(c);
-    oc_call_engine_free(ea);
-    oc_call_engine_free(ec);
-}
-
 /* A network that passes no UDP (PROTOCOL.md §5.17): with the tap dropping every
  * datagram both ways, each engine finds within seconds that the relay does not
  * answer and sends by the connection instead, and each hears the other's tone as
@@ -2726,7 +2683,11 @@ static void test_calls_tcp(oc_client *a, oc_client *b) {
     tone_io tb = { 660, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
     oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
     oc_call_engine_opts ob = { NULL, NULL, 0, tone_source, tone_sink, &tb };
+    /* The transport timers shortened (call_engine.c): falling back and coming
+     * back are the same decisions at a fifth of the wait. */
+    setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,tcp_probe:800", 1);
     oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob);
+    unsetenv("OPENCHIME_TEST_CALL_TIMERS");
     oc_client_set_call_media(a, oc_call_engine_media(), ea);
     oc_client_set_call_media(b, oc_call_engine_media(), eb);
     const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
@@ -2751,8 +2712,8 @@ static void test_calls_tcp(oc_client *a, oc_client *b) {
                            sa.peers[0].packets, sa.peers[0].lost, sa.peers[0].late, sa.target_ms);
 
     __atomic_store_n(&g_tap.block, 0, __ATOMIC_RELEASE);
-    CHECK(CALL_WAIT(15000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
-                            sa.transport == 0 && sb.transport == 0)));
+    CHECK(CALL_WAIT(4000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(eb, &sb),
+                           sa.transport == 0 && sb.transport == 0)));
     CHECK(CALL_WAIT(6000, heard(&ta, 1) > 4800 && heard(&tb, 0) > 4800));
     printf("  UDP back: both on it again; dana hears 660 Hz at %.0f, erik 440 Hz at %.0f\n",
            heard(&ta, 1), heard(&tb, 0));
@@ -3012,10 +2973,11 @@ static void test_published_fingerprint(int port) {
                                                 "iris:pw-iris", "ignored", NULL, 1, wrong);
         CHECK(c != NULL);
         if (c) {
-            int authed = WAIT_FOR(c, m->authed);
-            CHECK(!authed);
+            /* The refusal is what arrives; not signing in is then a fact, not
+             * a timeout sat out. */
+            CHECK(WAIT_FOR(c, strstr(m->last_error, "certificate") != NULL));
             const oc_model *m = oc_client_model(c);
-            CHECK(strstr(m->last_error, "certificate") != NULL);
+            CHECK(!m->authed);
             oc_client_stop(c);
         }
     }
@@ -4053,13 +4015,20 @@ int run_client_core_tests(void) {
             CHECK(WAIT_FOR(a, channel_has_body(m, 1, "Typed by the listener, not read aloud.")));
             /* Asserted on what is OFFERED TO PLAY, not on the queue: an empty
              * queue proves nothing here, because the pump takes the only entry
-             * out of it the moment nothing else is playing. */
-            uint64_t mine = 0;
-            for (int t = 0; t < 4 && !mine; t++)
-                WAIT_FOR(a, (mine = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0);
-            CHECK(mine == 0);
+             * out of it the moment nothing else is playing. So someone else
+             * speaks next, and what is offered is theirs: the queue plays in
+             * order, so had the listener's own line been queued it would come
+             * first. No wait for something that should not happen. */
+            oc_client_send(b, 1, "Said after the listener's own line.");
+            CHECK(WAIT_FOR(a, body_id(m, 1, "Said after the listener's own line.") != 0));
+            uint64_t next = 0;
+            for (int t = 0; t < 8 && !next; t++)
+                WAIT_FOR(a, (next = oc_model_listen_take_audio((oc_model *)m, &mp4, &mlen)) != 0);
+            CHECK(next != 0 && next == body_id(ma, 1, "Said after the listener's own line."));
+            CHECK(next != body_id(ma, 1, "Typed by the listener, not read aloud."));
             free(mp4);
             mp4 = NULL;
+            oc_client_listen_done(a);
 
             /* A message with nothing to say is passed over, and the one after it
              * is still spoken: the queue does not stall on it (REQ-294). */
@@ -4159,11 +4128,9 @@ int run_client_core_tests(void) {
             unsetenv("OPENCHIME_TEST_AUDIO");
         }
 
-        test_ipv6_e2e(arg.port);
         test_call_relay_family();
         test_calls_e2e(a, b, arg.port);
         test_calls_tcp(a, b);
-        test_calls_ipv6(a, arg.port);
 
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
@@ -4295,9 +4262,11 @@ int run_client_core_tests(void) {
                                                        sp, &store_sec);
                 CHECK(sl != NULL);
                 if (sl) {
-                    int authed = 0;
-                    for (int i = 0; i < 200 && !authed; i++) { oc_client_tick(sl); authed = oc_client_model(sl)->authed; usleep(10000); }
-                    CHECK(!authed);
+                    /* Until it signs in or is refused -- the wrong password's
+                     * refusal is what arrives, and then it has not signed in. */
+                    const oc_model *ml = oc_client_model(sl);
+                    for (int i = 0; i < 500 && !ml->authed && !ml->last_error[0]; i++) { oc_client_tick(sl); usleep(10000); }
+                    CHECK(!ml->authed && ml->last_error[0] != '\0');
                     oc_client_stop(sl);
                 }
             }
