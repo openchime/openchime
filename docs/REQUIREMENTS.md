@@ -1614,7 +1614,9 @@ only REQ-212/213/214 apply.*
 
 - **REQ-220.** A message body has supported **inline rich-text formatting** —
   bold, italic, strikethrough, inline `code`, fenced code blocks, blockquotes,
-  and ordered/unordered lists — authored in a markdown-like syntax and rendered
+  ordered/unordered lists, and **links with text of their own** (`[label](url)`,
+  whose real address a reader has seen before one opens) — authored in a
+  markdown-like syntax and rendered
   by each client per its capabilities (a text frontend renders the same structure
   without proportional styling; the TUI shows code blocks and emphasis in-band).
   The stored body has remained plain UTF-8 (REQ-054) with formatting expressed
@@ -1622,8 +1624,9 @@ only REQ-212/213/214 apply.*
   construct has shown its literal source legibly.
 
   **Settled by ARCH-100:** a Slack-compatible subset for inline
-  emphasis, extended with the list syntax Slack's markup lacks, parsed
-  **client-side in `client/core/`** and never by the daemon, returning spans over
+  emphasis, extended with the list syntax Slack's markup lacks and Markdown's
+  labelled links, parsed by one parser in **`shared/`** that every client and the
+  daemon's read-aloud use, returning spans over
   the unchanged body. Full dialect, the escaping rules, and the places we
   deliberately diverge from Slack are in [MARKDOWN.md](./MARKDOWN.md).
 - **REQ-221.** A message has been able to **@mention** a user, and the broadcast

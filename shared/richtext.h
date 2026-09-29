@@ -36,6 +36,9 @@ enum {
     OC_RT_BULLET    = 0x0040,   /* - item */
     OC_RT_ORDERED   = 0x0080,   /* 1. item */
     OC_RT_LINK      = 0x0100,   /* a bare http(s) URL, autolinked */
+    OC_RT_LABELLED  = 0x0200,   /* [label](https://...): the label; its address
+                                 * is in the `](...)` delimiter after it, found
+                                 * with oc_rt_target */
 
     OC_RT_DELIM     = 0x8000    /* the delimiter bytes of the construct above */
 };
@@ -81,6 +84,14 @@ typedef struct {
  *     not the full stop. Only those two schemes are recognised: a link span is
  *     what a frontend turns into something the OS opens, so widening the set is
  *     a security decision and it is taken HERE rather than per frontend.
+ *   - `[label](https://address)` is a labelled link: an OC_RT_LABELLED span
+ *     over the label, which may itself carry emphasis, with OC_RT_DELIM |
+ *     OC_RT_LABELLED spans over the `[` and over `](address)`. The address
+ *     follows the autolink rules exactly -- http or https, the same end -- and
+ *     must be followed by the closing `)`; the label is one line, non-empty,
+ *     with no brackets of its own. Anything else is literal text, in which the
+ *     bare address still autolinks. Because the label can say anything, a
+ *     frontend shows the address before opening one (MARKDOWN.md §4).
  *
 
  * Anything unmatched or ambiguous degrades to its literal source: an unclosed
@@ -88,5 +99,11 @@ typedef struct {
  * of the message.
  */
 size_t oc_rt_scan(const char *body, size_t len, oc_rt_span *out, size_t max);
+
+/* The address a labelled link opens: for an OC_RT_LABELLED span (the label,
+ * not a delimiter) from oc_rt_scan over the same `body`, its offset and length.
+ * Returns 1, or 0 when `span` is not a labelled link's label. */
+int oc_rt_target(const char *body, size_t len, const oc_rt_span *span,
+                 size_t *off, size_t *tlen);
 
 #endif /* OC_RICHTEXT_H */

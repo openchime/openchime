@@ -90,6 +90,22 @@ static size_t url_len(rt_ctx *c, size_t i, size_t e) {
     return oc_url_len(c->b, e, i);
 }
 
+/* A labelled link `[label](https://address)` opening at `i` and ending before
+ * `e`: its total length, with the label's end (the `]`) in *close; 0 if not one.
+ * One line (scan_inline's range already is), a non-empty label with no brackets
+ * of its own, and an address the autolinker would link in full, closed by `)`. */
+static size_t labelled_len(rt_ctx *c, size_t i, size_t e, size_t *close) {
+    size_t j, L;
+    if (c->b[i] != '[') return 0;
+    for (j = i + 1; j < e && c->b[j] != ']'; j++)
+        if (c->b[j] == '[' || c->b[j] == '\n') return 0;
+    if (j >= e || j == i + 1 || j + 2 >= e || c->b[j + 1] != '(') return 0;
+    L = url_len(c, j + 2, e);
+    if (!L || j + 2 + L >= e || c->b[j + 2 + L] != ')') return 0;
+    *close = j;
+    return j + 2 + L + 1 - i;
+}
+
 /* The first valid closer for a `d`-byte run of `ch` in [from, e), or RT_NONE.
  * Escapes, code spans and URLs are stepped over rather than looked inside, so
  * the `*` in "*a `b*c` d*" closes at the end and not in the middle — and an
@@ -103,6 +119,11 @@ static size_t find_close(rt_ctx *c, size_t from, size_t e, char ch, size_t d) {
         if (cs) { i += cs; continue; }
         cs = url_len(c, i, e);
         if (cs) { i += cs; continue; }
+        {
+            size_t k;
+            cs = labelled_len(c, i, e, &k);
+            if (cs) { i += cs; continue; }
+        }
         if (c->b[i] == ch && i > from && i + d <= e && !rt_space(c->b[i - 1])) {
             size_t k;
             for (k = 1; k < d; k++) if (c->b[i + k] != ch) break;
@@ -150,6 +171,17 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
         {
             size_t L = url_len(c, i, e);
             if (L) { emit(c, i, L, OC_RT_LINK); i += L; continue; }
+        }
+        if (ch == '[') {
+            size_t k, L = labelled_len(c, i, e, &k);
+            if (L) {
+                emit(c, i, 1, OC_RT_DELIM | OC_RT_LABELLED);
+                emit(c, i + 1, k - i - 1, OC_RT_LABELLED);
+                scan_inline(c, i + 1, k, depth + 1);
+                emit(c, k, i + L - k, OC_RT_DELIM | OC_RT_LABELLED);
+                i += L;
+                continue;
+            }
         }
         if (ch == '`') {
             size_t L = code_span_len(c, i, e);
@@ -277,4 +309,16 @@ size_t oc_rt_scan(const char *body, size_t len, oc_rt_span *out, size_t max) {
     }
     scan_text(&c, seg, len);
     return c.n;
+}
+
+int oc_rt_target(const char *body, size_t len, const oc_rt_span *span,
+                 size_t *off, size_t *tlen) {
+    size_t o, L;
+    if (!body || !span || span->style != OC_RT_LABELLED) return 0;
+    o = span->start + span->len + 2;                  /* past "](" */
+    if (o > len || body[o - 2] != ']' || body[o - 1] != '(') return 0;
+    L = oc_url_len(body, len, o);
+    if (!L) return 0;
+    *off = o; *tlen = L;
+    return 1;
 }
