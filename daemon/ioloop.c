@@ -454,10 +454,14 @@ static void service(io_thread *t, io_conn *c, uint32_t events) {
             return;
         }
         if (st != OC_TLS_OK) { finish(t, c); return; }
+        const char *alpn = oc_tls_alpn_selected(&c->tls);
+        /* An ACME validation (RFC 8737) is the handshake and nothing after it:
+         * the CA has seen the challenge certificate, and the connection ends
+         * here, never reaching the loop as a client of either kind. */
+        if (alpn && strcmp(alpn, OC_TLS_ALPN_ACME) == 0) { finish(t, c); return; }
         c->state = S_OPEN;
         /* ALPN demux (ARCH-54): a peer that did not negotiate oc/1 is an HTTP
          * client -- a webhook sender (ARCH-32). */
-        const char *alpn = oc_tls_alpn_selected(&c->tls);
         c->http = !alpn || strcmp(alpn, OC_ALPN_PROTO) != 0;
         if (c->http) c->deadline = mono_ms() + http_timeout_ms();
         oc_io_event *e = ev_new(OC_IO_OPENED, c, NULL, 0);

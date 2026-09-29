@@ -23,6 +23,8 @@
 #include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
 #include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
 #include <shobjidl.h>         /* ITaskbarList3: the overlay badge (REQ-138) */
+#include <wincrypt.h>         /* the certificate a trust question shows */
+#include <cryptuiapi.h>       /* ...and Windows' viewer for it (loaded at run time) */
 #include <wincodec.h>       /* WIC: decode an inline image from memory */
 #include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
 #include "a11y.h"           /* the UIA provider (REQ-269, ARCH-99) */
@@ -1158,6 +1160,9 @@ static NOTIFYICONDATAW g_tray;
  * per-window-class space that a subclass may already be using, WM_APP+n is the
  * application's. */
 #define WM_APP_TRAY (WM_APP + 1)
+/* A trusted certificate's sign-in step, run again once the question that asked
+ * about it has finished closing (cert_trust_run). */
+#define WM_APP_TRUST_RESUME (WM_APP + 2)
 /* Closing the window HIDES it (REQ-138): a chat client that stops notifying the
  * moment you close it has stopped doing the one thing it is for. Said once, the
  * first time, because an app that vanishes without a word reads as a crash. */
@@ -1883,12 +1888,36 @@ static uint64_t g_confirm_root;     /* CONF_DRAFT_DELETE: the draft's thread roo
 enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
        CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD, CONF_DRAFT_DELETE,
-       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN };
+       CONF_GROUP_DELETE, CONF_CHANNEL_GROUP_REMOVE, CONF_LINK_OPEN, CONF_CERT_TRUST };
 static char     g_confirm_url[1024]; /* CONF_LINK_OPEN: the address, as the parser found it */
 static uint64_t g_confirm_cid;      /* CONF_CHANNEL_GROUP_REMOVE: the channel */
 
 static char     g_confirm_title[80];
-static char     g_confirm_body[320];
+
+/* The certificate question on screen (CONF_CERT_TRUST), and what it is about:
+ * a connection that met the certificate, or a sign-in's probe that did -- which
+ * files the trust under the workspace's key and runs its step again. Kept beside
+ * the question because the question answers on a later click. */
+enum { TRUST_NONE = 0, TRUST_SUBMIT, TRUST_KNOWN };
+static struct {
+    char       fp[65];         /* hex */
+    uint8_t    der[OC_CERT_DER_MAX];   /* the certificate, for View certificate */
+    size_t     der_len;        /* 0: too large to carry; judged by fingerprint alone */
+    int        changed;        /* it replaced a certificate trusted before */
+    char       shown_ws[256];  /* the workspace, as the question names it */
+    oc_client *client;         /* the connection that met it, or NULL: a probe */
+    uint32_t   err_seq;        /* its refusal, which trusting answers */
+    int        answered;       /* Trust was pressed */
+    char       key[256];       /* a probe's: the key the trust is filed under */
+    int        resume;         /* ...and the step to run again (TRUST_*) */
+    char       ws[256], user[128];
+} g_trust;
+
+/* Copy fingerprint, and View certificate: the question's two footer actions. */
+enum { CERT_CMD_COPY = 2700, CERT_CMD_VIEW = 2701 };
+static float cert_q_body(gfx *rt, rectf body);   /* fwd */
+
+static char     g_confirm_body[640];
 static char     g_confirm_ok[32];
 static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
 
@@ -11970,6 +11999,7 @@ static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
 }
 
 static void link_open(const char *url);   /* fwd */
+static void cert_trust_run(HWND hwnd);    /* fwd */
 
 static void confirm_run(HWND hwnd) {
     (void)hwnd;
@@ -11978,6 +12008,7 @@ static void confirm_run(HWND hwnd) {
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    case CONF_CERT_TRUST: cert_trust_run(g_main_hwnd); break;
     case CONF_LINK_OPEN: {
         char u[sizeof g_confirm_url];
         memcpy(u, g_confirm_url, sizeof u);
@@ -12087,6 +12118,7 @@ static void channel_group_pick(HWND hwnd, const oc_model *m, uint64_t cid, int a
 }
 
 static void draw_confirm(gfx *rt, rectf body) {
+    if (g_confirm_act == CONF_CERT_TRUST) { cert_q_body(rt, body); return; }
     /* Wrapping text, because a confirmation that clips its own explanation is worse
      * than one that does not explain. */
     draw_text(rt, g_confirm_body, g_meta_w,
@@ -13091,6 +13123,23 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[0] = (oc_mbtn){ "Cancel",     MB_NORMAL,         MODAL_CANCEL };
         sp.buttons[1] = (oc_mbtn){ g_confirm_ok, MB_DANGER_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
+        if (g_confirm_act == CONF_CERT_TRUST) {
+            /* The safe answer is the primary, on the right, and Enter's; trusting
+             * is the danger button, alone on the far left (ask_trust_cert). */
+            sp.size = MODAL_LG;
+            int n = 0;
+            sp.buttons[n++] = (oc_mbtn){ "Trust and connect", MB_DANGER, MODAL_OK };
+            sp.buttons[n++] = (oc_mbtn){ "Copy fingerprint",  MB_NORMAL, CERT_CMD_COPY };
+            if (g_trust.der_len)
+                sp.buttons[n++] = (oc_mbtn){ "View certificate", MB_NORMAL, CERT_CMD_VIEW };
+            sp.buttons[n++] = (oc_mbtn){ "Don't connect",     MB_PRIMARY, MODAL_CANCEL };
+            sp.n_buttons = n;
+            /* Measured as the body is drawn, at the width the card will have;
+             * want_h is in unscaled DIPs. */
+            float bw = UIS(720.0f) - 2 * MODAL_PAD;
+            sp.want_h = (MODAL_TITLE_H + cert_q_body(NULL, rf(0, 0, bw, 0)) + MODAL_FOOT_H + UIS(24.0f))
+                        / g_text_scale;
+        }
     } else if (g_prefs_open) {
         sp.title = "Preferences";
         sp.subtitle = "Saved to your account, so they follow you to another machine.";
@@ -13210,6 +13259,7 @@ static void modal_finish(int save) {
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
+    if (g_view == VIEW_SIGNIN) layout_signin(g_main_hwnd);   /* its fields, back */
     /* Back to the dialog this one was opened from (g_modal_stack). Its snapshot
      * is the one taken when IT opened and is left alone: the dialog on top was a
      * detour, not a second opening. The action above may have left instead --
@@ -13368,6 +13418,7 @@ static int modal_key(HWND hwnd, WPARAM vk) {
     if (vk == VK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
     if (vk == VK_RETURN) {
         if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
+        else if (g_modal_primary_cmd == MODAL_CANCEL) { modal_finish(0); g_modal_closed_by = "enter"; }
         else if (g_modal_primary_cmd != -1)  menu_dispatch(hwnd, g_modal_primary_cmd);
         return 1;
     }
@@ -16466,7 +16517,11 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
      * workspace still connected the shell stays on screen, dimmed, so adding or
      * re-entering a workspace never blanks an app you are already using. */
     int si_over = (g_view == VIEW_SIGNIN) && shell_visible();
-    if (g_view == VIEW_SIGNIN && !si_over) { draw_signin(rt, W, H); return; }
+    if (g_view == VIEW_SIGNIN && !si_over) {
+        draw_signin(rt, W, H);
+        draw_modal(rt, m, W, H);   /* a certificate to judge, over the card */
+        return;
+    }
     if (!m) return;
     ensure_selection(m);
     draw_rail(rt, m, H);
@@ -16580,7 +16635,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         }
         mem_hits_clear();
     }
-    draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
+    if (!si_over) draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_video_overlay(rt, m, W, H);   /* the recording card and the player; menus float above */
     draw_share_full(rt, m, W, H);      /* a shared screen, full screen, when asked for */
     draw_more_flyout(rt);   /* floats over the pane when open */
@@ -16596,6 +16651,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         rectf all = rf(0, 0, W, H);
         gfx_fill(rt, gr(all), 0x000000, 0.55f);
         draw_signin(rt, W, H);
+        draw_modal(rt, m, W, H);   /* ...and a certificate to judge over that */
     }
     draw_lightbox(rt, W, H);   /* the expanded image covers everything */
     draw_toasts(rt, W, H);  /* …and failure notices float above even those */
@@ -21315,7 +21371,7 @@ static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * pad/step offsets here in step with that function. */
 static void layout_signin(HWND hwnd) {
     if (!g_si_e_ws) return;
-    int on = (g_view == VIEW_SIGNIN && !g_si_connecting);
+    int on = (g_view == VIEW_SIGNIN && !g_si_connecting && !g_confirm_open);
     ShowWindow(g_si_e_ws,   (on && g_si_step == 1) ? SW_SHOW : SW_HIDE);
     ShowWindow(g_si_e_user, (on && g_si_step == 2) ? SW_SHOW : SW_HIDE);
     ShowWindow(g_si_e_pass, (on && g_si_step == 2) ? SW_SHOW : SW_HIDE);
@@ -23839,6 +23895,194 @@ static void ws_key(const char *ws, char *out, size_t cap) {
     if (oc_workspace_key(ws, oc_default_suffix(), out, cap) != 0) snprintf(out, cap, "%s", ws ? ws : "");
 }
 
+/* --- a certificate the person must judge (ARCH-10) -------------------------- */
+
+static void signin_submit(HWND hwnd);   /* fwd */
+
+/* Ask whether to trust a server certificate no trusted authority vouches for,
+ * in the shape security prompts share (the Remote Desktop and browser warnings,
+ * and the research behind Chrome's): the title says what is wrong, a warning
+ * icon -- a stronger one for a certificate that CHANGED -- and the safe answer is
+ * the primary button and Enter; trusting is the danger button, far from it. The
+ * fingerprint is shown as an administrator's tools print it, with Copy and
+ * Windows' own certificate viewer beside it. The answer comes back through
+ * confirm_run -> cert_trust_run; declining is the confirmation's cancel. */
+static void ask_trust_cert(HWND hwnd, const char *ws, const char *fp_hex,
+                           const uint8_t *der, size_t der_len, int changed) {
+    g_trust.der_len = der && der_len <= sizeof g_trust.der ? der_len : 0;
+    if (g_trust.der_len) memcpy(g_trust.der, der, der_len);
+    g_trust.changed = changed;
+    snprintf(g_trust.shown_ws, sizeof g_trust.shown_ws, "%s", ws && ws[0] ? ws : "this workspace");
+    (void)fp_hex;   /* g_trust.fp, set by the caller */
+    confirm_open(hwnd, CONF_CERT_TRUST, 0,
+                 changed ? "This server's identity has changed" : "Can't verify this server's identity",
+                 "", "Trust and connect");
+    /* The sign-in's fields are native windows over the card; they give way to
+     * the question, and Enter and Esc go to it rather than to them. */
+    layout_signin(hwnd);
+    SetFocus(hwnd);
+}
+
+/* The question's body: its paragraphs, in order, for drawing and measuring. */
+static void cert_q_text(char *p1, size_t c1, char *fp, size_t cfp) {
+    if (g_trust.changed)
+        snprintf(p1, c1, "The server for %s is showing a different certificate from the one you trusted "
+                 "before. Someone may be intercepting the connection: if your administrator didn't tell "
+                 "you it was changing, don't connect.", g_trust.shown_ws);
+    else
+        snprintf(p1, c1, "The certificate for %s isn't from an authority this computer trusts. That's "
+                 "normal for a server your organisation runs itself \xE2\x80\x94 and also what an "
+                 "impostor's server would look like.", g_trust.shown_ws);
+    if (oc_fingerprint_format(g_trust.fp, 16, fp, cfp) != 0) fp[0] = '\0';
+}
+
+#define CERT_Q_P2 "Check this fingerprint (SHA-256) with your workspace's administrator:"
+#define CERT_Q_P3 "OpenChime will remember this server if you trust it."
+#define CERT_Q_ICON UIS(36.0f)
+
+/* Lay the body out in `body` -- drawing it when `rt` is set -- and return the
+ * height it takes, so the card is sized by the same arithmetic that fills it. */
+static float cert_q_body(gfx *rt, rectf body) {
+    char p1[640], fp[128];
+    cert_q_text(p1, sizeof p1, fp, sizeof fp);
+    float x = body.left + 4 + CERT_Q_ICON + UIS(16), w = body.right - 4 - x, y = body.top + UIS(8);
+    if (rt) draw_lucide(rt, g_trust.changed ? OC_ICON_SHIELD_ALERT : OC_ICON_ALERT,
+                        rf(body.left + 4, y, body.left + 4 + CERT_Q_ICON, y + CERT_Q_ICON),
+                        g_trust.changed ? OC_COL_DANGER : OC_COL_AWAY);
+    const char *paras[3] = { p1, CERT_Q_P2, fp };
+    for (int i = 0; i < 3; i++) {
+        fmtw *f = i == 2 ? g_ui : g_meta_w;
+        float h = text_height(paras[i], f, w);
+        if (rt) draw_text(rt, paras[i], f, rf(x, y, x + w, y + h), OC_COL_TEXT);
+        y += h + UIS(i == 1 ? 6.0f : 12.0f);
+    }
+    float h = text_height(CERT_Q_P3, g_meta_w, w);
+    if (rt) draw_text(rt, CERT_Q_P3, g_meta_w, rf(x, y, x + w, y + h), OC_COL_FAINT);
+    return y + h + UIS(8) - body.top;
+}
+
+static void cert_q_copy(HWND hwnd) {
+    char fp[128];
+    if (oc_fingerprint_format(g_trust.fp, 0, fp, sizeof fp) != 0) return;
+    copy_to_clipboard(hwnd, fp);
+    toast_push("Fingerprint copied", 0);
+}
+
+/* Windows' own certificate viewer -- the one its administrators know -- over the
+ * certificate that was shown. cryptui is loaded when asked for, as dbghelp is:
+ * a dialog few will open is no reason for every start to import it. */
+static void cert_q_view(HWND hwnd) {
+    if (!g_trust.der_len) return;
+    typedef BOOL (WINAPI *view_fn)(PCCRYPTUI_VIEWCERTIFICATE_STRUCTW, BOOL *);
+    HMODULE ui = LoadLibraryW(L"cryptui.dll");
+    view_fn view = ui ? (view_fn)(void *)GetProcAddress(ui, "CryptUIDlgViewCertificateW") : NULL;
+    PCCERT_CONTEXT cc = view ? CertCreateCertificateContext(X509_ASN_ENCODING, g_trust.der,
+                                                            (DWORD)g_trust.der_len) : NULL;
+    if (cc) {
+        CRYPTUI_VIEWCERTIFICATE_STRUCTW v;
+        memset(&v, 0, sizeof v);
+        v.dwSize = sizeof v;
+        v.hwndParent = hwnd;
+        v.szTitle = L"Server certificate";
+        v.pCertContext = cc;
+        /* Without "Install Certificate": that would make a server's own
+         * certificate a root this computer trusts for anything, which is far
+         * more than trusting this server. */
+        v.dwFlags = CRYPTUI_DISABLE_ADDTOSTORE;
+        BOOL changed = FALSE;
+        view(&v, &changed);
+        CertFreeCertificateContext(cc);
+    }
+    if (ui) FreeLibrary(ui);
+}
+
+/* What the person trusted for workspace `key`, kept with its credential. */
+static int trust_load(const char *key, unsigned char fp[32]) {
+    oc_store *st = oc_store_open(store_path());
+    if (!st) return 0;
+    oc_store_set_secret(st, g_secret);
+    int have = oc_store_load_pin(st, key, fp);
+    oc_store_close(st);
+    return have;
+}
+
+static void trust_save(const char *key, const unsigned char fp[32]) {
+    oc_store *st = oc_store_open(store_path());
+    if (!st) return;
+    oc_store_set_secret(st, g_secret);
+    oc_store_save_pin(st, key, fp);
+    oc_store_close(st);
+}
+
+/* Ask a workspace how it signs people in (oc_net_probe_ex), judging its
+ * certificate first -- before anything is typed. One nobody vouches for is put
+ * to the person and OC_PROBE_UNTRUSTED returned; trusting it files the trust and
+ * runs the sign-in step `resume` again, which probes with it. */
+static int probe_workspace(HWND hwnd, const char *ws, const char *domain, const char *host, int port,
+                           oc_signin_source *src, int max, int resume, const char *user) {
+    char key[256]; ws_key(ws, key, sizeof key);
+    unsigned char fp[32];
+    static oc_cert_seen seen;   /* large; the UI thread's alone */
+    int have = trust_load(key, fp);
+    int n = oc_net_probe_ex(domain, host, port, have ? fp : NULL, src, max, &seen);
+    if (n == OC_PROBE_UNTRUSTED) {
+        memset(&g_trust, 0, sizeof g_trust);
+        snprintf(g_trust.fp, sizeof g_trust.fp, "%s", seen.fp_hex);
+        snprintf(g_trust.key, sizeof g_trust.key, "%s", key);
+        snprintf(g_trust.ws, sizeof g_trust.ws, "%s", ws ? ws : "");
+        snprintf(g_trust.user, sizeof g_trust.user, "%s", user ? user : "");
+        g_trust.resume = resume;
+        ask_trust_cert(hwnd, ws, seen.fp_hex, seen.der, seen.der_len, have);
+    }
+    return n;
+}
+
+/* A connection met a certificate to judge (model->cert_seq moved): ask. Not over
+ * another dialog -- that would cancel it -- so it waits for that one to close.
+ * A connection that is up has had its answer. `seen` is the last seq handled
+ * for `c`, 0 for one not looked at yet: the question may have come before the
+ * first look, as it does for a workspace connected at start-up. */
+static void cert_tick(HWND hwnd, oc_client *c, const char *ws, uint32_t *seen) {
+    const oc_model *m = c ? oc_client_model(c) : NULL;
+    if (m && m->connected) *seen = m->cert_seq;
+    if (!m || m->cert_seq == *seen || modal_open()) return;
+    *seen = m->cert_seq;
+    memset(&g_trust, 0, sizeof g_trust);
+    snprintf(g_trust.fp, sizeof g_trust.fp, "%s", m->cert_fp);
+    g_trust.client = c;
+    g_trust.err_seq = m->error_seq;
+    ask_trust_cert(hwnd, ws, m->cert_fp, m->cert_der, m->cert_der_len, m->cert_changed);
+}
+
+/* Trust was pressed. A connection is told, and reconnects -- if it is still one
+ * of ours: the sign-in may have been abandoned while the question was up. A probe's
+ * trust is filed under the workspace and its step run again. */
+static void cert_trust_run(HWND hwnd) {
+    unsigned char fp[32];
+    if (oc_fingerprint_from_hex(g_trust.fp, fp) != 0) return;
+    g_trust.answered = 1;
+    if (g_trust.client) {
+        if (g_trust.client != g_si_client && g_trust.client != g_client) return;
+        if (g_trust.client == g_si_client) g_si_started = GetTickCount64();   /* a fresh wait */
+        oc_client_trust_cert(g_trust.client, g_trust.fp);
+        return;
+    }
+    trust_save(g_trust.key, fp);
+    /* Not from here: this runs inside the question's closing, which would then
+     * close any question the step asks in turn. */
+    PostMessageW(hwnd, WM_APP_TRUST_RESUME, 0, 0);
+}
+
+static void cert_trust_resume(HWND hwnd) {
+    int r = g_trust.resume;
+    g_trust.resume = TRUST_NONE;
+    if (g_view != VIEW_SIGNIN) return;
+    if (r == TRUST_KNOWN)
+        signin_begin_known(hwnd, g_trust.ws, g_trust.user[0] ? g_trust.user : NULL);
+    else if (r == TRUST_SUBMIT && g_si_step == 1)
+        signin_submit(hwnd);
+}
+
 /* An entry made when the token was filed under the resolved address and the book
  * under whatever was typed: both move to the key, once. */
 static void ws_adopt(oc_store *s, const char *key, const char *typed, const oc_endpoint *ep) {
@@ -23984,7 +24228,7 @@ static void ws_clear_session(const char *ws) {
     oc_store_close(st);
 }
 
-/* Remove a workspace from this device entirely (REQ-012): credential, TOFU pin
+/* Remove a workspace from this device entirely (REQ-012): credential, trusted fingerprint
  * and book entry in one delete, so "forget" leaves nothing behind. */
 static void ws_forget(const char *ws) {
     const char *sp = store_path();
@@ -24204,7 +24448,16 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
     /* Step 1 is skipped, so its question is asked here: a workspace that takes no
      * passwords goes to the browser, not to a password form it cannot use. An
      * unreachable one falls through to the form, which reports it on submit. */
-    g_si_nsrc = oc_net_probe(ep.domain, g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
+    g_si_nsrc = probe_workspace(hwnd, g_si_ws, ep.domain, g_si_host, g_si_port, g_si_src,
+                                (int)(sizeof g_si_src / sizeof g_si_src[0]), TRUST_KNOWN, user);
+    if (g_si_nsrc == OC_PROBE_UNTRUSTED) {
+        /* On the address step while the certificate is put to the person; trusting
+         * it comes back here (cert_trust_run). */
+        g_si_nsrc = 0;
+        snprintf(g_si_err, sizeof g_si_err, "the server's certificate was not trusted");
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
     if (g_si_nsrc < 0) g_si_nsrc = 0;
     if (g_si_nsrc > 0 && !si_has_local() && si_browser_source()) { signin_start_browser(hwnd); return; }
     g_si_step = 2;
@@ -24349,9 +24602,14 @@ static void signin_submit(HWND hwnd) {
         /* Ask the workspace how it signs people in before drawing the step that
          * asks them for anything (AUTH.md §8.1). */
         g_si_nsrc = 0;
-        int n = oc_net_probe(ep.domain, g_si_host, g_si_port, g_si_src, (int)(sizeof g_si_src / sizeof g_si_src[0]));
+        int n = probe_workspace(hwnd, g_si_ws, ep.domain, g_si_host, g_si_port, g_si_src,
+                                (int)(sizeof g_si_src / sizeof g_si_src[0]), TRUST_SUBMIT, NULL);
         if (n == OC_PROBE_VERSION) {
             snprintf(g_si_err, sizeof g_si_err, "this app and that server are different versions");
+            goto redraw;
+        }
+        if (n == OC_PROBE_UNTRUSTED) {
+            snprintf(g_si_err, sizeof g_si_err, "the server's certificate was not trusted");
             goto redraw;
         }
         if (n <= 0) { snprintf(g_si_err, sizeof g_si_err, "could not reach %.200s", g_si_host); goto redraw; }
@@ -24443,6 +24701,23 @@ static void signin_open_url(const char *url) {
 static void signin_poll(HWND hwnd) {
     const oc_model *m = g_si_client ? oc_client_model(g_si_client) : NULL;
     if (!m) return;
+    /* A certificate to judge first. While it is being read the attempt waits,
+     * with no deadline; declined, that is the failure; trusted, the attempt goes
+     * on, and the refusal it reported is not one. */
+    static oc_client *cert_for;
+    static uint32_t cert_seen;
+    if (cert_for != g_si_client) { cert_for = g_si_client; cert_seen = 0; }
+    cert_tick(hwnd, g_si_client, g_si_ws, &cert_seen);
+    int judged = g_trust.client && g_trust.client == g_si_client;
+    if (judged && g_confirm_open && g_confirm_act == CONF_CERT_TRUST) {
+        g_si_started = GetTickCount64();
+        return;
+    }
+    if (judged && !g_trust.answered) {
+        g_trust.client = NULL;
+        signin_fail(hwnd, "the server's certificate was not trusted");
+        return;
+    }
     if (m->authed) {
         /* Authenticated: NOW park whatever workspace was on screen and make this
          * the active one. Doing it here rather than at submit is what let the
@@ -24467,7 +24742,10 @@ static void signin_poll(HWND hwnd) {
         InvalidateRect(hwnd, NULL, FALSE);
         return;
     }
-    if (m->last_error[0] && !m->connected) { signin_fail(hwnd, m->last_error); return; }
+    if (m->last_error[0] && !m->connected && !(judged && m->error_seq == g_trust.err_seq)) {
+        signin_fail(hwnd, m->last_error);
+        return;
+    }
     if (g_si_browser && m->signin_url[0]) {
         /* The person is in their browser; the core gives them five minutes, so the
          * connect deadline does not apply. Each URL is opened once. */
@@ -25919,6 +26197,8 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (form_dialog(hwnd, "Create a channel", f, 2) && f[0].value[0])
             oc_client_create_channel_ex(g_client, f[0].value, atoi(f[1].value) == 0);
         break; }
+    case CERT_CMD_COPY: cert_q_copy(hwnd); break;
+    case CERT_CMD_VIEW: cert_q_view(hwnd); break;
     case 2600:                                         /* DRAFT_CMD_OPEN */
         if (!g_dmenu_cid) open_new_message(hwnd);
         else { select_channel(g_dmenu_cid); g_view = VIEW_HOME; }
@@ -29030,6 +29310,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            {   /* The workspace on screen met a certificate to judge (ARCH-10). */
+                static oc_client *cert_for;
+                static uint32_t cert_seen;
+                if (cert_for != g_client) { cert_for = g_client; cert_seen = 0; }
+                cert_tick(hwnd, g_client, g_cur_ws, &cert_seen);
+            }
             if (m) groups_roster_tick(m);
             /* You named somebody who is not in this channel (REQ-287). Driven off
              * `seq` rather than a changed name: mention the same absent colleague
@@ -30670,6 +30956,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+    case WM_APP_TRUST_RESUME:
+        cert_trust_resume(hwnd);
+        return 0;
     case WM_APP_TRAY:
         /* The tray icon is a control now. Left click shows the window; right
          * click shows it AND opens the app's own menu inside it.

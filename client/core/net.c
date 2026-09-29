@@ -68,11 +68,16 @@ struct oc_net {
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
     char          ws_key[288];  /* the workspace as named (oc_workspace_key); "" = host:port */
-    int           pin_only;     /* Remember-me off: keep the TOFU pin, and nothing else */
+    int           pin_only;     /* Remember-me off: keep the trusted fingerprint, and nothing else */
     /* The fingerprint the workspace PUBLISHED (ARCH-10, via `.well-known`), used
      * only when nothing is pinned yet -- see oc_net_start_verified. */
     unsigned char published_pin[OC_TLS_FINGERPRINT_LEN];
     int           have_published_pin;
+    /* The certificate last refused as untrusted (net thread), and one the person
+     * has since said to trust (set by the UI thread, taken by the net thread). */
+    oc_cert_seen  seen;         /* the certificate last put to the person */
+    atomic_int    trust_pending;
+    unsigned char trust_fp[OC_TLS_FINGERPRINT_LEN];
     /* A browser sign-in in progress (AUTH.md §8.1): the listener the browser comes
      * back to, the verifier kept for the daemon, and — once the browser has been —
      * the token to present on the next connection. Net thread only, but for
@@ -157,11 +162,11 @@ static void obox_free(obox *o) {
     obox_publish(o);
 }
 
-/* The store-backed connection context (session token + TOFU pin persistence),
+/* The store-backed connection context (session token + trusted fingerprint persistence),
  * threaded through run_connection so the net thread persists across restarts. */
 typedef struct {
     oc_store   *store;                          /* NULL = no persistence */
-    oc_store   *pins;        /* where the TOFU pin is kept — set even when `store` is not,
+    oc_store   *pins;        /* where the trusted fingerprint is kept — set even when `store` is not,
                                * because a pin is not what Remember-me is about (ARCH-10) */
     const char *workspace;                       /* "host:port" key */
     uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
@@ -2187,13 +2192,17 @@ enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3,
         * else (ARCH-10). Distinct from CERT_CHANGED: nothing changed and there is
         * nothing to re-trust -- this is the first connection, refused because the
         * certificate is not the one the workspace says is its own. */
-       RC_CERT_UNPUBLISHED = 5 };
+       RC_CERT_UNPUBLISHED = 5,
+       /* A certificate no trusted root vouches for, and nothing else trusts it:
+        * the person has not said to (ARCH-10). The fingerprint is shown to them. */
+       RC_CERT_UNTRUSTED = 6 };
 
-/* TOFU pinning defends against a network man-in-the-middle substituting the
- * server's certificate. A loopback connection never leaves the host, so there is
- * no MITM vector and pinning it only causes false alarms across local daemon
- * restarts (each fresh daemon self-signs a new cert). So we do not enforce the
- * pin for loopback — matching how tools skip TLS verification for localhost. */
+/* Checking a certificate defends against a network man-in-the-middle
+ * substituting the server's. A loopback connection never leaves the host, so
+ * there is no MITM vector, and asking about it would only raise false alarms
+ * across local daemon restarts (each fresh daemon self-signs a new cert). So a
+ * loopback certificate is accepted as it is (ARCH-10) — matching how tools skip
+ * TLS verification for localhost. */
 /* This machine, in any spelling (resolve.h). */
 static int is_loopback(const char *host) { return oc_addr_is_loopback(host); }
 
@@ -2234,24 +2243,62 @@ static void signin_forget(oc_net *n) {
  * enforced and none is stored — nothing secret is sent, and what comes back only
  * decides which controls to draw; the connection that signs in checks the pin. */
 int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max) {
+    oc_cert_seen *unused = malloc(sizeof *unused);   /* large for a stack */
+    if (!unused) return OC_PROBE_UNREACHABLE;
+    int rc = oc_net_probe_ex(workspace, host, port, NULL, out, max, unused);
+    free(unused);
+    return rc;
+}
+
+/* Describe a certificate for the person to judge: fingerprint in hex, and the
+ * certificate if it fits. */
+static void cert_seen_fill(oc_cert_seen *s, const unsigned char fp[OC_TLS_FINGERPRINT_LEN],
+                           const oc_tls_conn *conn) {
+    for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++) snprintf(s->fp_hex + 2 * i, 3, "%02x", fp[i]);
+    const uint8_t *der; size_t len;
+    s->der_len = 0;
+    if (oc_tls_peer_der(conn, &der, &len) == 0 && len <= sizeof s->der) {
+        memcpy(s->der, der, len);
+        s->der_len = len;
+    }
+}
+
+int oc_net_probe_ex(const char *workspace, const char *host, int port, const unsigned char *trusted_fp,
+                    oc_signin_source *out, int max, oc_cert_seen *seen) {
+    seen->fp_hex[0] = '\0';
+    seen->der_len = 0;
     int fd = dial(host, port);
     if (fd < 0) return OC_PROBE_UNREACHABLE;
     oc_tls_client cli;
     oc_tls_conn conn;
     oc_framebuf fb;
-    if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
+    if (oc_tls_client_init_verify(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd);
         return OC_PROBE_UNREACHABLE;
     }
+    oc_tls_conn_defer_verify(&conn);
     {
         char sni[256];
-        if (oc_sni_name(workspace && workspace[0] ? workspace : host, sni, sizeof sni))
-            oc_tls_conn_set_hostname(&conn, sni);
+        const char *name = workspace && workspace[0] ? workspace : host;
+        if (oc_sni_name(name, sni, sizeof sni)) oc_tls_conn_set_hostname(&conn, sni);
+        else oc_tls_conn_set_hostname(&conn, host);
     }
     oc_framebuf_init(&fb);
     atomic_int stop = 0;
     int rc = OC_PROBE_UNREACHABLE;
     if (do_handshake(&conn, fd, &stop) != 0) goto done;
+    /* The same judgement as the connection that signs in (cert_judge), before
+     * anything is asked of anyone: a certificate nobody vouches for is shown to
+     * the person to judge, not talked to. */
+    if (!oc_tls_conn_ca_trusted(&conn)) {
+        unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+        if (oc_tls_peer_fingerprint(&conn, fp) != 0) goto done;
+        if (!(trusted_fp && memcmp(fp, trusted_fp, sizeof fp) == 0) && !is_loopback(host)) {
+            cert_seen_fill(seen, fp, &conn);
+            rc = OC_PROBE_UNTRUSTED;
+            goto done;
+        }
+    }
     {
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("openchime-client/0.1") };
@@ -2283,6 +2330,46 @@ done:
     return rc;
 }
 
+/* The name the certificate must carry: the workspace's domain (its key), sent
+ * as SNI; or, for a workspace that is an address, the address -- checked among
+ * the certificate's iPAddress names, and never sent (RFC 6066 §3). */
+static void set_expected_name(oc_tls_conn *conn, const oc_net *n) {
+    char sni[256];
+    if (oc_sni_name(n->ws_key[0] ? n->ws_key : n->host, sni, sizeof sni))
+        oc_tls_conn_set_hostname(conn, sni);
+    else
+        oc_tls_conn_set_hostname(conn, n->host);
+}
+
+/* Is this certificate one to talk to (ARCH-10)? 0 if so; else the RC_ to end
+ * the attempt with. In order:
+ *   - a trusted root vouches for it, under the workspace's name: yes, and a
+ *     trust the person gave an earlier, self-signed certificate is no longer
+ *     needed, and is forgotten;
+ *   - the workspace published a fingerprint (.well-known, fetched over verified
+ *     HTTPS): yes if it is that one, and refused if not, whatever else holds --
+ *     the workspace said which certificate is its own;
+ *   - the person has said to trust this certificate: yes if it is that one;
+ *   - a daemon on this machine (loopback): yes -- nothing sits in that path;
+ *   - otherwise refused, its fingerprint kept for the person to judge. */
+static int cert_judge(oc_net *n, conn_store *cs, oc_tls_conn *conn) {
+    if (oc_tls_conn_ca_trusted(conn)) {
+        if (cs && cs->have_pin) {
+            cs->have_pin = 0;
+            if (cs->pins) oc_store_clear_pin(cs->pins, cs->workspace);
+        }
+        return 0;
+    }
+    unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+    if (oc_tls_peer_fingerprint(conn, fp) != 0) return RC_LOST;
+    if (n->have_published_pin)
+        return memcmp(fp, n->published_pin, sizeof fp) == 0 ? 0 : RC_CERT_UNPUBLISHED;
+    if (cs && cs->have_pin && memcmp(fp, cs->pin, sizeof fp) == 0) return 0;
+    if (is_loopback(n->host)) return 0;
+    cert_seen_fill(&n->seen, fp, conn);
+    return cs && cs->have_pin ? RC_CERT_CHANGED : RC_CERT_UNTRUSTED;
+}
+
 /* One connection lifecycle: dial → TLS → handshake → auth → serve, then clean up.
  * `reconnecting` selects session-token auth (OC_AUTH_SESSION) over password; the
  * AUTH_OK session token is captured into `sess`/`*have_sess` (kept across
@@ -2303,27 +2390,17 @@ static int run_connection(oc_net *n, int reconnecting,
     oc_tls_client cli;
     oc_tls_conn conn;
     oc_framebuf fb;
-    /* TOFU (ARCH-10): pin the stored fingerprint if we have one; otherwise trust
-     * the presented cert this once and capture its fingerprint below. Multiple
-     * oc_clients in one process (the headless test) set up TLS concurrently; safe
-     * because the vendored mbedTLS is built with MBEDTLS_THREADING. */
-    int enforce_pin = cs && cs->have_pin && !is_loopback(n->host);
-    /* No pin yet, but the workspace published one: check the FIRST connection
-     * against it (ARCH-10). That connection is the one TOFU cannot defend, and
-     * checking it is the only reason publishing a fingerprint is worth doing. A
-     * loopback daemon is exempt for the reason the pin itself is. */
-    /* No loopback exemption, unlike the TOFU pin above. That exemption exists
-     * because trusting an unknown certificate is only dangerous where something
-     * can sit in the path, and nothing sits inside the host. A PUBLISHED
-     * fingerprint is a different thing: the workspace stated which certificate
-     * is its own, so presenting another one is wrong wherever it happens, and a
-     * rule with no exception is one nobody has to reason about. */
-    int use_published = !enforce_pin && n->have_published_pin;
-    const unsigned char *want = enforce_pin ? cs->pin : use_published ? n->published_pin : NULL;
-    if (oc_tls_client_init(&cli, want) != 0 ||
+    /* Trust (ARCH-10): the certificate is verified as any HTTPS server's is --
+     * a trusted root, and the workspace's name -- and judged after the handshake
+     * (cert_judge), where the fallback for a daemon that has no such certificate
+     * is applied. Multiple oc_clients in one process (the headless test) set up
+     * TLS concurrently; safe because the vendored mbedTLS is built with
+     * MBEDTLS_THREADING. */
+    if (oc_tls_client_init_verify(&cli, NULL) != 0 ||
         oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
     }
+    oc_tls_conn_defer_verify(&conn);
     /* Resume the last session if the daemon still takes its ticket: a reconnect
      * then skips the certificate and signature of a full handshake. The ticket
      * came from a connection that passed the same pin check. */
@@ -2331,34 +2408,22 @@ static int run_connection(oc_net *n, int reconnecting,
     /* Name the workspace in the handshake (SNI): a shared front door reads it to
      * find the workspace's daemon, without terminating anything. It is the
      * workspace's own domain — its key — even when an SRV record sent this
-     * connection elsewhere, and never an address (RFC 6066 §3). Trust is still the
-     * pin: the verify callback clears the name mismatch a self-signed certificate
-     * would otherwise fail on. */
-    {
-        char sni[256];
-        if (oc_sni_name(n->ws_key[0] ? n->ws_key : n->host, sni, sizeof sni))
-            oc_tls_conn_set_hostname(&conn, sni);
-    }
+     * connection elsewhere, and never an address (RFC 6066 §3). It is also the
+     * name the certificate must carry. A workspace that is an address has the
+     * address checked instead, among the certificate's iPAddress names. */
+    set_expected_name(&conn, n);
     oc_framebuf_init(&fb);
     /* Attachment transfer state, valid from here to `drop:` (which may reset it). */
     oc_xfer xfer; memset(&xfer, 0, sizeof xfer);
     uint16_t negotiated = 0;   /* set from WELCOME; checked on every later frame */
 
     if (do_handshake(&conn, fd, &n->stop) != 0) {
-        /* A pinned handshake that fails on peer verification means the server's
-         * certificate changed (TOFU mismatch) — report that distinctly, not as a
-         * generic "unreachable". */
-        if (enforce_pin && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_CHANGED;
-        else if (use_published && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_UNPUBLISHED;
         oc_tls_session_free(&n->resume);   /* the next attempt starts from nothing */
         goto drop;
     }
-
-    /* First contact with this workspace: remember the cert fingerprint so every
-     * later connection pins it (TOFU first-use, ARCH-10). */
-    if (cs && !cs->have_pin && oc_tls_peer_fingerprint(&conn, cs->pin) == 0) {
-        cs->have_pin = 1;
-        if (cs->pins) oc_store_save_pin(cs->pins, cs->workspace, cs->pin);
+    {
+        int judged = cert_judge(n, cs, &conn);
+        if (judged != 0) { rc = judged; oc_tls_session_free(&n->resume); goto drop; }
     }
 
     /* HELLO -> WELCOME */
@@ -3399,6 +3464,14 @@ static void *net_thread(void *arg) {
 
     int reach_notified = 0;   /* latch so "unreachable" isn't repeated each retry */
     while (!n->stop) {
+        /* The person said to trust the certificate shown them: remember it, and
+         * this attempt presents it (cert_judge). */
+        if (atomic_exchange(&n->trust_pending, 0)) {
+            memcpy(cs.pin, n->trust_fp, sizeof cs.pin);
+            cs.have_pin = 1;
+            if (cs.pins) oc_store_save_pin(cs.pins, workspace, cs.pin);
+            reach_notified = 0;
+        }
         int served = 0;
         int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served, &cs);
         push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
@@ -3412,10 +3485,24 @@ static void *net_thread(void *arg) {
                                "connection was refused");
             reach_notified = 1;
         }
-        else if (rc == RC_CERT_CHANGED && !reach_notified) {
-            push_err(n->to_ui, "the server's security certificate has changed since you "
-                               "last connected — if unexpected this may be a security risk; "
-                               "forget this workspace (switcher: d) to trust the new one");
+        else if ((rc == RC_CERT_CHANGED || rc == RC_CERT_UNTRUSTED) && !reach_notified) {
+            /* What the person is asked to judge: the fingerprint, and whether a
+             * certificate they trusted before has been replaced. */
+            oc_ev *e = oc_ev_new(OC_EV_CERT_UNTRUSTED);
+            if (e) {
+                e->body = strdup(n->seen.fp_hex);
+                if (n->seen.der_len && (e->der = malloc(n->seen.der_len))) {
+                    memcpy(e->der, n->seen.der, n->seen.der_len);
+                    e->der_len = n->seen.der_len;
+                }
+                e->status = rc == RC_CERT_CHANGED;
+                oc_queue_push(n->to_ui, e);
+            }
+            push_err(n->to_ui, rc == RC_CERT_CHANGED
+                ? "the server's certificate has changed since you trusted it — if you did not "
+                  "expect that, someone may be in the way; check its fingerprint before trusting it"
+                : "the server's certificate is not from an authority this computer trusts — check "
+                  "its fingerprint with the workspace's administrator before trusting it");
             reach_notified = 1;
         }
         else if (rc == RC_LOST && !reach_notified) {
@@ -3461,6 +3548,18 @@ static void *net_thread(void *arg) {
              * is, so a frontend can open the sign-in instead of showing an error. */
             if (reconnecting) push_simple(n->to_ui, OC_EV_SIGNED_OUT, 0);
             break;
+        }
+        /* A certificate the person must judge: wait for them. Trusting it
+         * (oc_net_trust_cert) connects again at once; so does a retry
+         * (oc_net_reconnect), which asks again -- the way back for someone who
+         * declined, or closed the question unanswered. Stopping ends it. */
+        if (rc == RC_CERT_UNTRUSTED || rc == RC_CERT_CHANGED) {
+            while (!n->stop && !atomic_load(&n->trust_pending) && !n->reconnect_now)
+                oc_nanosleep(50 * 1000 * 1000);
+            if (n->stop) break;
+            if (n->reconnect_now) reach_notified = 0;   /* a retry asks again */
+            n->reconnect_now = 0;
+            continue;
         }
         if (!have_sess) break;   /* never authenticated: nothing to reconnect with */
         /* Connection lost mid-session: back off, then reconnect with the token.
@@ -3560,6 +3659,12 @@ void oc_net_set_invite(oc_net *n, const char *token) {
 }
 
 void oc_net_cancel_signin(oc_net *n) { if (n) n->signin_cancel = 1; }
+
+void oc_net_trust_cert(oc_net *n, const unsigned char fp[OC_TLS_FINGERPRINT_LEN]) {
+    if (!n || !fp) return;
+    memcpy(n->trust_fp, fp, OC_TLS_FINGERPRINT_LEN);
+    atomic_store(&n->trust_pending, 1);
+}
 
 void oc_net_reconnect(oc_net *n) {
     if (n) n->reconnect_now = 1;   /* the backoff loop polls this and retries at once */

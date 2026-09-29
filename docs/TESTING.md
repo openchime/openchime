@@ -370,11 +370,12 @@ further. `CLIENT_ACK`, backfill, version rejection and session revocation are
 exercised in the **in-process** integration suites (`itest_netloop`), not by this
 client.
 
-**Client-side TLS.** The wire protocol runs over TLS with TOFU
-pinning (ARCH-10, REQ-180); there is no plaintext fallback. The TLS library is
-mbedTLS (ARCH-51, [TLS.md](./TLS.md)), used by both the daemon and the test
-client; `shared/tls.c` provides the TOFU-pinning client, and
-`tests/itest_tls.c` exercises the handshake + pinning end-to-end.
+**Client-side TLS.** The wire protocol runs over TLS, verified as ARCH-10 says
+(REQ-180); there is no plaintext fallback. The TLS library is mbedTLS (ARCH-51,
+[TLS.md](./TLS.md)), used by both the daemon and the test client;
+`tests/itest_tls.c` exercises the handshake and the fingerprint check, and
+`test_client_core` the client's judgement of a certificate at this machine's LAN
+address — a root's, the person's trust, a change, a wrong name, and the probe.
 
 ### 3.2 Runner: a natively-run daemon in CI
 

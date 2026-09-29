@@ -26,7 +26,8 @@ replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile;
 **0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row;
-**0048** (§3am) user groups, and membership through them.
+**0048** (§3am) user groups, and membership through them; **0049** (§3an) a
+CA-issued TLS certificate and the ACME account behind it.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -342,15 +343,15 @@ REQ-090. A `delivery_cursors` row per `(user, channel)` advanced by
 
 ## 3f. Migration 0008 — server identity
 
-Persists the daemon's TLS identity across restart/restore so the TOFU
-fingerprint clients pinned (ARCH-10) survives a redeploy.
+Persists the daemon's self-signed TLS identity across restart/restore, so the
+fingerprint people trusted (ARCH-10) survives a redeploy.
 
 ### `server_identity`
 - `id` (INTEGER PK, `CHECK (id = 1)`) — a single-row table; the daemon has one
   identity.
 - `cert_pem` / `key_pem` (TEXT) — the self-signed certificate and its private
   key, PEM-encoded. This is the one private key in the daemon's database; it is
-  what makes the pin survive a restore onto a new box (ARCH-66b).
+  what makes a trusted fingerprint survive a restore onto a new box (ARCH-66b).
 - `created_at_ms` (INTEGER) — when the identity was generated.
 
 ---
@@ -1212,6 +1213,42 @@ mention counts it too:
 Rows are resolved at send time, so who is in the group later changes later
 mentions, not this one. Deleting a group sets its rows' `group_id` to NULL and
 keeps the rows.
+
+## 3an. Migration 0049 — a CA-issued TLS certificate (ARCH-10)
+
+```sql
+CREATE TABLE acme_account (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  directory_url   TEXT NOT NULL,
+  account_key_pem TEXT NOT NULL,
+  account_url     TEXT NOT NULL,
+  created_at_ms   INTEGER NOT NULL
+);
+CREATE TABLE tls_certificate (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  source        TEXT NOT NULL,        -- 'acme' | 'central'
+  names         TEXT NOT NULL,        -- comma-separated
+  chain_pem     TEXT NOT NULL,
+  key_pem       TEXT NOT NULL,
+  issued_at_ms  INTEGER NOT NULL,
+  not_after_ms  INTEGER NOT NULL
+);
+```
+
+### `acme_account`
+The ACME account (RFC 8555) the daemon made with its CA: its key and URL, kept
+with the **directory** it belongs to, so a daemon moved to another CA makes a new
+account rather than presenting one CA's key to another. Written once, by the
+certificate worker, through the writer.
+
+### `tls_certificate`
+The CA-issued certificate the daemon presents, with where it came from, the
+names it covers and when it runs out. At boot it is presented at once if it is
+from the source configured, for the names configured, and not expired; the
+worker renews it at two-thirds of its life. Both tables hold a private key, like
+`server_identity`.
+
+---
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

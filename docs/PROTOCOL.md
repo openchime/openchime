@@ -36,9 +36,11 @@ document and the codec disagree, the codec is right.
 
 - The protocol runs over a single TLS/TCP connection per client (ARCH-6,
   ARCH-10, REQ-180). There is no unencrypted fallback.
-- TLS trust is TOFU pinning against the daemon's self-signed certificate
-  (ARCH-10, REQ-183). Everything below §1 describes the plaintext *inside* the
-  TLS session.
+- The client verifies the daemon's certificate as any HTTPS client does — a
+  trusted root, and the workspace's name — or, for a daemon with only its
+  self-signed certificate, by the fingerprint the person trusted or the
+  workspace published (ARCH-10, REQ-183, [TLS.md](./TLS.md)). Everything below
+  §1 describes the plaintext *inside* the TLS session.
 - The connection is bidirectional and full-duplex. After the handshake and
   auth complete, either side may send an applicable frame at any time (e.g.
   the server may push a `BROADCAST` while the client is composing a `SEND`).
@@ -1344,7 +1346,7 @@ each new `TYPING_UPDATE` for that `(channel, user)`.
 
 ### 5.14 Attachments (REQ-140, REQ-141)
 
-File bytes are **proxied through the daemon** over this same pinned-TLS
+File bytes are **proxied through the daemon** over this same TLS
 connection, split into chunks — never fetched from a directly-reachable object
 store via a signed URL (ARCH-69). This makes access control a single in-daemon
 check on the ordinary membership path (§5.7, REQ-031), identical to reading the

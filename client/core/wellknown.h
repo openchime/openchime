@@ -19,8 +19,8 @@
  *     its other HTTP surfaces and vendors a parser for them.
  *   - **CA-verified**, against the roots built into the client (tls.h), and
  *     refused rather than downgraded when the chain does not reach one. This
- *     is the one that deserves the argument: ARCH-10 keeps the client off CA
- *     trust for the DAEMON connection, which is pinned (TOFU). That is a
+ *     is the one that deserves the argument: ARCH-10 lets a daemon with only a
+ *     self-signed certificate be trusted by its fingerprint. That is a
  *     statement about the daemon's self-signed certificate, not about an
  *     ordinary web server at the tenant's domain, and it cannot be stretched
  *     to cover this: a document that may carry the fingerprint a client is

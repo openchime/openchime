@@ -140,7 +140,7 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
 
     if (loopback) {
         /* One spelling, because this name becomes the key a session token and a
-         * TOFU pin are stored under: "LocalHost" and "localhost" are the same
+         * trusted fingerprint are stored under: "LocalHost" and "localhost" are the same
          * host, and keeping both would be two entries for one workspace. */
         if ((size_t)snprintf(out, cap, "localhost") >= cap) return -1;
     } else if (!strchr(host, '.') && suffix && *suffix) {   /* bare name -> append suffix */

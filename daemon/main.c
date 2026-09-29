@@ -12,6 +12,7 @@
  */
 
 #include "audio.h"
+#include "certs.h"
 #include "config.h"
 #include "dbwriter.h"
 #include "enroll.h"
@@ -117,7 +118,62 @@ typedef struct {
     int             claiming;
     oc_push        *push;
     oc_invite_mail *invite_mail;
+    /* The CA-issued certificate (TLS.md, "Certificates"): its worker, the TLS
+     * state it presents into, what the database kept, and whether the binding
+     * central needs is active. */
+    oc_tls_server  *tls;
+    oc_certs       *certs;
+    oc_tls_state    kept;
+    int             active;
 } fed_services;
+
+static void keep_account(void *ctx, const char *key_pem, const char *url) {
+    fed_services *f = ctx;
+    oc_dbwriter_store_acme_account(f->db, f->cfg->tls_src.directory, key_pem, url);
+}
+
+static void keep_cert(void *ctx, const oc_cert_issued *c) {
+    fed_services *f = ctx;
+    oc_dbwriter_store_tls_cert(f->db, f->cfg->tls_src.source == OC_TLS_SRC_ACME ? "acme" : "central",
+                               c->names, c->chain_pem, c->key_pem, c->not_before_ms, c->not_after_ms);
+}
+
+/* Start keeping the certificate CA-issued, for the source configured. ACME is
+ * answered through the listener, so this waits for the daemon to be serving;
+ * central needs an active binding. */
+static void start_certs(fed_services *f) {
+    const oc_config *cfg = f->cfg;
+    if (f->certs || !f->tls) return;
+    oc_certs_opts o;
+    memset(&o, 0, sizeof o);
+    o.tls = f->tls;
+    o.store_cert = keep_cert;
+    o.ctx = f;
+    o.issued_ms = f->kept.issued_ms;
+    o.not_after_ms = f->kept.not_after_ms;
+    if (cfg->tls_src.source == OC_TLS_SRC_ACME) {
+        o.source = OC_CERTS_ACME;
+        o.directory = cfg->tls_src.directory;
+        o.names = cfg->tls_src.names;
+        o.email = cfg->tls_src.email;
+        /* The kept account, only for the CA it belongs to. */
+        if (f->kept.acme_directory && !strcmp(f->kept.acme_directory, cfg->tls_src.directory)) {
+            o.account_key_pem = f->kept.acme_key_pem;
+            o.account_url = f->kept.acme_url;
+        }
+        o.store_account = keep_account;
+    } else if (cfg->tls_src.source == OC_TLS_SRC_CENTRAL) {
+        if (!f->active || !f->privkey || !f->audience) return;
+        o.source = OC_CERTS_CENTRAL;
+        o.central_url = cfg->enroll.url;
+        o.audience = f->audience;
+        o.enroll_key_pem = f->privkey;
+    } else {
+        return;
+    }
+    f->certs = oc_certs_start(&o);
+    if (!f->certs) fprintf(stderr, "openchimed: the certificate worker failed to start\n");
+}
 
 static void start_federated(fed_services *f) {
     const oc_config *cfg = f->cfg;
@@ -169,6 +225,8 @@ static void *claim_thread(void *arg) {
             oc_dbwriter_note_enrollment_active(f->db, f->privkey, f->audience);
             fprintf(stderr, "openchimed: binding claimed (audience=%s)\n", f->audience);
             start_federated(f);
+            f->active = 1;
+            start_certs(f);
             break;
         }
         if (er == OC_ENROLL_FAILED) {
@@ -187,9 +245,11 @@ static void *claim_thread(void *arg) {
     return NULL;
 }
 
-/* The net loop's ready hook: the listener takes connections, so claim now. */
+/* The net loop's ready hook: the listener takes connections, so a certificate
+ * can be validated through it, and a claim made. */
 static void on_serving(void *ctx) {
     fed_services *f = ctx;
+    start_certs(f);
     if (!f->ticket || f->claiming) return;
     if (pthread_create(&f->claim, NULL, claim_thread, f) == 0) f->claiming = 1;
     else fprintf(stderr, "openchimed: could not start the enrollment claim\n");
@@ -477,6 +537,13 @@ int main(int argc, char **argv) {
     fed.privkey = enroll_privkey;
     fed.audience = enroll_audience;
     enroll_privkey = enroll_audience = NULL;   /* fed owns them now */
+    fed.active = enroll_active;
+    /* A certificate through central needs a binding to ask with. */
+    if (cfg->tls_src.source == OC_TLS_SRC_CENTRAL && !(fed.privkey && fed.audience)) {
+        fprintf(stderr, "openchimed: OPENCHIME_TLS_SOURCE=central needs an enrollment "
+                        "(OPENCHIME_ENROLL_URL); refusing to start without one\n");
+        oc_dbwriter_stop(db); return 1;
+    }
     if (fed.privkey && fed.audience) {
         if (enroll_active) start_federated(&fed);
         else if (managed_claim) fed.ticket = ticket;
@@ -509,11 +576,14 @@ int main(int argc, char **argv) {
 
     /* TLS identity (ARCH-10). A persisted cert+key in the DB (ARCH-66b) is
      * restored to the cert/key files first, so a database moved or restored onto
-     * a new box keeps the same TOFU fingerprint instead of generating a new,
+     * a new box keeps the same fingerprint instead of generating a new,
      * pin-breaking one. If none is stored, the first-run generation below
      * creates one and we persist it. */
     char *stored_cert = NULL, *stored_key = NULL;
-    int had_identity = oc_dbwriter_load_identity(db, &stored_cert, &stored_key);
+    /* The operator's own certificate (OPENCHIME_TLS_SOURCE=file) is theirs:
+     * neither overwritten from the database nor kept in it. */
+    int own_files = cfg->tls_src.source == OC_TLS_SRC_FILE;
+    int had_identity = !own_files && oc_dbwriter_load_identity(db, &stored_cert, &stored_key);
     if (had_identity &&
         (write_file(cert_path, stored_cert) != 0 || write_file(key_path, stored_key) != 0)) {
         fprintf(stderr, "openchimed: warning: could not restore TLS identity to disk\n");
@@ -530,11 +600,33 @@ int main(int argc, char **argv) {
 
     /* First run (nothing was persisted): capture the just-generated (or
      * pre-existing on-disk) identity into the DB so a later restore reloads it. */
-    if (!had_identity) {
+    if (!had_identity && !own_files) {
         char *cert = read_file(cert_path), *key = read_file(key_path);
         if (cert && key && !oc_dbwriter_store_identity(db, cert, key))
             fprintf(stderr, "openchimed: warning: could not persist TLS identity\n");
         free(cert); free(key);
+    }
+
+    /* A CA-issued certificate kept from before (migration 0049) is presented at
+     * once, if it is from the source now configured, for the names now
+     * configured, and not run out; the worker renews it when due. Otherwise the
+     * identity above is presented until the worker obtains one. */
+    fed.tls = &tls;
+    oc_dbwriter_load_tls_state(db, &fed.kept);
+    {
+        const oc_tls_state *k = &fed.kept;
+        const char *want = cfg->tls_src.source == OC_TLS_SRC_ACME ? "acme"
+                         : cfg->tls_src.source == OC_TLS_SRC_CENTRAL ? "central" : NULL;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t now = (uint64_t)ts.tv_sec * 1000u;
+        int usable = want && k->source && !strcmp(k->source, want) && k->chain_pem && k->key_pem &&
+                     k->not_after_ms > now &&
+                     (cfg->tls_src.source != OC_TLS_SRC_ACME || (k->names && !strcmp(k->names, cfg->tls_src.names)));
+        if (usable && oc_tls_server_use(&tls, k->chain_pem, strlen(k->chain_pem), k->key_pem, strlen(k->key_pem)) == 0) {
+            fprintf(stderr, "openchimed: TLS certificate for %s (kept)\n", k->names);
+        } else {
+            fed.kept.issued_ms = fed.kept.not_after_ms = 0;    /* nothing to renew: obtain one */
+        }
     }
 
     /* /healthz and the landing page (ARCH-25): served by the loop's HTTP stack
@@ -572,6 +664,8 @@ int main(int argc, char **argv) {
      * with the rest. */
     g_stop = 1;
     if (fed.claiming) pthread_join(fed.claim, NULL);
+    oc_certs_stop(fed.certs);
+    oc_tls_state_free(&fed.kept);
     oc_netloop_set_push(NULL);
     oc_netloop_set_invite_mail(NULL);
     oc_push_stop(fed.push);

@@ -544,6 +544,7 @@ typedef struct {
     int        scroll;
     uint64_t   last_focus_cid;
     int        settings_req;          /* pulled the synced bucket this session */
+    uint32_t   cert_seen;             /* the certificate question last asked (cert_seq) */
 } ws_session;
 
 static ws_session g_ws[MAX_WS];
@@ -1429,7 +1430,7 @@ static int parse_hhmm(const char *s) {
  *   /edit  <text>   replace the text of your last message
  *   /delete         tombstone your last message
  */
-/* Resolve the local store path (session token + TOFU pin persistence): the
+/* Resolve the local store path (session token + trusted fingerprint persistence): the
  * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state
  * (creating the dirs). This is a DIRECTORY now, not a database file (ARCH-88).
  * Returns NULL when there is nowhere to put it (persistence then disabled — the
@@ -1495,6 +1496,86 @@ static int form_has_local(const login_form *f) {
     return 0;
 }
 
+/* `s` word-wrapped into columns [x, xmax) from row y; the rows it took. Breaks
+ * at spaces, and hard where a word is longer than the line. */
+static int tui_wrap(int x, int y, int xmax, const char *s, uintattr_t fg, uintattr_t bg) {
+    int w = xmax - x, rows = 0;
+    if (w < 8) w = 8;
+    while (*s) {
+        size_t n = strlen(s), take = n;
+        if ((int)n > w) {
+            take = (size_t)w;
+            while (take > 0 && s[take] != ' ') take--;
+            if (take == 0) take = (size_t)w;
+        }
+        char line[512];
+        snprintf(line, sizeof line, "%.*s", (int)take, s);
+        tk_text(x, y + rows++, xmax, line, fg, bg);
+        s += take;
+        while (*s == ' ') s++;
+    }
+    return rows;
+}
+
+/* A certificate the person must judge (ARCH-10): what is wrong, its fingerprint,
+ * and whether to trust it. The wording is the Win32 client's; the answer
+ * defaults to no -- Enter declines -- as security prompts do. 1 if they say yes. */
+static int tui_ask_trust(const char *ws, const char *fp_hex, int changed) {
+    char fp[128];
+    if (oc_fingerprint_format(fp_hex, 16, fp, sizeof fp) != 0) return 0;
+    char *fp2 = strchr(fp, '\n');
+    if (fp2) *fp2++ = '\0';
+    const char *who = ws && ws[0] ? ws : "this workspace";
+    char p1[400];
+    if (changed)
+        snprintf(p1, sizeof p1, "The server for %s is showing a different certificate from the one you "
+                 "trusted before. Someone may be intercepting the connection: if your administrator "
+                 "didn't tell you it was changing, don't connect.", who);
+    else
+        snprintf(p1, sizeof p1, "The certificate for %s isn't from an authority this computer trusts. "
+                 "That's normal for a server your organisation runs itself -- and also what an "
+                 "impostor's server would look like.", who);
+    for (;;) {
+        int W = tb_width(), H = tb_height(), xmax = W - 2;
+        int y = H / 2 - 8;
+        if (y < 0) y = 0;
+        tb_clear();
+        tk_text(2, y, xmax, changed ? "This server's identity has changed" : "Can't verify this server's identity",
+                (changed ? TB_RED : TB_YELLOW) | TB_BOLD, TB_DEFAULT);
+        y += 2;
+        y += tui_wrap(2, y, xmax, p1, TB_DEFAULT, TB_DEFAULT) + 1;
+        y += tui_wrap(2, y, xmax, "Check this fingerprint (SHA-256) with your workspace's administrator:",
+                      TB_DEFAULT, TB_DEFAULT) + 1;
+        tk_text(4, y++, xmax, fp, TB_CYAN, TB_DEFAULT);
+        if (fp2) tk_text(4, y++, xmax, fp2, TB_CYAN, TB_DEFAULT);
+        y++;
+        y += tui_wrap(2, y, xmax, "OpenChime will remember this server if you trust it.", TB_DEFAULT, TB_DEFAULT) + 1;
+        tk_text(2, y, xmax, "Trust and connect? [y/N]", TB_WHITE | TB_BOLD, TB_DEFAULT);
+        tb_present();
+        struct tb_event ev;
+        if (tb_poll_event(&ev) != TB_OK || ev.type != TB_EVENT_KEY) continue;
+        if (ev.ch == 'y' || ev.ch == 'Y') return 1;
+        if (ev.ch == 'n' || ev.ch == 'N' || ev.key == TB_KEY_ESC || ev.key == TB_KEY_ENTER) return 0;
+    }
+}
+
+static int tui_trust_load(const char *key, unsigned char fp[32]) {
+    oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+    if (!s) return 0;
+    oc_store_set_secret(s, g_secret);
+    int have = oc_store_load_pin(s, key, fp);
+    oc_store_close(s);
+    return have;
+}
+
+static void tui_trust_save(const char *key, const unsigned char fp[32]) {
+    oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+    if (!s) return;
+    oc_store_set_secret(s, g_secret);
+    oc_store_save_pin(s, key, fp);
+    oc_store_close(s);
+}
+
 /* Resolve the workspace and ask it how it signs people in. 1 on success; 0 with
  * the reason in `inl`. Asked once per workspace name. */
 static int form_probe(login_form *f, char *inl, size_t cap) {
@@ -1504,7 +1585,22 @@ static int form_probe(login_form *f, char *inl, size_t cap) {
     if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, cap, "invalid workspace '%s'", f->workspace); return 0; }
     if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found — does not resolve in DNS", f->workspace); return 0; }
     if (st == OC_RESOLVE_BAD_METADATA) { snprintf(inl, cap, "'%s' publishes discovery metadata that is not valid", f->workspace); return 0; }
-    int n = oc_net_probe(f->ep.domain, f->ep.host, f->ep.port, f->src, (int)(sizeof f->src / sizeof f->src[0]));
+    /* The certificate is judged first (ARCH-10): one nobody vouches for is shown
+     * to the person, and asked about again trusted if they say so. */
+    char key[256];
+    if (oc_workspace_key(f->workspace, oc_default_suffix(), key, sizeof key) != 0) snprintf(key, sizeof key, "%s", f->workspace);
+    unsigned char fp[32];
+    static oc_cert_seen seen;   /* large; the form is the UI thread's alone */
+    int have = tui_trust_load(key, fp);
+    int n = oc_net_probe_ex(f->ep.domain, f->ep.host, f->ep.port, have ? fp : NULL, f->src,
+                            (int)(sizeof f->src / sizeof f->src[0]), &seen);
+    if (n == OC_PROBE_UNTRUSTED && tui_ask_trust(f->workspace, seen.fp_hex, have) &&
+        oc_fingerprint_from_hex(seen.fp_hex, fp) == 0) {
+        tui_trust_save(key, fp);
+        n = oc_net_probe_ex(f->ep.domain, f->ep.host, f->ep.port, fp, f->src,
+                            (int)(sizeof f->src / sizeof f->src[0]), &seen);
+    }
+    if (n == OC_PROBE_UNTRUSTED) { snprintf(inl, cap, "the server's certificate was not trusted"); return 0; }
     if (n == OC_PROBE_VERSION) { snprintf(inl, cap, "this app and that server are different versions"); return 0; }
     if (n <= 0)                { snprintf(inl, cap, "could not reach %.120s", f->ep.host); return 0; }
     f->nsrc = n;
@@ -1631,11 +1727,20 @@ static void open_in_browser(const char *url) {
  * the model's sticky last_error. */
 static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap) {
     uint32_t opened = 0;                      /* the signin_seq whose URL was opened */
+    uint32_t cert_seen = 0, cert_err = 0;     /* a certificate judged, and its refusal */
     for (int i = 0; i < 1200; i++) {          /* ~18s at 15ms per tick */
         oc_client_tick(cl);
         const oc_model *m = oc_client_model(cl);
         if (m->authed) return AUTH_R_OK;
-        if (m->last_error[0] && !m->connected) {
+        if (m->cert_seq != cert_seen) {
+            cert_seen = m->cert_seq;
+            if (tui_ask_trust(host, m->cert_fp, m->cert_changed)) {
+                cert_err = m->error_seq;
+                oc_client_trust_cert(cl, m->cert_fp);
+                i = 0;
+            }
+        }
+        if (m->last_error[0] && !m->connected && !(cert_err && m->error_seq == cert_err)) {
             snprintf(why, whycap, "%s", m->last_error);
             return strstr(m->last_error, "reach") ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
         }
@@ -1981,6 +2086,20 @@ int main(int argc, char **argv) {
             else if (wm->authed && !g_ws[i].settings_req) {
                 oc_client_list_settings(g_ws[i].cl);
                 g_ws[i].settings_req = 1;
+            }
+        }
+        /* The active workspace's connection met a certificate to judge (ARCH-10),
+         * after sign-in -- a certificate that changed under a live session: asked
+         * as at sign-in. Declined, it stays refused, and a retry (Ctrl+R) asks
+         * again. A connection that is up has had its answer. */
+        {
+            ws_session *a = &g_ws[g_active];
+            const oc_model *am = oc_client_model(a->cl);
+            if (am->connected) a->cert_seen = am->cert_seq;
+            else if (am->cert_seq != a->cert_seen) {
+                a->cert_seen = am->cert_seq;
+                if (tui_ask_trust(a->label, am->cert_fp, am->cert_changed))
+                    oc_client_trust_cert(a->cl, am->cert_fp);
             }
         }
         /* The active workspace's session was refused and its connection has given

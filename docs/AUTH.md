@@ -417,9 +417,9 @@ Deliberate omissions from this design:
   air-gapped-safe.
 - **Argon2** password hashing: mbedTLS has none, so it would add a vendored
   dependency (§2).
-- **Cert-vs-restore interaction** (the TOFU fingerprint changing when a database
-  is restored onto a new box): handled by persisting the TLS identity in the
-  database (ARCH-66b); orthogonal to auth.
+- **Cert-vs-restore interaction** (a self-signed daemon's certificate changing
+  when a database is restored onto a new box): handled by persisting the TLS
+  identity in the database (ARCH-66b); orthogonal to auth.
 
 ---
 
@@ -645,3 +645,22 @@ freshness window is what bounds a replay.
 | `OPENCHIME_OIDC_ALLOW` | Who may join (§8.4). |
 | `OPENCHIME_OIDC_CONNECT_<n>` | One per direct connection (§8.5). |
 | `OPENCHIME_ENROLL_TICKET` | Managed workspaces only (§8.7). |
+
+### 8.9 Certificates through central
+
+A daemon bound to central (§8.7) with `OPENCHIME_TLS_SOURCE=central` gets its
+TLS certificate for its name under the service suffix through central, which
+holds that DNS zone and so completes an ACME DNS-01 challenge on the daemon's
+behalf; the daemon needs no inbound access and no DNS of its own (ARCH-10). Both
+requests are machine requests, signed as §8.7 says, to the enrollment origin:
+
+- `POST /api/machine/tls/names` with body `{}` answers `200 {"names":"<a,b>"}`:
+  the names this workspace may have, which are central's to say.
+- `POST /api/machine/tls/certificate` with body `{"csr":"<base64url DER>"}` — a
+  CSR for those names over a key the daemon has just made, which never leaves it
+  — answers `200 {"names":"<a,b>","chain_pem":"<leaf then intermediates>"}`;
+  `202` with `Retry-After` (seconds) while central is still completing the
+  challenge; or a `4xx`, which is final until the next boot.
+
+The daemon asks again at two-thirds of the certificate's life, and after a
+failure a minute later, doubling to six hours.

@@ -2,7 +2,7 @@
  * OpenChime client — the local store, which stores nothing locally (ARCH-88).
  *
  * Everything durable lives in ONE place: the OS credential store, one entry per
- * workspace holding the session token, the TOFU pin, and the book fields (the
+ * workspace holding the session token, the trusted fingerprint, and the book fields (the
  * address the user typed, the account, and a last-used stamp). Because there is
  * one credential per workspace, the *list* of credentials IS the workspace book —
  * enumeration replaces a file (oc_secret_each).
@@ -86,7 +86,7 @@ static int sec_load(oc_store *s, const char *ws, uint8_t *blob) {
     /* Version 1 is read as well as version 2: it is this layout without the
      * owner, and the zeroed tail says "owner unknown", which is exactly what an
      * entry written before tokens recorded their account means. Refusing it
-     * instead would drop that workspace's TOFU pin along with its token, and a
+     * instead would drop that workspace's trusted fingerprint along with its token, and a
      * dropped pin is a silent re-pin on the next connect (ARCH-10). The first
      * write of any kind upgrades the entry in place, because sec_store stamps
      * the current version. */
@@ -166,7 +166,7 @@ void oc_store_set_secret(oc_store *s, oc_secret *secret) {
     if (s) s->secret = secret;
 }
 
-/* ---- session token + TOFU pin (credential store) --------------------------- */
+/* ---- session token + trusted fingerprint (credential store) --------------------------- */
 
 int oc_store_load_session(oc_store *s, const char *workspace,
                           uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t *expiry,
@@ -246,6 +246,15 @@ void oc_store_save_pin(oc_store *s, const char *workspace,
     sec_load(s, workspace, b);
     b[1] |= SEC_HAS_PIN;
     memcpy(SEC_PIN(b), pin, OC_TLS_FINGERPRINT_LEN);
+    sec_store(s, workspace, b);
+}
+
+void oc_store_clear_pin(oc_store *s, const char *workspace) {
+    if (!s || !workspace || !s->secret) return;
+    uint8_t b[SEC_BLOB];
+    if (!sec_load(s, workspace, b) || !(b[1] & SEC_HAS_PIN)) return;
+    b[1] &= (uint8_t)~SEC_HAS_PIN;
+    memset(SEC_PIN(b), 0, OC_TLS_FINGERPRINT_LEN);
     sec_store(s, workspace, b);
 }
 

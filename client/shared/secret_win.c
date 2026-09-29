@@ -12,7 +12,7 @@
  *   CredentialBlob  the opaque token+expiry blob the core packs
  *   Persist         LOCAL_MACHINE             — deliberately not roaming
  *
- * Only the token blob lives here. The TOFU pin is public and the message cache
+ * Only the token blob lives here. The trusted fingerprint is public and the message cache
  * is far larger than a credential blob may be, so both stay in SQLite.
  *
  * Built into both Windows front-ends (the Console TUI and the Win32 GUI); on

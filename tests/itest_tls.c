@@ -1,6 +1,6 @@
 /* Integration test for the TLS wrapper (src/tls.c): the daemon generates a
  * self-signed cert (ARCH-10), a client connects over real TCP with that cert's
- * fingerprint pinned (TOFU), and a byte round-trips through the tunnel. Uses
+ * fingerprint pinned, and a byte round-trips through the tunnel. Uses
  * blocking loopback sockets and a server thread; hermetic and non-interactive,
  * so it runs under `make test`. Includes tls.c directly per the openblocks
  * convention; links vendored mbedTLS + pthread. */
@@ -86,7 +86,7 @@ static void test_tls_handshake_and_echo(void) {
     struct server_arg arg = { lfd, &srv, 0 };
     CHECK(pthread_create(&th, NULL, server_thread, &arg) == 0);
 
-    /* Client connects and pins the server's fingerprint (TOFU). */
+    /* Client connects and pins the server's fingerprint. */
     int cfd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(cfd >= 0);
     CHECK(connect(cfd, (struct sockaddr *)&addr, sizeof addr) == 0);
@@ -656,7 +656,7 @@ static void test_tls_ip_literal(void) {
 }
 
 int run_tls_tests(void) {
-    printf("itest_tls: self-signed cert generation, TOFU-pinned handshake,\n");
+    printf("itest_tls: self-signed cert generation, pinned handshake,\n");
     printf("           byte round-trip, pin-mismatch rejection, ALPN demux,\n");
     printf("           built-in CA roots, OPENCHIME_EXTRA_CA, session resumption\n");
     test_tls_handshake_and_echo();

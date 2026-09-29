@@ -438,37 +438,59 @@ model; translate input to intents }, stop.
 ## 4. The wire layer (reused, already tested)
 
 The core links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
-directions exists), `shared/tls.c` (client TLS + TOFU), `shared/framebuf.c`
+directions exists), `shared/tls.c` (client TLS and verification), `shared/framebuf.c`
 (reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
-PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10):**
-the first connect to a remote workspace records the cert's SHA-256 in that
-workspace's OS-credential blob (`oc_store_save_pin`, §5) and every later connect
-enforces an exact match; a genuine change is reported distinctly ("the server's security certificate
-has changed") rather than as an unreachable host. **Loopback is deliberately not
-pinned** — a `127.0.0.1` connection has no MITM vector, and pinning it only fires
-false alarms as local dev daemons re-self-sign (`client/core/net.c:is_loopback`,
-[TLS.md](./TLS.md)).
+PROTOCOL.md §3–§6 and the §10 state machine. **Trust (ARCH-10,
+[TLS.md](./TLS.md)):** a daemon's certificate must chain to a trusted root —
+built in, `OPENCHIME_EXTRA_CA`, or the operating system's — and name the
+workspace. One that does not is accepted only if the workspace's `.well-known`
+publishes its fingerprint, if the person has trusted it, or if the daemon is on
+loopback (`client/core/net.c:cert_judge`). Otherwise the attempt ends with
+`OC_EV_CERT_UNTRUSTED` carrying its fingerprint (`model->cert_fp`, `cert_changed`,
+`cert_seq`), and the net thread waits: `oc_client_trust_cert` keeps it with the
+workspace's credential (`oc_store_save_pin`, §5) and connects again at once; a
+retry (`oc_client_reconnect`) connects again and asks again, the way back for
+someone who declined. The sign-in probe judges the same way before anything is
+typed (`oc_net_probe_ex`, `OC_PROBE_UNTRUSTED`); both carry the certificate
+itself as well as its fingerprint (`oc_cert_seen`, `model->cert_der`). The
+question takes the shape security prompts share — the Remote Desktop and browser
+warnings, and the research behind Chrome's: a title saying what is wrong ("Can't
+verify this server's identity", or "This server's identity has changed" with a
+stronger icon), the fingerprint as an administrator's tools print it (upper case,
+colons: `oc_fingerprint_format`), and the safe answer as the default — Enter
+declines. The Win32 client asks in a `confirm()` on the modal frame, over the
+sign-in card too: **Don't connect** is the primary, **Trust and connect** the
+danger button on the far left, with **Copy fingerprint** and **View certificate**
+(Windows' own viewer, its "Install Certificate" disabled: that would trust the
+certificate as a root for everything). Trusting a probe's certificate runs that
+sign-in step again. The TUI asks on a full screen, `[y/N]`, at sign-in and for
+the workspace on screen after it. Both
+ask about a question that came before they first looked, as one does for a
+workspace connected at start-up. A trusted certificate that
+is replaced is shown as a change, not taken on the old trust; a CA-issued one
+replaces the trust, which is forgotten (`oc_store_clear_pin`).
 
 ## 5. Local store
 
 The core **stores nothing locally beyond credentials** (ARCH-88/REQ-201). There is
 no database and no file: `client/core/store.c` is a thin front for the OS
 credential store, holding one entry per workspace with the session token, the
-TOFU pin, and the book fields (typed address, account, last-used). Because there
+trusted certificate (if any), and the book fields (typed address, account,
+last-used). Because there
 is one credential per workspace, **enumerating the credential store is the
 workspace book** (`oc_secret_each`), and "forget" is a single delete. **The
 entry is keyed by the workspace as named** (`oc_workspace_key`: its domain,
 lowercased, with the port only if one was typed; an IPv6 address in its
 canonical spelling, bracketed) — not by the address resolution
 produced, which is an answer and can change: an SRV record moves, two names share a
-front door, and the pin and the session belong to the name a person trusted. An
+front door, and the trust and the session belong to the name a person trusted. An
 entry an earlier client filed under `host:port`, or under whatever was typed, is
 moved to the key the first time it is found (`oc_store_adopt`) — token with its
-owner, pin, device key and book fields together, never overwriting what the name
-already holds. **Remember me** governs the session, not the pin: off
+owner, trust, device key and book fields together, never overwriting what the
+name already holds. **Remember me** governs the session, not the trust: off
 (`oc_client_start_opts`), no token, account, device key or switcher entry is kept,
-and the certificate pin still is — it is not a secret, and without it every
-connection to that workspace would trust whatever certificate it met (ARCH-10).
+and a certificate the person trusted still is — it is not a secret, and without it
+they would be asked about the same certificate every time (ARCH-10).
 
 **A refused session is `signed_out`, not an error.** When a stored or reconnecting
 session is refused and there is no credential to fall back on, the core drops the
@@ -483,7 +505,8 @@ OS credential store, nothing persists at all.
   a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so
   that machine keeps no session and the user signs in again next launch. Opening a
   store also **erases any `state.db` an older build left behind**, so upgrading
-  costs one re-sign-in and one re-TOFU rather than leaving a plaintext credential
+  costs one re-sign-in (and a self-signed daemon's certificate asked about again)
+rather than leaving a plaintext credential
   on disk. macOS Keychain slots behind the same vtable.
 
 **One credential per workspace holds five things**, in a flat versioned blob
@@ -499,9 +522,10 @@ OS credential store, nothing persists at all.
   it. It is deliberately **not** the book's account below, which any frontend
   writes before it knows whether the sign-in worked — reading that one instead is
   exactly the bug, and it looks like a fix until two people share a machine;
-- the **TOFU pin** (REQ-183), which is not secret but is integrity-sensitive:
-  rewriting a pin is how a man-in-the-middle is accepted, so it lives where the
-  token does rather than in a file anyone can edit;
+- a **trusted certificate** (REQ-183): the fingerprint of a self-signed daemon's
+  certificate the person accepted. Not secret but integrity-sensitive — rewriting
+  it is how a man-in-the-middle is accepted — so it lives where the token does
+  rather than in a file anyone can edit;
 - the **workspace book** fields (REQ-012) — the address the user typed, the
   account, and a last-used stamp. Because there is one credential per workspace,
   **enumerating the credential store is the book** (`oc_secret_each`), and
@@ -517,12 +541,13 @@ prefix of a newer one. Version 2 appended
 the token's account to the end of the blob, so a version 1 entry is a byte-exact
 prefix of one: it is read as it stands with the account unknown, and the next
 write of anything upgrades it in place. Refusing it would have dropped that
-workspace's TOFU pin along with its token, and a dropped pin is a silent re-pin on
-the next connect. The rule this pays for: a token whose account is unknown is not
+workspace's trusted certificate along with its token, and the person would be
+asked about it again. The rule this pays for: a token whose account is unknown is not
 reused when a caller names an account — one password sign-in, once, rather than a
 client that is quietly the wrong person. **Downgrading costs more**: an older
 client cannot read a version 2 entry and its next write drops the entry, so going
-back a release is one re-sign-in and one re-TOFU.
+back a release is one re-sign-in (and a self-signed daemon's certificate asked
+about again).
 
 **A token belongs to one account, but a workspace has room for one token.** So a
 launch that names an account gets that account, and a launch that names nobody —
@@ -566,7 +591,7 @@ keybinding belongs to a frontend and not the shared core), and
 `Ctrl+R` in the TUI) cuts the current sleep short to retry immediately.
 
 **Cross-restart reconnect (via the §5 store).** The net thread
-pre-loads a still-valid stored token and pins the stored fingerprint, so the
+pre-loads a still-valid stored token and any certificate the person trusted, so the
 *first* connect after a relaunch already uses `OC_AUTH_SESSION` — no password
 prompt. A rejected token (expired/revoked) is dropped and, if a password is
 still held, retried once with it; logging out clears the stored token.

@@ -13,6 +13,8 @@
 #ifndef OPENCHIME_JWT_H
 #define OPENCHIME_JWT_H
 
+#include <mbedtls/pk.h>
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -78,6 +80,16 @@ int oc_jwt_key_thumbprint(const char *pubkey_pem, size_t pem_len,
 /* 1 if `nonce` is base64url(SHA-256(verifier)) — the proof that whoever
  * presents a token is the client that asked for it (AUTH.md §8.2). */
 int oc_jwt_nonce_matches(const char *nonce, const uint8_t *verifier, size_t verifier_len);
+
+/* The canonical JWK of an EC P-256 key (RFC 7638 §3.2) into `out`; its length,
+ * or -1 if the key is not P-256 or `cap` is too small. */
+int oc_jwk_p256(mbedtls_pk_context *pk, char *out, size_t cap);
+/* RFC 7638 thumbprint of a parsed EC P-256 key, as oc_jwt_key_thumbprint. */
+int oc_jwk_thumbprint(mbedtls_pk_context *pk, char out[OC_JWT_THUMBPRINT_LEN + 1]);
+
+/* base64url (RFC 4648 §5, no padding) of `n` bytes into `out`, which needs
+ * room for 4 * ((n + 2) / 3) + 1; the length written. */
+size_t oc_base64url_encode(const uint8_t *in, size_t n, char *out);
 
 /* base64url (RFC 4648 §5, no padding) decode. Returns the decoded byte count,
  * or -1 on an invalid character or insufficient `out_cap`. */

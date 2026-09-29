@@ -75,7 +75,7 @@ static int ls_put(void *ctx, const char *account, const uint8_t *val, size_t n) 
     ls_ctx *c = (ls_ctx *)ctx;
     /* Hex doubles what it holds, so this buffer is the real cap on a credential:
      * at 1024 it was 511 bytes, and the blob is 466. A store that quietly refuses
-     * to write is the worst failure this code can have -- the token, the TOFU pin
+     * to write is the worst failure this code can have -- the token, the trusted fingerprint
      * and the workspace book all vanish together with nothing said -- so the
      * headroom is generous rather than exact. */
     char hex[2048];

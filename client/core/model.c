@@ -2408,6 +2408,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->signed_out = true;
         m->authed = false;
         break;
+    case OC_EV_CERT_UNTRUSTED:
+        if (e->body && strlen(e->body) < sizeof m->cert_fp) {
+            snprintf(m->cert_fp, sizeof m->cert_fp, "%s", e->body);
+            m->cert_der_len = e->der && e->der_len <= sizeof m->cert_der ? e->der_len : 0;
+            if (m->cert_der_len) memcpy(m->cert_der, e->der, m->cert_der_len);
+            m->cert_changed = e->status != 0;
+            m->cert_seq++;
+        }
+        break;
     case OC_EV_AUTH_BROWSER:
         if (e->body && strlen(e->body) < sizeof m->signin_url) {
             snprintf(m->signin_url, sizeof m->signin_url, "%s", e->body);

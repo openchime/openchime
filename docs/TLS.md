@@ -1,7 +1,7 @@
 # OpenChime — TLS
 
-How the daemon terminates TLS and how clients trust it. Realizes ARCH-10 (TOFU
-self-signed certs) and records the library choice (ARCH-51). The wire protocol
+How the daemon terminates TLS, where its certificate comes from, and how clients
+trust it. Realizes ARCH-10 and records the library choice (ARCH-51). The wire protocol
 runs entirely inside this TLS session ([PROTOCOL.md](./PROTOCOL.md) §1).
 
 ## Library: vendored mbedTLS (ARCH-51)
@@ -16,10 +16,11 @@ OpenSSL and LibreSSL for fit with this project's constraints:
   shared C app-core (ARCH-74) links it on every host, and each native frontend
   builds it with its own toolchain (the TUI on the host, like the daemon); no
   reliance on a system TLS.
-- In-process X.509 certificate *writing* (`x509write`), so the daemon mints its
-  own self-signed cert without shelling out to `openssl`.
-- A verify callback for client-side TOFU pinning, and standard CA verification
-  available for the webhook endpoint (ARCH-34).
+- In-process X.509 *writing* (`x509write`): the daemon's self-signed identity,
+  ACME's challenge certificate and its CSRs, without shelling out to `openssl`.
+- A per-handshake certificate callback (`mbedtls_ssl_conf_cert_cb`), which runs
+  once the whole ClientHello is read and so knows both the name asked for and
+  the ALPN chosen.
 
 **Thread safety.** The vendored build enables **`MBEDTLS_THREADING_C` +
 `MBEDTLS_THREADING_PTHREAD`** (`scripts/build_mbedtls.sh`). OpenChime uses mbedTLS
@@ -38,76 +39,66 @@ likewise vendored — as committed single-file source, both MIT (ARCH-75).
 
 ## Trust model (ARCH-10)
 
-- **Daemon:** on first run generates a P-256 self-signed certificate and
-  persists the PEM cert+key next to its data, reusing them on restart. No CA, no
-  ACME, no renewal machinery.
-- **Client:** TOFU pinning. On first connect the client records the cert's
-  SHA-256 fingerprint; thereafter it requires an exact match. Because trust is
-  the pin, not a CA chain, a cert under any hostname "just works" — which is what
-  makes the free self-hoster vanity CNAME (ARCH-14) cost nothing to support.
-  **Exception — loopback is not pinned.** TOFU defends against a network
-  man-in-the-middle substituting the server's cert; a `127.0.0.1` / `localhost`
-  connection never leaves the host, so there is no MITM vector and pinning it only
-  causes false alarms across local daemon restarts (each fresh daemon self-signs a
-  new cert). The client therefore does not enforce the pin for loopback
-  (`client/core/net.c:is_loopback`), matching how tools skip TLS verification for
-  localhost. Remote workspaces are always pinned; if a remote cert genuinely
-  changes, the client reports that distinctly ("the server's security
-  certificate has changed") rather than "could not reach the server", so the user
-  can forget the workspace to re-pin.
-- **Fingerprint** = SHA-256 of the certificate DER; it may be published
-  out-of-band in `.well-known` metadata for verification (ARCH-10/14).
-- **A published fingerprint is checked on the FIRST connection**, the one
-  trust-on-first-use cannot defend. With no pin stored yet and a fingerprint in
-  the workspace's metadata, that fingerprint is the pin: a daemon presenting
-  anything else is refused, and the client says so in its own words ("this
-  workspace publishes the certificate its server should present, and the server
-  presented a different one") rather than reporting the certificate as *changed*
-  — nothing changed, and there is nothing to re-trust. A stored pin takes
-  precedence over the document. **Loopback is not exempt here**, though it is for
-  TOFU: that exemption exists because nothing can sit in the path inside one
-  host, whereas a published fingerprint is a statement about which certificate
-  is the workspace's own. Text that is not 32 bytes of hex is treated as no
-  fingerprint at all, never as a pin half-read.
+- **Client:** a daemon is verified as any HTTPS server is. The certificate must
+  chain to a trusted root and name the workspace — the domain the client sends as
+  SNI, or, for a workspace that is an address, the address among the
+  certificate's iPAddress names (which is never sent as SNI, RFC 6066 §3). The
+  trusted roots are the built-in ones (below), `OPENCHIME_EXTRA_CA`, and **the
+  operating system's**: Windows' ROOT store (`CertOpenSystemStoreW`), or the
+  distribution's bundle (`/etc/ssl/certs/ca-certificates.crt`, then
+  `/etc/pki/tls/certs/ca-bundle.crt`), which is where an organisation installs
+  its internal CA. They are parsed once and shared by every client connection;
+  setting new extra roots gives later connections a new set
+  (`oc_tls_client_init_verify`).
+- **A certificate no root vouches for** is accepted only by one of:
+  - **the person's say-so.** The client shows its SHA-256 fingerprint ("check
+    this with the workspace's administrator") and, if they trust it, keeps it
+    with the workspace's credential; the next connection presents it without a
+    question. A different certificate later is shown as a *change*, and not
+    taken on the old trust.
+  - **a published fingerprint.** The workspace's `.well-known` document
+    (ARCH-14), fetched over verified HTTPS, may name its certificate's
+    fingerprint; the certificate must then be that one or the connection is
+    refused, in its own words ("this workspace publishes the certificate its
+    server should present, and the server presented a different one"). Text that
+    is not 32 bytes of hex is no fingerprint at all.
+  - **loopback.** A daemon on the same host is accepted: nothing can sit in that
+    path, and a local daemon restarted with a fresh self-signed certificate would
+    otherwise ask every time (`client/core/net.c:is_loopback`).
 
-### How pinning is enforced with mbedTLS
+  Nothing is trusted merely for having been seen before. **A CA-issued
+  certificate replaces a trust the person gave** a self-signed one: it is
+  forgotten, and from then on only a root vouches.
+- **The daemon** presents one certificate to every connection — the binary
+  protocol and HTTP alike (ARCH-34) — from the source it was told
+  (`OPENCHIME_TLS_SOURCE`, "Certificates" below): its own self-signed identity,
+  the operator's files, or a CA-issued certificate it obtains and renews.
+- **Fingerprint** = SHA-256 of the certificate DER.
 
-There is no CA chain, so `MBEDTLS_SSL_VERIFY_REQUIRED` can't be used (it refuses
-to run without one). Instead the client uses `VERIFY_OPTIONAL` plus a verify
-callback that clears the chain-trust flag only when the leaf's fingerprint
-matches the pin. After the handshake, `oc_tls_handshake` inspects
-`mbedtls_ssl_get_verify_result()`: a pinned mismatch leaves `BADCERT_NOT_TRUSTED`
-set and the connection is rejected. A **server** connection performs no peer
-verification, so its result is exactly `BADCERT_SKIP_VERIFY`, which is masked off
-— everything else is a real failure. (The test guards both rules against
-regression.)
+### How the client judges a certificate
 
-### The client names the workspace, and still trusts the pin
-
-Every client connection names its workspace in the handshake (SNI, RFC 6066): the
-workspace's own **domain** — the name as typed, after suffixing — even when an SRV
-record sent the connection to another host, because a shared front door in front
-of several daemons routes by workspace and reads nothing else; it terminates
-nothing and holds no certificate. An IPv4 or IPv6 literal is never sent (RFC 6066
-§3; mbedTLS would send whatever it is given, so `oc_sni_name` decides), and
-`localhost` is a name and is.
-
-**The name is for routing; trust is the pin.** Setting a hostname makes mbedTLS
-check the certificate's name, which a daemon's self-signed certificate does not
-carry. The verify callback clears the leaf's flags on a pin match and on first
-use, and that includes the name mismatch — so a named, pinned handshake completes,
-and a wrong pin fails exactly as it does unnamed. `tests/itest_tls.c` holds both,
-so a change to the callback cannot turn every pinned workspace into "certificate
-changed". A daemon reached directly ignores the name.
+The client verifies with `VERIFY_OPTIONAL` against the roots above and defers
+the verdict (`oc_tls_conn_defer_verify`): the handshake completes, and
+`oc_tls_conn_ca_trusted` then says whether the chain and the name held. If not,
+`cert_judge` (`client/core/net.c`) applies the fallbacks in order — a published
+fingerprint (decisive either way), a fingerprint the person trusted, loopback —
+and otherwise ends the attempt with the fingerprint for the person to judge
+(`OC_EV_CERT_UNTRUSTED`; `oc_client_trust_cert` accepts it). The sign-in probe
+(`oc_net_probe_ex`) judges the same way, before anything is typed. A **server**
+connection performs no peer verification, so its result is exactly
+`BADCERT_SKIP_VERIFY`, which is masked off.
 
 ## Outbound HTTPS: the built-in roots
 
 Where the daemon or a client is itself the HTTPS client of someone else's
 service — S3, the control plane, a linked page, a workspace's `.well-known`
-document — trust is an ordinary CA chain, not a pin (ARCH-10).
+document, an ACME CA — trust is an ordinary CA chain (ARCH-10).
 `oc_tls_client_init_ca` verifies the chain and the hostname
 (`MBEDTLS_SSL_VERIFY_REQUIRED`) against **Mozilla's trusted roots, compiled
-into the binary**. The host's CA store is never read.
+into the binary**, plus `OPENCHIME_EXTRA_CA`. The daemon never reads the host's
+store, so what a daemon build trusts is the same on every distribution and in a
+container with none; a client connecting to a daemon adds the operating
+system's roots (above).
 
 - **Where they come from.** `third_party/ca-roots/ca_roots.c` is generated by
   `scripts/update_ca_roots.sh` from curl's extract of Mozilla's `certdata.txt`
@@ -147,6 +138,55 @@ translate socket `EAGAIN` into `MBEDTLS_ERR_SSL_WANT_READ/WRITE`, and
 A `recv()` of 0 (EOF) is returned to mbedTLS as a connection error rather than 0,
 which would otherwise spin its input loop forever.
 
+## Certificates
+
+`OPENCHIME_TLS_SOURCE` (CONFIG.md) says where the daemon's certificate comes
+from:
+
+- **`self`** (the default): a P-256 self-signed certificate made on first run,
+  kept in the database (ARCH-66b) and in `OPENCHIME_TLS_CERT` / `_KEY`.
+- **`file`**: the operator's certificate and key, those files, as given.
+- **`acme`**: ACME (RFC 8555) for the names in `OPENCHIME_TLS_NAME`, from the CA
+  at `OPENCHIME_ACME_DIRECTORY` — Let's Encrypt by default, or an internal CA's
+  ACME directory for a network with no internet.
+- **`central`**: through central, for a name under the service suffix (AUTH.md
+  §8.9) — the default on a managed box bound to central.
+
+Until a CA-issued certificate is obtained the daemon presents its self-signed
+one; once one is, it is kept (migration 0049) and presented at once on every
+restart that still has the same source and names and has not run out.
+
+**ACME, with TLS-ALPN-01 (RFC 8737).** A worker thread (`daemon/certs.c`), started
+once the listener accepts, runs `oc_acme_issue` (`daemon/acme.c`): the directory
+and a nonce; the account — made once, with `termsOfServiceAgreed` (turning ACME on
+is the operator's agreement to the CA's subscriber terms), and kept with the
+directory it belongs to, so a different CA gets a different account; an order for
+the names; for each name, a **challenge certificate** — self-signed, naming it,
+carrying the critical acmeIdentifier extension (1.3.6.1.5.5.7.1.31) that holds
+SHA-256 of the key authorization — installed in the listener, then the challenge
+posted and the authorization polled; the finalization with a CSR for a new
+P-256 key; and the chain. Every request is a JWS (ES256) with a fresh nonce; a
+`badNonce` is retried with the one it brings. The CA validates by connecting to
+port **443** at the name with ALPN `acme-tls/1` only: the listener then presents
+the challenge certificate for that name — only to that ALPN, and a validation
+naming a name with no challenge pending is refused — and ends the connection after
+the handshake (`daemon/ioloop.c`). A challenge certificate is parsed with an
+extension callback that admits exactly the acmeIdentifier extension; any other
+unknown critical extension is still refused (RFC 5280).
+
+**Renewal and the swap.** The worker renews at two-thirds of a certificate's
+life, looking hourly, and retries a failure after a minute, doubling to six
+hours. A new certificate is swapped in whole (`oc_tls_server_use`): each
+handshake takes a reference to the certificate it presents
+(`mbedtls_ssl_set_hs_own_cert`), so handshakes under way and connections already
+up keep theirs, and a retired certificate is freed with the last connection
+that holds it.
+
+**Through central.** A daemon bound to central asks it for its names and sends a
+CSR for them, both as signed machine requests (AUTH.md §8.9); central completes
+the DNS-01 challenge in the zone it controls and returns the chain. A `202` asks
+it to come back; a `4xx` is final.
+
 ## Session resumption
 
 The daemon issues **session tickets** (`mbedtls_ssl_ticket`): after a full
@@ -161,16 +201,23 @@ nothing: the handshake is simply a full one. The ticket context locks for itself
 so the I/O threads share it. The daemon counts resumptions in
 `oc_tls_server.resumed`.
 
-A resumed session carries no certificate, so the pin is not checked again; it was
-checked on the connection the ticket came from, and only the daemon holding the
-ticket key can resume it. A client whose pin check fails forgets its ticket, so
-the next attempt is a full, pinned handshake.
+A resumed session was judged on the connection the ticket came from, and only
+the daemon holding the ticket key can resume it. A client whose judgement
+refuses a certificate forgets its ticket, so the next attempt is a full
+handshake.
 
 ## Testing
 
 `tests/itest_tls.c` (run by `make test`) is hermetic: it stands up a loopback
-TLS server that generates a self-signed cert, connects a client that pins the
+TLS server that generates a self-signed cert, connects a client that checks the
 server's fingerprint, round-trips a byte through the tunnel, and asserts that a
-**wrong** pin makes the handshake fail. It also resumes a session with the
+**wrong** fingerprint makes the handshake fail. `tests/test_acme.c` runs ACME
+against a fake CA that checks every JWS and nonce and validates as a CA does —
+with an independent TLS client (OpenSSL's), since mbedTLS's own refuses the
+challenge certificate's extension before anything can look at it — plus the
+listener's choice of certificate, renewal with a connection kept through the
+swap, and certificates through a fake central. `test_client_core` covers the
+client's judgement at this machine's LAN address, where loopback's exemption does
+not apply. It also resumes a session with the
 ticket the first connection was given, and checks that a restarted server —
 a new ticket key — falls back to a full handshake that still succeeds.

@@ -1152,8 +1152,9 @@ where one exists.
   is proxied through the daemon, access control is a **single in-daemon check on
   the same membership path as reading the message** (`channel_read_access`) —
   there is no signed-URL scheme, TTL, or object-store ACL. Proxying (not
-  presigned URLs) is forced by TOFU pinning (ARCH-10, one trusted cert, no CA
-  bundle) and the island model (ARCH-4/26, the tenant's object store stays private).
+  presigned URLs) is forced by the island model (ARCH-4/26: the tenant's object
+  store stays private, and the daemon is the one endpoint a client trusts,
+  ARCH-10).
 - **REQ-142.** A graphical client has **rendered image attachments inline** — a
   thumbnail in the transcript, expandable to a preview — rather than showing only
   a filename line, for the common image types. This is a graphical-frontend
@@ -1386,14 +1387,11 @@ where one exists.
   fixed-window rate limit (60/min) bounds abuse. The endpoint is ALPN-demuxed on
   the proto port (ARCH-54): the daemon advertises `oc/1` and `http/1.1`, and a
   connection that doesn't negotiate `oc/1` is routed to the HTTP handler.
-- **REQ-171.** A tenant that has enabled webhooks has had a CA-signed TLS
-  certificate obtained on-demand for that endpoint, since third-party
-  webhook senders validate against a standard CA trust store and cannot pin
-  a custom certificate (ARCH-34). A tenant with webhooks disabled has had no
-  such certificate and no such requirement. Issuance needs public HTTP or DNS
-  reachability to complete a challenge (ARCH-10's rationale), which is a
-  deployment concern separate from the daemon's request handling; the
-  certificate is selected by SNI at the TLS layer (ARCH-34).
+- **REQ-171.** A tenant that takes webhooks has been able to present a
+  CA-issued certificate on that endpoint, since third-party webhook senders
+  validate against a standard CA trust store and can be told to trust nothing
+  else (ARCH-34). It is the daemon's one certificate, obtained as REQ-183 says
+  and served to every connection.
 - **REQ-172.** A tenant has been able to install **app integrations** that post
   and respond in channels under a **bot identity** distinct from human users,
   including **slash-command apps** invoked as `/command` from the composer and
@@ -1452,12 +1450,14 @@ where one exists.
   daemon's own local session table — not against a stateless provider token —
   revocation is an immediate row delete.
 - **REQ-183.** Certificate trust for the client-daemon connection has been
-  established via TOFU (trust-on-first-connect) pinning against a
-  self-signed certificate the daemon generates on first run, not CA-chain
-  validation, uniformly across all three deployment models (ARCH-76) (ARCH-10).
-  The one exception has been the incoming-webhooks endpoint (REQ-171), which
-  uses a real CA-signed certificate because its clients are uncontrolled
-  third parties.
+  ordinary CA-chain validation under the workspace's name, against the built-in
+  roots and the operating system's (where an organisation's internal CA is),
+  and a daemon has been able to obtain and renew such a certificate itself — by
+  ACME from a public or internal CA, or through central for a name under the
+  service suffix (ARCH-10). A daemon with only its self-signed certificate has
+  been accepted by a client only on the person's explicit trust of its
+  fingerprint, on a fingerprint the workspace published over verified HTTPS, or
+  on loopback; never merely for having been seen before.
 - **REQ-184.** In local mode (REQ-024) the daemon has supported optional
   **multi-factor authentication** — a second factor (TOTP) enrolled per account
   and required after the password check (ARCH-59) — so a compromised password
@@ -1497,7 +1497,8 @@ where one exists.
   REQ-020 (iOS/macOS), and push delivery via both APNs and FCM (REQ-132).
 
 - **REQ-201.** **No client has stored anything locally beyond its credentials.**
-  Every client's durable state — the session token, the TOFU pin (REQ-183) and the
+  Every client's durable state — the session token, a certificate the person
+  trusted (REQ-183) and the
   remembered-workspace book (REQ-012) — has lived in the **operating system's
   credential store**, one entry per workspace, and a client has embedded no
   database engine and written **no files** (ARCH-88). Cached history has not been

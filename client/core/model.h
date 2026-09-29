@@ -618,6 +618,14 @@ typedef struct {
     bool     signed_out;
     char     signin_url[2048];
     uint32_t signin_seq;
+    /* A certificate the person must judge (ARCH-10): its SHA-256 in hex, whether
+     * it replaced one they trusted, and a count that moves each time one is
+     * shown. oc_client_trust_cert accepts it. */
+    char     cert_fp[65];
+    uint8_t  cert_der[OC_CERT_DER_MAX];   /* the certificate itself, to show; */
+    size_t   cert_der_len;                /* 0 when it did not fit */
+    bool     cert_changed;
+    uint32_t cert_seq;
     /* Bumped every time an error arrives, even an identical one. A frontend that
      * notices only when the TEXT changes stays silent when you repeat a failing
      * action — the second attempt looks like it worked. */

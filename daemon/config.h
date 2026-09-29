@@ -38,6 +38,14 @@ typedef enum {
     OC_DEPLOY_MANAGED    = 2,
 } oc_deploy_mode;
 
+/* Where the certificate the daemon presents comes from (TLS.md, "Certificates"). */
+typedef enum {
+    OC_TLS_SRC_SELF    = 0,   /* its own self-signed certificate, made at first run */
+    OC_TLS_SRC_FILE    = 1,   /* the operator's, OPENCHIME_TLS_CERT / _KEY */
+    OC_TLS_SRC_ACME    = 2,   /* ACME (RFC 8555, TLS-ALPN-01) for OPENCHIME_TLS_NAME */
+    OC_TLS_SRC_CENTRAL = 3,   /* through central, for a name under the service suffix */
+} oc_tls_source;
+
 typedef struct {
     /* Workspace identity (infra). */
     oc_deploy_mode deployment_mode;
@@ -80,6 +88,14 @@ typedef struct {
     /* Invitation mail through central (REQ-280, ARCH-85): OPENCHIME_INVITE_MAIL,
      * off unless "on". Needs an active enrollment as well. */
     int invite_mail;
+
+    /* The certificate's source, and for ACME its names, CA and contact. */
+    struct {
+        oc_tls_source source;
+        const char   *names;        /* comma-separated DNS names */
+        const char   *directory;    /* the ACME directory URL */
+        const char   *email;        /* ACME contact, or NULL */
+    } tls_src;
 
     /* Link unfurls (REQ-222, ARCH-105). Always on — there is no switch.
      * `allow_private` disables the SSRF gate and exists only for tests. */
