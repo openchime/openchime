@@ -110,7 +110,9 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   attachment is not queued twice. The queue outlives a connection: the job
   running when the link drops goes back to the front and starts over.
   `oc_client_post_files` is one job for up to `OC_MAX_ATTACH` files and a line of
-  text: it uploads the files in order and then sends ONE message carrying the
+  text, and `oc_client_post_items` the same job whose files may also be bytes in
+  memory under a name -- an image pasted from the clipboard, which the core copies
+  and uploads without writing anything to disk (ARCH-88): it uploads the files in order and then sends ONE message carrying the
   text and all of them, to a channel or into a thread; a file that cannot be
   read, an upload the daemon refuses, or a cancel posts nothing, and a restart
   after a lost link starts from the first file (what an earlier connection
@@ -1041,8 +1043,8 @@ set. Consequences worth knowing before touching it:
 - **Anything that replaces `g_body` must call `ed_invalidate_layout()`** (see
   `scale_apply`). A stale layout is not visibly broken, which is worse than broken.
 - **Files wait in the box until Send** (REQ-140). The attach button, the file
-  picker (several at once), dropping files on the window and the Files view's
-  Upload all put chips in a tray at the top of the box — an image shows itself,
+  picker (several at once), dropping files on the window, pasting, and the Files
+  view's Upload all put chips in a tray at the top of the box — an image shows itself,
   anything else the Files view's type badge — and nothing moves until Send,
   which posts them with the text as one message (`oc_client_post_files`) into
   the conversation, or the thread, it is sent in. A chip's × removes it; once
@@ -1055,6 +1057,15 @@ set. Consequences worth knowing before touching it:
   tray height is part of `composer_chrome()`, so the box and the field agree
   about it, and a chip belongs to its workspace's client as well as its
   conversation. An edit changes text only; the tray waits it out.
+- **Pasting attaches what is not text** (REQ-140). Ctrl+V in the message box
+  checks the clipboard before it pastes: copied files become chips as they are,
+  so a GIF keeps its animation; clipboard content that carries text pastes as
+  text, since a copy out of a document puts a picture of it beside the words;
+  otherwise an image becomes a chip named `pasted-image-<date>-<time>` -- a GIF's
+  own bytes where the source put the `GIF` format on the clipboard, else its `PNG`,
+  else the bitmap re-encoded as PNG through WIC, so a screenshot travels at PNG
+  size. The bytes stay in memory until Send (`oc_client_post_items`). The New
+  message pane pastes text only: the tray belongs to a conversation.
 - **Rich mode carries a typing-intent layer** — pending styles and continuation
   across whitespace — described with the dialect in
   [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor

@@ -3870,6 +3870,42 @@ int run_client_core_tests(void) {
             const char *blank[1] = { "" };
             CHECK(oc_client_post_files(a, 1, 0, blank, 1, "") == 0);
 
+            /* An image pasted from the clipboard (REQ-140): bytes held in memory
+             * beside a file on disk, posted as one message under the name given,
+             * the bytes intact. The core copies them, so the caller's buffer may
+             * go at once. */
+            {
+                uint8_t *img = malloc(150000);
+                CHECK(img != NULL);
+                if (img) {
+                    for (size_t i2 = 0; i2 < 150000; i2++) img[i2] = (uint8_t)(i2 * 7);
+                    oc_post_item items[2];
+                    memset(items, 0, sizeof items);
+                    items[0].data = img; items[0].len = 150000; items[0].name = "pasted-image-1.png";
+                    items[1].path = fp3[0];
+                    uint64_t it = oc_client_post_items(a, 1, 0, items, 2, "pasted");
+                    CHECK(it != 0);
+                    free(img);
+                    CHECK(WAIT_FOR(b, channel_has_body(m, 1, "pasted")));
+                    const oc_msg *im = channel_msg_by_body(oc_client_model(b), 1, "pasted");
+                    CHECK(im && im->n_attach == 2);
+                    if (im && im->n_attach == 2) {
+                        CHECK(strcmp(im->attach[0].filename, "pasted-image-1.png") == 0);
+                        CHECK(im->attach[0].size == 150000);
+                        CHECK(strcmp(im->attach[0].mime, "image/png") == 0);
+                        CHECK(strcmp(im->attach[1].filename, "itest_core_pf0.txt") == 0);
+                    }
+                }
+                /* Exactly one of a path and bytes, and bytes need a name. */
+                uint8_t one = 1;
+                oc_post_item both = { fp3[0], &one, 1, "x.png" };
+                oc_post_item unnamed = { NULL, &one, 1, NULL };
+                oc_post_item neither = { NULL, NULL, 0, "x.png" };
+                CHECK(oc_client_post_items(a, 1, 0, &both, 1, "") == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &unnamed, 1, "") == 0);
+                CHECK(oc_client_post_items(a, 1, 0, &neither, 1, "") == 0);
+            }
+
             for (int k = 0; k < 3; k++) unlink(fp3[k]);
         }
 

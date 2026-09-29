@@ -656,9 +656,16 @@ static FILE *open_upload(disp_ctx *ctx, const char *path, uint64_t *size) {
     return fp;
 }
 
-/* POST_FILES: start uploading the file `ffile` names. */
+/* POST_FILES: start uploading the file `ffile` names, or the in-memory item
+ * held in its place. */
 static void files_next(disp_ctx *ctx) {
     oc_cmd *c = ctx->xq->active;
+    unsigned f = ctx->xq->ffile;
+    if (c->mem[f]) {
+        const char *name = c->paths[f];
+        begin_upload(ctx, c->channel_id, name, mime_for(name), c->mem[f], c->mem_len[f], 4);
+        return;
+    }
     uint64_t sz = 0;
     FILE *fp = open_upload(ctx, c->paths[ctx->xq->ffile], &sz);
     if (!fp) return;

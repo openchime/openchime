@@ -1122,7 +1122,10 @@ to assistive technology, with nothing uploaded; that a chip's × takes it out;
 that Send posts what is left and the text as ONE message and the tray empties;
 and that a file that cannot be read stops the post, the chip coming back marked
 and the text back in the box, with nothing posted — shown by the next message
-being the last. It reads the dump's `ftray` line (`here=`, `all=`, `posts=`,
+being the last. Then it pastes, setting the Windows clipboard through PowerShell
+the way other programs do and pressing Ctrl+V through the real key path: a copied
+file becomes a chip as itself, a copied image a `pasted-image-…png` chip with its
+picture that posts under that name, and text still pastes as text with no chip. It reads the dump's `ftray` line (`here=`, `all=`, `posts=`,
 `height=`) and one `fchip` line per chip (`pic=`, `state=` -1 waiting for Send,
 0 queued, 1 moving; `failed=`, `done=`, and the `x=` button's rect). Its last
 step sends a large file so the bars can be seen moving in `uploads_moving`; that

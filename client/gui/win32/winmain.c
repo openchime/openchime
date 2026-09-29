@@ -11291,9 +11291,10 @@ enum { FTRAY_MAX = OC_MAX_ATTACH };
 static void thumb_decode(uint64_t id, const uint8_t *data, size_t len);   /* fwd */
 static void ed_changed(HWND hwnd);                                         /* fwd */
 typedef struct {
-    char      path[1024];
+    char      path[1024];   /* a local file; empty when the bytes are in `mem` */
     char      name[128];
     uint64_t  size;
+    uint8_t  *mem;          /* a pasted image's bytes, owned: never written to disk (ARCH-88) */
     oc_client *cl;          /* the workspace it was added in */
     uint64_t  cid;          /* ...and the conversation */
     uint64_t  thumb;        /* its key in the thumbnail cache, when it is an image */
@@ -11396,8 +11397,41 @@ static void ftray_add(HWND hwnd, const char *path) {
     ftray_changed(hwnd);
 }
 
+/* Add bytes held in memory -- an image pasted from the clipboard -- to the tray
+ * of the open conversation, under `name`. Takes ownership of `data`. */
+static void ftray_add_mem(HWND hwnd, const char *name, uint8_t *data, size_t len) {
+    if (!g_client || !g_sel || !data || !len) { free(data); return; }
+    if (g_n_ftray == FTRAY_MAX) {
+        char t[80];
+        snprintf(t, sizeof t, "A message can carry %u files at most.", (unsigned)FTRAY_MAX);
+        toast_push(t, 1);
+        free(data);
+        return;
+    }
+    if (len > OC_MAX_ATTACHMENT_SIZE) {
+        toast_push("That image is larger than a message can carry.", 1);
+        free(data);
+        return;
+    }
+    ftray_chip *c = &g_ftray[g_n_ftray];
+    memset(c, 0, sizeof *c);
+    snprintf(c->name, sizeof c->name, "%s", name);
+    c->size = len;
+    c->mem = data;
+    c->cl = g_client;
+    c->cid = g_sel;
+    if (mime_is_image(ftray_mime(c->name)) && len <= 8u * 1024u * 1024u) {
+        static uint64_t seq;
+        c->thumb = (1ull << 61) | ++seq;
+        thumb_decode(c->thumb, data, len);
+    }
+    g_n_ftray++;
+    ftray_changed(hwnd);
+}
+
 static void ftray_drop(int i) {
     if (i < 0 || i >= g_n_ftray) return;
+    free(g_ftray[i].mem);
     memmove(&g_ftray[i], &g_ftray[i + 1], (size_t)(g_n_ftray - i - 1) * sizeof g_ftray[0]);
     g_n_ftray--;
 }
@@ -11419,14 +11453,21 @@ static void ftray_post_forget(int i) {
 static int ftray_post(const char *text) {
     const oc_model *m = model();
     if (!g_client || !g_sel || !m || g_n_ftray_posts == FTRAY_MAX) return 0;
-    const char *paths[FTRAY_MAX];
+    oc_post_item items[FTRAY_MAX];
     int ix[FTRAY_MAX], n = 0;
-    for (int i = 0; i < g_n_ftray; i++)
-        if (ftray_here(&g_ftray[i]) && !g_ftray[i].tag) { ix[n] = i; paths[n++] = g_ftray[i].path; }
+    memset(items, 0, sizeof items);
+    for (int i = 0; i < g_n_ftray; i++) {
+        ftray_chip *c = &g_ftray[i];
+        if (!ftray_here(c) || c->tag) continue;
+        ix[n] = i;
+        if (c->mem) { items[n].data = c->mem; items[n].len = (size_t)c->size; items[n].name = c->name; }
+        else items[n].path = c->path;
+        n++;
+    }
     if (!n) return 0;
     uint64_t cid = m->thread_open ? m->thread_channel : g_sel;
     uint64_t root = m->thread_open ? m->thread_parent : 0;
-    uint64_t tag = oc_client_post_files(g_client, cid, root, paths, (size_t)n, text);
+    uint64_t tag = oc_client_post_items(g_client, cid, root, items, (size_t)n, text);
     if (!tag) { toast_push("Those files could not be sent.", 1); return 0; }
     for (int k = 0; k < n; k++) {
         ftray_chip *c = &g_ftray[ix[k]];
@@ -17642,7 +17683,137 @@ static void ed_clip_copy(HWND hwnd) {
     CloseClipboard();
 }
 
+/* A clipboard DIB as a PNG file in memory, through WIC: the DIB becomes a BMP
+ * file (a header in front of it), which WIC decodes and re-encodes. A pasted
+ * screenshot then travels at PNG size rather than as raw pixels. NULL if it
+ * cannot. */
+static uint8_t *dib_to_png(const uint8_t *dib, size_t dlen, size_t *out_len) {
+    *out_len = 0;
+    if (!dib || dlen < sizeof(BITMAPINFOHEADER)) return NULL;
+    const BITMAPINFOHEADER *bi = (const BITMAPINFOHEADER *)dib;
+    if (bi->biSize < sizeof(BITMAPINFOHEADER) || bi->biSize > dlen) return NULL;
+    size_t colors = bi->biClrUsed ? bi->biClrUsed : (bi->biBitCount <= 8 ? (1u << bi->biBitCount) : 0);
+    size_t masks = (bi->biSize == sizeof(BITMAPINFOHEADER) && bi->biCompression == BI_BITFIELDS) ? 12 : 0;
+    size_t off = sizeof(BITMAPFILEHEADER) + bi->biSize + masks + colors * sizeof(RGBQUAD);
+    size_t blen = sizeof(BITMAPFILEHEADER) + dlen;
+    if (off > blen) return NULL;
+    uint8_t *bmp = malloc(blen);
+    if (!bmp) return NULL;
+    BITMAPFILEHEADER fh = { 0x4D42, (DWORD)blen, 0, 0, (DWORD)off };
+    memcpy(bmp, &fh, sizeof fh);
+    memcpy(bmp + sizeof fh, dib, dlen);
+
+    uint8_t *png = NULL;
+    if (!g_wic &&
+        FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IWICImagingFactory, (void **)&g_wic))) { free(bmp); return NULL; }
+    IWICStream *in = NULL; IWICBitmapDecoder *dec = NULL; IWICBitmapFrameDecode *frame = NULL;
+    IStream *out = NULL; IWICBitmapEncoder *enc = NULL; IWICBitmapFrameEncode *fe = NULL;
+    if (SUCCEEDED(IWICImagingFactory_CreateStream(g_wic, &in)) &&
+        SUCCEEDED(IWICStream_InitializeFromMemory(in, bmp, (DWORD)blen)) &&
+        SUCCEEDED(IWICImagingFactory_CreateDecoderFromStream(g_wic, (IStream *)in, NULL,
+                                                             WICDecodeMetadataCacheOnLoad, &dec)) &&
+        SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame)) &&
+        SUCCEEDED(CreateStreamOnHGlobal(NULL, TRUE, &out)) &&
+        SUCCEEDED(IWICImagingFactory_CreateEncoder(g_wic, &GUID_ContainerFormatPng, NULL, &enc)) &&
+        SUCCEEDED(IWICBitmapEncoder_Initialize(enc, out, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(IWICBitmapEncoder_CreateNewFrame(enc, &fe, NULL)) &&
+        SUCCEEDED(IWICBitmapFrameEncode_Initialize(fe, NULL)) &&
+        SUCCEEDED(IWICBitmapFrameEncode_WriteSource(fe, (IWICBitmapSource *)frame, NULL)) &&
+        SUCCEEDED(IWICBitmapFrameEncode_Commit(fe)) &&
+        SUCCEEDED(IWICBitmapEncoder_Commit(enc))) {
+        STATSTG st;
+        HGLOBAL hg = NULL;
+        if (SUCCEEDED(IStream_Stat(out, &st, STATFLAG_NONAME)) && st.cbSize.QuadPart &&
+            st.cbSize.QuadPart <= OC_MAX_ATTACHMENT_SIZE &&
+            SUCCEEDED(GetHGlobalFromStream(out, &hg))) {
+            const void *src = GlobalLock(hg);
+            if (src && (png = malloc((size_t)st.cbSize.QuadPart)) != NULL) {
+                memcpy(png, src, (size_t)st.cbSize.QuadPart);
+                *out_len = (size_t)st.cbSize.QuadPart;
+            }
+            if (src) GlobalUnlock(hg);
+        }
+    }
+    if (fe)    IWICBitmapFrameEncode_Release(fe);
+    if (enc)   IWICBitmapEncoder_Release(enc);
+    if (out)   IStream_Release(out);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (dec)   IWICBitmapDecoder_Release(dec);
+    if (in)    IWICStream_Release(in);
+    free(bmp);
+    return png;
+}
+
+/* A copy of clipboard format `fmt`'s bytes, or NULL. The clipboard is open. */
+static uint8_t *clip_bytes(UINT fmt, size_t *len) {
+    *len = 0;
+    HANDLE h = fmt ? GetClipboardData(fmt) : NULL;
+    if (!h) return NULL;
+    SIZE_T n = GlobalSize(h);
+    const void *src = n ? GlobalLock(h) : NULL;
+    uint8_t *d = (src && n <= OC_MAX_ATTACHMENT_SIZE) ? malloc(n) : NULL;
+    if (d) { memcpy(d, src, n); *len = n; }
+    if (src) GlobalUnlock(h);
+    return d;
+}
+
+/* Paste what is not text as attachments (REQ-140): copied files as themselves,
+ * so a GIF keeps its animation; otherwise an image, as the source put it on the
+ * clipboard -- a GIF's own bytes, else PNG, else the bitmap turned into a PNG.
+ * Anything that also carries text pastes as text: a copy out of a document puts
+ * a picture of it beside the words, and the words are what was meant. Returns 1
+ * if it attached something. The tray lives in the conversation, so the New
+ * message pane pastes text only. */
+static int clip_paste_attach(HWND hwnd) {
+    if (!g_client || !g_sel || g_view == VIEW_NEWMSG) return 0;
+    if (!OpenClipboard(hwnd)) return 0;
+    int did = 0;
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        HDROP drop = (HDROP)GetClipboardData(CF_HDROP);
+        UINT nf = drop ? DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0) : 0;
+        char paths[FTRAY_MAX][1024];
+        UINT np = 0;
+        for (UINT i = 0; i < nf && np < FTRAY_MAX; i++) {
+            WCHAR wf[MAX_PATH];
+            if (DragQueryFileW(drop, i, wf, MAX_PATH) &&
+                WideCharToMultiByte(CP_UTF8, 0, wf, -1, paths[np], sizeof paths[np], NULL, NULL) > 0)
+                np++;
+        }
+        CloseClipboard();                        /* before adding: a toast may pump */
+        for (UINT i = 0; i < np; i++) ftray_add(hwnd, paths[i]);
+        return np > 0;
+    }
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        char name[64];
+        SYSTEMTIME t; GetLocalTime(&t);
+        uint8_t *d = NULL; size_t n = 0;
+        UINT gif = RegisterClipboardFormatW(L"GIF"), png = RegisterClipboardFormatW(L"PNG");
+        if (IsClipboardFormatAvailable(gif) && (d = clip_bytes(gif, &n)) != NULL) {
+            snprintf(name, sizeof name, "pasted-image-%04u%02u%02u-%02u%02u%02u.gif",
+                     t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        } else if (IsClipboardFormatAvailable(png) && (d = clip_bytes(png, &n)) != NULL) {
+            snprintf(name, sizeof name, "pasted-image-%04u%02u%02u-%02u%02u%02u.png",
+                     t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        } else if (IsClipboardFormatAvailable(CF_DIB)) {
+            size_t dl = 0;
+            uint8_t *dib = clip_bytes(CF_DIB, &dl);
+            d = dib_to_png(dib, dl, &n);
+            free(dib);
+            snprintf(name, sizeof name, "pasted-image-%04u%02u%02u-%02u%02u%02u.png",
+                     t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        }
+        CloseClipboard();
+        if (d && n) { ftray_add_mem(hwnd, name, d, n); did = 1; }
+        else free(d);
+        return did;
+    }
+    CloseClipboard();
+    return 0;
+}
+
 static void ed_clip_paste(HWND hwnd) {
+    if (clip_paste_attach(hwnd)) return;
     if (!OpenClipboard(hwnd)) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (h) {

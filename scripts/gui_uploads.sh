@@ -12,7 +12,9 @@
 #   - a chip's x takes it out, before anything has moved;
 #   - Send posts what is left and the text as ONE message, and the tray empties;
 #   - a file that cannot be read stops the post: the chip comes back marked, the
-#     text comes back into the box, and nothing is posted.
+#     text comes back into the box, and nothing is posted;
+#   - Ctrl+V attaches what is not text: a copied file as itself, a copied image
+#     as a PNG chip with its picture, while text still pastes as text.
 #
 # Its own daemon on its own port. The last step sends a large file so the bars
 # can be seen moving in the screenshot; that shot is for looking at, and asserts
@@ -130,6 +132,29 @@ click_x 0
 anchored() { snap; grep -q '^  ch 1 .*prev="after the failure"' "$D"; }
 check "nothing was posted for it (the next message is the last)" waitfor 10 anchored
 check "...and no such file was shared" bash -c "! grep -q 'name=\"up-gone.txt\"' $D"
+
+say "== pasting attaches what is not text"
+# The Windows clipboard, set the way other programs set it: Explorer's copy puts a
+# file list on it (CF_HDROP); an image copied out of a program puts a bitmap.
+clip() { powershell.exe -NoProfile -STA -Command "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $1" >/dev/null 2>&1; }
+clip "\$c = New-Object Collections.Specialized.StringCollection; [void]\$c.Add('$WIN_DIR\\up-picture.png'); [Windows.Forms.Clipboard]::SetFileDropList(\$c)"
+"$DRIVE" key ctrl+v >/dev/null
+pasted_file() { [ "$(tray here)" = 1 ] && [ "$(chip 0 name)" = up-picture.png ]; }
+check "a copied file pastes as itself" waitfor 5 pasted_file
+clip "[Windows.Forms.Clipboard]::SetImage([Drawing.Image]::FromFile('$WIN_DIR\\up-picture.png'))"
+"$DRIVE" key ctrl+v >/dev/null
+pasted_image() { [ "$(tray here)" = 2 ] && chip 1 name | grep -Eq '^pasted-image-[0-9]{8}-[0-9]{6}\.png$' && [ "$(chip 1 pic)" = 1 ]; }
+check "a copied image pastes as a PNG with its picture" waitfor 5 pasted_image
+"$DRIVE" send "pasted" >/dev/null
+check "the pasted ones land" waitfor 20 landed
+pasted_msg() { snap; grep -q 'attach msg=.* name="pasted-image-' "$D"; }
+check "...the image under its pasted name" waitfor 10 pasted_msg
+clip "[Windows.Forms.Clipboard]::SetText('plain words')"
+"$DRIVE" key ctrl+v >/dev/null
+as_text() { [ "$(tray here)" = 0 ] && grep -Eq '^ed len=11 ' "$D"; }
+check "text still pastes as text, and adds no chip" waitfor 5 as_text
+"$DRIVE" key ctrl+a >/dev/null; "$DRIVE" key delete >/dev/null
+clip "[Windows.Forms.Clipboard]::Clear()"
 
 say "== a large one, to watch (not asserted)"
 head -c $((120 * 1024 * 1024)) /dev/urandom > "$LIN_DIR/up-large.bin"

@@ -421,6 +421,18 @@ uint64_t oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
  * the tag, or 0 if nothing was queued. */
 uint64_t oc_client_post_files(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                               const char *const *paths, size_t n_paths, const char *text);
+/* One file of a post: a local file (`path`), or bytes held in memory (`data`,
+ * `len`) uploaded under `name` -- an image pasted from the clipboard, which is
+ * never written to disk (ARCH-88). The core copies the bytes. */
+typedef struct {
+    const char    *path;
+    const uint8_t *data;
+    size_t         len;
+    const char    *name;
+} oc_post_item;
+/* oc_client_post_files, for files and in-memory items alike. */
+uint64_t oc_client_post_items(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                              const oc_post_item *items, size_t n_items, const char *text);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
 
 /* Fetch an attachment INTO MEMORY: the bytes arrive as an
