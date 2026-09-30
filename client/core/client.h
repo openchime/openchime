@@ -285,6 +285,11 @@ void oc_client_list_settings(oc_client *c);
  * member). The answer folds into the model as `storage`/`storage_have`. Toggle
  * the overlay is frontend view state. */
 void oc_client_storage_status(oc_client *c);
+/* The daemon's critical failures (REQ-263), owner/admin only: ask for the list
+ * (into the model's `srvalerts`), or acknowledge one -- `id` 0 for every one --
+ * after which the list is asked for again. */
+void oc_client_srvalerts_list(oc_client *c);
+void oc_client_srvalert_ack(oc_client *c, uint64_t id);
 void oc_client_toggle_storage(oc_client *c, int open);
 
 /* Audit log (REQ-251; owner/admin only). Request a page ending before

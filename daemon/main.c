@@ -138,6 +138,13 @@ static void keep_cert(void *ctx, const oc_cert_issued *c) {
                                c->names, c->chain_pem, c->key_pem, c->not_before_ms, c->not_after_ms);
 }
 
+/* What the certificate worker cannot fix alone, for owners and admins (REQ-263). */
+static void raise_alert(void *ctx, const char *key, const char *message) {
+    fed_services *f = ctx;
+    if (message) oc_dbwriter_alert(f->db, key, message);
+    else         oc_dbwriter_alert_clear(f->db, key);
+}
+
 /* Start keeping the certificate CA-issued, for the source configured. ACME is
  * answered through the listener, so this waits for the daemon to be serving;
  * central needs an active binding. */
@@ -148,6 +155,7 @@ static void start_certs(fed_services *f) {
     memset(&o, 0, sizeof o);
     o.tls = f->tls;
     o.store_cert = keep_cert;
+    o.alert = raise_alert;
     o.ctx = f;
     o.issued_ms = f->kept.issued_ms;
     o.not_after_ms = f->kept.not_after_ms;

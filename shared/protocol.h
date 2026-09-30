@@ -459,6 +459,13 @@ typedef enum {
      * reached fewer people than it named -- a group larger than the notice's
      * eight names: how many it could not reach in all (REQ-308). */
     OC_MSG_MENTION_UNRESOLVED_MORE = 0x00F5,
+    /* The daemon's critical failures, for owners and admins only (REQ-263):
+     * how many are unacknowledged and how many still hold, pushed at sign-in and
+     * on every change; the entries, asked for; and an acknowledgement. */
+    OC_MSG_ALERTS_SUMMARY       = 0x00F6, /* S->C, owner/admin */
+    OC_MSG_ALERTS_LIST          = 0x00F7, /* C->S, owner/admin */
+    OC_MSG_ALERTS               = 0x00F8, /* S->C, the answer: newest first */
+    OC_MSG_ALERT_ACK            = 0x00F9, /* C->S, owner/admin: one entry, or 0 for every one */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1084,6 +1091,18 @@ typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *group_ids;
 /* The members a channel has only through a group (REQ-309); capped like a member list. */
 typedef struct { uint64_t channel_id; uint16_t count; const uint64_t *user_ids; } oc_channel_via_group;
 typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t total; } oc_mention_unresolved_more;
+/* Critical failures (REQ-263). An entry is one failure, by what failed (`key`,
+ * stable: "tls.obtain"), in the latest words (`message`); `count` times between
+ * `first_ms` and `last_ms`; `current` while it still holds; `acked` once an
+ * owner or admin has acknowledged it. */
+#define OC_MAX_ALERTS         100
+#define OC_MAX_ALERT_KEY       64
+#define OC_MAX_ALERT_MESSAGE  400
+typedef struct { uint32_t unacked; uint32_t current; } oc_alerts_summary;
+typedef struct { uint64_t id; uint64_t first_ms; uint64_t last_ms; uint32_t count;
+                 uint8_t current; uint8_t acked; oc_slice key; oc_slice message; } oc_alert;
+typedef struct { uint16_t count; const oc_alert *alerts; } oc_alerts;
+typedef struct { uint64_t alert_id; } oc_alert_ack;
 typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_group_dm;
 /* Custom emoji (REQ-072). The image is an attachment id for the same reason an
  * avatar is: the store already handles upload, caps, dedup and reclamation. The
@@ -1551,6 +1570,10 @@ oc_result oc_encode_channel_group_op(oc_wbuf *w, uint16_t version, uint16_t type
 oc_result oc_encode_channel_groups(oc_wbuf *w, uint16_t version, const oc_channel_groups *m);
 oc_result oc_encode_channel_via_group(oc_wbuf *w, uint16_t version, const oc_channel_via_group *m);
 oc_result oc_encode_mention_unresolved_more(oc_wbuf *w, uint16_t version, const oc_mention_unresolved_more *m);
+oc_result oc_encode_alerts_summary(oc_wbuf *w, uint16_t version, const oc_alerts_summary *m);
+oc_result oc_encode_alerts_list(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_alerts(oc_wbuf *w, uint16_t version, const oc_alerts *m);
+oc_result oc_encode_alert_ack(oc_wbuf *w, uint16_t version, const oc_alert_ack *m);
 oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m);
 oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m);
 oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version);
@@ -1571,6 +1594,10 @@ oc_result oc_decode_channel_groups(oc_rbuf *p, oc_channel_groups *m, uint64_t *g
 /* `user_ids` receives up to `cap`; more is malformed. */
 oc_result oc_decode_channel_via_group(oc_rbuf *p, oc_channel_via_group *m, uint64_t *user_ids, uint16_t cap);
 oc_result oc_decode_mention_unresolved_more(oc_rbuf *p, oc_mention_unresolved_more *m);
+oc_result oc_decode_alerts_summary(oc_rbuf *p, oc_alerts_summary *m);
+/* Into `out` (room for `cap`); the slices point into the frame. */
+oc_result oc_decode_alerts(oc_rbuf *p, oc_alerts *m, oc_alert *out, uint16_t cap);
+oc_result oc_decode_alert_ack(oc_rbuf *p, oc_alert_ack *m);
 oc_result oc_decode_add_emoji(oc_rbuf *p, oc_add_emoji *m);
 oc_result oc_decode_delete_emoji(oc_rbuf *p, oc_delete_emoji *m);
 oc_result oc_decode_list_emoji(oc_rbuf *p);

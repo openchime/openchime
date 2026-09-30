@@ -3737,6 +3737,67 @@ oc_result oc_decode_mention_unresolved_more(oc_rbuf *p, oc_mention_unresolved_mo
     return r_done(p);
 }
 
+/* Critical failures (REQ-263). */
+oc_result oc_encode_alerts_summary(oc_wbuf *w, uint16_t version, const oc_alerts_summary *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ALERTS_SUMMARY);
+    oc_w_u32(w, m->unacked);
+    oc_w_u32(w, m->current);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_alerts_summary(oc_rbuf *p, oc_alerts_summary *m) {
+    m->unacked = oc_r_u32(p);
+    m->current = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_alerts_list(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ALERTS_LIST);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_alerts(oc_wbuf *w, uint16_t version, const oc_alerts *m) {
+    if (m->count > OC_MAX_ALERTS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < m->count; i++)
+        if (m->alerts[i].key.len > OC_MAX_ALERT_KEY || m->alerts[i].message.len > OC_MAX_ALERT_MESSAGE)
+            return OC_E_MALFORMED;
+    size_t off = oc_frame_begin(w, version, OC_MSG_ALERTS);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_alert *a = &m->alerts[i];
+        oc_w_u64(w, a->id); oc_w_u64(w, a->first_ms); oc_w_u64(w, a->last_ms);
+        oc_w_u32(w, a->count); oc_w_u8(w, a->current); oc_w_u8(w, a->acked);
+        oc_w_str(w, a->key); oc_w_str(w, a->message);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_alerts(oc_rbuf *p, oc_alerts *m, oc_alert *out, uint16_t cap) {
+    uint16_t n = oc_r_u16(p);
+    if (n > cap || n > OC_MAX_ALERTS) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < n; i++) {
+        oc_alert *a = &out[i];
+        a->id = oc_r_u64(p); a->first_ms = oc_r_u64(p); a->last_ms = oc_r_u64(p);
+        a->count = oc_r_u32(p); a->current = oc_r_u8(p); a->acked = oc_r_u8(p);
+        a->key = oc_r_str(p); a->message = oc_r_str(p);
+        if (a->key.len > OC_MAX_ALERT_KEY || a->message.len > OC_MAX_ALERT_MESSAGE) return OC_E_MALFORMED;
+    }
+    m->count = n;
+    m->alerts = out;
+    return r_done(p);
+}
+
+oc_result oc_encode_alert_ack(oc_wbuf *w, uint16_t version, const oc_alert_ack *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ALERT_ACK);
+    oc_w_u64(w, m->alert_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_alert_ack(oc_rbuf *p, oc_alert_ack *m) {
+    m->alert_id = oc_r_u64(p);
+    return r_done(p);
+}
+
 /* Custom emoji (REQ-072). */
 oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_ADD_EMOJI);

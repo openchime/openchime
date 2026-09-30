@@ -780,6 +780,39 @@ static void test_new_channel_takes_the_default_level(void) {
 /* Every CHANNEL_INFO for a channel moves its info_seq, and one for another
  * channel does not: an invite or a removal is answered with nothing else, so it
  * is what an open roster watches to know it should ask again. */
+/* The daemon's critical failures in the model (REQ-263): nothing until a summary
+ * says this is an owner or admin; the counts; a list that replaces the last;
+ * and a new session that starts from nothing again. */
+static void test_srvalerts_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_AUTH_OK; e.user_id = 4;
+    oc_model_apply(&m, &e);
+    CHECK(!m.srvalerts_have && m.srvalerts_unacked == 0);             /* a member hears nothing */
+    uint32_t seq = m.srvalerts_seq;
+    memset(&e, 0, sizeof e); e.type = OC_EV_SRVALERTS; e.count = 2; e.srvalert_current = 1;
+    oc_model_apply(&m, &e);
+    CHECK(m.srvalerts_have && m.srvalerts_unacked == 2 && m.srvalerts_current == 1 && m.srvalerts_seq != seq);
+    for (int round = 0; round < 2; round++) {
+        memset(&e, 0, sizeof e); e.type = OC_EV_SRVALERT_BEGIN;
+        oc_model_apply(&m, &e);
+        for (int i = 0; i < 3 - round; i++) {
+            memset(&e, 0, sizeof e); e.type = OC_EV_SRVALERT;
+            e.srvalert = calloc(1, sizeof *e.srvalert);
+            e.srvalert->id = (uint64_t)(10 + i); e.srvalert->current = i == 0;
+            snprintf(e.srvalert->key, sizeof e.srvalert->key, "tls.obtain");
+            snprintf(e.srvalert->message, sizeof e.srvalert->message, "failure %d", i);
+            oc_model_apply(&m, &e);
+            free(e.srvalert);
+        }
+    }
+    CHECK(m.n_srvalerts == 2 && m.srvalerts[1].id == 11 && !strcmp(m.srvalerts[1].message, "failure 1"));
+    memset(&e, 0, sizeof e); e.type = OC_EV_AUTH_OK; e.user_id = 4;     /* a new session */
+    oc_model_apply(&m, &e);
+    CHECK(!m.srvalerts_have && m.n_srvalerts == 0);
+    oc_model_free(&m);
+}
+
 static void test_channel_info_seq(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -3759,6 +3792,7 @@ int run_client_core_tests(void) {
     test_sidebar();
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
+    test_srvalerts_model();
     test_notify_scan();
     test_thread_notices();
     test_unread_counts_what_notifies();

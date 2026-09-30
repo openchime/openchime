@@ -829,6 +829,35 @@ static void test_worker(void) {
     g_ca_backdate_s = 60;
 }
 
+/* What the worker raised and cleared (REQ-263), in order: the key, and the
+ * message or "" for a clear. */
+static struct { char key[32]; char msg[OC_MAX_ALERT_MESSAGE + 1]; int raise; } g_alerts[256];
+static int g_n_alerts;
+static pthread_mutex_t g_alerts_mu = PTHREAD_MUTEX_INITIALIZER;
+static void record_alert(void *ctx, const char *key, const char *message) {
+    (void)ctx;
+    pthread_mutex_lock(&g_alerts_mu);
+    if (g_n_alerts < 256) {
+        snprintf(g_alerts[g_n_alerts].key, sizeof g_alerts[0].key, "%s", key);
+        snprintf(g_alerts[g_n_alerts].msg, sizeof g_alerts[0].msg, "%s", message ? message : "");
+        g_alerts[g_n_alerts].raise = message != NULL;
+        g_n_alerts++;
+    }
+    pthread_mutex_unlock(&g_alerts_mu);
+}
+static void alerts_reset(void) { pthread_mutex_lock(&g_alerts_mu); g_n_alerts = 0; pthread_mutex_unlock(&g_alerts_mu); }
+/* The index of the first raise (1) or clear (0) of `key` at or after `from` whose
+ * message holds `has` (a raise), or -1. */
+static int alert_at(const char *key, int raise, const char *has, int from) {
+    int at = -1;
+    pthread_mutex_lock(&g_alerts_mu);
+    for (int i = from < 0 ? 0 : from; i < g_n_alerts && at < 0; i++)
+        if (!strcmp(g_alerts[i].key, key) && g_alerts[i].raise == raise && (!has || strstr(g_alerts[i].msg, has)))
+            at = i;
+    pthread_mutex_unlock(&g_alerts_mu);
+    return at;
+}
+
 /* The first chain kept, for what ARI and a replacement name. */
 static char g_first_chain[8192];
 static int g_first_kept;
@@ -845,6 +874,8 @@ static oc_certs *worker_on(const char *dir, int life_s) {
     o.source = OC_CERTS_ACME; o.tls = &g_srv; o.directory = dir; o.names = NAME;
     o.account_key_pem = g_kept_key; o.account_url = g_kept_url;
     o.store_cert = keep_first; o.retry_ms = 200; o.poll_ms = 20; o.check_ms = 100; o.ari_check_ms = 100;
+    o.alert = record_alert;
+    alerts_reset();
     g_fake.life_s = life_s;
     __atomic_store_n(&g_first_kept, 0, __ATOMIC_RELEASE);
     return oc_certs_start(&o);
@@ -887,6 +918,10 @@ static void test_worker_ari(void) {
     msleep(600);
     CHECK(obtained(w) == 2);                                      /* and the replacement is not due */
     oc_certs_stop(w);
+    /* An owner or admin was told the CA asked (REQ-263), and told again when
+     * the replacement answered it. */
+    int asked = alert_at(OC_CERTS_ALERT_REPLACE, 1, "replaced now", 0);
+    CHECK(asked >= 0 && alert_at(OC_CERTS_ALERT_REPLACE, 0, NULL, asked) > asked);
 
     /* Later: a two-second life would renew within 1.3 s; the CA's window,
      * three seconds on, holds it. */
@@ -903,6 +938,13 @@ static void test_worker_ari(void) {
     CHECK(obtained(w) >= 2 && wall_ms() - first_at >= 1500);
     oc_certs_stop(w);
     CHECK(g_fake.ari_asked >= 1);
+    /* A certificate within a week of expiry, not renewed, is raised -- once for
+     * its day, not at every look -- and its renewal clears it. */
+    int near = alert_at(OC_CERTS_ALERT_EXPIRING, 1, "has not been renewed", 0);
+    int cleared = alert_at(OC_CERTS_ALERT_EXPIRING, 0, NULL, near);
+    CHECK(near >= 0 && cleared > near);
+    int again = alert_at(OC_CERTS_ALERT_EXPIRING, 1, NULL, near + 1);
+    CHECK(again < 0 || again > cleared);
     g_fake.ari = 0;
     g_ca_backdate_s = 60;
 }
@@ -918,6 +960,8 @@ static void test_worker_retries(void) {
     o.source = OC_CERTS_ACME; o.tls = &g_srv; o.directory = dir; o.names = NAME;
     o.account_key_pem = g_kept_key; o.account_url = g_kept_url;
     o.retry_ms = 20; o.retry_max_ms = 400; o.poll_ms = 20;
+    o.alert = record_alert;
+    alerts_reset();
     oc_certs *w = oc_certs_start(&o);
     CHECK(w != NULL);
     if (!w) return;
@@ -933,6 +977,11 @@ static void test_worker_retries(void) {
     g_fake.order_fail = 0;
     pthread_mutex_unlock(&g_fake.mu);
     CHECK(n >= 5);
+    /* Each failure is raised, in words a person can act on, under one key --
+     * one entry, however many times (REQ-263). Never obtained, never cleared. */
+    int f1 = alert_at(OC_CERTS_ALERT_OBTAIN, 1, "could not be obtained", 0);
+    CHECK(f1 >= 0 && alert_at(OC_CERTS_ALERT_OBTAIN, 1, NULL, f1 + 1) > f1);
+    CHECK(alert_at(OC_CERTS_ALERT_OBTAIN, 0, NULL, 0) < 0);
     if (n < 5) return;
     printf("  retries after a failed order: %llu, %llu, %llu, %llu ms\n", (unsigned long long)(t[1] - t[0]),
            (unsigned long long)(t[2] - t[1]), (unsigned long long)(t[3] - t[2]), (unsigned long long)(t[4] - t[3]));

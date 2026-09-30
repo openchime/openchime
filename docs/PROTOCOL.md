@@ -1830,6 +1830,31 @@ family (admin / account / security / moderation), action, actor, target, outcome
 detail. It **never carries the secret involved** — that a password changed, never
 the password; that an invite was redeemed, never the token (ARCH-79).
 
+**The daemon's critical failures (REQ-263).** What the daemon cannot fix alone —
+a TLS certificate it cannot obtain or renew, a CA asking for one to be replaced
+now, one within a week of expiry — is kept for owners and admins (SCHEMA.md
+migration 0051), one entry per failure while it holds. Nobody else is sent any of
+it, and a member's request is refused with `ERROR FORBIDDEN`.
+
+**`ALERTS_SUMMARY` (S → C), `0x00F6`** `{ unacked: u32, current: u32 }` — how
+many entries nobody has acknowledged, and how many still hold. Sent to an owner
+or admin as the last frame of the sign-in sequence (after `SNOOZE`), and to every
+owner and admin connected whenever an entry is raised, cleared or acknowledged.
+
+**`ALERTS_LIST` (C → S), `0x00F7`** — empty payload. Asks for the entries.
+
+**`ALERTS` (S → C), `0x00F8`** `{ n: u16, n × { id: u64, first_ms: u64, last_ms:
+u64, count: u32, current: u8, acked: u8, key: str, message: str } }` — newest
+first, at most `OC_MAX_ALERTS` (100): what failed (`key`, stable, for example
+`tls.obtain`), in the daemon's latest words (`message`, at most 400 bytes), how
+many times between `first_ms` and `last_ms`, whether it still holds, and whether
+it has been acknowledged.
+
+**`ALERT_ACK` (C → S), `0x00F9`** `{ alert_id: u64 }` — acknowledge one entry,
+or every one with `0`. Audited (`alert.ack`); answered by the `ALERTS_SUMMARY`
+every owner and admin connected is sent. An entry still holding stays
+acknowledged when it is raised again, until it stops and comes back.
+
 ---
 
 ### 5.16d Notification schedule, pause, and the notify default
@@ -2839,6 +2864,10 @@ this table cannot silently gain a shared value.
 | `0x00F3` | `CHANNEL_GROUPS` | S → C | the groups a channel has |
 | `0x00F4` | `CHANNEL_VIA_GROUP` | S → C | after a member list: who is in only through a group |
 | `0x00F5` | `MENTION_UNRESOLVED_MORE` | S → C | how many a message could not reach in all (REQ-308) |
+| `0x00F6` | `ALERTS_SUMMARY` | S → C | owner/admin: the daemon's critical failures, counted (REQ-263) |
+| `0x00F7` | `ALERTS_LIST` | C → S | owner/admin: ask for them |
+| `0x00F8` | `ALERTS` | S → C | the entries, newest first |
+| `0x00F9` | `ALERT_ACK` | C → S | owner/admin: acknowledge one, or all |
 
 ## 10. Connection state machine
 

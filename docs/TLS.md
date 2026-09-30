@@ -186,6 +186,11 @@ the CA asks for. A window the CA has already opened is renewed at once: that is
 how an incident or a revocation reaches the daemon. A replacement order names
 the certificate it replaces (`replaces`, §5). A failure is retried after a
 minute, ten, a hundred, then daily, as Let's Encrypt's integration guide asks.
+And, as it also asks, every failure reaches a person: besides the log, the worker
+raises it for the workspace's owners and admins (PROTOCOL.md §5.16c) — a
+certificate not obtained or renewed, with the CA's or the network's words; the CA
+asking for one to be replaced now; one within a week of expiry and still not
+renewed — and the next certificate obtained clears all three.
 Through central, where there is no ARI, the daemon's own window applies. A new
 certificate is swapped in whole (`oc_tls_server_use`): each
 handshake takes a reference to the certificate it presents
@@ -234,7 +239,13 @@ fixes; a window set later holds a renewal the daemon's own would have made; and 
 CA failing every order is asked again after the base wait, ten times it, then at
 the ceiling. The window picks and the retry ladder are checked as values, and the challenge
 certificate's serial as DER on 32 of them. The suite resets its state at the
-start of each run, so `OC_TEST_REPEAT` runs it again in one process. `test_client_core` covers the
+start of each run, so `OC_TEST_REPEAT` runs it again in one process. The worker's
+alerts are recorded as it raises and clears them: each failed order raised under
+one key, the CA's "replace now" raised and then cleared by the replacement, and a
+certificate near expiry raised once for its day and cleared by its renewal.
+`test_dbwriter` holds the store to one entry per failure, the counts, the
+owners-and-admins-only list and acknowledgement and the bound; `itest_netloop`
+sends it over the wire to an owner at sign-in and refuses a member. `test_client_core` covers the
 client's judgement at this machine's LAN address, where loopback's exemption does
 not apply. It also resumes a session with the
 ticket the first connection was given, and checks that a restarted server —

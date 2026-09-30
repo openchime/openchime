@@ -203,6 +203,7 @@ void oc_model_free(oc_model *m) {
     free(m->webhooks);
     free(m->settings);
     free(m->audit);
+    free(m->srvalerts);
     memset(m, 0, sizeof *m);
 }
 
@@ -1453,6 +1454,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_AUTH_OK:
         m->authed = true;
         m->user_id = e->user_id;
+        /* A new session says afresh whether there is anything to show: only an
+         * owner's or admin's sign-in is followed by a summary. */
+        m->srvalerts_have = 0; m->srvalerts_unacked = m->srvalerts_current = 0; m->n_srvalerts = 0;
+        m->srvalerts_seq++;
         m->last_error[0] = '\0';
         m->signin_url[0] = '\0';
         m->device_url[0] = m->device_code[0] = m->device_fp[0] = '\0';
@@ -2202,6 +2207,27 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             m->audit = na; m->cap_audit = nc;
         }
         m->audit[m->n_audit++] = e->audit;
+        break;
+    case OC_EV_SRVALERTS:
+        m->srvalerts_have = 1;
+        m->srvalerts_unacked = e->count;
+        m->srvalerts_current = e->srvalert_current;
+        m->srvalerts_seq++;
+        break;
+    case OC_EV_SRVALERT_BEGIN:
+        m->n_srvalerts = 0;          /* an answer replaces the list */
+        m->srvalerts_seq++;
+        break;
+    case OC_EV_SRVALERT:
+        if (!e->srvalert) break;
+        if (m->n_srvalerts == m->cap_srvalerts) {
+            size_t nc = m->cap_srvalerts ? m->cap_srvalerts * 2 : 16;
+            oc_srvalert_view *na = realloc(m->srvalerts, nc * sizeof *na);
+            if (!na) break;
+            m->srvalerts = na; m->cap_srvalerts = nc;
+        }
+        m->srvalerts[m->n_srvalerts++] = *e->srvalert;
+        m->srvalerts_seq++;
         break;
     case OC_EV_STORAGE:
         m->storage = e->storage;

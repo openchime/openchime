@@ -239,6 +239,7 @@ int oc_job_set_body(oc_job *j, const void *body, size_t len) {
 
 static void job_free(oc_job *j) {
     if (!j) return;
+    free(j->alert_key); free(j->alert_message);
     free(j->token);
     free(j->proof);
     free(j->email);
@@ -422,6 +423,7 @@ void oc_job_free(oc_job *j) { job_free(j); }
 
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
+    free(r->alert_rows);
     free(r->body);
     /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
@@ -891,6 +893,166 @@ static uint8_t get_role(sqlite3 *db, uint64_t uid) {
 
 /* Has this user been removed from the tenant (REQ-033)? A removed member is
  * locked out of every auth path but their row survives for message authorship. */
+/* --- Critical failures (REQ-263) -------------------------------------------- */
+
+#define OC_ALERTS_KEEP 100   /* rows kept; the oldest that no longer hold go first */
+
+/* How many entries no owner or admin has acknowledged, and how many still hold. */
+static void alerts_counts(sqlite3 *db, uint32_t *unacked, uint32_t *current) {
+    sqlite3_stmt *st = NULL;
+    *unacked = *current = 0;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FILTER (WHERE acked_ms IS NULL),"
+                               " COUNT(*) FILTER (WHERE current = 1) FROM alerts;", -1, &st, NULL) != SQLITE_OK) return;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *unacked = (uint32_t)sqlite3_column_int(st, 0);
+        *current = (uint32_t)sqlite3_column_int(st, 1);
+    }
+    sqlite3_finalize(st);
+}
+
+/* An owner's or admin's sign-in carries the counts, so the client can show them
+ * at once; nobody else's does. */
+static void alerts_on_auth(sqlite3 *db, oc_dbres *r) {
+    if (!oc_role_can_manage_members(r->role)) return;
+    r->alerts_admin = 1;
+    alerts_counts(db, &r->alerts_unacked, &r->alerts_current);
+}
+
+/* The counts, and to whom: every owner and admin, by their role now -- the net
+ * thread sends it to whichever of their connections are open. */
+static oc_dbres *alerts_summary(sqlite3 *db) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_ALERTS_SUMMARY;
+    r->alerts_admin = 1;
+    alerts_counts(db, &r->alerts_unacked, &r->alerts_current);
+    sqlite3_stmt *st = NULL;
+    size_t cap = 0;
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE role IN ('owner','admin') AND disabled=0;", -1, &st, NULL);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (r->n_members == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            uint64_t *m = realloc(r->members, nc * sizeof *m);
+            if (!m) break;
+            r->members = m; cap = nc;
+        }
+        r->members[r->n_members++] = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* At most `cap` bytes of `s`, cut before a UTF-8 continuation byte. */
+static size_t utf8_cut(const char *s, size_t cap) {
+    size_t n = strlen(s);
+    if (n <= cap) return n;
+    while (cap > 0 && ((unsigned char)s[cap] & 0xC0) == 0x80) cap--;
+    return cap;
+}
+
+/* Raise: again on the entry that still holds for this key, else a new one; an
+ * acknowledged entry that holds stays acknowledged -- the failure is known --
+ * until it stops and comes back. Then the oldest that no longer hold go, down to
+ * OC_ALERTS_KEEP. Clear: the entry stops holding; nothing to say if none did. */
+static oc_dbres *process_alert(sqlite3 *db, const oc_job *j) {
+    const char *key = j->alert_key ? j->alert_key : "";
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    if (j->type == OC_JOB_ALERT_CLEAR) {
+        sqlite3_prepare_v2(db, "UPDATE alerts SET current=0, cleared_ms=?2 WHERE key=?1 AND current=1;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, key, (int)utf8_cut(key, OC_MAX_ALERT_KEY), SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)now);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return sqlite3_changes(db) ? alerts_summary(db) : NULL;
+    }
+    const char *msg = j->alert_message ? j->alert_message : "";
+    sqlite3_prepare_v2(db, "UPDATE alerts SET message=?2, last_ms=?3, count=count+1 WHERE key=?1 AND current=1;",
+                       -1, &st, NULL);
+    sqlite3_bind_text(st, 1, key, (int)utf8_cut(key, OC_MAX_ALERT_KEY), SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, msg, (int)utf8_cut(msg, OC_MAX_ALERT_MESSAGE), SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (sqlite3_changes(db) == 0) {
+        sqlite3_prepare_v2(db, "INSERT INTO alerts(key, message, first_ms, last_ms) VALUES(?1, ?2, ?3, ?3);",
+                           -1, &st, NULL);
+        sqlite3_bind_text(st, 1, key, (int)utf8_cut(key, OC_MAX_ALERT_KEY), SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, msg, (int)utf8_cut(msg, OC_MAX_ALERT_MESSAGE), SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    sqlite3_prepare_v2(db, "DELETE FROM alerts WHERE id IN (SELECT id FROM alerts WHERE current=0 "
+                           "ORDER BY last_ms ASC, id ASC LIMIT max(0, (SELECT COUNT(*) FROM alerts) - ?1));",
+                       -1, &st, NULL);
+    sqlite3_bind_int(st, 1, OC_ALERTS_KEEP);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return alerts_summary(db);
+}
+
+/* The entries, newest first, for an owner or admin -- the role read now, so a
+ * demotion takes effect at once. Read. */
+static oc_dbres *process_alerts_list(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_ALERTS_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    r->type = OC_RES_ALERTS;
+    r->alert_rows = calloc(OC_MAX_ALERTS, sizeof *r->alert_rows);
+    if (!r->alert_rows) { r->type = OC_RES_ALERTS_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT id, first_ms, last_ms, count, current, acked_ms IS NOT NULL, key, message "
+                           "FROM alerts ORDER BY last_ms DESC, id DESC LIMIT ?1;", -1, &st, NULL);
+    sqlite3_bind_int(st, 1, OC_MAX_ALERTS);
+    while (sqlite3_step(st) == SQLITE_ROW && r->n_alert_rows < OC_MAX_ALERTS) {
+        struct oc_alert_row *a = &r->alert_rows[r->n_alert_rows++];
+        a->id = (uint64_t)sqlite3_column_int64(st, 0);
+        a->first_ms = (uint64_t)sqlite3_column_int64(st, 1);
+        a->last_ms = (uint64_t)sqlite3_column_int64(st, 2);
+        a->count = (uint32_t)sqlite3_column_int(st, 3);
+        a->current = (uint8_t)sqlite3_column_int(st, 4);
+        a->acked = (uint8_t)sqlite3_column_int(st, 5);
+        const char *k = (const char *)sqlite3_column_text(st, 6), *m = (const char *)sqlite3_column_text(st, 7);
+        snprintf(a->key, sizeof a->key, "%.*s", (int)utf8_cut(k ? k : "", OC_MAX_ALERT_KEY), k ? k : "");
+        snprintf(a->message, sizeof a->message, "%.*s", (int)utf8_cut(m ? m : "", OC_MAX_ALERT_MESSAGE), m ? m : "");
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Acknowledged by an owner or admin: one entry, or every one (0). Audited, and
+ * every owner and admin connected is told the new counts. Write. */
+static oc_dbres *process_alert_ack(sqlite3 *db, const oc_job *j) {
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        oc_dbres *r = calloc(1, sizeof *r);
+        if (!r) return NULL;
+        r->conn_id = j->conn_id;
+        r->type = OC_RES_ALERTS_ERR; r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE alerts SET acked_ms=?1, acked_by=?2 "
+                           "WHERE acked_ms IS NULL AND (?3 = 0 OR id = ?3);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->alert_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    int n = sqlite3_changes(db);
+    if (n) {
+        char detail[48];
+        snprintf(detail, sizeof detail, "entries=%d", n);
+        audit_actor(db, OC_AUDIT_ADMIN, "alert.ack", j->user_id, j->alert_id, NULL, 1, detail);
+    }
+    return alerts_summary(db);
+}
+
 static int user_disabled(sqlite3 *db, uint64_t uid) {
     sqlite3_stmt *st = NULL;
     int disabled = 0;
@@ -1372,6 +1534,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
+    alerts_on_auth(db, r);
     /* Do-not-disturb rides along, BOTH halves: the net thread keeps the FACT in
      * memory so presence fan-out can carry it, and it has no database of its
      * own. The pause is an instant (REQ-278); the schedule is a rule the net
@@ -1818,6 +1981,7 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     r->session_id = sid;
     r->user_id = uid;
     r->role = role;
+    alerts_on_auth(db, r);
     r->snooze_until_ms = snooze_until(db, uid);
     fill_schedule(db, uid, r);              /* REQ-136, as above */
     memcpy(r->session_token, token, sizeof token);
@@ -8073,7 +8237,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_EMOJI || type == OC_JOB_GET_CHANNEL_DESCRIPTION ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
-           type == OC_JOB_STORAGE_STATUS ||
+           type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
            type == OC_JOB_AUDIT_QUERY ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
            type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS;
@@ -8096,6 +8260,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
+    if (j->type == OC_JOB_ALERTS_LIST)    return process_alerts_list(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_TTS_LOOKUP)     return process_tts_lookup(rdb, j);
     if (j->type == OC_JOB_TTS_PREVIEW)    return process_tts_preview(rdb, j);
@@ -8169,6 +8334,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
     if (j->type == OC_JOB_LOAD_TLS_STATE) return process_load_tls_state(w->db, j);
     if (j->type == OC_JOB_STORE_ACME_ACCOUNT || j->type == OC_JOB_STORE_TLS_CERT) return process_store_tls(w->db, j);
+    if (j->type == OC_JOB_ALERT_RAISE || j->type == OC_JOB_ALERT_CLEAR) return process_alert(w->db, j);
+    if (j->type == OC_JOB_ALERT_ACK) return process_alert_ack(w->db, j);
     if (j->type == OC_JOB_LOAD_ENROLLMENT)  return process_load_enrollment(w->db, j);
     if (j->type == OC_JOB_STORE_ENROLLMENT) return process_store_enrollment(w->db, j);
     if (j->type == OC_JOB_WELCOME_GENERAL)  return process_welcome_general(w->db, j);
@@ -9032,6 +9199,20 @@ void oc_dbwriter_store_tls_cert(oc_dbwriter *w, const char *source, const char *
     j->tls_state->key_pem = dup_or_null(key_pem);
     j->tls_state->issued_ms = issued_ms;
     j->tls_state->not_after_ms = not_after_ms;
+    oc_dbwriter_submit(w, j);
+}
+
+void oc_dbwriter_alert(oc_dbwriter *w, const char *key, const char *message) {
+    oc_job *j = oc_job_new(OC_JOB_ALERT_RAISE, 0);
+    if (!j) return;
+    j->alert_key = dup_or_null(key); j->alert_message = dup_or_null(message);
+    oc_dbwriter_submit(w, j);
+}
+
+void oc_dbwriter_alert_clear(oc_dbwriter *w, const char *key) {
+    oc_job *j = oc_job_new(OC_JOB_ALERT_CLEAR, 0);
+    if (!j) return;
+    j->alert_key = dup_or_null(key);
     oc_dbwriter_submit(w, j);
 }
 

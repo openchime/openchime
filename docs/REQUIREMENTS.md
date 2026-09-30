@@ -2130,7 +2130,10 @@ choose — which makes each one a per-frontend *obligation*.*
   grades captured frames can only fail on a pixel something actually painted: a
   marker no scene draws, or a fill derived per scheme whose other values are
   never rendered, is invisible to it.
-- **REQ-263.** Every client has presented a **transient error/toast and
+- **REQ-263.** A failure of the daemon's own that needs a person — a TLS
+  certificate it cannot obtain or renew, one close to expiry — has been shown to
+  the workspace's owners and admins in every client, with a distinct warning
+  sign, until acknowledged. Every client has presented a **transient error/toast and
   connection-status surface** — a visible, non-blocking channel for failures
   (failed send, rate-limit REQ-190, bad login, storage pressure REQ-214) and for
   connection state (reconnecting with a countdown, REQ-100) — so a failure or a

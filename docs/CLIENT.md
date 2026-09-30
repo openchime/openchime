@@ -232,7 +232,7 @@ model; translate input to intents }, stop.
   DM. **Action launcher** (`:` on an empty composer, or Ctrl+K): a
   fuzzy-filtered, sectioned list of every action — New channel, Leave,
   Notifications, Webhooks, Upload, Search, New DM, Set away/online, Change
-  display name/password, DND, Profile, Invite, Storage usage, Audit log, Switch
+  display name/password, DND, Profile, Invite, Storage usage, Audit log, Daemon alerts, Switch
   workspace, Help, Log out. Enter runs a parameterless action immediately, or
   opens a modal prompt dialog for one needing an argument.
   **Emoji picker:** `r` on a selected message opens a filterable emoji popup
@@ -276,6 +276,12 @@ model; translate input to intents }, stop.
   **Audit log (REQ-251):** the launcher's "Audit log" opens an admin overlay of
   administrative/security actions, newest first, with denials/failures in red;
   owner/admin only.
+  **Daemon alerts (REQ-263):** for an owner or admin, the header shows a warning
+  sign — "⚠ 2 alerts" in red while any of the daemon's critical failures is
+  unacknowledged, "⚠ 1 ongoing" in yellow while an acknowledged one still holds —
+  left of the unread count; members never see it. The launcher's "Daemon alerts"
+  lists them, newest first, each with its state, count and message; `a`
+  acknowledges the one selected, `A` all of them.
   **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
   signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
   frame, rendering only the active one — so a workspace you aren't looking at
@@ -433,6 +439,7 @@ model; translate input to intents }, stop.
   REQ-289 and REQ-261.
 
   **User groups (REQ-307–309)** appear in these places:
+  - **Admin → Alerts (REQ-263)** lists the daemon's critical failures, newest first — what failed, whether it still holds, how often and when, and its message — with **Acknowledge** on each unacknowledged one and **Acknowledge all** above. The Admin rail item carries a warning-sign badge, red while any is unacknowledged and amber while an acknowledged one still holds (on **More** when Admin is folded into it); a glyph, so it is not read as unread messages, with the count in its accessible name. Entering Admin while any is unacknowledged opens this tab.
   - **Admin → Groups** lists every group with its handle, name and size. New, Edit and Delete (confirmed) act on a group, and **People** opens its members, with Remove on each. Add people above them is the target picker New message uses (REQ-229), limited to people, yourself included, and to those not yet in the group. Up to 32 can be chosen, and Add (or Enter on an empty query) adds them in one go. The two uses share one picker, which belongs to one of them at a time: opening a group's people takes it, and New message's recipients stay in its draft.
   - A channel's menu gains **Add a group** and **Remove a group**, each a pick from the groups it lacks or has. In the members pane, groups sit under a quiet **GROUPS** subheading whose **+** (tooltip "Add a group") adds one; there are no rows of buttons — every action is beside what it acts on.
   - **Add someone** (the channel menu) and **Add people** — a person-with-a-plus icon in the channel header beside the member count, tooltip "Add people", not in DMs — open the people picker in the members pane — the target picker New message uses (REQ-229), limited to people not already in the channel, directly or through a group. Several can be chosen, and Add (or Enter on an empty query) invites them all; Escape on an empty query, or Cancel under it, closes it. A click anywhere else gives the keys back, so typing in the composer never lands in the picker. A narrow window, where the pane yields to the conversation, says so. The roster on screen asks for the channel's members again whenever a `CHANNEL_INFO` for the channel arrives (the model's `info_seq`), as it does when the channel's groups change: an invite and a removal are each answered with one and nothing else, and the pane kept showing the channel as it was.

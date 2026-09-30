@@ -34,13 +34,27 @@ typedef struct {
     uint64_t        issued_ms, not_after_ms;
     const char     *chain_pem;
     void          (*store_cert)(void *ctx, const oc_cert_issued *c);
+    /* What needs a person (REQ-263): `key` raised with `message`, or cleared
+     * (NULL) once it has stopped -- OC_CERTS_ALERT_*. */
+    void          (*alert)(void *ctx, const char *key, const char *message);
     void           *ctx;
     /* Tests: the first wait after a failure (0 = a minute) and the last (0 = a
      * day), the poll interval handed to ACME (0 = its default), how often a due
      * renewal is looked for (0 = hourly), and how often ARI is asked (0 = as its
      * Retry-After says, within an hour to twelve). */
     int             retry_ms, retry_max_ms, poll_ms, check_ms, ari_check_ms;
+    /* Tests: how close to expiry a certificate not yet renewed is raised (0 =
+     * seven days). */
+    int64_t         expiry_warn_ms;
 } oc_certs_opts;
+
+/* The worker's alerts: a certificate not obtained or renewed (cleared by the next
+ * one obtained); the CA asking for one to be replaced now, which is how a
+ * revocation reaches the daemon (cleared by its replacement); and one within a
+ * week of expiry and still not renewed (cleared likewise). */
+#define OC_CERTS_ALERT_OBTAIN   "tls.obtain"
+#define OC_CERTS_ALERT_REPLACE  "tls.replace"
+#define OC_CERTS_ALERT_EXPIRING "tls.expiring"
 
 typedef struct oc_certs oc_certs;
 

@@ -834,6 +834,21 @@ void oc_client_list_settings(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_srvalerts_list(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SRVALERTS_LIST);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_srvalert_ack(oc_client *c, uint64_t id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SRVALERT_ACK);
+    if (!cmd) return;
+    cmd->message_id = id;
+    oc_queue_push(&c->cmds, cmd);
+    oc_client_srvalerts_list(c);
+}
+
 void oc_client_storage_status(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_STORAGE_STATUS);

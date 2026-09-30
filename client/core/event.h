@@ -42,6 +42,15 @@ typedef struct {
     uint8_t  outcome;   /* 1 ok, 0 denied/failed */
 } oc_audit_view;
 
+/* One of the daemon's critical failures as an owner or admin sees it (REQ-263). */
+typedef struct {
+    uint64_t id, first_ms, last_ms;
+    uint32_t count;
+    uint8_t  current, acked;
+    char     key[OC_MAX_ALERT_KEY + 1];
+    char     message[OC_MAX_ALERT_MESSAGE + 1];
+} oc_srvalert_view;
+
 /* A call as the model holds it (REQ-150, REQ-301-305): what CALL_STATE says of a
  * call in the Calls section, or -- on CALL_JOINED / CALL_ROSTER -- of the call
  * this client is in, with each participant's slot. Heap-owned by the event and
@@ -141,6 +150,9 @@ enum {
     OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
     OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
     OC_EV_AUDIT,           /* one audit entry (REQ-251) */
+    OC_EV_SRVALERTS,       /* an ALERTS_SUMMARY (REQ-263): count = unacknowledged, srvalert_current */
+    OC_EV_SRVALERT_BEGIN,  /* an ALERTS answer starts: clears the model's list */
+    OC_EV_SRVALERT,        /* one entry of it: `srvalert` */
     OC_EV_PIN,             /* a PIN_UPDATED: channel/message + user_id=pinner, op=add/remove,
                               server_time=when it was pinned (REQ-230) */
     OC_EV_PINNED_MSG,      /* one entry of a pins list: message/author/body + pinner in user_id */
@@ -258,6 +270,8 @@ typedef struct {
     uint8_t  is_public;    /* CHANNEL: 1 public, 0 private/DM */
     oc_storage_view storage;  /* OC_EV_STORAGE */
     oc_audit_view   audit;    /* OC_EV_AUDIT */
+    oc_srvalert_view *srvalert; /* heap; OC_EV_SRVALERT */
+    uint32_t        srvalert_current; /* OC_EV_SRVALERTS: how many still hold */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
     uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
@@ -398,6 +412,8 @@ enum {
     OC_CMD_MARK_ALL_READ,   /* MARK_ALL_READ: every membership, in one frame; no fields */
     OC_CMD_GET_CHANNEL_DESCRIPTION, /* ask for `channel_id`'s description (REQ-034) */
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
+    OC_CMD_SRVALERTS_LIST,  /* ask for the daemon's critical failures (owner/admin) */
+    OC_CMD_SRVALERT_ACK,    /* acknowledge one: message_id = its id, 0 = every one */
     OC_CMD_AUDIT_QUERY,     /* page the audit log (owner/admin): message_id = before_ms */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* invite: op = role, body = the address it is bound to (NULL = a token) */

@@ -759,7 +759,7 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
        ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
-       ACT_STORAGE, ACT_AUDIT, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT };
+       ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
 static int      g_nmenu;
@@ -818,6 +818,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
+    { "Admin",   "Daemon alerts",       NULL, NULL, ACT_ALERTS },
     { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
     { "Session", "Help",                NULL, "?",  ACT_HELP },
     { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
@@ -946,6 +947,18 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (other)        snprintf(u, sizeof u, "%d elsewhere ", other);
     else                   u[0] = '\0';
     if (u[0]) tk_text(W - (int)strlen(u) - 1, 0, W, u, th->accent2 | TB_BOLD, th->header_bg);
+    /* The daemon's critical failures, to an owner or admin only (REQ-263): a
+     * warning sign and how many nobody has acknowledged -- red -- or, all
+     * acknowledged, how many still hold -- yellow. Left of the unread count. */
+    if (m->srvalerts_have && (m->srvalerts_unacked || m->srvalerts_current)) {
+        char a[48];
+        if (m->srvalerts_unacked) snprintf(a, sizeof a, "\xe2\x9a\xa0 %u alert%s ", m->srvalerts_unacked,
+                                           m->srvalerts_unacked == 1 ? "" : "s");
+        else snprintf(a, sizeof a, "\xe2\x9a\xa0 %u ongoing ", m->srvalerts_current);
+        int aw = tk_str_width(a);
+        int at = W - (u[0] ? (int)strlen(u) + 1 : 0) - aw - 1;
+        if (at > 0) tk_text(at, 0, W, a, (m->srvalerts_unacked ? TB_RED : TB_YELLOW) | TB_BOLD, th->header_bg);
+    }
 
     /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
     int panels_top = 1, panels_h = H - 4;
@@ -1250,6 +1263,44 @@ static void draw_audit(const oc_model *m, int W, int H) {
                 a->outcome ? th->fg : (TB_RED | TB_BOLD), th->bg);
     }
     tb_present();
+}
+
+/* The daemon's critical failures (REQ-263): newest first, those still holding
+ * marked, the unacknowledged in red. Up/down selects; a acknowledges the one
+ * selected, A every one; Esc closes. */
+static void draw_alerts(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    const char *title = "Daemon alerts  ·  a acknowledge · A all · Esc closes";
+    if (!m->n_srvalerts) {
+        const char *e = m->srvalerts_have ? "Nothing has failed." : "Nothing to show, or you are not an admin.";
+        tk_rect r = modal_frame(W, H, tk_str_width(title), 1, title);
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
+        return;
+    }
+    int want = (int)m->n_srvalerts * 2 + 1;
+    tk_rect r = modal_frame(W, H, W, want > 22 ? 22 : want, title);
+    char hdr[160];
+    snprintf(hdr, sizeof hdr, "  %-12s %-9s %-6s %s", "last", "state", "times", "what");
+    tk_text(r.x, r.y, r.x + r.w, hdr, th->accent2 | TB_BOLD, th->bg);
+    int per = 2, shown = (r.h - 1) / per;
+    int first = sel >= shown ? sel - shown + 1 : 0;
+    for (int i = 0; i < shown && (size_t)(first + i) < m->n_srvalerts; i++) {
+        const oc_srvalert_view *a = &m->srvalerts[first + i];
+        char when[32];
+        time_t t = (time_t)(a->last_ms / 1000);
+        struct tm tmv;
+        oc_localtime_r(&t, &tmv);
+        strftime(when, sizeof when, g_cfg && g_cfg->time_24h ? "%m-%d %H:%M" : "%m-%d %I:%M%p", &tmv);
+        char line[256];
+        snprintf(line, sizeof line, "%s %-12s %-9s %-6u %s%s", first + i == sel ? "\xe2\x96\xb8" : " ", when,
+                 a->current ? "ongoing" : "stopped", a->count, a->key, a->acked ? "" : "  · not acknowledged");
+        uintattr_t fg = !a->acked ? (TB_RED | TB_BOLD) : a->current ? (TB_YELLOW | TB_BOLD) : th->fg;
+        int y = r.y + 1 + i * per;
+        tk_text(r.x, y, r.x + r.w, line, fg, th->bg);
+        char msg[OC_MAX_ALERT_MESSAGE + 8];
+        snprintf(msg, sizeof msg, "    %s", a->message);
+        tk_text(r.x, y + 1, r.x + r.w, msg, a->acked ? th->muted : th->fg, th->bg);
+    }
 }
 
 /* ---- workspace switcher (REQ-013) -------------------------------------------
@@ -2097,6 +2148,7 @@ int main(int argc, char **argv) {
     int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
+    int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int ac_idx = 0;                           /* autocomplete cycle index */
@@ -2265,6 +2317,7 @@ int main(int argc, char **argv) {
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
+        if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
         tb_present();
 
         struct tb_event ev;
@@ -2274,7 +2327,8 @@ int main(int argc, char **argv) {
         if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
-            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open) {
+            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open &&
+                     !alerts_open) {
                 int Wm = tb_width(); int chw, memw, msgx, msgw;
                 layout(Wm, &chw, &memw, &msgx, &msgw);
                 int prow = ev.y - 2;           /* first panel content row */
@@ -2366,6 +2420,18 @@ int main(int argc, char **argv) {
                 msg_sel = -1; panel = 0; editing = 0;
                 remember_workspace(g_ws[g_active].key, NULL, NULL);   /* bump last-used */
             }
+            continue;
+        }
+        if (alerts_open) {                     /* daemon alerts: select, acknowledge, close */
+            const oc_model *am = oc_client_model(cl);
+            int n = (int)am->n_srvalerts;
+            if (asel >= n) asel = n ? n - 1 : 0;
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.key == TB_KEY_ESC) alerts_open = 0;
+            else if (ev.key == TB_KEY_ARROW_DOWN) { if (asel + 1 < n) asel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)   { if (asel > 0) asel--; }
+            else if (ev.ch == 'a' && asel < n && !am->srvalerts[asel].acked) oc_client_srvalert_ack(cl, am->srvalerts[asel].id);
+            else if (ev.ch == 'A') oc_client_srvalert_ack(cl, 0);
             continue;
         }
         if (audit_open) {                      /* audit overlay: any key closes */
@@ -2482,6 +2548,7 @@ int main(int argc, char **argv) {
                 else if (id == ACT_PROFILE) profile_open = 1;
                 else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                 else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
+                else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                 else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                 else if (id == ACT_HELP)    help_open = 1;
                 else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
@@ -2565,6 +2632,7 @@ int main(int argc, char **argv) {
                     else if (id == ACT_PROFILE) profile_open = 1;
                     else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
                     else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
+                    else if (id == ACT_ALERTS)  { oc_client_srvalerts_list(cl); alerts_open = 1; asel = 0; }
                     else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                     else if (id == ACT_HELP)    help_open = 1;
                     else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
