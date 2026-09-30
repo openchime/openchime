@@ -507,7 +507,7 @@ int oc_acme_issue(const oc_acme_opts *o, oc_cert_issued *out, char *err, size_t 
 
     /* The order, for every name. */
     {
-        size_t cap = strlen(o->names) * 2 + 64;
+        size_t cap = strlen(o->names) * 2 + 64 + (o->replaces ? strlen(o->replaces) + 32 : 0);
         payload = malloc(cap + 64 * MAX_NAMES);
         char *names = strdup(o->names);
         if (!payload || !names) { free(names); fail(err, errcap, "out of memory", NULL); goto out; }
@@ -515,7 +515,10 @@ int oc_acme_issue(const oc_acme_opts *o, oc_cert_issued *out, char *err, size_t 
         int n = 0;
         for (char *t = strtok(names, ", "); t; t = strtok(NULL, ", "))
             sprintf(payload + strlen(payload), "%s{\"type\":\"dns\",\"value\":\"%s\"}", n++ ? "," : "", t);
-        strcat(payload, "]}");
+        strcat(payload, "]");
+        /* A replacement names what it replaces (RFC 9773 §5). */
+        if (o->replaces && *o->replaces) sprintf(payload + strlen(payload), ",\"replaces\":\"%s\"", o->replaces);
+        strcat(payload, "}");
         free(names);
         if (!n) { fail(err, errcap, "no names to certify", NULL); goto out; }
     }
@@ -569,3 +572,92 @@ out:
     free(a);
     return rc;
 }
+
+/* --- renewal information (RFC 9773) ---------------------------------------- */
+
+int oc_acme_cert_id_raw(const uint8_t *aki, size_t aki_len, const uint8_t *serial, size_t serial_len,
+                        char *out, size_t cap) {
+    if (!aki_len || !serial_len || 4 * ((aki_len + 2) / 3) + 1 + 4 * ((serial_len + 2) / 3) + 1 > cap) return -1;
+    size_t o = oc_base64url_encode(aki, aki_len, out);
+    out[o++] = '.';
+    oc_base64url_encode(serial, serial_len, out + o);
+    return 0;
+}
+
+int oc_acme_cert_id(const char *chain_pem, char *out, size_t cap) {
+    mbedtls_x509_crt crt;
+    mbedtls_x509_crt_init(&crt);
+    int rc = -1;
+    if (chain_pem && mbedtls_x509_crt_parse(&crt, (const unsigned char *)chain_pem, strlen(chain_pem) + 1) >= 0 &&
+        crt.version >= 3)
+        rc = oc_acme_cert_id_raw(crt.authority_key_id.keyIdentifier.p, crt.authority_key_id.keyIdentifier.len,
+                                 crt.serial.p, crt.serial.len, out, cap);
+    mbedtls_x509_crt_free(&crt);
+    return rc;
+}
+
+static int digits(const char *s, int n, int *out) {
+    int v = 0;
+    for (int i = 0; i < n; i++) { if (s[i] < '0' || s[i] > '9') return -1; v = v * 10 + (s[i] - '0'); }
+    *out = v;
+    return 0;
+}
+
+int oc_rfc3339_ms(const char *s, uint64_t *out) {
+    int Y, M, D, h, m, sec;
+    if (!s || strlen(s) < 20 || digits(s, 4, &Y) || s[4] != '-' || digits(s + 5, 2, &M) || s[7] != '-' ||
+        digits(s + 8, 2, &D) || (s[10] != 'T' && s[10] != 't') || digits(s + 11, 2, &h) || s[13] != ':' ||
+        digits(s + 14, 2, &m) || s[16] != ':' || digits(s + 17, 2, &sec)) return -1;
+    const char *p = s + 19;
+    int ms = 0;
+    if (*p == '.') {                               /* fractions: the first three digits count */
+        int scale = 100;
+        for (p++; *p >= '0' && *p <= '9'; p++) { ms += (*p - '0') * scale; scale /= 10; }
+    }
+    long off = 0;
+    if (*p == 'Z' || *p == 'z') p++;
+    else if (*p == '+' || *p == '-') {
+        int oh, om;
+        if (digits(p + 1, 2, &oh) || p[3] != ':' || digits(p + 4, 2, &om)) return -1;
+        off = (long)(oh * 60 + om) * 60 * (*p == '-' ? -1 : 1);
+        p += 6;
+    } else return -1;
+    if (*p || M < 1 || M > 12 || D < 1 || D > 31 || h > 23 || m > 59 || sec > 60) return -1;
+    struct tm t;
+    memset(&t, 0, sizeof t);
+    t.tm_year = Y - 1900; t.tm_mon = M - 1; t.tm_mday = D; t.tm_hour = h; t.tm_min = m; t.tm_sec = sec;
+    time_t e = timegm(&t);
+    if (e == (time_t)-1 || (long long)e - off < 0) return -1;
+    *out = (uint64_t)((long long)e - off) * 1000u + (uint64_t)ms;
+    return 0;
+}
+
+int oc_acme_renewal_info(const char *directory, const char *chain_pem, uint64_t *start_ms, uint64_t *end_ms,
+                         uint64_t *retry_after_ms, char *err, size_t errcap) {
+    *start_ms = *end_ms = *retry_after_ms = 0;
+    char id[OC_ACME_CERT_ID_MAX], base[512], url[768];
+    if (oc_acme_cert_id(chain_pem, id, sizeof id) != 0) { fail(err, errcap, "the certificate has no ARI identifier", NULL); return -1; }
+    oc_https_resp r; jdoc d;
+    if (oc_https_request("GET", directory, NULL, NULL, 0, NULL, HTTP_TIMEOUT_MS, &r, err, errcap) != 0) return -1;
+    base[0] = '\0';
+    if (r.status == 200 && jparse(&d, r.body, r.body_len) == 0) { jgetstr(&d, 0, "renewalInfo", base, sizeof base); jfree(&d); }
+    oc_https_resp_free(&r);
+    if (!base[0]) { fail(err, errcap, "the CA offers no renewal information", NULL); return -1; }
+    snprintf(url, sizeof url, "%s%s%s", base, base[strlen(base) - 1] == '/' ? "" : "/", id);
+    if (oc_https_request("GET", url, NULL, NULL, 0, NULL, HTTP_TIMEOUT_MS, &r, err, errcap) != 0) return -1;
+    int rc = -1;
+    char hv[32], st[64] = "", en[64] = "";
+    if (r.status == 200 && jparse(&d, r.body, r.body_len) == 0) {
+        int w = jget(&d, 0, "suggestedWindow");
+        if (w > 0) { jgetstr(&d, w, "start", st, sizeof st); jgetstr(&d, w, "end", en, sizeof en); }
+        jfree(&d);
+        if (oc_rfc3339_ms(st, start_ms) == 0 && oc_rfc3339_ms(en, end_ms) == 0 && *end_ms > *start_ms) rc = 0;
+        else fail(err, errcap, "the CA's renewal information is unreadable", NULL);
+    } else {
+        fail(err, errcap, "the CA gave no renewal information", NULL);
+    }
+    if (oc_https_header(&r, "Retry-After", hv, sizeof hv)) *retry_after_ms = (uint64_t)strtoull(hv, NULL, 10) * 1000u;
+    oc_https_resp_free(&r);
+    return rc;
+}
+

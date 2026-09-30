@@ -670,8 +670,9 @@ requests are machine requests, signed as §8.7 says, to the enrollment origin:
   `202` with `Retry-After` (seconds) while central is still completing the
   challenge; or a `4xx`, which is final until the next boot.
 
-The daemon asks again at two-thirds of the certificate's life, and after a
-failure a minute later, doubling to six hours.
+The daemon asks again at a random moment from 60% to two-thirds of the
+certificate's life, and after a failure a minute later, then ten, a hundred, and
+daily.
 
 ### 8.10 Local accounts in the browser
 

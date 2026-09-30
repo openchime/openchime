@@ -1246,7 +1246,8 @@ certificate worker, through the writer.
 The CA-issued certificate the daemon presents, with where it came from, the
 names it covers and when it runs out. At boot it is presented at once if it is
 from the source configured, for the names configured, and not expired; the
-worker renews it at two-thirds of its life. Both tables hold a private key, like
+worker renews it within the CA's renewal window, or its own from 60% to
+two-thirds of its life. Both tables hold a private key, like
 `server_identity`.
 
 ---

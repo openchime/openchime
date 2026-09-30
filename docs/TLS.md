@@ -174,9 +174,18 @@ the handshake (`daemon/ioloop.c`). A challenge certificate is parsed with an
 extension callback that admits exactly the acmeIdentifier extension; any other
 unknown critical extension is still refused (RFC 5280).
 
-**Renewal and the swap.** The worker renews at two-thirds of a certificate's
-life, looking hourly, and retries a failure after a minute, doubling to six
-hours. A new certificate is swapped in whole (`oc_tls_server_use`): each
+**Renewal and the swap.** The worker renews each certificate at a random moment
+in a window, drawn once for that certificate so daemons issued together renew
+apart: the CA's, where it offers **ACME Renewal Information** (RFC 9773) —
+asked with the certificate's identifier (its authority key identifier and serial)
+at the interval the CA's `Retry-After` names, within an hour and twelve — and
+otherwise its own, from 60% to two-thirds of the life, which leaves the third
+the CA asks for. A window the CA has already opened is renewed at once: that is
+how an incident or a revocation reaches the daemon. A replacement order names
+the certificate it replaces (`replaces`, §5). A failure is retried after a
+minute, ten, a hundred, then daily, as Let's Encrypt's integration guide asks.
+Through central, where there is no ARI, the daemon's own window applies. A new
+certificate is swapped in whole (`oc_tls_server_use`): each
 handshake takes a reference to the certificate it presents
 (`mbedtls_ssl_set_hs_own_cert`), so handshakes under way and connections already
 up keep theirs, and a retired certificate is freed with the last connection
@@ -216,7 +225,12 @@ against a fake CA that checks every JWS and nonce and validates as a CA does —
 with an independent TLS client (OpenSSL's), since mbedTLS's own refuses the
 challenge certificate's extension before anything can look at it — plus the
 listener's choice of certificate, renewal with a connection kept through the
-swap, and certificates through a fake central. `test_client_core` covers the
+swap, and certificates through a fake central. Its fake CA also answers ACME
+Renewal Information: a window already open renews at once, the replacement
+naming the certificate it replaces by the identifier RFC 9773's own example
+fixes; a window set later holds a renewal the daemon's own would have made; and a
+CA failing every order is asked again after the base wait, ten times it, then at
+the ceiling. The window picks and the retry ladder are checked as values. `test_client_core` covers the
 client's judgement at this machine's LAN address, where loopback's exemption does
 not apply. It also resumes a session with the
 ticket the first connection was given, and checks that a restarted server —
