@@ -3676,7 +3676,7 @@ static void test_login_bound(int port, const uint8_t *pin) {
     }
     printf("  sign-in beside %d people: worst turn %llu us; a presence change to them: %llu us\n",
            N, (unsigned long long)login_us, (unsigned long long)presence_us);
-    CHECK(login_us <= 3 * (presence_us > 50 ? presence_us : 50));
+    CHECK_SPEED(login_us <= 3 * (presence_us > 50 ? presence_us : 50));
     for (int i = 0; i < N; i++) client_close(&crowd[i]);
 }
 

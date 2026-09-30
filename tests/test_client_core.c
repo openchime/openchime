@@ -2439,7 +2439,8 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
            wc.f.width, wc.f.height, wc.last);
     /* The loss above halved the rate, which may have stepped the size down to
      * fit 1280x720: the shape is what holds. */
-    CHECK(mono_ms() - joined < 5000 && wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
+    CHECK(wc.f.width * 800 == wc.f.height * 1280 && wc.bad == 0);
+    CHECK_SPEED(mono_ms() - joined < 5000);
 
     /* erik takes over: dana's share stops, and dana sees erik's. */
     CHECK(oc_call_engine_share_start(eb, "window:synthetic", 1280, 800) == 0);

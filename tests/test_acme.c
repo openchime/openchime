@@ -105,9 +105,15 @@ static int ca_init(void) {
     return rc;
 }
 
+/* How far back what the CA issues is dated: a minute, as a CA allows for clocks;
+ * none where a test counts the worker's renewals, which fall at two thirds of a
+ * certificate's whole validity -- so a minute's backdate on a life of seconds
+ * would make every certificate due the moment it arrived. */
+static int g_ca_backdate_s = 60;
+
 /* A leaf for `subject_key`, naming `names` (comma-separated), valid for
- * `life_s` from a minute ago, signed by the test root. The chain (leaf then
- * root) into `out`. */
+ * `life_s` from g_ca_backdate_s ago, signed by the test root. The chain (leaf
+ * then root) into `out`. */
 static int ca_issue(mbedtls_pk_context *subject_key, const char *names, int life_s, char *out, size_t cap) {
     mbedtls_x509write_cert w; mbedtls_x509write_crt_init(&w);
     char store[512]; snprintf(store, sizeof store, "%s", names);
@@ -123,7 +129,7 @@ static int ca_issue(mbedtls_pk_context *subject_key, const char *names, int life
     }
     char subj[300]; snprintf(subj, sizeof subj, "CN=%s", first);
     static unsigned char serial = 10; serial++;
-    time_t a = time(NULL) - 60, b = time(NULL) + life_s;
+    time_t a = time(NULL) - g_ca_backdate_s, b = time(NULL) + life_s;
     struct tm ta, tb; gmtime_r(&a, &ta); gmtime_r(&b, &tb);
     char nb[16], na[16]; strftime(nb, sizeof nb, "%Y%m%d%H%M%S", &ta); strftime(na, sizeof na, "%Y%m%d%H%M%S", &tb);
     mbedtls_x509write_crt_set_subject_key(&w, subject_key); mbedtls_x509write_crt_set_issuer_key(&w, &g_ca.key);
@@ -675,7 +681,8 @@ static void keep_cert(void *ctx, const oc_cert_issued *c) {
 
 static void test_worker(void) {
     char dir[128]; snprintf(dir, sizeof dir, "http://127.0.0.1:%d/dir", g_fake.port);
-    g_fake.life_s = 4;                                             /* renewed at ~2.7 s */
+    g_fake.life_s = 3;                                             /* renewed every ~2 s */
+    g_ca_backdate_s = 0;
     oc_certs_opts o; memset(&o, 0, sizeof o);
     o.source = OC_CERTS_ACME; o.tls = &g_srv; o.directory = dir; o.names = NAME;
     o.account_key_pem = g_kept_key; o.account_url = g_kept_url;
@@ -687,15 +694,22 @@ static void test_worker(void) {
     int got = 0;
     for (int i = 0; i < 100 && !got; i++) { oc_certs_status(w, &got, NULL, NULL, 0); if (!got) msleep(50); }
     CHECK(got >= 1 && g_cert_stores >= 1);
-    unsigned char before[32];
-    CHECK(oc_tls_server_fingerprint(&g_srv, before) == 0);
-    /* A connection up before the renewal. */
+    /* A connection up before a renewal, and the certificate it was given. The
+     * worker swaps a certificate in and only then counts it, so the count read
+     * after the handshake may lag a swap already made: two more are waited for,
+     * the second of which was begun only after the count was read -- and so
+     * swapped in after this connection was made. */
     int fd = connect_loopback(g_srv_port);
     oc_tls_client cli; oc_tls_conn c;
     CHECK(fd >= 0 && oc_tls_client_init_ca(&cli) == 0);
     CHECK(oc_tls_conn_init(&c, &cli.conf, fd) == 0 && oc_tls_conn_set_hostname(&c, NAME) == 0 && handshake(&c) == 0);
-    for (int i = 0; i < 100 && got < 2; i++) { oc_certs_status(w, &got, NULL, NULL, 0); if (got < 2) msleep(50); }
-    CHECK(got >= 2);                                               /* renewed */
+    unsigned char before[32];
+    CHECK(oc_tls_peer_fingerprint(&c, before) == 0);
+    int base = 0;
+    oc_certs_status(w, &base, NULL, NULL, 0);
+    got = base;
+    for (int i = 0; i < 600 && got < base + 2; i++) { oc_certs_status(w, &got, NULL, NULL, 0); if (got < base + 2) msleep(50); }
+    CHECK(got >= base + 2);                                        /* renewed since the connection */
     unsigned char after[32];
     CHECK(oc_tls_server_fingerprint(&g_srv, after) == 0 && memcmp(before, after, 32) != 0);
     size_t n = 0; char echo[8] = "";
@@ -709,6 +723,7 @@ static void test_worker(void) {
     CHECK(probe(NULL, NAME, 1, NULL, NULL) == 0);                  /* and a new one gets the new certificate */
     oc_tls_conn_free(&c); oc_tls_client_free(&cli); close(fd);
     oc_certs_stop(w);
+    g_ca_backdate_s = 60;
 }
 
 static void test_central(void) {
