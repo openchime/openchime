@@ -1565,6 +1565,28 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 slice_to_buf(ents[i].detail,     e->audit.detail,     sizeof e->audit.detail);
                 oc_queue_push(ctx->to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_ALERTS_SUMMARY) {
+            oc_alerts_summary sm;
+            if (oc_decode_alerts_summary(&p, &sm) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_SRVALERTS);
+            if (e) { e->count = sm.unacked; e->srvalert_current = sm.current; oc_queue_push(ctx->to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_ALERTS) {
+            static oc_alert rows[OC_MAX_ALERTS];
+            oc_alerts al;
+            if (oc_decode_alerts(&p, &al, rows, OC_MAX_ALERTS) != OC_OK) return -1;
+            oc_ev *b = oc_ev_new(OC_EV_SRVALERT_BEGIN);
+            if (b) oc_queue_push(ctx->to_ui, b);
+            for (uint16_t i = 0; i < al.count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SRVALERT);
+                if (!e) break;
+                if (!(e->srvalert = calloc(1, sizeof *e->srvalert))) { oc_ev_free(e); break; }
+                oc_srvalert_view *v = e->srvalert;
+                v->id = rows[i].id; v->first_ms = rows[i].first_ms; v->last_ms = rows[i].last_ms;
+                v->count = rows[i].count; v->current = rows[i].current; v->acked = rows[i].acked;
+                slice_to_buf(rows[i].key, v->key, sizeof v->key);
+                slice_to_buf(rows[i].message, v->message, sizeof v->message);
+                oc_queue_push(ctx->to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_STORAGE_STATUS) {
             oc_storage_status ss;
             if (oc_decode_storage_status(&p, &ss) != OC_OK) return -1;
@@ -3061,6 +3083,17 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_audit_query aq = { c->message_id, 50 };   /* message_id = before_ms */
                 if (oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &aq) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SRVALERTS_LIST) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_alerts_list(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SRVALERT_ACK) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_alert_ack ak = { c->message_id };
+                if (oc_encode_alert_ack(&w, OC_PROTOCOL_VERSION, &ak) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_STORAGE_STATUS) {

@@ -6711,6 +6711,145 @@ static void test_auth_pool(void) {
     cleanup_db(path);
 }
 
+/* The daemon's critical failures (REQ-263): one entry per failure while it
+ * holds, counted and in its latest words; cleared when it stops, and new if it
+ * comes back; listed and acknowledged by owners and admins only, whose sign-in
+ * carries the counts and who are each told of a change; bounded. */
+static int has_uid(const oc_dbres *r, uint64_t uid) {
+    for (size_t i = 0; r && i < r->n_members; i++) if (r->members[i] == uid) return 1;
+    return 0;
+}
+static oc_dbres *alerts_job(oc_dbwriter *w, int type, uint64_t conn, uint64_t user, uint64_t id) {
+    oc_job *j = oc_job_new(type, conn);
+    j->user_id = user; j->alert_id = id;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void test_alerts(void) {
+    const char *path = "build/test_dbwriter_alerts.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "olga", "pw-olga", OC_ROLE_OWNER);
+    uint64_t admin = reg(w, "adam", "pw-adam", OC_ROLE_ADMIN);
+    uint64_t member = reg(w, "mo", "pw-mo", OC_ROLE_MEMBER);
+
+    oc_dbwriter_alert(w, "tls.obtain", "the CA refused the order");
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ALERTS_SUMMARY && r->alerts_unacked == 1 && r->alerts_current == 1);
+    CHECK(has_uid(r, owner) && has_uid(r, admin) && !has_uid(r, member));   /* told: owners and admins */
+    oc_dbres_free(r);
+    oc_dbwriter_alert(w, "tls.obtain", "the CA is unreachable");
+    r = wait_result(w);
+    CHECK(r && r->alerts_unacked == 1 && r->alerts_current == 1);           /* the same entry, again */
+    oc_dbres_free(r);
+
+    r = alerts_job(w, OC_JOB_ALERTS_LIST, 5, owner, 0);
+    CHECK(r && r->type == OC_RES_ALERTS && r->n_alert_rows == 1);
+    if (r && r->n_alert_rows == 1) {
+        CHECK(r->alert_rows[0].count == 2 && r->alert_rows[0].current && !r->alert_rows[0].acked);
+        CHECK(!strcmp(r->alert_rows[0].key, "tls.obtain") && !strcmp(r->alert_rows[0].message, "the CA is unreachable"));
+        CHECK(r->alert_rows[0].last_ms >= r->alert_rows[0].first_ms);
+    }
+    uint64_t first = r && r->n_alert_rows ? r->alert_rows[0].id : 0;
+    oc_dbres_free(r);
+
+    /* A member neither reads nor acknowledges them. */
+    r = alerts_job(w, OC_JOB_ALERTS_LIST, 6, member, 0);
+    CHECK(r && r->type == OC_RES_ALERTS_ERR && r->err_code == OC_ERR_FORBIDDEN && r->conn_id == 6);
+    oc_dbres_free(r);
+    r = alerts_job(w, OC_JOB_ALERT_ACK, 6, member, 0);
+    CHECK(r && r->type == OC_RES_ALERTS_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Sign-in: an owner's carries the counts; a member's nothing. */
+    uint8_t role = 0;
+    oc_job *aj;
+    {
+        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        oc_encode_local_credential(&cw, oc_slice_str("olga"), oc_slice_str("pw-olga"));
+        aj = oc_job_new(OC_JOB_AUTH, 7); aj->method = OC_AUTH_LOCAL; oc_job_set_token(aj, cbuf, cw.len);
+        oc_dbwriter_submit(w, aj);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_OK && r->alerts_admin && r->alerts_unacked == 1 && r->alerts_current == 1);
+        oc_dbres_free(r);
+    }
+    CHECK(auth_local(w, 8, "mo", "pw-mo", NULL, &role) == member);
+    {
+        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        oc_encode_local_credential(&cw, oc_slice_str("mo"), oc_slice_str("pw-mo"));
+        aj = oc_job_new(OC_JOB_AUTH, 9); aj->method = OC_AUTH_LOCAL; oc_job_set_token(aj, cbuf, cw.len);
+        oc_dbwriter_submit(w, aj);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_OK && !r->alerts_admin && r->alerts_unacked == 0);
+        oc_dbres_free(r);
+    }
+
+    /* Acknowledged by the admin: nobody is asked again; still holding. */
+    r = alerts_job(w, OC_JOB_ALERT_ACK, 10, admin, first);
+    CHECK(r && r->type == OC_RES_ALERTS_SUMMARY && r->alerts_unacked == 0 && r->alerts_current == 1 && has_uid(r, owner));
+    oc_dbres_free(r);
+    oc_dbwriter_alert(w, "tls.obtain", "still unreachable");        /* known: stays acknowledged */
+    r = wait_result(w);
+    CHECK(r && r->alerts_unacked == 0 && r->alerts_current == 1);
+    oc_dbres_free(r);
+
+    /* Stopped: cleared once; a clear of nothing says nothing -- the next result
+     * is the list asked for after it. */
+    oc_dbwriter_alert_clear(w, "tls.obtain");
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ALERTS_SUMMARY && r->alerts_unacked == 0 && r->alerts_current == 0);
+    oc_dbres_free(r);
+    oc_dbwriter_alert_clear(w, "tls.obtain");
+    r = alerts_job(w, OC_JOB_ALERTS_LIST, 11, owner, 0);
+    CHECK(r && r->type == OC_RES_ALERTS && r->n_alert_rows == 1 && !r->alert_rows[0].current && r->alert_rows[0].acked);
+    oc_dbres_free(r);
+
+    /* Back again: a new entry, unacknowledged; "every one" acknowledges it. */
+    oc_dbwriter_alert(w, "tls.obtain", "the CA refused the order");
+    r = wait_result(w);
+    CHECK(r && r->alerts_unacked == 1 && r->alerts_current == 1);
+    oc_dbres_free(r);
+    r = alerts_job(w, OC_JOB_ALERT_ACK, 12, owner, 0);
+    CHECK(r && r->alerts_unacked == 0);
+    oc_dbres_free(r);
+
+    /* Bounded: many past failures, and the newest are kept, the current one with them. */
+    for (int i = 0; i < 130; i++) {
+        char key[32]; snprintf(key, sizeof key, "test.%d", i);
+        oc_dbwriter_alert(w, key, "x");
+        oc_dbres_free(wait_result(w));
+        oc_dbwriter_alert_clear(w, key);
+        oc_dbres_free(wait_result(w));
+    }
+    oc_dbwriter_alert(w, "test.last", "x");
+    oc_dbres_free(wait_result(w));
+    r = alerts_job(w, OC_JOB_ALERTS_LIST, 13, owner, 0);
+    CHECK(r && r->n_alert_rows <= OC_MAX_ALERTS && r->n_alert_rows >= 90);
+    int cur = 0, last_first = 0;
+    for (size_t i = 0; r && i < r->n_alert_rows; i++) {
+        if (r->alert_rows[i].current) cur++;
+        if (i == 0) last_first = !strcmp(r->alert_rows[i].key, "test.last");
+    }
+    CHECK(cur == 2 && last_first);                                      /* tls.obtain and test.last hold */
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw, "SELECT (SELECT COUNT(*) FROM alerts),"
+                            " (SELECT COUNT(*) FROM audit_log WHERE action='alert.ack'),"
+                            " (SELECT COUNT(*) FROM alerts WHERE key='tls.obtain' AND acked_by IS NOT NULL);", -1, &st, NULL);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    /* Kept to the bound; both acknowledgements audited; the entry that still
+     * holds acknowledged -- the first, long stopped, went with the bound. */
+    CHECK(sqlite3_column_int(st, 0) <= 100 && sqlite3_column_int(st, 1) == 2 && sqlite3_column_int(st, 2) == 1);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
@@ -6725,6 +6864,7 @@ int run_dbwriter_tests(void) {
     test_oidc_auth();
     test_oidc_join_rules();
     test_oidc_link();
+    test_alerts();
     test_oidc_limits_and_audit();
     test_auth_rate_limit();
     test_source_rate_limit();

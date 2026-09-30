@@ -1922,6 +1922,10 @@ static char     g_confirm_ok[32];
 static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
 
 static struct { rectf r; uint64_t id; } g_invrows[64];   /* Revoke buttons */
+/* Admin > Alerts (REQ-263): each unacknowledged entry's Acknowledge, and the
+ * one that acknowledges them all (id 0). */
+static struct { rectf r; uint64_t id; char key[OC_MAX_ALERT_KEY + 1]; } g_alertrows[OC_MAX_ALERTS + 1];
+static int g_n_alertrows;
 static int g_n_invrows;
 /* Admin > Groups (REQ-307): the group whose members are open (0 = the list),
  * and the buttons drawn this frame. */
@@ -3788,6 +3792,17 @@ static void rail_item(gfx *rt, float y, int icon, const char *label, int act) {
     rail_hit(y, y + RAIL_IH, act);
 }
 
+/* The warning sign on the Admin rail item (REQ-263): red while any of the
+ * daemon's failures is unacknowledged, amber while one acknowledged still holds;
+ * a glyph, not a number, so it is not read as unread messages. */
+static void draw_alert_badge(gfx *rt, const oc_model *m, float y) {
+    if (!m || !m->srvalerts_have || !(m->srvalerts_unacked || m->srvalerts_current)) return;
+    float cx = RAIL_W / 2;
+    rectf b = rf(cx + 6, y + 2, cx + 24, y + 20);
+    fill_round(rt, b, OC_R_PILL, m->srvalerts_unacked ? OC_COL_DANGER : OC_COL_AWAY);
+    draw_lucide(rt, OC_ICON_ALERT, rf(b.left + 3, b.top + 3, b.right - 3, b.bottom - 3), 0xFFFFFF);
+}
+
 /* The main nav items (the user's list). "More" is synthesized only on overflow. */
 static const struct { int act; int icon; const char *label; int admin; } RAIL_ITEMS[] = {
     { VIEW_HOME,     OC_ICON_HOME,     "Home",     0 },
@@ -3965,6 +3980,7 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     g_n_more = 0;
     for (int k = 0; k < shown; k++) {
         rail_item(rt, y, RAIL_ITEMS[vis[k]].icon, RAIL_ITEMS[vis[k]].label, RAIL_ITEMS[vis[k]].act);
+        if (RAIL_ITEMS[vis[k]].act == VIEW_ADMIN) draw_alert_badge(rt, m, y);
         y += RAIL_IH;
     }
     if (overflow) {
@@ -3976,6 +3992,9 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
         }
         g_more_y = y;
         rail_item(rt, y, OC_ICON_ELLIPSIS, "More", NAV_MORE);
+        /* Admin folded away takes its alert sign with it: onto More, not nowhere. */
+        for (int k = shown; k < nv; k++)
+            if (RAIL_ITEMS[vis[k]].act == VIEW_ADMIN) draw_alert_badge(rt, m, y);
         y += RAIL_IH;
     } else {
         g_more_open = 0;   /* nothing folded — no flyout */
@@ -6159,7 +6178,7 @@ static void ovl_end(gfx *rt, rectf body) {
     gfx_clip_pop(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS, OVL_WSMGR, OVL_GROUPS, OVL_ALERTS };
 
 /* Measured from the previous frame's draw, for the same reason the notifications
  * card's is: computing it means restating every row's height a second time. */
@@ -13627,7 +13646,9 @@ static int shell_visible(void) {
  * promised they were. */
 /* adds Invites: the `invites` table has always held role and expiry, and
  * nothing could see them, so a minted invite was write-only. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_COUNT };
+/* adds Alerts: the daemon's critical failures (REQ-263), last so the tabs
+ * before it keep their places. */
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_GROUPS, ADM_ALERTS, ADM_COUNT };
 static int g_adm_tab;
 static rectf g_adm_tabs[ADM_COUNT];
 
@@ -13640,6 +13661,7 @@ static void admin_select(int t) {
     if (t == ADM_STORAGE)      { oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); }
     else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
     else if (t == ADM_GROUPS)  { g_grp_sel = 0; oc_client_list_groups(g_client); }
+    else if (t == ADM_ALERTS)   oc_client_srvalerts_list(g_client);
     else                       { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
 }
 
@@ -13705,6 +13727,81 @@ static void draw_invites(gfx *rt, const oc_model *m, rectf body) {
             g_invrows[g_n_invrows].r = b;
             g_invrows[g_n_invrows].id = iv->invite_id;
             g_n_invrows++;
+        }
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    ovl_end(rt, body);
+}
+
+/* Which tab entering Admin opens: Alerts while any is unacknowledged -- the badge
+ * that brought the person here is about them -- else the tab last shown. */
+static int admin_entry_tab(const oc_model *m) {
+    return m && m->srvalerts_have && m->srvalerts_unacked ? ADM_ALERTS : g_adm_tab;
+}
+
+/* Admin > Alerts (REQ-263): the daemon's critical failures, newest first -- what
+ * failed, whether it still holds, how often and when, in the daemon's words --
+ * each unacknowledged one with its Acknowledge, and Acknowledge all above. */
+static void draw_alerts_admin(gfx *rt, const oc_model *m, rectf body) {
+    g_n_alertrows = 0;
+    if (!m->n_srvalerts) {
+        overlay_empty(rt, body, "Nothing has failed that needs a person.");
+        return;
+    }
+    char line[160];
+    if (m->srvalerts_unacked)
+        snprintf(line, sizeof line, "%u not acknowledged  \u00B7  %u still failing", m->srvalerts_unacked,
+                 m->srvalerts_current);
+    else
+        snprintf(line, sizeof line, "All acknowledged  \u00B7  %u still failing", m->srvalerts_current);
+    draw_text(rt, line, g_meta, rf(body.left + 20, body.top + 8, body.right - 170, body.top + 28), OC_COL_FAINT);
+    if (m->srvalerts_unacked) {
+        rectf all = rf(body.right - 156, body.top + 4, body.right - 20, body.top + 30);
+        int hot = in_rect(all, g_mouse_x, g_mouse_y);
+        fill_round(rt, all, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, all, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Acknowledge all", g_meta, all, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+        g_alertrows[g_n_alertrows].r = all; g_alertrows[g_n_alertrows].id = 0;
+        snprintf(g_alertrows[g_n_alertrows].key, sizeof g_alertrows[0].key, "all");
+        g_n_alertrows++;
+    }
+    body.top += 36;
+    ovl_use(OVL_ALERTS);
+    float rowh = UIS(76);
+    float y = ovl_begin(rt, body, (float)m->n_srvalerts * rowh + 8);
+    uint64_t now = (uint64_t)time(NULL) * 1000u;      /* wall clock: the times are epoch-ms */
+    for (size_t i = 0; i < m->n_srvalerts; i++) {
+        const oc_srvalert_view *a = &m->srvalerts[i];
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        uint32_t col = !a->acked ? OC_COL_DANGER : a->current ? OC_COL_AWAY : OC_COL_FAINT;
+        draw_lucide(rt, OC_ICON_ALERT, rf(body.left + 20, y + 6, body.left + 38, y + 24), col);
+        char ago[48];
+        uint64_t d = now > a->last_ms ? (now - a->last_ms) / 1000 : 0;
+        if (d >= 86400)     snprintf(ago, sizeof ago, "%llud ago", (unsigned long long)(d / 86400));
+        else if (d >= 3600) snprintf(ago, sizeof ago, "%lluh ago", (unsigned long long)(d / 3600));
+        else if (d >= 60)   snprintf(ago, sizeof ago, "%llum ago", (unsigned long long)(d / 60));
+        else                snprintf(ago, sizeof ago, "just now");
+        char head[200];
+        snprintf(head, sizeof head, "%s  \u00B7  %s  \u00B7  %u time%s, last %s%s", a->key,
+                 a->current ? "still failing" : "stopped", a->count, a->count == 1 ? "" : "s", ago,
+                 a->acked ? "" : "  \u00B7  not acknowledged");
+        draw_text(rt, head, g_ui, rf(body.left + 46, y + 4, body.right - 150, y + 24), OC_COL_TEXT);
+        draw_text(rt, a->message, g_meta_w, rf(body.left + 46, y + 26, body.right - 150, y + rowh - 6), OC_COL_MUTED);
+        if (!a->acked && g_n_alertrows < (int)(sizeof g_alertrows / sizeof g_alertrows[0])) {
+            rectf b = rf(body.right - 136, y + 8, body.right - 20, y + 34);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Acknowledge", g_meta, b, OC_COL_TEXT);
+            g_meta->align = ST_ALIGN_LEFT;
+            g_alertrows[g_n_alertrows].r = b; g_alertrows[g_n_alertrows].id = a->id;
+            snprintf(g_alertrows[g_n_alertrows].key, sizeof g_alertrows[0].key, "%s", a->key);
+            g_n_alertrows++;
         }
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
         y += rowh;
@@ -13885,6 +13982,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
         { "Audit log", OC_ICON_SETTINGS },
         { "Invites",   OC_ICON_USER },
         { "Groups",    OC_ICON_USER },
+        { "Alerts",    OC_ICON_ALERT },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     for (int i = 0; i < ADM_COUNT; i++) {
@@ -13907,6 +14005,7 @@ static void draw_admin(gfx *rt, const oc_model *m, rectf reg) {
     if (g_adm_tab == ADM_STORAGE)     draw_storage(rt, m, body, 1);
     else if (g_adm_tab == ADM_INVITES) draw_invites(rt, m, body);
     else if (g_adm_tab == ADM_GROUPS)  draw_groups(rt, m, body);
+    else if (g_adm_tab == ADM_ALERTS)  draw_alerts_admin(rt, m, body);
     else                              draw_audit(rt, m, body, 1);
 }
 
@@ -18605,7 +18704,9 @@ enum {
     AT_FCHAN,         /* payload: channel id, or 0 for "All files" */
     AT_FILEROW,       /* payload: file id — open it */
     AT_VOICE,         /* payload: 0 = the microphone (talk / stop), 1 = free talk on/off */
-    AT_FTRAY          /* payload: upload-tray chip index — remove it, or cancel its post */
+    AT_FTRAY,         /* payload: upload-tray chip index — remove it, or cancel its post */
+    AT_ADMTAB,        /* payload: Admin tab index */
+    AT_ALERTACK       /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -18805,9 +18906,38 @@ static void a11y_publish_scene(const oc_model *m) {
         char aid[OC_ACC_AID_MAX], nm[64];
         snprintf(aid, sizeof aid, "rail.%s", a[0] ? a : "more");
         snprintf(nm, sizeof nm, "%s", a[0] ? a : "more");
+        /* The alert badge is a glyph: its meaning goes in the name (REQ-263). */
+        if (g_navrows[i].act == VIEW_ADMIN && m->srvalerts_have && m->srvalerts_unacked)
+            snprintf(nm, sizeof nm, "admin, %u alert%s not acknowledged", m->srvalerts_unacked,
+                     m->srvalerts_unacked == 1 ? "" : "s");
+        else if (g_navrows[i].act == VIEW_ADMIN && m->srvalerts_have && m->srvalerts_current)
+            snprintf(nm, sizeof nm, "admin, %u alert%s still failing", m->srvalerts_current,
+                     m->srvalerts_current == 1 ? "" : "s");
         acc_push(items, &n, OC_ACC_BUTTON, aid, nm,
                  rf(0, g_navrows[i].top, RAIL_W, g_navrows[i].bot),
                  ATOK(AT_VIEW, (uint64_t)(g_navrows[i].act + 1000)));
+    }
+
+    /* Admin's tabs, and Alerts' Acknowledge buttons, named for what they act on. */
+    if (g_view == VIEW_ADMIN && self_role(m) >= OC_ROLE_ADMIN) {
+        static const char *const TABAID[ADM_COUNT] = { "storage", "audit", "invites", "groups", "alerts" };
+        for (int t = 0; t < ADM_COUNT && n < OC_ACC_MAX; t++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "admin.tab.%s", TABAID[t]);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, TABAID[t], g_adm_tabs[t], ATOK(AT_ADMTAB, (uint64_t)t));
+        }
+        if (g_adm_tab == ADM_ALERTS)
+            for (int i = 0; i < g_n_alertrows && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX], nm[OC_MAX_ALERT_KEY + 32];
+                if (g_alertrows[i].id) {
+                    snprintf(aid, sizeof aid, "admin.alert.%llu.ack", (unsigned long long)g_alertrows[i].id);
+                    snprintf(nm, sizeof nm, "Acknowledge %s", g_alertrows[i].key);
+                } else {
+                    snprintf(aid, sizeof aid, "admin.alerts.ackall");
+                    snprintf(nm, sizeof nm, "Acknowledge all");
+                }
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_alertrows[i].r, ATOK(AT_ALERTACK, (uint64_t)i));
+            }
     }
 
     /* Talking mode's toggle, with its state in the name: a button that reads
@@ -22560,6 +22690,14 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_GROUPS && model() && self_role(model()) >= OC_ROLE_ADMIN &&
         groups_click(hwnd, model(), x, y))
         return 1;
+    /* Acknowledge, in Admin > Alerts (REQ-263): no confirmation -- it hides
+     * nothing and changes nothing but who has seen it. */
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS)
+        for (int i = 0; i < g_n_alertrows; i++)
+            if (in_rect(g_alertrows[i].r, x, y)) {
+                if (g_client) oc_client_srvalert_ack(g_client, g_alertrows[i].id);
+                return 1;
+            }
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
             if (in_rect(g_invrows[i].r, x, y)) {
@@ -22878,7 +23016,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     g_view = act; layout_composer(hwnd);
                     /* Entering a report view fetches it: both are point-in-time
                      * and a stale one is worse than a moment's wait. */
-                    if (act == VIEW_ADMIN) admin_select(g_adm_tab);
+                    if (act == VIEW_ADMIN) admin_select(admin_entry_tab(model()));
                     if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
                                              oc_client_list_files(g_client, 0);
                                              oc_client_list_file_channels(g_client); }
@@ -28903,7 +29041,7 @@ static void test_poll(HWND hwnd) {
             if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
                                     oc_client_list_files(g_client, 0);
                                     oc_client_list_file_channels(g_client); }
-            if (v == VIEW_ADMIN)    admin_select(g_adm_tab);
+            if (v == VIEW_ADMIN)    admin_select(admin_entry_tab(model()));
             test_ack("ok");
         } else test_ack("err");
     } else if (!strcmp(verb, "chup")) {
@@ -29319,6 +29457,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             remember_tick(m);
             if (m) groups_roster_tick(m);
+            /* The daemon's alerts (REQ-263): repaint on any change, and fetch the
+             * list again when the counts move while it is on screen. */
+            {
+                static uint32_t seen_seq, seen_u = UINT32_MAX, seen_c = UINT32_MAX;
+                if (m && m->srvalerts_seq != seen_seq) { seen_seq = m->srvalerts_seq; InvalidateRect(hwnd, NULL, FALSE); }
+                if (m && (m->srvalerts_unacked != seen_u || m->srvalerts_current != seen_c)) {
+                    seen_u = m->srvalerts_unacked; seen_c = m->srvalerts_current;
+                    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && g_client) oc_client_srvalerts_list(g_client);
+                }
+            }
             /* You named somebody who is not in this channel (REQ-287). Driven off
              * `seq` rather than a changed name: mention the same absent colleague
              * in two messages and the second must not be swallowed as a repeat of
@@ -30738,6 +30886,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (cmd == MODAL_CANCEL) modal_finish(0);
                 else                          menu_dispatch(hwnd, cmd);
             }
+            break;
+        case AT_ADMTAB:
+            if (g_view == VIEW_ADMIN && (int)arg < ADM_COUNT) admin_select((int)arg);
+            break;
+        case AT_ALERTACK:
+            if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && (int)arg < g_n_alertrows && g_client)
+                oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
             break;
         case AT_WSMGR:
             if (g_wsmgr_open && (int)arg < g_n_wsmgr_hits)

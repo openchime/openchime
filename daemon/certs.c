@@ -20,6 +20,7 @@
 #define ARI_MIN_MS    3600000u               /* ARI is asked no more often than hourly, */
 #define ARI_MAX_MS    (12u * 3600u * 1000u)  /* and at least twice a day, */
 #define ARI_DEFAULT_MS (6u * 3600u * 1000u)  /* six-hourly where it names no time */
+#define EXPIRY_WARN_MS (7ull * 86400000ull)   /* a week from expiry and not renewed: a person is needed */
 
 struct oc_certs {
     oc_certs_opts   o;
@@ -205,9 +206,14 @@ static void ari_check(oc_certs *c, uint64_t now) {
          * revocation -- and is not waited out; one still to come gets its
          * moment drawn from it. */
         c->renew_ms = st <= now ? now : oc_certs_window_pick(st, en, draw());
-        if (st <= now)
+        if (st <= now) {
             fprintf(stderr, "openchimed: the CA asks for the TLS certificate to be renewed now (its window opened "
                             "%llu s ago)\n", (unsigned long long)((now - st) / 1000));
+            if (c->o.alert)
+                c->o.alert(c->o.ctx, OC_CERTS_ALERT_REPLACE,
+                           "The certificate authority asked for the TLS certificate to be replaced now, as it does "
+                           "when a certificate is revoked. The daemon is replacing it.");
+        }
     }
     uint64_t next = after ? after : ARI_DEFAULT_MS;
     if (next < ARI_MIN_MS) next = ARI_MIN_MS;
@@ -222,10 +228,30 @@ static void *worker(void *p) {
     uint64_t max = c->o.retry_max_ms > 0 ? (uint64_t)c->o.retry_max_ms : RETRY_MAX_MS;
     uint64_t check = c->o.check_ms > 0 ? (uint64_t)c->o.check_ms : CHECK_MS;
     int fails = 0;
+    uint64_t warn = c->o.expiry_warn_ms > 0 ? (uint64_t)c->o.expiry_warn_ms : EXPIRY_WARN_MS;
+    uint64_t warned_days = UINT64_MAX;           /* the days left last raised, so a day's checks raise once */
     if (c->not_after_ms) hold(c, c->o.chain_pem, c->issued_ms, c->not_after_ms);
     for (;;) {
         if (__atomic_load_n(&c->stop, __ATOMIC_ACQUIRE)) break;
         uint64_t now = now_ms();
+        /* Close to expiry and still not renewed: renewal has been failing for
+         * weeks by now, and the certificate will stop working. */
+        pthread_mutex_lock(&c->mu);
+        uint64_t exp = c->not_after_ms;
+        pthread_mutex_unlock(&c->mu);
+        if (c->o.alert && exp && exp - (exp > now ? now : exp) < warn) {
+            uint64_t days = exp > now ? (exp - now) / 86400000u : 0;
+            if (days != warned_days) {
+                char msg[256];
+                if (exp > now) snprintf(msg, sizeof msg, "The TLS certificate for %s expires in %llu day%s and has not "
+                                        "been renewed.", c->s_names ? c->s_names : "this workspace",
+                                        (unsigned long long)days, days == 1 ? "" : "s");
+                else snprintf(msg, sizeof msg, "The TLS certificate for %s has expired and has not been renewed.",
+                              c->s_names ? c->s_names : "this workspace");
+                c->o.alert(c->o.ctx, OC_CERTS_ALERT_EXPIRING, msg);
+                warned_days = days;
+            }
+        }
         /* The CA's word first, where there is a CA to ask and something to ask about. */
         if (c->o.source == OC_CERTS_ACME && c->held && now >= c->ari_next_ms) ari_check(c, now);
         if (c->renew_ms && now < c->renew_ms) {         /* nothing due: look again later */
@@ -257,6 +283,12 @@ static void *worker(void *p) {
             fprintf(stderr, "openchimed: TLS certificate for %s, valid until %llu\n", got.names,
                     (unsigned long long)(got.not_after_ms / 1000));
             if (c->o.store_cert) c->o.store_cert(c->o.ctx, &got);
+            if (c->o.alert) {                     /* whatever needed a person has stopped */
+                c->o.alert(c->o.ctx, OC_CERTS_ALERT_OBTAIN, NULL);
+                c->o.alert(c->o.ctx, OC_CERTS_ALERT_REPLACE, NULL);
+                c->o.alert(c->o.ctx, OC_CERTS_ALERT_EXPIRING, NULL);
+            }
+            warned_days = UINT64_MAX;
             hold(c, got.chain_pem, got.not_before_ms, got.not_after_ms);
             pthread_mutex_lock(&c->mu);
             c->obtained++;
@@ -270,6 +302,13 @@ static void *worker(void *p) {
         if (rc == 1) { if (wait_ms(c, (uint64_t)later_ms)) break; continue; }   /* central: not yet */
         fprintf(stderr, "openchimed: TLS certificate not obtained: %s%s\n", err,
                 final ? " (not retried)" : "");
+        if (c->o.alert) {
+            char msg[1024];                       /* the store cuts it to OC_MAX_ALERT_MESSAGE */
+            snprintf(msg, sizeof msg, "The TLS certificate for %s could not be %s: %s%s",
+                     c->s_names ? c->s_names : "this workspace", c->held ? "renewed" : "obtained", err,
+                     final ? " It will not be tried again until the daemon restarts." : "");
+            c->o.alert(c->o.ctx, OC_CERTS_ALERT_OBTAIN, msg);
+        }
         pthread_mutex_lock(&c->mu);
         snprintf(c->err, sizeof c->err, "%s", err);
         pthread_mutex_unlock(&c->mu);

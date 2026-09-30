@@ -1531,6 +1531,41 @@ static void test_group_frames(void) {
         CHECK(oc_decode_mention_unresolved_more(&p, &out) == OC_OK);
         CHECK(out.channel_id == 3 && out.message_id == 99 && out.total == 10);
     }
+    {   /* Critical failures (REQ-263): the summary, the entries, an acknowledgement. */
+        oc_alerts_summary in = { 3, 1 };
+        ROUNDTRIP(oc_encode_alerts_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ALERTS_SUMMARY, h, p);
+        oc_alerts_summary out;
+        CHECK(oc_decode_alerts_summary(&p, &out) == OC_OK && out.unacked == 3 && out.current == 1);
+    }
+    {
+        ROUNDTRIP(oc_encode_alerts_list(&w, OC_PROTOCOL_VERSION), OC_MSG_ALERTS_LIST, h, p);
+        CHECK(p.len == p.pos);
+    }
+    {
+        oc_alert_ack ain = { 42 };
+        ROUNDTRIP(oc_encode_alert_ack(&w, OC_PROTOCOL_VERSION, &ain), OC_MSG_ALERT_ACK, h, p);
+        oc_alert_ack aout;
+        CHECK(oc_decode_alert_ack(&p, &aout) == OC_OK && aout.alert_id == 42);
+    }
+    {
+        oc_alert two[2] = {
+            { 7, 1000, 5000, 4, 1, 0, oc_slice_str("tls.obtain"), oc_slice_str("the CA refused the order") },
+            { 6, 900, 900, 1, 0, 1, oc_slice_str("tls.expiring"), oc_slice_str("") } };
+        oc_alerts lin = { 2, two };
+        ROUNDTRIP(oc_encode_alerts(&w, OC_PROTOCOL_VERSION, &lin), OC_MSG_ALERTS, h, p);
+        oc_alert got[2]; oc_alerts lout;
+        CHECK(oc_decode_alerts(&p, &lout, got, 2) == OC_OK && lout.count == 2);
+        CHECK(got[0].id == 7 && got[0].first_ms == 1000 && got[0].last_ms == 5000 && got[0].count == 4 &&
+              got[0].current == 1 && got[0].acked == 0 && got[0].key.len == 10 &&
+              !memcmp(got[0].message.ptr, "the CA refused the order", 24));
+        CHECK(got[1].id == 6 && got[1].acked == 1 && got[1].message.len == 0);
+        oc_rbuf p2; oc_header h2;
+        CHECK(oc_parse_frame(frame, w.len, &h2, &p2) == OC_OK);
+        CHECK(oc_decode_alerts(&p2, &lout, got, 1) == OC_E_MALFORMED);           /* more than room for */
+        char big[OC_MAX_ALERT_MESSAGE + 1]; memset(big, 'x', sizeof big);
+        two[0].message = (oc_slice){ (const uint8_t *)big, sizeof big };
+        CHECK(oc_encode_alerts(&w, OC_PROTOCOL_VERSION, &lin) == OC_E_MALFORMED);  /* over the cap */
+    }
     {   /* The encoders refuse a type that is not theirs. */
         uint8_t buf[64]; oc_wbuf w2; oc_wbuf_init(&w2, buf, sizeof buf);
         oc_channel_group_op op = { 1, 2 };

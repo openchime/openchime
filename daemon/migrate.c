@@ -1093,6 +1093,27 @@ static const char MIGRATION_0050[] =
     "  created_at_ms INTEGER NOT NULL"
     ");";
 
+static const char MIGRATION_0051[] =
+    /* The daemon's critical failures, kept where it can show them to an owner or
+     * admin (REQ-263): one row per failure, by what failed (`key`), raised again
+     * on the same row while it holds -- `count` times, the latest words in
+     * `message` -- and no longer `current` once it stops. Acknowledging records
+     * who and when. At most one current row per key; bounded, oldest first,
+     * as the audit log is (ARCH-79). */
+    "CREATE TABLE alerts ("
+    "  id         INTEGER PRIMARY KEY,"
+    "  key        TEXT NOT NULL,"
+    "  message    TEXT NOT NULL,"
+    "  first_ms   INTEGER NOT NULL,"
+    "  last_ms    INTEGER NOT NULL,"
+    "  count      INTEGER NOT NULL DEFAULT 1,"
+    "  current    INTEGER NOT NULL DEFAULT 1 CHECK (current IN (0,1)),"
+    "  cleared_ms INTEGER,"
+    "  acked_ms   INTEGER,"
+    "  acked_by   INTEGER REFERENCES users(id)"
+    ");"
+    "CREATE UNIQUE INDEX alerts_current_key ON alerts(key) WHERE current = 1;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1144,6 +1165,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 48, MIGRATION_0048 },
     { 49, MIGRATION_0049 },
     { 50, MIGRATION_0050 },
+    { 51, MIGRATION_0051 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

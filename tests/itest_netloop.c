@@ -282,7 +282,8 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_CALL_STATE &&
             hdr->msg_type != OC_MSG_CHANNEL_GROUPS &&  /* beside every CHANNEL_INFO (REQ-309) */
             hdr->msg_type != OC_MSG_GROUP_INFO &&      /* the groups, unasked after a sign-in's */
-            hdr->msg_type != OC_MSG_GROUPS_END)        /*   user list (REQ-307) */
+            hdr->msg_type != OC_MSG_GROUPS_END &&      /*   user list (REQ-307) */
+            hdr->msg_type != OC_MSG_ALERTS_SUMMARY)    /* an owner's or admin's, at sign-in (REQ-263) */
             return 0;
     }
 }
@@ -315,6 +316,7 @@ static int do_handshake(client *c) {
 static int      g_auth_stt;
 static uint32_t g_auth_stt_max_ms;
 
+static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
@@ -352,6 +354,13 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
      * positional. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_SNOOZE) return -1;
     { oc_snooze sn; if (oc_decode_snooze(&p, &sn) != OC_OK) return -1; }
+    /* Then, for an owner or admin only, the daemon's critical failures (REQ-263). */
+    if (ok.role == OC_ROLE_OWNER || ok.role == OC_ROLE_ADMIN) {
+        if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_ALERTS_SUMMARY) return -1;
+        oc_alerts_summary sm;
+        if (oc_decode_alerts_summary(&p, &sm) != OC_OK) return -1;
+        g_auth_alerts = sm;
+    }
     return 0;
 }
 
@@ -2415,6 +2424,58 @@ static int read_error(client *c, uint16_t *code) {
     if (read_type(c, OC_MSG_ERROR, &hdr, &p) != 0 || oc_decode_error(&p, &er) != OC_OK) return -1;
     *code = er.code;
     return 0;
+}
+
+/* The daemon's critical failures on the wire (REQ-263): an owner signing in is
+ * told the counts at once, and told again as they change; the entries are read
+ * and acknowledged; a member is told nothing, and may ask for nothing. */
+static int read_summary(client *c, oc_alerts_summary *sm) {
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_ALERTS_SUMMARY, &hdr, &p) != 0) return -1;
+    return oc_decode_alerts_summary(&p, sm) == OC_OK ? 0 : -1;
+}
+static void test_alerts_wire(int port, const uint8_t *pin, oc_dbwriter *dbw) {
+    oc_dbwriter_alert(dbw, "test.wire", "a thing the daemon cannot fix alone");
+    usleep(100000);                                   /* stored, and told to nobody signed in */
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    oc_alerts_summary sm = g_auth_alerts;
+    CHECK(sm.unacked >= 1 && sm.current >= 1);                                      /* at sign-in */
+    uint32_t before = sm.unacked;
+
+    /* bob, a member: no summary at sign-in, and a refusal when he asks. */
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_alerts_list(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    oc_header hdr; oc_rbuf p; int told = 0, refused = 0;
+    for (int i = 0; i < 64 && !refused; i++) {
+        if (read_frame_raw(&b, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_ALERTS_SUMMARY || hdr.msg_type == OC_MSG_ALERTS) told = 1;
+        if (hdr.msg_type == OC_MSG_ERROR) { oc_error er; refused = oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN; }
+    }
+    CHECK(refused && !told);
+
+    /* alice reads them, newest first, and acknowledges this one. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_alerts_list(&w, OC_PROTOCOL_VERSION) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_ALERTS, &hdr, &p) == 0);
+    static oc_alert got[OC_MAX_ALERTS]; oc_alerts al = { 0, NULL };
+    CHECK(oc_decode_alerts(&p, &al, got, OC_MAX_ALERTS) == OC_OK && al.count >= 1);
+    uint64_t id = 0;
+    for (uint16_t i = 0; i < al.count; i++)
+        if (got[i].key.len == 9 && !memcmp(got[i].key.ptr, "test.wire", 9) && got[i].current && !got[i].acked) id = got[i].id;
+    CHECK(id != 0);
+    oc_alert_ack ack = { id };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_alert_ack(&w, OC_PROTOCOL_VERSION, &ack) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_summary(&a, &sm) == 0 && sm.unacked == before - 1);
+
+    /* A change reaches her unasked; it ends as it began. */
+    oc_dbwriter_alert_clear(dbw, "test.wire");
+    CHECK(read_summary(&a, &sm) == 0 && sm.current == 0);
+    client_close(&b);
+    client_close(&a);
 }
 
 /* A leave sent while the same connection's join is still being checked (REQ-301,
@@ -4577,6 +4638,7 @@ int run_netloop_tests(void) {
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);
         test_call_leave_while_joining(arg.port, pin, dbw);
+        test_alerts_wire(arg.port, pin, dbw);
         test_call_state_audience(arg.port, pin);
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);

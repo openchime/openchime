@@ -576,6 +576,16 @@ typedef struct {
     uint8_t   storage_have;
     uint8_t   storage_open;
 
+    /* The daemon's critical failures (REQ-263), owner/admin only. `srvalerts_have`
+     * once a summary has come -- which only an owner's or admin's sign-in
+     * brings: how many are unacknowledged and how many still hold. The list,
+     * newest first, once asked for. `srvalerts_seq` moves with any change. */
+    uint8_t   srvalerts_have;
+    uint32_t  srvalerts_unacked, srvalerts_current;
+    oc_srvalert_view *srvalerts;
+    size_t    n_srvalerts, cap_srvalerts;
+    uint32_t  srvalerts_seq;
+
     /* Audit log page (REQ-251), newest first. Owner/admin only. */
     oc_audit_view *audit;
     size_t    n_audit, cap_audit;

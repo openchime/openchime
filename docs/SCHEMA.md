@@ -1272,6 +1272,34 @@ carries. Made once, when the writer first starts on the database, and kept, so a
 restored database still verifies what it signed. A private key, like
 `server_identity`.
 
+## 3ap. Migration 0051 — the daemon's critical failures (REQ-263)
+
+```sql
+CREATE TABLE alerts (
+  id         INTEGER PRIMARY KEY,
+  key        TEXT NOT NULL,
+  message    TEXT NOT NULL,
+  first_ms   INTEGER NOT NULL,
+  last_ms    INTEGER NOT NULL,
+  count      INTEGER NOT NULL DEFAULT 1,
+  current    INTEGER NOT NULL DEFAULT 1 CHECK (current IN (0,1)),
+  cleared_ms INTEGER,
+  acked_ms   INTEGER,
+  acked_by   INTEGER REFERENCES users(id)
+);
+CREATE UNIQUE INDEX alerts_current_key ON alerts(key) WHERE current = 1;
+```
+
+### `alerts`
+What the daemon cannot fix alone, kept where it can show owners and admins
+(PROTOCOL.md §5.16c). One row per failure, by what failed (`key`): raised again
+on the same row while it holds — `count` up, `last_ms` and `message` the latest —
+and no longer `current` once it stops (`cleared_ms`); a failure that comes back
+is a new row. Acknowledging records who and when, and survives a repeat of a
+failure still holding. At most one current row per key. Bounded to 100 rows: past
+that, the oldest that no longer hold are deleted, as the audit log is bounded
+(ARCH-79).
+
 ---
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)

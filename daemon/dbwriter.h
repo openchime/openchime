@@ -212,7 +212,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_GROUP_REMOVE_MEMBERS = 113,
        OC_JOB_CHANNEL_ADD_GROUP = 114,
        OC_JOB_CHANNEL_REMOVE_GROUP = 115,
-       OC_JOB_LOAD_TLS_STATE = 116, OC_JOB_STORE_ACME_ACCOUNT = 117, OC_JOB_STORE_TLS_CERT = 118 };
+       OC_JOB_LOAD_TLS_STATE = 116, OC_JOB_STORE_ACME_ACCOUNT = 117, OC_JOB_STORE_TLS_CERT = 118,
+       /* Critical failures (REQ-263): raised or cleared by the daemon's own
+        * workers (`alert_key`, `alert_message`), listed and acknowledged by an
+        * owner or admin (`alert_id`, 0 for every one). */
+       OC_JOB_ALERT_RAISE = 119, OC_JOB_ALERT_CLEAR = 120,
+       OC_JOB_ALERTS_LIST = 121, OC_JOB_ALERT_ACK = 122 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -468,6 +473,9 @@ typedef struct oc_job {
     uint16_t       n_call_uids;
     uint8_t        call_key[OC_CALL_DEVICE_KEY_LEN];   /* a join's device key, echoed */
     uint8_t        call_codecs;                        /* a join's decodable codecs, echoed */
+    /* ALERT_* (REQ-263): heap strings; the entry acknowledged. */
+    char          *alert_key, *alert_message;
+    uint64_t       alert_id;
 } oc_job;
 
 /* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
@@ -583,7 +591,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The daemon's own sign-in pages (AUTH.md §8.10): done -- `body` the ID
         * token for a sign-in or sign-up, empty for a password change -- or
         * refused, `err_code` why. */
-       OC_RES_WEB_OK = 102, OC_RES_WEB_ERR = 103 };
+       OC_RES_WEB_OK = 102, OC_RES_WEB_ERR = 103,
+       /* Critical failures (REQ-263): the counts, to every owner and admin
+        * connected (conn_id 0) or to the one that asked; the entries; a
+        * refusal (err_code). */
+       OC_RES_ALERTS_SUMMARY = 104, OC_RES_ALERTS = 105, OC_RES_ALERTS_ERR = 106 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1116,6 +1128,19 @@ typedef struct oc_dbres {
     size_t                  n_call_uids;
     uint8_t                 call_key[OC_CALL_DEVICE_KEY_LEN];
     uint8_t                 call_codecs;
+
+    /* Critical failures (REQ-263). On AUTH_OK for an owner or admin, and on
+     * OC_RES_ALERTS_SUMMARY: `alerts_admin` set, and the counts. On
+     * OC_RES_ALERTS: the entries, newest first (heap). */
+    int                     alerts_admin;
+    uint32_t                alerts_unacked, alerts_current;
+    struct oc_alert_row {
+        uint64_t id, first_ms, last_ms;
+        uint32_t count;
+        uint8_t  current, acked;
+        char     key[OC_MAX_ALERT_KEY + 1], message[OC_MAX_ALERT_MESSAGE + 1];
+    }                      *alert_rows;
+    size_t                  n_alert_rows;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -1195,6 +1220,12 @@ void   oc_dbwriter_hold_auth(oc_dbwriter *w, int on);
 /* A test's knob: while on, neither the writer nor a reader takes a job from its
  * queue, so a test can put frames between a job's submission and its result. */
 void   oc_dbwriter_hold(oc_dbwriter *w, int on);
+
+/* A critical failure (REQ-263), from any thread: raise `key` with `message` --
+ * again on the same entry while it holds -- or clear it, once it has stopped.
+ * Every owner and admin connected is told the new counts. */
+void   oc_dbwriter_alert(oc_dbwriter *w, const char *key, const char *message);
+void   oc_dbwriter_alert_clear(oc_dbwriter *w, const char *key);
 /* The jobs of `type` (OC_JOB_*) queued for the writer or a reader, for a test
  * waiting on them. */
 size_t oc_dbwriter_jobs_waiting(oc_dbwriter *w, int type);

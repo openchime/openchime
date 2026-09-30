@@ -3165,6 +3165,19 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_ALERTS_LIST || hdr.msg_type == OC_MSG_ALERT_ACK) {
+            /* Critical failures (REQ-263), owner/admin only, checked by the
+             * writer on the current role as the storage report is. */
+            oc_alert_ack ack = { 0 };
+            if (hdr.msg_type == OC_MSG_ALERT_ACK && oc_decode_alert_ack(&p, &ack) != OC_OK) return -1;
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_ALERTS_LIST ? OC_JOB_ALERTS_LIST : OC_JOB_ALERT_ACK,
+                                   c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->alert_id = ack.alert_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_STORAGE_STATUS_REQ) {
             /* Owner/admin only (REQ-214). The check lives in the writer, which
              * reads the user's CURRENT role, rather than here — the same shape
@@ -4317,6 +4330,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, fd, sbuf, sw.len);
             if (!conns[fd]) break;
         }
+        /* An owner or admin learns at once what the daemon has failed at
+         * (REQ-263); nobody else is sent anything. */
+        if (r->alerts_admin) {
+            oc_alerts_summary sm = { r->alerts_unacked, r->alerts_current };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_encode_alerts_summary(&w, OC_PROTOCOL_VERSION, &sm);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;
+        }
 
         /* The calls there are, as the Calls section lists them (REQ-303): one
          * CALL_STATE for each this user may hear about. */
@@ -5382,6 +5404,39 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         if (!c) break;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("audit query denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ALERTS_SUMMARY: {
+        /* To every owner and admin connected (REQ-263): at a change, and at
+         * their sign-in (AUTH_OK). */
+        oc_alerts_summary sm = { r->alerts_unacked, r->alerts_current };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_encode_alerts_summary(&w, OC_PROTOCOL_VERSION, &sm);
+        for (size_t i = 0; i < r->n_members; i++) send_to_user(ep, conns, r->members[i], 0, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ALERTS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        static oc_alert rows[OC_MAX_ALERTS];
+        size_t n = r->n_alert_rows < OC_MAX_ALERTS ? r->n_alert_rows : OC_MAX_ALERTS;
+        for (size_t i = 0; i < n; i++) {
+            const struct oc_alert_row *a = &r->alert_rows[i];
+            rows[i] = (oc_alert){ a->id, a->first_ms, a->last_ms, a->count, a->current, a->acked,
+                                  oc_slice_str(a->key), oc_slice_str(a->message) };
+        }
+        oc_alerts al = { (uint16_t)n, rows };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_alerts(&w, OC_PROTOCOL_VERSION, &al) == OC_OK) send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ALERTS_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("alerts are for owners and admins") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
