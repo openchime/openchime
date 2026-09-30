@@ -2294,7 +2294,10 @@ leave. A device that finds its own slot gone from the roster is out of the call
 
 **`CALL_LEAVE` (C → S), `0x00A1`** `{ channel_id: u64 }` — leave the call in
 this conversation; naming another conversation does nothing. The last one out
-ends the call.
+ends the call. A leave sent while this connection's `CALL_JOIN` to the same
+conversation is still being checked voids that join: its answer, when it comes,
+puts nobody in the call. Of several joins sent before any is answered, only the
+latest can take effect.
 
 **`CALL_INVITE` (C → S), `0x00A4`** `{ channel_id: u64, n: u16, n × { user_id:
 u64 } }` — a participant asks more people, each of whom must be able to read the

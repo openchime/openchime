@@ -2417,6 +2417,40 @@ static int read_error(client *c, uint16_t *code) {
     return 0;
 }
 
+/* A leave sent while the same connection's join is still being checked (REQ-301,
+ * ARCH-73). The readers are held, and JOIN, LEAVE, INVITE sent: two checks
+ * queued means the loop has read all three, the leave between them. Released,
+ * the join's answer finds the join left and does nothing, so the invitation,
+ * checked after it, is refused -- alice is in no call to invite anyone to. Her
+ * next join is the one she is in: her first CALL_JOINED carries its key. */
+static void test_call_leave_while_joining(int port, const uint8_t *pin, oc_dbwriter *dbw) {
+    client a;
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    const uint64_t ch = OC_DEFAULT_CHANNEL;
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32];
+
+    oc_dbwriter_hold(dbw, 1);
+    CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
+    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
+    uint64_t someone[1] = { ua + 1 };
+    CHECK(call_invite(&a, ch, someone, 1) == 0);
+    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) < 2; i++) usleep(10000);
+    CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_CALL_AUTH) == 2);   /* the join and the invitation, unanswered */
+    oc_dbwriter_hold(dbw, 0);
+    uint16_t code = 0;
+    CHECK(read_error(&a, &code) == 0 && code == OC_ERR_NOT_IN_CALL);  /* no call: the join was void */
+
+    CHECK(call_join(&a, ch, 0xA2, NULL, 0) == 0);
+    CHECK(read_type(&a, OC_MSG_CALL_JOINED, &hdr, &p) == 0);
+    oc_call_joined jd;
+    memset(&jd, 0, sizeof jd);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.count == 1 && parts[0].user_id == ua);
+    CHECK(parts[0].device_key[0] == 0xA2);                          /* this join's, not the left one's */
+    CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
+    client_close(&a);
+}
+
 /* Calls over the wire (REQ-150-152, REQ-301-305): a start with invitations,
  * joining, the roster with slots, keys and epochs, sealed keys forwarded only
  * between participants for the current epoch, the cap, declining, ending, the
@@ -4542,6 +4576,7 @@ int run_netloop_tests(void) {
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);
+        test_call_leave_while_joining(arg.port, pin, dbw);
         test_call_state_audience(arg.port, pin);
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);

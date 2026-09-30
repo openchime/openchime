@@ -204,6 +204,13 @@ typedef struct conn_s {
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
     struct rate_win { uint64_t start; uint32_t count; } presence_rl, typing_rl, react_rl, call_rl;
+    /* CALL_JOIN is answered after the reader's check, so a leave can arrive
+     * first. Each join advances the counter and carries it (oc_job.gen), a leave
+     * of the conversation the latest join named advances it again, and a join's
+     * answer is acted on only while the counter is still its own: a join
+     * superseded or left before it was answered does nothing (REQ-301). */
+    uint32_t     call_gen;
+    uint64_t     call_join_ch;
     int          presence_deferred;   /* a broadcast is owed once presence_rl allows it */
     uint64_t     audio_win_start;/* the same, for read-aloud requests (ARCH-111) */
     uint32_t     audio_count;
@@ -3029,6 +3036,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (!(j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id))) return -1;
                 j->call_op = OC_CALL_OP_JOIN;
                 j->channel_id = cj.channel_id;
+                j->gen = ++c->call_gen;
+                c->call_join_ch = cj.channel_id;
                 memcpy(j->call_key, cj.device_key, OC_CALL_DEVICE_KEY_LEN);
                 j->call_codecs = cj.codecs;
                 j->n_call_uids = cj.n_invite;
@@ -3054,6 +3063,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
              * so a late leave cannot take someone out of the call they moved to. */
             oc_call_leave cl;
             if (oc_decode_call_leave(&p, &cl) != OC_OK) return -1;
+            if (c->call_join_ch == cl.channel_id) { c->call_gen++; c->call_join_ch = 0; }   /* a join still out is void */
             int idx;
             call_t *cc = call_of_conn(c->conn_id, &idx);
             if (cc && cc->channel_id == cl.channel_id) call_drop(ep, conns, cc, idx);
@@ -5946,6 +5956,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             call_push_invites(c, added, na, jc->user_id);
             break;
         }
+        if (r->gen != jc->call_gen) break;   /* left, or joined elsewhere, before this was answered */
         if (!g_relay) {
             /* No media endpoint: say so, rather than hand the joiner a UDP port
              * that nothing is listening on. */
