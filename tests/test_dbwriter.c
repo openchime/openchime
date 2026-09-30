@@ -1015,9 +1015,9 @@ static void test_oidc_join_rules(void) {
         CHECK(oidc_signin(w, &is, 72, "g|mallory2", "i2", LEE_UNVERIFIED, &role, &err) == 0);
         uint64_t lee = oidc_signin(w, &is, 73, "g|lee", "i3", LEE, &role, &err);
         CHECK(lee != 0 && role == OC_ROLE_ADMIN);
-        /* Spent: the same address under another identity finds nothing. */
-        CHECK(oidc_signin(w, &is, 74, "g|lee-again", "i4", LEE, &role, &err) == 0);
-        CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);
+        /* Spent: the same address under another identity is Lee again, not a
+         * second invitation's worth of person. */
+        CHECK(oidc_signin(w, &is, 74, "g|lee-again", "i4", LEE, &role, &err) == lee);
     }
 
     /* A token whose subject is not "<issuer>|<subject>" names nobody. */
@@ -1034,7 +1034,7 @@ static void test_oidc_join_rules(void) {
         CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw,
-            "SELECT (SELECT COUNT(*) FROM user_identities),"
+            "SELECT (SELECT COUNT(*) FROM user_identities WHERE subject != 'lee-again'),"
             " (SELECT COUNT(*) FROM user_identities WHERE issuer='g' AND subject='dana'"
             "   AND idp='' AND email='dana@acme.example' AND email_verified=1"
             "   AND last_login_ms >= first_seen_ms),"
@@ -1065,6 +1065,105 @@ static void test_oidc_join_rules(void) {
     CHECK(oc_dbwriter_configure_join_rules(w, "owner:pat@acme.example", why, sizeof why) == 0);
     CHECK(oidc_signin(w, &is, 41, "g|pat", "k2", PAT, &role, &err) == pat);
     CHECK(role == OC_ROLE_OWNER);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* A person who signs in a second way is the same person (AUTH.md §8.4): a new
+ * identity whose provider verified an address a member's provider verified is
+ * that member, whatever the case of the address -- Google then an emailed code,
+ * Google then a personal Microsoft account. Never on an unverified address, never
+ * into a removed member, never where the address is more than one person's; a
+ * link is audited and costs no seat. */
+static void test_oidc_link(void) {
+    const char *path = "build/test_dbwriter_link.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-link") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "owner:dana@acme.example,domain:acme.example,"
+                                           "tenant:microsoft:t-work", why, sizeof why) == 0);
+    uint8_t role; int err;
+    const char *MS = "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0";
+    char sub[256];
+
+    uint64_t dana = oidc_signin(w, &is, 1, "https://accounts.google.com|dana-g", "l1",
+                                "\"email\":\"dana@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err);
+    CHECK(dana != 0 && role == OC_ROLE_OWNER);
+    /* An emailed code for the same address: Dana, as owner, with no new account. */
+    CHECK(oidc_signin(w, &is, 2, "https://auth.openchime.io/email|dana@acme.example", "l2",
+                      "\"email\":\"dana@acme.example\",\"email_verified\":true,\"idp\":\"email\"", &role, &err) == dana);
+    CHECK(role == OC_ROLE_OWNER);
+    /* A personal Microsoft account, the address in another case: Dana. The seat
+     * cap is full, and a link is not a new user. */
+    oc_dbwriter_set_max_users(w, 1);
+    snprintf(sub, sizeof sub, "%s|dana-oid", MS);
+    CHECK(oidc_signin(w, &is, 3, sub, "l3",
+                      "\"email\":\"Dana@ACME.example\",\"email_verified\":true,\"idp\":\"microsoft\"", &role, &err) == dana);
+    oc_dbwriter_set_max_users(w, 0);
+    /* A work account whose address its tenant has not verified: admitted by its
+     * tenant, as somebody new -- an unverified address is whatever was typed. */
+    uint64_t other = oidc_signin(w, &is, 4, "https://login.microsoftonline.com/t-work/v2.0|w-oid", "l4",
+                                 "\"email\":\"dana@acme.example\",\"email_verified\":false,\"idp\":\"microsoft\","
+                                 "\"tenant\":\"t-work\"", &role, &err);
+    CHECK(other != 0 && other != dana && role == OC_ROLE_MEMBER);
+
+    /* Erin is removed; her address by another way in does not bring her back. */
+    uint64_t erin = oidc_signin(w, &is, 5, "https://accounts.google.com|erin-g", "l5",
+                                "\"email\":\"erin@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err);
+    CHECK(erin != 0 && erin != dana);
+    {
+        oc_job *j = oc_job_new(OC_JOB_REMOVE_USER, 6);
+        j->user_id = dana; j->target_user_id = erin;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    uint64_t erin2 = oidc_signin(w, &is, 7, "https://auth.openchime.io/email|erin@acme.example", "l6",
+                                 "\"email\":\"erin@acme.example\",\"email_verified\":true,\"idp\":\"email\"", &role, &err);
+    CHECK(erin2 != 0 && erin2 != erin);                              /* somebody new, as the rules admit */
+    CHECK(oidc_signin(w, &is, 8, "https://accounts.google.com|erin-g", "l7",
+                      "\"email\":\"erin@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err) == 0);
+    oc_dbwriter_stop(w);
+
+    /* What was written: Dana's three identities are hers, each link audited with
+     * the provider and never the token. Then an address made two people's -- as
+     * accounts from before links could be -- which a new identity cannot choose
+     * between. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw,
+            "SELECT (SELECT COUNT(*) FROM user_identities WHERE user_id=?1),"
+            " (SELECT COUNT(*) FROM audit_log WHERE action='auth.subject_linked' AND target_id=?1),"
+            " (SELECT COUNT(*) FROM audit_log WHERE action='auth.subject_linked' AND detail LIKE '%idp=email%'),"
+            " (SELECT COUNT(*) FROM audit_log WHERE action='auth.subject_linked' AND detail LIKE '%idp=microsoft%'),"
+            " (SELECT COUNT(*) FROM audit_log WHERE action='auth.subject_linked' AND detail LIKE '%eyJ%');", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)dana);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        CHECK(sqlite3_column_int(st, 0) == 3 && sqlite3_column_int(st, 1) == 2);
+        CHECK(sqlite3_column_int(st, 2) == 1 && sqlite3_column_int(st, 3) == 1 && sqlite3_column_int(st, 4) == 0);
+        sqlite3_finalize(st);
+        CHECK(sqlite3_exec(raw,
+            "INSERT INTO users(subject, email, created_at_ms) VALUES('oidc:x|y|twin', 'pat@acme.example', 1);"
+            "INSERT INTO user_identities(user_id, issuer, subject, email, email_verified, first_seen_ms, last_login_ms)"
+            " VALUES(last_insert_rowid(), 'y', 'twin', 'pat@acme.example', 1, 1, 1);"
+            "INSERT INTO users(subject, email, created_at_ms) VALUES('oidc:x|y|twin2', 'pat@acme.example', 1);"
+            "INSERT INTO user_identities(user_id, issuer, subject, email, email_verified, first_seen_ms, last_login_ms)"
+            " VALUES(last_insert_rowid(), 'y', 'twin2', 'PAT@acme.example', 1, 1, 1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    w = start_db(path);
+    CHECK(w != NULL);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    CHECK(oc_dbwriter_configure_join_rules(w, "", why, sizeof why) == 0);
+    CHECK(oidc_signin(w, &is, 9, "https://accounts.google.com|pat-g", "l8",
+                      "\"email\":\"pat@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_NOT_ALLOWED);                        /* neither twin: the rules decide, and say no */
     oc_issuer_free(&is);
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -6625,6 +6724,7 @@ int run_dbwriter_tests(void) {
     test_auth_and_send();
     test_oidc_auth();
     test_oidc_join_rules();
+    test_oidc_link();
     test_oidc_limits_and_audit();
     test_auth_rate_limit();
     test_source_rate_limit();

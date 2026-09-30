@@ -997,6 +997,24 @@ static uint64_t user_by_subject(sqlite3 *db, const char *subject) {
     return uid;
 }
 
+/* The one active user a verified address is (AUTH.md §8.4): someone with an
+ * identity whose provider verified that same address, compared without case. 0 if
+ * nobody -- or if the address is more than one person's, since it cannot then
+ * say which -- and never a disabled or removed user: a new way of signing in does
+ * not revive an account. */
+static uint64_t user_by_verified_email(sqlite3 *db, const char *email) {
+    sqlite3_stmt *st = NULL;
+    uint64_t found = 0;
+    int n = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT DISTINCT i.user_id FROM user_identities i JOIN users u ON u.id = i.user_id "
+        "WHERE i.email_verified = 1 AND lower(i.email) = lower(?1) AND u.disabled = 0;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, email, -1, SQLITE_STATIC);
+    while (sqlite3_step(st) == SQLITE_ROW && n < 2) { found = (uint64_t)sqlite3_column_int64(st, 0); n++; }
+    sqlite3_finalize(st);
+    return n == 1 ? found : 0;
+}
+
 /* Record what the provider said this time. The identity row is the only thing a
  * later sign-in touches: the display name and address on `users` are the
  * person's own once they exist. Creates the row when `uid` has none yet. */
@@ -1288,6 +1306,14 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
          * filed under, and gets its row at this sign-in. */
         uid = identity_user(db, issuer, person);
         if (!uid) uid = user_by_subject(db, subject);
+        /* A new way in for someone already here: an identity not seen before,
+         * whose provider verified an address a member's provider verified too, is
+         * that member -- Google one day, an emailed code the next, one account.
+         * Nothing below refuses what the checks above let through, so this comes
+         * after them: it never admits an identity the relay may not deliver. */
+        int linked = 0;
+        if (!uid && claims.email_verified && claims.email[0])
+            linked = (uid = user_by_verified_email(db, claims.email)) != 0;
         int known = uid != 0;
         /* An invite bound to this verified address admits it where no rule does,
          * and says what role it joins with. */
@@ -1309,6 +1335,11 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
         }
         if (!known) uid = create_oidc_user(db, subject, claims.email, claims.name);
         if (uid) identity_touch(db, uid, issuer, person, &claims);
+        if (linked) {
+            char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
+            snprintf(detail, sizeof detail, "source=relay idp=%s tenant=%s", claims.idp, claims.tenant);
+            audit_actor(db, OC_AUDIT_SECURITY, "auth.subject_linked", uid, uid, NULL, 1, detail);
+        }
         if (uid && invited) {
             consume_email_invite(db, claims.email);
             if (invited_role != OC_ROLE_MEMBER) set_role(db, uid, invited_role);
