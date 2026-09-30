@@ -154,8 +154,8 @@ static const char MIGRATION_0007[] =
     "  PRIMARY KEY (user_id, channel_id)"
     ");";
 
-/* 0008: persist the daemon's self-signed TLS identity (ARCH-66b) so the TOFU
- * fingerprint (ARCH-10) survives the database being restored onto a new box. The cert+key live in
+/* 0008: persist the daemon's self-signed TLS identity (ARCH-66b) so the
+ * fingerprint people trusted (ARCH-10) survives the database being restored onto a new box. The cert+key live in
  * the replicated database; on a cold restore the daemon reloads the same
  * identity instead of generating a new one (which would trip every client's
  * pin). Single row (id=1). */
@@ -1056,6 +1056,30 @@ static const char MIGRATION_0048[] =
     "CREATE INDEX idx_channel_groups_group ON channel_groups(group_id);"
     "ALTER TABLE mentions ADD COLUMN group_id INTEGER REFERENCES user_groups(id);";
 
+static const char MIGRATION_0049[] =
+    /* A CA-issued TLS certificate (ARCH-10, TLS.md "Certificates"). The ACME
+     * account is kept with the directory it belongs to, so switching CAs makes a
+     * new one rather than presenting one CA's key to another. The certificate
+     * is kept with where it came from and when it runs out: a restart presents
+     * it at once instead of the self-signed identity, and renews it when due.
+     * Both hold a private key, like server_identity. */
+    "CREATE TABLE acme_account ("
+    "  id              INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  directory_url   TEXT NOT NULL,"
+    "  account_key_pem TEXT NOT NULL,"
+    "  account_url     TEXT NOT NULL,"
+    "  created_at_ms   INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE tls_certificate ("
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  source        TEXT NOT NULL,"             /* 'acme' | 'central' */
+    "  names         TEXT NOT NULL,"             /* comma-separated */
+    "  chain_pem     TEXT NOT NULL,"
+    "  key_pem       TEXT NOT NULL,"
+    "  issued_at_ms  INTEGER NOT NULL,"
+    "  not_after_ms  INTEGER NOT NULL"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1105,6 +1129,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 46, MIGRATION_0046 },
     { 47, MIGRATION_0047 },
     { 48, MIGRATION_0048 },
+    { 49, MIGRATION_0049 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

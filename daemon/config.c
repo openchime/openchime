@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static oc_config g_cfg;
 
@@ -196,6 +197,39 @@ int oc_config_load(char *err, size_t errcap) {
         else if (strcmp(im, "off") == 0) c->invite_mail = 0;
         else {
             snprintf(err, errcap, "OPENCHIME_INVITE_MAIL='%s' is invalid (want on|off)", im);
+            return -1;
+        }
+    }
+
+    /* The certificate (TLS.md, "Certificates"). A managed box bound to central
+     * gets its through central, where its name is; anyone else keeps the
+     * self-signed one unless told otherwise. What each source needs is checked here, so a box that
+     * cannot get the certificate it was told to get does not start instead of
+     * serving the wrong one. Whether central is reachable (an enrollment) is
+     * main's to check, where the enrollment is known. */
+    {
+        int managed_bound = c->deployment_mode == OC_DEPLOY_MANAGED && c->enroll.url && *c->enroll.url;
+        const char *src = env_or2("OPENCHIME_TLS_SOURCE", NULL, managed_bound ? "central" : "self");
+        if      (!strcmp(src, "self"))    c->tls_src.source = OC_TLS_SRC_SELF;
+        else if (!strcmp(src, "file"))    c->tls_src.source = OC_TLS_SRC_FILE;
+        else if (!strcmp(src, "acme"))    c->tls_src.source = OC_TLS_SRC_ACME;
+        else if (!strcmp(src, "central")) c->tls_src.source = OC_TLS_SRC_CENTRAL;
+        else {
+            snprintf(err, errcap, "OPENCHIME_TLS_SOURCE='%s' is invalid (want self|file|acme|central)", src);
+            return -1;
+        }
+        c->tls_src.names = getenv("OPENCHIME_TLS_NAME");
+        c->tls_src.directory = env_or2("OPENCHIME_ACME_DIRECTORY", NULL,
+                                       "https://acme-v02.api.letsencrypt.org/directory");
+        c->tls_src.email = getenv("OPENCHIME_ACME_EMAIL");
+        if (c->tls_src.source == OC_TLS_SRC_ACME && (!c->tls_src.names || !*c->tls_src.names)) {
+            snprintf(err, errcap, "OPENCHIME_TLS_SOURCE=acme needs OPENCHIME_TLS_NAME, the names to certify");
+            return -1;
+        }
+        if (c->tls_src.source == OC_TLS_SRC_FILE &&
+            (access(c->tls_cert, R_OK) != 0 || access(c->tls_key, R_OK) != 0)) {
+            snprintf(err, errcap, "OPENCHIME_TLS_SOURCE=file needs OPENCHIME_TLS_CERT and OPENCHIME_TLS_KEY "
+                                  "to be readable ('%s', '%s')", c->tls_cert, c->tls_key);
             return -1;
         }
     }

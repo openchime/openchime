@@ -38,7 +38,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_DB_PATH` | `/data/openchime.db` | SQLite database file (WAL, ARCH-2). |
 | `OPENCHIME_PROTO_PORT` | `8443` | The binary-protocol + ALPN-demuxed HTTP port. Production is 443 (ARCH-54). |
 | `OPENCHIME_HEALTH_PORT` | `8080` | Plaintext `/healthz` + landing-page port (ARCH-25). |
-| `OPENCHIME_TLS_CERT` | `/data/cert.pem` | Self-signed certificate path. Generated on first run; also persisted in the DB so the TOFU pin survives a restore (ARCH-10/66b). |
+| `OPENCHIME_TLS_CERT` | `/data/cert.pem` | The certificate path: the self-signed identity, generated on first run and persisted in the DB so a trusted fingerprint survives a restore (ARCH-10/66b); or, with `OPENCHIME_TLS_SOURCE=file`, the operator's own. |
 | `OPENCHIME_TLS_KEY` | `/data/key.pem` | Private key for the above. |
 | `OPENCHIME_MAX_CONNS_PER_IP` | `256` | Accept-loop cap on concurrent connections from one source: an IPv4 address, or an IPv6 **/64** — one host can take a whole /64, so counting its addresses one by one would cap nothing. The sign-in limiter counts sources the same way, and an IPv4-mapped IPv6 address counts as its IPv4 address. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(none)* | Addresses and CIDR blocks, IPv4 or IPv6, comma-separated, of TCP forwarders in front of the daemon. A connection from one must begin with a **PROXY protocol v2** header, read before TLS, and the client address it names is what the per-address connection cap and the sign-in limiter count; a trusted peer that sends none is closed. Nobody else's header is read. A list the daemon cannot parse stops the boot. |
@@ -66,11 +66,29 @@ verifies the server against **Mozilla's trusted roots, built into the binary**
 (ARCH-10). The host's CA store is never read, so what the daemon trusts is the
 same on every distribution and in a container with no `ca-certificates`. The
 roots are refreshed with each release ([TLS.md](./TLS.md)). The clients verify
-their `.well-known` discovery fetch against the same built-in roots.
+their `.well-known` discovery fetch against the same built-in roots, and a
+daemon's certificate against those, `OPENCHIME_EXTRA_CA` if set in their
+environment, and the operating system's own trusted roots.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENCHIME_EXTRA_CA` | *(none)* | A PEM file of further root certificates to trust **as well as** the built-in ones, never instead of them — for a self-hosted service behind a private CA, such as an S3-compatible store. Read at startup: a file that is missing, empty, or holds any certificate that does not parse stops the boot. |
+
+## Certificates
+
+Where the certificate the daemon presents comes from ([TLS.md](./TLS.md),
+"Certificates"). A CA-issued certificate is obtained once the daemon is serving,
+kept in the database, presented at once on later restarts, and renewed at
+two-thirds of its life; until the first arrives the self-signed one is presented.
+**Turning ACME on (`acme`) is the operator's acceptance of the CA's subscriber
+agreement** — for Let's Encrypt, <https://letsencrypt.org/repository/>.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCHIME_TLS_SOURCE` | `self` (`central` on a managed box with `OPENCHIME_ENROLL_URL`) | `self`: the self-signed identity. `file`: the operator's `OPENCHIME_TLS_CERT`/`_KEY`, which must be readable. `acme`: ACME with TLS-ALPN-01, for `OPENCHIME_TLS_NAME` — the CA connects to **port 443** at each name, so the names must resolve to the daemon and 443 must reach it. `central`: through central, for the workspace's name under the service suffix; needs an enrollment. Anything else, or a source missing what it needs, stops the boot. |
+| `OPENCHIME_TLS_NAME` | *(none)* | The DNS names to certify with ACME, comma-separated (for example `chat.acme.com`). |
+| `OPENCHIME_ACME_DIRECTORY` | `https://acme-v02.api.letsencrypt.org/directory` | The ACME CA's directory URL: Let's Encrypt, or an internal CA's ACME directory (step-ca, Vault PKI, AD CS through ACME) for a network with no internet. Its certificate is verified like any other outbound HTTPS (`OPENCHIME_EXTRA_CA` for an internal root). |
+| `OPENCHIME_ACME_EMAIL` | *(none)* | Contact address given to the CA for its expiry notices. Optional. |
 
 ## Attachments and blob storage
 
@@ -199,6 +217,7 @@ column detail is in [SCHEMA.md](./SCHEMA.md).
 |---|---|---|
 | `schema_version` | By the migrator, one row per applied migration | Which migrations have run. At each boot every migration above the highest row is applied in its own transaction; a failure rolls that one back and stops the boot (ARCH-27). |
 | `server_identity` (one row) | On the first run that generates a TLS identity | The daemon's certificate and private key. When present it is written over `OPENCHIME_TLS_CERT` / `OPENCHIME_TLS_KEY` at startup, so a restored database keeps the fingerprint clients pinned (ARCH-10/66b). |
+| `acme_account`, `tls_certificate` (one row each) | When a CA-issued certificate is first obtained | The ACME account (with its CA's directory) and the certificate presented, with its source, names and expiry; presented at once on a restart that still has that source and those names (migration 0049). |
 | `enrollment` (one row) | When `OPENCHIME_ENROLL_URL` first takes effect | The enrollment key, the audience and `pending` / `active`. The stored audience outranks `OPENCHIME_OIDC_AUDIENCE`, and push and invitation mail need `active` (ARCH-84/85). |
 | `invites` with no `created_by` | At boot, in `local` auth mode, while no owner exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). |
 | `users.role` | By owners and admins | `owner` / `admin` / `member` — who may administer the workspace (ARCH-60). |

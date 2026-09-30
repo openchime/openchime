@@ -1322,6 +1322,36 @@ void oc_client_cancel_signin(oc_client *c) {
     if (c && c->net) oc_net_cancel_signin(c->net);
 }
 
+int oc_fingerprint_from_hex(const char *hex, unsigned char fp[32]) {
+    if (!hex || strlen(hex) != 64) return -1;
+    for (int i = 0; i < 32; i++) {
+        unsigned v = 0;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return -1;
+        fp[i] = (unsigned char)v;
+    }
+    return 0;
+}
+
+int oc_fingerprint_format(const char *hex, int per_line, char *out, size_t cap) {
+    unsigned char fp[32];
+    if (oc_fingerprint_from_hex(hex, fp) != 0 || cap < 32 * 3) return -1;
+    size_t o = 0;
+    for (int i = 0; i < 32; i++) {
+        if (i) out[o++] = (per_line > 0 && i % per_line == 0) ? '\n' : ':';
+        o += (size_t)snprintf(out + o, cap - o, "%02X", fp[i]);
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+int oc_client_trust_cert(oc_client *c, const char *fp_hex) {
+    unsigned char fp[32];
+    if (!c || !c->net || oc_fingerprint_from_hex(fp_hex, fp) != 0) return -1;
+    oc_net_trust_cert(c->net, fp);
+    oc_net_reconnect(c->net);               /* try again now, not after the back-off */
+    return 0;
+}
+
 void oc_client_reconnect(oc_client *c) {
     if (c) oc_net_reconnect(c->net);
 }

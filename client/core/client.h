@@ -24,7 +24,7 @@ typedef struct oc_client oc_client;
 oc_client *oc_client_start(const char *host, int port, const char *cred);
 
 /* As oc_client_start, plus a local SQLite store at `store_path` (NULL = none)
- * that persists the session token + TOFU pin, so a relaunch reconnects silently
+ * that persists the session token + trusted fingerprint, so a relaunch reconnects silently
  * with the token instead of the password (REQ-100, ARCH-58). The parent
  * directory must exist; an unusable path just disables persistence. */
 oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
@@ -473,6 +473,19 @@ void oc_client_reconnect(oc_client *c);
 /* Stop waiting for a browser sign-in (model->signin_url is set while one waits).
  * The model then carries "sign-in cancelled" as its last error. */
 void oc_client_cancel_signin(oc_client *c);
+
+/* Trust the certificate the person was shown (model->cert_fp, ARCH-10): kept
+ * for this workspace and presented on a new attempt, made at once. Its
+ * fingerprint in hex, as the model carries it. Returns 0, or -1 if `fp_hex` is
+ * not one. */
+int oc_client_trust_cert(oc_client *c, const char *fp_hex);
+/* 64 hex digits into 32 bytes. Returns 0. */
+int oc_fingerprint_from_hex(const char *hex, unsigned char fp[32]);
+
+/* A fingerprint as a person reads it and an administrator's tools print it:
+ * upper-case byte pairs joined by colons, `per_line` bytes to a line (0: one
+ * line). Returns 0, or -1 if `hex` is not a fingerprint. */
+int oc_fingerprint_format(const char *hex, int per_line, char *out, size_t cap);
 
 /* How many sends are queued but unacknowledged (REQ-102). The outbox lives in
  * memory only (ARCH-88), so a frontend should warn before quitting while this is

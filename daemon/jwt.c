@@ -243,7 +243,7 @@ static const char PEM_END[]   = "-----END PUBLIC KEY-----";
 static const char B64URL[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-static size_t b64url_encode(const uint8_t *in, size_t n, char *out) {
+size_t oc_base64url_encode(const uint8_t *in, size_t n, char *out) {
     size_t o = 0;
     for (size_t i = 0; i < n; i += 3) {
         size_t rem = n - i;
@@ -259,10 +259,10 @@ static size_t b64url_encode(const uint8_t *in, size_t n, char *out) {
     return o;
 }
 
-/* RFC 7638 over a parsed key: SHA-256 of the canonical JWK
+/* The canonical JWK of a P-256 key (RFC 7638 §3.2): its members in order,
  * {"crv":"P-256","kty":"EC","x":"..","y":".."}. The point comes off the end of
  * the SubjectPublicKeyInfo, whose last 65 bytes for P-256 are 04 || X || Y. */
-static int thumbprint_of(mbedtls_pk_context *pk, char out[OC_JWT_THUMBPRINT_LEN + 1]) {
+int oc_jwk_p256(mbedtls_pk_context *pk, char *out, size_t cap) {
     if (mbedtls_pk_get_type(pk) != MBEDTLS_PK_ECKEY || mbedtls_pk_get_bitlen(pk) != 256)
         return -1;
     unsigned char der[160];
@@ -270,15 +270,21 @@ static int thumbprint_of(mbedtls_pk_context *pk, char out[OC_JWT_THUMBPRINT_LEN 
     if (n < 65) return -1;
     const unsigned char *pt = der + sizeof der - 65;
     if (pt[0] != 0x04) return -1;
-    char x[44], y[44], jwk[160];
-    b64url_encode(pt + 1, 32, x);
-    b64url_encode(pt + 33, 32, y);
-    int jl = snprintf(jwk, sizeof jwk,
-                      "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"%s\",\"y\":\"%s\"}", x, y);
-    if (jl <= 0 || (size_t)jl >= sizeof jwk) return -1;
+    char x[44], y[44];
+    oc_base64url_encode(pt + 1, 32, x);
+    oc_base64url_encode(pt + 33, 32, y);
+    int jl = snprintf(out, cap, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"%s\",\"y\":\"%s\"}", x, y);
+    return jl <= 0 || (size_t)jl >= cap ? -1 : jl;
+}
+
+/* RFC 7638 over a parsed key: SHA-256 of its canonical JWK. */
+int oc_jwk_thumbprint(mbedtls_pk_context *pk, char out[OC_JWT_THUMBPRINT_LEN + 1]) {
+    char jwk[160];
+    int jl = oc_jwk_p256(pk, jwk, sizeof jwk);
+    if (jl < 0) return -1;
     uint8_t hash[32];
     if (mbedtls_sha256((const unsigned char *)jwk, (size_t)jl, hash, 0) != 0) return -1;
-    return b64url_encode(hash, sizeof hash, out) == OC_JWT_THUMBPRINT_LEN ? 0 : -1;
+    return oc_base64url_encode(hash, sizeof hash, out) == OC_JWT_THUMBPRINT_LEN ? 0 : -1;
 }
 
 int oc_jwt_key_thumbprint(const char *pubkey_pem, size_t pem_len,
@@ -288,7 +294,7 @@ int oc_jwt_key_thumbprint(const char *pubkey_pem, size_t pem_len,
     int rc = -1;
     if (pubkey_pem &&
         mbedtls_pk_parse_public_key(&pk, (const unsigned char *)pubkey_pem, pem_len) == 0)
-        rc = thumbprint_of(&pk, out);
+        rc = oc_jwk_thumbprint(&pk, out);
     mbedtls_pk_free(&pk);
     return rc;
 }
@@ -311,7 +317,7 @@ static int pick_key(const char *pems, const char *kid, mbedtls_pk_context *pk) {
             char tp[OC_JWT_THUMBPRINT_LEN + 1];
             mbedtls_pk_init(pk);
             if (mbedtls_pk_parse_public_key(pk, (const unsigned char *)one, len + 2) == 0 &&
-                thumbprint_of(pk, tp) == 0 && strcmp(tp, kid) == 0)
+                oc_jwk_thumbprint(pk, tp) == 0 && strcmp(tp, kid) == 0)
                 return 0;
             mbedtls_pk_free(pk);
         }
@@ -325,7 +331,7 @@ int oc_jwt_nonce_matches(const char *nonce, const uint8_t *verifier, size_t veri
     uint8_t hash[32];
     char want[OC_JWT_THUMBPRINT_LEN + 1];
     if (mbedtls_sha256(verifier, verifier_len, hash, 0) != 0) return 0;
-    b64url_encode(hash, sizeof hash, want);
+    oc_base64url_encode(hash, sizeof hash, want);
     /* Constant time over the fixed length: the nonce is public, but there is no
      * reason to hand out a byte-at-a-time oracle on principle. */
     if (strlen(nonce) != OC_JWT_THUMBPRINT_LEN) return 0;

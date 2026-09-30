@@ -17,6 +17,10 @@
 /* Storage usage, policy, and what maintenance has reclaimed (REQ-214/215),
  * carried on OC_EV_STORAGE and folded into the model for the frontend to
  * render. Owner/admin only — the daemon refuses the request otherwise. */
+/* The largest certificate (DER) a frontend is handed to show; a larger one is
+ * judged by its fingerprint alone. */
+#define OC_CERT_DER_MAX 8192
+
 typedef struct {
     uint64_t total_bytes, avail_bytes, attach_bytes, attach_count;
     uint64_t rec_orphan, rec_expired, rec_evicted, last_reclaim_ms;
@@ -69,6 +73,9 @@ enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
     OC_EV_AUTH_OK,         /* authenticated; user_id set */
     OC_EV_AUTH_BROWSER,    /* a browser sign-in is waiting: body = the URL to open */
+    OC_EV_CERT_UNTRUSTED,  /* the server's certificate is not one to trust: body = its
+                            * SHA-256 in hex; der = the certificate; status = 1 if it
+                            * replaced one trusted before */
     OC_EV_SIGNED_OUT,      /* the session was refused and there is nothing to fall back on:
                             * the person has to sign in again, and the thread has stopped */
     OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name */
@@ -322,6 +329,8 @@ typedef struct {
     uint64_t *ids;        /* heap; CHANNEL_VIA_GROUP */
     size_t    n_ids;
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
+    uint8_t *der;         /* heap; CERT_UNTRUSTED: the certificate (DER) */
+    size_t    der_len;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);

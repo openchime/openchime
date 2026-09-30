@@ -211,7 +211,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_GROUP_ADD_MEMBERS = 112,
        OC_JOB_GROUP_REMOVE_MEMBERS = 113,
        OC_JOB_CHANNEL_ADD_GROUP = 114,
-       OC_JOB_CHANNEL_REMOVE_GROUP = 115 };
+       OC_JOB_CHANNEL_REMOVE_GROUP = 115,
+       OC_JOB_LOAD_TLS_STATE = 116, OC_JOB_STORE_ACME_ACCOUNT = 117, OC_JOB_STORE_TLS_CERT = 118 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -276,6 +277,7 @@ typedef struct oc_job {
     /* STORE_IDENTITY (persist the TLS cert+key PEM) */
     char          *cert_pem;   /* heap */
     char          *key_pem;    /* heap */
+    struct oc_tls_state *tls_state;   /* heap: STORE_ACME_ACCOUNT, STORE_TLS_CERT */
 
     /* STORE_ENROLLMENT (CP-8): the federated keypair + audience + state. */
     char          *enroll_privkey;   /* heap */
@@ -559,7 +561,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * READ_CURSOR naming them, so each of their devices resets its count; the
         * channel's other members are not told -- having seen a message stays
         * true. */
-       OC_RES_OWN_READ_CURSOR = 100 };
+       OC_RES_OWN_READ_CURSOR = 100,
+       OC_RES_TLS_STATE = 101 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -965,6 +968,7 @@ typedef struct oc_dbres {
     /* IDENTITY (load): the stored TLS cert+key PEM, or NULL if none. */
     char           *cert_pem;
     char           *key_pem;
+    struct oc_tls_state *tls_state;   /* OC_RES_TLS_STATE */
 
     /* ENROLLMENT (load, CP-8): the persisted keypair + audience + state. */
     char           *enroll_privkey;
@@ -1166,12 +1170,28 @@ size_t oc_dbwriter_auth_waiting(oc_dbwriter *w);
  * if an owner already exists. Setup-time only (drains one result). */
 int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_LEN]);
 
-/* Persisted TLS identity (ARCH-66b) so the TOFU cert survives the database being
+/* Persisted TLS identity (ARCH-66b) so the trusted certificate survives the database being
  * restored onto a new box (the cert lives in the DB, not just on local disk).
  * load returns 1 + heap cert/key PEM (caller frees) if stored, else 0; store
  * returns 1 on success. Setup-time only (each drains one result). */
 int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out);
 int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char *key_pem);
+
+/* A CA-issued certificate and the ACME account behind it (migration 0049). Any
+ * member may be NULL (none kept). */
+typedef struct oc_tls_state {
+    char    *acme_directory, *acme_key_pem, *acme_url;
+    char    *source, *names, *chain_pem, *key_pem;
+    uint64_t issued_ms, not_after_ms;
+} oc_tls_state;
+void oc_tls_state_free(oc_tls_state *s);
+/* What is kept, into `out`. Setup-time only, like oc_dbwriter_load_identity. */
+int  oc_dbwriter_load_tls_state(oc_dbwriter *w, oc_tls_state *out);
+/* Keep the ACME account / the certificate obtained. Any thread, while serving:
+ * the job is the writer's and nothing is answered. */
+void oc_dbwriter_store_acme_account(oc_dbwriter *w, const char *directory, const char *key_pem, const char *url);
+void oc_dbwriter_store_tls_cert(oc_dbwriter *w, const char *source, const char *names, const char *chain_pem,
+                                const char *key_pem, uint64_t issued_ms, uint64_t not_after_ms);
 
 /* Federated enrollment persistence (CP-8), setup-time only. Load returns 1 and
  * heap-allocates privkey_pem + audience (caller frees) + *active when a row

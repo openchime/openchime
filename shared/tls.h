@@ -2,8 +2,8 @@
  * OpenChime TLS (ARCH-10, ARCH-51) — a thin wrapper over vendored mbedTLS.
  *
  * The daemon terminates TLS on every client connection (REQ-180, no plaintext
- * fallback). On first run it generates its own self-signed certificate; clients
- * trust it via TOFU pinning (ARCH-10). The wrapper is written for a
+ * fallback). It presents a CA-issued certificate, or on first run generates its
+ * own self-signed one, which a client trusts only by its fingerprint (ARCH-10). The wrapper is written for a
  * non-blocking epoll loop: handshake/read/write return WANT_READ / WANT_WRITE
  * when the socket would block, which the caller maps to epoll interest.
  *
@@ -24,7 +24,14 @@
 #include <mbedtls/ssl_ticket.h>
 #include <mbedtls/x509_crt.h>
 
+#include "oc_thread.h"
+
 #define OC_TLS_FINGERPRINT_LEN 32 /* SHA-256 of the certificate DER */
+
+/* ALPN of an ACME TLS-ALPN-01 validation (RFC 8737): the CA connects with only
+ * this, and is answered with the challenge certificate for the name it asks. */
+#define OC_TLS_ALPN_ACME "acme-tls/1"
+#define OC_TLS_CHALLENGES 8          /* names being validated at once */
 
 typedef enum {
     OC_TLS_OK        =  0,
@@ -38,10 +45,25 @@ typedef enum {
  * is made at start, so a restart ends every ticket issued before it. */
 #define OC_TLS_TICKET_LIFETIME_S 86400
 
+/* A certificate chain and its key, as a handshake presents them. Shared by the
+ * handshakes that chose it and freed when the last lets go of a retired one. */
+typedef struct oc_tls_bundle {
+    mbedtls_x509_crt chain;
+    mbedtls_pk_context key;
+    int              refs;
+} oc_tls_bundle;
+
 /* Server-side TLS state: RNG, the daemon's cert+key, the shared config, and the
  * key its session tickets are sealed with. A client that returns with one
  * resumes the session without the certificate exchange and signature a full
- * handshake costs; `resumed` counts those (read with __atomic loads). */
+ * handshake costs; `resumed` counts those (read with __atomic loads).
+ *
+ * `cert`/`key` are what the daemon started with (its own, self-signed, or the
+ * operator's). `current` is what it presents now: a CA-issued certificate once
+ * one has been obtained, swapped in whole by oc_tls_server_use without touching
+ * a handshake under way. `challenge` holds the ACME TLS-ALPN-01 certificates
+ * (RFC 8737) for names being validated: presented only on an OC_TLS_ALPN_ACME
+ * handshake that names one of them. */
 typedef struct {
     mbedtls_entropy_context  entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
@@ -50,12 +72,14 @@ typedef struct {
     mbedtls_ssl_config       conf;
     mbedtls_ssl_ticket_context ticket;
     unsigned long            resumed;
+    oc_mutex_t               mu;             /* current, challenge */
+    oc_tls_bundle           *current;        /* NULL: cert/key */
+    struct { char name[256]; oc_tls_bundle *b; } challenge[OC_TLS_CHALLENGES];
 } oc_tls_server;
 
 /* Client-side TLS state, with three mutually exclusive trust modes:
- *   - **TOFU pinning** (`oc_tls_client_init` with a non-NULL `pin`): the peer
- *     leaf's SHA-256 must equal the pin. This is how clients trust a daemon's
- *     self-signed cert (ARCH-10) and is the project's normal mode.
+ *   - **Pinning** (`oc_tls_client_init` with a non-NULL `pin`): the peer
+ *     leaf's SHA-256 must equal the pin -- a fingerprint known in advance.
  *   - **No verification** (`oc_tls_client_init` with `pin == NULL`): any
  *     certificate is accepted. Only for callers that pin out-of-band.
  *   - **CA-chain verification** (`oc_tls_client_init_ca`): an ordinary public
@@ -73,6 +97,7 @@ typedef struct {
     uint8_t                  pin[OC_TLS_FINGERPRINT_LEN];
     int                      have_pin;
     int                      ca_mode;
+    void                    *roots;   /* oc_tls_client_init_verify's shared roots, held */
 } oc_tls_client;
 
 /* A session a client can resume: kept from a connection the daemon gave a
@@ -92,6 +117,12 @@ typedef struct {
      * address, which is never sent as SNI (RFC 6066 §3). */
     unsigned char       expect_ip[16];
     size_t              expect_ip_len;
+    /* server: the certificate this handshake presents, held until it is freed */
+    oc_tls_bundle      *bundle;
+    void               *server;
+    /* client: verification is the caller's to judge after the handshake
+     * (oc_tls_conn_defer_verify); `ip_ok` is the address check's answer. */
+    int                 defer, ip_ok;
 } oc_tls_conn;
 
 /* Load the cert+key from the given PEM paths, generating a self-signed pair
@@ -100,12 +131,27 @@ typedef struct {
 int  oc_tls_server_init(oc_tls_server *s, const char *cert_path, const char *key_path);
 void oc_tls_server_free(oc_tls_server *s);
 
-/* SHA-256 fingerprint of the server's certificate, for out-of-band publication
- * (e.g. the .well-known metadata, ARCH-10/14). Returns 0 on success. */
-int  oc_tls_server_fingerprint(const oc_tls_server *s, uint8_t out[OC_TLS_FINGERPRINT_LEN]);
+/* SHA-256 fingerprint of the certificate the server presents now, for
+ * out-of-band publication (the .well-known metadata, ARCH-10/14). Returns 0 on
+ * success. */
+int  oc_tls_server_fingerprint(oc_tls_server *s, uint8_t out[OC_TLS_FINGERPRINT_LEN]);
+
+/* Present this chain and key from the next handshake on (a CA-issued
+ * certificate, or its renewal). Handshakes under way, and connections already
+ * up, keep what they had. The PEM is copied. Returns 0, or negative if either
+ * does not parse -- in which case nothing changes. */
+int  oc_tls_server_use(oc_tls_server *s, const char *chain_pem, size_t chain_len,
+                       const char *key_pem, size_t key_len);
+
+/* The ACME TLS-ALPN-01 certificate for `name` (RFC 8737), presented only to a
+ * handshake offering OC_TLS_ALPN_ACME for that name; NULL `chain_pem` removes
+ * it. Returns 0, or negative (unparsable, or every slot taken). */
+int  oc_tls_server_set_challenge(oc_tls_server *s, const char *name,
+                                 const char *chain_pem, size_t chain_len,
+                                 const char *key_pem, size_t key_len);
 
 /* Initialize a client. If `pin` is non-NULL it must point to
- * OC_TLS_FINGERPRINT_LEN bytes and enables TOFU pinning. Returns 0 on success. */
+ * OC_TLS_FINGERPRINT_LEN bytes and enables pinning. Returns 0 on success. */
 int  oc_tls_client_init(oc_tls_client *c, const uint8_t *pin);
 /* As above, but with an explicit NULL-terminated ALPN list (which must outlive
  * the client): pass an HTTP list, or NULL to offer no ALPN at all, for a client
@@ -120,6 +166,21 @@ int  oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, const char **al
  * oc_tls_conn_set_hostname() before the handshake, or the hostname is not
  * checked. Returns 0 on success, negative on failure. */
 int  oc_tls_client_init_ca(oc_tls_client *c);
+
+/* Initialize a client that verifies an OpenChime daemon (TLS.md, "Trust"): the
+ * built-in roots, any set by oc_tls_set_extra_ca, and the operating system's
+ * own trusted roots -- where an organisation's internal CA is -- with ALPN
+ * `alpn` (NULL: oc/1). The result is judged by the caller after the handshake:
+ * call oc_tls_conn_defer_verify on each connection, then oc_tls_conn_ca_trusted.
+ * Returns 0. */
+int  oc_tls_client_init_verify(oc_tls_client *c, const char **alpn);
+
+/* Complete the handshake without refusing an untrusted certificate, so the
+ * caller can judge it (oc_tls_conn_ca_trusted, oc_tls_peer_fingerprint). */
+void oc_tls_conn_defer_verify(oc_tls_conn *c);
+/* After a deferred handshake: 1 if the certificate chains to a trusted root and
+ * names the host set by oc_tls_conn_set_hostname (or the address). */
+int  oc_tls_conn_ca_trusted(const oc_tls_conn *c);
 
 /* Add the roots in the PEM file at `path` to those every later
  * oc_tls_client_init_ca trusts: for a self-hosted service behind a private CA.
@@ -165,8 +226,12 @@ oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *
  * Returns 0 on success, negative if no peer cert is available. */
 int  oc_tls_peer_fingerprint(const oc_tls_conn *c, uint8_t out[OC_TLS_FINGERPRINT_LEN]);
 
+/* The peer's certificate itself (DER), borrowed from the connection: valid until
+ * it is freed. 0 on success, negative if there is none. */
+int  oc_tls_peer_der(const oc_tls_conn *c, const uint8_t **der, size_t *len);
+
 /* Nonzero if the last handshake failed the client-side peer verification (a
- * TOFU pin mismatch — the server presented a different certificate), as opposed
+ * pin mismatch — the server presented a different certificate), as opposed
  * to a plain transport failure. Distinguishes "cert changed" from "unreachable". */
 int  oc_tls_conn_cert_rejected(const oc_tls_conn *c);
 

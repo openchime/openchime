@@ -1,7 +1,7 @@
 /*
  * OpenChime client — network thread (ARCH-62).
  *
- * Owns the TLS socket for one connection: connect → TLS handshake (TOFU) →
+ * Owns the TLS socket for one connection: connect → TLS handshake (ARCH-10) →
  * HELLO/WELCOME → (stub) AUTH → read loop dispatching server frames into `to_ui`
  * as oc_ev, while draining user oc_cmd from `from_ui` to send. Lifts the
  * connect/read/write logic from tests/e2e_client.c; blocking-style over a
@@ -12,6 +12,7 @@
 #define OC_NET_H
 
 #include "callsig.h"
+#include "event.h"
 #include "queue.h"
 #include "secret.h"
 
@@ -30,11 +31,32 @@ typedef struct { char id[64]; char label[96]; uint8_t kind; } oc_signin_source;
  * sign-in connection names it; NULL names `host`. */
 int oc_net_probe(const char *workspace, const char *host, int port, oc_signin_source *out, int max);
 
+/* A certificate shown to the person to judge (ARCH-10): its fingerprint, and
+ * the certificate itself for a frontend that shows it (der_len 0 if it was
+ * larger than OC_CERT_DER_MAX). */
+typedef struct {
+    char    fp_hex[65];
+    uint8_t der[OC_CERT_DER_MAX];
+    size_t  der_len;
+} oc_cert_seen;
+
+/* The certificate a probe was shown was not one to trust (ARCH-10): no trusted
+ * root vouches for it and `trusted_fp` (what the person trusted, or NULL) is not
+ * it. It is described in `seen`. */
+#define OC_PROBE_UNTRUSTED   (-3)
+int oc_net_probe_ex(const char *workspace, const char *host, int port, const unsigned char *trusted_fp,
+                    oc_signin_source *out, int max, oc_cert_seen *seen);
+
+/* Trust the certificate with this fingerprint -- one the person was shown
+ * (OC_EV_CERT_UNTRUSTED) and accepted: kept for the workspace, and presented to
+ * the next attempt. Any thread. */
+void oc_net_trust_cert(oc_net *n, const unsigned char fp[32]);
+
 /* Start the network thread. `token` carries local credentials as
  * "username:password"; NULL or "" means a browser sign-in through the first such
  * source the workspace offers — OC_EV_AUTH_BROWSER then carries the URL for the
  * frontend to open, and the thread waits for the browser to come back. `store_path` (or NULL for in-memory only) is a local
- * SQLite store persisting the session token + TOFU pin, so a relaunch reconnects
+ * SQLite store persisting the session token + trusted fingerprint, so a relaunch reconnects
  * silently. `secret` (borrowed; NULL = none) routes the session token into an OS
  * keyring instead of the SQLite file. Returns NULL on failure to spawn. */
 oc_net *oc_net_start(const char *host, int port, const char *token,
@@ -50,7 +72,7 @@ oc_net *oc_net_start_named(const char *workspace_key, const char *host, int port
 
 /* As oc_net_start_named. With `pin_only` set nothing about the session is kept —
  * no token, owner, device key or book entry, which is what Remember-me off means —
- * but the workspace's TOFU pin still is: it is not a secret, and without it every
+ * but the workspace's trusted fingerprint still is: it is not a secret, and without it every
  * connection is a first connection (ARCH-10). */
 oc_net *oc_net_start_opts(const char *workspace_key, const char *host, int port, const char *token,
                           const char *store_path, oc_secret *secret, int pin_only,

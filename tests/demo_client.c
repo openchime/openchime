@@ -1,5 +1,5 @@
 /* Flexible black-box client for the local federated demo (scripts/demo-federated.sh).
- * Connects to a *running* daemon over TLS (TOFU-trusting, like e2e_client), logs in
+ * Connects to a *running* daemon over TLS (trusting any certificate, like e2e_client), logs in
  * with local credentials, and runs ONE command — enough to drive the cross-repo
  * flows by hand/script:
  *

@@ -1,13 +1,13 @@
 /*
  * OpenChime client — the local store (ARCH-58/88, CLIENT.md §5). Persists across
  * process restarts the bits a silent relaunch needs: the session token (so we
- * reconnect with OC_AUTH_SESSION instead of a password), the per-host TOFU pin,
+ * reconnect with OC_AUTH_SESSION instead of a password), the per-host trusted fingerprint,
  * the cached history, the offline outbox, and the workspace book. Keyed by
  * `workspace` — the workspace as named (oc_workspace_key), not the address it
  * resolved to — so one store holds several servers' state.
  *
  * **No local storage at all (ARCH-88).** Everything durable is one credential per
- * workspace in the OS credential store: session token, TOFU pin, and the book
+ * workspace in the OS credential store: session token, trusted fingerprint, and the book
  * fields. There is no database and no file. Cached history is gone — the daemon
  * is the source of truth and remembers each user's read position server-side
  * (REQ-090) — and the offline outbox lives in RAM on the net thread. With no OS
@@ -31,9 +31,9 @@ typedef struct oc_store oc_store;
 oc_store *oc_store_open(const char *path);
 void      oc_store_close(oc_store *s);
 
-/* Attach the OS credential store (borrowed). The session token AND the TOFU pin
+/* Attach the OS credential store (borrowed). The session token AND the trusted fingerprint
  * live there and NOWHERE else, so with NULL neither is persisted — the user signs
- * in again next launch and the next connect re-TOFUs. Set once, right after
+ * in again next launch and is asked about a self-signed certificate again. Set once, right after
  * open, and before any load_session/load_pin probe. */
 void      oc_store_set_secret(oc_store *s, oc_secret *secret);
 
@@ -61,12 +61,15 @@ void oc_store_clear_session(oc_store *s, const char *workspace);
  * whether a token is its own must not read the first as the second. */
 int  oc_store_session_user(oc_store *s, const char *workspace, char *out, size_t cap);
 
-/* TOFU pin (ARCH-10): the server cert's SHA-256, remembered on first connect and
- * enforced thereafter. load returns 1 and fills `pin` iff one is stored. */
+/* A certificate the person has explicitly trusted (ARCH-10): the SHA-256 of a
+ * daemon's own, self-signed certificate, accepted though no root vouches for
+ * it. A certificate a trusted root does vouch for needs none, and clears it.
+ * load returns 1 and fills `pin` iff one is stored. */
 int  oc_store_load_pin(oc_store *s, const char *workspace,
                        uint8_t pin[OC_TLS_FINGERPRINT_LEN]);
 void oc_store_save_pin(oc_store *s, const char *workspace,
                        const uint8_t pin[OC_TLS_FINGERPRINT_LEN]);
+void oc_store_clear_pin(oc_store *s, const char *workspace);
 
 /* This device's key pair for calls in `workspace` (ARCH-113, CALLS.md §5.2): the
  * X25519 private key kept in the credential store beside the token, made the

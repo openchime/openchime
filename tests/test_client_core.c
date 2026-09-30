@@ -29,8 +29,10 @@
 #include "e2e_hpke.h"
 #include "e2e_sframe.h"
 #include "check.h"
+#include "testpki.h"
 #include "issuer.h"       /* mints what central would, for the browser sign-in test */
 #include "signin.h"
+#include <mbedtls/sha256.h>
 #include "net.h"          /* oc_net_probe */
 
 #include <math.h>
@@ -38,6 +40,8 @@
 #include "oc_port.h"      /* oc_utc_offset_min: the value the core sends on connect */
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -1708,7 +1712,7 @@ static void test_session_owner(void) {
 }
 
 /* An entry written by a client from before tokens recorded their account is read,
- * not discarded. Discarding it would take the TOFU pin with it, and a dropped pin
+ * not discarded. Discarding it would take the trusted fingerprint with it, and a dropped pin
  * is a silent re-pin on the next connect (ARCH-10) — a downgrade in what the
  * client promises, paid by everyone who upgrades. */
 static void test_store_legacy_entry(void) {
@@ -2928,6 +2932,153 @@ static void fp_hex(const uint8_t *b, size_t n, char *out, size_t cap) {
         at += (size_t)snprintf(out + at, cap - at, "%02x", b[i]);
 }
 
+/* A LAN address of this machine: the daemon is reached off loopback, where
+ * loopback's exemption does not apply (ARCH-10). "" if it has none. */
+static void lan_address(char *out, size_t cap) {
+    out[0] = '\0';
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) != 0) return;
+    for (struct ifaddrs *i = ifs; i && !out[0]; i = i->ifa_next)
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_UP) && !(i->ifa_flags & IFF_LOOPBACK))
+            inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, out, (socklen_t)cap);
+    freeifaddrs(ifs);
+}
+
+/* Trust instead of pinning (ARCH-10): a certificate a trusted root vouches for
+ * under the workspace's name is taken as it is; one nobody vouches for is shown
+ * to the person -- its fingerprint -- and taken only once they say so, and
+ * then only that certificate; a CA-issued certificate replaces a trust the
+ * person gave, which is forgotten. Reached at this machine's LAN address, where
+ * loopback's exemption does not apply. */
+/* `der` is the certificate whose SHA-256 is `fp_hex`. */
+static int der_is(const uint8_t *der, size_t len, const char *want) {
+    unsigned char h[32]; char hex[65];
+    if (!len || mbedtls_sha256(der, len, h, 0) != 0) return 0;
+    fp_hex(h, sizeof h, hex, sizeof hex);
+    return strcmp(hex, want) == 0;
+}
+
+static void test_cert_trust(int port) {
+    {   /* A fingerprint as it is shown: upper case, colons, 16 bytes a line. */
+        char out[128];
+        CHECK(oc_fingerprint_format("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", 16,
+                                    out, sizeof out) == 0);
+        CHECK(!strcmp(out, "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\n"
+                           "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"));
+        CHECK(oc_fingerprint_format("not hex", 16, out, sizeof out) == -1);
+    }
+    char lan[64];
+    lan_address(lan, sizeof lan);
+    if (!lan[0]) { printf("  (no LAN address: the certificate-trust checks are skipped)\n"); return; }
+    testpki pki;
+    CHECK(testpki_init(&pki) == 0);
+    FILE *f = fopen("build/test_core_root.pem", "w");
+    if (f) { fputs(pki.pem, f); fclose(f); }
+
+    oc_tls_server srv;
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+    unlink("build/test_core_trust.db"); unlink("build/test_core_trust.db-wal"); unlink("build/test_core_trust.db-shm");
+    oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_trust.db");
+    CHECK(dbw != NULL);
+    if (!dbw) { oc_tls_server_free(&srv); return; }
+    CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
+    struct core_loop_arg arg;
+    arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+    wait_port_ready(arg.port);
+    /* After the daemon is up: its configuration, loaded as it starts, sets the
+     * extra roots from its environment -- none, here. */
+    CHECK(oc_tls_set_extra_ca("build/test_core_root.pem") == 0);
+    mock_reset();
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    uint8_t real[OC_TLS_FINGERPRINT_LEN]; char real_hex[65];
+    CHECK(oc_tls_server_fingerprint(&srv, real) == 0);
+    fp_hex(real, sizeof real, real_hex, sizeof real_hex);
+
+    /* Self-signed, off loopback: shown, not talked to -- its fingerprint the
+     * one the daemon has. */
+    oc_client *c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    CHECK(c != NULL);
+    if (!c) goto out;
+    CHECK(WAIT_FOR(c, m->cert_seq > 0));
+    CHECK(!strcmp(oc_client_model(c)->cert_fp, real_hex) && !oc_client_model(c)->cert_changed);
+    CHECK(der_is(oc_client_model(c)->cert_der, oc_client_model(c)->cert_der_len, real_hex));
+    CHECK(!oc_client_model(c)->authed);
+    /* Not answered, and retried: asked again -- the way back for someone who
+     * declined -- and still not talked to. */
+    {
+        uint32_t asked = oc_client_model(c)->cert_seq;
+        oc_client_reconnect(c);
+        CHECK(WAIT_FOR(c, m->cert_seq > asked));
+        CHECK(!oc_client_model(c)->authed);
+    }
+    /* The person trusts it: in, and it is kept for next time. */
+    CHECK(oc_client_trust_cert(c, oc_client_model(c)->cert_fp) == 0);
+    CHECK(WAIT_FOR(c, m->authed));
+    oc_client_stop(c);
+    c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    CHECK(c && WAIT_FOR(c, m->authed) && oc_client_model(c)->cert_seq == 0);   /* no question asked */
+    if (c) oc_client_stop(c);
+
+    /* The daemon's certificate is replaced by another self-signed one: that is
+     * a change, shown as one, and not taken on the old trust. */
+    char chain[8192], key[2048];
+    CHECK(testpki_leaf(&pki, "anything.test", 1, chain, sizeof chain, key, sizeof key) == 0);
+    CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+    c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    CHECK(c && WAIT_FOR(c, m->cert_seq > 0) && oc_client_model(c)->cert_changed && !oc_client_model(c)->authed);
+    if (c) oc_client_stop(c);
+
+    /* A certificate the root vouches for, for the name the workspace is: taken
+     * as it is, and the person's old trust is forgotten. */
+    CHECK(testpki_leaf(&pki, "trust.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+    CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+    c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);   /* key: the address */
+    CHECK(c && WAIT_FOR(c, m->cert_seq > 0) && !oc_client_model(c)->authed);        /* ...which it does not name */
+    if (c) oc_client_stop(c);
+    c = oc_client_start_named("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    CHECK(c && WAIT_FOR(c, m->authed) && oc_client_model(c)->cert_seq == 0);
+    if (c) oc_client_stop(c);
+    {
+        oc_store *chk = oc_store_open("ignored");
+        uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            oc_store_save_pin(chk, "trust.openchime.test", real);            /* an old trust... */
+            oc_store_close(chk);
+        }
+        c = oc_client_start_named("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec);
+        CHECK(c && WAIT_FOR(c, m->authed));
+        if (c) oc_client_stop(c);
+        chk = oc_store_open("ignored");
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            CHECK(oc_store_load_pin(chk, "trust.openchime.test", pin) == 0);  /* ...forgotten */
+            oc_store_close(chk);
+        }
+    }
+    /* The probe judges the same way, before anyone is asked anything. */
+    {
+        oc_signin_source src[4];
+        static oc_cert_seen seen;
+        CHECK(oc_net_probe_ex("trust.openchime.test", lan, arg.port, NULL, src, 4, &seen) >= 0);
+        CHECK(oc_net_probe_ex("other.openchime.test", lan, arg.port, NULL, src, 4, &seen) == OC_PROBE_UNTRUSTED);
+        CHECK(der_is(seen.der, seen.der_len, seen.fp_hex));     /* the certificate itself, to show */
+    }
+
+out:
+    __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    oc_tls_set_extra_ca(NULL);
+    testpki_free(&pki);
+    unlink("build/test_core_root.pem");
+    unlink("build/test_core_trust.db"); unlink("build/test_core_trust.db-wal"); unlink("build/test_core_trust.db-shm");
+    mock_reset();
+}
+
 static void test_published_fingerprint(int port) {
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -2966,8 +3117,8 @@ static void test_published_fingerprint(int port) {
     }
 
     /* One bit different: refused, and never authenticated. The store is a fresh
-     * key, so there is no pin -- this is the first connection, the one TOFU
-     * cannot check and this exists to check. */
+     * key, so there is no pin -- this is the first connection, the one only
+     * the published fingerprint can check. */
     {
         oc_client *c = oc_client_start_verified("fp-wrong.openchime.test", "127.0.0.1", arg.port,
                                                 "iris:pw-iris", "ignored", NULL, 1, wrong);
@@ -3116,16 +3267,15 @@ static void test_browser_signin(int port) {
             oc_store_set_secret(chk, &sec);
             uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
             CHECK(oc_store_load_session(chk, KEY, tok, NULL, 0) == 0);
-            CHECK(oc_store_load_pin(chk, KEY, pin) == 1);
+            CHECK(oc_store_load_pin(chk, KEY, pin) == 0);         /* nothing trusted by default */
             oc_store_close(chk);
         }
         mock_reset();
     }
 
-    /* Remember-me off leaves nothing of the SESSION behind — and still keeps the
-     * pin, so the next connection is checked against this one (ARCH-10). Against a
-     * non-loopback name the pin would then be enforced; here it is enough that it
-     * was kept, and that nothing else was. */
+    /* Remember-me off leaves nothing of the SESSION behind, and nothing is
+     * trusted by default either: a certificate is trusted by a root, or by the
+     * person, never by having been seen once (ARCH-10). */
     {
         mock_reset();
         oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
@@ -3143,8 +3293,8 @@ static void test_browser_signin(int port) {
             oc_store_set_secret(chk, &sec);
             uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], want[OC_TLS_FINGERPRINT_LEN];
             char who[64];
-            CHECK(oc_store_load_pin(chk, "forgetful.openchime.test", pin) == 1);
-            CHECK(oc_tls_server_fingerprint(&srv, want) == 0 && memcmp(pin, want, sizeof pin) == 0);
+            CHECK(oc_store_load_pin(chk, "forgetful.openchime.test", pin) == 0);
+            (void)want;
             CHECK(oc_store_load_session(chk, "forgetful.openchime.test", tok, NULL, 0) == 0);
             CHECK(oc_store_session_user(chk, "forgetful.openchime.test", who, sizeof who) == 0);
             oc_store_close(chk);
@@ -4158,7 +4308,7 @@ int run_client_core_tests(void) {
         oc_client_stop(a);
         oc_client_stop(b);
 
-        /* local store (ARCH-58): the session token + TOFU pin persist to a client
+        /* local store (ARCH-58): the session token + trusted fingerprint persist to a client
          * SQLite file. A client authenticates with a password, its token lands in
          * the store, and a second client pointed at the same store — given a
          * *wrong* password — still authenticates, because it rides in on the
@@ -4185,7 +4335,7 @@ int run_client_core_tests(void) {
                 uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
                 oc_store_set_secret(chk, &store_sec);
                 CHECK(oc_store_load_session(chk, inst, tok, NULL, 0) == 1);
-                CHECK(oc_store_load_pin(chk, inst, pin) == 1);
+                CHECK(oc_store_load_pin(chk, inst, pin) == 0);    /* loopback: accepted, not trusted */
                 oc_store_close(chk);
             }
             /* Wrong password, but the stored token authenticates it anyway —
@@ -4449,5 +4599,6 @@ int run_client_core_tests(void) {
     test_browser_signin(21500 + (int)(getpid() % 2000));
     test_big_channel_list(23600 + (int)(getpid() % 2000));
     test_published_fingerprint(25700 + (int)(getpid() % 2000));
+    test_cert_trust(27800 + (int)(getpid() % 2000));
     return failures;
 }

@@ -15,6 +15,7 @@ void oc_ev_free(oc_ev *e) {
     free(e->call);
     free(e->group);
     free(e->ids);
+    free(e->der);
     free(e);
 }
 

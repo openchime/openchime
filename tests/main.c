@@ -34,6 +34,7 @@ int run_media_tests(void);
 int run_video_media_tests(void);
 int run_emoji_tests(void);
 int run_tls_tests(void);
+int run_acme_tests(void);
 int run_netloop_tests(void);
 int run_client_core_tests(void);
 int run_enroll_tests(void);
@@ -222,6 +223,7 @@ int main(void) {
     total += SUITE(run_video_media_tests);
     total += SUITE(run_emoji_tests);
     total += SUITE(run_tls_tests);
+    total += SUITE(run_acme_tests);
     total += SUITE(run_netloop_tests);
     total += SUITE(run_client_core_tests);
     total += SUITE(run_enroll_tests);

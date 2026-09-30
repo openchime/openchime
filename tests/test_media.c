@@ -616,9 +616,11 @@ static void test_i420_view(void) {
  *     with fewer frames to show.
  *   - the timestamps go forwards, and the run has no hole in it -- a gap of a
  *     whole second means the source stopped, which no amount of load explains.
- *   - a shortfall is a shortfall and not a stop: a floor of a fifth of the rate,
- *     6 fps of a nominal 30. Below that there is nothing to watch, whatever the
- *     machine.
+ *   - a shortfall is a shortfall and not a stop: the frames run from the start
+ *     of the span to its end, with no second anywhere without one. That is a
+ *     stop's signature, whatever the machine; a count floor is not -- "a fifth of
+ *     the rate" failed at 5.4 fps under ThreadSanitizer, on a tree with nothing
+ *     wrong in it.
  *
  * The rate itself is PRINTED. That is the number a benchmark wants, and it says
  * which machine it expects; a unit suite cannot assert it. */
@@ -626,12 +628,13 @@ static void check_frame_rate(const char *what, const int64_t *pts_us, int n,
                              int fps, int span_ms) {
     int want   = span_ms * fps / 1000;
     int ceil_n = want + 2;                 /* the frames on each boundary */
-    int floor_n = want / 5;
     double period = 1e6 / (double)fps;
     printf("  %s: %d frames in %d ms -- %.1f fps, asked for %d\n",
            what, n, span_ms, n * 1000.0 / (span_ms ? span_ms : 1), fps);
     CHECK(n <= ceil_n);
-    CHECK(n >= floor_n);
+    CHECK(n >= 1);
+    if (n >= 2)                            /* from the start of the span to its end */
+        CHECK(pts_us[n - 1] - pts_us[0] > (int64_t)span_ms * 1000 - 1000000);
     if (n < 3) return;
     double gaps[4096];
     int ng = 0, backwards = 0;
@@ -756,7 +759,6 @@ static double tone_amp(const int16_t *x, size_t n, double hz) {
 static void test_screen_recording(void) {
     setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
     setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "3000", 1);
     /* The microphone hears the computer's sound back, 20 ms late at half strength:
      * a room, on a machine with speakers. */
     setenv("OPENCHIME_TEST_MIC_ECHO", "1", 1);

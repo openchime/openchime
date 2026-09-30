@@ -7,7 +7,7 @@
  * one on Linux, Windows' Credential Manager later, …). A NULL secret means "no
  * secure store" — the caller then falls back to the SQLite store, which is also
  * what happens on a headless box with no keyring. Only the session TOKEN goes
- * here; the (public) TOFU pin and message cache stay in SQLite.
+ * here; the (public) trusted fingerprint and message cache stay in SQLite.
  */
 
 #ifndef OC_SECRET_H

@@ -47,8 +47,8 @@ static int dial(const char *host, int port) {
     return -1;
 }
 
-/* Connect + TLS handshake, trusting any cert (TOFU pin verified in unit tests;
- * here we exercise the deployed stack, not pinning). */
+/* Connect + TLS handshake, trusting any cert (certificate trust is verified in unit
+ * tests; here we exercise the deployed stack). */
 static int client_open(client *c, const char *host, int port) {
     c->fd = dial(host, port);
     if (c->fd < 0) return -1;

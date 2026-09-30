@@ -259,6 +259,7 @@ static void job_free(oc_job *j) {
     free(j->emoji);
     free(j->cert_pem);
     free(j->key_pem);
+    if (j->tls_state) { oc_tls_state_free(j->tls_state); free(j->tls_state); }
     free(j->enroll_privkey);
     free(j->enroll_audience);
     free(j->filename);
@@ -482,6 +483,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
+    if (r->tls_state) { oc_tls_state_free(r->tls_state); free(r->tls_state); }
     free(r->enroll_privkey);
     free(r->enroll_audience);
     free(r->storage_key);
@@ -1698,8 +1700,73 @@ static oc_dbres *process_load_identity(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+void oc_tls_state_free(oc_tls_state *s) {
+    if (!s) return;
+    free(s->acme_directory); free(s->acme_url); free(s->source); free(s->names); free(s->chain_pem);
+    if (s->acme_key_pem) { memset(s->acme_key_pem, 0, strlen(s->acme_key_pem)); free(s->acme_key_pem); }
+    if (s->key_pem) { memset(s->key_pem, 0, strlen(s->key_pem)); free(s->key_pem); }
+    memset(s, 0, sizeof *s);
+}
+
+static char *col_dup(sqlite3_stmt *st, int i) {
+    const unsigned char *t = sqlite3_column_text(st, i);
+    return t ? strdup((const char *)t) : NULL;
+}
+
+/* The kept ACME account and CA-issued certificate (migration 0049). */
+static oc_dbres *process_load_tls_state(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_TLS_STATE;
+    oc_tls_state *s = r->tls_state = calloc(1, sizeof *s);
+    if (!s) return r;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT directory_url, account_key_pem, account_url FROM acme_account WHERE id=1;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        s->acme_directory = col_dup(st, 0); s->acme_key_pem = col_dup(st, 1); s->acme_url = col_dup(st, 2);
+    }
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_prepare_v2(db, "SELECT source, names, chain_pem, key_pem, issued_at_ms, not_after_ms "
+                           "FROM tls_certificate WHERE id=1;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        s->source = col_dup(st, 0); s->names = col_dup(st, 1); s->chain_pem = col_dup(st, 2); s->key_pem = col_dup(st, 3);
+        s->issued_ms = (uint64_t)sqlite3_column_int64(st, 4); s->not_after_ms = (uint64_t)sqlite3_column_int64(st, 5);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Keep what was obtained; nothing is answered (a background worker's write). */
+static oc_dbres *process_store_tls(sqlite3 *db, const oc_job *j) {
+    const oc_tls_state *s = j->tls_state;
+    if (!s) return NULL;
+    sqlite3_stmt *st = NULL;
+    if (j->type == OC_JOB_STORE_ACME_ACCOUNT) {
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO acme_account(id,directory_url,account_key_pem,account_url,created_at_ms) "
+                               "VALUES(1,?,?,?,?);", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, s->acme_directory ? s->acme_directory : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, s->acme_key_pem ? s->acme_key_pem : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, s->acme_url ? s->acme_url : "", -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    } else {
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO tls_certificate(id,source,names,chain_pem,key_pem,issued_at_ms,not_after_ms) "
+                               "VALUES(1,?,?,?,?,?,?);", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, s->source ? s->source : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, s->names ? s->names : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, s->chain_pem ? s->chain_pem : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 4, s->key_pem ? s->key_pem : "", -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)s->issued_ms);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)s->not_after_ms);
+    }
+    if (sqlite3_step(st) != SQLITE_DONE)
+        fprintf(stderr, "openchimed: could not keep the TLS certificate: %s\n", sqlite3_errmsg(db));
+    sqlite3_finalize(st);
+    return NULL;
+}
+
 /* Persist the TLS identity so a database restored onto a new box keeps the same
- * TOFU cert. */
+ * trusted certificate. */
 static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -7945,6 +8012,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_MARK_ALL_READ)  return process_mark_all_read(w->db, j);
     if (j->type == OC_JOB_LOAD_IDENTITY)  return process_load_identity(w->db, j);
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
+    if (j->type == OC_JOB_LOAD_TLS_STATE) return process_load_tls_state(w->db, j);
+    if (j->type == OC_JOB_STORE_ACME_ACCOUNT || j->type == OC_JOB_STORE_TLS_CERT) return process_store_tls(w->db, j);
     if (j->type == OC_JOB_LOAD_ENROLLMENT)  return process_load_enrollment(w->db, j);
     if (j->type == OC_JOB_STORE_ENROLLMENT) return process_store_enrollment(w->db, j);
     if (j->type == OC_JOB_WELCOME_GENERAL)  return process_welcome_general(w->db, j);
@@ -8726,6 +8795,52 @@ int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const 
         usleep(1000);
     }
     return 0;
+}
+
+int oc_dbwriter_load_tls_state(oc_dbwriter *w, oc_tls_state *out) {
+    memset(out, 0, sizeof *out);
+    oc_job *j = oc_job_new(OC_JOB_LOAD_TLS_STATE, 0);
+    if (!j) return 0;
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int ok = r->type == OC_RES_TLS_STATE && r->tls_state;
+            if (ok) { *out = *r->tls_state; memset(r->tls_state, 0, sizeof *r->tls_state); }
+            oc_dbres_free(r);
+            return ok;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+static char *dup_or_null(const char *s) { return s ? strdup(s) : NULL; }
+
+void oc_dbwriter_store_acme_account(oc_dbwriter *w, const char *directory, const char *key_pem, const char *url) {
+    oc_job *j = oc_job_new(OC_JOB_STORE_ACME_ACCOUNT, 0);
+    if (!j) return;
+    j->tls_state = calloc(1, sizeof *j->tls_state);
+    if (!j->tls_state) { job_free(j); return; }
+    j->tls_state->acme_directory = dup_or_null(directory);
+    j->tls_state->acme_key_pem = dup_or_null(key_pem);
+    j->tls_state->acme_url = dup_or_null(url);
+    oc_dbwriter_submit(w, j);
+}
+
+void oc_dbwriter_store_tls_cert(oc_dbwriter *w, const char *source, const char *names, const char *chain_pem,
+                                const char *key_pem, uint64_t issued_ms, uint64_t not_after_ms) {
+    oc_job *j = oc_job_new(OC_JOB_STORE_TLS_CERT, 0);
+    if (!j) return;
+    j->tls_state = calloc(1, sizeof *j->tls_state);
+    if (!j->tls_state) { job_free(j); return; }
+    j->tls_state->source = dup_or_null(source);
+    j->tls_state->names = dup_or_null(names);
+    j->tls_state->chain_pem = dup_or_null(chain_pem);
+    j->tls_state->key_pem = dup_or_null(key_pem);
+    j->tls_state->issued_ms = issued_ms;
+    j->tls_state->not_after_ms = not_after_ms;
+    oc_dbwriter_submit(w, j);
 }
 
 void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem, const char *audience) {
