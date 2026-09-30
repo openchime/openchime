@@ -140,6 +140,7 @@ static int ca_issue(mbedtls_pk_context *subject_key, const char *names, int life
              mbedtls_x509write_crt_set_serial_raw(&w, &serial, 1) ||
              mbedtls_x509write_crt_set_validity(&w, nb, na) ||
              mbedtls_x509write_crt_set_subject_alternative_name(&w, &nodes[0]) ||
+             mbedtls_x509write_crt_set_authority_key_identifier(&w) ||   /* for ARI's identifier */
              mbedtls_x509write_crt_pem(&w, leaf, sizeof leaf, mbedtls_ctr_drbg_random, &g_ca.rng) ? -1 : 0;
     mbedtls_x509write_crt_free(&w);
     if (!rc) snprintf(out, cap, "%s%s", (char *)leaf, g_ca.pem);
@@ -290,7 +291,28 @@ static struct {
     int      central_pending;               /* 202s still to answer */
     int      central_refuse;                /* answer 403 */
     int      central_bad_sigs;
+    /* ARI (RFC 9773): offered at all; a window already open, for the first ask
+     * only (a replacement is not due at once); else a window of these absolute
+     * times (ms); its Retry-After; and what was asked, and replaced. */
+    int      ari, ari_open_once, ari_retry_s;
+    uint64_t ari_start_ms, ari_end_ms;
+    int      ari_asked;
+    char     ari_last_id[200], order_replaces[200];
+    /* Orders: fail every one; and when each came. */
+    int      order_fail, n_orders;
+    uint64_t order_ms[32];
 } g_fake;
+
+static uint64_t wall_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void rfc3339(uint64_t ms, char *out, size_t cap) {
+    time_t t = (time_t)(ms / 1000); struct tm tm; gmtime_r(&t, &tm);
+    char b[32]; strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", &tm);
+    snprintf(out, cap, "%s.%03uZ", b, (unsigned)(ms % 1000));
+}
 
 static int jtok(const char *js, jsmntok_t *t, int n, const char *key, char *out, size_t cap) {
     size_t kl = strlen(key);
@@ -454,9 +476,24 @@ static void acme_request(int fd, const char *method, const char *path, const cha
     char nonce[32]; new_nonce(nonce);
     char nh[64]; snprintf(nh, sizeof nh, "Replay-Nonce: %s\r\n", nonce);
     if (!strcmp(path, "/dir")) {
-        char js[512];
-        snprintf(js, sizeof js, "{\"newNonce\":\"%s/nonce\",\"newAccount\":\"%s/acct\",\"newOrder\":\"%s/order\"}", base, base, base);
+        char js[640], ri[160] = "";
+        if (g_fake.ari) snprintf(ri, sizeof ri, ",\"renewalInfo\":\"%s/renewal-info/\"", base);
+        snprintf(js, sizeof js, "{\"newNonce\":\"%s/nonce\",\"newAccount\":\"%s/acct\",\"newOrder\":\"%s/order\"%s}", base, base, base, ri);
         reply(fd, 200, NULL, "application/json", js); return;
+    }
+    if (!strncmp(path, "/renewal-info/", 14) && g_fake.ari) {
+        pthread_mutex_lock(&g_fake.mu);
+        snprintf(g_fake.ari_last_id, sizeof g_fake.ari_last_id, "%s", path + 14);
+        uint64_t now = wall_ms(), st = g_fake.ari_start_ms, en = g_fake.ari_end_ms;
+        if (g_fake.ari_open_once && g_fake.ari_asked == 0) { st = now - 60000; en = now + 60000; }
+        g_fake.ari_asked++;
+        int ra = g_fake.ari_retry_s;
+        pthread_mutex_unlock(&g_fake.mu);
+        char js[256], a[40], b[40], ex[64] = "";
+        rfc3339(st, a, sizeof a); rfc3339(en, b, sizeof b);
+        snprintf(js, sizeof js, "{\"suggestedWindow\":{\"start\":\"%s\",\"end\":\"%s\"}}", a, b);
+        if (ra) snprintf(ex, sizeof ex, "Retry-After: %d\r\n", ra);
+        reply(fd, 200, ex, "application/json", js); return;
     }
     if (!strcmp(path, "/nonce")) { reply(fd, 200, nh, NULL, NULL); return; }
     if (strcmp(method, "POST")) { reply(fd, 405, NULL, NULL, NULL); return; }
@@ -477,6 +514,19 @@ static void acme_request(int fd, const char *method, const char *path, const cha
         reply(fd, 201, loc, "application/json", "{\"status\":\"valid\"}"); return;
     }
     if (!strcmp(path, "/order")) {
+        pthread_mutex_lock(&g_fake.mu);
+        if (g_fake.n_orders < 32) g_fake.order_ms[g_fake.n_orders] = wall_ms();
+        g_fake.n_orders++;
+        /* What it replaces (RFC 9773 §5), if anything. */
+        g_fake.order_replaces[0] = '\0';
+        const char *rp = strstr(pay, "\"replaces\":\"");
+        if (rp) { rp += 12; snprintf(g_fake.order_replaces, sizeof g_fake.order_replaces, "%.*s", (int)strcspn(rp, "\""), rp); }
+        int failing = g_fake.order_fail;
+        pthread_mutex_unlock(&g_fake.mu);
+        if (failing) {
+            reply(fd, 500, nh, "application/problem+json", "{\"type\":\"urn:ietf:params:acme:error:serverInternal\",\"detail\":\"down\"}");
+            return;
+        }
         /* The names asked for, in order. */
         char *s = pay; g_fake.order_names[0] = '\0';
         while ((s = strstr(s, "\"value\":\""))) {
@@ -604,9 +654,41 @@ static void test_units(void) {
     oc_base64url_encode(h, 32, want);
     CHECK(oc_jwk_thumbprint(&pk, th) == 0 && !strcmp(th, want));
     mbedtls_pk_free(&pk);
-    /* Renewal comes two-thirds of the way through a certificate's life. */
-    CHECK(oc_certs_renew_at(1000, 4000) == 3000);
-    CHECK(oc_certs_renew_at(0, 90ull * 86400000ull) == 60ull * 86400000ull);
+    /* Renewal comes at a random moment from 60% to two-thirds of the way through
+     * a certificate's life, chosen per certificate; a CA's window likewise. */
+    CHECK(oc_certs_renew_pick(0, 90ull * 86400000ull, 0.0) == 54ull * 86400000ull);
+    uint64_t hi = oc_certs_renew_pick(0, 90ull * 86400000ull, 0.999999);
+    CHECK(hi < 60ull * 86400000ull && hi > 59ull * 86400000ull);
+    CHECK(oc_certs_window_pick(1000, 2000, 0.0) == 1000 && oc_certs_window_pick(1000, 2000, 0.5) == 1500);
+    CHECK(oc_certs_window_pick(1000, 1000, 0.7) == 1000);
+    {
+        int differ = 0;
+        uint64_t first = oc_certs_renew_pick(0, 7776000000ull, (double)rand() / ((double)RAND_MAX + 1));
+        for (int i = 0; i < 100; i++)
+            if (oc_certs_renew_pick(0, 7776000000ull, (double)rand() / ((double)RAND_MAX + 1)) != first) differ = 1;
+        CHECK(differ);
+    }
+    /* Retries: a minute, ten, a hundred, then a day (Let's Encrypt's guide). */
+    CHECK(oc_certs_retry_ms(0, 60000, 86400000) == 60000 && oc_certs_retry_ms(1, 60000, 86400000) == 600000 &&
+          oc_certs_retry_ms(2, 60000, 86400000) == 6000000 && oc_certs_retry_ms(3, 60000, 86400000) == 86400000 &&
+          oc_certs_retry_ms(9, 60000, 86400000) == 86400000);
+    /* ARI's certificate identifier: RFC 9773 §4.1's own example. */
+    {
+        static const uint8_t aki[] = { 0x69, 0x88, 0x5B, 0x6B, 0x87, 0x46, 0x40, 0x41, 0xE1, 0xB3,
+                                       0x7B, 0x84, 0x7B, 0xA0, 0xAE, 0x2C, 0xDE, 0x01, 0xC8, 0xD4 };
+        static const uint8_t ser[] = { 0x00, 0x87, 0x65, 0x43, 0x21 };
+        char id[OC_ACME_CERT_ID_MAX];
+        CHECK(oc_acme_cert_id_raw(aki, sizeof aki, ser, sizeof ser, id, sizeof id) == 0 &&
+              !strcmp(id, "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE"));
+    }
+    /* RFC 3339, as ARI writes its windows. */
+    {
+        uint64_t t = 0;
+        CHECK(oc_rfc3339_ms("2025-01-02T04:00:00Z", &t) == 0 && t == 1735790400000ull);
+        CHECK(oc_rfc3339_ms("2025-01-02T04:00:00.250Z", &t) == 0 && t == 1735790400250ull);
+        CHECK(oc_rfc3339_ms("2025-01-02T06:00:00+02:00", &t) == 0 && t == 1735790400000ull);
+        CHECK(oc_rfc3339_ms("2025-01-02 04:00:00", &t) == -1 && oc_rfc3339_ms("2025-13-02T04:00:00Z", &t) == -1);
+    }
 }
 
 /* No challenge pending: an ACME handshake is refused, and everyone else is
@@ -726,6 +808,118 @@ static void test_worker(void) {
     g_ca_backdate_s = 60;
 }
 
+/* The first chain kept, for what ARI and a replacement name. */
+static char g_first_chain[8192];
+static int g_first_kept;
+static void keep_first(void *ctx, const oc_cert_issued *c) {
+    (void)ctx;
+    if (!__atomic_load_n(&g_first_kept, __ATOMIC_ACQUIRE)) {
+        snprintf(g_first_chain, sizeof g_first_chain, "%s", c->chain_pem);
+        __atomic_store_n(&g_first_kept, 1, __ATOMIC_RELEASE);
+    }
+}
+
+static oc_certs *worker_on(const char *dir, int life_s) {
+    oc_certs_opts o; memset(&o, 0, sizeof o);
+    o.source = OC_CERTS_ACME; o.tls = &g_srv; o.directory = dir; o.names = NAME;
+    o.account_key_pem = g_kept_key; o.account_url = g_kept_url;
+    o.store_cert = keep_first; o.retry_ms = 200; o.poll_ms = 20; o.check_ms = 100; o.ari_check_ms = 100;
+    g_fake.life_s = life_s;
+    __atomic_store_n(&g_first_kept, 0, __ATOMIC_RELEASE);
+    return oc_certs_start(&o);
+}
+
+static int obtained(oc_certs *w) { int n = 0; oc_certs_status(w, &n, NULL, NULL, 0); return n; }
+
+/* ARI (RFC 9773): the CA's window rules. One already open means now -- a
+ * certificate with an hour to run is replaced at once, the replacement naming
+ * it -- and one set later holds a renewal the daemon's own window would have
+ * made. */
+static void test_worker_ari(void) {
+    char dir[128]; snprintf(dir, sizeof dir, "http://127.0.0.1:%d/dir", g_fake.port);
+    g_ca_backdate_s = 0;
+    /* Open now: renewed at once, though its own moment is forty minutes off. */
+    g_fake.ari = 1; g_fake.ari_open_once = 1; g_fake.ari_asked = 0; g_fake.ari_retry_s = 0;
+    g_fake.ari_start_ms = wall_ms() + 3600000; g_fake.ari_end_ms = wall_ms() + 7200000;
+    oc_certs *w = worker_on(dir, 3600);
+    CHECK(w != NULL);
+    if (!w) return;
+    int i;
+    for (i = 0; i < 200 && obtained(w) < 2; i++) msleep(50);
+    CHECK(obtained(w) >= 2);
+    char id[OC_ACME_CERT_ID_MAX];
+    CHECK(__atomic_load_n(&g_first_kept, __ATOMIC_ACQUIRE) && oc_acme_cert_id(g_first_chain, id, sizeof id) == 0);
+    pthread_mutex_lock(&g_fake.mu);                               /* the fake is still answering ARI checks */
+    int asked_first = g_fake.ari_asked >= 1;
+    char replaced[200]; snprintf(replaced, sizeof replaced, "%s", g_fake.order_replaces);
+    pthread_mutex_unlock(&g_fake.mu);
+    CHECK(asked_first && strcmp(replaced, id) == 0);              /* the replacement names the replaced */
+    {   /* ...and the identifier is the certificate's own: its authority key and serial. */
+        mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
+        CHECK(mbedtls_x509_crt_parse(&crt, (const unsigned char *)g_first_chain, strlen(g_first_chain) + 1) >= 0);
+        char want[OC_ACME_CERT_ID_MAX];
+        CHECK(crt.authority_key_id.keyIdentifier.len == 20 &&
+              oc_acme_cert_id_raw(crt.authority_key_id.keyIdentifier.p, 20, crt.serial.p, crt.serial.len, want,
+                                  sizeof want) == 0 && strcmp(want, id) == 0);
+        mbedtls_x509_crt_free(&crt);
+    }
+    msleep(600);
+    CHECK(obtained(w) == 2);                                      /* and the replacement is not due */
+    oc_certs_stop(w);
+
+    /* Later: a two-second life would renew within 1.3 s; the CA's window,
+     * three seconds on, holds it. */
+    g_fake.ari_open_once = 0; g_fake.ari_asked = 0;
+    g_fake.ari_start_ms = wall_ms() + 3000; g_fake.ari_end_ms = wall_ms() + 3400;
+    w = worker_on(dir, 2);
+    CHECK(w != NULL);
+    if (!w) return;
+    for (i = 0; i < 100 && obtained(w) < 1; i++) msleep(50);
+    CHECK(obtained(w) == 1);
+    uint64_t first_at = wall_ms();
+    while (wall_ms() < g_fake.ari_start_ms - 300) { CHECK(obtained(w) == 1); msleep(100); }
+    for (i = 0; i < 100 && obtained(w) < 2; i++) msleep(50);
+    CHECK(obtained(w) >= 2 && wall_ms() - first_at >= 1500);
+    oc_certs_stop(w);
+    CHECK(g_fake.ari_asked >= 1);
+    g_fake.ari = 0;
+    g_ca_backdate_s = 60;
+}
+
+/* A CA that fails every order is asked again after the base wait, ten times
+ * it, a hundred times it, then at the ceiling -- not a doubling. */
+static void test_worker_retries(void) {
+    char dir[128]; snprintf(dir, sizeof dir, "http://127.0.0.1:%d/dir", g_fake.port);
+    pthread_mutex_lock(&g_fake.mu);
+    g_fake.order_fail = 1; g_fake.n_orders = 0;
+    pthread_mutex_unlock(&g_fake.mu);
+    oc_certs_opts o; memset(&o, 0, sizeof o);
+    o.source = OC_CERTS_ACME; o.tls = &g_srv; o.directory = dir; o.names = NAME;
+    o.account_key_pem = g_kept_key; o.account_url = g_kept_url;
+    o.retry_ms = 20; o.retry_max_ms = 400; o.poll_ms = 20;
+    oc_certs *w = oc_certs_start(&o);
+    CHECK(w != NULL);
+    if (!w) return;
+    for (int i = 0; i < 100; i++) {
+        pthread_mutex_lock(&g_fake.mu); int n = g_fake.n_orders; pthread_mutex_unlock(&g_fake.mu);
+        if (n >= 5) break;
+        msleep(50);
+    }
+    oc_certs_stop(w);
+    pthread_mutex_lock(&g_fake.mu);
+    int n = g_fake.n_orders;
+    uint64_t t[5]; for (int i = 0; i < 5 && i < n; i++) t[i] = g_fake.order_ms[i];
+    g_fake.order_fail = 0;
+    pthread_mutex_unlock(&g_fake.mu);
+    CHECK(n >= 5);
+    if (n < 5) return;
+    printf("  retries after a failed order: %llu, %llu, %llu, %llu ms\n", (unsigned long long)(t[1] - t[0]),
+           (unsigned long long)(t[2] - t[1]), (unsigned long long)(t[3] - t[2]), (unsigned long long)(t[4] - t[3]));
+    CHECK(t[1] - t[0] >= 20);
+    CHECK(t[2] - t[1] >= 200);                                    /* ten times, not twice */
+    CHECK(t[3] - t[2] >= 400 && t[4] - t[3] >= 400);              /* the ceiling (a hundred times is over it) */
+}
+
 static void test_central(void) {
     char pk[1024], aud[128];
     CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
@@ -772,6 +966,8 @@ int run_acme_tests(void) {
     test_listener_choice();
     test_issue();
     test_worker();
+    test_worker_ari();
+    test_worker_retries();
     test_central();
 
     __atomic_store_n(&g_srv_stop, 1, __ATOMIC_RELEASE); __atomic_store_n(&g_fake.stop, 1, __ATOMIC_RELEASE);

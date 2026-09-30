@@ -29,6 +29,9 @@ typedef struct {
     void         (*store_account)(void *ctx, const char *key_pem, const char *url);
     void          *ctx;
     int            poll_ms;          /* between polls of a pending object; 0 = 2000 */
+    /* The certificate this one replaces, by its ARI identifier (RFC 9773 §5),
+     * or NULL: the CA links the two, and may favour a replacement it asked for. */
+    const char    *replaces;
     const int     *stop;             /* nonzero: give up at the next poll (shutdown) */
 } oc_acme_opts;
 
@@ -55,6 +58,30 @@ int oc_acme_challenge_cert(const char *name, const char *keyauth, char **cert_pe
 /* A CSR for `names` (comma-separated) over a new P-256 key: its DER into `*der`
  * and the key's PEM into `*key_pem`, both malloc'd. Returns 0. */
 int oc_acme_csr(const char *names, uint8_t **der, size_t *der_len, char **key_pem);
+
+/* ACME Renewal Information (RFC 9773): the CA's own word on when a certificate
+ * should be renewed -- earlier than usual after an incident or a revocation.
+ *
+ * The certificate's identifier (§4.1): base64url of its authority key
+ * identifier, a dot, base64url of its serial number's content octets -- of the
+ * first certificate in `chain_pem`. 0, or -1 if it has no authority key
+ * identifier or `cap` is too small. The raw form, for tests. */
+#define OC_ACME_CERT_ID_MAX 200
+int oc_acme_cert_id(const char *chain_pem, char *out, size_t cap);
+int oc_acme_cert_id_raw(const uint8_t *aki, size_t aki_len, const uint8_t *serial, size_t serial_len,
+                        char *out, size_t cap);
+
+/* The window the CA suggests for renewing `chain_pem`'s certificate, from the
+ * directory's renewalInfo (unauthenticated GET, §4.2), in ms since the epoch,
+ * and how long to wait before asking again (its Retry-After; 0 if none). 0; or
+ * -1 with `err` -- including where the directory offers no renewalInfo, as an
+ * internal CA may not. */
+int oc_acme_renewal_info(const char *directory, const char *chain_pem, uint64_t *start_ms, uint64_t *end_ms,
+                         uint64_t *retry_after_ms, char *err, size_t errcap);
+
+/* An RFC 3339 time -- "2025-01-02T04:00:00Z", with or without fractions and a
+ * numeric offset -- in ms since the epoch. 0, or -1 if it is not one. */
+int oc_rfc3339_ms(const char *s, uint64_t *out);
 
 /* A certificate's validity window (the first in `pem`) in ms since the epoch.
  * Returns 0. */

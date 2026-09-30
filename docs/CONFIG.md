@@ -78,8 +78,10 @@ environment, and the operating system's own trusted roots.
 
 Where the certificate the daemon presents comes from ([TLS.md](./TLS.md),
 "Certificates"). A CA-issued certificate is obtained once the daemon is serving,
-kept in the database, presented at once on later restarts, and renewed at
-two-thirds of its life; until the first arrives the self-signed one is presented.
+kept in the database, presented at once on later restarts, and renewed when the
+CA's renewal information says (RFC 9773) or, where it gives none, at a random
+moment from 60% to two-thirds of its life; until the first arrives the
+self-signed one is presented.
 **Turning ACME on (`acme`) is the operator's acceptance of the CA's subscriber
 agreement** — for Let's Encrypt, <https://letsencrypt.org/repository/>.
 

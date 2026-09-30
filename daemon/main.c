@@ -151,6 +151,7 @@ static void start_certs(fed_services *f) {
     o.ctx = f;
     o.issued_ms = f->kept.issued_ms;
     o.not_after_ms = f->kept.not_after_ms;
+    o.chain_pem = f->kept.not_after_ms ? f->kept.chain_pem : NULL;
     if (cfg->tls_src.source == OC_TLS_SRC_ACME) {
         o.source = OC_CERTS_ACME;
         o.directory = cfg->tls_src.directory;

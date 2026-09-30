@@ -12,10 +12,14 @@
 #include "https_client.h"
 #include "jwt.h"      /* oc_base64url_encode */
 #include "push.h"     /* oc_push_sign: the machine signature (AUTH.md §8.7) */
+#include "auth.h"     /* oc_rand_bytes: each certificate's moment its own */
 
-#define RETRY_MIN_MS  60000u                 /* a failure waits a minute... */
-#define RETRY_MAX_MS  (6u * 3600u * 1000u)   /* ...doubling, to six hours */
+#define RETRY_MIN_MS  60000u                 /* a failure waits a minute, ten, a hundred... */
+#define RETRY_MAX_MS  (24u * 3600u * 1000u)  /* ...then a day */
 #define CHECK_MS      3600000u               /* renewal is looked for hourly */
+#define ARI_MIN_MS    3600000u               /* ARI is asked no more often than hourly, */
+#define ARI_MAX_MS    (12u * 3600u * 1000u)  /* and at least twice a day, */
+#define ARI_DEFAULT_MS (6u * 3600u * 1000u)  /* six-hourly where it names no time */
 
 struct oc_certs {
     oc_certs_opts   o;
@@ -27,6 +31,10 @@ struct oc_certs {
     int             obtained;
     uint64_t        issued_ms, not_after_ms;
     char            err[512];
+    /* The worker's own (unlocked): the certificate held, when it is renewed,
+     * the window that moment was drawn from, and when ARI is next asked. */
+    char           *held;
+    uint64_t        renew_ms, win_start, win_end, ari_next_ms;
 };
 
 static uint64_t now_ms(void) {
@@ -34,9 +42,29 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-uint64_t oc_certs_renew_at(uint64_t issued_ms, uint64_t not_after_ms) {
+uint64_t oc_certs_window_pick(uint64_t start_ms, uint64_t end_ms, double rnd) {
+    if (end_ms <= start_ms) return start_ms;
+    if (rnd < 0) rnd = 0;
+    if (rnd >= 1) rnd = 0.999999;
+    return start_ms + (uint64_t)((double)(end_ms - start_ms) * rnd);
+}
+
+uint64_t oc_certs_renew_pick(uint64_t issued_ms, uint64_t not_after_ms, double rnd) {
     if (not_after_ms <= issued_ms) return issued_ms;
-    return issued_ms + (not_after_ms - issued_ms) / 3 * 2;
+    uint64_t life = not_after_ms - issued_ms;
+    return oc_certs_window_pick(issued_ms + life / 10 * 6, issued_ms + life / 3 * 2, rnd);
+}
+
+uint64_t oc_certs_retry_ms(int n, uint64_t base, uint64_t max) {
+    uint64_t w = n <= 0 ? base : n == 1 ? base * 10 : n == 2 ? base * 100 : max;
+    return w > max ? max : w;
+}
+
+/* A uniform draw in [0, 1). */
+static double draw(void) {
+    uint32_t v = 0;
+    if (oc_rand_bytes(&v, sizeof v) != 0) return 0.5;
+    return (double)v / 4294967296.0;
 }
 
 /* --- through central (AUTH.md §8.9) --------------------------------------- */
@@ -153,28 +181,70 @@ static int wait_ms(oc_certs *c, uint64_t ms) {
     return s;
 }
 
+/* A certificate now held: its renewal drawn from the daemon's own window, and
+ * ARI asked about it at once (ACME). */
+static void hold(oc_certs *c, const char *chain, uint64_t issued_ms, uint64_t not_after_ms) {
+    if (chain != c->held) { free(c->held); c->held = chain ? strdup(chain) : NULL; }
+    c->win_start = issued_ms + (not_after_ms - issued_ms) / 10 * 6;
+    c->win_end = issued_ms + (not_after_ms - issued_ms) / 3 * 2;
+    c->renew_ms = not_after_ms > issued_ms ? oc_certs_renew_pick(issued_ms, not_after_ms, draw()) : 0;
+    c->ari_next_ms = 0;
+}
+
+/* Ask the CA when to renew (RFC 9773): a window it has not said before replaces
+ * the moment, drawn anew from it -- one already open means now, which is how a
+ * revocation reaches the daemon. When to ask next: as the CA says, within an
+ * hour and twelve. */
+static void ari_check(oc_certs *c, uint64_t now) {
+    uint64_t st = 0, en = 0, after = 0;
+    char err[256] = "";
+    if (oc_acme_renewal_info(c->s_directory, c->held, &st, &en, &after, err, sizeof err) == 0 &&
+        (st != c->win_start || en != c->win_end)) {
+        c->win_start = st; c->win_end = en;
+        /* A window already open is the CA asking now -- an incident, a
+         * revocation -- and is not waited out; one still to come gets its
+         * moment drawn from it. */
+        c->renew_ms = st <= now ? now : oc_certs_window_pick(st, en, draw());
+        if (st <= now)
+            fprintf(stderr, "openchimed: the CA asks for the TLS certificate to be renewed now (its window opened "
+                            "%llu s ago)\n", (unsigned long long)((now - st) / 1000));
+    }
+    uint64_t next = after ? after : ARI_DEFAULT_MS;
+    if (next < ARI_MIN_MS) next = ARI_MIN_MS;
+    if (next > ARI_MAX_MS) next = ARI_MAX_MS;
+    if (c->o.ari_check_ms > 0) next = (uint64_t)c->o.ari_check_ms;
+    c->ari_next_ms = now + next;
+}
+
 static void *worker(void *p) {
     oc_certs *c = p;
-    uint64_t retry = c->o.retry_ms > 0 ? (uint64_t)c->o.retry_ms : RETRY_MIN_MS;
+    uint64_t base = c->o.retry_ms > 0 ? (uint64_t)c->o.retry_ms : RETRY_MIN_MS;
+    uint64_t max = c->o.retry_max_ms > 0 ? (uint64_t)c->o.retry_max_ms : RETRY_MAX_MS;
     uint64_t check = c->o.check_ms > 0 ? (uint64_t)c->o.check_ms : CHECK_MS;
+    int fails = 0;
+    if (c->not_after_ms) hold(c, c->o.chain_pem, c->issued_ms, c->not_after_ms);
     for (;;) {
-        pthread_mutex_lock(&c->mu);
-        uint64_t renew = c->not_after_ms ? oc_certs_renew_at(c->issued_ms, c->not_after_ms) : 0;
-        int stop = c->stop;
-        pthread_mutex_unlock(&c->mu);
-        if (stop) break;
+        if (__atomic_load_n(&c->stop, __ATOMIC_ACQUIRE)) break;
         uint64_t now = now_ms();
-        if (renew && now < renew) {                     /* nothing due: look again later */
-            uint64_t w = renew - now < check ? renew - now : check;
+        /* The CA's word first, where there is a CA to ask and something to ask about. */
+        if (c->o.source == OC_CERTS_ACME && c->held && now >= c->ari_next_ms) ari_check(c, now);
+        if (c->renew_ms && now < c->renew_ms) {         /* nothing due: look again later */
+            uint64_t w = c->renew_ms - now;
+            if (w > check) w = check;
+            if (c->o.source == OC_CERTS_ACME && c->held && c->ari_next_ms > now && c->ari_next_ms - now < w)
+                w = c->ari_next_ms - now;
             if (wait_ms(c, w)) break;
             continue;
         }
         oc_cert_issued got;
-        char err[512] = "";
+        char err[512] = "", replaces[OC_ACME_CERT_ID_MAX] = "";
         int rc, final = 0, later_ms = 0;
         if (c->o.source == OC_CERTS_ACME) {
-            oc_acme_opts ao = { c->s_directory, c->s_names, c->s_email, c->o.tls, c->s_akey, c->s_aurl,
-                                c->o.store_account, c->o.ctx, c->o.poll_ms, &c->stop };
+            if (c->held && oc_acme_cert_id(c->held, replaces, sizeof replaces) != 0) replaces[0] = '\0';
+            oc_acme_opts ao = { .directory = c->s_directory, .names = c->s_names, .email = c->s_email,
+                                .tls = c->o.tls, .account_key_pem = c->s_akey, .account_url = c->s_aurl,
+                                .store_account = c->o.store_account, .ctx = c->o.ctx, .poll_ms = c->o.poll_ms,
+                                .stop = &c->stop, .replaces = replaces[0] ? replaces : NULL };
             rc = oc_acme_issue(&ao, &got, err, sizeof err);
         } else {
             rc = oc_central_issue(c->s_curl, c->s_aud, c->s_ekey, &got, &later_ms, &final, err, sizeof err);
@@ -187,13 +257,14 @@ static void *worker(void *p) {
             fprintf(stderr, "openchimed: TLS certificate for %s, valid until %llu\n", got.names,
                     (unsigned long long)(got.not_after_ms / 1000));
             if (c->o.store_cert) c->o.store_cert(c->o.ctx, &got);
+            hold(c, got.chain_pem, got.not_before_ms, got.not_after_ms);
             pthread_mutex_lock(&c->mu);
             c->obtained++;
             c->issued_ms = got.not_before_ms; c->not_after_ms = got.not_after_ms;
             c->err[0] = '\0';
             pthread_mutex_unlock(&c->mu);
             oc_cert_issued_free(&got);
-            retry = c->o.retry_ms > 0 ? (uint64_t)c->o.retry_ms : RETRY_MIN_MS;
+            fails = 0;
             continue;
         }
         if (rc == 1) { if (wait_ms(c, (uint64_t)later_ms)) break; continue; }   /* central: not yet */
@@ -203,8 +274,8 @@ static void *worker(void *p) {
         snprintf(c->err, sizeof c->err, "%s", err);
         pthread_mutex_unlock(&c->mu);
         if (final) break;
-        if (wait_ms(c, retry)) break;
-        retry = retry * 2 > RETRY_MAX_MS ? RETRY_MAX_MS : retry * 2;
+        if (wait_ms(c, oc_certs_retry_ms(fails, base, max))) break;
+        fails++;
     }
     return NULL;
 }
@@ -239,6 +310,7 @@ void oc_certs_stop(oc_certs *c) {
     pthread_cond_destroy(&c->cv);
     free(c->s_directory); free(c->s_names); free(c->s_email); free(c->s_akey); free(c->s_aurl);
     free(c->s_curl); free(c->s_aud); free(c->s_ekey);
+    free(c->held);
     free(c);
 }
 
