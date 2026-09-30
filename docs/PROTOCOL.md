@@ -1465,7 +1465,10 @@ be empty when it carries attachments.
 **`TRANSFER_CANCEL` (C → S), `0x008A`** `{ attachment_id: u64 }` — aborts an
 in-progress upload or download; the server tears down the transfer and, for an
 uncommitted upload, discards the partial blob. Abandoned uploads that never
-finalize are swept by a time-gated cleanup (ARCH-70).
+finalize are swept by a time-gated cleanup (ARCH-70). A new transfer may begin
+at once, even while the cancelled one's `UPLOAD_BEGIN` or `DOWNLOAD_BEGIN` is still
+being answered: whatever that answer is — its attachment, or a refusal — it
+belongs to the cancelled transfer and is dropped, never taken for the new one's.
 
 ---
 

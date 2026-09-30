@@ -1031,6 +1031,86 @@ static void test_upload_abandoned(int port, const uint8_t *pin) {
     free(fbuf);
 }
 
+/* An upload cancelled and begun again before the first one's create is answered
+ * (REQ-140, ARCH-69). The writer is held, so both creates are queued behind
+ * BEGIN, CANCEL, BEGIN; released, the first answer comes back while the second
+ * upload awaits its own. It must be taken for what it is -- the cancelled
+ * upload's -- and the second upload streams, finishes and downloads under its
+ * own attachment: its name, its size. Taken for the second's, the upload would
+ * be streaming into the first's row, promised 1000 bytes, and 3000 are refused. */
+static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw) {
+    client a;
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    uint8_t *fbuf = malloc(OC_MAX_FRAME_SIZE), *payload = malloc(3000);
+    CHECK(fbuf && payload);
+    if (!fbuf || !payload) { free(fbuf); free(payload); client_close(&a); return; }
+    for (int i = 0; i < 3000; i++) payload[i] = (uint8_t)(i * 13u + 1u);
+    oc_header hdr; oc_rbuf p; oc_wbuf w;
+
+    oc_dbwriter_hold(dbw, 1);
+    oc_upload_begin first = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("first.bin"), oc_slice_str("application/octet-stream"), 1000 };
+    memset(first.idem, 0xA1, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &first) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    oc_transfer_cancel tc = { 0 };
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &tc) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    oc_upload_begin second = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("second.bin"), oc_slice_str("application/octet-stream"), 3000 };
+    memset(second.idem, 0xB2, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &second) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) < 2; i++) usleep(10000);
+    CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) == 2);   /* both asked, neither answered */
+    oc_dbwriter_hold(dbw, 0);
+
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+    oc_upload_ready rd = { 0 };
+    CHECK(oc_decode_upload_ready(&p, &rd) == OC_OK && rd.attachment_id);
+    oc_upload_chunk uc = { rd.attachment_id, 0, { payload, 3000 } };
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_ACK);   /* all 3000 taken */
+    oc_upload_end ue = { rd.attachment_id };
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_OK);
+    oc_upload_ok ok = { 0 };
+    CHECK(oc_decode_upload_ok(&p, &ok) == OC_OK && ok.attachment_id == rd.attachment_id && ok.size == 3000);
+
+    /* Stored as the second upload: its name and its size, not the first's. */
+    oc_download_begin db = { rd.attachment_id };
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DOWNLOAD_INFO);
+    oc_download_info di;
+    memset(&di, 0, sizeof di);
+    CHECK(oc_decode_download_info(&p, &di) == OC_OK && di.total_size == 3000 &&
+          di.filename.len == 10 && !memcmp(di.filename.ptr, "second.bin", 10));
+    client_close(&a);
+
+    /* The same with a refusal: the cancelled upload's create fails (a channel
+     * that does not exist), and its error is not the next upload's -- which is
+     * made ready, not ended. */
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    oc_dbwriter_hold(dbw, 1);
+    first.channel_id = 987654321;
+    memset(first.idem, 0xA3, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &first) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &tc) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    memset(second.idem, 0xB4, OC_IDEM_SIZE);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &second) == OC_OK && send_frame(&a, fbuf, w.len) == 0);
+    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) < 2; i++) usleep(10000);
+    CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_ATTACH_CREATE) == 2);
+    oc_dbwriter_hold(dbw, 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+    free(fbuf); free(payload);
+    client_close(&a);
+}
+
 /* Read-aloud over the wire (REQ-291-295, ARCH-111), with a stub engine in place
  * of the voice model: a message is asked for, rendered, streamed and cached; the
  * second ask is served from the cache without rendering again; a message with
@@ -4458,6 +4538,7 @@ int run_netloop_tests(void) {
         test_voice_input_vertical(arg.port, pin);
         test_voice_input_rate(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
+        test_upload_restarted(arg.port, pin, dbw);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);

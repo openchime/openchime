@@ -70,6 +70,7 @@ struct oc_dbwriter {
     int             auth_deferred;           /* writer-only: the job went on to a reader */
     int             evfd;                    /* signals results ready */
     int             stop;
+    int             hold;                     /* oc_dbwriter_hold: no queue is served */
     int             started;
 
     /* Auth config (set before serving; read only on the writer thread). */
@@ -8532,7 +8533,7 @@ static void *writer_loop(void *arg) {
     oc_dbwriter *w = (oc_dbwriter *)arg;
     for (;;) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->jobs_head)
+        while (!w->stop && (!w->jobs_head || w->hold))
             pthread_cond_wait(&w->cv, &w->mu);
         if (w->stop && !w->jobs_head) { pthread_mutex_unlock(&w->mu); break; }
         oc_job *j = w->jobs_head;
@@ -8542,6 +8543,7 @@ static void *writer_loop(void *arg) {
 
         w->auth_deferred = 0;
         oc_dbres *r = process_write(w, j);
+        for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
         if (!w->auth_deferred) job_free(j);   /* else the auth pool has it (process_auth) */
         push_result(w, r);
         maybe_prune_idem(w);
@@ -8556,7 +8558,7 @@ static void *reader_loop(void *arg) {
     oc_dbwriter *w = rd->w;
     for (;;) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !rd->head)
+        while (!w->stop && (!rd->head || w->hold))
             pthread_cond_wait(&rd->cv, &w->mu);
         if (w->stop && !rd->head) { pthread_mutex_unlock(&w->mu); break; }
         oc_job *j = rd->head;
@@ -8569,6 +8571,7 @@ static void *reader_loop(void *arg) {
             continue;
         }
         oc_dbres *r = process_read(rd->rdb, j);
+        for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
         job_free(j);
         push_result(w, r);
     }
@@ -8664,6 +8667,24 @@ static void submit_to_reader(oc_dbwriter *w, oc_job *j) {
 }
 
 void oc_dbwriter_hold_auth(oc_dbwriter *w, int on) { oc_authpool_hold(w->auth, on); }
+
+size_t oc_dbwriter_jobs_waiting(oc_dbwriter *w, int type) {
+    size_t n = 0;
+    pthread_mutex_lock(&w->mu);
+    for (const oc_job *j = w->jobs_head; j; j = j->next) n += j->type == type;
+    for (int i = 0; i < OC_DB_READERS; i++)
+        for (const oc_job *j = w->readers[i].head; j; j = j->next) n += j->type == type;
+    pthread_mutex_unlock(&w->mu);
+    return n;
+}
+
+void oc_dbwriter_hold(oc_dbwriter *w, int on) {
+    pthread_mutex_lock(&w->mu);
+    w->hold = on;
+    pthread_cond_broadcast(&w->cv);
+    for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_broadcast(&w->readers[i].cv);
+    pthread_mutex_unlock(&w->mu);
+}
 size_t oc_dbwriter_auth_waiting(oc_dbwriter *w) { return oc_authpool_waiting(w->auth); }
 
 void oc_dbwriter_submit(oc_dbwriter *w, oc_job *j) {
