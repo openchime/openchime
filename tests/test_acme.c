@@ -27,6 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <mbedtls/asn1.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/pem.h>
 #include <mbedtls/ctr_drbg.h>
@@ -128,7 +129,8 @@ static int ca_issue(mbedtls_pk_context *subject_key, const char *names, int life
         n++;
     }
     char subj[300]; snprintf(subj, sizeof subj, "CN=%s", first);
-    static unsigned char serial = 10; serial++;
+    static unsigned n_issued; n_issued++;          /* two bytes, 0x40.. first: positive, minimal, distinct across repeats */
+    unsigned char serial[2] = { (unsigned char)(0x40 | ((n_issued >> 8) & 0x3f)), (unsigned char)n_issued };
     time_t a = time(NULL) - g_ca_backdate_s, b = time(NULL) + life_s;
     struct tm ta, tb; gmtime_r(&a, &ta); gmtime_r(&b, &tb);
     char nb[16], na[16]; strftime(nb, sizeof nb, "%Y%m%d%H%M%S", &ta); strftime(na, sizeof na, "%Y%m%d%H%M%S", &tb);
@@ -137,7 +139,7 @@ static int ca_issue(mbedtls_pk_context *subject_key, const char *names, int life
     unsigned char leaf[4096];
     int rc = mbedtls_x509write_crt_set_subject_name(&w, subj) ||
              mbedtls_x509write_crt_set_issuer_name(&w, "CN=ACME Test Root") ||
-             mbedtls_x509write_crt_set_serial_raw(&w, &serial, 1) ||
+             mbedtls_x509write_crt_set_serial_raw(&w, serial, sizeof serial) ||
              mbedtls_x509write_crt_set_validity(&w, nb, na) ||
              mbedtls_x509write_crt_set_subject_alternative_name(&w, &nodes[0]) ||
              mbedtls_x509write_crt_set_authority_key_identifier(&w) ||   /* for ARI's identifier */
@@ -628,6 +630,25 @@ static void test_units(void) {
     CHECK(names_raw(der0, dl0, NAME) && has_acme_id(der0, dl0, "tok.thumb"));
     CHECK(!has_acme_id(der0, dl0, "tok.other"));
     free(cp); free(kp);
+    /* Its serial is a DER INTEGER a CA's parser accepts: positive and minimal --
+     * no leading zero byte, which OpenSSL and Go refuse. The random serial's
+     * top byte is built to be 0x40-0x7f, which guarantees both; checked on
+     * enough certificates that a byte left random would show. */
+    int serials_ok = 1;
+    for (int i = 0; i < 32; i++) {
+        cp = kp = NULL;
+        if (oc_acme_challenge_cert(NAME, "tok.thumb", &cp, &kp) != 0 || der_of(cp, der0, sizeof der0, &dl0) != 0) serials_ok = 0;
+        unsigned char *q = der0, *e = der0 + dl0; size_t l = 0;
+        if (serials_ok &&
+            (mbedtls_asn1_get_tag(&q, e, &l, MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE) ||   /* certificate */
+             mbedtls_asn1_get_tag(&q, e, &l, MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE) ||   /* tbsCertificate */
+             mbedtls_asn1_get_tag(&q, e, &l, MBEDTLS_ASN1_CONTEXT_SPECIFIC | MBEDTLS_ASN1_CONSTRUCTED) ||
+             (q += l, 0) ||                                                                          /* version */
+             mbedtls_asn1_get_tag(&q, e, &l, MBEDTLS_ASN1_INTEGER) || l != 16 ||                     /* serial */
+             (q[0] & 0x80) || (q[0] == 0 && !(q[1] & 0x80)) || (q[0] & 0xc0) != 0x40)) serials_ok = 0;
+        free(cp); free(kp);
+    }
+    CHECK(serials_ok);
     /* The CSR names what it was asked to. */
     uint8_t *der = NULL; size_t dl = 0; char *key = NULL;
     CHECK(oc_acme_csr("a.acme.test,b.acme.test", &der, &dl, &key) == 0 && der && key);
@@ -950,6 +971,14 @@ static void test_central(void) {
 int run_acme_tests(void) {
     printf("test_acme: ACME TLS-ALPN-01 against a fake CA, the listener's certificate choice, renewal and swap, certificates through central\n");
     srand((unsigned)time(NULL));
+    /* Every run starts from nothing, so the suite runs again in one process
+     * (OC_TEST_REPEAT): the fake CA's state and stop flag, the listener's,
+     * and what the last run kept. */
+    memset(&g_fake, 0, sizeof g_fake);
+    g_srv_stop = 0; g_ca_backdate_s = 60;
+    g_kept_key[0] = g_kept_url[0] = '\0'; g_kept_accounts = 0;
+    g_cert_stores = 0; g_stored_chain[0] = '\0';
+    g_first_chain[0] = '\0'; g_first_kept = 0;
     CHECK(ca_init() == 0);
     CHECK(oc_tls_set_extra_ca(g_ca.path) == 0);
     unlink("build/test_acme_cert.pem"); unlink("build/test_acme_key.pem");
@@ -978,6 +1007,7 @@ int run_acme_tests(void) {
     oc_tls_server_free(&g_srv);
     oc_tls_set_extra_ca(NULL);
     if (g_fake.have_acct) mbedtls_pk_free(&g_fake.acct);
+    pthread_mutex_destroy(&g_fake.mu);
     mbedtls_pk_free(&g_ca.key); mbedtls_ctr_drbg_free(&g_ca.rng); mbedtls_entropy_free(&g_ca.ent);
     unlink(g_ca.path); unlink("build/test_acme_cert.pem"); unlink("build/test_acme_key.pem");
     return failures;
