@@ -169,6 +169,12 @@ typedef struct {
     int              audio;
     uint64_t         audio_message_id;
     uint32_t         audio_duration_ms;
+    /* Which transfer this is: advanced whenever one ends (xfer_reset), stamped
+     * on each database job the transfer submits and echoed on its result, so a
+     * result is acted on only by the transfer that asked for it. A cancelled
+     * upload's create, answered after the next UPLOAD_BEGIN, is otherwise the
+     * next upload's (REQ-140); its row stays unlinked, for the storage sweep. */
+    uint32_t         gen;
 } conn_xfer;
 
 /* A page's post, kept while the writer checks it: what the answer needs. */
@@ -416,9 +422,19 @@ static void xfer_reset(conn_xfer *x) {
      * connection paused until the outstanding completion lands, which then
      * clears it. */
     int outstanding = x->in_flight;
+    uint32_t gen = x->gen;
     memset(x, 0, sizeof *x);
     x->in_flight = outstanding;
+    x->gen = gen + 1;          /* whatever the ended transfer still has out is now stale */
 }
+
+/* Submit a job on behalf of the connection's transfer, and ask whether a result
+ * answers the transfer now in progress (conn_xfer.gen). */
+static void xfer_submit(oc_dbwriter *dbw, const conn_xfer *x, oc_job *j) {
+    j->gen = x->gen;
+    oc_dbwriter_submit(dbw, j);
+}
+static int xfer_current(const conn_xfer *x, const oc_dbres *r) { return r->gen == x->gen; }
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -3179,7 +3195,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->filename = ub.filename.len ? strndup((const char *)ub.filename.ptr, ub.filename.len) : strdup("");
             j->mime     = ub.mime.len     ? strndup((const char *)ub.mime.ptr, ub.mime.len)         : strdup("");
             if (!j->filename || !j->mime) { return -1; }
-            oc_dbwriter_submit(dbw, j);
+            xfer_submit(dbw, &c->xfer, j);
             c->xfer.state = XFER_UP_AWAIT_CREATE;
             c->xfer.declared_size = ub.total_size;
             continue;
@@ -3263,7 +3279,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->attachment_id = db.attachment_id;
-            oc_dbwriter_submit(dbw, j);
+            xfer_submit(dbw, &c->xfer, j);
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
             c->xfer.attachment_id = db.attachment_id;
             continue;
@@ -3415,7 +3431,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->tts_model_version = strdup(g_tts_engine->version);
             j->tts_voices = tts_voice_list();
             j->tts_lang = strdup(g_tts_engine->lang ? g_tts_engine->lang : "");
-            oc_dbwriter_submit(dbw, j);
+            xfer_submit(dbw, &c->xfer, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
             continue;
@@ -3465,7 +3481,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->tts_voice = (uint8_t)voice;
             j->tts_text = strdup(preview);
             j->tts_model_version = strdup(g_tts_engine->version);
-            oc_dbwriter_submit(dbw, j);
+            xfer_submit(dbw, &c->xfer, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
             continue;
@@ -5124,7 +5140,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         conn_xfer *x = &c->xfer;
-        if (x->state != XFER_UP_AWAIT_CREATE) break;   /* client canceled/closed */
+        if (!xfer_current(x, r) || x->state != XFER_UP_AWAIT_CREATE) break;   /* cancelled, or another's */
         /* Opening an S3 object is a connect + TLS handshake, so it goes to the
          * pool; UPLOAD_READY is sent when it completes. */
         oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_W, c->conn_id);
@@ -5152,7 +5168,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         conn_xfer *x = &c->xfer;
-        if (x->state != XFER_UP_AWAIT_FINAL) break;
+        if (!xfer_current(x, r) || x->state != XFER_UP_AWAIT_FINAL) break;
         int fd = c->fd;
         oc_upload_ok ok = { x->attachment_id, r->att_size, { x->digest, 32 } };
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -5208,7 +5224,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         conn_xfer *x = &c->xfer;
-        if (x->state != XFER_DOWN_AWAIT_LOOKUP || !x->audio) break;
+        if (!xfer_current(x, r) || x->state != XFER_DOWN_AWAIT_LOOKUP || !x->audio) break;
         /* The voice the daemon picked for this author becomes a fact on their
          * profile, written once (REQ-292). */
         if (r->tts_persist && g_tts_engine && g_tts_engine->voice_id) {
@@ -5265,7 +5281,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_TTS_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        if (c->xfer.state == XFER_DOWN_AWAIT_LOOKUP && c->xfer.audio) {
+        if (xfer_current(&c->xfer, r) && c->xfer.state == XFER_DOWN_AWAIT_LOOKUP && c->xfer.audio) {
             int fd = c->fd;
             send_transfer_error(c, r->message_id, r->err_code);
             if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
@@ -5278,7 +5294,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         conn_xfer *x = &c->xfer;
-        if (x->state != XFER_DOWN_AWAIT_LOOKUP) break;
+        if (!xfer_current(x, r) || x->state != XFER_DOWN_AWAIT_LOOKUP) break;
         /* Stash what DOWNLOAD_INFO needs: this DB result is freed before the
          * blob finishes opening on the worker. */
         free(x->dl_filename); free(x->dl_mime);
@@ -5394,7 +5410,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     }
     case OC_RES_ATTACH_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
-        if (!c) break;
+        if (!c || !xfer_current(&c->xfer, r)) break;   /* a transfer since ended: not this one's error */
         int fd = c->fd;
         send_transfer_error(c, r->attachment_id, r->err_code);   /* resets the xfer */
         if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
@@ -6517,7 +6533,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
             fj->attachment_id = x->attachment_id;
             fj->att_size = x->received;
             memcpy(fj->att_sha256, x->digest, 32);
-            oc_dbwriter_submit(dbw, fj);
+            xfer_submit(dbw, x, fj);
             x->state = XFER_UP_AWAIT_FINAL;
         }
         break;

@@ -231,6 +231,12 @@ typedef struct oc_job {
     int            type;
     uint64_t       conn_id;   /* originating connection, echoed on the result */
     uint64_t       user_id;   /* the authenticated user (for SEND author / backfill auth) */
+    /* Which state of the connection's this job's answer is for -- the net
+     * thread's counter for it: a transfer's, a call join's -- echoed on every
+     * result it gives, 0 for work that has none. A result for a transfer since
+     * cancelled, or a join since left, is then known for what it is, and never
+     * taken for the one after it (REQ-140, REQ-301). */
+    uint32_t       gen;
 
     /* AUTH */
     uint8_t        method;    /* OC_AUTH_LOCAL / OC_AUTH_OIDC / OC_AUTH_SESSION */
@@ -807,6 +813,7 @@ typedef struct oc_dbres {
     struct oc_dbres *next;
     int            type;
     uint64_t       conn_id;
+    uint32_t       gen;  /* the job's, echoed (oc_job) */
     uint16_t       err_code;  /* reason code for *_ERR */
 
     /* AUTH_OK / REGISTER_OK */
@@ -1185,6 +1192,12 @@ uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
  * knob, for putting a password change between a sign-in's fetch of the
  * credential and its check of the password. */
 void   oc_dbwriter_hold_auth(oc_dbwriter *w, int on);
+/* A test's knob: while on, neither the writer nor a reader takes a job from its
+ * queue, so a test can put frames between a job's submission and its result. */
+void   oc_dbwriter_hold(oc_dbwriter *w, int on);
+/* The jobs of `type` (OC_JOB_*) queued for the writer or a reader, for a test
+ * waiting on them. */
+size_t oc_dbwriter_jobs_waiting(oc_dbwriter *w, int type);
 size_t oc_dbwriter_auth_waiting(oc_dbwriter *w);
 
 /* First-run bootstrap (REQ-024): if the tenant has no owner, mint a one-time
