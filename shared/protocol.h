@@ -176,6 +176,10 @@ typedef enum {
     OC_MSG_AUTH_BEGIN       = 0x0015, /* C->S, pre-auth: start a browser sign-in (AUTH.md §8.1) */
     OC_MSG_AUTH_REDIRECT    = 0x0016, /* S->C: the authorize URL the daemon built */
     OC_MSG_AUTH_CONTINUE    = 0x0017, /* S->C: a first step that is correct but not sufficient */
+    OC_MSG_AUTH_DEVICE_BEGIN = 0x0018, /* C->S, pre-auth: ask for a device code (AUTH.md §8.11) */
+    OC_MSG_AUTH_DEVICE      = 0x0019, /* S->C: the user code, where to enter it, and the device code */
+    OC_MSG_AUTH_DEVICE_POLL = 0x001A, /* C->S, pre-auth: has the code been approved? */
+    OC_MSG_AUTH_DEVICE_TOKEN = 0x001B, /* S->C: approved -- the token to present on AUTH */
     OC_MSG_SEND             = 0x0020, /* C->S */
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
@@ -502,6 +506,13 @@ typedef enum {
     OC_ERR_USER_LIMIT          = 2004, /* workspace at its registered-user cap (OPENCHIME_MAX_USERS) */
     OC_ERR_AUTH_SOURCE_UNAVAILABLE = 2006, /* AUTH_BEGIN named a source this deployment does not offer, or cannot reach */
     OC_ERR_AUTH_NOT_ALLOWED    = 2005, /* a valid identity that no join rule or invite admits (AUTH.md §8.4) */
+    /* A device code's wait (AUTH.md §8.11), all non-fatal: not approved yet;
+     * polled sooner than asked; gone (never was, expired, or already spent);
+     * refused on the page. */
+    OC_ERR_AUTH_PENDING        = 2007,
+    OC_ERR_AUTH_SLOW_DOWN      = 2008,
+    OC_ERR_AUTH_EXPIRED        = 2009,
+    OC_ERR_AUTH_DENIED         = 2010,
     OC_ERR_BODY_TOO_LARGE      = 3001,
     OC_ERR_NOT_A_MEMBER        = 3002,
     OC_ERR_UNKNOWN_CHANNEL     = 3003,
@@ -837,6 +848,14 @@ typedef struct { uint8_t n_sources; oc_auth_source sources[OC_MAX_SOURCES]; } oc
 typedef struct { uint8_t method; oc_slice source; oc_slice credential; oc_slice proof; } oc_auth;
 typedef struct { oc_slice source; oc_slice redirect_uri; oc_slice challenge; } oc_auth_begin;
 typedef struct { oc_slice authorize_url; } oc_auth_redirect;
+/* A device code (AUTH.md §8.11): asked for with the client's PKCE challenge;
+ * answered with the code the person types, the page path to type it on, and the
+ * secret the client polls with; polled; answered with the token once approved. */
+typedef struct { oc_slice source; oc_slice challenge; } oc_auth_device_begin;
+typedef struct { oc_slice device_code; oc_slice user_code; oc_slice verification_path;
+                 uint16_t interval_s; uint16_t expires_in_s; } oc_auth_device;
+typedef struct { oc_slice device_code; } oc_auth_device_poll;
+typedef struct { oc_slice token; } oc_auth_device_token;
 #define OC_AUTH_STEP_TOTP 1u
 typedef struct { uint8_t step; } oc_auth_continue;
 typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
@@ -1444,6 +1463,10 @@ oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m);
 oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m);
 oc_result oc_encode_auth_begin(oc_wbuf *w, uint16_t version, const oc_auth_begin *m);
 oc_result oc_encode_auth_redirect(oc_wbuf *w, uint16_t version, const oc_auth_redirect *m);
+oc_result oc_encode_auth_device_begin(oc_wbuf *w, uint16_t version, const oc_auth_device_begin *m);
+oc_result oc_encode_auth_device(oc_wbuf *w, uint16_t version, const oc_auth_device *m);
+oc_result oc_encode_auth_device_poll(oc_wbuf *w, uint16_t version, const oc_auth_device_poll *m);
+oc_result oc_encode_auth_device_token(oc_wbuf *w, uint16_t version, const oc_auth_device_token *m);
 oc_result oc_encode_auth_continue(oc_wbuf *w, uint16_t version, const oc_auth_continue *m);
 oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
@@ -1699,6 +1722,10 @@ oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m);
 oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m);
 oc_result oc_decode_auth_begin(oc_rbuf *p, oc_auth_begin *m);
 oc_result oc_decode_auth_redirect(oc_rbuf *p, oc_auth_redirect *m);
+oc_result oc_decode_auth_device_begin(oc_rbuf *p, oc_auth_device_begin *m);
+oc_result oc_decode_auth_device(oc_rbuf *p, oc_auth_device *m);
+oc_result oc_decode_auth_device_poll(oc_rbuf *p, oc_auth_device_poll *m);
+oc_result oc_decode_auth_device_token(oc_rbuf *p, oc_auth_device_token *m);
 oc_result oc_decode_auth_continue(oc_rbuf *p, oc_auth_continue *m);
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);

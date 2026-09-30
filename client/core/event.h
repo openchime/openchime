@@ -73,6 +73,9 @@ enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
     OC_EV_AUTH_OK,         /* authenticated; user_id set */
     OC_EV_AUTH_BROWSER,    /* a browser sign-in is waiting: body = the URL to open */
+    OC_EV_AUTH_DEVICE,     /* a device code is waiting (AUTH.md §8.11): body = the URL, topic =
+                            * the code to enter, preview = the daemon's fingerprint in hex where
+                            * no authority vouches for it (else ""), count = seconds it lasts */
     OC_EV_CERT_UNTRUSTED,  /* the server's certificate is not one to trust: body = its
                             * SHA-256 in hex; der = the certificate; status = 1 if it
                             * replaced one trusted before */

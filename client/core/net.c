@@ -68,6 +68,12 @@ struct oc_net {
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
     char          signin_pref[64];  /* the source to sign in with; "" the first browser one */
+    /* A device code (AUTH.md §8.11): this client signs in by a code the person
+     * enters on the daemon's page elsewhere. The secret it polls with, kept
+     * across a dropped connection, and the interval to poll at. Net thread only. */
+    int           device;
+    char          device_secret[64];
+    unsigned      device_interval;
     /* How the certificate of the last connection that got past it was accepted
      * (cert_judge): whether a trusted authority vouched for it, and which it
      * was. The daemon's pages are opened directly on a CA-trusted daemon and
@@ -2254,6 +2260,108 @@ static int daemon_authority(const oc_net *n, char *name, size_t ncap, char *auth
     return oc_url_hostheader(name[0] ? name : n->host, port, auth, acap);
 }
 
+static void device_forget(oc_net *n) {
+    oc_signin_wipe(n->device_secret, sizeof n->device_secret);
+    n->device_interval = 0;
+}
+
+/* A device code's wait (AUTH.md §8.11), on this connection: ask for a code if
+ * there is none yet, publish it for the frontend, then poll at the interval the
+ * daemon keeps. 0 once the token is in n->oidc_token; else the RC_ to end the
+ * attempt with -- a dropped connection keeps the code, and the next one polls
+ * on with it. */
+static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, uint16_t negotiated) {
+    oc_header hdr; oc_rbuf p;
+    if (!n->device_secret[0]) {
+        char challenge[OC_SIGNIN_CHALLENGE_LEN + 1];
+        if (oc_signin_verifier(n->verifier, challenge) != 0) {
+            push_err(n->to_ui, "could not start a sign-in on this computer");
+            return RC_FATAL;
+        }
+        uint8_t bb[256]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+        oc_auth_device_begin b = { oc_slice_str(OC_SOURCE_ID_LOCAL), oc_slice_str(challenge) };
+        if (oc_encode_auth_device_begin(&bw, OC_PROTOCOL_VERSION, &b) != OC_OK ||
+            write_all(conn, fd, bb, bw.len, &n->stop) != 0 ||
+            read_one(conn, fd, fb, &hdr, &p, &n->stop) != 0 || hdr.version != negotiated) return RC_LOST;
+        if (hdr.msg_type != OC_MSG_AUTH_DEVICE) {
+            oc_error er0; uint16_t code = 0;
+            if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+            push_err(n->to_ui, code == OC_ERR_AUTH_RATE_LIMITED ? "too many sign-in codes waiting — try again later"
+                                                               : auth_error_text(code, 0));
+            return RC_FATAL;
+        }
+        oc_auth_device d;
+        if (oc_decode_auth_device(&p, &d) != OC_OK || d.device_code.len >= sizeof n->device_secret ||
+            d.user_code.len > 16 || d.verification_path.len == 0 || d.verification_path.len > 64 ||
+            d.verification_path.ptr[0] != '/') return RC_FATAL;
+        memcpy(n->device_secret, d.device_code.ptr, d.device_code.len);
+        n->device_secret[d.device_code.len] = '\0';
+        n->device_interval = d.interval_s ? d.interval_s : 5;
+        /* Where the person goes: the daemon's own https origin, under the name
+         * its certificate was checked for. A daemon no authority vouches for
+         * gets a browser's warning there, so its fingerprint -- the one this
+         * client accepted -- goes along, to be checked against it. */
+        char name[256], auth[300], url[600], ucode[20];
+        snprintf(ucode, sizeof ucode, "%.*s", (int)d.user_code.len, (const char *)d.user_code.ptr);
+        oc_mutex_lock(&n->accept_mu);
+        int ca = n->accepted_ca;
+        unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+        memcpy(fp, n->accepted_fp, sizeof fp);
+        oc_mutex_unlock(&n->accept_mu);
+        if (daemon_authority(n, name, sizeof name, auth, sizeof auth) != 0) return RC_FATAL;
+        int w = snprintf(url, sizeof url, "https://%s%.*s?code=%s", auth, (int)d.verification_path.len,
+                         (const char *)d.verification_path.ptr, ucode);
+        if (w < 0 || (size_t)w >= sizeof url) return RC_FATAL;
+        char fphex[OC_TLS_FINGERPRINT_LEN * 2 + 1] = "";
+        if (!ca) for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++) snprintf(fphex + 2 * i, 3, "%02x", fp[i]);
+        n->signin_cancel = 0;
+        oc_ev *e = oc_ev_new(OC_EV_AUTH_DEVICE);
+        if (e) {
+            e->body = strdup(url);
+            e->topic = strdup(ucode);
+            e->preview = strdup(fphex);
+            e->count = d.expires_in_s;
+            oc_queue_push(n->to_ui, e);
+        }
+    }
+    for (;;) {
+        /* The interval, watching for a stop or a cancel. */
+        for (unsigned waited = 0; waited < n->device_interval * 10u; waited++) {
+            if (n->stop) return RC_STOP;
+            if (n->signin_cancel) {
+                device_forget(n);
+                push_err(n->to_ui, "sign-in cancelled");
+                return RC_FATAL;
+            }
+            oc_nanosleep(100 * 1000 * 1000);
+        }
+        uint8_t pb[128]; oc_wbuf pw; oc_wbuf_init(&pw, pb, sizeof pb);
+        oc_auth_device_poll dp = { oc_slice_str(n->device_secret) };
+        if (oc_encode_auth_device_poll(&pw, OC_PROTOCOL_VERSION, &dp) != OC_OK ||
+            write_all(conn, fd, pb, pw.len, &n->stop) != 0 ||
+            read_one(conn, fd, fb, &hdr, &p, &n->stop) != 0 || hdr.version != negotiated) return RC_LOST;
+        if (hdr.msg_type == OC_MSG_AUTH_DEVICE_TOKEN) {
+            oc_auth_device_token t;
+            if (oc_decode_auth_device_token(&p, &t) != OC_OK || !(n->oidc_token = malloc(t.token.len + 1)))
+                return RC_FATAL;
+            memcpy(n->oidc_token, t.token.ptr, t.token.len);
+            n->oidc_token[t.token.len] = '\0';
+            snprintf(n->source_id, sizeof n->source_id, "%s", OC_SOURCE_ID_LOCAL);
+            device_forget(n);
+            return 0;
+        }
+        oc_error er0; uint16_t code = 0;
+        if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
+        if (code == OC_ERR_AUTH_PENDING) continue;
+        if (code == OC_ERR_AUTH_SLOW_DOWN) { n->device_interval += 5; continue; }
+        device_forget(n);
+        push_err(n->to_ui, code == OC_ERR_AUTH_DENIED  ? "the sign-in was refused on the sign-in page" :
+                           code == OC_ERR_AUTH_EXPIRED ? "the sign-in code expired — start again" :
+                                                         auth_error_text(code, 0));
+        return RC_FATAL;
+    }
+}
+
 /* Where the browser goes for one of the daemon's pages (AUTH.md §8.10): the
  * daemon itself, when a trusted authority vouched for its certificate -- the
  * page then has the workspace's own origin, which password managers and
@@ -2567,7 +2675,17 @@ static int run_connection(oc_net *n, int reconnecting,
          * browser (AUTH.md §8.1). */
         int has_password = n->token && strchr(n->token, ':') != NULL;
         int fresh = !(reconnecting && *have_sess) && !(n->invite && n->invite[0] && has_password);
-        if (fresh && !has_password && !n->oidc_token) {
+        if (fresh && !has_password && !n->oidc_token && n->device) {
+            int local = 0;
+            for (uint8_t i = 0; i < ch.n_sources; i++) if (ch.sources[i].kind == OC_SOURCE_LOCAL) local = 1;
+            if (!local) {
+                push_err(n->to_ui, "this workspace has no accounts of its own to sign in to with a code");
+                rc = RC_FATAL; goto drop;
+            }
+            int dr = device_flow(n, &conn, fd, &fb, negotiated);
+            if (dr != 0) { rc = dr; goto drop; }
+            /* ...and on to AUTH below, with the token, on this connection. */
+        } else if (fresh && !has_password && !n->oidc_token) {
             /* The source asked for; else the first browser source offered; else
              * local accounts, which sign in on the daemon's own pages (§8.10). */
             const oc_auth_source *src = NULL;
@@ -3659,6 +3777,12 @@ static void *net_thread(void *arg) {
             n->reconnect_now = 0;
             continue;
         }
+        /* A device code still waiting: its secret outlives the connection, so
+         * connect again and poll on. */
+        if (!have_sess && rc == RC_LOST && n->device && n->device_secret[0]) {
+            for (int s = 0; s < 20 && !n->stop; s++) oc_nanosleep(100 * 1000 * 1000);
+            continue;
+        }
         if (!have_sess) break;   /* never authenticated: nothing to reconnect with */
         /* Connection lost mid-session: back off, then reconnect with the token.
          * A connection that actually served resets the backoff so the first
@@ -3726,13 +3850,37 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
                                published_pin, to_ui, from_ui);
 }
 
+static oc_net *net_start(const char *workspace_key, const char *host, int port,
+                         const char *token, const char *source_id, const char *invite, int device,
+                         const char *store_path, oc_secret *secret,
+                         int pin_only, const unsigned char *published_pin,
+                         oc_queue *to_ui, oc_queue *from_ui);
+
 oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int port,
                             const char *token, const char *source_id, const char *invite,
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui) {
+    return net_start(workspace_key, host, port, token, source_id, invite, 0, store_path, secret, pin_only,
+                     published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_device(const char *workspace_key, const char *host, int port,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui) {
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, store_path, secret, pin_only,
+                     published_pin, to_ui, from_ui);
+}
+
+static oc_net *net_start(const char *workspace_key, const char *host, int port,
+                         const char *token, const char *source_id, const char *invite, int device,
+                         const char *store_path, oc_secret *secret,
+                         int pin_only, const unsigned char *published_pin,
+                         oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
+    n->device = device;
     if (source_id) snprintf(n->signin_pref, sizeof n->signin_pref, "%s", source_id);
     if (invite && invite[0] && !(n->invite = strdup(invite))) { free(n); return NULL; }
     if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
@@ -3839,6 +3987,7 @@ void oc_net_stop(oc_net *n) {
     oc_callsig_destroy(&n->calls);
     oc_tls_session_free(&n->resume);
     signin_forget(n);
+    device_forget(n);
     oc_mutex_destroy(&n->accept_mu);
     free(n->token);
     free(n->store_path);

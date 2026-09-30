@@ -142,7 +142,9 @@ where one exists.
   together. Through every source the login has been a client-driven browser flow using
   platform-native auth session APIs — `ASWebAuthenticationSession` on iOS/macOS,
   a loopback redirect on desktop — with PKCE; for local accounts, on the
-  daemon's own sign-in pages (AUTH.md §8.10). The daemon has advertised its
+  daemon's own sign-in pages (AUTH.md §8.10), and from a terminal with no
+  browser of its own, by a device code entered on those pages from any device
+  (AUTH.md §8.11). The daemon has advertised its
   enabled sources to the client before authentication.
 - **REQ-021.** The system has supported OIDC login against Microsoft Entra
   ID and Google Workspace as identity providers. Provider integration has lived

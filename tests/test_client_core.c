@@ -3160,6 +3160,10 @@ static void test_published_fingerprint(int port) {
  * (a trusted root, and the URL's name), or plain http to loopback -- sending
  * `method`, the extra header lines `hdrs` and `body`. The status, and the whole
  * response in `resp`. The daemon under test is on loopback whatever the name. */
+/* A browser that has been told to go on past its certificate warning -- for a
+ * daemon only a fingerprint vouches for. */
+static int g_web_insecure;
+
 static int web_fetch(const char *url, const char *method, const char *hdrs, const char *body,
                      char *resp, size_t cap) {
     resp[0] = '\0';
@@ -3200,7 +3204,7 @@ static int web_fetch(const char *url, const char *method, const char *hdrs, cons
                 oc_tls_status st;
                 while ((st = oc_tls_handshake(&conn)) == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) {}
                 /* What a browser insists on: a root it trusts vouches for this name. */
-                if (st == OC_TLS_OK && oc_tls_conn_ca_trusted(&conn)) {
+                if (st == OC_TLS_OK && (g_web_insecure || oc_tls_conn_ca_trusted(&conn))) {
                     size_t off = 0, w = 0;
                     while (off < (size_t)n && oc_tls_write(&conn, req + off, (size_t)n - off, &w) != OC_TLS_ERROR) off += w;
                     for (;;) {
@@ -3419,6 +3423,123 @@ static void test_local_browser(int port) {
     }
     unlink("build/test_core_web1.db"); unlink("build/test_core_web1.db-wal"); unlink("build/test_core_web1.db-shm");
     unlink("build/test_core_web2.db"); unlink("build/test_core_web2.db-wal"); unlink("build/test_core_web2.db-shm");
+}
+
+/* A local account signed in to with a device code (AUTH.md §8.11): the client
+ * shows where to enter which code -- and, where no authority vouches for the
+ * daemon, its fingerprint, for the browser's warning -- and signs in once the
+ * code is approved on the /device page, from anywhere. */
+static int device_approve(const char *url, const char *code, const char *user, const char *pw) {
+    char resp[32768], post[640], origin[300], hdrs[400], body[256];
+    if (web_fetch(url, "GET", NULL, NULL, resp, sizeof resp) != 200 || !strstr(resp, code)) return -1;
+    const char *path = strchr(url + 8, '/');
+    snprintf(origin, sizeof origin, "%.*s", (int)(path - url), url);
+    snprintf(post, sizeof post, "%s/device", origin);
+    snprintf(hdrs, sizeof hdrs, "Origin: %s\r\nContent-Type: application/x-www-form-urlencoded\r\n", origin);
+    snprintf(body, sizeof body, "code=%s&username=%s&password=%s&action=approve", code, user, pw);
+    return web_fetch(post, "POST", hdrs, body, resp, sizeof resp) == 200 && strstr(resp, "Go back to your terminal")
+           ? 0 : -1;
+}
+
+static void test_device_client(int port) {
+    /* --- a daemon only a fingerprint vouches for (loopback, self-signed) --- */
+    {
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        uint8_t fpb[OC_TLS_FINGERPRINT_LEN]; char fp[65];
+        CHECK(oc_tls_server_fingerprint(&srv, fpb) == 0);
+        fp_hex(fpb, sizeof fpb, fp, sizeof fp);
+        oc_dbwriter *dbw = web_daemon("build/test_core_dev1.db", NULL);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); return; }
+        oc_netloop_set_device_interval_s(1);
+        oc_netloop_set_device_ttl_ms(4000);
+        struct core_loop_arg arg;
+        arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+        wait_port_ready(arg.port);
+
+        oc_client *c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        char url[700], code[20], want[128];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
+        snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
+        snprintf(want, sizeof want, "https://127.0.0.1:%d/device?code=%s", arg.port, code);
+        CHECK(strcmp(url, want) == 0);
+        CHECK(strcmp(oc_client_model(c)->device_fp, fp) == 0);        /* for the browser's warning */
+        CHECK(!oc_client_model(c)->authed);
+        g_web_insecure = 1;                                          /* the person went on past it */
+        CHECK(device_approve(url, code, "lia", "wrong") != 0);
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);
+        g_web_insecure = 0;
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(c)->device_code[0] == '\0');
+        oc_client_stop(c);
+
+        /* Cancel; and a code nobody enters runs out. */
+        c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        oc_client_cancel_signin(c);
+        CHECK(WAIT_FOR(c, strstr(m->last_error, "cancelled") != NULL));
+        oc_client_stop(c);
+        c = oc_client_start_device(NULL, "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        CHECK(WAIT_FOR(c, strstr(m->last_error, "expired") != NULL) && !oc_client_model(c)->authed);
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_netloop_set_device_interval_s(0);
+        oc_netloop_set_device_ttl_ms(0);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+    }
+
+    /* --- a daemon a trusted root vouches for: no fingerprint, its own name --- */
+    {
+        testpki pki;
+        CHECK(testpki_init(&pki) == 0);
+        FILE *f = fopen("build/test_core_dev_root.pem", "w");
+        if (f) { fputs(pki.pem, f); fclose(f); }
+        char chain[8192], key[2048];
+        CHECK(testpki_leaf(&pki, "web.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+        oc_dbwriter *dbw = web_daemon("build/test_core_dev2.db", NULL);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); testpki_free(&pki); return; }
+        oc_netloop_set_device_interval_s(1);
+        struct core_loop_arg arg;
+        arg.port = port + 1; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+        wait_port_ready(arg.port);
+        CHECK(oc_tls_set_extra_ca("build/test_core_dev_root.pem") == 0);
+
+        oc_client *c = oc_client_start_device("web.openchime.test", "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        char url[700], code[20], want[128];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
+        snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
+        snprintf(want, sizeof want, "https://web.openchime.test:%d/device?code=%s", arg.port, code);
+        CHECK(strcmp(url, want) == 0 && oc_client_model(c)->device_fp[0] == '\0');
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);          /* verified as a browser would */
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_netloop_set_device_interval_s(0);
+        oc_tls_set_extra_ca(NULL);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+        testpki_free(&pki);
+        unlink("build/test_core_dev_root.pem");
+    }
+    unlink("build/test_core_dev1.db"); unlink("build/test_core_dev1.db-wal"); unlink("build/test_core_dev1.db-shm");
+    unlink("build/test_core_dev2.db"); unlink("build/test_core_dev2.db-wal"); unlink("build/test_core_dev2.db-shm");
 }
 
 static void test_browser_signin(int port) {
@@ -4869,5 +4990,6 @@ int run_client_core_tests(void) {
     test_published_fingerprint(25700 + (int)(getpid() % 2000));
     test_cert_trust(27800 + (int)(getpid() % 2000));
     test_local_browser(33900 + 2 * (int)(getpid() % 1000));
+    test_device_client(36000 + 2 * (int)(getpid() % 1000));
     return failures;
 }

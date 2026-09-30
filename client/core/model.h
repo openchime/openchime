@@ -618,6 +618,15 @@ typedef struct {
     bool     signed_out;
     char     signin_url[2048];
     uint32_t signin_seq;
+    /* A device code waiting to be entered (AUTH.md §8.11): where, the code, the
+     * daemon's fingerprint where a browser will warn about it ("" where an
+     * authority vouches for it), when it runs out, and a count that moves with
+     * each. Cleared by the sign-in, and by any error. */
+    char     device_url[600];
+    char     device_code[20];
+    char     device_fp[65];
+    uint64_t device_expires_ms;
+    uint32_t device_seq;
     /* A certificate the person must judge (ARCH-10): its SHA-256 in hex, whether
      * it replaced one they trusted, and a count that moves each time one is
      * shown. oc_client_trust_cert accepts it. */

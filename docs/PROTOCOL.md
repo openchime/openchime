@@ -364,6 +364,26 @@ Answers a first step that is correct but not sufficient (AUTH.md §8.6).
 |--------|------|------------------------------------|
 | `step` | u8   | What is wanted next: `1` a TOTP code. |
 
+### 4.2c A device code: `AUTH_DEVICE_BEGIN` `0x0018`, `AUTH_DEVICE` `0x0019`, `AUTH_DEVICE_POLL` `0x001A`, `AUTH_DEVICE_TOKEN` `0x001B`
+
+How a client with no browser of its own signs in to a local account (AUTH.md
+§8.11). Pre-auth, and nothing is kept on the connection: the daemon keeps the
+request, and the client may poll from a new connection.
+
+| Frame | Direction | Fields |
+|---|---|---|
+| `AUTH_DEVICE_BEGIN` | C → S | `source` str (`local`), `challenge` str (as `AUTH_BEGIN`'s) |
+| `AUTH_DEVICE` | S → C | `device_code` str (the client's secret), `user_code` str (`XXXX-XXXX`), `verification_path` str (`/device`), `interval_s` u16, `expires_in_s` u16 |
+| `AUTH_DEVICE_POLL` | C → S | `device_code` str |
+| `AUTH_DEVICE_TOKEN` | S → C | `token` lstr — presented next on `AUTH{oidc, local}` with the verifier |
+
+`AUTH_DEVICE_BEGIN` is refused with `AUTH_SOURCE_UNAVAILABLE` (no local
+accounts), `AUTH_INVALID_TOKEN` (not a challenge) or `AUTH_RATE_LIMITED` (five
+already waiting from this source, or the table full). A poll not yet approved is
+`AUTH_PENDING`; one sooner than the interval `AUTH_SLOW_DOWN`, and the interval
+grows by five seconds; a refusal `AUTH_DENIED`, once; a code that ran out, was
+collected or never was `AUTH_EXPIRED`. All non-fatal.
+
 ### 4.3 `AUTH_OK` (server → client), msg_type `0x0011`
 
 On success the daemon mints a session (ARCH-58) and returns:
@@ -2551,6 +2571,10 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
 | `2005` | `AUTH_NOT_ALLOWED`    | auth       | yes   | A valid identity that no join rule or invite admits (AUTH.md §8.4). An identity the workspace already knows still signs in. |
 | `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | no    | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach; or a password came in a frame, where the daemon takes one only on its pages (AUTH.md §8.10). |
+| `2007` | `AUTH_PENDING` | auth   | no    | A device code not approved yet (§4.2c). |
+| `2008` | `AUTH_SLOW_DOWN` | auth   | no    | A device-code poll sooner than the interval; the interval grows by five seconds. |
+| `2009` | `AUTH_EXPIRED` | auth   | no    | A device code that ran out, was collected, or never was. |
+| `2010` | `AUTH_DENIED` | auth   | no    | A device code refused on the page. |
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
@@ -2616,6 +2640,10 @@ this table cannot silently gain a shared value.
 | `0x0015` | `AUTH_BEGIN` | C → S | pre-auth: start a browser sign-in |
 | `0x0016` | `AUTH_REDIRECT` | S → C | the authorize URL the daemon built |
 | `0x0017` | `AUTH_CONTINUE` | S → C | a first step that is correct but not sufficient |
+| `0x0018` | `AUTH_DEVICE_BEGIN` | C → S | pre-auth: ask for a device code |
+| `0x0019` | `AUTH_DEVICE` | S → C | the user code, where to enter it, and the device code |
+| `0x001A` | `AUTH_DEVICE_POLL` | C → S | pre-auth: has the code been approved? |
+| `0x001B` | `AUTH_DEVICE_TOKEN` | S → C | approved: the token to present on `AUTH` |
 | `0x0020` | `SEND` | C → S |  |
 | `0x0021` | `SEND_ACK` | S → C |  |
 | `0x0022` | `BROADCAST` | S → C |  |

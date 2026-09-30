@@ -68,10 +68,30 @@ oc_client *oc_client_start_verified(const char *workspace_key, const char *host,
                                   remember, published_fingerprint);
 }
 
+static oc_client *client_start(const char *workspace_key, const char *host, int port,
+                               const char *cred, const char *source_id, const char *invite, int device,
+                               const char *store_path, oc_secret *secret,
+                               int remember, const char *published_fingerprint);
+
+oc_client *oc_client_start_device(const char *workspace_key, const char *host, int port,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, store_path, secret,
+                        remember, published_fingerprint);
+}
+
 oc_client *oc_client_start_signin(const char *workspace_key, const char *host, int port,
                                   const char *cred, const char *source_id, const char *invite,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, cred, source_id, invite, 0, store_path, secret,
+                        remember, published_fingerprint);
+}
+
+static oc_client *client_start(const char *workspace_key, const char *host, int port,
+                               const char *cred, const char *source_id, const char *invite, int device,
+                               const char *store_path, oc_secret *secret,
+                               int remember, const char *published_fingerprint) {
     oc_client *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     oc_queue_init(&c->events);
@@ -82,8 +102,10 @@ oc_client *oc_client_start_signin(const char *workspace_key, const char *host, i
     unsigned char pin[OC_TLS_FINGERPRINT_LEN];
     int have = published_fingerprint && published_fingerprint[0] &&
                oc_wellknown_fingerprint_bytes(published_fingerprint, pin) == 0;
-    c->net = oc_net_start_signin(workspace_key, host, port, cred, source_id, invite, store_path, secret,
-                                 !remember, have ? pin : NULL, &c->events, &c->cmds);
+    c->net = device ? oc_net_start_device(workspace_key, host, port, store_path, secret, !remember,
+                                          have ? pin : NULL, &c->events, &c->cmds)
+                    : oc_net_start_signin(workspace_key, host, port, cred, source_id, invite, store_path, secret,
+                                          !remember, have ? pin : NULL, &c->events, &c->cmds);
     if (!c->net) {
         oc_queue_destroy(&c->events);
         oc_queue_destroy(&c->cmds);

@@ -1455,6 +1455,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->user_id = e->user_id;
         m->last_error[0] = '\0';
         m->signin_url[0] = '\0';
+        m->device_url[0] = m->device_code[0] = m->device_fp[0] = '\0';
         m->signed_out = false;
         /* Self: the server won't tell us. A pause survives a reconnect, and the
          * SNOOZE frame that follows AUTH_OK is what sets it — this only seeds
@@ -2424,8 +2425,19 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             set_status(m, "Waiting for your browser…");
         }
         break;
+    case OC_EV_AUTH_DEVICE:
+        if (e->body && strlen(e->body) < sizeof m->device_url && e->topic && strlen(e->topic) < sizeof m->device_code) {
+            snprintf(m->device_url, sizeof m->device_url, "%s", e->body);
+            snprintf(m->device_code, sizeof m->device_code, "%s", e->topic);
+            snprintf(m->device_fp, sizeof m->device_fp, "%s", e->preview && strlen(e->preview) == 64 ? e->preview : "");
+            m->device_expires_ms = oc_model_now_ms() + (uint64_t)e->count * 1000u;
+            m->device_seq++;
+            set_status(m, "Waiting for the code to be entered…");
+        }
+        break;
     case OC_EV_ERROR:
         m->signin_url[0] = '\0';
+        m->device_url[0] = m->device_code[0] = m->device_fp[0] = '\0';
         if (e->body) {
             set_status(m, e->body);
             snprintf(m->last_error, sizeof m->last_error, "%s", e->body);

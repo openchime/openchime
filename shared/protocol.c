@@ -272,6 +272,36 @@ oc_result oc_encode_auth_redirect(oc_wbuf *w, uint16_t version, const oc_auth_re
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_auth_device_begin(oc_wbuf *w, uint16_t version, const oc_auth_device_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_DEVICE_BEGIN);
+    oc_w_str(w, m->source);
+    oc_w_str(w, m->challenge);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_auth_device(oc_wbuf *w, uint16_t version, const oc_auth_device *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_DEVICE);
+    oc_w_str(w, m->device_code);
+    oc_w_str(w, m->user_code);
+    oc_w_str(w, m->verification_path);
+    oc_w_u16(w, m->interval_s);
+    oc_w_u16(w, m->expires_in_s);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_auth_device_poll(oc_wbuf *w, uint16_t version, const oc_auth_device_poll *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_DEVICE_POLL);
+    oc_w_str(w, m->device_code);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_auth_device_token(oc_wbuf *w, uint16_t version, const oc_auth_device_token *m) {
+    OC_CHECK_BODY(m->token);
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_DEVICE_TOKEN);
+    oc_w_lstr(w, m->token);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_auth_continue(oc_wbuf *w, uint16_t version, const oc_auth_continue *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_CONTINUE);
     oc_w_u8(w, m->step);
@@ -2213,6 +2243,31 @@ oc_result oc_decode_auth_begin(oc_rbuf *p, oc_auth_begin *m) {
 
 oc_result oc_decode_auth_redirect(oc_rbuf *p, oc_auth_redirect *m) {
     m->authorize_url = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_device_begin(oc_rbuf *p, oc_auth_device_begin *m) {
+    m->source = oc_r_str(p);
+    m->challenge = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_device(oc_rbuf *p, oc_auth_device *m) {
+    m->device_code = oc_r_str(p);
+    m->user_code = oc_r_str(p);
+    m->verification_path = oc_r_str(p);
+    m->interval_s = oc_r_u16(p);
+    m->expires_in_s = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_device_poll(oc_rbuf *p, oc_auth_device_poll *m) {
+    m->device_code = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_auth_device_token(oc_rbuf *p, oc_auth_device_token *m) {
+    m->token = oc_r_lstr(p);
     return r_done(p);
 }
 

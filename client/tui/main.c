@@ -40,6 +40,7 @@
  */
 
 #include "tuikit.h"      /* terminal layer + width-correct draw/style primitives (tuikit) */
+#include "tk_qr.h"        /* the device code's URL, for a phone's camera (AUTH.md §8.11) */
 #include "oc_port.h"
 
 #include "utf8proc.h"
@@ -1482,6 +1483,7 @@ typedef struct {
     int  nsrc;
     char probed[256];                     /* the workspace `src` was read from */
     int  browser;                         /* submit means: sign in with the browser */
+    int  device;                          /* ...or with a device code (AUTH.md §8.11) */
 } login_form;
 
 static const oc_signin_source *form_browser_source(const login_form *f) {
@@ -1630,35 +1632,34 @@ static void draw_field(int x, int y, int w, const char *label, const char *val,
  * `f->ep`) or quits. `err` is an optional message to show (e.g. a prior auth
  * failure). Returns LOGIN_SUBMIT or LOGIN_QUIT. */
 static int login_dialog(login_form *f, const char *err) {
-    /* On a retry (err set) land on the password — that's what needs fixing;
-     * otherwise start past a pre-filled workspace. */
-    int focus = err ? 2 : (f->workspace[0] ? 1 : 0);
+    /* Past a pre-filled workspace -- unless a retry says it is what needs fixing. */
+    int focus = f->workspace[0] && !err ? 1 : 0;
     char inl[160]; inl[0] = '\0';
     for (;;) {
         int W = tb_width(), H = tb_height();
         tb_clear();
         int bw = 56; if (bw > W - 2) bw = W - 2; if (bw < 24) bw = 24;
-        int bh = 12;
+        int bh = 10;
         int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
         tk_box(x, y, bw, bh);
         tk_text(x + 2, y, x + bw - 1, " Sign in to OpenChime ", TB_CYAN | TB_BOLD, TB_DEFAULT);
         int ix = x + 2, iw = bw - 4;
+        /* No password is typed here (AUTH.md §8.10): a local account signs in
+         * with a code entered on the workspace's page, from any device (§8.11). */
         draw_field(ix, y + 2, iw, "Workspace", f->workspace, focus == 0, 0);
-        draw_field(ix, y + 4, iw, "Username", f->user, focus == 1, 0);
-        draw_field(ix, y + 5, iw, "Password", f->pass, focus == 2, 1);
         char rem[40]; snprintf(rem, sizeof rem, "[%c] Remember me", f->remember ? 'x' : ' ');
-        tk_text(ix, y + 7, ix + iw, rem, focus == 3 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
+        tk_text(ix, y + 4, ix + iw, rem, focus == 1 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
         /* Once the workspace has said how it signs people in, offer the browser
-         * where it does — and only the browser where it takes no passwords. */
+         * beside the code where it has a browser source. */
         const oc_signin_source *bs =
             strcmp(f->probed, f->workspace) == 0 ? form_browser_source(f) : NULL;
         if (bs) {
             char hint[160];
             snprintf(hint, sizeof hint, "Ctrl+B  %s", bs->label);
-            tk_text(ix, y + 8, ix + iw, hint, TB_GREEN | TB_BOLD, TB_DEFAULT);
+            tk_text(ix, y + 5, ix + iw, hint, TB_GREEN | TB_BOLD, TB_DEFAULT);
         }
         const char *e = inl[0] ? inl : err;
-        if (e) tk_text(ix, y + 9, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
+        if (e) tk_text(ix, y + 7, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
         tk_text(ix, y + bh - 1, ix + iw, " Enter connect · Tab next · Esc quit ",
                   TB_BLACK | TB_BOLD, TB_DEFAULT);
         tb_present();
@@ -1668,30 +1669,27 @@ static int login_dialog(login_form *f, const char *err) {
         if (ev.type != TB_EVENT_KEY) continue;
         if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)
             return LOGIN_QUIT;
-        if (ev.key == TB_KEY_TAB || ev.key == TB_KEY_ARROW_DOWN) { focus = (focus + 1) & 3; continue; }
-        if (ev.key == TB_KEY_ARROW_UP) { focus = (focus + 3) & 3; continue; }
+        if (ev.key == TB_KEY_TAB || ev.key == TB_KEY_ARROW_DOWN || ev.key == TB_KEY_ARROW_UP) {
+            focus = !focus;
+            continue;
+        }
         int is_space = (ev.ch == ' ' || ev.key == TB_KEY_SPACE);
         if (ev.key == TB_KEY_ENTER || ev.key == TB_KEY_CTRL_B) {
             int want_browser = ev.key == TB_KEY_CTRL_B;
             if (!f->workspace[0]) { snprintf(inl, sizeof inl, "enter a workspace (domain or name)"); focus = 0; continue; }
             if (!form_probe(f, inl, sizeof inl)) { focus = 0; continue; }
             const oc_signin_source *browser = form_browser_source(f);
-            if (want_browser && !browser) { snprintf(inl, sizeof inl, "this workspace signs in with a password"); continue; }
-            /* A workspace with no passwords has one way in; so has an empty form
-             * where the browser is offered. */
-            if (browser && (want_browser || !form_has_local(f) || (!f->user[0] && !f->pass[0]))) {
-                f->browser = 1;
-                return LOGIN_SUBMIT;
-            }
-            if (!f->user[0]) { snprintf(inl, sizeof inl, "enter a username"); focus = 1; continue; }
-            f->browser = 0;
+            if (want_browser && !browser) { snprintf(inl, sizeof inl, "this workspace has no browser sign-in"); continue; }
+            /* Local accounts: a code. The browser where asked for, or where it is
+             * the only way in. */
+            f->browser = f->device = 0;
+            if (browser && (want_browser || !form_has_local(f))) f->browser = 1;
+            else if (form_has_local(f)) f->device = 1;
+            else { snprintf(inl, sizeof inl, "this workspace offers no way to sign in here"); continue; }
             return LOGIN_SUBMIT;
         }
-        if (focus == 3) { if (is_space) f->remember = !f->remember; continue; }
-        char *buf; size_t cap;
-        if (focus == 0)      { buf = f->workspace; cap = sizeof f->workspace; }
-        else if (focus == 1) { buf = f->user;     cap = sizeof f->user; }
-        else                 { buf = f->pass;     cap = sizeof f->pass; }
+        if (focus == 1) { if (is_space) f->remember = !f->remember; continue; }
+        char *buf = f->workspace; size_t cap = sizeof f->workspace;
         if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
             size_t n = strlen(buf); if (n) { buf[n - 1] = '\0'; inl[0] = '\0'; }
         } else if (is_space) {
@@ -1725,8 +1723,58 @@ static void open_in_browser(const char *url) {
 /* Tick a freshly-started client until it authenticates, fails, or is cancelled,
  * drawing a "connecting…" screen. Distinguishes auth-fail from unreachable via
  * the model's sticky last_error. */
+/* The device code's screen (AUTH.md §8.11): where to go and what to enter --
+ * large, since it is read across a room or copied onto a phone -- the URL as a
+ * QR code where the terminal has room, the daemon's fingerprint where a browser
+ * will warn about its certificate, and the time left. */
+static void draw_device(const oc_model *m, int W, int H) {
+    char qr[16384]; int qc = 0, qrow = 0;
+    int have_qr = tk_qr_render(m->device_url, qr, sizeof qr, &qc, &qrow) == 0;
+    int need = 10 + (m->device_fp[0] ? 3 : 0);
+    int show_qr = have_qr && qc + 4 <= W && qrow + need <= H;
+    int y = (H - (need + (show_qr ? qrow + 1 : 0))) / 2;
+    if (y < 0) y = 0;
+    int xm = W - 2;
+    tk_text(2, y, xm, "Sign in from any device", TB_WHITE | TB_BOLD, TB_DEFAULT);
+    tk_text(2, y + 2, xm, "Go to:", TB_DEFAULT, TB_DEFAULT);
+    y += 3;
+    y += tui_wrap(4, y, xm, m->device_url, TB_CYAN | TB_BOLD, TB_DEFAULT);
+    char code[48];
+    snprintf(code, sizeof code, "and enter the code   %s", m->device_code);
+    tk_text(2, y + 1, xm, code, TB_YELLOW | TB_BOLD, TB_DEFAULT);
+    y += 3;
+    if (show_qr) {
+        /* Light modules as white on black, whatever the terminal's colours. */
+        const char *r = qr;
+        for (int row = 0; row < qrow && *r; row++) {
+            const char *e = strchr(r, '\n');
+            char line[4096];
+            size_t n = e ? (size_t)(e - r) : strlen(r);
+            if (n >= sizeof line) n = sizeof line - 1;
+            memcpy(line, r, n); line[n] = '\0';
+            tk_text(4, y + row, W, line, TB_WHITE, TB_BLACK);
+            r = e ? e + 1 : r + n;
+        }
+        y += qrow + 1;
+    }
+    if (m->device_fp[0]) {
+        char fp[128];
+        if (oc_fingerprint_format(m->device_fp, 0, fp, sizeof fp) == 0) {
+            y += tui_wrap(2, y, xm, "Your browser will warn about this server's certificate. Go on only if its "
+                                    "SHA-256 fingerprint is:", TB_DEFAULT, TB_DEFAULT);
+            y += tui_wrap(4, y, xm, fp, TB_CYAN, TB_DEFAULT) + 1;
+        }
+    }
+    uint64_t now = oc_model_now_ms();
+    unsigned left = m->device_expires_ms > now ? (unsigned)((m->device_expires_ms - now) / 1000u) : 0;
+    char t[80];
+    snprintf(t, sizeof t, "Waiting …  %u:%02u left   (Esc to cancel)", left / 60, left % 60);
+    tk_text(2, y, xm, t, TB_DEFAULT, TB_DEFAULT);
+}
+
 static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap) {
     uint32_t opened = 0;                      /* the signin_seq whose URL was opened */
+    uint32_t dev_opened = 0;                  /* ...and the device_seq */
     uint32_t cert_seen = 0, cert_err = 0;     /* a certificate judged, and its refusal */
     for (int i = 0; i < 1200; i++) {          /* ~18s at 15ms per tick */
         oc_client_tick(cl);
@@ -1743,6 +1791,24 @@ static int await_auth(oc_client *cl, const char *host, char *why, size_t whycap)
         if (m->last_error[0] && !m->connected && !(cert_err && m->error_seq == cert_err)) {
             snprintf(why, whycap, "%s", m->last_error);
             return strstr(m->last_error, "reach") ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
+        }
+        if (m->device_code[0]) {
+            /* A device code: the core polls for ten minutes, so this waits too.
+             * The page is opened here as well, where there is a desktop to open
+             * it on; the code is shown for everywhere else. */
+            i = 0;
+            if (dev_opened != m->device_seq) { dev_opened = m->device_seq; open_in_browser(m->device_url); }
+            int W = tb_width(), H = tb_height();
+            tb_clear();
+            draw_device(m, W, H);
+            tb_present();
+            struct tb_event ev;
+            if (tb_peek_event(&ev, 15) == TB_OK && ev.type == TB_EVENT_KEY &&
+                (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)) {
+                oc_client_cancel_signin(cl);
+                return AUTH_R_CANCELLED;
+            }
+            continue;
         }
         int waiting = m->signin_url[0] != '\0';
         if (waiting) {
@@ -1809,8 +1875,8 @@ static int run_login(const char *initial_workspace, const char *initial_user,
     char err[320]; err[0] = '\0';
     for (;;) {
         if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
-        char cred[260] = "";   /* empty: the core signs in through the browser */
-        if (!f.browser) snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
+        char cred[260] = "";   /* empty: the core signs in through the browser or a code */
+        if (!f.browser && !f.device && f.pass[0]) snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
         /* Filed under the workspace as the person named it, not the address it
          * resolved to this time. */
         char key[288];
@@ -1818,9 +1884,10 @@ static int run_login(const char *initial_workspace, const char *initial_user,
             oc_hostport(f.ep.host, f.ep.port, key, sizeof key);
         /* With the fingerprint the workspace published, if it did (ARCH-10): the
          * first connection is checked against it instead of trusted blind. */
-        oc_client *cl = oc_client_start_verified(key, f.ep.host, f.ep.port, cred,
-                                                 store_path, secret, f.remember,
-                                                 f.ep.fingerprint);
+        oc_client *cl = f.device
+            ? oc_client_start_device(key, f.ep.host, f.ep.port, store_path, secret, f.remember, f.ep.fingerprint)
+            : oc_client_start_verified(key, f.ep.host, f.ep.port, cred, store_path, secret, f.remember,
+                                       f.ep.fingerprint);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         char why[200] = "";
         int res = await_auth(cl, f.ep.host, why, sizeof why);
@@ -1840,7 +1907,7 @@ static int run_login(const char *initial_workspace, const char *initial_user,
         if (res == AUTH_R_UNREACHABLE) snprintf(err, sizeof err, "could not reach %s", f.ep.host);
         else if (why[0] && strcmp(why, "auth failed") != 0)
                                       snprintf(err, sizeof err, "%s", why);
-        else                          snprintf(err, sizeof err, "sign-in failed — check your username and password");
+        else                          snprintf(err, sizeof err, "sign-in failed");
         f.pass[0] = '\0';   /* clear the password for the retry */
     }
 }

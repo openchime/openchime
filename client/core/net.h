@@ -109,6 +109,13 @@ oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int por
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui);
+/* As oc_net_start_signin, signing in to a local account with a device code
+ * (AUTH.md §8.11): OC_EV_AUTH_DEVICE carries the code and where to enter it,
+ * and the thread polls until it is approved, refused or runs out. */
+oc_net *oc_net_start_device(const char *workspace_key, const char *host, int port,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui);
 
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
