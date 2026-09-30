@@ -217,6 +217,7 @@ column detail is in [SCHEMA.md](./SCHEMA.md).
 |---|---|---|
 | `schema_version` | By the migrator, one row per applied migration | Which migrations have run. At each boot every migration above the highest row is applied in its own transaction; a failure rolls that one back and stops the boot (ARCH-27). |
 | `server_identity` (one row) | On the first run that generates a TLS identity | The daemon's certificate and private key. When present it is written over `OPENCHIME_TLS_CERT` / `OPENCHIME_TLS_KEY` at startup, so a restored database keeps the fingerprint clients pinned (ARCH-10/66b). |
+| `local_issuer` (one row) | At first start | The key and issuer name that sign the ID token a browser sign-in on the daemon's own pages ends with (AUTH.md §8.10, migration 0050): a restored database still verifies what it signed. A private key. |
 | `acme_account`, `tls_certificate` (one row each) | When a CA-issued certificate is first obtained | The ACME account (with its CA's directory) and the certificate presented, with its source, names and expiry; presented at once on a restart that still has that source and those names (migration 0049). |
 | `enrollment` (one row) | When `OPENCHIME_ENROLL_URL` first takes effect | The enrollment key, the audience and `pending` / `active`. The stored audience outranks `OPENCHIME_OIDC_AUDIENCE`, and push and invitation mail need `active` (ARCH-84/85). |
 | `invites` with no `created_by` | At boot, in `local` auth mode, while no owner exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). |
@@ -290,7 +291,12 @@ rather than client state (ARCH-88/REQ-201).
 ## Test-only knobs
 
 Compile-time or test-harness values, listed so they are not mistaken for
-deployment configuration: `OPENCHIME_UNFURL_ALLOW_PRIVATE` (disables the unfurl
+deployment configuration: `OPENCHIME_TEST_PASSWORD_AUTH=1` (the daemon takes a
+local password in a frame — `AUTH` local, `REDEEM_INVITE`, `CHANGE_PASSWORD` —
+as well as on its sign-in pages, so the test suites, CI's end-to-end job and the
+GUI scripts can sign in without a browser; the daemon warns when it starts with
+it, and it must never be set in a deployment: no client collects a password,
+AUTH.md §8.10), `OPENCHIME_UNFURL_ALLOW_PRIVATE` (disables the unfurl
 fetcher's SSRF gate so a test can fetch a loopback fixture — never set it in a
 deployment), `OC_FUZZ_RANDOM_ITERS` / `OC_FUZZ_FRAMED_ITERS` (fuzz
 depth, defaults 5000 / 2000), `OC_NETLOOP_MAX_FD` (4096, a compile-time

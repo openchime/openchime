@@ -22,6 +22,7 @@
 #include "authpool.h"
 #include "joinrules.h"
 #include "jwt.h"
+#include "localissuer.h"
 #include "ratelimit.h"
 #include "roles.h"
 #include "srccount.h"   /* oc_source_key */
@@ -78,7 +79,9 @@ struct oc_dbwriter {
     char           *oidc_audience;
     char           *oidc_pubkey_pem;
     char           *relay_origin;            /* where the relay is ("" if nowhere) */
-    struct oc_seen_jti *seen_jti;            /* relay tokens already used (AUTH.md §8.2) */
+    struct oc_seen_jti *seen_jti;            /* relay and local tokens already used (AUTH.md §8.2) */
+    oc_local_issuer *local_iss;              /* this daemon's issuer for local accounts (§8.10) */
+    int             password_frames;         /* OPENCHIME_TEST_PASSWORD_AUTH: frames may carry one */
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
@@ -1130,7 +1133,9 @@ static oc_dbres *oidc_refuse(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint1
  * token) and converge on a daemon-issued session (AUTH.md §4). */
 static void submit_to_reader(oc_dbwriter *w, oc_job *j);
 
-static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
+static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid);
+
+static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1144,6 +1149,11 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     if (j->method == OC_AUTH_LOCAL) {
         if (!(w->auth_methods & OC_AUTH_LOCAL)) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+        }
+        /* A password is typed into the daemon's own pages, not sent in a frame
+         * (AUTH.md §8.10) -- but for the test knob. */
+        if (!j->web && !w->password_frames) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_SOURCE_UNAVAILABLE; return r;
         }
         oc_slice cred = { (const uint8_t *)j->token, j->token_len };
         oc_slice user, pass;
@@ -1193,6 +1203,38 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
              * single success can't reset an in-progress account-spray. */
             oc_ratelimit_reset(w->auth_rl, acct);
         }
+        if (j->web) return web_finish(w, j, r, uid);
+    } else if (j->method == OC_AUTH_OIDC && strcmp(j->auth_source, OC_SOURCE_ID_LOCAL) == 0) {
+        /* The token this daemon's own pages issued (AUTH.md §8.10): its key, its
+         * issuer, bound to this client's verifier, used once, naming a user by
+         * id -- no join rules, nothing created. */
+        if (!(w->auth_methods & OC_AUTH_LOCAL) || !w->local_iss || !w->seen_jti) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+        }
+        if (j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms())) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
+        }
+        const char *pem = oc_local_issuer_pubkey_pem(w->local_iss);
+        oc_jwt_claims claims;
+        oc_jwt_result jr = oc_jwt_verify(j->token, j->token_len, pem, strlen(pem) + 1,
+                                         oc_local_issuer_name(w->local_iss), OC_LOCAL_AUDIENCE,
+                                         dbw_now_ms() / 1000u, &claims);
+        if (jr != OC_JWT_OK) {
+            char reason[48];
+            snprintf(reason, sizeof reason, "source=local reason=%s", jwt_reason(jr));
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL, reason);
+        }
+        if (!oc_jwt_nonce_matches(claims.nonce, (const uint8_t *)j->proof, j->proof_len))
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL,
+                               "source=local reason=verifier");
+        if (!seen_jti_claim(w->seen_jti, claims.jti, claims.exp, dbw_now_ms() / 1000u))
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL,
+                               "source=local reason=replayed");
+        uid = oc_local_subject_uid(claims.sub);
+        if (!uid) return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL,
+                                     "source=local reason=subject");
+        role = get_role(db, uid);
+        snprintf(how, sizeof how, "source=local via=browser");
     } else if (j->method == OC_AUTH_OIDC) {
         if (!w->oidc_enabled) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
@@ -1322,6 +1364,42 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         r->has_session_token = 0;   /* no new token on reconnect (PROTOCOL.md §4.3) */
         r->session_expiry = sess_exp;
     }
+    return r;
+}
+
+/* A password check from the daemon's pages is done (AUTH.md §8.10): a sign-in
+ * ends with an ID token for the client that sent the person there; a password
+ * change stores the new password, derived on the pool, against the version
+ * that was checked. A removed member is refused either way, as an invalid
+ * credential. */
+static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint16_t *err);
+
+static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid) {
+    sqlite3 *db = w->db;
+    if (uid && user_disabled(db, uid)) uid = 0;
+    if (!uid) { r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
+    if (j->web == OC_WEB_PASSWORD) {
+        uint16_t err = 0;
+        if (store_new_password(db, j, uid, &err) != 0) { r->type = OC_RES_WEB_ERR; r->err_code = err; return r; }
+        audit_actor(db, OC_AUDIT_ACCOUNT, "password.change", uid, 0, NULL, 1, "via=browser");
+        r->type = OC_RES_WEB_OK;
+        r->user_id = uid;
+        return r;
+    }
+    char *tok = w->local_iss ? oc_local_issuer_mint(w->local_iss, uid, j->web_nonce, dbw_now_ms() / 1000u)
+                             : NULL;
+    if (!tok) { r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_WEB_OK;
+    r->user_id = uid;
+    r->body = (uint8_t *)tok;
+    r->body_len = strlen(tok);
+    return r;
+}
+
+/* An AUTH job, from a frame or the daemon's pages; a page's refusal is a page's. */
+static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
+    oc_dbres *r = process_auth_job(w, j);
+    if (r && j->web && r->type == OC_RES_AUTH_ERR) r->type = OC_RES_WEB_ERR;
     return r;
 }
 
@@ -1583,7 +1661,28 @@ static oc_dbres *process_setup_invite(sqlite3 *db, const oc_job *j) {
  * single-use-consume the token, and mint a session — the redeeming client is now
  * authenticated (result is an AUTH_OK). Any failure is a non-disclosing
  * AUTH_INVALID_TOKEN. */
+static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j);
+
+/* A sign-up from the pages is a guess at an invitation like any other, so its
+ * source is limited as a sign-in's is; a refusal is the page's. */
 static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
+    if (j->web && j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms())) {
+        oc_dbres *r = calloc(1, sizeof *r);
+        if (!r) return NULL;
+        r->conn_id = j->conn_id;
+        r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED;
+        return r;
+    }
+    oc_dbres *r = process_redeem_job(w, j);
+    if (r && j->web && r->type == OC_RES_AUTH_ERR) {
+        r->type = OC_RES_WEB_ERR;
+        if (r->err_code == OC_ERR_AUTH_INVALID_TOKEN && j->source[0])
+            oc_ratelimit_record(w->source_rl, src_key(j->source), dbw_now_ms());
+    }
+    return r;
+}
+
+static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1593,6 +1692,11 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
      * be the phishable credential the provider is there to remove (AUTH.md §8.4). */
     if (!(w->auth_methods & OC_AUTH_LOCAL)) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+    }
+    /* Sign-up happens on the daemon's pages (AUTH.md §8.10) -- but for the test
+     * knob. */
+    if (!j->web && !w->password_frames) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_SOURCE_UNAVAILABLE; return r;
     }
     if (j->token_len != OC_INVITE_TOKEN_LEN) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
@@ -1659,6 +1763,13 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
 
+    if (j->web) {
+        /* From the sign-up page: the account is made, and the person goes on
+         * signed in, with an ID token like a sign-in's. */
+        if (created_by) audit_actor(db, OC_AUDIT_ACCOUNT, "invite.redeem", uid, 0, NULL, 1, "via=browser");
+        else            audit_log(db, OC_AUDIT_ACCOUNT, "user.bootstrap", 0, NULL, uid, user, 1, "via=browser");
+        return web_finish(w, j, r, uid);
+    }
     uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t sexp = 0, sid = 0;
     if (mint_session(db, uid, token, &sexp, &sid) != 0) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
@@ -7601,20 +7712,14 @@ static oc_dbres *process_set_display_name(sqlite3 *db, const oc_job *j) {
  * the test and the write. A non-local (OIDC) account, a wrong old password, or a
  * change that another beat to it is FORBIDDEN. On success the self ack echoes
  * the unchanged display name. Write. */
-static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
-    sqlite3 *db = w->db;
-    const char *newpw = j->pf_new_pw ? j->pf_new_pw : "";
-    if (newpw[0] == '\0') return profile_err(j, OC_ERR_FORBIDDEN);
-    if (j->auth_stage == OC_AUTH_STAGE_NEW) {
-        ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
-        submit_to_reader(w, (oc_job *)j);
-        w->auth_deferred = 1;
-        return NULL;
-    }
-    if (j->auth_ok != 1) return profile_err(j, OC_ERR_FORBIDDEN);
-    if (!j->pw_derived) return profile_err(j, OC_ERR_INTERNAL);
+/* Store the new password a check derived, against the version that was checked
+ * -- one statement, so no other change can land between the test and the
+ * write. 0, or -1 with `err` FORBIDDEN (changed meanwhile) or INTERNAL. */
+static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint16_t *err) {
+    *err = OC_ERR_INTERNAL;
+    if (!j->pw_derived) return -1;
     uint64_t version = next_credential_version(db);
-    if (!version) return profile_err(j, OC_ERR_INTERNAL);
+    if (!version) return -1;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "UPDATE local_credentials SET salt=?, iterations=?, hash=?, updated_at_ms=?, version=? "
@@ -7624,12 +7729,30 @@ static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
     sqlite3_bind_blob (st, 3, j->pw_hash, OC_PW_HASH_LEN, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
     sqlite3_bind_int64(st, 5, (sqlite3_int64)version);
-    sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)uid);
     sqlite3_bind_int64(st, 7, (sqlite3_int64)j->auth_version);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) return profile_err(j, OC_ERR_INTERNAL);
-    if (sqlite3_changes(db) != 1) return profile_err(j, OC_ERR_FORBIDDEN);   /* changed meanwhile */
+    if (rc != SQLITE_DONE) return -1;
+    if (sqlite3_changes(db) != 1) { *err = OC_ERR_FORBIDDEN; return -1; }
+    return 0;
+}
+
+static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
+    const char *newpw = j->pf_new_pw ? j->pf_new_pw : "";
+    if (newpw[0] == '\0') return profile_err(j, OC_ERR_FORBIDDEN);
+    /* Changed on the daemon's pages (AUTH.md §8.10) -- but for the test knob. */
+    if (!w->password_frames) return profile_err(j, OC_ERR_FORBIDDEN);
+    if (j->auth_stage == OC_AUTH_STAGE_NEW) {
+        ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
+        submit_to_reader(w, (oc_job *)j);
+        w->auth_deferred = 1;
+        return NULL;
+    }
+    if (j->auth_ok != 1) return profile_err(j, OC_ERR_FORBIDDEN);
+    uint16_t err = 0;
+    if (store_new_password(db, j, j->user_id, &err) != 0) return profile_err(j, err);
     /* Never the password itself — only that it changed (ARCH-79). */
     audit_actor(db, OC_AUDIT_ACCOUNT, "password.change", j->user_id, 0, NULL, 1, NULL);
     return profile_ok(j, lookup_display_name(db, j->user_id));
@@ -8503,6 +8626,17 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
             chk->password = (const char *)pass.ptr;     /* in j->token, which outlives the check */
             chk->pwlen = pass.len;
         }
+        /* A change from the password page: the new password's key too, as a
+         * signed-in change gets it. */
+        if (found && j->web == OC_WEB_PASSWORD) {
+            found = j->pf_new_pw && j->pf_new_pw[0] &&
+                    oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0;
+            if (found) {
+                chk->new_password = j->pf_new_pw;
+                chk->new_pwlen = strlen(j->pf_new_pw);
+                chk->new_iters = OC_PW_ITERATIONS;
+            }
+        }
     }
     if (found) {
         j->auth_uid = uid;
@@ -8596,6 +8730,12 @@ void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users) {
 }
 
 uint8_t oc_dbwriter_auth_methods(oc_dbwriter *w) { return w->auth_methods; }
+
+int oc_dbwriter_local_browser(oc_dbwriter *w) {
+    return (w->auth_methods & OC_AUTH_LOCAL) && w->local_iss != NULL;
+}
+
+int oc_dbwriter_password_frames(oc_dbwriter *w) { return w->password_frames; }
 
 int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
                                      char *err, size_t errcap) {
@@ -8876,6 +9016,37 @@ int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char 
 
 /* --- Lifecycle ---------------------------------------------------------- */
 
+/* This daemon's issuer for its local accounts (AUTH.md §8.10): the one kept, or
+ * a new one, made and kept now. Setup, before any thread runs. */
+static int local_issuer_load(oc_dbwriter *w) {
+    char *key = NULL, *iss = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(w->db, "SELECT key_pem, issuer FROM local_issuer WHERE id=1;", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        key = strdup((const char *)sqlite3_column_text(st, 0));
+        iss = strdup((const char *)sqlite3_column_text(st, 1));
+    }
+    sqlite3_finalize(st);
+    if (!key || !iss) {
+        free(key); free(iss);
+        if (oc_local_issuer_generate(&key, &iss) != 0) return -1;
+        sqlite3_prepare_v2(w->db, "INSERT INTO local_issuer(id, key_pem, issuer, created_at_ms) VALUES (1,?,?,?);",
+                           -1, &st, NULL);
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, iss, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { free(key); free(iss); return -1; }
+    }
+    w->local_iss = oc_local_issuer_open(key, iss);
+    oc_e2e_wipe(key, strlen(key));
+    free(key); free(iss);
+    if (!w->seen_jti) w->seen_jti = calloc(1, sizeof *w->seen_jti);
+    return w->local_iss && w->seen_jti ? 0 : -1;
+}
+
 oc_dbwriter *oc_dbwriter_start(const char *path) {
     oc_dbwriter *w = calloc(1, sizeof *w);
     if (!w) return NULL;
@@ -8903,6 +9074,14 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     if (oc_migrate_default(w->db, &err) != SQLITE_OK) {
         fprintf(stderr, "dbwriter: migration failed: %s\n", err ? err : "?");
         sqlite3_free(err); goto fail;
+    }
+    if (local_issuer_load(w) != 0) {
+        fprintf(stderr, "dbwriter: the local issuer could not be made\n");
+        goto fail;
+    }
+    {   /* The test knob (CONFIG.md): a password in a frame. */
+        const char *k = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
+        w->password_frames = k && strcmp(k, "1") == 0;
     }
 
     w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -8958,6 +9137,8 @@ fail:
     if (w->evfd >= 0) close(w->evfd);
     for (int i = 0; i < OC_DB_READERS; i++) sqlite3_close(w->readers[i].rdb);
     sqlite3_close(w->db);
+    oc_local_issuer_close(w->local_iss);
+    free(w->seen_jti);
     free(w);
     return NULL;
 }
@@ -8988,6 +9169,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     free(w->oidc_issuer); free(w->oidc_audience);
     free(w->oidc_pubkey_pem); free(w->relay_origin);
     free(w->seen_jti);
+    oc_local_issuer_close(w->local_iss);
     oc_join_rules_free(w->join_rules);
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);

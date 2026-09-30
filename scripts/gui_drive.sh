@@ -78,6 +78,7 @@ case "${1:-}" in
             OPENCHIME_TLS_CERT="$OC_DEV_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_DEV_DIR/key.pem" \
             OPENCHIME_BLOB_DIR="$OC_DEV_DIR/blobs" \
             OPENCHIME_PROTO_PORT="${OC_DEV_PORT}" OPENCHIME_HEALTH_PORT=8080 \
+            OPENCHIME_TEST_PASSWORD_AUTH=1 \
             OPENCHIME_WORKSPACE_NAME="${OC_DEV_WS:-Acme HQ}" \
             OPENCHIME_BOOTSTRAP_USERS="${OC_DEV_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
             OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \

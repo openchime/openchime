@@ -4,6 +4,9 @@
 #include "check.h"
 #include "../client/core/signin.h"
 #include "../daemon/jwt.h"     /* the daemon's own check of the pair */
+#include "tls.h"               /* a fake daemon for the tunnel */
+#include "protocol.h"
+#include <sys/time.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -55,6 +58,170 @@ static void *browser_thread(void *arg) {
 
 static atomic_int g_cancel;
 static void *cancel_thread(void *arg) { (void)arg; usleep(150000); g_cancel = 1; return NULL; }
+
+/* --- the tunnel ------------------------------------------------------------ */
+
+/* A fake daemon on TLS: every request is answered 303 to one of its own paths,
+ * with the request's head echoed back as the body -- what the tunnel sent. */
+static oc_tls_server g_fd_srv;
+static int g_fd_listen = -1, g_fd_port;
+static atomic_int g_fd_stop;
+
+static void *fake_daemon(void *arg) {
+    (void)arg;
+    while (!atomic_load(&g_fd_stop)) {
+        struct timeval tv = { 0, 200000 };
+        fd_set rs; FD_ZERO(&rs); FD_SET(g_fd_listen, &rs);
+        if (select(g_fd_listen + 1, &rs, NULL, NULL, &tv) <= 0) continue;
+        int fd = accept(g_fd_listen, NULL, NULL);
+        if (fd < 0) continue;
+        struct timeval to = { 5, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+        oc_tls_conn c;
+        if (oc_tls_conn_init(&c, &g_fd_srv.conf, fd) == 0) {
+            oc_tls_status st;
+            while ((st = oc_tls_handshake(&c)) == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) {}
+            char req[8192]; size_t got = 0;
+            req[0] = '\0';
+            /* The head, then the body its Content-Length declares. */
+            for (;;) {
+                char *hend = strstr(req, "\r\n\r\n");
+                if (hend) {
+                    const char *cl = strstr(req, "Content-Length: ");
+                    size_t want = (size_t)(hend + 4 - req) + (cl && cl < hend ? (size_t)atoi(cl + 16) : 0);
+                    if (got >= want) break;
+                }
+                if (st != OC_TLS_OK || got >= sizeof req - 1) break;
+                size_t n = 0;
+                oc_tls_status rs2 = oc_tls_read(&c, req + got, sizeof req - 1 - got, &n);
+                got += n; req[got] = '\0';
+                if (rs2 != OC_TLS_OK && rs2 != OC_TLS_WANT_READ) break;
+                if (n == 0 && rs2 == OC_TLS_OK) break;
+            }
+            if (st == OC_TLS_OK) {
+                char resp[9000];
+                int n = snprintf(resp, sizeof resp, "HTTP/1.1 303 See Other\r\nLocation: /signup?x=1\r\n"
+                                 "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(req), req);
+                size_t off = 0, w = 0;
+                while (off < (size_t)n && oc_tls_write(&c, resp + off, (size_t)n - off, &w) != OC_TLS_ERROR) off += w;
+            }
+            oc_tls_conn_free(&c);
+        }
+        close(fd);
+    }
+    return NULL;
+}
+
+/* One raw request to the listener; the whole answer in `out`. */
+static void http_raw(int port, const char *request, char *out, size_t cap) {
+    out[0] = '\0';
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+    struct timeval to = { 10, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+        ssize_t w = write(fd, request, strlen(request)); (void)w;
+        size_t got = 0;
+        for (ssize_t r; got < cap - 1 && (r = read(fd, out + got, cap - 1 - got)) > 0; ) got += (size_t)r;
+        out[got] = '\0';
+    }
+    close(fd);
+}
+
+struct serve_arg { oc_loopback *lb; atomic_int cancel; };
+static void *serve_thread(void *arg) {
+    struct serve_arg *sa = arg;
+    oc_loopback_serve(sa->lb, 20000, &sa->cancel);
+    return NULL;
+}
+
+/* The tunnel: it carries the sign-in pages, and nothing else, to the one
+ * certificate it was given, as the daemon's origin -- rewriting Host, Origin
+ * (for its own page's post only) and a Location on the daemon's pages. */
+static void test_tunnel(void) {
+    CHECK(oc_tls_server_init(&g_fd_srv, NULL, NULL) == 0);
+    oc_tunnel_target t;
+    memset(&t, 0, sizeof t);
+    CHECK(oc_tls_server_fingerprint(&g_fd_srv, t.fp) == 0);
+    g_fd_listen = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    CHECK(bind(g_fd_listen, (struct sockaddr *)&a, sizeof a) == 0 && listen(g_fd_listen, 8) == 0 &&
+          getsockname(g_fd_listen, (struct sockaddr *)&a, &al) == 0);
+    g_fd_port = ntohs(a.sin_port);
+    atomic_store(&g_fd_stop, 0);
+    pthread_t dth;
+    CHECK(pthread_create(&dth, NULL, fake_daemon, NULL) == 0);
+
+    snprintf(t.host, sizeof t.host, "127.0.0.1");
+    t.port = g_fd_port;
+    snprintf(t.authority, sizeof t.authority, "d.test:%d", g_fd_port);
+
+    for (int round = 0; round < 2; round++) {
+        /* Round 1: a target whose certificate is not the accepted one. */
+        oc_tunnel_target tt = t;
+        if (round == 1) tt.fp[0] ^= 0xff;
+        oc_loopback *lb = oc_loopback_open(NULL, 0);
+        CHECK(lb != NULL);
+        if (!lb) break;
+        oc_loopback_set_tunnel(lb, &tt);
+        char base[128];
+        CHECK(oc_loopback_tunnel_base(lb, base, sizeof base) == 0 && strncmp(base, "http://127.0.0.1:", 17) == 0);
+        int lport = atoi(base + 17);
+        const char *tp = strchr(base + 17, '/');
+        struct serve_arg sa = { lb, 0 };
+        pthread_t sth;
+        CHECK(pthread_create(&sth, NULL, serve_thread, &sa) == 0);
+        char req[1024], out[16384];
+        if (round == 0) {
+            snprintf(req, sizeof req, "GET %s/signin?q=1 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", tp, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 303") == out);
+            char want[160];
+            snprintf(want, sizeof want, "\r\nLocation: %s/signup?x=1\r\n", tp);
+            CHECK(strstr(out, want) != NULL);                             /* back into the tunnel */
+            CHECK(strstr(out, "GET /signin?q=1 HTTP/1.1\r\n") != NULL);     /* the path, stripped */
+            snprintf(want, sizeof want, "Host: d.test:%d\r\n", g_fd_port);
+            CHECK(strstr(out, want) != NULL);                              /* the daemon's origin */
+            /* Its own page's post goes as the daemon's origin... */
+            snprintf(req, sizeof req, "POST %s/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: http://127.0.0.1:%d\r\n"
+                     "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=b", tp, lport, lport);
+            http_raw(lport, req, out, sizeof out);
+            snprintf(want, sizeof want, "Origin: https://d.test:%d\r\n", g_fd_port);
+            CHECK(strstr(out, want) != NULL && strstr(out, "\r\n\r\na=b") != NULL);
+            /* ...another site's keeps its own, for the daemon to refuse. */
+            snprintf(req, sizeof req, "POST %s/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: https://evil.example\r\n"
+                     "Content-Length: 0\r\n\r\n", tp, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "Origin: https://evil.example\r\n") != NULL && !strstr(out, "Origin: https://d.test"));
+            /* Not a sign-in page, not this listener's name, not its secret: not carried. */
+            snprintf(req, sizeof req, "GET %s/webhook/00 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", tp, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 404") == out);
+            snprintf(req, sizeof req, "GET %s/signin HTTP/1.1\r\nHost: evil.example:%d\r\n\r\n", tp, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 404") == out);
+            snprintf(req, sizeof req, "GET /p/not-the-secret/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 404") == out);
+        } else {
+            snprintf(req, sizeof req, "GET %s/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", tp, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 502") == out);                     /* not the accepted certificate */
+        }
+        atomic_store(&sa.cancel, 1);
+        pthread_join(sth, NULL);
+        oc_loopback_close(lb);
+    }
+    atomic_store(&g_fd_stop, 1);
+    pthread_join(dth, NULL);
+    close(g_fd_listen);
+    oc_tls_server_free(&g_fd_srv);
+}
 
 int run_signin_tests(void) {
     printf("test_signin: verifier + challenge, loopback listener (one GET, wrong path and "
@@ -171,5 +338,6 @@ int run_signin_tests(void) {
         char tiny[8];
         CHECK(oc_loopback_open(tiny, sizeof tiny) == NULL);
     }
+    test_tunnel();
     return failures;
 }

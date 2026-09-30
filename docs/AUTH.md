@@ -17,7 +17,7 @@ used.
 
 | Source | How identity is proven | Depends on |
 |---|---|---|
-| **Local** (§2) | The daemon manages accounts + passwords itself. | Nothing outside the box — fully air-gappable. |
+| **Local** (§2) | The daemon manages accounts + passwords itself; the password is typed into the daemon's own sign-in page, in the browser (§8.10). | Nothing outside the box — fully air-gappable. |
 | **Relay** (§3) | The client logs in with Google/MS/Apple through the project's central service, which re-issues a token the daemon trusts. | The project's central service, at login time only. |
 | **Direct connection** | The client logs in at an OIDC provider the operator names, and the daemon is the relying party: it redeems the code and validates the provider's ID token. | The operator's own provider. No OpenChime-operated service. |
 
@@ -58,18 +58,20 @@ authority.
   per-user random salt and a high iteration count (~600k, OWASP-tier). Only the
   derived hash + salt + iteration count are stored (`local_credentials` table).
   PBKDF2 was chosen over argon2/bcrypt to add **no new dependency** — mbedTLS is
-  already linked and has no argon2. Passwords travel only inside the TLS session (REQ-180), so a
-  plaintext password in the `AUTH` frame is acceptable on the wire; it is never
-  stored.
+  already linked and has no argon2. **No OpenChime client collects a password.**
+  It is typed only into the daemon's own sign-in page, in the system browser, and
+  reaches the daemon only inside TLS — directly, or through the client's loopback
+  tunnel (§8.10). It is never stored. A password in a frame is refused, but for a
+  test knob.
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
   created at first run from a one-time **setup token**. There is no config file
   and no configuration variable for it (ARCH-26): the daemon **mints** the token
   itself when a local-mode first run finds no owner, and prints it once to
-  stderr. This avoids the chicken-and-egg of "you need an admin to create the
+  stderr. The owner is created with it on the sign-up page (§8.10). This avoids the chicken-and-egg of "you need an admin to create the
   first admin" without requiring email (air-gapped-safe).
-- **Adding users:** an owner/admin creates an account and issues an **invite
-  token**; the invitee sets their password by presenting the token. Email
-  delivery is never required.
+- **Adding users:** an owner/admin issues an **invite token**; the invitee
+  creates the account — username and password — by presenting it on the sign-up
+  page (§8.10). Email delivery is never required.
 - **Registered-user cap:** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
   = unlimited). Creating a *new* user past the cap — via invite redeem, direct
   register, bootstrap, or a first-time OIDC login — is refused with
@@ -83,7 +85,10 @@ authority.
   attempts with `ERROR AUTH_RATE_LIMITED`. The per-source cap is higher than
   per-account, so many users behind one NAT are tolerated while an account-spray
   from a single IP is still stopped; a successful login clears the account
-  counter but not the source counter.
+  counter but not the source counter. The sign-in and password pages (§8.10)
+  go through the same limiters, by the address the request came from — the
+  browser's, or the client's through its tunnel — and a sign-up with an
+  invitation that is not valid counts against its source.
 - **Where the derivation runs:** not on the database writer. The writer checks
   the limiters, a reader fetches the stored credential and its version, a
   two-thread auth pool derives and compares, and the writer finishes the
@@ -372,9 +377,12 @@ After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 (`OPENCHIME_AUTH_MODE`: `local`, `relay`, or both). The client draws one control
 per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
-- `local` — username + password → verified against `local_credentials`.
+- `local` — username + password in the frame. Refused (`AUTH_SOURCE_UNAVAILABLE`)
+  unless the daemon runs with the test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`;
+  local accounts sign in in the browser (§8.10).
 - `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
-  `AUTH` then carries the central-issued ES256 JWT (§3.3) and the verifier (§8.2).
+  `AUTH` then carries an ES256 JWT and the verifier (§8.2): the central-issued one
+  (§3.3) for the relay, or, with source `local`, the daemon's own (§8.10).
 - `session` — a previously issued session token (reconnect).
 
 The daemon answers with `AUTH_OK` (session established) or an `ERROR`
@@ -664,3 +672,75 @@ requests are machine requests, signed as §8.7 says, to the enrollment origin:
 
 The daemon asks again at two-thirds of the certificate's life, and after a
 failure a minute later, doubling to six hours.
+
+### 8.10 Local accounts in the browser
+
+A local account signs in on the daemon's own pages, in the system browser; no
+OpenChime client collects a password, and the sign-in ends, as the relay's does,
+with the client holding an ID token.
+
+**The daemon as an issuer.** At first start the daemon makes a P-256 key and an
+issuer name (`openchime-local:<random>`) and keeps them in the database
+(`local_issuer`, SCHEMA.md migration 0050), so a restored database still verifies
+what it signed. Its token has the relay token's shape (§8.3): `iss` its name,
+`aud` `openchime-client`, `sub` `local|<user id>`, `nonce` the client's PKCE
+challenge, a fresh `jti`, and a life of 120 seconds; ES256, `kid` the key's
+thumbprint.
+
+**The exchange.** `AUTH_BEGIN{source: "local", redirect_uri, challenge}`, with the
+same loopback and challenge checks as §8.1, is answered with a **path**:
+`/signin?redirect_uri=…&nonce=…`. The client decides where the browser goes:
+
+- **Directly**, when a trusted authority vouched for the daemon's certificate
+  under the workspace's name (ARCH-10) — every managed workspace, and a
+  self-hosted one with a certificate from ACME, a file or an internal CA:
+  `https://<workspace>[:port]/signin…`. The page has the workspace's own origin,
+  which password managers and passkeys key on.
+- **Through the client's loopback tunnel** otherwise — a self-signed daemon
+  trusted by fingerprint, or one on loopback: `http://127.0.0.1:<port>/p/<secret>/signin…`.
+  A loopback origin is one the browser treats as secure, so there is no warning.
+  The tunnel carries only `/signin`, `/signup` and `/account/password`; only a
+  request whose `Host` is the listener's own (DNS rebinding); and only to the
+  certificate the client's own connection accepted — over TLS with ALPN
+  `http/1.1`, as the daemon's origin: its `Host`, and for a post from the
+  tunnel's own page its `Origin`. A post from any other page keeps its own
+  `Origin`, which the daemon refuses. It closes after the callback, on cancel,
+  or after five minutes (ten, for a page opened on its own).
+
+The person signs in on the page; the daemon checks the password on the same
+staged path as §2 — the limiters, the pool, the credential's version, the audit
+— and answers `303` to `redirect_uri?token=<jwt>`. The client presents
+`AUTH{oidc, source "local", token, verifier}`; the daemon verifies it against its
+own key, name and audience, then the verifier (§8.2), then single use, and takes
+the user by id from `sub` — no join rules, nothing created; a removed member is
+refused. The session is minted as for any sign-in.
+
+**The pages.** Served on the TLS port to a peer that negotiates HTTP (ARCH-54),
+from `daemon/webpages.c`:
+
+- `/signin` — username and password. A sign-in link carrying `invite=` opens the
+  sign-up form instead.
+- `/signup` — an invitation or the setup token, a username and a password twice.
+  It makes the account, then goes on as a sign-in.
+- `/account/password` — username, current password and a new one twice. It
+  needs no session, so the limiters stand in front of it as of a sign-in.
+
+Every page is self-contained HTML with its output escaped, no script, no
+cookies and no state kept between requests, with
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+frame-ancestors 'none'; base-uri 'none'; form-action 'self' <the callback's
+origin>` (browsers hold a form's redirect to `form-action`),
+`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+`Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Every URL on a
+page is relative, so the same pages serve both ways in. A post must be a form
+whose `Origin` is `https://` + its `Host`, and a sign-in's `redirect_uri` must be
+loopback and its `nonce` a challenge. A refusal shows the form again and never
+says which half of a credential was wrong.
+
+**Passwords in frames.** `AUTH{local}`, `REDEEM_INVITE` and `CHANGE_PASSWORD` are
+refused unless the daemon runs with `OPENCHIME_TEST_PASSWORD_AUTH=1`, a test
+knob (CONFIG.md) that it warns about at start; the test suites and the GUI
+scripts sign in with it.
+
+**The terminal client** signs in to a local account in the browser where it has
+one (Ctrl+B); its password-free path for everywhere else is a device code.

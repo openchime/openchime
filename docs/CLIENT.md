@@ -47,23 +47,38 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   source with no weaker fallback, and the **loopback listener**: `127.0.0.1` on a
   kernel-chosen port, one `GET` accepted on a path carrying a per-attempt secret,
   everything else answered 404 and ignored. Given no password, the network thread
-  takes the first browser source the challenge offers, sends `AUTH_BEGIN`, checks
+  takes the source asked for (`oc_client_start_signin`), else the first browser
+  source the challenge offers, else local accounts, sends `AUTH_BEGIN`, checks
   the daemon's URL is `https` (or `http` to loopback), publishes it as
-  `model->signin_url` for the frontend to open, and closes the connection. When the
+  `model->signin_url` for the frontend to open, and closes the connection. For
+  local accounts the daemon answers with a **path** on its own sign-in pages
+  (AUTH.md §8.10), and the client picks the origin from how its connection
+  accepted the certificate: the daemon's own `https` origin when a trusted
+  authority vouched for it, else the listener's **tunnel**, `/p/<secret>/…`,
+  which carries `/signin`, `/signup` and `/account/password` — only those, only
+  for a request naming the listener as its `Host`, and only to the certificate
+  the connection accepted — to the daemon over TLS as its own origin. An
+  invitation rides along (`&invite=`) and opens the sign-up page.
+  `oc_client_open_page` opens `account/password` the same way, on a tunnel of its
+  own held ten minutes. When the
   browser comes back it connects again and presents the token with the verifier,
   then wipes both. `oc_client_cancel_signin` and a five-minute timeout end the
   wait; a refused sign-in reaches `last_error` worded by its code.
   Every connection — the probe too — names the workspace's domain in its
   handshake (TLS.md), which is its store key minus any port. `oc_net_probe` is the step before any of it: connect, read the sources the
-  workspace offers, leave — so a frontend draws a password form, a browser
-  control, or both, before asking for anything. The TUI's sign-in dialog probes
+  workspace offers, leave — so a frontend draws the controls it offers before
+  asking for anything. The TUI's sign-in dialog probes
   once the workspace is named, offers the browser on Ctrl+B, goes straight to it
   where the workspace takes no passwords, and while the browser is open shows the
   URL in full beside trying the platform's opener.
   The Win32 sign-in card asks at the same point — when step 1 resolves the
-  workspace — and draws one control per source: the password form, and beneath it
-  a button in the daemon's words for a browser source; a workspace that takes no
-  passwords skips the form. While the browser is open the card says so, with
+  workspace — and **collects no password**: step 2 says the username and password
+  go into the workspace's own page, and its Sign in opens the browser for local
+  accounts, beside a button in the daemon's words for a browser source; a
+  workspace with no local accounts goes straight to its browser source. "Have an
+  invite? Create an account" asks only for the invitation, to fill in the sign-up
+  page, and Change password opens the password page. The workspace book takes the
+  account's name from the roster once it lists the signed-in user. While the browser is open the card says so, with
   Cancel and Esc; under the automation hook the URL is written to
   `signin_url.txt` in the test directory instead of being opened, so a harness
   can play the browser.
@@ -322,8 +337,8 @@ model; translate input to intents }, stop.
   - **self-service profile (REQ-240)** — the launcher's "Your profile" opens a
     modal with your name, role, id, and presence; "Change display name" renames
     you (the daemon fans a `PROFILE_UPDATED` so every roster — and your own header
-    — updates live); "Change password" rotates your local password (the server
-    verifies the old one, and a wrong one shows an error).
+    — updates live); "Change password" opens the workspace's password page in the
+    browser (AUTH.md §8.10), where the old password is checked and the new one set.
   - **admin / user management** — a member menu's "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
     only; a `USER_UPDATED` folds each change into the roster). "Invite a user"
@@ -627,7 +642,10 @@ takes a bracketed IPv6 address as an address, as it does an IPv4 one.
 
 **The local login box (REQ-020 local mode).** With no credential and no
 stored session token, the TUI shows a modal **Sign in** dialog — workspace /
-username / masked password / *Remember me* — that resolves the workspace on submit
+username / masked password / *Remember me* — which a daemon takes only with the
+test knob, since passwords go on its pages in the browser (AUTH.md §8.10; Ctrl+B
+opens them, and a refusal says so); its password-free path everywhere is a
+device code. The dialog resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
 reason and refocuses the password to retry. *Remember me* gates whether the
 session token persists (the store) or stays session-only. A returning user with a

@@ -166,3 +166,44 @@ int oc_url_hostheader(const char *host, const char *port, char *out, size_t cap)
                             : snprintf(out, cap, v6 ? "[%s]" : "%s", host);
     return (n < 0 || (size_t)n >= cap) ? -1 : 0;
 }
+
+/* --- query strings and form bodies ------------------------------------------ */
+
+static int hexv(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int oc_query_get(const char *query, const char *key, char *out, size_t cap) {
+    if (!query || !key || !out || cap == 0) return -1;
+    out[0] = '\0';
+    size_t kl = strlen(key);
+    const char *p = query;
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        const char *end = amp ? amp : p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        if (eq && (size_t)(eq - p) == kl && strncmp(p, key, kl) == 0) {
+            size_t o = 0;
+            for (const char *v = eq + 1; v < end; v++) {
+                int c = (unsigned char)*v;
+                if (c == '+') c = ' ';
+                else if (c == '%') {
+                    if (end - v < 3) return -1;
+                    int hi = hexv(v[1]), lo = hexv(v[2]);
+                    if (hi < 0 || lo < 0) return -1;
+                    c = hi * 16 + lo;
+                    v += 2;
+                }
+                if (c == 0 || o + 1 >= cap) { out[0] = '\0'; return -1; }
+                out[o++] = (char)c;
+            }
+            out[o] = '\0';
+            return 1;
+        }
+        p = amp ? amp + 1 : end;
+    }
+    return 0;
+}

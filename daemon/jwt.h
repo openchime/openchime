@@ -87,6 +87,13 @@ int oc_jwk_p256(mbedtls_pk_context *pk, char *out, size_t cap);
 /* RFC 7638 thumbprint of a parsed EC P-256 key, as oc_jwt_key_thumbprint. */
 int oc_jwk_thumbprint(mbedtls_pk_context *pk, char out[OC_JWT_THUMBPRINT_LEN + 1]);
 
+/* The JWS ES256 signature (RFC 7518 §3.4) of `input`/`len` by the P-256 key
+ * `pk`: SHA-256, ECDSA, and the DER signature as raw r || s, base64url into
+ * `sig64` (OC_JWS_SIG64_LEN + 1 bytes). `rng` is mbedTLS's shape. Returns 0. */
+#define OC_JWS_SIG64_LEN 86
+int oc_jws_es256_sign(mbedtls_pk_context *pk, int (*rng)(void *, unsigned char *, size_t), void *rng_ctx,
+                      const char *input, size_t len, char sig64[OC_JWS_SIG64_LEN + 1]);
+
 /* base64url (RFC 4648 §5, no padding) of `n` bytes into `out`, which needs
  * room for 4 * ((n + 2) / 3) + 1; the length written. */
 size_t oc_base64url_encode(const uint8_t *in, size_t n, char *out);

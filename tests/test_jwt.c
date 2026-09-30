@@ -10,6 +10,9 @@
 
 #include "jwt.h"
 #include "issuer.h"
+#include "localissuer.h"
+#include <stdlib.h>
+#include <time.h>
 #include "check.h"
 
 #include <string.h>
@@ -236,6 +239,52 @@ int run_jwt_tests(void) {
 
     /* Malformed (not three segments). */
     CHECK(oc_jwt_verify("abc.def", 7, pem, pem_len, ISS, AUD, NOW, &c) == OC_JWT_E_FORMAT);
+
+    /* The daemon's own issuer (AUTH.md §8.10): what it mints verifies against its
+     * key, name and audience; with a byte changed, for another audience, from
+     * another key, or past its time, it does not. */
+    {
+        char *k = NULL, *name = NULL;
+        CHECK(oc_local_issuer_generate(&k, &name) == 0);
+        oc_local_issuer *li = oc_local_issuer_open(k, name);
+        CHECK(li != NULL);
+        const char *nonce = "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0";
+        uint64_t now = (uint64_t)time(NULL);
+        char *t = li ? oc_local_issuer_mint(li, 42, nonce, now) : NULL;
+        CHECK(t != NULL);
+        if (li && t) {
+            const char *pub = oc_local_issuer_pubkey_pem(li);
+            size_t pl = strlen(pub) + 1;
+            oc_jwt_claims lc;
+            CHECK(oc_jwt_verify(t, strlen(t), pub, pl, name, OC_LOCAL_AUDIENCE, now, &lc) == OC_JWT_OK);
+            CHECK(oc_local_subject_uid(lc.sub) == 42 && strcmp(lc.nonce, nonce) == 0);
+            CHECK(lc.exp - lc.iat == OC_LOCAL_TOKEN_SECS && lc.jti[0]);
+            CHECK(oc_jwt_nonce_matches(lc.nonce, (const uint8_t *)OC_ISSUER_VERIFIER,
+                                       strlen(OC_ISSUER_VERIFIER)));
+            CHECK(oc_jwt_verify(t, strlen(t), pub, pl, name, "someone-else", now, &lc) == OC_JWT_E_CLAIMS);
+            CHECK(oc_jwt_verify(t, strlen(t), pub, pl, name, OC_LOCAL_AUDIENCE,
+                                now + OC_LOCAL_TOKEN_SECS + 600, &lc) == OC_JWT_E_EXPIRED);
+            CHECK(oc_jwt_verify(t, strlen(t), pem, pem_len, name, OC_LOCAL_AUDIENCE, now, &lc) == OC_JWT_E_KEY);
+            char *bad = strdup(t);
+            size_t dot = strcspn(bad, ".") + 5;
+            bad[dot] = bad[dot] == 'A' ? 'B' : 'A';                  /* a claim changed */
+            CHECK(oc_jwt_verify(bad, strlen(bad), pub, pl, name, OC_LOCAL_AUDIENCE, now, &lc) != OC_JWT_OK);
+            free(bad);
+            char *two = oc_local_issuer_mint(li, 42, nonce, now);     /* a fresh jti each time */
+            oc_jwt_claims c2;
+            CHECK(two && oc_jwt_verify(two, strlen(two), pub, pl, name, OC_LOCAL_AUDIENCE, now, &c2) == OC_JWT_OK &&
+                  strcmp(c2.jti, lc.jti) != 0);
+            free(two);
+        }
+        CHECK(oc_local_subject_uid("local|7") == 7 && oc_local_subject_uid("local|0") == 0 &&
+              oc_local_subject_uid("local|7x") == 0 && oc_local_subject_uid("oidc:x|7") == 0 &&
+              oc_local_subject_uid("relay|42") == 0 && oc_local_subject_uid("LOCAL|42") == 0 &&
+              oc_local_subject_uid("local|99999999999999999999") == 0);
+        CHECK(oc_local_issuer_open("not a key", name) == NULL);
+        free(t);
+        oc_local_issuer_close(li);
+        free(k); free(name);
+    }
 
     oc_issuer_free(&iss);
     oc_issuer_free(&other);

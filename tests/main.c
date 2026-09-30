@@ -188,6 +188,10 @@ static int g_ran;
 
 int main(void) {
     crash_report_install();
+    /* The suites sign in by password, in frames, as the test knob allows
+     * (AUTH.md §8.10); the checks that the product refuses them turn it off
+     * around themselves. */
+    setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
     g_only = getenv("OC_TEST_ONLY");
     g_except = getenv("OC_TEST_EXCEPT");
     const char *rep = getenv("OC_TEST_REPEAT");

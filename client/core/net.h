@@ -52,6 +52,19 @@ int oc_net_probe_ex(const char *workspace, const char *host, int port, const uns
  * the next attempt. Any thread. */
 void oc_net_trust_cert(oc_net *n, const unsigned char fp[32]);
 
+/* Sign in with this source (an AUTH_CHALLENGE id: "local", "relay", ...) when
+ * no password is given; "" or NULL, the first browser source offered, else
+ * local accounts. Before the first connection. */
+void oc_net_set_signin_source(oc_net *n, const char *source_id);
+
+/* One of the daemon's own pages -- `page` "account/password", `query` its
+ * query or NULL -- as the browser should open it (AUTH.md §8.10): the daemon's
+ * own https origin when a trusted authority vouched for its certificate, else a
+ * loopback tunnel carried for ten minutes to the certificate this client
+ * accepted. The URL into `url`. -1 before any connection has got that far. UI
+ * thread. */
+int oc_net_open_page(oc_net *n, const char *page, const char *query, char *url, size_t cap);
+
 /* Start the network thread. `token` carries local credentials as
  * "username:password"; NULL or "" means a browser sign-in through the first such
  * source the workspace offers — OC_EV_AUTH_BROWSER then carries the URL for the
@@ -88,6 +101,14 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
                               const char *token, const char *store_path, oc_secret *secret,
                               int pin_only, const unsigned char *published_pin,
                               oc_queue *to_ui, oc_queue *from_ui);
+/* As oc_net_start_verified, signing in with `source_id` (oc_net_set_signin_source)
+ * and, for a browser sign-in, carrying the invitation `invite` (hex) to the
+ * sign-up page -- both set before the thread runs. */
+oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int port,
+                            const char *token, const char *source_id, const char *invite,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui);
 
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */

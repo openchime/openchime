@@ -23,6 +23,8 @@
 #include "storage.h"
 #include "framebuf.h"
 #include "http.h"
+#include "webpages.h"   /* the sign-in pages (AUTH.md §8.10) */
+#include "e2e_hpke.h"  /* oc_e2e_wipe */
 #include "protocol.h"
 #include "ratelimit.h"
 #include "listen.h"
@@ -168,6 +170,12 @@ typedef struct {
     uint32_t         audio_duration_ms;
 } conn_xfer;
 
+/* A page's post, kept while the writer checks it: what the answer needs. */
+typedef struct web_req {
+    oc_page_kind kind;
+    char redirect_uri[512], nonce[48], username[128], invite[80];
+} web_req;
+
 typedef struct conn_s {
     int          fd;
     uint64_t     conn_id;
@@ -233,6 +241,7 @@ typedef struct conn_s {
      * the request. `http_pending` marks it as awaiting a webhook-post result. */
     int          http;
     int          http_pending;
+    struct web_req *web;         /* a sign-in page's post awaiting its check (AUTH.md §8.10) */
     int          groups_sent;    /* this session's groups have followed its user list (REQ-307) */
     /* The indexes (below): where this connection sits in the live list, its
      * neighbours among its user's connections once authenticated, and the last
@@ -757,6 +766,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     index_remove(c);
     for (int i = 0; i < c->bf_n; i++) oc_dbres_free(c->bf[i]);
     free(c->dq);
+    if (c->web) { oc_e2e_wipe(c->web, sizeof *c->web); free(c->web); }
     flush_out(c);   /* what was staged goes, if the socket takes it now */
     oc_ioloop_close(g_io, c->conn_id, fd);
     for (oc_io_event *e = c->fq_head, *n; e; e = n) { n = e->next; oc_io_event_free(e); }
@@ -1514,7 +1524,14 @@ static void send_auth_error(conn *c, uint16_t code, const char *what) {
  * operator's string and the audience reaches the relay from the one party that
  * knows it. Nothing is kept: the challenge rides the URL out and comes back
  * inside the token as `nonce` (§8.2). */
+static void handle_auth_begin_local(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw);
+
 static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw) {
+    if (b->source.len == strlen(OC_SOURCE_ID_LOCAL) &&
+        memcmp(b->source.ptr, OC_SOURCE_ID_LOCAL, b->source.len) == 0) {
+        handle_auth_begin_local(c, b, dbw);
+        return;
+    }
     const char *origin = oc_dbwriter_relay_origin(dbw);
     const char *aud = oc_dbwriter_oidc_audience(dbw);
     if (!(oc_dbwriter_auth_methods(dbw) & OC_AUTH_OIDC) || !origin[0] || !aud[0] ||
@@ -1548,6 +1565,37 @@ static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw)
     return;
 too_long:
     send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri is too long");
+}
+
+/* A local account signs in on this daemon's own pages (AUTH.md §8.10). The
+ * answer is a PATH: whether the browser reaches it directly or through the
+ * client's loopback tunnel is the client's call, made from how it judged this
+ * daemon's certificate, so the daemon names no host. */
+static void handle_auth_begin_local(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw) {
+    if (!oc_dbwriter_local_browser(dbw)) {
+        send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "no such sign-in source");
+        return;
+    }
+    if (!is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+        !is_challenge((const char *)b->challenge.ptr, b->challenge.len)) {
+        send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri must be loopback");
+        return;
+    }
+    char url[1024];
+    size_t o = (size_t)snprintf(url, sizeof url, "/signin?redirect_uri=");
+    if (pct_append(url, sizeof url, &o, (const char *)b->redirect_uri.ptr, b->redirect_uri.len) != 0 ||
+        o + 7 >= sizeof url) {
+        send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri is too long");
+        return;
+    }
+    memcpy(url + o, "&nonce=", 8); o += 7;
+    if (pct_append(url, sizeof url, &o, (const char *)b->challenge.ptr, b->challenge.len) != 0) {
+        send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri is too long");
+        return;
+    }
+    uint8_t rbuf[1200]; oc_wbuf rw; oc_wbuf_init(&rw, rbuf, sizeof rbuf);
+    oc_auth_redirect ar = { oc_slice_str(url) };
+    if (oc_encode_auth_redirect(&rw, c->version, &ar) == OC_OK) out_append(c, rbuf, rw.len);
 }
 
 /* --- Frame dispatch ----------------------------------------------------- */
@@ -1830,6 +1878,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (!j) return -1;
                 j->method = a.method;
                 memcpy(j->source, c->source, sizeof j->source);
+                if (a.source.len < sizeof j->auth_source) {
+                    memcpy(j->auth_source, a.source.ptr, a.source.len);
+                    j->auth_source[a.source.len] = '\0';
+                }
                 if (oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
                 if (a.proof.len && oc_job_set_proof(j, a.proof.ptr, a.proof.len) != 0) return -1;
                 oc_dbwriter_submit(dbw, j);
@@ -3389,8 +3441,16 @@ static void http_reply(conn *c, int status, const char *ctype, const char *body,
  * state and so is the loop's. On the health port (ARCH-25): `/healthz`, and the
  * landing page for every other path, both answered on the I/O thread. */
 #define WEBHOOK_PREFIX "/webhook/"
+/* The sign-in pages (AUTH.md §8.10): a GET shows one, a POST is its form. */
+#define WEB_MAX_BODY 8192u
 static const oc_http_route TLS_ROUTES[] = {
     { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0 },
+    { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "GET",  "/signup", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
 };
 static const oc_http_site TLS_SITE = { TLS_ROUTES, sizeof TLS_ROUTES / sizeof TLS_ROUTES[0], NULL };
 
@@ -3490,6 +3550,192 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     return 0;
 }
 
+/* --- the sign-in pages (AUTH.md §8.10) ------------------------------------- */
+
+/* A page with its headers: the policy names the sign-in's callback. */
+static void web_reply(conn *c, int status, const char *html, size_t len, const char *redirect_uri,
+                      const char *location) {
+    char extra[1024], hdr[1536];
+    if (oc_page_headers(redirect_uri, extra, sizeof extra) != 0) extra[0] = '\0';
+    if (location) {
+        size_t el = strlen(extra);
+        int n = snprintf(extra + el, sizeof extra - el, "Location: %s\r\n", location);
+        if (n < 0 || (size_t)n >= sizeof extra - el) { status = 500; extra[el] = '\0'; html = "error\n"; len = 6; }
+    }
+    size_t n = oc_http_head_ex(hdr, sizeof hdr, status, "text/html; charset=utf-8", len, extra);
+    if (!n) return;
+    out_append(c, (const uint8_t *)hdr, n);
+    if (len) out_append(c, (const uint8_t *)html, len);
+}
+
+static void web_page(conn *c, int status, const oc_page *pg) {
+    size_t len = 0;
+    char *html = oc_page_render(pg, &len);
+    if (!html) { http_reply(c, 500, "text/plain", "error\n", 6); return; }
+    web_reply(c, status, html, len, pg->redirect_uri, NULL);
+    free(html);
+}
+
+/* A post is from the page itself: its Origin is this origin, which a form on
+ * any other site cannot claim. The tunnel sends the daemon's origin for the
+ * pages it serves, and nothing else (client/core/signin.c). */
+static int same_origin(const oc_http_req *req) {
+    if (!req->host || !req->origin || req->origin_len != 8 + req->host_len) return 0;
+    return memcmp(req->origin, "https://", 8) == 0 &&
+           memcmp(req->origin + 8, req->host, req->host_len) == 0;
+}
+
+/* A form or query field, bounded; "" when absent. -1 if malformed or too long. */
+static int field_get(const char *q, const char *key, char *out, size_t cap) {
+    int r = oc_query_get(q, key, out, cap);
+    if (r == 0) out[0] = '\0';
+    return r < 0 ? -1 : 0;
+}
+
+static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
+    const char *qm = memchr(req->path, '?', req->path_len);
+    size_t plen = qm ? (size_t)(qm - req->path) : req->path_len;
+    oc_page_kind kind;
+    if (plen == 7 && memcmp(req->path, "/signin", 7) == 0) kind = OC_PAGE_SIGNIN;
+    else if (plen == 7 && memcmp(req->path, "/signup", 7) == 0) kind = OC_PAGE_SIGNUP;
+    else if (plen == 17 && memcmp(req->path, "/account/password", 17) == 0) kind = OC_PAGE_PASSWORD;
+    else { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
+    size_t len;
+    if (!oc_dbwriter_local_browser(dbw)) {
+        const char *b = oc_page_unavailable(&len);
+        web_reply(c, 404, b, len, NULL, NULL);
+        return -1;
+    }
+    int post = req->method_len == 4 && memcmp(req->method, "POST", 4) == 0;
+
+    /* The fields: the query's for a GET, the form's for a POST. */
+    char q[WEB_MAX_BODY + 1];
+    if (post) {
+        if (!req->is_form || req->body_len > WEB_MAX_BODY || !same_origin(req)) {
+            http_reply(c, 403, "text/plain", "forbidden\n", 10);
+            return -1;
+        }
+        memcpy(q, req->body, req->body_len);
+        q[req->body_len] = '\0';
+    } else {
+        size_t ql = qm ? req->path_len - plen - 1 : 0;
+        if (ql > WEB_MAX_BODY) { http_reply(c, 400, "text/plain", "bad request\n", 12); return -1; }
+        memcpy(q, qm ? qm + 1 : "", ql);
+        q[ql] = '\0';
+    }
+    web_req *w = calloc(1, sizeof *w);
+    if (!w) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
+    w->kind = kind;
+    char pass[512] = "", confirm[512] = "", current[512] = "";
+    int bad = field_get(q, "redirect_uri", w->redirect_uri, sizeof w->redirect_uri) ||
+              field_get(q, "nonce", w->nonce, sizeof w->nonce) ||
+              field_get(q, "username", w->username, sizeof w->username) ||
+              field_get(q, "invite", w->invite, sizeof w->invite) ||
+              field_get(q, "password", pass, sizeof pass) ||
+              field_get(q, "confirm", confirm, sizeof confirm) ||
+              field_get(q, "current", current, sizeof current);
+    /* A sign-in or sign-up sends its token to the client that asked, over
+     * loopback, bound to its challenge -- anything else is not our link. */
+    if (!bad && kind != OC_PAGE_PASSWORD &&
+        (!is_loopback_redirect(w->redirect_uri, strlen(w->redirect_uri)) ||
+         !is_challenge(w->nonce, strlen(w->nonce)))) bad = 1;
+    if (bad) {
+        const char *b = oc_page_invalid(&len);
+        web_reply(c, 400, b, len, NULL, NULL);
+        oc_e2e_wipe(pass, sizeof pass); oc_e2e_wipe(confirm, sizeof confirm); oc_e2e_wipe(current, sizeof current);
+        free(w);
+        return -1;
+    }
+    /* A sign-in link carrying an invitation opens the sign-up form. */
+    if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
+    oc_page pg = { kind, w->redirect_uri, w->nonce, w->username, w->invite, "", 0 };
+    if (!post) { web_page(c, 200, &pg); free(w); return -1; }
+
+    int rc = -1;
+    oc_job *j = NULL;
+    if (kind == OC_PAGE_SIGNUP || kind == OC_PAGE_PASSWORD) {
+        const char *np = pass;
+        if (strcmp(np, confirm) != 0) { pg.message = "The two passwords don't match."; goto show; }
+        if (!np[0]) { pg.message = "Choose a password."; goto show; }
+    }
+    if (kind == OC_PAGE_SIGNUP) {
+        uint8_t raw[OC_INVITE_TOKEN_LEN];
+        if (hex_decode(w->invite, strlen(w->invite), raw, sizeof raw) != (int)sizeof raw) {
+            pg.message = "That invitation isn't valid."; goto show;
+        }
+        j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
+        if (!j || oc_job_set_register(j, w->username, pass, 0, 0) != 0 ||
+            oc_job_set_token(j, raw, sizeof raw) != 0) goto fail;
+        j->web = OC_WEB_SIGNUP;
+    } else {
+        const char *pw = kind == OC_PAGE_PASSWORD ? current : pass;
+        uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        if (oc_encode_local_credential(&cw, oc_slice_str(w->username), oc_slice_str(pw)) != OC_OK) {
+            pg.message = "The username or password is too long."; goto show;
+        }
+        j = oc_job_new(OC_JOB_AUTH, c->conn_id);
+        if (!j || oc_job_set_token(j, cbuf, cw.len) != 0) { oc_e2e_wipe(cbuf, sizeof cbuf); goto fail; }
+        oc_e2e_wipe(cbuf, sizeof cbuf);
+        j->method = OC_AUTH_LOCAL;
+        j->web = kind == OC_PAGE_PASSWORD ? OC_WEB_PASSWORD : OC_WEB_SIGNIN;
+        if (kind == OC_PAGE_PASSWORD && !(j->pf_new_pw = strdup(pass))) goto fail;
+    }
+    memcpy(j->source, c->source, sizeof j->source);
+    snprintf(j->web_nonce, sizeof j->web_nonce, "%s", w->nonce);
+    oc_dbwriter_submit(dbw, j);
+    j = NULL;
+    c->web = w; w = NULL;
+    c->http_pending = 1;
+    rc = 0;
+    goto out;
+show:
+    web_page(c, 200, &pg);
+    goto out;
+fail:
+    if (j) oc_job_free(j);
+    http_reply(c, 500, "text/plain", "error\n", 6);
+out:
+    oc_e2e_wipe(pass, sizeof pass); oc_e2e_wipe(confirm, sizeof confirm); oc_e2e_wipe(current, sizeof current);
+    free(w);
+    return rc;
+}
+
+/* A page's check came back: a sign-in or sign-up goes on to the client's
+ * callback with its token; a password change says so; a refusal shows the form
+ * again, saying why, and never which half of a credential was wrong. */
+static void web_result(int ep, conn **conns, const oc_dbres *r) {
+    conn *c = find_by_id(conns, r->conn_id);
+    if (!c || !c->web) return;
+    web_req *w = c->web;
+    oc_page pg = { w->kind, w->redirect_uri, w->nonce, w->username, w->invite, "", 0 };
+    if (r->type == OC_RES_WEB_OK && w->kind == OC_PAGE_PASSWORD) {
+        pg.done = 1;
+        web_page(c, 200, &pg);
+    } else if (r->type == OC_RES_WEB_OK && r->body && r->body_len) {
+        char loc[2600];
+        int n = snprintf(loc, sizeof loc, "%s%ctoken=%.*s", w->redirect_uri,
+                         strchr(w->redirect_uri, '?') ? '&' : '?', (int)r->body_len, (const char *)r->body);
+        if (n > 0 && (size_t)n < sizeof loc) web_reply(c, 303, "", 0, w->redirect_uri, loc);
+        else http_reply(c, 500, "text/plain", "error\n", 6);
+        oc_e2e_wipe(loc, sizeof loc);
+    } else {
+        int status = 200;
+        switch (r->err_code) {
+        case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.message = "Too many attempts. Wait a minute and try again."; break;
+        case OC_ERR_USER_LIMIT:        pg.message = "This workspace is full."; break;
+        case OC_ERR_INTERNAL:          status = 500; pg.message = "Something went wrong. Try again."; break;
+        default:
+            pg.message = w->kind == OC_PAGE_SIGNUP   ? "That invitation isn't valid, or the username is taken." :
+                         w->kind == OC_PAGE_PASSWORD ? "The username or current password isn't right." :
+                                                       "The username or password isn't right.";
+            break;
+        }
+        web_page(c, status, &pg);
+    }
+    flush_out(c);
+    conn_close(ep, conns, c->fd);
+}
+
 /* An HTTP connection's request for a loop route, parsed and routed by its I/O
  * thread; every refusal was answered there. Returns 0 to keep, -1 to close. */
 static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
@@ -3500,8 +3746,15 @@ static int on_http_req(conn *c, const oc_io_event *e, oc_dbwriter *dbw) {
     req.method = d;                               req.method_len = e->method_len;
     req.path   = d + e->method_len;               req.path_len   = e->path_len;
     req.body   = d + e->method_len + e->path_len; req.body_len   = e->body_len;
+    const char *after = req.body + e->body_len;
+    if (e->host_len)   { req.host = after;                 req.host_len = e->host_len; }
+    if (e->origin_len) { req.origin = after + e->host_len; req.origin_len = e->origin_len; }
     req.is_json = e->is_json;
-    return on_http_request(c, &req, dbw);
+    req.is_form = e->is_form;
+    static const char PFX[] = WEBHOOK_PREFIX;
+    if (req.path_len >= sizeof PFX - 1 && memcmp(req.path, PFX, sizeof PFX - 1) == 0)
+        return on_http_request(c, &req, dbw);
+    return on_web_page(c, &req, dbw);
 }
 
 /* One event from the I/O threads (ioloop.h). */
@@ -4980,6 +5233,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         }
         break;
     }
+    case OC_RES_WEB_OK:
+    case OC_RES_WEB_ERR:
+        web_result(ep, conns, r);
+        break;
     case OC_RES_WEBHOOK_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;

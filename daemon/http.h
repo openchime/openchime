@@ -10,7 +10,8 @@
  *
  * Parsing is picohttpparser's (third_party/picohttpparser, MIT): it parses the
  * request line and headers and does nothing else. What is ours is small: which
- * headers matter (Content-Length, Content-Type; a Transfer-Encoding is refused,
+ * headers matter (Content-Length, Content-Type, and Host and Origin for the
+ * sign-in pages' same-origin check; a Transfer-Encoding is refused,
  * since no route takes a chunked body), the routes, and the bytes of a
  * response. One request per connection, answered with `Connection: close`. */
 
@@ -24,6 +25,9 @@ typedef struct {
     const char *path;   size_t path_len;     /* as sent, query included */
     const char *body;   size_t body_len;     /* set once the body is whole */
     int         is_json;                     /* Content-Type is application/json */
+    int         is_form;                     /* ...application/x-www-form-urlencoded */
+    const char *host;   size_t host_len;     /* the Host header; NULL if none */
+    const char *origin; size_t origin_len;   /* the Origin header; NULL if none */
     size_t      head_len;                    /* request line + headers + blank line */
     size_t      content_length;              /* declared; 0 when absent */
 } oc_http_req;
@@ -85,6 +89,10 @@ const oc_http_route *oc_http_route_find(const oc_http_site *site, const oc_http_
  * small. OC_HTTP_HEAD_MAX always suffices for a Content-Type under 64 bytes. */
 #define OC_HTTP_HEAD_MAX 256u
 size_t oc_http_head(char *out, size_t cap, int status, const char *ctype, size_t body_len);
+/* The same with `extra` -- whole header lines, each ending "\r\n", or NULL --
+ * after Content-Type: a Location, the pages' security headers. */
+size_t oc_http_head_ex(char *out, size_t cap, int status, const char *ctype, size_t body_len,
+                       const char *extra);
 
 /* The small fixed page an error status is answered with (text/plain). */
 const char *oc_http_error_body(int status, size_t *len);

@@ -344,17 +344,21 @@ static void http_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n)
 
     c->http_done = 1;
     c->deadline = 0;
-    size_t len = req.method_len + req.path_len + req.body_len;
+    size_t len = req.method_len + req.path_len + req.body_len + req.host_len + req.origin_len;
     oc_io_event *e = calloc(1, sizeof *e);
     if (e && len && !(e->data = malloc(len))) { free(e); e = NULL; }
     if (e) {
         e->kind = OC_IO_HTTP_REQ; e->conn_id = c->conn_id; e->fd = c->fd;
-        memcpy(e->data, req.method, req.method_len);
-        memcpy(e->data + req.method_len, req.path, req.path_len);
-        if (req.body_len) memcpy(e->data + req.method_len + req.path_len, req.body, req.body_len);
+        uint8_t *o = e->data;
+        memcpy(o, req.method, req.method_len); o += req.method_len;
+        memcpy(o, req.path, req.path_len);     o += req.path_len;
+        if (req.body_len)   { memcpy(o, req.body, req.body_len);     o += req.body_len; }
+        if (req.host_len)   { memcpy(o, req.host, req.host_len);     o += req.host_len; }
+        if (req.origin_len) { memcpy(o, req.origin, req.origin_len); o += req.origin_len; }
         e->len = len;
         e->method_len = req.method_len; e->path_len = req.path_len; e->body_len = req.body_len;
-        e->is_json = req.is_json;
+        e->host_len = req.host_len; e->origin_len = req.origin_len;
+        e->is_json = req.is_json; e->is_form = req.is_form;
     }
     free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;
     post_or_finish(t, c, e);

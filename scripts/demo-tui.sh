@@ -27,6 +27,7 @@ say "Start a local daemon (bootstrap users alice/bob)"
 mkdir -p "$WORK/blobs"
 OPENCHIME_DB_PATH="$WORK/tui.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem" \
 OPENCHIME_BLOB_DIR="$WORK/blobs" OPENCHIME_PROTO_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" \
+OPENCHIME_TEST_PASSWORD_AUTH=1 \
 OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" \
 "$ROOT/openchimed" >"$WORK/daemon.log" 2>&1 &
 D_PID=$!

@@ -64,6 +64,14 @@ oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int
 oc_client *oc_client_start_verified(const char *workspace_key, const char *host, int port,
                                     const char *cred, const char *store_path, oc_secret *secret,
                                     int remember, const char *published_fingerprint) {
+    return oc_client_start_signin(workspace_key, host, port, cred, NULL, NULL, store_path, secret,
+                                  remember, published_fingerprint);
+}
+
+oc_client *oc_client_start_signin(const char *workspace_key, const char *host, int port,
+                                  const char *cred, const char *source_id, const char *invite,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint) {
     oc_client *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     oc_queue_init(&c->events);
@@ -74,8 +82,8 @@ oc_client *oc_client_start_verified(const char *workspace_key, const char *host,
     unsigned char pin[OC_TLS_FINGERPRINT_LEN];
     int have = published_fingerprint && published_fingerprint[0] &&
                oc_wellknown_fingerprint_bytes(published_fingerprint, pin) == 0;
-    c->net = oc_net_start_verified(workspace_key, host, port, cred, store_path, secret, !remember,
-                                   have ? pin : NULL, &c->events, &c->cmds);
+    c->net = oc_net_start_signin(workspace_key, host, port, cred, source_id, invite, store_path, secret,
+                                 !remember, have ? pin : NULL, &c->events, &c->cmds);
     if (!c->net) {
         oc_queue_destroy(&c->events);
         oc_queue_destroy(&c->cmds);
@@ -1316,6 +1324,10 @@ void oc_client_logout(oc_client *c, uint8_t scope) {
 
 int oc_client_outbox_pending(oc_client *c) {
     return c ? oc_net_outbox_pending(c->net) : 0;
+}
+
+int oc_client_open_page(oc_client *c, const char *page, const char *query, char *url, size_t cap) {
+    return c ? oc_net_open_page(c->net, page, query, url, cap) : -1;
 }
 
 void oc_client_cancel_signin(oc_client *c) {
