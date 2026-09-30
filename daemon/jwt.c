@@ -5,6 +5,8 @@
 
 #include "jsmn.h"   /* vendored; this TU carries the implementation */
 
+#include <mbedtls/asn1.h>
+#include <mbedtls/ecdsa.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 
@@ -242,6 +244,31 @@ static const char PEM_END[]   = "-----END PUBLIC KEY-----";
 
 static const char B64URL[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/* An ECDSA signature's DER (SEQUENCE { r, s }) as JWS wants it: r || s, each
+ * 32 bytes big-endian. */
+static int der_to_raw(const unsigned char *der, size_t len, unsigned char raw[64]) {
+    unsigned char *p = (unsigned char *)der, *end = p + len;
+    size_t l;
+    mbedtls_mpi r, s;
+    mbedtls_mpi_init(&r); mbedtls_mpi_init(&s);
+    int rc = mbedtls_asn1_get_tag(&p, end, &l, MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE) ||
+             mbedtls_asn1_get_mpi(&p, end, &r) || mbedtls_asn1_get_mpi(&p, end, &s) ||
+             mbedtls_mpi_write_binary(&r, raw, 32) || mbedtls_mpi_write_binary(&s, raw + 32, 32) ? -1 : 0;
+    mbedtls_mpi_free(&r); mbedtls_mpi_free(&s);
+    return rc;
+}
+
+int oc_jws_es256_sign(mbedtls_pk_context *pk, int (*rng)(void *, unsigned char *, size_t), void *rng_ctx,
+                      const char *input, size_t len, char sig64[OC_JWS_SIG64_LEN + 1]) {
+    unsigned char hash[32], der[MBEDTLS_ECDSA_MAX_LEN], raw[64];
+    size_t dl = 0;
+    if (mbedtls_sha256((const unsigned char *)input, len, hash, 0) ||
+        mbedtls_pk_sign(pk, MBEDTLS_MD_SHA256, hash, sizeof hash, der, sizeof der, &dl, rng, rng_ctx) ||
+        der_to_raw(der, dl, raw)) return -1;
+    oc_base64url_encode(raw, sizeof raw, sig64);
+    return 0;
+}
 
 size_t oc_base64url_encode(const uint8_t *in, size_t n, char *out) {
     size_t o = 0;

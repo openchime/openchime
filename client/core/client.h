@@ -59,6 +59,15 @@ oc_client *oc_client_start_opts(const char *workspace_key, const char *host, int
 oc_client *oc_client_start_verified(const char *workspace_key, const char *host, int port,
                                     const char *cred, const char *store_path, oc_secret *secret,
                                     int remember, const char *published_fingerprint);
+/* As oc_client_start_verified, for a browser sign-in with no password (`cred`
+ * ""): with the source `source_id` ("local", "relay", ...; NULL the first
+ * browser source offered, else local accounts), and for local accounts with
+ * the invitation `invite` (hex, or NULL), which opens the sign-up page. Local
+ * accounts sign in on the daemon's own pages (AUTH.md §8.10). */
+oc_client *oc_client_start_signin(const char *workspace_key, const char *host, int port,
+                                  const char *cred, const char *source_id, const char *invite,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint);
 
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);
@@ -469,6 +478,12 @@ void oc_client_logout(oc_client *c, uint8_t scope);
 /* Force an immediate reconnect if the client is currently backing off after a
  * dropped connection (otherwise a no-op). */
 void oc_client_reconnect(oc_client *c);
+
+/* One of the daemon's own pages for the browser to open (AUTH.md §8.10) --
+ * `page` "account/password", `query` its query or NULL: directly on a daemon a
+ * trusted authority vouches for, else through a loopback tunnel held open ten
+ * minutes. Its URL into `url`. 0, or -1 before the client has connected. */
+int oc_client_open_page(oc_client *c, const char *page, const char *query, char *url, size_t cap);
 
 /* Stop waiting for a browser sign-in (model->signin_url is set while one waits).
  * The model then carries "sign-in cancelled" as its last error. */

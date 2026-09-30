@@ -21,7 +21,7 @@
 #include "jsmn.h"
 
 #include "https_client.h"
-#include "jwt.h"      /* oc_base64url_encode, oc_jwk_p256, oc_jwk_thumbprint */
+#include "jwt.h"      /* oc_base64url_encode, oc_jwk_p256, oc_jwk_thumbprint, oc_jws_es256_sign */
 
 #define HTTP_TIMEOUT_MS 30000
 #define POLLS           60       /* a pending object is asked about this often at most */
@@ -286,20 +286,6 @@ typedef struct {
     const int          *stop;
 } acme;
 
-/* An ECDSA signature's DER (SEQUENCE { r, s }) as JWS wants it: r || s, each
- * 32 bytes big-endian. */
-static int der_to_raw(const unsigned char *der, size_t len, unsigned char raw[64]) {
-    unsigned char *p = (unsigned char *)der, *end = p + len;
-    size_t l;
-    mbedtls_mpi r, s;
-    mbedtls_mpi_init(&r); mbedtls_mpi_init(&s);
-    int rc = mbedtls_asn1_get_tag(&p, end, &l, MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE) ||
-             mbedtls_asn1_get_mpi(&p, end, &r) || mbedtls_asn1_get_mpi(&p, end, &s) ||
-             mbedtls_mpi_write_binary(&r, raw, 32) || mbedtls_mpi_write_binary(&s, raw + 32, 32) ? -1 : 0;
-    mbedtls_mpi_free(&r); mbedtls_mpi_free(&s);
-    return rc;
-}
-
 /* The request body for `url`: `payload` NULL is POST-as-GET (an empty
  * payload). The account is named by its key until it has a URL. */
 static char *jws(acme *a, const char *url, const char *payload) {
@@ -319,14 +305,8 @@ static char *jws(acme *a, const char *url, const char *payload) {
     input = malloc(il + 1);
     if (!input) goto out;
     sprintf(input, "%s.%s", prot64, pay64);
-    unsigned char hash[32], der[MBEDTLS_ECDSA_MAX_LEN], raw[64];
-    size_t dl = 0;
-    char sig64[90];
-    if (mbedtls_sha256((const unsigned char *)input, il, hash, 0) ||
-        mbedtls_pk_sign(&a->key, MBEDTLS_MD_SHA256, hash, sizeof hash, der, sizeof der, &dl,
-                        mbedtls_ctr_drbg_random, &a->r.drbg) ||
-        der_to_raw(der, dl, raw)) goto out;
-    oc_base64url_encode(raw, sizeof raw, sig64);
+    char sig64[OC_JWS_SIG64_LEN + 1];
+    if (oc_jws_es256_sign(&a->key, mbedtls_ctr_drbg_random, &a->r.drbg, input, il, sig64) != 0) goto out;
     out = malloc(strlen(prot64) + strlen(pay64) + strlen(sig64) + 64);
     if (out) sprintf(out, "{\"protected\":\"%s\",\"payload\":\"%s\",\"signature\":\"%s\"}", prot64, pay64, sig64);
 out:

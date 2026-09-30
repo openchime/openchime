@@ -319,7 +319,7 @@ A `method` discriminator selects the credential the payload carries (ARCH-59 for
 |--------------|------|----------------------------------------------------------------|
 | `method`     | u8   | `0x01` local, `0x02` oidc, `0x04` session.                     |
 | `source`     | str  | The `id` of the challenge entry being used; empty for `session`. |
-| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — the central-issued ES256 JWT (AUTH.md §8.3); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — an ES256 JWT: the central-issued one (AUTH.md §8.3), or with source `local` the daemon's own (AUTH.md §8.10); **session** — the 32-byte session token from a prior `AUTH_OK`. |
 | `proof`      | str  | **oidc** — the verifier whose hash the client sent as `challenge` in `AUTH_BEGIN` (AUTH.md §8.2). Empty otherwise. |
 
 The daemon rejects on any mismatch with an `ERROR`: `AUTH_INVALID_TOKEN`
@@ -327,8 +327,12 @@ The daemon rejects on any mismatch with an `ERROR`: `AUTH_INVALID_TOKEN`
 a bad password), `AUTH_RATE_LIMITED` (too many failed attempts from this address,
 REQ-191), `AUTH_NOT_ALLOWED` (a valid identity no join rule or invite admits), or
 `AUTH_REQUIRED` (a source this deployment does not offer). The `oidc` credential
-is the relay's: a central-issued ES256 JWT, verified against the pinned keys
-(AUTH.md §3), never a raw *provider* token.
+is a JWT some issuer the daemon trusts signed — the relay's, verified against its
+pinned keys (AUTH.md §3), or the daemon's own for a local account (AUTH.md
+§8.10) — never a raw *provider* token. A **local** credential, a password in the
+frame, is refused with `AUTH_SOURCE_UNAVAILABLE` unless the daemon runs with the
+test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a local account signs in in the
+browser.
 
 ### 4.2a `AUTH_BEGIN` (client → server), msg_type `0x0015`, and `AUTH_REDIRECT` (server → client), msg_type `0x0016`
 
@@ -346,7 +350,7 @@ The daemon answers `AUTH_REDIRECT`:
 
 | Field           | Type | Notes                                                      |
 |-----------------|------|------------------------------------------------------------|
-| `authorize_url` | str  | The whole URL to open. The client opens it only if it is `https` (plain `http` to loopback, for development), and neither builds nor parses it. |
+| `authorize_url` | str  | For a relay source, the whole URL to open; the client opens it only if it is `https` (plain `http` to loopback, for development), and neither builds nor parses it. For the `local` source, a **path** on the daemon's own sign-in pages, `/signin?redirect_uri=…&nonce=…`: the client opens it at the daemon's own `https` origin when a trusted authority vouched for its certificate, and through its loopback tunnel otherwise (AUTH.md §8.10). |
 
 or a non-fatal `ERROR`: `AUTH_SOURCE_UNAVAILABLE` (no such source, or the box is
 enrolled nowhere to send a browser), `AUTH_INVALID_TOKEN` (a `redirect_uri` that is
@@ -838,7 +842,9 @@ Either way the reply is
 
 **`REDEEM_INVITE` (client → server), msg_type `0x0047`** — sent **before** `AUTH`
 (the invitee has no account yet), it creates the account and authenticates in one
-step:
+step. Refused (`AUTH_SOURCE_UNAVAILABLE`) unless the daemon runs with the test knob
+`OPENCHIME_TEST_PASSWORD_AUTH=1`: an invitation is redeemed on the sign-up page
+(AUTH.md §8.10).
 
 | Field      | Type  | Notes                                                        |
 |------------|-------|--------------------------------------------------------------|
@@ -1766,7 +1772,9 @@ a field), so neither can touch another account.
 — rotate your local password. The daemon verifies `old_password` (constant-time)
 against `local_credentials` and stores a fresh PBKDF2 salt+hash. A non-local
 (OIDC) account or a wrong `old_password` is `FORBIDDEN` (an `ERROR`, non-fatal);
-success answers with `PROFILE_UPDATED` (the name unchanged) as the ack.
+success answers with `PROFILE_UPDATED` (the name unchanged) as the ack. `FORBIDDEN`
+too unless the daemon runs with the test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a
+password is changed on the password page (AUTH.md §8.10).
 
 **`PROFILE_UPDATED` (S → C), `0x004A`** `{ user_id: u64, display_name: str }` — a
 user's display name (after a rename; or the caller's unchanged name after a
@@ -2542,7 +2550,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
 | `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
 | `2005` | `AUTH_NOT_ALLOWED`    | auth       | yes   | A valid identity that no join rule or invite admits (AUTH.md §8.4). An identity the workspace already knows still signs in. |
-| `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | no    | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach. |
+| `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | no    | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach; or a password came in a frame, where the daemon takes one only on its pages (AUTH.md §8.10). |
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |

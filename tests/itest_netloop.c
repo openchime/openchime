@@ -16,6 +16,8 @@
 #include "stt_render.h"
 #include "check.h"
 #include "sqlite3.h"
+#include "signin.h"       /* a verifier and its challenge, as a client makes them */
+#include "localissuer.h"   /* a token the daemon did not sign, to refuse */
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -1592,6 +1594,257 @@ static void test_voice_input_rate(int port, const uint8_t *pin) {
     stt_send(&a, 160, OC_STT_MODE_PTT, OC_DEFAULT_CHANNEL, 0, 0x70, 1, 2, 0);
     CHECK(stt_await(&a, 160, NULL, 0, NULL, &code, NULL, 0) == 0 && code == OC_ERR_STT_UNAVAILABLE);
     client_close(&a);
+}
+
+/* --- the sign-in pages (AUTH.md §8.10) ---------------------------------------- */
+
+/* One request to the pages over TLS, as a browser sends it; the status, and the
+ * whole response in `resp`. `origin` NULL sends none. */
+static int web_call(int port, const uint8_t *pin, const char *method, const char *path,
+                    const char *origin, const char *ctype, const char *body, char *resp, size_t cap) {
+    client h;
+    resp[0] = '\0';
+    if (http_client_open(&h, port, pin) != 0) return -1;
+    char req[8192], ob[160] = "";
+    if (origin) snprintf(ob, sizeof ob, "Origin: %s\r\n", origin);
+    size_t bl = body ? strlen(body) : 0;
+    int n = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: web.test\r\n%s%s%s%sContent-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s", method, path, ob, ctype ? "Content-Type: " : "",
+                     ctype ? ctype : "", ctype ? "\r\n" : "", bl, body ? body : "");
+    int rc = -1;
+    if (n > 0 && (size_t)n < sizeof req && write_all(&h.conn, (const uint8_t *)req, (size_t)n) == 0) {
+        http_read_response(&h, resp, cap);
+        if (strncmp(resp, "HTTP/1.1 ", 9) == 0) rc = atoi(resp + 9);
+    }
+    client_close(&h);
+    return rc;
+}
+
+#define FORM "application/x-www-form-urlencoded"
+#define GOOD_ORIGIN "https://web.test"
+
+/* The token a sign-in's 303 carries to the callback, into `tok`. 1 if there. */
+static int token_of(const char *resp, char *tok, size_t cap) {
+    const char *l = strstr(resp, "\r\nLocation: http://127.0.0.1:5/cb?token=");
+    if (!l) return 0;
+    l += strlen("\r\nLocation: http://127.0.0.1:5/cb?token=");
+    size_t n = strcspn(l, "\r\n");
+    if (n == 0 || n >= cap) return 0;
+    memcpy(tok, l, n); tok[n] = '\0';
+    return 1;
+}
+
+/* Present a token on the AUTH path, as the client does after the browser: 0 and
+ * the user on AUTH_OK, else the ERROR's code. */
+static int token_auth(int port, const uint8_t *pin, const char *tok, const char *verifier, uint64_t *uid) {
+    client a;
+    if (client_open(&a, port, pin) != 0 || do_handshake(&a) != 0) return -1;
+    uint8_t buf[4096]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(verifier) };
+    int rc = -1;
+    oc_header hdr; oc_rbuf p;
+    if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&a.conn, buf, w.len) == 0 &&
+        read_frame_raw(&a, &hdr, &p) == 0) {
+        if (hdr.msg_type == OC_MSG_AUTH_OK) {
+            oc_auth_ok ok;
+            if (oc_decode_auth_ok(&p, &ok) == OC_OK) { *uid = ok.user_id; rc = 0; }
+        } else if (hdr.msg_type == OC_MSG_ERROR) {
+            oc_error e;
+            if (oc_decode_error(&p, &e) == OC_OK) rc = e.code;
+        }
+    }
+    client_close(&a);
+    return rc;
+}
+
+/* A sign-in on the pages, for `user`: the status, and the token if one came. */
+static int web_signin(int port, const uint8_t *pin, const char *user, const char *pw, const char *challenge,
+                      char *tok, size_t cap, char *resp, size_t rcap) {
+    char body[512];
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&username=%s&password=%s",
+             challenge, user, pw);
+    int st = web_call(port, pin, "POST", "/signin", GOOD_ORIGIN, FORM, body, resp, rcap);
+    if (tok) { tok[0] = '\0'; token_of(resp, tok, cap); }
+    return st;
+}
+
+/* The pages end to end, on a daemon of their own with the test knob OFF -- the
+ * product as shipped: a password is taken only by a page, which ends with an ID
+ * token the client presents on AUTH. */
+static void test_web_signin(int port) {
+    const char *knob = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    char saved[8] = "";
+    if (knob) snprintf(saved, sizeof saved, "%s", knob);
+    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin) == 0);
+    unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_web.db");
+    CHECK(dbw2 != NULL);
+    if (!dbw2) { oc_tls_server_free(&srv2); goto restore; }
+    CHECK(!oc_dbwriter_password_frames(dbw2) && oc_dbwriter_local_browser(dbw2));
+    uint8_t setup[OC_INVITE_TOKEN_LEN];
+    CHECK(oc_dbwriter_setup_invite(dbw2, setup) == 1);
+    /* The members, made before the loop runs: the helper takes the writer's
+     * next result, which is the loop's once it does. */
+    uint64_t mia = oc_dbwriter_register_local(dbw2, "mia", "pw-mia", OC_ROLE_MEMBER, 2048);
+    CHECK(mia != 0);
+    CHECK(oc_dbwriter_register_local(dbw2, "pat", "pw-old", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw2, "zed", "pw-zed", OC_ROLE_MEMBER, 2048) != 0);
+    char setup_hex[2 * OC_INVITE_TOKEN_LEN + 1];
+    for (size_t i = 0; i < sizeof setup; i++) snprintf(setup_hex + 2 * i, 3, "%02x", setup[i]);
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    char resp[16384], tok[2048], body[1024], ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1];
+    CHECK(oc_signin_verifier(ver, ch) == 0);
+    char path[512];
+
+    /* The form, with the headers every page carries: nothing framed, cached or
+     * run, and forms posted only to itself and the client's callback. */
+    snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s", ch);
+    CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "Content-Security-Policy: default-src 'none'") != NULL);
+    CHECK(strstr(resp, "form-action 'self' http://127.0.0.1:5\r\n") != NULL);
+    CHECK(strstr(resp, "X-Frame-Options: DENY") && strstr(resp, "Cache-Control: no-store") &&
+          strstr(resp, "Referrer-Policy: no-referrer"));
+    CHECK(strstr(resp, "autocomplete=\"current-password\"") != NULL);
+    CHECK(strstr(resp, "action=\"signin\"") != NULL);                    /* relative: direct or tunnel */
+    /* Not a sign-in's link: the redirect is not loopback, or there is no challenge. */
+    CHECK(web_call(port, pin, "GET", "/signin?redirect_uri=https%3A%2F%2Fevil.example%2Fcb&nonce=x", NULL, NULL,
+                   NULL, resp, sizeof resp) == 400);
+    snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=short");
+    CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 400);
+    /* What the page puts back is escaped. */
+    snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s"
+             "&username=%%22%%3E%%3Cscript%%3E", ch);
+    CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "<script>") == NULL && strstr(resp, "&quot;&gt;&lt;script&gt;") != NULL);
+
+    /* A sign-in link carrying an invitation opens sign-up; the first owner signs
+     * up with the setup token and goes on signed in. */
+    snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s",
+             ch, setup_hex);
+    CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "name=\"confirm\"") != NULL && strstr(resp, setup_hex) != NULL);
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
+             "&username=wes&password=pw-wes&confirm=pw-other", ch, setup_hex);
+    CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "don&#39;t match") != NULL);
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
+             "&username=wes&password=pw-wes&confirm=pw-wes", ch, setup_hex);
+    CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
+    CHECK(token_of(resp, tok, sizeof tok));
+    uint64_t wes = 0;
+    CHECK(token_auth(port, pin, tok, ver, &wes) == 0 && wes != 0);
+    /* Once only: the token, and the invitation. */
+    uint64_t again = 0;
+    CHECK(token_auth(port, pin, tok, ver, &again) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "invitation isn&#39;t valid") != NULL);
+
+    /* A sign-in: the token names the account by id, and is good only with the
+     * verifier whose hash it was bound to. */
+    CHECK(web_signin(port, pin, "mia", "wrong", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+    CHECK(!tok[0] && strstr(resp, "username or password isn&#39;t right") != NULL);
+    CHECK(web_signin(port, pin, "mia", "pw-mia", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+    uint64_t got = 0;
+    CHECK(token_auth(port, pin, tok, "not-the-verifier-of-this-challenge-at-all", &got) ==
+          OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(token_auth(port, pin, tok, ver, &got) == 0 && got == mia);    /* not spent by the refusal */
+
+    /* A token this daemon did not sign, and one past its time, are refused. */
+    {
+        char *k = NULL, *iss = NULL;
+        CHECK(oc_local_issuer_generate(&k, &iss) == 0);
+        sqlite3 *db = NULL;
+        char real_iss[128] = "";
+        if (sqlite3_open("build/itest_web.db", &db) == SQLITE_OK) {
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(db, "SELECT issuer FROM local_issuer WHERE id=1;", -1, &st, NULL) == SQLITE_OK &&
+                sqlite3_step(st) == SQLITE_ROW)
+                snprintf(real_iss, sizeof real_iss, "%s", (const char *)sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(db);
+        CHECK(real_iss[0] != '\0');
+        oc_local_issuer *other = oc_local_issuer_open(k, real_iss);
+        CHECK(other != NULL);
+        char *forged = other ? oc_local_issuer_mint(other, mia, ch, (uint64_t)time(NULL)) : NULL;
+        CHECK(forged && token_auth(port, pin, forged, ver, &got) == OC_ERR_AUTH_INVALID_TOKEN);
+        free(forged);
+        oc_local_issuer_close(other);
+        free(k); free(iss);
+    }
+
+    /* Only a post from the page itself: no Origin, another site's, or not a form. */
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&username=mia&password=pw-mia", ch);
+    CHECK(web_call(port, pin, "POST", "/signin", NULL, FORM, body, resp, sizeof resp) == 403);
+    CHECK(web_call(port, pin, "POST", "/signin", "https://evil.example", FORM, body, resp, sizeof resp) == 403);
+    CHECK(web_call(port, pin, "POST", "/signin", "http://web.test", FORM, body, resp, sizeof resp) == 403);
+    CHECK(web_call(port, pin, "POST", "/signin", GOOD_ORIGIN, "application/json", body, resp, sizeof resp) == 403);
+    /* ...and only to a loopback callback. */
+    snprintf(body, sizeof body, "redirect_uri=https%%3A%%2F%%2Fevil.example%%2Fcb&nonce=%s&username=mia&password=pw-mia", ch);
+    CHECK(web_call(port, pin, "POST", "/signin", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 400);
+
+    /* A password change on its page: the old one stops working, the new one works. */
+    CHECK(web_call(port, pin, "GET", "/account/password", NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "autocomplete=\"new-password\"") != NULL);
+    CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
+                   "username=pat&current=pw-bad&password=pw-new&confirm=pw-new", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "current password isn&#39;t right") != NULL);
+    CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
+                   "username=pat&current=pw-old&password=pw-new&confirm=pw-new", resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "Password changed") != NULL);
+    CHECK(web_signin(port, pin, "pat", "pw-old", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+    CHECK(web_signin(port, pin, "pat", "pw-new", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+
+    /* A removed member is refused, whatever they type. */
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        char sql[96];
+        snprintf(sql, sizeof sql, "UPDATE users SET disabled=1 WHERE id=%llu;", (unsigned long long)mia);
+        CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    CHECK(web_signin(port, pin, "mia", "pw-mia", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+
+    /* Outside the knob, a password in a frame is refused: AUTH local,
+     * REDEEM_INVITE, and CHANGE_PASSWORD from a signed-in connection. */
+    {
+        client a;
+        CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+        uint64_t u = 0;
+        CHECK(do_auth(&a, "pat", "pw-new", &u) != 0);
+        client_close(&a);
+        client b;
+        CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
+        uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_redeem_invite ri = { oc_slice_str(setup_hex), oc_slice_str("eve"), oc_slice_str("pw-eve") };
+        CHECK(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK && write_all(&b.conn, buf, w.len) == 0);
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+        client_close(&b);
+    }
+
+    /* The per-account limiter stands in front of the page as of the frame. */
+    for (int i = 0; i < 5; i++)
+        CHECK(web_signin(port, pin, "zed", "wrong", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+    CHECK(web_signin(port, pin, "zed", "pw-zed", ch, tok, sizeof tok, resp, sizeof resp) == 429 && !tok[0]);
+    CHECK(strstr(resp, "Too many attempts") != NULL);
+
+    stop_loop(&arg2, th2);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
+restore:
+    if (saved[0]) setenv("OPENCHIME_TEST_PASSWORD_AUTH", saved, 1);
 }
 
 /* Voice input absent (REQ-300): turned off by the operator, or with no engine --
@@ -3878,7 +4131,12 @@ static void test_auth_begin(int port) {
     /* A challenge that cannot be a SHA-256, and a source nobody offered. */
     CHECK(auth_begin(&c, "relay", "http://127.0.0.1/cb", "short", url, sizeof url) == OC_ERR_AUTH_INVALID_TOKEN);
     CHECK(auth_begin(&c, "acme-sso", "http://127.0.0.1/cb", CH, url, sizeof url) == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
-    CHECK(auth_begin(&c, "local", "http://127.0.0.1/cb", CH, url, sizeof url) == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
+    /* The local source signs in on the daemon's own pages (AUTH.md §8.10): the
+     * answer is a path, and the client picks the origin. */
+    CHECK(auth_begin(&c, "local", "http://127.0.0.1/cb", CH, url, sizeof url) == 0);
+    CHECK(strcmp(url, "/signin?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb"
+                      "&nonce=JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0") == 0);
+    CHECK(auth_begin(&c, "local", "https://evil.example/cb", CH, url, sizeof url) == OC_ERR_AUTH_INVALID_TOKEN);
     client_close(&c);
 
     /* A loop with no call relay -- the main loop holds the suite's audio socket,
@@ -4060,6 +4318,7 @@ int run_netloop_tests(void) {
     if (failures == 0) {
         test_voice_input_absent(arg.port + 124, 1);
         test_voice_input_absent(arg.port + 125, 0);
+        test_web_signin(arg.port + 128);
     }
 
     oc_netloop_set_audio(-1, 0);

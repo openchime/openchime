@@ -67,6 +67,21 @@ struct oc_net {
     int           port;
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
+    char          signin_pref[64];  /* the source to sign in with; "" the first browser one */
+    /* How the certificate of the last connection that got past it was accepted
+     * (cert_judge): whether a trusted authority vouched for it, and which it
+     * was. The daemon's pages are opened directly on a CA-trusted daemon and
+     * through the loopback tunnel otherwise (AUTH.md §8.10). Written by the net
+     * thread, read by the UI thread's oc_net_open_page, under accept_mu. */
+    oc_mutex_t    accept_mu;
+    int           accepted, accepted_ca;
+    unsigned char accepted_fp[OC_TLS_FINGERPRINT_LEN];
+    /* A page opened on its own through the tunnel (the password page), and the
+     * thread carrying it. */
+    oc_loopback  *page_lb;
+    oc_thread_t   page_th;
+    int           page_running;
+    atomic_int    page_cancel;
     char          ws_key[288];  /* the workspace as named (oc_workspace_key); "" = host:port */
     int           pin_only;     /* Remember-me off: keep the trusted fingerprint, and nothing else */
     /* The fingerprint the workspace PUBLISHED (ARCH-10, via `.well-known`), used
@@ -2230,6 +2245,44 @@ static const char *auth_error_text(uint16_t code, int reconnecting) {
     }
 }
 
+/* The daemon's origin as a browser names it: the name its certificate was
+ * checked for (set_expected_name), or its address, and the port unless 443. */
+static int daemon_authority(const oc_net *n, char *name, size_t ncap, char *auth, size_t acap) {
+    char port[8] = "";
+    if (n->port != 443) snprintf(port, sizeof port, "%d", n->port);
+    if (!oc_sni_name(n->ws_key[0] ? n->ws_key : n->host, name, ncap)) name[0] = '\0';
+    return oc_url_hostheader(name[0] ? name : n->host, port, auth, acap);
+}
+
+/* Where the browser goes for one of the daemon's pages (AUTH.md §8.10): the
+ * daemon itself, when a trusted authority vouched for its certificate -- the
+ * page then has the workspace's own origin, which password managers and
+ * passkeys key on; otherwise `lb`'s tunnel, carrying the pages to the very
+ * certificate this client accepted. -1 before any connection got that far. */
+static int page_url(oc_net *n, oc_loopback *lb, const char *path, char *out, size_t cap) {
+    oc_mutex_lock(&n->accept_mu);
+    int have = n->accepted, ca = n->accepted_ca;
+    oc_tunnel_target t;
+    memset(&t, 0, sizeof t);
+    memcpy(t.fp, n->accepted_fp, sizeof t.fp);
+    oc_mutex_unlock(&n->accept_mu);
+    if (!have) return -1;
+    if (daemon_authority(n, t.name, sizeof t.name, t.authority, sizeof t.authority) != 0) return -1;
+    int w;
+    if (ca) {
+        w = snprintf(out, cap, "https://%s%s", t.authority, path);
+    } else {
+        if (!lb) return -1;
+        snprintf(t.host, sizeof t.host, "%s", n->host);
+        t.port = n->port;
+        oc_loopback_set_tunnel(lb, &t);
+        char base[128];
+        if (oc_loopback_tunnel_base(lb, base, sizeof base) != 0) return -1;
+        w = snprintf(out, cap, "%s%s", base, path);
+    }
+    return w < 0 || (size_t)w >= cap ? -1 : 0;
+}
+
 static void signin_forget(oc_net *n) {
     oc_loopback_close(n->loopback);
     n->loopback = NULL;
@@ -2352,7 +2405,25 @@ static void set_expected_name(oc_tls_conn *conn, const oc_net *n) {
  *   - the person has said to trust this certificate: yes if it is that one;
  *   - a daemon on this machine (loopback): yes -- nothing sits in that path;
  *   - otherwise refused, its fingerprint kept for the person to judge. */
+static void accepted_as(oc_net *n, oc_tls_conn *conn, int ca) {
+    unsigned char fp[OC_TLS_FINGERPRINT_LEN];
+    if (oc_tls_peer_fingerprint(conn, fp) != 0) return;
+    oc_mutex_lock(&n->accept_mu);
+    memcpy(n->accepted_fp, fp, sizeof fp);
+    n->accepted_ca = ca;
+    n->accepted = 1;
+    oc_mutex_unlock(&n->accept_mu);
+}
+
+static int cert_judge_why(oc_net *n, conn_store *cs, oc_tls_conn *conn);
+
 static int cert_judge(oc_net *n, conn_store *cs, oc_tls_conn *conn) {
+    int rc = cert_judge_why(n, cs, conn);
+    if (rc == 0) accepted_as(n, conn, oc_tls_conn_ca_trusted(conn));
+    return rc;
+}
+
+static int cert_judge_why(oc_net *n, conn_store *cs, oc_tls_conn *conn) {
     if (oc_tls_conn_ca_trusted(conn)) {
         if (cs && cs->have_pin) {
             cs->have_pin = 0;
@@ -2495,14 +2566,22 @@ static int run_connection(oc_net *n, int reconnecting,
          * connection ends — nothing is held open while the person is in their
          * browser (AUTH.md §8.1). */
         int has_password = n->token && strchr(n->token, ':') != NULL;
-        int fresh = !(reconnecting && *have_sess) && !(n->invite && n->invite[0]);
+        int fresh = !(reconnecting && *have_sess) && !(n->invite && n->invite[0] && has_password);
         if (fresh && !has_password && !n->oidc_token) {
+            /* The source asked for; else the first browser source offered; else
+             * local accounts, which sign in on the daemon's own pages (§8.10). */
             const oc_auth_source *src = NULL;
-            for (uint8_t i = 0; i < ch.n_sources && !src; i++)
+            for (uint8_t i = 0; i < ch.n_sources && !src && n->signin_pref[0]; i++)
+                if (ch.sources[i].id.len == strlen(n->signin_pref) &&
+                    memcmp(ch.sources[i].id.ptr, n->signin_pref, ch.sources[i].id.len) == 0)
+                    src = &ch.sources[i];
+            for (uint8_t i = 0; i < ch.n_sources && !src && !n->signin_pref[0]; i++)
                 if (ch.sources[i].kind == OC_SOURCE_RELAY || ch.sources[i].kind == OC_SOURCE_OIDC)
                     src = &ch.sources[i];
+            for (uint8_t i = 0; i < ch.n_sources && !src && !n->signin_pref[0]; i++)
+                if (ch.sources[i].kind == OC_SOURCE_LOCAL) src = &ch.sources[i];
             if (!src || src->id.len >= sizeof n->source_id) {
-                push_err(n->to_ui, "this workspace signs in with a password");
+                push_err(n->to_ui, "this workspace doesn't offer that way of signing in");
                 rc = RC_FATAL; goto drop;
             }
             memcpy(n->source_id, src->id.ptr, src->id.len);
@@ -2538,6 +2617,19 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             memcpy(url, ar.authorize_url.ptr, ar.authorize_url.len);
             url[ar.authorize_url.len] = '\0';
+            if (url[0] == '/') {
+                /* A path on the daemon's own pages: direct, or through the
+                 * tunnel, as this connection judged its certificate. An
+                 * invitation rides along and opens the sign-up form. */
+                char path[1200];
+                int pw = snprintf(path, sizeof path, "%s%s%s", url, n->invite && n->invite[0] ? "&invite=" : "",
+                                  n->invite && n->invite[0] ? n->invite : "");
+                if (pw < 0 || (size_t)pw >= sizeof path || page_url(n, n->loopback, path, url, sizeof url) != 0) {
+                    signin_forget(n);
+                    push_err(n->to_ui, "could not start a browser sign-in on this computer");
+                    rc = RC_FATAL; goto drop;
+                }
+            }
             if (!url_is_openable(url)) {
                 signin_forget(n);
                 push_err(n->to_ui, "the server sent a sign-in address this app will not open");
@@ -2560,6 +2652,7 @@ static int run_connection(oc_net *n, int reconnecting,
     {
         uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);   /* room for a token */
         oc_result er;
+        int sent_password = 0;
         if (n->oidc_token && !(reconnecting && *have_sess)) {
             /* What the browser brought back, with the verifier only this client
              * holds (AUTH.md §8.2). Both are spent here, whatever the answer. */
@@ -2577,6 +2670,7 @@ static int run_connection(oc_net *n, int reconnecting,
         } else {
             const char *cred = n->token ? n->token : "";
             const char *sep = strchr(cred, ':');
+            sent_password = 1;
             oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
                                 : oc_slice_str(cred);
             oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
@@ -2605,7 +2699,11 @@ static int run_connection(oc_net *n, int reconnecting,
              * reconnect — either way there is nothing to silently retry. */
             oc_error er0; uint16_t code = 0;
             if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
-            push_err(n->to_ui, auth_error_text(code, reconnecting));
+            /* A password in a frame, where the daemon takes one only on its own
+             * pages (AUTH.md §8.10): say where it goes instead. */
+            push_err(n->to_ui, sent_password && code == OC_ERR_AUTH_SOURCE_UNAVAILABLE
+                                   ? "this workspace takes passwords on its sign-in page, in the browser"
+                                   : auth_error_text(code, reconnecting));
             rc = RC_FATAL; goto drop;
         }
         oc_auth_ok ok;
@@ -3624,8 +3722,19 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
                               const char *token, const char *store_path, oc_secret *secret,
                               int pin_only, const unsigned char *published_pin,
                               oc_queue *to_ui, oc_queue *from_ui) {
+    return oc_net_start_signin(workspace_key, host, port, token, NULL, NULL, store_path, secret, pin_only,
+                               published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int port,
+                            const char *token, const char *source_id, const char *invite,
+                            const char *store_path, oc_secret *secret,
+                            int pin_only, const unsigned char *published_pin,
+                            oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
+    if (source_id) snprintf(n->signin_pref, sizeof n->signin_pref, "%s", source_id);
+    if (invite && invite[0] && !(n->invite = strdup(invite))) { free(n); return NULL; }
     if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
     if (published_pin) { memcpy(n->published_pin, published_pin, OC_TLS_FINGERPRINT_LEN);
                          n->have_published_pin = 1; }
@@ -3638,11 +3747,13 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
     snprintf(n->client_type, sizeof n->client_type, "%s", "tui");
     n->to_ui = to_ui;
     n->from_ui = from_ui;
+    oc_mutex_init(&n->accept_mu);
     oc_callsig_init(&n->calls);
     oc_tls_session_init(&n->resume);
     if (oc_thread_create(&n->thread, net_thread, n) != 0) {
         oc_callsig_destroy(&n->calls);
         oc_tls_session_free(&n->resume);
+        oc_mutex_destroy(&n->accept_mu);
         free(n->token); free(n->invite); free(n->store_path); free(n); return NULL;
     }
     return n;
@@ -3659,6 +3770,47 @@ void oc_net_set_invite(oc_net *n, const char *token) {
 }
 
 void oc_net_cancel_signin(oc_net *n) { if (n) n->signin_cancel = 1; }
+
+void oc_net_set_signin_source(oc_net *n, const char *source_id) {
+    if (n) snprintf(n->signin_pref, sizeof n->signin_pref, "%s", source_id ? source_id : "");
+}
+
+/* The page tunnel's thread: it carries the pages until it is stopped or ten
+ * minutes pass. */
+static void *page_thread(void *arg) {
+    oc_net *n = arg;
+    oc_loopback_serve(n->page_lb, 10 * 60 * 1000, &n->page_cancel);
+    return NULL;
+}
+
+static void page_stop(oc_net *n) {
+    if (n->page_running) {
+        atomic_store(&n->page_cancel, 1);
+        oc_thread_join(n->page_th);
+        n->page_running = 0;
+    }
+    oc_loopback_close(n->page_lb);
+    n->page_lb = NULL;
+}
+
+int oc_net_open_page(oc_net *n, const char *page, const char *query, char *url, size_t cap) {
+    if (!n || !page || !url) return -1;
+    char path[600];
+    int w = snprintf(path, sizeof path, "/%s%s%s", page, query && query[0] ? "?" : "", query ? query : "");
+    if (w < 0 || (size_t)w >= sizeof path) return -1;
+    oc_mutex_lock(&n->accept_mu);
+    int have = n->accepted, ca = n->accepted_ca;
+    oc_mutex_unlock(&n->accept_mu);
+    if (!have) return -1;
+    if (ca) return page_url(n, NULL, path, url, cap);
+    page_stop(n);                                  /* one page tunnel at a time */
+    n->page_lb = oc_loopback_open(NULL, 0);
+    if (!n->page_lb || page_url(n, n->page_lb, path, url, cap) != 0) { page_stop(n); return -1; }
+    atomic_store(&n->page_cancel, 0);
+    if (oc_thread_create(&n->page_th, page_thread, n) != 0) { page_stop(n); return -1; }
+    n->page_running = 1;
+    return 0;
+}
 
 void oc_net_trust_cert(oc_net *n, const unsigned char fp[OC_TLS_FINGERPRINT_LEN]) {
     if (!n || !fp) return;
@@ -3677,6 +3829,7 @@ void oc_net_set_client_type(oc_net *n, const char *client_type) {
 
 void oc_net_stop(oc_net *n) {
     if (!n) return;
+    page_stop(n);
     n->stop = 1;
     oc_queue_push(n->from_ui, oc_cmd_new(OC_CMD_QUIT)); /* wake it promptly */
     oc_thread_join(n->thread);
@@ -3686,6 +3839,7 @@ void oc_net_stop(oc_net *n) {
     oc_callsig_destroy(&n->calls);
     oc_tls_session_free(&n->resume);
     signin_forget(n);
+    oc_mutex_destroy(&n->accept_mu);
     free(n->token);
     free(n->store_path);
     free(n);

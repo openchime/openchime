@@ -27,7 +27,8 @@ follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile;
 **0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row;
 **0048** (§3am) user groups, and membership through them; **0049** (§3an) a
-CA-issued TLS certificate and the ACME account behind it.
+CA-issued TLS certificate and the ACME account behind it; **0050** (§3ao) the
+daemon's issuer for its local accounts.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1246,6 +1247,26 @@ The CA-issued certificate the daemon presents, with where it came from, the
 names it covers and when it runs out. At boot it is presented at once if it is
 from the source configured, for the names configured, and not expired; the
 worker renews it at two-thirds of its life. Both tables hold a private key, like
+`server_identity`.
+
+---
+
+## 3ao. Migration 0050 — the daemon's issuer for local accounts (AUTH.md §8.10)
+
+```sql
+CREATE TABLE local_issuer (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  key_pem       TEXT NOT NULL,
+  issuer        TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL
+);
+```
+
+### `local_issuer`
+The P-256 key that signs the ID token a browser sign-in on the daemon's own
+pages ends with, and the issuer name (`openchime-local:<random>`) the token
+carries. Made once, when the writer first starts on the database, and kept, so a
+restored database still verifies what it signed. A private key, like
 `server_identity`.
 
 ---

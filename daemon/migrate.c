@@ -1080,6 +1080,19 @@ static const char MIGRATION_0049[] =
     "  not_after_ms  INTEGER NOT NULL"
     ");";
 
+static const char MIGRATION_0050[] =
+    /* The daemon's issuer for its own local accounts (AUTH.md §8.10): the key
+     * that signs the ID token a browser sign-in on its pages ends with, and the
+     * issuer name that token carries. Made once, at first start, and kept here
+     * so a restored database still verifies what it signed. A private key, like
+     * server_identity. */
+    "CREATE TABLE local_issuer ("
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  key_pem       TEXT NOT NULL,"
+    "  issuer        TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1130,6 +1143,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 47, MIGRATION_0047 },
     { 48, MIGRATION_0048 },
     { 49, MIGRATION_0049 },
+    { 50, MIGRATION_0050 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

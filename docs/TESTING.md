@@ -377,6 +377,33 @@ client.
 `test_client_core` the client's judgement of a certificate at this machine's LAN
 address — a root's, the person's trust, a change, a wrong name, and the probe.
 
+**Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, with
+the test knob `OPENCHIME_TEST_PASSWORD_AUTH` off — the product as shipped; the
+other suites sign in by password with it on (`tests/main.c` sets it).
+`test_jwt`: a token the daemon's issuer mints verifies against its key, name and
+audience, and not with a byte changed, for another audience, from another key or
+past its time; a `sub` names a user only as `local|<id>`. `itest_netloop`
+(`test_web_signin`, a daemon of its own): the pages and their headers, escaping,
+the setup token signing up the owner, a sign-in's token presented on `AUTH`
+once and only with its verifier, a forged token, `Origin` and a non-loopback
+redirect refused, a password change, a removed member, the three frames refused,
+and the account limiter in front of the page. `test_signin`: the tunnel against a
+fake daemon — the pages only, its own `Host` only, `Host`, `Origin` and a
+`Location` rewritten to the daemon's origin, and a certificate other than the
+accepted one refused. `test_client_core` (`test_local_browser`): the whole client
+both ways in — **directly**, at a daemon a test root vouches for, with a browser
+that verifies the root and the name; and **through the tunnel**, at a
+self-signed daemon on loopback — sign-up with the setup token, the password
+page, a wrong password leaving it waiting, cancel, a password typed into the
+client refused with where it goes, and a session kept by Remember me. Mutation
+proofs cover the knob, the verifier, `Origin`, direct-versus-tunnel both ways,
+the tunnel's certificate and `Host` checks, the page's limiter and the subject.
+`scripts/gui_web_signin.sh` drives it on Windows: the Win32 client, with no
+credentials, against a knob-free self-signed daemon at the WSL address —
+certificate trusted, sign-up through the tunnel with the setup token, password
+changed on its page, and, the workspace forgotten, the old password refused and
+the new one signing in; PowerShell plays the browser from `signin_url.txt`.
+
 ### 3.2 Runner: a natively-run daemon in CI
 
 Integration tests run **against the daemon binary CI just built**, started

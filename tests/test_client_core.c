@@ -35,6 +35,7 @@
 #include <mbedtls/sha256.h>
 #include "net.h"          /* oc_net_probe */
 
+#include <ctype.h>
 #include <math.h>
 #include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
 #include "oc_port.h"      /* oc_utc_offset_min: the value the core sends on connect */
@@ -3153,6 +3154,273 @@ static void test_published_fingerprint(int port) {
     unlink("build/test_core_fp.db-shm");
 }
 
+/* --- local accounts in the browser (AUTH.md §8.10) --------------------------- */
+
+/* A browser: one HTTP/1.1 exchange at `url` -- https verified as a browser does
+ * (a trusted root, and the URL's name), or plain http to loopback -- sending
+ * `method`, the extra header lines `hdrs` and `body`. The status, and the whole
+ * response in `resp`. The daemon under test is on loopback whatever the name. */
+static int web_fetch(const char *url, const char *method, const char *hdrs, const char *body,
+                     char *resp, size_t cap) {
+    resp[0] = '\0';
+    int https = strncmp(url, "https://", 8) == 0;
+    const char *auth = url + (https ? 8 : 7);
+    const char *path = strchr(auth, '/');
+    if (!path) return -1;
+    char authority[300], name[300];
+    snprintf(authority, sizeof authority, "%.*s", (int)(path - auth), auth);
+    snprintf(name, sizeof name, "%s", authority);
+    char *colon = strrchr(name, ':');
+    int port = https ? 443 : 80;
+    if (colon) { port = atoi(colon + 1); *colon = '\0'; }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+    struct timeval tv = { 10, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    char req[8192];
+    size_t bl = body ? strlen(body) : 0;
+    int n = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: %s\r\n%sContent-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s", method, path, authority, hdrs ? hdrs : "", bl, body ? body : "");
+    size_t got = 0;
+    int status = -1;
+    if (!https) {
+        if (write(fd, req, (size_t)n) == n) {
+            for (ssize_t r; got < cap - 1 && (r = read(fd, resp + got, cap - 1 - got)) > 0; ) got += (size_t)r;
+        }
+    } else {
+        static const char *alpn[] = { OC_ALPN_HTTP11, NULL };
+        oc_tls_client cli; oc_tls_conn conn;
+        if (oc_tls_client_init_verify(&cli, alpn) == 0) {
+            if (oc_tls_conn_init(&conn, &cli.conf, fd) == 0) {
+                oc_tls_conn_defer_verify(&conn);
+                oc_tls_conn_set_hostname(&conn, name);
+                oc_tls_status st;
+                while ((st = oc_tls_handshake(&conn)) == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) {}
+                /* What a browser insists on: a root it trusts vouches for this name. */
+                if (st == OC_TLS_OK && oc_tls_conn_ca_trusted(&conn)) {
+                    size_t off = 0, w = 0;
+                    while (off < (size_t)n && oc_tls_write(&conn, req + off, (size_t)n - off, &w) != OC_TLS_ERROR) off += w;
+                    for (;;) {
+                        size_t r = 0;
+                        oc_tls_status rs = oc_tls_read(&conn, resp + got, cap - 1 - got, &r);
+                        got += r;
+                        if (rs == OC_TLS_WANT_READ || rs == OC_TLS_WANT_WRITE) continue;
+                        if (r == 0 || got >= cap - 1) break;
+                    }
+                }
+                oc_tls_conn_free(&conn);
+            }
+            oc_tls_client_free(&cli);
+        }
+    }
+    close(fd);
+    resp[got] = '\0';
+    if (strncmp(resp, "HTTP/1.1 ", 9) == 0) status = atoi(resp + 9);
+    return status;
+}
+
+/* Play the person in the browser for a waiting local sign-in: open the URL the
+ * client published, post the form as the page does -- from the page's own
+ * origin -- and follow the answer to the client's callback. 0 when the callback
+ * has answered; else the status the post got (a form shown again is 200). */
+static int web_person(const char *url, const char *page, const char *fields) {
+    char resp[32768];
+    if (web_fetch(url, "GET", NULL, NULL, resp, sizeof resp) != 200) return -1;
+    if (!strstr(resp, "<form method=\"post\"")) return -1;
+    const char *q = strchr(url, '?');
+    char redirect[256] = "", nonce[64] = "";
+    if (q && (oc_query_get(q + 1, "redirect_uri", redirect, sizeof redirect) != 1 ||
+              oc_query_get(q + 1, "nonce", nonce, sizeof nonce) != 1)) return -1;
+    /* The page's own URL, and its origin. */
+    char base[1024], origin[300], post[1200], hdrs[400];
+    snprintf(base, sizeof base, "%.*s", (int)(q ? (size_t)(q - url) : strlen(url)), url);
+    const char *auth = strstr(base, "://") + 3;
+    const char *slash = strchr(auth, '/');
+    snprintf(origin, sizeof origin, "%.*s", (int)(slash - base), base);
+    /* The form posts to the page's own relative action. */
+    char *last = strrchr(base, '/');
+    snprintf(post, sizeof post, "%.*s/%s", (int)(last - base), base, page);
+    snprintf(hdrs, sizeof hdrs, "Origin: %s\r\nContent-Type: application/x-www-form-urlencoded\r\n", origin);
+    char body[1024], er[512], en[128];
+    size_t eo = 0; er[0] = '\0';
+    for (const char *c = redirect; *c; c++) eo += (size_t)snprintf(er + eo, sizeof er - eo, isalnum((unsigned char)*c) ? "%c" : "%%%02X", (unsigned char)*c);
+    snprintf(en, sizeof en, "%s", nonce);
+    snprintf(body, sizeof body, "%s%sredirect_uri=%s&nonce=%s", fields, fields[0] ? "&" : "", er, en);
+    int st = web_fetch(post, "POST", hdrs, body, resp, sizeof resp);
+    if (st != 303) return st;
+    const char *loc = strstr(resp, "\r\nLocation: ");
+    if (!loc) return -1;
+    loc += 12;
+    char cb[4096];
+    snprintf(cb, sizeof cb, "%.*s", (int)strcspn(loc, "\r\n"), loc);
+    return web_fetch(cb, "GET", NULL, NULL, resp, sizeof resp) == 200 ? 0 : -1;
+}
+
+/* A daemon for local sign-in in the browser, as shipped (the test knob off). */
+static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN]) {
+    const char *k = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    int had = k != NULL;
+    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    char f[128];
+    unlink(db);
+    snprintf(f, sizeof f, "%s-wal", db); unlink(f);
+    snprintf(f, sizeof f, "%s-shm", db); unlink(f);
+    oc_dbwriter *dbw = oc_dbwriter_start(db);
+    if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
+    if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
+        oc_dbwriter_stop(dbw); return NULL;
+    }
+    return dbw;
+}
+
+/* End to end, both ways a browser reaches the pages. A daemon a trusted root
+ * vouches for is opened DIRECTLY, at its own https origin; one this client
+ * accepted another way (here, on loopback with its self-signed certificate) is
+ * opened through the client's loopback TUNNEL. Either way the person types the
+ * password into the page, and the client ends signed in with the ID token. */
+static void test_local_browser(int port) {
+    /* --- the tunnel ---------------------------------------------------------- */
+    {
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        uint8_t setup[OC_INVITE_TOKEN_LEN];
+        oc_dbwriter *dbw = web_daemon("build/test_core_web1.db", setup);
+        CHECK(dbw != NULL && !oc_dbwriter_password_frames(dbw));
+        if (!dbw) { oc_tls_server_free(&srv); return; }
+        struct core_loop_arg arg;
+        arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+        wait_port_ready(arg.port);
+
+        /* The first owner signs up with the setup token, through the tunnel. */
+        char setup_hex[2 * OC_INVITE_TOKEN_LEN + 1];
+        for (size_t i = 0; i < sizeof setup; i++) snprintf(setup_hex + 2 * i, 3, "%02x", setup[i]);
+        oc_client *c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", setup_hex,
+                                              NULL, NULL, 1, NULL);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        char url[2048];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        CHECK(strncmp(url, "http://127.0.0.1:", 17) == 0 && strstr(url, "/p/") && strstr(url, "/signin?"));
+        CHECK(strstr(url, setup_hex) != NULL);
+        {   /* The tunnel carries the pages, under its own Host, and nothing else. */
+            char resp[32768], other[2100];
+            const char *p = strstr(url + 7, "/");
+            snprintf(other, sizeof other, "%.*s/webhook/00", (int)(strstr(url, "/signin?") - url), url);
+            CHECK(web_fetch(other, "GET", NULL, NULL, resp, sizeof resp) == 404);
+            char foreign[2100];
+            snprintf(foreign, sizeof foreign, "http://evil.example:%d%s", atoi(url + 17), p);
+            CHECK(web_fetch(foreign, "GET", NULL, NULL, resp, sizeof resp) == 404);
+            /* A post from another site keeps its own Origin, which the daemon refuses. */
+            char post[2100];
+            snprintf(post, sizeof post, "%.*s/signin", (int)(strstr(url, "/signin?") - url), url);
+            CHECK(web_fetch(post, "POST", "Origin: https://evil.example\r\nContent-Type: application/x-www-form-urlencoded\r\n",
+                            "username=lia&password=pw-lia", resp, sizeof resp) == 403);
+        }
+        CHECK(web_person(url, "signup", "invite=&username=owen&password=pw-owen&confirm=pw-owen") == 200);
+        char f2[256];
+        snprintf(f2, sizeof f2, "invite=%s&username=owen&password=pw-owen&confirm=pw-owen", setup_hex);
+        CHECK(web_person(url, "signup", f2) == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        /* The password page, opened on its own through a tunnel of its own. */
+        char purl[1024];
+        CHECK(oc_client_open_page(c, "account/password", "username=owen", purl, sizeof purl) == 0);
+        CHECK(strncmp(purl, "http://127.0.0.1:", 17) == 0 && strstr(purl, "/account/password?username=owen"));
+        {
+            char resp[32768];
+            CHECK(web_fetch(purl, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "value=\"owen\"") != NULL);
+        }
+        oc_client_stop(c);
+
+        /* A member signs in: a wrong password shows the form again and the
+         * client keeps waiting; the right one signs it in. */
+        c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", NULL, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->signin_url[0] != '\0'));
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        CHECK(web_person(url, "signin", "username=lia&password=wrong") == 200);
+        CHECK(!oc_client_model(c)->authed);
+        CHECK(web_person(url, "signin", "username=lia&password=pw-lia") == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        oc_client_stop(c);
+
+        /* A password typed into the client is refused, saying where it goes. */
+        c = oc_client_start("127.0.0.1", arg.port, "lia:pw-lia");
+        CHECK(c != NULL && WAIT_FOR(c, strstr(m->last_error, "sign-in page") != NULL) && !oc_client_model(c)->authed);
+        oc_client_stop(c);
+
+        /* Cancel. */
+        c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", NULL, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->signin_url[0] != '\0'));
+        oc_client_cancel_signin(c);
+        CHECK(WAIT_FOR(c, strstr(m->last_error, "cancelled") != NULL));
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+    }
+
+    /* --- direct -------------------------------------------------------------- */
+    {
+        testpki pki;
+        CHECK(testpki_init(&pki) == 0);
+        FILE *f = fopen("build/test_core_web_root.pem", "w");
+        if (f) { fputs(pki.pem, f); fclose(f); }
+        char chain[8192], key[2048];
+        CHECK(testpki_leaf(&pki, "web.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+        oc_tls_server srv;
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+        oc_dbwriter *dbw = web_daemon("build/test_core_web2.db", NULL);
+        CHECK(dbw != NULL);
+        if (!dbw) { oc_tls_server_free(&srv); testpki_free(&pki); return; }
+        struct core_loop_arg arg;
+        arg.port = port + 1; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+        wait_port_ready(arg.port);
+        CHECK(oc_tls_set_extra_ca("build/test_core_web_root.pem") == 0);   /* after the daemon's config */
+
+        mock_reset();
+        oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+        oc_client *c = oc_client_start_signin("web.openchime.test", "127.0.0.1", arg.port, "", "local", NULL,
+                                              "ignored", &sec, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->signin_url[0] != '\0'));
+        char url[2048], want[128];
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        snprintf(want, sizeof want, "https://web.openchime.test:%d/signin?", arg.port);
+        CHECK(strncmp(url, want, strlen(want)) == 0);
+        CHECK(web_person(url, "signin", "username=lia&password=pw-lia") == 0);   /* verified as a browser would */
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        char purl[1024];
+        snprintf(want, sizeof want, "https://web.openchime.test:%d/account/password", arg.port);
+        CHECK(oc_client_open_page(c, "account/password", NULL, purl, sizeof purl) == 0 && strcmp(purl, want) == 0);
+        oc_client_stop(c);
+        /* Remember me kept the session: the next start rides in on it, no browser. */
+        c = oc_client_start_signin("web.openchime.test", "127.0.0.1", arg.port, "", "local", NULL,
+                                   "ignored", &sec, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->authed) && oc_client_model(c)->signin_seq == 0);
+        oc_client_stop(c);
+
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        oc_tls_set_extra_ca(NULL);
+        oc_dbwriter_stop(dbw);
+        oc_tls_server_free(&srv);
+        testpki_free(&pki);
+        unlink("build/test_core_web_root.pem");
+    }
+    unlink("build/test_core_web1.db"); unlink("build/test_core_web1.db-wal"); unlink("build/test_core_web1.db-shm");
+    unlink("build/test_core_web2.db"); unlink("build/test_core_web2.db-wal"); unlink("build/test_core_web2.db-shm");
+}
+
 static void test_browser_signin(int port) {
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -4600,5 +4868,6 @@ int run_client_core_tests(void) {
     test_big_channel_list(23600 + (int)(getpid() % 2000));
     test_published_fingerprint(25700 + (int)(getpid() % 2000));
     test_cert_trust(27800 + (int)(getpid() % 2000));
+    test_local_browser(33900 + 2 * (int)(getpid() % 1000));
     return failures;
 }

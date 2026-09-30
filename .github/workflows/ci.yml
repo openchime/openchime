@@ -132,6 +132,8 @@ jobs:
           OPENCHIME_HEALTH_PORT: '8080'
           OPENCHIME_PROTO_PORT: '8443'
           OPENCHIME_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
+          # The e2e client signs in by password, in a frame (AUTH.md §8.10).
+          OPENCHIME_TEST_PASSWORD_AUTH: '1'
         run: |
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/itest/blobs"

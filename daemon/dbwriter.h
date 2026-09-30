@@ -218,6 +218,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
 
 /* Where a password sign-in is on its way (see auth_stage below). */
+#define OC_WEB_NONE     0
+#define OC_WEB_SIGNIN   1
+#define OC_WEB_PASSWORD 2
+#define OC_WEB_SIGNUP   3
 #define OC_AUTH_STAGE_NEW     0   /* as submitted: the writer checks the limiter */
 #define OC_AUTH_STAGE_READ    1   /* a reader fetches the credential */
 #define OC_AUTH_STAGE_CHECKED 2   /* back from the auth pool: the writer finishes */
@@ -235,6 +239,13 @@ typedef struct oc_job {
     char           source[46];/* peer IP string, for per-source rate limiting ("" if none) */
     char          *proof;     /* heap; the verifier a browser sign-in carries (AUTH.md §8.2) */
     size_t         proof_len;
+    char           auth_source[16];   /* AUTH: the source it names ("local", "relay"; "" none) */
+    /* From the daemon's own sign-in pages (AUTH.md §8.10) rather than a frame:
+     * which page (OC_WEB_*), and for a sign-in or sign-up the PKCE challenge the
+     * token it ends with is bound to. An AUTH job signs in or changes a password;
+     * a REDEEM job signs up. */
+    uint8_t        web;
+    char           web_nonce[48];
     /* A password sign-in's path (AUTH.md §2): the writer checks the limiter, a
      * reader fetches the credential and its version, the auth pool checks the
      * password, and the writer mints the session if that version is still the
@@ -562,7 +573,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * channel's other members are not told -- having seen a message stays
         * true. */
        OC_RES_OWN_READ_CURSOR = 100,
-       OC_RES_TLS_STATE = 101 };
+       OC_RES_TLS_STATE = 101,
+       /* The daemon's own sign-in pages (AUTH.md §8.10): done -- `body` the ID
+        * token for a sign-in or sign-up, empty for a password change -- or
+        * refused, `err_code` why. */
+       OC_RES_WEB_OK = 102, OC_RES_WEB_ERR = 103 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1131,6 +1146,13 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
 /* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
  * authorize URL from. For the net loop; set before serving and never after. */
 uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
+/* Local accounts sign in in the browser, on the daemon's pages (AUTH.md §8.10):
+ * its issuer is ready. */
+int         oc_dbwriter_local_browser(oc_dbwriter *w);
+/* The test knob OPENCHIME_TEST_PASSWORD_AUTH=1, read when the writer starts: a
+ * password may still come in a frame -- AUTH local, REDEEM_INVITE,
+ * CHANGE_PASSWORD. Off, only the pages take one. */
+int         oc_dbwriter_password_frames(oc_dbwriter *w);
 const char *oc_dbwriter_relay_origin(oc_dbwriter *w);
 const char *oc_dbwriter_oidc_audience(oc_dbwriter *w);
 

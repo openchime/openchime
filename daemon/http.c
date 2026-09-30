@@ -37,6 +37,16 @@ int oc_http_parse_head(const char *buf, size_t len, oc_http_req *req) {
 
     int have_len = 0;
     for (size_t i = 0; i < nh; i++) {
+        if (h[i].name && ci_eq(h[i].name, h[i].name_len, "host")) {
+            if (req->host) return -1;                   /* one Host (RFC 9112 §3.2) */
+            req->host = h[i].value; req->host_len = h[i].value_len;
+            continue;
+        }
+        if (h[i].name && ci_eq(h[i].name, h[i].name_len, "origin")) {
+            if (req->origin) return -1;
+            req->origin = h[i].value; req->origin_len = h[i].value_len;
+            continue;
+        }
         if (!h[i].name) continue;                       /* a folded continuation line */
         if (ci_eq(h[i].name, h[i].name_len, "content-length")) {
             if (h[i].value_len == 0 || h[i].value_len > 19) return -1;
@@ -58,6 +68,9 @@ int oc_http_parse_head(const char *buf, size_t len, oc_http_req *req) {
             if (h[i].value_len >= 16 && ci_eq(h[i].value, 16, "application/json") &&
                 (h[i].value_len == 16 || h[i].value[16] == ';' || h[i].value[16] == ' '))
                 req->is_json = 1;
+            if (h[i].value_len >= 33 && ci_eq(h[i].value, 33, "application/x-www-form-urlencoded") &&
+                (h[i].value_len == 33 || h[i].value[33] == ';' || h[i].value[33] == ' '))
+                req->is_form = 1;
         }
     }
     return 1;
@@ -128,6 +141,7 @@ const oc_http_route *oc_http_route_find(const oc_http_site *site, const oc_http_
 static const char *reason(int status) {
     switch (status) {
     case 200: return "OK";
+    case 303: return "See Other";
     case 400: return "Bad Request";
     case 403: return "Forbidden";
     case 404: return "Not Found";
@@ -142,12 +156,18 @@ static const char *reason(int status) {
 }
 
 size_t oc_http_head(char *out, size_t cap, int status, const char *ctype, size_t body_len) {
+    return oc_http_head_ex(out, cap, status, ctype, body_len, NULL);
+}
+
+size_t oc_http_head_ex(char *out, size_t cap, int status, const char *ctype, size_t body_len,
+                       const char *extra) {
     int n = snprintf(out, cap,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
+        "%s"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n\r\n",
-        status, reason(status), ctype, body_len);
+        status, reason(status), ctype, extra ? extra : "", body_len);
     return (n < 0 || (size_t)n >= cap) ? 0 : (size_t)n;
 }
 

@@ -72,6 +72,10 @@ typedef struct oc_io_event {
      * reported per connection: what follows it is not read. */
     size_t     method_len, path_len, body_len;
     int        is_json;
+    /* ...and, after the body, the Host and Origin headers (the sign-in pages'
+     * same-origin check), and whether the body is a form. */
+    size_t     host_len, origin_len;
+    int        is_form;
     struct oc_io_event *next;
 } oc_io_event;
 

@@ -2360,6 +2360,9 @@ static oc_client *g_si_client;
 /* An invite token entered on step 2. Non-empty turns the next attempt
  * into a redeem: the account is created and signed in together. */
 static char  g_si_invite[128];
+/* A workspace just signed in to with Remember me: its book entry takes the
+ * account's name once the roster lists it (remember_tick). */
+static char  g_remember_ws[256];
 static rectf g_si_invite_link;
 static rectf g_si_cancel;      /* overlay sign-in: back to the live workspace */
 static char  g_si_ws[256];        /* the workspace string as typed */
@@ -2388,7 +2391,7 @@ static int      g_si_browser;        /* the attempt in flight is a browser sign-
 static uint32_t g_si_opened_seq;     /* the model's signin_seq whose URL was opened */
 static rectf    g_si_browser_btn;    /* step 2: "Continue in your browser" */
 static rectf    g_si_wait_cancel;    /* while waiting for the browser */
-static void signin_start_browser(HWND hwnd);
+static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite);
 
 static const oc_signin_source *si_browser_source(void) {
     for (int i = 0; i < g_si_nsrc; i++)
@@ -10217,6 +10220,7 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
  * (they must agree on the field rects to the pixel — the EDITs sit on top of the
  * chrome the painter draws). Height grows with the error row and the step, so an
  * error can never overlap the button below it. */
+#define SI_NOTE_H 48.0f
 static si_geom si_layout(float W, float H) {
     si_geom g;
     g.w  = SI_W;
@@ -10226,9 +10230,10 @@ static si_geom si_layout(float W, float H) {
     g.fw = SI_W - 2 * pad;
 
     float head = 26 + 52 + 30 + 30;              /* mark + heading + subheading */
-    int   nfields = (g_si_step == 1) ? 1 : 2;
+    int   nfields = (g_si_step == 1) ? 1 : 0;
     float body = g_si_connecting ? (g_si_browser ? 120.0f : 76.0f)
                : (float)nfields * 62.0f
+                 + (g_si_step == 2 ? SI_NOTE_H : 0.0f)   /* where the password goes */
                  + (g_si_err[0] ? 34.0f : 0.0f)
                  + (g_si_step == 1 ? 26.0f : 0.0f)   /* advanced-options link */
                  + (g_si_step == 2 ? 30.0f : 0.0f)   /* remember-me row */
@@ -10278,7 +10283,7 @@ static void draw_signin(gfx *rt, float W, float H) {
         char sub[300]; oc_hostport(g_si_host, g_si_port, sub, sizeof sub);
         /* A browser sign-in asks for no credentials here, so it does not say so. */
         draw_text(rt, strcmp(head + 11, sub) ? sub
-                      : (g_si_connecting && g_si_browser) ? "" : "Enter your credentials",
+                      : (g_si_connecting && g_si_browser) ? "" : "Continue in your browser",
                   g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
     } else {
         draw_text(rt, "Enter your workspace address", g_meta,
@@ -10313,9 +10318,13 @@ static void draw_signin(gfx *rt, float W, float H) {
     g_si_wait_cancel = rf(0, 0, 0, 0);
 
     /* Field chrome. The EDITs are placed on these same rects by layout_signin. */
-    const char *labels[2]; int nfields;
-    if (g_si_step == 1) { labels[0] = "Workspace"; nfields = 1; }
-    else                { labels[0] = "Username"; labels[1] = "Password"; nfields = 2; }
+    const char *labels[1] = { "Workspace" }; int nfields = g_si_step == 1 ? 1 : 0;
+    if (g_si_step == 2) {
+        draw_text(rt, "Your username and password go into the workspace's own sign-in page, "
+                      "which opens in your browser.", g_meta_w, rf(fx, y, fx + fw, y + SI_NOTE_H - 6),
+                  OC_COL_MUTED);
+        y += SI_NOTE_H;
+    }
     for (int i = 0; i < nfields; i++) {
         draw_text(rt, labels[i], g_meta, rf(fx, y, fx + fw, y + 18), OC_COL_MUTED);
         rectf box = rf(fx, y + 20, fx + fw, y + 52);
@@ -12340,6 +12349,11 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
                 g_modal_btns[g_n_modal_btns].r = r;
                 g_modal_btns[g_n_modal_btns].cmd = b->cmd;
                 g_modal_btns[g_n_modal_btns].kind = b->kind;
+                /* Named as the others are (REQ-290): a danger button left
+                 * nameless was announced as nothing, or as whatever this slot
+                 * last held. */
+                snprintf(g_modal_btns[g_n_modal_btns].label,
+                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", b->label);
                 g_n_modal_btns++;
             }
             dx = r.right + 10;
@@ -21373,8 +21387,10 @@ static void layout_signin(HWND hwnd) {
     if (!g_si_e_ws) return;
     int on = (g_view == VIEW_SIGNIN && !g_si_connecting && !g_confirm_open);
     ShowWindow(g_si_e_ws,   (on && g_si_step == 1) ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_si_e_user, (on && g_si_step == 2) ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_si_e_pass, (on && g_si_step == 2) ? SW_SHOW : SW_HIDE);
+    /* No credentials are typed here any more (AUTH.md §8.10): the fields stay
+     * hidden, and the page in the browser asks. */
+    ShowWindow(g_si_e_user, SW_HIDE);
+    ShowWindow(g_si_e_pass, SW_HIDE);
     if (!on) return;
 
     RECT rc; GetClientRect(hwnd, &rc);
@@ -22733,28 +22749,25 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
         if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
-        if (pt_in(g_si_browser_btn, x, y))   { signin_start_browser(hwnd); return 1; }
+        if (pt_in(g_si_browser_btn, x, y)) {
+            const oc_signin_source *bs = si_browser_source();
+            signin_start_browser(hwnd, bs ? bs->id : NULL, NULL);
+            return 1;
+        }
         if (pt_in(g_si_cancel, x, y))        { signin_cancel(hwnd); return 1; }
         if (pt_in(g_si_back, x, y))          { signin_back(hwnd);   return 1; }
         if (pt_in(g_si_adv_link, x, y))      { signin_set_advanced(hwnd, !g_si_advanced); return 1; }
         if (pt_in(g_si_invite_link, x, y)) {
-            oc_field f[3] = {
-                { FF_TEXT,     "Invite token", "The one-time token you were sent.", "" },
-                { FF_TEXT,     "Choose a username", "", "" },
-                { FF_PASSWORD, "Choose a password", "", "" },
+            /* The account is made on the workspace's sign-up page, in the
+             * browser (AUTH.md §8.10); only the invitation is asked for here, to
+             * fill that page in -- and it can be pasted there instead. */
+            oc_field f[1] = {
+                { FF_TEXT, "Invitation", "The one-time token you were sent, if you have it to paste.", "" },
             };
-            if (!form_dialog(hwnd, "Create your account", f, 3)) return 1;
-            if (!f[0].value[0] || !f[1].value[0] || !f[2].value[0]) {
-                snprintf(g_si_err, sizeof g_si_err, "invite token, username and password are all required");
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 1;
-            }
+            if (!form_dialog(hwnd, "Create your account", f, 1)) return 1;
             snprintf(g_si_invite, sizeof g_si_invite, "%s", f[0].value);
-            WCHAR wu[192], wp[192];
-            to_w(f[1].value, wu, 192); to_w(f[2].value, wp, 192);
-            if (g_si_e_user) SetWindowTextW(g_si_e_user, wu);
-            if (g_si_e_pass) SetWindowTextW(g_si_e_pass, wp);
-            signin_submit(hwnd);      /* redeems, because g_si_invite is set */
+            signin_start_browser(hwnd, OC_SOURCE_ID_LOCAL, g_si_invite[0] ? g_si_invite : NULL);
+            g_si_invite[0] = '\0';
             return 1;
         }
         if (pt_in(g_si_remember_box, x, y) ||
@@ -24130,6 +24143,18 @@ static void remember_workspace(const char *ws, const char *user) {
     oc_store_close(s);
 }
 
+/* The account a browser sign-in ended in, into the book: the roster's name for
+ * the signed-in user, once the roster has come. */
+static void remember_tick(const oc_model *m) {
+    if (!g_remember_ws[0] || !m || !m->authed) return;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id && m->users[i].name[0]) {
+            remember_workspace(g_remember_ws, m->users[i].name);
+            g_remember_ws[0] = '\0';
+            return;
+        }
+}
+
 /* ---- N concurrent workspaces (REQ-012–015) -------------------------
  * The rail switcher used to stop the single client and start another, so a
  * background workspace received nothing and accrued no unread — you only found
@@ -24459,7 +24484,7 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
         return;
     }
     if (g_si_nsrc < 0) g_si_nsrc = 0;
-    if (g_si_nsrc > 0 && !si_has_local() && si_browser_source()) { signin_start_browser(hwnd); return; }
+    if (g_si_nsrc > 0 && !si_has_local() && si_browser_source()) { signin_start_browser(hwnd, NULL, NULL); return; }
     g_si_step = 2;
     layout_signin(hwnd);
     /* Set the account AFTER the step-2 layout has shown the field. signin_begin
@@ -24614,55 +24639,31 @@ static void signin_submit(HWND hwnd) {
         }
         if (n <= 0) { snprintf(g_si_err, sizeof g_si_err, "could not reach %.200s", g_si_host); goto redraw; }
         g_si_nsrc = n;
-        if (!si_has_local() && si_browser_source()) { signin_start_browser(hwnd); return; }
+        if (!si_has_local() && si_browser_source()) { signin_start_browser(hwnd, NULL, NULL); return; }
         g_si_step = 2;
         layout_signin(hwnd);
         if (g_si_e_user) SetFocus(g_si_e_user);
         goto redraw;
     }
 
-    char user[128], pass[192];
-    si_get(g_si_e_user, user, sizeof user);
-    si_get(g_si_e_pass, pass, sizeof pass);
-    if (!user[0]) {
-        snprintf(g_si_err, sizeof g_si_err, "enter a username");
-        if (g_si_e_user) SetFocus(g_si_e_user);
-        goto redraw;
-    }
-
-    snprintf(g_host, sizeof g_host, "%s", g_si_host);
-    g_port = g_si_port;
-    ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
-    snprintf(g_cred, sizeof g_cred, "%s:%s", user, pass);
-    /* "Remember me" off means leave no trace: passing a NULL store path keeps
-     * the session token out of the store entirely (the TUI's mechanism). */
-    g_si_client = oc_client_start_verified(g_cur_ws, g_host, g_port, g_cred,
-                                           store_path(), g_secret, g_si_remember, g_si_fp);
-    if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
-    /* Signup: with an invite in hand this connection redeems it instead
-     * of authenticating — one step that creates the account and signs in — so
-     * bringing up a tenant no longer needs the command line. */
-    if (g_si_invite[0]) {
-        oc_client_redeem_invite(g_si_client, g_si_invite);
-        g_si_invite[0] = '\0';
-    }
-    g_si_connecting = 1;
-    g_si_started = GetTickCount64();
-    layout_signin(hwnd);
+    /* A local account signs in on the workspace's own page, in the browser
+     * (AUTH.md §8.10): no password is typed into this app. */
+    signin_start_browser(hwnd, OC_SOURCE_ID_LOCAL, NULL);
+    return;
 redraw:
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
 /* Sign in through the browser: the core asks the daemon for the URL and waits on
  * its loopback listener; the poll opens the URL when the model carries it. */
-static void signin_start_browser(HWND hwnd) {
+static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite) {
     g_si_err[0] = '\0';
     snprintf(g_host, sizeof g_host, "%s", g_si_host);
     g_port = g_si_port;
     ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
     g_cred[0] = '\0';
-    g_si_client = oc_client_start_verified(g_cur_ws, g_host, g_port, "",
-                                           store_path(), g_secret, g_si_remember, g_si_fp);
+    g_si_client = oc_client_start_signin(g_cur_ws, g_host, g_port, "", source_id, invite,
+                                         store_path(), g_secret, g_si_remember, g_si_fp);
     if (!g_si_client) {
         snprintf(g_si_err, sizeof g_si_err, "could not start the client");
         InvalidateRect(hwnd, NULL, FALSE);
@@ -24733,8 +24734,10 @@ static void signin_poll(HWND hwnd) {
         g_view = VIEW_HOME;
         ws_register();               /* the client exists; give it a slot */
         if (g_si_remember) {
-            char user[128]; si_get(g_si_e_user, user, sizeof user);
-            remember_workspace(g_si_ws, user[0] ? user : NULL);
+            /* The book keeps who signed in: nobody typed a name here, so it is
+             * taken from the roster once it lists this user (remember_tick). */
+            remember_workspace(g_si_ws, NULL);
+            snprintf(g_remember_ws, sizeof g_remember_ws, "%s", g_si_ws);
         }
         if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");   /* don't keep it in a control */
         layout_signin(hwnd);
@@ -26452,16 +26455,10 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 56:                                   /* */
         oc_client_set_avatar(g_client, 0);
         break;
-    case 31: {   /* a confirm field, which the chained prompts had none of. */
-        oc_field f[3] = {
-            { FF_PASSWORD, "Current password", "", "" },
-            { FF_PASSWORD, "New password",     "", "" },
-            { FF_PASSWORD, "Confirm new password", "", "" },
-        };
-        if (!form_dialog(hwnd, "Change password", f, 3)) break;
-        if (!f[1].value[0])                        toast_push("Enter a new password.", 1);
-        else if (strcmp(f[1].value, f[2].value))   toast_push("The new passwords do not match.", 1);
-        else                                       oc_client_change_password(g_client, f[0].value, f[1].value);
+    case 31: {   /* the workspace's own page, in the browser (AUTH.md §8.10) */
+        char url[1200];
+        if (oc_client_open_page(g_client, "account/password", NULL, url, sizeof url) == 0) signin_open_url(url);
+        else toast_push("Couldn't open the password page. Try again once you're connected.", 1);
         break; }
     case 40: invite_people(hwnd, OC_ROLE_MEMBER); break;
     case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;
@@ -27221,6 +27218,10 @@ static void test_dump(const char *path) {
      * assertable rather than eyeballed — Cancel silently behaving like Save is
      * exactly the bug this design exists to prevent. */
     fprintf(f, "host=\"%s\"\n", g_host);
+    /* The sign-in card's controls, in scene units, for a harness to click. */
+    fprintf(f, "signin step=%d connecting=%d browser=%d btn=%.0f,%.0f,%.0f,%.0f invite=%.0f,%.0f,%.0f,%.0f\n",
+            g_si_step, g_si_connecting, g_si_browser, g_si_btn.left, g_si_btn.top, g_si_btn.right, g_si_btn.bottom,
+            g_si_invite_link.left, g_si_invite_link.top, g_si_invite_link.right, g_si_invite_link.bottom);
     fprintf(f, "profilemenu open=%d sub=%d\n",
             g_menu == MENU_PROFILE, g_sub_open != 0);
     for (int i = 0; i < g_n_mirows && g_menu; i++)
@@ -29316,6 +29317,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (cert_for != g_client) { cert_for = g_client; cert_seen = 0; }
                 cert_tick(hwnd, g_client, g_cur_ws, &cert_seen);
             }
+            remember_tick(m);
             if (m) groups_roster_tick(m);
             /* You named somebody who is not in this channel (REQ-287). Driven off
              * `seq` rather than a changed name: mention the same absent colleague

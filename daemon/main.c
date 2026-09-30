@@ -361,6 +361,9 @@ int main(int argc, char **argv) {
      * serve any traffic (ARCH-27). Fatal if it can't. */
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
+    if (oc_dbwriter_password_frames(db))
+        fprintf(stderr, "openchimed: WARNING: OPENCHIME_TEST_PASSWORD_AUTH is set -- passwords are "
+                        "accepted outside the sign-in pages. A test setting; never set it in production.\n");
 
     /* Registered-user cap (CP-7, hosted plan CP-4): 0/unset = unlimited
      * (self-hosted). Injected into managed-box config at provision time. */
@@ -568,7 +571,7 @@ int main(int argc, char **argv) {
         uint8_t stok[OC_INVITE_TOKEN_LEN];
         if (oc_dbwriter_setup_invite(db, stok)) {
             fprintf(stderr, "openchimed: no owner yet — first-run setup token "
-                            "(redeem to create the owner): ");
+                            "(the invitation that creates the owner, on the sign-up page): ");
             for (size_t i = 0; i < OC_INVITE_TOKEN_LEN; i++) fprintf(stderr, "%02x", stok[i]);
             fprintf(stderr, "\n");
         }

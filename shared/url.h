@@ -41,4 +41,9 @@ int oc_url_authority(const char *auth, size_t len, char *host, size_t hcap, char
 /* A Host header's value: `host`, bracketed when it is an IPv6 address, then
  * `:port` unless `port` is NULL or empty. 0, or -1 if it does not fit. */
 int oc_url_hostheader(const char *host, const char *port, char *out, size_t cap);
+/* The percent-decoded value of `key` in a query string or a form body
+ * (application/x-www-form-urlencoded; '+' is a space). 1 found, 0 absent, -1
+ * malformed or too long for `cap`. */
+int oc_query_get(const char *query, const char *key, char *out, size_t cap);
+
 #endif /* OC_URL_H */

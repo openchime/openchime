@@ -139,9 +139,10 @@ where one exists.
   (ARCH-76), so self-hosted federated deployments have added it precisely by
   opting in; hosted deployments have used the relay or a direct connection to
   the customer's own provider. A deployment has enabled more than one source
-  together. Through the relay or a direct connection the login has been a client-driven browser flow using
+  together. Through every source the login has been a client-driven browser flow using
   platform-native auth session APIs — `ASWebAuthenticationSession` on iOS/macOS,
-  a loopback redirect on desktop — with PKCE. The daemon has advertised its
+  a loopback redirect on desktop — with PKCE; for local accounts, on the
+  daemon's own sign-in pages (AUTH.md §8.10). The daemon has advertised its
   enabled sources to the client before authentication.
 - **REQ-021.** The system has supported OIDC login against Microsoft Entra
   ID and Google Workspace as identity providers. Provider integration has lived
@@ -162,8 +163,12 @@ where one exists.
 - **REQ-024.** In local mode the daemon has managed accounts itself: passwords
   hashed with PBKDF2-HMAC-SHA256 and never stored in the clear, the first owner
   bootstrapped from a one-time setup token, further users created by invite
-  token, and repeated failed attempts rate-limited (ARCH-59). This mode has
-  required no external identity provider and has functioned air-gapped.
+  token, and repeated failed attempts rate-limited (ARCH-59). No OpenChime
+  client has collected a password: signing in, signing up with an invitation and
+  changing a password have happened on the daemon's own pages, in the browser,
+  and a sign-in has ended with the client holding an ID token the daemon signed
+  (AUTH.md §8.10). This mode has required no external identity provider and has
+  functioned air-gapped.
 - **REQ-025.** In OIDC mode the maintainer's central service has held the
   provider app credentials and re-issued a workspace-scoped identity token that
   the daemon trusts; self-hosted deployments have reached it through a relay so

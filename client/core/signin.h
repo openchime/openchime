@@ -12,6 +12,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
+#include "url.h"   /* oc_query_get, for what the browser brings back */
+
 #define OC_SIGNIN_VERIFIER_LEN  43   /* base64url of 32 random bytes */
 #define OC_SIGNIN_CHALLENGE_LEN 43   /* base64url(SHA-256(verifier)) */
 
@@ -53,8 +55,25 @@ oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const atomi
 
 void oc_loopback_close(oc_loopback *lb);
 
-/* The percent-decoded value of `key` in a query string. 1 found, 0 absent, -1
- * malformed or too long for `cap`. */
-int oc_query_get(const char *query, const char *key, char *out, size_t cap);
+/* The tunnel (AUTH.md §8.10): for a daemon the browser cannot be sent to
+ * directly -- its certificate is one this client trusts by fingerprint, not one
+ * a browser would -- the listener also carries the daemon's sign-in pages, under
+ * "/p/<secret>/", to the daemon over TLS. The browser sees a loopback origin,
+ * which it treats as secure, so there is no certificate warning. Only the
+ * sign-in pages are carried, only for a request naming this listener as its
+ * Host, and only to the certificate the client's own connection accepted. */
+typedef struct {
+    char          host[256];       /* where the daemon is dialled */
+    int           port;
+    char          name[256];       /* the name its certificate is checked for (SNI), or "" */
+    char          authority[300];  /* its origin's host[:port]: the Host and Origin the pages see */
+    unsigned char fp[32];          /* the certificate the client accepted */
+} oc_tunnel_target;
+void oc_loopback_set_tunnel(oc_loopback *lb, const oc_tunnel_target *t);
+/* "http://127.0.0.1:<port>/p/<secret>": a page's path goes after it. */
+int  oc_loopback_tunnel_base(const oc_loopback *lb, char *out, size_t cap);
+/* Carry pages only -- no callback is awaited -- until `timeout_ms` passes or
+ * `cancel` is set: a page opened on its own (the password page). */
+oc_loopback_result oc_loopback_serve(oc_loopback *lb, int timeout_ms, const atomic_int *cancel);
 
 #endif /* OC_SIGNIN_H */
