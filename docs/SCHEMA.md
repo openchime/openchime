@@ -1138,7 +1138,9 @@ direct connection is one account.
 | `email`, `email_verified` | TEXT, INTEGER 0/1 | As the provider gave them at the last sign-in. |
 | `first_seen_ms`, `last_login_ms` | INTEGER NOT NULL | |
 
-A sign-in updates this row only: `users.display_name` and `users.email` are set
+A person has one row per way they sign in: a new identity whose verified
+address is verified on exactly one active member's identity is filed under that
+member (AUTH.md §8.4). A sign-in updates this row only: `users.display_name` and `users.email` are set
 at a person's first sign-in and are theirs afterwards. The migration files
 existing accounts from `users.subject` (`oidc:<central issuer>|<issuer>|<subject>`);
 an account whose string has no second bar gets its row at its next sign-in.

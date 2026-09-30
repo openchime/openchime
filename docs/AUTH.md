@@ -346,8 +346,9 @@ self-hosted stand-alone (no enrollment / no `OPENCHIME_PUSH_URL`).
 However identity was proven (local password, OIDC token, or an existing session
 token on reconnect), the daemon then does the same thing:
 
-1. **Provision/look-up the user** (`users` table). `users.subject` is the unique
-   identity key, namespaced by source: `oidc:<issuer>|<sub>` or `local:<username>`.
+1. **Provision/look-up the user** (`users` table). A local user is keyed by
+   `users.subject`, `local:<username>`; a person signing in by OIDC by their
+   identities (§8.4), of which they may have several — one per way they sign in.
    OIDC users are provisioned just-in-time on first login, always with the
    schema's default role `member` — there is no bootstrap-subject setting, and
    promotion to owner or admin is a separate administrative action. Local users
@@ -507,8 +508,8 @@ Standard JWT, ES256, as §3.3. The claims:
 |---|---|
 | `iss`, `aud` | Central, and this workspace's opaque id (§3.3). |
 | `sub` | `<upstream issuer>|<stable subject>`. For Google the provider's `sub`. For Microsoft, `oid` under the tenant's issuer — `https://login.microsoftonline.com/<tid>/v2.0|<oid>` — not the per-application `sub`. |
-| `idp` | Which provider vouched: `google`, `microsoft`. |
-| `tenant` | The organization the provider places the person in: Google's hosted domain, Microsoft's tenant id. Absent for a personal account. |
+| `idp` | Which provider vouched: `google`, `microsoft`, or `email` for a sign-in by a code central mailed to the address. |
+| `tenant` | The organization the provider places the person in: Google's hosted domain, Microsoft's tenant id. Absent for a personal account and for an emailed code. |
 | `email`, `email_verified`, `name` | As the provider gave them. `email_verified` is true only when the provider says so; for Microsoft, only when the address's domain is verified by the tenant. |
 | `nonce`, `jti` | §8.2. |
 | `iat`, `nbf`, `exp` | `exp` at most 300 seconds after `iat`. |
@@ -577,6 +578,20 @@ so a false claim harms nobody else.
 Bearer invite tokens (§2) remain for the local source only, and `REDEEM_INVITE` is
 refused where local accounts are not enabled: with a provider in charge, a bearer
 token would be the phishable credential the provider exists to remove.
+
+**A person who signs in a second way is the same person.** An identity the
+workspace has not seen, whose provider verified its address, signs in as the
+member one of whose identities has that address verified too, compared without
+case — Google one day and an emailed code the next is one account, with its
+channels, history and role — and the new identity is recorded beside the old
+(`auth.subject_linked` in the audit log, with the provider, never the token). The
+join rules are not consulted, as for any known identity, and no seat is taken.
+There is no link on an address its provider did not verify, into a member who is
+disabled or removed — a new way in does not revive an account — or where the
+address is verified for more than one member, since it cannot then say which;
+each of those is a first sign-in, which the rules and invites decide. Linking
+comes after every check on the token and its source, so it never admits an
+identity the relay may not deliver.
 
 A first sign-in sets the display name and address from the token; later ones
 update the identity row only, and never overwrite a name the person chose.
