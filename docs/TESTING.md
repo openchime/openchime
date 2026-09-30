@@ -340,7 +340,15 @@ suite **once**, split by whether its code runs threads:
   threads, the writer and readers, the worker pools, the client, the recorder and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
   for the one test-only reconfiguration). The list is the Makefile's
-  `TSAN_SUITES`; a suite that starts a thread belongs on it.
+  `TSAN_SUITES`; a suite that starts a thread belongs on it. The sanitizer run
+  judges races, never speed: a limit on how fast code runs — wall-clock time, or
+  one timing against another — is a `CHECK_SPEED` (`tests/check.h`), asserted in
+  the ordinary build and not under the sanitizer, which slows code five to
+  fifteen times and unevenly. A timeout that must fire, checked with a wide
+  margin, is not a speed limit and stays a `CHECK`. And a test must not read an
+  order the code does not promise — a count, a status or a flag taken to mean
+  something happened before or after another thread's step — since the
+  sanitizer's slowing is exactly what brings the other order out.
 - `make test-rest` runs every other suite, plainly (`OC_TEST_EXCEPT` names the
   suites to leave out). A suite with no thread cannot race, so instrumenting it
   would only make it slower.

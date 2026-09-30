@@ -31,4 +31,26 @@ static int failures OC_UNUSED = 0;
         }                                                                    \
     } while (0)
 
+/* A limit on how fast code runs -- wall-clock time, or one timing against
+ * another -- is asserted in the ordinary build, where it measures the code. Under
+ * ThreadSanitizer, which slows code five to fifteen times and unevenly, it would
+ * measure the sanitizer, so it is not: the code still runs there, for the races
+ * the sanitizer is for. A timeout that must fire, checked with a wide margin,
+ * is not a speed limit and stays a CHECK. */
+#if defined(__SANITIZE_THREAD__)
+#define OC_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define OC_UNDER_TSAN 1
+#endif
+#endif
+#ifndef OC_UNDER_TSAN
+#define OC_UNDER_TSAN 0
+#endif
+
+#define CHECK_SPEED(cond)                                                    \
+    do {                                                                     \
+        if (!OC_UNDER_TSAN) CHECK(cond);                                     \
+    } while (0)
+
 #endif /* OC_TEST_CHECK_H */
