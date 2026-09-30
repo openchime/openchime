@@ -110,7 +110,7 @@ int oc_acme_challenge_cert(const char *name, const char *keyauth, char **cert_pe
     snprintf(subj, sizeof subj, "CN=%s", name);
     unsigned char serial[16];
     mbedtls_ctr_drbg_random(&r.drbg, serial, sizeof serial);
-    serial[0] &= 0x7f;
+    serial[0] = (unsigned char)(0x40 | (serial[0] & 0x3f));   /* positive, and never a leading zero: DER's minimal INTEGER */
     time_t now = time(NULL), a = now - 86400, b = now + 7 * 86400;
     struct tm ta, tb; gmtime_r(&a, &ta); gmtime_r(&b, &tb);
     char nb[16], na[16];

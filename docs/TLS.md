@@ -161,8 +161,10 @@ once the listener accepts, runs `oc_acme_issue` (`daemon/acme.c`): the directory
 and a nonce; the account — made once, with `termsOfServiceAgreed` (turning ACME on
 is the operator's agreement to the CA's subscriber terms), and kept with the
 directory it belongs to, so a different CA gets a different account; an order for
-the names; for each name, a **challenge certificate** — self-signed, naming it,
-carrying the critical acmeIdentifier extension (1.3.6.1.5.5.7.1.31) that holds
+the names; for each name, a **challenge certificate** — self-signed, naming it, with a
+random 16-byte serial whose first byte is 0x40–0x7f (a positive, minimal DER
+INTEGER: a CA's parser refuses a leading zero byte, and one serial in 256 drawn
+without that rule would have one), carrying the critical acmeIdentifier extension (1.3.6.1.5.5.7.1.31) that holds
 SHA-256 of the key authorization — installed in the listener, then the challenge
 posted and the authorization polled; the finalization with a CSR for a new
 P-256 key; and the chain. Every request is a JWS (ES256) with a fresh nonce; a
@@ -230,7 +232,9 @@ Renewal Information: a window already open renews at once, the replacement
 naming the certificate it replaces by the identifier RFC 9773's own example
 fixes; a window set later holds a renewal the daemon's own would have made; and a
 CA failing every order is asked again after the base wait, ten times it, then at
-the ceiling. The window picks and the retry ladder are checked as values. `test_client_core` covers the
+the ceiling. The window picks and the retry ladder are checked as values, and the challenge
+certificate's serial as DER on 32 of them. The suite resets its state at the
+start of each run, so `OC_TEST_REPEAT` runs it again in one process. `test_client_core` covers the
 client's judgement at this machine's LAN address, where loopback's exemption does
 not apply. It also resumes a session with the
 ticket the first connection was given, and checks that a restarted server —
