@@ -13,7 +13,7 @@
 
 #include <stddef.h>
 
-typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD } oc_page_kind;
+typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD, OC_PAGE_DEVICE } oc_page_kind;
 
 typedef struct {
     oc_page_kind kind;
@@ -22,7 +22,13 @@ typedef struct {
     const char  *username;       /* prefilled, or "" */
     const char  *invite;         /* SIGNUP: the invitation, prefilled, or "" */
     const char  *message;        /* why the form is back, or "" */
-    int          done;           /* PASSWORD: it was changed */
+    int          done;           /* PASSWORD: it was changed. DEVICE: approved */
+    /* DEVICE (AUTH.md §8.11): the code, once one is found -- "" asks for it --
+     * where the request came from and how long ago, and whether it was denied. */
+    const char  *user_code;
+    const char  *from;
+    unsigned     minutes_ago;
+    int          denied;
 } oc_page;
 
 /* The page, malloc'd, its length in *len. NULL on no memory. */

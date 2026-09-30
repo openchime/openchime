@@ -24,6 +24,7 @@
 #include "framebuf.h"
 #include "http.h"
 #include "webpages.h"   /* the sign-in pages (AUTH.md §8.10) */
+#include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
 #include "e2e_hpke.h"  /* oc_e2e_wipe */
 #include "protocol.h"
 #include "ratelimit.h"
@@ -174,6 +175,7 @@ typedef struct {
 typedef struct web_req {
     oc_page_kind kind;
     char redirect_uri[512], nonce[48], username[128], invite[80];
+    char user_code[16];          /* DEVICE: the code being approved */
 } web_req;
 
 typedef struct conn_s {
@@ -360,6 +362,16 @@ static __thread uint64_t      g_max_video  = OC_MAX_VIDEO_MESSAGE_SIZE;   /* REQ
  * fixed window keyed by the token, so one noisy integration can't flood a
  * channel. Created in oc_netloop_run. */
 static __thread oc_ratelimit *g_webhook_rl;
+/* Device codes (AUTH.md §8.11): the pending requests, and how often one source
+ * may look a code up on the /device page -- a guessed code is the attack. */
+static __thread oc_devcodes  *g_devcodes;
+static __thread oc_ratelimit *g_device_rl;
+#define OC_DEVICE_LOOKUPS_MAX    10u
+#define OC_DEVICE_LOOKUPS_WINDOW 60000u
+static uint64_t g_device_ttl_ms;
+static unsigned g_device_interval_s;
+void oc_netloop_set_device_ttl_ms(uint64_t ms) { __atomic_store_n(&g_device_ttl_ms, ms, __ATOMIC_RELAXED); }
+void oc_netloop_set_device_interval_s(unsigned s) { __atomic_store_n(&g_device_interval_s, s, __ATOMIC_RELAXED); }
 #define OC_WEBHOOK_RATE_MAX     60u
 #define OC_WEBHOOK_RATE_WINDOW  60000u
 
@@ -1598,6 +1610,70 @@ static void handle_auth_begin_local(conn *c, const oc_auth_begin *b, oc_dbwriter
     if (oc_encode_auth_redirect(&rw, c->version, &ar) == OC_OK) out_append(c, rbuf, rw.len);
 }
 
+/* --- device codes (AUTH.md §8.11) ----------------------------------------- */
+
+/* A client with no browser of its own asks for a code: the person enters it on
+ * the /device page, on any device. Bound to the client's challenge, so what the
+ * page's sign-in mints is good only with the client's verifier. */
+static void handle_device_begin(conn *c, const oc_auth_device_begin *b, oc_dbwriter *dbw) {
+    if (!oc_dbwriter_local_browser(dbw) || !g_devcodes ||
+        b->source.len != strlen(OC_SOURCE_ID_LOCAL) ||
+        memcmp(b->source.ptr, OC_SOURCE_ID_LOCAL, b->source.len) != 0) {
+        send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "no such sign-in source");
+        return;
+    }
+    if (!is_challenge((const char *)b->challenge.ptr, b->challenge.len)) {
+        send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "not a challenge");
+        return;
+    }
+    char ch[48], key[OC_SRC_LEN], dcode[OC_DEVICE_CODE_LEN + 1], ucode[OC_USER_CODE_LEN + 1];
+    memcpy(ch, b->challenge.ptr, b->challenge.len); ch[b->challenge.len] = '\0';
+    oc_source_key(c->source, key, sizeof key);
+    if (oc_devcodes_begin(g_devcodes, key, c->source, ch, now_ms(), dcode, ucode) != 0) {
+        send_auth_error(c, OC_ERR_AUTH_RATE_LIMITED, "too many sign-in codes waiting");
+        return;
+    }
+    uint64_t ttl = __atomic_load_n(&g_device_ttl_ms, __ATOMIC_RELAXED);
+    if (!ttl) ttl = OC_DEVICE_TTL_MS;
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth_device ad = { oc_slice_str(dcode), oc_slice_str(ucode), oc_slice_str("/device"),
+                          (uint16_t)oc_devcodes_interval(g_devcodes), (uint16_t)(ttl / 1000u ? ttl / 1000u : 1) };
+    if (oc_encode_auth_device(&w, c->version, &ad) == OC_OK) out_append(c, buf, w.len);
+    oc_e2e_wipe(dcode, sizeof dcode);
+}
+
+/* Has the code been approved? Its secret, not the code a person sees, is what
+ * collects the token. */
+static void handle_device_poll(conn *c, const oc_auth_device_poll *dp) {
+    char dcode[OC_DEVICE_CODE_LEN + 1];
+    if (!g_devcodes || dp->device_code.len != OC_DEVICE_CODE_LEN) {
+        send_auth_error(c, OC_ERR_AUTH_EXPIRED, "no such sign-in code");
+        return;
+    }
+    memcpy(dcode, dp->device_code.ptr, OC_DEVICE_CODE_LEN); dcode[OC_DEVICE_CODE_LEN] = '\0';
+    char *tok = NULL;
+    unsigned interval = OC_DEVICE_INTERVAL_S;
+    switch (oc_devcodes_poll(g_devcodes, dcode, now_ms(), &tok, &interval)) {
+    case OC_DEV_PENDING: send_auth_error(c, OC_ERR_AUTH_PENDING, "not approved yet"); break;
+    case OC_DEV_SLOW: {
+        char why[48];
+        snprintf(why, sizeof why, "poll every %u seconds", interval);
+        send_auth_error(c, OC_ERR_AUTH_SLOW_DOWN, why);
+        break; }
+    case OC_DEV_DENIED:  send_auth_error(c, OC_ERR_AUTH_DENIED, "refused on the sign-in page"); break;
+    case OC_DEV_GONE:    send_auth_error(c, OC_ERR_AUTH_EXPIRED, "the sign-in code expired"); break;
+    case OC_DEV_TOKEN: {
+        uint8_t buf[4096]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_auth_device_token t = { oc_slice_str(tok) };
+        if (oc_encode_auth_device_token(&w, c->version, &t) == OC_OK) out_append(c, buf, w.len);
+        oc_e2e_wipe(buf, sizeof buf);
+        oc_e2e_wipe(tok, strlen(tok));
+        free(tok);
+        break; }
+    }
+    oc_e2e_wipe(dcode, sizeof dcode);
+}
+
 /* --- Frame dispatch ----------------------------------------------------- */
 
 /* Queue a non-fatal SEND_RATE_LIMITED error echoing the offending idempotency
@@ -1885,6 +1961,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
                 if (a.proof.len && oc_job_set_proof(j, a.proof.ptr, a.proof.len) != 0) return -1;
                 oc_dbwriter_submit(dbw, j);
+                continue;
+            }
+            if (hdr.msg_type == OC_MSG_AUTH_DEVICE_BEGIN) {
+                oc_auth_device_begin b;
+                if (oc_decode_auth_device_begin(&p, &b) != OC_OK) return -1;
+                handle_device_begin(c, &b, dbw);
+                continue;
+            }
+            if (hdr.msg_type == OC_MSG_AUTH_DEVICE_POLL) {
+                oc_auth_device_poll dp;
+                if (oc_decode_auth_device_poll(&p, &dp) != OC_OK) return -1;
+                handle_device_poll(c, &dp);
                 continue;
             }
             if (hdr.msg_type == OC_MSG_AUTH_BEGIN) {
@@ -3451,6 +3539,8 @@ static const oc_http_route TLS_ROUTES[] = {
     { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
 };
 static const oc_http_site TLS_SITE = { TLS_ROUTES, sizeof TLS_ROUTES / sizeof TLS_ROUTES[0], NULL };
 
@@ -3592,6 +3682,8 @@ static int field_get(const char *q, const char *key, char *out, size_t cap) {
     return r < 0 ? -1 : 0;
 }
 
+static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
+
 static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     const char *qm = memchr(req->path, '?', req->path_len);
     size_t plen = qm ? (size_t)(qm - req->path) : req->path_len;
@@ -3599,6 +3691,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     if (plen == 7 && memcmp(req->path, "/signin", 7) == 0) kind = OC_PAGE_SIGNIN;
     else if (plen == 7 && memcmp(req->path, "/signup", 7) == 0) kind = OC_PAGE_SIGNUP;
     else if (plen == 17 && memcmp(req->path, "/account/password", 17) == 0) kind = OC_PAGE_PASSWORD;
+    else if (plen == 7 && memcmp(req->path, "/device", 7) == 0) kind = OC_PAGE_DEVICE;
     else { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
     size_t len;
     if (!oc_dbwriter_local_browser(dbw)) {
@@ -3623,6 +3716,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         memcpy(q, qm ? qm + 1 : "", ql);
         q[ql] = '\0';
     }
+    if (kind == OC_PAGE_DEVICE) return on_device_page(c, post, q, dbw);
     web_req *w = calloc(1, sizeof *w);
     if (!w) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
     w->kind = kind;
@@ -3648,7 +3742,8 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     }
     /* A sign-in link carrying an invitation opens the sign-up form. */
     if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
-    oc_page pg = { kind, w->redirect_uri, w->nonce, w->username, w->invite, "", 0 };
+    oc_page pg = { .kind = kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
+                   .username = w->username, .invite = w->invite, .message = "" };
     if (!post) { web_page(c, 200, &pg); free(w); return -1; }
 
     int rc = -1;
@@ -3700,6 +3795,81 @@ out:
     return rc;
 }
 
+/* The /device page (AUTH.md §8.11). Without a code, a form asks for one; with
+ * one, who is asking and from where, and the credentials to approve with -- or
+ * a refusal. A lookup of a code that is not pending counts against the source,
+ * so the codes cannot be walked. Returns 0 to keep, -1 to close. */
+static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
+    char typed[64] = "", user[128] = "", pass[512] = "", action[16] = "";
+    oc_page pg = { .kind = OC_PAGE_DEVICE, .redirect_uri = "", .nonce = "", .username = user,
+                   .invite = "", .message = "", .user_code = "" };
+    if (field_get(q, "code", typed, sizeof typed) || field_get(q, "username", user, sizeof user) ||
+        field_get(q, "password", pass, sizeof pass) || field_get(q, "action", action, sizeof action)) {
+        size_t len; const char *b = oc_page_invalid(&len);
+        web_reply(c, 400, b, len, NULL, NULL);
+        return -1;
+    }
+    int rc = -1;
+    if (!typed[0]) { web_page(c, 200, &pg); goto out; }
+    char key[OC_SRC_LEN];
+    oc_source_key(c->source, key, sizeof key);
+    uint64_t now = now_ms();
+    if (g_device_rl && oc_ratelimit_blocked(g_device_rl, key, now)) {
+        pg.message = "Too many codes tried. Wait a minute and try again.";
+        web_page(c, 429, &pg);
+        goto out;
+    }
+    oc_dev_info info;
+    if (!g_devcodes || !oc_devcodes_find(g_devcodes, typed, now, &info)) {
+        if (g_device_rl) oc_ratelimit_record(g_device_rl, key, now);
+        pg.message = "That code isn't one we're waiting for. Check it, or start again in your terminal.";
+        web_page(c, 200, &pg);
+        goto out;
+    }
+    pg.user_code = info.user_code;
+    pg.from = info.addr;
+    pg.minutes_ago = (unsigned)((now - info.created_ms) / 60000u);
+    if (!post) { web_page(c, 200, &pg); goto out; }
+    if (strcmp(action, "deny") == 0) {
+        oc_devcodes_deny(g_devcodes, info.user_code, now);
+        pg.denied = 1;
+        web_page(c, 200, &pg);
+        goto out;
+    }
+    /* Approve: the sign-in the other pages make (AUTH.md §8.10), its token bound
+     * to the terminal's challenge rather than a callback's. */
+    uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) {
+        pg.message = "The username or password is too long.";
+        web_page(c, 200, &pg);
+        goto out;
+    }
+    web_req *w = calloc(1, sizeof *w);
+    oc_job *j = w ? oc_job_new(OC_JOB_AUTH, c->conn_id) : NULL;
+    if (!j || oc_job_set_token(j, cbuf, cw.len) != 0) {
+        oc_e2e_wipe(cbuf, sizeof cbuf);
+        if (j) oc_job_free(j);
+        free(w);
+        http_reply(c, 500, "text/plain", "error\n", 6);
+        goto out;
+    }
+    oc_e2e_wipe(cbuf, sizeof cbuf);
+    j->method = OC_AUTH_LOCAL;
+    j->web = OC_WEB_SIGNIN;
+    memcpy(j->source, c->source, sizeof j->source);
+    snprintf(j->web_nonce, sizeof j->web_nonce, "%s", info.challenge);
+    w->kind = OC_PAGE_DEVICE;
+    snprintf(w->username, sizeof w->username, "%s", user);
+    snprintf(w->user_code, sizeof w->user_code, "%s", info.user_code);
+    oc_dbwriter_submit(dbw, j);
+    c->web = w;
+    c->http_pending = 1;
+    rc = 0;
+out:
+    oc_e2e_wipe(pass, sizeof pass);
+    return rc;
+}
+
 /* A page's check came back: a sign-in or sign-up goes on to the client's
  * callback with its token; a password change says so; a refusal shows the form
  * again, saying why, and never which half of a credential was wrong. */
@@ -3707,9 +3877,19 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
     conn *c = find_by_id(conns, r->conn_id);
     if (!c || !c->web) return;
     web_req *w = c->web;
-    oc_page pg = { w->kind, w->redirect_uri, w->nonce, w->username, w->invite, "", 0 };
+    oc_page pg = { .kind = w->kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
+                   .username = w->username, .invite = w->invite, .message = "", .user_code = w->user_code };
     if (r->type == OC_RES_WEB_OK && w->kind == OC_PAGE_PASSWORD) {
         pg.done = 1;
+        web_page(c, 200, &pg);
+    } else if (r->type == OC_RES_WEB_OK && w->kind == OC_PAGE_DEVICE) {
+        /* The terminal's next poll collects the token -- unless the request went
+         * meanwhile (expired, or denied from another tab). */
+        char tok[4096];
+        snprintf(tok, sizeof tok, "%.*s", (int)r->body_len, r->body ? (const char *)r->body : "");
+        if (oc_devcodes_approve(g_devcodes, w->user_code, tok, now_ms()) == 0) pg.done = 1;
+        else { pg.user_code = ""; pg.message = "That code has expired. Start again in your terminal."; }
+        oc_e2e_wipe(tok, sizeof tok);
         web_page(c, 200, &pg);
     } else if (r->type == OC_RES_WEB_OK && r->body && r->body_len) {
         char loc[2600];
@@ -3720,6 +3900,16 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         oc_e2e_wipe(loc, sizeof loc);
     } else {
         int status = 200;
+        oc_dev_info info;
+        if (w->kind == OC_PAGE_DEVICE) {
+            /* The form again, still saying who is asking -- if they still are. */
+            if (g_devcodes && oc_devcodes_find(g_devcodes, w->user_code, now_ms(), &info)) {
+                pg.from = info.addr;
+                pg.minutes_ago = (unsigned)((now_ms() - info.created_ms) / 60000u);
+            } else {
+                pg.user_code = "";
+            }
+        }
         switch (r->err_code) {
         case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.message = "Too many attempts. Wait a minute and try again."; break;
         case OC_ERR_USER_LIMIT:        pg.message = "This workspace is full."; break;
@@ -6617,6 +6807,12 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     /* Per-webhook rate limit (REQ-170); best-effort — if allocation fails the
      * endpoint still works, just unthrottled. */
     g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
+    g_devcodes = oc_devcodes_new();
+    if (g_devcodes) {
+        oc_devcodes_set_ttl(g_devcodes, __atomic_load_n(&g_device_ttl_ms, __ATOMIC_RELAXED));
+        oc_devcodes_set_interval(g_devcodes, __atomic_load_n(&g_device_interval_s, __ATOMIC_RELAXED));
+    }
+    g_device_rl = oc_ratelimit_new(OC_DEVICE_LOOKUPS_MAX, OC_DEVICE_LOOKUPS_WINDOW, 1024);
 
     /* Per-source-IP concurrent-connection cap (0 disables). Blunts a
      * connection-exhaustion flood from one host while staying generous enough
@@ -6856,6 +7052,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_blobstore_close(g_blobs);
     g_blobs = NULL;
     oc_ratelimit_free(g_webhook_rl);
+    oc_devcodes_free(g_devcodes);
+    g_devcodes = NULL;
+    oc_ratelimit_free(g_device_rl);
+    g_device_rl = NULL;
     g_webhook_rl = NULL;
     oc_trusted_proxies_free(trusted);
     oc_relay_close(g_relay);

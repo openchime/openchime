@@ -68,6 +68,15 @@ oc_client *oc_client_start_signin(const char *workspace_key, const char *host, i
                                   const char *cred, const char *source_id, const char *invite,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint);
+/* A local account, signed in to with a device code (AUTH.md §8.11), for a
+ * client with no browser of its own: model->device_url and device_code say
+ * where to enter which code, from any device; device_fp is the daemon's
+ * fingerprint where a browser will warn about its certificate. The client polls
+ * until the code is approved there, refused, or runs out; oc_client_cancel_signin
+ * stops it. */
+oc_client *oc_client_start_device(const char *workspace_key, const char *host, int port,
+                                  const char *store_path, oc_secret *secret,
+                                  int remember, const char *published_fingerprint);
 
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);

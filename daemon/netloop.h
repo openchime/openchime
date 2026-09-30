@@ -48,6 +48,12 @@ void oc_netloop_set_relay_silence_ms(uint64_t ms);
  * can be seen without waiting out the window. Any thread. */
 void oc_netloop_set_presence_rate_ms(uint32_t ms);
 
+/* How long a device code lives (AUTH.md §8.11); 0 restores ten minutes. A
+ * test's knob, read when a loop starts. */
+void oc_netloop_set_device_ttl_ms(uint64_t ms);
+/* ...and the interval, in seconds, a client is asked to poll at; 0 restores five. */
+void oc_netloop_set_device_interval_s(unsigned s);
+
 /* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
  * contentless notify decision to it for offline mobile delivery. NULL (the
  * default) disables push. May be called while the loop runs: a managed box

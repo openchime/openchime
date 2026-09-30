@@ -742,5 +742,45 @@ refused unless the daemon runs with `OPENCHIME_TEST_PASSWORD_AUTH=1`, a test
 knob (CONFIG.md) that it warns about at start; the test suites and the GUI
 scripts sign in with it.
 
-**The terminal client** signs in to a local account in the browser where it has
-one (Ctrl+B); its password-free path for everywhere else is a device code.
+**The terminal client** signs in to a local account with a device code (§8.11),
+which works where it has no browser of its own.
+
+### 8.11 A terminal signs in with a code
+
+A client with no browser of its own — the terminal client over SSH, on a
+headless host — signs in to a local account with a **device code** (RFC 8628,
+as the GitHub CLI and AWS SSO do), on its protocol connection:
+
+1. `AUTH_DEVICE_BEGIN{source: "local", challenge}` — the client's PKCE challenge
+   (§8.2) — is answered with `AUTH_DEVICE{device_code, user_code,
+   verification_path: "/device", interval_s, expires_in_s}`. The **user code** is
+   eight letters from `BCDFGHJKLMNPQRSTVWXZ`, shown `XXXX-XXXX` — no vowels, none
+   people confuse. The **device code** is 32 random bytes, base64url: the
+   client's secret, never shown, and the daemon keeps only its SHA-256.
+2. The client shows `https://<workspace>/device?code=<user code>`, the code, and
+   the URL as a QR code; where no authority vouches for the daemon's certificate
+   it shows the fingerprint it accepted, for the person to check against the
+   browser's warning.
+3. The person opens the page on any device. It shows **who is asking** — the
+   requesting connection's address and how long ago — and asks for the username
+   and password, with **Sign in the terminal** and **That wasn't me**. Approving
+   runs the sign-in of §8.10 — the same staged check and limiters — whose token
+   is bound to the terminal's challenge rather than a callback's, and kept for
+   the terminal to collect.
+4. The client polls with `AUTH_DEVICE_POLL{device_code}` at the interval:
+   `AUTH_PENDING` until then; `AUTH_SLOW_DOWN` for a poll sooner than the
+   interval, which grows by five seconds (RFC 8628 §3.5); `AUTH_DENIED` once, for
+   a refusal; `AUTH_EXPIRED` for a code that ran out, was collected, or never
+   was. Approved, it is answered `AUTH_DEVICE_TOKEN{token}`, once, and the client
+   presents `AUTH{oidc, "local", token, verifier}` on the same connection. A
+   dropped connection keeps the device code, and the next one polls on.
+
+**Bounds.** The pending requests live in the event loop's memory — ten minutes
+each, dropped by a restart — at most 256, and at most five waiting from one
+source. A lookup of a code that is not waiting counts against its source, ten a
+minute, so the codes cannot be walked (20⁸ of them against ten guesses a
+minute). A code is found only while pending; the page never says whose it is.
+
+**Phishing.** A device code can be sent to someone to approve for an attacker,
+so the page says where the request came from and when, tells the person to go on
+only if it was them, and offers a refusal the terminal is told about.

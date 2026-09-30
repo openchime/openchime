@@ -159,6 +159,49 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         carry(&p, pp);
         raw(&p, "\">Sign in</a></p>\n");
         break;
+    case OC_PAGE_DEVICE:
+        open_page(&p, "Sign in a device \xE2\x80\x94 OpenChime");
+        if (pp->done) {
+            raw(&p, "<h1>Signed in</h1>\n<p>Go back to your terminal: it is signing in now. "
+                    "You can close this tab.</p>\n");
+            break;
+        }
+        if (pp->denied) {
+            raw(&p, "<h1>Sign-in refused</h1>\n<p>The terminal was not signed in. "
+                    "You can close this tab.</p>\n");
+            break;
+        }
+        if (!pp->user_code || !pp->user_code[0]) {
+            /* Step one: the code the terminal shows. */
+            raw(&p, "<h1>Sign in a device</h1>\n<p>Enter the code your terminal shows.</p>\n");
+            message(&p, pp->message);
+            raw(&p, "<form method=\"get\" action=\"device\">\n");
+            field(&p, "code", "Code", "text", "off", "", 1);
+            raw(&p, "<button type=\"submit\">Continue</button>\n</form>\n");
+            break;
+        }
+        /* Step two: who is asking, then the credentials to approve with. */
+        raw(&p, "<h1>Sign in a device</h1>\n<p>A terminal is asking to sign in to this workspace with the code <b>");
+        esc(&p, pp->user_code);
+        raw(&p, "</b>, from <b>");
+        esc(&p, pp->from && pp->from[0] ? pp->from : "an unknown address");
+        {
+            char ago[64];
+            if (pp->minutes_ago == 0) snprintf(ago, sizeof ago, "</b>, just now.");
+            else snprintf(ago, sizeof ago, "</b>, %u minute%s ago.", pp->minutes_ago, pp->minutes_ago == 1 ? "" : "s");
+            raw(&p, ago);
+        }
+        raw(&p, " Only go on if that was you.</p>\n");
+        message(&p, pp->message);
+        raw(&p, "<form method=\"post\" action=\"device\">\n");
+        hidden(&p, "code", pp->user_code);
+        field(&p, "username", "Username", "text", "username", user, !user[0]);
+        field(&p, "password", "Password", "password", "current-password", "", user[0] != 0);
+        raw(&p, "<button type=\"submit\" name=\"action\" value=\"approve\">Sign in the terminal</button>\n");
+        raw(&p, "<button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate "
+                "style=\"background:none;color:inherit;border:1px solid #c4c8cf;margin-top:.6rem\">"
+                "That wasn't me</button>\n</form>\n");
+        break;
     case OC_PAGE_PASSWORD:
         open_page(&p, "Change your password \xE2\x80\x94 OpenChime");
         if (pp->done) {

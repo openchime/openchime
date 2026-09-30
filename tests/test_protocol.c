@@ -152,6 +152,33 @@ static void test_auth_frames(void) {
         CHECK(oc_decode_auth_redirect(&p, &out) == OC_OK);
         CHECK(slice_eq_str(out.authorize_url, "https://central.example/oidc/authorize?workspace=ws_1"));
     }
+    {   /* A device code's four frames (AUTH.md §8.11). */
+        oc_auth_device_begin in = { oc_slice_str("local"), oc_slice_str("47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU") };
+        ROUNDTRIP(oc_encode_auth_device_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE_BEGIN, h, p);
+        oc_auth_device_begin out;
+        CHECK(oc_decode_auth_device_begin(&p, &out) == OC_OK && slice_eq_str(out.source, "local") &&
+              out.challenge.len == 43);
+    }
+    {
+        oc_auth_device in = { oc_slice_str("dc-secret"), oc_slice_str("WDJB-MJHT"), oc_slice_str("/device"), 5, 600 };
+        ROUNDTRIP(oc_encode_auth_device(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE, h, p);
+        oc_auth_device out;
+        CHECK(oc_decode_auth_device(&p, &out) == OC_OK && slice_eq_str(out.device_code, "dc-secret") &&
+              slice_eq_str(out.user_code, "WDJB-MJHT") && slice_eq_str(out.verification_path, "/device") &&
+              out.interval_s == 5 && out.expires_in_s == 600);
+    }
+    {
+        oc_auth_device_poll in = { oc_slice_str("dc-secret") };
+        ROUNDTRIP(oc_encode_auth_device_poll(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE_POLL, h, p);
+        oc_auth_device_poll out;
+        CHECK(oc_decode_auth_device_poll(&p, &out) == OC_OK && slice_eq_str(out.device_code, "dc-secret"));
+    }
+    {
+        oc_auth_device_token in = { oc_slice_str("aaa.bbb.ccc") };
+        ROUNDTRIP(oc_encode_auth_device_token(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_DEVICE_TOKEN, h, p);
+        oc_auth_device_token out;
+        CHECK(oc_decode_auth_device_token(&p, &out) == OC_OK && slice_eq_str(out.token, "aaa.bbb.ccc"));
+    }
     {
         oc_auth_continue in = { OC_AUTH_STEP_TOTP };
         ROUNDTRIP(oc_encode_auth_continue(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CONTINUE, h, p);

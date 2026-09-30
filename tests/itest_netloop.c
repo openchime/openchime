@@ -18,6 +18,7 @@
 #include "sqlite3.h"
 #include "signin.h"       /* a verifier and its challenge, as a client makes them */
 #include "localissuer.h"   /* a token the daemon did not sign, to refuse */
+#include "devicecodes.h"
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -1845,6 +1846,165 @@ static void test_web_signin(int port) {
     unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
 restore:
     if (saved[0]) setenv("OPENCHIME_TEST_PASSWORD_AUTH", saved, 1);
+}
+
+/* --- device codes (AUTH.md §8.11) -------------------------------------------- */
+
+/* AUTH_DEVICE_BEGIN on `a`: 0 with the codes, else the ERROR's code. */
+static int device_begin(client *a, const char *challenge, char *dcode, size_t dcap, char *ucode, size_t ucap,
+                        unsigned *interval, unsigned *expires, char *path, size_t pcap) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth_device_begin b = { oc_slice_str("local"), oc_slice_str(challenge) };
+    if (oc_encode_auth_device_begin(&w, OC_PROTOCOL_VERSION, &b) != OC_OK || write_all(&a->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame_raw(a, &hdr, &p) != 0) return -1;
+    if (hdr.msg_type == OC_MSG_ERROR) { oc_error e; return oc_decode_error(&p, &e) == OC_OK ? e.code : -1; }
+    oc_auth_device d;
+    if (hdr.msg_type != OC_MSG_AUTH_DEVICE || oc_decode_auth_device(&p, &d) != OC_OK) return -1;
+    snprintf(dcode, dcap, "%.*s", (int)d.device_code.len, (const char *)d.device_code.ptr);
+    snprintf(ucode, ucap, "%.*s", (int)d.user_code.len, (const char *)d.user_code.ptr);
+    snprintf(path, pcap, "%.*s", (int)d.verification_path.len, (const char *)d.verification_path.ptr);
+    *interval = d.interval_s; *expires = d.expires_in_s;
+    return 0;
+}
+
+/* AUTH_DEVICE_POLL: 0 with the token, else the ERROR's code (its message in `why`). */
+static int device_poll(client *a, const char *dcode, char *tok, size_t cap, char *why, size_t wcap) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth_device_poll dp = { oc_slice_str(dcode) };
+    if (oc_encode_auth_device_poll(&w, OC_PROTOCOL_VERSION, &dp) != OC_OK || write_all(&a->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame_raw(a, &hdr, &p) != 0) return -1;
+    if (hdr.msg_type == OC_MSG_ERROR) {
+        oc_error e;
+        if (oc_decode_error(&p, &e) != OC_OK) return -1;
+        if (why) snprintf(why, wcap, "%.*s", (int)e.message.len, (const char *)e.message.ptr);
+        return e.code;
+    }
+    oc_auth_device_token t;
+    if (hdr.msg_type != OC_MSG_AUTH_DEVICE_TOKEN || oc_decode_auth_device_token(&p, &t) != OC_OK) return -1;
+    snprintf(tok, cap, "%.*s", (int)t.token.len, (const char *)t.token.ptr);
+    return 0;
+}
+
+static int user_code_shape(const char *u) {
+    if (strlen(u) != 9 || u[4] != '-') return 0;
+    for (int i = 0; i < 9; i++) if (i != 4 && !strchr("BCDFGHJKLMNPQRSTVWXZ", u[i])) return 0;
+    return 1;
+}
+
+/* A daemon of its own for device codes, knob off; `ttl` the codes' life (0 the
+ * default). */
+struct dev_daemon { oc_tls_server srv; uint8_t pin[OC_TLS_FINGERPRINT_LEN]; oc_dbwriter *dbw;
+                    struct loop_arg arg; pthread_t th; uint64_t dee; };
+static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
+    memset(d, 0, sizeof *d);
+    const char *knob = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    int had = knob != NULL;
+    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
+    unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
+    d->dbw = oc_dbwriter_start("build/itest_dev.db");
+    if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    if (!d->dbw) return -1;
+    d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
+    oc_netloop_set_device_ttl_ms(ttl);
+    d->arg.port = port; d->arg.srv = &d->srv; d->arg.dbw = d->dbw; d->arg.stop = 0;
+    return pthread_create(&d->th, NULL, loop_thread, &d->arg) == 0 && d->dee ? 0 : -1;
+}
+static void dev_daemon_stop(struct dev_daemon *d) {
+    stop_loop(&d->arg, d->th);
+    oc_netloop_set_device_ttl_ms(0);
+    oc_dbwriter_stop(d->dbw);
+    oc_tls_server_free(&d->srv);
+    unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
+}
+
+/* A terminal signs in with a code: asked for on the protocol, entered and
+ * approved on the /device page, collected by a poll, presented on AUTH. */
+static void test_device_signin(int port) {
+    struct dev_daemon d;
+    CHECK(dev_daemon_start(&d, port, 0) == 0);
+    const uint8_t *pin = d.pin;
+    char ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1];
+    CHECK(oc_signin_verifier(ver, ch) == 0);
+    char dcode[64], ucode[16], vpath[32], tok[2048], why[64], resp[16384], body[512], path[160];
+    unsigned interval = 0, expires = 0;
+
+    client a;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+    CHECK(device_begin(&a, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
+    CHECK(strlen(dcode) == OC_DEVICE_CODE_LEN && user_code_shape(ucode) && strcmp(vpath, "/device") == 0);
+    CHECK(interval == 5 && expires == 600);
+    /* Not yet; and a poll sooner than the interval makes it longer. */
+    CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_PENDING);
+    CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_SLOW_DOWN);
+    CHECK(strcmp(why, "poll every 10 seconds") == 0);
+    /* The code a person sees does not collect the token. */
+    CHECK(device_poll(&a, ucode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
+
+    /* The page: a form for the code; then, for the code -- typed in lower case,
+     * without its dash -- who is asking and from where. */
+    CHECK(web_call(port, pin, "GET", "/device", NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "name=\"code\"") && strstr(resp, "Content-Security-Policy: default-src 'none'"));
+    char typed[16];
+    snprintf(typed, sizeof typed, "%.4s%.4s", ucode, ucode + 5);
+    for (char *t = typed; *t; t++) *t = (char)(*t - 'A' + 'a');
+    snprintf(path, sizeof path, "/device?code=%s", typed);
+    CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, ucode) && strstr(resp, "from <b>127.0.0.1</b>") && strstr(resp, "Only go on if that was you"));
+    /* Approve: a wrong password shows the form again; the right one signs the
+     * terminal in, and its next poll collects the token. */
+    snprintf(body, sizeof body, "code=%s&username=dee&password=wrong&action=approve", ucode);
+    CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "isn&#39;t right") && strstr(resp, "from <b>127.0.0.1</b>"));
+    CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_PENDING ||
+          strcmp(why, "poll every 15 seconds") == 0);
+    snprintf(body, sizeof body, "code=%s&username=dee&password=pw-dee&action=approve", ucode);
+    CHECK(web_call(port, pin, "POST", "/device", NULL, FORM, body, resp, sizeof resp) == 403);   /* Origin */
+    CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "Go back to your terminal") != NULL);
+    CHECK(device_poll(&a, dcode, tok, sizeof tok, why, sizeof why) == 0 && tok[0]);
+    CHECK(device_poll(&a, dcode, tok + 1024, sizeof tok - 1024, why, sizeof why) == OC_ERR_AUTH_EXPIRED);   /* once */
+    client_close(&a);
+    uint64_t uid = 0;
+    CHECK(token_auth(port, pin, tok, "not-the-verifier-of-this-challenge-at-all", &uid) == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(token_auth(port, pin, tok, ver, &uid) == 0 && uid == d.dee);
+
+    /* "That wasn't me": the terminal is told, once. */
+    client b;
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
+    CHECK(device_begin(&b, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
+    snprintf(body, sizeof body, "code=%s&action=deny", ucode);
+    CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "Sign-in refused") != NULL);
+    CHECK(device_poll(&b, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_DENIED);
+    CHECK(device_poll(&b, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
+    /* One source keeps at most five waiting. */
+    for (int i = 0; i < 5; i++)
+        CHECK(device_begin(&b, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
+    CHECK(device_begin(&b, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) ==
+          OC_ERR_AUTH_RATE_LIMITED);
+    client_close(&b);
+    /* Codes cannot be walked: ten wrong lookups a minute, then refused. */
+    for (int i = 0; i < 10; i++)
+        CHECK(web_call(port, pin, "GET", "/device?code=BBBB-BBBB", NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+              strstr(resp, "isn&#39;t one we&#39;re waiting for"));
+    CHECK(web_call(port, pin, "GET", "/device?code=BBBB-BBBB", NULL, NULL, NULL, resp, sizeof resp) == 429);
+    dev_daemon_stop(&d);
+
+    /* A code's life runs out. */
+    CHECK(dev_daemon_start(&d, port + 1, 400) == 0);
+    client e;
+    CHECK(client_open(&e, port + 1, d.pin) == 0 && do_handshake(&e) == 0);
+    CHECK(device_begin(&e, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
+    usleep(600 * 1000);
+    CHECK(device_poll(&e, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_EXPIRED);
+    snprintf(path, sizeof path, "/device?code=%s", ucode);
+    CHECK(web_call(port + 1, d.pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+          strstr(resp, "isn&#39;t one we&#39;re waiting for"));
+    client_close(&e);
+    dev_daemon_stop(&d);
 }
 
 /* Voice input absent (REQ-300): turned off by the operator, or with no engine --
@@ -4319,6 +4479,7 @@ int run_netloop_tests(void) {
         test_voice_input_absent(arg.port + 124, 1);
         test_voice_input_absent(arg.port + 125, 0);
         test_web_signin(arg.port + 128);
+        test_device_signin(arg.port + 130);
     }
 
     oc_netloop_set_audio(-1, 0);

@@ -33,6 +33,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 |---------|---------|---------|---------|--------|---------|
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
+| **qrcodegen** | v1.8.0 | QR codes: the device-code sign-in's URL, for a phone's camera (AUTH.md §8.11) | tuikit `tk_qr` (→ TUI) | https://github.com/nayuki/QR-Code-generator | MIT |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
@@ -76,7 +77,7 @@ texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
 `packaging/licenses.sh` reads them out of the trees the build actually used, so
 the notice cannot drift from what was linked, and it **fails the build** if a
 licence file is missing rather than shipping a binary without one. termbox2,
-utf8proc and lucide are deliberately absent from that file: they are TUI and
+utf8proc, qrcodegen and lucide are deliberately absent from that file: they are TUI and
 client components, and none is linked into the daemon.
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
@@ -86,7 +87,7 @@ raw `tb_*` grid calls — so the toolbox is the shared layer rather than an
 exclusive one.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
-utf8proc/utf8proc_data.c, jsmn/jsmn.h, miniaudio/miniaudio.h,
+utf8proc/utf8proc_data.c, qrcodegen/qrcodegen.{c,h} (with its LICENSE), jsmn/jsmn.h, miniaudio/miniaudio.h,
 stb/stb_image_write.h, stb/stb_image.h}`, libfvad's `include/` and `src/` trees
 (its `LICENSE`, `AUTHORS` and `PATENTS` beside them, compiled in one translation
 unit, `fvad_unit.c`, with our warnings held off vendored code), and **each carries
@@ -97,7 +98,7 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`utf8proc/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/` and `lucide/`
+`utf8proc/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/` and `lucide/`
 (see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
@@ -307,7 +308,7 @@ paths ship; nothing is fetched at runtime.
 
 | License | Packages | Notes |
 |---------|----------|-------|
-| **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
+| **MIT** | termbox2, utf8proc, qrcodegen, jsmn | Vendored, committed |
 | **MIT** | ONNX Runtime, Moonshine Tiny Streaming | Fetched at build; ONNX Runtime static-linked and Moonshine shipped as data, **daemon only** (ARCH-111/112) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |

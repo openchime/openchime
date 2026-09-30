@@ -60,7 +60,12 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   the connection accepted — to the daemon over TLS as its own origin. An
   invitation rides along (`&invite=`) and opens the sign-up page.
   `oc_client_open_page` opens `account/password` the same way, on a tunnel of its
-  own held ten minutes. When the
+  own held ten minutes. `oc_client_start_device` signs in with a **device code**
+  instead (AUTH.md §8.11): the thread asks for one, publishes
+  `model->device_url`, `device_code`, `device_fp` (the accepted fingerprint,
+  where no authority vouches for the daemon) and `device_expires_ms`, polls at the
+  daemon's interval — longer on `AUTH_SLOW_DOWN` — and presents the token when it
+  comes; a dropped connection keeps the code and polls on. When the
   browser comes back it connects again and presents the token with the verifier,
   then wipes both. `oc_client_cancel_signin` and a five-minute timeout end the
   wait; a refused sign-in reaches `last_error` worded by its code.
@@ -641,11 +646,16 @@ IPv4-mapped `127.x` and `localhost`. The Win32 sign-in form's advanced mode
 takes a bracketed IPv6 address as an address, as it does an IPv4 one.
 
 **The local login box (REQ-020 local mode).** With no credential and no
-stored session token, the TUI shows a modal **Sign in** dialog — workspace /
-username / masked password / *Remember me* — which a daemon takes only with the
-test knob, since passwords go on its pages in the browser (AUTH.md §8.10; Ctrl+B
-opens them, and a refusal says so); its password-free path everywhere is a
-device code. The dialog resolves the workspace on submit
+stored session token, the TUI shows a modal **Sign in** dialog — the workspace
+and *Remember me*, **no password** (AUTH.md §8.10). Enter signs in to local
+accounts with a **device code** (§8.11); Ctrl+B takes the workspace's browser
+source where it has one. The code's screen shows where to go and the code, the
+URL as a QR code (`tuikit/tk_qr.c`, qrcodegen, half blocks, light modules white
+on black so any terminal's colours read the same) where the terminal has room,
+the daemon's fingerprint where the browser will warn about its certificate, and
+the time left; it also opens the page where there is a desktop to open it on,
+and Esc cancels. A `host port user:pw` command line still signs in by password,
+against a daemon with the test knob. The dialog resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
 reason and refocuses the password to retry. *Remember me* gates whether the
 session token persists (the store) or stays session-only. A returning user with a

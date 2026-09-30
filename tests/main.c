@@ -16,6 +16,8 @@ int run_jwt_tests(void);
 int run_joinrules_tests(void);
 int run_proxyproto_tests(void);
 int run_signin_tests(void);
+int run_tkqr_tests(void);
+int run_devicecodes_tests(void);
 int run_ratelimit_tests(void);
 int run_idmap_tests(void);
 int run_srccount_tests(void);
@@ -209,6 +211,8 @@ int main(void) {
     total += SUITE(run_joinrules_tests);
     total += SUITE(run_proxyproto_tests);
     total += SUITE(run_signin_tests);
+    total += SUITE(run_tkqr_tests);
+    total += SUITE(run_devicecodes_tests);
     total += SUITE(run_ratelimit_tests);
     total += SUITE(run_idmap_tests);
     total += SUITE(run_srccount_tests);
