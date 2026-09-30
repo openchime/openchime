@@ -467,6 +467,7 @@ void oc_netloop_stats_get(oc_netloop_stats *out) {
     out->results     = __atomic_load_n(&g_stats.results, __ATOMIC_RELAXED);
     out->bytes_read  = __atomic_load_n(&g_stats.bytes_read, __ATOMIC_RELAXED);
     out->turn_read_max = __atomic_load_n(&g_stats.turn_read_max, __ATOMIC_RELAXED);
+    out->live_visits   = __atomic_load_n(&g_stats.live_visits, __ATOMIC_RELAXED);
     for (unsigned i = 0; i < OC_NETLOOP_HIST_BUCKETS; i++)
         out->turn_hist[i] = __atomic_load_n(&g_stats.turn_hist[i], __ATOMIC_RELAXED);
 }
@@ -485,6 +486,7 @@ void oc_netloop_stats_reset(void) {
     __atomic_store_n(&g_stats.results, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_stats.bytes_read, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_stats.turn_read_max, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_stats.live_visits, 0, __ATOMIC_RELAXED);
     for (unsigned i = 0; i < OC_NETLOOP_HIST_BUCKETS; i++)
         __atomic_store_n(&g_stats.turn_hist[i], 0, __ATOMIC_RELAXED);
 }
@@ -610,6 +612,14 @@ static __thread oc_idmap g_by_user;
 static __thread conn   **g_live;
 static __thread size_t   g_nlive;
 #define OC_LIVE_CAP (2 * OC_NETLOOP_MAX_FD)
+
+/* A walk of every connection that something arriving causes -- a fan-out, a
+ * newcomer's snapshot -- goes through LIVE_EACH, which counts the connections it
+ * will examine (the stats' live_visits), so a test can hold an event to the walks
+ * it should make, by count rather than by time (ARCH-22). The sweeps that run on
+ * every turn whatever arrives walk the list plainly. */
+static void live_note_walk(void) { __atomic_add_fetch(&g_stats.live_visits, g_nlive, __ATOMIC_RELAXED); }
+#define LIVE_EACH(i) for (size_t i = (live_note_walk(), 0); i < g_nlive; i++)
 static __thread uint64_t g_fan_gen;
 
 static __thread oc_srccount g_by_src;
@@ -757,7 +767,7 @@ static void send_to_user(int ep, conn **conns, uint64_t uid, uint64_t except_con
 
 /* Write `buf` to every authenticated connection. */
 static void send_to_all_authed(int ep, conn **conns, const uint8_t *buf, size_t len) {
-    for (size_t i = 0; i < g_nlive; i++)
+    LIVE_EACH(i)
         if (g_live[i] && g_live[i]->authed) send_bytes(ep, conns, g_live[i]->fd, buf, len);
 }
 
@@ -913,7 +923,7 @@ static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t statu
      * presence change look like a DND change on the next turn. */
     (void)conns;
     for (conn *c = user_head(uid); c; c = c->u_next) c->dnd_announced = dnd;
-    for (size_t i = 0; i < g_nlive; i++) {
+    LIVE_EACH(i) {
         conn *c = g_live[i];
         if (c && c->authed && c->user_id != uid) presence_send(ep, c, buf, len);
     }
@@ -4296,7 +4306,8 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* Presence (REQ-120): send the new client a snapshot of who is currently
          * online/away, then — if this is the user's first connection — announce
          * them online to everyone. */
-        for (size_t li = 0; li < g_nlive && conns[fd]; li++) {
+        LIVE_EACH(li) {
+            if (!conns[fd]) break;
             conn *v = g_live[li];
             /* Once per user: their first connection in the index speaks for all. */
             if (!v || !v->authed || v->user_id == uid || user_head(v->user_id) != v) continue;

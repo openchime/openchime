@@ -3633,12 +3633,12 @@ static uint64_t settled_turn_max(client *poke) {
 /* A sign-in costs the loop about what telling everyone a presence change does
  * (ARCH-22). Both reach every one of a hundred people online; the sign-in also
  * sends the newcomer who each of them is, which with the indexes is a lookup per
- * person, and the two measure about the same. Before the indexes each person's
- * presence and do-not-disturb were each a walk of the whole 4096-slot table:
- * with only the presence walk put back, the sign-in's turn is five times the
- * presence change's, and both walks cost more. The ratio does not grow with the
- * crowd, since both sides do per person. Measured against each other in one
- * run, the best of four of each, so the machine's speed cancels out. */
+ * person. Held by the connections the loop examines, not by time: a presence
+ * change is one walk of everyone, a sign-in two (the newcomer's snapshot and the
+ * announcement), and a walk per person -- how each person's presence and
+ * do-not-disturb were found before the indexes -- is a hundred. The worst turn
+ * of each is printed as a measurement; it is not a bound, since one preemption
+ * of the loop inside the window moves it. */
 static void test_login_bound(int port, const uint8_t *pin) {
     enum { N = 100, R = 4 };
     static client crowd[N];
@@ -3651,7 +3651,7 @@ static void test_login_bound(int port, const uint8_t *pin) {
     }
     CHECK(open_ok);
     if (!open_ok) return;
-    uint64_t presence_us = UINT64_MAX, login_us = UINT64_MAX;
+    uint64_t presence_us = UINT64_MAX, login_us = UINT64_MAX, presence_v = UINT64_MAX, login_v = UINT64_MAX;
     for (int r = 0; r < R; r++) {
         uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         oc_set_presence sp = { (uint8_t)(r % 2 ? OC_PRESENCE_ONLINE : OC_PRESENCE_AWAY) };
@@ -3661,6 +3661,8 @@ static void test_login_bound(int port, const uint8_t *pin) {
         CHECK(wait_presence_of(&crowd[N - 1], uids[0], sp.status) == 0);
         uint64_t m = settled_turn_max(&crowd[0]);
         if (m < presence_us) presence_us = m;
+        oc_netloop_stats st; oc_netloop_stats_get(&st);
+        if (st.live_visits < presence_v) presence_v = st.live_visits;
     }
     for (int r = 0; r < R; r++) {
         client b;
@@ -3671,12 +3673,16 @@ static void test_login_bound(int port, const uint8_t *pin) {
         CHECK(wait_presence_of(&crowd[N - 1], ub, OC_PRESENCE_ONLINE) == 0);
         uint64_t m = settled_turn_max(&crowd[0]);
         if (m < login_us) login_us = m;
+        oc_netloop_stats st; oc_netloop_stats_get(&st);
+        if (st.live_visits < login_v) login_v = st.live_visits;
         client_close(&b);
         CHECK(wait_presence_of(&crowd[N - 1], ub, OC_PRESENCE_OFFLINE) == 0);   /* gone: the next is a first sign-in */
     }
-    printf("  sign-in beside %d people: worst turn %llu us; a presence change to them: %llu us\n",
-           N, (unsigned long long)login_us, (unsigned long long)presence_us);
-    CHECK_SPEED(login_us <= 3 * (presence_us > 50 ? presence_us : 50));
+    printf("  sign-in beside %d people: %llu connections examined, worst turn %llu us; "
+           "a presence change to them: %llu, %llu us\n", N, (unsigned long long)login_v,
+           (unsigned long long)login_us, (unsigned long long)presence_v, (unsigned long long)presence_us);
+    CHECK(presence_v >= N && presence_v < 2 * (N + 8));            /* one walk of everyone */
+    CHECK(login_v <= 3 * presence_v);                              /* a few walks, never one per person */
     for (int i = 0; i < N; i++) client_close(&crowd[i]);
 }
 

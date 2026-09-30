@@ -109,6 +109,9 @@ typedef struct {
     uint64_t results;      /* database results delivered */
     uint64_t bytes_read;   /* plaintext read from clients */
     uint64_t turn_read_max;/* the most plaintext read in any one turn */
+    uint64_t live_visits;  /* connections examined by walks of every connection
+                            * that something arriving caused -- a fan-out, a
+                            * snapshot -- and not by the sweeps every turn makes */
 } oc_netloop_stats;
 
 void oc_netloop_stats_get(oc_netloop_stats *out);
