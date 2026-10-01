@@ -84,6 +84,9 @@ void oc_a11y_publish(const oc_acc_item *items, int n,
 /* Speak something that is not a focus change: an arriving message, a send that
  * failed, a connection that dropped. */
 void oc_a11y_announce(const char *utf8);
+/* The same, for what must interrupt: a failure, a lost connection. The reader
+ * says it ahead of what it was saying (ImportantMostRecent). */
+void oc_a11y_announce_assertive(const char *utf8);
 
 /* How many announcements have been raised — the harness's only handle on a path
  * whose effect is audible and therefore unobservable here (the same honest limit

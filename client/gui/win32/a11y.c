@@ -60,6 +60,7 @@ void oc_a11y_publish(const oc_acc_item *i, int n, const WCHAR *c, int a, int b) 
     (void)i; (void)n; (void)c; (void)a; (void)b;
 }
 void oc_a11y_announce(const char *s) { (void)s; }
+void oc_a11y_announce_assertive(const char *s) { (void)s; }
 unsigned oc_a11y_announced(void) { return 0; }
 void oc_a11y_focus(oc_acc_kind k, uint64_t id) { (void)k; (void)id; }
 #else
@@ -561,7 +562,10 @@ void oc_a11y_publish(const oc_acc_item *items, int n,
     LeaveCriticalSection(&g_lock);
 }
 
-void oc_a11y_announce(const char *utf8) {
+static void announce(const char *utf8, int important);
+void oc_a11y_announce(const char *utf8) { announce(utf8, 0); }
+void oc_a11y_announce_assertive(const char *utf8) { announce(utf8, 1); }
+static void announce(const char *utf8, int important) {
     g_announced++;
     if (!g_ready || !p_raise_notify || !utf8 || !utf8[0]) return;
     acc_el *root = el_new(EL_ROOT);
@@ -571,7 +575,9 @@ void oc_a11y_announce(const char *utf8) {
     /* NotificationProcessing_MostRecent: a burst of arriving messages should
      * leave the reader saying the latest, not queueing a backlog it will still
      * be reading a minute later. */
-    p_raise_notify(&root->s, NotificationKind_Other, NotificationProcessing_MostRecent, text, id);
+    p_raise_notify(&root->s, NotificationKind_Other,
+                   important ? NotificationProcessing_ImportantMostRecent : NotificationProcessing_MostRecent,
+                   text, id);
     SysFreeString(text);
     SysFreeString(id);
     s_Release(&root->s);

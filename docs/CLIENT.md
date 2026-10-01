@@ -418,7 +418,8 @@ model; translate input to intents }, stop.
   **Invite people** (as member or as admin) asks for an email address where the
   workspace offers a browser sign-in, saying the address must be able to sign in
   with the workspace's provider — by name where the workspace's sources say which,
-  as the TUI does — and refusing, in a toast, anything that is not an address;
+  as the TUI does — and refusing anything that is not an address at the field, in
+  red, with the form asked again;
   where it also has password accounts the address
   may be left empty for a one-time token, and where it has password accounts only
   the token is minted without asking. The answer opens the invitation — the
@@ -1043,6 +1044,35 @@ another machine is not what you asked for. DPI belongs to the display. `g_text_s
 is the product of the first two, so nothing downstream has to know there are two
 inputs; anything that caches a font size of its own (the form fields' HFONT among
 them) is rebuilt by `scale_apply`.
+
+## What the window says, and where (REQ-263)
+
+Each kind of message has one surface, decided by what it is
+(`client/shared/feedback.{h,c}`, which holds the state with time passed in; the
+GUI only draws it):
+
+- **A confirmation** the screen does not already show (copied, saved, marked
+  read): a toast that leaves by itself — four seconds, longer for a longer
+  sentence. Nothing for what the screen shows anyway: joining a channel opens it.
+- **Something undoable** (a deleted draft): a toast with **Undo**, ten seconds,
+  instead of a question before every delete.
+- **Progress** (sending a video message): one toast, updated in place, ending as a
+  confirmation or a failure.
+- **A failure with nothing to mark**: a toast that stays until dismissed, said
+  assertively — one that leaves by itself is one nobody saw.
+- **An ongoing state** (the connection): a banner under the tabs, the most severe
+  first, said once as it starts and gone when it ends.
+- **A hint about a field or the composer** ("Who is this for?", a file too large):
+  inline at that field or composer — above the conversation's composer, under the
+  New message pane's — until the next edit; a form's field turns red and the form
+  asks again.
+
+A toast is a card sized to what it says: an icon by kind, the text wrapped, its
+one action, and a close button. The pointer on one holds it; Esc dismisses the
+newest; Ctrl+Shift+Z does what the newest offers. At most three show, where the
+**Notices** preference puts them (bottom centre, bottom right, top right). Every
+toast, banner and hint is spoken — politely, or assertively for a failure — and
+each toast's action and close are published for UI Automation.
 
 ## Two standing UI rules
 

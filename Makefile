@@ -262,7 +262,7 @@ STT ?= 1
 # What `make test` links of voice input whatever STT is: the worker (driven by a
 # stub engine) and the tokenizer -- everything but the model.
 QR_TEST_SRC := tuikit/tk_qr.c $(QRCODEGEN)
-OSN_TEST_SRC := client/shared/osnotify_null.c
+OSN_TEST_SRC := client/shared/osnotify_null.c client/shared/feedback.c
 STT_TEST_SRC := daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
 ifeq ($(STT),1)
 STT_SRC   := daemon/stt.c daemon/stt_moonshine.c daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
@@ -547,7 +547,7 @@ $(WIN_SPEEXDSP_A):
 # Debug symbols, split out of the shipped binary (see the strip step below).
 WIN_GUI_SYMS := build/openchime.debug
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
-           client/shared/osnotify_win.c \
+           client/shared/osnotify_win.c client/shared/feedback.c \
            $(SDLTEXT_WIN) $(GFX_SRC)
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
                $(CORE_INC) $(CALL_INC) -Iclient/gui/win32 -Iclient/shared \

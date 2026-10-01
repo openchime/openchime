@@ -223,7 +223,7 @@ check "the To field takes #crewroom" waitfor a 5 nm_chan
 for i in 1 2 3 4 5 6 7 8 9; do "$PAIR" a typekeys "u$i" >/dev/null; press a enter; done
 eight() { [ "$(pick a chips)" = "u1,u2,u3,u4,u5,u6,u7,u8" ]; }
 check "people replace the channel, and the ninth is refused" waitfor a 5 eight
-capped() { grep -q '^toast.*at most 8 people' /tmp/oc-groups-dump-a.txt; }
+capped() { grep -q '^hint.*at most 8 people' /tmp/oc-groups-dump-a.txt; }   # said at the composer
 check "and it says so" waitfor a 5 capped
 # A body, so there is a draft to keep: an unaddressed draft with no text is no
 # draft at all (the model drops it), recipients or not.

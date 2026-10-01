@@ -287,7 +287,7 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 Most of the graphical clients' icons come from [Lucide](https://lucide.dev)
 (ISC License). We vendor **only the handful of SVGs we use**
-(`third_party/lucide/icons/*.svg` — 32 of them) plus the license
+(`third_party/lucide/icons/*.svg` — 36 of them) plus the license
 (`third_party/lucide/LICENSE`).
 
 **Four icons are ours, not Lucide's**, and live outside `third_party/` for exactly

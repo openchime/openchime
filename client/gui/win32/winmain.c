@@ -59,6 +59,7 @@
 #include "openchime_res.h"    /* IDI_APPICON */
 #include "theme.h"
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
+#include "feedback.h"    /* in-app toasts and banners (REQ-263) */
 #include <mmsystem.h>       /* PlaySoundW, the notification sound (REQ-138) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
 #include "oc_capture.h"       /* video messages: the camera list (REQ-163) */
@@ -500,6 +501,10 @@ typedef struct {
      * happens again the next time a longer one is added. */
     char        value[1024];       /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
 } oc_field;
+/* The field whose hint says what is wrong with its value: drawn in red, the
+ * border with it, so the problem is shown where it is (REQ-263). -1: none.
+ * Set by the caller asking again; form_dialog clears it as it returns. */
+static int g_form_err_field = -1;
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
 
 /* The form is drawn on the modal frame like every other sheet, so its
@@ -2427,52 +2432,61 @@ static si_geom si_layout(float W, float H);
  * stacking a duplicate), because there is nothing in the model to tell the two
  * apart. A monotonic error counter in oc_model would remove that; it is a core
  * change, deliberately out of this item's scope. */
-#define TOAST_MAX      4
-#define TOAST_MS       6000       /* long enough to read a sentence, short enough not to nag */
-#define TOAST_W        340.0f
-#define TOAST_H        UIS(52.0f)
+/* The toasts and banners themselves are client/shared/feedback.c: what is
+ * showing, until when, and what was said. This file draws them and turns
+ * clicks, keys and the pointer into the module's terms. */
+static oc_fb g_fb;
+/* Where toasts sit (a preference): above the composer, centred in the
+ * conversation pane; bottom-right of the window; or top-right, under the header,
+ * clear of the composer and the newest messages. */
+enum { TOASTPOS_BOTTOM_CENTRE = 0, TOASTPOS_BOTTOM_RIGHT = 1, TOASTPOS_TOP_RIGHT = 2 };
+static int g_pref_toastpos = TOASTPOS_BOTTOM_CENTRE;
+/* What a toast's one action does (oc_fb_toast.action_id). */
+enum { FBA_NONE = 0, FBA_UNDO_DRAFT, FBA_RETRY };
+/* Banner states this client can be in (oc_fb_banner.id). */
+enum { FBB_CONNECTION = 1 };
 #define TOAST_GAP      UIS(10.0f)
 #define BANNER_H       UIS(34.0f)
-static struct {
-    char      text[192];
-    ULONGLONG born;               /* GetTickCount64 at push */
-    int       danger;             /* 1 = failure (red), 0 = neutral notice */
-} g_toast[TOAST_MAX];
-static int  g_n_toast;
-static rectf g_toast_box[TOAST_MAX];   /* hit-boxes, captured during paint */
+/* Hit-boxes, captured during paint: the card, its close and its action. */
+static struct { uint32_t id; rectf card, close, action; } g_toast_hit[OC_FB_TOASTS];
+static int  g_n_toast_hit;
 static uint32_t g_err_seq;
 static char g_err_seen[160];                 /* last `last_error` we turned into a toast */
-static rectf g_retry_btn;              /* banner Retry-now hit-box */
+static rectf g_retry_btn;              /* banner action hit-box */
 static int  g_banner_on;                     /* banner drawn this frame (arms the hit-box) */
+static int  g_banner_action;           /* what the banner's button does (FBA_*) */
+/* The draft a Delete took away, so its toast's Undo can put it back. */
+static struct { uint64_t cid, root; char to[256]; char body[DRAFT_TEXT_MAX * 3]; int valid; } g_undo_draft;
 
-/* Drop toast `i`, sliding the rest down. */
-static void toast_drop(int i) {
-    for (int k = i; k < g_n_toast - 1; k++) g_toast[k] = g_toast[k + 1];
-    if (g_n_toast > 0) g_n_toast--;
+/* Spoken as each toast and banner appears (ARCH-99): politely, or -- for a
+ * failure and an error banner -- assertively, so a screen reader interrupts. */
+static void fb_say(const char *text, int assertive) {
+    if (assertive) oc_a11y_announce_assertive(text);
+    else           oc_a11y_announce(text);
+}
+static uint64_t fb_now(void) { return (uint64_t)GetTickCount64(); }
+static void toast_action_run(int action);   /* fwd */
+/* The four kinds, by what the message is (feedback.h). */
+static uint32_t fb_confirm(const char *text) { return oc_fb_show(&g_fb, OC_FB_CONFIRM, text, NULL, 0, fb_now()); }
+static uint32_t fb_failed(const char *text)  { return oc_fb_show(&g_fb, OC_FB_FAILED, text, NULL, 0, fb_now()); }
+static uint32_t fb_progress(const char *text) { return oc_fb_show(&g_fb, OC_FB_PROGRESS, text, NULL, 0, fb_now()); }
+static uint32_t fb_undo(const char *text, int action) {
+    return oc_fb_show(&g_fb, OC_FB_UNDO, text, "Undo", action, fb_now());
 }
 
-/* Show a toast. A repeat of the text currently showing refreshes its timer
- * rather than stacking, so a burst of identical failures reads as one event. */
-static void toast_push(const char *text, int danger) {
-    if (!text || !text[0]) return;
-    /* Every toast is also spoken (ARCH-99). A toast is how this client says
-     * something went wrong — a send refused, a rate limit, a connection dropped —
-     * and it says it by drawing, which reaches nobody using a screen reader.
-     * Announcing here rather than at each call site means a failure surfaced in
-     * future cannot be silent by omission: it is one code path, not thirty.
-     *
-     * Raised before the de-duplication below on purpose: a toast repeating is
-     * the app telling you it happened AGAIN, and swallowing that would make a
-     * repeated failure indistinguishable from a single one. */
-    oc_a11y_announce(text);
-    for (int i = 0; i < g_n_toast; i++) {
-        if (strcmp(g_toast[i].text, text) == 0) { g_toast[i].born = GetTickCount64(); return; }
-    }
-    if (g_n_toast == TOAST_MAX) toast_drop(0);      /* oldest falls off the top */
-    snprintf(g_toast[g_n_toast].text, sizeof g_toast[g_n_toast].text, "%s", text);
-    g_toast[g_n_toast].born   = GetTickCount64();
-    g_toast[g_n_toast].danger = danger;
-    g_n_toast++;
+/* What the composer holds is wrong, or not enough, to send: said AT the
+ * composer, not in a toast across the window -- a hint about a field belongs on
+ * that field. It stays until the next edit or another conversation, and is
+ * spoken as it appears. */
+static char  g_cmp_hint[256];
+static int   g_cmp_hint_err;
+static rectf g_cmp_hint_anchor;        /* the composer box it sits by, this paint */
+static int   g_cmp_hint_below;         /* under the box (the New message pane), else above it */
+static void composer_hint_draw(gfx *rt);   /* fwd */
+static void composer_hint(const char *text, int is_error) {
+    snprintf(g_cmp_hint, sizeof g_cmp_hint, "%s", text ? text : "");
+    g_cmp_hint_err = is_error;
+    if (g_cmp_hint[0]) fb_say(g_cmp_hint, is_error);
 }
 
 /* Expire elapsed toasts, and turn a *new* model error into one. Called each tick
@@ -2500,9 +2514,7 @@ static void groups_roster_tick(const oc_model *m) {
 }
 
 static void toast_tick(const oc_model *m) {
-    ULONGLONG now = GetTickCount64();
-    for (int i = g_n_toast - 1; i >= 0; i--)
-        if (now - g_toast[i].born >= TOAST_MS) toast_drop(i);
+    oc_fb_tick(&g_fb, fb_now());
     /* Keyed on the sequence, not the text: repeating a failing action must
      * notify again, or the second attempt reads as having worked. */
     if (m && m->error_seq != g_err_seq) {
@@ -2513,7 +2525,34 @@ static void toast_tick(const oc_model *m) {
          * belongs to the banner (which is on screen exactly when !authed), while
          * anything that goes wrong mid-session — a refused send, a rate limit, a
          * storage refusal — has no persistent home and needs the toast. */
-        if (g_err_seen[0] && m->authed) toast_push(g_err_seen, 1);
+        if (g_err_seen[0] && m->authed) fb_failed(g_err_seen);
+    }
+    /* The connection is a STATE, so it is a banner, said once as it starts and
+     * gone when it ends -- never a toast, which would say it again and again. */
+    if (m && !m->authed) {
+        /* A LIVE countdown. The core's error string states the delay once per
+         * backoff, so the number in it never moved -- it read as a hung client.
+         * The deadline ticks because the model carries it, and the same clock
+         * source is used on both sides so the two cannot disagree. */
+        char live[192];
+        const char *why = m->last_error[0] ? m->last_error
+                        : !m->connected    ? "Connecting\u2026"
+                                           : "Signing in\u2026";
+        uint64_t left = oc_model_reconnect_in(m, oc_model_now_ms());
+        if (left > 0) {
+            snprintf(live, sizeof live, "Connection lost \u2014 reconnecting in %llus\u2026",
+                     (unsigned long long)((left + 999) / 1000));
+            why = live;
+        } else if (m->reconnect_at_ms) {
+            why = "Reconnecting\u2026";
+        }
+        /* Amber while a connection is plausibly coming back, red once the core
+         * has told us something concrete went wrong -- the distinction the user
+         * acts on. */
+        oc_fb_banner_set(&g_fb, FBB_CONNECTION, m->last_error[0] ? OC_FB_ERROR : OC_FB_WARN, why,
+                         "Retry now", FBA_RETRY);
+    } else {
+        oc_fb_banner_clear(&g_fb, FBB_CONNECTION);
     }
 }
 
@@ -3582,11 +3621,23 @@ static void draft_delete(uint64_t cid, uint64_t root) {
     /* The daemon does not echo a draft to the connection that wrote it, so this
      * client's copy is updated here, as draft_flush does for a save. */
     oc_model *dm = (oc_model *)model();
+    /* Kept, so the toast's Undo can put it back exactly. */
+    g_undo_draft.valid = 0;
+    if (dm) {
+        const char *body = oc_model_draft(dm, cid, cid ? root : 0);
+        const char *to = cid ? NULL : oc_model_draft_recipients(dm);
+        if (body && body[0]) {
+            g_undo_draft.cid = cid; g_undo_draft.root = root;
+            snprintf(g_undo_draft.body, sizeof g_undo_draft.body, "%s", body);
+            snprintf(g_undo_draft.to, sizeof g_undo_draft.to, "%s", to ? to : "");
+            g_undo_draft.valid = 1;
+        }
+    }
     if (!cid) {
         oc_client_set_draft_to(g_client, "", "");
         if (dm) oc_model_draft_local_to(dm, "", "");
         if (g_ed_is_newmsg) ed_clear();
-        toast_push("Draft deleted", 0);
+        if (g_undo_draft.valid) fb_undo("Draft deleted.", FBA_UNDO_DRAFT); else fb_confirm("Draft deleted.");
         return;
     }
     oc_client_set_draft(g_client, cid, root, "");
@@ -3597,25 +3648,17 @@ static void draft_delete(uint64_t cid, uint64_t root) {
         g_draft_sent[0] = 0;
         g_draft_dirty = 0;
     }
-    toast_push("Draft deleted", 0);
+    if (g_undo_draft.valid) fb_undo("Draft deleted.", FBA_UNDO_DRAFT); else fb_confirm("Draft deleted.");
 }
 
-/* Ask first: a draft is writing, and deleting it cannot be undone. Slack asks too. */
+/* Deleted at once, with Undo on the toast it raises: a draft is writing, and
+ * the safeguard against losing one is being able to take the delete back, not a
+ * question asked before every delete (feedback.h). */
 static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
                          const char *body, const char *ok_label);   /* fwd */
-static void channel_label(const oc_model *m, const oc_channel *c, char *out, size_t cap);   /* fwd */
 static void draft_delete_ask(HWND hwnd, uint64_t cid, uint64_t root) {
-    const oc_model *m = model();
-    char where[96] = "", body[200];
-    const oc_channel *c = m && cid ? oc_model_channel((oc_model *)m, cid) : NULL;
-    if (c) channel_label(m, c, where, sizeof where);
-    if (!cid)       snprintf(body, sizeof body, "Your unaddressed message will be deleted. This can\u2019t be undone.");
-    else if (root)  snprintf(body, sizeof body, "Your draft reply in %s will be deleted. This can\u2019t be undone.",
-                             where[0] ? where : "this conversation");
-    else            snprintf(body, sizeof body, "Your draft in %s will be deleted. This can\u2019t be undone.",
-                             where[0] ? where : "this conversation");
-    g_confirm_root = root;
-    confirm_open(hwnd, CONF_DRAFT_DELETE, cid, "Delete draft?", body, "Delete");
+    (void)hwnd;
+    draft_delete(cid, root);
 }
 
 static void nm_editor_release(void);             /* fwd: one owner for the editor */
@@ -3662,6 +3705,7 @@ static void select_channel(uint64_t cid) {
      * before the flush below, which would otherwise file the pane's text as this
      * channel's draft. */
     nm_editor_release();
+    g_cmp_hint[0] = '\0';                 /* the hint was about the conversation left */
     if (g_sel && g_sel != cid) draft_flush(g_sel);   /* leaving writes it, if changed */
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
@@ -7133,7 +7177,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
        ACC_FOCUS, ACC_PREFS, ACC_LISTEN, ACC_PTT, ACC_FREETALK, ACC_QUIT, ACC_CALL_MUTE, ACC_CALL_SHARE,
-       ACC_MARK_ALL_READ };
+       ACC_MARK_ALL_READ, ACC_TOAST_ACTION };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -7175,6 +7219,9 @@ static const struct {
     /* Shift+Esc, as the reference client binds it. Plain Esc closes whatever is
      * open, so the Esc handler below stands aside while Shift is held. */
     { AM_SHIFT,           VK_ESCAPE,  ACC_MARK_ALL_READ, "Shift+Esc",  "Mark every conversation read" },
+    /* The newest toast's action -- Undo, most often -- without reaching for the
+     * pointer (REQ-290); plain Esc dismisses the newest toast. */
+    { AM_CTRL | AM_SHIFT, 'Z',        ACC_TOAST_ACTION, "Ctrl+Shift+Z", "Do what the newest notice offers (Undo)" },
     /* Ctrl and a digit, as the reference client binds it: the digit is the
      * workspace's place in the rail, counting from 1. Handled in the dispatcher
      * below rather than as nine rows, so this one is the documentation. */
@@ -7216,6 +7263,15 @@ static void accel_run(HWND hwnd, int action) {
     switch (action) {
     case ACC_QUIT:    app_quit(hwnd);     break;
     case ACC_PALETTE: palette_open(hwnd); break;
+    case ACC_TOAST_ACTION:
+        for (int i = g_fb.n - 1; i >= 0; i--)
+            if (g_fb.t[i].action[0]) {
+                int act = g_fb.t[i].action_id;
+                oc_fb_dismiss(&g_fb, g_fb.t[i].id);
+                toast_action_run(act);
+                break;
+            }
+        break;
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
@@ -7405,6 +7461,12 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 1;
             }
+        }
+        /* Then the newest notice: Esc dismisses it, as its close button does. */
+        if (g_fb.n > 0 && !modal_open()) {
+            oc_fb_dismiss(&g_fb, g_fb.t[g_fb.n - 1].id);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 1;
         }
         return 0;
     }
@@ -8320,7 +8382,7 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_RESET,
-       PREF_ROW_EDITOR, PREF_ROW_FLASH };
+       PREF_ROW_EDITOR, PREF_ROW_FLASH, PREF_ROW_TOASTPOS };
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -8489,6 +8551,9 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      DENS, 2, g_pref_density);
         y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
                      "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
+        static const char *TPOS[3] = { "Bottom centre", "Bottom right", "Top right" };
+        y = pref_row(rt, body, y, PREF_ROW_TOASTPOS, "Notices",
+                     "Where confirmations, Undo and failures appear in the window.", TPOS, 3, g_pref_toastpos);
     } else if (g_pref_cat == PC_MESSAGES) {
         y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
                      "How message timestamps are shown.", TIMES, 2, g_pref_time24);
@@ -9210,42 +9275,32 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
  * server", the reconnect countdown, a changed certificate); without one we fall
  * back to the phase. Returns its height so the caller can push content down. */
 static float draw_banner(gfx *rt, const oc_model *m, float x0, float w, float top_off) {
+    (void)m;
     g_banner_on = 0;
-    if (!m || m->authed) return 0;
-
-    /* A LIVE countdown. The core's error string states the delay once
-     * per backoff, so the number in it never moved — it read as a hung client.
-     * The deadline ticks because the model now carries it, and the same clock
-     * source is used on both sides so the two cannot disagree. */
-    char live[192];
-    const char *why = m->last_error[0] ? m->last_error
-                    : !m->connected    ? "Connecting…"
-                                       : "Signing in…";
-    uint64_t left = oc_model_reconnect_in(m, oc_model_now_ms());
-    if (left > 0) {
-        snprintf(live, sizeof live, "Connection lost — reconnecting in %llus…",
-                 (unsigned long long)((left + 999) / 1000));
-        why = live;
-    } else if (m->reconnect_at_ms) {
-        why = "Reconnecting…";
-    }
-    /* Amber while a connection is plausibly coming back, red once the core has
-     * told us something concrete went wrong — the distinction the user acts on. */
-    uint32_t accent = m->last_error[0] ? OC_COL_DANGER : OC_COL_AWAY;
-
+    const oc_fb_banner *b = oc_fb_banner_top(&g_fb);
+    if (!b) return 0;
+    uint32_t accent = b->severity == OC_FB_ERROR ? OC_COL_DANGER
+                    : b->severity == OC_FB_WARN  ? OC_COL_AWAY : OC_COL_NOTICE;
     rectf r = rf(x0, HEADER_H + top_off, x0 + w, HEADER_H + top_off + BANNER_H);
     fill(rt, r, OC_COL_SIDEBAR);
     fill(rt, rf(x0, r.top, x0 + 3, r.bottom), accent);          /* status edge */
     fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
-
-    g_retry_btn = rf(x0 + w - 104, r.top + 5, x0 + w - 14, r.bottom - 5);
-    fill_round(rt, g_retry_btn, OC_R_CONTROL, OC_COL_INPUT);
-    stroke_round(rt, g_retry_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Retry now", g_meta, g_retry_btn, OC_COL_TEXT);
-    g_meta->align = ST_ALIGN_LEFT;
-
-    draw_text(rt, why, g_meta, rf(x0 + 16, r.top, g_retry_btn.left - 12, r.bottom), accent);
+    draw_lucide(rt, b->severity == OC_FB_INFO ? OC_ICON_INFO : OC_ICON_ALERT,
+                rf(x0 + 14, r.top + (BANNER_H - 16) / 2, x0 + 30, r.top + (BANNER_H + 16) / 2), accent);
+    float text_right = x0 + w - 14;
+    g_retry_btn = rf(0, 0, 0, 0);
+    if (b->action[0]) {
+        float bw = text_width(b->action, g_meta) + 28;
+        g_retry_btn = rf(x0 + w - 14 - bw, r.top + 5, x0 + w - 14, r.bottom - 5);
+        fill_round(rt, g_retry_btn, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_retry_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, b->action, g_meta, g_retry_btn, OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_LEFT;
+        text_right = g_retry_btn.left - 12;
+    }
+    draw_text(rt, b->text, g_meta, rf(x0 + 38, r.top, text_right, r.bottom), accent);
+    g_banner_action = b->action_id;
     g_banner_on = 1;
     return BANNER_H;
 }
@@ -9912,31 +9967,110 @@ static void nt_tick(void) {
     else { nt_layout(); nt_paint(); }
 }
 
+/* Toasts (feedback.h), drawn last so nothing can hide them. A card sized to
+ * what it says: an icon by kind, the text wrapped rather than cut, the one
+ * action if there is one, and a close button -- the newest nearest the edge it
+ * grows from, at the place the preference names. The pointer on one holds it
+ * (oc_fb_hold), so the one being read is not the one that leaves. */
+static float g_toast_area_l, g_toast_area_r;      /* the conversation pane, for centring */
+static rectf g_ed_box;                            /* the composer's text rect (below); empty: no composer */
 static void draw_toasts(gfx *rt, float W, float H) {
-    /* Clear every hit-box first: in a short window the loop below stops early,
-     * and a box left over from a taller frame would let a click dismiss a toast
-     * that isn't on screen. */
-    for (int i = 0; i < TOAST_MAX; i++) g_toast_box[i] = rf(0, 0, 0, 0);
-    float y = H - g_composer_h - TOAST_GAP;
-    for (int i = g_n_toast - 1; i >= 0; i--) {
-        rectf r = rf(W - TOAST_W - 20, y - TOAST_H, W - 20, y);
-        g_toast_box[i] = r;
-        /* Squared on every corner — a toast is a rectangle, not a pill — with a
-         * full-height accent stripe flush to the left edge. */
-        uint32_t accent = g_toast[i].danger ? OC_COL_DANGER : OC_COL_NOTICE;
-        uint32_t edge   = g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER;
-        float bar = 4.0f;
-        fill(rt, rf(r.left + 2, r.top + 3, r.right + 2, r.bottom + 3), OC_COL_RAIL);  /* shadow */
-        fill(rt, r, OC_COL_INPUT);
-        fill(rt, rf(r.left, r.top, r.right, r.top + 1), edge);            /* border */
-        fill(rt, rf(r.left, r.bottom - 1, r.right, r.bottom), edge);
-        fill(rt, rf(r.right - 1, r.top, r.right, r.bottom), edge);
-        fill(rt, rf(r.left, r.top, r.left + bar, r.bottom), accent);      /* stripe */
-        draw_text(rt, g_toast[i].text, g_meta,
-                  rf(r.left + 14, r.top + 6, r.right - 12, r.bottom - 6), OC_COL_TEXT);
-        y -= TOAST_H + TOAST_GAP;
-        if (y < HEADER_H + TOAST_H) break;     /* never climb into the header */
+    g_n_toast_hit = 0;
+    if (!g_fb.n) return;
+    float pane_l = g_toast_area_r > g_toast_area_l ? g_toast_area_l : RAIL_W;
+    float pane_r = g_toast_area_r > g_toast_area_l ? g_toast_area_r : W;
+    float cw = UIS(420.0f);
+    if (cw > pane_r - pane_l - 32) cw = pane_r - pane_l - 32;
+    if (cw < UIS(200.0f)) cw = UIS(200.0f);
+    float left = g_pref_toastpos == TOASTPOS_BOTTOM_CENTRE ? (pane_l + pane_r - cw) / 2 : W - cw - 20;
+    int down = g_pref_toastpos == TOASTPOS_TOP_RIGHT;          /* stacks downward from the top */
+    /* Above the composer where there is one; at the bottom of the window where
+     * the view has none (a list, a report). */
+    float floor_y = g_ed_box.right > g_ed_box.left ? H - g_composer_h : H - UIS(12.0f);
+    float edge = down ? HEADER_H + UIS(12.0f) : floor_y - TOAST_GAP;
+    uint32_t hover = 0;
+    for (int k = g_fb.n - 1; k >= 0; k--) {                    /* newest at the edge */
+        const oc_fb_toast *t = &g_fb.t[k];
+        uint32_t tint = t->kind == OC_FB_FAILED ? OC_COL_DANGER
+                      : t->kind == OC_FB_CONFIRM ? OC_COL_ONLINE : OC_COL_NOTICE;
+        int icon = t->kind == OC_FB_FAILED ? OC_ICON_ALERT : t->kind == OC_FB_CONFIRM ? OC_ICON_CHECK
+                 : t->kind == OC_FB_UNDO ? OC_ICON_UNDO : OC_ICON_INFO;
+        float aw = t->action[0] ? text_width(t->action, g_meta) + UIS(24.0f) : 0;
+        float tl = left + UIS(40.0f), tr = left + cw - UIS(36.0f) - (aw ? aw + UIS(8.0f) : 0);
+        float th = text_height(t->text, g_meta_w, tr - tl);
+        float h = th + UIS(22.0f);
+        if (h < UIS(44.0f)) h = UIS(44.0f);
+        rectf r = down ? rf(left, edge, left + cw, edge + h) : rf(left, edge - h, left + cw, edge);
+        if (down ? r.bottom > floor_y : r.top < HEADER_H) break;   /* never over the header or composer */
+        fill_round_a(rt, rf(r.left, r.top + 2, r.right, r.bottom + 3), OC_R_CONTROL, 0x000000, 0.10f);  /* soft shadow */
+        fill_round(rt, r, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, r, OC_R_CONTROL, t->kind == OC_FB_FAILED ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+        draw_lucide(rt, icon, rf(left + UIS(14.0f), r.top + (h - UIS(18.0f)) / 2, left + UIS(32.0f),
+                                 r.top + (h + UIS(18.0f)) / 2), tint);
+        draw_text(rt, t->text, g_meta_w, rf(tl, r.top + (h - th) / 2, tr, r.top + (h + th) / 2), OC_COL_TEXT);
+        rectf cl = rf(r.right - UIS(30.0f), r.top + (h - UIS(22.0f)) / 2, r.right - UIS(8.0f),
+                      r.top + (h + UIS(22.0f)) / 2);
+        int on_close = in_rect(cl, g_mouse_x, g_mouse_y);
+        if (on_close) fill_round(rt, cl, OC_R_CONTROL, OC_COL_HOVER);
+        draw_lucide(rt, OC_ICON_CLOSE, rf(cl.left + 4, cl.top + 4, cl.right - 4, cl.bottom - 4), OC_COL_MUTED);
+        rectf ab = rf(0, 0, 0, 0);
+        if (aw) {
+            ab = rf(cl.left - UIS(8.0f) - aw, r.top + (h - UIS(26.0f)) / 2, cl.left - UIS(8.0f),
+                    r.top + (h + UIS(26.0f)) / 2);
+            int hot = in_rect(ab, g_mouse_x, g_mouse_y);
+            fill_round(rt, ab, OC_R_CONTROL, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, ab, OC_R_CONTROL, OC_COL_ACCENT, 1.0f);
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, t->action, g_meta, ab, OC_COL_ACCENT);
+            g_meta->align = ST_ALIGN_LEFT;
+        }
+        if (g_n_toast_hit < OC_FB_TOASTS) {
+            g_toast_hit[g_n_toast_hit].id = t->id;
+            g_toast_hit[g_n_toast_hit].card = r;
+            g_toast_hit[g_n_toast_hit].close = cl;
+            g_toast_hit[g_n_toast_hit].action = ab;
+            g_n_toast_hit++;
+        }
+        if (in_rect(r, g_mouse_x, g_mouse_y)) hover = t->id;
+        edge = down ? r.bottom + TOAST_GAP : r.top - TOAST_GAP;
     }
+    oc_fb_hold(&g_fb, hover, fb_now());
+}
+
+/* A toast's action, by what it is (FBA_*). The draft Delete took is put back as
+ * it was, here and on the daemon. */
+static void toast_action_run(int action) {
+    if (action == FBA_UNDO_DRAFT && g_undo_draft.valid && g_client) {
+        oc_model *dm = (oc_model *)model();
+        if (!g_undo_draft.cid) {
+            oc_client_set_draft_to(g_client, g_undo_draft.to, g_undo_draft.body);
+            if (dm) oc_model_draft_local_to(dm, g_undo_draft.to, g_undo_draft.body);
+        } else {
+            oc_client_set_draft(g_client, g_undo_draft.cid, g_undo_draft.root, g_undo_draft.body);
+            if (dm) oc_model_draft_local(dm, g_undo_draft.cid, g_undo_draft.root, g_undo_draft.body);
+        }
+        g_undo_draft.valid = 0;
+        fb_confirm("Draft restored.");
+    }
+}
+
+/* A click on a toast: its action, its close, or -- anywhere else on the card --
+ * nothing, so reading one never dismisses it by accident. 1 if it was ours. */
+static int toast_click(int x, int y) {
+    for (int i = 0; i < g_n_toast_hit; i++) {
+        uint32_t id = g_toast_hit[i].id;
+        const oc_fb_toast *t = oc_fb_find(&g_fb, id);
+        if (!t) continue;
+        if (in_rect(g_toast_hit[i].action, x, y)) {
+            int act = t->action_id;
+            oc_fb_dismiss(&g_fb, id);
+            toast_action_run(act);
+            return 1;
+        }
+        if (in_rect(g_toast_hit[i].close, x, y)) { oc_fb_dismiss(&g_fb, id); return 1; }
+        if (in_rect(g_toast_hit[i].card, x, y)) return 1;
+    }
+    return 0;
 }
 
 /* What the context pane is currently showing. MEMBERS is the resting state; the
@@ -9966,7 +10100,7 @@ static int profile_open(uint64_t uid) {
     const oc_model *m = model();
     const char *nm = (m && uid) ? oc_model_user_name((oc_model *)m, uid) : NULL;
     if (!nm || !nm[0]) {
-        toast_push("That person is not in this workspace.", 1);
+        fb_failed("That person is not in this workspace.");
         return 0;
     }
     g_profile_uid = uid;
@@ -11410,7 +11544,7 @@ static void ftray_add(HWND hwnd, const char *path) {
     if (g_n_ftray == FTRAY_MAX) {
         char t[80];
         snprintf(t, sizeof t, "A message can carry %u files at most.", (unsigned)FTRAY_MAX);
-        toast_push(t, 1);
+        composer_hint(t, 1);
         return;
     }
     WCHAR wp[MAX_PATH];
@@ -11418,7 +11552,7 @@ static void ftray_add(HWND hwnd, const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (!GetFileAttributesExW(wp, GetFileExInfoStandard, &fa) ||
         (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        toast_push("That is not a file that can be attached.", 1);
+        composer_hint("That is not a file that can be attached.", 1);
         return;
     }
     uint64_t size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
@@ -11428,7 +11562,7 @@ static void ftray_add(HWND hwnd, const char *path) {
         char t[200], lim[32];
         human_bytes(OC_MAX_ATTACHMENT_SIZE, lim, sizeof lim);
         snprintf(t, sizeof t, "%.120s is larger than a message can carry (%s).", base, lim);
-        toast_push(t, 1);
+        composer_hint(t, 1);
         return;
     }
     ftray_chip *c = &g_ftray[g_n_ftray];
@@ -11462,12 +11596,12 @@ static void ftray_add_mem(HWND hwnd, const char *name, uint8_t *data, size_t len
     if (g_n_ftray == FTRAY_MAX) {
         char t[80];
         snprintf(t, sizeof t, "A message can carry %u files at most.", (unsigned)FTRAY_MAX);
-        toast_push(t, 1);
+        composer_hint(t, 1);
         free(data);
         return;
     }
     if (len > OC_MAX_ATTACHMENT_SIZE) {
-        toast_push("That image is larger than a message can carry.", 1);
+        composer_hint("That image is larger than a message can carry.", 1);
         free(data);
         return;
     }
@@ -11526,7 +11660,7 @@ static int ftray_post(const char *text) {
     uint64_t cid = m->thread_open ? m->thread_channel : g_sel;
     uint64_t root = m->thread_open ? m->thread_parent : 0;
     uint64_t tag = oc_client_post_items(g_client, cid, root, items, (size_t)n, text);
-    if (!tag) { toast_push("Those files could not be sent.", 1); return 0; }
+    if (!tag) { fb_failed("Those files could not be sent."); return 0; }
     for (int k = 0; k < n; k++) {
         ftray_chip *c = &g_ftray[ix[k]];
         c->tag = tag; c->ix = (uint8_t)k; c->failed = 0; c->shown = 0; c->done_at = 0;
@@ -11775,6 +11909,24 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
     }
 }
 
+static void composer_hint_draw(gfx *rt) {
+    if (!g_cmp_hint[0] || g_cmp_hint_anchor.right <= g_cmp_hint_anchor.left) return;
+    float th = text_height(g_cmp_hint, g_meta_w, g_cmp_hint_anchor.right - g_cmp_hint_anchor.left - UIS(40.0f));
+    rectf r = g_cmp_hint_below
+            ? rf(g_cmp_hint_anchor.left, g_cmp_hint_anchor.bottom + UIS(6.0f), g_cmp_hint_anchor.right,
+                 g_cmp_hint_anchor.bottom + th + UIS(16.0f))
+            : rf(g_cmp_hint_anchor.left, g_cmp_hint_anchor.top - th - UIS(14.0f), g_cmp_hint_anchor.right,
+                 g_cmp_hint_anchor.top - UIS(4.0f));
+    uint32_t col = g_cmp_hint_err ? OC_COL_DANGER : OC_COL_NOTICE;
+    fill_round(rt, r, OC_R_CONTROL, OC_COL_INPUT);
+    stroke_round(rt, r, OC_R_CONTROL, col, 1.0f);
+    draw_lucide(rt, g_cmp_hint_err ? OC_ICON_ALERT : OC_ICON_INFO,
+                rf(r.left + UIS(10.0f), r.top + (r.bottom - r.top - UIS(16.0f)) / 2, r.left + UIS(26.0f),
+                   r.top + (r.bottom - r.top + UIS(16.0f)) / 2), col);
+    draw_text(rt, g_cmp_hint, g_meta_w, rf(r.left + UIS(34.0f), r.top + UIS(5.0f), r.right - UIS(8.0f),
+                                           r.bottom - UIS(5.0f)), OC_COL_TEXT);
+}
+
 /* A press on a chip's × . Returns 1 if it took the click. */
 static int ftray_click(HWND hwnd, float x, float y) {
     for (int i = 0; i < g_n_ftray; i++)
@@ -11877,6 +12029,9 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
     if (cfield.right > cfield.left) ed_draw(rt, cfield);
+    g_cmp_hint_anchor = cbox;
+    g_cmp_hint_below = 0;                  /* the conversation's composer is at the bottom */
+    composer_hint_draw(rt);
 
     /* Send on the right — accent when there is something to send. A paper
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
@@ -12124,9 +12279,9 @@ static void channel_group_pick(HWND hwnd, const oc_model *m, uint64_t cid, int a
         ids[n++] = m->groups[i]->id;
     }
     if (!n) {
-        toast_push(add ? (m->n_groups ? "This channel already has every group."
+        fb_confirm(add ? (m->n_groups ? "This channel already has every group."
                                       : "There are no groups yet. An admin makes them in Admin > Groups.")
-                       : "This channel has no groups.", 0);
+                       : "This channel has no groups.");
         return;
     }
     oc_field f[1] = { { FF_SELECT, "Group", opts, "0" } };
@@ -12550,13 +12705,14 @@ static void draw_form(gfx *rt, rectf body) {
              * which it was not: both rows draw through this same line. Weight
              * now says "this is a field", colour says "this one has the
              * keyboard", and the two facts stop competing. */
-            stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
+            stroke_round(rt, box, OC_R_CONTROL,
+                         i == g_form_err_field ? OC_COL_DANGER : focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
             if (f->hint && f->hint[0])
                 draw_text(rt, f->hint, g_meta_w,
                           rf(body.left, box.bottom + 3, body.right,
                              box.bottom + 3 + form_hint_h(f->hint, body.right - body.left)),
-                          OC_COL_FAINT);
+                          i == g_form_err_field ? OC_COL_DANGER : OC_COL_FAINT);
         }
         y += rh;
     }
@@ -12784,6 +12940,7 @@ static struct {
     char quick[160];
     int  richtext;
     int  flash;
+    int  toastpos;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -12793,6 +12950,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.daysep  = g_pref_daysep;
     g_prefs_snap.notify  = g_pref_notify;
     g_prefs_snap.flash   = g_pref_flash;
+    g_prefs_snap.toastpos = g_pref_toastpos;
     g_prefs_snap.accent   = oc_theme_scheme();
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
@@ -12815,6 +12973,7 @@ static void prefs_restore(void) {
     g_pref_daysep  = g_prefs_snap.daysep;
     g_pref_notify  = g_prefs_snap.notify;
     g_pref_flash   = g_prefs_snap.flash;
+    g_pref_toastpos = g_prefs_snap.toastpos;
     if (oc_theme_scheme() != g_prefs_snap.accent) scheme_set(g_prefs_snap.accent);
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
@@ -14888,7 +15047,7 @@ static void tgt_accept(int i) {
     if (g_n_tgt_chip >= (group ? TGT_GROUP_CHIPS : TGT_MSG_CHIPS)) {
         /* A control that refuses in silence reads as a broken one: the ninth
          * Enter did nothing and said nothing about why. */
-        toast_push(group ? "Add at most 32 people at a time." : "A message goes to at most 8 people.", 0);
+        composer_hint(group ? "Add at most 32 people at a time." : "A message goes to at most 8 people.", 0);
         return;
     }
     /* A CHANNEL is a whole destination on its own: mixing "#general and @bob"
@@ -15151,7 +15310,7 @@ static int grp_pick_click(int x, int y) {
         return 1;
     }
     if (in_rect(g_grp_add_btn, x, y)) {
-        if (!grp_pick_commit()) toast_push("Choose who to add first.", 0);
+        if (!grp_pick_commit()) fb_confirm("Choose who to add first.");
         return 1;
     }
     /* A click anywhere else lets go of the keys; one on the open list's
@@ -15215,7 +15374,7 @@ static int chan_pick_click(int x, int y) {
         return 1;
     }
     if (in_rect(g_mem_pick_add, x, y)) {
-        if (!chan_pick_commit()) toast_push("Choose who to add first.", 0);
+        if (!chan_pick_commit()) fb_confirm("Choose who to add first.");
         return 1;
     }
     if (in_rect(g_mem_pick_cancel, x, y)) { mem_mode_set(MEM_NORMAL, 0); return 1; }
@@ -15241,7 +15400,7 @@ static void members_open(HWND hwnd, uint64_t cid, int adding) {
      * than seem to do nothing. */
     RECT rc; GetClientRect(hwnd, &rc);
     if (members_w(DIPF(rc.right)) <= 0)
-        toast_push("Widen the window to show the channel's members.", 0);
+        fb_confirm("Widen the window to show the channel's members.");
 }
 
 /* ---- New message (REQ-229) -------------------------------------------------
@@ -15313,6 +15472,9 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
                  edbox.right - COMPOSER_PAD, aty - COMPOSER_GAP);
     if (g_nm_ed.bottom < g_nm_ed.top + lh) g_nm_ed.bottom = g_nm_ed.top + lh;
     ed_draw(rt, g_nm_ed);
+    g_cmp_hint_anchor = edbox;
+    g_cmp_hint_below = 1;                  /* clear of the To: field and its suggestions */
+    composer_hint_draw(rt);
     /* The cue is ed_draw's — composer_cue() answers "Start a new message" for
      * this view — so it is not painted a second time here, in a colour the
      * contrast ladder would not have allowed. */
@@ -15485,7 +15647,7 @@ static void newmsg_deliver(uint64_t cid, const char *body, uint64_t at) {
         oc_client_schedule(g_client, cid, 0, at, body);
         sch_describe(at, when, sizeof when);
         snprintf(msg, sizeof msg, "Scheduled for %s \u2014 see Drafts, scheduled & sent.", when);
-        toast_push(msg, 0);
+        fb_confirm(msg);
     } else {
         oc_client_send(g_client, cid, body);
     }
@@ -15499,8 +15661,8 @@ static void newmsg_send_at(HWND hwnd, uint64_t at) {
     /* A refusal SAYS WHY. A send button that does nothing when pressed is
      * indistinguishable from one that is broken, and this one had three ways to
      * return in silence. */
-    if (!g_n_tgt_chip) { toast_push("Who is this for? Add a channel or a person above.", 0); return; }
-    if (!ed_len())     { toast_push("There is nothing to send yet.", 0); return; }
+    if (!g_n_tgt_chip) { composer_hint("Who is this for? Add a channel or a person above.", 0); return; }
+    if (!ed_len())     { composer_hint("There is nothing to send yet.", 0); return; }
     WCHAR w[DRAFT_TEXT_MAX];          /* ED_MAX + 1; asserted where ED_MAX lives */
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n <= 0) return;
@@ -15508,7 +15670,7 @@ static void newmsg_send_at(HWND hwnd, uint64_t at) {
         int only_ws = 1;
         for (int i = 0; i < n; i++)
             if (w[i] != L' ' && w[i] != L'\t' && w[i] != L'\n' && w[i] != L'\r') { only_ws = 0; break; }
-        if (only_ws) { toast_push("There is nothing to send yet.", 0); return; }
+        if (only_ws) { composer_hint("There is nothing to send yet.", 0); return; }
     }
     /* An archived channel is read-only (REQ-035). Refuse here, with the message
      * still in the box, rather than emptying the box and letting the daemon
@@ -15517,13 +15679,13 @@ static void newmsg_send_at(HWND hwnd, uint64_t at) {
         const oc_model *cm = model();
         const oc_channel *cc = cm ? oc_model_channel((oc_model *)cm, g_tgt_chip[0].id) : NULL;
         if (cc && cc->archived) {
-            toast_push("That channel is archived \u2014 it is read-only.", 1);
+            composer_hint("That channel is archived \u2014 it is read-only.", 1);
             return;
         }
     }
     /* One send at a time. A second press while the first is still waiting for its
      * conversation used to free the first message and replace it. */
-    if (g_nm_pending) { toast_push("Still sending the last one\u2026", 0); return; }
+    if (g_nm_pending) { composer_hint("Still sending the last one\u2026", 0); return; }
     int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
@@ -16645,6 +16807,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         if (!dm_index0) draw_header(rt, m, main_x, main_w);
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
+        g_toast_area_l = main_x; g_toast_area_r = main_x + main_w;
         {
             /* In the DMs view, the middle column is the PERSON list until a
              * conversation is picked — that is what makes it a destination
@@ -18035,6 +18198,7 @@ static void layout_composer(HWND hwnd);     /* fwd */
 /* Anything that CHANGED the text: re-measure the box, refresh the completion
  * popover and repaint. One place, so no key handler can forget a step. */
 static void ed_changed(HWND hwnd) {
+    g_cmp_hint[0] = '\0';                 /* an edit answers the hint */
     /* The typing indicator used to ride EN_CHANGE from the RichEdit. This is that
      * notification's replacement, and the rate limit is the same 2s. */
     DWORD now = GetTickCount();
@@ -18699,6 +18863,7 @@ enum {
     AT_VOICE,         /* payload: 0 = the microphone (talk / stop), 1 = free talk on/off */
     AT_FTRAY,         /* payload: upload-tray chip index — remove it, or cancel its post */
     AT_ADMTAB,        /* payload: Admin tab index */
+    AT_TOAST,         /* payload: toast id * 2, + 1 for its close */
     AT_ALERTACK       /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
@@ -18931,6 +19096,22 @@ static void a11y_publish_scene(const oc_model *m) {
                 }
                 acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_alertrows[i].r, ATOK(AT_ALERTACK, (uint64_t)i));
             }
+    }
+
+    /* The notices: each toast's action and close, named by what they act on, so
+     * a screen reader and the keyboard reach what the pointer does (REQ-290). */
+    for (int i = 0; i < g_n_toast_hit && n < OC_ACC_MAX; i++) {
+        const oc_fb_toast *t = oc_fb_find(&g_fb, g_toast_hit[i].id);
+        if (!t) continue;
+        char aid[OC_ACC_AID_MAX], nm[OC_FB_TEXT + 24];
+        if (t->action[0] && g_toast_hit[i].action.right > g_toast_hit[i].action.left) {
+            snprintf(aid, sizeof aid, "toast.%u.action", (unsigned)t->id);
+            snprintf(nm, sizeof nm, "%s: %s", t->action, t->text);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_toast_hit[i].action, ATOK(AT_TOAST, (uint64_t)t->id * 2));
+        }
+        snprintf(aid, sizeof aid, "toast.%u.close", (unsigned)t->id);
+        snprintf(nm, sizeof nm, "Dismiss: %s", t->text);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_toast_hit[i].close, ATOK(AT_TOAST, (uint64_t)t->id * 2 + 1));
     }
 
     /* Talking mode's toggle, with its state in the name: a button that reads
@@ -19539,7 +19720,7 @@ static void sched_at(HWND hwnd, uint64_t at) {
     sch_describe(at, when, sizeof when);
     snprintf(msg, sizeof msg, "%s for %s \u2014 see Drafts, scheduled & sent.",
              reply ? "Reply scheduled" : "Scheduled", when);
-    toast_push(msg, 0);
+    fb_confirm(msg);
     ed_changed(hwnd);
 }
 
@@ -19558,7 +19739,7 @@ static void composer_send(void) {
         const oc_model *m = model();
         const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         if (c && c->archived) {
-            toast_push("This channel is archived \u2014 it is read-only.", 1);
+            composer_hint("This channel is archived \u2014 it is read-only.", 1);
             return;
         }
     }
@@ -20063,7 +20244,7 @@ static void palette_accept(HWND hwnd) {
      * half-finished forward should not run "Upload a file…". */
     if (g_fwd_mid) {
         if (cid) forward_send(hwnd, cid);
-        else     { g_fwd_mid = g_fwd_cid = 0; toast_push("Forward cancelled.", 0); }
+        else     { g_fwd_mid = g_fwd_cid = 0; fb_confirm("Forward cancelled."); }
         g_pal_accepting = 0;
         return;
     }
@@ -20123,6 +20304,7 @@ static HWND         g_recbar;           /* the recording bar, while a screen rec
 static int          g_recbar_excluded;  /* ... and kept out of the capture */
 static float        g_vm_volume = 1.0f;      /* 0..1, Up and Down in the player */
 static uint64_t     g_vm_post_tag;            /* the last send, for its outcome toast */
+static uint32_t     g_vm_fb;                  /* its progress toast, until it ends (feedback.h) */
 static gfx_tex     *g_vm_tex;
 static int          g_vm_tw, g_vm_th;
 static uint8_t     *g_vm_px;
@@ -20215,7 +20397,7 @@ static void listen_set(HWND hwnd, int on) {
     listen_drop_player();
     g_listen_heard = 0;
     oc_client_listen(g_client, on ? g_sel : 0, on);
-    if (on) toast_push("Reading new messages aloud", 0);
+    if (on) fb_confirm("Reading new messages aloud");
     oc_a11y_announce(on ? "Reading new messages aloud" : "Stopped reading aloud");
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -20361,7 +20543,7 @@ static int dict_start(HWND hwnd, uint8_t mode) {
     g_dict = oc_dictate_start(g_client, mode, ch, root, mic, model()->stt_max_ms, &err);
     crumb("dict_start mode=%u ch=%llu root=%llu err=%d", (unsigned)mode,
           (unsigned long long)ch, (unsigned long long)root, err);
-    if (!g_dict) { toast_push(dict_error_text(err), 1); return 0; }
+    if (!g_dict) { fb_failed(dict_error_text(err)); return 0; }
     g_dict_client = g_client;
     oc_a11y_announce(mode == OC_STT_MODE_FREE ? "Free talk on" : "Listening");
     InvalidateRect(hwnd, NULL, FALSE);
@@ -20404,7 +20586,7 @@ static void dict_tick(HWND hwnd, const oc_model *m) {
     if (!m) return;
     if (m->stt_error_seq != g_dict_err_seen) {
         g_dict_err_seen = m->stt_error_seq;
-        toast_push(dict_refusal_text(m->stt_error_code), 1);
+        fb_failed(dict_refusal_text(m->stt_error_code));
     }
     if (g_view == VIEW_NEWMSG || !main_is_conversation()) return;
     uint64_t ch, root;
@@ -20456,7 +20638,7 @@ static void preview_tick(const oc_model *m) {
         GetTickCount64() - g_preview_asked_ms > 12000) {
         g_form_action_busy = 0;
         g_preview_asked_ms = 0;
-        toast_push("That voice could not be played just now.", 1);
+        fb_failed("That voice could not be played just now.");
     }
     uint8_t *mp4 = NULL;
     size_t len = 0;
@@ -20496,7 +20678,7 @@ static void profile_voice_picked(int field, int val) {
 static void profile_voice_play(int field) {
     if (field != 6 || !g_client) return;
     int val = atoi(g_form_f[field].value);
-    if (val <= 0) { toast_push("Pick a voice first \u2014 \u201cAutomatic\u201d is chosen by the server.", 0); return; }
+    if (val <= 0) { fb_confirm("Pick a voice first \u2014 \u201cAutomatic\u201d is chosen by the server."); return; }
     const char *id = voice_id_at(model(), val);
     if (!id[0]) return;
     preview_drop();
@@ -20704,7 +20886,7 @@ static void vm_open_player(HWND hwnd, const oc_attachment *at) {
     if (d) {
         g_vplayer = oc_player_open(d, n);
         if (g_vplayer) { oc_player_volume(g_vplayer, g_vm_muted ? 0.0f : g_vm_volume); oc_player_play(g_vplayer); }
-        else toast_push("This video could not be played", 1);
+        else fb_failed("This video could not be played");
         g_vplay_loading = 0;
     } else {
         g_vplay_loading = 1;
@@ -20722,7 +20904,7 @@ static int vm_take_bytes(uint64_t id, uint8_t *d, size_t n) {
     g_vplay_loading = 0;
     g_vplayer = cd ? oc_player_open(cd, cn) : NULL;
     if (g_vplayer) { oc_player_volume(g_vplayer, g_vm_muted ? 0.0f : g_vm_volume); oc_player_play(g_vplayer); }
-    else toast_push("This video could not be played", 1);
+    else fb_failed("This video could not be played");
     return 1;
 }
 
@@ -20743,7 +20925,7 @@ static void vm_send(HWND hwnd) {
                                          (uint16_t)g_rec_res.height, cap);
     g_rec_res.video = g_rec_res.poster = NULL;        /* the core owns them now */
     if (cap[0]) ed_clear();
-    toast_push("Sending video message\xE2\x80\xA6", 0);
+    g_vm_fb = fb_progress("Sending video message\xE2\x80\xA6");
     vm_close(hwnd);
 }
 
@@ -20925,10 +21107,16 @@ static void vm_command(HWND hwnd, int cmd) {
 static void vm_tick(HWND hwnd, const oc_model *m) {
     if (m && g_vm_post_tag) {
         if (m->media_posted_tag == g_vm_post_tag) {
-            toast_push("Video message sent", 0);
+            if (g_vm_fb) oc_fb_update(&g_fb, g_vm_fb, OC_FB_CONFIRM, "Video message sent.", fb_now());
+        else fb_confirm("Video message sent.");
+        g_vm_fb = 0;
             g_vm_post_tag = 0;
         } else if (m->xfer_tag == g_vm_post_tag && m->xfer_phase == 2) {
-            toast_push(m->status[0] ? m->status : "The video message could not be sent", 1);
+            {
+            const char *why = m->status[0] ? m->status : "The video message could not be sent.";
+            if (g_vm_fb) oc_fb_update(&g_fb, g_vm_fb, OC_FB_FAILED, why, fb_now()); else fb_failed(why);
+            g_vm_fb = 0;
+        }
             g_vm_post_tag = 0;
         }
     }
@@ -21879,7 +22067,7 @@ static void msg_menu_run(HWND hwnd, int cmd) {
         snprintf(link, sizeof link, "openchime://%s/c/%llu/m/%llu", linkhost,
                  (unsigned long long)chan, (unsigned long long)mid);
         copy_to_clipboard(hwnd, link);
-        toast_push("Link copied.", 0);
+        fb_confirm("Link copied.");
     } else if (cmd == 107) {
         /* The cursor is exclusive — it names the last message READ — so marking this
          * message unread means setting it to the id before it. Not mid - 1: ids are
@@ -21903,7 +22091,7 @@ static void msg_menu_run(HWND hwnd, int cmd) {
             g_unread_from = prev;
             g_unread_count = uc ? uc->unread : 0;
         }
-        toast_push("Marked unread.", 0);
+        fb_confirm("Marked unread.");
     } else if (cmd == 106) {
         /* The palette picks the destination: it already lists every conversation
          * with a filter, so a forward needs no picker of its own. */
@@ -21913,7 +22101,7 @@ static void msg_menu_run(HWND hwnd, int cmd) {
         /* Private, so there is no "unsave" state to reflect here — the Later view
          * is where you remove one. */
         oc_client_save_item(g_client, mid, OC_SAVE_ADD);
-        toast_push("Saved to Later.", 0);
+        fb_confirm("Saved to Later.");
     } else if (cmd == 103) {
         oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
@@ -22148,7 +22336,7 @@ static void forward_send(HWND hwnd, uint64_t to_cid) {
     if (!m || !g_client || !g_fwd_mid || !to_cid) return;
     const oc_channel *src = oc_model_channel((oc_model *)m, g_fwd_cid);
     const oc_msg *msg = find_msg(src, g_fwd_mid);
-    if (!msg) { toast_push("That message is no longer loaded.", 1); g_fwd_mid = 0; return; }
+    if (!msg) { fb_failed("That message is no longer loaded."); g_fwd_mid = 0; return; }
 
     /* The attribution is NOT prose in the body (REQ-057). The two source ids
      * travel with the send and the daemon resolves the author, the excerpt and
@@ -22170,7 +22358,7 @@ static void forward_send(HWND hwnd, uint64_t to_cid) {
     } else {
         snprintf(note, sizeof note, "Forwarded to #%s.", (dst && dst->name[0]) ? dst->name : "channel");
     }
-    toast_push(note, 0);
+    fb_confirm(note);
     g_fwd_mid = g_fwd_cid = 0;
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -22180,7 +22368,7 @@ static void forward_send(HWND hwnd, uint64_t to_cid) {
 static int permalink_follow(HWND hwnd, const char *text) {
     char host[256]; uint64_t chan = 0, mid = 0;
     if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
-    if (!g_client) { toast_push("Sign in to open a link.", 1); return 1; }
+    if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
     /* A different workspace is a real case and we do not guess: switching would
      * drop what you are reading, and we may not even hold that workspace. */
     char self[288];
@@ -22192,12 +22380,12 @@ static int permalink_follow(HWND hwnd, const char *text) {
     if (host[0] && self[0] && _stricmp(host, self) != 0 && _stricmp(host, g_host) != 0) {
         char msg[256];
         snprintf(msg, sizeof msg, "That link is for %s \u2014 switch workspace first.", host);
-        toast_push(msg, 1);
+        fb_failed(msg);
         return 1;
     }
     const oc_model *m = model();
     if (!m || !oc_model_channel((oc_model *)m, chan)) {
-        toast_push("That conversation is not one you can see.", 1);
+        fb_failed("That conversation is not one you can see.");
         return 1;
     }
     g_view = VIEW_HOME;
@@ -22371,7 +22559,7 @@ static int on_click(HWND hwnd, int x, int y) {
         if (in_rect(g_nm_send, x, y)) { newmsg_send_at(hwnd, 0); return 1; }
         if (in_rect(g_nm_sched, x, y)) {
             if (g_n_tgt_chip && ed_len()) sched_menu_open(x, y);
-            else toast_push("Choose who this is for, and write something to send.", 0);
+            else composer_hint("Choose who this is for, and write something to send.", 0);
             return 1;
         }
         if (in_rect(g_nm_emoji, x, y)) { g_nm_to_focus = 0; ed_focus(hwnd); picker_open(hwnd, 0); return 1; }
@@ -22380,7 +22568,7 @@ static int on_click(HWND hwnd, int x, int y) {
             /* An attachment needs a conversation to hang on, and this pane does
              * not have one until the send resolves it. Say so, rather than
              * opening a file dialog whose result has nowhere to go. */
-            toast_push("Choose who this is for first \u2014 then you can attach a file.", 0);
+            composer_hint("Choose who this is for first \u2014 then you can attach a file.", 0);
             return 1;
         }
         if (in_rect(g_nm_ed, x, y)) { g_nm_to_focus = 0; ed_focus(hwnd); ed_mouse_down(hwnd, (float)x, (float)y); return 1; }
@@ -22592,7 +22780,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     p2 = e + 1;
                 }
                 oc_client_set_keywords(g_client, terms, n);
-                toast_push(n ? "Keywords saved." : "Keywords cleared.", 0);
+                fb_confirm(n ? "Keywords saved." : "Keywords cleared.");
                 return 1;
             }
             /* Priority people, by display name — the roster resolves them, and a
@@ -22633,8 +22821,8 @@ static int on_click(HWND hwnd, int x, int y) {
                 if (missing[0]) {
                     char msg[160];
                     snprintf(msg, sizeof msg, "No such person: %s", missing);
-                    toast_push(msg, 1);
-                } else toast_push(n ? "Priority people saved." : "Priority people cleared.", 0);
+                    fb_failed(msg);
+                } else fb_confirm(n ? "Priority people saved." : "Priority people cleared.");
                 return 1;
             }
             for (int i = 0; i < g_n_notify_hits; i++)
@@ -22710,7 +22898,6 @@ static int on_click(HWND hwnd, int x, int y) {
                     /* Join and stay: the directory is a place you browse, so it does
                      * not close under you on the first join. */
                     oc_client_join_channel(g_client, cid);
-                    toast_push("Joined.", 0);
                 } else {
                     modal_finish(1);          /* Open means leave the directory */
                     g_view = VIEW_HOME;
@@ -22814,6 +23001,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
+            case PREF_ROW_TOASTPOS: g_pref_toastpos = v; break;
             case PREF_ROW_DELIVER: g_pref_deliver = v; break;
             case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
             case PREF_ROW_CLOSE:   g_pref_close = v; break;
@@ -22910,14 +23098,13 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     /* Toasts are painted above everything, so they must be hit-tested above
-     * everything too — otherwise a toast over the composer eats a click it
-     * appears to own. Clicking one dismisses it. */
-    for (int i = g_n_toast - 1; i >= 0; i--)
-        if (pt_in(g_toast_box[i], x, y)) { toast_drop(i); return 1; }
-    /* Banner "Retry now": cut short the net thread's backoff sleep. */
+     * everything too -- otherwise a toast over the composer eats a click it
+     * appears to own. */
+    if (toast_click(x, y)) return 1;
+    /* The banner's button: for the connection, cut short the net thread's
+     * backoff sleep. The banner itself says what happens next. */
     if (g_banner_on && pt_in(g_retry_btn, x, y)) {
-        if (g_client) oc_client_reconnect(g_client);
-        toast_push("Reconnecting\xE2\x80\xA6", 0);
+        if (g_banner_action == FBA_RETRY && g_client) oc_client_reconnect(g_client);
         return 1;
     }
     /* An open dropdown menu takes clicks first: a row runs its command; a click
@@ -23197,8 +23384,7 @@ static int on_click(HWND hwnd, int x, int y) {
      * first or the menu swallows it. It only exists while retrying is
      * meaningful — see draw_sidebar. */
     if (in_rect(g_ws_dot, x, y)) {
-        oc_client_reconnect(g_client);
-        toast_push("Reconnecting\u2026", 0);
+        oc_client_reconnect(g_client);      /* the connection banner says what happens next */
         return 1;
     }
     if (in_rect(g_ws_hdr_btn, x, y))  { open_ws_menu(hwnd); return 1; }
@@ -23404,7 +23590,7 @@ static int on_click(HWND hwnd, int x, int y) {
         if (in_rect(g_fwd_hits[i].r, x, y)) {
             const oc_model *fm = model();
             if (!fm || !oc_model_channel((oc_model *)fm, g_fwd_hits[i].chan)) {
-                toast_push("That conversation is not one you can see.", 1);
+                fb_failed("That conversation is not one you can see.");
                 return 1;
             }
             g_view = VIEW_HOME;
@@ -23594,7 +23780,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     char why[200];
                     const char *nm = oc_model_user_name((oc_model *)pm, uid);
                     via_group_reason(why, sizeof why, nm && nm[0] ? nm : "They", vg->handle);
-                    toast_push(why, 1);
+                    fb_failed(why);
                 } else {
                     oc_client_channel_kick(g_client, g_sel, uid);
                 }
@@ -24109,7 +24295,7 @@ static void cert_q_copy(HWND hwnd) {
     char fp[128];
     if (oc_fingerprint_format(g_trust.fp, 0, fp, sizeof fp) != 0) return;
     copy_to_clipboard(hwnd, fp);
-    toast_push("Fingerprint copied", 0);
+    fb_confirm("Fingerprint copied");
 }
 
 /* Windows' own certificate viewer -- the one its administrators know -- over the
@@ -24459,7 +24645,7 @@ static void ws_load(int i) {
     g_port = w->port;
     /* Cross-workspace leftovers: a selection, an edit or a toast from the other
      * workspace means nothing here. */
-    g_has_sel = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+    g_has_sel = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
     g_menu = MENU_NONE; g_more_open = 0; submenu_close();
     /* And the composer shows THIS workspace's draft for its conversation, or
      * nothing — never the text left over from the one parked above. Restoring also
@@ -24580,7 +24766,7 @@ static void reset_session(void) {
     }
     g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE; submenu_close();
-    g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
+    g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
 }
 
 /* Sign back in to a workspace we already know: the book has its address and the
@@ -24857,7 +25043,7 @@ static void signin_poll(HWND hwnd) {
         ws_save_active();
         g_client = g_si_client; g_si_client = NULL;
         g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
-        g_n_backfilled = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+        g_n_backfilled = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
         g_si_overlay = 0;
         g_si_connecting = 0;
         g_si_browser = 0;
@@ -25010,6 +25196,7 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
         int seeded = g_form_seeded, cancel = g_form_seed_cancel;
         g_form_seeded = 0; g_form_seed_cancel = 0;
         g_form_side.on = 0;
+        g_form_err_field = -1;
         if (cancel) return 0;
         for (int i = 0; i < n && i < seeded; i++)
             snprintf(f[i].value, sizeof f[i].value, "%s", g_form_seed[i]);
@@ -25103,6 +25290,7 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
     for (int i = 0; i < n; i++)
         if (g_form_edit[i]) { DestroyWindow(g_form_edit[i]); g_form_edit[i] = NULL; }
     g_form_sel_field = -1;
+    g_form_err_field = -1;                 /* the next form starts with nothing wrong */
     g_form_f = NULL; g_form_n = 0;
     g_form_side.on = 0;
     g_form_side.up_btn = g_form_side.rm_btn = rf(0, 0, 0, 0);
@@ -25181,23 +25369,28 @@ static void invite_people(HWND hwnd, uint8_t role) {
              by_token ? " Leave it empty to make a one-time invite token for a password "
                         "account instead." : "");
     oc_field f[1] = { { FF_TEXT, "Email address", hint, "" } };
-    if (!form_dialog(hwnd, role == OC_ROLE_ADMIN ? "Invite people as admin" : "Invite people",
-                     f, 1)) return;
-    {   /* checked as it will be sent: without the spaces a paste brings along */
-        char *v = f[0].value, *b = v;
-        while (*b == ' ' || *b == '\t') b++;
-        size_t n = strlen(b);
-        while (n && (b[n - 1] == ' ' || b[n - 1] == '\t' || b[n - 1] == '\r' || b[n - 1] == '\n')) n--;
-        memmove(v, b, n);
-        v[n] = '\0';
-    }
-    if (!f[0].value[0] && !by_token) {
-        toast_push("An email address is needed to invite someone here.", 1);
-        return;
-    }
-    if (f[0].value[0] && !oc_email_plausible(f[0].value)) {
-        toast_push("That does not look like an email address.", 1);
-        return;
+    for (;;) {
+        int seeded = g_form_seeded;
+        if (!form_dialog(hwnd, role == OC_ROLE_ADMIN ? "Invite people as admin" : "Invite people",
+                         f, 1)) return;
+        {   /* checked as it will be sent: without the spaces a paste brings along */
+            char *v = f[0].value, *b = v;
+            while (*b == ' ' || *b == '\t') b++;
+            size_t n = strlen(b);
+            while (n && (b[n - 1] == ' ' || b[n - 1] == '\t' || b[n - 1] == '\r' || b[n - 1] == '\n')) n--;
+            memmove(v, b, n);
+            v[n] = '\0';
+        }
+        const char *why = (!f[0].value[0] && !by_token) ? "An email address is needed to invite someone here."
+                        : (f[0].value[0] && !oc_email_plausible(f[0].value))
+                          ? "That does not look like an email address." : NULL;
+        if (!why) break;
+        /* Said at the field, and the form asked again with what was typed: a
+         * problem with a value belongs on the value (REQ-263). A run the
+         * harness filled in has no second form to show, so it says so instead. */
+        if (seeded) { fb_failed(why); return; }
+        f[0].hint = why;
+        g_form_err_field = 0;
     }
     oc_client_invite(g_client, role, f[0].value);
     g_await_invite = 1;
@@ -25231,7 +25424,7 @@ static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
     close_overlays();
     g_client = NULL;           /* not a stop: the old client lives on in its slot */
     g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
-    g_n_backfilled = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+    g_n_backfilled = 0; g_edit_msg = 0; g_fb.n = 0; g_err_seen[0] = '\0';
     g_view = VIEW_HOME;
     if (!connect_start(ws, cred ? cred : "")) {
         /* Nothing is running now, so the sign-in view is where the user can act:
@@ -25436,7 +25629,8 @@ static void prefs_save(void) {
         /* Calls: noise suppression, and the devices by a hash of their ids --
          * an id this machine lacks matches nothing here, which is the default. */
         at = strlen(enc);
-        snprintf(enc + at, sizeof enc - at, ";z:%d;o:%u;p:%u", g_call_ns, g_call_mic_h, g_call_spk_h);
+        snprintf(enc + at, sizeof enc - at, ";z:%d;o:%u;p:%u;e:%d", g_call_ns, g_call_mic_h, g_call_spk_h,
+                 g_pref_toastpos);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -25478,6 +25672,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'g') g_pref_close = (val == CLOSE_HIDES) ? CLOSE_HIDES : CLOSE_QUITS;
             else if (k == 'i') g_pref_min_tray = val ? 1 : 0;
             else if (k == 'z') g_call_ns = val ? 1 : 0;
+            else if (k == 'e') g_pref_toastpos = (val < 0 || val > 2) ? TOASTPOS_BOTTOM_CENTRE : val;
             else if (k == 'o') g_call_mic_h = (uint32_t)strtoul(p + 2, NULL, 10);
             else if (k == 'p') g_call_spk_h = (uint32_t)strtoul(p + 2, NULL, 10);
             else if (k == 'q') {
@@ -26197,7 +26392,7 @@ static int share_begin(HWND hwnd, const char *id, const char *name) {
     const oc_model *m = model();
     if (!call_here(m) || !g_call_engine) return 0;
     if (oc_call_engine_share_start(g_call_engine, id, 1920, 1080) != 0) {
-        toast_push("Screen sharing could not start.", 1);
+        fb_failed("Screen sharing could not start.");
         return 0;
     }
     snprintf(g_share_id, sizeof g_share_id, "%s", id);
@@ -26244,11 +26439,11 @@ static void share_tick(HWND hwnd) {
             char t[160];
             snprintf(t, sizeof t, "%s is sharing now, so your screen is no longer shared.", (sn && sn[0]) ? sn : "Someone");
             share_end(0);
-            toast_push(t, 0);
+            fb_confirm(t);
         } else if (st.share_state == 0) {
             share_end(1);                              /* the source went away, or never opened */
             g_share_err_until = GetTickCount64() + 8000;
-            toast_push("Screen sharing stopped.", 1);
+            fb_failed("Screen sharing stopped.");
         } else {
             shareborder_place();                       /* a shared window moves */
         }
@@ -26261,7 +26456,7 @@ static void share_tick(HWND hwnd) {
             snprintf(t, sizeof t, "%s started sharing their screen", (sn && sn[0]) ? sn : "Someone");
             oc_a11y_announce(t);
             /* A toast only when the call is not on screen: there, the picture says it. */
-            if (!(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id)) toast_push(t, 0);
+            if (!(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id)) fb_confirm(t);
         }
         if (!sharer || sharer == m->user_id) { share_tex_drop(); g_share_full = 0; }
         g_share_actual = 0;
@@ -26384,7 +26579,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     /* Pausing notifications (REQ-278). Presets are durations, as Slack's
      * are; "until tomorrow" resolves against the LOCAL clock here, which is the
      * whole reason the wire carries minutes rather than an instant. */
-    case 57: oc_client_set_snooze(g_client, 0);   toast_push("Notifications resumed.", 0); break;
+    case 57: oc_client_set_snooze(g_client, 0);   fb_confirm("Notifications resumed."); break;
     case 58: oc_client_set_snooze(g_client, 30);  break;
     case 59: oc_client_set_snooze(g_client, 60);  break;
     case 62: oc_client_set_snooze(g_client, 120); break;
@@ -26427,7 +26622,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             time_t now = time(NULL); struct tm tv;
             int tomorrow = oc_localtime_r(&now, &tv) && (hh * 60 + mm) <= (tv.tm_hour * 60 + tv.tm_min);
             snprintf(msg, sizeof msg, "Notifications paused until %s%s.", lbl, tomorrow ? " tomorrow" : "");
-            toast_push(msg, 0);
+            fb_confirm(msg);
         }
         break;
     }
@@ -26441,7 +26636,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!m || !form_dialog(hwnd, "New direct message", f, 1) || !f[0].value[0]) break;
         uint64_t id = oc_model_user_id(m, f[0].value);
         /* An unknown name used to do nothing at all, which looked like a bug. */
-        if (!id) { toast_push("No such user in this workspace.", 1); break; }
+        if (!id) { fb_failed("No such user in this workspace."); break; }
         g_view = VIEW_HOME;
         open_dm_go(id);
         break; }
@@ -26580,7 +26775,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             if (um->channels[i].kind == OC_CHANNEL_KIND_DM &&
                 um->channels[i].peer_id == um->user_id) { up = um->channels[i].channel_id; break; }
         if (!up) up = g_sel;
-        if (!up) { toast_push("Open a conversation first.", 1); break; }
+        if (!up) { fb_confirm("Open a conversation first."); break; }
         oc_client_upload_avatar(g_client, up, path);
         break; }
     case 56:                                   /* */
@@ -26589,7 +26784,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 31: {   /* the workspace's own page, in the browser (AUTH.md §8.10) */
         char url[1200];
         if (oc_client_open_page(g_client, "account/password", NULL, url, sizeof url) == 0) signin_open_url(url);
-        else toast_push("Couldn't open the password page. Try again once you're connected.", 1);
+        else fb_failed("Couldn't open the password page. Try again once you're connected.");
         break; }
     case 40: invite_people(hwnd, OC_ROLE_MEMBER); break;
     case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;
@@ -26635,7 +26830,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         char msg[64];
         snprintf(msg, sizeof msg, n ? "Marked %d conversation%s read." : "Nothing unread.",
                  n, n == 1 ? "" : "s");
-        toast_push(msg, 0);
+        fb_confirm(msg);
         break; }
     case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
@@ -26682,7 +26877,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             if (em->channels[i].kind == OC_CHANNEL_KIND_DM &&
                 em->channels[i].peer_id == em->user_id) { up = em->channels[i].channel_id; break; }
         if (!up) up = g_sel;
-        if (!up) { toast_push("Open a conversation first.", 1); break; }
+        if (!up) { fb_confirm("Open a conversation first."); break; }
         oc_client_upload_emoji(g_client, up, name, path);
         break; }
     case 83:      /* REQ-056: a group DM — open the picker */
@@ -26700,14 +26895,14 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         break;
     case 82: {   /* 82 because 10 and 11 are the presence items */
         if (g_sb.n_custom >= (int)OC_SB_CUSTOM_MAX) {
-            toast_push("You already have 8 sections.", 1);
+            fb_failed("You already have 8 sections.");
             break;
         }
         oc_field f[1] = { { FF_TEXT, "Section name",
                             "A heading in your sidebar. Only you see it.", "" } };
         if (!form_dialog(hwnd, "New section", f, 1) || !f[0].value[0]) break;
         if (oc_sidebar_section_add(&g_sb, f[0].value) < 0)
-            toast_push("That name is not usable.", 1);
+            fb_failed("That name is not usable.");
         else
             sidebar_opts_save();
         break; }
@@ -26889,7 +27084,7 @@ static void channel_menu_run(HWND hwnd, int cmd) {
         break; }
     case 30:                                   /* */
         if (oc_sidebar_toggle_star(&g_sb, cid)) sidebar_opts_save();
-        else toast_push("Starred is full (32).", 1);
+        else fb_failed("Starred is full (32).");
         break;
     case 1:  oc_client_join_channel(g_client, cid); break;
     case 2:  oc_client_mark_read(g_client, cid); break;
@@ -26921,7 +27116,7 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     default:
         if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
             if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
-            else toast_push("That section is full (32).", 1);
+            else fb_failed("That section is full (32).");
         }
         break;
     }
@@ -27310,8 +27505,14 @@ static void test_dump(const char *path) {
             g_mic_btn.left, g_mic_btn.top, g_mic_btn.right, g_mic_btn.bottom,
             g_freetalk_btn.left, g_freetalk_btn.top, g_freetalk_btn.right, g_freetalk_btn.bottom);
     /* The toasts on screen: how a refusal is told, so a test can read it. */
-    for (int i = 0; i < g_n_toast; i++)
-        fprintf(f, "toast[%d] danger=%d \"%s\"\n", i, g_toast[i].danger, g_toast[i].text);
+    for (int i = 0; i < g_fb.n; i++)
+        fprintf(f, "toast[%d] danger=%d kind=%d action=\"%s\" \"%s\"\n", i, g_fb.t[i].kind == OC_FB_FAILED,
+                g_fb.t[i].kind, g_fb.t[i].action, g_fb.t[i].text);
+    {
+        const oc_fb_banner *bn = oc_fb_banner_top(&g_fb);
+        if (bn) fprintf(f, "banner id=%d severity=%d \"%s\"\n", bn->id, bn->severity, bn->text);
+    }
+    if (g_cmp_hint[0]) fprintf(f, "hint error=%d \"%s\"\n", g_cmp_hint_err, g_cmp_hint);
     /* A voice's audition (REQ-292): whether one is playing, and whether audio
      * reaches a device -- the same distinction the listen line draws. */
     {
@@ -29240,7 +29441,7 @@ static void unresolved_notice(HWND hwnd, const oc_model *m, int update) {
         char t[256];
         snprintf(t, sizeof t, "%s %s not in this conversation.",
                  names, several ? "are" : "is");
-        toast_push(t, 1);   /* a toast cannot grow: an update says it again, whole */
+        fb_failed(t);   /* a toast cannot grow: an update says it again, whole */
     }
 }
 
@@ -29255,6 +29456,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
     case WM_CREATE:
+        oc_fb_init(&g_fb, fb_say);
         /* Before any child: the provider must exist by the time the first
          * WM_GETOBJECT arrives, and a screen reader may ask immediately. */
         oc_a11y_init(hwnd);
@@ -29518,7 +29720,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 open_new_message(hwnd);
                 ed_set(back);
                 ed_changed(hwnd);
-                toast_push("That conversation could not be opened \u2014 your message is back here.", 1);
+                fb_failed("That conversation could not be opened \u2014 your message is back here.");
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             if (g_nm_pending) {
@@ -29910,7 +30112,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     /* Asked and it still did not arrive: it is not in a channel
                      * we can read, or it is gone. */
                     g_jump_mid = 0; g_jump_fetched = 0;
-                    toast_push("Could not find that message.", 1);
+                    fb_failed("Could not find that message.");
                 }
             }
             if (!g_jump_mid) g_jump_fetched = 0;
@@ -30015,7 +30217,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     layout_composer(hwnd);
                     char msg[160];
                     snprintf(msg, sizeof msg, "Signed out of %s.", label[0] ? label : ws);
-                    toast_push(msg, 0);
+                    fb_confirm(msg);
                 } else {
                     signin_begin(hwnd, ws, NULL);
                 }
@@ -30889,6 +31091,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else                          menu_dispatch(hwnd, cmd);
             }
             break;
+        case AT_TOAST: {
+            uint32_t tid = (uint32_t)(arg / 2);
+            const oc_fb_toast *t = oc_fb_find(&g_fb, tid);
+            if (t && (arg & 1)) oc_fb_dismiss(&g_fb, tid);
+            else if (t) { int act = t->action_id; oc_fb_dismiss(&g_fb, tid); toast_action_run(act); }
+            break;
+        }
         case AT_ADMTAB:
             if (g_view == VIEW_ADMIN && (int)arg < ADM_COUNT) admin_select((int)arg);
             break;

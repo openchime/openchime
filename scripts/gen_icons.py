@@ -50,6 +50,10 @@ ICONS = [
     ("MINIMIZE", "minimize"),
     ("ALERT",    "triangle-alert"),
     ("SHIELD_ALERT","shield-alert"),
+    ("CHECK",    "circle-check"),
+    ("INFO",     "info"),
+    ("CLOSE",    "x"),
+    ("UNDO",     "undo-2"),
 ]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SVGDIR = os.path.join(ROOT, "third_party", "lucide", "icons")
