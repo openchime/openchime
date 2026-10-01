@@ -914,6 +914,23 @@ static void test_badge_tiers(void) {
     oc_model_free(&m);
 }
 
+/* Disconnected, nobody reads as present -- yourself least of all: what the model
+ * holds is what it was when the line dropped. Back, it is what it says again. */
+static void test_presence_offline(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_AUTH_OK; e.user_id = 1; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_PRESENCE; e.user_id = 1; e.status = OC_PRESENCE_ONLINE; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_PRESENCE; e.user_id = 2; e.status = OC_PRESENCE_AWAY; oc_model_apply(&m, &e);
+    CHECK(oc_model_presence_of(&m, 1) == OC_PRESENCE_ONLINE && oc_model_presence_of(&m, 2) == OC_PRESENCE_AWAY);
+    m.authed = false;                                       /* the line drops */
+    CHECK(oc_model_presence_of(&m, 1) == OC_PRESENCE_OFFLINE && oc_model_presence_of(&m, 2) == OC_PRESENCE_OFFLINE);
+    m.authed = true;
+    CHECK(oc_model_presence_of(&m, 2) == OC_PRESENCE_AWAY);
+    oc_model_free(&m);
+}
+
 static void test_srvalerts_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -1359,6 +1376,7 @@ static void test_sidebar(void) {
         memset(&ge, 0, sizeof ge);
         ge.type = OC_EV_PRESENCE; ge.user_id = 3; ge.status = OC_PRESENCE_ONLINE;
         oc_model_apply(&m, &ge);
+        m.authed = true;                         /* presence means something only while connected */
         an = oc_model_sidebar(&m, &a2, ar, 16);
         saw_group = 0;
         for (size_t i = 0; i < an; i++)
@@ -3924,6 +3942,7 @@ int run_client_core_tests(void) {
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
     test_srvalerts_model();
+    test_presence_offline();
     test_restore_model();
     test_badge_tiers();
     test_osnotify_null();
