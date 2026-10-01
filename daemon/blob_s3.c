@@ -16,10 +16,12 @@
  * still reachable with an explicit `http://` scheme or a non-443 port, for a
  * local S3 implementation on a private network.
  *
- * NOTE: this backend does blocking network I/O; the daemon currently drives it
- * from the net thread, which is fine for the local-FS default but means a slow
- * S3 endpoint can stall the event loop. Moving blob I/O to a dedicated transfer
- * worker (ARCH-69) is the prerequisite for S3 under concurrent load. */
+ * This backend does blocking network I/O, and runs where every blob operation
+ * runs: on the transfer workers (daemon/xferpool.c, ARCH-69) -- opens, reads,
+ * writes, commits and deletes alike -- so a slow endpoint holds a worker, never
+ * the event loop. The blob store counts any operation made on the loop's thread
+ * (oc_blobstore_loop_ops), and a test holds that count to zero through a slow
+ * transfer. */
 
 #include "blob_backend.h"
 #include "sigv4.h"
