@@ -29,6 +29,7 @@
 #include "e2e_hpke.h"
 #include "e2e_sframe.h"
 #include "osnotify.h"
+#include "feedback.h"
 #include "check.h"
 #include "testpki.h"
 #include "issuer.h"       /* mints what central would, for the browser sign-in test */
@@ -784,6 +785,57 @@ static void test_new_channel_takes_the_default_level(void) {
 /* The daemon's critical failures in the model (REQ-263): nothing until a summary
  * says this is an owner or admin; the counts; a list that replaces the last;
  * and a new session that starts from nothing again. */
+/* In-app feedback (feedback.h): each kind's lifetime, a repeat refreshing
+ * rather than stacking, what goes when full, holding, progress ending as a
+ * result, and banners by severity -- with what was said, and how loudly. */
+static char g_fb_said[8][OC_FB_TEXT];
+static int  g_fb_loud[8], g_fb_n_said;
+static void fb_say(const char *text, int assertive) {
+    if (g_fb_n_said < 8) { snprintf(g_fb_said[g_fb_n_said], OC_FB_TEXT, "%s", text); g_fb_loud[g_fb_n_said++] = assertive; }
+}
+static void test_feedback(void) {
+    oc_fb f; oc_fb_init(&f, fb_say);
+    uint64_t t = 1000;
+    uint32_t a = oc_fb_show(&f, OC_FB_CONFIRM, "Link copied.", NULL, 0, t);
+    CHECK(a && f.n == 1 && f.t[0].deadline_ms == t + 4000);
+    CHECK(g_fb_n_said == 1 && !g_fb_loud[0] && !strcmp(g_fb_said[0], "Link copied."));
+    CHECK(oc_fb_show(&f, OC_FB_CONFIRM, "Link copied.", NULL, 0, t + 3000) == a && f.n == 1);   /* again: refreshed */
+    CHECK(f.t[0].deadline_ms == t + 7000 && g_fb_n_said == 2);
+    CHECK(oc_fb_duration_ms(OC_FB_CONFIRM, "a sentence that runs well past forty characters, as some do") > 4000);
+    CHECK(oc_fb_duration_ms(OC_FB_CONFIRM, "x") == 4000 && oc_fb_duration_ms(OC_FB_UNDO, "x") == 10000);
+    CHECK(oc_fb_duration_ms(OC_FB_FAILED, "x") == 0 && oc_fb_duration_ms(OC_FB_PROGRESS, "x") == 0);
+    uint32_t fail = oc_fb_show(&f, OC_FB_FAILED, "Screen sharing could not start.", NULL, 0, t);
+    CHECK(g_fb_loud[2] == 1);                                                     /* a failure, said assertively */
+    uint32_t prog = oc_fb_show(&f, OC_FB_PROGRESS, "Sending video message…", NULL, 0, t);
+    CHECK(f.n == 3);
+    /* Full: a fourth sends the confirmation away, never the failure or progress. */
+    uint32_t und = oc_fb_show(&f, OC_FB_UNDO, "Draft deleted", "Undo", 7, t);
+    CHECK(f.n == 3 && !oc_fb_find(&f, a) && oc_fb_find(&f, fail) && oc_fb_find(&f, prog) && oc_fb_find(&f, und));
+    CHECK(!strcmp(oc_fb_find(&f, und)->action, "Undo") && oc_fb_find(&f, und)->action_id == 7);
+    /* Time passes: failures and progress stay; Undo held while pointed at. */
+    oc_fb_hold(&f, und, t + 9000);
+    CHECK(!oc_fb_tick(&f, t + 60000) && oc_fb_find(&f, und));
+    oc_fb_hold(&f, 0, t + 60000);                                                  /* the pointer leaves: 2 s more */
+    CHECK(!oc_fb_tick(&f, t + 61000) && oc_fb_tick(&f, t + 62500) && !oc_fb_find(&f, und));
+    CHECK(oc_fb_find(&f, fail) && oc_fb_find(&f, prog));
+    /* Progress ends as a confirmation, which then leaves by itself. */
+    CHECK(oc_fb_update(&f, prog, OC_FB_CONFIRM, "Video message sent", t + 70000));
+    CHECK(oc_fb_tick(&f, t + 74100) && !oc_fb_find(&f, prog) && oc_fb_find(&f, fail));
+    oc_fb_dismiss(&f, fail);
+    CHECK(f.n == 0 && !oc_fb_update(&f, prog, OC_FB_CONFIRM, "x", t));
+    /* Banners: the most severe shows; a repeat of the same state is not said again. */
+    int said = g_fb_n_said;
+    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost — reconnecting in 3s…", "Retry now", 9);
+    oc_fb_banner_set(&f, 2, OC_FB_INFO, "This channel is archived.", NULL, 0);
+    CHECK(oc_fb_banner_top(&f) && oc_fb_banner_top(&f)->id == 1 && g_fb_n_said == said + 2 && g_fb_loud[said]);
+    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost — reconnecting in 2s…", "Retry now", 9);
+    CHECK(g_fb_n_said == said + 2 && strstr(oc_fb_banner_top(&f)->text, "2s"));
+    oc_fb_banner_clear(&f, 1);
+    CHECK(oc_fb_banner_top(&f) && oc_fb_banner_top(&f)->id == 2);
+    oc_fb_banner_set(&f, 2, OC_FB_INFO, "", NULL, 0);                            /* empty: cleared */
+    CHECK(oc_fb_banner_top(&f) == NULL);
+}
+
 /* Where the platform's own notifications are not built (osnotify_null.c):
  * nothing can be raised or taken back, and every call says so, so the frontend
  * falls back and the badges carry on. */
@@ -3809,6 +3861,7 @@ int run_client_core_tests(void) {
     test_channel_info_seq();
     test_srvalerts_model();
     test_osnotify_null();
+    test_feedback();
     test_notify_scan();
     test_thread_notices();
     test_unread_counts_what_notifies();

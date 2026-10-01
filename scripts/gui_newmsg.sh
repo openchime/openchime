@@ -292,7 +292,7 @@ d="$(snap)"
 [ "$(nm_of "$d" body)" = "$before_body" ] && ok "the message is still in the box ($before_body characters)" \
   || fail "the message went from $before_body characters to $(nm_of "$d" body) with nobody to send it to"
 case "$d" in
-  *'Who is this for?'*) ok "and a toast says why" ;;
+  *'Who is this for?'*) ok "and the composer says why" ;;
   *) fail "nothing said why the send did not happen" ;;
 esac
 

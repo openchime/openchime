@@ -1038,7 +1038,7 @@ port (9520):
   stops a held key walking backwards through the whole list.
 - **Does a send with nobody addressed refuse, and say so?** The recipients being
   gone is asserted *before* Enter is pressed, the message must still be in the box
-  afterwards, and a toast must say why. The harness releases Backspace between
+  afterwards, and the composer must say why (the dump's `hint` line). The harness releases Backspace between
   presses (see the `key`/`keyup` rule above); otherwise the check would run with a
   recipient still attached.
 
