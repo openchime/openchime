@@ -142,7 +142,10 @@ casts them to float, so a config taken from one conversion leaves the other unab
 - **A request** checks read access to the message's channel, builds the speakable text,
   and looks the key up. A hit streams the stored render. A miss queues a render, unless one
   for the same key is already in flight, in which case the request waits for that one. A
-  finished render writes the cache row and starts every waiting stream.
+  finished render writes the cache row and starts every waiting stream. Until no lookup can
+  miss that row — it is written, and every lookup sent before it was has answered — the
+  daemon keeps the finished render in memory and serves it from there, every one however
+  deep the writer's queue: a request between the render and its row never renders again.
 - **The auditions are warmed at startup.** All eight voices audition with the same one
   sentence, so there are exactly eight renderings to have, and the daemon checks for them
   when it starts — rendering only what is missing, through the ordinary preview path, so a

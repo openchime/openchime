@@ -333,6 +333,7 @@ typedef struct oc_job {
     char          *tts_lang;      /* the language it speaks; picks the voice rules */
     char          *tts_blob_key;
     uint8_t        tts_handle[32];
+    uint64_t       tts_seq;    /* TTS_LOOKUP/PREVIEW: the net thread's count, echoed */
     uint64_t       tts_bytes;
     uint32_t       tts_duration_ms;
     uint8_t        tts_voice;
@@ -595,7 +596,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Critical failures (REQ-263): the counts, to every owner and admin
         * connected (conn_id 0) or to the one that asked; the entries; a
         * refusal (err_code). */
-       OC_RES_ALERTS_SUMMARY = 104, OC_RES_ALERTS = 105, OC_RES_ALERTS_ERR = 106 };
+       OC_RES_ALERTS_SUMMARY = 104, OC_RES_ALERTS = 105, OC_RES_ALERTS_ERR = 106,
+       /* A rendering's row has been written (ARCH-111): `tts_handle`. Until this
+        * comes the net thread answers lookups for it from memory. */
+       OC_RES_TTS_STORED = 107 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1076,6 +1080,7 @@ typedef struct oc_dbres {
      * asks the caller to write that voice back to the author's profile. */
     char                   *tts_text, *tts_blob_key;
     uint8_t                 tts_handle[32];
+    uint64_t                tts_seq;    /* the lookup's, echoed (oc_job) */
     uint64_t                tts_bytes;
     uint32_t                tts_duration_ms;
     uint8_t                 tts_voice, tts_cached, tts_persist, tts_warm;
@@ -1217,9 +1222,11 @@ uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
  * knob, for putting a password change between a sign-in's fetch of the
  * credential and its check of the password. */
 void   oc_dbwriter_hold_auth(oc_dbwriter *w, int on);
-/* A test's knob: while on, neither the writer nor a reader takes a job from its
- * queue, so a test can put frames between a job's submission and its result. */
-void   oc_dbwriter_hold(oc_dbwriter *w, int on);
+/* A test's knob: while held, the writer, the readers, or both take no job from
+ * their queues, so a test can put frames between a job's submission and its
+ * result. 0 releases. */
+enum { OC_DBW_HOLD_WRITER = 1, OC_DBW_HOLD_READERS = 2, OC_DBW_HOLD_ALL = 3 };
+void   oc_dbwriter_hold(oc_dbwriter *w, int what);
 
 /* A critical failure (REQ-263), from any thread: raise `key` with `message` --
  * again on the same entry while it holds -- or clear it, once it has stopped.
