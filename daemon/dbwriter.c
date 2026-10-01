@@ -70,7 +70,7 @@ struct oc_dbwriter {
     int             auth_deferred;           /* writer-only: the job went on to a reader */
     int             evfd;                    /* signals results ready */
     int             stop;
-    int             hold;                     /* oc_dbwriter_hold: no queue is served */
+    int             hold;                     /* oc_dbwriter_hold: OC_DBW_HOLD_* not served */
     int             started;
 
     /* Auth config (set before serving; read only on the writer thread). */
@@ -8019,6 +8019,7 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    r->tts_seq = j->tts_seq;
     r->message_id = j->message_id;
     r->type = OC_RES_TTS_ERR;
     r->err_code = OC_ERR_UNKNOWN_MESSAGE;
@@ -8137,6 +8138,7 @@ static oc_dbres *process_tts_preview(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    r->tts_seq = j->tts_seq;
     r->message_id = 0;
     r->type = OC_RES_TTS_ERR;
     r->err_code = OC_ERR_NOT_RENDERABLE;
@@ -8159,7 +8161,10 @@ static oc_dbres *process_tts_store(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = 0;
-    r->type = OC_RES_OK;
+    /* Said whether or not the row went in: the net thread lets go of the
+     * rendering either way, and a lookup after a failed write renders again. */
+    r->type = OC_RES_TTS_STORED;
+    memcpy(r->tts_handle, j->tts_handle, 32);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO rendered_audio"
@@ -8731,7 +8736,7 @@ static void *writer_loop(void *arg) {
     oc_dbwriter *w = (oc_dbwriter *)arg;
     for (;;) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && (!w->jobs_head || w->hold))
+        while (!w->stop && (!w->jobs_head || (w->hold & OC_DBW_HOLD_WRITER)))
             pthread_cond_wait(&w->cv, &w->mu);
         if (w->stop && !w->jobs_head) { pthread_mutex_unlock(&w->mu); break; }
         oc_job *j = w->jobs_head;
@@ -8756,7 +8761,7 @@ static void *reader_loop(void *arg) {
     oc_dbwriter *w = rd->w;
     for (;;) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && (!rd->head || w->hold))
+        while (!w->stop && (!rd->head || (w->hold & OC_DBW_HOLD_READERS)))
             pthread_cond_wait(&rd->cv, &w->mu);
         if (w->stop && !rd->head) { pthread_mutex_unlock(&w->mu); break; }
         oc_job *j = rd->head;
@@ -8876,9 +8881,9 @@ size_t oc_dbwriter_jobs_waiting(oc_dbwriter *w, int type) {
     return n;
 }
 
-void oc_dbwriter_hold(oc_dbwriter *w, int on) {
+void oc_dbwriter_hold(oc_dbwriter *w, int what) {
     pthread_mutex_lock(&w->mu);
-    w->hold = on;
+    w->hold = what;
     pthread_cond_broadcast(&w->cv);
     for (int i = 0; i < OC_DB_READERS; i++) pthread_cond_broadcast(&w->readers[i].cv);
     pthread_mutex_unlock(&w->mu);

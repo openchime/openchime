@@ -323,13 +323,55 @@ static __thread tts_wait *g_tts_waits;
 static __thread uint64_t  g_tts_req_seq;
 /* Renderings just finished, whose rows are on their way to the database. The
  * blob is already written when the worker reports, but the row that says so
- * commits a little later, and a listener asking in between -- the same one
- * pressing Play again, or the next -- would miss it and pay for a second
- * render. So the last few are remembered here and served from until then. */
-#define OC_TTS_FRESH 16
-static __thread struct { int used; uint8_t handle[32]; char key[OC_TTS_KEY_MAX]; uint64_t bytes; uint32_t duration_ms; }
-    g_tts_fresh[OC_TTS_FRESH];
-static __thread unsigned g_tts_fresh_next;
+ * commits later -- as much later as the writer's queue is deep -- and a lookup in
+ * between would miss it and pay for a second render. So each is kept here, and
+ * served from, until no lookup can miss it: past the writer's word that its row
+ * is written (OC_RES_TTS_STORED), and past the answer to every lookup sent before
+ * that word -- a reader may have looked just before the row went in and answer
+ * just after. Every one, however many are waiting: the window is closed, not
+ * narrowed. Bounded by the renders the writer has yet to store, and the lookups
+ * still out. */
+typedef struct tts_fresh {
+    uint8_t  handle[32];
+    char     key[OC_TTS_KEY_MAX];
+    uint64_t bytes;
+    uint32_t duration_ms;
+    int      stored;           /* its row is written... */
+    uint64_t release_seq;      /* ...and lookups up to this one could not see it */
+    struct tts_fresh *next;
+} tts_fresh;
+static __thread tts_fresh *g_tts_fresh;
+/* Lookups (TTS_LOOKUP, TTS_PREVIEW) by the count each was sent with, and those
+ * not yet answered. */
+static __thread uint64_t  g_tts_lookup_seq;
+static __thread uint64_t *g_tts_out;
+static __thread size_t    g_n_tts_out, g_cap_tts_out;
+
+/* Let go of every stored rendering whose lookups have all been answered. */
+static void tts_fresh_prune(void) {
+    uint64_t oldest = UINT64_MAX;
+    for (size_t i = 0; i < g_n_tts_out; i++) if (g_tts_out[i] < oldest) oldest = g_tts_out[i];
+    for (tts_fresh **link = &g_tts_fresh; *link; ) {
+        tts_fresh *f = *link;
+        if (f->stored && f->release_seq < oldest) { *link = f->next; free(f); continue; }
+        link = &f->next;
+    }
+}
+static void tts_lookup_sent(oc_job *j) {
+    j->tts_seq = ++g_tts_lookup_seq;
+    if (g_n_tts_out == g_cap_tts_out) {
+        size_t nc = g_cap_tts_out ? g_cap_tts_out * 2 : 16;
+        uint64_t *na = realloc(g_tts_out, nc * sizeof *na);
+        if (!na) return;            /* untracked: its entry may go early, and it renders again */
+        g_tts_out = na; g_cap_tts_out = nc;
+    }
+    g_tts_out[g_n_tts_out++] = j->tts_seq;
+}
+static void tts_lookup_answered(uint64_t seq) {
+    for (size_t i = 0; i < g_n_tts_out; i++)
+        if (g_tts_out[i] == seq) { g_tts_out[i] = g_tts_out[--g_n_tts_out]; break; }
+    tts_fresh_prune();
+}
 static void tts_drop_waiters(uint64_t conn_id);
 #endif
 #ifdef OC_STT
@@ -3454,6 +3496,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->tts_model_version = strdup(g_tts_engine->version);
             j->tts_voices = tts_voice_list();
             j->tts_lang = strdup(g_tts_engine->lang ? g_tts_engine->lang : "");
+            tts_lookup_sent(j);
             xfer_submit(dbw, &c->xfer, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
@@ -3504,6 +3547,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->tts_voice = (uint8_t)voice;
             j->tts_text = strdup(preview);
             j->tts_model_version = strdup(g_tts_engine->version);
+            tts_lookup_sent(j);
             xfer_submit(dbw, &c->xfer, j);
             c->xfer.audio = 1;
             c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
@@ -5245,11 +5289,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
 #endif
 #ifdef OC_TTS
     case OC_RES_TTS_META: {
+        tts_lookup_answered(r->tts_seq);
         /* A warming probe has no listener: render what is missing and stop. The
          * point is that the next person to press Play waits for a database read
-         * rather than for the model. */
+         * rather than for the model. Missing means not stored, not just
+         * finished, and not being rendered now. */
         if (r->tts_warm) {
-            if (!r->tts_cached && g_tts)
+            int have = r->tts_cached;
+            for (const tts_fresh *f = g_tts_fresh; f && !have; f = f->next) have = !memcmp(f->handle, r->tts_handle, 32);
+            for (const tts_wait *wt = g_tts_waits; wt && !have; wt = wt->next) have = !memcmp(wt->handle, r->tts_handle, 32);
+            if (!have && g_tts)
                 oc_tts_worker_submit(g_tts, ++g_tts_req_seq, r->tts_handle, r->tts_voice, r->tts_text);
             break;
         }
@@ -5281,10 +5330,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (audio_open_blob(ep, conns, c, r->tts_blob_key, r->tts_bytes) != 0) break;
             break;
         }
-        for (int k = 0; k < OC_TTS_FRESH; k++)
-            if (g_tts_fresh[k].used && memcmp(g_tts_fresh[k].handle, r->tts_handle, 32) == 0) {
-                x->audio_duration_ms = g_tts_fresh[k].duration_ms;
-                audio_open_blob(ep, conns, c, g_tts_fresh[k].key, g_tts_fresh[k].bytes);
+        for (const tts_fresh *f = g_tts_fresh; f; f = f->next)
+            if (memcmp(f->handle, r->tts_handle, 32) == 0) {
+                x->audio_duration_ms = f->duration_ms;
+                audio_open_blob(ep, conns, c, f->key, f->bytes);
                 goto tts_meta_done;
             }
         if (!g_tts) { send_transfer_error(c, r->message_id, OC_ERR_TTS_UNAVAILABLE); break; }
@@ -5310,7 +5359,21 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     tts_meta_done:
         break;
     }
+    case OC_RES_TTS_STORED: {
+        /* The row is written: a lookup sent from now on finds it, and one sent
+         * before may not have -- so the copy held for the meantime goes once
+         * those are answered. One per store, as one was added per render. */
+        for (tts_fresh *f = g_tts_fresh; f; f = f->next)
+            if (!f->stored && memcmp(f->handle, r->tts_handle, 32) == 0) {
+                f->stored = 1;
+                f->release_seq = g_tts_lookup_seq;
+                break;
+            }
+        tts_fresh_prune();
+        break;
+    }
     case OC_RES_TTS_ERR: {
+        tts_lookup_answered(r->tts_seq);
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
         if (xfer_current(&c->xfer, r) && c->xfer.state == XFER_DOWN_AWAIT_LOOKUP && c->xfer.audio) {
@@ -6456,13 +6519,14 @@ static void deliver_tts_results(int ep, conn **conns, oc_dbwriter *dbw) {
                 sj->tts_duration_ms = res.duration_ms;
                 oc_dbwriter_submit(dbw, sj);
             }
-            if (strlen(res.key) < sizeof g_tts_fresh[0].key) {
-                unsigned k = g_tts_fresh_next++ % OC_TTS_FRESH;
-                g_tts_fresh[k].used = 1;
-                memcpy(g_tts_fresh[k].handle, res.handle, 32);
-                snprintf(g_tts_fresh[k].key, sizeof g_tts_fresh[k].key, "%s", res.key);
-                g_tts_fresh[k].bytes = res.bytes;
-                g_tts_fresh[k].duration_ms = res.duration_ms;
+            tts_fresh *f = sj && strlen(res.key) < OC_TTS_KEY_MAX ? calloc(1, sizeof *f) : NULL;
+            if (f) {                                   /* held until its store answers */
+                memcpy(f->handle, res.handle, 32);
+                snprintf(f->key, sizeof f->key, "%s", res.key);
+                f->bytes = res.bytes;
+                f->duration_ms = res.duration_ms;
+                f->next = g_tts_fresh;
+                g_tts_fresh = f;
             }
         } else if (res.status == OC_TTS_FAILED) {
             fprintf(stderr, "tts: render failed: %s\n", res.reason);
@@ -6848,7 +6912,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     }
 #endif
 #ifdef OC_TTS
-    memset(g_tts_fresh, 0, sizeof g_tts_fresh);   /* another loop's store is not this one's */
+    g_tts_fresh = NULL;   /* another loop's store is not this one's */
+    g_tts_out = NULL; g_n_tts_out = g_cap_tts_out = 0; g_tts_lookup_seq = 0;
     /* Read-aloud's render worker (ARCH-111), beside the transfer pool because it
      * writes to the same store. No engine (a daemon built without read-aloud) or
      * an operator who turned it off means no worker, and TTS_INFO then says the
@@ -6885,6 +6950,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                         wj->tts_voice = (uint8_t)v;
                         wj->tts_text = strdup(g_tts_engine->preview);
                         wj->tts_model_version = strdup(g_tts_engine->version);
+                        tts_lookup_sent(wj);
                         oc_dbwriter_submit(dbw, wj);
                         warmed++;
                     }
@@ -7139,6 +7205,9 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_tts = NULL;
     for (tts_wait *wt = g_tts_waits, *next; wt; wt = next) { next = wt->next; free(wt); }
     g_tts_waits = NULL;
+    for (tts_fresh *f = g_tts_fresh, *next; f; f = next) { next = f->next; free(f); }
+    g_tts_fresh = NULL;
+    free(g_tts_out); g_tts_out = NULL; g_n_tts_out = g_cap_tts_out = 0;
 #endif
     oc_xferpool_stop(g_xfers);
     g_xfers = NULL;

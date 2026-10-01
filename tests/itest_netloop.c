@@ -1057,7 +1057,7 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
     for (int i = 0; i < 3000; i++) payload[i] = (uint8_t)(i * 13u + 1u);
     oc_header hdr; oc_rbuf p; oc_wbuf w;
 
-    oc_dbwriter_hold(dbw, 1);
+    oc_dbwriter_hold(dbw, OC_DBW_HOLD_ALL);
     oc_upload_begin first = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("first.bin"), oc_slice_str("application/octet-stream"), 1000 };
     memset(first.idem, 0xA1, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
@@ -1102,7 +1102,7 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
      * that does not exist), and its error is not the next upload's -- which is
      * made ready, not ended. */
     CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
-    oc_dbwriter_hold(dbw, 1);
+    oc_dbwriter_hold(dbw, OC_DBW_HOLD_ALL);
     first.channel_id = 987654321;
     memset(first.idem, 0xA3, OC_IDEM_SIZE);
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
@@ -1241,6 +1241,44 @@ static uint64_t say_something(client *c, uint64_t channel_id, const char *body, 
         }
     }
     return id;
+}
+
+/* A rendering is served between its render and its row (ARCH-111): with the
+ * writer held, every row waits, so each rendering lives only in the net thread's
+ * keeping -- and is served from it, for as many renderings as are waiting, not
+ * the last few. Seventeen are rendered, more than a sixteen-place ring keeps; the
+ * first asked for again renders nothing. Released, the rows are written and it
+ * is served from its row, still without rendering. */
+static void test_read_aloud_store_window(int port, const uint8_t *pin, oc_dbwriter *dbw) {
+    client a;
+    uint64_t ua = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    enum { N = 17 };
+    uint64_t mids[N];
+    for (int i = 0; i < N; i++) {
+        char text[64]; snprintf(text, sizeof text, "Status line %d is ready for review.", i);
+        mids[i] = say_something(&a, OC_DEFAULT_CHANNEL, text, (uint8_t)(0xC0 + i));
+        CHECK(mids[i] != 0);
+    }
+    oc_dbwriter_hold(dbw, OC_DBW_HOLD_WRITER);
+    uint16_t code = 0;
+    uint64_t first_bytes = 0;
+    for (int i = 0; i < N; i++) {
+        int before = g_stub_says;
+        uint64_t bytes = fetch_audio(&a, mids[i], NULL, &code);
+        CHECK(code == 0 && bytes > 0 && g_stub_says == before + 1);    /* each rendered once */
+        if (i == 0) first_bytes = bytes;
+    }
+    CHECK(oc_dbwriter_jobs_waiting(dbw, OC_JOB_TTS_STORE) == N);      /* not one row written */
+    int rendered = g_stub_says;
+    CHECK(fetch_audio(&a, mids[0], NULL, &code) == first_bytes && code == 0);
+    CHECK(g_stub_says == rendered);                                   /* kept, though the oldest */
+    oc_dbwriter_hold(dbw, 0);
+    for (int i = 0; i < 500 && oc_dbwriter_jobs_waiting(dbw, OC_JOB_TTS_STORE) > 0; i++) usleep(10000);
+    CHECK(fetch_audio(&a, mids[0], NULL, &code) == first_bytes && code == 0);
+    CHECK(fetch_audio(&a, mids[N - 1], NULL, &code) > 0 && code == 0);
+    CHECK(g_stub_says == rendered);                                   /* and from its row after */
+    client_close(&a);
 }
 
 static void test_read_aloud_vertical(int port, const uint8_t *pin) {
@@ -2491,7 +2529,7 @@ static void test_call_leave_while_joining(int port, const uint8_t *pin, oc_dbwri
     const uint64_t ch = OC_DEFAULT_CHANNEL;
     oc_header hdr; oc_rbuf p; oc_call_part parts[32];
 
-    oc_dbwriter_hold(dbw, 1);
+    oc_dbwriter_hold(dbw, OC_DBW_HOLD_ALL);
     CHECK(call_join(&a, ch, 0xA1, NULL, 0) == 0);
     CHECK(call_simple(&a, OC_MSG_CALL_LEAVE, ch) == 0);
     uint64_t someone[1] = { ua + 1 };
@@ -4630,6 +4668,7 @@ int run_netloop_tests(void) {
         test_fanout_limits(arg.port, pin);
         test_presence_dnd(arg.port, pin);
         test_read_aloud_vertical(arg.port, pin);
+        test_read_aloud_store_window(arg.port, pin, dbw);
         test_voice_input_vertical(arg.port, pin);
         test_voice_input_rate(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
