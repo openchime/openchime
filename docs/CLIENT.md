@@ -13,9 +13,11 @@ client is the reference implementation and runs on the portable stack: an SDL3
 renderer on its own native window, primitives through oc_gfx, text through
 sdltext's DirectWrite backend.
 
-**Frontends.** The app-core carries the **TUI** and the **Win32 GUI** (the
-reference client). The portable GUI on Linux/macOS, a web DOM UI and mobile are
-further frontends over the same core (§8).
+**Frontends.** The app-core carries the **TUI** and the **portable GUI**, whose
+reference implementation is the Win32 client. The same GUI on Linux, macOS and the
+web (compiled to WebAssembly and served by the daemon) is a port of that one
+program, not a further frontend; mobile (Android, iOS) has its own frontends over
+the same core (§8).
 
 ---
 
@@ -459,8 +461,13 @@ model; translate input to intents }, stop.
   CoreText backend and an Obj-C native shim where Apple leaves no C surface;
   UIKit on iOS is its own effort over the core.
 - **Android:** Android views (Kotlin) over the core.
-- **Web:** a DOM UI — WASM can't use native desktop widgets; the core
-  compiles to WASM and drives a JS/TS view.
+- **Web:** the portable client compiled to WebAssembly — the core and the GUI,
+  SDL3 under Emscripten — served by the daemon over HTTPS from its own origin, with
+  the protocol carried inside WebSocket frames (a browser opens no raw socket) and
+  a shim for what the browser provides: text drawn through the canvas, an ARIA tree
+  mirroring the accessibility tree, the credential store, notifications, file
+  pickers and media capture. Nothing is installed: the browser loads it from the
+  workspace.
 
 ## 4. The wire layer (reused, already tested)
 
@@ -1274,7 +1281,7 @@ to change a format's size, so any preference that moves the scale must call
   a shared parser in `client/core/` plus sdltext byte ranges.
 - **The TUI** sits on the same core and is text-only (§3).
 - **Further desktops are ports of the portable layer** (ARCH-80): the portable
-  GUI on Linux and macOS is a text backend + native shim each. A web DOM UI and
-  mobile are their own frontends. Each platform has its own screen capture for
+  GUI on Linux, macOS and the web is a text backend + native shim each. Mobile
+  (Android, iOS) has its own frontends. Each platform has its own screen capture for
   sharing in calls; the codec and the transport are in the core (REQ-161,
   [VIDEO.md](./VIDEO.md)).
