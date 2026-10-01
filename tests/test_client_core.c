@@ -5040,7 +5040,10 @@ int run_client_core_tests(void) {
     test_big_channel_list(23600 + (int)(getpid() % 2000));
     test_published_fingerprint(25700 + (int)(getpid() % 2000));
     test_cert_trust(27800 + (int)(getpid() % 2000));
-    test_local_browser(33900 + 2 * (int)(getpid() % 1000));
-    test_device_client(36000 + 2 * (int)(getpid() % 1000));
+    /* Every port here is below 32768, where Linux's ephemeral range starts: a
+     * port in that range can be held for a moment by any outgoing connection on
+     * the machine, and a daemon that cannot bind it fails the test for nothing. */
+    test_local_browser(29900 + 2 * (int)(getpid() % 400));
+    test_device_client(30800 + 2 * (int)(getpid() % 400));
     return failures;
 }
