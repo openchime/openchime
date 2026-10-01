@@ -289,6 +289,9 @@ void oc_client_storage_status(oc_client *c);
  * (into the model's `srvalerts`), or acknowledge one -- `id` 0 for every one --
  * after which the list is asked for again. */
 void oc_client_srvalerts_list(oc_client *c);
+/* Take back a delete this user made, for the short while the daemon holds it
+ * (REQ-052); every member is told it is back (MSG_RESTORED). */
+void oc_client_restore_message(oc_client *c, uint64_t channel_id, uint64_t message_id);
 void oc_client_srvalert_ack(oc_client *c, uint64_t id);
 void oc_client_toggle_storage(oc_client *c, int open);
 

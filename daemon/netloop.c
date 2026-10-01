@@ -2127,6 +2127,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_RESTORE) {
+            /* A delete taken back (REQ-052); the writer checks who and when. */
+            oc_restore rs;
+            if (oc_decode_restore(&p, &rs) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_RESTORE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = rs.channel_id;
+            j->message_id = rs.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_DELETE) {
             oc_delete d;
             if (oc_decode_delete(&p, &d) != OC_OK) return -1;
@@ -4546,7 +4558,18 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
         break;
     }
+    case OC_RES_RESTORE_OK: {
+        /* Back for every member: the message whole, replacing its tombstone. */
+        oc_slice body = { r->body, r->body_len };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
+        broadcast_set_attach(&b, r->attach, r->n_attach);
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK)
+            fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
+        break;
+    }
     case OC_RES_EDIT_ERR:
+    case OC_RES_RESTORE_ERR:
     case OC_RES_DELETE_ERR: {
         /* Non-fatal: report to the requester with the offending message_id in
          * `context` (8 bytes, big-endian) so the client can correlate. */

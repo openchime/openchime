@@ -834,6 +834,15 @@ void oc_client_list_settings(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_restore_message(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c || !channel_id || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_RESTORE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_srvalerts_list(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SRVALERTS_LIST);

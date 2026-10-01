@@ -474,6 +474,11 @@ typedef enum {
     OC_MSG_ALERTS_LIST          = 0x00F7, /* C->S, owner/admin */
     OC_MSG_ALERTS               = 0x00F8, /* S->C, the answer: newest first */
     OC_MSG_ALERT_ACK            = 0x00F9, /* C->S, owner/admin: one entry, or 0 for every one */
+    /* A delete taken back (REQ-052): the person who deleted a message asks, for
+     * a short while after, and every member is told it is back -- the message
+     * whole, in BROADCAST's layout, replacing its tombstone. */
+    OC_MSG_RESTORE              = 0x00FA, /* C->S { channel_id, message_id } */
+    OC_MSG_MSG_RESTORED         = 0x00FB, /* S->C, BROADCAST's layout */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1107,6 +1112,7 @@ typedef struct { uint64_t channel_id; uint64_t message_id; uint16_t total; } oc_
 #define OC_MAX_ALERT_KEY       64
 #define OC_MAX_ALERT_MESSAGE  400
 typedef struct { uint32_t unacked; uint32_t current; } oc_alerts_summary;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_restore;
 typedef struct { uint64_t id; uint64_t first_ms; uint64_t last_ms; uint32_t count;
                  uint8_t current; uint8_t acked; oc_slice key; oc_slice message; } oc_alert;
 typedef struct { uint16_t count; const oc_alert *alerts; } oc_alerts;
@@ -1579,6 +1585,9 @@ oc_result oc_encode_channel_groups(oc_wbuf *w, uint16_t version, const oc_channe
 oc_result oc_encode_channel_via_group(oc_wbuf *w, uint16_t version, const oc_channel_via_group *m);
 oc_result oc_encode_mention_unresolved_more(oc_wbuf *w, uint16_t version, const oc_mention_unresolved_more *m);
 oc_result oc_encode_alerts_summary(oc_wbuf *w, uint16_t version, const oc_alerts_summary *m);
+oc_result oc_encode_restore(oc_wbuf *w, uint16_t version, const oc_restore *m);
+/* MSG_RESTORED: a BROADCAST under its own type; read with oc_decode_broadcast. */
+oc_result oc_encode_msg_restored(oc_wbuf *w, uint16_t version, const oc_broadcast *m);
 oc_result oc_encode_alerts_list(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_alerts(oc_wbuf *w, uint16_t version, const oc_alerts *m);
 oc_result oc_encode_alert_ack(oc_wbuf *w, uint16_t version, const oc_alert_ack *m);
@@ -1603,6 +1612,7 @@ oc_result oc_decode_channel_groups(oc_rbuf *p, oc_channel_groups *m, uint64_t *g
 oc_result oc_decode_channel_via_group(oc_rbuf *p, oc_channel_via_group *m, uint64_t *user_ids, uint16_t cap);
 oc_result oc_decode_mention_unresolved_more(oc_rbuf *p, oc_mention_unresolved_more *m);
 oc_result oc_decode_alerts_summary(oc_rbuf *p, oc_alerts_summary *m);
+oc_result oc_decode_restore(oc_rbuf *p, oc_restore *m);
 /* Into `out` (room for `cap`); the slices point into the frame. */
 oc_result oc_decode_alerts(oc_rbuf *p, oc_alerts *m, oc_alert *out, uint16_t cap);
 oc_result oc_decode_alert_ack(oc_rbuf *p, oc_alert_ack *m);

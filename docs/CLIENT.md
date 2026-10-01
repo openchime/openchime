@@ -1054,8 +1054,9 @@ GUI only draws it):
 - **A confirmation** the screen does not already show (copied, saved, marked
   read): a toast that leaves by itself — four seconds, longer for a longer
   sentence. Nothing for what the screen shows anyway: joining a channel opens it.
-- **Something undoable** (a deleted draft): a toast with **Undo**, ten seconds,
-  instead of a question before every delete.
+- **Something undoable** (a deleted draft or message): a toast with **Undo**, ten
+  seconds, instead of a question before every delete. A message's Undo asks the
+  daemon to restore it (`RESTORE`), so it comes back for everyone.
 - **Progress** (sending a video message): one toast, updated in place, ending as a
   confirmation or a failure.
 - **A failure with nothing to mark**: a toast that stays until dismissed, said

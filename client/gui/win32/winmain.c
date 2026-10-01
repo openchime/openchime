@@ -2442,7 +2442,7 @@ static oc_fb g_fb;
 enum { TOASTPOS_BOTTOM_CENTRE = 0, TOASTPOS_BOTTOM_RIGHT = 1, TOASTPOS_TOP_RIGHT = 2 };
 static int g_pref_toastpos = TOASTPOS_BOTTOM_CENTRE;
 /* What a toast's one action does (oc_fb_toast.action_id). */
-enum { FBA_NONE = 0, FBA_UNDO_DRAFT, FBA_RETRY };
+enum { FBA_NONE = 0, FBA_UNDO_DRAFT, FBA_RETRY, FBA_UNDO_DELETE };
 /* Banner states this client can be in (oc_fb_banner.id). */
 enum { FBB_CONNECTION = 1 };
 #define TOAST_GAP      UIS(10.0f)
@@ -2457,6 +2457,9 @@ static int  g_banner_on;                     /* banner drawn this frame (arms th
 static int  g_banner_action;           /* what the banner's button does (FBA_*) */
 /* The draft a Delete took away, so its toast's Undo can put it back. */
 static struct { uint64_t cid, root; char to[256]; char body[DRAFT_TEXT_MAX * 3]; int valid; } g_undo_draft;
+/* The message a Delete took away, for its toast's Undo: the daemon holds it a
+ * short while and gives it back to whoever deleted it (REQ-052). */
+static struct { uint64_t cid, mid; } g_undo_delete;
 
 /* Spoken as each toast and banner appears (ARCH-99): politely, or -- for a
  * failure and an error banner -- assertively, so a screen reader interrupts. */
@@ -10051,6 +10054,9 @@ static void toast_action_run(int action) {
         }
         g_undo_draft.valid = 0;
         fb_confirm("Draft restored.");
+    } else if (action == FBA_UNDO_DELETE && g_undo_delete.mid && g_client) {
+        oc_client_restore_message(g_client, g_undo_delete.cid, g_undo_delete.mid);
+        g_undo_delete.cid = g_undo_delete.mid = 0;
     }
 }
 
@@ -22048,6 +22054,10 @@ static void msg_menu_run(HWND hwnd, int cmd) {
         composer_begin_edit(msg);
     } else if (cmd == 22) {
         oc_client_delete(g_client, chan, mid);
+        /* Taken back with Undo: the daemon holds a deleted message a short
+         * while for whoever deleted it (REQ-052). */
+        g_undo_delete.cid = chan; g_undo_delete.mid = mid;
+        fb_undo("Message deleted.", FBA_UNDO_DELETE);
     } else if (cmd == 100) {
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
     } else if (cmd == 102) {
@@ -29166,7 +29176,9 @@ static void test_poll(HWND hwnd) {
         const oc_model *dm = model();
         const oc_channel *dc = dm && g_sel ? oc_model_channel((oc_model *)dm, g_sel) : NULL;
         if (!mid && dc && dc->n_msgs) mid = dc->msgs[dc->n_msgs - 1].message_id;
-        if (g_client && mid) { oc_client_delete(g_client, g_sel, (uint64_t)mid); test_ack("ok"); }
+        /* Through the menu's own path, so what the harness does is what a click
+         * does -- the delete and its Undo. */
+        if (g_client && mid) { g_menu_target = mid; g_menu_target2 = g_sel; msg_menu_run(hwnd, 22); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "reactors")) {
         /* Open the who-reacted pane for a message; mid 0 = the newest. The menu

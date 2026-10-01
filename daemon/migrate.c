@@ -1114,6 +1114,26 @@ static const char MIGRATION_0051[] =
     ");"
     "CREATE UNIQUE INDEX alerts_current_key ON alerts(key) WHERE current = 1;";
 
+static const char MIGRATION_0052[] =
+    /* A delete that can be taken back (REQ-052): what a tombstone gave up -- the
+     * body, the files it carried, its reactions -- held for the short while the
+     * person who deleted it may restore it, then purged. Nothing is read from
+     * here but a restore. */
+    "CREATE TABLE deleted_holds ("
+    "  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),"
+    "  body          TEXT,"
+    "  deleted_by    INTEGER NOT NULL REFERENCES users(id),"
+    "  deleted_at_ms INTEGER NOT NULL,"
+    "  attach_ids    TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE TABLE deleted_hold_reactions ("
+    "  message_id    INTEGER NOT NULL REFERENCES deleted_holds(message_id),"
+    "  user_id       INTEGER NOT NULL,"
+    "  emoji         TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX deleted_hold_reactions_msg ON deleted_hold_reactions(message_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1166,6 +1186,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 49, MIGRATION_0049 },
     { 50, MIGRATION_0050 },
     { 51, MIGRATION_0051 },
+    { 52, MIGRATION_0052 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

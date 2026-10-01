@@ -6850,6 +6850,92 @@ static void test_alerts(void) {
     cleanup_db(path);
 }
 
+/* A delete taken back (REQ-052): by the person who deleted it, while it is
+ * held, the message returns whole -- body, files, reactions -- and is searchable
+ * and backfilled again; by anyone else, or after the window, it stays gone; a
+ * moderator's restore is audited as the delete was. */
+static oc_dbres *del_or_restore(oc_dbwriter *w, int type, uint64_t uid, uint64_t mid) {
+    oc_job *j = oc_job_new(type, 9);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static void test_restore(void) {
+    const char *path = "build/test_dbwriter_restore.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw-alice", OC_ROLE_MEMBER);
+    uint64_t bob = reg(w, "bob", "pw-bob", OC_ROLE_MEMBER);
+    uint64_t mod = reg(w, "mo", "pw-mo", OC_ROLE_ADMIN);
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0x51, sizeof idem);
+    uint64_t mid = send_msg(w, alice, idem, "the rollback plan is in the doc");
+    CHECK(mid != 0);
+    {
+        oc_job *j = oc_job_new(OC_JOB_REACT, 8);
+        j->user_id = bob; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+        j->react_op = OC_REACT_ADD; j->emoji = strdup("\xF0\x9F\x91\x8D");
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    oc_dbres *r = del_or_restore(w, OC_JOB_DELETE, alice, mid);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    /* Not bob's to take back. */
+    r = del_or_restore(w, OC_JOB_RESTORE, bob, mid);
+    CHECK(r && r->type == OC_RES_RESTORE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    /* Alice's: the message whole, for every member. */
+    r = del_or_restore(w, OC_JOB_RESTORE, alice, mid);
+    CHECK(r && r->type == OC_RES_RESTORE_OK && r->author_id == alice && r->message_id == mid);
+    CHECK(r && r->body_len == 31 && !memcmp(r->body, "the rollback plan is in the doc", 31) && r->n_members >= 3);
+    oc_dbres_free(r);
+    {   /* ...with bob's reaction, and searchable again. */
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *q = NULL;
+        sqlite3_prepare_v2(raw, "SELECT (SELECT COUNT(*) FROM reactions WHERE message_id=?1 AND user_id=?2),"
+                                " (SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'rollback' AND rowid=?1);",
+                           -1, &q, NULL);
+        sqlite3_bind_int64(q, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int64(q, 2, (sqlite3_int64)bob);
+        CHECK(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 1 && sqlite3_column_int(q, 1) == 1);
+        sqlite3_finalize(q);
+        sqlite3_close(raw);
+    }
+    /* Once only: the hold is spent. */
+    r = del_or_restore(w, OC_JOB_RESTORE, alice, mid);
+    CHECK(r && r->type == OC_RES_RESTORE_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+    /* A moderator's delete, taken back by the moderator: audited. */
+    oc_dbres_free(del_or_restore(w, OC_JOB_DELETE, mod, mid));
+    r = del_or_restore(w, OC_JOB_RESTORE, mod, mid);
+    CHECK(r && r->type == OC_RES_RESTORE_OK);
+    oc_dbres_free(r);
+    /* Past the window: gone for good, and nothing of it is kept. */
+    oc_dbwriter_set_restore_window_ms(w, 50);
+    oc_dbres_free(del_or_restore(w, OC_JOB_DELETE, alice, mid));
+    usleep(120000);
+    r = del_or_restore(w, OC_JOB_RESTORE, alice, mid);
+    CHECK(r && r->type == OC_RES_RESTORE_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+    oc_dbwriter_stop(w);
+
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw, "SELECT (SELECT COUNT(*) FROM deleted_holds), (SELECT COUNT(*) FROM deleted_hold_reactions),"
+                            " (SELECT COUNT(*) FROM audit_log WHERE action='message.restore'),"
+                            " (SELECT body IS NULL FROM messages WHERE id=?1);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    CHECK(sqlite3_column_int(st, 0) == 0 && sqlite3_column_int(st, 1) == 0);   /* purged with the window */
+    CHECK(sqlite3_column_int(st, 2) == 1 && sqlite3_column_int(st, 3) == 1);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
@@ -6865,6 +6951,7 @@ int run_dbwriter_tests(void) {
     test_oidc_join_rules();
     test_oidc_link();
     test_alerts();
+    test_restore();
     test_oidc_limits_and_audit();
     test_auth_rate_limit();
     test_source_rate_limit();

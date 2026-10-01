@@ -850,6 +850,29 @@ static void test_osnotify_null(void) {
     oc_osn_done();
 }
 
+/* A tombstone taken back (REQ-052): the body returns in place. */
+static void test_restore_model(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 70; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("room");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 70; e.message_id = 5; e.author_id = 2;
+    e.body = strdup("keep this");
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_DELETE; e.channel_id = 70; e.message_id = 5;
+    oc_model_apply(&m, &e);
+    const oc_channel *c = oc_model_channel(&m, 70);
+    CHECK(c && c->n_msgs == 1 && c->msgs[0].deleted);
+    memset(&e, 0, sizeof e); e.type = OC_EV_RESTORE; e.channel_id = 70; e.message_id = 5;
+    e.body = strdup("keep this");
+    oc_model_apply(&m, &e);
+    free(e.body);
+    c = oc_model_channel(&m, 70);
+    CHECK(c && c->n_msgs == 1 && !c->msgs[0].deleted && c->msgs[0].body && !strcmp(c->msgs[0].body, "keep this"));
+    oc_model_free(&m);
+}
+
 static void test_srvalerts_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -3860,6 +3883,7 @@ int run_client_core_tests(void) {
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
     test_srvalerts_model();
+    test_restore_model();
     test_osnotify_null();
     test_feedback();
     test_notify_scan();

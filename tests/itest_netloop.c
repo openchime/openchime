@@ -741,7 +741,7 @@ static void test_drafts_vertical(int port, const uint8_t *pin) {
         oc_wbuf_init(&w, buf, sizeof buf);
         oc_send sm = {0};
         sm.channel_id = 1;
-        memset(sm.idem, 0xD1, OC_IDEM_SIZE);
+        memset(sm.idem, 0x5A, OC_IDEM_SIZE);   /* used by no other send here: a repeat is a replay, acknowledged and not sent */
         sm.body = oc_slice_str("about to send");
         CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
         CHECK(send_frame(&a, buf, w.len) == 0);
@@ -2512,6 +2512,66 @@ static void test_alerts_wire(int port, const uint8_t *pin, oc_dbwriter *dbw) {
     /* A change reaches her unasked; it ends as it began. */
     oc_dbwriter_alert_clear(dbw, "test.wire");
     CHECK(read_summary(&a, &sm) == 0 && sm.current == 0);
+    client_close(&b);
+    client_close(&a);
+}
+
+/* A delete taken back, over the wire (REQ-052): carol deletes, alice sees the
+ * tombstone; carol restores, alice is sent the message whole again; alice may
+ * not restore what carol deleted, owner though she is. */
+static void test_restore_wire(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "carol", "pw", &ua) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "alice", "pw-alice", &ub) == 0);
+    oc_header hdr; oc_rbuf p;
+    /* A room of their own, public, that alice joins: what earlier tests did to
+     * #general's membership is not this test's business. */
+    uint64_t room = 0;
+    {
+        uint8_t cb[128]; oc_wbuf cw; oc_wbuf_init(&cw, cb, sizeof cb);
+        oc_create_channel cc = { oc_slice_str("undo-room"), 1 };
+        CHECK(oc_encode_create_channel(&cw, OC_PROTOCOL_VERSION, &cc) == OC_OK && send_frame(&a, cb, cw.len) == 0);
+        oc_channel_info ci;
+        CHECK(read_type(&a, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0 && oc_decode_channel_info(&p, &ci) == OC_OK);
+        room = ci.channel_id;
+        oc_channel_ref jr = { room };
+        oc_wbuf_init(&cw, cb, sizeof cb);
+        CHECK(oc_encode_join_channel(&cw, OC_PROTOCOL_VERSION, &jr) == OC_OK && send_frame(&b, cb, cw.len) == 0);
+        CHECK(read_type(&b, OC_MSG_CHANNEL_INFO, &hdr, &p) == 0);
+    }
+    uint64_t mid = 0;
+    {
+        uint8_t sb[512]; oc_wbuf sw; oc_wbuf_init(&sw, sb, sizeof sb);
+        oc_send sm = {0};
+        sm.channel_id = room;
+        memset(sm.idem, 0x5A, OC_IDEM_SIZE);   /* used by no other send here: a repeat is a replay, acknowledged and not sent */
+        sm.body = oc_slice_str("taking this back");
+        CHECK(oc_encode_send(&sw, OC_PROTOCOL_VERSION, &sm) == OC_OK && send_frame(&a, sb, sw.len) == 0);
+        oc_send_ack ack;
+        CHECK(read_type(&a, OC_MSG_SEND_ACK, &hdr, &p) == 0 && oc_decode_send_ack(&p, &ack) == OC_OK);
+        mid = ack.message_id;
+    }
+    CHECK(mid != 0);
+    CHECK(read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    uint8_t buf[64]; oc_wbuf w;
+    oc_delete d = { room, mid };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_delete(&w, OC_PROTOCOL_VERSION, &d) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_MSG_DELETED, &hdr, &p) == 0);
+    /* bob cannot take back alice's delete. */
+    oc_restore rs = { room, mid };
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_restore(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && send_frame(&b, buf, w.len) == 0);
+    uint16_t code = 0;
+    CHECK(read_error(&b, &code) == 0 && code == OC_ERR_FORBIDDEN);
+    /* alice can; bob is sent it whole. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_restore(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_MSG_RESTORED, &hdr, &p) == 0);
+    oc_broadcast back;
+    CHECK(oc_decode_broadcast(&p, &back) == OC_OK && back.message_id == mid && back.author_id == ua &&
+          back.body.len == 16 && !memcmp(back.body.ptr, "taking this back", 16));
     client_close(&b);
     client_close(&a);
 }
@@ -4678,6 +4738,7 @@ int run_netloop_tests(void) {
         test_call_vertical(arg.port, pin);
         test_call_leave_while_joining(arg.port, pin, dbw);
         test_alerts_wire(arg.port, pin, dbw);
+        test_restore_wire(arg.port, pin);
         test_call_state_audience(arg.port, pin);
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
