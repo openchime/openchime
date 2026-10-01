@@ -9005,13 +9005,18 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
 }
 
 static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
+    /* Offline, what was loaded stays readable under the banner, which says why
+     * and when it will try again; only a conversation with nothing loaded has an
+     * empty state. Sending waits in the composer (composer_send). */
     if (!m->authed) {
-        /* The reason lives in the banner above (draw_banner) — repeating it here
-         * put the same sentence on screen twice. This is just the empty state. */
-        g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "No conversation to show while you are offline.", g_ui, reg, OC_COL_FAINT);
-        g_ui->align = ST_ALIGN_LEFT;
-        return;
+        const oc_channel *oc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        if (!oc || !oc->n_msgs) {
+            g_ui->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Nothing loaded for this conversation yet. It appears once you are back online.",
+                      g_ui, reg, OC_COL_FAINT);
+            g_ui->align = ST_ALIGN_LEFT;
+            return;
+        }
     }
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
@@ -19785,6 +19790,15 @@ static void composer_send(void) {
      * last open. One send per pane, and this is the conversation's. */
     if (g_view == VIEW_NEWMSG) { newmsg_send_at(GetActiveWindow(), 0); return; }
     if (!g_client || !g_sel) return;
+    /* Offline: the message waits in the box, said there, rather than going into a
+     * queue that a dropped connection could lose. */
+    {
+        const oc_model *om = model();
+        if (om && !om->authed) {
+            composer_hint("You are offline. Your message stays here; send it once you are back.", 0);
+            return;
+        }
+    }
     /* Refuse locally in an archived channel so the text is not lost to a server
      * rejection you have to read in a toast (REQ-035). The daemon refuses it
      * too — this is the courteous half, not the enforcing one. */

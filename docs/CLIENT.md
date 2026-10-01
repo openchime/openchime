@@ -1062,7 +1062,10 @@ GUI only draws it):
 - **A failure with nothing to mark**: a toast that stays until dismissed, said
   assertively — one that leaves by itself is one nobody saw.
 - **An ongoing state** (the connection): a banner under the tabs, the most severe
-  first, said once as it starts and gone when it ends.
+  first, said once as it starts and gone when it ends. While it is down, what was
+  loaded stays readable under it; nobody, you included, reads as present (the
+  model's presence is stale until the connection says otherwise); and a message
+  written meanwhile waits in the composer, said there, until it can be sent.
 - **A hint about a field or the composer** ("Who is this for?", a file too large):
   inline at that field or composer — above the conversation's composer, under the
   New message pane's — until the next edit; a form's field turns red and the form

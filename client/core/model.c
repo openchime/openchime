@@ -1458,6 +1458,10 @@ static void call_state_fold(oc_model *m, const oc_call_view *v) {
 }
 
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
+    /* Disconnected, every presence is what it was when the line dropped -- stale,
+     * and yours is simply untrue: nobody can reach you. So nobody reads as
+     * present until the connection is back and says so again. */
+    if (!m->authed) return OC_PRESENCE_OFFLINE;
     for (size_t i = 0; i < m->n_presence; i++)
         if (m->presence[i].user_id == user_id) return m->presence[i].status;
     return OC_PRESENCE_OFFLINE;
