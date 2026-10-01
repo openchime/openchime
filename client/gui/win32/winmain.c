@@ -58,7 +58,7 @@
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "openchime_res.h"    /* IDI_APPICON */
 #include "theme.h"
-#include "wintoast.h"    /* the real Windows notification (REQ-138) */
+#include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include <mmsystem.h>       /* PlaySoundW, the notification sound (REQ-138) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
 #include "oc_capture.h"       /* video messages: the camera list (REQ-163) */
@@ -1139,7 +1139,7 @@ static char g_pending_url[512];
 /* What a second process, or the toast activator, hands to the running client. */
 #define OC_COPYDATA_URL    0x4F43  /* a UTF-8 openchime:// URL */
 #define OC_COPYDATA_ACTION 0x4F44  /* a toast button: "arg\nreply" */
-static int  g_wintoast_ok;         /* oc_wintoast_init's answer, once */
+static int  g_wintoast_ok;         /* oc_osn_init's answer, once: the OS raises notifications */
 static char g_aumid[128];
 /* The AppUserModelID. A constant, not a setting: it identifies the application
  * to Windows and must match the installer's shortcut exactly. Changing it
@@ -1289,14 +1289,22 @@ static int g_toasts_raised;      /* observable by the harness; see test_dump */
  * way the OS already differentiates them. */
 enum { OCSND_MESSAGE = 0, OCSND_PRIORITY, OCSND_DM, OCSND_CALL, OCSND_COUNT };
 enum { SNDV_DEFAULT = 0, SNDV_IM, SNDV_MAIL, SNDV_REMINDER, SNDV_SILENT, SNDV_COUNT };
-static const struct { const char *label, *winsound, *alias; } SNDV[SNDV_COUNT] = {
-    /* label        toast XML (ms-winsoundevent:)            PlaySound SND_ALIAS */
-    { "Default",   "ms-winsoundevent:Notification.Default",  "Notification.Default"  },
-    { "Message",   "ms-winsoundevent:Notification.IM",       "Notification.IM"       },
-    { "Mail",      "ms-winsoundevent:Notification.Mail",     "Notification.Mail"     },
-    { "Reminder",  "ms-winsoundevent:Notification.Reminder", "Notification.Reminder" },
-    { "Silent",    "",                                       NULL                    },
+/* The OS notification is told the same choice by meaning (OC_OSN_SOUND_*, in
+ * this order) and names it the platform's way; only our own window plays one,
+ * by alias. */
+static const struct { const char *label, *alias; } SNDV[SNDV_COUNT] = {
+    /* label        PlaySound SND_ALIAS */
+    { "Default",   "Notification.Default"  },
+    { "Message",   "Notification.IM"       },
+    { "Mail",      "Notification.Mail"     },
+    { "Reminder",  "Notification.Reminder" },
+    { "Silent",    NULL                    },
 };
+typedef char sndv_matches_osn[((int)SNDV_DEFAULT == (int)OC_OSN_SOUND_DEFAULT && (int)SNDV_IM == (int)OC_OSN_SOUND_IM &&
+                               (int)SNDV_MAIL == (int)OC_OSN_SOUND_MAIL &&
+                               (int)SNDV_REMINDER == (int)OC_OSN_SOUND_REMINDER &&
+                               (int)SNDV_SILENT == (int)OC_OSN_SOUND_SILENT &&
+                               (int)SNDV_COUNT == (int)OC_OSN_SOUND_COUNT) ? 1 : -1];
 static int  g_snd_choice[OCSND_COUNT] = { SNDV_IM, SNDV_REMINDER, SNDV_MAIL, SNDV_DEFAULT };
 static int  g_snd_muted;           /* one switch, leaving the choices intact */
 
@@ -1322,15 +1330,11 @@ static void sound_play(int v) {
     PlaySoundW(w, NULL, SND_ASYNC | SND_ALIAS | SND_NODEFAULT);
 }
 
-/* The tray balloon. No longer the mechanism -- it is the middle of the chain
- * below -- but kept, because it is the one surface that needs no identity. */
-static int notify_balloon(const char *title, const char *body) {
-    if (!g_tray_live) return 0;
-    g_tray.uFlags = NIF_INFO;
-    g_tray.dwInfoFlags = NIIF_NONE;
-    to_w(title, g_tray.szInfoTitle, 64);
-    to_w(body,  g_tray.szInfo, 256);
-    return Shell_NotifyIconW(NIM_MODIFY, &g_tray) ? 1 : 0;
+/* A notice from the app itself rather than about a conversation -- no key, no
+ * sound, nothing to do from it: through the OS like any other (osnotify.h). */
+static int notify_plain(const char *title, const char *body) {
+    oc_osn n = { title, body, NULL, NULL, NULL, NULL, OC_OSN_SOUND_SILENT, NULL, NULL, NULL, 0 };
+    return oc_osn_show(&n) != OC_OSN_NOT_SHOWN;
 }
 
 static void own_toast_show(const char *title, const char *body,
@@ -1388,43 +1392,38 @@ static void notify_deliver(const char *title, const char *body, const char *sour
 
 
     if (g_pref_deliver == DELIVER_OS) {
-        /* Tag and group are per conversation, so a second message REPLACES the
-         * first rather than stacking three deep for one busy channel. */
+        /* Key and group are per conversation, so a second message REPLACES the
+         * first rather than stacking three deep for one busy channel, and the
+         * conversation's can be withdrawn once it is read. */
         char tag[64], grp[64], arg[96];
         snprintf(tag, sizeof tag, "c%llu", (unsigned long long)channel_id);
         snprintf(grp, sizeof grp, "w%llu", (unsigned long long)ws_slot);
-        /* A REAL openchime:// URL, because the app already speaks them. With
-         * activationType="protocol" the click needs no COM activator and no
-         * registered CLSID -- Windows just opens the URL, the scheme points at
-         * this exe, and the running instance follows it. The conversation, not
-         * a line in it: a notification is about the former. */
+        /* A REAL openchime:// URL, because the app already speaks them: a click
+         * opens it, the scheme points at this exe, and the running instance
+         * follows it. The conversation, not a line in it: a notification is
+         * about the former. */
         snprintf(arg, sizeof arg, "openchime://%s/c/%llu",
                  g_host[0] ? g_host : "workspace", (unsigned long long)channel_id);
-        /* Windows plays it, named in the toast. Not us: a sound the OS owns
-         * obeys Focus Assist and the per-app notification settings, and one we
-         * play behind its back does not. */
         /* Actionable when it names a real conversation: a reply box and the
-         * first quick reaction, so the two things you most often want to do
-         * about a message can be done without opening the app at all. The test
-         * verb's notification names no channel and gets the plain shape. */
-        int shown = 0;
-        if (g_wintoast_ok && channel_id) {
-            /* SEND, THEN THE QUICK REACTIONS -- the same ones the message menu
-             * offers, so the toast and the app cannot disagree about what your
-             * quick reactions are.
-             *
-             * Windows allows five buttons on a toast, counting context-menu
-             * items, and Send takes one. Three reactions is what fits the row
-             * without crowding it and leaves a slot spare. */
-            #define TOAST_REACTS 3
-            static char rargs[TOAST_REACTS][160];
-            char send_arg[160];
-            const char *labels[1 + TOAST_REACTS];
-            const char *args[1 + TOAST_REACTS];
+         * quick reactions, so the two things you most often want to do about a
+         * message can be done without opening the app at all. The test verb's
+         * notification names no channel and gets the plain shape.
+         *
+         * SEND, THEN THE QUICK REACTIONS -- the same ones the message menu
+         * offers, so the notification and the app cannot disagree about what
+         * your quick reactions are. Windows allows five buttons on a toast,
+         * Send takes one, and three reactions fit the row without crowding. */
+        #define TOAST_REACTS 3
+        static char rargs[TOAST_REACTS][160];
+        char send_arg[160];
+        const char *labels[1 + TOAST_REACTS];
+        const char *args[1 + TOAST_REACTS];
+        int nb = 0;
+        if (channel_id) {
             snprintf(send_arg, sizeof send_arg, "reply|%llu|%llu|",
                      (unsigned long long)ws_slot, (unsigned long long)channel_id);
             labels[0] = "Send"; args[0] = send_arg;
-            int nb = 1;
+            nb = 1;
             for (int q = 0; q < g_n_quick && nb < 1 + TOAST_REACTS; q++) {
                 /* Never a NULL: quick_rebuild leaves an entry empty when a
                  * configured name is not in the catalogue, and a name that does
@@ -1444,19 +1443,13 @@ static void notify_deliver(const char *title, const char *body, const char *sour
                          (unsigned long long)ws_slot, (unsigned long long)channel_id);
                 labels[1] = "\xF0\x9F\x91\x8D"; args[1] = rargs[0]; nb = 2;
             }
-            shown = oc_wintoast_show_actions(title, body, source, tag, grp, arg,
-                                             SNDV[snd].winsound, "Reply", labels, args, nb);
         }
-        if (!shown && g_wintoast_ok)
-            shown = oc_wintoast_show(title, body, tag, grp, arg, SNDV[snd].winsound);
-        if (shown) {
-            g_delivered_by = DELIVERED_WINRT;
-            return;
-        }
-        /* The balloon has no way to name a sound, so we play it. */
-        if (notify_balloon(title, body)) {
-            sound_play(snd); g_delivered_by = DELIVERED_BALLOON; return;
-        }
+        /* The OS plays the sound it is told to, so it obeys Focus Assist; a
+         * surface that cannot play one says so and we play it. */
+        oc_osn n = { title, body, source, tag, grp, arg, snd, nb ? "Reply" : NULL, labels, args, nb };
+        int r = oc_osn_show(&n);
+        if (r == OC_OSN_SHOWN) { g_delivered_by = DELIVERED_WINRT; return; }
+        if (r == OC_OSN_SHOWN_SILENT) { sound_play(snd); g_delivered_by = DELIVERED_BALLOON; return; }
     }
     own_toast_show(title, body, ws_slot, channel_id);
     sound_play(snd);                       /* our window, our sound */
@@ -26306,7 +26299,7 @@ static void draw_share_full(gfx *rt, const oc_model *m, float W, float H) {
 static void notify_call(const char *title, const char *body, const char *source,
                         uint64_t ws_slot, uint64_t channel_id) {
     int snd = g_snd_muted ? SNDV_SILENT : g_snd_choice[OCSND_CALL];
-    if (g_pref_deliver == DELIVER_OS && g_wintoast_ok) {
+    if (g_pref_deliver == DELIVER_OS && (oc_osn_caps() & OC_OSN_CAP_ACTIONS)) {
         char tag[64], grp[64], arg[96], ja[96], da[96];
         snprintf(tag, sizeof tag, "call%llu", (unsigned long long)channel_id);
         snprintf(grp, sizeof grp, "w%llu", (unsigned long long)ws_slot);
@@ -26316,8 +26309,8 @@ static void notify_call(const char *title, const char *body, const char *source,
         snprintf(da, sizeof da, "decline|%llu|%llu|", (unsigned long long)ws_slot, (unsigned long long)channel_id);
         const char *labels[2] = { "Join", "Decline" }, *args[2] = { ja, da };
         g_last_notify_ws = ws_slot; g_last_notify_cid = channel_id;
-        if (g_pref_deliver != DELIVER_NONE &&
-            oc_wintoast_show_actions(title, body, source, tag, grp, arg, SNDV[snd].winsound, NULL, labels, args, 2)) {
+        oc_osn n = { title, body, source, tag, grp, arg, snd, NULL, labels, args, 2 };
+        if (oc_osn_show(&n) == OC_OSN_SHOWN) {
             g_toasts_raised++;
             g_delivered_by = DELIVERED_WINRT;
             return;
@@ -28658,6 +28651,16 @@ static void test_poll(HWND hwnd) {
         int v = atoi(arg);
         if (v >= 0 && v <= 2) { g_pref_deliver = v; prefs_save(); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "withdraw")) {
+        /* withdraw <ws>|<channel> -- take back that conversation's notification;
+         * withdraw <ws> -- every one of that workspace's (osnotify.h). */
+        unsigned long long ws = strtoull(arg, NULL, 10), cid = 0;
+        const char *bar = strchr(arg, '|');
+        if (bar) cid = strtoull(bar + 1, NULL, 10);
+        char tag[64], grp[64];
+        snprintf(tag, sizeof tag, "c%llu", cid);
+        snprintf(grp, sizeof grp, "w%llu", ws);
+        test_ack((bar ? oc_osn_withdraw(tag, grp) : oc_osn_withdraw_group(grp)) ? "ok" : "err");
     } else if (!strcmp(verb, "wintoast")) {
         /* wintoast 0|1 -- 0 behaves as if the WinRT toast could not be set up, so
          * the next `toast` falls to the tray balloon through the real chain. The
@@ -28666,6 +28669,7 @@ static void test_poll(HWND hwnd) {
          * back whatever initialisation actually found. Nothing is saved. */
         static int real = -1;
         if (real < 0) real = g_wintoast_ok;
+        oc_osn_test_unavailable(!atoi(arg));
         g_wintoast_ok = atoi(arg) ? real : 0;
         test_ack("ok");
     } else if (!strcmp(verb, "notify")) {
@@ -29293,20 +29297,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             GetProcAddress(sh, "SetCurrentProcessExplicitAppUserModelID");
             if (setid) { WCHAR w[128]; to_w(g_aumid, w, 128); setid(w); }
         }
-        g_wintoast_ok = oc_wintoast_init(g_aumid);
+        /* The OS notifications: the identity this process is known by, the
+         * tray icon the balloon fallback rides on, and where a button's or the
+         * reply box's use is handed. The activator and the Start-menu
+         * shortcut Windows resolves it through are the backend's to set up --
+         * Windows reads the activator CLSID off that shortcut for an
+         * unpackaged app, and Inno cannot write the property. */
+        oc_osn_init(g_aumid, "OpenChime", g_tray_live ? hwnd : NULL, TRAY_UID, toast_action_cb);
+        g_wintoast_ok = (oc_osn_caps() & OC_OSN_CAP_ACTIONS) != 0;
         /* So a toast's click has somewhere to land. Written on every start
          * rather than at install time only: a developer build, a portable copy
          * and an upgraded path all need it to point at THIS exe. */
         url_scheme_register();
-        /* The activator, and the shortcut both it and the AUMID are resolved
-         * through. Windows reads the activator CLSID off the Start-menu
-         * shortcut for an unpackaged app, and Inno cannot write that property --
-         * so the app writes its own rather than shipping a toast whose buttons
-         * silently do nothing. */
-        if (g_wintoast_ok) {
-            oc_wintoast_ensure_shortcut(g_aumid, "OpenChime");
-            oc_wintoast_activator_register(toast_action_cb);
-        }
         return 0;
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
@@ -31047,7 +31049,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_close_to_tray_told) {
                 g_close_to_tray_told = 1;
                 prefs_save();
-                notify_balloon("OpenChime is still running",
+                notify_plain("OpenChime is still running",
                              "Messages will keep arriving. Open it from the "
                              "notification area, or quit with Ctrl+Q.");
             }

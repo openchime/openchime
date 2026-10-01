@@ -142,6 +142,37 @@ typedef struct IToastNotificationManagerStaticsVtbl {
 } IToastNotificationManagerStaticsVtbl;
 struct IToastNotificationManagerStatics { const IToastNotificationManagerStaticsVtbl *lpVtbl; };
 
+/* The notification history (Notification Center), reached through the
+ * manager's second statics interface: what lets a toast be WITHDRAWN once the
+ * messages it was about have been read, rather than left behind to disagree
+ * with the app. */
+typedef struct IToastNotificationHistory IToastNotificationHistory;
+typedef struct IToastNotificationHistoryVtbl {
+    HRESULT (WINAPI *QueryInterface)(IToastNotificationHistory *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(IToastNotificationHistory *);
+    ULONG   (WINAPI *Release)(IToastNotificationHistory *);
+    void   *GetIids, *GetRuntimeClassName, *GetTrustLevel;
+    void   *RemoveGroup;                              /* (group) — package identity only */
+    HRESULT (WINAPI *RemoveGroupWithId)(IToastNotificationHistory *, HSTRING group, HSTRING app);
+    HRESULT (WINAPI *RemoveGroupedTagWithId)(IToastNotificationHistory *, HSTRING tag, HSTRING group,
+                                             HSTRING app);
+    void   *RemoveGroupedTag, *Remove, *Clear, *ClearWithId;
+} IToastNotificationHistoryVtbl;
+struct IToastNotificationHistory { const IToastNotificationHistoryVtbl *lpVtbl; };
+
+typedef struct IToastNotificationManagerStatics2 IToastNotificationManagerStatics2;
+typedef struct IToastNotificationManagerStatics2Vtbl {
+    HRESULT (WINAPI *QueryInterface)(IToastNotificationManagerStatics2 *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(IToastNotificationManagerStatics2 *);
+    ULONG   (WINAPI *Release)(IToastNotificationManagerStatics2 *);
+    void   *GetIids, *GetRuntimeClassName, *GetTrustLevel;
+    HRESULT (WINAPI *get_History)(IToastNotificationManagerStatics2 *, IToastNotificationHistory **);
+} IToastNotificationManagerStatics2Vtbl;
+struct IToastNotificationManagerStatics2 { const IToastNotificationManagerStatics2Vtbl *lpVtbl; };
+
+static const IID IID_IToastNotificationManagerStatics2 =
+    { 0x7ab93c52, 0x0e48, 0x4750, { 0xba, 0x9d, 0x1a, 0x41, 0x13, 0x98, 0x18, 0x47 } };
+
 static const IID IID_IXmlDocumentIO =
     { 0x6cd0e74e, 0xee65, 0x4489, { 0x9e, 0xbf, 0xca, 0x43, 0xe8, 0x7b, 0xa6, 0x37 } };
 static const IID IID_IToastNotificationManagerStatics =
@@ -748,6 +779,33 @@ int oc_wintoast_show_actions(const char *title, const char *body,
         warg, wtitle, wbody, wsrc, acts, wsnd);
     return oc_wintoast_show_xml(xml, tag, group);
 }
+
+/* Withdraw: one conversation's toast (tag + group), or a whole workspace's
+ * (group). The history is asked for each time -- this is rare, and a cached
+ * interface is one more thing to release in the right order. */
+static int withdraw(const char *tag, const char *group) {
+    if (!g_ready || !g_mgr || !group) return 0;
+    IToastNotificationManagerStatics2 *m2 = NULL;
+    IToastNotificationHistory *hist = NULL;
+    if (FAILED(g_mgr->lpVtbl->QueryInterface(g_mgr, &IID_IToastNotificationManagerStatics2, (void **)&m2)) || !m2)
+        return 0;
+    HRESULT r = m2->lpVtbl->get_History(m2, &hist);
+    m2->lpVtbl->Release(m2);
+    if (FAILED(r) || !hist) return 0;
+    WCHAR wt[128], wg[128];
+    MultiByteToWideChar(CP_UTF8, 0, group, -1, wg, 128);
+    HSTRING hg = hs(wg), ha = hs(g_aumid), ht = NULL;
+    if (tag) { MultiByteToWideChar(CP_UTF8, 0, tag, -1, wt, 128); ht = hs(wt); }
+    r = (!hg || !ha || (tag && !ht)) ? E_FAIL
+      : tag ? hist->lpVtbl->RemoveGroupedTagWithId(hist, ht, hg, ha)
+            : hist->lpVtbl->RemoveGroupWithId(hist, hg, ha);
+    hs_free(ht); hs_free(hg); hs_free(ha);
+    hist->lpVtbl->Release(hist);
+    return SUCCEEDED(r);
+}
+
+int oc_wintoast_withdraw(const char *tag, const char *group) { return tag ? withdraw(tag, group) : 0; }
+int oc_wintoast_withdraw_group(const char *group) { return withdraw(NULL, group); }
 
 void oc_wintoast_done(void) {
     if (g_toast_factory) { g_toast_factory->lpVtbl->Release(g_toast_factory); g_toast_factory = NULL; }

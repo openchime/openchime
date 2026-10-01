@@ -28,6 +28,7 @@
 #include "audio.h"        /* the relay, run on a thread for the call test */
 #include "e2e_hpke.h"
 #include "e2e_sframe.h"
+#include "osnotify.h"
 #include "check.h"
 #include "testpki.h"
 #include "issuer.h"       /* mints what central would, for the browser sign-in test */
@@ -783,6 +784,20 @@ static void test_new_channel_takes_the_default_level(void) {
 /* The daemon's critical failures in the model (REQ-263): nothing until a summary
  * says this is an owner or admin; the counts; a list that replaces the last;
  * and a new session that starts from nothing again. */
+/* Where the platform's own notifications are not built (osnotify_null.c):
+ * nothing can be raised or taken back, and every call says so, so the frontend
+ * falls back and the badges carry on. */
+static void test_osnotify_null(void) {
+    CHECK(oc_osn_init("test.app", "Test", NULL, 0, NULL) == 0);
+    CHECK(oc_osn_available() == 0 && oc_osn_caps() == 0);
+    const char *labels[1] = { "Send" }, *args[1] = { "reply|0|1|" };
+    oc_osn n = { "bob", "hello", "#general", "c1", "w0", "openchime://x/c/1", OC_OSN_SOUND_IM, "Reply",
+                 labels, args, 1 };
+    CHECK(oc_osn_show(&n) == OC_OSN_NOT_SHOWN);
+    CHECK(oc_osn_withdraw("c1", "w0") == 0 && oc_osn_withdraw_group("w0") == 0);
+    oc_osn_done();
+}
+
 static void test_srvalerts_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -3793,6 +3808,7 @@ int run_client_core_tests(void) {
     test_new_channel_takes_the_default_level();
     test_channel_info_seq();
     test_srvalerts_model();
+    test_osnotify_null();
     test_notify_scan();
     test_thread_notices();
     test_unread_counts_what_notifies();

@@ -97,6 +97,12 @@ const char *oc_wintoast_activator_clsid(void);
  * idempotent: it rewrites only when missing or pointing elsewhere. */
 int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name);
 
+/* Withdraw from the Notification Center: the toast raised with this `tag` and
+ * `group`, or every toast in `group`. Returns 1 if Windows took the request
+ * (including when there was nothing to remove), 0 when it could not be asked. */
+int oc_wintoast_withdraw(const char *tag, const char *group);
+int oc_wintoast_withdraw_group(const char *group);
+
 /* Release the factories. Called on shutdown; safe when init never succeeded. */
 void oc_wintoast_done(void);
 
