@@ -1138,6 +1138,18 @@ void oc_model_mark_read(oc_model *m, uint64_t channel_id) {
     if (!c) return;
     c->read_marker = c->high_water;
     c->unread = 0;
+    c->priority_unread = 0;
+}
+
+void oc_model_badge(const oc_model *m, const oc_channel *c, int *count, int *dot) {
+    (void)m;
+    int n = 0, d = 0;
+    if (c && !c->muted && c->unread > 0) {
+        n = c->kind == OC_CHANNEL_KIND_DM ? c->unread : c->priority_unread;
+        d = n == 0;
+    }
+    if (count) *count = n;
+    if (dot) *dot = d;
 }
 
 /* Mark unread (REQ-235): put this user's position in `channel_id` at
@@ -1149,7 +1161,7 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
     oc_channel *c = oc_model_channel(m, channel_id);
     if (!c) return;
     c->read_marker = message_id;
-    int n = 0;
+    int n = 0, pri = 0;
     for (size_t i = 0; i < c->n_msgs; i++) {
         const oc_msg *msg = &c->msgs[i];
         if (msg->message_id <= message_id || msg->deleted) continue;
@@ -1159,12 +1171,15 @@ void oc_model_set_read_marker(oc_model *m, uint64_t channel_id, uint64_t message
             men = oc_model_mentions_me(m, msg->body, blen);
             kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
         }
-        if (oc_notify_decide(msg->author_id == m->user_id, c->muted,
-                             oc_model_is_priority(m, msg->author_id),
-                             c->notify_level, men, kw, 0, 0, 0))
+        int vip = oc_model_is_priority(m, msg->author_id);
+        if (oc_notify_decide(msg->author_id == m->user_id, c->muted, vip,
+                             c->notify_level, men, kw, 0, 0, 0)) {
             n++;
+            if (men || kw || vip) pri++;
+        }
     }
     c->unread = n;
+    c->priority_unread = pri;
     c->srv_unread = (uint32_t)n;
 }
 
@@ -1564,11 +1579,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 men = oc_model_mentions_me(m, msg->body, blen);
                 kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
             }
+            int vip = oc_model_is_priority(m, e->author_id);
             if (e->message_id > c->read_marker &&
-                oc_notify_decide(e->author_id == m->user_id, c->muted,
-                                 oc_model_is_priority(m, e->author_id),
-                                 c->notify_level, men, kw, 0, 0, 0))
+                oc_notify_decide(e->author_id == m->user_id, c->muted, vip,
+                                 c->notify_level, men, kw, 0, 0, 0)) {
                 c->unread++;
+                if (men || kw || vip) c->priority_unread++;   /* the badge's count, not its dot */
+            }
             /* Talking mode speaks what arrives from now on (ARCH-111), except
              * one's own messages: you know what you just typed, and hearing it
              * read back -- over the next person's reply, since the queue plays

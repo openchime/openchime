@@ -166,6 +166,9 @@ typedef struct {
     uint64_t high_water;   /* dedup mark: ignore message_id <= this (ARCH-45) */
     uint64_t read_marker;  /* high_water as of the last mark-read; drives unread */
     int      unread;       /* messages from others since the last mark-read */
+    /* Of those, the ones that are about YOU -- a mention, a keyword, a priority
+     * person -- which the badge counts; the rest are a dot (oc_model_badge). */
+    int      priority_unread;
     /* Server-reported, from CHANNEL_LIST — the only activity a cache-less client
      * (ARCH-88) knows about a channel it has not opened. `srv_unread` seeds the
      * badge before any backfill; `last_message_at` drives Recency sorting. */
@@ -848,6 +851,12 @@ void oc_sidebar_opts_defaults(oc_sidebar_opts *o);
  * Format is a compact "c:s,f,x;d:s,f,x" so one setting key carries all of it. */
 void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
+/* A conversation's badge, two tiers as every chat client draws it: a COUNT of
+ * what is about you -- mentions, keywords, priority people, and in a direct
+ * message every message, since all of it is to you -- and a DOT for any other
+ * unread. Muted shows neither. */
+void oc_model_badge(const oc_model *m, const oc_channel *c, int *count, int *dot);
+
 /* Clear a channel's unread count and advance its read marker to high_water. */
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
 /* Put this user's read position in a channel at `message_id`, backwards included
