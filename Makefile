@@ -262,6 +262,7 @@ STT ?= 1
 # What `make test` links of voice input whatever STT is: the worker (driven by a
 # stub engine) and the tokenizer -- everything but the model.
 QR_TEST_SRC := tuikit/tk_qr.c $(QRCODEGEN)
+OSN_TEST_SRC := client/shared/osnotify_null.c
 STT_TEST_SRC := daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
 ifeq ($(STT),1)
 STT_SRC   := daemon/stt.c daemon/stt_moonshine.c daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
@@ -342,14 +343,14 @@ RELEASE_CC ?= /opt/zig/zig cc -target x86_64-linux-gnu.2.34
 # binary's flags -- so this one clang pass is the tree's second-compiler check
 # as well: -Werror makes any warning clang raises and gcc does not fatal.
 RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
-                       $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(QR_TEST_SRC)
+                       $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
 check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
 	@for f in $(SRC) $(TTS_SRC) $(STT_SRC); do \
 	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -c -o /dev/null $$f || exit 1; \
 	done
 	@for f in $(RELEASE_CC_TEST_SRC); do \
 	  $(RELEASE_CC) $(CFLAGS) $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) \
-	    -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Ituikit -Ithird_party/qrcodegen -c -o /dev/null $$f || exit 1; \
+	    -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen -c -o /dev/null $$f || exit 1; \
 	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
@@ -378,9 +379,9 @@ test-rest: check-opcodes check-refs $(TEST_BIN)
 # a Windows host and a developer who remembers; this needs neither.
 THEME_SRC := client/gui/win32/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Ituikit -Ithird_party/qrcodegen \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # The same test binary under ThreadSanitizer, for the code that shares memory
 # between threads: the event loop and its I/O threads, the writer and readers,
@@ -394,9 +395,9 @@ TSAN_BIN := build/tests-tsan
 test-tsan: $(TSAN_BIN)
 	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
-$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Ituikit -Ithird_party/qrcodegen \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
@@ -546,6 +547,7 @@ $(WIN_SPEEXDSP_A):
 # Debug symbols, split out of the shipped binary (see the strip step below).
 WIN_GUI_SYMS := build/openchime.debug
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
+           client/shared/osnotify_win.c \
            $(SDLTEXT_WIN) $(GFX_SRC)
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
                $(CORE_INC) $(CALL_INC) -Iclient/gui/win32 -Iclient/shared \
