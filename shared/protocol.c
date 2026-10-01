@@ -1573,6 +1573,7 @@ static void w_call_parts(oc_wbuf *w, uint16_t n, const oc_call_part *parts) {
         oc_w_u8(w, parts[i].slot);
         w_raw(w, parts[i].device_key, OC_CALL_DEVICE_KEY_LEN);
         oc_w_u8(w, parts[i].codecs);
+        oc_w_u8(w, parts[i].flags);
     }
 }
 
@@ -1584,6 +1585,7 @@ static void r_call_parts(oc_rbuf *p, uint16_t *count, oc_call_part *parts, uint1
         parts[i].slot = oc_r_u8(p);
         r_raw(p, parts[i].device_key, OC_CALL_DEVICE_KEY_LEN);
         parts[i].codecs = oc_r_u8(p);
+        parts[i].flags = oc_r_u8(p);
     }
     *count = n;
 }

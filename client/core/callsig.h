@@ -58,7 +58,19 @@ typedef struct {
     void (*tcp)(void *ctx, int (*send)(void *sctx, uint16_t seq, const uint8_t *ct, size_t len),
                 void *sctx);
     void (*rx_tcp)(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len);
+    /* Nonzero once UDP that worked has gone quiet (AUDIO.md §4): the path has
+     * most likely moved to an address the relay will not take for this token,
+     * and the core rejoins for a fresh one. NULL in an engine that cannot tell. */
+    int  (*lost)(void *ctx);
 } oc_call_media;
+
+/* Getting back into a call this device was put out of (PROTOCOL.md §5.17): at
+ * most OC_CALLSIG_REJOINS rejoins in any OC_CALLSIG_REJOIN_MS, and given up
+ * that long after the loss; after a reconnect, given up when the call is not
+ * reported within OC_CALLSIG_STATE_WAIT_MS of signing in. */
+#define OC_CALLSIG_REJOINS         3
+#define OC_CALLSIG_REJOIN_MS       60000u
+#define OC_CALLSIG_STATE_WAIT_MS   5000u
 
 /* Packets queued for the connection, oldest first; past OC_CALLSIG_TCPQ the
  * oldest is dropped, as a UDP one would be. */
@@ -90,6 +102,19 @@ typedef struct {
     int      tq_head, tq_n;
     void   (*wake)(void *wctx);    /* ends the connection thread's wait: a packet is queued */
     void    *wake_ctx;
+
+    /* A call this device is getting back into: put out of it by its connection,
+     * a sweep or a moved media path, not by its own act. */
+    struct {
+        int      on;
+        uint64_t channel_id, call_id;
+        uint64_t since_ms;         /* when it was lost */
+        uint64_t authed_ms;        /* a connection signed in since; 0 = none yet */
+        int      sent;             /* its CALL_JOIN went on this connection */
+    } rj;
+    uint64_t rj_at[OC_CALLSIG_REJOINS];   /* when the last rejoins were sent */
+    uint64_t rejoin_ms, state_wait_ms;    /* a test's shorter bounds; 0 = the defaults */
+    uint64_t now_ms;                      /* the clock, as last told (lost, authed, tick) */
 } oc_callsig;
 
 void oc_callsig_init(oc_callsig *cs);
@@ -115,8 +140,25 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
 int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host,
                      oc_callsig_write write, void *wctx, oc_queue *to_ui);
 
-/* The connection dropped: the daemon took this device out of any call. */
-void oc_callsig_lost(oc_callsig *cs, oc_queue *to_ui);
+/* The connection dropped. A call this device was in is held for it by the
+ * daemon for a while (PROTOCOL.md §5.17); it is rejoined once a connection
+ * signs in again and the daemon still reports it. `now_ms` is the caller's
+ * clock, the one oc_callsig_authed and oc_callsig_tick are given. */
+void oc_callsig_lost(oc_callsig *cs, oc_queue *to_ui, uint64_t now_ms);
+
+/* A connection signed in. */
+void oc_callsig_authed(oc_callsig *cs, uint64_t now_ms);
+
+/* Going on purpose (the client is closing): a CALL_LEAVE for the call this
+ * device is in, and no rejoin. */
+void oc_callsig_quit(oc_callsig *cs, oc_callsig_write write, void *wctx, oc_queue *to_ui);
+
+/* A call request was refused: a rejoin waiting on one is given up. */
+void oc_callsig_refused(oc_callsig *cs, oc_queue *to_ui);
+
+/* Time passing: a moved media path is rejoined, and a rejoin past its bounds is
+ * given up. `write` NULL while there is no connection. */
+void oc_callsig_tick(oc_callsig *cs, uint64_t now_ms, oc_callsig_write write, void *wctx, oc_queue *to_ui);
 
 /* Write the media packets the engine queued for the connection, as CALL_MEDIA.
  * The network thread calls it at the top of every turn, and is woken to (see

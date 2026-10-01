@@ -2170,6 +2170,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                  * why, in its own words, rather than a status line. */
                 oc_ev *e = oc_ev_new(OC_EV_CALL_ERROR);
                 if (e) { e->size = err.code; oc_queue_push(to_ui, e); }
+                if (ctx->calls) oc_callsig_refused(ctx->calls, to_ui);
             } else {
                 char msg[256];
                 size_t n = err.message.len < sizeof msg - 1 ? err.message.len : sizeof msg - 1;
@@ -2885,6 +2886,7 @@ static int run_connection(oc_net *n, int reconnecting,
         }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
+        oc_callsig_authed(&n->calls, oc_model_now_ms());   /* a call to get back into is rejoined */
 
         /* Refresh the stored UTC offset on every connect (ARCH-103). It was only
          * ever written as a field on SET_SCHEDULE, so it was captured when the
@@ -2977,9 +2979,15 @@ static int run_connection(oc_net *n, int reconnecting,
         /* Media first in each turn, ahead of an upload's chunks or a voice
          * segment: it is the one thing here that is late if it waits. */
         oc_callsig_pump(&n->calls, ctx_write, &ctx);
+        oc_callsig_tick(&n->calls, oc_model_now_ms(), ctx_write, &ctx, n->to_ui);
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
-            if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); rc = RC_STOP; goto drop; }
+            if (c->type == OC_CMD_QUIT) {
+                /* Going on purpose: out of any call now, so the daemon holds no
+                 * seat for a rejoin that will not come. */
+                oc_callsig_quit(&n->calls, ctx_write, &ctx, n->to_ui);
+                oc_cmd_free(c); rc = RC_STOP; goto drop;
+            }
             if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_SHARE) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
                                          ctx_write, &ctx, n->to_ui);
@@ -3624,11 +3632,12 @@ static int run_connection(oc_net *n, int reconnecting,
     }
 
 drop:
-    /* The daemon takes a closed connection out of its call (REQ-152); so does
-     * this side, at once, rather than leave the audio running to nobody. */
+    /* The daemon holds a closed connection's seat in its call for a rejoin
+     * (REQ-152); this side stops the audio at once -- its token is dead -- and
+     * rejoins once a connection signs in again. */
     oc_callsig_set_wake(&n->calls, NULL, NULL);   /* no call engine thread touches it after this */
     oc_wake_close(&wake);
-    oc_callsig_lost(&n->calls, n->to_ui);
+    oc_callsig_lost(&n->calls, n->to_ui, oc_model_now_ms());
     xfer_reset(&xfer);   /* close any half-done transfer file */
     xq_requeue_active(&n->xq);
     oc_framebuf_free(&fb);
@@ -3863,6 +3872,7 @@ static void *net_thread(void *arg) {
         n->reconnect_now = 0;
         for (int s = 0; s < backoff_ms && !n->stop && !n->reconnect_now; s += 50) {
             oc_nanosleep(50 * 1000 * 1000);
+            oc_callsig_tick(&n->calls, oc_model_now_ms(), NULL, NULL, n->to_ui);   /* a rejoin's deadline */
         }
         n->reconnect_now = 0;
         { oc_ev *e = oc_ev_new(OC_EV_BACKOFF);      /* attempting now */

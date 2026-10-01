@@ -2431,9 +2431,25 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_CALL_JOINED:
         if (!e->call) break;
+        if (m->call_rejoining) {
+            if (m->call_rejoining == e->call->channel_id) m->call_back_seq++;
+            m->call_rejoining = 0;
+        }
         m->in_call = 1;
         m->call = *e->call;
         if (m->call_pending == e->call->channel_id) m->call_pending = 0;
+        break;
+    case OC_EV_CALL_REJOINING:
+        /* Out, for now: the view of the call is kept, to say what is coming back. */
+        m->in_call = 0;
+        m->call_rejoining = e->channel_id;
+        break;
+    case OC_EV_CALL_LOST:
+        if (m->call_rejoining == e->channel_id) {
+            m->call_rejoining = 0;
+            memset(&m->call, 0, sizeof m->call);
+            m->call_lost_seq++;
+        }
         break;
     case OC_EV_CALL_ROSTER:
         if (!e->call || !m->in_call || e->call->call_id != m->call.call_id) break;
@@ -2441,10 +2457,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->call.n_parts = e->call->n_parts;
         memcpy(m->call.parts, e->call->parts, e->call->n_parts * sizeof e->call->parts[0]);
         memcpy(m->call.slots, e->call->slots, e->call->n_parts * sizeof e->call->slots[0]);
+        memcpy(m->call.away, e->call->away, e->call->n_parts * sizeof e->call->away[0]);
         break;
     case OC_EV_CALL_LEFT:
-        if (m->in_call && m->call.channel_id == e->channel_id) {
+        if ((m->in_call || m->call_rejoining) && m->call.channel_id == e->channel_id) {
             m->in_call = 0;
+            m->call_rejoining = 0;
             memset(&m->call, 0, sizeof m->call);
         }
         break;

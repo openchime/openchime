@@ -333,7 +333,16 @@ void oc_client_call_join(oc_client *c, uint64_t channel_id) {
     oc_client_call_start(c, channel_id, NULL, 0);
 }
 
-void oc_client_call_leave(oc_client *c, uint64_t channel_id)   { call_cmd(c, OC_CMD_CALL_LEAVE, channel_id, NULL, 0); }
+void oc_client_call_leave(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    /* Leaving while getting back in is over here at once, connected or not:
+     * the command waits for a connection, the window does not. */
+    if (c->model.call_rejoining && c->model.call_rejoining == channel_id) {
+        c->model.call_rejoining = 0;
+        memset(&c->model.call, 0, sizeof c->model.call);
+    }
+    call_cmd(c, OC_CMD_CALL_LEAVE, channel_id, NULL, 0);
+}
 void oc_client_call_decline(oc_client *c, uint64_t channel_id) { call_cmd(c, OC_CMD_CALL_DECLINE, channel_id, NULL, 0); }
 void oc_client_call_end(oc_client *c, uint64_t channel_id)     { call_cmd(c, OC_CMD_CALL_END, channel_id, NULL, 0); }
 

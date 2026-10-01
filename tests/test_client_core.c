@@ -2423,6 +2423,7 @@ static struct {
     int      big;                            /* payloads over 1000 bytes: a shared screen's */
     volatile int drop_pm;                    /* client -> relay packets lost, per mille */
     volatile int block;                      /* every packet lost, both ways: UDP is blocked */
+    volatile int rebind;                     /* every client's path moves: new source ports */
     unsigned rng;
     volatile int stop;
 } g_tap;
@@ -2442,6 +2443,10 @@ static void *tap_thread(void *p) {
     relay.sin_port = htons(g_tap.relay_port);
     uint8_t buf[2048];
     while (!__atomic_load_n(&g_tap.stop, __ATOMIC_ACQUIRE)) {
+        /* A NAT rebinding, or a front door's failover: each client's packets
+         * reach the relay from a new address from now on. */
+        if (__atomic_exchange_n(&g_tap.rebind, 0, __ATOMIC_ACQ_REL))
+            for (int i = 0; i < g_tap.n_cl; i++) { close(g_tap.cl[i].up); g_tap.cl[i].up = socket(AF_INET, SOCK_DGRAM, 0); }
         /* Only the sockets polled are looked at afterwards: a client first seen
          * in this pass has no revents yet, and reading one anyway is a blocking
          * recv on an empty socket. Every recv is non-blocking all the same. */
@@ -2913,6 +2918,179 @@ static void test_calls_tcp(oc_client *a, oc_client *b) {
     oc_client_set_call_media(b, NULL, NULL);
     oc_call_engine_free(ea);
     oc_call_engine_free(eb);
+}
+
+/* A TCP forwarder in front of the daemon, for one client: what passes through
+ * it can be cut, as a front door's failover or a network change cuts a
+ * connection, while the daemon and every other client go on. */
+#define PROXY_PAIRS 8
+static struct {
+    int lfd, port, daemon_port;
+    struct { int c, d; } pr[PROXY_PAIRS];
+    int n;
+    volatile int cut, stop;
+} g_px;
+static pthread_t g_px_th;
+
+static void *proxy_thread(void *arg) {
+    (void)arg;
+    uint8_t buf[16384];
+    while (!__atomic_load_n(&g_px.stop, __ATOMIC_ACQUIRE)) {
+        if (__atomic_exchange_n(&g_px.cut, 0, __ATOMIC_ACQ_REL)) {
+            for (int i = 0; i < g_px.n; i++) { close(g_px.pr[i].c); close(g_px.pr[i].d); }
+            g_px.n = 0;
+        }
+        struct pollfd pf[1 + 2 * PROXY_PAIRS];
+        pf[0].fd = g_px.lfd; pf[0].events = POLLIN; pf[0].revents = 0;
+        int n = g_px.n;
+        for (int i = 0; i < n; i++) {
+            pf[1 + 2 * i] = (struct pollfd){ g_px.pr[i].c, POLLIN, 0 };
+            pf[2 + 2 * i] = (struct pollfd){ g_px.pr[i].d, POLLIN, 0 };
+        }
+        if (poll(pf, (nfds_t)(1 + 2 * n), 50) <= 0) continue;
+        int dead[PROXY_PAIRS] = { 0 };
+        for (int i = 0; i < n; i++)
+            for (int side = 0; side < 2; side++) {
+                if (!(pf[1 + 2 * i + side].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                int from = side ? g_px.pr[i].d : g_px.pr[i].c, to = side ? g_px.pr[i].c : g_px.pr[i].d;
+                ssize_t r = recv(from, buf, sizeof buf, MSG_DONTWAIT);
+                if (r <= 0) { dead[i] = 1; continue; }
+                for (ssize_t off = 0; off < r; ) {
+                    ssize_t w = send(to, buf + off, (size_t)(r - off), MSG_NOSIGNAL);
+                    if (w <= 0) { dead[i] = 1; break; }
+                    off += w;
+                }
+            }
+        for (int i = n - 1; i >= 0; i--)
+            if (dead[i]) { close(g_px.pr[i].c); close(g_px.pr[i].d); g_px.pr[i] = g_px.pr[--g_px.n]; }
+        if ((pf[0].revents & POLLIN) && g_px.n < PROXY_PAIRS) {
+            int c = accept(g_px.lfd, NULL, NULL);
+            if (c < 0) continue;
+            int d = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            sa.sin_port = htons((uint16_t)g_px.daemon_port);
+            if (d < 0 || connect(d, (struct sockaddr *)&sa, sizeof sa) != 0) { close(c); if (d >= 0) close(d); continue; }
+            g_px.pr[g_px.n].c = c; g_px.pr[g_px.n].d = d; g_px.n++;
+        }
+    }
+    for (int i = 0; i < g_px.n; i++) { close(g_px.pr[i].c); close(g_px.pr[i].d); }
+    return NULL;
+}
+
+static int proxy_start(int daemon_port) {
+    memset(&g_px, 0, sizeof g_px);
+    g_px.daemon_port = daemon_port;
+    g_px.lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (g_px.lfd < 0 || bind(g_px.lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(g_px.lfd, 8) != 0 ||
+        getsockname(g_px.lfd, (struct sockaddr *)&sa, &sl) != 0) return -1;
+    g_px.port = ntohs(sa.sin_port);
+    return pthread_create(&g_px_th, NULL, proxy_thread, NULL) == 0 ? g_px.port : -1;
+}
+
+static void proxy_stop(void) {
+    __atomic_store_n(&g_px.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(g_px_th, NULL);
+    close(g_px.lfd);
+}
+
+/* Whether `uid` is marked away in the call `m` is in: 1, 0, or -1 if not in it. */
+static int away_in(const oc_model *m, uint64_t uid) {
+    for (int i = 0; i < m->call.n_parts; i++) if (m->call.parts[i] == uid) return m->call.away[i] != 0;
+    return -1;
+}
+
+/* A call survives what moves under it (REQ-152, PROTOCOL.md §5.17): faye's
+ * connection is cut mid-call, and she is back in the same call by herself --
+ * her seat held meanwhile, dana's roster never dropping her -- and they hear
+ * each other again; then everyone's UDP path moves, as a NAT rebinding or a
+ * front door's failover moves it, and each engine reports its path lost and
+ * rejoins for a fresh token, and they hear each other over UDP again, not
+ * left on the connection. */
+static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
+    int pport = proxy_start(port);
+    CHECK(pport > 0);
+    if (pport <= 0) return;
+    tone_io ta = { 440, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
+    oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
+    oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
+    /* A lost path is reported after 1.5 s of quiet rather than twelve. */
+    setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:1500,tcp_probe:800", 1);
+    oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
+    unsetenv("OPENCHIME_TEST_CALL_TIMERS");
+    oc_client *c = oc_client_start("127.0.0.1", pport, "faye:pw-faye");
+    CHECK(c != NULL);
+    if (!c) { oc_call_engine_free(ea); oc_call_engine_free(ec); proxy_stop(); return; }
+    oc_client_set_call_media(a, oc_call_engine_media(), ea);
+    oc_client_set_call_media(c, oc_call_engine_media(), ec);
+    CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+    const oc_model *ma = oc_client_model(a), *mc = oc_client_model(c);
+    oc_call_stats sa, sc;
+
+    oc_client_call_start(a, 1, NULL, 0);
+    CHECK(CALL_WAIT(3000, ma->in_call && ma->call.channel_id == 1));
+    uint64_t call_id = ma->call.call_id;
+    /* dana talks alone -- nothing comes back but the relay's answers to her
+     * keep-alives -- for twice the lost-path time: her path is not lost, and
+     * she stays put, on UDP. */
+    { uint32_t b0 = ma->call_back_seq;
+      CALL_WAIT(3200, 0);
+      oc_call_engine_stats(ea, &sa);
+      CHECK(ma->in_call && ma->call_back_seq == b0 && !ma->call_rejoining && sa.transport == 0); }
+    oc_client_call_join(c, 1);
+    CHECK(CALL_WAIT(3000, mc->in_call && ma->call.n_parts == 2));
+    CHECK(CALL_WAIT(8000, heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
+
+    /* faye's connection is cut: she is getting back in, and dana's roster still
+     * has her -- the seat is held. dana, still connected, goes nowhere. */
+    uint32_t back = mc->call_back_seq, epoch = ma->call.epoch, back_a0 = ma->call_back_seq;
+    __atomic_store_n(&g_px.cut, 1, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(3000, mc->call_rejoining == 1 && !mc->in_call));
+    /* ...and dana sees her marked as away, not gone. */
+    CHECK(CALL_WAIT(3000, ma->call.n_parts == 2 && away_in(ma, mc->user_id) == 1));
+    oc_client_reconnect(c);
+    CHECK(CALL_WAIT(8000, mc->in_call && mc->call_back_seq == back + 1));
+    CHECK(mc->call.call_id == call_id && mc->call_rejoining == 0 && mc->call_lost_seq == 0);
+    CHECK(ma->call.n_parts == 2 && ma->call.epoch > epoch);
+    CHECK(CALL_WAIT(3000, away_in(ma, mc->user_id) == 0));   /* back: not away */
+    CHECK(ma->call_back_seq == back_a0);
+    /* Heard since: faye's engine started afresh on the rejoin, so what it
+     * counts from dana arrived after it. */
+    CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ec, &sc), sc.n_peers == 1 && sc.peers[0].keyed &&
+                           sc.peers[0].packets > 25) && heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
+    printf("  faye's connection cut: back in the same call; dana hears 880 Hz at %.0f, faye 440 Hz at %.0f\n",
+           heard(&ta, 2), heard(&tc, 0));
+
+    /* Everyone's path moves. Both rejoin -- a new epoch each -- and are heard by
+     * UDP again from the new addresses. */
+    uint32_t back_a = ma->call_back_seq, back_c = mc->call_back_seq;
+    epoch = ma->call.epoch;
+    __atomic_store_n(&g_tap.rebind, 1, __ATOMIC_RELEASE);
+    CHECK(CALL_WAIT(10000, ma->call_back_seq > back_a && mc->call_back_seq > back_c &&
+                           ma->in_call && mc->in_call && ma->call.n_parts == 2));
+    CHECK(ma->call.call_id == call_id && ma->call.epoch > epoch);
+    CHECK(CALL_WAIT(6000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(ec, &sc),
+                           sa.transport == 0 && sc.transport == 0)));
+    CHECK(CALL_WAIT(8000, (oc_call_engine_stats(ea, &sa), oc_call_engine_stats(ec, &sc),
+                           sa.n_peers == 1 && sa.peers[0].packets > 25 && sc.n_peers == 1 && sc.peers[0].packets > 25) &&
+                          heard(&ta, 2) > 1500 && heard(&tc, 0) > 1500));
+    printf("  every path moved: both rejoined, by UDP; dana hears 880 Hz at %.0f, faye 440 Hz at %.0f\n",
+           heard(&ta, 2), heard(&tc, 0));
+    CHECK(ma->call_lost_seq == 0 && mc->call_lost_seq == 0);
+
+    oc_client_call_leave(c, 1);
+    oc_client_call_leave(a, 1);
+    CHECK(CALL_WAIT(3000, !ma->in_call && !mc->in_call));
+    oc_client_set_call_media(a, NULL, NULL);
+    oc_client_set_call_media(c, NULL, NULL);
+    oc_client_stop(c);
+    oc_call_engine_free(ea);
+    oc_call_engine_free(ec);
+    proxy_stop();
 }
 
 /* The device key (ARCH-113): made once and kept beside the token, the same one
@@ -4859,6 +5037,7 @@ int run_client_core_tests(void) {
         test_call_relay_family();
         test_calls_e2e(a, b, arg.port);
         test_calls_tcp(a, b);
+        test_calls_rejoin(a, b, arg.port);
 
         oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
         CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));

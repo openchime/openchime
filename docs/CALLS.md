@@ -35,6 +35,11 @@ conversation may join its call. There is no ringing and no answering: a call is
   CONFIG.md). A join or an invitation past it is refused with `CALL_FULL`.
 - **One call at a time.** A connection is in at most one call; joining another leaves the
   first. A user is in a call from one device: joining from a second moves them.
+- **Losing the connection is not leaving.** The daemon holds a disconnected participant's
+  seat for 15 s, and the client gets back into the call by itself — after a reconnect, a
+  sweep, or its media path moving — saying "Reconnecting to the call…" meanwhile, and
+  "Lost the call" if it cannot (§4). A call whose members all lose their connection at
+  once is still there when they come back.
 
 Calls are ephemeral, as presence is (ARCH-67): the daemon holds them in memory, and a
 restart ends them.
@@ -130,7 +135,23 @@ messages; this is the one kind it admits.
 **The relay** runs in the daemon's event loop (ARCH-18/31): it forwards opaque payloads
 tagged with the sender and never decodes them — audio, a shared screen and the viewers'
 requests alike. What it forwards is ciphertext. When its silence sweep drops a participant
-the loop removes them from the call so the roster stays honest. A participant whose
+the loop removes them from the call so the roster stays honest, and tells that participant,
+if its connection is still open, with a roster without it.
+
+**Getting back in** (PROTOCOL.md §5.17, `client/core/callsig.c`). A device put out of a call
+by anything but its own act stops its media — its token is dead — and remembers the call:
+
+- **its connection dropped:** once a connection signs in again, it rejoins if the sign-in
+  `CALL_STATE` still lists the call, and gives up if the call ended, another took its place,
+  or none is reported within 5 s;
+- **a roster without it:** if the roster names its user on another device, it moved there
+  and is out; otherwise it was swept, and it rejoins at once;
+- **its media path moved:** the engine reports UDP that worked going quiet for 12 s (AUDIO.md
+  §4), and it rejoins for a fresh token, which the relay binds to the new address.
+
+It gives up 60 s after the loss, when the rejoin is refused, or after three rejoins in 60 s.
+Leaving while getting back in stops it, and a client closing on purpose sends `CALL_LEAVE`
+first. Each rejoin is an ordinary join: a new epoch, new keys (§5.3). A participant whose
 network passes no UDP carries the same packets over its connection (`CALL_MEDIA`, offered
 as `calls-tcp`; PROTOCOL.md §5.17, AUDIO.md §4), and the relay forwards between the two
 transports; nothing about the encryption changes, since the packets are the same.
@@ -162,7 +183,8 @@ participation and hands it to the others in `CALL_JOINED` and `CALL_ROSTER`.
 ### 5.3 Media keys and epochs
 
 The daemon numbers the call's membership: the **epoch** starts at 1 and goes up by one on
-every join and every leave. On each epoch every participant device:
+every join and every leave, and when a participant's connection goes and its seat is held.
+On each epoch every participant device:
 
 1. makes a fresh random 16-byte SFrame **base key**, used only by it, only for this epoch;
 2. **seals** it to every other participant's device key with HPKE Auth mode (its own
@@ -228,7 +250,9 @@ CTR is older than a **1024-packet window** or already seen in it (replay).
 - **Someone who leaves** cannot decrypt what is said after they leave — past the 1 s grace
   in which the others still use the previous epoch's key (and the relay stops forwarding
   to a leaver at once).
-- **Someone who joins** cannot decrypt what was said before they joined.
+- **Someone who joins** cannot decrypt what was said before they joined. A rejoin is a
+  join: nothing said while a device was out is decryptable to it, and a seat held for a
+  disconnected device receives nothing — its token is revoked at the disconnect.
 
 ### 5.6 What it does not
 

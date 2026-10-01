@@ -683,6 +683,12 @@ typedef struct {
     uint8_t      in_call;
     oc_call_view call;
     uint64_t     call_pending;          /* the channel a join is on its way to, 0 = none */
+    /* Getting back into the call in this channel (0 = not), after the
+     * connection or the media path went (PROTOCOL.md §5.17); `call` still says
+     * what it was. `call_back_seq` bumps when that succeeds, `call_lost_seq`
+     * when it is given up -- each once, for a frontend to say so. */
+    uint64_t     call_rejoining;
+    uint32_t     call_back_seq, call_lost_seq;
     /* The last refusal: an OC_ERR_* code, `seq` bumping per occurrence, as the
      * error line's does. */
     uint16_t     call_error;

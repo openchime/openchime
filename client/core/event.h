@@ -63,6 +63,7 @@ typedef struct {
     uint16_t n_parts, n_invited;
     uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
     uint8_t  slots[OC_MAX_CALL_PARTICIPANTS];
+    uint8_t  away[OC_MAX_CALL_PARTICIPANTS];   /* connection gone, seat held (OC_CALL_PART_AWAY) */
     uint64_t invited[OC_MAX_CALL_INVITES];
     uint64_t sharer;      /* who is sharing a screen, 0 for nobody (REQ-161) */
 } oc_call_view;
@@ -229,14 +230,19 @@ enum {
     /* Calls (REQ-150, REQ-301-305). STATE: a call for the Calls section, in
      * `call` (ended set when it is over). JOINED: this client is in the call in
      * `call`. ROSTER: that call's participants changed. LEFT: this client is in
-     * no call any more (left, ended, moved to another device, disconnected);
-     * channel_id says which. ERROR: a call request refused, the reason code in
-     * `size`, channel_id where known. */
+     * no call any more (left, ended, moved to another device); channel_id says
+     * which. ERROR: a call request refused, the reason code in `size`,
+     * channel_id where known. REJOINING: put out of the call in channel_id by
+     * something other than its own act -- the connection, a sweep, a moved
+     * media path -- and getting back in; a JOINED ends it, or LOST, which says
+     * it could not be done (PROTOCOL.md §5.17). */
     OC_EV_CALL_STATE,
     OC_EV_CALL_JOINED,
     OC_EV_CALL_ROSTER,
     OC_EV_CALL_LEFT,
     OC_EV_CALL_ERROR,
+    OC_EV_CALL_REJOINING,
+    OC_EV_CALL_LOST,
     /* CHANNEL_DESCRIPTION (REQ-034): channel_id + description in body ("" = none).
      * The answer to a fetch and the announcement of a change are one frame. */
     OC_EV_CHANNEL_DESCRIPTION,

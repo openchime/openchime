@@ -43,6 +43,11 @@ void oc_netloop_set_audio(int udp_fd, uint16_t udp_port);
  * without waiting twenty seconds. Any thread; applied on the loop's next tick. */
 void oc_netloop_set_relay_silence_ms(uint64_t ms);
 
+/* Hold a lost connection's seat in a call for `ms` rather than
+ * OC_CALL_REJOIN_GRACE_MS (0 restores it); a test's knob, so a seat's expiry can
+ * be seen without waiting fifteen seconds. Any thread. */
+void oc_netloop_set_call_grace_ms(uint64_t ms);
+
 /* Hold a connection's presence changes to OC_PRESENCE_RATE_MAX per `ms` rather
  * than per ten seconds (0 restores it); a test's knob, so the deferred last word
  * can be seen without waiting out the window. Any thread. */

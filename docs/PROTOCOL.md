@@ -181,7 +181,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 20** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 21** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -2314,7 +2314,9 @@ that has exited and could not be restarted refuses the join with
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
 u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
 started_at: u64, n: u16, n × participant }`, where a participant is `{ user_id:
-u64, slot: u8, device_key: 32 bytes, codecs: u8 }` — the joiner's private media endpoint
+u64, slot: u8, device_key: 32 bytes, codecs: u8, flags: u8 }` — `flags` bit 0
+(`AWAY`) marking one whose connection went and whose seat is held for its rejoin
+(below) — the joiner's private media endpoint
 (the relay's `udp_port` and a bearer `token`), its slot, and the call as
 it stands. The token is opaque to the client and 16 to 32 bytes long: 16 random
 bytes behind the daemon's `OPENCHIME_AUDIO_TOKEN_PREFIX`, if one is set, and
@@ -2326,8 +2328,10 @@ ciphertext (CALLS.md §5.4); an empty one is a keep-alive.
 
 **`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ channel_id:
 u64, call_id: u64, epoch: u32, n: u16, n × participant }` — on every join and
-leave. A device that finds its own slot gone from the roster is out of the call
-(its user moved to another device, or the relay swept it).
+leave, and when a participant's connection goes (it is then marked `AWAY`). A
+device that finds its own slot gone from the roster is out of the call: its user
+moved to another device if the roster names its user elsewhere, else the relay
+swept it.
 
 **`CALL_LEAVE` (C → S), `0x00A1`** `{ channel_id: u64 }` — leave the call in
 this conversation; naming another conversation does nothing. The last one out
@@ -2377,12 +2381,27 @@ having joined, and somebody invited, leaves a message of kind *call event* in th
 conversation, authored by the starter, body "Missed call" — an ordinary
 `BROADCAST` with `kind = 1` (§5.3).
 
-**Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE`, on TCP
-disconnect, and when the relay's silence sweep drops it (the relay runs in the
-daemon's event loop, which takes the participant out as a leave would; a client
-keeps alive every 5 s, so only the vanished are swept).
-Each drop is a new epoch for the rest, who rekey. The dropped user rejoins with
-`CALL_JOIN`.
+**Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE`, and when
+the relay's silence sweep drops it (the relay runs in the daemon's event loop,
+which takes the participant out as a leave would; a client keeps alive every 5 s,
+so only the vanished are swept). A swept participant whose connection is still
+open is sent a `CALL_ROSTER` without it, as a device its user moved away from is,
+so it knows it is out. Each drop is a new epoch for the rest, who rekey.
+
+A **TCP disconnect holds the seat** rather than dropping it: the participant's
+token is revoked, so nothing reaches it, but it stays in the roster and the call
+for 15 s (`OC_CALL_REJOIN_GRACE_MS`), marked `AWAY` in a `CALL_ROSTER` to the
+rest in a new epoch. A `CALL_JOIN` from the same user on a new connection takes
+the seat back — a fresh token and slot, a new epoch — and past
+the grace the seat is dropped as a leave would be. A call whose participants all
+lose their connection at once is therefore still there when they come back. A
+sharer that disconnects stops sharing at once.
+
+A client rejoins by itself (CALLS.md §4): after a reconnect, when the sign-in
+`CALL_STATE` still lists the call; after a roster without it that does not name
+its user on another device; and when its media path has gone quiet after
+working. A rejoin is an ordinary `CALL_JOIN`; a client closing on purpose sends
+`CALL_LEAVE` first, so no seat is held for it.
 
 **`CALL_SHARE` (C → S), `0x00AA`** `{ channel_id: u64, on: u8 }` — start
 (`on = 1`) or stop sharing a screen in the call (REQ-161). **One sharer per

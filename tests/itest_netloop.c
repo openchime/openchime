@@ -2707,7 +2707,9 @@ static void test_call_vertical(int port, const uint8_t *pin) {
     CHECK(call_simple(&b, OC_MSG_CALL_END, ch) == 0);
     CHECK(read_error(&b, &code) == 0 && code == OC_ERR_NOT_CALL_STARTER);
     CHECK(call_simple(&b, OC_MSG_CALL_LEAVE, ch + 999) == 0);
-    /* bob disconnects: alice's roster drops to herself in a new epoch (REQ-152). */
+    /* bob disconnects: his seat is held for the rejoin grace (a short one here,
+     * set by the suite), then alice's roster drops to herself in a new epoch
+     * (REQ-152). */
     client_close(&b);
     uint32_t last_epoch = 0;
     for (int i = 0; i < 4; i++) {
@@ -2716,7 +2718,8 @@ static void test_call_vertical(int port, const uint8_t *pin) {
         last_epoch = ro.epoch;
         if (ro.count == 1) break;
     }
-    CHECK(ro.count == 1 && parts[0].user_id == ua && last_epoch == 5);   /* joins 1,2,3(d); leaves 4(d),5(b) */
+    /* joins 1,2,3(d); leaves 4(d); bob's connection 5 (his seat held, away), his seat gone 6 */
+    CHECK(ro.count == 1 && parts[0].user_id == ua && last_epoch == 6);
 
     /* alice ends it for everyone: carol is told it is over. No missed call --
      * bob and d joined. */
@@ -2895,18 +2898,118 @@ static void test_call_share(int port, const uint8_t *pin) {
     CHECK(call_share(&b, ch, 1) == 0);
     CHECK(wait_sharer(&a, call_id, ub, &st) == 0);
     client_close(&b);
-    CHECK(wait_sharer(&a, call_id, 0, &st) == 0 && st.n_parts == 1);
+    /* At once, though bob's seat is held for his rejoin; the seat goes at the
+     * grace. */
+    CHECK(wait_sharer(&a, call_id, 0, &st) == 0 && st.n_parts == 2);
+    { uint64_t sp[32], si[32];
+      for (int i = 0; i < 8 && st.n_parts != 1; i++) CHECK(read_state(&a, &st, sp, si) == 0);
+      CHECK(st.call_id == call_id && st.n_parts == 1); }
 
     CHECK(call_simple(&a, OC_MSG_CALL_END, ch) == 0);
     client_close(&c);
     client_close(&a);
 }
 
+static void set_read_timeout(client *c, int ms);
+
+/* The roster `c` is sent next, its count; -1 if none comes in the read timeout. */
+static int next_roster(client *c, oc_call_roster *ro, oc_call_part *parts) {
+    oc_header hdr; oc_rbuf p;
+    if (read_type(c, OC_MSG_CALL_ROSTER, &hdr, &p) != 0) return -1;
+    return oc_decode_call_roster(&p, ro, parts, 32) == OC_OK ? ro->count : -1;
+}
+
+/* Join the default conversation's call as `user`, on a fresh connection; the
+ * CALL_JOINED is decoded into `jd`. */
+static int rejoin_as(client *c, int port, const uint8_t *pin, const char *user, const char *pw,
+                     uint8_t key, oc_call_joined *jd, oc_call_part *parts) {
+    uint64_t uid = 0; oc_header hdr; oc_rbuf p;
+    if (client_open(c, port, pin) != 0 || do_handshake(c) != 0 || do_auth(c, user, pw, &uid) != 0) return -1;
+    if (call_join(c, OC_DEFAULT_CHANNEL, key, NULL, 0) != 0) return -1;
+    if (read_type(c, OC_MSG_CALL_JOINED, &hdr, &p) != 0) return -1;
+    return oc_decode_call_joined(&p, jd, parts, 32) == OC_OK ? 0 : -1;
+}
+
+/* A lost connection's seat is held for its rejoin (REQ-152, PROTOCOL.md §5.17):
+ * the rest see no change until the grace runs out; a rejoin from a new
+ * connection inside it takes the seat back in the same call, a new epoch; past
+ * it the seat goes as a leave would; and a call whose members all lose their
+ * connection together survives if they come back, and ends at the grace if
+ * they do not. */
+static void test_call_rejoin_grace(int port, const uint8_t *pin) {
+    client a, b, o;
+    oc_header hdr; oc_rbuf p; oc_call_part parts[32]; oc_call_roster ro; oc_call_joined jd;
+    uint64_t sp[32], si[32]; oc_call_state st;
+    oc_netloop_set_call_grace_ms(5000);
+    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA1, &jd, parts) == 0);
+    uint64_t call_id = jd.call_id;
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB1, &jd, parts) == 0);
+    CHECK(jd.call_id == call_id && jd.count == 2);
+    uint32_t epoch = jd.epoch;
+    CHECK(next_roster(&a, &ro, parts) == 2);
+
+    /* bob's connection goes: his seat is held -- still in alice's roster, marked
+     * away, in a new epoch -- and nothing more until the grace. */
+    client_close(&b);
+    CHECK(next_roster(&a, &ro, parts) == 2 && ro.epoch == epoch + 1);
+    { int away_b = 0, away_a = 0;
+      for (int i = 0; i < ro.count; i++) {
+          if (parts[i].device_key[0] == 0xB1) away_b = (parts[i].flags & OC_CALL_PART_AWAY) != 0;
+          if (parts[i].device_key[0] == 0xA1) away_a = (parts[i].flags & OC_CALL_PART_AWAY) != 0;
+      }
+      CHECK(away_b && !away_a); }
+    set_read_timeout(&a, 400);
+    CHECK(next_roster(&a, &ro, parts) == -1);
+    set_read_timeout(&a, 20000);
+
+    /* bob is back on a new connection: what he is told at sign-in still has him
+     * in the call, and his join takes the seat -- the same call, a new epoch,
+     * his new key on alice's roster, and nobody away. */
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB2, &jd, parts) == 0);
+    CHECK(jd.call_id == call_id && jd.count == 2 && jd.epoch == epoch + 2);
+    CHECK(next_roster(&a, &ro, parts) == 2 && ro.epoch == epoch + 2);
+    { int fresh = 0, away = 0;
+      for (int i = 0; i < ro.count; i++) {
+          if (parts[i].device_key[0] == 0xB2) fresh = 1;
+          if (parts[i].flags & OC_CALL_PART_AWAY) away = 1;
+      }
+      CHECK(fresh && !away); }
+
+    /* bob goes again and does not come back: away, then at the grace his seat goes. */
+    oc_netloop_set_call_grace_ms(300);
+    client_close(&b);
+    CHECK(next_roster(&a, &ro, parts) == 2);
+    CHECK(next_roster(&a, &ro, parts) == 1 && parts[0].device_key[0] == 0xA1 && !parts[0].flags);
+
+    /* Everyone's connection goes at once, and both come back inside the grace:
+     * the call is still there. An observer outside the call watches it. */
+    oc_netloop_set_call_grace_ms(5000);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB3, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(client_open(&o, port, pin) == 0 && do_handshake(&o) == 0);
+    { uint64_t uo = 0; CHECK(do_auth(&o, "carol", "pw", &uo) == 0); }
+    client_close(&a);
+    client_close(&b);
+    CHECK(rejoin_as(&a, port, pin, "alice", "pw-alice", 0xA2, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(rejoin_as(&b, port, pin, "bob", "pw-bob", 0xB4, &jd, parts) == 0 && jd.call_id == call_id);
+    CHECK(jd.count == 2);
+
+    /* ...and when neither comes back, it ends at the grace. */
+    oc_netloop_set_call_grace_ms(300);
+    client_close(&a);
+    client_close(&b);
+    { int ended = 0;
+      for (int i = 0; i < 16 && !ended; i++) {
+          if (read_state(&o, &st, sp, si) != 0) break;
+          ended = st.call_id == call_id && st.ended;
+      }
+      CHECK(ended); }
+    (void)hdr; (void)p;
+    client_close(&o);
+}
+
 /* Full audio path (REQ-150/151): two participants join a call, each gets a UDP
  * endpoint + bearer token in CALL_JOINED, and one participant's audio is relayed
  * to the other by the relay, tagged with the sender's user id. */
-static void set_read_timeout(client *c, int ms);
-
 static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_port) {
     client a, b;
     CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
@@ -2989,6 +3092,14 @@ static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_
     set_read_timeout(&a, 20000);
     CHECK(gone);
     oc_netloop_set_relay_silence_ms(0);
+    /* ...and bob, whose connection is still open, is told: a roster without him,
+     * his cue to rejoin (PROTOCOL.md §5.17). */
+    { int told = 0;
+      for (int i = 0; i < 8 && !told; i++)
+          if (read_type(&b, OC_MSG_CALL_ROSTER, &hdr, &p) == 0 &&
+              oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 1 && parts[0].user_id == ua)
+              told = 1;
+      CHECK(told); }
 
     close(sa); close(sb);
     client_close(&a);
@@ -4735,6 +4846,7 @@ int run_netloop_tests(void) {
         test_upload_restarted(arg.port, pin, dbw);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
+        oc_netloop_set_call_grace_ms(300);   /* the call tests see a held seat go quickly */
         test_call_vertical(arg.port, pin);
         test_call_leave_while_joining(arg.port, pin, dbw);
         test_alerts_wire(arg.port, pin, dbw);
@@ -4742,8 +4854,11 @@ int run_netloop_tests(void) {
         test_call_state_audience(arg.port, pin);
         test_call_share(arg.port, pin);
         test_call_udp_vertical(arg.port, pin, audio_port);
+        test_call_rejoin_grace(arg.port, pin);
+        oc_netloop_set_call_grace_ms(300);
         test_call_transports(arg.port, pin, audio_port);
         test_call_routed(arg.port + 126);
+        oc_netloop_set_call_grace_ms(0);
         test_concurrent_load(arg.port, pin);
         test_login_bound(arg.port, pin);
         test_send_rate_limit(arg.port, pin);

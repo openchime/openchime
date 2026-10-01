@@ -133,11 +133,16 @@
  * (REQ-122/278). One byte appended to a fixed frame is still a layout change,
  * and the rule above has no exception for small ones.
  *
+ * 21: every call participant (CALL_JOINED, CALL_ROSTER) carries a flags byte
+ * after its codecs: OC_CALL_PART_AWAY marks one whose connection went and whose
+ * seat is held for its rejoin, so the others can say so. A repeated entry, so
+ * the byte shifts every participant after the first.
+ *
  * 4: USER_LIST carries each user's avatar attachment id. A frame LAYOUT
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 20u
+#define OC_PROTOCOL_VERSION 21u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1312,7 +1317,10 @@ typedef struct { oc_slice client_type; uint16_t count;
  * of its SFrame KIDs) and the device's public key, which the others seal their
  * media keys to (ARCH-113, CALLS.md §5). */
 typedef struct { uint64_t user_id; uint8_t slot; uint8_t device_key[OC_CALL_DEVICE_KEY_LEN];
-                 uint8_t codecs; } oc_call_part;
+                 uint8_t codecs; uint8_t flags; } oc_call_part;
+/* oc_call_part.flags: its connection went and its seat is held for a rejoin
+ * (PROTOCOL.md §5.17) -- in the roster, receiving nothing, until it is back. */
+#define OC_CALL_PART_AWAY 0x01u
 /* The video codecs a participant can decode, as bits (ARCH-87). VP9 is the one
  * every client has; a later codec is a new bit, chosen only when everyone has it. */
 #define OC_CALL_CODEC_VP9 0x01u
