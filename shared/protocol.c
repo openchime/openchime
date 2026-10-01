@@ -408,9 +408,16 @@ static oc_result r_attach_entry(oc_rbuf *p, oc_attach_entry *a) {
     return OC_OK;
 }
 
+static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type, const oc_broadcast *m);
 oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *m) {
+    return encode_broadcast_as(w, version, OC_MSG_BROADCAST, m);
+}
+oc_result oc_encode_msg_restored(oc_wbuf *w, uint16_t version, const oc_broadcast *m) {
+    return encode_broadcast_as(w, version, OC_MSG_MSG_RESTORED, m);
+}
+static oc_result encode_broadcast_as(oc_wbuf *w, uint16_t version, uint16_t type, const oc_broadcast *m) {
     OC_CHECK_BODY(m->body);
-    size_t off = oc_frame_begin(w, version, OC_MSG_BROADCAST);
+    size_t off = oc_frame_begin(w, version, type);
     oc_w_u64(w, m->message_id);
     oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->author_id);
@@ -3734,6 +3741,20 @@ oc_result oc_decode_mention_unresolved_more(oc_rbuf *p, oc_mention_unresolved_mo
     m->channel_id = oc_r_u64(p);
     m->message_id = oc_r_u64(p);
     m->total = oc_r_u16(p);
+    return r_done(p);
+}
+
+/* A delete taken back (REQ-052). */
+oc_result oc_encode_restore(oc_wbuf *w, uint16_t version, const oc_restore *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_RESTORE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_restore(oc_rbuf *p, oc_restore *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
     return r_done(p);
 }
 

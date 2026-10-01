@@ -855,6 +855,22 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     free(cb);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_MSG_RESTORED) {
+            /* A delete taken back (REQ-052): the message whole, over its
+             * tombstone, then its files folded on as a BROADCAST's are. */
+            oc_broadcast b;
+            if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_RESTORE);
+            if (e) {
+                e->channel_id = b.channel_id;
+                e->author_id = b.author_id;
+                e->message_id = b.message_id;
+                e->server_time = b.server_time;
+                e->body = malloc(b.body.len + 1);
+                if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+                push_attachments(to_ui, b.channel_id, b.message_id, b.attach, b.n_attach);
+            }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
             oc_channel_list_entry ents[OC_CHANNEL_LIST_PAGE]; uint16_t count = 0;
             if (oc_decode_channel_list(&p, ents, OC_CHANNEL_LIST_PAGE, &count) != OC_OK) return -1;
@@ -3083,6 +3099,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_audit_query aq = { c->message_id, 50 };   /* message_id = before_ms */
                 if (oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &aq) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_RESTORE) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_restore rs = { c->channel_id, c->message_id };
+                if (oc_encode_restore(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SRVALERTS_LIST) {

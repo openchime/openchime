@@ -217,7 +217,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * workers (`alert_key`, `alert_message`), listed and acknowledged by an
         * owner or admin (`alert_id`, 0 for every one). */
        OC_JOB_ALERT_RAISE = 119, OC_JOB_ALERT_CLEAR = 120,
-       OC_JOB_ALERTS_LIST = 121, OC_JOB_ALERT_ACK = 122 };
+       OC_JOB_ALERTS_LIST = 121, OC_JOB_ALERT_ACK = 122,
+       /* A delete taken back, by the person who made it (REQ-052):
+        * channel_id, message_id, user_id. */
+       OC_JOB_RESTORE = 123 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -599,7 +602,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_ALERTS_SUMMARY = 104, OC_RES_ALERTS = 105, OC_RES_ALERTS_ERR = 106,
        /* A rendering's row has been written (ARCH-111): `tts_handle`. Until this
         * comes the net thread answers lookups for it from memory. */
-       OC_RES_TTS_STORED = 107 };
+       OC_RES_TTS_STORED = 107,
+       /* RESTORE: the message whole again -- author, time, body, attachments,
+        * the members to tell -- or refused (err_code). */
+       OC_RES_RESTORE_OK = 108, OC_RES_RESTORE_ERR = 109 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1227,6 +1233,8 @@ void   oc_dbwriter_hold_auth(oc_dbwriter *w, int on);
  * result. 0 releases. */
 enum { OC_DBW_HOLD_WRITER = 1, OC_DBW_HOLD_READERS = 2, OC_DBW_HOLD_ALL = 3 };
 void   oc_dbwriter_hold(oc_dbwriter *w, int what);
+/* How long a delete can be taken back (default two minutes); tests shorten it. */
+void   oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms);
 
 /* A critical failure (REQ-263), from any thread: raise `key` with `message` --
  * again on the same entry while it holds -- or clear it, once it has stopped.

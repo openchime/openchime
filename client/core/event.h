@@ -98,6 +98,7 @@ enum {
     OC_EV_REACTION,        /* a REACTION_UPDATED: channel/message/user + emoji/op/count */
     OC_EV_EDIT,            /* a MSG_EDITED: channel/message + new body */
     OC_EV_DELETE,          /* a MSG_DELETED: channel/message tombstone */
+    OC_EV_RESTORE,         /* a MSG_RESTORED: channel/message back, `body`; its files follow as ATTACH */
     OC_EV_TYPING,          /* a TYPING_UPDATE: user_id is typing in channel_id */
     OC_EV_THREAD_REPLY,    /* a THREAD_REPLY: parent_id/message + body + count */
     OC_EV_THREAD_END,      /* a THREAD: the LIST_THREAD replay is complete (parent_id) */
@@ -413,6 +414,7 @@ enum {
     OC_CMD_GET_CHANNEL_DESCRIPTION, /* ask for `channel_id`'s description (REQ-034) */
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
     OC_CMD_SRVALERTS_LIST,  /* ask for the daemon's critical failures (owner/admin) */
+    OC_CMD_RESTORE,         /* take a delete back: channel_id, message_id (REQ-052) */
     OC_CMD_SRVALERT_ACK,    /* acknowledge one: message_id = its id, 0 = every one */
     OC_CMD_AUDIT_QUERY,     /* page the audit log (owner/admin): message_id = before_ms */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */

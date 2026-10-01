@@ -69,6 +69,15 @@ static void msg_tombstone(oc_msg *msg) {
     msg->saved_at = 0;
 }
 
+/* A tombstone that was taken back (REQ-052): the body again. Whatever the
+ * tombstone dropped -- files, reactions -- is told again separately. */
+static void msg_untombstone(oc_msg *msg, const char *body) {
+    if (!msg->deleted) return;
+    msg->deleted = 0;
+    free(msg->body);
+    msg->body = body ? strdup(body) : NULL;
+}
+
 /* Apply a PIN event to one message, wherever it lives (REQ-230). */
 /* Both message lists, always — the channel's and any open thread's. Keeping this
  * beside msg_set_pinned because it is the same shape and the same trap: applying
@@ -2049,6 +2058,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 msg_tombstone(&m->thread_msgs[i]);
                 break;
             }
+        break;
+    }
+    case OC_EV_RESTORE: {
+        /* Back over its tombstone, in both lists it may be in; its files follow
+         * as ATTACH events and fold on as for any message. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg_untombstone(&c->msgs[i], e->body); break; }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { msg_untombstone(&m->thread_msgs[i], e->body); break; }
         break;
     }
     case OC_EV_THREAD_REPLY:

@@ -3536,6 +3536,129 @@ static oc_dbres *process_unfurl_store(sqlite3 *db, const oc_job *j) {
  * and an admin/owner who belongs to the channel may delete any (moderation,
  * REQ-032). The body is nulled while id/author/timestamps survive; deleted_by
  * records who removed it, distinguishing a self- from a moderator-delete. */
+/* How long a delete can be taken back (REQ-052). The writer's; the test knob
+ * sets it under the writer's mutex, which the writer takes for every job. */
+static uint64_t g_restore_window_ms = 120000;
+
+/* Holds past the window go: what a delete gave up is kept no longer than it can
+ * be asked back. */
+static void holds_purge(sqlite3 *db, uint64_t now) {
+    uint64_t cut = now > g_restore_window_ms ? now - g_restore_window_ms : 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "DELETE FROM deleted_hold_reactions WHERE message_id IN "
+                           "(SELECT message_id FROM deleted_holds WHERE deleted_at_ms < ?1);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cut); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM deleted_holds WHERE deleted_at_ms < ?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cut); sqlite3_step(st); sqlite3_finalize(st);
+}
+
+/* Keep what a delete is about to give up, so it can be taken back: the body,
+ * the files' ids, the reactions. */
+static void hold_deleted(sqlite3 *db, uint64_t message_id, uint64_t by, uint64_t at) {
+    sqlite3_stmt *st = NULL;
+    char ids[OC_MAX_ATTACH * 21 + 1] = "";
+    size_t n = 0;
+    sqlite3_prepare_v2(db, "SELECT id FROM attachments WHERE message_id=? ORDER BY id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+    while (sqlite3_step(st) == SQLITE_ROW && n + 22 < sizeof ids)
+        n += (size_t)snprintf(ids + n, sizeof ids - n, "%s%lld", n ? "," : "", (long long)sqlite3_column_int64(st, 0));
+    sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO deleted_holds(message_id, body, deleted_by, deleted_at_ms, attach_ids) "
+                           "SELECT id, body, ?2, ?3, ?4 FROM messages WHERE id=?1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)by);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)at);
+    sqlite3_bind_text(st, 4, ids, -1, SQLITE_STATIC);
+    sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM deleted_hold_reactions WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "INSERT INTO deleted_hold_reactions(message_id, user_id, emoji, created_at_ms) "
+                           "SELECT message_id, user_id, emoji, created_at_ms FROM reactions WHERE message_id=?;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id); sqlite3_step(st); sqlite3_finalize(st);
+}
+
+/* Take a delete back (REQ-052): only the person who made it, only while it is
+ * held, and only into a channel they still belong to. The body, its files --
+ * those the storage sweep has not reclaimed -- and its reactions come back; a
+ * pin and link previews do not (a pin is a deliberate act of its own, previews
+ * are drawn again). Audited when it undoes a moderator's delete, as that delete
+ * was. Write. */
+static oc_dbres *process_restore(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+    uint64_t now = dbw_now_ms();
+    holds_purge(db, now);
+    uint64_t author = 0; int deleted = 0;
+    sqlite3_stmt *st = NULL;
+    char *body = NULL, ids[OC_MAX_ATTACH * 21 + 1] = "";
+    uint64_t by = 0;
+    int held = 0;
+    if (message_lookup(db, j->channel_id, j->message_id, &author, &deleted) && deleted) {
+        sqlite3_prepare_v2(db, "SELECT body, deleted_by, attach_ids FROM deleted_holds WHERE message_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *b = (const char *)sqlite3_column_text(st, 0), *a = (const char *)sqlite3_column_text(st, 2);
+            body = strdup(b ? b : "");
+            by = (uint64_t)sqlite3_column_int64(st, 1);
+            snprintf(ids, sizeof ids, "%s", a ? a : "");
+            held = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    if (!held || !body) {
+        free(body);
+        r->type = OC_RES_RESTORE_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;   /* gone for good */
+    }
+    if (by != j->user_id || !is_member(db, j->channel_id, j->user_id)) {
+        free(body);
+        r->type = OC_RES_RESTORE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    sqlite3_prepare_v2(db, "UPDATE messages SET body=?, deleted_at_ms=NULL, deleted_by=NULL WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, body, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { free(body); r->type = OC_RES_RESTORE_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    for (char *p = ids; *p; ) {
+        long long aid = strtoll(p, &p, 10);
+        if (aid > 0) {
+            sqlite3_prepare_v2(db, "UPDATE attachments SET message_id=?1 WHERE id=?2 AND message_id IS NULL "
+                                   "AND reclaimed_at_ms = 0;", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)aid);
+            sqlite3_step(st); sqlite3_finalize(st);
+        }
+        while (*p == ',') p++;
+    }
+    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO reactions(message_id, user_id, emoji, created_at_ms) "
+                           "SELECT message_id, user_id, emoji, created_at_ms FROM deleted_hold_reactions "
+                           "WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM deleted_hold_reactions WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM deleted_holds WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+    if (author != j->user_id)
+        audit_actor(db, OC_AUDIT_MODERATION, "message.restore", j->user_id, j->message_id, NULL, 1,
+                    "moderator delete undone");
+    r->type = OC_RES_RESTORE_OK;
+    r->author_id = author;
+    r->body = (uint8_t *)body;
+    r->body_len = strlen(body);
+    sqlite3_prepare_v2(db, "SELECT created_at_ms FROM messages WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    if (sqlite3_step(st) == SQLITE_ROW) r->server_time = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    load_message_attachments(db, j->message_id, r->attach, &r->n_attach);
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
 static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -3556,6 +3679,8 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     }
 
     uint64_t ts = dbw_now_ms();
+    holds_purge(db, ts);
+    hold_deleted(db, j->message_id, j->user_id, ts);   /* before anything below gives it up */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "UPDATE messages SET body=NULL, deleted_at_ms=?, deleted_by=? WHERE id=?;",
@@ -8298,6 +8423,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
     if (j->type == OC_JOB_DELETE)        return process_delete(w->db, j);
+    if (j->type == OC_JOB_RESTORE)       return process_restore(w->db, j);
     if (j->type == OC_JOB_CREATE_CHANNEL) return process_create_channel(w->db, j);
     if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);
     if (j->type == OC_JOB_LEAVE_CHANNEL)  return process_leave_channel(w->db, j);
@@ -8972,6 +9098,12 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
 
 const char *oc_dbwriter_relay_origin(oc_dbwriter *w) {
     return w->relay_origin ? w->relay_origin : "";
+}
+
+void oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms) {
+    pthread_mutex_lock(&w->mu);
+    g_restore_window_ms = ms;
+    pthread_mutex_unlock(&w->mu);
 }
 
 void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,

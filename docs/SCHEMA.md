@@ -1300,6 +1300,34 @@ failure still holding. At most one current row per key. Bounded to 100 rows: pas
 that, the oldest that no longer hold are deleted, as the audit log is bounded
 (ARCH-79).
 
+
+## 3aq. Migration 0052 — a delete that can be taken back (REQ-052)
+
+```sql
+CREATE TABLE deleted_holds (
+  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),
+  body          TEXT,
+  deleted_by    INTEGER NOT NULL REFERENCES users(id),
+  deleted_at_ms INTEGER NOT NULL,
+  attach_ids    TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE deleted_hold_reactions (
+  message_id    INTEGER NOT NULL REFERENCES deleted_holds(message_id),
+  user_id       INTEGER NOT NULL,
+  emoji         TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX deleted_hold_reactions_msg ON deleted_hold_reactions(message_id);
+```
+
+### `deleted_holds`, `deleted_hold_reactions`
+What a tombstone gave up — the body, the ids of the files it carried
+(comma-separated), its reactions — kept for the two minutes the person who
+deleted the message may take it back (PROTOCOL.md, `RESTORE`). Nothing reads
+them but a restore, which puts the body back, re-links the files the storage
+sweep has not reclaimed and re-adds the reactions, then removes the hold. Every
+delete and restore first purges holds past the window, so a deleted body is kept
+no longer than it can be asked back.
 ---
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)

@@ -1531,6 +1531,19 @@ static void test_group_frames(void) {
         CHECK(oc_decode_mention_unresolved_more(&p, &out) == OC_OK);
         CHECK(out.channel_id == 3 && out.message_id == 99 && out.total == 10);
     }
+    {   /* A delete taken back (REQ-052): the request, and the message whole again. */
+        oc_restore in = { 7, 42 };
+        ROUNDTRIP(oc_encode_restore(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RESTORE, h, p);
+        oc_restore out;
+        CHECK(oc_decode_restore(&p, &out) == OC_OK && out.channel_id == 7 && out.message_id == 42);
+    }
+    {
+        oc_broadcast in = { 42, 7, 3, 1000, 0, oc_slice_str("back again"), 0, {{0}}, {0} };
+        ROUNDTRIP(oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_RESTORED, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK && out.message_id == 42 && out.channel_id == 7 &&
+              out.body.len == 10 && !memcmp(out.body.ptr, "back again", 10));
+    }
     {   /* Critical failures (REQ-263): the summary, the entries, an acknowledgement. */
         oc_alerts_summary in = { 3, 1 };
         ROUNDTRIP(oc_encode_alerts_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ALERTS_SUMMARY, h, p);

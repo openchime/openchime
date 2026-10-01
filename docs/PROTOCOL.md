@@ -627,6 +627,18 @@ On success the daemon fans a **`MSG_DELETED` (server → client), msg_type
 | `deleted_by`  | u64  | Who deleted it — the author (self) or a moderator (REQ-032). |
 | `deleted_at`  | u64  | Server delete time, ms since epoch UTC.         |
 
+**A delete can be taken back.** For two minutes the daemon holds what a delete
+gave up — the body, the files' ids, the reactions — and the person who deleted
+the message may ask for it back with **`RESTORE` (client → server), msg_type
+`0x00FA`** `{ channel_id: u64, message_id: u64 }`. Nobody else may, not even an
+owner, and not after the window (the hold is then purged). Every connected
+member is sent **`MSG_RESTORED` (server → client), msg_type `0x00FB`**, which is
+`BROADCAST`'s layout — the message whole, with its original time and its files —
+and replaces the tombstone in place. Its reactions return too, seen at the next
+history load; a pin and link previews do not come back. Refusals are the same
+non-fatal `ERROR`s as below: `FORBIDDEN` for someone else's delete,
+`UNKNOWN_MESSAGE` once the hold is gone.
+
 Errors for both `EDIT` and `DELETE` are non-fatal `ERROR` frames carrying the
 offending `message_id` (8 bytes, big-endian) in `context` so the client can
 correlate: `UNKNOWN_MESSAGE` (no such message in the channel, or it is already
@@ -2868,6 +2880,8 @@ this table cannot silently gain a shared value.
 | `0x00F7` | `ALERTS_LIST` | C → S | owner/admin: ask for them |
 | `0x00F8` | `ALERTS` | S → C | the entries, newest first |
 | `0x00F9` | `ALERT_ACK` | C → S | owner/admin: acknowledge one, or all |
+| `0x00FA` | `RESTORE` | C → S | take back a delete you made, while it is held |
+| `0x00FB` | `MSG_RESTORED` | S → C | a deleted message, whole again (`BROADCAST`'s layout) |
 
 ## 10. Connection state machine
 
