@@ -633,7 +633,11 @@ int main(int argc, char **argv) {
         uint64_t now = (uint64_t)ts.tv_sec * 1000u;
         int usable = want && k->source && !strcmp(k->source, want) && k->chain_pem && k->key_pem &&
                      k->not_after_ms > now &&
-                     (cfg->tls_src.source != OC_TLS_SRC_ACME || (k->names && !strcmp(k->names, cfg->tls_src.names)));
+                     (cfg->tls_src.source != OC_TLS_SRC_ACME || (k->names && !strcmp(k->names, cfg->tls_src.names))) &&
+                     /* Moved to a new address: the kept certificate does not name it,
+                      * so central is asked for one that does (both names, during the move). */
+                     (cfg->tls_src.source != OC_TLS_SRC_CENTRAL || !cfg->workspace_address[0] ||
+                      oc_certs_names_include(k->names, cfg->workspace_address));
         if (usable && oc_tls_server_use(&tls, k->chain_pem, strlen(k->chain_pem), k->key_pem, strlen(k->key_pem)) == 0) {
             fprintf(stderr, "openchimed: TLS certificate for %s (kept)\n", k->names);
         } else {

@@ -690,6 +690,12 @@ static void test_units(void) {
         CHECK(differ);
     }
     /* Retries: a minute, ten, a hundred, then a day (Let's Encrypt's guide). */
+    /* A moved box re-issues when its kept certificate does not name the new address. */
+    CHECK(oc_certs_names_include("acme-new.workspace.openchime.io,acme.workspace.openchime.io", "ACME.workspace.openchime.io") == 1);
+    CHECK(oc_certs_names_include("acme.workspace.openchime.io", "acme-new.workspace.openchime.io") == 0);
+    CHECK(oc_certs_names_include("acme.workspace.openchime.io", "acme.workspace.openchime") == 0);
+    CHECK(oc_certs_names_include(NULL, "acme.workspace.openchime.io") == 0);
+    CHECK(oc_certs_names_include("acme.workspace.openchime.io", "") == 0);
     CHECK(oc_certs_retry_ms(0, 60000, 86400000) == 60000 && oc_certs_retry_ms(1, 60000, 86400000) == 600000 &&
           oc_certs_retry_ms(2, 60000, 86400000) == 6000000 && oc_certs_retry_ms(3, 60000, 86400000) == 86400000 &&
           oc_certs_retry_ms(9, 60000, 86400000) == 86400000);

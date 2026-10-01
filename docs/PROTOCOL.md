@@ -412,6 +412,18 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
 | `call_max`        | u8   | The most people in one call, `OPENCHIME_CALL_MAX` (REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
 
+### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
+
+Pushed right after `WORKSPACE_INFO`, and only where the deployment names the
+workspace's canonical address (`OPENCHIME_WORKSPACE_ADDRESS`). A hosted workspace
+that moved to a new address still answers at its former one for a while; a client
+that connected by it files the workspace under the new one (CLIENT.md, "The
+workspace key") and dials that next time. A new frame, so no version bump.
+
+| Field     | Type | Notes                                             |
+|-----------|------|---------------------------------------------------|
+| `address` | str  | The workspace's address now, e.g. `acme.workspace.openchime.io`. |
+
 ### 4.4 `LOGOUT` (client → server), msg_type `0x0013`
 
 Revokes daemon-issued sessions (REQ-182) — the local revocation a stateless
@@ -2687,6 +2699,7 @@ this table cannot silently gain a shared value.
 | `0x0019` | `AUTH_DEVICE` | S → C | the user code, where to enter it, and the device code |
 | `0x001A` | `AUTH_DEVICE_POLL` | C → S | pre-auth: has the code been approved? |
 | `0x001B` | `AUTH_DEVICE_TOKEN` | S → C | approved: the token to present on `AUTH` |
+| `0x001C` | `WORKSPACE_ADDRESS` | S → C | after `WORKSPACE_INFO`: the workspace's address now |
 | `0x0020` | `SEND` | C → S |  |
 | `0x0021` | `SEND_ACK` | S → C |  |
 | `0x0022` | `BROADCAST` | S → C |  |

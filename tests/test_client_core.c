@@ -2012,6 +2012,49 @@ static void test_sni_name(void) {
     unsetenv("OPENCHIME_SUFFIX");
 }
 
+struct moved_label { const char *workspace; char label[256]; };
+static void moved_label_cb(void *ctx, const char *workspace, const char *label,
+                           const char *username, uint64_t last_used_ms) {
+    struct moved_label *m = ctx;
+    (void)username; (void)last_used_ms;
+    if (strcmp(workspace, m->workspace) == 0) snprintf(m->label, sizeof m->label, "%s", label ? label : "");
+}
+
+/* A workspace that moved (WORKSPACE_ADDRESS) is filed under its new address, its
+ * session and book entry with it, so the next connection dials the new one. The
+ * same address, or none, changes nothing. */
+static void test_workspace_move(void) {
+    mock_reset();
+    unsetenv("OPENCHIME_SUFFIX");
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("ignored");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &sec);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN], got[OC_SESSION_TOKEN_LEN];
+    memset(tok, 0x5a, sizeof tok);
+    oc_store_save_session(s, "acme.workspace.openchime.io", tok, 0, "dana");
+    oc_store_workspace_remember(s, "acme.workspace.openchime.io", "acme", "dana", 5);
+
+    char key[288];
+    CHECK(oc_workspace_move(s, "acme.workspace.openchime.io", "acme.workspace.openchime.io", key, sizeof key) == 0);
+    CHECK(oc_workspace_move(s, "acme.workspace.openchime.io", "", key, sizeof key) == 0);
+
+    CHECK(oc_workspace_move(s, "acme.workspace.openchime.io", "Acme-New.workspace.openchime.io", key, sizeof key) == 1);
+    CHECK(strcmp(key, "acme-new.workspace.openchime.io") == 0);
+    CHECK(oc_store_load_session(s, key, got, NULL, 0) == 1 && memcmp(got, tok, sizeof tok) == 0);
+    CHECK(mock_len_of("acme.workspace.openchime.io") == 0);
+    struct moved_label m = { key, "" };
+    oc_store_workspace_each(s, moved_label_cb, &m);
+    CHECK(strcmp(m.label, "Acme-New.workspace.openchime.io") == 0);
+
+    /* Nothing kept (Remember-me off): only the key moves. */
+    CHECK(oc_workspace_move(NULL, "beta.workspace.openchime.io", "gamma.workspace.openchime.io", key, sizeof key) == 1);
+    CHECK(strcmp(key, "gamma.workspace.openchime.io") == 0);
+    oc_store_close(s);
+}
+
 /* An entry from when the key was the resolved address moves to the name — all of
  * it, once — and an entry already under the name keeps what it has. */
 static void test_store_adopt(void) {
@@ -3962,6 +4005,7 @@ int run_client_core_tests(void) {
     test_workspace_key();
     test_sni_name();
     test_store_adopt();
+    test_workspace_move();
     test_secret_routing();
     test_store_no_persistence_without_keyring();
     test_workspace_book();

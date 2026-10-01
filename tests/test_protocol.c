@@ -228,6 +228,14 @@ static void test_auth_frames(void) {
         CHECK(slice_eq_str(out.workspace_name, ""));
     }
     {
+        /* WORKSPACE_ADDRESS — where a workspace that moved is now. */
+        oc_workspace_address in = { oc_slice_str("acme-new.workspace.openchime.io") };
+        ROUNDTRIP(oc_encode_workspace_address(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_ADDRESS, h, p);
+        oc_workspace_address out;
+        CHECK(oc_decode_workspace_address(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.address, "acme-new.workspace.openchime.io"));
+    }
+    {
         /* LOGOUT — scope + the session token to revoke. */
         uint8_t token[OC_SESSION_TOKEN_LEN];
         memset(token, 0x3C, sizeof token);

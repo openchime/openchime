@@ -84,6 +84,10 @@ int oc_config_load(char *err, size_t errcap) {
         return -1;
     }
     c->workspace_name = env_or2("OPENCHIME_WORKSPACE_NAME", NULL, "");
+    /* Where the workspace is now. A hosted workspace that moved still answers at
+     * its old address for a while; this tells a client that connected by the old
+     * one to file it under the new one, and keeps the certificate naming it. */
+    c->workspace_address = env_or2("OPENCHIME_WORKSPACE_ADDRESS", NULL, "");
 
     /* Paths + ports. */
     c->db_path     = env_or2("OPENCHIME_DB_PATH",   NULL, "/data/openchime.db");

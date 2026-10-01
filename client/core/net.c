@@ -189,7 +189,7 @@ typedef struct {
     oc_store   *store;                          /* NULL = no persistence */
     oc_store   *pins;        /* where the trusted fingerprint is kept — set even when `store` is not,
                                * because a pin is not what Remember-me is about (ARCH-10) */
-    const char *workspace;                       /* "host:port" key */
+    char       *workspace;                       /* the key; rewritten in place if the workspace moves */
     uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
     int         have_pin;                       /* pin loaded/captured this run */
     int         logged_out;                     /* set on /logout: drop the stored token */
@@ -382,6 +382,8 @@ typedef struct {
     oc_stt_sent *stt;
     oc_callsig  *calls;
     const char  *host;        /* where the relay is, for a call (CALLS.md §4) */
+    char        *rekey;       /* the stored key, rewritten when the workspace moves (288 bytes) */
+    char        *sni;         /* the name the next connection sends (oc_net.ws_key, 288 bytes) */
 } disp_ctx;
 
 /* The call engine queued media for the connection: end this thread's wait. */
@@ -914,6 +916,22 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->body = malloc(wi.workspace_name.len + 1);
                 if (e->body) { memcpy(e->body, wi.workspace_name.ptr, wi.workspace_name.len); e->body[wi.workspace_name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_WORKSPACE_ADDRESS) {
+            /* The workspace's address now: one that moved still answers at the old
+             * one for a while. File it under the new one, and dial that next time. */
+            oc_workspace_address wa;
+            if (oc_decode_workspace_address(&p, &wa) != OC_OK) return -1;
+            char address[256], key[288];
+            slice_to_buf(wa.address, address, sizeof address);
+            if (ctx->rekey && oc_workspace_move(ctx->store, ctx->rekey, address, key, sizeof key)) {
+                snprintf(ctx->rekey, 288, "%s", key);
+                if (ctx->sni) snprintf(ctx->sni, 288, "%s", key);
+                oc_ev *e = oc_ev_new(OC_EV_WORKSPACE_MOVED);
+                if (e) {
+                    e->body = strdup(key);
+                    oc_queue_push(to_ui, e);
+                }
             }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_INFO) {
             oc_channel_info ci;
@@ -2968,7 +2986,7 @@ static int run_connection(oc_net *n, int reconnecting,
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
                      cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
-                     &n->calls, n->host };
+                     &n->calls, n->host, cs ? cs->workspace : NULL, n->ws_key[0] ? n->ws_key : NULL };
     /* Call media on the connection (PROTOCOL.md §5.17) is queued by the call
      * engine's threads, which wake this one to write it rather than leave it
      * for the next 50 ms poll. Without a wake it still goes, at that pace. */

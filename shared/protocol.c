@@ -336,6 +336,12 @@ oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_worksp
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_workspace_address(oc_wbuf *w, uint16_t version, const oc_workspace_address *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WORKSPACE_ADDRESS);
+    oc_w_str(w, m->address);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LOGOUT);
     oc_w_u8(w, m->scope);
@@ -2304,6 +2310,11 @@ oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m) {
     m->max_users = oc_r_u32(p);
     m->workspace_name = oc_r_str(p);
     m->call_max = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_workspace_address(oc_rbuf *p, oc_workspace_address *m) {
+    m->address = oc_r_str(p);
     return r_done(p);
 }
 

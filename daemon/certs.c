@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #define JSMN_HEADER
@@ -113,6 +114,18 @@ static int json_str(const char *js, size_t len, const char *key, char *out, size
         }
     }
     return -1;
+}
+
+int oc_certs_names_include(const char *names, const char *name) {
+    size_t n = name ? strlen(name) : 0;
+    if (!n) return 0;
+    for (const char *p = names; p && *p; ) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == n && strncasecmp(p, name, n) == 0) return 1;
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
 }
 
 int oc_central_issue(const char *central_url, const char *audience, const char *enroll_key_pem,
