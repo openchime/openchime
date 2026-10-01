@@ -1074,7 +1074,12 @@ GUI only draws it):
 A toast is a card sized to what it says: an icon by kind, the text wrapped, its
 one action, and a close button. The pointer on one holds it; Esc dismisses the
 newest; Ctrl+Shift+Z does what the newest offers. At most three show, where the
-**Notices** preference puts them (bottom centre, bottom right, top right). Every
+**Notices** preference puts them (bottom centre, bottom right, top right — under
+the tab strip and any banner, never over them). While a dialog is open they go
+to the window's bottom edge, centred under its card, whatever the preference;
+where there is no room for even one, the newest overlaps the footer's empty
+middle. Toasts are painted above everything, a dialog included, and take a
+click before anything under them, so one can always be closed. Every
 toast, banner and hint is spoken — politely, or assertively for a failure — and
 each toast's action and close are published for UI Automation.
 

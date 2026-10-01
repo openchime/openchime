@@ -10024,7 +10024,9 @@ static void nt_tick(void) {
  * grows from, at the place the preference names. The pointer on one holds it
  * (oc_fb_hold), so the one being read is not the one that leaves. */
 static float g_toast_area_l, g_toast_area_r;      /* the conversation pane, for centring */
+static float g_toast_area_t;                      /* under the header, tab strip and banner */
 static rectf g_ed_box;                            /* the composer's text rect (below); empty: no composer */
+static rectf g_modal_card;                        /* the open dialog's card (below); empty: none */
 static void draw_toasts(gfx *rt, float W, float H) {
     g_n_toast_hit = 0;
     if (!g_fb.n) return;
@@ -10033,12 +10035,24 @@ static void draw_toasts(gfx *rt, float W, float H) {
     float cw = UIS(420.0f);
     if (cw > pane_r - pane_l - 32) cw = pane_r - pane_l - 32;
     if (cw < UIS(200.0f)) cw = UIS(200.0f);
-    float left = g_pref_toastpos == TOASTPOS_BOTTOM_CENTRE ? (pane_l + pane_r - cw) / 2 : W - cw - 20;
-    int down = g_pref_toastpos == TOASTPOS_TOP_RIGHT;          /* stacks downward from the top */
+    /* An open dialog owns the middle of the window: the stack goes to the
+     * window's bottom edge, centred under the card, whatever the preference --
+     * centred because a footer's buttons sit at its right. Where the window is
+     * too short for that the newest still shows, over the footer's empty middle
+     * -- and it is clicked before the dialog is, so it can always be closed. */
+    int dialog = g_modal_card.right > g_modal_card.left;
+    if (dialog) { pane_l = 0; pane_r = W; }
+    float left = dialog || g_pref_toastpos == TOASTPOS_BOTTOM_CENTRE ? (pane_l + pane_r - cw) / 2
+                                                                     : W - cw - 20;
+    int down = !dialog && g_pref_toastpos == TOASTPOS_TOP_RIGHT;  /* stacks downward from the top */
     /* Above the composer where there is one; at the bottom of the window where
-     * the view has none (a list, a report). */
-    float floor_y = g_ed_box.right > g_ed_box.left ? H - g_composer_h : H - UIS(12.0f);
-    float edge = down ? HEADER_H + UIS(12.0f) : floor_y - TOAST_GAP;
+     * the view has none (a list, a report), or a dialog covers it. */
+    float floor_y = dialog ? H - UIS(4.0f)
+                  : g_ed_box.right > g_ed_box.left ? H - g_composer_h : H - UIS(12.0f);
+    /* Top right starts under the tab strip and any banner, never over them. */
+    float top_y = g_toast_area_t > HEADER_H ? g_toast_area_t : HEADER_H;
+    float ceil_y = dialog ? g_modal_card.bottom + TOAST_GAP : top_y;
+    float edge = down ? top_y + UIS(12.0f) : dialog ? floor_y : floor_y - TOAST_GAP;
     uint32_t hover = 0;
     for (int k = g_fb.n - 1; k >= 0; k--) {                    /* newest at the edge */
         const oc_fb_toast *t = &g_fb.t[k];
@@ -10052,7 +10066,9 @@ static void draw_toasts(gfx *rt, float W, float H) {
         float h = th + UIS(22.0f);
         if (h < UIS(44.0f)) h = UIS(44.0f);
         rectf r = down ? rf(left, edge, left + cw, edge + h) : rf(left, edge - h, left + cw, edge);
-        if (down ? r.bottom > floor_y : r.top < HEADER_H) break;   /* never over the header or composer */
+        /* Never over the header, the tabs or the composer, nor a dialog's card --
+         * except the newest, when a dialog leaves no room for even one. */
+        if (down ? r.bottom > floor_y : r.top < (dialog && k == g_fb.n - 1 ? HEADER_H : ceil_y)) break;
         fill_round_a(rt, rf(r.left, r.top + 2, r.right, r.bottom + 3), OC_R_CONTROL, 0x000000, 0.10f);  /* soft shadow */
         fill_round(rt, r, OC_R_CONTROL, OC_COL_INPUT);
         stroke_round(rt, r, OC_R_CONTROL, t->kind == OC_FB_FAILED ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
@@ -16862,6 +16878,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
         g_toast_area_l = main_x; g_toast_area_r = main_x + main_w;
+        g_toast_area_t = (dm_index0 ? 0 : HEADER_H) + th + bh;
         {
             /* In the DMs view, the middle column is the PERSON list until a
              * conversation is picked — that is what makes it a destination
@@ -22568,6 +22585,10 @@ static int wsmgr_key(HWND hwnd, WPARAM vk) {
 
 static int on_click(HWND hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
+    /* Toasts are painted above everything, a dialog included, so they are
+     * hit-tested above everything too -- a toast over the composer or a
+     * dialog's card would otherwise pass on a click it appears to own. */
+    if (toast_click(x, y)) return 1;
     /* A modal owns the window while it is up: a click outside the card dismisses
      * it, and nothing behind it is reachable. Tested first for that reason. */
     /* The frame owns ✕, the footer buttons and the scrim; a modal's own content
@@ -23168,10 +23189,6 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         return 1;
     }
-    /* Toasts are painted above everything, so they must be hit-tested above
-     * everything too -- otherwise a toast over the composer eats a click it
-     * appears to own. */
-    if (toast_click(x, y)) return 1;
     /* The banner's button: for the connection, cut short the net thread's
      * backoff sleep. The banner itself says what happens next. */
     if (g_banner_on && pt_in(g_retry_btn, x, y)) {
