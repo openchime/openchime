@@ -1004,8 +1004,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                 uintattr_t fg = sel ? (th->sel_fg | TB_BOLD) : c->joined ? th->fg : th->muted;
                 char title[96];
                 sidebar_label(m, c, title, sizeof title);
-                if (c->unread > 0) snprintf(label, sizeof label, "  %s (%d)", title, c->unread);
-                else               snprintf(label, sizeof label, "  %s", title);
+                /* Two tiers, as the GUI draws them (oc_model_badge): a count for
+                 * what is about you, bold for any other unread. */
+                int bn = 0, bdot = 0;
+                oc_model_badge(m, c, &bn, &bdot);
+                if (bn > 0) snprintf(label, sizeof label, "  %s (%d)", title, bn);
+                else        snprintf(label, sizeof label, "  %s", title);
+                if ((bn > 0 || bdot) && !sel) fg |= TB_BOLD;
                 tk_text(1, iy, ch_w - 1, label, fg, bg);
             }
         }

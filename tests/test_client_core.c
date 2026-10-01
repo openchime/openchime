@@ -873,6 +873,47 @@ static void test_restore_model(void) {
     oc_model_free(&m);
 }
 
+/* The two-tier badge: a channel's plain unread is a dot, a mention a count; in a
+ * direct message every unread is to you, so it counts; muted shows neither; and
+ * reading clears both. */
+static void test_badge_tiers(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 80; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.body = strdup("general"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e); e.type = OC_EV_CHANNEL; e.channel_id = 81; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; oc_model_apply(&m, &e);
+    const char *bodies[3] = { "lunch?", "deploy is green", "@alice can you look" };
+    for (int i = 0; i < 3; i++) {
+        memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 80; e.message_id = (uint64_t)(10 + i);
+        e.author_id = 2; e.body = strdup(bodies[i]);
+        oc_model_apply(&m, &e);
+    }
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 81; e.message_id = 20; e.author_id = 2;
+    e.body = strdup("ping"); oc_model_apply(&m, &e);
+    int n = -1, dot = -1;
+    const oc_channel *ch = oc_model_channel(&m, 80), *dm = oc_model_channel(&m, 81);
+    CHECK(ch && ch->unread == 3 && ch->priority_unread == 1);
+    oc_model_badge(&m, ch, &n, &dot);
+    CHECK(n == 1 && dot == 0);                                   /* the mention, counted */
+    oc_model_badge(&m, dm, &n, &dot);
+    CHECK(n == 1 && dot == 0);                                   /* a DM's every message */
+    oc_model_mark_read(&m, 80);
+    oc_model_badge(&m, oc_model_channel(&m, 80), &n, &dot);
+    CHECK(n == 0 && dot == 0 && oc_model_channel(&m, 80)->priority_unread == 0);
+    memset(&e, 0, sizeof e); e.type = OC_EV_MESSAGE; e.channel_id = 80; e.message_id = 30; e.author_id = 2;
+    e.body = strdup("no mention here"); oc_model_apply(&m, &e);
+    oc_model_badge(&m, oc_model_channel(&m, 80), &n, &dot);
+    CHECK(n == 0 && dot == 1);                                   /* plain unread: a dot */
+    oc_model_channel(&m, 80)->muted = 1;
+    oc_model_badge(&m, oc_model_channel(&m, 80), &n, &dot);
+    CHECK(n == 0 && dot == 0);                                   /* muted: nothing */
+    oc_model_free(&m);
+}
+
 static void test_srvalerts_model(void) {
     oc_model m; oc_model_init(&m);
     oc_ev e;
@@ -3884,6 +3925,7 @@ int run_client_core_tests(void) {
     test_channel_info_seq();
     test_srvalerts_model();
     test_restore_model();
+    test_badge_tiers();
     test_osnotify_null();
     test_feedback();
     test_notify_scan();

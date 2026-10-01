@@ -1075,6 +1075,25 @@ newest; Ctrl+Shift+Z does what the newest offers. At most three show, where the
 toast, banner and hint is spoken — politely, or assertively for a failure — and
 each toast's action and close are published for UI Automation.
 
+## Badges, and notifications that leave when read (REQ-138)
+
+**Two tiers, everywhere a conversation is counted** (`oc_model_badge`): a
+**count** for what is about you — a mention, a keyword, a priority person, and
+in a direct message every message, since all of it is to you — and for any other
+unread only the conversation's name in bold (the dot every chat client uses).
+Muted shows neither. The sidebar's pill, the workspace badge on the rail (a small
+dot when only plain unread waits elsewhere), the taskbar overlay (a disc with no
+number for the same) and the TUI's sidebar all follow it, and each accessible
+name says "N for you" or "unread".
+
+**A notification leaves when its conversation is read.** Every conversation the
+OS is showing a notification for is withdrawn from the Notification Center
+(`oc_osn_withdraw`) once its unread is gone — read here, or on another device,
+since that read reaches this model too — so the Notification Center, the badge
+and the app agree. A busy conversation's notifications chime at most once every
+five seconds; the rest arrive silently. A notification is raised for any
+conversation but the one being read in a focused window.
+
 ## Two standing UI rules
 
 **No "…" on a command.** Not in menus, not on buttons, not in cue banners. The

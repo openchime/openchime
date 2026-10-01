@@ -1267,6 +1267,7 @@ static void tray_done(void) {
 }
 
 static int g_toasts_raised;      /* observable by the harness; see test_dump */
+static int g_osn_withdrawn;      /* notifications taken back on read; likewise */
 
 /* ---- notification sounds (REQ-138) ---------------------------------------
  * The client was silent. A notification you have to be looking at the screen to
@@ -1383,6 +1384,28 @@ static void toast_action_cb(const char *arg, const char *reply) {
  *
  * `g_delivered_by` records which one actually carried it, because "asked for
  * OS" and "got OS" are different facts and the test needs the second. */
+/* The conversations the OS is showing a notification for, so each is withdrawn
+ * once its unread is gone -- read here, or on any other device, since a read
+ * there reaches this model too (REQ-138): the Notification Center then agrees
+ * with the badge. And when each last played a sound: a busy conversation chimes
+ * once in a while, not at every message. */
+#define OSN_TRACK 64
+#define OSN_SOUND_GAP_MS 5000
+static struct { uint64_t ws, cid; int raised; ULONGLONG sound_at; } g_osn_track[OSN_TRACK];
+static int osn_track_slot(uint64_t ws, uint64_t cid) {
+    int free_i = -1, oldest = 0;
+    for (int i = 0; i < OSN_TRACK; i++) {
+        if (g_osn_track[i].cid == cid && g_osn_track[i].ws == ws && cid) return i;
+        if (!g_osn_track[i].cid && free_i < 0) free_i = i;
+        if (g_osn_track[i].sound_at < g_osn_track[oldest].sound_at) oldest = i;
+    }
+    int i = free_i >= 0 ? free_i : oldest;
+    memset(&g_osn_track[i], 0, sizeof g_osn_track[i]);
+    g_osn_track[i].ws = ws; g_osn_track[i].cid = cid;
+    return i;
+}
+static void osn_withdraw_read(void);   /* fwd: needs the workspaces */
+
 static void notify_deliver(const char *title, const char *body, const char *source,
                            uint64_t ws_slot, uint64_t channel_id, int snd) {
     /* `snd` is an SNDV_* index: WHICH system sound this event asks for. Who
@@ -1393,6 +1416,12 @@ static void notify_deliver(const char *title, const char *body, const char *sour
     if (snd < 0 || snd >= SNDV_COUNT) snd = SNDV_DEFAULT;
     g_last_notify_ws = ws_slot; g_last_notify_cid = channel_id;
     if (g_pref_deliver == DELIVER_NONE) return;
+    int tk = channel_id ? osn_track_slot(ws_slot, channel_id) : -1;
+    if (tk >= 0 && snd != SNDV_SILENT) {
+        ULONGLONG now = GetTickCount64();
+        if (g_osn_track[tk].sound_at && now - g_osn_track[tk].sound_at < OSN_SOUND_GAP_MS) snd = SNDV_SILENT;
+        else g_osn_track[tk].sound_at = now;
+    }
     g_toasts_raised++;
 
 
@@ -1453,7 +1482,11 @@ static void notify_deliver(const char *title, const char *body, const char *sour
          * surface that cannot play one says so and we play it. */
         oc_osn n = { title, body, source, tag, grp, arg, snd, nb ? "Reply" : NULL, labels, args, nb };
         int r = oc_osn_show(&n);
-        if (r == OC_OSN_SHOWN) { g_delivered_by = DELIVERED_WINRT; return; }
+        if (r == OC_OSN_SHOWN) {
+            g_delivered_by = DELIVERED_WINRT;
+            if (tk >= 0) g_osn_track[tk].raised = 1;   /* to withdraw once it is read */
+            return;
+        }
         if (r == OC_OSN_SHOWN_SILENT) { sound_play(snd); g_delivered_by = DELIVERED_BALLOON; return; }
     }
     own_toast_show(title, body, ws_slot, channel_id);
@@ -1504,8 +1537,9 @@ static HICON badge_icon(int count) {
     }
     HGDIOBJ oldbm = SelectObject(mem, dib);
     char t[4];
-    if (count > 9) snprintf(t, sizeof t, "9+");
-    else           snprintf(t, sizeof t, "%d", count);
+    if (count < 0)      t[0] = '\0';           /* the dot tier: a disc and nothing in it */
+    else if (count > 9) snprintf(t, sizeof t, "9+");
+    else                snprintf(t, sizeof t, "%d", count);
     WCHAR wt[4];
     to_w(t, wt, 4);
     HFONT font = CreateFontW(-(s * (count > 9 ? 10 : 12) / 16), 0, 0, 0, FW_BOLD,
@@ -1606,16 +1640,17 @@ static void taskbar_badge_apply(HWND hwnd, int count) {
     if (!taskbar_obj()) return;
     HICON ic = NULL;
     WCHAR alt[24] = L"";
-    if (count > 0) {
+    if (count != 0) {
         ic = badge_icon(count);
         if (!ic) { backoff = GetTickCount64() + 1000; return; }
-        char a[24];
-        if (count > 9) snprintf(a, sizeof a, "9+ unread");
-        else           snprintf(a, sizeof a, "%d unread", count);
-        to_w(a, alt, 24);
+        char a[32];
+        if (count < 0)      snprintf(a, sizeof a, "Unread messages");
+        else if (count > 9) snprintf(a, sizeof a, "9+ for you");
+        else                snprintf(a, sizeof a, "%d for you", count);
+        to_w(a, alt, 32);
     }
     if (SUCCEEDED(ITaskbarList3_SetOverlayIcon(g_taskbar, hwnd, ic,
-                                               count > 0 ? alt : NULL)))
+                                               count != 0 ? alt : NULL)))
         g_badge_shown = count;
     else
         backoff = GetTickCount64() + 1000;
@@ -3973,7 +4008,10 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     /* "N elsewhere": unread sitting in the workspaces you are not
      * looking at. Without it, holding several clients would be invisible. */
     int elsewhere = ws_unread_elsewhere();
-    if (elsewhere > 0) {
+    if (elsewhere < 0) {                          /* unread elsewhere, none about you: a dot */
+        rectf b = rf(av.right - 4, av.top - 4, av.right + 6, av.top + 6);
+        fill_round(rt, b, OC_R_PILL, OC_COL_TEXT);
+    } else if (elsewhere > 0) {
         char badge[8];
         snprintf(badge, sizeof badge, "%d", elsewhere > 99 ? 99 : elsewhere);
         float bw = text_width(badge, g_meta) + 12;
@@ -5016,8 +5054,13 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                                          g_ui, g_meta, sx0 + 34 + w + 8, sx1 - UIS(44)),
                           OC_INK_ON(TH_FAINT, row_surface));
             }
-            if (unread) {
-                char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
+            /* Two tiers (oc_model_badge): a count for what is about you -- a
+             * mention, a keyword, a priority person, a DM -- and for anything
+             * else the bold name alone, the dot every chat client uses. */
+            int bcount = 0;
+            oc_model_badge(m, rc, &bcount, NULL);
+            if (unread && bcount > 0) {
+                char badge[16]; snprintf(badge, sizeof badge, "%d", bcount);
                 rectf br = rf(sx1 - UIS(40), ry + 6, sx1 - UIS(10), ry + ROW_H - 6);
                 fill_round(rt, br, OC_R_PILL, OC_COL_ACCENT);
                 g_meta->align = ST_ALIGN_CENTER;
@@ -19006,8 +19049,12 @@ static void a11y_publish_scene(const oc_model *m) {
         /* Unread belongs in the NAME, not only in a property: it is the reason a
          * person is scanning this list, and a count nobody reads aloud is a
          * count that does not exist. */
-        if (c && c->unread > 0)
-            snprintf(it->name, sizeof it->name, "%s, %d unread", g_rows[i].label, (int)c->unread);
+        int an = 0, adot = 0;
+        oc_model_badge(m, c, &an, &adot);
+        if (an > 0)
+            snprintf(it->name, sizeof it->name, "%s, %d for you", g_rows[i].label, an);
+        else if (adot)
+            snprintf(it->name, sizeof it->name, "%s, unread", g_rows[i].label);
         else
             snprintf(it->name, sizeof it->name, "%s", g_rows[i].label);
     }
@@ -24512,22 +24559,53 @@ static void remember_tick(const oc_model *m) {
  * Threads shelf) and would otherwise let a day of nothing but replies leave a
  * badge claiming there is nothing. REQ-284's finer rule — count only what would
  * have notified — is still an open call and is deliberately not decided here. */
+/* A workspace's badge, two tiers as each conversation's (oc_model_badge): the
+ * count of what is about you, followed thread replies with it; and whether
+ * anything else is unread, for the dot. */
 static int ws_unread_of(const oc_model *m) {
     if (!m) return 0;
     int total = 0;
-    for (size_t c = 0; c < m->n_channels; c++)
-        if (!m->channels[c].muted) total += m->channels[c].unread;
+    for (size_t c = 0; c < m->n_channels; c++) {
+        int n = 0;
+        oc_model_badge(m, &m->channels[c], &n, NULL);
+        total += n;
+    }
     total += (int)oc_model_thread_unread(m);
     return total;
 }
+/* Withdraw what the OS shows for each conversation now read (notify_deliver). */
+static void osn_withdraw_read(void) {
+    for (int i = 0; i < OSN_TRACK; i++) {
+        if (!g_osn_track[i].raised) continue;
+        int slot = (int)g_osn_track[i].ws;
+        const oc_model *wm = (g_n_wss > 0) ? (slot < g_n_wss && g_wss[slot].client
+                                              ? oc_client_model(g_wss[slot].client) : NULL)
+                                           : model();
+        const oc_channel *c = wm ? oc_model_channel((oc_model *)wm, g_osn_track[i].cid) : NULL;
+        if (c && c->unread > 0) continue;
+        char tag[64], grp[64];
+        snprintf(tag, sizeof tag, "c%llu", (unsigned long long)g_osn_track[i].cid);
+        snprintf(grp, sizeof grp, "w%llu", (unsigned long long)g_osn_track[i].ws);
+        oc_osn_withdraw(tag, grp);
+        g_osn_track[i].raised = 0;
+        g_osn_withdrawn++;
+    }
+}
+
+static int ws_any_unread(const oc_model *m) {
+    for (size_t c = 0; m && c < m->n_channels; c++)
+        if (!m->channels[c].muted && m->channels[c].unread > 0) return 1;
+    return 0;
+}
 
 static int ws_unread_elsewhere(void) {
-    int total = 0;
+    int total = 0, any = 0;
     for (int i = 0; i < g_n_wss; i++) {
         if (i == g_ws_active || !g_wss[i].client) continue;
         total += ws_unread_of(oc_client_model(g_wss[i].client));
+        any |= ws_any_unread(oc_client_model(g_wss[i].client));
     }
-    return total;
+    return total ? total : any ? -1 : 0;        /* -1: unread, none of it about you -- a dot */
 }
 
 static int ws_find(const char *ws) {
@@ -28337,9 +28415,9 @@ static void test_dump(const char *path) {
                     (unsigned long)rp);
         }
     }
-    fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d\n",
+    fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d withdrawn=%d\n",
             g_pref_deliver, g_delivered_by, g_wintoast_ok, g_aumid,
-            g_nt_shown, g_n_nt, g_snd_muted);
+            g_nt_shown, g_n_nt, g_snd_muted, g_osn_withdrawn);
     fprintf(f, "hidden=%d visible=%d told=%d connected=%d\n",
             g_hidden_to_tray,
             g_main_hwnd ? (IsWindowVisible(g_main_hwnd) ? 1 : 0) : 0,
@@ -29584,7 +29662,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * below — which owns the badge — never runs again, and an overlay
              * advertising unread mail in a session that no longer exists would
              * sit over the sign-in view for good. Cleared from here instead. */
-            if (!g_client && g_badge_shown > 0) taskbar_badge_apply(hwnd, 0);
+            if (!g_client && g_badge_shown != 0) taskbar_badge_apply(hwnd, 0);
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
@@ -29673,6 +29751,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             remember_tick(m);
             if (m) groups_roster_tick(m);
+            osn_withdraw_read();
             /* The daemon's alerts (REQ-263): repaint on any change, and fetch the
              * list again when the counts move while it is on screen. */
             {
@@ -30053,7 +30132,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         ChangeWindowMessageFilterEx(hwnd, g_taskbar_created_msg,
                                                     MSGFLT_ALLOW, NULL);
                 }
-                int total = 0;
+                int total = 0, any_unread = 0;
                 for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
                     const oc_model *wm = (g_n_wss > 0)
                         ? (g_wss[wi].client ? oc_client_model(g_wss[wi].client) : NULL) : m;
@@ -30062,8 +30141,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      * excluded, thread replies included. They were two sums
                      * and disagreed. */
                     total += ws_unread_of(wm);
+                    any_unread |= ws_any_unread(wm);
                 }
                 if (total > 10) total = 10;         /* rendered as "9+" */
+                if (!total && any_unread) total = -1;   /* a dot: unread, none of it about you */
                 if (total != g_badge_shown) taskbar_badge_apply(hwnd, total);
             }
             /* An inline image arrived: decode and cache it. */
