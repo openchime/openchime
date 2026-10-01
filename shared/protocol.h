@@ -38,7 +38,15 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 19: LIST_FILES pages (REQ-143). The request carries a keyset cursor -- the
+/* 20: sign-in sources and the browser (AUTH.md §8). AUTH_CHALLENGE lists the
+ * deployment's sources -- each its id, kind and label -- where it carried a
+ * methods byte; AUTH carries the source it signs in through and a proof (the
+ * verifier the relay's nonce is the hash of); INVITE_USER carries the address an
+ * invite is bound to. AUTH_BEGIN, AUTH_REDIRECT and AUTH_CONTINUE (0x0015-0x0017)
+ * are new. Every changed frame is one a client sends or reads before it is
+ * signed in, where a mismatch must be a clean refusal, not a misread sign-in.
+ *
+ * 19: LIST_FILES pages (REQ-143). The request carries a keyset cursor -- the
  * created-at and id of the last row a client already has, 0/0 for the first page
  * -- and FILES says whether more remain. The list was capped at 200 with no way
  * to ask for the next ones, so a channel older than a few hundred files could
