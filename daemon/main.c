@@ -533,6 +533,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW: %s\n", why);
             oc_dbwriter_stop(db); return 1;
         }
+        oc_dbwriter_set_email_link(db, cfg->oidc.email_link_any);
         if (!cfg->oidc.allow || !cfg->oidc.allow[0])
             fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW is empty: nobody new may join "
                             "by OIDC except through an invite\n");

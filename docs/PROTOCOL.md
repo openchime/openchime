@@ -2658,6 +2658,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2008` | `AUTH_SLOW_DOWN` | auth   | no    | A device-code poll sooner than the interval; the interval grows by five seconds. |
 | `2009` | `AUTH_EXPIRED` | auth   | no    | A device code that ran out, was collected, or never was. |
 | `2010` | `AUTH_DENIED` | auth   | no    | A device code refused on the page. |
+| `2011` | `AUTH_USE_PROVIDER` | auth | yes | A sign-in by emailed code for a person who signs in here with a provider; they sign in with that provider instead (AUTH.md §8.4). |
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |

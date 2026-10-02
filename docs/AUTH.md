@@ -586,8 +586,8 @@ token would be the phishable credential the provider exists to remove.
 **A person who signs in a second way is the same person.** An identity the
 workspace has not seen, whose provider verified its address, signs in as the
 member one of whose identities has that address verified too, compared without
-case — Google one day and an emailed code the next is one account, with its
-channels, history and role — and the new identity is recorded beside the old
+case — Google one day and Microsoft the next is one account, with its channels,
+history and role — and the new identity is recorded beside the old
 (`auth.subject_linked` in the audit log, with the provider, never the token). The
 join rules are not consulted, as for any known identity, and no seat is taken.
 There is no link on an address its provider did not verify, into a member who is
@@ -596,6 +596,16 @@ address is verified for more than one member, since it cannot then say which;
 each of those is a first sign-in, which the rules and invites decide. Linking
 comes after every check on the token and its source, so it never admits an
 identity the relay may not deliver.
+
+**Never downward.** An emailed code proves only that its holder reads the
+mailbox, so it does not sign into a person who signs in here with a provider —
+and that provider's second factor: it is refused with `AUTH_USE_PROVIDER`
+(`auth.denied`, `reason=downgrade`), and the client says to use the provider. An
+emailed code for an address is always the same identity, so only a person who
+came by emailed code signs in by one. The other way links: a person known by
+emailed code who later signs in with Google or Microsoft is the same person, by
+the stronger proof. A workspace may allow the downward link with
+`OPENCHIME_OIDC_EMAIL_LINK=any`.
 
 A first sign-in sets the display name and address from the token; later ones
 update the identity row only, and never overwrite a name the person chose.

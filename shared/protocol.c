@@ -1255,6 +1255,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_AUTH_SLOW_DOWN: return "waiting for the code to be approved";
     case OC_ERR_AUTH_EXPIRED: return "the code expired — start again";
     case OC_ERR_AUTH_DENIED: return "the sign-in was declined";
+    case OC_ERR_AUTH_USE_PROVIDER: return "this address signs in here with Google or Microsoft — use that";
     case OC_ERR_BODY_TOO_LARGE: return "that message is too long";
     case OC_ERR_NOT_A_MEMBER: return "you are not in that channel";
     case OC_ERR_UNKNOWN_CHANNEL: return "that channel no longer exists";

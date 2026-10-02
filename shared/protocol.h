@@ -539,6 +539,9 @@ typedef enum {
     OC_ERR_AUTH_SLOW_DOWN      = 2008,
     OC_ERR_AUTH_EXPIRED        = 2009,
     OC_ERR_AUTH_DENIED         = 2010,
+    /* An emailed code for a person who signs in here with a provider: they use
+     * that provider (AUTH.md §8.4). */
+    OC_ERR_AUTH_USE_PROVIDER   = 2011,
     OC_ERR_BODY_TOO_LARGE      = 3001,
     OC_ERR_NOT_A_MEMBER        = 3002,
     OC_ERR_UNKNOWN_CHANNEL     = 3003,

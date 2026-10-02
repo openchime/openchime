@@ -1188,6 +1188,9 @@ void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on);
  * does not understand; call before the writer serves traffic. */
 int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
                                      char *err, size_t errcap);
+/* Whether an emailed code may sign into a person who signs in here with a
+ * provider (OPENCHIME_OIDC_EMAIL_LINK=any); off, it is refused. Before serving. */
+void oc_dbwriter_set_email_link(oc_dbwriter *w, int any);
 
 /* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
  * authorize URL from. For the net loop; set before serving and never after. */

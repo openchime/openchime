@@ -84,6 +84,7 @@ struct oc_dbwriter {
     oc_local_issuer *local_iss;              /* this daemon's issuer for local accounts (§8.10) */
     int             password_frames;         /* OPENCHIME_TEST_PASSWORD_AUTH: frames may carry one */
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
+    int             email_link_any;          /* an emailed code may stand in for a provider */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed sign-ins per source IP, every source */
@@ -1467,6 +1468,16 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
         int linked = 0;
         if (!uid && claims.email_verified && claims.email[0])
             linked = (uid = user_by_verified_email(db, claims.email)) != 0;
+        /* ...but never downward: an emailed code proves only the mailbox, so it
+         * does not stand in for a provider -- and its second factor -- the person
+         * already signs in with, unless the workspace allows it. An emailed code
+         * for an address is always the same identity, so one that would link is
+         * one onto a provider's. The other way, a provider for someone known by
+         * emailed code, is the stronger proof and links. */
+        if (linked && strcmp(claims.idp, "email") == 0 && !w->email_link_any) {
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_USE_PROVIDER, "auth.denied", claims.email,
+                               "source=relay idp=email reason=downgrade");
+        }
         int known = uid != 0;
         /* An invite bound to this verified address admits it where no rule does,
          * and says what role it joins with. */
@@ -9165,6 +9176,8 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
     w->join_rules = rules;
     return 0;
 }
+
+void oc_dbwriter_set_email_link(oc_dbwriter *w, int any) { w->email_link_any = any != 0; }
 
 const char *oc_dbwriter_relay_origin(oc_dbwriter *w) {
     return w->relay_origin ? w->relay_origin : "";
