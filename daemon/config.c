@@ -178,6 +178,17 @@ int oc_config_load(char *err, size_t errcap) {
     c->oidc.issuer    = env_or2("OPENCHIME_OIDC_ISSUER",   "OC_OIDC_ISSUER",   NULL);
     c->oidc.audience  = env_or2("OPENCHIME_OIDC_AUDIENCE", "OC_OIDC_AUDIENCE", NULL);
     c->oidc.allow     = getenv("OPENCHIME_OIDC_ALLOW");
+    /* Whether an emailed code may sign into a person known by a provider (AUTH.md
+     * §8.4). Off unless asked for; a value that is neither word stops the boot. */
+    {
+        const char *el = env_or2("OPENCHIME_OIDC_EMAIL_LINK", NULL, "provider-only");
+        if      (strcmp(el, "provider-only") == 0) c->oidc.email_link_any = 0;
+        else if (strcmp(el, "any") == 0)           c->oidc.email_link_any = 1;
+        else {
+            snprintf(err, errcap, "OPENCHIME_OIDC_EMAIL_LINK='%s' is invalid (want provider-only|any)", el);
+            return -1;
+        }
+    }
     const char *pk_file = env_or2("OPENCHIME_OIDC_PUBKEY_FILE", "OC_OIDC_PUBKEY_FILE", NULL);
     c->oidc.pubkey    = pk_file ? read_file(pk_file)
                                 : env_or2("OPENCHIME_OIDC_PUBKEY", "OC_OIDC_PUBKEY", NULL);

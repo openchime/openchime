@@ -2291,6 +2291,7 @@ static int url_is_openable(const char *u) {
 static const char *auth_error_text(uint16_t code, int reconnecting) {
     switch (code) {
     case OC_ERR_AUTH_NOT_ALLOWED:        return "this account isn't allowed in this workspace";
+    case OC_ERR_AUTH_USE_PROVIDER:       return "this address signs in here with Google or Microsoft — use that";
     case OC_ERR_AUTH_RATE_LIMITED:       return "too many attempts — try again in a minute";
     case OC_ERR_USER_LIMIT:              return "this workspace is full";
     case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";

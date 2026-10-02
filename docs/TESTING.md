@@ -532,6 +532,10 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **Owner by identity (`test_joinrules`, `test_dbwriter` `test_oidc_join_rules`):**
   `subject:` admits that exact `<issuer>|<subject>` as owner with no verified
   address, and no other subject, issuer or letter case.
+- **Never downward (`test_dbwriter` `test_oidc_no_downgrade`):** an emailed
+  code for a Google user's address is refused with `AUTH_USE_PROVIDER` and makes
+  no identity; Microsoft for a person known by emailed code links; with
+  `OPENCHIME_OIDC_EMAIL_LINK=any` the emailed code links too.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

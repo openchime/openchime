@@ -913,6 +913,51 @@ static uint64_t oidc_signin(oc_dbwriter *w, oc_issuer *is, uint64_t conn, const 
     return uid;
 }
 
+/* A1 (AUTH.md §8.4): one person whatever way they arrive -- but an emailed code
+ * proves only the mailbox, so it does not sign into someone who signs in here
+ * with a provider, unless the workspace allows it. The other way links. */
+static void test_oidc_no_downgrade(void) {
+    const char *path = "build/test_dbwriter_downgrade.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-downgrade") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "domain:acme.example", why, sizeof why) == 0);
+    uint8_t role; int err;
+    const char *G_KIM = "\"email\":\"kim@acme.example\",\"email_verified\":true,\"idp\":\"google\"";
+    const char *E_KIM = "\"email\":\"kim@acme.example\",\"email_verified\":true,\"idp\":\"email\"";
+    const char *E_LEE = "\"email\":\"lee@acme.example\",\"email_verified\":true,\"idp\":\"email\"";
+    const char *M_LEE = "\"email\":\"lee@acme.example\",\"email_verified\":true,\"idp\":\"microsoft\"";
+
+    /* Known by Google: an emailed code for the address is refused, with a reason
+     * the client can turn into "use Google", and adds no identity. */
+    uint64_t kim = oidc_signin(w, &is, 1, "https://accounts.google.com|kim", "d1", G_KIM, &role, &err);
+    CHECK(kim != 0);
+    CHECK(oidc_signin(w, &is, 2, "https://openchime.io/email|kim@acme.example", "d2", E_KIM, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_USE_PROVIDER);
+    /* ...still refused the next time: the refusal made no row to find it by. */
+    CHECK(oidc_signin(w, &is, 3, "https://openchime.io/email|kim@acme.example", "d3", E_KIM, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_USE_PROVIDER);
+
+    /* Known by emailed code: a provider for the address links -- the stronger proof. */
+    uint64_t lee = oidc_signin(w, &is, 4, "https://openchime.io/email|lee@acme.example", "d4", E_LEE, &role, &err);
+    CHECK(lee != 0 && lee != kim);
+    CHECK(oidc_signin(w, &is, 5, "https://login.microsoftonline.com/t/v2.0|lee", "d5", M_LEE, &role, &err) == lee);
+    /* ...after which Lee signs in with Microsoft, and an emailed code no longer does. */
+    CHECK(oidc_signin(w, &is, 6, "https://openchime.io/email|lee@acme.example", "d6", E_LEE, &role, &err) == lee);
+
+    /* A workspace that allows it links the emailed code to Kim. */
+    oc_dbwriter_set_email_link(w, 1);
+    CHECK(oidc_signin(w, &is, 7, "https://openchime.io/email|kim@acme.example", "d7", E_KIM, &role, &err) == kim);
+
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
  * new identity, the owner rule creates an owner and restores one. */
 static void test_oidc_join_rules(void) {
@@ -1088,10 +1133,11 @@ static void test_oidc_join_rules(void) {
 
 /* A person who signs in a second way is the same person (AUTH.md §8.4): a new
  * identity whose provider verified an address a member's provider verified is
- * that member, whatever the case of the address -- Google then an emailed code,
- * Google then a personal Microsoft account. Never on an unverified address, never
- * into a removed member, never where the address is more than one person's; a
- * link is audited and costs no seat. */
+ * that member, whatever the case of the address -- Google then a personal
+ * Microsoft account. Never on an unverified address, never into a removed
+ * member, never where the address is more than one person's, never an emailed
+ * code onto a provider (test_oidc_no_downgrade); a link is audited and costs no
+ * seat. */
 static void test_oidc_link(void) {
     const char *path = "build/test_dbwriter_link.db";
     cleanup_db(path);
@@ -1110,10 +1156,11 @@ static void test_oidc_link(void) {
     uint64_t dana = oidc_signin(w, &is, 1, "https://accounts.google.com|dana-g", "l1",
                                 "\"email\":\"dana@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err);
     CHECK(dana != 0 && role == OC_ROLE_OWNER);
-    /* An emailed code for the same address: Dana, as owner, with no new account. */
+    /* An emailed code for the same address is not Dana: she signs in with Google
+     * here, and a code proves only the mailbox (test_oidc_no_downgrade). */
     CHECK(oidc_signin(w, &is, 2, "https://auth.openchime.io/email|dana@acme.example", "l2",
-                      "\"email\":\"dana@acme.example\",\"email_verified\":true,\"idp\":\"email\"", &role, &err) == dana);
-    CHECK(role == OC_ROLE_OWNER);
+                      "\"email\":\"dana@acme.example\",\"email_verified\":true,\"idp\":\"email\"", &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_USE_PROVIDER);
     /* A personal Microsoft account, the address in another case: Dana. The seat
      * cap is full, and a link is not a new user. */
     oc_dbwriter_set_max_users(w, 1);
@@ -1145,8 +1192,8 @@ static void test_oidc_link(void) {
                       "\"email\":\"erin@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err) == 0);
     oc_dbwriter_stop(w);
 
-    /* What was written: Dana's three identities are hers, each link audited with
-     * the provider and never the token. Then an address made two people's -- as
+    /* What was written: Dana's two identities are hers, the link audited with
+     * the provider and never the token, and no emailed code linked. Then an address made two people's -- as
      * accounts from before links could be -- which a new identity cannot choose
      * between. */
     {
@@ -1161,8 +1208,8 @@ static void test_oidc_link(void) {
             " (SELECT COUNT(*) FROM audit_log WHERE action='auth.subject_linked' AND detail LIKE '%eyJ%');", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)dana);
         CHECK(sqlite3_step(st) == SQLITE_ROW);
-        CHECK(sqlite3_column_int(st, 0) == 3 && sqlite3_column_int(st, 1) == 2);
-        CHECK(sqlite3_column_int(st, 2) == 1 && sqlite3_column_int(st, 3) == 1 && sqlite3_column_int(st, 4) == 0);
+        CHECK(sqlite3_column_int(st, 0) == 2 && sqlite3_column_int(st, 1) == 1);
+        CHECK(sqlite3_column_int(st, 2) == 0 && sqlite3_column_int(st, 3) == 1 && sqlite3_column_int(st, 4) == 0);
         sqlite3_finalize(st);
         CHECK(sqlite3_exec(raw,
             "INSERT INTO users(subject, email, created_at_ms) VALUES('oidc:x|y|twin', 'pat@acme.example', 1);"
@@ -7131,6 +7178,7 @@ int run_dbwriter_tests(void) {
     test_auth_and_send();
     test_oidc_auth();
     test_oidc_join_rules();
+    test_oidc_no_downgrade();
     test_oidc_link();
     test_alerts();
     test_restore();

@@ -77,7 +77,8 @@ typedef struct {
 
     /* Auth. */
     const char *auth_mode;          /* "local" | "oidc" */
-    struct { const char *issuer, *audience, *pubkey, *allow; } oidc;  /* pubkey resolved */
+    struct { const char *issuer, *audience, *pubkey, *allow;          /* pubkey resolved */
+             int email_link_any; } oidc;  /* OPENCHIME_OIDC_EMAIL_LINK=any */
     const char *bootstrap_users;
 
     /* Federated enrollment (CP-8). */
