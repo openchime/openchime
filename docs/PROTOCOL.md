@@ -906,8 +906,9 @@ username) is a fatal `ERROR AUTH_INVALID_TOKEN`, non-disclosing by design.
 **`REMOVE_USER` (client → server), msg_type `0x0044`** `{ user_id: u64 }` —
 owner/admin only; an admin cannot remove an admin/owner, and the last owner
 cannot be removed (`LAST_OWNER`). The member is **locked out** (their sessions,
-channel memberships, and local password are dropped, and a `disabled` flag bars
-every future login) rather than deleted, so their authored messages keep a valid
+channel memberships, local password and push device tokens are dropped, their
+webhooks are turned off and post nothing while they are removed, and a
+`disabled` flag bars every future login) rather than deleted, so their authored messages keep a valid
 author. The actor is acked with `USER_UPDATED` (`disabled=1`); the removed user's
 live connections receive the same notice and are then dropped.
 
