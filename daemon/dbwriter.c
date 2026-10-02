@@ -8090,19 +8090,45 @@ static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint64
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* The sign-in limiter's key for a local account: its username, so a guess at
+ * the old password in a change counts with a guess at a sign-in. */
+static void account_key(sqlite3 *db, uint64_t uid, char *out, size_t cap) {
+    out[0] = '\0';
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT subject FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *sub = (const char *)sqlite3_column_text(st, 0);
+        if (sub && strncmp(sub, "local:", 6) == 0) snprintf(out, cap, "%s", sub + 6);
+    }
+    sqlite3_finalize(st);
+}
+
 static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     const char *newpw = j->pf_new_pw ? j->pf_new_pw : "";
     if (newpw[0] == '\0') return profile_err(j, OC_ERR_FORBIDDEN);
     /* Changed on the daemon's pages (AUTH.md §8.10) -- but for the test knob. */
     if (!w->password_frames) return profile_err(j, OC_ERR_FORBIDDEN);
+    char acct[OC_RL_KEYMAX];
+    account_key(db, j->user_id, acct, sizeof acct);
+    uint64_t now = dbw_now_ms();
+    /* Behind the sign-in limiter, as the page is: a held session must not guess
+     * its account's password at the pool's speed (REQ-191). */
+    if (j->auth_stage == OC_AUTH_STAGE_NEW && acct[0] && oc_ratelimit_blocked(w->auth_rl, acct, now))
+        return profile_err(j, OC_ERR_AUTH_RATE_LIMITED);
     if (j->auth_stage == OC_AUTH_STAGE_NEW) {
         ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
         submit_to_reader(w, (oc_job *)j);
         w->auth_deferred = 1;
         return NULL;
     }
-    if (j->auth_ok != 1) return profile_err(j, OC_ERR_FORBIDDEN);
+    if (j->auth_ok != 1) {
+        if (acct[0]) oc_ratelimit_record(w->auth_rl, acct, now);
+        /* That it failed, and whose -- never what was typed (ARCH-79). */
+        audit_actor(db, OC_AUDIT_SECURITY, "password.change.failed", j->user_id, 0, NULL, 0, NULL);
+        return profile_err(j, OC_ERR_FORBIDDEN);
+    }
     uint16_t err = 0;
     /* The caller's own session stays: it just proved the old password. */
     if (store_new_password(db, j, j->user_id, j->message_id, &err) != 0) return profile_err(j, err);

@@ -6695,6 +6695,36 @@ static void test_change_password(void) {
     r = wait_result_ms(w, 60000);
     CHECK(r && r->conn_id == 30 && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
     oc_dbres_free(r);
+    {   /* a wrong old password is seen, as an owner reads the log */
+        uint64_t boss = reg(w, "chg-boss", "pw", OC_ROLE_OWNER);
+        oc_job *qj = oc_job_new(OC_JOB_AUDIT_QUERY, 31);
+        qj->user_id = boss; qj->audit_limit = 100;
+        oc_dbwriter_submit(w, qj);
+        r = wait_result(w);
+        int seen = 0;
+        for (size_t i = 0; r && r->type == OC_RES_AUDIT_PAGE && i < r->n_audit; i++)
+            if (r->audit[i].action && !strcmp(r->audit[i].action, "password.change.failed") &&
+                r->audit[i].actor_id == u && !r->audit[i].outcome) seen = 1;
+        CHECK(seen);
+        oc_dbres_free(r);
+    }
+
+    /* And it counts with the sign-in limiter: wrong old passwords run out the
+     * account's tries, after which neither a change nor a sign-in is checked. */
+    {
+        uint64_t g = reg(w, "chg-guess", "pw-real", OC_ROLE_MEMBER);
+        CHECK(g != 0);
+        int refused = 0, limited = 0;
+        for (int k = 0; k < 8; k++) {
+            submit_change(w, 40 + (uint64_t)k, g, "guess", "pw-new");
+            r = wait_result_ms(w, 60000);
+            if (r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN) refused++;
+            if (r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_AUTH_RATE_LIMITED) limited++;
+            oc_dbres_free(r);
+        }
+        CHECK(refused >= 1 && limited >= 1 && refused + limited == 8);
+        CHECK(auth_local(w, 50, "chg-guess", "pw-real", NULL, NULL) == 0);
+    }
 
     /* Held on the pool, the change leaves the writer free. */
     oc_dbwriter_hold_auth(w, 1);
