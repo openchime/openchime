@@ -1447,7 +1447,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
         /* Who may join (AUTH.md §8.4). The rules speak only to an identity this
          * workspace has not seen — a known one signs in without them — except the
          * owner rule, which also restores an owner to a workspace left with none. */
-        oc_join_verdict verdict = oc_join_rules_eval(w->join_rules, claims.idp, claims.tenant,
+        oc_join_verdict verdict = oc_join_rules_eval(w->join_rules, claims.sub, claims.idp, claims.tenant,
                                                      claims.email, claims.email_verified);
         char issuer[OC_JWT_MAX_FIELD];
         const char *person = NULL;

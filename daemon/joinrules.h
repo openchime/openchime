@@ -4,6 +4,9 @@
  * the workspace has not seen.
  *
  *   owner:<email>                  that verified address, created as owner
+ *   subject:<issuer>|<subject>     that exact identity, created as owner -- no
+ *                                  address needed, for an owner whose provider
+ *                                  does not verify one
  *   tenant:google:<hosted domain>  anyone the provider places in that
  *   tenant:microsoft:<tenant id>   organization, as member
  *   domain:<domain>                a verified address at that domain, as member
@@ -31,10 +34,11 @@ typedef struct oc_join_rules oc_join_rules;
 oc_join_rules *oc_join_rules_parse(const char *spec, char *err, size_t errcap);
 void oc_join_rules_free(oc_join_rules *r);
 
-/* The best verdict any rule gives this identity. `email` counts only when
+/* The best verdict any rule gives this identity. `sub` is the relay's
+ * `<upstream issuer>|<subject>`, matched exactly. `email` counts only when
  * `email_verified` is set: an unverified address is whatever its holder typed.
  * Any string may be NULL or "". */
-oc_join_verdict oc_join_rules_eval(const oc_join_rules *r, const char *idp,
+oc_join_verdict oc_join_rules_eval(const oc_join_rules *r, const char *sub, const char *idp,
                                    const char *tenant, const char *email,
                                    int email_verified);
 

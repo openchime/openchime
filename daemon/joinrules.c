@@ -6,12 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum { RULE_OWNER, RULE_TENANT, RULE_DOMAIN } rule_kind;
+typedef enum { RULE_OWNER, RULE_SUBJECT, RULE_TENANT, RULE_DOMAIN } rule_kind;
 
 typedef struct {
     rule_kind kind;
     char     *idp;     /* RULE_TENANT only */
-    char     *value;   /* the address, the organization, or the domain; lowercased */
+    char     *value;   /* the address, the organization, or the domain, lowercased;
+                        * a subject exactly as given */
 } rule;
 
 struct oc_join_rules {
@@ -95,6 +96,17 @@ oc_join_rules *oc_join_rules_parse(const char *spec, char *err, size_t errcap) {
             if (!plausible_email(s + 6, n - 6)) { fail(err, errcap, "not an address", s, n); goto bad; }
             ru->kind = RULE_OWNER;
             ru->value = dup_lower(s + 6, n - 6);
+        } else if (n > 8 && strncmp(s, "subject:", 8) == 0) {
+            /* <issuer>|<subject>, both halves there, kept as given: an issuer
+             * and a provider's subject are compared exactly, case and all. */
+            const char *v = s + 8, *bar = memchr(v, '|', (size_t)(e - v));
+            if (!bar || bar == v || bar + 1 == e || memchr(v, ' ', (size_t)(e - v))) {
+                fail(err, errcap, "a subject rule is subject:<issuer>|<subject>", s, n);
+                goto bad;
+            }
+            ru->kind = RULE_SUBJECT;
+            ru->value = malloc((size_t)(e - v) + 1);
+            if (ru->value) { memcpy(ru->value, v, (size_t)(e - v)); ru->value[e - v] = '\0'; }
         } else if (n > 7 && strncmp(s, "domain:", 7) == 0) {
             if (!plausible_domain(s + 7, n - 7)) { fail(err, errcap, "not a domain", s, n); goto bad; }
             ru->kind = RULE_DOMAIN;
@@ -126,7 +138,7 @@ bad:
     return NULL;
 }
 
-oc_join_verdict oc_join_rules_eval(const oc_join_rules *r, const char *idp,
+oc_join_verdict oc_join_rules_eval(const oc_join_rules *r, const char *sub, const char *idp,
                                    const char *tenant, const char *email,
                                    int email_verified) {
     if (!r) return OC_JOIN_DENY;
@@ -140,6 +152,9 @@ oc_join_verdict oc_join_rules_eval(const oc_join_rules *r, const char *idp,
         switch (ru->kind) {
         case RULE_OWNER:
             if (addr && eq_nocase(addr, ru->value)) return OC_JOIN_OWNER;
+            break;
+        case RULE_SUBJECT:
+            if (sub && strcmp(sub, ru->value) == 0) return OC_JOIN_OWNER;
             break;
         case RULE_DOMAIN:
             if (dom && eq_nocase(dom, ru->value)) best = OC_JOIN_MEMBER;
