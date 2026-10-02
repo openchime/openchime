@@ -837,6 +837,9 @@ typedef struct oc_dbres {
     uint64_t       conn_id;
     uint32_t       gen;  /* the job's, echoed (oc_job) */
     uint16_t       err_code;  /* reason code for *_ERR */
+    /* LOGOUT_OK, WEB_OK, PROFILE_UPDATED: the user's sessions were revoked, so
+     * every connection of `user_id` closes but `conn_id`'s (REQ-182). */
+    uint8_t        revoked;
 
     /* AUTH_OK / REGISTER_OK */
     uint64_t       user_id;

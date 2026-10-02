@@ -439,7 +439,7 @@ provider JWT cannot offer, and the reason the daemon issues its own sessions.
 The daemon deletes the matching `sessions` row(s) — the `scope=0` delete is
 scoped to the authenticated user, so a leaked token still cannot revoke another
 user's session — then closes the connection (the client re-authenticates to
-continue).
+continue); with `scope=1`, every other connection of the user's too.
 
 ---
 
@@ -1821,7 +1821,8 @@ a field), so neither can touch another account.
 — rotate your local password. The daemon verifies `old_password` (constant-time)
 against `local_credentials` and stores a fresh PBKDF2 salt+hash. A non-local
 (OIDC) account or a wrong `old_password` is `FORBIDDEN` (an `ERROR`, non-fatal);
-success answers with `PROFILE_UPDATED` (the name unchanged) as the ack. `FORBIDDEN`
+success answers with `PROFILE_UPDATED` (the name unchanged) as the ack, deletes the
+user's other sessions and closes their connections. `FORBIDDEN`
 too unless the daemon runs with the test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a
 password is changed on the password page (AUTH.md §8.10).
 

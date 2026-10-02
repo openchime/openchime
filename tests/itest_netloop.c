@@ -1762,6 +1762,92 @@ static int token_of(const char *resp, char *tok, size_t cap) {
     return 1;
 }
 
+/* Whether the daemon closed `c`: 1 when the stream ends within five seconds,
+ * 0 when it is still open (the read only timed out). Frames on the way are
+ * skipped. */
+static int peer_closed(client *c) {
+    struct timeval tv = { 5, 0 };
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int closed = -1;
+    while (closed < 0) {
+        const uint8_t *frame; size_t flen;
+        int r = oc_framebuf_next(&c->fb, &frame, &flen);
+        if (r == 1) continue;
+        if (r < 0) { closed = 1; break; }
+        uint8_t buf[4096]; size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->conn, buf, sizeof buf, &n);
+        if (st == OC_TLS_WANT_READ) closed = 0;
+        else if (st != OC_TLS_OK || oc_framebuf_push(&c->fb, buf, n) != 0) closed = 1;
+    }
+    tv.tv_sec = 20;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return closed;
+}
+
+/* How many sessions the signed-in `c` sees, or -1; `current` how many of them
+ * it is told are its own. */
+static int session_count_of(client *c, int *current) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_list_sessions(&w, OC_PROTOCOL_VERSION) != OC_OK || write_all(&c->conn, buf, w.len) != 0)
+        return -1;
+    oc_header hdr; oc_rbuf p;
+    for (int i = 0; i < 16; i++) {
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type != OC_MSG_SESSION_LIST) continue;
+        oc_session_entry e[OC_MAX_SESSIONS]; uint16_t n = 0;
+        if (oc_decode_session_list(&p, e, OC_MAX_SESSIONS, &n) != OC_OK) return -1;
+        if (current) { *current = 0; for (uint16_t k = 0; k < n; k++) *current += e[k].current; }
+        return (int)n;
+    }
+    return -1;
+}
+
+static int signed_in(client *c, int port, const uint8_t *pin, const char *user, const char *pw) {
+    uint64_t uid = 0;
+    return client_open(c, port, pin) == 0 && do_handshake(c) == 0 && do_auth(c, user, pw, &uid) == 0 ? 0 : -1;
+}
+
+/* Revoking a user's sessions closes their other live connections, which are
+ * authenticated in memory and would otherwise carry on (REQ-182): a password
+ * change keeps only the device that made it, signing out everywhere keeps none,
+ * and signing out this device leaves the others alone. */
+static void test_revoke_other_devices(int port, const uint8_t *pin) {
+    client a, b, c;
+    CHECK(signed_in(&a, port, pin, "roy", "pw-roy") == 0);
+    CHECK(signed_in(&b, port, pin, "roy", "pw-roy") == 0);
+    CHECK(signed_in(&c, port, pin, "roy", "pw-roy") == 0);
+    int cur = 0;
+    CHECK(session_count_of(&a, &cur) == 3 && cur == 1);   /* a fresh sign-in knows its own */
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_change_password cp = { oc_slice_str("pw-roy"), oc_slice_str("pw-roy2") };
+    CHECK(oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &cp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    CHECK(peer_closed(&b) == 1);
+    CHECK(peer_closed(&c) == 1);
+    int mine = 0;
+    CHECK(session_count_of(&a, &mine) == 1 && mine == 1);   /* the changer's own, still working */
+    client_close(&b); client_close(&c);
+
+    /* Signing out this device leaves the user's others signed in. */
+    client d, e;
+    CHECK(signed_in(&d, port, pin, "roy", "pw-roy2") == 0);
+    CHECK(signed_in(&e, port, pin, "roy", "pw-roy2") == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    uint8_t none[OC_SESSION_TOKEN_LEN] = {0};
+    oc_logout lo = { OC_LOGOUT_THIS, { none, sizeof none } };
+    CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK && write_all(&e.conn, buf, w.len) == 0);
+    CHECK(peer_closed(&e) == 1);
+    CHECK(peer_closed(&d) == 0 && peer_closed(&a) == 0);
+    client_close(&e);
+
+    /* Signing out everywhere closes every connection the user has. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    lo.scope = OC_LOGOUT_ALL;
+    CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK && write_all(&d.conn, buf, w.len) == 0);
+    CHECK(peer_closed(&d) == 1);
+    CHECK(peer_closed(&a) == 1);
+    client_close(&a); client_close(&d);
+}
+
 /* Present a token on the AUTH path, as the client does after the browser: 0 and
  * the user on AUTH_OK, else the ERROR's code. */
 static int token_auth(int port, const uint8_t *pin, const char *tok, const char *verifier, uint64_t *uid) {
@@ -1919,7 +2005,20 @@ static void test_web_signin(int port) {
     snprintf(body, sizeof body, "redirect_uri=https%%3A%%2F%%2Fevil.example%%2Fcb&nonce=%s&username=mia&password=pw-mia", ch);
     CHECK(web_call(port, pin, "POST", "/signin", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 400);
 
-    /* A password change on its page: the old one stops working, the new one works. */
+    /* A password change on its page: the old one stops working, the new one works,
+     * and a device signed in with the old one is signed out -- the page is no
+     * session, so none is kept. */
+    client held;
+    CHECK(web_signin(port, pin, "pat", "pw-old", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+    CHECK(client_open(&held, port, pin) == 0 && do_handshake(&held) == 0);
+    {
+        uint8_t ab[4096]; oc_wbuf aw; oc_wbuf_init(&aw, ab, sizeof ab);
+        oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver) };
+        oc_header hdr; oc_rbuf p;
+        CHECK(oc_encode_auth(&aw, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&held.conn, ab, aw.len) == 0);
+        CHECK(read_frame_raw(&held, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);
+    }
+    CHECK(peer_closed(&held) == 0);
     CHECK(web_call(port, pin, "GET", "/account/password", NULL, NULL, NULL, resp, sizeof resp) == 200);
     CHECK(strstr(resp, "autocomplete=\"new-password\"") != NULL);
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
@@ -1928,6 +2027,8 @@ static void test_web_signin(int port) {
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
                    "username=pat&current=pw-old&password=pw-new&confirm=pw-new", resp, sizeof resp) == 200);
     CHECK(strstr(resp, "Password changed") != NULL);
+    CHECK(peer_closed(&held) == 1);
+    client_close(&held);
     CHECK(web_signin(port, pin, "pat", "pw-old", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
     CHECK(web_signin(port, pin, "pat", "pw-new", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
 
@@ -4804,6 +4905,7 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "bf-sender", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "bf-reader", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "carol",     "pw",       OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "roy",       "pw-roy",   OC_ROLE_MEMBER, 2048) != 0);
     uint64_t flooder = oc_dbwriter_register_local(dbw, "flooder", "pw", OC_ROLE_MEMBER, 2048);
     for (int i = 0; i < 100; i++) {   /* a crowd, for test_login_bound and the groups tests */
         char un[16]; snprintf(un, sizeof un, "u%03d", i);
@@ -4864,6 +4966,7 @@ int run_netloop_tests(void) {
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
+        test_revoke_other_devices(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack(arg.port + 128, arg.port + 129);
