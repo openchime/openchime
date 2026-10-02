@@ -1823,7 +1823,9 @@ a field), so neither can touch another account.
 **`CHANGE_PASSWORD` (C → S), `0x0049`** `{ old_password: str, new_password: str }`
 — rotate your local password. The daemon verifies `old_password` (constant-time)
 against `local_credentials` and stores a fresh PBKDF2 salt+hash. A non-local
-(OIDC) account or a wrong `old_password` is `FORBIDDEN` (an `ERROR`, non-fatal);
+(OIDC) account or a wrong `old_password` is `FORBIDDEN` (an `ERROR`, non-fatal),
+audited as `password.change.failed` and counted by the account's sign-in limiter,
+past which the change is `AUTH_RATE_LIMITED` unchecked;
 success answers with `PROFILE_UPDATED` (the name unchanged) as the ack, deletes the
 user's other sessions and closes their connections. `FORBIDDEN`
 too unless the daemon runs with the test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a
