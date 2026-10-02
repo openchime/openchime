@@ -19,11 +19,14 @@
  */
 
 #include "store.h"
+#include "resolve.h"
 
 #include "e2e_hpke.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 struct oc_store { oc_secret *secret; };
 
@@ -148,6 +151,23 @@ int oc_store_adopt(oc_store *s, const char *key, const char *legacy) {
     memset(from, 0, sizeof from);
     memset(to, 0, sizeof to);
     return ok;
+}
+
+int oc_workspace_move(oc_store *s, const char *from_key, const char *address,
+                      char *new_key, size_t cap) {
+    char key[288];
+    if (!address || !address[0] || !new_key || !cap ||
+        oc_workspace_key(address, oc_default_suffix(), key, sizeof key) != 0 || !key[0])
+        return 0;
+    if (from_key && strcmp(key, from_key) == 0) return 0;
+    if (s && from_key && from_key[0]) {
+        oc_store_adopt(s, key, from_key);
+        /* The book says what to dial next: the address the workspace has now, not
+         * the one typed before it moved. The username stays as it was. */
+        oc_store_workspace_remember(s, key, address, NULL, (uint64_t)time(NULL) * 1000u);
+    }
+    snprintf(new_key, cap, "%s", key);
+    return 1;
 }
 
 /* ---- open / close ---------------------------------------------------------- */

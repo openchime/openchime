@@ -50,6 +50,7 @@ typedef struct {
     /* Workspace identity (infra). */
     oc_deploy_mode deployment_mode;
     const char *workspace_name;     /* "" ⇒ client derives from the host subdomain */
+    const char *workspace_address;  /* canonical address, "" ⇒ none: clients keep what they dialled */
 
     /* Paths + ports. */
     const char *db_path, *tls_cert, *tls_key;

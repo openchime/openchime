@@ -685,6 +685,10 @@ requests are machine requests, signed as §8.7 says, to the enrollment origin:
   `202` with `Retry-After` (seconds) while central is still completing the
   challenge; or a `4xx`, which is final until the next boot.
 
+A box whose `OPENCHIME_WORKSPACE_ADDRESS` its kept certificate does not name — it
+moved to a new address, and central restarted it — asks for a new one at boot
+rather than presenting the old one until renewal.
+
 The daemon asks again at a random moment from 60% to two-thirds of the
 certificate's life, and after a failure a minute later, then ten, a hundred, and
 daily.

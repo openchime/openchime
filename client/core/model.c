@@ -2328,6 +2328,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->signin_kinds = e->count;
         set_signin_provider(m, e->body);
         break;
+    case OC_EV_WORKSPACE_MOVED:
+        if (e->body) {
+            char buf[320];
+            snprintf(buf, sizeof buf, "This workspace has moved to %s; it is used from now on.", e->body);
+            set_status(m, buf);
+        }
+        break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
         /* The roster carries the profile fields now (REQ-289), so every surface

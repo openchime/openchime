@@ -188,6 +188,7 @@ typedef enum {
     OC_MSG_AUTH_DEVICE      = 0x0019, /* S->C: the user code, where to enter it, and the device code */
     OC_MSG_AUTH_DEVICE_POLL = 0x001A, /* C->S, pre-auth: has the code been approved? */
     OC_MSG_AUTH_DEVICE_TOKEN = 0x001B, /* S->C: approved -- the token to present on AUTH */
+    OC_MSG_WORKSPACE_ADDRESS = 0x001C, /* S->C, after WORKSPACE_INFO: the workspace's address now */
     OC_MSG_SEND             = 0x0020, /* C->S */
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
@@ -887,6 +888,11 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
  * client starting one in a large channel knows when the starter has to pick. */
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
                  uint8_t call_max; } oc_workspace_info;
+/* Pushed after WORKSPACE_INFO, only where the deployment names the workspace's
+ * canonical address (OPENCHIME_WORKSPACE_ADDRESS): a workspace moved to a new
+ * address still answers at the old one for a while, and a client that connected
+ * by it re-files its stored workspace under the new one (CLIENT.md). */
+typedef struct { oc_slice address; } oc_workspace_address;
 /* src_channel/src_message are the forward source (REQ-057), zero when the
  * message is not a forward. The client asserts nothing but the two ids: the
  * daemon resolves the author, the excerpt and the attachment count from the
@@ -1504,6 +1510,7 @@ oc_result oc_encode_auth_continue(oc_wbuf *w, uint16_t version, const oc_auth_co
 oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
 oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_workspace_info *m);
+oc_result oc_encode_workspace_address(oc_wbuf *w, uint16_t version, const oc_workspace_address *m);
 oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m);
 oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
 oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m);
@@ -1775,6 +1782,7 @@ oc_result oc_decode_auth_continue(oc_rbuf *p, oc_auth_continue *m);
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);
 oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m);
+oc_result oc_decode_workspace_address(oc_rbuf *p, oc_workspace_address *m);
 oc_result oc_decode_logout(oc_rbuf *p, oc_logout *m);
 oc_result oc_decode_send(oc_rbuf *p, oc_send *m);
 oc_result oc_decode_send_ack(oc_rbuf *p, oc_send_ack *m);

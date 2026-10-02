@@ -76,6 +76,11 @@ uint64_t oc_certs_window_pick(uint64_t start_ms, uint64_t end_ms, double rnd);
  * times it, then `max` -- a minute, ten, a hundred, a day. */
 uint64_t oc_certs_retry_ms(int n, uint64_t base, uint64_t max);
 
+/* Whether the comma-separated `names` a certificate was issued for include `name`,
+ * without regard to case. A box bound to central that has moved to a new address
+ * re-issues at boot when its kept certificate does not name it. */
+int oc_certs_names_include(const char *names, const char *name);
+
 /* One certificate through central (AUTH.md §8.9): a CSR for a new key, sent as
  * a signed machine request; the names are central's to say. 0 with `out`
  * filled; 1 if central is still working on it (`*retry_ms` how long to wait);

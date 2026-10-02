@@ -44,6 +44,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_TRUSTED_PROXIES` | *(none)* | Addresses and CIDR blocks, IPv4 or IPv6, comma-separated, of TCP forwarders in front of the daemon. A connection from one must begin with a **PROXY protocol v2** header, read before TLS, and the client address it names is what the per-address connection cap and the sign-in limiter count; a trusted peer that sends none is closed. Nobody else's header is read. A list the daemon cannot parse stops the boot. |
 | `OPENCHIME_DEPLOYMENT_MODE` | `standalone` | `standalone` \| `federated` \| `managed` — reported to clients in `WORKSPACE_INFO` (ARCH-76). Does **not** by itself enable federated services; those are gated on their own URLs. On `managed`, the first boot creates `#general` with a welcome topic and description (PROTOCOL.md §5.7). |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | Human-readable workspace name, reported in `WORKSPACE_INFO`. |
+| `OPENCHIME_WORKSPACE_ADDRESS` | *(empty)* | The workspace's canonical address, which central sets on a hosted box. Sent to clients in `WORKSPACE_ADDRESS`, so one that connected by a former address re-files the workspace under this one; and with `OPENCHIME_TLS_SOURCE=central`, a kept certificate that does not name it is re-issued at boot. Empty: neither. |
 
 ## Authentication
 

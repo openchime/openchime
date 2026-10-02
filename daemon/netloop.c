@@ -4298,6 +4298,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
+
+            /* Where the workspace is now, when the deployment says: a client that
+             * dialled a former address files its workspace under this one. */
+            if (cfg->workspace_address && cfg->workspace_address[0]) {
+                oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+                oc_workspace_address wa = { oc_slice_str(cfg->workspace_address) };
+                oc_encode_workspace_address(&w, OC_PROTOCOL_VERSION, &wa);
+                send_bytes(ep, conns, fd, g_enc, w.len);
+                if (!conns[fd]) break;
+            }
         }
 
         /* What this daemon offers, by name (REQ-295). Always sent, and sent

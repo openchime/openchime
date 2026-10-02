@@ -527,6 +527,13 @@ name already holds. **Remember me** governs the session, not the trust: off
 and a certificate the person trusted still is — it is not a secret, and without it
 they would be asked about the same certificate every time (ARCH-10).
 
+**A workspace that moved is re-filed.** A hosted workspace can change its address,
+and answers at the former one for a while. Its daemon says where it is now
+(`WORKSPACE_ADDRESS`); when that is another key, the net thread moves what is kept
+to it (`oc_workspace_move`, which adopts as above), shows the new address in the
+book, and names it on the next connection. `OC_EV_WORKSPACE_MOVED` carries the new
+key, and the model says so in the status line.
+
 **A refused session is `signed_out`, not an error.** When a stored or reconnecting
 session is refused and there is no credential to fall back on, the core drops the
 dead token, raises `OC_EV_SIGNED_OUT` and stops; the model's `signed_out` is set

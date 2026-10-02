@@ -113,4 +113,13 @@ typedef void (*oc_store_workspace_cb)(void *ctx, const char *workspace,
                                       uint64_t last_used_ms);
 void oc_store_workspace_each(oc_store *s, oc_store_workspace_cb cb, void *ctx);
 
+/* A workspace that moved (WORKSPACE_ADDRESS): file what is kept under `from_key`
+ * under the key of `address` instead (oc_store_adopt), and show the new address in
+ * the book, so the next connection dials it and nothing is lost when the old one
+ * stops answering. `s` may be NULL (nothing kept). Writes the new key to `new_key`
+ * and returns 1 when the address is another workspace key than `from_key`; 0, and
+ * nothing done, when it is the same or unusable. */
+int oc_workspace_move(oc_store *s, const char *from_key, const char *address,
+                      char *new_key, size_t cap);
+
 #endif /* OC_STORE_H */

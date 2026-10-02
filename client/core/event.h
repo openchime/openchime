@@ -256,7 +256,11 @@ enum {
     /* How this workspace signs people in, from the AUTH_CHALLENGE of every
      * connection: `count` holds one bit per source kind, 1u << OC_SOURCE_*, and
      * body the ids of its browser sources, each ended by "\n". */
-    OC_EV_SIGNIN_SOURCES
+    OC_EV_SIGNIN_SOURCES,
+    /* The workspace moved (WORKSPACE_ADDRESS): what was kept is filed under the
+     * new key, in `body`, and the next connection dials it. A frontend showing the
+     * workspace by its old key relabels it. */
+    OC_EV_WORKSPACE_MOVED
 };
 
 typedef struct {
