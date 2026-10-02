@@ -396,7 +396,10 @@ client.
 [TLS.md](./TLS.md)), used by both the daemon and the test client;
 `tests/itest_tls.c` exercises the handshake and the fingerprint check, and
 `test_client_core` the client's judgement of a certificate at this machine's LAN
-address — a root's, the person's trust, a change, a wrong name, and the probe.
+address — a root's, the person's trust, a change, a wrong name, and the probe —
+and a connected client across its daemon's certificate re-issued with a new key
+under the same name, on a box restarted with it: a full handshake, no session
+resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, with
 the test knob `OPENCHIME_TEST_PASSWORD_AUTH` off — the product as shipped; the
