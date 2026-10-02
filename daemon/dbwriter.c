@@ -27,6 +27,7 @@
 #include "roles.h"
 #include "srccount.h"   /* oc_source_key */
 #include "totp.h"
+#include "webauthn.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -254,6 +255,7 @@ static void job_free(oc_job *j) {
     free(j->token);
     free(j->proof);
     free(j->email);
+    free(j->wa_cred); free(j->wa_cd); free(j->wa_ad); free(j->wa_sig); free(j->wa_att);
     free(j->sq_from);
     free(j->sq_in);
     free(j->username);
@@ -436,6 +438,7 @@ void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->alert_rows);
     free(r->body);
+    free(r->pk_creds);
     /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
@@ -1609,6 +1612,70 @@ static int has_second_step(sqlite3 *db, uint64_t uid) {
     return yes;
 }
 
+/* `uid`'s passkeys on relying party `rp`: their ids, base64url, comma-separated
+ * (heap), or NULL for none. */
+static char *passkeys_for(sqlite3 *db, uint64_t uid, const char *rp) {
+    if (!rp || !rp[0]) return NULL;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT cred_id FROM webauthn_credentials WHERE user_id=? AND rp_id=? ORDER BY id LIMIT 16;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_text(st, 2, rp, -1, SQLITE_TRANSIENT);
+    char *out = NULL;
+    size_t len = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int n = sqlite3_column_bytes(st, 0);
+        if (n <= 0 || n > (int)OC_WA_CRED_MAX) continue;
+        char enc[4 * ((OC_WA_CRED_MAX + 2) / 3) + 2];
+        size_t el = oc_base64url_encode(sqlite3_column_blob(st, 0), (size_t)n, enc);
+        char *g = realloc(out, len + el + 2);
+        if (!g) break;
+        out = g;
+        if (len) out[len++] = ',';
+        memcpy(out + len, enc, el);
+        len += el;
+        out[len] = '\0';
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+/* A passkey's answer for `uid` (AUTH.md §8.6), on the relying party, challenge
+ * and origin its ticket named: 1 and its counter moved on, or 0. */
+static int check_passkey(sqlite3 *db, uint64_t uid, const oc_job *j) {
+    uint8_t id[OC_WA_CRED_MAX], cd[2048], ad[1024], sig[600];
+    long il = j->wa_cred ? oc_base64url_decode(j->wa_cred, strlen(j->wa_cred), id, sizeof id) : -1;
+    long cl = j->wa_cd ? oc_base64url_decode(j->wa_cd, strlen(j->wa_cd), cd, sizeof cd) : -1;
+    long al = j->wa_ad ? oc_base64url_decode(j->wa_ad, strlen(j->wa_ad), ad, sizeof ad) : -1;
+    long sl = j->wa_sig ? oc_base64url_decode(j->wa_sig, strlen(j->wa_sig), sig, sizeof sig) : -1;
+    if (il <= 0 || cl <= 0 || al <= 0 || sl <= 0 || !j->wa_rp[0] || !j->wa_challenge[0]) return 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT id, cose_key, sign_count FROM webauthn_credentials "
+                           "WHERE user_id=? AND cred_id=? AND rp_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_blob(st, 2, id, (int)il, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, j->wa_rp, -1, SQLITE_TRANSIENT);
+    int ok = 0;
+    int64_t row = 0;
+    uint32_t count = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        row = sqlite3_column_int64(st, 0);
+        ok = oc_webauthn_assert(cd, (size_t)cl, ad, (size_t)al, sig, (size_t)sl,
+                                sqlite3_column_blob(st, 1), (size_t)sqlite3_column_bytes(st, 1),
+                                (uint32_t)sqlite3_column_int64(st, 2), j->wa_challenge, j->wa_origin, j->wa_rp,
+                                &count) == OC_WA_OK;
+    }
+    sqlite3_finalize(st);
+    if (!ok) return 0;
+    sqlite3_prepare_v2(db, "UPDATE webauthn_credentials SET sign_count=?, last_used_at_ms=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)count);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 3, row);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return 1;
+}
+
 /* What a page's password check ends in. `stepped`: the second step has been
  * passed too, or the account has none; otherwise an account with one is asked
  * for it (WEB_STEP2) and nothing is minted or stored yet. */
@@ -1629,6 +1696,7 @@ static oc_dbres *web_finish_as(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uin
         r->type = OC_RES_WEB_STEP2;
         r->user_id = uid;
         r->step_version = j->auth_version;
+        r->pk_creds = passkeys_for(db, uid, j->wa_rp);   /* offered on its trusted name only */
         if (j->web == OC_WEB_PASSWORD && j->pw_derived) {
             r->step_pw = 1;
             r->step_iters = j->pw_iters;
@@ -1764,9 +1832,12 @@ static oc_dbres *process_auth_step(oc_dbwriter *w, const oc_job *j) {
         r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
     }
     const char *code = j->token ? j->token : "";
-    int ok = strlen(code) == OC_TOTP_DIGITS ? check_totp(w, uid, code) : 0;
-    int recovery = 0;
-    if (ok == 0 && strlen(code) != OC_TOTP_DIGITS) recovery = ok = spend_recovery(db, uid, code);
+    int ok = 0, recovery = 0;
+    if (j->wa_cd) ok = check_passkey(db, uid, j);   /* a passkey, in place of a code */
+    else {
+        ok = strlen(code) == OC_TOTP_DIGITS ? check_totp(w, uid, code) : 0;
+        if (ok == 0 && strlen(code) != OC_TOTP_DIGITS) recovery = ok = spend_recovery(db, uid, code);
+    }
     if (ok != 1) {
         oc_ratelimit_record(w->step_rl, key, now);
         audit_actor(db, OC_AUDIT_SECURITY, "auth.failed", uid, 0, NULL, 0,
@@ -1875,7 +1946,7 @@ static oc_dbres *process_security(oc_dbwriter *w, const oc_job *j) {
     const char *code = j->token ? j->token : "";
     int ok = 0;
     sqlite3_stmt *st = NULL;
-    if (j->scope == 1) {
+    if (j->scope == OC_SEC_CONFIRM_TOTP) {
         /* The new secret's first code: proof the authenticator has it. */
         uint8_t sealed[OC_TOTP_SEALED_LEN], secret[OC_TOTP_SECRET_LEN];
         int have = 0;
@@ -1915,12 +1986,49 @@ static oc_dbres *process_security(oc_dbwriter *w, const oc_job *j) {
             r->body_len = strlen(codes);
             return r;
         }
-    } else if (j->scope == 2) {
+    } else if (j->scope == OC_SEC_PASSKEY_ASK) {
+        /* A code first: a password alone does not add a way past the step. */
+        ok = strlen(code) == OC_TOTP_DIGITS ? check_totp(w, uid, code) : spend_recovery(db, uid, code);
+        if (ok == 1) {
+            oc_ratelimit_reset(w->step_rl, key);
+            r->type = OC_RES_WEB_OK;
+            r->user_id = uid;
+            r->step_pw = OC_SEC_PASSKEY_ASK;
+            r->pk_creds = passkeys_for(db, uid, j->wa_rp);
+            return r;
+        }
+    } else if (j->scope == OC_SEC_PASSKEY_ADD) {
+        uint8_t cd[2048], att[4096];
+        long cl = j->wa_cd ? oc_base64url_decode(j->wa_cd, strlen(j->wa_cd), cd, sizeof cd) : -1;
+        long al = j->wa_att ? oc_base64url_decode(j->wa_att, strlen(j->wa_att), att, sizeof att) : -1;
+        oc_wa_cred cr;
+        if (cl > 0 && al > 0 && has_second_step(db, uid) &&
+            oc_webauthn_register(cd, (size_t)cl, att, (size_t)al, j->wa_challenge, j->wa_origin, j->wa_rp, &cr) == OC_WA_OK) {
+            sqlite3_prepare_v2(db, "INSERT INTO webauthn_credentials(user_id, cred_id, cose_key, sign_count, rp_id, "
+                                   "created_at_ms) VALUES(?,?,?,?,?,?);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+            sqlite3_bind_blob (st, 2, cr.cred_id, (int)cr.cred_len, SQLITE_TRANSIENT);
+            sqlite3_bind_blob (st, 3, cr.cose, (int)cr.cose_len, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)cr.count);
+            sqlite3_bind_text (st, 5, j->wa_rp, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 6, (sqlite3_int64)now);
+            ok = sqlite3_step(st) == SQLITE_DONE;   /* a credential already here is refused by its id */
+            sqlite3_finalize(st);
+        }
+        if (ok == 1) {
+            audit_actor(db, OC_AUDIT_SECURITY, "auth.passkey_added", uid, 0, NULL, 1, NULL);
+            r->type = OC_RES_WEB_OK;
+            r->user_id = uid;
+            r->step_pw = OC_SEC_PASSKEY_ADD;
+            return r;
+        }
+    } else if (j->scope == OC_SEC_TURN_OFF) {
         ok = strlen(code) == OC_TOTP_DIGITS ? check_totp(w, uid, code) : spend_recovery(db, uid, code);
         if (ok == 1) {
             static const char *const DEL[] = { "DELETE FROM local_totp WHERE user_id=?;",
-                                               "DELETE FROM local_recovery WHERE user_id=?;" };
-            for (int i = 0; i < 2; i++) {
+                                               "DELETE FROM local_recovery WHERE user_id=?;",
+                                               "DELETE FROM webauthn_credentials WHERE user_id=?;" };
+            for (int i = 0; i < 3; i++) {
                 sqlite3_prepare_v2(db, DEL[i], -1, &st, NULL);
                 sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
                 sqlite3_step(st);
@@ -2148,8 +2256,9 @@ static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
     }
     static const char *const WIPE[] = { "DELETE FROM sessions WHERE user_id=?;",
                                         "DELETE FROM local_totp WHERE user_id=?;",
-                                        "DELETE FROM local_recovery WHERE user_id=?;" };
-    for (int i = 0; ok && i < (clear ? 3 : 1); i++) {
+                                        "DELETE FROM local_recovery WHERE user_id=?;",
+                                        "DELETE FROM webauthn_credentials WHERE user_id=?;" };
+    for (int i = 0; ok && i < (clear ? 4 : 1); i++) {
         sqlite3_prepare_v2(db, WIPE[i], -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
         ok = sqlite3_step(st) == SQLITE_DONE;

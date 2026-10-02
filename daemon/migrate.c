@@ -1169,6 +1169,24 @@ static const char MIGRATION_0054[] =
     "  clear_factors  INTEGER NOT NULL DEFAULT 0 CHECK (clear_factors IN (0,1))"
     ");";
 
+static const char MIGRATION_0055[] =
+    /* Passkeys, as a second step (AUTH.md §8.6): the credential's id, its COSE
+     * public key and its signature counter, named by its person. A passkey is
+     * bound to the workspace's address -- its relying party -- so one made
+     * before a rename does not answer after it. */
+    "CREATE TABLE webauthn_credentials ("
+    "  id              INTEGER PRIMARY KEY,"
+    "  user_id         INTEGER NOT NULL REFERENCES users(id),"
+    "  cred_id         BLOB NOT NULL UNIQUE,"
+    "  cose_key        BLOB NOT NULL,"
+    "  sign_count      INTEGER NOT NULL DEFAULT 0,"
+    "  rp_id           TEXT NOT NULL,"
+    "  name            TEXT NOT NULL DEFAULT '',"
+    "  created_at_ms   INTEGER NOT NULL,"
+    "  last_used_at_ms INTEGER"
+    ");"
+    "CREATE INDEX webauthn_credentials_user ON webauthn_credentials(user_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1224,6 +1242,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 52, MIGRATION_0052 },
     { 53, MIGRATION_0053 },
     { 54, MIGRATION_0054 },
+    { 55, MIGRATION_0055 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

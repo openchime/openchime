@@ -572,6 +572,16 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **An account's own address (`test_dbwriter` `test_set_email`):** set
   lower-cased, cleared, one address only; a provider's sign-in with the same
   address is somebody else; a provider's account keeps its provider's address.
+- **Passkeys (`test_webauthn`; `itest_netloop` `test_web_signin`):** the CBOR
+  reader refuses truncation at every byte, indefinite lengths, reserved forms
+  and nesting past its bound; registration and assertion against an in-process
+  authenticator, refused for the wrong type, challenge, origin, relying party,
+  a missing user-presence flag, a changed signature or data, another key, a
+  counter that did not rise, and a field named twice. Through the pages, on a
+  trusted name: a code allows adding one, the step page then offers it and it
+  signs in once; the script is served with the hash the page names; off the
+  trusted name none is offered and no script runs; turning the step off removes
+  them.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).
