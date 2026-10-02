@@ -542,6 +542,9 @@ typedef enum {
     /* An emailed code for a person who signs in here with a provider: they use
      * that provider (AUTH.md §8.4). */
     OC_ERR_AUTH_USE_PROVIDER   = 2011,
+    /* A local account with no second step, where the workspace requires one: it
+     * sets one up on the daemon's page first (AUTH.md §8.6). */
+    OC_ERR_AUTH_SETUP_REQUIRED = 2012,
     OC_ERR_BODY_TOO_LARGE      = 3001,
     OC_ERR_NOT_A_MEMBER        = 3002,
     OC_ERR_UNKNOWN_CHANNEL     = 3003,

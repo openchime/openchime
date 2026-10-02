@@ -225,7 +225,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * version its password was checked against (`auth_version`), the code in
         * `token`, which page it finishes (`web`) with that page's `web_nonce`
         * and, for a password change, the new password's key (`pw_*`). */
-       OC_JOB_AUTH_STEP = 124 };
+       OC_JOB_AUTH_STEP = 124,
+       /* The second step's own page (AUTH.md §8.6), past its password: `scope`
+        * 1 confirms a new secret with its first code (in `token`) and hands out
+        * recovery codes, 2 turns the step off with a current code. `user_id`
+        * and `auth_version` as for AUTH_STEP. */
+       OC_JOB_SECURITY = 125 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -235,6 +240,7 @@ typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
 #define OC_WEB_SIGNIN   1
 #define OC_WEB_PASSWORD 2
 #define OC_WEB_SIGNUP   3
+#define OC_WEB_SECURITY 4   /* the second step's own page: set it up or turn it off */
 #define OC_AUTH_STAGE_NEW     0   /* as submitted: the writer checks the limiter */
 #define OC_AUTH_STAGE_READ    1   /* a reader fetches the credential */
 #define OC_AUTH_STAGE_CHECKED 2   /* back from the auth pool: the writer finishes */
@@ -613,7 +619,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_RESTORE_OK = 108, OC_RES_RESTORE_ERR = 109,
        /* A page's password was right and the account has a second step: no token
         * yet. `user_id`, `step_version`, and a password change's new key. */
-       OC_RES_WEB_STEP2 = 110 };
+       OC_RES_WEB_STEP2 = 110,
+       /* The second step's page, past its password: `step_version`, and either
+        * the account has one (`step_pw` 1) or a new secret waits for its first
+        * code, `body` its base32. */
+       OC_RES_WEB_SECURITY = 111 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1209,6 +1219,15 @@ void oc_dbwriter_set_email_link(oc_dbwriter *w, int any);
  * when none could be had: an account with a second step then cannot pass it,
  * rather than passing without it. Before serving. */
 void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32);
+/* Whether local accounts are asked for a second step (OPENCHIME_LOCAL_MFA):
+ * OC_MFA_OFF never, and its page is closed; OC_MFA_OPTIONAL when one is set
+ * up; OC_MFA_REQUIRED always -- an account with none signs in only once it has
+ * set one up. Before serving. */
+#define OC_MFA_OFF      0
+#define OC_MFA_OPTIONAL 1
+#define OC_MFA_REQUIRED 2
+void oc_dbwriter_set_local_mfa(oc_dbwriter *w, int policy);
+int  oc_dbwriter_local_mfa(oc_dbwriter *w);
 
 /* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
  * authorize URL from. For the net loop; set before serving and never after. */

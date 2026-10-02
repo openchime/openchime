@@ -33,7 +33,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 |---------|---------|---------|---------|--------|---------|
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
-| **qrcodegen** | v1.8.0 | QR codes: the device-code sign-in's URL, for a phone's camera (AUTH.md §8.11) | tuikit `tk_qr` (→ TUI) | https://github.com/nayuki/QR-Code-generator | MIT |
+| **qrcodegen** | v1.8.0 | QR codes: the device-code sign-in's URL, for a phone's camera (AUTH.md §8.11); a second step's setup key, for an authenticator app (AUTH.md §8.6) | tuikit `tk_qr` (→ TUI); the daemon's setup page | https://github.com/nayuki/QR-Code-generator | MIT |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |

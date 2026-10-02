@@ -1,5 +1,7 @@
 #include "webpages.h"
 
+#include "qrcodegen.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +89,8 @@ static const char STYLE[] =
     ".msg{margin:1rem 0 0;padding:.6rem .75rem;border-radius:8px;background:#fdecea;color:#b3261e}\n"
     ".alt{margin-top:1.25rem;font-size:.92rem}\n"
     "a{color:#1264a3}\n"
+    "pre,code{font:15px/1.6 ui-monospace,Consolas,monospace}\n"
+    ".qr{display:block;margin:1rem auto}\n"
     "@media (prefers-color-scheme:dark){body{background:#1a1d21;color:#e8e9ea}"
     "main{background:#222529;border-color:#3a3d42}p{color:#a6a9ad}input{border-color:#4a4e54}"
     ".msg{background:#3b1f1d;color:#f2b8b5}a{color:#6cb3f0}}\n"
@@ -124,6 +128,25 @@ static void carry(pg *p, const oc_page *pp) {
     raw(p, "&amp;nonce="); qval(p, pp->nonce);
 }
 
+/* `text` as a QR code, inline SVG: the policy fetches nothing, so the image is
+ * the page's own markup -- one path of unit squares, a quiet zone round it. */
+static void qr_svg(pg *p, const char *text) {
+    static uint8_t qr[qrcodegen_BUFFER_LEN_MAX], tmp[qrcodegen_BUFFER_LEN_MAX];
+    if (!qrcodegen_encodeText(text, tmp, qr, qrcodegen_Ecc_MEDIUM, qrcodegen_VERSION_MIN,
+                              qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true)) return;
+    int n = qrcodegen_getSize(qr);
+    char b[192];
+    snprintf(b, sizeof b, "<svg class=\"qr\" role=\"img\" aria-label=\"QR code\" viewBox=\"0 0 %d %d\" "
+             "width=\"200\" height=\"200\" shape-rendering=\"crispEdges\">", n + 8, n + 8);
+    raw(p, b);
+    snprintf(b, sizeof b, "<rect width=\"%d\" height=\"%d\" fill=\"white\"/><path fill=\"black\" d=\"", n + 8, n + 8);
+    raw(p, b);
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            if (qrcodegen_getModule(qr, x, y)) { snprintf(b, sizeof b, "M%d %dh1v1h-1z", x + 4, y + 4); raw(p, b); }
+    raw(p, "\"/></svg>\n");
+}
+
 char *oc_page_render(const oc_page *pp, size_t *len) {
     pg p = { 0 };
     const char *user = pp->username ? pp->username : "";
@@ -141,7 +164,8 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         raw(&p, "<p class=\"alt\">Have an invitation? <a href=\"signup?");
         carry(&p, pp);
         raw(&p, "\">Create an account</a></p>\n");
-        raw(&p, "<p class=\"alt\"><a href=\"account/password\">Change your password</a></p>\n");
+        raw(&p, "<p class=\"alt\"><a href=\"account/password\">Change your password</a> \xC2\xB7 "
+                "<a href=\"account/security\">Two-step sign-in</a></p>\n");
         break;
     case OC_PAGE_SIGNUP:
         open_page(&p, "Create an account \xE2\x80\x94 OpenChime");
@@ -213,6 +237,55 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         hidden(&p, "ticket", pp->ticket);
         field(&p, "code", "Code", "text", "one-time-code", "", 1);
         raw(&p, "<button type=\"submit\">Continue</button>\n</form>\n");
+        break;
+    case OC_PAGE_SECURITY:
+        open_page(&p, "Two-step sign-in \xE2\x80\x94 OpenChime");
+        raw(&p, "<h1>Two-step sign-in</h1>\n");
+        switch (pp->sec) {
+        case OC_SEC_SIGNIN:
+            raw(&p, "<p>After your password, signing in will also ask for a code from an authenticator "
+                    "app on your phone.</p>\n");
+            message(&p, pp->message);
+            raw(&p, "<form method=\"post\" action=\"security\">\n");
+            field(&p, "username", "Username", "text", "username", user, !user[0]);
+            field(&p, "password", "Password", "password", "current-password", "", user[0] != 0);
+            raw(&p, "<button type=\"submit\">Continue</button>\n</form>\n");
+            break;
+        case OC_SEC_SETUP:
+        case OC_SEC_CONFIRM:
+            if (pp->sec == OC_SEC_SETUP) {
+                raw(&p, "<p>Scan this with your authenticator app, or type the key into it.</p>\n");
+                qr_svg(&p, pp->otpauth ? pp->otpauth : "");
+                raw(&p, "<p>Key: <code>"); esc(&p, pp->secret); raw(&p, "</code></p>\n");
+            }
+            raw(&p, "<p>Then enter the code it shows, to turn two-step sign-in on.</p>\n");
+            message(&p, pp->message);
+            raw(&p, "<form method=\"post\" action=\"security\">\n");
+            hidden(&p, "ticket", pp->ticket);
+            hidden(&p, "action", "confirm");
+            field(&p, "code", "Code", "text", "one-time-code", "", 1);
+            raw(&p, "<button type=\"submit\">Turn on</button>\n</form>\n");
+            break;
+        case OC_SEC_CODES:
+            raw(&p, "<p>Two-step sign-in is on. Keep these recovery codes somewhere safe: each signs you in "
+                    "once if you lose your phone. They are not shown again.</p>\n<pre>");
+            esc(&p, pp->codes);
+            raw(&p, "</pre>\n<p>You can close this tab.</p>\n");
+            break;
+        case OC_SEC_ON:
+            raw(&p, "<p>Two-step sign-in is on. To turn it off, enter a code from your authenticator app or "
+                    "a recovery code.</p>\n");
+            message(&p, pp->message);
+            raw(&p, "<form method=\"post\" action=\"security\">\n");
+            hidden(&p, "ticket", pp->ticket);
+            hidden(&p, "action", "remove");
+            field(&p, "code", "Code", "text", "one-time-code", "", 1);
+            raw(&p, "<button type=\"submit\">Turn off</button>\n</form>\n");
+            break;
+        case OC_SEC_OFF:
+            raw(&p, "<p>Two-step sign-in is off. You can close this tab.</p>\n");
+            break;
+        }
         break;
     case OC_PAGE_PASSWORD:
         open_page(&p, "Change your password \xE2\x80\x94 OpenChime");

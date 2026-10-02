@@ -364,7 +364,9 @@ model; translate input to intents }, stop.
     you (the daemon fans a `PROFILE_UPDATED` so every roster — and your own header
     — updates live); "Change password" opens the workspace's password page in the
     browser (AUTH.md §8.10), where the old password is checked and the new one set;
-    every device, this one included, then signs in again.
+    every device, this one included, then signs in again. "Two-step sign-in" opens
+    the workspace's page for setting up or turning off a TOTP second step the same
+    way (AUTH.md §8.6); the terminal client's launcher has it too.
   - **admin / user management** — a member menu's "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
     only; a `USER_UPDATED` folds each change into the roster). "Invite a user"

@@ -505,6 +505,7 @@ int main(int argc, char **argv) {
         }
     }
     oc_dbwriter_set_local_enabled(db, want_local);
+    oc_dbwriter_set_local_mfa(db, cfg->local_mfa);
 
     /* The factor key (AUTH.md §8.6), kept outside the database: without it a
      * stolen database gives away no second step. Made at first start; if it

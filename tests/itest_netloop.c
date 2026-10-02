@@ -1935,6 +1935,29 @@ static int web_signin(int port, const uint8_t *pin, const char *user, const char
     return st;
 }
 
+/* The text between `after` and the next `until` in `page`, or 0. */
+static int between(const char *page, const char *after, const char *until, char *out, size_t cap) {
+    const char *k = strstr(page, after);
+    if (!k) return 0;
+    k += strlen(after);
+    const char *e = strstr(k, until);
+    if (!e || (size_t)(e - k) >= cap) return 0;
+    memcpy(out, k, (size_t)(e - k)); out[e - k] = '\0';
+    return 1;
+}
+
+/* RFC 4648 base32 back to bytes, as an authenticator reads a typed key. */
+static size_t base32_bytes(const char *in, uint8_t *out, size_t cap) {
+    uint32_t buf = 0; int bits = 0; size_t n = 0;
+    for (; *in; in++) {
+        const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", *p = strchr(A, *in);
+        if (!p) return 0;
+        buf = (buf << 5) | (uint32_t)(p - A); bits += 5;
+        if (bits >= 8) { if (n == cap) return 0; out[n++] = (uint8_t)(buf >> (bits - 8)); bits -= 8; }
+    }
+    return n;
+}
+
 /* The ticket a step page carries, from its hidden field. */
 static int ticket_of(const char *page, char *out, size_t cap) {
     const char *k = strstr(page, "name=\"ticket\" value=\"");
@@ -1982,6 +2005,7 @@ static void test_web_signin(int port) {
     CHECK(oc_dbwriter_register_local(dbw2, "pat", "pw-old", OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw2, "zed", "pw-zed", OC_ROLE_MEMBER, 2048) != 0);
     uint64_t sam = oc_dbwriter_register_local(dbw2, "sam", "pw-sam", OC_ROLE_MEMBER, 2048);
+    CHECK(oc_dbwriter_register_local(dbw2, "kim", "pw-kim", OC_ROLE_MEMBER, 2048) != 0);
     CHECK(sam != 0);
     uint8_t fkey[OC_FACTOR_KEY_LEN];
     memset(fkey, 0x5a, sizeof fkey);
@@ -2230,6 +2254,76 @@ static void test_web_signin(int port) {
             CHECK(web_verify(port, pin, ticket, "111111", tok, sizeof tok, resp, sizeof resp) == 200);
         CHECK(web_verify(port, pin, ticket, "111111", tok, sizeof tok, resp, sizeof resp) == 400);
         CHECK(web_verify(port, pin, ticket, "111111", tok, sizeof tok, resp, sizeof resp) == 400);
+    }
+
+    /* Setting the step up, and turning it off (AUTH.md §8.6): the password, then a
+     * key and its QR code; the first code turns it on and hands out recovery
+     * codes, once; from then on a sign-in asks for a code; a code turns it off. */
+    {
+        char ticket[64], key[64], code[8], codes[256], one[16];
+        CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "name=\"password\"") != NULL);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
+                       "username=kim&password=wrong", resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "isn&#39;t right") != NULL && !ticket_of(resp, ticket, sizeof ticket));
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
+                       "username=kim&password=pw-kim", resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && between(resp, "Key: <code>", "</code>", key, sizeof key));
+        CHECK(strstr(resp, "<svg class=\"qr\"") != NULL && strstr(resp, "<path fill=\"black\" d=\"M") != NULL);
+        uint8_t secret[OC_TOTP_SECRET_LEN];
+        CHECK(base32_bytes(key, secret, sizeof secret) == sizeof secret);
+        /* Not on until its first code: a sign-in is not asked for one yet. */
+        CHECK(web_signin(port, pin, "kim", "pw-kim", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        char body[256];
+        snprintf(body, sizeof body, "ticket=%s&action=confirm&code=000000", ticket);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "That code isn&#39;t right") != NULL && strstr(resp, "value=\"confirm\"") != NULL);
+        uint64_t step = (uint64_t)time(NULL) / OC_TOTP_STEP_S;
+        snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step));
+        snprintf(body, sizeof body, "ticket=%s&action=confirm&code=%s", ticket, code);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(between(resp, "<pre>", "</pre>", codes, sizeof codes));
+        int lines = 0;
+        for (const char *q = codes; *q; q++) lines += *q == '\n';
+        CHECK(lines == 10 && strlen(codes) == 10 * 12);
+        snprintf(one, sizeof one, "%.11s", codes);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 400);
+        /* Now a sign-in asks, and a recovery code it handed out works. */
+        CHECK(web_signin(port, pin, "kim", "pw-kim", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+              ticket_of(resp, ticket, sizeof ticket));
+        CHECK(web_verify(port, pin, ticket, one, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        /* On: the page offers to turn it off, with a code -- the next step's. */
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
+                       "username=kim&password=pw-kim", resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "value=\"remove\"") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step + 1));
+        snprintf(body, sizeof body, "ticket=%s&action=remove&code=%s", ticket, code);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Two-step sign-in is off") != NULL);
+        {   /* nothing of it is left: no secret, no recovery codes */
+            sqlite3 *db = NULL;
+            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            sqlite3_busy_timeout(db, 5000);
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(db, "SELECT (SELECT COUNT(*) FROM local_totp t JOIN users u ON u.id=t.user_id "
+                                   "         WHERE u.subject='local:kim'),"
+                                   "       (SELECT COUNT(*) FROM local_recovery r JOIN users u ON u.id=r.user_id "
+                                   "         WHERE u.subject='local:kim');", -1, &st, NULL);
+            CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0 && sqlite3_column_int(st, 1) == 0);
+            sqlite3_finalize(st);
+            sqlite3_close(db);
+        }
+        CHECK(web_signin(port, pin, "kim", "pw-kim", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+
+        /* Required: an account with no step signs in only once it has one. Off:
+         * no step is asked, and the page is closed. */
+        oc_dbwriter_set_local_mfa(dbw2, OC_MFA_REQUIRED);
+        CHECK(web_signin(port, pin, "kim", "pw-kim", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+        CHECK(strstr(resp, "requires two-step sign-in") != NULL);
+        oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OFF);
+        CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 404);
+        CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OPTIONAL);
     }
 
     /* The per-account limiter stands in front of the page as of the frame. */

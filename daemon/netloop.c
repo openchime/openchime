@@ -3724,6 +3724,8 @@ static const oc_http_route TLS_ROUTES[] = {
     { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
 };
@@ -3869,6 +3871,7 @@ static int field_get(const char *q, const char *key, char *out, size_t cap) {
 
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
 static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);               /* fwd */
+static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw); /* fwd */
 
 static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     const char *qm = memchr(req->path, '?', req->path_len);
@@ -3879,6 +3882,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     else if (plen == 17 && memcmp(req->path, "/account/password", 17) == 0) kind = OC_PAGE_PASSWORD;
     else if (plen == 7 && memcmp(req->path, "/device", 7) == 0) kind = OC_PAGE_DEVICE;
     else if (plen == 14 && memcmp(req->path, "/signin/verify", 14) == 0) kind = OC_PAGE_STEP;
+    else if (plen == 17 && memcmp(req->path, "/account/security", 17) == 0) kind = OC_PAGE_SECURITY;
     else { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
     size_t len;
     if (!oc_dbwriter_local_browser(dbw)) {
@@ -3905,6 +3909,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     }
     if (kind == OC_PAGE_DEVICE) return on_device_page(c, post, q, dbw);
     if (kind == OC_PAGE_STEP) return on_step_page(c, q, dbw);
+    if (kind == OC_PAGE_SECURITY) return on_security_page(c, post, q, dbw);
     web_req *w = calloc(1, sizeof *w);
     if (!w) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
     w->kind = kind;
@@ -4106,6 +4111,149 @@ static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
     return 0;
 }
 
+/* The second step's own page (AUTH.md §8.6): a password first, as on every
+ * page; then, against the ticket that earned, the first code of a new secret
+ * or a code to turn it off. Closed when the workspace asks for no second step.
+ * Returns 0 to keep, -1 to close. */
+static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
+    char user[128] = "", pass[512] = "", ticket[OC_STEP_TICKET_LEN + 8] = "", code[64] = "", action[16] = "";
+    oc_page pg = { .kind = OC_PAGE_SECURITY, .redirect_uri = "", .nonce = "", .username = user,
+                   .invite = "", .message = "", .user_code = "", .sec = OC_SEC_SIGNIN };
+    size_t len;
+    int rc = -1;
+    if (oc_dbwriter_local_mfa(dbw) == OC_MFA_OFF) {
+        const char *b = oc_page_unavailable(&len);
+        web_reply(c, 404, b, len, NULL, NULL);
+        return -1;
+    }
+    if (field_get(q, "username", user, sizeof user) || field_get(q, "password", pass, sizeof pass) ||
+        field_get(q, "ticket", ticket, sizeof ticket) || field_get(q, "code", code, sizeof code) ||
+        field_get(q, "action", action, sizeof action)) {
+        const char *b = oc_page_invalid(&len);
+        web_reply(c, 400, b, len, NULL, NULL);
+        goto out;
+    }
+    if (!post) { web_page(c, 200, &pg); goto out; }
+    web_req *w = calloc(1, sizeof *w);
+    oc_job *j = NULL;
+    if (!w) goto fail;
+    w->kind = OC_PAGE_SECURITY;
+    snprintf(w->username, sizeof w->username, "%s", user);
+    if (strcmp(action, "confirm") == 0 || strcmp(action, "remove") == 0) {
+        oc_step_ticket t;
+        if (!g_websteps || !oc_websteps_get(g_websteps, ticket, now_ms(), &t) || t.page != OC_PAGE_SECURITY) {
+            free(w);
+            const char *b = oc_page_invalid(&len);
+            web_reply(c, 400, b, len, NULL, NULL);
+            goto out;
+        }
+        j = oc_job_new(OC_JOB_SECURITY, c->conn_id);
+        if (!j || oc_job_set_token(j, code, strlen(code)) != 0) goto fail;
+        j->user_id = t.uid;
+        j->auth_version = t.version;
+        j->scope = action[0] == 'c' ? 1 : 2;
+        memcpy(w->step, ticket, OC_STEP_TICKET_LEN);
+        w->step[OC_STEP_TICKET_LEN] = '\0';
+        w->redirect_uri[0] = action[0];   /* which screen a wrong code returns to */
+        oc_e2e_wipe(&t, sizeof t);
+    } else {
+        uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) {
+            free(w);
+            pg.message = "The username or password is too long.";
+            web_page(c, 200, &pg);
+            goto out;
+        }
+        j = oc_job_new(OC_JOB_AUTH, c->conn_id);
+        if (!j || oc_job_set_token(j, cbuf, cw.len) != 0) { oc_e2e_wipe(cbuf, sizeof cbuf); goto fail; }
+        oc_e2e_wipe(cbuf, sizeof cbuf);
+        j->method = OC_AUTH_LOCAL;
+        j->web = OC_WEB_SECURITY;
+    }
+    memcpy(j->source, c->source, sizeof j->source);
+    oc_dbwriter_submit(dbw, j);
+    c->web = w;
+    c->http_pending = 1;
+    rc = 0;
+    goto out;
+fail:
+    if (j) oc_job_free(j);
+    free(w);
+    http_reply(c, 500, "text/plain", "error\n", 6);
+out:
+    oc_e2e_wipe(pass, sizeof pass);
+    return rc;
+}
+
+/* The second step's page, answered (AUTH.md §8.6). */
+static void security_result(conn *c, web_req *w, const oc_dbres *r) {
+    oc_page pg = { .kind = OC_PAGE_SECURITY, .redirect_uri = "", .nonce = "", .username = w->username,
+                   .invite = "", .message = "", .user_code = "", .ticket = w->step };
+    if (r->type == OC_RES_WEB_SECURITY) {
+        /* Past the password: a ticket for the code that comes next. */
+        oc_step_ticket t;
+        memset(&t, 0, sizeof t);
+        t.page = OC_PAGE_SECURITY;
+        t.uid = r->user_id;
+        t.version = r->step_version;
+        char key[OC_SRC_LEN];
+        oc_source_key(c->source, key, sizeof key);
+        int put = g_websteps ? oc_websteps_put(g_websteps, key, &t, now_ms(), w->step) : -1;
+        if (put != 0) {
+            pg.message = "Too many sign-ins are under way. Wait a minute and try again.";
+            web_page(c, 429, &pg);
+            return;
+        }
+        char uri[400] = "";
+        if (r->step_pw) pg.sec = OC_SEC_ON;
+        else {
+            /* otpauth's label is "issuer:account"; the name is the username, whose
+             * characters a URI path takes as they are but for these. */
+            char esc_user[256] = "";
+            size_t o = 0;
+            for (const char *u = w->username; *u && o + 4 < sizeof esc_user; u++) {
+                unsigned char ch = (unsigned char)*u;
+                if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+                    ch == '-' || ch == '.' || ch == '_') esc_user[o++] = (char)ch;
+                else o += (size_t)snprintf(esc_user + o, 4, "%%%02X", ch);
+            }
+            esc_user[o] = '\0';
+            snprintf(uri, sizeof uri, "otpauth://totp/OpenChime:%s?secret=%.*s&issuer=OpenChime",
+                     esc_user, (int)r->body_len, r->body ? (const char *)r->body : "");
+            pg.sec = OC_SEC_SETUP;
+            pg.secret = r->body ? (const char *)r->body : "";
+            pg.otpauth = uri;
+        }
+        web_page(c, 200, &pg);
+        oc_e2e_wipe(uri, sizeof uri);
+        return;
+    }
+    if (r->type == OC_RES_WEB_OK) {
+        if (g_websteps) oc_websteps_drop(g_websteps, w->step);
+        pg.sec = r->body && r->body_len ? OC_SEC_CODES : OC_SEC_OFF;
+        pg.codes = r->body ? (const char *)r->body : "";
+        web_page(c, 200, &pg);
+        return;
+    }
+    if (!w->step[0]) {
+        /* The password, refused. */
+        int status = r->err_code == OC_ERR_AUTH_RATE_LIMITED ? 429 : r->err_code == OC_ERR_INTERNAL ? 500 : 200;
+        pg.message = status == 429 ? "Too many attempts. Wait a minute and try again." :
+                     status == 500 ? "Something went wrong. Try again." :
+                                     "The username or password isn't right.";
+        web_page(c, status, &pg);
+        return;
+    }
+    int status = 200, left = 1;
+    pg.message = "That code isn't right.";
+    if (r->err_code == OC_ERR_AUTH_RATE_LIMITED) { status = 429; pg.message = "Too many wrong codes. Wait a few minutes and try again."; }
+    else if (r->err_code == OC_ERR_INTERNAL) { status = 500; pg.message = "Something went wrong. Try again."; }
+    else left = g_websteps ? oc_websteps_fail(g_websteps, w->step, now_ms()) : 0;
+    if (left <= 0) { size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL); return; }
+    pg.sec = w->redirect_uri[0] == 'c' ? OC_SEC_CONFIRM : OC_SEC_ON;
+    web_page(c, status, &pg);
+}
+
 /* The step page for `w`'s ticket, posting back to `action`, saying `msg`. */
 static void step_page(conn *c, int status, const web_req *w, const char *action, const char *msg) {
     oc_page pg = { .kind = OC_PAGE_STEP, .redirect_uri = w->redirect_uri, .nonce = "", .username = "",
@@ -4122,6 +4270,12 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
     conn *c = find_by_id(conns, r->conn_id);
     if (!c || !c->web) return;
     web_req *w = c->web;
+    if (w->kind == OC_PAGE_SECURITY) {
+        security_result(c, w, r);
+        flush_out(c);
+        conn_close(ep, conns, c->fd);
+        return;
+    }
     oc_page pg = { .kind = w->kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
                    .username = w->username, .invite = w->invite, .message = "", .user_code = w->user_code };
     if (r->type == OC_RES_WEB_STEP2) {
@@ -4199,6 +4353,10 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         switch (r->err_code) {
         case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.message = "Too many attempts. Wait a minute and try again."; break;
         case OC_ERR_USER_LIMIT:        pg.message = "This workspace is full."; break;
+        case OC_ERR_AUTH_SETUP_REQUIRED:
+            pg.message = "This workspace requires two-step sign-in. Set it up on the Two-step sign-in page "
+                         "(below), then sign in.";
+            break;
         case OC_ERR_INTERNAL:          status = 500; pg.message = "Something went wrong. Try again."; break;
         default:
             pg.message = w->kind == OC_PAGE_SIGNUP   ? "That invitation isn't valid, or the username is taken." :
@@ -5811,6 +5969,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_WEB_OK:
     case OC_RES_WEB_ERR:
     case OC_RES_WEB_STEP2:
+    case OC_RES_WEB_SECURITY:
         web_result(ep, conns, r);
         break;
     case OC_RES_WEBHOOK_ERR: {

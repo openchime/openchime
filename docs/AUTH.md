@@ -638,6 +638,20 @@ changes and no frame carries it.
   passed: the sign-in is refused and the log says why, rather than letting the
   person in without it.
 
+**Setting it up** is a page too, `/account/security`, reached from the sign-in
+page and from each client's account menu. The password first, as on every page;
+then a new secret — sealed, kept unconfirmed — shown as a key to type and a QR
+code (inline SVG, so the page still fetches nothing) of its `otpauth://` URI. The
+first code it shows turns the step on and hands out ten recovery codes, shown
+once (only salted hashes are kept). On, the same page turns it off with a code
+or a recovery code, which removes the secret and the codes. Wrong codes count
+as a sign-in step's do.
+
+**Policy** is `OPENCHIME_LOCAL_MFA`: `optional` (the default) asks for the step
+where one is set up; `required` also refuses the sign-in of an account with none
+until it sets one up — the page says where; `off` asks for none and closes the
+setup page.
+
 A provider's own second factor is the provider's business and never reaches this
 step.
 
@@ -731,8 +745,8 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
 - **Through the client's loopback tunnel** otherwise — a self-signed daemon
   trusted by fingerprint, or one on loopback: `http://127.0.0.1:<port>/p/<secret>/signin…`.
   A loopback origin is one the browser treats as secure, so there is no warning.
-  The tunnel carries only `/signin`, `/signin/verify`, `/signup` and
-  `/account/password`; only a
+  The tunnel carries only `/signin`, `/signin/verify`, `/signup`,
+  `/account/password` and `/account/security`; only a
   request whose `Host` is the listener's own (DNS rebinding); and only to the
   certificate the client's own connection accepted — over TLS with ALPN
   `http/1.1`, as the daemon's origin: its `Host`, and for a post from the
