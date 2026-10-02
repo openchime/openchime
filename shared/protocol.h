@@ -576,6 +576,9 @@ typedef enum {
     OC_ERR_INVALID_GROUP       = 3035, /* a handle, name or description out of bounds, or a group or channel at its cap */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
+/* What a reason code means, in words a person reads: the client shows this, not
+ * the server's own text. NULL for a code this build does not know. */
+const char *oc_error_text(uint16_t code);
 
 /* --- Codec result codes ------------------------------------------------- */
 

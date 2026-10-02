@@ -2842,9 +2842,11 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
                     mei.ThreadId = GetCurrentThreadId();
                     mei.ExceptionPointers = ep;
                     mei.ClientPointers = FALSE;
+                    /* Stacks, threads and modules only: the data segments and
+                     * the memory the stacks point at hold session tokens,
+                     * message text and keys, and the file is asked to be sent. */
                     dumped = mdwd(GetCurrentProcess(), pid, h,
-                                  MiniDumpWithIndirectlyReferencedMemory |
-                                  MiniDumpWithDataSegs | MiniDumpWithHandleData,
+                                  MiniDumpNormal | MiniDumpWithHandleData,
                                   &mei, NULL, NULL) ? 1 : 0;
                     if (!dumped) dump_err = GetLastError();
                     CloseHandle(h);

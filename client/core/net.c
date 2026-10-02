@@ -2190,21 +2190,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e) { e->size = err.code; oc_queue_push(to_ui, e); }
                 if (ctx->calls) oc_callsig_refused(ctx->calls, to_ui);
             } else {
-                char msg[256];
-                size_t n = err.message.len < sizeof msg - 1 ? err.message.len : sizeof msg - 1;
-                memcpy(msg, err.message.ptr, n); msg[n] = '\0';
-                /* Two storage conditions deserve their own wording: the server
-                 * sends a generic "transfer error" string, but "this file was
-                 * reclaimed" and "the server is out of space" are different
-                 * situations a user can act on, and neither is a bug they
-                 * should read as one (REQ-215/216). */
-                if (err.code == OC_ERR_ATTACHMENT_GONE)
-                    push_err(to_ui, "attachment is no longer available "
-                                    "(reclaimed by the server's storage policy)");
-                else if (err.code == OC_ERR_STORAGE_FULL)
-                    push_err(to_ui, "upload refused: the server is low on storage");
-                else
-                    push_err(to_ui, msg[0] ? msg : "server error");
+                /* The code's meaning, in this client's words: the server's own
+                 * text is its to choose, and says less. The storage conditions
+                 * read as what they are -- "this file was reclaimed", "the
+                 * server is out of space" -- not as a bug (REQ-215/216). */
+                const char *t = oc_error_text(err.code);
+                push_err(to_ui, t ? t : "the workspace refused that");
                 /* An error ABOUT THE TRANSFER aborts it; abandon the local file.
                  *
                  * It used to abort on *any* error that happened to arrive while a

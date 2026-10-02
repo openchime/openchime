@@ -520,6 +520,10 @@ works. Nothing proves the shipped *image* works (§3.2).
   `OPENCHIME_PUSH_URL`, and is refused by the push emitter and the enrollment
   client before any connection is made — 127.0.0.2, which reaches the host but
   is no loopback name, included (ARCH-84, ARCH-85).
+- **Refusals in the client's words (`test_protocol` `test_error_texts`,
+  `test_client_core`):** every `OC_ERR_*` the header defines has words, read from
+  the header so a new code without them fails; a refused role change reaches
+  `last_error` as its code's words, not the server's text.
 - **Idempotency:** re-sending with the same token after a simulated drop yields
   the same `message_id` and no duplicate row (REQ-093).
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
@@ -925,7 +929,8 @@ build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direc
 ## A death always leaves evidence
 
 The client writes a crash report and a minidump from an unhandled-exception
-filter — but a filter only runs if the process gets to run code on the way out,
+filter (stacks, threads, modules and handles only — no data segments and no
+memory the stacks point at, which hold session tokens and message text) — but a filter only runs if the process gets to run code on the way out,
 and three classes of death do not. `__fastfail`, which the CRT's buffer-overrun
 and heap-corruption checks raise, goes past every handler by design. A stack
 overflow may have no stack left to run one on. `TerminateProcess` from outside
