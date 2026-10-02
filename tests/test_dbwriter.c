@@ -6672,11 +6672,34 @@ static void test_change_password(void) {
     r = wait_result_ms(w, 60000);
     CHECK(r && r->conn_id == 14 && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN);
     oc_dbres_free(r);
+    int queued = 0;
+
+    /* A name with no account goes through the same slow check as a wrong
+     * password, so the time to answer says nothing of which names exist. */
+    oc_dbwriter_hold_auth(w, 1);
+    {
+        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        oc_encode_local_credential(&cw, oc_slice_str("nobody-here"), oc_slice_str("pw-one"));
+        oc_job *aj = oc_job_new(OC_JOB_AUTH, 30);
+        aj->method = OC_AUTH_LOCAL;
+        oc_job_set_token(aj, cbuf, cw.len);
+        oc_dbwriter_submit(w, aj);
+    }
+    queued = 0;
+    for (int i = 0; i < 500 && !queued; i++) {
+        queued = oc_dbwriter_auth_waiting(w) == 1;
+        if (!queued) usleep(10000);
+    }
+    CHECK(queued);
+    oc_dbwriter_hold_auth(w, 0);
+    r = wait_result_ms(w, 60000);
+    CHECK(r && r->conn_id == 30 && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
 
     /* Held on the pool, the change leaves the writer free. */
     oc_dbwriter_hold_auth(w, 1);
     submit_change(w, 15, u, "pw-two", "pw-three");
-    int queued = 0;
+    queued = 0;
     for (int i = 0; i < 500 && !queued; i++) {
         queued = oc_dbwriter_auth_waiting(w) == 1;
         if (!queued) usleep(10000);

@@ -48,6 +48,12 @@ void oc_netloop_set_relay_silence_ms(uint64_t ms);
  * be seen without waiting fifteen seconds. Any thread. */
 void oc_netloop_set_call_grace_ms(uint64_t ms);
 
+/* A connection not signed in within OC_UNAUTHED_MS of being accepted is closed,
+ * TLS handshake included. A test's knob for a shorter time (0 restores it). Any
+ * thread. */
+#define OC_UNAUTHED_MS 60000u
+void oc_netloop_set_unauthed_ms(uint64_t ms);
+
 /* Hold a connection's presence changes to OC_PRESENCE_RATE_MAX per `ms` rather
  * than per ten seconds (0 restores it); a test's knob, so the deferred last word
  * can be seen without waiting out the window. Any thread. */

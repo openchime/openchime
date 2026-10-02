@@ -8985,12 +8985,11 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
         }
     } else if (chk) {
         oc_slice cred = { (const uint8_t *)j->token, j->token_len }, user, pass;
-        found = oc_parse_local_credential(cred, &user, &pass) == OC_OK &&
-                local_credential(rdb, (const char *)user.ptr, user.len, &uid, chk->salt, sizeof chk->salt,
-                                 &chk->slen, &chk->iters, chk->stored, &version);
-        if (found) {
+        if (oc_parse_local_credential(cred, &user, &pass) == OC_OK) {
             chk->password = (const char *)pass.ptr;     /* in j->token, which outlives the check */
             chk->pwlen = pass.len;
+            found = local_credential(rdb, (const char *)user.ptr, user.len, &uid, chk->salt, sizeof chk->salt,
+                                     &chk->slen, &chk->iters, chk->stored, &version);
         }
         /* A change from the password page: the new password's key too, as a
          * signed-in change gets it. */
@@ -9003,6 +9002,17 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
                 chk->new_iters = OC_PW_ITERATIONS;
             }
         }
+    }
+    /* A name with no account is checked all the same, against a credential no
+     * password matches, so the time to answer does not tell which names exist.
+     * It is a check against user 0, which no sign-in completes. */
+    if (!found && chk && j->type != OC_JOB_CHANGE_PASSWORD && chk->password &&
+        oc_rand_bytes(chk->salt, OC_PW_SALT_LEN) == 0 && oc_rand_bytes(chk->stored, sizeof chk->stored) == 0) {
+        chk->slen = OC_PW_SALT_LEN;
+        chk->iters = OC_PW_ITERATIONS;
+        chk->new_password = NULL;
+        uid = 0;
+        found = 1;
     }
     if (found) {
         j->auth_uid = uid;

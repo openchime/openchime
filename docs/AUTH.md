@@ -100,7 +100,15 @@ authority.
   goes the same way — the pool checks the old password and derives the new one,
   and the writer stores the new one only if the credential still carries the
   version the old one was checked against; a change that lost that race is
-  refused, and the password is whatever the change that won it set.
+  refused, and the password is whatever the change that won it set. A name
+  with no account is checked the same way, against a credential no password
+  matches, so how long a refusal takes says nothing of which names exist.
+- **A connection that has not signed in is let go:** a failed `AUTH` is a fatal
+  `ERROR` and the connection is closed, so another try is a new connection the
+  limiters count afresh; and one not signed in within 60 seconds of being
+  accepted (`OC_UNAUTHED_MS`) is closed, whether it is still in its TLS
+  handshake, never said `HELLO`, or is waiting on a device code (§8.11, which
+  polls on from a new connection).
   The per-source counter stands in front of **every** source: a refused relay
   token and a wrong session token count against the address they came from, the
   check runs before any signature work, and a refused relay sign-in is audited as
