@@ -6,6 +6,7 @@
 #include "auth.h"       /* oc_sha256, to re-derive an invitation's id */
 #include "config.h"     /* OC_DEPLOY_* */
 #include "dbwriter.h"
+#include "relaykeys.h"
 #include "migrate.h"
 #include "notify.h"   /* the badge asks the same rule a toast does */
 #include "protocol.h"
@@ -999,6 +1000,51 @@ static void test_set_email(void) {
     CHECK(r && r->type == OC_RES_PROFILE_INFO && (!r->body || !((const char *)r->body)[0]));
     oc_dbres_free(r);
     oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* The relay's published keys (relaykeys.h): a key the relay publishes is
+ * trusted beside the pinned ones, each fetch replaces the last, and no fetch
+ * removes a pinned key. */
+static void test_relay_published_keys(void) {
+    const char *path = "build/test_dbwriter_relaykeys.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer pinned, next, other;
+    CHECK(oc_issuer_init(&pinned, "oc-dbw-rk-pinned") == 0 && oc_issuer_init(&next, "oc-dbw-rk-next") == 0 &&
+          oc_issuer_init(&other, "oc-dbw-rk-other") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", pinned.pem, "") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "domain:acme.example", why, sizeof why) == 0);
+    const char *ANN = "\"email\":\"ann@acme.example\",\"email_verified\":true,\"idp\":\"google\"";
+    uint8_t role; int err;
+
+    /* Before the relay publishes it, the next key is nobody's. */
+    CHECK(oidc_signin(w, &next, 1, "https://accounts.google.com|ann", "rk1", ANN, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_INVALID_TOKEN);
+
+    char jwk[400], jwks[1000], pem[2048];
+    CHECK(oc_jwk_p256(&next.key, jwk, sizeof jwk) > 0);
+    snprintf(jwks, sizeof jwks, "{\"keys\":[%s]}", jwk);
+    CHECK(oc_relaykeys_pem(jwks, strlen(jwks), pem, sizeof pem) == 1);
+    oc_dbwriter_set_relay_keys(w, pem);
+    uint64_t ann = oidc_signin(w, &next, 2, "https://accounts.google.com|ann", "rk2", ANN, &role, &err);
+    CHECK(ann != 0);
+    CHECK(oidc_signin(w, &pinned, 3, "https://accounts.google.com|ann", "rk3", ANN, &role, &err) == ann);
+
+    /* A later set without it: the next key is retired, the pinned one stays. */
+    CHECK(oc_jwk_p256(&other.key, jwk, sizeof jwk) > 0);
+    snprintf(jwks, sizeof jwks, "{\"keys\":[%s]}", jwk);
+    CHECK(oc_relaykeys_pem(jwks, strlen(jwks), pem, sizeof pem) == 1);
+    oc_dbwriter_set_relay_keys(w, pem);
+    CHECK(oidc_signin(w, &next, 4, "https://accounts.google.com|ann", "rk4", ANN, &role, &err) == 0);
+    CHECK(err == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(oidc_signin(w, &other, 5, "https://accounts.google.com|ann", "rk5", ANN, &role, &err) == ann);
+    CHECK(oidc_signin(w, &pinned, 6, "https://accounts.google.com|ann", "rk6", ANN, &role, &err) == ann);
+
+    oc_issuer_free(&pinned); oc_issuer_free(&next); oc_issuer_free(&other);
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }
@@ -7476,6 +7522,7 @@ int run_dbwriter_tests(void) {
     test_oidc_auth();
     test_oidc_join_rules();
     test_direct_identities();
+    test_relay_published_keys();
     test_oidc_no_downgrade();
     test_set_email();
     test_oidc_link();

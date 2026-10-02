@@ -1259,6 +1259,10 @@ void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
                                const char *relay_origin);
+/* The keys the relay publishes (relaykeys.h), trusted beside the pinned ones,
+ * which no fetch removes; each call replaces the last. Any thread, after
+ * oc_dbwriter_configure_oidc. */
+void oc_dbwriter_set_relay_keys(oc_dbwriter *w, const char *fetched_pem);
 
 /* Local accounts on or off (on by default). Off, AUTH{local} and REDEEM_INVITE
  * are refused. */
