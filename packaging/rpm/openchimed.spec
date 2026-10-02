@@ -63,7 +63,7 @@ EnvironmentFile at /etc/openchime/openchimed.env.
 %install
 install -D -m 0755 %{_bindir_src}/openchimed          %{buildroot}%{_bindir}/openchimed
 install -D -m 0644 %{_bindir_src}/openchimed.service  %{buildroot}%{_unitdir}/openchimed.service
-install -D -m 0644 %{_bindir_src}/openchimed.env      %{buildroot}%{_sysconfdir}/openchime/openchimed.env
+install -D -m 0600 %{_bindir_src}/openchimed.env      %{buildroot}%{_sysconfdir}/openchime/openchimed.env
 install -D -m 0644 %{_bindir_src}/copyright           %{buildroot}%{_datadir}/licenses/openchimed/copyright
 %if 0%{?_with_voices}
 mkdir -p %{buildroot}%{_datadir}/openchime
@@ -86,7 +86,8 @@ cp -r %{_bindir_src}/stt %{buildroot}%{_datadir}/openchime/stt
 # noreplace is the %config form that preserves an operator's edits across an
 # upgrade, writing any new version alongside as .rpmnew. It is the RPM
 # equivalent of Debian's conffiles.
-%config(noreplace) %{_sysconfdir}/openchime/openchimed.env
+# 0600: it holds secrets, and systemd (root) is what reads it, not the daemon.
+%attr(0600,root,root) %config(noreplace) %{_sysconfdir}/openchime/openchimed.env
 %license %{_datadir}/licenses/openchimed/copyright
 %dir %{_sysconfdir}/openchime
 
@@ -95,6 +96,8 @@ cp -r %{_bindir_src}/stt %{buildroot}%{_datadir}/openchime/stt
 # Debian maintainer scripts. $1 is the count of installed versions: 1 on a fresh
 # install, 2+ on an upgrade.
 %post
+# An install from before the file was made private keeps its own mode: tighten it.
+[ -f %{_sysconfdir}/openchime/openchimed.env ] && chmod 0600 %{_sysconfdir}/openchime/openchimed.env || :
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || :
     if [ "$1" -eq 1 ]; then

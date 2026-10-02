@@ -147,6 +147,20 @@ static int test_authority(void) {
         if (!ok) printf("  authority(%s) = %d host=%s port=%s\n", T[i].in, rc, host, port);
         CHECK(ok);
     }
+    /* Where the daemon may send a signed request: https anywhere, plain http to
+     * loopback only. */
+    CHECK(oc_url_transport_ok("https://central.example/api/machine"));
+    CHECK(oc_url_transport_ok("https://[2001:db8::1]:8443/x"));
+    CHECK(oc_url_transport_ok("http://127.0.0.1:9000/x"));
+    CHECK(oc_url_transport_ok("http://[::1]:9000"));
+    CHECK(oc_url_transport_ok("http://localhost/x"));
+    CHECK(!oc_url_transport_ok("http://central.example/api"));
+    CHECK(!oc_url_transport_ok("http://127.0.0.1.evil.example/x"));
+    CHECK(!oc_url_transport_ok("http://localhost.evil.example/x"));
+    CHECK(!oc_url_transport_ok("http://10.0.0.5/x"));
+    CHECK(!oc_url_transport_ok("ftp://127.0.0.1/x"));
+    CHECK(!oc_url_transport_ok("https:///x"));
+    CHECK(!oc_url_transport_ok(NULL));
     char out[64];
     CHECK(oc_url_hostheader("2001:db8::1", "8443", out, sizeof out) == 0 && strcmp(out, "[2001:db8::1]:8443") == 0);
     CHECK(oc_url_hostheader("::1", NULL, out, sizeof out) == 0 && strcmp(out, "[::1]") == 0);

@@ -138,6 +138,7 @@ typedef struct {
 
 static int parse_url(const char *url, enroll_ctx *ctx) {
     memset(ctx, 0, sizeof *ctx);
+    if (!oc_url_transport_ok(url)) return -1;   /* never in the clear but to loopback */
     const char *p = url;
     if (strncmp(p, "https://", 8) == 0) { p += 8; ctx->use_tls = 1; snprintf(ctx->port, sizeof ctx->port, "443"); }
     else if (strncmp(p, "http://", 7) == 0) { p += 7; ctx->use_tls = 0; snprintf(ctx->port, sizeof ctx->port, "80"); }

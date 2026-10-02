@@ -5,6 +5,10 @@ set -e
 
 case "$1" in
   configure)
+    # The settings hold secrets, and systemd (root) is what reads them: an
+    # install from before the file was made private keeps its own mode, so
+    # tighten it.
+    if [ -f /etc/openchime/openchimed.env ]; then chmod 0600 /etc/openchime/openchimed.env; fi
     # No user or directory to create: the unit uses DynamicUser + StateDirectory,
     # so systemd allocates the user at start and owns /var/lib/openchime.
     if [ -d /run/systemd/system ]; then

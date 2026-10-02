@@ -37,7 +37,7 @@ VOICES="$(dirname "$BINARY")/voices"
 STT="$(dirname "$BINARY")/stt"
 [ -f "$STT/manifest" ] && cp -r "$STT" "$dir/stt"
 install -m 0644 "$root/packaging/debian/openchimed.service" "$dir/openchimed.service"
-install -m 0644 "$root/packaging/openchimed.env"            "$dir/openchimed.env"
+install -m 0600 "$root/packaging/openchimed.env"            "$dir/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"              > "$dir/COPYRIGHT"
 chmod 0644 "$dir/COPYRIGHT"
 
@@ -70,9 +70,10 @@ install -D -m 0644 COPYRIGHT          /usr/share/doc/openchimed/copyright
 if [ -f /etc/openchime/openchimed.env ]; then
     echo "install.sh: keeping your /etc/openchime/openchimed.env"
     echo "install.sh: the new default is alongside it as openchimed.env.new"
-    install -D -m 0644 openchimed.env /etc/openchime/openchimed.env.new
+    chmod 0600 /etc/openchime/openchimed.env   # it holds secrets; systemd (root) reads it
+    install -D -m 0600 openchimed.env /etc/openchime/openchimed.env.new
 else
-    install -D -m 0644 openchimed.env /etc/openchime/openchimed.env
+    install -D -m 0600 openchimed.env /etc/openchime/openchimed.env
 fi
 
 if [ -d /run/systemd/system ]; then

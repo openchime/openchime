@@ -4,6 +4,7 @@
 #include "proxyproto.h"
 #include "protocol.h"   /* OC_MAX_ATTACHMENT_SIZE */
 #include "tls.h"        /* oc_tls_set_extra_ca */
+#include "url.h"        /* oc_url_transport_ok */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -190,6 +191,20 @@ int oc_config_load(char *err, size_t errcap) {
 
     /* Outbound push emitter (ARCH-85). */
     c->push.url = env_or2("OPENCHIME_PUSH_URL", "OC_PUSH_URL", NULL);
+
+    /* Both carry signed requests, and the enrollment its claim: https, or plain
+     * http to loopback for a test. Anything else stops the boot rather than
+     * sending them in the clear. */
+    if (c->enroll.url && *c->enroll.url && !oc_url_transport_ok(c->enroll.url)) {
+        snprintf(err, errcap, "OPENCHIME_ENROLL_URL='%s' is not https (plain http is for loopback only)",
+                 c->enroll.url);
+        return -1;
+    }
+    if (c->push.url && *c->push.url && !oc_url_transport_ok(c->push.url)) {
+        snprintf(err, errcap, "OPENCHIME_PUSH_URL='%s' is not https (plain http is for loopback only)",
+                 c->push.url);
+        return -1;
+    }
 
     /* Invitation mail (REQ-280's carve-out): whether each invite bound to an
      * address is reported to central for it to mail. Off unless asked for, and a

@@ -38,7 +38,7 @@ if [ -f "$(dirname "$BINARY")/stt/manifest" ]; then
   with_stt=1
 fi
 install -m 0644 "$root/packaging/debian/openchimed.service"    "$stage/openchimed.service"
-install -m 0644 "$root/packaging/openchimed.env"               "$stage/openchimed.env"
+install -m 0600 "$root/packaging/openchimed.env"               "$stage/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"                 > "$stage/copyright"
 chmod 0644 "$stage/copyright"
 
