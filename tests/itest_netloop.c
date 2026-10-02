@@ -1807,6 +1807,34 @@ static int signed_in(client *c, int port, const uint8_t *pin, const char *user, 
     return client_open(c, port, pin) == 0 && do_handshake(c) == 0 && do_auth(c, user, pw, &uid) == 0 ? 0 : -1;
 }
 
+/* A device token is checked on the wire: one no device issues -- too long, with
+ * a quote or a NUL -- is refused rather than cut short or stored (ARCH-85). */
+static void test_device_token_wire(int port, const uint8_t *pin) {
+    client a;
+    CHECK(signed_in(&a, port, pin, "carol", "pw") == 0);
+    static char big[OC_DEVICE_TOKEN_MAX + 64];
+    memset(big, 'a', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    /* A NUL inside would otherwise store the token cut short at it. */
+    oc_slice toks[4] = { oc_slice_str(big), oc_slice_str("tok\"carol"), { (const uint8_t *)"tok\0carol", 9 },
+                         oc_slice_str("tok-carol") };
+    for (int i = 0; i < 4; i++) {
+        uint8_t buf[OC_DEVICE_TOKEN_MAX + 256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_register_device_token rd = { OC_PUSH_FCM, toks[i] };
+        CHECK(oc_encode_register_device_token(&w, OC_PROTOCOL_VERSION, &rd) == OC_OK &&
+              write_all(&a.conn, buf, w.len) == 0);
+        oc_header hdr; oc_rbuf p; int got = -1;
+        for (int k = 0; k < 16 && got < 0; k++) {
+            if (read_frame(&a, &hdr, &p) != 0) break;
+            if (hdr.msg_type != OC_MSG_DEVICE_TOKEN_ACK) continue;
+            oc_device_token_ack ack;
+            got = oc_decode_device_token_ack(&p, &ack) == OC_OK ? ack.ok : -1;
+        }
+        CHECK(got == (i == 3));
+    }
+    client_close(&a);
+}
+
 /* Revoking a user's sessions closes their other live connections, which are
  * authenticated in memory and would otherwise carry on (REQ-182): a password
  * change keeps only the device that made it, signing out everywhere keeps none,
@@ -4967,6 +4995,7 @@ int run_netloop_tests(void) {
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_revoke_other_devices(arg.port, pin);
+        test_device_token_wire(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack(arg.port + 128, arg.port + 129);

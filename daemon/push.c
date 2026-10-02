@@ -560,14 +560,19 @@ int oc_push_build_body_kind(uint64_t channel_id, int call, const oc_push_target 
     if (w < 0 || (size_t)w >= cap) return -1;
     size_t off = (size_t)w;
 
+    int sent = 0;
     for (int i = 0; i < n; i++) {
+        /* Checked when registered; a row from before that check, or one that is
+         * not a token, is left out rather than written raw into the JSON. */
+        if (!oc_device_token_ok((const uint8_t *)targets[i].token, strlen(targets[i].token))) continue;
         const char *plat = targets[i].platform == OC_PUSH_FCM ? "fcm" : "apns";
         w = snprintf(out + off, cap - off,
                      "%s{\"platform\":\"%s\",\"token\":\"%s\",\"channelId\":\"%s\"%s}",
-                     i ? "," : "", plat, targets[i].token, chbuf, call ? ",\"kind\":\"call\"" : "");
+                     sent++ ? "," : "", plat, targets[i].token, chbuf, call ? ",\"kind\":\"call\"" : "");
         if (w < 0 || (size_t)w >= cap - off) return -1;
         off += (size_t)w;
     }
+    if (!sent) return -1;   /* nobody to wake: nothing to send */
     w = snprintf(out + off, cap - off, "]}");
     if (w < 0 || (size_t)w >= cap - off) return -1;
     return 0;

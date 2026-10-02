@@ -506,6 +506,10 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **Removing a member (`test_dbwriter`, `test_remove_user_integrations`):** the
   member's webhook posts nothing, even turned back on, and their push device
   tokens are gone (REQ-033, REQ-170).
+- **Push device tokens (`test_protocol`, `test_push`, `itest_netloop`):** a token
+  too long, with a quote or a NUL is refused on the wire and by the writer, and a
+  stored string that is no token is left out of the push body rather than written
+  into its JSON (ARCH-85).
 - **Idempotency:** re-sending with the same token after a simulated drop yields
   the same `message_id` and no duplicate row (REQ-093).
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
