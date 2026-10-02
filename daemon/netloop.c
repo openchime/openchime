@@ -25,6 +25,7 @@
 #include "http.h"
 #include "webpages.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
+#include "webstep.h"     /* a local account's second step (AUTH.md §8.6) */
 #include "e2e_hpke.h"  /* oc_e2e_wipe */
 #include "protocol.h"
 #include "ratelimit.h"
@@ -182,6 +183,7 @@ typedef struct web_req {
     oc_page_kind kind;
     char redirect_uri[512], nonce[48], username[128], invite[80];
     char user_code[16];          /* DEVICE: the code being approved */
+    char step[OC_STEP_TICKET_LEN + 1];   /* a second step's: the ticket it is for */
 } web_req;
 
 typedef struct conn_s {
@@ -421,6 +423,7 @@ static __thread oc_ratelimit *g_webhook_rl;
 /* Device codes (AUTH.md §8.11): the pending requests, and how often one source
  * may look a code up on the /device page -- a guessed code is the attack. */
 static __thread oc_devcodes  *g_devcodes;
+static __thread oc_websteps  *g_websteps;
 static __thread oc_ratelimit *g_device_rl;
 #define OC_DEVICE_LOOKUPS_MAX    10u
 #define OC_DEVICE_LOOKUPS_WINDOW 60000u
@@ -3716,6 +3719,7 @@ static const oc_http_route TLS_ROUTES[] = {
     { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0 },
     { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "POST", "/signin/verify", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/signup", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
@@ -3864,6 +3868,7 @@ static int field_get(const char *q, const char *key, char *out, size_t cap) {
 }
 
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
+static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);               /* fwd */
 
 static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     const char *qm = memchr(req->path, '?', req->path_len);
@@ -3873,6 +3878,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     else if (plen == 7 && memcmp(req->path, "/signup", 7) == 0) kind = OC_PAGE_SIGNUP;
     else if (plen == 17 && memcmp(req->path, "/account/password", 17) == 0) kind = OC_PAGE_PASSWORD;
     else if (plen == 7 && memcmp(req->path, "/device", 7) == 0) kind = OC_PAGE_DEVICE;
+    else if (plen == 14 && memcmp(req->path, "/signin/verify", 14) == 0) kind = OC_PAGE_STEP;
     else { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
     size_t len;
     if (!oc_dbwriter_local_browser(dbw)) {
@@ -3898,6 +3904,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         q[ql] = '\0';
     }
     if (kind == OC_PAGE_DEVICE) return on_device_page(c, post, q, dbw);
+    if (kind == OC_PAGE_STEP) return on_step_page(c, q, dbw);
     web_req *w = calloc(1, sizeof *w);
     if (!w) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
     w->kind = kind;
@@ -4040,6 +4047,7 @@ static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     memcpy(j->source, c->source, sizeof j->source);
     snprintf(j->web_nonce, sizeof j->web_nonce, "%s", info.challenge);
     w->kind = OC_PAGE_DEVICE;
+    snprintf(w->nonce, sizeof w->nonce, "%s", info.challenge);   /* a second step binds to it */
     snprintf(w->username, sizeof w->username, "%s", user);
     snprintf(w->user_code, sizeof w->user_code, "%s", info.user_code);
     oc_dbwriter_submit(dbw, j);
@@ -4051,15 +4059,112 @@ out:
     return rc;
 }
 
+/* The code for a second step (AUTH.md §8.6), against the ticket its password
+ * page earned: the writer checks it and finishes what that page began. An
+ * unknown or spent ticket is a link that is no longer good. Returns 0 to keep,
+ * -1 to close. */
+static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
+    char ticket[OC_STEP_TICKET_LEN + 8] = "", code[64] = "";
+    oc_step_ticket t;
+    size_t len;
+    if (field_get(q, "ticket", ticket, sizeof ticket) || field_get(q, "code", code, sizeof code) ||
+        !g_websteps || !oc_websteps_get(g_websteps, ticket, now_ms(), &t)) {
+        const char *b = oc_page_invalid(&len);
+        web_reply(c, 400, b, len, NULL, NULL);
+        return -1;
+    }
+    web_req *w = calloc(1, sizeof *w);
+    oc_job *j = w ? oc_job_new(OC_JOB_AUTH_STEP, c->conn_id) : NULL;
+    if (!j || oc_job_set_token(j, code, strlen(code)) != 0) {
+        if (j) oc_job_free(j);
+        free(w);
+        oc_e2e_wipe(&t, sizeof t);
+        http_reply(c, 500, "text/plain", "error\n", 6);
+        return -1;
+    }
+    j->user_id = t.uid;
+    j->auth_version = t.version;
+    j->web = t.page == OC_PAGE_PASSWORD ? OC_WEB_PASSWORD : OC_WEB_SIGNIN;
+    snprintf(j->web_nonce, sizeof j->web_nonce, "%s", t.nonce);
+    if (t.pw) {
+        j->pw_derived = 1;
+        j->pw_iters = t.pw_iters;
+        memcpy(j->pw_salt, t.pw_salt, sizeof j->pw_salt);
+        memcpy(j->pw_hash, t.pw_hash, sizeof j->pw_hash);
+    }
+    memcpy(j->source, c->source, sizeof j->source);
+    w->kind = (oc_page_kind)t.page;
+    snprintf(w->redirect_uri, sizeof w->redirect_uri, "%s", t.redirect_uri);
+    snprintf(w->nonce, sizeof w->nonce, "%s", t.nonce);
+    snprintf(w->user_code, sizeof w->user_code, "%s", t.user_code);
+    memcpy(w->step, ticket, OC_STEP_TICKET_LEN);   /* found, so exactly this long */
+    w->step[OC_STEP_TICKET_LEN] = '\0';
+    oc_e2e_wipe(&t, sizeof t);
+    oc_dbwriter_submit(dbw, j);
+    c->web = w;
+    c->http_pending = 1;
+    return 0;
+}
+
+/* The step page for `w`'s ticket, posting back to `action`, saying `msg`. */
+static void step_page(conn *c, int status, const web_req *w, const char *action, const char *msg) {
+    oc_page pg = { .kind = OC_PAGE_STEP, .redirect_uri = w->redirect_uri, .nonce = "", .username = "",
+                   .invite = "", .message = msg, .user_code = "", .ticket = w->step, .action = action };
+    web_page(c, status, &pg);
+}
+
 /* A page's check came back: a sign-in or sign-up goes on to the client's
  * callback with its token; a password change says so; a refusal shows the form
- * again, saying why, and never which half of a credential was wrong. */
+ * again, saying why, and never which half of a credential was wrong. A right
+ * password on an account with a second step shows the step page instead, and
+ * the step's own answer comes back here too. */
 static void web_result(int ep, conn **conns, const oc_dbres *r) {
     conn *c = find_by_id(conns, r->conn_id);
     if (!c || !c->web) return;
     web_req *w = c->web;
     oc_page pg = { .kind = w->kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
                    .username = w->username, .invite = w->invite, .message = "", .user_code = w->user_code };
+    if (r->type == OC_RES_WEB_STEP2) {
+        /* What the password proved, kept against a ticket for the step page --
+         * which posts from the page it replaces, at that page's depth. */
+        oc_step_ticket t;
+        memset(&t, 0, sizeof t);
+        t.page = w->kind;
+        t.uid = r->user_id;
+        t.version = r->step_version;
+        snprintf(t.redirect_uri, sizeof t.redirect_uri, "%s", w->redirect_uri);
+        snprintf(t.nonce, sizeof t.nonce, "%s", w->nonce);
+        snprintf(t.user_code, sizeof t.user_code, "%s", w->user_code);
+        if (r->step_pw) {
+            t.pw = 1;
+            t.pw_iters = r->step_iters;
+            memcpy(t.pw_salt, r->step_salt, sizeof t.pw_salt);
+            memcpy(t.pw_hash, r->step_hash, sizeof t.pw_hash);
+        }
+        char key[OC_SRC_LEN];
+        oc_source_key(c->source, key, sizeof key);
+        int put = g_websteps ? oc_websteps_put(g_websteps, key, &t, now_ms(), w->step) : -1;
+        oc_e2e_wipe(&t, sizeof t);
+        if (put == 0) step_page(c, 200, w, w->kind == OC_PAGE_PASSWORD ? "../signin/verify" : "signin/verify", "");
+        else { pg.message = "Too many sign-ins are under way. Wait a minute and try again."; web_page(c, 429, &pg); }
+        flush_out(c);
+        conn_close(ep, conns, c->fd);
+        return;
+    }
+    if (w->step[0] && r->type == OC_RES_WEB_ERR) {
+        /* A wrong code: the step again while its ticket has tries left. */
+        const char *msg = "That code isn't right.";
+        int status = 200, left = 1;
+        if (r->err_code == OC_ERR_AUTH_RATE_LIMITED) { status = 429; msg = "Too many wrong codes. Wait a few minutes and try again."; }
+        else if (r->err_code == OC_ERR_INTERNAL) { status = 500; msg = "Something went wrong. Try again."; }
+        else left = g_websteps ? oc_websteps_fail(g_websteps, w->step, now_ms()) : 0;
+        if (left > 0) step_page(c, status, w, "verify", msg);
+        else { size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL); }
+        flush_out(c);
+        conn_close(ep, conns, c->fd);
+        return;
+    }
+    if (w->step[0] && g_websteps) oc_websteps_drop(g_websteps, w->step);   /* passed: spent */
     if (r->type == OC_RES_WEB_OK && w->kind == OC_PAGE_PASSWORD) {
         pg.done = 1;
         web_page(c, 200, &pg);
@@ -5705,6 +5810,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     }
     case OC_RES_WEB_OK:
     case OC_RES_WEB_ERR:
+    case OC_RES_WEB_STEP2:
         web_result(ep, conns, r);
         break;
     case OC_RES_WEBHOOK_ERR: {
@@ -7093,6 +7199,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * endpoint still works, just unthrottled. */
     g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
     g_devcodes = oc_devcodes_new();
+    g_websteps = oc_websteps_new();
     if (g_devcodes) {
         oc_devcodes_set_ttl(g_devcodes, __atomic_load_n(&g_device_ttl_ms, __ATOMIC_RELAXED));
         oc_devcodes_set_interval(g_devcodes, __atomic_load_n(&g_device_interval_s, __ATOMIC_RELAXED));
@@ -7348,6 +7455,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     oc_ratelimit_free(g_webhook_rl);
     oc_devcodes_free(g_devcodes);
     g_devcodes = NULL;
+    oc_websteps_free(g_websteps);
+    g_websteps = NULL;
     oc_ratelimit_free(g_device_rl);
     g_device_rl = NULL;
     g_webhook_rl = NULL;

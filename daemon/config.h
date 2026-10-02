@@ -54,6 +54,9 @@ typedef struct {
 
     /* Paths + ports. */
     const char *db_path, *tls_cert, *tls_key;
+    /* The key local accounts' second-step secrets are sealed under (AUTH.md
+     * §8.6): OPENCHIME_FACTOR_KEY_FILE, else factor.key beside the database. */
+    char        factor_key_file[1024];
     int health_port, proto_port, audio_port;
     /* The audio relay as clients reach it, where that differs from the socket
      * (AUDIO.md §4): the UDP port CALL_JOINED names (0: the bound one), and the

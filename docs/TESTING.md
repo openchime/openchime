@@ -536,6 +536,16 @@ works. Nothing proves the shipped *image* works (§3.2).
   code for a Google user's address is refused with `AUTH_USE_PROVIDER` and makes
   no identity; Microsoft for a person known by emailed code links; with
   `OPENCHIME_OIDC_EMAIL_LINK=any` the emailed code links too.
+- **A second step (`test_totp`; `itest_netloop` `test_web_signin`,
+  `test_device_signin`):** RFC 6238's SHA1 vectors, one step either side and no
+  replay; base32; a sealed secret opens with its key and account only; the
+  factor key is made 0600 and a file that is not one is refused. Through the
+  pages: a right password on an account with TOTP shows the step page, a wrong
+  code shows it again, the right one ends the sign-in, and neither the ticket nor
+  the code is good twice; a recovery code, typed any way, works once; a sign-in
+  waiting at its step when the password changes is refused; the password page
+  changes nothing until the step; five wrong codes end the ticket; no factor key
+  refuses the step; a device approval waits for its code (AUTH.md §8.6).
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

@@ -193,6 +193,11 @@ static void test_tunnel(void) {
             http_raw(lport, req, out, sizeof out);
             snprintf(want, sizeof want, "Origin: https://d.test:%d\r\n", g_fd_port);
             CHECK(strstr(out, want) != NULL && strstr(out, "\r\n\r\na=b") != NULL);
+            /* The second step's post (AUTH.md §8.6) is carried the same way. */
+            snprintf(req, sizeof req, "POST %s/signin/verify HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: http://127.0.0.1:%d\r\n"
+                     "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nc=d", tp, lport, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "POST /signin/verify HTTP/1.1\r\n") != NULL && strstr(out, "\r\n\r\nc=d") != NULL);
             /* ...another site's keeps its own, for the daemon to refuse. */
             snprintf(req, sizeof req, "POST %s/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: https://evil.example\r\n"
                      "Content-Length: 0\r\n\r\n", tp, lport);

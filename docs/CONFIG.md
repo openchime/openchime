@@ -38,6 +38,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENCHIME_DB_PATH` | `/data/openchime.db` | SQLite database file (WAL, ARCH-2). |
+| `OPENCHIME_FACTOR_KEY_FILE` | `factor.key` beside the database | The 32-byte key local accounts' second-step secrets are sealed under (AUTH.md §8.6), kept outside the database so the database alone gives none away. Made at first start, mode `0600`, when there is none. **Back it up with the database.** A file that is there but not a key, or cannot be read, is logged and the daemon serves on — but no second step can be passed until it is fixed. |
 | `OPENCHIME_PROTO_PORT` | `8443` | The binary-protocol + ALPN-demuxed HTTP port. Production is 443 (ARCH-54). |
 | `OPENCHIME_HEALTH_PORT` | `8080` | Plaintext `/healthz` + landing-page port (ARCH-25). |
 | `OPENCHIME_TLS_CERT` | `/data/cert.pem` | The certificate path: the self-signed identity, generated on first run and persisted in the DB so a trusted fingerprint survives a restore (ARCH-10/66b); or, with `OPENCHIME_TLS_SOURCE=file`, the operator's own. |

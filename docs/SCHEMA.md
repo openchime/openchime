@@ -1327,6 +1327,40 @@ them but a restore, which puts the body back, re-links the files the storage
 sweep has not reclaimed and re-adds the reactions, then removes the hold. Every
 delete and restore first purges holds past the window, so a deleted body is kept
 no longer than it can be asked back.
+
+## 3ar. Migration 0053 — a local account's second step (AUTH.md §8.6, REQ-184)
+
+```sql
+CREATE TABLE local_totp (
+  user_id         INTEGER PRIMARY KEY REFERENCES users(id),
+  secret          BLOB NOT NULL,
+  confirmed_at_ms INTEGER,
+  last_step       INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE local_recovery (
+  id         INTEGER PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  code_hash  BLOB NOT NULL,
+  used_at_ms INTEGER
+);
+CREATE INDEX local_recovery_user ON local_recovery(user_id);
+```
+
+### `local_totp`
+An account's TOTP secret, **sealed**: AES-256-GCM under the factor key
+(`OPENCHIME_FACTOR_KEY_FILE`, CONFIG.md), which is kept outside the database,
+with the account's id as associated data — a 12-byte nonce, the ciphertext and a
+16-byte tag. The database alone therefore gives away no second step, and a
+secret moved to another account does not open. **A backup needs the key file as
+well as the database**; restored without it, accounts with a second step cannot
+sign in until it is set up again. The step is asked for only once
+`confirmed_at_ms` is set. `last_step` is the last thirty-second step a code was
+accepted for, so a code is never good twice.
+
+### `local_recovery`
+One row per recovery code: a 16-byte salt and the SHA-256 of salt and code, the
+code being its ten letters and digits. Spending one sets `used_at_ms`; it is
+never good again.
 ---
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)

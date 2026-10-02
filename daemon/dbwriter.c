@@ -26,6 +26,7 @@
 #include "ratelimit.h"
 #include "roles.h"
 #include "srccount.h"   /* oc_source_key */
+#include "totp.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -85,6 +86,9 @@ struct oc_dbwriter {
     int             password_frames;         /* OPENCHIME_TEST_PASSWORD_AUTH: frames may carry one */
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             email_link_any;          /* an emailed code may stand in for a provider */
+    oc_ratelimit   *step_rl;                 /* wrong second-step codes, per account */
+    uint8_t         factor_key[OC_FACTOR_KEY_LEN];
+    int             have_factor_key;         /* without it no step can be passed */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed sign-ins per source IP, every source */
@@ -104,6 +108,11 @@ struct oc_dbwriter {
 #define OC_AUTH_SOURCE_MAX_FAILURES 20
 #define OC_AUTH_WINDOW_MS           60000u
 #define OC_AUTH_RL_CAPACITY         1024u
+/* A second step's own limiter (AUTH.md §8.6): five wrong codes per account in
+ * five minutes, apart from the password's, so guessing a code is no faster
+ * than guessing the password was. */
+#define OC_STEP_MAX_FAILURES        5
+#define OC_STEP_WINDOW_MS           (5u * 60u * 1000u)
 
 /* Idempotency retention (ARCH-44): keep a (channel, token) -> id mapping this
  * long — enough to cover realistic reconnect-retry — then prune it. Pruning runs
@@ -1573,10 +1582,36 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
 static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint64_t keep_session,
                               uint16_t *err);
 
-static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid) {
+/* Whether `uid` has a second step set up (AUTH.md §8.6). */
+static int has_second_step(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM local_totp WHERE user_id=? AND confirmed_at_ms IS NOT NULL;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    int yes = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* What a page's password check ends in. `stepped`: the second step has been
+ * passed too, or the account has none; otherwise an account with one is asked
+ * for it (WEB_STEP2) and nothing is minted or stored yet. */
+static oc_dbres *web_finish_as(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid, int stepped) {
     sqlite3 *db = w->db;
     if (uid && user_disabled(db, uid)) uid = 0;
     if (!uid) { r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
+    if (!stepped && j->web != OC_WEB_SIGNUP && has_second_step(db, uid)) {
+        r->type = OC_RES_WEB_STEP2;
+        r->user_id = uid;
+        r->step_version = j->auth_version;
+        if (j->web == OC_WEB_PASSWORD && j->pw_derived) {
+            r->step_pw = 1;
+            r->step_iters = j->pw_iters;
+            memcpy(r->step_salt, j->pw_salt, sizeof r->step_salt);
+            memcpy(r->step_hash, j->pw_hash, sizeof r->step_hash);
+        }
+        return r;
+    }
     if (j->web == OC_WEB_PASSWORD) {
         uint16_t err = 0;
         if (store_new_password(db, j, uid, 0, &err) != 0) { r->type = OC_RES_WEB_ERR; r->err_code = err; return r; }
@@ -1594,6 +1629,130 @@ static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64
     r->body = (uint8_t *)tok;
     r->body_len = strlen(tok);
     return r;
+}
+
+static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid) {
+    return web_finish_as(w, j, r, uid, 0);
+}
+
+/* A recovery code as typed -- any case, with or without its dash and spaces --
+ * reduced to the ten characters it stands for. 0, or -1 if it is not one. */
+static int recovery_norm(const char *in, char out[11]) {
+    size_t n = 0;
+    for (; in && *in; in++) {
+        char c = *in;
+        if (c == '-' || c == ' ') continue;
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) || n == 10) return -1;
+        out[n++] = c;
+    }
+    out[n] = '\0';
+    return n == 10 ? 0 : -1;
+}
+
+/* Spend one of `uid`'s recovery codes: 1 if `code` is one not yet used, now used. */
+static int spend_recovery(sqlite3 *db, uint64_t uid, const char *code) {
+    char norm[11];
+    if (recovery_norm(code, norm) != 0) return 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT id, code_hash FROM local_recovery WHERE user_id=? AND used_at_ms IS NULL;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    int64_t hit = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const uint8_t *h = sqlite3_column_blob(st, 1);
+        if (sqlite3_column_bytes(st, 1) != 16 + OC_SHA256_LEN || !h) continue;
+        uint8_t buf[16 + 10], dig[OC_SHA256_LEN];
+        memcpy(buf, h, 16);
+        memcpy(buf + 16, norm, 10);
+        if (oc_sha256(buf, sizeof buf, dig) != 0) continue;
+        /* Every row is compared whole, so the time says nothing of which matched. */
+        if (oc_ct_eq(dig, h + 16, OC_SHA256_LEN) && !hit) hit = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!hit) return 0;
+    sqlite3_prepare_v2(db, "UPDATE local_recovery SET used_at_ms=? WHERE id=? AND used_at_ms IS NULL;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 2, hit);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* Check a TOTP code against `uid`'s sealed secret, and on a match take its step,
+ * so the same code is not good twice. 1 matched; 0 not; -1 the factor key is
+ * missing or does not open the secret -- which refuses, and says so. */
+static int check_totp(oc_dbwriter *w, uint64_t uid, const char *code) {
+    sqlite3 *db = w->db;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT secret, last_step FROM local_totp WHERE user_id=? AND confirmed_at_ms IS NOT NULL;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    uint8_t sealed[OC_TOTP_SEALED_LEN];
+    int have = 0;
+    uint64_t last = 0;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_bytes(st, 0) == (int)sizeof sealed) {
+        memcpy(sealed, sqlite3_column_blob(st, 0), sizeof sealed);
+        last = (uint64_t)sqlite3_column_int64(st, 1);
+        have = 1;
+    }
+    sqlite3_finalize(st);
+    if (!have) return 0;
+    uint8_t secret[OC_TOTP_SECRET_LEN];
+    if (!w->have_factor_key || oc_factor_open(w->factor_key, uid, sealed, sizeof sealed, secret) != 0) {
+        fprintf(stderr, "openchimed: a second step was refused: the factor key %s (OPENCHIME_FACTOR_KEY_FILE)\n",
+                w->have_factor_key ? "does not open its secret" : "is missing");
+        return -1;
+    }
+    uint64_t matched = 0;
+    int ok = oc_totp_verify(secret, sizeof secret, code, dbw_now_ms() / 1000u, last, &matched);
+    oc_e2e_wipe(secret, sizeof secret);
+    if (!ok) return 0;
+    sqlite3_prepare_v2(db, "UPDATE local_totp SET last_step=? WHERE user_id=? AND last_step < ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)matched);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)uid);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)matched);
+    ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* A page's second step (AUTH.md §8.6): the code -- a TOTP code, or a recovery
+ * code, spent -- against the account whose password was right, then what that
+ * page does: a sign-in's token, or the password change it was holding. The
+ * password must still be the one checked; wrong codes have a limiter of their
+ * own. */
+static oc_dbres *process_auth_step(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint64_t uid = j->user_id, now = dbw_now_ms();
+    char key[32];
+    snprintf(key, sizeof key, "uid:%llu", (unsigned long long)uid);
+    if (oc_ratelimit_blocked(w->step_rl, key, now)) {
+        r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
+    }
+    uint8_t role = 0;
+    if (!uid || !credential_current(db, uid, j->auth_version, &role) || user_disabled(db, uid)) {
+        r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    const char *code = j->token ? j->token : "";
+    int ok = strlen(code) == OC_TOTP_DIGITS ? check_totp(w, uid, code) : 0;
+    int recovery = 0;
+    if (ok == 0 && strlen(code) != OC_TOTP_DIGITS) recovery = ok = spend_recovery(db, uid, code);
+    if (ok != 1) {
+        oc_ratelimit_record(w->step_rl, key, now);
+        audit_actor(db, OC_AUDIT_SECURITY, "auth.failed", uid, 0, NULL, 0,
+                    ok < 0 ? "step=totp reason=factor-key" : "step=code");
+        r->type = OC_RES_WEB_ERR;
+        r->err_code = ok < 0 ? OC_ERR_INTERNAL : OC_ERR_AUTH_INVALID_TOKEN;
+        return r;
+    }
+    oc_ratelimit_reset(w->step_rl, key);
+    if (recovery) audit_actor(db, OC_AUDIT_SECURITY, "auth.recovery_code", uid, 0, NULL, 1, NULL);
+    return web_finish_as(w, j, r, uid, 1);
 }
 
 /* An AUTH job, from a frame or the daemon's pages; a page's refusal is a page's. */
@@ -8484,6 +8643,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j);
 
 static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_AUTH)          return process_auth(w, j);
+    if (j->type == OC_JOB_AUTH_STEP)     return process_auth_step(w, j);
     if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
     if (j->type == OC_JOB_REGISTER)      return process_register(w, j);
     if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);
@@ -9178,6 +9338,11 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
 }
 
 void oc_dbwriter_set_email_link(oc_dbwriter *w, int any) { w->email_link_any = any != 0; }
+void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32) {
+    w->have_factor_key = key32 != NULL;
+    if (key32) memcpy(w->factor_key, key32, OC_FACTOR_KEY_LEN);
+    else memset(w->factor_key, 0, sizeof w->factor_key);
+}
 
 const char *oc_dbwriter_relay_origin(oc_dbwriter *w) {
     return w->relay_origin ? w->relay_origin : "";
@@ -9509,8 +9674,9 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->prune_interval_ms = OC_PRUNE_INTERVAL_MS;
     w->auth_rl   = oc_ratelimit_new(OC_AUTH_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->source_rl = oc_ratelimit_new(OC_AUTH_SOURCE_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
-    if (!w->auth_rl || !w->source_rl) {
-        oc_ratelimit_free(w->auth_rl); oc_ratelimit_free(w->source_rl);
+    w->step_rl   = oc_ratelimit_new(OC_STEP_MAX_FAILURES, OC_STEP_WINDOW_MS, OC_AUTH_RL_CAPACITY);
+    if (!w->auth_rl || !w->source_rl || !w->step_rl) {
+        oc_ratelimit_free(w->auth_rl); oc_ratelimit_free(w->source_rl); oc_ratelimit_free(w->step_rl);
         free(w); return NULL;
     }
 
@@ -9626,6 +9792,8 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     oc_join_rules_free(w->join_rules);
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);
+    oc_ratelimit_free(w->step_rl);
+    oc_e2e_wipe(w->factor_key, sizeof w->factor_key);
     if (w->evfd >= 0) close(w->evfd);
     for (int i = 0; i < OC_DB_READERS; i++) sqlite3_close(w->readers[i].rdb);
     sqlite3_close(w->db);

@@ -13,7 +13,7 @@
 
 #include <stddef.h>
 
-typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD, OC_PAGE_DEVICE } oc_page_kind;
+typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD, OC_PAGE_DEVICE, OC_PAGE_STEP } oc_page_kind;
 
 typedef struct {
     oc_page_kind kind;
@@ -29,6 +29,11 @@ typedef struct {
     const char  *from;
     unsigned     minutes_ago;
     int          denied;
+    /* STEP (AUTH.md §8.6): the ticket the password page earned, and where the
+     * code is posted -- relative to the page it answers, which is not always
+     * at the same depth. */
+    const char  *ticket;
+    const char  *action;
 } oc_page;
 
 /* The page, malloc'd, its length in *len. NULL on no memory. */

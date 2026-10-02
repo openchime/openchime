@@ -220,7 +220,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_ALERTS_LIST = 121, OC_JOB_ALERT_ACK = 122,
        /* A delete taken back, by the person who made it (REQ-052):
         * channel_id, message_id, user_id. */
-       OC_JOB_RESTORE = 123 };
+       OC_JOB_RESTORE = 123,
+       /* A local account's second step (AUTH.md §8.6): `user_id`, the credential
+        * version its password was checked against (`auth_version`), the code in
+        * `token`, which page it finishes (`web`) with that page's `web_nonce`
+        * and, for a password change, the new password's key (`pw_*`). */
+       OC_JOB_AUTH_STEP = 124 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -605,7 +610,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_TTS_STORED = 107,
        /* RESTORE: the message whole again -- author, time, body, attachments,
         * the members to tell -- or refused (err_code). */
-       OC_RES_RESTORE_OK = 108, OC_RES_RESTORE_ERR = 109 };
+       OC_RES_RESTORE_OK = 108, OC_RES_RESTORE_ERR = 109,
+       /* A page's password was right and the account has a second step: no token
+        * yet. `user_id`, `step_version`, and a password change's new key. */
+       OC_RES_WEB_STEP2 = 110 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -837,6 +845,12 @@ typedef struct oc_dbres {
     uint64_t       conn_id;
     uint32_t       gen;  /* the job's, echoed (oc_job) */
     uint16_t       err_code;  /* reason code for *_ERR */
+    /* WEB_STEP2: the credential version the password was checked against, and a
+     * password change's new key, held for the step that finishes it. */
+    uint64_t       step_version;
+    int            step_pw;
+    uint32_t       step_iters;
+    uint8_t        step_salt[16], step_hash[32];
     /* LOGOUT_OK, WEB_OK, PROFILE_UPDATED: the user's sessions were revoked, so
      * every connection of `user_id` closes but `conn_id`'s (REQ-182). */
     uint8_t        revoked;
@@ -1191,6 +1205,10 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
 /* Whether an emailed code may sign into a person who signs in here with a
  * provider (OPENCHIME_OIDC_EMAIL_LINK=any); off, it is refused. Before serving. */
 void oc_dbwriter_set_email_link(oc_dbwriter *w, int any);
+/* The key a local account's TOTP secret is sealed under (AUTH.md §8.6), or NULL
+ * when none could be had: an account with a second step then cannot pass it,
+ * rather than passing without it. Before serving. */
+void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32);
 
 /* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
  * authorize URL from. For the net loop; set before serving and never after. */

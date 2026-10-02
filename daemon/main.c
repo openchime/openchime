@@ -22,6 +22,7 @@
 #include "push.h"
 #include "unfurl.h"
 #include "tls.h"
+#include "totp.h"
 #ifdef OC_TTS
 #include "tts.h"
 #include "tts_render.h"
@@ -504,6 +505,25 @@ int main(int argc, char **argv) {
         }
     }
     oc_dbwriter_set_local_enabled(db, want_local);
+
+    /* The factor key (AUTH.md §8.6), kept outside the database: without it a
+     * stolen database gives away no second step. Made at first start; if it
+     * cannot be had, the daemon serves on and no second step can be passed --
+     * refusing those sign-ins rather than passing them without it. */
+    if (want_local) {
+        uint8_t fkey[OC_FACTOR_KEY_LEN];
+        char why[256];
+        int got = oc_factor_key_load(cfg->factor_key_file, fkey, why, sizeof why);
+        if (got >= 0) {
+            oc_dbwriter_set_factor_key(db, fkey);
+            if (got == 1) fprintf(stderr, "openchimed: made the factor key %s -- back it up with the database\n",
+                                  cfg->factor_key_file);
+        } else {
+            oc_dbwriter_set_factor_key(db, NULL);
+            fprintf(stderr, "openchimed: no factor key (%s): local accounts with a second step cannot sign in\n", why);
+        }
+        memset(fkey, 0, sizeof fkey);
+    }
 
     /* The relay source (AUTH.md §3): pin central's ES256 keys + issuer/audience.
      * An enrolled box (CP-8) uses its daemon-generated audience automatically, and

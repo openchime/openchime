@@ -610,6 +610,37 @@ the stronger proof. A workspace may allow the downward link with
 A first sign-in sets the display name and address from the token; later ones
 update the identity row only, and never overwrite a name the person chose.
 
+### 8.6 A second step for local accounts
+
+An account with a second step (REQ-184) passes it on the daemon's own pages,
+after its password: the step happens where the password does, so no client
+changes and no frame carries it.
+
+- **When.** A right password on `/signin`, on `/account/password`, or approving a
+  device code on `/device` (§8.11), for an account with a confirmed TOTP secret,
+  is answered with the step page instead of a token, a stored password or an
+  approval. Nothing is minted or changed until the step is passed.
+- **The ticket.** What the password proved — the account, the version of its
+  password, and what the page was doing: a sign-in's callback and challenge, a
+  device code, a password change's new key, already derived — is kept in the
+  event loop's memory against a random ticket the step page carries. Only its
+  hash is kept; it lives five minutes and five wrong codes; a source holds a
+  few at once; a restart drops them.
+- **The code.** `POST /signin/verify` with the ticket and a code: six digits are
+  a TOTP code (RFC 6238, HMAC-SHA1, thirty-second steps, one step either side,
+  never a step already used); anything else is tried as a recovery code, which
+  is spent. The writer checks the password is still the one checked, then the
+  code, then does what the page was doing. Wrong codes have a limiter of their
+  own — five per account in five minutes — apart from the password's, and are
+  audited (`auth.failed`, `step=code`); a recovery code spent is audited too.
+- **The secret is sealed** under the factor key, outside the database (SCHEMA.md
+  migration 0053). Without the key, or with the wrong one, the step cannot be
+  passed: the sign-in is refused and the log says why, rather than letting the
+  person in without it.
+
+A provider's own second factor is the provider's business and never reaches this
+step.
+
 ### 8.7 Enrolling a managed workspace
 
 Exactly one party mints a workspace's audience. **Self-hosted:** the daemon, as
@@ -700,7 +731,8 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
 - **Through the client's loopback tunnel** otherwise — a self-signed daemon
   trusted by fingerprint, or one on loopback: `http://127.0.0.1:<port>/p/<secret>/signin…`.
   A loopback origin is one the browser treats as secure, so there is no warning.
-  The tunnel carries only `/signin`, `/signup` and `/account/password`; only a
+  The tunnel carries only `/signin`, `/signin/verify`, `/signup` and
+  `/account/password`; only a
   request whose `Host` is the listener's own (DNS rebinding); and only to the
   certificate the client's own connection accepted — over TLS with ALPN
   `http/1.1`, as the daemon's origin: its `Host`, and for a post from the

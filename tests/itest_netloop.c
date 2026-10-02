@@ -19,6 +19,8 @@
 #include "signin.h"       /* a verifier and its challenge, as a client makes them */
 #include "localissuer.h"   /* a token the daemon did not sign, to refuse */
 #include "devicecodes.h"
+#include <mbedtls/sha256.h>
+#include "totp.h"          /* a second step's codes, as an authenticator makes them */
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -1933,6 +1935,27 @@ static int web_signin(int port, const uint8_t *pin, const char *user, const char
     return st;
 }
 
+/* The ticket a step page carries, from its hidden field. */
+static int ticket_of(const char *page, char *out, size_t cap) {
+    const char *k = strstr(page, "name=\"ticket\" value=\"");
+    if (!k) return 0;
+    k += 21;
+    const char *e = strchr(k, '"');
+    if (!e || (size_t)(e - k) >= cap) return 0;
+    memcpy(out, k, (size_t)(e - k)); out[e - k] = '\0';
+    return 1;
+}
+
+/* The step's post: the status, and a sign-in's token if one came. */
+static int web_verify(int port, const uint8_t *pin, const char *ticket, const char *code,
+                      char *tok, size_t cap, char *resp, size_t rcap) {
+    char body[256];
+    snprintf(body, sizeof body, "ticket=%s&code=%s", ticket, code);
+    int st = web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, rcap);
+    if (tok) { tok[0] = '\0'; token_of(resp, tok, cap); }
+    return st;
+}
+
 /* The pages end to end, on a daemon of their own with the test knob OFF -- the
  * product as shipped: a password is taken only by a page, which ends with an ID
  * token the client presents on AUTH. */
@@ -1958,6 +1981,11 @@ static void test_web_signin(int port) {
     CHECK(mia != 0);
     CHECK(oc_dbwriter_register_local(dbw2, "pat", "pw-old", OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw2, "zed", "pw-zed", OC_ROLE_MEMBER, 2048) != 0);
+    uint64_t sam = oc_dbwriter_register_local(dbw2, "sam", "pw-sam", OC_ROLE_MEMBER, 2048);
+    CHECK(sam != 0);
+    uint8_t fkey[OC_FACTOR_KEY_LEN];
+    memset(fkey, 0x5a, sizeof fkey);
+    oc_dbwriter_set_factor_key(dbw2, fkey);
     char setup_hex[2 * OC_INVITE_TOKEN_LEN + 1];
     for (size_t i = 0; i < sizeof setup; i++) snprintf(setup_hex + 2 * i, 3, "%02x", setup[i]);
     struct loop_arg arg2;
@@ -2113,6 +2141,97 @@ static void test_web_signin(int port) {
         client_close(&b);
     }
 
+    /* A second step (AUTH.md §8.6). Sam has TOTP: the right password is answered
+     * with the step page, not a token; a wrong code shows it again; the right
+     * one ends the sign-in -- and never twice. Each code is computed as an
+     * authenticator would from the secret, sealed under the factor key. */
+    {
+        uint8_t secret[OC_TOTP_SECRET_LEN], sealed[OC_TOTP_SEALED_LEN];
+        memset(secret, 0x33, sizeof secret);
+        CHECK(oc_factor_seal(fkey, sam, secret, sealed) == 0);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(?, ?, 1);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)sam);
+        sqlite3_bind_blob(st, 2, sealed, sizeof sealed, SQLITE_STATIC);
+        CHECK(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        /* A recovery code: its salt and the SHA-256 of salt and code. */
+        uint8_t row[16 + 32], buf[16 + 10];
+        memset(row, 0x44, 16);
+        memcpy(buf, row, 16); memcpy(buf + 16, "ABCDE12345", 10);
+        mbedtls_sha256(buf, sizeof buf, row + 16, 0);
+        for (int k = 0; k < 2; k++) {
+            if (k) { memcpy(buf + 16, "FGHIJ67890", 10); mbedtls_sha256(buf, sizeof buf, row + 16, 0); }
+            sqlite3_prepare_v2(db, "INSERT INTO local_recovery(user_id, code_hash) VALUES(?, ?);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)sam);
+            sqlite3_bind_blob(st, 2, row, sizeof row, SQLITE_STATIC);
+            CHECK(sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(db);
+
+        uint64_t step = (uint64_t)time(NULL) / OC_TOTP_STEP_S;
+        char code[8], ticket[64], ticket2[64];
+        CHECK(web_signin(port, pin, "sam", "pw-sam", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+        CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        CHECK(strstr(resp, "action=\"signin/verify\"") != NULL);
+        CHECK(web_verify(port, pin, ticket, "000000", tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+        CHECK(strstr(resp, "That code isn&#39;t right") != NULL && strstr(resp, ticket) != NULL);
+        CHECK(strstr(resp, "action=\"verify\"") != NULL);
+        snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step));
+        CHECK(web_verify(port, pin, ticket, code, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        uint64_t got = 0;
+        CHECK(token_auth(port, pin, tok, ver, &got) == 0 && got == sam);
+        /* Spent: the ticket, and the code. */
+        CHECK(web_verify(port, pin, ticket, code, tok, sizeof tok, resp, sizeof resp) == 400 && !tok[0]);
+        CHECK(web_signin(port, pin, "sam", "pw-sam", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket));
+        CHECK(web_verify(port, pin, ticket, code, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+        /* A recovery code, as typed, works once. */
+        CHECK(web_verify(port, pin, ticket, "abcde-12345", tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        CHECK(web_signin(port, pin, "sam", "pw-sam", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket));
+        CHECK(web_verify(port, pin, ticket, "ABCDE12345", tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+
+        /* Without the factor key no step is passed, whatever the code. */
+        oc_dbwriter_set_factor_key(dbw2, NULL);
+        CHECK(web_signin(port, pin, "sam", "pw-sam", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+              ticket_of(resp, ticket, sizeof ticket));
+        snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step + 1));
+        CHECK(web_verify(port, pin, ticket, code, tok, sizeof tok, resp, sizeof resp) == 500 && !tok[0]);
+        oc_dbwriter_set_factor_key(dbw2, fkey);
+
+        /* A sign-in waiting at its step when the password changes is no longer good. */
+        char stale[64];
+        CHECK(web_signin(port, pin, "sam", "pw-sam", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+              ticket_of(resp, stale, sizeof stale));
+
+        /* The password page asks for the step too, and changes nothing until it
+         * is passed: the next step's code finishes it. */
+        CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
+                       "username=sam&current=pw-sam&password=pw-sam2&confirm=pw-sam2", resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket2, sizeof ticket2));
+        CHECK(strstr(resp, "action=\"../signin/verify\"") != NULL);
+        CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+              !ticket_of(resp, ticket, sizeof ticket));                   /* not changed yet */
+        snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step + 1));
+        CHECK(web_verify(port, pin, ticket2, code, NULL, 0, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Password changed") != NULL);
+        CHECK(web_verify(port, pin, stale, "FGHIJ67890", tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
+        CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+              ticket_of(resp, ticket, sizeof ticket));
+
+        /* Five wrong codes and the ticket is gone (the step that changed the
+         * password cleared the account's count of wrong ones). */
+        for (int i = 0; i < 4; i++)
+            CHECK(web_verify(port, pin, ticket, "111111", tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(web_verify(port, pin, ticket, "111111", tok, sizeof tok, resp, sizeof resp) == 400);
+        CHECK(web_verify(port, pin, ticket, "111111", tok, sizeof tok, resp, sizeof resp) == 400);
+    }
+
     /* The per-account limiter stands in front of the page as of the frame. */
     for (int i = 0; i < 5; i++)
         CHECK(web_signin(port, pin, "zed", "wrong", ch, tok, sizeof tok, resp, sizeof resp) == 200);
@@ -2249,6 +2368,52 @@ static void test_device_signin(int port) {
     uint64_t uid = 0;
     CHECK(token_auth(port, pin, tok, "not-the-verifier-of-this-challenge-at-all", &uid) == OC_ERR_AUTH_INVALID_TOKEN);
     CHECK(token_auth(port, pin, tok, ver, &uid) == 0 && uid == d.dee);
+
+    /* With a second step, approving takes the code as well (AUTH.md §8.6): the
+     * right password shows the step page, and the terminal is signed in only
+     * once its code is in. */
+    {
+        uint8_t fkey[OC_FACTOR_KEY_LEN], secret[OC_TOTP_SECRET_LEN], sealed[OC_TOTP_SEALED_LEN];
+        memset(fkey, 0x6b, sizeof fkey);
+        memset(secret, 0x21, sizeof secret);
+        oc_dbwriter_set_factor_key(d.dbw, fkey);
+        CHECK(oc_factor_seal(fkey, d.dee, secret, sealed) == 0);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open("build/itest_dev.db", &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(?, ?, 1);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)d.dee);
+        sqlite3_bind_blob(st, 2, sealed, sizeof sealed, SQLITE_STATIC);
+        CHECK(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        client s2;
+        CHECK(client_open(&s2, port, pin) == 0 && do_handshake(&s2) == 0);
+        CHECK(device_begin(&s2, ch, dcode, sizeof dcode, ucode, sizeof ucode, &interval, &expires, vpath, sizeof vpath) == 0);
+        snprintf(body, sizeof body, "code=%s&username=dee&password=pw-dee&action=approve", ucode);
+        CHECK(web_call(port, pin, "POST", "/device", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        char ticket[64], code[8];
+        CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        CHECK(strstr(resp, "action=\"signin/verify\"") != NULL);
+        CHECK(device_poll(&s2, dcode, tok, sizeof tok, why, sizeof why) == OC_ERR_AUTH_PENDING ||
+              strcmp(why, "poll every 15 seconds") == 0);
+        snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, (uint64_t)time(NULL) / OC_TOTP_STEP_S));
+        CHECK(web_verify(port, pin, ticket, code, NULL, 0, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Go back to your terminal") != NULL);
+        int polled = -1;
+        for (int i = 0; i < 6 && polled != 0; i++) {
+            polled = device_poll(&s2, dcode, tok, sizeof tok, why, sizeof why);
+            if (polled == OC_ERR_AUTH_SLOW_DOWN) usleep(100000);
+        }
+        CHECK(polled == 0 && tok[0]);
+        CHECK(token_auth(port, pin, tok, ver, &uid) == 0 && uid == d.dee);
+        client_close(&s2);
+        sqlite3_open("build/itest_dev.db", &db);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_exec(db, "DELETE FROM local_totp;", NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
 
     /* "That wasn't me": the terminal is told, once. */
     client b;
