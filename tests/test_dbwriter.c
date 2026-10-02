@@ -4021,7 +4021,8 @@ static void test_tls_identity(void) {
 }
 
 /* First-owner setup token (REQ-024): a fresh tenant mints a one-time owner
- * invite; redeeming it creates the owner; afterward none is minted. */
+ * invite; redeeming it creates the owner; afterward none is minted, and none
+ * minted before works. Only owners who can sign in count. */
 static void test_setup_invite(void) {
     const char *path = "build/test_dbwriter_setup.db";
     cleanup_db(path);
@@ -4045,6 +4046,48 @@ static void test_setup_invite(void) {
 
     /* An owner now exists -> nothing is minted. */
     CHECK(oc_dbwriter_setup_invite(w, tok) == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+
+    /* Only the newest setup token works: each boot prints one, and a log keeps
+     * every one it printed. */
+    w = start_db(path);
+    CHECK(w != NULL);
+    uint8_t old[OC_INVITE_TOKEN_LEN], newer[OC_INVITE_TOKEN_LEN];
+    CHECK(oc_dbwriter_setup_invite(w, old) == 1);
+    CHECK(oc_dbwriter_setup_invite(w, newer) == 1);
+    r = redeem_invite(w, old, "early", "pw");
+    CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+
+    /* A token printed before an owner was made otherwise makes no second one. */
+    uint64_t first = reg(w, "first", "pw", OC_ROLE_OWNER);
+    CHECK(first != 0);
+    r = redeem_invite(w, newer, "late", "pw");
+    CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+
+    /* A removed owner is no owner: with the other owner removed, the one left is
+     * the last -- it can be neither demoted nor removed -- and with every owner
+     * removed, a setup token is minted again. */
+    uint64_t second = reg(w, "second", "pw", OC_ROLE_OWNER);
+    CHECK(second != 0);
+    CHECK(remove_user(w, first, second) == 0);
+    CHECK(set_role(w, first, first, OC_ROLE_MEMBER) == OC_ERR_LAST_OWNER);
+    CHECK(remove_user(w, first, first) == OC_ERR_LAST_OWNER);
+    CHECK(oc_dbwriter_setup_invite(w, tok) == 0);
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        CHECK(sqlite3_exec(db, "UPDATE users SET disabled=1;", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    CHECK(oc_dbwriter_setup_invite(w, tok) == 1);
+    r = redeem_invite(w, tok, "rescuer", "pw");
+    CHECK(r && r->type == OC_RES_AUTH_OK && r->role == OC_ROLE_OWNER);
+    oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
     cleanup_db(path);

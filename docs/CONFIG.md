@@ -223,7 +223,7 @@ column detail is in [SCHEMA.md](./SCHEMA.md).
 | `local_issuer` (one row) | At first start | The key and issuer name that sign the ID token a browser sign-in on the daemon's own pages ends with (AUTH.md §8.10, migration 0050): a restored database still verifies what it signed. A private key. |
 | `acme_account`, `tls_certificate` (one row each) | When a CA-issued certificate is first obtained | The ACME account (with its CA's directory) and the certificate presented, with its source, names and expiry; presented at once on a restart that still has that source and those names (migration 0049). |
 | `enrollment` (one row) | When `OPENCHIME_ENROLL_URL` first takes effect | The enrollment key, the audience and `pending` / `active`. The stored audience outranks `OPENCHIME_OIDC_AUDIENCE`, and push and invitation mail need `active` (ARCH-84/85). |
-| `invites` with no `created_by` | At boot, in `local` auth mode, while no owner exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). |
+| `invites` with no `created_by` | At boot, in `local` auth mode, while no owner who can sign in exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). A newer token spends the older ones, and none is redeemed once an owner can sign in. |
 | `users.role` | By owners and admins | `owner` / `admin` / `member` — who may administer the workspace (ARCH-60). |
 | `users.disabled` | By member removal | A removed member cannot sign in and does not count against `OPENCHIME_MAX_USERS` (CP-7). |
 | `webhooks` | By owners and admins | Incoming webhooks and the channel each posts to (REQ-170). |

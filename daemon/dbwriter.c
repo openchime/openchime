@@ -1063,15 +1063,6 @@ static int user_disabled(sqlite3 *db, uint64_t uid) {
     return disabled;
 }
 
-static int count_owners(sqlite3 *db) {
-    sqlite3_stmt *st = NULL;
-    int n = 0;
-    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE role='owner';", -1, &st, NULL);
-    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st);
-    return n;
-}
-
 /* Owners who can still sign in. A removed owner keeps the role on its row, and a
  * workspace whose only owners are removed has nobody to run it. */
 static int count_active_owners(sqlite3 *db) {
@@ -1623,7 +1614,7 @@ static oc_dbres *process_set_role(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     /* ≥1-owner invariant: refuse demoting the tenant's last owner. */
-    if (target_cur == OC_ROLE_OWNER && next != OC_ROLE_OWNER && count_owners(db) <= 1) {
+    if (target_cur == OC_ROLE_OWNER && next != OC_ROLE_OWNER && count_active_owners(db) <= 1) {
         r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
     }
 
@@ -1836,15 +1827,29 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     return r;
 }
 
-/* First-run bootstrap (REQ-024): if the tenant has no owner yet, mint a one-time
- * owner invite so the operator can create the first owner by redeeming it (no
- * pre-existing admin needed, air-gapped-safe). Returns INVITE_OK with the token,
- * or INVITE_ERR/err_code 0 when an owner already exists (nothing to do). */
+/* Unredeemed setup tokens are spent: a newer one replaces them, and an owner who
+ * can sign in ends them all. */
+static void spend_setup_tokens(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "UPDATE invites SET consumed_at_ms=? WHERE created_by IS NULL AND consumed_at_ms IS NULL;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+/* First-run bootstrap (REQ-024): if the tenant has no owner who can sign in, mint
+ * a one-time owner invite so the operator can create one by redeeming it (no
+ * pre-existing admin needed, air-gapped-safe). Only the newest works: each boot
+ * prints one, and a log keeps every one it printed. Returns INVITE_OK with the
+ * token, or INVITE_ERR/err_code 0 when an owner exists (nothing to do). */
 static oc_dbres *process_setup_invite(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
-    if (count_owners(db) > 0) { r->type = OC_RES_INVITE_ERR; r->err_code = 0; return r; }
+    if (count_active_owners(db) > 0) { r->type = OC_RES_INVITE_ERR; r->err_code = 0; return r; }
+    spend_setup_tokens(db);
     uint8_t token[OC_INVITE_TOKEN_LEN]; uint64_t expiry = 0;
     if (mint_invite(db, 0, OC_ROLE_OWNER, token, &expiry) != 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
@@ -1926,6 +1931,12 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     }
     sqlite3_finalize(st);
     if (!found || consumed || (expiry != 0 && dbw_now_ms() >= expiry)) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    /* A setup token makes an owner only for a workspace with none who can sign
+     * in: one printed before the first owner signed up makes no second. */
+    if (!created_by && count_active_owners(db) > 0) {
+        spend_setup_tokens(db);
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
     }
 
@@ -2159,7 +2170,7 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     if (target_role != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) {
         r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-    if (target_role == OC_ROLE_OWNER && count_owners(db) <= 1) {
+    if (target_role == OC_ROLE_OWNER && count_active_owners(db) <= 1) {
         r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
     }
 
