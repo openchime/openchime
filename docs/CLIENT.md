@@ -168,7 +168,17 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   core's, on the network thread (`client/core/callsig.c`): `oc_client_call_start`,
   `_join`, `_leave`, `_decline`, `_end` and `_invite`, answered in the model as
   `calls` (the Calls section), `call`/`in_call` and `call_error`, with invitations
-  worth a toast drained by `oc_client_call_notify_take`. The audio is the
+  worth a toast drained by `oc_client_call_notify_take`. A call the device was put
+  out of by its connection, a sweep or a moved media path is rejoined by the core
+  (CALLS.md §4): `call_rejoining` names it meanwhile, `call` still describing it,
+  and `call_back_seq` / `call_lost_seq` count how such attempts ended. The Win32
+  client keeps the in-call strip and the call view up, reading "Reconnecting to
+  the call…", the tiles greyed and Leave the one control; it says "Back in the
+  call." when that works and "Lost the call. Join it again from the channel." when
+  it does not. Someone else whose connection went (`call.away`, from the roster's
+  `AWAY` flag) has a greyed tile reading "Reconnecting…" until they are back or
+  their seat goes. In the call view, toasts stand above the call's controls and
+  the line of who is invited, not on them. The audio is the
   engine's (`client/core/call/`, linked by the Win32 client and the tests),
   plugged in with `oc_client_set_call_media` behind the `oc_call_media` seam, so
   the TUI links no codec. See [CALLS.md](./CALLS.md) and [AUDIO.md](./AUDIO.md).

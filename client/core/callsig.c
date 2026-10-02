@@ -100,7 +100,11 @@ static void push_view(oc_queue *to_ui, int type, const oc_callsig *cs, uint64_t 
     v->epoch = cs->epoch;
     v->my_slot = cs->slot;
     v->n_parts = cs->n;
-    for (uint16_t i = 0; i < cs->n; i++) { v->parts[i] = cs->parts[i].user_id; v->slots[i] = cs->parts[i].slot; }
+    for (uint16_t i = 0; i < cs->n; i++) {
+        v->parts[i] = cs->parts[i].user_id;
+        v->slots[i] = cs->parts[i].slot;
+        v->away[i] = (cs->parts[i].flags & OC_CALL_PART_AWAY) != 0;
+    }
     oc_queue_push(to_ui, e);
 }
 
@@ -169,6 +173,118 @@ static void leave_local(oc_callsig *cs, oc_queue *to_ui) {
     push_left(to_ui, ch);
 }
 
+/* --- getting back in (PROTOCOL.md §5.17) -------------------------------------- */
+
+static uint64_t rejoin_window(const oc_callsig *cs) { return cs->rejoin_ms ? cs->rejoin_ms : OC_CALLSIG_REJOIN_MS; }
+
+static void push_ch(oc_queue *to_ui, int type, uint64_t channel_id) {
+    oc_ev *e = oc_ev_new(type);
+    if (!e) return;
+    e->channel_id = channel_id;
+    oc_queue_push(to_ui, e);
+}
+
+/* Out of the call by no act of this device's: media stops -- its token is dead
+ * -- but the call is remembered, to get back into. `connected`: on a
+ * connection that is signed in now, as after a sweep or a moved path. */
+static void rejoin_begin(oc_callsig *cs, oc_queue *to_ui, int connected) {
+    uint64_t ch = cs->channel_id, call = cs->call_id;
+    media_stop(cs);
+    cs->in_call = 0;
+    cs->n = 0;
+    cs->channel_id = cs->call_id = 0;
+    cs->rj.on = 1;
+    cs->rj.channel_id = ch;
+    cs->rj.call_id = call;
+    cs->rj.since_ms = cs->now_ms;
+    cs->rj.authed_ms = connected ? cs->now_ms : 0;
+    cs->rj.sent = 0;
+    push_ch(to_ui, OC_EV_CALL_REJOINING, ch);
+}
+
+/* No more rejoining: LOST when it could not be done, LEFT when this device
+ * left, 0 when a join of its own took over. */
+static void rejoin_end(oc_callsig *cs, oc_queue *to_ui, int ev) {
+    uint64_t ch = cs->rj.channel_id;
+    memset(&cs->rj, 0, sizeof cs->rj);
+    if (ev) push_ch(to_ui, ev, ch);
+}
+
+static int send_join(oc_callsig *cs, uint64_t channel_id, const uint64_t *uids, uint16_t n_uids,
+                     oc_callsig_write write, void *wctx) {
+    uint8_t buf[512];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_mutex_lock(&cs->mu);
+    uint8_t codecs = cs->media ? cs->media->codecs : 0;
+    oc_mutex_unlock(&cs->mu);
+    oc_call_join cj = { channel_id, {0}, n_uids, uids, codecs };
+    memcpy(cj.device_key, cs->pk, OC_CALL_DEVICE_KEY_LEN);
+    if (oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) != OC_OK) return -1;
+    return write(wctx, buf, w.len);
+}
+
+/* The join that gets back in -- unless this device has rejoined too often
+ * lately, which a path that keeps failing would make it do for ever. */
+static void rejoin_send(oc_callsig *cs, oc_callsig_write write, void *wctx, oc_queue *to_ui) {
+    int recent = 0, oldest = 0;
+    for (int i = 0; i < OC_CALLSIG_REJOINS; i++) {
+        if (cs->rj_at[i] && cs->now_ms - cs->rj_at[i] < rejoin_window(cs)) recent++;
+        if (cs->rj_at[i] < cs->rj_at[oldest]) oldest = i;
+    }
+    if (recent >= OC_CALLSIG_REJOINS) { rejoin_end(cs, to_ui, OC_EV_CALL_LOST); return; }
+    cs->rj_at[oldest] = cs->now_ms ? cs->now_ms : 1;
+    cs->rj.sent = 1;
+    if (send_join(cs, cs->rj.channel_id, NULL, 0, write, wctx) != 0) rejoin_end(cs, to_ui, OC_EV_CALL_LOST);
+}
+
+void oc_callsig_lost(oc_callsig *cs, oc_queue *to_ui, uint64_t now_ms) {
+    cs->now_ms = now_ms;
+    if (cs->in_call) {
+        rejoin_begin(cs, to_ui, 0);
+    } else if (cs->rj.on) {
+        cs->rj.authed_ms = 0;       /* lost again on the way back: wait for the next */
+        cs->rj.sent = 0;
+    }
+}
+
+void oc_callsig_authed(oc_callsig *cs, uint64_t now_ms) {
+    cs->now_ms = now_ms;
+    if (cs->rj.on) { cs->rj.authed_ms = now_ms ? now_ms : 1; cs->rj.sent = 0; }
+}
+
+void oc_callsig_quit(oc_callsig *cs, oc_callsig_write write, void *wctx, oc_queue *to_ui) {
+    if (cs->in_call) {
+        oc_call_leave cl = { cs->channel_id };
+        uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        if (oc_encode_call_leave(&w, OC_PROTOCOL_VERSION, &cl) == OC_OK) write(wctx, buf, w.len);
+        leave_local(cs, to_ui);
+    }
+    if (cs->rj.on) rejoin_end(cs, to_ui, OC_EV_CALL_LEFT);
+}
+
+void oc_callsig_refused(oc_callsig *cs, oc_queue *to_ui) {
+    if (cs->rj.on && cs->rj.sent) rejoin_end(cs, to_ui, OC_EV_CALL_LOST);
+}
+
+void oc_callsig_tick(oc_callsig *cs, uint64_t now_ms, oc_callsig_write write, void *wctx, oc_queue *to_ui) {
+    cs->now_ms = now_ms;
+    if (cs->in_call && write) {
+        oc_mutex_lock(&cs->mu);
+        int lost = cs->media && cs->media->lost && cs->media->lost(cs->mctx);
+        oc_mutex_unlock(&cs->mu);
+        if (lost) {
+            rejoin_begin(cs, to_ui, 1);
+            rejoin_send(cs, write, wctx, to_ui);
+        }
+    }
+    if (!cs->rj.on) return;
+    if (now_ms - cs->rj.since_ms >= rejoin_window(cs)) { rejoin_end(cs, to_ui, OC_EV_CALL_LOST); return; }
+    /* Signed in, and the daemon has not reported the call: it is over. */
+    uint64_t wait = cs->state_wait_ms ? cs->state_wait_ms : OC_CALLSIG_STATE_WAIT_MS;
+    if (write && cs->rj.authed_ms && !cs->rj.sent && now_ms - cs->rj.authed_ms >= wait)
+        rejoin_end(cs, to_ui, OC_EV_CALL_LOST);
+}
+
 static int find_slot(const oc_callsig *cs, uint8_t slot) {
     for (uint16_t i = 0; i < cs->n; i++) if (cs->parts[i].slot == slot) return i;
     return -1;
@@ -226,8 +342,12 @@ int oc_callsig_command(oc_callsig *cs, const oc_cmd *c, oc_store *store, const c
     if (rc != OC_OK) return -1;
     int wr = write(wctx, buf, w.len);
     /* Leaving is this device's own act: it is out now, whatever the daemon says
-     * next -- which to a leaver is nothing about the call's participants. */
+     * next -- which to a leaver is nothing about the call's participants. A
+     * leave while getting back in stops that; a join of its own takes over. */
     if (c->type == OC_CMD_CALL_LEAVE && cs->in_call && cs->channel_id == c->channel_id) leave_local(cs, to_ui);
+    if (c->type == OC_CMD_CALL_LEAVE && cs->rj.on && cs->rj.channel_id == c->channel_id)
+        rejoin_end(cs, to_ui, OC_EV_CALL_LEFT);
+    if (c->type == OC_CMD_CALL_JOIN && cs->rj.on) rejoin_end(cs, to_ui, 0);
     return wr;
 }
 
@@ -242,6 +362,7 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
         if (oc_decode_call_joined(p, &jd, parts, OC_MAX_CALL_PARTICIPANTS) != OC_OK) return -1;
         /* In another call a moment ago: that one is over for this device. */
         if (cs->in_call) leave_local(cs, to_ui);
+        if (cs->rj.on) rejoin_end(cs, to_ui, 0);   /* back in: JOINED says so */
         cs->in_call = 1;
         cs->channel_id = jd.channel_id;
         cs->call_id = jd.call_id;
@@ -286,11 +407,17 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
         oc_call_roster ro;
         if (oc_decode_call_roster(p, &ro, parts, OC_MAX_CALL_PARTICIPANTS) != OC_OK) return -1;
         if (!cs->in_call || ro.call_id != cs->call_id) return 1;
-        int still = 0;
-        for (uint16_t i = 0; i < ro.count; i++)
+        int still = 0, elsewhere = 0;
+        for (uint16_t i = 0; i < ro.count; i++) {
             if (parts[i].slot == cs->slot && parts[i].user_id == cs->self_user &&
                 !memcmp(parts[i].device_key, cs->pk, OC_CALL_DEVICE_KEY_LEN)) still = 1;
-        if (!still) { leave_local(cs, to_ui); return 1; }   /* moved to another device, or swept */
+            else if (parts[i].user_id == cs->self_user) elsewhere = 1;
+        }
+        /* Not here any more. On another device of this user's, it moved there:
+         * out. Otherwise the relay swept it -- its path went -- and it gets
+         * back in. */
+        if (!still && elsewhere) { leave_local(cs, to_ui); return 1; }
+        if (!still) { rejoin_begin(cs, to_ui, 1); rejoin_send(cs, write, wctx, to_ui); return 1; }
         cs->epoch = ro.epoch;
         cs->n = ro.count;
         memcpy(cs->parts, parts, ro.count * sizeof parts[0]);
@@ -350,6 +477,12 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
         }
         /* Ended for everyone -- by its starter, or its last participant left. */
         if (st.ended && cs->in_call && st.call_id == cs->call_id) leave_local(cs, to_ui);
+        /* The call being got back into: still there, so join it; over -- or a
+         * new call in its place -- so it cannot be. */
+        if (cs->rj.on && st.channel_id == cs->rj.channel_id) {
+            if (st.call_id == cs->rj.call_id ? st.ended : !st.ended) rejoin_end(cs, to_ui, OC_EV_CALL_LOST);
+            else if (cs->rj.authed_ms && !cs->rj.sent) rejoin_send(cs, write, wctx, to_ui);
+        }
         return 1;
     }
     default:
@@ -357,6 +490,4 @@ int oc_callsig_frame(oc_callsig *cs, uint16_t type, oc_rbuf *p, const char *host
     }
 }
 
-void oc_callsig_lost(oc_callsig *cs, oc_queue *to_ui) {
-    leave_local(cs, to_ui);
-}
+

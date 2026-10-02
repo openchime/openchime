@@ -264,17 +264,22 @@ type, the frame number and the Opus packet, encrypted as one SFrame (CALLS.md §
 an encrypted packet saying it is muted; and every client sends an empty
 **keep-alive** at least every 5 s, so the relay's 20 s silence sweep takes only
 the vanished and never someone quiet. The relay answers a keep-alive to its sender alone,
-so a client hears back from the relay even when nobody else is in the call.
+so a client hears back from the relay even when nobody else is in the call — and a
+client sends one every 4 s while talking too, three in every 12 s, so that answer
+alone proves the path when nobody else is sending.
 
 **The return address is bound on first use.** The relay learns where to send a
 participant's audio from the first datagram carrying their token, and after that
 drops that token from any other address. The token leads every packet in the
 clear, so re-learning the address freely would let anyone who saw one packet
 redirect that participant's audio to themselves. A client whose address changes
-mid-call — NAT rebinding, a switch from Wi-Fi to cellular — is therefore not
-relayed from the new one: its packets stop counting, the relay's silence sweep
-drops it and says so, and it rejoins with `CALL_JOIN`, which issues a fresh token
-over the authenticated TCP connection.
+mid-call — NAT rebinding, a switch from Wi-Fi to cellular, a front door's
+failover — is therefore not relayed from the new one. Its engine notices first:
+UDP that worked and has gone quiet for 12 s is reported as a lost path, and the
+client rejoins with `CALL_JOIN`, which issues a fresh token over the
+authenticated TCP connection and binds the new address (the connection transport
+carries the audio meanwhile, where the daemon offers it). Failing that, the
+relay's silence sweep drops it at 20 s and tells it, and it rejoins then.
 
 **Reaching the relay.** The relay binds its UDP port on every address, IPv6 and
 IPv4 on one socket, as the protocol port does. It answers each participant

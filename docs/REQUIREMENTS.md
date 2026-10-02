@@ -1197,9 +1197,11 @@ where one exists.
   hold up a call (ARCH-18/22). The daemon never touches the codec (ARCH-73).
 - **REQ-152.** A participant's connection loss during a call has not ended the
   call for the others; the daemon has kept relaying for them and has let the
-  disconnected participant rejoin. A `CALL_LEAVE`, a TCP disconnect or the
-  relay's silence sweep (20 s) drops the participant, the rest rekey, and the
-  call persists while one remains; rejoin is a fresh `CALL_JOIN` (ARCH-73).
+  disconnected participant rejoin. A `CALL_LEAVE` or the relay's silence sweep
+  (20 s) drops the participant, the rest rekey, and the call persists while one
+  remains; a TCP disconnect holds the participant's seat for 15 s before it is
+  dropped. The client rejoins by itself — after a reconnect, a sweep or a moved
+  media path — with a fresh `CALL_JOIN`, and says so while it does (ARCH-73).
 - **REQ-301.** A user has been able to **start a call** from a conversation's
   header or the **+** on the Calls section. Starting in a channel or a group DM
   has invited every member up to the cap, and where the members outnumber it the

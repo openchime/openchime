@@ -1012,6 +1012,8 @@ typedef struct {
     uint8_t  token[OC_AUDIO_TOKEN_MAX];   /* audio_token_len() of it */
     uint8_t  device_key[OC_CALL_DEVICE_KEY_LEN];
     uint8_t  codecs;               /* the video codecs it can decode (ARCH-87) */
+    uint64_t detached_ms;          /* when its connection went (conn_id is then 0):
+                                    * its seat is held for a rejoin; 0 while attached */
 } call_part;
 typedef struct {
     uint64_t  channel_id;          /* 0 marks a free slot */
@@ -1066,6 +1068,17 @@ void oc_netloop_set_health_port(int port) {
 
 void oc_netloop_set_relay_silence_ms(uint64_t ms) {
     __atomic_store_n(&g_relay_silence_ms, ms, __ATOMIC_RELAXED);
+}
+
+/* How long a lost connection's seat in a call is held for its rejoin
+ * (OC_CALL_REJOIN_GRACE_MS), or a test's shorter time; 0 restores it. */
+static uint64_t g_call_grace_ms;
+static uint64_t call_grace_ms(void) {
+    uint64_t v = __atomic_load_n(&g_call_grace_ms, __ATOMIC_RELAXED);
+    return v ? v : OC_CALL_REJOIN_GRACE_MS;
+}
+void oc_netloop_set_call_grace_ms(uint64_t ms) {
+    __atomic_store_n(&g_call_grace_ms, ms, __ATOMIC_RELAXED);
 }
 
 /* The presence-change window (OC_PRESENCE_RATE_MS), or a test's shorter one; 0
@@ -1337,6 +1350,7 @@ static void call_fill_parts(const call_t *c, oc_call_part *out) {
         out[k].slot = c->parts[k].slot;
         memcpy(out[k].device_key, c->parts[k].device_key, OC_CALL_DEVICE_KEY_LEN);
         out[k].codecs = c->parts[k].codecs;
+        out[k].flags = c->parts[k].detached_ms ? OC_CALL_PART_AWAY : 0;
     }
 }
 
@@ -1390,22 +1404,58 @@ static void call_finish(int ep, conn **conns, call_t *c) {
 }
 
 /* Take participant `idx` out of `c`: off the relay, and a new epoch for the
- * rest, who rekey (CALLS.md §5.3). The last one out ends the call. */
-static void call_drop(int ep, conn **conns, call_t *c, int idx) {
+ * rest, who rekey (CALLS.md §5.3). The last one out ends the call. `tell_conn`,
+ * when not 0, is a connection that was the participant and is still open -- one
+ * the relay swept -- and is sent the roster without it, so it knows it is out
+ * and can rejoin (PROTOCOL.md §5.17). */
+static void call_drop_tell(int ep, conn **conns, call_t *c, int idx, uint64_t tell_conn) {
     audio_revoke(c->parts[idx].token);
     call_remove_part(c, idx);
     if (c->n == 0) { call_finish(ep, conns, c); return; }
     c->epoch++;
     uint64_t ch = c->channel_id;
-    call_send_roster(ep, conns, c, 0, 0);
+    call_send_roster(ep, conns, c, 0, tell_conn);
     call_t *cc = call_find(ch);
     if (cc) call_send_state(ep, conns, cc, 0);
 }
 
+static void call_drop(int ep, conn **conns, call_t *c, int idx) {
+    call_drop_tell(ep, conns, c, idx, 0);
+}
+
+/* A participant's connection went (REQ-152). Its seat is held, not emptied:
+ * off the relay, so nothing reaches it, but still in the roster -- marked away,
+ * so the others can say so -- for call_grace_ms(): long enough for a client to
+ * reconnect and rejoin, which takes the seat back (the join's same-user path).
+ * A call whose members all lose their connection together, as a front door's
+ * failover does, is still there when they come back. The rest are told in a
+ * new epoch, as for any change to the roster; a sharer that goes stops sharing
+ * at once. */
 static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
     int idx;
     call_t *c = call_of_conn(conn_id, &idx);
-    if (c) call_drop(ep, conns, c, idx);
+    if (!c) return;
+    call_part *pt = &c->parts[idx];
+    audio_revoke(pt->token);
+    int was_sharer = c->sharer_conn == conn_id;
+    if (was_sharer) c->sharer_conn = 0;
+    pt->conn_id = 0;
+    pt->detached_ms = now_ms();
+    if (!pt->detached_ms) pt->detached_ms = 1;
+    c->epoch++;
+    call_send_roster(ep, conns, c, 0, 0);
+    if (was_sharer) call_send_state(ep, conns, c, 0);
+}
+
+/* Seats whose grace has run out are dropped as a leave would be. */
+static void call_expire_detached(int ep, conn **conns) {
+    uint64_t t = now_ms(), grace = call_grace_ms();
+    for (int i = 0; i < OC_MAX_CALLS; i++) {
+        call_t *c = &g_calls[i];
+        for (int k = c->channel_id ? c->n - 1 : -1; k >= 0 && c->channel_id; k--)
+            if (c->parts[k].detached_ms && t - c->parts[k].detached_ms >= grace)
+                call_drop(ep, conns, c, k);   /* swaps the last, already seen, into k */
+    }
 }
 
 /* The relay swept a participant for silence (CALLS.md §3: a client keeps alive
@@ -1416,7 +1466,7 @@ static void call_drop_token(int ep, conn **conns, const uint8_t *token) {
         if (!c->channel_id) continue;
         for (int k = 0; k < c->n; k++)
             if (memcmp(c->parts[k].token, token, audio_token_len()) == 0) {
-                call_drop(ep, conns, c, k);
+                call_drop_tell(ep, conns, c, k, c->parts[k].conn_id);
                 return;
             }
     }
@@ -6143,7 +6193,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
              * per call); that device is told by a roster without it. */
             int k = call_part_of_user(c, jc->user_id);
             if (k >= 0) {
-                moved_from = c->parts[k].conn_id;
+                moved_from = c->parts[k].conn_id;   /* 0 for a held seat: nobody to tell */
                 audio_revoke(c->parts[k].token);
                 call_remove_part(c, k);
             }
@@ -7124,7 +7174,11 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             uint64_t sm = __atomic_load_n(&g_relay_silence_ms, __ATOMIC_RELAXED);
             oc_relay_set_silence_ms(g_relay, sm);
             uint64_t t = now_ms();
-            if (t - last_sweep >= 500) { last_sweep = t; oc_relay_sweep(g_relay); }
+            if (t - last_sweep >= 500) {
+                last_sweep = t;
+                oc_relay_sweep(g_relay);
+                call_expire_detached(ep, conns);
+            }
         }
         if (nfds < 0) { if (errno == EINTR) continue; break; }
         for (int i = 0; i < nfds; i++) {

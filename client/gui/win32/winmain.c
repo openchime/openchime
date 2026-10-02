@@ -4554,6 +4554,12 @@ static int call_here(const oc_model *m) {
     return m && m->in_call && g_call_client == g_client;
 }
 
+/* ...or was, and is getting back in: the connection or the media path went
+ * (PROTOCOL.md §5.17). `m->call` still says which call. */
+static int call_back_here(const oc_model *m) {
+    return m && m->call_rejoining && g_call_client == g_client;
+}
+
 static void share_tex_drop(void) {
     if (g_share_tex) gfx_tex_destroy(g_share_tex);
     g_share_tex = NULL;
@@ -4720,7 +4726,8 @@ static float draw_calls_section(gfx *rt, const oc_model *m, float sy, float sx0,
 /* ---- the in-call strip, at the foot of the sidebar ---------------------------------- */
 
 static float call_strip_h(const oc_model *m) {
-    return call_here(m) && !(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id) ? UIS(64.0f) : 0;
+    return (call_here(m) || call_back_here(m)) && !(g_view == VIEW_CALL && g_call_view_ch == m->call.channel_id)
+           ? UIS(64.0f) : 0;
 }
 
 static void draw_call_strip(gfx *rt, const oc_model *m, float h) {
@@ -4733,6 +4740,16 @@ static void draw_call_strip(gfx *rt, const oc_model *m, float h) {
     char lbl[96], dur[16], line[140];
     call_conv_label(m, m->call.channel_id, lbl, sizeof lbl);
     call_duration(m->call.started_at, dur, sizeof dur);
+    if (call_back_here(m)) {
+        /* Nothing to mute while out: Leave alone, which stops getting back in. */
+        snprintf(line, sizeof line, "%s  \u00B7  Reconnecting to the call\u2026", lbl);
+        draw_lucide(rt, OC_ICON_PHONE, rf(x0 + UIS(8), g_cstrip.top + UIS(8), x0 + UIS(24), g_cstrip.top + UIS(24)),
+                    OC_COL_MUTED);
+        draw_text(rt, line, g_ui_b, rf(x0 + UIS(30), g_cstrip.top + 2, x1 - 8, g_cstrip.top + UIS(30)), OC_COL_MUTED);
+        g_cstrip_leave = rf(x0 + UIS(8), g_cstrip.bottom - UIS(30), x1 - UIS(8), g_cstrip.bottom - UIS(6));
+        call_button(rt, g_cstrip_leave, OC_ICON_PHONE_OFF, "Leave", 0, 1);
+        return;
+    }
     if (m->call.sharer == m->user_id) {
         snprintf(line, sizeof line, "%s  \u00B7  You're sharing", lbl);
     } else if (m->call.sharer) {
@@ -10025,10 +10042,13 @@ static void nt_tick(void) {
  * (oc_fb_hold), so the one being read is not the one that leaves. */
 static float g_toast_area_l, g_toast_area_r;      /* the conversation pane, for centring */
 static float g_toast_area_t;                      /* under the header, tab strip and banner */
+static float g_toast_floor;                       /* a view's own controls start here; 0: none */
 static rectf g_ed_box;                            /* the composer's text rect (below); empty: no composer */
 static rectf g_modal_card;                        /* the open dialog's card (below); empty: none */
 static void draw_toasts(gfx *rt, float W, float H) {
     g_n_toast_hit = 0;
+    float view_floor = g_toast_floor;
+    g_toast_floor = 0;              /* this frame's: the next frame's view says again */
     if (!g_fb.n) return;
     float pane_l = g_toast_area_r > g_toast_area_l ? g_toast_area_l : RAIL_W;
     float pane_r = g_toast_area_r > g_toast_area_l ? g_toast_area_r : W;
@@ -10047,7 +10067,9 @@ static void draw_toasts(gfx *rt, float W, float H) {
     int down = !dialog && g_pref_toastpos == TOASTPOS_TOP_RIGHT;  /* stacks downward from the top */
     /* Above the composer where there is one; at the bottom of the window where
      * the view has none (a list, a report), or a dialog covers it. */
+    /* ...above a view's own row of controls (the call view's), where it has one. */
     float floor_y = dialog ? H - UIS(4.0f)
+                  : view_floor > 0 ? view_floor
                   : g_ed_box.right > g_ed_box.left ? H - g_composer_h : H - UIS(12.0f);
     /* Top right starts under the tab strip and any banner, never over them. */
     float top_y = g_toast_area_t > HEADER_H ? g_toast_area_t : HEADER_H;
@@ -16060,7 +16082,10 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     call_conv_label(m, g_call_view_ch, lbl, sizeof lbl);
     const oc_call_view *v = oc_model_call_in(m, g_call_view_ch);
     int in = call_here(m) && m->call.channel_id == g_call_view_ch;
-    if (in) {
+    int back = !in && call_back_here(m) && m->call.channel_id == g_call_view_ch;
+    if (back) {
+        snprintf(sub, sizeof sub, "Reconnecting to the call\u2026");
+    } else if (in) {
         char dur[16];
         call_duration(m->call.started_at, dur, sizeof dur);
         snprintf(sub, sizeof sub, "In the call \u00B7 %s \u00B7 %u %s \u00B7 end-to-end encrypted", dur,
@@ -16093,7 +16118,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
 
     uint64_t people[OC_MAX_CALL_PARTICIPANTS];
     int np = 0;
-    if (in) for (int i = 0; i < m->call.n_parts && np < 32; i++) people[np++] = m->call.parts[i];
+    if (in || back) for (int i = 0; i < m->call.n_parts && np < 32; i++) people[np++] = m->call.parts[i];
     else if (v) for (int i = 0; i < v->n_parts && np < 32; i++) people[np++] = v->parts[i];
     float cardw = UIS(176.0f), cardh = UIS(150.0f), gap = UIS(14.0f);
     float gx = body.left + 24, gy = body.top + 36;
@@ -16187,6 +16212,17 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
         g_ui->align = ST_ALIGN_CENTER;
         draw_text(rt, name, g_ui, rf(card.left + 8, ay + av + 6, card.right - 8, ay + av + UIS(28)), OC_COL_TEXT);
         g_ui->align = ST_ALIGN_LEFT;
+        /* Their connection went; their seat is held for a few seconds while
+         * they get back in (PROTOCOL.md §5.17). */
+        int away = in && i < m->call.n_parts && m->call.away[i];
+        if (back || away) fill_round_a(rt, card, OC_R_CONTROL, OC_COL_BASE, 0.6f);   /* not heard while out */
+        if (away) {
+            g_meta->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Reconnecting\u2026", g_meta,
+                      rf(card.left + 8, card.bottom - UIS(28), card.right - 8, card.bottom - UIS(8)), OC_COL_MUTED);
+            g_meta->align = ST_ALIGN_LEFT;
+            continue;   /* no volume for someone not here */
+        }
         /* Their volume, for this listener: - bar + (REQ-150). */
         if (in && !me && g_call_engine && i < 40) {
             float gain = oc_call_engine_volume(g_call_engine, uid);
@@ -16225,7 +16261,16 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
 
     /* The controls, along the bottom. */
     float by = body.bottom - UIS(64), bh = UIS(40), x = body.left + 24;
+    /* Toasts stand above the controls, and the line of who is invited, never
+     * on them. */
+    g_toast_floor = iv && iv->n_invited ? body.bottom - UIS(176) : by - UIS(8);
     rectf b;
+    if (back) {
+        b = rf(x, by, x + call_button_w("Leave", OC_ICON_PHONE_OFF), by + bh);
+        call_button(rt, b, OC_ICON_PHONE_OFF, "Leave", 0, 1);
+        call_btn_add(b, CC_LEAVE, "call.leave", "Leave");
+        return;
+    }
     if (!in) {
         if (!np && !v) {
             draw_empty_state(rt, rf(body.left, body.top, body.right, body.bottom - UIS(80)), OC_ICON_PHONE,
@@ -16259,6 +16304,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     for (int i = 0; i < g_call_nspks; i++) if (oc_hash32(g_call_spks[i].id) == g_call_spk_h) snprintf(spk, sizeof spk, "%s", g_call_spks[i].name);
     const char *nsl = g_call_ns ? "Noise suppression: on" : "Noise suppression: off";
     float row1 = by - bh - UIS(10);
+    if (g_toast_floor > row1 - UIS(30)) g_toast_floor = row1 - UIS(30);   /* ...the devices and their hint */
     float nsw = call_button_w(nsl, -1);
     float avail = body.right - 24 - x - nsw - 20;
     float dw = avail / 2 > UIS(260) ? UIS(260) : avail / 2;
@@ -26024,7 +26070,7 @@ static void call_claim(void) {
     if (!g_call_engine || !g_client) return;
     if (g_call_client && g_call_client != g_client) {
         const oc_model *om = oc_client_model(g_call_client);
-        if (om && om->in_call) oc_client_call_leave(g_call_client, om->call.channel_id);
+        if (om && (om->in_call || om->call_rejoining)) oc_client_call_leave(g_call_client, om->call.channel_id);
         oc_client_set_call_media(g_call_client, NULL, NULL);
     }
     oc_client_set_call_media(g_client, oc_call_engine_media(), g_call_engine);
@@ -26120,6 +26166,21 @@ static void call_tick(HWND hwnd) {
         g_call_err_at = GetTickCount64();
         if (m->call_error == OC_ERR_CALL_FULL) oc_a11y_announce("The call is full");
     }
+    /* Getting back into a call (PROTOCOL.md §5.17): said as it starts, and how
+     * it ended -- each once, and only for the model they happened in. */
+    static const oc_model *seq_m;
+    static uint32_t back_seq, lost_seq;
+    static uint64_t rejoin_said;
+    if (m && m != seq_m) { seq_m = m; back_seq = m->call_back_seq; lost_seq = m->call_lost_seq; rejoin_said = 0; }
+    if (m && g_call_client == g_client) {
+        if (m->call_rejoining && m->call_rejoining != rejoin_said) oc_a11y_announce("Reconnecting to the call");
+        rejoin_said = m->call_rejoining;
+        if (m->call_back_seq != back_seq) { back_seq = m->call_back_seq; fb_confirm("Back in the call."); }
+        if (m->call_lost_seq != lost_seq) {
+            lost_seq = m->call_lost_seq;
+            fb_failed("Lost the call. Join it again from the channel.");
+        }
+    }
     if (m) share_tick(hwnd);
 }
 
@@ -26196,7 +26257,7 @@ static void call_cmd(HWND hwnd, int cmd) {
         }
         break;
     case CC_LEAVE:
-        if (in) oc_client_call_leave(g_client, m->call.channel_id);
+        if (in || call_back_here(m)) oc_client_call_leave(g_client, m->call.channel_id);
         break;
     case CC_END:
         if (in) oc_client_call_end(g_client, m->call.channel_id);

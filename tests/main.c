@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 int run_protocol_tests(void);
+int run_callsig_tests(void);
 int run_fuzz_tests(void);
 int run_framebuf_tests(void);
 int run_migrate_tests(void);
@@ -234,6 +235,7 @@ int main(void) {
     total += SUITE(run_acme_tests);
     total += SUITE(run_netloop_tests);
     total += SUITE(run_client_core_tests);
+    total += SUITE(run_callsig_tests);
     total += SUITE(run_enroll_tests);
     total += SUITE(run_push_tests);
     total += SUITE(run_invite_mail_tests);

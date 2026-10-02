@@ -30,7 +30,10 @@
  * connection transport, the engine sends by the connection instead. It does the
  * same if UDP goes quiet mid-call for UDP_LOST_MS, over two keepalive echoes.
  * On the connection it still probes UDP every TCP_PROBE_MS, and the first
- * datagram back moves it to UDP again. */
+ * datagram back moves it to UDP again. UDP quiet for UDP_LOST_MS after it had
+ * worked is also reported (the media hook's `lost`): the path has most likely
+ * moved -- a new address the relay will not take for this token -- and the core
+ * rejoins the call for a fresh one (PROTOCOL.md §5.17). */
 #define PROBE_MS     1000
 #define UDP_WAIT_MS  3000
 #define UDP_LOST_MS  12000
@@ -95,9 +98,9 @@ typedef struct { uint64_t user; float gain; } volume;
 
 struct oc_call_engine {
     oc_call_engine_opts opts;
-    /* PROBE_MS, UDP_WAIT_MS and TCP_PROBE_MS for this engine: the defaults, or
-     * a test's shorter ones (call_timers). */
-    int         probe_ms, udp_wait_ms, tcp_probe_ms;
+    /* PROBE_MS, UDP_WAIT_MS, UDP_LOST_MS and TCP_PROBE_MS for this engine: the
+     * defaults, or a test's shorter ones (call_timers). */
+    int         probe_ms, udp_wait_ms, udp_lost_ms, tcp_probe_ms;
     char        mic_id[520], spk_id[520];
     oc_mutex_t  mu;
 
@@ -131,6 +134,7 @@ struct oc_call_engine {
     atomic_int  mic_level, speaking, mic_error, spk_error, loss_pct;
     atomic_uint sent, keepalives;
     atomic_llong last_send;   /* written by every sender, read by the I/O thread */
+    int64_t     last_ka;      /* the last keep-alive: the relay's echo of one proves the path */
 
     /* The connection transport: how to hand a packet to it (NULL when the
      * daemon offers none), whether sending goes that way now, and when the
@@ -138,6 +142,7 @@ struct oc_call_engine {
     int       (*tcp_send)(void *sctx, uint16_t seq, const uint8_t *ct, size_t len);
     void       *tcp_ctx;
     atomic_int  on_tcp;
+    atomic_int  path_lost;   /* UDP worked, then went quiet for udp_lost_ms */
     int64_t     started_ms, udp_heard_ms, last_probe_ms;
 
     /* Screen sharing (REQ-161, VIDEO.md). share_mu guards all of it and is taken
@@ -178,8 +183,10 @@ static void m_sharer(void *ctx, uint64_t user);
 static void m_tcp(void *ctx, int (*send)(void *, uint16_t, const uint8_t *, size_t), void *sctx);
 static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct, size_t len);
 
+static int m_lost(void *ctx);
+
 static const oc_call_media MEDIA = { m_start, m_roster, m_tx_key, m_rx_key, m_stop, m_sharer, OC_CALL_CODEC_VP9,
-                                     m_tcp, m_rx_tcp };
+                                     m_tcp, m_rx_tcp, m_lost };
 const oc_call_media *oc_call_engine_media(void) { return &MEDIA; }
 
 static uint64_t kid_of(uint32_t epoch, uint8_t slot) { return ((uint64_t)epoch << 8) | slot; }
@@ -227,6 +234,7 @@ static void send_keepalive(oc_call_engine *e) {
     oc_mutex_lock(&e->mu);
     send_raw(e, NULL, 0);
     oc_mutex_unlock(&e->mu);
+    e->last_ka = now_ms();
     atomic_fetch_add(&e->keepalives, 1);
 }
 
@@ -391,9 +399,10 @@ static void *io_main(void *arg) {
         }
         int64_t t = now_ms();
         int tcp = atomic_load(&e->on_tcp);
+        if (e->udp_heard_ms && t - e->udp_heard_ms >= e->udp_lost_ms) atomic_store(&e->path_lost, 1);
         if (!tcp && e->tcp_send) {
             int64_t since = e->udp_heard_ms ? e->udp_heard_ms : e->started_ms;
-            if (t - since >= (e->udp_heard_ms ? UDP_LOST_MS : e->udp_wait_ms)) {
+            if (t - since >= (e->udp_heard_ms ? e->udp_lost_ms : e->udp_wait_ms)) {
                 atomic_store(&e->on_tcp, 1);
                 e->last_send = 0;   /* the first keepalive by the connection goes now */
                 tcp = 1;
@@ -408,7 +417,13 @@ static void *io_main(void *arg) {
             send_udp(e, NULL, 0);
             oc_mutex_unlock(&e->mu);
         }
-        if (t - e->last_send >= KEEPALIVE_MS) send_keepalive(e);
+        /* And, talking or not, three in every udp_lost_ms: the relay answers a
+         * keep-alive to its sender, and that answer is what says the path still
+         * works when nobody else is sending -- someone talking alone, or to
+         * people who are silent, would otherwise hear nothing and think the
+         * path lost. */
+        int64_t echo_every = e->udp_lost_ms / 3 < KEEPALIVE_MS ? e->udp_lost_ms / 3 : KEEPALIVE_MS;
+        if (t - e->last_send >= KEEPALIVE_MS || t - e->last_ka >= echo_every) send_keepalive(e);
         if (t - last_sweep >= 1000) {
             last_sweep = t;
             oc_mutex_lock(&e->mu);
@@ -905,8 +920,10 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
     oc_mutex_unlock(&e->share_mu);
     e->seq = 0;
     e->last_send = 0;
+    e->last_ka = 0;
     e->started_ms = now_ms();
     e->udp_heard_ms = 0;
+    atomic_store(&e->path_lost, 0);
     atomic_store(&e->on_tcp, s < 0);             /* no UDP: on the connection from the start */
     atomic_store(&e->stop, 0);
     atomic_store(&e->sent, 0);
@@ -945,6 +962,12 @@ static void m_rx_tcp(void *ctx, uint64_t sender, uint16_t seq, const uint8_t *ct
     pkt[8] = (uint8_t)(seq >> 8); pkt[9] = (uint8_t)seq;
     if (len) memcpy(pkt + S2C_HDR, ct, len);
     on_packet(e, pkt, S2C_HDR + len);
+}
+
+/* UDP worked and has gone quiet: the path has most likely moved. */
+static int m_lost(void *ctx) {
+    oc_call_engine *e = ctx;
+    return atomic_load(&e->path_lost);
 }
 
 static void m_roster(void *ctx, uint32_t epoch, const oc_call_part *parts, int n) {
@@ -1044,15 +1067,17 @@ static void m_stop(void *ctx) {
 /* --- the frontend's calls ------------------------------------------------------- */
 
 /* The transport timers, shortened for a test: OPENCHIME_TEST_CALL_TIMERS is
- * "probe:<ms>,udp_wait:<ms>,tcp_probe:<ms>", any subset, read once when an
+ * "probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>", any subset, read once when an
  * engine is made. Unset, the defaults above; a test of falling back to the
  * connection and back then takes a second rather than fifteen. */
 static void call_timers(oc_call_engine *e) {
-    e->probe_ms = PROBE_MS; e->udp_wait_ms = UDP_WAIT_MS; e->tcp_probe_ms = TCP_PROBE_MS;
+    e->probe_ms = PROBE_MS; e->udp_wait_ms = UDP_WAIT_MS; e->udp_lost_ms = UDP_LOST_MS;
+    e->tcp_probe_ms = TCP_PROBE_MS;
     const char *v = getenv("OPENCHIME_TEST_CALL_TIMERS");
     for (const char *p = v; p && *p; ) {
         int *dst = !strncmp(p, "probe:", 6) ? &e->probe_ms :
                    !strncmp(p, "udp_wait:", 9) ? &e->udp_wait_ms :
+                   !strncmp(p, "udp_lost:", 9) ? &e->udp_lost_ms :
                    !strncmp(p, "tcp_probe:", 10) ? &e->tcp_probe_ms : NULL;
         const char *c = strchr(p, ':');
         if (dst && c) { long ms = strtol(c + 1, NULL, 10); if (ms > 0 && ms <= 60000) *dst = (int)ms; }

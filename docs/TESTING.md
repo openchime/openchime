@@ -194,14 +194,27 @@ framework, and OpenChime follows suit.
   between participants for the current epoch, the cap, declining, only the
   starter ending, a leave naming another conversation doing nothing, the missed
   call, one call per connection, a non-member refused, a rejoin's old token
-  revoked, and the relay's sweep reported and applied. `test_client_core`: two
+  revoked, and the relay's sweep reported, applied, and told to the swept
+  connection; a disconnected participant's seat held (marked away in a new
+  epoch, nothing more until the grace), taken back by a join from a new connection in the same call at a new epoch, dropped
+  at the grace, and a call whose members all disconnect surviving their return
+  and ending at the grace when they do not return. `test_callsig`: getting back
+  into a call, frame by frame with a fake engine and clock — after a reconnect,
+  a sweep or a moved path; given up when the call ended, another took its place,
+  none was reported, the join was refused, the window passed or three rejoins
+  came within it; not after a leave, a quit or a move to another device. `test_client_core`: two
   and then three client cores in a call through the daemon and a relay with a
   **tap** in front of it, synthetic tones out and Goertzel measurements in —
   each hears the others at full level and never itself; a joiner misses only the
   grace; the tap sees only SFrame, never a repeating plaintext byte; after a
   leave, only keys the leaver never had; mute (seen by the others), push to talk
   and per-person volume; only the starter ending; the missed call; and the device
-  key stored, re-read, upgraded from a version 2 entry and forgotten on sign-out.
+  key stored, re-read, upgraded from a version 2 entry and forgotten on sign-out;
+  and getting back in — someone talking alone for twice the lost-path time
+  staying put on UDP; one client's connection cut by a forwarder in front of
+  the daemon, marked away on the other's roster, her seat held and the same call
+  rejoined, heard again from her new engine, the other never moving; then every UDP path moved by the tap, each engine reporting its path
+  lost and rejoining, and heard again by UDP, not left on the connection.
 - **Screen sharing** (REQ-161, ARCH-86/87) — `tests/test_share_media.c`: a sharer
   and a viewer over a simulated network that loses, delays, reorders and
   duplicates — fragments at the edge sizes, 5% loss recovered by NACKs, a whole

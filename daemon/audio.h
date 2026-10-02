@@ -38,4 +38,9 @@
  * swept. */
 #define OC_AUDIO_SILENCE_MS 20000u
 
+/* How long a call holds the seat of a participant whose connection went, for
+ * the client to reconnect and rejoin (REQ-152): off the relay meanwhile, still
+ * in the roster. Past it the seat is dropped as a leave would be. */
+#define OC_CALL_REJOIN_GRACE_MS 15000u
+
 #endif /* OC_AUDIO_H */

@@ -1338,6 +1338,7 @@ static void test_call_frames(void) {
     pa[0].user_id = 10; pa[0].slot = 0; memset(pa[0].device_key, 0xAA, OC_CALL_DEVICE_KEY_LEN);
     pa[1].user_id = 20; pa[1].slot = 3; memset(pa[1].device_key, 0xBB, OC_CALL_DEVICE_KEY_LEN);
     pa[0].codecs = OC_CALL_CODEC_VP9; pa[1].codecs = 0x03;
+    pa[1].flags = OC_CALL_PART_AWAY;   /* the second's connection went: its seat is held */
     {
         uint64_t inv[3] = { 20, 30, 40 };
         oc_call_join in = { 7, {0}, 3, inv, OC_CALL_CODEC_VP9 };
@@ -1368,6 +1369,7 @@ static void test_call_frames(void) {
         CHECK(got[0].user_id == 10 && got[1].user_id == 20 && got[1].slot == 3);
         CHECK(got[0].device_key[0] == 0xAA && got[1].device_key[31] == 0xBB);
         CHECK(got[0].codecs == OC_CALL_CODEC_VP9 && got[1].codecs == 0x03);
+        CHECK(got[0].flags == 0 && got[1].flags == OC_CALL_PART_AWAY);
     }
     {
         oc_call_roster in = { 7, 99, 6, 2, pa };
@@ -1375,7 +1377,7 @@ static void test_call_frames(void) {
         oc_call_roster out; oc_call_part got[8];
         CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2 && out.epoch == 6);
         CHECK(out.call_id == 99 && got[1].user_id == 20 && got[1].device_key[0] == 0xBB);
-        CHECK(got[1].codecs == 0x03);
+        CHECK(got[1].codecs == 0x03 && got[0].flags == 0 && got[1].flags == OC_CALL_PART_AWAY);
     }
     {
         uint64_t users[2] = { 30, 40 };
