@@ -2305,6 +2305,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         set_status(m, buf);
         break;
     }
+    case OC_EV_CREDENTIAL_RESET:
+        m->reset_user_id = e->user_id;
+        snprintf(m->reset_token, sizeof m->reset_token, "%s", e->body ? e->body : "");
+        break;
     case OC_EV_INVITE:
         snprintf(m->invite_token, sizeof m->invite_token, "%s", e->body ? e->body : "");
         m->invite_role = e->op;

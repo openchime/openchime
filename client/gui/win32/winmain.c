@@ -1912,6 +1912,7 @@ static ULONGLONG g_flash_until;
 /* Per-row action buttons: enable/disable, rotate, delete. */
 static rectf g_srch_more_btn;   /* next page of search results */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
+static int g_await_reset;       /* a reset link asked for: show it once (AUTH.md §2) */
 static int      g_sessions_open;   /* REQ-182 */
 static int      g_confirm_open;
 static int      g_confirm_act;
@@ -22307,6 +22308,8 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
             mi_item(12, lbl);
         }
         mi_sep();
+        mi_item(15, "Reset password\xE2\x80\xA6");
+        mi_item(16, "Reset password and two-step sign-in\xE2\x80\xA6");
         mi_item_d(13, "Remove from workspace");
     }
     g_menu = MENU_MEMBER; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 236;
@@ -22332,6 +22335,10 @@ static void member_menu_run(HWND hwnd, int cmd) {
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
     case 13: oc_client_remove_user(g_client, uid); break;
+    case 15: case 16:   /* a one-time link for them, shown once it comes (AUTH.md §2) */
+        g_await_reset = 1;
+        oc_client_reset_credential(g_client, uid, cmd == 16);
+        break;
     case 14: if (g_menu_target2) oc_client_channel_kick(g_client, g_menu_target2, uid); break;
     default: break;
     }
@@ -30447,6 +30454,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_await_invite && m->invite_token[0]) {   /* show the invitation once */
                 g_await_invite = 0;
                 show_invitation(hwnd, m);
+            }
+            if (g_await_reset && m->reset_token[0]) {      /* show the reset link once */
+                g_await_reset = 0;
+                char q[96], url[1200];
+                snprintf(q, sizeof q, "t=%s", m->reset_token);
+                if (oc_client_open_page(g_client, "account/reset", q, url, sizeof url) == 0)
+                    show_secret(hwnd, "Password reset", "Link to send them", url,
+                                "It works once, for a day. Using it signs them out everywhere.");
             }
             if (g_await_webhook && m->webhook_token[0]) {  /* show the minted webhook token once */
                 g_await_webhook = 0;

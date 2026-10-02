@@ -287,6 +287,20 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             break;
         }
         break;
+    case OC_PAGE_RESET:
+        open_page(&p, "Set a new password \xE2\x80\x94 OpenChime");
+        if (pp->done) {
+            raw(&p, "<h1>Password set</h1>\n<p>Sign in with your new password. You can close this tab.</p>\n");
+            break;
+        }
+        raw(&p, "<h1>Set a new password</h1>\n<p>An administrator sent you this link. It works once, for a day.</p>\n");
+        message(&p, pp->message);
+        raw(&p, "<form method=\"post\" action=\"reset\">\n");
+        hidden(&p, "t", pp->reset);
+        field(&p, "password", "New password", "password", "new-password", "", 1);
+        field(&p, "confirm", "New password again", "password", "new-password", "", 0);
+        raw(&p, "<button type=\"submit\">Set password</button>\n</form>\n");
+        break;
     case OC_PAGE_PASSWORD:
         open_page(&p, "Change your password \xE2\x80\x94 OpenChime");
         if (pp->done) {

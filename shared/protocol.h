@@ -194,6 +194,8 @@ typedef enum {
     OC_MSG_AUTH_DEVICE_POLL = 0x001A, /* C->S, pre-auth: has the code been approved? */
     OC_MSG_AUTH_DEVICE_TOKEN = 0x001B, /* S->C: approved -- the token to present on AUTH */
     OC_MSG_WORKSPACE_ADDRESS = 0x001C, /* S->C, after WORKSPACE_INFO: the workspace's address now */
+    OC_MSG_RESET_CREDENTIAL  = 0x001D, /* C->S, owner/admin: a one-time link to set a local password */
+    OC_MSG_CREDENTIAL_RESET  = 0x001E, /* S->C: the link's token, for the person it is for */
     OC_MSG_SEND             = 0x0020, /* C->S */
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
@@ -1462,6 +1464,11 @@ typedef struct { uint8_t role; oc_slice email; } oc_invite_user;
  * the person hears it before anything is sent. */
 int oc_email_plausible(const char *s);
 typedef struct { uint64_t user_id; } oc_remove_user;
+/* An administrator's reset of a local account (AUTH.md §2): `clear_factors` 1
+ * also turns its second step off when the link is used. The answer carries the
+ * link's token, hex, which the page `/account/reset?t=` takes. */
+typedef struct { uint64_t user_id; uint8_t clear_factors; } oc_reset_credential;
+typedef struct { uint64_t user_id; oc_slice token; } oc_credential_reset;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
 /* An outstanding invite, identified by a server-side id rather than its
@@ -1767,6 +1774,8 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
 oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m);
 oc_result oc_encode_invite_user(oc_wbuf *w, uint16_t version, const oc_invite_user *m);
 oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_user *m);
+oc_result oc_encode_reset_credential(oc_wbuf *w, uint16_t version, const oc_reset_credential *m);
+oc_result oc_encode_credential_reset(oc_wbuf *w, uint16_t version, const oc_credential_reset *m);
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
 oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
 oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
@@ -1955,6 +1964,8 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries, uint16_t 
 oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m);
 oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m);
 oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
+oc_result oc_decode_reset_credential(oc_rbuf *p, oc_reset_credential *m);
+oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
 oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);

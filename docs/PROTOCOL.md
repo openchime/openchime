@@ -905,6 +905,14 @@ the invite's role, and replies with a normal **`AUTH_OK`** (§4.3) — the
 connection is now authenticated. Any failure (bad/expired/consumed token, taken
 username) is a fatal `ERROR AUTH_INVALID_TOKEN`, non-disclosing by design.
 
+**`RESET_CREDENTIAL` (client → server), msg_type `0x001D`** `{ user_id: u64, clear_factors: u8 }`
+— an owner or admin makes a one-time link for a local account (AUTH.md §2). Who
+may reset whom is who may remove whom; a provider's account cannot be reset
+here. `clear_factors` 1 also turns the account's second step off when the link
+is used. Answered with **`CREDENTIAL_RESET` (server → client), msg_type
+`0x001E`** `{ user_id: u64, token: str }`, the token in hex, which the page
+`/account/reset?t=<token>` takes; or a non-fatal `ERROR` `FORBIDDEN`.
+
 **`REMOVE_USER` (client → server), msg_type `0x0044`** `{ user_id: u64 }` —
 owner/admin only; an admin cannot remove an admin/owner, and the last owner
 cannot be removed (`LAST_OWNER`). The member is **locked out** (their sessions,
@@ -2730,6 +2738,8 @@ this table cannot silently gain a shared value.
 | `0x001A` | `AUTH_DEVICE_POLL` | C → S | pre-auth: has the code been approved? |
 | `0x001B` | `AUTH_DEVICE_TOKEN` | S → C | approved: the token to present on `AUTH` |
 | `0x001C` | `WORKSPACE_ADDRESS` | S → C | after `WORKSPACE_INFO`: the workspace's address now |
+| `0x001D` | `RESET_CREDENTIAL` | C → S | owner/admin: a one-time link to set a local account's password |
+| `0x001E` | `CREDENTIAL_RESET` | S → C | the reset link's token |
 | `0x0020` | `SEND` | C → S |  |
 | `0x0021` | `SEND_ACK` | S → C |  |
 | `0x0022` | `BROADCAST` | S → C |  |

@@ -981,6 +981,19 @@ static void test_admin_frames(void) {
         CHECK(oc_decode_remove_user(&p, &out) == OC_OK);
         CHECK(out.user_id == 42);
     }
+    {   /* An administrator's reset of a local account, and its link's token (AUTH.md §2). */
+        oc_reset_credential in = { 42, 1 };
+        ROUNDTRIP(oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RESET_CREDENTIAL, h, p);
+        oc_reset_credential out;
+        CHECK(oc_decode_reset_credential(&p, &out) == OC_OK && out.user_id == 42 && out.clear_factors == 1);
+    }
+    {
+        oc_credential_reset cin = { 42, oc_slice_str("abcdef0123") };
+        ROUNDTRIP(oc_encode_credential_reset(&w, OC_PROTOCOL_VERSION, &cin), OC_MSG_CREDENTIAL_RESET, h, p);
+        oc_credential_reset cout;
+        CHECK(oc_decode_credential_reset(&p, &cout) == OC_OK && cout.user_id == 42 &&
+              cout.token.len == 10 && memcmp(cout.token.ptr, "abcdef0123", 10) == 0);
+    }
     {
         oc_user_updated in = { 42, OC_ROLE_MEMBER, 1 };
         ROUNDTRIP(oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_UPDATED, h, p);

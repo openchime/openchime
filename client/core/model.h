@@ -557,6 +557,9 @@ typedef struct {
     oc_webhook_view *webhooks;
     size_t    n_webhooks, cap_webhooks;
     char      webhook_token[80];
+    /* The last reset link made (AUTH.md §2): whose, and its token -- shown once. */
+    uint64_t  reset_user_id;
+    char      reset_token[80];
     /* Outstanding invites (REQ-026). Refreshed on open, like every other
      * admin report — a client caches nothing (ARCH-88). */
     uint8_t   invites_open, invites_loading;

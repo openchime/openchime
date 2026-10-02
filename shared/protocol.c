@@ -2172,6 +2172,20 @@ oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_us
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_reset_credential(oc_wbuf *w, uint16_t version, const oc_reset_credential *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_RESET_CREDENTIAL);
+    oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->clear_factors);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_credential_reset(oc_wbuf *w, uint16_t version, const oc_credential_reset *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREDENTIAL_RESET);
+    oc_w_u64(w, m->user_id);
+    oc_w_str(w, m->token);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_USER_UPDATED);
     oc_w_u64(w, m->user_id);
@@ -3198,6 +3212,18 @@ oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m) {
 
 oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m) {
     m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_reset_credential(oc_rbuf *p, oc_reset_credential *m) {
+    m->user_id = oc_r_u64(p);
+    m->clear_factors = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m) {
+    m->user_id = oc_r_u64(p);
+    m->token = oc_r_str(p);
     return r_done(p);
 }
 

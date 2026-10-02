@@ -5025,6 +5025,97 @@ static int count_rows(sqlite3 *db, const char *sql) {
     return n;
 }
 
+static oc_dbres *wait_result_ms(oc_dbwriter *w, int ms);   /* below */
+
+static oc_dbres *reset_issue(oc_dbwriter *w, uint64_t actor, uint64_t target, int clear) {
+    oc_job *j = oc_job_new(OC_JOB_RESET_CREDENTIAL, 70);
+    j->user_id = actor; j->target_user_id = target; j->scope = clear;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *reset_redeem(oc_dbwriter *w, const char *token, const char *pw) {
+    oc_job *j = oc_job_new(OC_JOB_RESET_REDEEM, 71);
+    oc_job_set_token(j, token, strlen(token));
+    j->pf_new_pw = strdup(pw);
+    oc_dbwriter_submit(w, j);
+    return wait_result_ms(w, 60000);
+}
+
+/* An administrator's reset of a local account (AUTH.md §2): who may reset whom
+ * is who may remove whom; the link sets a new password once, within its day,
+ * signs the account out everywhere and, if asked, clears its second step. */
+static void test_reset_credential(void) {
+    const char *path = "build/test_dbwriter_reset.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "rs-owner", "pw", OC_ROLE_OWNER);
+    uint64_t admin = reg(w, "rs-admin", "pw", OC_ROLE_ADMIN);
+    uint64_t mem   = reg(w, "rs-mem", "pw-old", OC_ROLE_MEMBER);
+    CHECK(owner && admin && mem);
+
+    uint64_t mem2  = reg(w, "rs-mem2", "pw", OC_ROLE_MEMBER);
+    oc_dbres *r = reset_issue(w, mem, admin, 0);
+    CHECK(r && r->type == OC_RES_USER_ERR && r->err_code == OC_ERR_FORBIDDEN);   /* a member resets nobody */
+    oc_dbres_free(r);
+    r = reset_issue(w, mem2, mem, 0);
+    CHECK(r && r->type == OC_RES_USER_ERR && r->err_code == OC_ERR_FORBIDDEN);   /* not even a member */
+    oc_dbres_free(r);
+    r = reset_issue(w, admin, owner, 0);
+    CHECK(r && r->type == OC_RES_USER_ERR && r->err_code == OC_ERR_FORBIDDEN);   /* an admin, no owner */
+    oc_dbres_free(r);
+
+    uint8_t stok[OC_SESSION_TOKEN_LEN];
+    CHECK(auth_local(w, 72, "rs-mem", "pw-old", stok, NULL) == mem);
+    r = reset_issue(w, admin, mem, 0);
+    CHECK(r && r->type == OC_RES_CREDENTIAL_RESET && r->user_id == mem && r->body_len == 64);
+    char tok[65] = "";
+    if (r && r->body) snprintf(tok, sizeof tok, "%.*s", (int)r->body_len, (const char *)r->body);
+    oc_dbres_free(r);
+    r = reset_redeem(w, tok, "pw-new");
+    CHECK(r && r->type == OC_RES_WEB_OK && r->user_id == mem && r->revoked);
+    oc_dbres_free(r);
+    CHECK(auth_local(w, 73, "rs-mem", "pw-new", NULL, NULL) == mem);
+    CHECK(auth_local(w, 74, "rs-mem", "pw-old", NULL, NULL) == 0);
+    CHECK(auth_session(w, 75, stok) == 0);                              /* signed out everywhere */
+    r = reset_redeem(w, tok, "pw-again");                               /* once */
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    r = reset_redeem(w, "00", "pw-again");
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+
+    /* Clearing the second step: the secret and the recovery codes go with it. */
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    char sql[200];
+    snprintf(sql, sizeof sql, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(%llu, x'00', 1);"
+             "INSERT INTO local_recovery(user_id, code_hash) VALUES(%llu, x'00');",
+             (unsigned long long)mem, (unsigned long long)mem);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    r = reset_issue(w, owner, mem, 1);
+    if (r && r->body) snprintf(tok, sizeof tok, "%.*s", (int)r->body_len, (const char *)r->body);
+    oc_dbres_free(r);
+    r = reset_redeem(w, tok, "pw-third");
+    CHECK(r && r->type == OC_RES_WEB_OK);
+    oc_dbres_free(r);
+    CHECK(count_rows(db, "SELECT COUNT(*) FROM local_totp;") == 0);
+    CHECK(count_rows(db, "SELECT COUNT(*) FROM local_recovery;") == 0);
+    /* ...and a link past its day is no link. */
+    r = reset_issue(w, owner, mem, 0);
+    if (r && r->body) snprintf(tok, sizeof tok, "%.*s", (int)r->body_len, (const char *)r->body);
+    oc_dbres_free(r);
+    CHECK(sqlite3_exec(db, "UPDATE credential_resets SET expires_at_ms=1;", NULL, NULL, NULL) == SQLITE_OK);
+    r = reset_redeem(w, tok, "pw-late");
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    sqlite3_close(db);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Removing a member stops what acts for them (REQ-033, REQ-170): their webhooks
  * post no more -- not even once an admin turns one back on -- and their devices
  * are no longer woken. */
@@ -7208,6 +7299,7 @@ int run_dbwriter_tests(void) {
     test_search_filters_and_paging();
     test_setup_invite();
     test_remove_user_integrations();
+    test_reset_credential();
     test_tls_identity();
     test_delivery_cursor();
     test_mark_all_read();
