@@ -29,7 +29,8 @@ typedef struct oc_auth_check {
     uint32_t      iters;
     uint8_t       stored[OC_PW_HASH_LEN];
     /* A password change: the new password (borrowed), and the salt and count to
-     * derive it with. NULL for a sign-in. */
+     * derive it with. NULL for a sign-in. A check with no `password` derives
+     * the new one only: a reset, whose one-time link stood in for the old. */
     const char   *new_password;
     size_t        new_pwlen;
     uint8_t       new_salt[OC_PW_SALT_LEN];

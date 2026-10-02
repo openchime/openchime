@@ -14,7 +14,7 @@
 #include <stddef.h>
 
 typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD, OC_PAGE_DEVICE, OC_PAGE_STEP,
-               OC_PAGE_SECURITY } oc_page_kind;
+               OC_PAGE_SECURITY, OC_PAGE_RESET } oc_page_kind;
 
 typedef enum {
     OC_SEC_SIGNIN = 0,   /* username and password, to begin */
@@ -51,6 +51,8 @@ typedef struct {
     const char  *secret;
     const char  *otpauth;
     const char  *codes;
+    /* RESET (AUTH.md §2): the one-time link's token. */
+    const char  *reset;
 } oc_page;
 
 /* The page, malloc'd, its length in *len. NULL on no memory. */

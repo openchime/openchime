@@ -1926,6 +1926,159 @@ static oc_dbres *process_security(oc_dbwriter *w, const oc_job *j) {
     return r;
 }
 
+#define OC_RESET_TTL_MS (24ull * 60 * 60 * 1000)
+
+/* An administrator's reset of a local account (AUTH.md §2): a one-time link,
+ * good for a day, on which its person sets a new password. Who may reset whom
+ * is who may remove whom; a removed account may be reset, for its return. */
+static oc_dbres *process_reset_credential(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t actor_role = OC_ROLE_MEMBER, target_role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &actor_role) || !user_role(db, j->target_user_id, &target_role) ||
+        !oc_role_can_manage_members(actor_role) ||
+        (target_role != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER)) {
+        audit_actor(db, OC_AUDIT_SECURITY, "credential.reset.denied", j->user_id, j->target_user_id, NULL, 0, NULL);
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* Only an account with a password here: a provider's is the provider's. */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE id=? AND subject LIKE 'local:%';", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+    int local = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    if (!local) { r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r; }
+    uint8_t tok[32], hash[OC_SHA256_LEN];
+    char hex[65];
+    if (oc_rand_bytes(tok, sizeof tok) != 0 || oc_sha256(tok, sizeof tok, hash) != 0) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    for (size_t i = 0; i < sizeof tok; i++) snprintf(hex + 2 * i, 3, "%02x", tok[i]);
+    oc_e2e_wipe(tok, sizeof tok);
+    uint64_t now = dbw_now_ms();
+    sqlite3_prepare_v2(db,
+        "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, expires_at_ms, clear_factors) "
+        "VALUES(?,?,?,?,?,?);", -1, &st, NULL);
+    sqlite3_bind_blob (st, 1, hash, sizeof hash, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)(now + OC_RESET_TTL_MS));
+    sqlite3_bind_int  (st, 6, j->scope == 1);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    if (!ok || !(r->body = (uint8_t *)strdup(hex))) {
+        oc_e2e_wipe(hex, sizeof hex);
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    oc_e2e_wipe(hex, sizeof hex);
+    r->body_len = 64;
+    audit_actor(db, OC_AUDIT_SECURITY, "credential.reset.issue", j->user_id, j->target_user_id, NULL, 1,
+                j->scope == 1 ? "clear_factors=1" : NULL);
+    r->type = OC_RES_CREDENTIAL_RESET;
+    r->user_id = j->target_user_id;
+    return r;
+}
+
+/* The live reset a link's token names: its account and whether it clears the
+ * second step. 1, or 0 if there is none -- unknown, spent or past its day. */
+static int reset_lookup(sqlite3 *db, const char *hex, uint8_t hash[OC_SHA256_LEN], uint64_t *uid, int *clear) {
+    uint8_t tok[32];
+    if (!hex || strlen(hex) != 64) return 0;
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return 0;
+        tok[i] = (uint8_t)v;
+    }
+    if (oc_sha256(tok, sizeof tok, hash) != 0) return 0;
+    oc_e2e_wipe(tok, sizeof tok);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT user_id, clear_factors FROM credential_resets "
+                           "WHERE token_hash=? AND consumed_at_ms IS NULL AND expires_at_ms > ?;", -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, OC_SHA256_LEN, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    if (found) { *uid = (uint64_t)sqlite3_column_int64(st, 0); *clear = sqlite3_column_int(st, 1); }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* The reset page (AUTH.md §2): the link's token and a new password. The token is
+ * checked, the password derived on the auth pool -- no old one to check -- and
+ * then, the token still unspent, stored: a new version, every session revoked,
+ * the second step cleared if the reset said so. */
+static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
+    uint8_t hash[OC_SHA256_LEN];
+    uint64_t uid = 0;
+    int clear = 0;
+    oc_dbres *r = NULL;
+    int live = reset_lookup(db, j->token, hash, &uid, &clear) && !user_disabled(db, uid);
+    if (j->auth_stage == OC_AUTH_STAGE_NEW) {
+        oc_auth_check *chk = live && j->pf_new_pw && j->pf_new_pw[0] ? calloc(1, sizeof *chk) : NULL;
+        if (chk && oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0) {
+            chk->new_password = j->pf_new_pw;
+            chk->new_pwlen = strlen(j->pf_new_pw);
+            chk->new_iters = OC_PW_ITERATIONS;
+            chk->owner = (oc_job *)j;
+            ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
+            oc_authpool_submit(w->auth, chk);
+            w->auth_deferred = 1;
+            return NULL;
+        }
+        free(chk);
+        if (!(r = calloc(1, sizeof *r))) return NULL;
+        r->conn_id = j->conn_id;
+        r->type = OC_RES_WEB_ERR; r->err_code = live ? OC_ERR_INTERNAL : OC_ERR_AUTH_INVALID_TOKEN;
+        return r;
+    }
+    if (!(r = calloc(1, sizeof *r))) return NULL;
+    r->conn_id = j->conn_id;
+    if (!live || j->auth_ok != 1 || !j->pw_derived) {
+        r->type = OC_RES_WEB_ERR; r->err_code = live ? OC_ERR_INTERNAL : OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    uint64_t version = next_credential_version(db), now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db, "UPDATE credential_resets SET consumed_at_ms=? WHERE token_hash=? AND consumed_at_ms IS NULL;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+    sqlite3_bind_blob(st, 2, hash, sizeof hash, SQLITE_STATIC);
+    int ok = version && sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    if (ok) {
+        sqlite3_prepare_v2(db,
+            "INSERT INTO local_credentials(user_id, salt, iterations, hash, updated_at_ms, version) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt, iterations=excluded.iterations, "
+            " hash=excluded.hash, updated_at_ms=excluded.updated_at_ms, version=excluded.version;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        sqlite3_bind_blob (st, 2, j->pw_salt, OC_PW_SALT_LEN, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->pw_iters);
+        sqlite3_bind_blob (st, 4, j->pw_hash, OC_PW_HASH_LEN, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)version);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    static const char *const WIPE[] = { "DELETE FROM sessions WHERE user_id=?;",
+                                        "DELETE FROM local_totp WHERE user_id=?;",
+                                        "DELETE FROM local_recovery WHERE user_id=?;" };
+    for (int i = 0; ok && i < (clear ? 3 : 1); i++) {
+        sqlite3_prepare_v2(db, WIPE[i], -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+    if (!ok) { r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    audit_actor(db, OC_AUDIT_ACCOUNT, "credential.reset", uid, 0, NULL, 1, clear ? "via=browser clear_factors=1" : "via=browser");
+    r->type = OC_RES_WEB_OK;
+    r->user_id = uid;
+    r->revoked = 1;   /* every device signs in again, with the new password */
+    return r;
+}
+
 /* An AUTH job, from a frame or the daemon's pages; a page's refusal is a page's. */
 static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     oc_dbres *r = process_auth_job(w, j);
@@ -8816,6 +8969,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_AUTH)          return process_auth(w, j);
     if (j->type == OC_JOB_AUTH_STEP)     return process_auth_step(w, j);
     if (j->type == OC_JOB_SECURITY)      return process_security(w, j);
+    if (j->type == OC_JOB_RESET_CREDENTIAL) return process_reset_credential(w->db, j);
+    if (j->type == OC_JOB_RESET_REDEEM)  return process_reset_redeem(w, j);
     if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
     if (j->type == OC_JOB_REGISTER)      return process_register(w, j);
     if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);

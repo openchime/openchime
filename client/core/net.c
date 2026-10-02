@@ -1660,6 +1660,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_user_updated(&p, &uu) != OC_OK) return -1;
             oc_ev *e = oc_ev_new(OC_EV_USER_UPDATED);
             if (e) { e->user_id = uu.user_id; e->status = uu.role; e->op = uu.disabled; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_CREDENTIAL_RESET) {
+            oc_credential_reset cr;
+            if (oc_decode_credential_reset(&p, &cr) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_CREDENTIAL_RESET);
+            if (e) {
+                e->user_id = cr.user_id;
+                e->body = malloc(cr.token.len + 1);
+                if (e->body) { memcpy(e->body, cr.token.ptr, cr.token.len); e->body[cr.token.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_INVITE_CREATED) {
             oc_invite_created ic;
             if (oc_decode_invite_created(&p, &ic) != OC_OK) return -1;
@@ -3377,6 +3387,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 /* op = role; body = the address, or none for a bearer token */
                 oc_invite_user iu = { c->op, c->body ? oc_slice_str(c->body) : (oc_slice){ NULL, 0 } };
                 if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_RESET_CREDENTIAL) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_reset_credential rc = { c->channel_id, (uint8_t)(c->op ? 1 : 0) };
+                if (oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_REMOVE_USER) {

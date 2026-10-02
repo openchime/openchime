@@ -115,6 +115,7 @@ enum {
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
+    OC_EV_CREDENTIAL_RESET,/* a CREDENTIAL_RESET: user_id, body=the link's token */
     /* One outstanding invite (message_id=invite_id, op=role,
      * server_time=expires_at, user_id=created_by); END terminates a list; REVOKED is
      * the ack. No token: only its hash is stored, so a list cannot carry one. */
@@ -430,6 +431,7 @@ enum {
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* invite: op = role, body = the address it is bound to (NULL = a token) */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
+    OC_CMD_RESET_CREDENTIAL,/* a reset link for a local account: channel_id = user_id, op = clear its step */
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */

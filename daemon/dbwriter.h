@@ -230,7 +230,14 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * 1 confirms a new secret with its first code (in `token`) and hands out
         * recovery codes, 2 turns the step off with a current code. `user_id`
         * and `auth_version` as for AUTH_STEP. */
-       OC_JOB_SECURITY = 125 };
+       OC_JOB_SECURITY = 125,
+       /* An administrator's reset of a local account (AUTH.md §2): actor
+        * `user_id`, account `target_user_id`, `scope` 1 to clear its second
+        * step too. Answered CREDENTIAL_RESET, or USER_ERR. */
+       OC_JOB_RESET_CREDENTIAL = 126,
+       /* The reset page's new password, for the link's token (hex, `token`):
+        * `pf_new_pw`. Derived on the auth pool, then stored. WEB_OK/WEB_ERR. */
+       OC_JOB_RESET_REDEEM = 127 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -623,7 +630,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The second step's page, past its password: `step_version`, and either
         * the account has one (`step_pw` 1) or a new secret waits for its first
         * code, `body` its base32. */
-       OC_RES_WEB_SECURITY = 111 };
+       OC_RES_WEB_SECURITY = 111,
+       /* A reset link made: `user_id` the account, `body` the token, hex. */
+       OC_RES_CREDENTIAL_RESET = 112 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {

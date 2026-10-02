@@ -552,6 +552,12 @@ works. Nothing proves the shipped *image* works (§3.2).
   asks for a code and takes a recovery code; a code turns it off and leaves no
   secret or code behind; `required` refuses an account with no step, `off` asks
   for none and closes the page.
+- **Resetting a password (`test_dbwriter` `test_reset_credential`, `itest_netloop`
+  `test_reset_frame` and `test_web_signin`):** a member resets nobody and an
+  admin no owner; the link sets a new password once, within its day, signs the
+  account out everywhere and clears its second step when asked; over the wire an
+  owner gets a 64-hex token and a member `FORBIDDEN`; the page refuses a token of
+  the wrong shape, a mismatch, and a spent link.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

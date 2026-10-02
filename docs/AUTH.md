@@ -72,6 +72,15 @@ authority.
 - **Adding users:** an owner/admin issues an **invite token**; the invitee
   creates the account — username and password — by presenting it on the sign-up
   page (§8.10). Email delivery is never required.
+- **Resetting a password:** an owner or admin makes a one-time link for a local
+  account (`RESET_CREDENTIAL`; who may reset whom is who may remove whom) and
+  sends it to its person, who sets a new password on `/account/reset`. The link
+  is kept as the SHA-256 of its token, is good for a day and once; using it
+  stores the new password under a new version, signs the account out on every
+  device, and — if the reset said so — turns its second step off (§8.6), for a
+  person who lost their phone and their recovery codes. The new password is
+  derived on the auth pool, with no old one to check. Issuing and using a link
+  are both audited.
 - **Registered-user cap:** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
   = unlimited). Creating a *new* user past the cap — via invite redeem, direct
   register, bootstrap, or a first-time OIDC login — is refused with

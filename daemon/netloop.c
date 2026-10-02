@@ -2322,6 +2322,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_RESET_CREDENTIAL) {
+            oc_reset_credential rc;
+            if (oc_decode_reset_credential(&p, &rc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_RESET_CREDENTIAL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = rc.user_id;
+            j->scope = rc.clear_factors ? 1 : 0;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_REMOVE_USER) {
             oc_remove_user ru;
             if (oc_decode_remove_user(&p, &ru) != OC_OK) return -1;
@@ -3726,6 +3737,8 @@ static const oc_http_route TLS_ROUTES[] = {
     { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
 };
@@ -3872,6 +3885,7 @@ static int field_get(const char *q, const char *key, char *out, size_t cap) {
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
 static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);               /* fwd */
 static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw); /* fwd */
+static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw);    /* fwd */
 
 static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     const char *qm = memchr(req->path, '?', req->path_len);
@@ -3883,6 +3897,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     else if (plen == 7 && memcmp(req->path, "/device", 7) == 0) kind = OC_PAGE_DEVICE;
     else if (plen == 14 && memcmp(req->path, "/signin/verify", 14) == 0) kind = OC_PAGE_STEP;
     else if (plen == 17 && memcmp(req->path, "/account/security", 17) == 0) kind = OC_PAGE_SECURITY;
+    else if (plen == 14 && memcmp(req->path, "/account/reset", 14) == 0) kind = OC_PAGE_RESET;
     else { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
     size_t len;
     if (!oc_dbwriter_local_browser(dbw)) {
@@ -3910,6 +3925,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     if (kind == OC_PAGE_DEVICE) return on_device_page(c, post, q, dbw);
     if (kind == OC_PAGE_STEP) return on_step_page(c, q, dbw);
     if (kind == OC_PAGE_SECURITY) return on_security_page(c, post, q, dbw);
+    if (kind == OC_PAGE_RESET) return on_reset_page(c, post, q, dbw);
     web_req *w = calloc(1, sizeof *w);
     if (!w) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
     w->kind = kind;
@@ -4185,6 +4201,43 @@ out:
     return rc;
 }
 
+/* The reset page (AUTH.md §2): the link's token, and a new password twice.
+ * Returns 0 to keep, -1 to close. */
+static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
+    char t[80] = "", pass[512] = "", confirm[512] = "";
+    oc_page pg = { .kind = OC_PAGE_RESET, .redirect_uri = "", .nonce = "", .username = "",
+                   .invite = "", .message = "", .user_code = "", .reset = t };
+    size_t len;
+    int rc = -1;
+    if (field_get(q, "t", t, sizeof t) || field_get(q, "password", pass, sizeof pass) ||
+        field_get(q, "confirm", confirm, sizeof confirm) || strlen(t) != 64) {
+        const char *b = oc_page_invalid(&len);
+        web_reply(c, 400, b, len, NULL, NULL);
+        goto out;
+    }
+    if (!post) { web_page(c, 200, &pg); goto out; }
+    if (strcmp(pass, confirm) != 0) { pg.message = "The two passwords don't match."; web_page(c, 200, &pg); goto out; }
+    if (!pass[0]) { pg.message = "Choose a password."; web_page(c, 200, &pg); goto out; }
+    web_req *w = calloc(1, sizeof *w);
+    oc_job *j = w ? oc_job_new(OC_JOB_RESET_REDEEM, c->conn_id) : NULL;
+    if (!j || oc_job_set_token(j, t, strlen(t)) != 0 || !(j->pf_new_pw = strdup(pass))) {
+        if (j) oc_job_free(j);
+        free(w);
+        http_reply(c, 500, "text/plain", "error\n", 6);
+        goto out;
+    }
+    memcpy(j->source, c->source, sizeof j->source);
+    w->kind = OC_PAGE_RESET;
+    snprintf(w->invite, sizeof w->invite, "%s", t);   /* the token, for the form again */
+    oc_dbwriter_submit(dbw, j);
+    c->web = w;
+    c->http_pending = 1;
+    rc = 0;
+out:
+    oc_e2e_wipe(pass, sizeof pass); oc_e2e_wipe(confirm, sizeof confirm);
+    return rc;
+}
+
 /* The second step's page, answered (AUTH.md §8.6). */
 static void security_result(conn *c, web_req *w, const oc_dbres *r) {
     oc_page pg = { .kind = OC_PAGE_SECURITY, .redirect_uri = "", .nonce = "", .username = w->username,
@@ -4319,6 +4372,17 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         return;
     }
     if (w->step[0] && g_websteps) oc_websteps_drop(g_websteps, w->step);   /* passed: spent */
+    if (w->kind == OC_PAGE_RESET) {
+        pg.reset = w->invite;
+        if (r->type == OC_RES_WEB_OK) pg.done = 1;
+        else pg.message = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
+                        ? "This link isn't good any more: it was used, or a day has passed. Ask for another."
+                        : "Something went wrong. Try again.";
+        web_page(c, r->type == OC_RES_WEB_OK ? 200 : r->err_code == OC_ERR_INTERNAL ? 500 : 200, &pg);
+        flush_out(c);
+        conn_close(ep, conns, c->fd);
+        return;
+    }
     if (r->type == OC_RES_WEB_OK && w->kind == OC_PAGE_PASSWORD) {
         pg.done = 1;
         web_page(c, 200, &pg);
@@ -5155,6 +5219,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &ic);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CREDENTIAL_RESET: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_credential_reset cr = { r->user_id, { r->body, r->body_len } };
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (oc_encode_credential_reset(&w, OC_PROTOCOL_VERSION, &cr) == OC_OK)
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_INVITE_ERR:

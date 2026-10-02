@@ -1809,6 +1809,36 @@ static int signed_in(client *c, int port, const uint8_t *pin, const char *user, 
     return client_open(c, port, pin) == 0 && do_handshake(c) == 0 && do_auth(c, user, pw, &uid) == 0 ? 0 : -1;
 }
 
+/* An administrator's reset over the wire (AUTH.md §2): an owner gets the link's
+ * token for a member's account; a member gets no link for anybody. */
+static void test_reset_frame(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t alice = 0, carol = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0 && do_auth(&a, "alice", "pw-alice", &alice) == 0);
+    CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0 && do_auth(&b, "carol", "pw", &carol) == 0);
+    for (int k = 0; k < 2; k++) {
+        client *c = k ? &b : &a;
+        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_reset_credential rc = { k ? alice : carol, 0 };
+        CHECK(oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK && write_all(&c->conn, buf, w.len) == 0);
+        oc_header hdr; oc_rbuf p; int got = 0;
+        for (int i = 0; i < 16 && !got; i++) {
+            if (read_frame(c, &hdr, &p) != 0) break;
+            if (!k && hdr.msg_type == OC_MSG_CREDENTIAL_RESET) {
+                oc_credential_reset cr;
+                CHECK(oc_decode_credential_reset(&p, &cr) == OC_OK && cr.user_id == carol && cr.token.len == 64);
+                got = 1;
+            } else if (k && hdr.msg_type == OC_MSG_ERROR) {
+                oc_error e;
+                CHECK(oc_decode_error(&p, &e) == OC_OK && e.code == OC_ERR_FORBIDDEN);
+                got = 1;
+            }
+        }
+        CHECK(got);
+    }
+    client_close(&a); client_close(&b);
+}
+
 /* A device token is checked on the wire: one no device issues -- too long, with
  * a quote or a NUL -- is refused rather than cut short or stored (ARCH-85). */
 static void test_device_token_wire(int port, const uint8_t *pin) {
@@ -2324,6 +2354,39 @@ static void test_web_signin(int port) {
         CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 404);
         CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OPTIONAL);
+    }
+
+    /* The reset page (AUTH.md §2): the link's form; the new password, set once. */
+    {
+        uint8_t raw[32], hash[32];
+        char hex[65], body[256], path[128];
+        for (int i = 0; i < 32; i++) raw[i] = (uint8_t)(0x90 + i);
+        for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
+        mbedtls_sha256(raw, sizeof raw, hash, 0);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, "
+                               "expires_at_ms) SELECT ?, id, id, 1, 9000000000000 FROM users WHERE subject='local:pat';",
+                           -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        CHECK(sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        snprintf(path, sizeof path, "/account/reset?t=%s", hex);
+        CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Set a new password") != NULL && strstr(resp, hex) != NULL);
+        CHECK(web_call(port, pin, "GET", "/account/reset?t=short", NULL, NULL, NULL, resp, sizeof resp) == 400);
+        snprintf(body, sizeof body, "t=%s&password=pw-reset&confirm=pw-other", hex);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "don&#39;t match") != NULL);
+        snprintf(body, sizeof body, "t=%s&password=pw-reset&confirm=pw-reset", hex);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Password set") != NULL);
+        CHECK(web_signin(port, pin, "pat", "pw-reset", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "isn&#39;t good any more") != NULL);
     }
 
     /* The per-account limiter stands in front of the page as of the frame. */
@@ -5279,6 +5342,7 @@ int run_netloop_tests(void) {
         test_revoke_other_devices(arg.port, pin);
         test_device_token_wire(arg.port, pin);
         test_unauthed_closed(arg.port, pin);
+        test_reset_frame(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack(arg.port + 128, arg.port + 129);

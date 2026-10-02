@@ -1155,6 +1155,20 @@ static const char MIGRATION_0053[] =
     ");"
     "CREATE INDEX local_recovery_user ON local_recovery(user_id);";
 
+static const char MIGRATION_0054[] =
+    /* An administrator's reset of a local account (AUTH.md §2): a one-time link,
+     * kept as the SHA-256 of its token, good for a day, spent once; whether it
+     * also turns the account's second step off. */
+    "CREATE TABLE credential_resets ("
+    "  token_hash     BLOB PRIMARY KEY,"
+    "  user_id        INTEGER NOT NULL REFERENCES users(id),"
+    "  created_by     INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms  INTEGER NOT NULL,"
+    "  expires_at_ms  INTEGER NOT NULL,"
+    "  consumed_at_ms INTEGER,"
+    "  clear_factors  INTEGER NOT NULL DEFAULT 0 CHECK (clear_factors IN (0,1))"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1209,6 +1223,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 51, MIGRATION_0051 },
     { 52, MIGRATION_0052 },
     { 53, MIGRATION_0053 },
+    { 54, MIGRATION_0054 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

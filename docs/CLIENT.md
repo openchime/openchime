@@ -367,7 +367,9 @@ model; translate input to intents }, stop.
     every device, this one included, then signs in again. "Two-step sign-in" opens
     the workspace's page for setting up or turning off a TOTP second step the same
     way (AUTH.md §8.6); the terminal client's launcher has it too.
-  - **admin / user management** — a member menu's "Make admin/Make member/Remove"
+  - **admin / user management** — a member menu's "Reset password…" (or with
+    their two-step sign-in too) shows a one-time link to send them (AUTH.md §2);
+    "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
     only; a `USER_UPDATED` folds each change into the roster). "Invite a user"
     asks for an email address where the workspace offers a browser sign-in — the

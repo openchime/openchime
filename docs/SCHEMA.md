@@ -1361,6 +1361,25 @@ accepted for, so a code is never good twice.
 One row per recovery code: a 16-byte salt and the SHA-256 of salt and code, the
 code being its ten letters and digits. Spending one sets `used_at_ms`; it is
 never good again.
+
+## 3as. Migration 0054 — an administrator's reset (AUTH.md §2)
+
+```sql
+CREATE TABLE credential_resets (
+  token_hash     BLOB PRIMARY KEY,
+  user_id        INTEGER NOT NULL REFERENCES users(id),
+  created_by     INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms  INTEGER NOT NULL,
+  expires_at_ms  INTEGER NOT NULL,
+  consumed_at_ms INTEGER,
+  clear_factors  INTEGER NOT NULL DEFAULT 0 CHECK (clear_factors IN (0,1))
+);
+```
+
+### `credential_resets`
+A one-time link to set a local account's password, kept as the SHA-256 of its
+token: a day to live, spent once (`consumed_at_ms`), and whether using it also
+turns the account's second step off.
 ---
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
