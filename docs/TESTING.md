@@ -558,6 +558,10 @@ works. Nothing proves the shipped *image* works (§3.2).
   account out everywhere and clears its second step when asked; over the wire an
   owner gets a 64-hex token and a member `FORBIDDEN`; the page refuses a token of
   the wrong shape, a mismatch, and a spent link.
+- **Bringing a member back (`test_dbwriter` `test_enable_user`, `itest_netloop`
+  `test_reset_frame`):** only a removed member, only by whoever may remove them,
+  not at the seat cap; with a reset link on which they sign in again; over the
+  wire, removed then back, the owner gets the link.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

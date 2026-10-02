@@ -5116,6 +5116,58 @@ static void test_reset_credential(void) {
     cleanup_db(path);
 }
 
+/* A removed member brought back (REQ-033): by whoever may remove them, only if
+ * removed, taking a seat; with a reset link for the password removal took, on
+ * which they sign in again. */
+static void test_enable_user(void) {
+    const char *path = "build/test_dbwriter_enable.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "en-owner", "pw", OC_ROLE_OWNER);
+    uint64_t admin = reg(w, "en-admin", "pw", OC_ROLE_ADMIN);
+    uint64_t mem   = reg(w, "en-mem", "pw-mem", OC_ROLE_MEMBER);
+    CHECK(owner && admin && mem);
+    oc_job *j = oc_job_new(OC_JOB_ENABLE_USER, 80);
+    j->user_id = owner; j->target_user_id = mem;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_ERR && r->err_code == OC_ERR_FORBIDDEN);   /* not removed */
+    oc_dbres_free(r);
+    CHECK(remove_user(w, owner, mem) == 0);
+    CHECK(remove_user(w, owner, admin) == 0);
+    j = oc_job_new(OC_JOB_ENABLE_USER, 81);
+    j->user_id = mem; j->target_user_id = admin;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_ERR && r->err_code == OC_ERR_FORBIDDEN);   /* removed can't */
+    oc_dbres_free(r);
+    /* At the seat cap, nobody comes back. */
+    oc_dbwriter_set_max_users(w, 1);
+    j = oc_job_new(OC_JOB_ENABLE_USER, 82);
+    j->user_id = owner; j->target_user_id = mem;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_ERR && r->err_code == OC_ERR_USER_LIMIT);
+    oc_dbres_free(r);
+    oc_dbwriter_set_max_users(w, 0);
+    j = oc_job_new(OC_JOB_ENABLE_USER, 83);
+    j->user_id = owner; j->target_user_id = mem;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_UPDATED && r->user_id == mem && r->disabled == 0 && r->body_len == 64);
+    char tok[65] = "";
+    if (r && r->body) snprintf(tok, sizeof tok, "%.*s", (int)r->body_len, (const char *)r->body);
+    oc_dbres_free(r);
+    CHECK(auth_local(w, 84, "en-mem", "pw-mem", NULL, NULL) == 0);       /* no password yet */
+    r = reset_redeem(w, tok, "pw-back");
+    CHECK(r && r->type == OC_RES_WEB_OK);
+    oc_dbres_free(r);
+    CHECK(auth_local(w, 85, "en-mem", "pw-back", NULL, NULL) == mem);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Removing a member stops what acts for them (REQ-033, REQ-170): their webhooks
  * post no more -- not even once an admin turns one back on -- and their devices
  * are no longer woken. */
@@ -7300,6 +7352,7 @@ int run_dbwriter_tests(void) {
     test_setup_invite();
     test_remove_user_integrations();
     test_reset_credential();
+    test_enable_user();
     test_tls_identity();
     test_delivery_cursor();
     test_mark_all_read();

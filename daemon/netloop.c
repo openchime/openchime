@@ -2322,6 +2322,16 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_ENABLE_USER) {
+            oc_enable_user eu;
+            if (oc_decode_enable_user(&p, &eu) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_ENABLE_USER, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = eu.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_RESET_CREDENTIAL) {
             oc_reset_credential rc;
             if (oc_decode_reset_credential(&p, &rc) != OC_OK) return -1;
@@ -5271,6 +5281,14 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             int tfd = t->fd;
             send_bytes(ep, conns, tfd, g_enc, len);
             if (r->disabled && conns[tfd]) conn_close(ep, conns, tfd);
+        }
+        /* Brought back: the actor gets the link that gives them a password. */
+        actor = find_by_id(conns, r->conn_id);
+        if (actor && !r->disabled && r->body && r->body_len) {
+            oc_credential_reset cr = { r->user_id, { r->body, r->body_len } };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_credential_reset(&w, OC_PROTOCOL_VERSION, &cr) == OC_OK)
+                send_bytes(ep, conns, actor->fd, g_enc, w.len);
         }
         break;
     }

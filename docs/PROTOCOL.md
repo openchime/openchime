@@ -913,6 +913,14 @@ is used. Answered with **`CREDENTIAL_RESET` (server → client), msg_type
 `0x001E`** `{ user_id: u64, token: str }`, the token in hex, which the page
 `/account/reset?t=<token>` takes; or a non-fatal `ERROR` `FORBIDDEN`.
 
+**`ENABLE_USER` (client → server), msg_type `0x001F`** `{ user_id: u64 }` — bring a
+removed member back (REQ-033): who may do it is who may remove them, and only a
+removed member, and they take a seat as a new member would (`USER_LIMIT` at the
+cap). Nothing removal dropped comes back — channels, groups, drafts — but the
+default channel at their next sign-in. Answered with `USER_UPDATED`
+(`disabled=0`) and, for a local account, whose password removal took, a
+`CREDENTIAL_RESET` with the link that sets one; or a non-fatal `ERROR`.
+
 **`REMOVE_USER` (client → server), msg_type `0x0044`** `{ user_id: u64 }` —
 owner/admin only; an admin cannot remove an admin/owner, and the last owner
 cannot be removed (`LAST_OWNER`). The member is **locked out** (their sessions,
@@ -2740,6 +2748,7 @@ this table cannot silently gain a shared value.
 | `0x001C` | `WORKSPACE_ADDRESS` | S → C | after `WORKSPACE_INFO`: the workspace's address now |
 | `0x001D` | `RESET_CREDENTIAL` | C → S | owner/admin: a one-time link to set a local account's password |
 | `0x001E` | `CREDENTIAL_RESET` | S → C | the reset link's token |
+| `0x001F` | `ENABLE_USER` | C → S | owner/admin: bring a removed member back |
 | `0x0020` | `SEND` | C → S |  |
 | `0x0021` | `SEND_ACK` | S → C |  |
 | `0x0022` | `BROADCAST` | S → C |  |

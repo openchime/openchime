@@ -369,6 +369,8 @@ model; translate input to intents }, stop.
     way (AUTH.md §8.6); the terminal client's launcher has it too.
   - **admin / user management** — a member menu's "Reset password…" (or with
     their two-step sign-in too) shows a one-time link to send them (AUTH.md §2);
+    an owner's or admin's People pane lists removed members too, and right-click
+    on one brings them back, with the link to set a password (`ENABLE_USER`);
     "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
     only; a `USER_UPDATED` folds each change into the roster). "Invite a user"
