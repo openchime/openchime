@@ -62,9 +62,13 @@ authority.
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
   created at first run from a one-time **setup token**. There is no config file
   and no configuration variable for it (ARCH-26): the daemon **mints** the token
-  itself when a local-mode first run finds no owner, and prints it once to
-  stderr. The owner is created with it on the sign-up page (§8.10). This avoids the chicken-and-egg of "you need an admin to create the
-  first admin" without requiring email (air-gapped-safe).
+  itself when a local-mode start finds no owner who can sign in, and prints it
+  once to stderr. The owner is created with it on the sign-up page (§8.10). Only
+  the newest token works — each start prints one, and a log keeps them all — and
+  none works once an owner can sign in. This avoids the chicken-and-egg of "you
+  need an admin to create the first admin" without requiring email
+  (air-gapped-safe); and since a removed owner is no owner, a workspace whose
+  owners were all removed gets a token again.
 - **Adding users:** an owner/admin issues an **invite token**; the invitee
   creates the account — username and password — by presenting it on the sign-up
   page (§8.10). Email delivery is never required.
@@ -399,8 +403,10 @@ unit-tested in `daemon/roles.c`.
 - **Role changes:** `SET_ROLE` applies the policy — only owner/admin
   may change roles, only an owner may grant/revoke owner, an admin may only
   promote/keep members — refusing with `FORBIDDEN`.
-- **≥1 owner invariant:** demoting the tenant's last owner is
-  refused with `LAST_OWNER` (REQ-030), checked against a live `COUNT(*)` of owners.
+- **≥1 owner invariant:** demoting or removing the tenant's last owner is
+  refused with `LAST_OWNER` (REQ-030), checked against a live `COUNT(*)` of owners
+  who can sign in — a removed owner keeps the role on its row but counts for
+  nothing.
 - **Moderation delete (REQ-032):** an admin/owner who belongs to the
   channel may delete (not edit) others' messages; `process_delete` performs the
   tombstone after an `oc_role_can_moderate` check for a non-author and records it

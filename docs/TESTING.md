@@ -499,6 +499,10 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **Messaging:** two clients in a channel — a `SEND` from one produces a
   `SEND_ACK` to the sender and a `BROADCAST` to both; ordering within the
   channel matches send order (REQ-092).
+- **The first owner (`test_dbwriter`, `test_setup_invite`):** the setup token
+  makes the owner once; only the newest one works, and none once an owner can
+  sign in; a removed owner neither satisfies the last-owner guard nor stops a
+  new token when every owner is removed (REQ-024, REQ-030).
 - **Idempotency:** re-sending with the same token after a simulated drop yields
   the same `message_id` and no duplicate row (REQ-093).
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
