@@ -324,6 +324,9 @@ void oc_client_remove_user(oc_client *c, uint64_t user_id);
 /* An owner's or admin's reset link for a local account (AUTH.md §2), with its
  * second step cleared too when `clear_step`; the model's reset_token is it. */
 void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step);
+/* Bring a removed member back (owner/admin). A local account's reset link comes
+ * with it, as the model's reset_token. */
+void oc_client_enable_user(oc_client *c, uint64_t user_id);
 
 /* Incoming-webhook management (REQ-170). Open the webhook overlay for a channel
  * (refreshes the list), close it, mint a webhook (the server answers with a

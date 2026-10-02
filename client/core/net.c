@@ -3389,6 +3389,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_ENABLE_USER) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_enable_user eu = { c->channel_id };
+                if (oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &eu) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_RESET_CREDENTIAL) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_reset_credential rc = { c->channel_id, (uint8_t)(c->op ? 1 : 0) };

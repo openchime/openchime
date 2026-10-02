@@ -1809,6 +1809,8 @@ static int signed_in(client *c, int port, const uint8_t *pin, const char *user, 
     return client_open(c, port, pin) == 0 && do_handshake(c) == 0 && do_auth(c, user, pw, &uid) == 0 ? 0 : -1;
 }
 
+static uint64_t g_ned;   /* a member for removing and bringing back */
+
 /* An administrator's reset over the wire (AUTH.md §2): an owner gets the link's
  * token for a member's account; a member gets no link for anybody. */
 static void test_reset_frame(int port, const uint8_t *pin) {
@@ -1836,6 +1838,27 @@ static void test_reset_frame(int port, const uint8_t *pin) {
         }
         CHECK(got);
     }
+    /* Removed, then brought back (REQ-033): the roster says so, and the owner
+     * gets the link that gives them a password again. */
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_remove_user ru = { g_ned };
+    CHECK(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_enable_user eu = { g_ned };
+    CHECK(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &eu) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    int removed = 0, back = 0, link = 0;
+    oc_header hdr; oc_rbuf p;
+    for (int i = 0; i < 24 && !link; i++) {
+        if (read_frame(&a, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_USER_UPDATED) {
+            oc_user_updated u;
+            if (oc_decode_user_updated(&p, &u) == OC_OK && u.user_id == g_ned) { if (u.disabled) removed = 1; else back = 1; }
+        } else if (hdr.msg_type == OC_MSG_CREDENTIAL_RESET) {
+            oc_credential_reset cr;
+            link = oc_decode_credential_reset(&p, &cr) == OC_OK && cr.user_id == g_ned && cr.token.len == 64;
+        }
+    }
+    CHECK(removed && back && link);
     client_close(&a); client_close(&b);
 }
 
@@ -5279,6 +5302,8 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "bf-reader", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "carol",     "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "roy",       "pw-roy",   OC_ROLE_MEMBER, 2048) != 0);
+    g_ned = oc_dbwriter_register_local(dbw, "ned",     "pw-ned",   OC_ROLE_MEMBER, 2048);
+    CHECK(g_ned != 0);
     uint64_t flooder = oc_dbwriter_register_local(dbw, "flooder", "pw", OC_ROLE_MEMBER, 2048);
     for (int i = 0; i < 100; i++) {   /* a crowd, for test_login_bound and the groups tests */
         char un[16]; snprintf(un, sizeof un, "u%03d", i);

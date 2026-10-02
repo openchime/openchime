@@ -981,6 +981,12 @@ static void test_admin_frames(void) {
         CHECK(oc_decode_remove_user(&p, &out) == OC_OK);
         CHECK(out.user_id == 42);
     }
+    {   /* A removed member brought back (REQ-033). */
+        oc_enable_user in = { 43 };
+        ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);
+        oc_enable_user out;
+        CHECK(oc_decode_enable_user(&p, &out) == OC_OK && out.user_id == 43);
+    }
     {   /* An administrator's reset of a local account, and its link's token (AUTH.md §2). */
         oc_reset_credential in = { 42, 1 };
         ROUNDTRIP(oc_encode_reset_credential(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_RESET_CREDENTIAL, h, p);

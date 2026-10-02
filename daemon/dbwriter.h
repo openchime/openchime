@@ -237,7 +237,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_RESET_CREDENTIAL = 126,
        /* The reset page's new password, for the link's token (hex, `token`):
         * `pf_new_pw`. Derived on the auth pool, then stored. WEB_OK/WEB_ERR. */
-       OC_JOB_RESET_REDEEM = 127 };
+       OC_JOB_RESET_REDEEM = 127,
+       /* A removed member brought back (REQ-033): actor `user_id`, member
+        * `target_user_id`. USER_UPDATED (disabled 0; for a local account
+        * `body` a reset link's token), or USER_ERR. */
+       OC_JOB_ENABLE_USER = 128 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;

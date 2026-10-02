@@ -1981,6 +1981,43 @@ static oc_dbres *process_reset_credential(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Bring a removed member back (REQ-033): who may do it is who may remove them.
+ * Nothing removal dropped comes back -- channels, groups, drafts -- but the
+ * workspace's default channel at the next sign-in; a local account, whose
+ * password went too, comes back with a reset link to set one. */
+static oc_dbres *process_enable_user(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t actor_role = OC_ROLE_MEMBER, target_role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &actor_role) || !user_role(db, j->target_user_id, &target_role) ||
+        !oc_role_can_manage_members(actor_role) ||
+        (target_role != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) || !user_disabled(db, j->target_user_id)) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* Back is a seat taken, as a new member's is (CP-7). */
+    if (user_slots_full(db, "", 0, w->max_users)) { r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_USER_LIMIT; return r; }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET disabled=0 WHERE id=? AND disabled=1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    if (!ok) { r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    audit_actor(db, OC_AUDIT_ADMIN, "user.enable", j->user_id, j->target_user_id, NULL, 1, NULL);
+    /* A local account's way back in: the link a reset makes. */
+    oc_job rj = *j;
+    rj.scope = 0;
+    oc_dbres *link = process_reset_credential(db, &rj);
+    if (link && link->type == OC_RES_CREDENTIAL_RESET) { r->body = link->body; r->body_len = link->body_len; link->body = NULL; }
+    oc_dbres_free(link);
+    r->type = OC_RES_USER_UPDATED;
+    r->user_id = j->target_user_id;
+    r->role = target_role;
+    r->disabled = 0;
+    return r;
+}
+
 /* The live reset a link's token names: its account and whether it clears the
  * second step. 1, or 0 if there is none -- unknown, spent or past its day. */
 static int reset_lookup(sqlite3 *db, const char *hex, uint8_t hash[OC_SHA256_LEN], uint64_t *uid, int *clear) {
@@ -8971,6 +9008,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SECURITY)      return process_security(w, j);
     if (j->type == OC_JOB_RESET_CREDENTIAL) return process_reset_credential(w->db, j);
     if (j->type == OC_JOB_RESET_REDEEM)  return process_reset_redeem(w, j);
+    if (j->type == OC_JOB_ENABLE_USER)   return process_enable_user(w, j);
     if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
     if (j->type == OC_JOB_REGISTER)      return process_register(w, j);
     if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);

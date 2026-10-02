@@ -15942,8 +15942,10 @@ static void thread_menu_run(HWND hwnd, int cmd) {
  * are the three things visible in the row — searching over a field the row does
  * not show makes a match look like a bug. Disabled accounts are out: a directory
  * is who you can reach. */
-static int dir_matches(const oc_member *u, const char *lower_needle) {
-    if (u->disabled) return 0;
+/* `removed_too`: an owner's or admin's People pane lists removed members as
+ * well, for bringing one back. */
+static int dir_matches(const oc_member *u, const char *lower_needle, int removed_too) {
+    if (u->disabled && !removed_too) return 0;
     if (!lower_needle || !lower_needle[0]) return 1;
     char hay[256];
     snprintf(hay, sizeof hay, "%s %s %s", u->name, u->title, u->status_text);
@@ -16006,7 +16008,8 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
 
     const float ROWH2 = UIS(56.0f);
     size_t shown = 0;
-    for (size_t i = 0; i < m->n_users; i++) if (dir_matches(&m->users[i], filter)) shown++;
+    int removed_too = self_role(m) >= OC_ROLE_ADMIN;
+    for (size_t i = 0; i < m->n_users; i++) if (dir_matches(&m->users[i], filter, removed_too)) shown++;
     if (!shown) {
         draw_text(rt, filter[0] ? "Nobody by that name." : "The roster is empty.",
                   g_meta, rf(body.left + 24, body.top + 8, body.right - 24, body.top + 30),
@@ -16017,7 +16020,7 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
     float y = ovl_begin(rt, body, (float)shown * ROWH2 + 16);
     for (size_t i = 0; i < m->n_users; i++) {
         const oc_member *u = &m->users[i];
-        if (!dir_matches(u, filter)) continue;
+        if (!dir_matches(u, filter, removed_too)) continue;
         if (y + ROWH2 < body.top) { y += ROWH2; continue; }
         if (y > body.bottom) break;
         rectf row = rf(body.left + 16, y, body.right - 16, y + ROWH2 - 4);
@@ -16031,7 +16034,8 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
         /* Title, or the custom status when there is one — Slack shows the status
          * in its place, because it is the more current of the two. */
         char sub[160];
-        if (u->status_text[0])
+        if (u->disabled) snprintf(sub, sizeof sub, "Removed \xE2\x80\x94 right-click to bring them back");
+        else if (u->status_text[0])
             snprintf(sub, sizeof sub, "%s%s%s", u->status_emoji,
                      u->status_emoji[0] ? "  " : "", u->status_text);
         else snprintf(sub, sizeof sub, "%s", u->title);
@@ -22289,7 +22293,14 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
             }
         }
     }
-    if (me >= OC_ROLE_ADMIN && !self) {
+    int removed = 0;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == uid) { removed = m->users[i].disabled; break; }
+    if (removed && me >= OC_ROLE_ADMIN && !self) {
+        /* Removed: the one thing to do is bring them back (REQ-033). */
+        mi_sep();
+        mi_item(17, "Bring back to the workspace");
+    } else if (me >= OC_ROLE_ADMIN && !self) {
         /* The role submenu is FLATTENED into a checked section: the custom
          * menu has no submenus, and "set role" is a three-way choice where showing
          * the current one is the useful part — a submenu hid it behind a hover. */
@@ -22335,6 +22346,10 @@ static void member_menu_run(HWND hwnd, int cmd) {
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
     case 13: oc_client_remove_user(g_client, uid); break;
+    case 17:   /* back, with a reset link to set their password (REQ-033) */
+        g_await_reset = 1;
+        oc_client_enable_user(g_client, uid);
+        break;
     case 15: case 16:   /* a one-time link for them, shown once it comes (AUTH.md §2) */
         g_await_reset = 1;
         oc_client_reset_credential(g_client, uid, cmd == 16);
@@ -24296,6 +24311,13 @@ static void on_rclick(HWND hwnd, int x, int y) {
             show_member_menu(hwnd, m, g_memrows[i].uid, (float)x, (float)y);
             return;
         }
+    /* The People pane's rows: a person's menu, removed or not. */
+    if (g_view == VIEW_DIRECTORY)
+        for (int i = 0; i < g_n_listrows; i++)
+            if (in_rect(g_listrows[i].row, (float)x, (float)y) && g_listrows[i].mid) {
+                show_member_menu(hwnd, m, g_listrows[i].mid, (float)x, (float)y);
+                return;
+            }
     /* Inside an open thread the replies own the region, so their rows are
      * checked first — and the same message menu applies, since a reply is an
      * ordinary message with an id. */
@@ -28395,7 +28417,7 @@ static void test_dump(const char *path) {
         char low[80]; snprintf(low, sizeof low, "%s", g_dir_filter);
         for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
         if (m) for (size_t i = 0; i < m->n_users; i++)
-            if (dir_matches(&m->users[i], low)) nvis++;
+            if (dir_matches(&m->users[i], low, 0)) nvis++;
         fprintf(f, "people n=%d q=\"%s\" box=%d\n", nvis, g_dir_filter,
                 g_dir_edit && IsWindowVisible(g_dir_edit));
     }

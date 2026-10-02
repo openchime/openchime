@@ -432,6 +432,7 @@ enum {
     OC_CMD_INVITE_USER,     /* invite: op = role, body = the address it is bound to (NULL = a token) */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
     OC_CMD_RESET_CREDENTIAL,/* a reset link for a local account: channel_id = user_id, op = clear its step */
+    OC_CMD_ENABLE_USER,     /* bring a removed member back: channel_id = user_id */
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */

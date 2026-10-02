@@ -960,6 +960,15 @@ void oc_client_reset_credential(oc_client *c, uint64_t user_id, int clear_step) 
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_enable_user(oc_client *c, uint64_t user_id) {
+    if (!c || !user_id) return;
+    c->model.reset_token[0] = '\0';
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_ENABLE_USER);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_webhooks(oc_client *c, uint64_t channel_id) {
     if (!c || !channel_id) return;
     oc_model_weblist_begin(&c->model, channel_id);   /* open overlay + clear prior */
