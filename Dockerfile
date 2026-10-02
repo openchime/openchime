@@ -18,6 +18,9 @@ COPY third_party/picohttpparser ./third_party/picohttpparser
 # SQLite is compiled into the daemon from its vendored amalgamation, which is
 # likewise only in the build context.
 COPY third_party/sqlite-3.53.4 ./third_party/sqlite-3.53.4
+# The Mozilla root certificates compiled into the daemon (ARCH-10), also only in
+# the build context.
+COPY third_party/ca-roots ./third_party/ca-roots
 # Stamped by the release so a running container reports the release it came from
 # (`openchimed --version`). Unset for a local build, which reports "dev".
 ARG OC_VERSION=
