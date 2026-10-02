@@ -958,6 +958,51 @@ static void test_oidc_no_downgrade(void) {
     cleanup_db(path);
 }
 
+static oc_dbres *set_email(oc_dbwriter *w, uint64_t uid, const char *e) {
+    oc_job *j = oc_job_new(OC_JOB_SET_EMAIL, 95);
+    j->user_id = uid; j->pf_name = strdup(e);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* A local account's own address: set, cleared, one address only -- and never a
+ * verified one, so a provider's sign-in with the same address is somebody else.
+ * A provider's account keeps its provider's address. */
+static void test_set_email(void) {
+    const char *path = "build/test_dbwriter_email.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-email") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "domain:acme.example", why, sizeof why) == 0);
+    uint64_t kim = reg(w, "em-kim", "pw", OC_ROLE_MEMBER);
+    oc_dbres *r = set_email(w, kim, "Kim@Acme.example");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->body && strcmp((const char *)r->body, "kim@acme.example") == 0);
+    oc_dbres_free(r);
+    static const char *const BAD[] = { "no-at", "a@b@c", "@acme.example", "kim@", "a b@acme.example", "<a@b>" };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        r = set_email(w, kim, BAD[i]);
+        CHECK(r && r->type == OC_RES_PROFILE_ERR);
+        oc_dbres_free(r);
+    }
+    uint8_t role; int err;
+    uint64_t g = oidc_signin(w, &is, 96, "https://accounts.google.com|kim", "e1",
+                             "\"email\":\"kim@acme.example\",\"email_verified\":true,\"idp\":\"google\"", &role, &err);
+    CHECK(g != 0 && g != kim);                                           /* not Kim's account */
+    r = set_email(w, g, "other@acme.example");
+    CHECK(r && r->type == OC_RES_PROFILE_ERR);                          /* the provider's address stays */
+    oc_dbres_free(r);
+    r = set_email(w, kim, "");
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && (!r->body || !((const char *)r->body)[0]));
+    oc_dbres_free(r);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
  * new identity, the owner rule creates an owner and restores one. */
 static void test_oidc_join_rules(void) {
@@ -7362,6 +7407,7 @@ int run_dbwriter_tests(void) {
     test_oidc_auth();
     test_oidc_join_rules();
     test_oidc_no_downgrade();
+    test_set_email();
     test_oidc_link();
     test_alerts();
     test_restore();

@@ -507,6 +507,7 @@ typedef enum {
     OC_MSG_LIST_INVITES     = 0x004B, /* C->S, outstanding invites (owner/admin) */
     OC_MSG_INVITE_LIST      = 0x004C, /* S->C, the list (token HASHES only, never tokens) */
     OC_MSG_REVOKE_INVITE    = 0x004D, /* C->S, revoke one by id */
+    OC_MSG_SET_EMAIL        = 0x004F, /* C->S, a local account's own address (unverified) */
     OC_MSG_INVITE_REVOKED   = 0x004E, /* S->C, ack */
     OC_MSG_SEARCH           = 0x0060, /* C->S (REQ-080) */
     OC_MSG_SEARCH_RESULTS   = 0x0061, /* S->C */
@@ -1478,6 +1479,10 @@ typedef struct { uint64_t user_id; } oc_enable_user;
 /* Sign one of your own sessions out (REQ-182): its row goes and its connection
  * closes. Answered with a fresh SESSION_LIST. */
 typedef struct { uint64_t session_id; } oc_revoke_session;
+/* A local account's own address: recorded unverified, so it admits nobody
+ * anywhere; answered with PROFILE_INFO. */
+typedef struct { oc_slice email; } oc_set_email;
+#define OC_MAX_EMAIL 254u
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
 /* An outstanding invite, identified by a server-side id rather than its
@@ -1787,6 +1792,7 @@ oc_result oc_encode_reset_credential(oc_wbuf *w, uint16_t version, const oc_rese
 oc_result oc_encode_credential_reset(oc_wbuf *w, uint16_t version, const oc_credential_reset *m);
 oc_result oc_encode_enable_user(oc_wbuf *w, uint16_t version, const oc_enable_user *m);
 oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke_session *m);
+oc_result oc_encode_set_email(oc_wbuf *w, uint16_t version, const oc_set_email *m);
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
 oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
 oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
@@ -1979,6 +1985,7 @@ oc_result oc_decode_reset_credential(oc_rbuf *p, oc_reset_credential *m);
 oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m);
 oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m);
 oc_result oc_decode_revoke_session(oc_rbuf *p, oc_revoke_session *m);
+oc_result oc_decode_set_email(oc_rbuf *p, oc_set_email *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
 oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);

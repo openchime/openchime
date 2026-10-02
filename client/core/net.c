@@ -3355,6 +3355,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_mark_all_read(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_SET_EMAIL) {
+                uint8_t buf[320]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_email se = { oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_email(&w, OC_PROTOCOL_VERSION, &se) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SET_DISPLAY_NAME) {
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_display_name sn = { oc_slice_str(c->body ? c->body : "") };

@@ -7398,6 +7398,33 @@ static oc_dbres *process_set_status(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* A local account's own address (REQ-240): one address, nothing else; stored as
+ * the account's, never as a verified identity, so it admits nobody under a join
+ * rule or an invitation (AUTH.md §8.4). A provider's account keeps the address
+ * its provider gives, refreshed at each sign-in. Empty clears it. */
+static oc_dbres *profile_err(const oc_job *j, uint16_t code);   /* below */
+static oc_dbres *process_set_email(sqlite3 *db, const oc_job *j) {
+    const char *e = j->pf_name ? j->pf_name : "";
+    size_t n = strlen(e);
+    const char *at = strchr(e, '@');
+    int ok = n == 0 || (n <= OC_MAX_EMAIL && at && at != e && at[1] && !strchr(at + 1, '@') &&
+                        !strpbrk(e, " \t\r\n<>\",;"));
+    if (!ok) return profile_err(j, OC_ERR_FORBIDDEN);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET email=lower(?) WHERE id=? AND subject LIKE 'local:%';", -1, &st, NULL);
+    if (n) sqlite3_bind_text(st, 1, e, (int)n, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 1);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    int changed = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    if (!changed) return profile_err(j, OC_ERR_FORBIDDEN);   /* not a local account */
+    audit_actor(db, OC_AUDIT_ACCOUNT, "account.email", j->user_id, 0, NULL, 1, NULL);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_profile(db, j->user_id, r);
+    return r;
+}
+
 static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -9131,6 +9158,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_NOTIFY_DEFAULT) return process_set_notify_default(w->db, j);
     if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
+    if (j->type == OC_JOB_SET_EMAIL)       return process_set_email(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_LIST_THREADS)    return process_list_threads(w->db, j);

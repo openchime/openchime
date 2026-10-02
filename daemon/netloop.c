@@ -3202,6 +3202,19 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_EMAIL) {
+            oc_set_email se;
+            if (oc_decode_set_email(&p, &se) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_EMAIL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            /* One byte past the limit is still too long: the writer refuses it. */
+            size_t nl = se.email.len <= OC_MAX_EMAIL ? se.email.len : OC_MAX_EMAIL + 1;
+            j->pf_name = strndup((const char *)se.email.ptr, nl);
+            if (!j->pf_name) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_DISPLAY_NAME) {
             oc_set_display_name sn;
             if (oc_decode_set_display_name(&p, &sn) != OC_OK) return -1;

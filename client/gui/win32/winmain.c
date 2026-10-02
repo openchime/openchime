@@ -9397,6 +9397,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Edit profile",            53 },
     { "Change password",         31 },
     { "Two-step sign-in",        32 },
+    { "Change email address",    33 },
     { "Threads",                 74 },
     { "People",                  75 },
     { "Notification schedule",   50 },
@@ -27017,6 +27018,11 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         char url[1200];
         if (oc_client_open_page(g_client, "account/password", NULL, url, sizeof url) == 0) signin_open_url(url);
         else fb_failed("Couldn't open the password page. Try again once you're connected.");
+        break; }
+    case 33: {   /* a local account's own address (REQ-240) */
+        oc_field f[1] = { { FF_TEXT, "Email address",
+                            "Shown on your profile; empty removes it. It does not sign you in anywhere.", "" } };
+        if (form_dialog(hwnd, "Change email address", f, 1)) oc_client_set_email(g_client, f[0].value);
         break; }
     case 32: {   /* the second step's page, in the browser (AUTH.md §8.6) */
         char url[1200];

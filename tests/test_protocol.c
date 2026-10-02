@@ -981,6 +981,13 @@ static void test_admin_frames(void) {
         CHECK(oc_decode_remove_user(&p, &out) == OC_OK);
         CHECK(out.user_id == 42);
     }
+    {   /* A local account's own address. */
+        oc_set_email in = { oc_slice_str("kim@acme.example") };
+        ROUNDTRIP(oc_encode_set_email(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_EMAIL, h, p);
+        oc_set_email out;
+        CHECK(oc_decode_set_email(&p, &out) == OC_OK && out.email.len == 16 &&
+              memcmp(out.email.ptr, "kim@acme.example", 16) == 0);
+    }
     {   /* One of your sessions signed out (REQ-182). */
         oc_revoke_session in = { 77 };
         ROUNDTRIP(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REVOKE_SESSION, h, p);

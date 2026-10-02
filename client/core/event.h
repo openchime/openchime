@@ -419,6 +419,7 @@ enum {
     OC_CMD_CANCEL_SCHEDULED,
     OC_CMD_UPDATE_SCHEDULED,
     OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
+    OC_CMD_SET_EMAIL,        /* a local account's own address: body=address ("" clears) */
     OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
     OC_CMD_MARK_ALL_READ,   /* MARK_ALL_READ: every membership, in one frame; no fields */

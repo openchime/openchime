@@ -1836,6 +1836,13 @@ a field), so neither can touch another account.
 **`SET_DISPLAY_NAME` (C → S), `0x0048`** `{ name: str }` — set your own
 `users.display_name` (non-empty, ≤ 48 bytes). Answered with `PROFILE_UPDATED`.
 
+**`SET_EMAIL` (C → S), `0x004F`** `{ email: str }` — a local account's own address
+(REQ-240): one address of at most 254 bytes, or empty to remove it, stored
+lower-cased. It is the account's, never a verified identity, so it satisfies no
+join rule or invitation (AUTH.md §8.4). A provider's account keeps the address its
+provider gives, refreshed at each sign-in, and is refused (`FORBIDDEN`), as is
+something that is not one address. Answered with `PROFILE_INFO`.
+
 **`CHANGE_PASSWORD` (C → S), `0x0049`** `{ old_password: str, new_password: str }`
 — rotate your local password. The daemon verifies `old_password` (constant-time)
 against `local_credentials` and stores a fresh PBKDF2 salt+hash. A non-local
@@ -2801,6 +2808,7 @@ this table cannot silently gain a shared value.
 | `0x004C` | `INVITE_LIST` | S → C | the list (token HASHES only, never tokens) |
 | `0x004D` | `REVOKE_INVITE` | C → S | revoke one by id |
 | `0x004E` | `INVITE_REVOKED` | S → C | ack |
+| `0x004F` | `SET_EMAIL` | C → S | a local account's own address, unverified; answered with `PROFILE_INFO` |
 | `0x0050` | `CREATE_CHANNEL` | C → S | (REQ-050) |
 | `0x0051` | `CHANNEL_INFO` | S → C | ack for create/join/leave/invite/remove |
 | `0x0052` | `LIST_CHANNELS` | C → S |  |

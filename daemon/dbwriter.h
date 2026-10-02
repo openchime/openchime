@@ -248,7 +248,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_REVOKE_SESSION = 129,
        /* Sessions in use (REQ-181): `grp_uids` holds their ids, `n_grp_uids`
         * how many; each one's last_seen_ms becomes now. No answer. */
-       OC_JOB_SESSIONS_SEEN = 130 };
+       OC_JOB_SESSIONS_SEEN = 130,
+       /* A local account's own address (`pf_name` the address): PROFILE_INFO, or
+        * PROFILE_ERR. */
+       OC_JOB_SET_EMAIL = 131 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
