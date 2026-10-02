@@ -197,6 +197,7 @@ typedef struct conn_s {
     int          authed;
     uint64_t     user_id;
     uint64_t     session_id;   /* REQ-182: which sessions row this conn uses */
+    uint64_t     accepted_ms;  /* when accepted: one not signed in soon after closes */
     char         source[46]; /* peer IP string, for per-source rate limiting */
     uint8_t     *out;       /* growable pending-output buffer (capped, see out_append) */
     size_t       out_cap, out_len, out_sent;
@@ -1079,6 +1080,29 @@ static uint64_t call_grace_ms(void) {
 }
 void oc_netloop_set_call_grace_ms(uint64_t ms) {
     __atomic_store_n(&g_call_grace_ms, ms, __ATOMIC_RELAXED);
+}
+
+static uint64_t g_unauthed_ms;
+void oc_netloop_set_unauthed_ms(uint64_t ms) {
+    __atomic_store_n(&g_unauthed_ms, ms, __ATOMIC_RELAXED);
+}
+
+/* Close every connection that has not signed in within its time (REQ-191): each
+ * holds a slot under the per-address cap and a descriptor, and one that never
+ * finishes TLS or never signs in would hold them for as long as its peer liked.
+ * HTTP is the I/O thread's, with its own deadline, and a page waiting on the
+ * writer is answered when it is done. Once a second is often enough. */
+static void close_unauthed(int ep, conn **conns) {
+    static __thread uint64_t last;
+    uint64_t now = now_ms();
+    if (now - last < 1000) return;
+    last = now;
+    uint64_t limit = __atomic_load_n(&g_unauthed_ms, __ATOMIC_RELAXED);
+    if (!limit) limit = OC_UNAUTHED_MS;
+    for (size_t i = 0; i < g_nlive; i++) {
+        conn *c = g_live[i];
+        if (c && !c->authed && !c->http && now - c->accepted_ms >= limit) conn_close(ep, conns, c->fd);
+    }
 }
 
 /* The presence-change window (OC_PRESENCE_RATE_MS), or a test's shorter one; 0
@@ -4500,12 +4524,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         break;
     }
     case OC_RES_AUTH_ERR: {
+        /* Fatal, and meant: another try is on a new connection, which the
+         * limiters and the unauthenticated timeout see afresh. */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_error e = { r->err_code, 1, { NULL, 0 }, oc_slice_str("auth failed") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        int fd = c->fd;
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        if (conns[fd] == c) conn_close(ep, conns, fd);
         break;
     }
     case OC_RES_LOGOUT_OK: {
@@ -6863,6 +6891,7 @@ static void accept_all(int lfd, int plain, conn **conns, const oc_trusted_proxie
         c->fd = cfd;
         memcpy(c->source, src, sizeof c->source);
         c->conn_id = g_next_conn_id++;
+        c->accepted_ms = now_ms();
         c->state = CONN_OPENING;
         if (index_add(c) != 0) { free(c); close(cfd); continue; }
         int rc = plain ? oc_ioloop_adopt_plain(g_io, cfd, c->conn_id, src)
@@ -7183,6 +7212,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         maybe_run_maintenance(dbw);
         maybe_fire_scheduled(dbw);
         expire_snoozes(ep, conns);
+        close_unauthed(ep, conns);
         flush_deferred_presence(ep, conns);
         if (g_relay) {
             uint64_t sm = __atomic_load_n(&g_relay_silence_ms, __ATOMIC_RELAXED);

@@ -1835,6 +1835,29 @@ static void test_device_token_wire(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* A connection that has not signed in is let go (REQ-191): a failed AUTH ends
+ * it, and one that never signs in -- or never says HELLO -- is closed once its
+ * time is up, while a signed-in one is kept. */
+static void test_unauthed_closed(int port, const uint8_t *pin) {
+    client a;
+    uint64_t uid = 0;
+    CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
+    CHECK(do_auth(&a, "roy", "not-the-password", &uid) != 0);
+    CHECK(peer_closed(&a) == 1);
+    client_close(&a);
+
+    oc_netloop_set_unauthed_ms(1500);
+    client idle, quiet, in;
+    CHECK(client_open(&idle, port, pin) == 0 && do_handshake(&idle) == 0);
+    CHECK(client_open(&quiet, port, pin) == 0);                 /* TLS, then nothing */
+    CHECK(signed_in(&in, port, pin, "carol", "pw") == 0);
+    CHECK(peer_closed(&idle) == 1);
+    CHECK(peer_closed(&quiet) == 1);
+    CHECK(peer_closed(&in) == 0);
+    oc_netloop_set_unauthed_ms(0);
+    client_close(&idle); client_close(&quiet); client_close(&in);
+}
+
 /* Revoking a user's sessions closes their other live connections, which are
  * authenticated in memory and would otherwise carry on (REQ-182): a password
  * change keeps only the device that made it, signing out everywhere keeps none,
@@ -4996,6 +5019,7 @@ int run_netloop_tests(void) {
         test_admin_vertical(arg.port, pin);
         test_revoke_other_devices(arg.port, pin);
         test_device_token_wire(arg.port, pin);
+        test_unauthed_closed(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack(arg.port + 128, arg.port + 129);
