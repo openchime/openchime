@@ -92,6 +92,16 @@ int oc_config_load(char *err, size_t errcap) {
 
     /* Paths + ports. */
     c->db_path     = env_or2("OPENCHIME_DB_PATH",   NULL, "/data/openchime.db");
+    {
+        const char *fk = getenv("OPENCHIME_FACTOR_KEY_FILE");
+        if (fk && fk[0]) snprintf(c->factor_key_file, sizeof c->factor_key_file, "%s", fk);
+        else {
+            const char *slash = strrchr(c->db_path, '/');
+            int dl = slash ? (int)(slash - c->db_path) : 1;
+            snprintf(c->factor_key_file, sizeof c->factor_key_file, "%.*s/factor.key",
+                     dl, slash ? c->db_path : ".");
+        }
+    }
     c->tls_cert    = env_or2("OPENCHIME_TLS_CERT",  NULL, "/data/cert.pem");
     c->tls_key     = env_or2("OPENCHIME_TLS_KEY",   NULL, "/data/key.pem");
     c->health_port = env_int("OPENCHIME_HEALTH_PORT", NULL, 8080);

@@ -202,6 +202,18 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 "style=\"background:none;color:inherit;border:1px solid #c4c8cf;margin-top:.6rem\">"
                 "That wasn't me</button>\n</form>\n");
         break;
+    case OC_PAGE_STEP:
+        open_page(&p, "Two-step sign-in \xE2\x80\x94 OpenChime");
+        raw(&p, "<h1>Two-step sign-in</h1>\n<p>Enter the code your authenticator app shows, "
+                "or one of your recovery codes.</p>\n");
+        message(&p, pp->message);
+        raw(&p, "<form method=\"post\" action=\"");
+        esc(&p, pp->action && pp->action[0] ? pp->action : "signin/verify");
+        raw(&p, "\">\n");
+        hidden(&p, "ticket", pp->ticket);
+        field(&p, "code", "Code", "text", "one-time-code", "", 1);
+        raw(&p, "<button type=\"submit\">Continue</button>\n</form>\n");
+        break;
     case OC_PAGE_PASSWORD:
         open_page(&p, "Change your password \xE2\x80\x94 OpenChime");
         if (pp->done) {

@@ -1134,6 +1134,27 @@ static const char MIGRATION_0052[] =
     ");"
     "CREATE INDEX deleted_hold_reactions_msg ON deleted_hold_reactions(message_id);";
 
+static const char MIGRATION_0053[] =
+    /* A local account's second step (AUTH.md §8.6, REQ-184). The TOTP secret is
+     * sealed under the factor key, which is kept outside the database, with the
+     * account as associated data: the database alone gives away no second
+     * factor. `last_step` is the last step a code was accepted for, so a code is
+     * never good twice. A recovery code is kept as a salt and the SHA-256 of
+     * salt and code, and is spent once. */
+    "CREATE TABLE local_totp ("
+    "  user_id         INTEGER PRIMARY KEY REFERENCES users(id),"
+    "  secret          BLOB NOT NULL,"
+    "  confirmed_at_ms INTEGER,"
+    "  last_step       INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE TABLE local_recovery ("
+    "  id         INTEGER PRIMARY KEY,"
+    "  user_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  code_hash  BLOB NOT NULL,"
+    "  used_at_ms INTEGER"
+    ");"
+    "CREATE INDEX local_recovery_user ON local_recovery(user_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1187,6 +1208,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 50, MIGRATION_0050 },
     { 51, MIGRATION_0051 },
     { 52, MIGRATION_0052 },
+    { 53, MIGRATION_0053 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
