@@ -70,7 +70,9 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   comes; a dropped connection keeps the code and polls on. When the
   browser comes back it connects again and presents the token with the verifier,
   then wipes both. `oc_client_cancel_signin` and a five-minute timeout end the
-  wait; a refused sign-in reaches `last_error` worded by its code.
+  wait; a refused sign-in reaches `last_error` worded by its code — as does
+  every other refusal, in the client's own words for the reason code
+  (`oc_error_text`), never the server's free text.
   Every connection — the probe too — names the workspace's domain in its
   handshake (TLS.md), which is its store key minus any port. `oc_net_probe` is the step before any of it: connect, read the sources the
   workspace offers, leave — so a frontend draws the controls it offers before

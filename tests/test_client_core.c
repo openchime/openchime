@@ -5098,7 +5098,13 @@ int run_client_core_tests(void) {
             /* The address goes on the wire as INVITE_USER's email -- trimmed of
              * what a paste brings -- and this daemon, which nothing could redeem
              * it at, refuses it in words. */
+            /* A refusal is told in this client's words for its code, not the
+             * server's text ("admin op rejected"). */
             uint32_t seq = am->error_seq;
+            oc_client_set_role(a, am->user_id, OC_ROLE_MEMBER);   /* the only owner */
+            CHECK(WAIT_FOR(a, m->error_seq != seq &&
+                              strcmp(m->last_error, "a workspace needs at least one owner") == 0));
+            seq = am->error_seq;
             oc_client_invite(a, OC_ROLE_MEMBER, "  lee@partner.example \n");
             CHECK(WAIT_FOR(a, m->error_seq != seq && strstr(m->last_error, "email address") != NULL));
             CHECK(am->invite_token[0] == '\0');

@@ -2237,10 +2237,33 @@ static void test_reason_codes_unique(void) {
     CHECK(OC_ERR_INVALID_MESSAGE != OC_ERR_INVALID_DEVICE_TOKEN);
 }
 
+/* Every reason code the protocol defines has words a person reads (the client
+ * shows them, not the server's text). Read from the header itself, so a code
+ * added without its words fails here. */
+static void test_error_texts(void) {
+    FILE *f = fopen("shared/protocol.h", "r");
+    CHECK(f != NULL);
+    if (!f) return;
+    char line[512];
+    int seen = 0;
+    while (fgets(line, sizeof line, f)) {
+        char name[64]; unsigned code = 0;
+        if (sscanf(line, " OC_ERR_%63[A-Z_] = %u", name, &code) != 2) continue;
+        seen++;
+        const char *t = oc_error_text((uint16_t)code);
+        if (!t || !t[0]) printf("  FAIL no words for OC_ERR_%s (%u)\n", name, code);
+        CHECK(t && t[0]);
+    }
+    fclose(f);
+    CHECK(seen >= 50);
+    CHECK(oc_error_text(65000) == NULL);
+}
+
 int run_protocol_tests(void) {
     printf("test_protocol: primitives, handshake, auth, messaging, backfill,\n");
     printf("               error, size limits, malformed frames, version negotiation\n");
     test_reason_codes_unique();
+    test_error_texts();
     test_primitives();
     test_device_token_ok();
     test_handshake_frames();

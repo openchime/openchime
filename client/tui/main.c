@@ -20,7 +20,6 @@
  *
  * Usage: openchime-tui [<workspace>] [user:pass]   (login box if omitted)
  *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
- *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
  * Keys: everything is menus, dialogs, and screens — no commands to type. The
  *       composer only sends: Enter posts your message (or, inside a thread, posts
@@ -2080,12 +2079,12 @@ int main(int argc, char **argv) {
     if (argc >= 3 && all_digits(argv[2])) {          /* dev host:port */
         snprintf(host, sizeof host, "%s", argv[1]);
         port = atoi(argv[2]);
-        cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
+        cred = argc > 3 ? argv[3] : NULL;
         oc_hostport(host, port, key0, sizeof key0);   /* an address IS its name here */
         direct = 1;
     } else if (argc >= 2 || cfg.workspace[0]) {       /* workspace mode (arg or config default) */
         const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
-        const char *cli_cred = argc >= 3 ? argv[2] : getenv("OPENCHIME_CRED");
+        const char *cli_cred = argc >= 3 ? argv[2] : NULL;
         oc_endpoint ep;
         oc_resolve_status st = oc_resolve(inst, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
