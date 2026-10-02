@@ -4953,6 +4953,76 @@ static void test_status_and_profile(void) {
     cleanup_db(path);
 }
 
+static int count_rows(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Removing a member stops what acts for them (REQ-033, REQ-170): their webhooks
+ * post no more -- not even once an admin turns one back on -- and their devices
+ * are no longer woken. */
+static void test_remove_user_integrations(void) {
+    const char *path = "build/test_dbwriter_rm_integrations.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "ri-owner", "pw", OC_ROLE_OWNER);
+    uint64_t admin = reg(w, "ri-admin", "pw", OC_ROLE_ADMIN);
+    CHECK(owner && admin);
+
+    oc_job *j = oc_job_new(OC_JOB_CREATE_WEBHOOK, 1);
+    j->user_id = admin; j->channel_id = OC_DEFAULT_CHANNEL; j->ch_name = strdup("ci");
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_CREATED);
+    uint64_t wid = r ? r->message_id : 0;
+    uint8_t token[OC_SESSION_TOKEN_LEN];
+    if (r) memcpy(token, r->session_token, sizeof token);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_REGISTER_DEVICE_TOKEN, 2);
+    j->user_id = admin; j->device_platform = OC_PUSH_FCM; j->device_token = strdup("ri-device");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_DEVICE_TOKEN_OK);
+    oc_dbres_free(r);
+
+    CHECK(remove_user(w, owner, admin) == 0);
+
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 3);
+    oc_job_set_token(j, token, sizeof token);
+    oc_job_set_body(j, "after", 5);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_UNKNOWN_WEBHOOK);
+    oc_dbres_free(r);
+
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    CHECK(count_rows(db, "SELECT COUNT(*) FROM device_tokens;") == 0);
+    CHECK(count_rows(db, "SELECT COUNT(*) FROM webhooks WHERE disabled=1;") == 1);
+    /* Turned back on, it still posts nothing in a removed member's name. */
+    char sql[64];
+    snprintf(sql, sizeof sql, "UPDATE webhooks SET disabled=0 WHERE id=%llu;", (unsigned long long)wid);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 4);
+    oc_job_set_token(j, token, sizeof token);
+    oc_job_set_body(j, "again", 5);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_UNKNOWN_WEBHOOK);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_webhooks(void) {
     const char *path = "build/test_dbwriter_webhook.db";
     cleanup_db(path);
@@ -7020,6 +7090,7 @@ int run_dbwriter_tests(void) {
     test_search();
     test_search_filters_and_paging();
     test_setup_invite();
+    test_remove_user_integrations();
     test_tls_identity();
     test_delivery_cursor();
     test_mark_all_read();

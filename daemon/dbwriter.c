@@ -2222,6 +2222,12 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    /* What acts for them when they are not there stops too: their webhooks post
+     * in their name, and their devices would keep being woken for the workspace. */
+    sqlite3_prepare_v2(db, "UPDATE webhooks SET disabled=1 WHERE creator_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     /* Their drafts go with them (REQ-223, ARCH-101) — user content, and the
      * account is gone. The second sweep catches OTHER people's drafts for the
      * DM channels just deleted above: those channels no longer exist, so a row
@@ -6451,7 +6457,8 @@ static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
     }
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, creator_id, label FROM webhooks WHERE token_hash=? AND disabled=0;", -1, &st, NULL);
+        "SELECT w.channel_id, w.creator_id, w.label FROM webhooks w JOIN users u ON u.id=w.creator_id "
+        " WHERE w.token_hash=? AND w.disabled=0 AND u.disabled=0;", -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
     int found = sqlite3_step(st) == SQLITE_ROW;
     uint64_t cid = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
