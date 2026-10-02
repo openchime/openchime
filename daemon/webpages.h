@@ -13,7 +13,17 @@
 
 #include <stddef.h>
 
-typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD, OC_PAGE_DEVICE, OC_PAGE_STEP } oc_page_kind;
+typedef enum { OC_PAGE_SIGNIN, OC_PAGE_SIGNUP, OC_PAGE_PASSWORD, OC_PAGE_DEVICE, OC_PAGE_STEP,
+               OC_PAGE_SECURITY } oc_page_kind;
+
+typedef enum {
+    OC_SEC_SIGNIN = 0,   /* username and password, to begin */
+    OC_SEC_SETUP,        /* the key and QR code, and the first code */
+    OC_SEC_CONFIRM,      /* the first code again, after a wrong one */
+    OC_SEC_CODES,        /* on: the recovery codes, once */
+    OC_SEC_ON,           /* already on: a code turns it off */
+    OC_SEC_OFF           /* turned off */
+} oc_sec_screen;
 
 typedef struct {
     oc_page_kind kind;
@@ -34,6 +44,13 @@ typedef struct {
      * at the same depth. */
     const char  *ticket;
     const char  *action;
+    /* SECURITY (AUTH.md §8.6): which of its screens -- and, setting one up, the
+     * key to type and the otpauth URI its QR code holds; done, the recovery
+     * codes, one per line. */
+    oc_sec_screen sec;
+    const char  *secret;
+    const char  *otpauth;
+    const char  *codes;
 } oc_page;
 
 /* The page, malloc'd, its length in *len. NULL on no memory. */

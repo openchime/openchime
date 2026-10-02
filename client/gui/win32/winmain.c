@@ -8804,7 +8804,7 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
             { NULL,                   0, 0 },
             { "Change password",     31, 1 },
             { "Active sessions",     54, 1 },
-            { NULL,                   0, 0 },
+            { "Two-step sign-in",    32, 1 },
         };
         for (int gi = 0; gi < 2; gi++) {
             draw_text(rt, gi == 0 ? "PROFILE" : "ACCOUNT", g_meta,
@@ -9393,6 +9393,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Mark all as read",        73 },
     { "Edit profile",            53 },
     { "Change password",         31 },
+    { "Two-step sign-in",        32 },
     { "Threads",                 74 },
     { "People",                  75 },
     { "Notification schedule",   50 },
@@ -26967,6 +26968,11 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         char url[1200];
         if (oc_client_open_page(g_client, "account/password", NULL, url, sizeof url) == 0) signin_open_url(url);
         else fb_failed("Couldn't open the password page. Try again once you're connected.");
+        break; }
+    case 32: {   /* the second step's page, in the browser (AUTH.md §8.6) */
+        char url[1200];
+        if (oc_client_open_page(g_client, "account/security", NULL, url, sizeof url) == 0) signin_open_url(url);
+        else fb_failed("Couldn't open the two-step sign-in page. Try again once you're connected.");
         break; }
     case 40: invite_people(hwnd, OC_ROLE_MEMBER); break;
     case 41: invite_people(hwnd, OC_ROLE_ADMIN);  break;

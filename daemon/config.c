@@ -93,6 +93,18 @@ int oc_config_load(char *err, size_t errcap) {
     /* Paths + ports. */
     c->db_path     = env_or2("OPENCHIME_DB_PATH",   NULL, "/data/openchime.db");
     {
+        /* Whether local accounts are asked for a second step (AUTH.md §8.6). A
+         * value that is none of the three stops the boot. */
+        const char *mfa = env_or2("OPENCHIME_LOCAL_MFA", NULL, "optional");
+        if      (strcmp(mfa, "off") == 0)      c->local_mfa = 0;
+        else if (strcmp(mfa, "optional") == 0) c->local_mfa = 1;
+        else if (strcmp(mfa, "required") == 0) c->local_mfa = 2;
+        else {
+            snprintf(err, errcap, "OPENCHIME_LOCAL_MFA='%s' is invalid (want off|optional|required)", mfa);
+            return -1;
+        }
+    }
+    {
         const char *fk = getenv("OPENCHIME_FACTOR_KEY_FILE");
         if (fk && fk[0]) snprintf(c->factor_key_file, sizeof c->factor_key_file, "%s", fk);
         else {

@@ -259,7 +259,8 @@ static int read_request(int fd, breq *r) {
 
 /* The pages the tunnel carries, and nothing else: it is not a proxy. */
 static int tunnel_page(const char *p) {
-    static const char *const PAGES[] = { "/signin", "/signin/verify", "/signup", "/account/password" };
+    static const char *const PAGES[] = { "/signin", "/signin/verify", "/signup", "/account/password",
+                                         "/account/security" };
     for (size_t i = 0; i < sizeof PAGES / sizeof PAGES[0]; i++) {
         size_t n = strlen(PAGES[i]);
         if (strncmp(p, PAGES[i], n) == 0 && (p[n] == '\0' || p[n] == '?')) return 1;

@@ -546,6 +546,12 @@ works. Nothing proves the shipped *image* works (§3.2).
   waiting at its step when the password changes is refused; the password page
   changes nothing until the step; five wrong codes end the ticket; no factor key
   refuses the step; a device approval waits for its code (AUTH.md §8.6).
+- **Setting the step up (`itest_netloop` `test_web_signin`):** the page takes the
+  password, then shows a key and a QR code; a wrong first code is refused, the
+  right one turns the step on and shows ten recovery codes once; a sign-in then
+  asks for a code and takes a recovery code; a code turns it off and leaves no
+  secret or code behind; `required` refuses an account with no step, `off` asks
+  for none and closes the page.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

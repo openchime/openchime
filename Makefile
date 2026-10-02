@@ -85,7 +85,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/totp.c daemon/webstep.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/totp.c daemon/webstep.c third_party/qrcodegen/qrcodegen.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
@@ -99,7 +99,7 @@ MBEDTLS_LIBS := $(MBEDTLS_DIR)/library/libmbedtls.a \
                 $(MBEDTLS_DIR)/library/libmbedx509.a \
                 $(MBEDTLS_DIR)/library/libmbedcrypto.a
 
-INC := -Ishared -Idaemon -Ithird_party/jsmn -Ithird_party/picohttpparser -I$(MBEDTLS_INC)
+INC := -Ishared -Idaemon -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird_party/qrcodegen -I$(MBEDTLS_INC)
 
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
@@ -261,7 +261,7 @@ endif
 STT ?= 1
 # What `make test` links of voice input whatever STT is: the worker (driven by a
 # stub engine) and the tokenizer -- everything but the model.
-QR_TEST_SRC := tuikit/tk_qr.c $(QRCODEGEN)
+QR_TEST_SRC := tuikit/tk_qr.c   # qrcodegen is the daemon's own now (APP_SRC)
 OSN_TEST_SRC := client/shared/osnotify_null.c client/shared/feedback.c
 STT_TEST_SRC := daemon/stt_worker.c daemon/stt_tokens.c daemon/stt_mentions.c
 ifeq ($(STT),1)
