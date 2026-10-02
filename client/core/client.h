@@ -383,6 +383,8 @@ void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name,
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
 void oc_client_list_file_channels(oc_client *c);   /* */
 void oc_client_list_sessions(oc_client *c);        /* REQ-182 */
+/* Sign one of your own devices out (REQ-182); the list comes back without it. */
+void oc_client_revoke_session(oc_client *c, uint64_t session_id);
 void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
                           uint64_t expires_at);
 void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,

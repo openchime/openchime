@@ -3448,6 +3448,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_REVOKE_SESSION) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_revoke_session rs = { c->message_id };
+                if (oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_LIST_SESSIONS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 if (oc_encode_list_sessions(&w, OC_PROTOCOL_VERSION) == OC_OK)

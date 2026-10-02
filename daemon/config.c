@@ -95,6 +95,18 @@ int oc_config_load(char *err, size_t errcap) {
     {
         /* Whether local accounts are asked for a second step (AUTH.md §8.6). A
          * value that is none of the three stops the boot. */
+        /* The session policy (REQ-181): whole days, a lifetime of at least one. */
+        const char *sd = env_or2("OPENCHIME_SESSION_DAYS", NULL, "30");
+        const char *si = env_or2("OPENCHIME_SESSION_IDLE_DAYS", NULL, "0");
+        char *e1 = NULL, *e2 = NULL;
+        unsigned long d = strtoul(sd, &e1, 10), idle = strtoul(si, &e2, 10);
+        if (!sd[0] || *e1 || d < 1 || d > 3650 || !si[0] || *e2 || idle > 3650) {
+            snprintf(err, errcap, "OPENCHIME_SESSION_DAYS='%s' / OPENCHIME_SESSION_IDLE_DAYS='%s' are invalid "
+                     "(whole days: a lifetime of 1-3650, an idle limit of 0-3650)", sd, si);
+            return -1;
+        }
+        c->session_days = (unsigned)d;
+        c->session_idle_days = (unsigned)idle;
         const char *mfa = env_or2("OPENCHIME_LOCAL_MFA", NULL, "optional");
         if      (strcmp(mfa, "off") == 0)      c->local_mfa = 0;
         else if (strcmp(mfa, "optional") == 0) c->local_mfa = 1;

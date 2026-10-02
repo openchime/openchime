@@ -58,6 +58,8 @@ typedef struct {
      * §8.6): OPENCHIME_FACTOR_KEY_FILE, else factor.key beside the database. */
     char        factor_key_file[1024];
     int         local_mfa;   /* OPENCHIME_LOCAL_MFA: 0 off, 1 optional, 2 required */
+    /* How long a session lives, and may go unused (0: no limit), in days (REQ-181). */
+    unsigned    session_days, session_idle_days;
     int health_port, proto_port, audio_port;
     /* The audio relay as clients reach it, where that differs from the socket
      * (AUDIO.md §4): the UDP port CALL_JOINED names (0: the bound one), and the

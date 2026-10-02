@@ -200,6 +200,8 @@ typedef struct conn_s {
     uint64_t     user_id;
     uint64_t     session_id;   /* REQ-182: which sessions row this conn uses */
     uint64_t     accepted_ms;  /* when accepted: one not signed in soon after closes */
+    uint64_t     seen_ms;      /* when its session's last_seen_ms was last written */
+    int          used;         /* a frame since then: the session is in use */
     char         source[46]; /* peer IP string, for per-source rate limiting */
     uint8_t     *out;       /* growable pending-output buffer (capped, see out_append) */
     size_t       out_cap, out_len, out_sent;
@@ -1083,6 +1085,47 @@ static uint64_t call_grace_ms(void) {
 }
 void oc_netloop_set_call_grace_ms(uint64_t ms) {
     __atomic_store_n(&g_call_grace_ms, ms, __ATOMIC_RELAXED);
+}
+
+static uint64_t g_seen_ms;
+void oc_netloop_set_seen_ms(uint64_t ms) {
+    __atomic_store_n(&g_seen_ms, ms, __ATOMIC_RELAXED);
+}
+
+/* Sessions in use (REQ-181): every connection that has sent a frame since its
+ * session's last_seen_ms was written, and not within the interval, goes into one
+ * writer job -- so an idle limit measures disuse, and a busy workspace pays one
+ * statement per session an hour, not one per message. Checked once a second. */
+static void sessions_seen(conn **conns, oc_dbwriter *dbw) {
+    (void)conns;
+    static __thread uint64_t last;
+    uint64_t now = now_ms();
+    if (now - last < 1000) return;
+    last = now;
+    uint64_t every = __atomic_load_n(&g_seen_ms, __ATOMIC_RELAXED);
+    if (!every) every = OC_SESSION_SEEN_MS;
+    uint64_t *ids = NULL;
+    uint16_t n = 0, cap = 0;
+    for (size_t i = 0; i < g_nlive; i++) {
+        conn *c = g_live[i];
+        if (!c || !c->authed || !c->used || !c->session_id || now - c->seen_ms < every) continue;
+        if (n == cap) {
+            if (cap == 4096) break;   /* the rest go next second */
+            uint16_t nc = cap ? (uint16_t)(cap * 2) : 64;
+            uint64_t *g = realloc(ids, (size_t)nc * sizeof *g);
+            if (!g) break;
+            ids = g; cap = nc;
+        }
+        ids[n++] = c->session_id;
+        c->seen_ms = now;
+        c->used = 0;
+    }
+    if (!n) { free(ids); return; }
+    oc_job *j = oc_job_new(OC_JOB_SESSIONS_SEEN, 0);
+    if (!j) { free(ids); return; }
+    j->grp_uids = ids;
+    j->n_grp_uids = n;
+    oc_dbwriter_submit(dbw, j);
 }
 
 static uint64_t g_unauthed_ms;
@@ -2061,6 +2104,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
 
         oc_header hdr; oc_rbuf p;
         if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
+        if (c->authed) c->used = 1;   /* the session is in use (sessions_seen) */
 
         if (!c->did_hello) {
             if (hdr.msg_type != OC_MSG_HELLO) {
@@ -2319,6 +2363,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->role = iu.role;
             if (iu.email.len && oc_job_set_email(j, iu.email.ptr, iu.email.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REVOKE_SESSION) {
+            oc_revoke_session rs;
+            if (oc_decode_revoke_session(&p, &rs) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REVOKE_SESSION, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = rs.session_id;
+            j->message_id = c->session_id;      /* so the list marks "this device" */
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -4675,6 +4730,12 @@ static size_t encode_group(const oc_group_row *g) {
  * connections: each is authenticated in memory, so deleting its session row
  * alone would leave it working until it dropped by itself (REQ-182). */
 static void close_revoked(int ep, conn **conns, const oc_dbres *r) {
+    if (r->revoked_session && r->user_id) {   /* one session signed out: its connections */
+        for (conn *t = user_head(r->user_id), *next; t; t = next) {
+            next = t->u_next;
+            if (t->session_id == r->revoked_session) conn_close(ep, conns, t->fd);
+        }
+    }
     if (!r->revoked || !r->user_id) return;
     for (conn *t = user_head(r->user_id), *next; t; t = next) {
         next = t->u_next;
@@ -4694,6 +4755,8 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         c->user_id = r->user_id;
         user_link(c);
         c->session_id = r->session_id;   /* REQ-182 */
+        c->seen_ms = now_ms();           /* the sign-in wrote last_seen_ms */
+        c->used = 0;
         c->presence = OC_PRESENCE_ONLINE;
         c->dnd_until_ms = r->snooze_until_ms;   /* REQ-278, already expiry-checked */
         cache_schedule(conns, r->user_id, r);   /* REQ-136, the other DND half */
@@ -7570,6 +7633,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         maybe_fire_scheduled(dbw);
         expire_snoozes(ep, conns);
         close_unauthed(ep, conns);
+        sessions_seen(conns, dbw);
         flush_deferred_presence(ep, conns);
         if (g_relay) {
             uint64_t sm = __atomic_load_n(&g_relay_silence_ms, __ATOMIC_RELAXED);

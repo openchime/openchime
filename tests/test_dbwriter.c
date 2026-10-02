@@ -5168,6 +5168,46 @@ static void test_enable_user(void) {
     cleanup_db(path);
 }
 
+/* The session policy (REQ-181): a session lives the days the workspace sets,
+ * and one unused past the idle limit is refused -- and gone -- at its next use,
+ * while one marked in use goes on. */
+static void test_session_policy(void) {
+    const char *path = "build/test_dbwriter_sessions.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t u = reg(w, "sp-user", "pw", OC_ROLE_MEMBER);
+    oc_dbwriter_set_session_policy(w, 2ull * 86400000ull, 3ull * 86400000ull);
+    uint8_t t1[OC_SESSION_TOKEN_LEN], t2[OC_SESSION_TOKEN_LEN];
+    CHECK(auth_local(w, 90, "sp-user", "pw", t1, NULL) == u);
+    CHECK(auth_local(w, 91, "sp-user", "pw", t2, NULL) == u);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    CHECK(count_rows(db, "SELECT COUNT(*) FROM sessions WHERE expires_at_ms - created_at_ms = 172800000;") == 2);
+    /* Both four days unused; one is then marked in use. */
+    CHECK(sqlite3_exec(db, "UPDATE sessions SET last_seen_ms = last_seen_ms - 345600000;", NULL, NULL, NULL) == SQLITE_OK);
+    int64_t first = 0;
+    {
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "SELECT MIN(id) FROM sessions;", -1, &st, NULL);
+        if (sqlite3_step(st) == SQLITE_ROW) first = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    oc_job *j = oc_job_new(OC_JOB_SESSIONS_SEEN, 0);
+    j->grp_uids = calloc(1, sizeof *j->grp_uids);
+    j->grp_uids[0] = (uint64_t)first;
+    j->n_grp_uids = 1;
+    oc_dbwriter_submit(w, j);
+    CHECK(auth_session(w, 92, t1) == u);                 /* marked: goes on */
+    CHECK(auth_session(w, 93, t2) == 0);                 /* idle: refused */
+    CHECK(count_rows(db, "SELECT COUNT(*) FROM sessions;") == 1);   /* ...and gone */
+    oc_dbwriter_set_session_policy(w, 0, 0);
+    sqlite3_close(db);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Removing a member stops what acts for them (REQ-033, REQ-170): their webhooks
  * post no more -- not even once an admin turns one back on -- and their devices
  * are no longer woken. */
@@ -7353,6 +7393,7 @@ int run_dbwriter_tests(void) {
     test_remove_user_integrations();
     test_reset_credential();
     test_enable_user();
+    test_session_policy();
     test_tls_identity();
     test_delivery_cursor();
     test_mark_all_read();

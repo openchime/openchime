@@ -241,7 +241,14 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* A removed member brought back (REQ-033): actor `user_id`, member
         * `target_user_id`. USER_UPDATED (disabled 0; for a local account
         * `body` a reset link's token), or USER_ERR. */
-       OC_JOB_ENABLE_USER = 128 };
+       OC_JOB_ENABLE_USER = 128,
+       /* Sign one of `user_id`'s sessions out (REQ-182): `target_user_id` is the
+        * session's id, `message_id` the asking connection's own. Answered with a
+        * SESSION_LIST, `revoked_session` the one that went. */
+       OC_JOB_REVOKE_SESSION = 129,
+       /* Sessions in use (REQ-181): `grp_uids` holds their ids, `n_grp_uids`
+        * how many; each one's last_seen_ms becomes now. No answer. */
+       OC_JOB_SESSIONS_SEEN = 130 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -877,6 +884,9 @@ typedef struct oc_dbres {
     /* LOGOUT_OK, WEB_OK, PROFILE_UPDATED: the user's sessions were revoked, so
      * every connection of `user_id` closes but `conn_id`'s (REQ-182). */
     uint8_t        revoked;
+    /* SESSION_LIST from REVOKE_SESSION: the session signed out, whose connection
+     * closes too. */
+    uint64_t       revoked_session;
 
     /* AUTH_OK / REGISTER_OK */
     uint64_t       user_id;
@@ -1240,6 +1250,10 @@ void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32);
 #define OC_MFA_OPTIONAL 1
 #define OC_MFA_REQUIRED 2
 void oc_dbwriter_set_local_mfa(oc_dbwriter *w, int policy);
+/* How long a session lives (OPENCHIME_SESSION_DAYS), and how long one may go
+ * unused before it is refused (OPENCHIME_SESSION_IDLE_DAYS; 0, never), in ms.
+ * Before serving. */
+void oc_dbwriter_set_session_policy(oc_dbwriter *w, uint64_t ttl_ms, uint64_t idle_ms);
 int  oc_dbwriter_local_mfa(oc_dbwriter *w);
 
 /* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's

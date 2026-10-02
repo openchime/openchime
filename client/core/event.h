@@ -452,6 +452,7 @@ enum {
     OC_CMD_GET_PROFILE,
     OC_CMD_LIST_FILE_CHANNELS,   /* */
     OC_CMD_LIST_SESSIONS,        /* REQ-182 */
+    OC_CMD_REVOKE_SESSION,       /* sign one of your sessions out: message_id = its id */
     OC_CMD_SET_NOTIFY_DEFAULT,   /* REQ-134: op = level */
     OC_CMD_SET_AVATAR,           /* message_id = attachment id, 0 clears */
     OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
