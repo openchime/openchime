@@ -18,6 +18,23 @@ static int slice_eq_str(oc_slice s, const char *str) {
 }
 
 /* --- Primitive encodings (§7) ------------------------------------------- */
+/* A push device token is what APNs and FCM issue, and nothing that could break
+ * the JSON it is sent in (ARCH-85). */
+static void test_device_token_ok(void) {
+    CHECK(oc_device_token_ok((const uint8_t *)"0a1B", 4));
+    CHECK(oc_device_token_ok((const uint8_t *)"fcm:APA91b-x_y.z", 16));
+    CHECK(!oc_device_token_ok((const uint8_t *)"", 0));
+    CHECK(!oc_device_token_ok(NULL, 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a\"b", 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a\\b", 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a b", 3));
+    CHECK(!oc_device_token_ok((const uint8_t *)"a\0b", 3));
+    uint8_t big[OC_DEVICE_TOKEN_MAX];
+    memset(big, 'a', sizeof big);
+    CHECK(oc_device_token_ok(big, OC_DEVICE_TOKEN_MAX - 1));
+    CHECK(!oc_device_token_ok(big, OC_DEVICE_TOKEN_MAX));   /* refused, never cut short */
+}
+
 static void test_primitives(void) {
     oc_wbuf w;
     oc_wbuf_init(&w, frame, sizeof frame);
@@ -2225,6 +2242,7 @@ int run_protocol_tests(void) {
     printf("               error, size limits, malformed frames, version negotiation\n");
     test_reason_codes_unique();
     test_primitives();
+    test_device_token_ok();
     test_handshake_frames();
     test_auth_frames();
     test_messaging_frames();

@@ -1235,6 +1235,10 @@ typedef struct { uint64_t until_ms; } oc_snooze;
 #define OC_PUSH_FCM         1u
 #define OC_DEVICE_TOKEN_MAX 512u
 typedef struct { uint8_t platform; oc_slice token; } oc_register_device_token;
+/* A token as APNs (hex) and FCM (letters, digits, `_`, `-`, `:`, `.`) issue them,
+ * 1 to OC_DEVICE_TOKEN_MAX-1 bytes: anything else is no real device's, and a
+ * quote or a backslash would break the JSON it is sent in. */
+int oc_device_token_ok(const uint8_t *tok, size_t len);
 typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
 /* `muted` appended per entry — which IS a layout change, not a compatible one: this
  * is a repeated list, so an extra byte per entry shifts every entry after the first.

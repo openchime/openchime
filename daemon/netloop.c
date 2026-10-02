@@ -2970,10 +2970,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (oc_decode_register_device_token(&p, &rd) != OC_OK) return -1;
             oc_job *j = oc_job_new(OC_JOB_REGISTER_DEVICE_TOKEN, c->conn_id);
             if (!j) return -1;
-            size_t tl = rd.token.len < OC_DEVICE_TOKEN_MAX - 1 ? rd.token.len : OC_DEVICE_TOKEN_MAX - 1;
             j->user_id = c->user_id;
             j->device_platform = rd.platform;
-            j->device_token = strndup((const char *)rd.token.ptr, tl);
+            /* Not a token any device has: the writer refuses the empty one. */
+            j->device_token = oc_device_token_ok(rd.token.ptr, rd.token.len)
+                            ? strndup((const char *)rd.token.ptr, rd.token.len) : strdup("");
             if (!j->device_token) return -1;
             oc_dbwriter_submit(dbw, j);
             continue;

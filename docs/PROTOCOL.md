@@ -2462,7 +2462,8 @@ change. [VIDEO.md](./VIDEO.md) is the design.
 
 **`REGISTER_DEVICE_TOKEN` (C → S), `0x00B0`** `{ platform: u8, token: str }` —
 register the caller's mobile push token (`platform` 0 = APNs, 1 = FCM). Upserts on
-`(user, token)`. The daemon owns this registry; the control-plane gateway stores
+`(user, token)`. A token is 1–511 bytes of letters, digits, `_`, `-`, `:` and `.`,
+as APNs and FCM issue them; anything else is refused whole, never cut short. The daemon owns this registry; the control-plane gateway stores
 nothing (REQ-041). Answered with `DEVICE_TOKEN_ACK`.
 
 **`UNREGISTER_DEVICE_TOKEN` (C → S), `0x00B1`** `{ token: str }` — drop the caller's
@@ -2666,7 +2667,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3011` | `UNKNOWN_ATTACHMENT`  | messaging  | no    | No such attachment, or not finalized (REQ-141). |
 | `3012` | `STORAGE_FULL`        | messaging  | no    | Upload refused: below the DB reserve (REQ-216). |
 | `3013` | `ATTACHMENT_GONE`     | messaging  | no    | Reclaimed by age or storage pressure (REQ-215/217). |
-| `3014` | `INVALID_DEVICE_TOKEN`| messaging  | no    | `REGISTER_DEVICE_TOKEN` had an empty token or unknown platform (REQ-132). |
+| `3014` | `INVALID_DEVICE_TOKEN`| messaging  | no    | `REGISTER_DEVICE_TOKEN` had a token no device issues (empty, over 511 bytes, or a character outside letters, digits, `_`, `-`, `:`, `.`) or an unknown platform (REQ-132). |
 | `3015` | `TRANSFER_PROTOCOL`   | messaging  | no    | Out-of-order/oversized chunk or bad transfer state. |
 | `3016` | `UNKNOWN_WEBHOOK`     | webhook    | no    | No such (or disabled) incoming webhook token (REQ-170). |
 | `3017` | `CHANNEL_EXISTS`      | channel    | no    | `CREATE_CHANNEL` name already taken, compared case-insensitively (REQ-040). |

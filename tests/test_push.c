@@ -121,6 +121,14 @@ static void test_build_body(void) {
     /* Contentless: no message body/title/sender leaks into the wire. */
     CHECK(strstr(body, "title") == NULL);
     CHECK(strstr(body, "body") == NULL);
+
+    /* A stored string that is no token is left out, never written raw into the
+     * JSON; with nobody left, there is nothing to send. */
+    snprintf(t[0].token, sizeof t[0].token, "x\",\"kind\":\"call");
+    CHECK(oc_push_build_body(42, t, 2, body, sizeof body) == 0);
+    CHECK(strstr(body, "kind") == NULL && strstr(body, "\"token\":\"tokB\"") != NULL);
+    CHECK(strstr(body, "[{\"platform\":\"fcm\"") != NULL);   /* no stray comma */
+    CHECK(oc_push_build_body(42, t, 1, body, sizeof body) == -1);
 }
 
 /* --- CP-12 signature ------------------------------------------------------- */
@@ -189,6 +197,9 @@ static void test_collect(void) {
     CHECK(oc_dbwriter_register_device_token(w, bob,   OC_PUSH_APNS, "tok-bob"));
     CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_FCM,  "tok-carol"));
     CHECK(oc_dbwriter_register_device_token(w, dave,  OC_PUSH_APNS, "tok-dave"));
+    /* What no device issues is refused, never stored to be sent later. */
+    CHECK(!oc_dbwriter_register_device_token(w, dave, OC_PUSH_APNS, "tok\"dave"));
+    CHECK(!oc_dbwriter_register_device_token(w, dave, OC_PUSH_APNS, "tok dave"));
 
     set_level(w, carol, 1, OC_NOTIFY_NONE);   /* carol muted this channel */
     set_quiet(w, bob, 600, 660);                /* bob quiet 10:00–11:00 */

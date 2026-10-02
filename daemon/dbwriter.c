@@ -7298,7 +7298,8 @@ static oc_dbres *process_register_device_token(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     const char *platform = j->device_platform == OC_PUSH_FCM ? "fcm" : "apns";
-    if (j->device_platform > OC_PUSH_FCM || !j->device_token || !*j->device_token) {
+    if (j->device_platform > OC_PUSH_FCM || !j->device_token ||
+        !oc_device_token_ok((const uint8_t *)j->device_token, strlen(j->device_token))) {
         r->type = OC_RES_DEVICE_TOKEN_ERR; r->err_code = OC_ERR_INVALID_DEVICE_TOKEN; return r;
     }
     uint64_t now = dbw_now_ms();

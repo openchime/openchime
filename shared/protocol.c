@@ -1227,6 +1227,16 @@ oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc
     return oc_frame_end(w, off);
 }
 
+int oc_device_token_ok(const uint8_t *tok, size_t len) {
+    if (!tok || len == 0 || len >= OC_DEVICE_TOKEN_MAX) return 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = tok[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-' || c == ':' || c == '.')) return 0;
+    }
+    return 1;
+}
+
 oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m) {
     m->platform = oc_r_u8(p);
     m->token = oc_r_str(p);
