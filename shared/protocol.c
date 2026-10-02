@@ -315,6 +315,7 @@ oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m) {
     oc_w_str(w, m->source);
     oc_w_lstr(w, m->credential);
     oc_w_str(w, m->proof);
+    oc_w_str(w, m->state);
     return oc_frame_end(w, off);
 }
 
@@ -2398,6 +2399,7 @@ oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m) {
     m->source = oc_r_str(p);
     m->credential = oc_r_lstr(p);
     m->proof = oc_r_str(p);
+    m->state = oc_r_str(p);
     return r_done(p);
 }
 

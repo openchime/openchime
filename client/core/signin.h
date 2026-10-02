@@ -34,6 +34,12 @@ typedef struct oc_loopback oc_loopback;
  * secret is per attempt: another local process that finds the port still cannot
  * hand this listener an answer. NULL on failure. */
 oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap);
+/* For a direct connection's provider (AUTH.md §8.5), which registers a redirect
+ * with no path and matches it: "http://127.0.0.1:<port>", the callback a GET of
+ * "/". The provider's `state`, which the daemon checks, does the secret path's
+ * work. It listens on [::1] at the same port as well, where it can, so a redirect
+ * the daemon writes as `localhost` arrives whichever address that resolves to. */
+oc_loopback *oc_loopback_open_provider(char *redirect_uri, size_t cap);
 /* A test's knob: open the listener on IPv6 loopback, as a host without IPv4
  * loopback does (the redirect is then http://[::1]:<port>/...). */
 void oc_loopback_force_v6(int on);

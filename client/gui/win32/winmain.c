@@ -2429,14 +2429,15 @@ static oc_signin_source g_si_src[8];
 static int      g_si_nsrc;
 static int      g_si_browser;        /* the attempt in flight is a browser sign-in */
 static uint32_t g_si_opened_seq;     /* the model's signin_seq whose URL was opened */
-static rectf    g_si_browser_btn;    /* step 2: "Continue in your browser" */
+static rectf    g_si_browser_btn[8]; /* step 2: one per browser source, as g_si_src */
 static rectf    g_si_wait_cancel;    /* while waiting for the browser */
 static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite);
 
-static const oc_signin_source *si_browser_source(void) {
-    for (int i = 0; i < g_si_nsrc; i++)
-        if (g_si_src[i].kind != OC_SOURCE_LOCAL) return &g_si_src[i];
-    return NULL;
+/* How many browser sources: the relay, and each of the operator's own providers. */
+static int si_browser_count(void) {
+    int n = 0;
+    for (int i = 0; i < g_si_nsrc; i++) n += g_si_src[i].kind != OC_SOURCE_LOCAL;
+    return n;
 }
 static int si_has_local(void) {
     for (int i = 0; i < g_si_nsrc; i++)
@@ -10483,7 +10484,7 @@ static si_geom si_layout(float W, float H) {
                  + (g_si_step == 1 ? 26.0f : 0.0f)   /* advanced-options link */
                  + (g_si_step == 2 ? 30.0f : 0.0f)   /* remember-me row */
                  + 40.0f + 24.0f                      /* button + bottom pad */
-                 + (g_si_step == 2 && si_browser_source() ? 50.0f : 0.0f)   /* browser button */
+                 + (g_si_step == 2 ? 50.0f * (float)si_browser_count() : 0.0f)   /* browser buttons */
                  + (g_si_step == 2 ? 26.0f + 22.0f : 0.0f)   /* back + signup links */
                  + (g_si_overlay ? 24.0f : 0.0f);            /* cancel row */
     g.h  = head + body;
@@ -10548,7 +10549,7 @@ static void draw_signin(gfx *rt, float W, float H) {
                   g_ui, rf(x0, y + 24, x0 + SI_W, y + 52), OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
         g_si_btn = g_si_remember_box = g_si_back = g_si_adv_link = rf(0, 0, 0, 0);
-        g_si_browser_btn = rf(0, 0, 0, 0);
+        memset(g_si_browser_btn, 0, sizeof g_si_browser_btn);
         /* A wait that can last minutes needs a way out that is on the screen. */
         if (g_si_browser) {
             g_si_wait_cancel = rf(fx, y + 64, fx + fw, y + 86);
@@ -10622,18 +10623,18 @@ static void draw_signin(gfx *rt, float W, float H) {
     y += 50;
 
     /* One control per source the workspace offers: the password form above, and
-     * beside it a quieter button for the browser, labelled in the daemon's words. */
-    const oc_signin_source *bs = g_si_step == 2 ? si_browser_source() : NULL;
-    if (bs) {
-        g_si_browser_btn = rf(fx, y, fx + fw, y + 40);
-        fill_round(rt, g_si_browser_btn, OC_R_CONTROL, OC_COL_INPUT);
-        stroke_round(rt, g_si_browser_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+     * beneath it a quieter button for each browser source -- the relay, and each
+     * of the operator's own providers -- labelled in the daemon's words. */
+    memset(g_si_browser_btn, 0, sizeof g_si_browser_btn);
+    for (int i = 0; g_si_step == 2 && i < g_si_nsrc && i < 8; i++) {
+        if (g_si_src[i].kind == OC_SOURCE_LOCAL) continue;
+        g_si_browser_btn[i] = rf(fx, y, fx + fw, y + 40);
+        fill_round(rt, g_si_browser_btn[i], OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, g_si_browser_btn[i], OC_R_CONTROL, OC_COL_BORDER, 1.0f);
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, bs->label, g_ui, g_si_browser_btn, OC_COL_TEXT);
+        draw_text(rt, g_si_src[i].label, g_ui, g_si_browser_btn[i], OC_COL_TEXT);
         g_ui->align = ST_ALIGN_LEFT;
         y += 50;
-    } else {
-        g_si_browser_btn = rf(0, 0, 0, 0);
     }
 
     if (g_si_step == 2) {
@@ -23252,11 +23253,8 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
         if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
-        if (pt_in(g_si_browser_btn, x, y)) {
-            const oc_signin_source *bs = si_browser_source();
-            signin_start_browser(hwnd, bs ? bs->id : NULL, NULL);
-            return 1;
-        }
+        for (int i = 0; i < g_si_nsrc && i < 8; i++)
+            if (pt_in(g_si_browser_btn[i], x, y)) { signin_start_browser(hwnd, g_si_src[i].id, NULL); return 1; }
         if (pt_in(g_si_cancel, x, y))        { signin_cancel(hwnd); return 1; }
         if (pt_in(g_si_back, x, y))          { signin_back(hwnd);   return 1; }
         if (pt_in(g_si_adv_link, x, y))      { signin_set_advanced(hwnd, !g_si_advanced); return 1; }
@@ -25019,7 +25017,7 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
         return;
     }
     if (g_si_nsrc < 0) g_si_nsrc = 0;
-    if (g_si_nsrc > 0 && !si_has_local() && si_browser_source()) { signin_start_browser(hwnd, NULL, NULL); return; }
+    if (g_si_nsrc > 0 && !si_has_local() && si_browser_count() == 1) { signin_start_browser(hwnd, NULL, NULL); return; }
     g_si_step = 2;
     layout_signin(hwnd);
     /* Set the account AFTER the step-2 layout has shown the field. signin_begin
@@ -25174,7 +25172,7 @@ static void signin_submit(HWND hwnd) {
         }
         if (n <= 0) { snprintf(g_si_err, sizeof g_si_err, "could not reach %.200s", g_si_host); goto redraw; }
         g_si_nsrc = n;
-        if (!si_has_local() && si_browser_source()) { signin_start_browser(hwnd, NULL, NULL); return; }
+        if (!si_has_local() && si_browser_count() == 1) { signin_start_browser(hwnd, NULL, NULL); return; }
         g_si_step = 2;
         layout_signin(hwnd);
         if (g_si_e_user) SetFocus(g_si_e_user);

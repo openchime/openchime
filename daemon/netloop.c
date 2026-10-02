@@ -25,7 +25,8 @@
 #include "http.h"
 #include "webpages.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
-#include "jwt.h"         /* oc_base64url_encode: a passkey ceremony's challenge */
+#include "jwt.h"         /* oc_base64url_encode: a passkey's challenge; oc_jwt_nonce_matches */
+#include "oidcrp.h"      /* direct connections (AUTH.md §8.5) */
 #include "webstep.h"     /* a local account's second step (AUTH.md §8.6) */
 #include "e2e_hpke.h"  /* oc_e2e_wipe */
 #include "protocol.h"
@@ -427,6 +428,12 @@ static __thread oc_ratelimit *g_webhook_rl;
 /* Device codes (AUTH.md §8.11): the pending requests, and how often one source
  * may look a code up on the /device page -- a guessed code is the attack. */
 static __thread oc_devcodes  *g_devcodes;
+/* Direct connections (AUTH.md §8.5): set before serving. */
+static struct oc_oidcrp  *g_rp;
+static oc_oidc_connect    g_direct[OC_OIDC_MAX_CONNECT];
+static int                g_n_direct;
+static int  direct_index(const uint8_t *s, size_t n);                                   /* fwd */
+static void handle_auth_begin_direct(struct conn_s *c, const oc_auth_begin *b, int idx); /* fwd */
 static __thread oc_websteps  *g_websteps;
 static __thread oc_ratelimit *g_device_rl;
 #define OC_DEVICE_LOOKUPS_MAX    10u
@@ -1664,6 +1671,11 @@ static int handle_hello(conn *c, oc_rbuf *payload, oc_dbwriter *dbw) {
             ch.sources[ch.n_sources++] = (oc_auth_source){
                 oc_slice_str(OC_SOURCE_ID_RELAY), OC_SOURCE_RELAY,
                 oc_slice_str("Continue in your browser") };
+        /* Each direct connection, by the operator's own label (AUTH.md §8.5). */
+        static const char *const IDS[OC_OIDC_MAX_CONNECT] = { "oidc-1", "oidc-2", "oidc-3", "oidc-4" };
+        for (int i = 0; i < g_n_direct && ch.n_sources < OC_MAX_SOURCES; i++)
+            ch.sources[ch.n_sources++] = (oc_auth_source){
+                .id = oc_slice_str(IDS[i]), .kind = OC_SOURCE_OIDC, .label = oc_slice_str(g_direct[i].label) };
         oc_encode_auth_challenge(&cw, OC_PROTOCOL_VERSION, &ch);
         out_append(c, cbuf, cw.len);
     }
@@ -1741,6 +1753,8 @@ static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw)
         handle_auth_begin_local(c, b, dbw);
         return;
     }
+    int di = direct_index(b->source.ptr, b->source.len);
+    if (di >= 0) { handle_auth_begin_direct(c, b, di); return; }
     const char *origin = oc_dbwriter_relay_origin(dbw);
     const char *aud = oc_dbwriter_oidc_audience(dbw);
     if (!(oc_dbwriter_auth_methods(dbw) & OC_AUTH_OIDC) || !origin[0] || !aud[0] ||
@@ -1774,6 +1788,155 @@ static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw)
     return;
 too_long:
     send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri is too long");
+}
+
+/* --- direct connections (AUTH.md §8.5) ------------------------------------- */
+
+#define DIRECT_TTL_MS     (10u * 60u * 1000u)
+#define DIRECT_MAX        256
+#define DIRECT_PER_SOURCE 16
+
+/* A sign-in begun with a direct connection, waiting for its code: the state the
+ * provider sends back, the daemon's own PKCE verifier and the nonce it put in
+ * the request, the client's challenge, and the redirect the provider will
+ * check the exchange against. */
+typedef struct {
+    int      used, idx;
+    char     state[48], verifier[48], nonce[48], challenge[48], source[46];
+    char     redirect[600];
+    uint64_t expires_ms;
+} direct_pending;
+
+static __thread direct_pending g_pending[DIRECT_MAX];
+
+void oc_netloop_set_direct(struct oc_oidcrp *rp, const oc_oidc_connect *conns, int n) {
+    g_rp = rp;
+    g_n_direct = n < 0 ? 0 : n > OC_OIDC_MAX_CONNECT ? OC_OIDC_MAX_CONNECT : n;
+    for (int i = 0; i < g_n_direct; i++) {
+        g_direct[i] = conns[i];
+        memset(g_direct[i].secret, 0, sizeof g_direct[i].secret);   /* the worker's alone */
+    }
+}
+
+/* "oidc-<n>" for a configured connection: its index, or -1. */
+static int direct_index(const uint8_t *s, size_t n) {
+    if (n != 6 || memcmp(s, "oidc-", 5) != 0 || s[5] < '1' || s[5] > '0' + g_n_direct) return -1;
+    return s[5] - '1';
+}
+
+/* 32 random bytes, base64url. 0 or -1. */
+static int rand64(char out[48]) {
+    uint8_t raw[32];
+    char enc[48];
+    if (oc_rand_bytes(raw, sizeof raw) != 0) return -1;
+    size_t n = oc_base64url_encode(raw, sizeof raw, enc);
+    oc_e2e_wipe(raw, sizeof raw);
+    if (n == 0 || n >= 48) return -1;
+    memcpy(out, enc, n + 1);
+    return 0;
+}
+
+static void handle_auth_begin_direct(conn *c, const oc_auth_begin *b, int idx) {
+    char authz[512];
+    if (!g_rp || !oc_oidcrp_ready(g_rp, idx, authz, sizeof authz)) {
+        send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "the sign-in provider cannot be reached");
+        return;
+    }
+    if (!is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+        !is_challenge((const char *)b->challenge.ptr, b->challenge.len) || b->redirect_uri.len >= 560) {
+        send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri must be loopback");
+        return;
+    }
+    uint64_t now = now_ms();
+    char key[OC_SRC_LEN];
+    oc_source_key(c->source, key, sizeof key);
+    direct_pending *slot = NULL;
+    int mine = 0;
+    for (int i = 0; i < DIRECT_MAX; i++) {
+        if (g_pending[i].used && now >= g_pending[i].expires_ms) { oc_e2e_wipe(&g_pending[i], sizeof g_pending[i]); }
+        if (!g_pending[i].used) { if (!slot) slot = &g_pending[i]; continue; }
+        if (!strcmp(g_pending[i].source, key)) mine++;
+    }
+    if (!slot || mine >= DIRECT_PER_SOURCE) {
+        send_auth_error(c, OC_ERR_AUTH_RATE_LIMITED, "too many sign-ins under way");
+        return;
+    }
+    direct_pending p;
+    memset(&p, 0, sizeof p);
+    p.idx = idx;
+    snprintf(p.source, sizeof p.source, "%s", key);
+    memcpy(p.challenge, b->challenge.ptr, b->challenge.len);
+    /* The redirect as the provider will see it: `localhost` where the connection
+     * says its provider matches that name. */
+    char ru[600];
+    snprintf(ru, sizeof ru, "%.*s", (int)b->redirect_uri.len, (const char *)b->redirect_uri.ptr);
+    if (g_direct[idx].localhost && strncmp(ru, "http://127.0.0.1", 16) == 0)
+        snprintf(p.redirect, sizeof p.redirect, "http://localhost%s", ru + 16);
+    else
+        snprintf(p.redirect, sizeof p.redirect, "%s", ru);
+    uint8_t h[32];
+    char cc[48];
+    if (rand64(p.state) || rand64(p.verifier) || rand64(p.nonce) ||
+        mbedtls_sha256((const unsigned char *)p.verifier, strlen(p.verifier), h, 0) != 0 ||
+        oc_base64url_encode(h, sizeof h, cc) >= sizeof cc) {
+        send_auth_error(c, OC_ERR_INTERNAL, "internal");
+        return;
+    }
+    char url[2400];
+    size_t o = (size_t)snprintf(url, sizeof url, "%s%sresponse_type=code&scope=openid%%20email%%20profile&client_id=",
+                                authz, strchr(authz, '?') ? "&" : "?");
+    int bad = o >= sizeof url || pct_append(url, sizeof url, &o, g_direct[idx].client_id, strlen(g_direct[idx].client_id));
+    static const char *const K[] = { "&redirect_uri=", "&state=", "&nonce=", "&code_challenge=" };
+    const char *V[] = { p.redirect, p.state, p.nonce, cc };
+    for (int k = 0; !bad && k < 4; k++) {
+        size_t kl = strlen(K[k]);
+        if (o + kl >= sizeof url) { bad = 1; break; }
+        memcpy(url + o, K[k], kl + 1); o += kl;
+        bad = pct_append(url, sizeof url, &o, V[k], strlen(V[k])) != 0;
+    }
+    if (!bad && o + 28 < sizeof url) { memcpy(url + o, "&code_challenge_method=S256", 28); o += 27; }
+    else bad = 1;
+    if (bad) { send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri is too long"); return; }
+    p.used = 1;
+    p.expires_ms = now + DIRECT_TTL_MS;
+    *slot = p;
+    oc_e2e_wipe(&p, sizeof p);
+    uint8_t rbuf[2600]; oc_wbuf rw; oc_wbuf_init(&rw, rbuf, sizeof rbuf);
+    oc_auth_redirect ar = { oc_slice_str(url) };
+    if (oc_encode_auth_redirect(&rw, c->version, &ar) == OC_OK) out_append(c, rbuf, rw.len);
+}
+
+/* AUTH for a direct connection: the code and state from the provider, and the
+ * client's verifier. The state names the sign-in -- once -- and the verifier
+ * must be the one the client's challenge was the hash of; then the worker
+ * exchanges the code. A refusal goes through the writer like any other, to be
+ * counted, audited and answered. */
+static void handle_auth_direct(conn *c, const oc_auth *a, int idx, oc_dbwriter *dbw) {
+    uint64_t now = now_ms();
+    direct_pending *p = NULL;
+    for (int i = 0; i < DIRECT_MAX; i++)
+        if (g_pending[i].used && now < g_pending[i].expires_ms && g_pending[i].idx == idx &&
+            a->state.len == strlen(g_pending[i].state) &&
+            oc_ct_eq(a->state.ptr, g_pending[i].state, a->state.len)) { p = &g_pending[i]; break; }
+    const char *why = !p ? "state" :
+                      !oc_jwt_nonce_matches(p->challenge, a->proof.ptr, a->proof.len) ? "verifier" :
+                      a->credential.len == 0 || a->credential.len >= 1024 ? "code" : NULL;
+    char code[1024];
+    snprintf(code, sizeof code, "%.*s", (int)(a->credential.len < 1024 ? a->credential.len : 0), (const char *)a->credential.ptr);
+    if (!why && oc_oidcrp_exchange(g_rp, idx, c->conn_id, code, p->redirect, p->verifier, p->nonce, c->source) != 0)
+        why = "busy";
+    if (p) oc_e2e_wipe(p, sizeof *p);   /* one use, whatever came of it */
+    oc_e2e_wipe(code, sizeof code);
+    if (!why) return;
+    oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
+    oc_direct_auth *d = j ? calloc(1, sizeof *d) : NULL;
+    if (!d) { if (j) oc_job_free(j); send_auth_error(c, OC_ERR_INTERNAL, "internal"); return; }
+    d->err = strcmp(why, "busy") ? OC_ERR_AUTH_INVALID_TOKEN : OC_ERR_AUTH_SOURCE_UNAVAILABLE;
+    snprintf(d->reason, sizeof d->reason, "%s", why);
+    j->method = OC_AUTH_OIDC;
+    j->direct = d;
+    memcpy(j->source, c->source, sizeof j->source);
+    oc_dbwriter_submit(dbw, j);
 }
 
 /* A local account signs in on this daemon's own pages (AUTH.md §8.10). The
@@ -2148,6 +2311,8 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (hdr.msg_type == OC_MSG_AUTH) {
                 oc_auth a;
                 if (oc_decode_auth(&p, &a) != OC_OK) return -1;
+                int di = a.method == OC_AUTH_OIDC ? direct_index(a.source.ptr, a.source.len) : -1;
+                if (di >= 0) { handle_auth_direct(c, &a, di, dbw); continue; }
                 oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
                 if (!j) return -1;
                 j->method = a.method;

@@ -19,6 +19,10 @@
 #include "signin.h"       /* a verifier and its challenge, as a client makes them */
 #include "localissuer.h"   /* a token the daemon did not sign, to refuse */
 #include "devicecodes.h"
+#include "oidcrp.h"        /* a direct connection's worker */
+#include "jwt.h"
+#include <poll.h>
+#include <mbedtls/sha256.h>
 #include <mbedtls/sha256.h>
 #include "totp.h"          /* a second step's codes, as an authenticator makes them */
 #include "jwt.h"           /* oc_base64url_encode */
@@ -326,7 +330,7 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
     uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
+    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0) return -1;
     if (write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
@@ -1305,7 +1309,7 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         uint8_t buf[512];
         oc_wbuf w;
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_auth au = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
+        oc_auth au = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
         CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK);
         CHECK(write_all(&cap.conn, buf, w.len) == 0);
         oc_header hdr;
@@ -2041,7 +2045,7 @@ static int token_auth(int port, const uint8_t *pin, const char *tok, const char 
     client a;
     if (client_open(&a, port, pin) != 0 || do_handshake(&a) != 0) return -1;
     uint8_t buf[4096]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(verifier) };
+    oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(verifier), { NULL, 0 } };
     int rc = -1;
     oc_header hdr; oc_rbuf p;
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&a.conn, buf, w.len) == 0 &&
@@ -2111,6 +2115,303 @@ static int web_verify(int port, const uint8_t *pin, const char *ticket, const ch
     int st = web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, rcap);
     if (tok) { tok[0] = '\0'; token_of(resp, tok, cap); }
     return st;
+}
+
+/* --- a fake OpenID provider, for direct connections (AUTH.md §8.5) -------- */
+
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/rsa.h>
+
+typedef struct {
+    int      lfd, port, stop, up;
+    mbedtls_pk_context key;
+    mbedtls_entropy_context ent;
+    mbedtls_ctr_drbg_context rng;
+    char     jwks[1024];
+    /* The one sign-in under way: what /authorize would have recorded. */
+    char     code[32], nonce[64], challenge[64], sub[64], email[96], seen_verifier[96];
+    int      tokens;   /* token requests received, good or not */
+} fake_idp;
+
+static void idp_b64u(const uint8_t *in, size_t n, char *out) { oc_base64url_encode(in, n, out); }
+
+static void idp_reply(int fd, int status, const char *ctype, const char *body) {
+    char h[256];
+    int n = snprintf(h, sizeof h, "HTTP/1.1 %d X\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                     status, ctype, strlen(body));
+    if (write(fd, h, (size_t)n) < 0 || write(fd, body, strlen(body)) < 0) return;
+}
+
+/* An RS256 ID token for the sign-in under way. */
+static void idp_token(fake_idp *f, char *out, size_t cap) {
+    char iss[64], hdr[] = "{\"alg\":\"RS256\",\"kid\":\"k1\"}", pl[600], hb[80], pb[900], in[1000], sb[400];
+    snprintf(iss, sizeof iss, "http://127.0.0.1:%d", f->port);
+    unsigned long long now = (unsigned long long)time(NULL);
+    snprintf(pl, sizeof pl, "{\"iss\":\"%s\",\"aud\":\"oc-client\",\"sub\":\"%s\",\"nonce\":\"%s\",\"exp\":%llu,"
+             "\"iat\":%llu,\"email\":\"%s\",\"email_verified\":true}", iss, f->sub, f->nonce, now + 300, now, f->email);
+    idp_b64u((const uint8_t *)hdr, strlen(hdr), hb);
+    idp_b64u((const uint8_t *)pl, strlen(pl), pb);
+    snprintf(in, sizeof in, "%s.%s", hb, pb);
+    uint8_t h[32], sig[256]; size_t sl = 0;
+    mbedtls_sha256((const unsigned char *)in, strlen(in), h, 0);
+    mbedtls_pk_sign(&f->key, MBEDTLS_MD_SHA256, h, 32, sig, sizeof sig, &sl, mbedtls_ctr_drbg_random, &f->rng);
+    idp_b64u(sig, sl, sb);
+    snprintf(out, cap, "%s.%s", in, sb);
+}
+
+static void *idp_thread(void *arg) {
+    fake_idp *f = arg;
+    while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
+        struct pollfd pf = { f->lfd, POLLIN, 0 };
+        if (poll(&pf, 1, 100) <= 0) continue;
+        int fd = accept(f->lfd, NULL, NULL);
+        if (fd < 0) continue;
+        char req[8192]; size_t got = 0; ssize_t r;
+        while (got < sizeof req - 1 && (r = read(fd, req + got, sizeof req - 1 - got)) > 0) {
+            got += (size_t)r; req[got] = '\0';
+            char *he = strstr(req, "\r\n\r\n");
+            if (!he) continue;
+            const char *cl = strstr(req, "Content-Length: ");
+            size_t want = cl ? (size_t)atoi(cl + 16) : 0;
+            if (got >= (size_t)(he + 4 - req) + want) break;
+        }
+        if (!__atomic_load_n(&f->up, __ATOMIC_ACQUIRE)) { idp_reply(fd, 503, "text/plain", "down"); close(fd); continue; }
+        char base[64];
+        snprintf(base, sizeof base, "http://127.0.0.1:%d", f->port);
+        if (!strncmp(req, "GET /.well-known/openid-configuration", 37)) {
+            char doc[600];
+            snprintf(doc, sizeof doc, "{\"issuer\":\"%s\",\"authorization_endpoint\":\"%s/authorize\","
+                     "\"token_endpoint\":\"%s/token\",\"jwks_uri\":\"%s/jwks\"}", base, base, base, base);
+            idp_reply(fd, 200, "application/json", doc);
+        } else if (!strncmp(req, "GET /jwks", 9)) {
+            idp_reply(fd, 200, "application/json", f->jwks);
+        } else if (!strncmp(req, "POST /token", 11)) {
+            __atomic_add_fetch(&f->tokens, 1, __ATOMIC_RELEASE);
+            const char *body = strstr(req, "\r\n\r\n") + 4;
+            char code[64] = "", ver[80] = "";
+            oc_query_get(body, "code", code, sizeof code);
+            oc_query_get(body, "code_verifier", ver, sizeof ver);
+            snprintf(f->seen_verifier, sizeof f->seen_verifier, "%s", ver);
+            /* The code is good once, and only with the verifier its challenge hashed. */
+            int ok = code[0] && !strcmp(code, f->code) && oc_jwt_nonce_matches(f->challenge, (const uint8_t *)ver, strlen(ver));
+            f->code[0] = '\0';
+            if (!ok) { idp_reply(fd, 400, "application/json", "{\"error\":\"invalid_grant\"}"); close(fd); continue; }
+            char tok[1500], resp[1700];
+            idp_token(f, tok, sizeof tok);
+            snprintf(resp, sizeof resp, "{\"access_token\":\"x\",\"token_type\":\"Bearer\",\"id_token\":\"%s\"}", tok);
+            idp_reply(fd, 200, "application/json", resp);
+        } else idp_reply(fd, 404, "text/plain", "no");
+        close(fd);
+    }
+    return NULL;
+}
+
+static int idp_start(fake_idp *f, pthread_t *th) {
+    memset(f, 0, sizeof *f);
+    mbedtls_pk_init(&f->key); mbedtls_entropy_init(&f->ent); mbedtls_ctr_drbg_init(&f->rng);
+    if (mbedtls_ctr_drbg_seed(&f->rng, mbedtls_entropy_func, &f->ent, (const unsigned char *)"idp", 3) ||
+        mbedtls_pk_setup(&f->key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA)) ||
+        mbedtls_rsa_gen_key(mbedtls_pk_rsa(f->key), mbedtls_ctr_drbg_random, &f->rng, 2048, 65537)) return -1;
+    uint8_t n[256], e[3] = { 1, 0, 1 };
+    mbedtls_rsa_export_raw(mbedtls_pk_rsa(f->key), n, sizeof n, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    char nb[400], eb[8];
+    idp_b64u(n, sizeof n, nb); idp_b64u(e, 3, eb);
+    snprintf(f->jwks, sizeof f->jwks, "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k1\",\"use\":\"sig\",\"n\":\"%s\",\"e\":\"%s\"}]}", nb, eb);
+    f->lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    int one = 1;
+    setsockopt(f->lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(f->lfd, (struct sockaddr *)&a, sizeof a) || listen(f->lfd, 16) ||
+        getsockname(f->lfd, (struct sockaddr *)&a, &al)) return -1;
+    f->port = ntohs(a.sin_port);
+    f->up = 1;
+    return pthread_create(th, NULL, idp_thread, f);
+}
+
+static void idp_stop(fake_idp *f, pthread_t th) {
+    __atomic_store_n(&f->stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    close(f->lfd);
+    mbedtls_pk_free(&f->key); mbedtls_ctr_drbg_free(&f->rng); mbedtls_entropy_free(&f->ent);
+}
+
+/* AUTH_BEGIN for `source`: the authorize URL, or the ERROR's code. */
+static int direct_begin(client *c, const char *source, const char *challenge, char *url, size_t cap) {
+    uint8_t buf[600]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth_begin b = { oc_slice_str(source), oc_slice_str("http://127.0.0.1:5/cb"), oc_slice_str(challenge) };
+    if (oc_encode_auth_begin(&w, OC_PROTOCOL_VERSION, &b) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame_raw(c, &hdr, &p) != 0) return -1;
+    if (hdr.msg_type == OC_MSG_ERROR) { oc_error e; return oc_decode_error(&p, &e) == OC_OK ? e.code : -1; }
+    oc_auth_redirect ar;
+    if (hdr.msg_type != OC_MSG_AUTH_REDIRECT || oc_decode_auth_redirect(&p, &ar) != OC_OK) return -1;
+    snprintf(url, cap, "%.*s", (int)ar.authorize_url.len, (const char *)ar.authorize_url.ptr);
+    return 0;
+}
+
+/* AUTH with a code: 0 and the user on AUTH_OK, else the ERROR's code. */
+static int direct_auth(client *c, const char *source, const char *code, const char *verifier, const char *state,
+                       uint64_t *uid) {
+    uint8_t buf[2000]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_OIDC, oc_slice_str(source), oc_slice_str(code), oc_slice_str(verifier), oc_slice_str(state) };
+    if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame_raw(c, &hdr, &p) != 0) return -1;
+    if (hdr.msg_type == OC_MSG_AUTH_OK) { oc_auth_ok ok; if (oc_decode_auth_ok(&p, &ok) != OC_OK) return -1; *uid = ok.user_id; return 0; }
+    if (hdr.msg_type == OC_MSG_ERROR) { oc_error e; return oc_decode_error(&p, &e) == OC_OK ? e.code : -1; }
+    return -1;
+}
+
+/* A direct connection end to end (AUTH.md §8.5): the challenge offers it by its
+ * label; AUTH_BEGIN builds the provider's authorize URL with the daemon's own
+ * PKCE, state and nonce; the code comes back with the state and the client's
+ * verifier, and the daemon exchanges it -- proving its verifier to the provider
+ * -- checks the ID token, and the join rules admit the person. A wrong state,
+ * a wrong verifier, a provider that is down: refused. */
+static void test_direct_signin(int port) {
+    fake_idp f;
+    pthread_t ith;
+    CHECK(idp_start(&f, &ith) == 0);
+    oc_tls_server srv;
+    uint8_t pin[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
+    unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
+    oc_dbwriter *dbw = oc_dbwriter_start("build/itest_direct.db");
+    CHECK(dbw != NULL);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(dbw, "domain:acme.example", why, sizeof why) == 0);
+    oc_oidc_connect k;
+    memset(&k, 0, sizeof k);
+    snprintf(k.label, sizeof k.label, "Acme SSO");
+    snprintf(k.issuer, sizeof k.issuer, "http://127.0.0.1:%d", f.port);
+    snprintf(k.client_id, sizeof k.client_id, "oc-client");
+    snprintf(k.secret, sizeof k.secret, "s3cret");
+    const char *iss[1] = { k.issuer };
+    oc_dbwriter_set_direct_issuers(dbw, iss, 1);
+    oc_oidcrp *rp = oc_oidcrp_start(&k, 1, dbw);
+    CHECK(rp != NULL);
+    for (int i = 0; i < 200 && !oc_oidcrp_ready(rp, 0, NULL, 0); i++) usleep(20000);
+    CHECK(oc_oidcrp_ready(rp, 0, NULL, 0));
+    oc_netloop_set_direct(rp, &k, 1);
+    struct loop_arg arg;
+    arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
+
+    /* Offered, by its label. */
+    client c;
+    CHECK(client_open(&c, port, pin) == 0 && send_hello(&c, OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION) == 0);
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WELCOME);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_CHALLENGE);
+    oc_auth_challenge ach;
+    int offered = 0;
+    if (oc_decode_auth_challenge(&p, &ach) == OC_OK)
+        for (uint8_t i = 0; i < ach.n_sources; i++)
+            if (ach.sources[i].kind == OC_SOURCE_OIDC && ach.sources[i].id.len == 6 &&
+                !memcmp(ach.sources[i].id.ptr, "oidc-1", 6) && ach.sources[i].label.len == 8 &&
+                !memcmp(ach.sources[i].label.ptr, "Acme SSO", 8)) offered = 1;
+    CHECK(offered);
+
+    char ver[OC_SIGNIN_VERIFIER_LEN + 1], ch[OC_SIGNIN_CHALLENGE_LEN + 1], url[2600], state[64] = "", nonce[64] = "",
+         cc[64] = "", ru[200] = "";
+    CHECK(oc_signin_verifier(ver, ch) == 0);
+    CHECK(direct_begin(&c, "oidc-1", ch, url, sizeof url) == 0);
+    char authz[80];
+    snprintf(authz, sizeof authz, "http://127.0.0.1:%d/authorize?", f.port);
+    CHECK(strncmp(url, authz, strlen(authz)) == 0);
+    const char *q = strchr(url, '?') + 1;
+    CHECK(oc_query_get(q, "state", state, sizeof state) == 1 && oc_query_get(q, "nonce", nonce, sizeof nonce) == 1 &&
+          oc_query_get(q, "code_challenge", cc, sizeof cc) == 1 && oc_query_get(q, "redirect_uri", ru, sizeof ru) == 1);
+    CHECK(strstr(url, "client_id=oc-client") && strstr(url, "code_challenge_method=S256") && strcmp(cc, ch) != 0);
+    /* The provider issues a code for that sign-in. */
+    snprintf(f.code, sizeof f.code, "code-1"); snprintf(f.nonce, sizeof f.nonce, "%s", nonce);
+    snprintf(f.challenge, sizeof f.challenge, "%s", cc);
+    snprintf(f.sub, sizeof f.sub, "kim-1"); snprintf(f.email, sizeof f.email, "kim@acme.example");
+    uint64_t uid = 0;
+    CHECK(direct_auth(&c, "oidc-1", "code-1", ver, state, &uid) == 0 && uid != 0);
+    client_close(&c);
+    int before = __atomic_load_n(&f.tokens, __ATOMIC_ACQUIRE);
+    CHECK(before == 1);
+
+    /* The same sign-in again, with a code the provider would honour: a state is
+     * good once, so it never reaches the provider. */
+    {
+        client d;
+        CHECK(client_open(&d, port, pin) == 0 && do_handshake(&d) == 0);
+        snprintf(f.code, sizeof f.code, "code-1b");
+        CHECK(direct_auth(&d, "oidc-1", "code-1b", ver, state, &uid) == OC_ERR_AUTH_INVALID_TOKEN);
+        client_close(&d);
+    }
+
+    /* A wrong state, or someone else's verifier: refused, and the code never
+     * reaches the provider -- which is armed to honour it, so only the daemon's
+     * own checks stand between. A second sign-in pending beside the real one
+     * means a missing state check would find a sign-in to use. */
+    for (int k2 = 0; k2 < 2; k2++) {
+        client d;
+        char other[OC_SIGNIN_VERIFIER_LEN + 1], och[OC_SIGNIN_CHALLENGE_LEN + 1], ourl[2600];
+        CHECK(client_open(&d, port, pin) == 0 && do_handshake(&d) == 0);
+        CHECK(oc_signin_verifier(other, och) == 0);
+        CHECK(direct_begin(&d, "oidc-1", och, ourl, sizeof ourl) == 0);
+        CHECK(oc_signin_verifier(ver, ch) == 0);
+        CHECK(direct_begin(&d, "oidc-1", ch, url, sizeof url) == 0);
+        q = strchr(url, '?') + 1;
+        oc_query_get(q, "state", state, sizeof state); oc_query_get(q, "nonce", nonce, sizeof nonce);
+        oc_query_get(q, "code_challenge", cc, sizeof cc);
+        snprintf(f.code, sizeof f.code, "code-2"); snprintf(f.nonce, sizeof f.nonce, "%s", nonce);
+        snprintf(f.challenge, sizeof f.challenge, "%s", cc);
+        snprintf(f.sub, sizeof f.sub, "kim-1"); snprintf(f.email, sizeof f.email, "kim@acme.example");
+        /* the unknown state comes with a verifier good for the other sign-in */
+        CHECK(direct_auth(&d, "oidc-1", "code-2", other, k2 ? state : "not-the-state", &uid) ==
+              OC_ERR_AUTH_INVALID_TOKEN);
+        CHECK(peer_closed(&d) == 1);
+        client_close(&d);
+    }
+    CHECK(__atomic_load_n(&f.tokens, __ATOMIC_ACQUIRE) == before);
+
+    /* A person no rule admits is refused after the exchange. */
+    {
+        client d;
+        CHECK(client_open(&d, port, pin) == 0 && do_handshake(&d) == 0);
+        CHECK(oc_signin_verifier(ver, ch) == 0);
+        CHECK(direct_begin(&d, "oidc-1", ch, url, sizeof url) == 0);
+        q = strchr(url, '?') + 1;
+        oc_query_get(q, "state", state, sizeof state); oc_query_get(q, "nonce", nonce, sizeof nonce);
+        oc_query_get(q, "code_challenge", cc, sizeof cc);
+        snprintf(f.code, sizeof f.code, "code-3"); snprintf(f.nonce, sizeof f.nonce, "%s", nonce);
+        snprintf(f.challenge, sizeof f.challenge, "%s", cc);
+        snprintf(f.sub, sizeof f.sub, "eve-1"); snprintf(f.email, sizeof f.email, "eve@elsewhere.example");
+        CHECK(direct_auth(&d, "oidc-1", "code-3", ver, state, &uid) == OC_ERR_AUTH_NOT_ALLOWED);
+        client_close(&d);
+    }
+
+    stop_loop(&arg, th);
+    oc_oidcrp_stop(rp);
+    /* A provider that is down: the source is unavailable at AUTH_BEGIN. */
+    __atomic_store_n(&f.up, 0, __ATOMIC_RELEASE);
+    rp = oc_oidcrp_start(&k, 1, dbw);
+    oc_netloop_set_direct(rp, &k, 1);
+    arg.stop = 0;
+    CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
+    usleep(300000);
+    {
+        client d;
+        CHECK(client_open(&d, port, pin) == 0 && do_handshake(&d) == 0);
+        CHECK(oc_signin_verifier(ver, ch) == 0);
+        CHECK(direct_begin(&d, "oidc-1", ch, url, sizeof url) == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
+        client_close(&d);
+    }
+    stop_loop(&arg, th);
+    oc_oidcrp_stop(rp);
+    oc_netloop_set_direct(NULL, NULL, 0);
+    oc_dbwriter_stop(dbw);
+    oc_tls_server_free(&srv);
+    idp_stop(&f, ith);
+    unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
 }
 
 /* The pages end to end, on a daemon of their own with the test knob OFF -- the
@@ -2252,7 +2553,7 @@ static void test_web_signin(int port) {
     CHECK(client_open(&held, port, pin) == 0 && do_handshake(&held) == 0);
     {
         uint8_t ab[4096]; oc_wbuf aw; oc_wbuf_init(&aw, ab, sizeof ab);
-        oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver) };
+        oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver), { NULL, 0 } };
         oc_header hdr; oc_rbuf p;
         CHECK(oc_encode_auth(&aw, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&held.conn, ab, aw.len) == 0);
         CHECK(read_frame_raw(&held, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);
@@ -5646,6 +5947,7 @@ int run_netloop_tests(void) {
         test_voice_input_absent(arg.port + 125, 0);
         test_web_signin(arg.port + 128);
         test_device_signin(arg.port + 130);
+        test_direct_signin(arg.port + 131);
     }
 
     oc_netloop_set_audio(-1, 0);

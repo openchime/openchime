@@ -205,10 +205,11 @@ static void test_auth_frames(void) {
     {
         /* AUTH — method-discriminated credential (here a local password). */
         oc_auth in = { OC_AUTH_LOCAL, oc_slice_str("local"), oc_slice_str("alice:hunter2"),
-                       oc_slice_str("the-verifier") };
+                       oc_slice_str("the-verifier"), oc_slice_str("the-state") };
         ROUNDTRIP(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH, h, p);
         oc_auth out;
         CHECK(oc_decode_auth(&p, &out) == OC_OK);
+        CHECK(out.state.len == 9 && memcmp(out.state.ptr, "the-state", 9) == 0);   /* protocol 22 */
         CHECK(out.method == OC_AUTH_LOCAL);
         CHECK(slice_eq_str(out.credential, "alice:hunter2"));
     }

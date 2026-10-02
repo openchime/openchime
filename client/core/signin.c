@@ -75,6 +75,7 @@ int oc_signin_verifier(char verifier[OC_SIGNIN_VERIFIER_LEN + 1],
 
 struct oc_loopback {
     int  fd;
+    int  fd6;          /* a provider's listener: [::1] at the same port, or -1 */
     unsigned port;
     int  v6;
     char secret[32];
@@ -89,8 +90,9 @@ static int g_loopback_v6_only;
 void oc_loopback_force_v6(int on) { g_loopback_v6_only = on; }
 
 /* A listening socket on this machine's loopback in `family`, never the wildcard
- * address, and the port it was given. -1 if the family has no loopback. */
-static int listen_loopback(int family, unsigned *port) {
+ * address, at `want` (0: any) and the port it was given. -1 if the family has no
+ * loopback or the port is taken. */
+static int listen_loopback_at(int family, unsigned want, unsigned *port) {
     int fd = (int)socket(family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_storage a;
@@ -99,10 +101,12 @@ static int listen_loopback(int family, unsigned *port) {
     if (family == AF_INET6) {
         struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&a;
         a6->sin6_family = AF_INET6; a6->sin6_addr = in6addr_loopback;
+        a6->sin6_port = htons((uint16_t)want);
         alen = (socklen_t)sizeof *a6;
     } else {
         struct sockaddr_in *a4 = (struct sockaddr_in *)&a;
         a4->sin_family = AF_INET; a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a4->sin_port = htons((uint16_t)want);
         alen = (socklen_t)sizeof *a4;
     }
     if (bind(fd, (struct sockaddr *)&a, alen) != 0 || listen(fd, 4) != 0 ||
@@ -114,6 +118,9 @@ static int listen_loopback(int family, unsigned *port) {
                                : ntohs(((struct sockaddr_in *)&a)->sin_port);
     return fd;
 }
+static int listen_loopback(int family, unsigned *port) {
+    return listen_loopback_at(family, 0, port);
+}
 
 oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap) {
     oc_sock_startup();
@@ -122,6 +129,7 @@ oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap) {
 
     oc_loopback *lb = calloc(1, sizeof *lb);
     if (!lb) return NULL;
+    lb->fd6 = -1;
     b64url(raw, sizeof raw, lb->secret);
     /* IPv4 loopback, which every host has; IPv6 loopback on one that does not.
      * The daemon accepts either as a redirect (AUTH.md §8.1). */
@@ -139,9 +147,34 @@ oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap) {
     return lb;
 }
 
+oc_loopback *oc_loopback_open_provider(char *redirect_uri, size_t cap) {
+    oc_loopback *lb = oc_loopback_open(NULL, 0);
+    if (!lb) return NULL;
+    /* [::1] beside 127.0.0.1 at one port; a port IPv6 has taken is given back
+     * and another tried, and a host with no IPv6 loopback keeps IPv4 alone. */
+    for (int tries = 0; !lb->v6 && lb->fd6 < 0 && tries < 8; tries++) {
+        unsigned p6 = 0;
+        lb->fd6 = listen_loopback_at(AF_INET6, lb->port, &p6);
+        if (lb->fd6 >= 0) { oc_sock_setnonblock(lb->fd6); break; }
+        unsigned p4 = 0;
+        int fd = listen_loopback(AF_INET, &p4);
+        if (fd < 0) break;
+        oc_closesock(lb->fd);
+        oc_sock_setnonblock(fd);
+        lb->fd = fd; lb->port = p4;
+    }
+    snprintf(lb->path, sizeof lb->path, "/");
+    if (redirect_uri) {
+        int n = snprintf(redirect_uri, cap, lb->v6 ? "http://[::1]:%u" : "http://127.0.0.1:%u", lb->port);
+        if (n < 0 || (size_t)n >= cap) { oc_loopback_close(lb); return NULL; }
+    }
+    return lb;
+}
+
 void oc_loopback_close(oc_loopback *lb) {
     if (!lb) return;
     if (lb->fd >= 0) oc_closesock(lb->fd);
+    if (lb->fd6 >= 0) oc_closesock(lb->fd6);
     oc_signin_wipe(lb, sizeof *lb);
     free(lb);
 }
@@ -410,10 +443,13 @@ static oc_loopback_result serve(oc_loopback *lb, int timeout_ms, const atomic_in
         uint64_t now = oc_model_now_ms();
         if (now >= until) return OC_LOOPBACK_TIMEOUT;
         uint64_t left = until - now;
-        int pr = oc_poll(lb->fd, 0, left > 200 ? 200 : (int)left);   /* short, to see `cancel` */
+        int slice = left > 200 ? 200 : (int)left;   /* short, to see `cancel` */
+        int lfd = lb->fd;
+        int pr = oc_poll(lb->fd, 0, lb->fd6 >= 0 ? 0 : slice);
+        if (pr == 0 && lb->fd6 >= 0) { lfd = lb->fd6; pr = oc_poll(lb->fd6, 0, slice); }
         if (pr < 0 && !oc_sock_wouldblock()) return OC_LOOPBACK_ERROR;
         if (pr <= 0) continue;
-        int c = (int)accept(lb->fd, NULL, NULL);
+        int c = (int)accept(lfd, NULL, NULL);
         if (c < 0) continue;
         oc_sock_setnonblock(c);
         int ours = want_callback ? serve_one(lb, c, query, qcap) : serve_one(lb, c, scratch, sizeof scratch);

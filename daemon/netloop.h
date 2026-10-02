@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <stdint.h>
 
+#include "config.h"     /* oc_oidc_connect */
 #include "dbwriter.h"
 #include "tls.h"
 
@@ -65,6 +66,10 @@ void oc_netloop_set_seen_ms(uint64_t ms);
  * self-signed daemon's, nor the loopback tunnel's. NULL or "": none. Before
  * serving. */
 void oc_netloop_set_passkey_names(const char *names);
+/* The direct connections (AUTH.md §8.5): offered as sources oidc-1 to oidc-<n>
+ * in the order configured, begun here and exchanged by `rp`. Before serving. */
+struct oc_oidcrp;
+void oc_netloop_set_direct(struct oc_oidcrp *rp, const oc_oidc_connect *conns, int n);
 
 /* Hold a connection's presence changes to OC_PRESENCE_RATE_MAX per `ms` rather
  * than per ten seconds (0 restores it); a test's knob, so the deferred last word

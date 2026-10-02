@@ -322,6 +322,61 @@ int run_signin_tests(void) {
         }
     }
 
+    /* A direct connection's provider: a redirect with no path, the callback at
+     * "/", and the same port on [::1] for a redirect written as `localhost`. */
+    {
+        char uri[128];
+        oc_loopback *lb = oc_loopback_open_provider(uri, sizeof uri);
+        CHECK(lb != NULL);
+        CHECK(strncmp(uri, "http://127.0.0.1:", 17) == 0 && strchr(uri + 17, '/') == NULL);
+        int port = atoi(uri + 17);
+        CHECK(port > 0);
+        for (int six = 0; lb && port > 0 && six < 2; six++) {
+            int fd;
+            if (six) {
+                struct sockaddr_in6 a6; memset(&a6, 0, sizeof a6);
+                a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_loopback; a6.sin6_port = htons((uint16_t)port);
+                /* whether this host has IPv6 loopback at all, asked apart from the listener */
+                struct sockaddr_in6 p6 = a6; p6.sin6_port = 0;
+                int probe = socket(AF_INET6, SOCK_STREAM, 0);
+                int have6 = probe >= 0 && bind(probe, (struct sockaddr *)&p6, sizeof p6) == 0;
+                if (probe >= 0) close(probe);
+                if (!have6) { printf("  (no IPv6 loopback on this host: the [::1] callback is skipped)\n"); break; }
+                fd = socket(AF_INET6, SOCK_STREAM, 0);
+                CHECK(connect(fd, (struct sockaddr *)&a6, sizeof a6) == 0);
+            } else {
+                struct sockaddr_in a4; memset(&a4, 0, sizeof a4);
+                a4.sin_family = AF_INET; a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a4.sin_port = htons((uint16_t)port);
+                fd = socket(AF_INET, SOCK_STREAM, 0);
+                CHECK(connect(fd, (struct sockaddr *)&a4, sizeof a4) == 0);
+            }
+            const char *req = six ? "GET /?code=c6&state=s6 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                                  : "GET /?code=c4&state=s4 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            ssize_t w = write(fd, req, strlen(req)); (void)w;
+            char query[64];
+            CHECK(oc_loopback_wait(lb, 5000, NULL, query, sizeof query) == OC_LOOPBACK_OK);
+            CHECK(strcmp(query, six ? "code=c6&state=s6" : "code=c4&state=s4") == 0);
+            close(fd);
+        }
+        /* Another path is not the callback. */
+        if (lb && port > 0) {
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in a4; memset(&a4, 0, sizeof a4);
+            a4.sin_family = AF_INET; a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a4.sin_port = htons((uint16_t)port);
+            CHECK(connect(fd, (struct sockaddr *)&a4, sizeof a4) == 0);
+            const char *req = "GET /cb/x?code=c&state=s HTTP/1.1\r\n\r\n";
+            ssize_t w = write(fd, req, strlen(req)); (void)w;
+            char query[64];
+            CHECK(oc_loopback_wait(lb, 400, NULL, query, sizeof query) == OC_LOOPBACK_TIMEOUT);
+            char st[64] = "";
+            ssize_t n = read(fd, st, sizeof st - 1);
+            if (n > 0) st[n] = '\0';
+            CHECK(strstr(st, "404") != NULL);
+            close(fd);
+        }
+        oc_loopback_close(lb);
+    }
+
     /* Two attempts never share a secret or, in practice, a port. */
     {
         char u1[128], u2[128];

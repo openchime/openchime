@@ -539,6 +539,18 @@ works. Nothing proves the shipped *image* works (§3.2).
   code for a Google user's address is refused with `AUTH_USE_PROVIDER` and makes
   no identity; Microsoft for a person known by emailed code links; with
   `OPENCHIME_OIDC_EMAIL_LINK=any` the emailed code links too.
+- **Direct connections (`test_idtoken`; `test_dbwriter`
+  `test_direct_identities`; `itest_netloop` `test_direct_signin`):** ID tokens
+  signed in the test with RSA, RSA-PSS and P-256 keys pass, and each of a wrong
+  issuer, audience, `azp`, nonce or key, an expired or future token, `alg=none`
+  and HS256 is refused. A direct identity never links by address either way, the
+  relay may not deliver a direct issuer, and a relay identity does not link onto a
+  direct one. Against a fake provider in the test: the source is offered by its
+  label, the authorize URL carries the daemon's own PKCE challenge, the code
+  exchanges into a member; a wrong `state`, someone else's verifier, or a `state`
+  used once already is refused with no request reaching the token endpoint; a
+  person no rule admits is refused after the exchange; a provider that is down
+  makes the source unavailable.
 - **A second step (`test_totp`; `itest_netloop` `test_web_signin`,
   `test_device_signin`):** RFC 6238's SHA1 vectors, one step either side and no
   replay; base32; a sealed secret opens with its key and account only; the

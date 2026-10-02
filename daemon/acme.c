@@ -17,8 +17,7 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/x509_csr.h>
 
-#define JSMN_HEADER
-#include "jsmn.h"
+#include "json.h"
 
 #include "https_client.h"
 #include "jwt.h"      /* oc_base64url_encode, oc_jwk_p256, oc_jwk_thumbprint, oc_jws_es256_sign */
@@ -201,76 +200,15 @@ int oc_cert_validity(const char *pem, size_t len, uint64_t *not_before_ms, uint6
     return rc;
 }
 
-/* --- JSON (the few shapes ACME returns) ------------------------------------ */
+/* --- JSON (the few shapes ACME returns): the daemon's reader, json.h -------- */
 
-typedef struct {
-    const char *js;
-    jsmntok_t  *t;
-    int         n;
-} jdoc;
-
-static int jparse(jdoc *d, const char *js, size_t len) {
-    jsmn_parser p;
-    int cap = 256;
-    d->js = js; d->t = NULL; d->n = 0;
-    for (;;) {
-        jsmntok_t *t = realloc(d->t, (size_t)cap * sizeof *t);
-        if (!t) return -1;
-        d->t = t;
-        jsmn_init(&p);
-        int n = jsmn_parse(&p, js, len, d->t, (unsigned)cap);
-        if (n == JSMN_ERROR_NOMEM && cap < 16384) { cap *= 4; continue; }
-        if (n <= 0) return -1;
-        d->n = n;
-        return 0;
-    }
-}
-
-static void jfree(jdoc *d) { free(d->t); d->t = NULL; }
-
-/* The index just past token `i`'s whole subtree. */
-static int jskip(const jdoc *d, int i) {
-    int end = i + 1;
-    if (d->t[i].type == JSMN_OBJECT || d->t[i].type == JSMN_ARRAY) {
-        int kids = d->t[i].size * (d->t[i].type == JSMN_OBJECT ? 2 : 1);
-        for (int k = 0; k < kids && end < d->n; k++) end = jskip(d, end);
-    }
-    return end;
-}
-
-/* The value of `key` in the object at `obj`, or -1. */
-static int jget(const jdoc *d, int obj, const char *key) {
-    if (obj < 0 || obj >= d->n || d->t[obj].type != JSMN_OBJECT) return -1;
-    size_t kl = strlen(key);
-    int i = obj + 1;
-    for (int k = 0; k < d->t[obj].size && i + 1 < d->n; k++) {
-        const jsmntok_t *kt = &d->t[i];
-        if (kt->type == JSMN_STRING && (size_t)(kt->end - kt->start) == kl &&
-            !memcmp(d->js + kt->start, key, kl)) return i + 1;
-        i = jskip(d, i + 1);
-    }
-    return -1;
-}
-
-/* String token `i` into `out`, with the escapes ACME values carry undone. */
-static int jstr(const jdoc *d, int i, char *out, size_t cap) {
-    if (i < 0 || i >= d->n || d->t[i].type != JSMN_STRING || !cap) return -1;
-    size_t o = 0;
-    for (int p = d->t[i].start; p < d->t[i].end && o + 1 < cap; p++) {
-        char ch = d->js[p];
-        if (ch == '\\' && p + 1 < d->t[i].end) {
-            char e = d->js[++p];
-            ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
-        }
-        out[o++] = ch;
-    }
-    out[o] = '\0';
-    return 0;
-}
-
-static int jgetstr(const jdoc *d, int obj, const char *key, char *out, size_t cap) {
-    return jstr(d, jget(d, obj, key), out, cap);
-}
+typedef oc_json jdoc;
+#define jparse(d, js, len)              oc_json_parse((d), (js), (len))
+#define jfree(d)                        oc_json_free(d)
+#define jskip(d, i)                     oc_json_skip((d), (i))
+#define jget(d, obj, key)               oc_json_get((d), (obj), (key))
+#define jstr(d, i, out, cap)            oc_json_str((d), (i), (out), (cap))
+#define jgetstr(d, obj, key, out, cap)  oc_json_get_str((d), (obj), (key), (out), (cap))
 
 /* --- JWS (RFC 7515 flattened JSON, ES256) --------------------------------- */
 

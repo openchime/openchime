@@ -138,11 +138,16 @@
  * seat is held for its rejoin, so the others can say so. A repeated entry, so
  * the byte shifts every participant after the first.
  *
+ * 22: AUTH carries `state` after its proof: a direct connection's sign-in
+ * (AUTH.md §8.5) comes back from the provider with a code and a state, and the
+ * daemon matches the state to the sign-in it began. A field appended to AUTH
+ * is a layout change like any other.
+ *
  * 4: USER_LIST carries each user's avatar attachment id. A frame LAYOUT
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 21u
+#define OC_PROTOCOL_VERSION 22u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -885,7 +890,9 @@ typedef struct { oc_slice id; uint8_t kind; oc_slice label; } oc_auth_source;
 typedef struct { uint8_t n_sources; oc_auth_source sources[OC_MAX_SOURCES]; } oc_auth_challenge;
 /* `source` names an entry of the challenge ("" for a session resume). `proof` is
  * the verifier whose hash the client sent in AUTH_BEGIN (§8.2); empty otherwise. */
-typedef struct { uint8_t method; oc_slice source; oc_slice credential; oc_slice proof; } oc_auth;
+/* `state` is a direct connection's (AUTH.md §8.5): what the provider sent
+ * back beside the code; empty for any other source. */
+typedef struct { uint8_t method; oc_slice source; oc_slice credential; oc_slice proof; oc_slice state; } oc_auth;
 typedef struct { oc_slice source; oc_slice redirect_uri; oc_slice challenge; } oc_auth_begin;
 typedef struct { oc_slice authorize_url; } oc_auth_redirect;
 /* A device code (AUTH.md §8.11): asked for with the client's PKCE challenge;

@@ -171,7 +171,7 @@ static int bc_login(bclient *c, int i) {
     uint8_t cred[128]; oc_wbuf cw; oc_wbuf_init(&cw, cred, sizeof cred);
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str("pw")) != OC_OK) return -1;
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cred, cw.len }, { NULL, 0 } };
+    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cred, cw.len }, { NULL, 0 }, { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(c, buf, w.len) != 0) return -1;
     if (read_until(c, OC_MSG_AUTH_OK, &p, 60000) != 0) return -1;
     oc_auth_ok ok;
