@@ -124,6 +124,17 @@ size_t oc_url_extract(const char *b, size_t len, oc_url_span *out, size_t max) {
     return n;
 }
 
+int oc_url_transport_ok(const char *url) {
+    if (!url) return 0;
+    int tls;
+    if (strncmp(url, "https://", 8) == 0)     { tls = 1; url += 8; }
+    else if (strncmp(url, "http://", 7) == 0) { tls = 0; url += 7; }
+    else return 0;
+    char host[256], port[8] = "";
+    if (oc_url_authority(url, strcspn(url, "/?#"), host, sizeof host, port, sizeof port) != 0) return 0;
+    return tls || strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0 || strcmp(host, "localhost") == 0;
+}
+
 int oc_url_authority(const char *auth, size_t len, char *host, size_t hcap, char *port, size_t pcap) {
     if (!auth || !host || !port || hcap == 0 || pcap == 0) return -1;
     const char *e = auth + len;

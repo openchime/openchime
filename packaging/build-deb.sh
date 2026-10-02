@@ -52,7 +52,8 @@ if [ -f "$STT/manifest" ]; then
   find "$stage/usr/share/openchime/stt" -type f -exec chmod 0644 {} +
 fi
 install -D -m 0644 "$root/packaging/debian/openchimed.service" "$stage/lib/systemd/system/openchimed.service"
-install -D -m 0644 "$root/packaging/openchimed.env"            "$stage/etc/openchime/openchimed.env"
+# 0600: it holds secrets, and systemd (root) is what reads it, not the daemon.
+install -D -m 0600 "$root/packaging/openchimed.env"            "$stage/etc/openchime/openchimed.env"
 
 # Attribution for the linked third-party components. Debian looks for this exact
 # path, and a binary package without it is one that should not be published.

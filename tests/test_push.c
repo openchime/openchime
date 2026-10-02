@@ -11,6 +11,7 @@
 #include "enroll.h"
 #include "migrate.h"
 #include "protocol.h"
+#include "config.h"
 /* The client's half of the same decision (ARCH-103): the sweep below compares
  * three answers, and this is the third. */
 #include "model.h"
@@ -767,6 +768,11 @@ static void test_notify_roundtrip(int v6) {
     char url[64];
     snprintf(url, sizeof url, v6 ? "http://[::1]:%d" : "http://127.0.0.1:%d", port);
 
+    /* Plain http anywhere but loopback is refused at start, before any send. */
+    oc_push *bad = oc_push_start(path, w, "http://127.0.0.2:9/api", aud, pk);
+    CHECK(bad == NULL);
+    if (bad) oc_push_stop(bad);
+
     oc_push *p = oc_push_start(path, w, url, aud, pk);
     CHECK(p != NULL);
     if (p) {
@@ -1152,6 +1158,25 @@ static void test_call_invite(void) {
     cleanup_db(path);
 }
 
+/* Enrollment and push carry signed requests: https, or plain http to loopback
+ * for a test's fake. Plain http elsewhere stops the boot (ARCH-84, ARCH-85). */
+static void test_transport_config(void) {
+    char err[256];
+    const char *names[2] = { "OPENCHIME_PUSH_URL", "OPENCHIME_ENROLL_URL" };
+    for (int i = 0; i < 2; i++) {
+        setenv(names[i], "http://push.example.com/api", 1);
+        CHECK(oc_config_load(err, sizeof err) != 0 && strstr(err, names[i]) != NULL);
+        setenv(names[i], "http://10.0.0.5:8080/api", 1);
+        CHECK(oc_config_load(err, sizeof err) != 0);
+        setenv(names[i], "http://127.0.0.1:9/api", 1);
+        CHECK(oc_config_load(err, sizeof err) == 0);
+        setenv(names[i], "https://push.example.com/api", 1);
+        CHECK(oc_config_load(err, sizeof err) == 0);
+        unsetenv(names[i]);
+    }
+    CHECK(oc_config_load(err, sizeof err) == 0);
+}
+
 int run_push_tests(void) {
     printf("test_push: DND window (incl wrap-around), recipient collect "
            "(level/DND/author gating), CP-12 sign+verify, contentless body, "
@@ -1170,5 +1195,6 @@ int run_push_tests(void) {
     test_notify_roundtrip(0);
     test_notify_roundtrip(1);
     test_call_invite();
+    test_transport_config();
     return failures;
 }

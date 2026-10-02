@@ -38,6 +38,11 @@ size_t oc_url_extract(const char *b, size_t len, oc_url_span *out, size_t max);
  * brackets, as getaddrinfo wants it; the port is left as the caller set it when
  * none is given. 0, or -1 when the authority is malformed or does not fit. */
 int oc_url_authority(const char *auth, size_t len, char *host, size_t hcap, char *port, size_t pcap);
+/* Whether the daemon may send to `url`: `https://` with a well-formed authority,
+ * or plain `http://` only to loopback (127.0.0.1, ::1, localhost) -- a test's
+ * fake. Anything else would carry signed requests and their answers in the
+ * clear. 1 or 0. */
+int oc_url_transport_ok(const char *url);
 /* A Host header's value: `host`, bracketed when it is an IPv6 address, then
  * `:port` unless `port` is NULL or empty. 0, or -1 if it does not fit. */
 int oc_url_hostheader(const char *host, const char *port, char *out, size_t cap);

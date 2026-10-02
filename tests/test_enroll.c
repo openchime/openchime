@@ -165,6 +165,7 @@ static void test_claim_signature(void) {
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -284,6 +285,29 @@ static void test_persistence(void) {
     oc_dbwriter_stop(w);
 }
 
+/* Plain http to anything but loopback is refused before a connection is made:
+ * the claim and the activation would otherwise cross the network in the clear.
+ * 127.0.0.2 reaches this host but is not one of the loopback names. */
+static void test_plain_http_refused(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { 0 };
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    socklen_t sl = sizeof sa;
+    CHECK(lfd >= 0 && bind(lfd, (struct sockaddr *)&sa, sl) == 0 && listen(lfd, 4) == 0);
+    getsockname(lfd, (struct sockaddr *)&sa, &sl);
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.2:%d/api/machine/enroll", ntohs(sa.sin_port));
+    char pk[1024], aud[128];
+    CHECK(oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0);
+    CHECK(oc_enroll_activate(url, aud, pk) == OC_ENROLL_FAILED);
+    CHECK(oc_enroll_claim(url, aud, pk, "AAAA") == OC_ENROLL_FAILED);
+    struct timeval tv = { 0, 200000 };
+    fd_set rf; FD_ZERO(&rf); FD_SET(lfd, &rf);
+    CHECK(select(lfd + 1, &rf, NULL, NULL, &tv) == 0);   /* nobody connected */
+    close(lfd);
+}
+
 int run_enroll_tests(void) {
     printf("test_enroll: keygen + opaque audience, oce1 code format + SPKI key, "
            "proof-signature verify, persistence round-trip\n");
@@ -297,6 +321,7 @@ int run_enroll_tests(void) {
     test_generate(&rng);
     test_code_and_signature();
     test_claim_signature();
+    test_plain_http_refused();
     test_claim_answers();
     test_persistence();
 
