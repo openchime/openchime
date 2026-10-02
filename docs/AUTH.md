@@ -555,6 +555,7 @@ of rules, default deny, evaluated only for an identity the workspace has not see
 | Rule | Admits |
 |---|---|
 | `owner:<email>` | that verified address, created as **owner**. It also applies whenever the workspace has no active owner, which makes it the recovery path as well as the first-run one. |
+| `subject:<issuer>\|<subject>` | that one identity — the relay's `sub`, matched exactly — as **owner**, on the same terms as `owner:`. It needs no address, so it names an owner whose provider verifies none: a Microsoft work account in a tenant that sends no `xms_edov`. A managed workspace's provisioning writes it beside `owner:` from the owner's console sign-in. |
 | `tenant:google:<hosted domain>`, `tenant:microsoft:<tenant id>` | anyone the provider places in that organization, as member. |
 | `domain:<domain>` | a **verified** address at that domain, as member. |
 

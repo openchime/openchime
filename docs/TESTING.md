@@ -529,6 +529,9 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **A password change by frame (`test_dbwriter` `test_change_password`):** a
   wrong old password is audited and counts with the sign-in limiter, which then
   stops both the change and a sign-in (REQ-191).
+- **Owner by identity (`test_joinrules`, `test_dbwriter` `test_oidc_join_rules`):**
+  `subject:` admits that exact `<issuer>|<subject>` as owner with no verified
+  address, and no other subject, issuer or letter case.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

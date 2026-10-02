@@ -8,7 +8,7 @@
 #include <string.h>
 
 int run_joinrules_tests(void) {
-    printf("test_joinrules: owner/tenant/domain rules, verified-address requirement, "
+    printf("test_joinrules: owner/subject/tenant/domain rules, verified-address requirement, "
            "default deny, strict parse\n");
     char err[128];
 
@@ -16,13 +16,13 @@ int run_joinrules_tests(void) {
     {
         oc_join_rules *r = oc_join_rules_parse(NULL, err, sizeof err);
         CHECK(r != NULL);
-        CHECK(oc_join_rules_eval(r, "google", "acme.example", "a@acme.example", 1) == OC_JOIN_DENY);
+        CHECK(oc_join_rules_eval(r, NULL, "google", "acme.example", "a@acme.example", 1) == OC_JOIN_DENY);
         oc_join_rules_free(r);
         r = oc_join_rules_parse("  ", err, sizeof err);
         CHECK(r != NULL);
-        CHECK(oc_join_rules_eval(r, "google", "acme.example", "a@acme.example", 1) == OC_JOIN_DENY);
+        CHECK(oc_join_rules_eval(r, NULL, "google", "acme.example", "a@acme.example", 1) == OC_JOIN_DENY);
         oc_join_rules_free(r);
-        CHECK(oc_join_rules_eval(NULL, "google", "acme.example", "a@acme.example", 1) == OC_JOIN_DENY);
+        CHECK(oc_join_rules_eval(NULL, NULL, "google", "acme.example", "a@acme.example", 1) == OC_JOIN_DENY);
     }
 
     oc_join_rules *r = oc_join_rules_parse(
@@ -64,11 +64,35 @@ int run_joinrules_tests(void) {
         { NULL, NULL, NULL, 1, OC_JOIN_DENY },
     };
     for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
-        oc_join_verdict got = oc_join_rules_eval(r, T[i].idp, T[i].tenant, T[i].email, T[i].verified);
+        oc_join_verdict got = oc_join_rules_eval(r, NULL, T[i].idp, T[i].tenant, T[i].email, T[i].verified);
         if (got != T[i].want) printf("  row %zu: got %d want %d\n", i, (int)got, (int)T[i].want);
         CHECK(got == T[i].want);
     }
     oc_join_rules_free(r);
+
+    /* subject: names one identity exactly -- an owner whose provider verifies
+     * no address (a Microsoft work account without xms_edov) is still the owner. */
+    {
+        static const char *MS = "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0";
+        char rule[256], sub[256];
+        snprintf(rule, sizeof rule, "subject:%s|00000000-0000-0000-66f3-3332eca7ea81,domain:partner.example", MS);
+        oc_join_rules *s1 = oc_join_rules_parse(rule, err, sizeof err);
+        CHECK(s1 != NULL);
+        snprintf(sub, sizeof sub, "%s|00000000-0000-0000-66f3-3332eca7ea81", MS);
+        CHECK(oc_join_rules_eval(s1, sub, "microsoft", "x", "dana@acme.example", 0) == OC_JOIN_OWNER);
+        /* exact: another subject, another issuer, another case, or none */
+        snprintf(sub, sizeof sub, "%s|00000000-0000-0000-66f3-3332eca7ea82", MS);
+        CHECK(oc_join_rules_eval(s1, sub, "microsoft", "x", "", 0) == OC_JOIN_DENY);
+        CHECK(oc_join_rules_eval(s1, "https://accounts.google.com|00000000-0000-0000-66f3-3332eca7ea81",
+                                 "google", "", "", 0) == OC_JOIN_DENY);
+        snprintf(sub, sizeof sub, "%s|00000000-0000-0000-66F3-3332ECA7EA81", MS);
+        CHECK(oc_join_rules_eval(s1, sub, "microsoft", "x", "", 0) == OC_JOIN_DENY);
+        CHECK(oc_join_rules_eval(s1, NULL, "microsoft", "x", "", 0) == OC_JOIN_DENY);
+        /* ...and beside a member rule it wins */
+        snprintf(sub, sizeof sub, "%s|00000000-0000-0000-66f3-3332eca7ea81", MS);
+        CHECK(oc_join_rules_eval(s1, sub, "microsoft", "x", "dana@partner.example", 1) == OC_JOIN_OWNER);
+        oc_join_rules_free(s1);
+    }
 
     /* A rule the parser does not understand stops the boot, with the rule named. */
     static const char *const BAD[] = {
@@ -76,6 +100,7 @@ int run_joinrules_tests(void) {
         "domain:", "domain:nodot", "domain:.example", "domain:a_b.example", "domain:*.example",
         "tenant:google", "tenant:google:", "tenant::acme.example",
         "domain:ok.example,alow:typo.example",
+        "subject:", "subject:no-bar", "subject:|sub", "subject:https://iss|", "subject:https://iss|a b",
     };
     for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
         err[0] = '\0';

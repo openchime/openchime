@@ -969,6 +969,22 @@ static void test_oidc_join_rules(void) {
     CHECK(oidc_signin(w, &is, 37, "g|pat", "j8", PAT, &role, &err) == pat);
     CHECK(role == OC_ROLE_MEMBER);
 
+    /* subject: names the owner by identity, no address needed -- a Microsoft work
+     * account whose tenant verifies none. As an owner rule, it restores an owner
+     * only to a workspace with none: here there is one, so a known member named
+     * by it stays a member, and a new identity named by it is made an owner. */
+    {
+        const char *MS = "\"email\":\"kim@contoso.example\",\"email_verified\":false,\"idp\":\"microsoft\","
+                         "\"tenant\":\"72f988bf\"";
+        CHECK(oc_dbwriter_configure_join_rules(w, "subject:https://login.microsoftonline.com/72f988bf/v2.0|kim-oid",
+                                               why, sizeof why) == 0);
+        uint64_t kim = oidc_signin(w, &is, 38, "https://login.microsoftonline.com/72f988bf/v2.0|kim-oid", "j8k",
+                                   MS, &role, &err);
+        CHECK(kim != 0 && role == OC_ROLE_OWNER);
+        CHECK(oidc_signin(w, &is, 39, "https://login.microsoftonline.com/72f988bf/v2.0|kim-other", "j8l",
+                          MS, &role, &err) == 0 && err == OC_ERR_AUTH_NOT_ALLOWED);
+    }
+
     /* A token in the wrong hands: whoever presents it must hold the verifier its
      * nonce is the hash of, and a failed try does not spend the token. */
     {
@@ -1034,7 +1050,7 @@ static void test_oidc_join_rules(void) {
         CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
         sqlite3_stmt *st = NULL;
         sqlite3_prepare_v2(raw,
-            "SELECT (SELECT COUNT(*) FROM user_identities WHERE subject != 'lee-again'),"
+            "SELECT (SELECT COUNT(*) FROM user_identities WHERE subject NOT IN ('lee-again', 'kim-oid')),"
             " (SELECT COUNT(*) FROM user_identities WHERE issuer='g' AND subject='dana'"
             "   AND idp='' AND email='dana@acme.example' AND email_verified=1"
             "   AND last_login_ms >= first_seen_ms),"
