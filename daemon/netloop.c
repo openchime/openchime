@@ -3116,6 +3116,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
+            j->message_id = c->session_id;   /* the session that stays */
             j->pf_old_pw = strndup((const char *)cp.old_password.ptr, cp.old_password.len);
             j->pf_new_pw = strndup((const char *)cp.new_password.ptr, cp.new_password.len);
             if (!j->pf_old_pw || !j->pf_new_pw) return -1;
@@ -4308,6 +4309,17 @@ static size_t encode_group(const oc_group_row *g) {
     return oc_encode_group_info(&w, OC_PROTOCOL_VERSION, &gi) == OC_OK ? w.len : 0;
 }
 
+/* A result that revoked a user's sessions (`revoked`) closes the user's other
+ * connections: each is authenticated in memory, so deleting its session row
+ * alone would leave it working until it dropped by itself (REQ-182). */
+static void close_revoked(int ep, conn **conns, const oc_dbres *r) {
+    if (!r->revoked || !r->user_id) return;
+    for (conn *t = user_head(r->user_id), *next; t; t = next) {
+        next = t->u_next;
+        if (t->conn_id != r->conn_id) conn_close(ep, conns, t->fd);
+    }
+}
+
 static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
     (void)dbw;
     oc_wbuf w;
@@ -4497,7 +4509,8 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     }
     case OC_RES_LOGOUT_OK: {
         /* The session is revoked; drop the connection (the client re-auths to
-         * continue). Any queued output is discarded with the conn. */
+         * continue). Any queued output is discarded with the conn. Signing out
+         * everywhere drops the user's other connections too (`revoked`). */
         conn *c = find_by_id(conns, r->conn_id);
         if (c) conn_close(ep, conns, c->fd);
         break;
@@ -7259,6 +7272,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 __atomic_add_fetch(&g_stats.results, 1, __ATOMIC_RELAXED);
                 if (r->type == OC_RES_BACKFILL_OK) { backfill_accept(ep, conns, r); continue; }
                 deliver_result(ep, conns, dbw, r);
+                close_revoked(ep, conns, r);
                 oc_dbres_free(r);
             }
             db_more = k == OC_RESULT_BUDGET;

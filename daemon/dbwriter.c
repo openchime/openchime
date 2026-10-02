@@ -1549,6 +1549,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
         }
         memcpy(r->session_token, token, sizeof token);
+        r->session_id = sess_id;    /* the row just made, not the none above */
         r->has_session_token = 1;
         r->session_expiry = expiry;
         /* Only a fresh local/OIDC login, never a session reconnect (REQ-251):
@@ -1567,7 +1568,8 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
  * change stores the new password, derived on the pool, against the version
  * that was checked. A removed member is refused either way, as an invalid
  * credential. */
-static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint16_t *err);
+static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint64_t keep_session,
+                              uint16_t *err);
 
 static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid) {
     sqlite3 *db = w->db;
@@ -1575,10 +1577,11 @@ static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64
     if (!uid) { r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
     if (j->web == OC_WEB_PASSWORD) {
         uint16_t err = 0;
-        if (store_new_password(db, j, uid, &err) != 0) { r->type = OC_RES_WEB_ERR; r->err_code = err; return r; }
+        if (store_new_password(db, j, uid, 0, &err) != 0) { r->type = OC_RES_WEB_ERR; r->err_code = err; return r; }
         audit_actor(db, OC_AUDIT_ACCOUNT, "password.change", uid, 0, NULL, 1, "via=browser");
         r->type = OC_RES_WEB_OK;
         r->user_id = uid;
+        r->revoked = 1;   /* the page is no session: every device signs in again */
         return r;
     }
     char *tok = w->local_iss ? oc_local_issuer_mint(w->local_iss, uid, j->web_nonce, dbw_now_ms() / 1000u)
@@ -1672,6 +1675,7 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
     audit_actor(db, OC_AUDIT_SECURITY, "session.revoke", j->user_id, 0,
                 j->scope == OC_LOGOUT_ALL ? "all" : "this", 1, NULL);
     r->type = OC_RES_LOGOUT_OK;
+    r->revoked = j->scope == OC_LOGOUT_ALL;
     return r;
 }
 
@@ -8035,8 +8039,11 @@ static oc_dbres *process_set_display_name(sqlite3 *db, const oc_job *j) {
  * the unchanged display name. Write. */
 /* Store the new password a check derived, against the version that was checked
  * -- one statement, so no other change can land between the test and the
- * write. 0, or -1 with `err` FORBIDDEN (changed meanwhile) or INTERNAL. */
-static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint16_t *err) {
+ * write -- and revoke every session of the user but `keep_session` (0: all),
+ * since each was opened with the old password (REQ-182). 0, or -1 with `err`
+ * FORBIDDEN (changed meanwhile) or INTERNAL. */
+static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint64_t keep_session,
+                              uint16_t *err) {
     *err = OC_ERR_INTERNAL;
     if (!j->pw_derived) return -1;
     uint64_t version = next_credential_version(db);
@@ -8056,7 +8063,12 @@ static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint16
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
     if (sqlite3_changes(db) != 1) { *err = OC_ERR_FORBIDDEN; return -1; }
-    return 0;
+    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=? AND id<>?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)keep_session);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
@@ -8073,10 +8085,13 @@ static oc_dbres *process_change_password(oc_dbwriter *w, const oc_job *j) {
     }
     if (j->auth_ok != 1) return profile_err(j, OC_ERR_FORBIDDEN);
     uint16_t err = 0;
-    if (store_new_password(db, j, j->user_id, &err) != 0) return profile_err(j, err);
+    /* The caller's own session stays: it just proved the old password. */
+    if (store_new_password(db, j, j->user_id, j->message_id, &err) != 0) return profile_err(j, err);
     /* Never the password itself — only that it changed (ARCH-79). */
     audit_actor(db, OC_AUDIT_ACCOUNT, "password.change", j->user_id, 0, NULL, 1, NULL);
-    return profile_ok(j, lookup_display_name(db, j->user_id));
+    oc_dbres *r = profile_ok(j, lookup_display_name(db, j->user_id));
+    if (r) r->revoked = 1;
+    return r;
 }
 
 /* ---- read-aloud (REQ-291-293, ARCH-111) ------------------------------------ */

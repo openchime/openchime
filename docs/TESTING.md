@@ -491,7 +491,11 @@ works. Nothing proves the shipped *image* works (§3.2).
   (standing in for the central service) reaches `AUTH_OK`, and a bad-signature /
   wrong-algorithm / wrong-audience / expired token is rejected; *session* — a
   reconnect with a stored session token resumes without re-auth, and a revoked
-  session is refused (REQ-023, REQ-100, REQ-182).
+  session is refused; with three live connections of one user, a password
+  change by frame closes the other two and keeps the changer's (which a fresh
+  sign-in marks as its own), one on the password page closes every one, signing
+  out this device leaves the others open, and signing out everywhere closes
+  them all (REQ-023, REQ-100, REQ-182).
 - **Messaging:** two clients in a channel — a `SEND` from one produces a
   `SEND_ACK` to the sender and a `BROADCAST` to both; ordering within the
   channel matches send order (REQ-092).

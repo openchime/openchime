@@ -360,8 +360,10 @@ token on reconnect), the daemon then does the same thing:
   without a full re-auth. The session lifetime is the daemon's to set (REQ-181) —
   it is not tied to a provider token's expiry.
 - **Revocation (REQ-182):** signing out deletes the session of this device
-  alone, or of every device the user has (`LOGOUT`'s scope); the next protocol
-  interaction on a revoked session fails. This local revocation is exactly what a stateless provider JWT cannot
+  alone, or of every device the user has (`LOGOUT`'s scope), and a password
+  change deletes them all. Each connection on a deleted session is closed at
+  once — it is authenticated in memory, so the row alone would not stop it — and
+  re-presenting the token fails. This local revocation is exactly what a stateless provider JWT cannot
   provide, and is the reason the daemon issues its own sessions.
 
 ---
@@ -697,7 +699,9 @@ from `daemon/webpages.c`:
 - `/signup` — an invitation or the setup token, a username and a password twice.
   It makes the account, then goes on as a sign-in.
 - `/account/password` — username, current password and a new one twice. It
-  needs no session, so the limiters stand in front of it as of a sign-in.
+  needs no session, so the limiters stand in front of it as of a sign-in. A
+  change revokes every session the account has and closes each connection on
+  one: a device signed in with the old password signs in again (REQ-182).
 
 Every page is self-contained HTML with its output escaped, no script, no
 cookies and no state kept between requests, with
