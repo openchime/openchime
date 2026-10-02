@@ -18,30 +18,26 @@ used.
 | Source | How identity is proven | Depends on |
 |---|---|---|
 | **Local** (§2) | The daemon manages accounts + passwords itself; the password is typed into the daemon's own sign-in page, in the browser (§8.10). | Nothing outside the box — fully air-gappable. |
-| **Relay** (§3) | The client logs in with Google/MS/Apple through the project's central service, which re-issues a token the daemon trusts. | The project's central service, at login time only. |
-| **Direct connection** | The client logs in at an OIDC provider the operator names, and the daemon is the relying party: it redeems the code and validates the provider's ID token. | The operator's own provider. No OpenChime-operated service. |
+| **Relay** (§3) | The client signs in with Google, Microsoft or a code mailed to their address through the project's central service, which re-issues a token the daemon trusts. | The project's central service, at login time only. |
 
 What a deployment may enable follows from the three deployment models of
 ARCH-76, because the relay is one of the functions a deployment federates and
-the other two sources need nothing from the project.
+local accounts need nothing from the project.
 
 | Deployment model (ARCH-76) | Sources |
 |---|---|
-| **Self-hosted stand-alone** | **Local**, a **direct connection**, or both. No dependency on any OpenChime-operated service; on local accounts alone this model is fully air-gappable. |
-| **Self-hosted federated** | Any of the three. Opting in to the federated OIDC function is what adds the relay; a federated deployment may equally decline it and federate only push, directory, SCIM, DNS, or packages. |
-| **Hosted** | The **relay**, operated by the project alongside the daemons, or a **direct connection** to the customer's own provider. |
+| **Self-hosted stand-alone** | **Local**. No dependency on any OpenChime-operated service; this model is fully air-gappable. |
+| **Self-hosted federated** | Local, the relay, or both. Opting in to the federated OIDC function is what adds the relay; a federated deployment may equally decline it and federate only push, directory, SCIM, DNS, or packages. |
+| **Hosted** | The **relay**, operated by the project alongside the daemons. |
 
-The two OIDC sources answer different needs. The relay keeps the daemon
-maximally lean on that path (it never fetches JWKS or handles multiple providers
-— it verifies one JWT from one pinned key, §3.3) and means a self-hoster never
-registers provider apps or holds provider credentials; its price is a login-time
-dependency on the project, and the project seeing who signs in where (§3.4). A
-direct connection is for the operator who would rather hold those credentials
-than pay that price, and it is the only single sign-on a stand-alone deployment
-can have. **SAML is not a source** (REQ-027).
+The relay keeps the daemon lean on that path (it never fetches JWKS or handles
+multiple providers — it verifies one JWT from one pinned key, §3.3) and means a
+self-hoster never registers provider apps or holds provider credentials; its
+price is a login-time dependency on the project, and the project seeing who
+signs in where (§3.4). **SAML is not a source** (REQ-027).
 
-**Sources may be enabled together** — an organization's provider for staff
-beside local accounts for contractors or a break-glass owner.
+**Sources may be enabled together** — the relay for staff beside local
+accounts for contractors or a break-glass owner.
 
 A deployment's sources are set in the daemon's static config (ARCH-26) and
 advertised to the client in-protocol via `AUTH_CHALLENGE` (§5).
@@ -115,13 +111,14 @@ authority.
 
 ## 3. OIDC via the central service and relay (ARCH-56)
 
-For social login (Google / Microsoft Entra / Apple, per REQ-021/022) without
+For social login (Google and Microsoft Entra, per REQ-021/022, and a code
+mailed to the address) without
 each operator registering provider apps.
 
 ### 3.1 The idea
 
 The **central service** (maintainer-controlled) is the OIDC Relying Party: it
-holds the Google/MS/Apple client credentials, runs the login flow, and
+holds the Google and Microsoft client credentials, runs the login flow, and
 **re-issues** an OpenChime **ES256 JWT** (§3.3) that the daemon trusts. For this
 source all the OIDC machinery — JWKS fetching, provider quirks, key rotation,
 multi-provider handling — lives in that service (a higher-level web service),
@@ -194,8 +191,7 @@ it over on.
 6. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
 
-The client half of this is the browser launch, the loopback listener and, on
-Apple platforms, the `ASWebAuthenticationSession` path.
+The client half of this is the browser launch and the loopback listener.
 
 ### 3.3 The identity token — an ES256 JWT (ARCH-57)
 
@@ -273,8 +269,7 @@ targets the high-frequency message path, not the auth bootstrap.)
 - **Privacy tradeoff:** in relay-OIDC the central service sees *who* logs into
   which workspace (identities, not message content — it never touches
   messages/channels). A self-hoster wanting zero project visibility declines the
-  relay and uses local accounts or a direct connection to their own provider
-  (§1); declining every federated function is exactly the self-hosted
+  relay and uses local accounts (§1); declining every federated function is exactly the self-hosted
   stand-alone model (ARCH-76).
 
 ### 3.5 Reconciling with the island model (REQ-041)
@@ -364,9 +359,9 @@ token on reconnect), the daemon then does the same thing:
   (`AUTH{method=session}`); the daemon hashes and looks it up, and resumes
   without a full re-auth. The session lifetime is the daemon's to set (REQ-181) —
   it is not tied to a provider token's expiry.
-- **Revocation (REQ-182):** "log out" / "log out other devices" deletes the
-  relevant `sessions` row(s); the next protocol interaction on a revoked session
-  fails. This local revocation is exactly what a stateless provider JWT cannot
+- **Revocation (REQ-182):** signing out deletes the session of this device
+  alone, or of every device the user has (`LOGOUT`'s scope); the next protocol
+  interaction on a revoked session fails. This local revocation is exactly what a stateless provider JWT cannot
   provide, and is the reason the daemon issues its own sessions.
 
 ---
@@ -446,38 +441,34 @@ client                                            daemon
   | ---- HELLO ---------------------------------> |
   | <--- WELCOME, AUTH_CHALLENGE{sources} ------- |   each source: id, kind, label
   |                                               |
-  |  a local source:                              |
-  | ---- AUTH{local, source, user, password} ---> |
-  |                                               |
-  |  a browser source (the relay, a direct connection):
+  |  every source signs in in the browser — local accounts on the
+  |  daemon's own pages (§8.10), the relay at central (§3):
   | ---- AUTH_BEGIN{source, redirect_uri, challenge} -> |
   | <--- AUTH_REDIRECT{authorize_url} ----------- |   the daemon builds the whole URL
   |        … the person signs in in their browser; the client may disconnect …
   | ---- AUTH{oidc, source, verifier, what came back} -> |
   |                                               |
-  | <--- AUTH_OK | AUTH_CONTINUE | ERROR -------- |
+  | <--- AUTH_OK | ERROR ------------------------ |
 ```
 
 - **`AUTH_CHALLENGE` lists sources** — `{id, kind, label}`, `kind` being `local`,
-  `relay` or `oidc`. The client
-  draws one control per source from the labels: fixed text for local accounts and
-  the relay, the operator's own words for a direct connection ("Acme SSO").
+  `relay` or `oidc` (`oidc` is reserved and not yet offered). The client
+  draws one control per source, with fixed text for local accounts and the
+  relay.
   Resuming a session (§4) is always accepted and is not a listed source.
 - **The daemon builds the authorize URL.** The client never assembles or parses an
   operator's or a provider's string, so it is the same client for the relay and
-  for a direct connection, and the workspace's audience reaches the relay from the
-  one party that knows it. The client opens the URL only if it is `https` (plain
+  for local accounts, and the workspace's audience reaches the relay from the one
+  party that knows it. The client opens the URL only if it is `https` (plain
   `http` to loopback, for development).
 - **`redirect_uri` is loopback** (RFC 8252); the daemon refuses anything else
   before it echoes it into a URL.
 - **No connection is held open while the browser is.** Nothing between
   `AUTH_REDIRECT` and `AUTH` lives on the connection (§8.2), so the client may
   disconnect and an unauthenticated connection can be short-lived.
-- **`AUTH_CONTINUE`** answers a first step that is correct but not sufficient
-  (§8.6). It is part of the exchange so that a second factor changes no handshake.
 - **Errors a client can explain:** `AUTH_NOT_ALLOWED` (a valid identity that may
   not join, §8.4), `AUTH_SOURCE_UNAVAILABLE` (a provider that cannot be reached,
-  §8.5), `AUTH_MFA_REQUIRED`, beside the codes that exist.
+  or that this deployment does not offer), beside the codes that exist.
 - **Protocol versions.** The daemon accepts the previous protocol version as
   well as its own, so a daemon upgrade is never a flag day for its clients.
 
@@ -491,8 +482,6 @@ construction, used here between the client and the daemon.
   `nonce`, central copies it into the token it mints, and the daemon accepts a
   token only when it arrives with the verifier whose hash is that `nonce` — and
   only once: a token's `jti` is remembered until its `exp`.
-- **Through a direct connection,** the daemon keeps the challenge with the pending
-  sign-in it created (§8.5) and requires the verifier with the code.
 
 A token or a code lifted from the loopback redirect, from browser history, or by
 another account on a shared machine is therefore useless: whoever presents it
@@ -520,9 +509,9 @@ refused rather than truncated — a truncated subject is a different person's
 subject.
 
 **The subject is the provider's stable one so that a person is the same identity
-whichever way they arrive.** A workspace that starts on the relay's Microsoft
-sign-in and later connects directly to its own tenant (§8.5) sees the same
-`<issuer>|<oid>` and keeps its accounts, roles and history.
+whichever way they arrive.** A Microsoft identity is `<issuer>|<oid>` — the
+tenant's own stable id for the person — so it would be the same identity from any
+other relying party of that tenant.
 
 **Keys.** `OPENCHIME_OIDC_PUBKEY[_FILE]` may hold several PEM keys. A token's
 `kid` is the signing key's RFC 7638 thumbprint; the daemon computes the same
@@ -542,9 +531,7 @@ be enrolled for central to mint for it, so the relay needs no address of its own
 ### 8.4 Identity, and who may join
 
 **A person is `(upstream issuer, subject)`**, held in a `user_identities` table,
-whichever source delivered them. One rule keeps the sources honest: an identity
-whose issuer belongs to one of the deployment's direct connections is accepted
-only from that connection, never from the relay.
+whichever source delivered them.
 
 **Who may join is one setting, `OPENCHIME_OIDC_ALLOW`** — a comma-separated list
 of rules, default deny, evaluated only for an identity the workspace has not seen:
@@ -596,38 +583,6 @@ identity the relay may not deliver.
 A first sign-in sets the display name and address from the token; later ones
 update the identity row only, and never overwrite a name the person chose.
 
-### 8.5 Direct connections
-
-One setting per connection, `OPENCHIME_OIDC_CONNECT_<n>`, holding
-`label=…;issuer=…;client_id=…;secret_file=…;subject=sub|oid`. The secret is
-optional — a public client with PKCE where the provider allows one — and
-`subject=oid` makes a Microsoft tenant's identities match the relay's (§8.3). Each
-connection is a source in `AUTH_CHALLENGE`.
-
-- **Discovery and keys** are fetched over CA-verified TLS at boot and on an unknown
-  `kid`, rate-limited and cached. A provider that cannot be reached makes its
-  source `AUTH_SOURCE_UNAVAILABLE`; sessions already issued are untouched (§3.4's
-  login-time-only dependency, here on the operator's provider).
-- **`AUTH_BEGIN`** creates a pending sign-in — `state`, the daemon's own PKCE
-  verifier, a nonce, the client's challenge, ten minutes to live — and returns the
-  provider's authorize URL.
-- **`AUTH{oidc}`** carries the code, the `state` and the client's verifier. A
-  worker of the push and unfurl kind redeems the code at the token endpoint;
-  nothing blocking runs on the writer.
-- **The ID token** is accepted under an algorithm allow-list (RS256, PS256, ES256),
-  with `iss` exact, `aud` containing the client id (`azp` when there are several),
-  `exp`, `iat`, `nbf`, and the nonce. §8.4 then applies unchanged.
-- **The redirect** is `127.0.0.1` or `localhost` as the connection says, with an
-  optional list of ports for a provider that matches the port exactly.
-
-### 8.6 A second step for local accounts
-
-A correct password on an account with a second factor (REQ-184) answers
-`AUTH_CONTINUE{totp}`. The connection is then half-authenticated for two minutes
-and accepts only `AUTH` carrying the code; attempts have a limiter of their own.
-A provider's own second factor is the provider's business and never reaches this
-step.
-
 ### 8.7 Enrolling a managed workspace
 
 Exactly one party mints a workspace's audience. **Self-hosted:** the daemon, as
@@ -663,10 +618,9 @@ freshness window is what bounds a replay.
 
 | Setting | Meaning |
 |---|---|
-| `OPENCHIME_AUTH_MODE` | A list of the built-in sources — `local`, `relay`, or `local,relay` — with `oidc` read as `relay`. A direct connection is enabled by being configured. |
+| `OPENCHIME_AUTH_MODE` | A list of the sources — `local`, `relay`, or `local,relay` — with `oidc` read as `relay`. |
 | `OPENCHIME_OIDC_PUBKEY[_FILE]` | May hold several keys (§8.3). |
 | `OPENCHIME_OIDC_ALLOW` | Who may join (§8.4). |
-| `OPENCHIME_OIDC_CONNECT_<n>` | One per direct connection (§8.5). |
 | `OPENCHIME_ENROLL_TICKET` | Managed workspaces only (§8.7). |
 
 ### 8.9 Certificates through central

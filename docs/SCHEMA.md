@@ -1123,8 +1123,7 @@ for the length of that participation; its private key never leaves the device
 ## 3ai. Migration 0044 — identities (AUTH.md §8.4)
 
 A person who signs in by OIDC is **(upstream issuer, subject)**, whichever source
-delivered them, so the same person arriving through the relay and through a
-direct connection is one account.
+delivered them, so the same person arriving by two ways in is one account.
 
 ### `user_identities`
 

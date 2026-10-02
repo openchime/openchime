@@ -358,7 +358,9 @@ not loopback, or a `challenge` of the wrong shape).
 
 ### 4.2b `AUTH_CONTINUE` (server → client), msg_type `0x0017`
 
-Answers a first step that is correct but not sufficient (AUTH.md §8.6).
+Reserved for a first step that is correct but not sufficient. The daemon sends
+none: a local account's sign-in, and any step after it, runs on the daemon's own
+pages (AUTH.md §8.10).
 
 | Field  | Type | Notes                              |
 |--------|------|------------------------------------|
