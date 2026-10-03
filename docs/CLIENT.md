@@ -88,7 +88,9 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   where the workspace takes no passwords, and while the browser is open shows the
   URL in full beside trying the platform's opener.
   The Win32 sign-in card asks at the same point — when step 1 resolves the
-  workspace — and **collects no password**: step 2 says the username and password
+  workspace — and **collects no password**: step 2's heading names the
+  workspace, the line under it gives the address only where the heading does
+  not already say it, and the card says the username and password
   go into the workspace's own page, and its Sign in opens the browser for local
   accounts, beside a button in the daemon's words for each browser source — the
   relay, and each of the operator's own providers; a workspace with no local
