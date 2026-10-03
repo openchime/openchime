@@ -393,7 +393,8 @@ model; translate input to intents }, stop.
     on one brings them back, with the reset to set a password (`ENABLE_USER`);
     "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
-    only; a `USER_UPDATED` folds each change into the roster). "Invite a user"
+    only; a `USER_UPDATED` folds each change into the roster, and someone who
+    joins meanwhile arrives in an unasked `USER_LIST` and is listed at once). "Invite a user"
     asks for an email address where the workspace offers a browser sign-in — the
     invitation is bound to it, and the prompt says the address must be able to
     sign in with the workspace's provider, by name where the workspace's browser

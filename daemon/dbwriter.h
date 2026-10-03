@@ -1057,6 +1057,10 @@ typedef struct oc_dbres {
     uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
     oc_user_row    *ulist;          /* USER_LIST: heap array */
     size_t          n_ulist;
+    /* Set on any result whose job created an account: `ulist` then holds that
+     * one member's row, which the loop sends everyone connected as a USER_LIST
+     * of one, so every roster gains them without asking (PROTOCOL.md §5.8). */
+    uint8_t         joined;
 
     /* Reactions (REQ-070/071). REACTION_OK: emoji + op + aggregate count for the
      * fan-out (message_id/channel_id/user_id above, members for the recipients).

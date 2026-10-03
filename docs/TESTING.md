@@ -518,6 +518,9 @@ works. Nothing proves the shipped *image* works (§3.2).
   makes the owner once; only the newest one works, and none once an owner can
   sign in; a removed owner neither satisfies the last-owner guard nor stops a
   new token when every owner is removed (REQ-024, REQ-030).
+- **Someone joins (`itest_netloop` `test_admin_vertical`):** with the owner
+  connected, an invitation redeemed on a second connection reaches the owner as
+  an unasked `USER_LIST` of exactly the new member, before anything else.
 - **Removing a member (`test_dbwriter`, `test_remove_user_integrations`):** the
   member's webhook posts nothing, even turned back on, and their push device
   tokens are gone (REQ-033, REQ-170).
