@@ -4851,7 +4851,7 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         }
         if (r->type == OC_RES_WEB_OK) pg.done = 1;
         else pg.message = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
-                        ? "This link isn't good any more: it was used, or a day has passed. Ask for another."
+                        ? "This reset isn't good any more: it was used, or a day has passed. Ask for another."
                         : "Something went wrong. Try again.";
         web_page(c, r->type == OC_RES_WEB_OK ? 200 : r->err_code == OC_ERR_INTERNAL ? 500 : 200, &pg);
         flush_out(c);

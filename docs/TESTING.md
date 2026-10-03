@@ -584,9 +584,10 @@ works. Nothing proves the shipped *image* works (§3.2).
   admin no owner; the link sets a new password once, within its day, signs the
   account out everywhere and clears its second step when asked; over the wire an
   owner gets a 64-hex token and a member `FORBIDDEN`; the page refuses a token of
-  the wrong shape, a mismatch, and a spent link; opened with a sign-in's
+  the wrong shape, a mismatch, and a spent reset; opened with a sign-in's
   redirect it carries it and, the password set, goes on to that sign-in, and a
-  redirect not a sign-in's is no link. `test_client_core`: the reset text names
+  redirect not a sign-in's is no link. A spent reset, opened from its link or
+  from a code typed into a client, is called a reset and never a link. `test_client_core`: the reset text names
   the workspace and the code, and a link only where given; a reset sign-in opens
   the reset page through the client's tunnel.
 - **Bringing a member back (`test_dbwriter` `test_enable_user`, `itest_netloop`
