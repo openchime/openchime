@@ -261,6 +261,9 @@ sleep 2
 S="$(state w4)"
 [ "$(field "$S" step)" = 2 ] || fail "no second step: $(grep '^signin' <<<"$S")"
 [ "$(field "$S" reset)" != "0,0,0,0" ] || fail "no reset-code link on the card"
+# Named by its address, the workspace is in the heading already, so the line
+# under it says nothing rather than repeating the heading or a button's label.
+grep -qx 'signinsub ""' <<<"$S" || fail "the card's subtitle repeats something: $(grep '^signinsub' <<<"$S")"
 drive shotfull web-4-card
 read -r XX XY < <(center "$(field "$S" reset)")
 # Cancel first: the card is still there to use afterwards.

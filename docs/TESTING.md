@@ -426,7 +426,8 @@ the tunnel's certificate and `Host` checks, the page's limiter and the subject.
 credentials, against a knob-free self-signed daemon at the WSL address —
 certificate trusted, sign-up through the tunnel with the setup token, password
 changed on its page, and, the workspace forgotten, the old password refused and
-the new one signing in; then, forgotten again, a reset's code entered on the
+the new one signing in; then, forgotten again, the card checked to say nothing
+under a heading that already names the workspace, a reset's code entered on the
 card, the reset page opened through the client's own tunnel, the password set
 and the sign-in it goes on to signing in; PowerShell plays the browser from
 `signin_url.txt`. The invitation and the reset code go through the card's real

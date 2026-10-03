@@ -2406,6 +2406,7 @@ static char  g_si_invite[128];
 static char  g_remember_ws[256];
 static rectf g_si_invite_link;
 static rectf g_si_reset_link;  /* "Have a reset code?" */
+static char  g_si_sub[300];    /* step 2's subtitle as last drawn, for the dump */
 static rectf g_si_cancel;      /* overlay sign-in: back to the live workspace */
 static char  g_si_ws[256];        /* the workspace string as typed */
 static char  g_si_host[256];      /* resolved host (step 1 output) */
@@ -10630,10 +10631,12 @@ static void draw_signin(gfx *rt, float W, float H) {
          * a host). "Sign in to 127.0.0.1:8443" over "127.0.0.1:8443" was the same
          * string twice. */
         char sub[300]; oc_hostport(g_si_host, g_si_port, sub, sizeof sub);
-        /* A browser sign-in asks for no credentials here, so it does not say so. */
-        draw_text(rt, strcmp(head + 11, sub) ? sub
-                      : (g_si_connecting && g_si_browser) ? "" : "Continue in your browser",
-                  g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
+        /* Nothing in its place when it would only repeat the heading: the card's
+         * buttons and the note below say where the sign-in goes, and a stand-in
+         * subtitle said "Continue in your browser" over the relay's button saying
+         * the same. */
+        snprintf(g_si_sub, sizeof g_si_sub, "%s", strcmp(head + 11, sub) ? sub : "");
+        draw_text(rt, g_si_sub, g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
     } else {
         draw_text(rt, "Enter your workspace address", g_meta,
                   rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
@@ -28072,6 +28075,7 @@ static void test_dump(const char *path) {
             g_si_step, g_si_connecting, g_si_browser, g_si_btn.left, g_si_btn.top, g_si_btn.right, g_si_btn.bottom,
             g_si_invite_link.left, g_si_invite_link.top, g_si_invite_link.right, g_si_invite_link.bottom,
             g_si_reset_link.left, g_si_reset_link.top, g_si_reset_link.right, g_si_reset_link.bottom);
+    fprintf(f, "signinsub \"%s\"\n", g_si_step == 2 ? g_si_sub : "");
     fprintf(f, "profilemenu open=%d sub=%d\n",
             g_menu == MENU_PROFILE, g_sub_open != 0);
     for (int i = 0; i < g_n_mirows && g_menu; i++)
