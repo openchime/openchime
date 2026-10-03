@@ -895,6 +895,14 @@ void oc_client_set_display_name(oc_client *c, const char *name) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_email(oc_client *c, const char *email) {
+    if (!c || !email) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_EMAIL);
+    if (!cmd) return;
+    cmd->body = strdup(email);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_change_password(oc_client *c, const char *old_pw, const char *new_pw) {
     if (!c || !new_pw || !new_pw[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CHANGE_PASSWORD);

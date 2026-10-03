@@ -305,6 +305,8 @@ void oc_client_toggle_audit(oc_client *c, int open);
  * folds a PROFILE_UPDATED into the model on success; a failure (e.g. wrong old
  * password) surfaces as a status/error line. */
 void oc_client_set_display_name(oc_client *c, const char *name);
+/* A local account's own email address ("" clears it); answered with your profile. */
+void oc_client_set_email(oc_client *c, const char *email);
 void oc_client_change_password(oc_client *c, const char *old_pw, const char *new_pw);
 
 /* Admin / user management (REQ-030/033; owner/admin only, enforced server-side).

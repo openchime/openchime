@@ -569,6 +569,9 @@ works. Nothing proves the shipped *image* works (§3.2).
   the asker's, another user's session id changes nothing; a connection in use
   has its session's last_seen_ms written once the interval is up, an idle one
   does not (REQ-181, REQ-182).
+- **An account's own address (`test_dbwriter` `test_set_email`):** set
+  lower-cased, cleared, one address only; a provider's sign-in with the same
+  address is somebody else; a provider's account keeps its provider's address.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

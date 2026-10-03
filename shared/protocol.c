@@ -2198,6 +2198,12 @@ oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_set_email(oc_wbuf *w, uint16_t version, const oc_set_email *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_EMAIL);
+    oc_w_str(w, m->email);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_USER_UPDATED);
     oc_w_u64(w, m->user_id);
@@ -3246,6 +3252,11 @@ oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m) {
 
 oc_result oc_decode_revoke_session(oc_rbuf *p, oc_revoke_session *m) {
     m->session_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_set_email(oc_rbuf *p, oc_set_email *m) {
+    m->email = oc_r_str(p);
     return r_done(p);
 }
 

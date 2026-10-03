@@ -366,7 +366,8 @@ model; translate input to intents }, stop.
     browser (AUTH.md §8.10), where the old password is checked and the new one set;
     every device, this one included, then signs in again. "Active sessions" lists
     each device signed in, with "Sign out" on every one but this
-    (`REVOKE_SESSION`, REQ-182). "Two-step sign-in" opens
+    (`REVOKE_SESSION`, REQ-182). "Change email address" sets a local account's
+    own address (`SET_EMAIL`; it signs nobody in). "Two-step sign-in" opens
     the workspace's page for setting up or turning off a TOTP second step the same
     way (AUTH.md §8.6); the terminal client's launcher has it too.
   - **admin / user management** — a member menu's "Reset password…" (or with
