@@ -2699,7 +2699,7 @@ static void test_web_signin(int port) {
     {
         char ticket[64], key[64], code[8], codes[256], one[16];
         CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "name=\"password\"") != NULL);
+        CHECK(strstr(resp, "name=\"password\"") != NULL && strstr(resp, "script-src") == NULL);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
                        "username=kim&password=wrong", resp, sizeof resp) == 200);
         CHECK(strstr(resp, "isn&#39;t right") != NULL && !ticket_of(resp, ticket, sizeof ticket));
@@ -2719,10 +2719,36 @@ static void test_web_signin(int port) {
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step));
         snprintf(body, sizeof body, "ticket=%s&action=confirm&code=%s", ticket, code);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(between(resp, "<pre>", "</pre>", codes, sizeof codes));
+        CHECK(between(resp, "<pre id=\"codes\">", "</pre>", codes, sizeof codes));
         int lines = 0;
         for (const char *q = codes; *q; q++) lines += *q == '\n';
         CHECK(lines == 10 && strlen(codes) == 10 * 12);
+        {   /* Saved as a file the page holds -- the same codes -- or copied by
+             * the one script it runs, named by its hash. */
+            char href[1024], want[512], sri[80];
+            size_t o = 0;
+            for (const char *q = codes; *q && o + 4 < sizeof want; q++)
+                o += (size_t)snprintf(want + o, sizeof want - o, *q == '\n' ? "%%0A" : "%c", *q);
+            CHECK(between(resp, "<a href=\"data:text/plain;charset=utf-8,", "\" download=\"openchime-recovery-codes.txt\">",
+                          href, sizeof href));
+            CHECK(strncmp(href, "OpenChime%20recovery%20codes%20for%20kim.", 41) == 0);
+            CHECK(strlen(href) > strlen(want) && strcmp(href + strlen(href) - strlen(want), want) == 0);
+            CHECK(strstr(resp, "<button type=\"button\" id=\"copy\" hidden>Copy</button>") != NULL);
+            CHECK(strstr(resp, "script-src 'self'") != NULL);
+            CHECK(between(resp, "<script src=\"../codes.js\" integrity=\"", "\"", sri, sizeof sri));
+            CHECK(web_call(port, pin, "GET", "/codes.js", NULL, NULL, NULL, resp, sizeof resp) == 200);
+            const char *js = strstr(resp, "\r\n\r\n");
+            CHECK(js != NULL && strstr(js, "navigator.clipboard") != NULL);
+            if (js) {
+                uint8_t h[32]; char got[80]; size_t ol = 0;
+                js += 4;
+                mbedtls_sha256((const unsigned char *)js, strlen(js), h, 0);
+                memcpy(got, "sha256-", 7);
+                mbedtls_base64_encode((unsigned char *)got + 7, sizeof got - 7, &ol, h, sizeof h);
+                got[7 + ol] = '\0';
+                CHECK(strcmp(got, sri) == 0);
+            }
+        }
         snprintf(one, sizeof one, "%.11s", codes);
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 400);
         /* Now a sign-in asks, and a recovery code it handed out works. */

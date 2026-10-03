@@ -738,7 +738,8 @@ page and from each client's account menu. The password first, as on every page;
 then a new secret — sealed, kept unconfirmed — shown as a key to type and a QR
 code (inline SVG, so the page still fetches nothing) of its `otpauth://` URI. The
 first code it shows turns the step on and hands out ten recovery codes, shown
-once (only salted hashes are kept). On, the same page turns it off with a code
+once (only salted hashes are kept), with a link that downloads them as a text
+file the page itself holds and a button that copies them. On, the same page turns it off with a code
 or a recovery code, which removes the secret and the codes. Wrong codes count
 as a sign-in step's do.
 
@@ -750,9 +751,11 @@ vouches for its certificate — the workspace address, or an ACME or operator's
 certificate name — never through the loopback tunnel, where a passkey would
 bind to `127.0.0.1`. The relying party is that name and the origin
 `https://<name>`; attestation is `none`; ES256 and RS256 keys are taken; a
-signature counter that is not zero must rise. The one script a page runs,
-`/webauthn.js`, is served by the daemon and named by its SRI hash, and only a
-page that offers a passkey allows scripts (`script-src 'self'`). A passkey is
+signature counter that is not zero must rise. The page's script,
+`/webauthn.js`, is served by the daemon and named by its SRI hash. Scripts
+(`script-src 'self'`) are allowed only on a page that offers a passkey and on
+the recovery codes, whose copy button is `/codes.js`, served and named the same
+way, and carried by the tunnel. A passkey is
 bound to its name, so one made before a rename does not answer after it; the
 page says to add it again. Turning the step off, or a reset that clears it,
 removes them. Passkey-only accounts, with no password, are not offered.

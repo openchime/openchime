@@ -3984,6 +3984,7 @@ static const oc_http_route TLS_ROUTES[] = {
     { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "GET",  "/codes.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
@@ -4114,7 +4115,8 @@ static void web_page(conn *c, int status, const oc_page *pg) {
     size_t len = 0;
     char *html = oc_page_render(pg, &len);
     if (!html) { http_reply(c, 500, "text/plain", "error\n", 6); return; }
-    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, pg->pk_mode != 0);
+    int scripts = pg->pk_mode != 0 || (pg->kind == OC_PAGE_SECURITY && pg->sec == OC_SEC_CODES);
+    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, scripts);
     free(html);
 }
 
@@ -4186,10 +4188,12 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     else if (plen == 14 && memcmp(req->path, "/signin/verify", 14) == 0) kind = OC_PAGE_STEP;
     else if (plen == 17 && memcmp(req->path, "/account/security", 17) == 0) kind = OC_PAGE_SECURITY;
     else if (plen == 14 && memcmp(req->path, "/account/reset", 14) == 0) kind = OC_PAGE_RESET;
-    else if (plen == 12 && memcmp(req->path, "/webauthn.js", 12) == 0) {
-        /* The passkey script: static, the one a page runs (AUTH.md §8.6). */
+    else if ((plen == 12 && memcmp(req->path, "/webauthn.js", 12) == 0) ||
+             (plen == 9 && memcmp(req->path, "/codes.js", 9) == 0)) {
+        /* A page's script: static, the passkey's or the recovery codes' copy
+         * button (AUTH.md §8.6). */
         size_t jl;
-        const char *js = oc_webauthn_js(&jl);
+        const char *js = plen == 9 ? oc_codes_js(&jl) : oc_webauthn_js(&jl);
         char hdr[512];
         size_t hn = oc_http_head_ex(hdr, sizeof hdr, 200, "text/javascript; charset=utf-8", jl,
                                     "X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n");

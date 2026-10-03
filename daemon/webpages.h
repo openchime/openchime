@@ -79,14 +79,18 @@ const char *oc_page_unavailable(size_t *len);
  * to form-action too). `redirect_uri` may be NULL. Returns 0, -1 if `cap` is
  * too small. */
 int oc_page_headers(const char *redirect_uri, char *out, size_t cap);
-/* The same, for a page that runs the one script the daemon serves (a passkey's,
- * `script-src 'self'`) when `scripts`. */
+/* The same, for a page that runs a script the daemon serves (a passkey's, or
+ * the recovery codes' copy button: `script-src 'self'`) when `scripts`. */
 int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t cap);
 
 /* The passkey script (AUTH.md §8.6), served at /webauthn.js, and its SRI
  * value ("sha256-<base64>") for the page that loads it. */
 const char *oc_webauthn_js(size_t *len);
 const char *oc_webauthn_js_integrity(void);
+/* The recovery codes' copy script (AUTH.md §8.6), served at /codes.js, and its
+ * SRI value. */
+const char *oc_codes_js(size_t *len);
+const char *oc_codes_js_integrity(void);
 
 /* `in`/`n` with &, <, >, " and ' escaped, appended at `*o` in `out`. -1 if it
  * does not fit. */

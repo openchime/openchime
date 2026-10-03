@@ -3784,6 +3784,11 @@ static void test_local_browser(int port) {
             char resp[32768];
             CHECK(web_fetch(purl, "GET", NULL, NULL, resp, sizeof resp) == 200);
             CHECK(strstr(resp, "value=\"owen\"") != NULL);
+            /* And the recovery codes' copy script, which that page runs. */
+            char js[1100];
+            snprintf(js, sizeof js, "%.*s/codes.js", (int)(strstr(purl, "/account/password") - purl), purl);
+            CHECK(web_fetch(js, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "navigator.clipboard") != NULL);
         }
         oc_client_stop(c);
 
