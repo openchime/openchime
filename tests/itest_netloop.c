@@ -1888,11 +1888,14 @@ static int token_of(const char *resp, char *tok, size_t cap) {
     return 1;
 }
 
-/* Whether the daemon closed `c`: 1 when the stream ends within five seconds,
- * 0 when it is still open (the read only timed out). Frames on the way are
- * skipped. */
-static int peer_closed(client *c) {
-    struct timeval tv = { 5, 0 };
+/* Whether the daemon closed `c`: 1 when the stream ends within `secs`, 0 when
+ * it is still open (the read only timed out). Frames on the way are skipped.
+ * A close the test expects gets PEER_CLOSES, long enough for a loaded machine
+ * and over as soon as it happens; a connection that must stay open is watched
+ * for PEER_STAYS. */
+enum { PEER_CLOSES = 30, PEER_STAYS = 5 };
+static int peer_closed(client *c, int secs) {
+    struct timeval tv = { secs, 0 };
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     int closed = -1;
     while (closed < 0) {
@@ -2026,15 +2029,15 @@ static void test_revoke_one_session(int port, const uint8_t *pin) {
     oc_revoke_session rs = { alids[almine] };   /* alice's, not sid's */
     CHECK(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
     CHECK(session_list_read(&a, ids, 8, &mine) == 2);     /* the answer: the list, both still there */
-    CHECK(peer_closed(&b) == 0);
-    CHECK(peer_closed(&al) == 0);
+    CHECK(peer_closed(&b, PEER_STAYS) == 0);
+    CHECK(peer_closed(&al, PEER_STAYS) == 0);
     int almine2 = -1;
     CHECK(session_ids(&al, alids, 8, &almine2) >= 1 && almine2 >= 0);   /* her row is still there */
     client_close(&al);
     oc_wbuf_init(&w, buf, sizeof buf);
     rs.session_id = other;
     CHECK(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
-    CHECK(peer_closed(&b) == 1);
+    CHECK(peer_closed(&b, PEER_CLOSES) == 1);
     CHECK(session_list_read(&a, ids, 8, &mine) == 1 && mine == 0);
     client_close(&b);
 
@@ -2100,7 +2103,7 @@ static void test_unauthed_closed(int port, const uint8_t *pin) {
     uint64_t uid = 0;
     CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
     CHECK(do_auth(&a, "roy", "not-the-password", &uid) != 0);
-    CHECK(peer_closed(&a) == 1);
+    CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     client_close(&a);
 
     oc_netloop_set_unauthed_ms(1500);
@@ -2108,9 +2111,9 @@ static void test_unauthed_closed(int port, const uint8_t *pin) {
     CHECK(client_open(&idle, port, pin) == 0 && do_handshake(&idle) == 0);
     CHECK(client_open(&quiet, port, pin) == 0);                 /* TLS, then nothing */
     CHECK(signed_in(&in, port, pin, "carol", "pw") == 0);
-    CHECK(peer_closed(&idle) == 1);
-    CHECK(peer_closed(&quiet) == 1);
-    CHECK(peer_closed(&in) == 0);
+    CHECK(peer_closed(&idle, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&quiet, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&in, PEER_STAYS) == 0);
     oc_netloop_set_unauthed_ms(0);
     client_close(&idle); client_close(&quiet); client_close(&in);
 }
@@ -2129,8 +2132,8 @@ static void test_revoke_other_devices(int port, const uint8_t *pin) {
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     oc_change_password cp = { oc_slice_str("pw-roy"), oc_slice_str("pw-roy2") };
     CHECK(oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &cp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
-    CHECK(peer_closed(&b) == 1);
-    CHECK(peer_closed(&c) == 1);
+    CHECK(peer_closed(&b, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&c, PEER_CLOSES) == 1);
     int mine = 0;
     CHECK(session_count_of(&a, &mine) == 1 && mine == 1);   /* the changer's own, still working */
     client_close(&b); client_close(&c);
@@ -2143,16 +2146,16 @@ static void test_revoke_other_devices(int port, const uint8_t *pin) {
     uint8_t none[OC_SESSION_TOKEN_LEN] = {0};
     oc_logout lo = { OC_LOGOUT_THIS, { none, sizeof none } };
     CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK && write_all(&e.conn, buf, w.len) == 0);
-    CHECK(peer_closed(&e) == 1);
-    CHECK(peer_closed(&d) == 0 && peer_closed(&a) == 0);
+    CHECK(peer_closed(&e, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&d, PEER_STAYS) == 0 && peer_closed(&a, PEER_STAYS) == 0);
     client_close(&e);
 
     /* Signing out everywhere closes every connection the user has. */
     oc_wbuf_init(&w, buf, sizeof buf);
     lo.scope = OC_LOGOUT_ALL;
     CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK && write_all(&d.conn, buf, w.len) == 0);
-    CHECK(peer_closed(&d) == 1);
-    CHECK(peer_closed(&a) == 1);
+    CHECK(peer_closed(&d, PEER_CLOSES) == 1);
+    CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     client_close(&a); client_close(&d);
 }
 
@@ -2502,7 +2505,7 @@ static void test_direct_signin(int port) {
         /* the unknown state comes with a verifier good for the other sign-in */
         CHECK(direct_auth(&d, "oidc-1", "code-2", other, k2 ? state : "not-the-state", &uid) ==
               OC_ERR_AUTH_INVALID_TOKEN);
-        CHECK(peer_closed(&d) == 1);
+        CHECK(peer_closed(&d, PEER_CLOSES) == 1);
         client_close(&d);
     }
     CHECK(__atomic_load_n(&f.tokens, __ATOMIC_ACQUIRE) == before);
@@ -2695,7 +2698,7 @@ static void test_web_signin(int port) {
         CHECK(oc_encode_auth(&aw, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&held.conn, ab, aw.len) == 0);
         CHECK(read_frame_raw(&held, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);
     }
-    CHECK(peer_closed(&held) == 0);
+    CHECK(peer_closed(&held, PEER_STAYS) == 0);
     CHECK(web_call(port, pin, "GET", "/account/password", NULL, NULL, NULL, resp, sizeof resp) == 200);
     CHECK(strstr(resp, "autocomplete=\"new-password\"") != NULL);
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
@@ -2704,7 +2707,7 @@ static void test_web_signin(int port) {
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
                    "username=pat&current=pw-old&password=pw-new&confirm=pw-new", resp, sizeof resp) == 200);
     CHECK(strstr(resp, "Password changed") != NULL);
-    CHECK(peer_closed(&held) == 1);
+    CHECK(peer_closed(&held, PEER_CLOSES) == 1);
     client_close(&held);
     CHECK(web_signin(port, pin, "pat", "pw-old", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
     CHECK(web_signin(port, pin, "pat", "pw-new", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);

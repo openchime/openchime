@@ -106,6 +106,7 @@ struct oc_dbwriter {
     /* Idempotency-map pruning (ARCH-44): drop sent_messages rows older than the
      * retention window, at most once per interval. Writer-thread state only. */
     uint64_t        idem_retention_ms;
+    uint64_t        restore_window_ms;    /* how long a delete can be taken back */
     uint64_t        prune_interval_ms;
     uint64_t        last_prune_ms;
 };
@@ -4441,14 +4442,13 @@ static oc_dbres *process_unfurl_store(sqlite3 *db, const oc_job *j) {
  * and an admin/owner who belongs to the channel may delete any (moderation,
  * REQ-032). The body is nulled while id/author/timestamps survive; deleted_by
  * records who removed it, distinguishing a self- from a moderator-delete. */
-/* How long a delete can be taken back (REQ-052). The writer's; the test knob
- * sets it under the writer's mutex, which the writer takes for every job. */
-static uint64_t g_restore_window_ms = 120000;
+/* How long a delete can be taken back (REQ-052), unless a test sets its own. */
+#define OC_RESTORE_WINDOW_MS 120000u
 
 /* Holds past the window go: what a delete gave up is kept no longer than it can
  * be asked back. */
-static void holds_purge(sqlite3 *db, uint64_t now) {
-    uint64_t cut = now > g_restore_window_ms ? now - g_restore_window_ms : 0;
+static void holds_purge(sqlite3 *db, uint64_t now, uint64_t window) {
+    uint64_t cut = now > window ? now - window : 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db, "DELETE FROM deleted_hold_reactions WHERE message_id IN "
                            "(SELECT message_id FROM deleted_holds WHERE deleted_at_ms < ?1);", -1, &st, NULL);
@@ -4489,14 +4489,15 @@ static void hold_deleted(sqlite3 *db, uint64_t message_id, uint64_t by, uint64_t
  * pin and link previews do not (a pin is a deliberate act of its own, previews
  * are drawn again). Audited when it undoes a moderator's delete, as that delete
  * was. Write. */
-static oc_dbres *process_restore(sqlite3 *db, const oc_job *j) {
+static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->channel_id = j->channel_id;
     r->message_id = j->message_id;
     uint64_t now = dbw_now_ms();
-    holds_purge(db, now);
+    holds_purge(db, now, w->restore_window_ms);
     uint64_t author = 0; int deleted = 0;
     sqlite3_stmt *st = NULL;
     char *body = NULL, ids[OC_MAX_ATTACH * 21 + 1] = "";
@@ -4567,7 +4568,8 @@ static oc_dbres *process_restore(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
+static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
@@ -4587,7 +4589,7 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     }
 
     uint64_t ts = dbw_now_ms();
-    holds_purge(db, ts);
+    holds_purge(db, ts, w->restore_window_ms);
     hold_deleted(db, j->message_id, j->user_id, ts);   /* before anything below gives it up */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -9472,8 +9474,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
-    if (j->type == OC_JOB_DELETE)        return process_delete(w->db, j);
-    if (j->type == OC_JOB_RESTORE)       return process_restore(w->db, j);
+    if (j->type == OC_JOB_DELETE)        return process_delete(w, j);
+    if (j->type == OC_JOB_RESTORE)       return process_restore(w, j);
     if (j->type == OC_JOB_CREATE_CHANNEL) return process_create_channel(w->db, j);
     if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);
     if (j->type == OC_JOB_LEAVE_CHANNEL)  return process_leave_channel(w->db, j);
@@ -9900,11 +9902,15 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
  * (channel, token) rows older than the retention window. Writer thread only. */
 static void maybe_prune_idem(oc_dbwriter *w) {
     uint64_t now = dbw_now_ms();
-    if (w->last_prune_ms != 0 && now - w->last_prune_ms < w->prune_interval_ms) return;
-    w->last_prune_ms = now;
+    pthread_mutex_lock(&w->mu);    /* the test knob may change these meanwhile */
+    int due = w->last_prune_ms == 0 || now - w->last_prune_ms >= w->prune_interval_ms;
+    if (due) w->last_prune_ms = now;
+    uint64_t retention = w->idem_retention_ms;
+    pthread_mutex_unlock(&w->mu);
+    if (!due) return;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(w->db, "DELETE FROM sent_messages WHERE created_at_ms < ?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)(now - w->idem_retention_ms));
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)(now - retention));
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
@@ -10210,7 +10216,7 @@ const char *oc_dbwriter_relay_origin(oc_dbwriter *w) {
 
 void oc_dbwriter_set_restore_window_ms(oc_dbwriter *w, uint64_t ms) {
     pthread_mutex_lock(&w->mu);
-    g_restore_window_ms = ms;
+    w->restore_window_ms = ms;
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -10532,6 +10538,7 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->evfd = -1;
     w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
     w->idem_retention_ms = OC_IDEM_RETENTION_MS;
+    w->restore_window_ms = OC_RESTORE_WINDOW_MS;
     w->prune_interval_ms = OC_PRUNE_INTERVAL_MS;
     w->auth_rl   = oc_ratelimit_new(OC_AUTH_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->source_rl = oc_ratelimit_new(OC_AUTH_SOURCE_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
