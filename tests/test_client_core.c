@@ -3463,6 +3463,40 @@ static void test_cert_trust(int port) {
             oc_store_close(chk);
         }
     }
+    /* Central re-keys the certificate -- a renewal, a rename -- under a client
+     * that is connected, and that once trusted another: a new key for the same
+     * name, on a box restarted with it, so no session resumes and the client
+     * sees the new certificate whole. It comes back, and nobody is asked
+     * anything, because the chain vouches for it and no pin is consulted. */
+    {
+        oc_store *chk = oc_store_open("ignored");
+        if (chk) {
+            oc_store_set_secret(chk, &sec);
+            oc_store_save_pin(chk, "trust.openchime.test", real);            /* a stale trust */
+            oc_store_close(chk);
+        }
+        c = oc_client_start_named("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec);
+        CHECK(c && WAIT_FOR(c, m->authed && m->connected));
+        uint8_t before[OC_TLS_FINGERPRINT_LEN], after[OC_TLS_FINGERPRINT_LEN];
+        CHECK(oc_tls_server_fingerprint(&srv, before) == 0);
+        __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th, NULL);
+        CHECK(c && WAIT_FOR(c, !m->connected));
+        oc_tls_server_free(&srv);
+        CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
+        CHECK(testpki_leaf(&pki, "trust.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
+        CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
+        CHECK(oc_tls_server_fingerprint(&srv, after) == 0 && memcmp(before, after, sizeof after) != 0);
+        arg.stop = 0;
+        CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+        wait_port_ready(arg.port);
+        CHECK(oc_tls_set_extra_ca("build/test_core_root.pem") == 0);   /* after the daemon's config, as above */
+        if (c) oc_client_reconnect(c);
+        CHECK(c && WAIT_FOR(c, m->connected && m->authed));
+        CHECK(c && oc_client_model(c)->cert_seq == 0);
+        CHECK(__atomic_load_n(&srv.resumed, __ATOMIC_RELAXED) == 0);   /* a full handshake, on the new key */
+        if (c) oc_client_stop(c);
+    }
     /* The probe judges the same way, before anyone is asked anything. */
     {
         oc_signin_source src[4];
