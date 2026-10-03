@@ -27,11 +27,19 @@ static void *relay_thread(void *arg) {
     for (;;) {
         int c = accept(f->fd, NULL, NULL);
         if (c < 0) break;
+        /* The whole request head before any answer: answering a part and
+         * closing with the rest unread resets the connection under the reader. */
+        char req[2048];
+        size_t got = 0;
+        req[0] = '\0';
+        while (got < sizeof req - 1 && !strstr(req, "\r\n\r\n")) {
+            ssize_t n = read(c, req + got, sizeof req - 1 - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+            req[got] = '\0';
+        }
         pthread_mutex_lock(&f->mu);
         if (f->stop) { pthread_mutex_unlock(&f->mu); close(c); break; }
-        char req[2048];
-        ssize_t n = read(c, req, sizeof req - 1);
-        req[n > 0 ? n : 0] = '\0';
         int ours = strncmp(req, "GET /oidc/jwks ", 15) == 0;
         if (ours) f->hits++;
         char resp[4400];
