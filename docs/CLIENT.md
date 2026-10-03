@@ -888,6 +888,13 @@ Leaving is not closing: anything that calls `close_overlays()` — switching
 workspace, signing out — empties the stack, so removing the workspace you are in
 does not hand the dialog back on top of the sign-in.
 
+**A dialog keeps the view it was opened over only where the view is the
+point.** The your-account dialogs move the window to Home; a confirmation and
+the schedule card keep the view they are about; and the sign-in card is kept
+under any dialog opened over it. The attempt "Have an invite?" or "Have a reset
+code?" starts is watched only while the card is the view, so a dialog that
+moved to Home would leave that attempt running with nobody watching it.
+
 **The Workspaces list scrolls** between a fixed header and footer, on the shared
 overlay offset the wheel already drives for a modal. The arrows, Page Up/Down,
 Home and End move a row focus the paint keeps in view, and Delete asks to remove

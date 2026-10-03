@@ -429,7 +429,11 @@ changed on its page, and, the workspace forgotten, the old password refused and
 the new one signing in; then, forgotten again, a reset's code entered on the
 card, the reset page opened through the client's own tunnel, the password set
 and the sign-in it goes on to signing in; PowerShell plays the browser from
-`signin_url.txt`.
+`signin_url.txt`. The invitation and the reset code go through the card's real
+dialogs — opened by a click on the link (`clickform`, acked before the dialog's
+nested loop starts), typed into (`formtype`) and answered with Enter or Esc —
+and the card is checked to stay the view under each and after it, since the
+attempt a dialog starts is watched only while the card is on screen.
 
 **A device code** (AUTH.md §8.11), also with the knob off: `test_protocol`
 round-trips its four frames. `test_devicecodes` drives the table alone — pending,
