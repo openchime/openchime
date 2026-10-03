@@ -61,10 +61,13 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   (AUTH.md §8.10), and the client picks the origin from how its connection
   accepted the certificate: the daemon's own `https` origin when a trusted
   authority vouched for it, else the listener's **tunnel**, `/p/<secret>/…`,
-  which carries `/signin`, `/signup` and `/account/password` — only those, only
+  which carries `/signin`, `/signup`, the `/account/` pages and the recovery
+  codes' script — only those, only
   for a request naming the listener as its `Host`, and only to the certificate
   the connection accepted — to the daemon over TLS as its own origin. An
-  invitation rides along (`&invite=`) and opens the sign-up page.
+  invitation rides along (`&invite=`) and opens the sign-up page;
+  `oc_client_start_reset` opens instead the page that sets a reset account's
+  new password (`/account/reset?t=…`), carrying the sign-in it goes on to.
   `oc_client_open_page` opens `account/password` the same way, on a tunnel of its
   own held ten minutes. `oc_client_start_device` signs in with a **device code**
   instead (AUTH.md §8.11): the thread asks for one, publishes
@@ -91,7 +94,10 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   relay, and each of the operator's own providers; a workspace with no local
   accounts and one browser source goes straight to it. "Have an
   invite? Create an account" asks only for the invitation, to fill in the sign-up
-  page, and Change password opens the password page. The workspace book takes the
+  page; "Have a reset code? Set a new password", where the workspace has local
+  accounts, asks for the code an administrator sent and opens the reset page
+  through this client's own connection; and Change password opens the password
+  page. The workspace book takes the
   account's name from the roster once it lists the signed-in user. While the browser is open the card says so, with
   Cancel and Esc; under the automation hook the URL is written to
   `signin_url.txt` in the test directory instead of being opened, so a harness
@@ -376,9 +382,12 @@ model; translate input to intents }, stop.
     the workspace's page for setting up or turning off a TOTP second step the same
     way (AUTH.md §8.6); the terminal client's launcher has it too.
   - **admin / user management** — a member menu's "Reset password…" (or with
-    their two-step sign-in too) shows a one-time link to send them (AUTH.md §2);
+    their two-step sign-in too) shows the reset to send them, copied to the
+    clipboard (`oc_model_reset_text`: the workspace, the code to enter on the
+    sign-in card, and the page's link only where a CA vouches for the
+    certificate, since a tunnel's works on this computer alone; AUTH.md §2);
     an owner's or admin's People pane lists removed members too, and right-click
-    on one brings them back, with the link to set a password (`ENABLE_USER`);
+    on one brings them back, with the reset to set a password (`ENABLE_USER`);
     "Make admin/Make member/Remove"
     and the launcher's "Invite a user" manage users (REQ-030/033, owner/admin
     only; a `USER_UPDATED` folds each change into the roster). "Invite a user"

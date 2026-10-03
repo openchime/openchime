@@ -401,6 +401,32 @@ static void invite_created(oc_model *m, const char *token, uint8_t role, uint64_
     free(e.body);
 }
 
+/* A reset to send its person: the workspace, the code for the app's sign-in,
+ * and the page's own link only where one is given (AUTH.md §2). */
+static void test_reset_text(void) {
+    oc_model m; oc_model_init(&m);
+    char text[1024];
+    CHECK(oc_model_reset_text(&m, "acme.example", NULL, text, sizeof text) == 0 && text[0] == '\0');
+    char tok[65];
+    memset(tok, 'a', 64); tok[64] = '\0';
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CREDENTIAL_RESET;
+    e.user_id = 7;
+    e.body = strdup(tok);
+    oc_model_apply(&m, &e);
+    free(e.body);
+    snprintf(m.workspace_name, sizeof m.workspace_name, "Acme");
+    size_t n = oc_model_reset_text(&m, "acme.example", NULL, text, sizeof text);
+    CHECK(n > 0 && n == strlen(text));
+    CHECK(strstr(text, "the Acme workspace") && strstr(text, "Workspace: acme.example\n"));
+    CHECK(strstr(text, "\"Have a reset code?\"") && strstr(text, "Reset code: "));
+    CHECK(strstr(text, tok) && !strstr(text, "http"));
+    CHECK(oc_model_reset_text(&m, "acme.example", "https://acme.example/account/reset?t=aa", text, sizeof text) > 0);
+    CHECK(strstr(text, "Or open this link in a browser: https://acme.example/account/reset?t=aa\n"));
+    oc_model_free(&m);
+}
+
 static void test_invitation_text(void) {
     oc_model m; oc_model_init(&m);
     char text[1024];
@@ -3792,6 +3818,24 @@ static void test_local_browser(int port) {
         }
         oc_client_stop(c);
 
+        /* Reset: the sign-in opens first on the page that sets the password,
+         * through this client's own tunnel, carrying the sign-in to go on to. */
+        char rtok[65];
+        memset(rtok, 'b', 64); rtok[64] = '\0';
+        c = oc_client_start_reset(NULL, "127.0.0.1", arg.port, rtok, NULL, NULL, 1, NULL);
+        CHECK(c != NULL);
+        CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->signin_url);
+        CHECK(strncmp(url, "http://127.0.0.1:", 17) == 0 && strstr(url, "/p/"));
+        CHECK(strstr(url, "/account/reset?t=") && strstr(url, rtok) && strstr(url, "&redirect_uri=") &&
+              strstr(url, "&nonce="));
+        {
+            char resp[32768];
+            CHECK(web_fetch(url, "GET", NULL, NULL, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "Set a new password") && strstr(resp, "name=\"redirect_uri\" value=\"http://127.0.0.1:"));
+        }
+        oc_client_stop(c);
+
         /* A member signs in: a wrong password shows the form again and the
          * client keeps waiting; the right one signs it in. */
         c = oc_client_start_signin(NULL, "127.0.0.1", arg.port, "", "local", NULL, NULL, NULL, 1, NULL);
@@ -4344,6 +4388,7 @@ int run_client_core_tests(void) {
     test_unread_counts_what_notifies();
     test_capabilities();
     test_invitation_text();
+    test_reset_text();
     test_addressable_targets();
     test_pins();
     test_resolve();

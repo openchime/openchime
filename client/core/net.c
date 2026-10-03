@@ -67,6 +67,7 @@ struct oc_net {
     int           port;
     char         *token;
     char         *invite;       /* one-shot signup token, else NULL */
+    int           invite_reset; /* `invite` is a password reset's token instead */
     char          signin_pref[64];  /* the source to sign in with; "" the first browser one */
     /* A device code (AUTH.md §8.11): this client signs in by a code the person
      * enters on the daemon's page elsewhere. The secret it polls with, kept
@@ -2909,9 +2910,15 @@ static int run_connection(oc_net *n, int reconnecting,
             if (url[0] == '/') {
                 /* A path on the daemon's own pages: direct, or through the
                  * tunnel, as this connection judged its certificate. An
-                 * invitation rides along and opens the sign-up form. */
+                 * invitation rides along and opens the sign-up form; a reset's
+                 * token opens the page that sets a new password, which goes
+                 * on to this sign-in. */
                 char path[1200];
-                int pw = snprintf(path, sizeof path, "%s%s%s", url, n->invite && n->invite[0] ? "&invite=" : "",
+                int pw;
+                if (n->invite_reset && n->invite && strncmp(url, "/signin?", 8) == 0)
+                    pw = snprintf(path, sizeof path, "/account/reset?t=%s&%s", n->invite, url + 8);
+                else
+                    pw = snprintf(path, sizeof path, "%s%s%s", url, n->invite && n->invite[0] ? "&invite=" : "",
                                   n->invite && n->invite[0] ? n->invite : "");
                 if (pw < 0 || (size_t)pw >= sizeof path || page_url(n, n->loopback, path, url, sizeof url) != 0) {
                     signin_forget(n);
@@ -2963,7 +2970,7 @@ static int run_connection(oc_net *n, int reconnecting,
             oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
                                 : oc_slice_str(cred);
             oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
-            if (n->invite && n->invite[0]) {
+            if (n->invite && n->invite[0] && !n->invite_reset) {
                 /* Signup: creates the account AND authenticates, so the
                  * reply below is the same AUTH_OK. Spent once — clearing it here
                  * means a later reconnect re-auths with the session token rather
@@ -4086,7 +4093,7 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
 
 static oc_net *net_start(const char *workspace_key, const char *host, int port,
                          const char *token, const char *source_id, const char *invite, int device,
-                         const char *store_path, oc_secret *secret,
+                         int reset, const char *store_path, oc_secret *secret,
                          int pin_only, const unsigned char *published_pin,
                          oc_queue *to_ui, oc_queue *from_ui);
 
@@ -4095,21 +4102,29 @@ oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int por
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui) {
-    return net_start(workspace_key, host, port, token, source_id, invite, 0, store_path, secret, pin_only,
+    return net_start(workspace_key, host, port, token, source_id, invite, 0, 0, store_path, secret, pin_only,
                      published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                           const char *store_path, oc_secret *secret,
+                           int pin_only, const unsigned char *published_pin,
+                           oc_queue *to_ui, oc_queue *from_ui) {
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, store_path, secret,
+                     pin_only, published_pin, to_ui, from_ui);
 }
 
 oc_net *oc_net_start_device(const char *workspace_key, const char *host, int port,
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui) {
-    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, store_path, secret, pin_only,
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, store_path, secret, pin_only,
                      published_pin, to_ui, from_ui);
 }
 
 static oc_net *net_start(const char *workspace_key, const char *host, int port,
                          const char *token, const char *source_id, const char *invite, int device,
-                         const char *store_path, oc_secret *secret,
+                         int reset, const char *store_path, oc_secret *secret,
                          int pin_only, const unsigned char *published_pin,
                          oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
@@ -4117,6 +4132,7 @@ static oc_net *net_start(const char *workspace_key, const char *host, int port,
     n->device = device;
     if (source_id) snprintf(n->signin_pref, sizeof n->signin_pref, "%s", source_id);
     if (invite && invite[0] && !(n->invite = strdup(invite))) { free(n); return NULL; }
+    n->invite_reset = reset;
     if (workspace_key) snprintf(n->ws_key, sizeof n->ws_key, "%s", workspace_key);
     if (published_pin) { memcpy(n->published_pin, published_pin, OC_TLS_FINGERPRINT_LEN);
                          n->have_published_pin = 1; }
@@ -4149,6 +4165,7 @@ void oc_net_set_invite(oc_net *n, const char *token) {
     if (!n) return;
     free(n->invite);
     n->invite = (token && token[0]) ? strdup(token) : NULL;
+    n->invite_reset = 0;
 }
 
 void oc_net_cancel_signin(oc_net *n) { if (n) n->signin_cancel = 1; }
@@ -4173,6 +4190,14 @@ static void page_stop(oc_net *n) {
     }
     oc_loopback_close(n->page_lb);
     n->page_lb = NULL;
+}
+
+int oc_net_pages_direct(oc_net *n) {
+    if (!n) return 0;
+    oc_mutex_lock(&n->accept_mu);
+    int direct = n->accepted && n->accepted_ca;
+    oc_mutex_unlock(&n->accept_mu);
+    return direct;
 }
 
 int oc_net_open_page(oc_net *n, const char *page, const char *query, char *url, size_t cap) {

@@ -187,6 +187,7 @@ typedef struct web_req {
     char user_code[16];          /* DEVICE: the code being approved */
     char step[OC_STEP_TICKET_LEN + 1];   /* a second step's: the ticket it is for */
     char rp[256], origin[300];           /* reached on a passkey's trusted name: which */
+    int  done;                           /* SIGNIN: just back from setting a new password */
 } web_req;
 
 typedef struct conn_s {
@@ -4269,6 +4270,9 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
               field_get(q, "password", pass, sizeof pass) ||
               field_get(q, "confirm", confirm, sizeof confirm) ||
               field_get(q, "current", current, sizeof current);
+    char set[4] = "";
+    if (!post && kind == OC_PAGE_SIGNIN && field_get(q, "set", set, sizeof set) == 0 && strcmp(set, "1") == 0)
+        w->done = 1;   /* just back from setting a new password */
     /* A sign-in or sign-up sends its token to the client that asked, over
      * loopback, bound to its challenge -- anything else is not our link. */
     if (!bad && kind != OC_PAGE_PASSWORD &&
@@ -4284,7 +4288,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     /* A sign-in link carrying an invitation opens the sign-up form. */
     if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
     oc_page pg = { .kind = kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
-                   .username = w->username, .invite = w->invite, .message = "" };
+                   .username = w->username, .invite = w->invite, .message = "", .done = w->done };
     if (!post) { web_page(c, 200, &pg); free(w); return -1; }
 
     int rc = -1;
@@ -4573,13 +4577,19 @@ out:
 /* The reset page (AUTH.md §2): the link's token, and a new password twice.
  * Returns 0 to keep, -1 to close. */
 static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
-    char t[80] = "", pass[512] = "", confirm[512] = "";
-    oc_page pg = { .kind = OC_PAGE_RESET, .redirect_uri = "", .nonce = "", .username = "",
+    char t[80] = "", pass[512] = "", confirm[512] = "", redirect[512] = "", nonce[48] = "";
+    oc_page pg = { .kind = OC_PAGE_RESET, .redirect_uri = redirect, .nonce = nonce, .username = "",
                    .invite = "", .message = "", .user_code = "", .reset = t };
     size_t len;
     int rc = -1;
+    /* Opened by the member's own client, the page carries that client's sign-in
+     * and goes on to it once the password is set; opened from a link, it does
+     * not. Either way, a redirect must be a sign-in's. */
     if (field_get(q, "t", t, sizeof t) || field_get(q, "password", pass, sizeof pass) ||
-        field_get(q, "confirm", confirm, sizeof confirm) || strlen(t) != 64) {
+        field_get(q, "confirm", confirm, sizeof confirm) || strlen(t) != 64 ||
+        field_get(q, "redirect_uri", redirect, sizeof redirect) || field_get(q, "nonce", nonce, sizeof nonce) ||
+        ((redirect[0] || nonce[0]) && (!is_loopback_redirect(redirect, strlen(redirect)) ||
+                                       !is_challenge(nonce, strlen(nonce))))) {
         const char *b = oc_page_invalid(&len);
         web_reply(c, 400, b, len, NULL, NULL);
         goto out;
@@ -4598,6 +4608,8 @@ static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     memcpy(j->source, c->source, sizeof j->source);
     w->kind = OC_PAGE_RESET;
     snprintf(w->invite, sizeof w->invite, "%s", t);   /* the token, for the form again */
+    snprintf(w->redirect_uri, sizeof w->redirect_uri, "%s", redirect);
+    snprintf(w->nonce, sizeof w->nonce, "%s", nonce);
     oc_dbwriter_submit(dbw, j);
     c->web = w;
     c->http_pending = 1;
@@ -4816,6 +4828,27 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
     if (w->step[0] && g_websteps) oc_websteps_drop(g_websteps, w->step);   /* passed: spent */
     if (w->kind == OC_PAGE_RESET) {
         pg.reset = w->invite;
+        if (r->type == OC_RES_WEB_OK && w->redirect_uri[0]) {
+            /* On to the sign-in it carries, with the new password. */
+            char loc[1200];
+            size_t o = (size_t)snprintf(loc, sizeof loc, "../signin?redirect_uri=");
+            int ok = pct_append(loc, sizeof loc, &o, w->redirect_uri, strlen(w->redirect_uri)) == 0 &&
+                     o + 7 < sizeof loc;
+            if (ok) {
+                memcpy(loc + o, "&nonce=", 8); o += 7;
+                ok = pct_append(loc, sizeof loc, &o, w->nonce, strlen(w->nonce)) == 0 && o + 6 < sizeof loc;
+            }
+            if (ok) {
+                memcpy(loc + o, "&set=1", 7);
+                web_reply(c, 303, "", 0, NULL, loc);
+            } else {
+                pg.done = 1;
+                web_page(c, 200, &pg);
+            }
+            flush_out(c);
+            conn_close(ep, conns, c->fd);
+            return;
+        }
         if (r->type == OC_RES_WEB_OK) pg.done = 1;
         else pg.message = r->err_code == OC_ERR_AUTH_INVALID_TOKEN
                         ? "This link isn't good any more: it was used, or a day has passed. Ask for another."

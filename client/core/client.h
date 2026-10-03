@@ -68,6 +68,12 @@ oc_client *oc_client_start_signin(const char *workspace_key, const char *host, i
                                   const char *cred, const char *source_id, const char *invite,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint);
+/* As oc_client_start_signin to a local account, for a person an administrator
+ * reset (AUTH.md §2): the browser opens first on the page that sets a new
+ * password with the reset's code `reset` (hex), then goes on to the sign-in. */
+oc_client *oc_client_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                                 const char *store_path, oc_secret *secret,
+                                 int remember, const char *published_fingerprint);
 /* A local account, signed in to with a device code (AUTH.md §8.11), for a
  * client with no browser of its own: model->device_url and device_code say
  * where to enter which code, from any device; device_fp is the daemon's
@@ -511,6 +517,9 @@ void oc_client_reconnect(oc_client *c);
  * trusted authority vouches for, else through a loopback tunnel held open ten
  * minutes. Its URL into `url`. 0, or -1 before the client has connected. */
 int oc_client_open_page(oc_client *c, const char *page, const char *query, char *url, size_t cap);
+/* 1 when those pages open directly -- a link to one works from any browser,
+ * not only through this client's tunnel -- else 0. */
+int oc_client_pages_direct(oc_client *c);
 
 /* Stop waiting for a browser sign-in (model->signin_url is set while one waits).
  * The model then carries "sign-in cancelled" as its last error. */

@@ -3149,6 +3149,47 @@ static void test_web_signin(int port) {
         CHECK(strstr(resp, "isn&#39;t good any more") != NULL);
     }
 
+    /* Opened by the person's own client, the reset page carries its sign-in and,
+     * the password set, goes on to it; a redirect not a sign-in's is no link. */
+    {
+        uint8_t raw[32], hash[32];
+        char hex[65], body[512], path[400], loc[400];
+        for (int i = 0; i < 32; i++) raw[i] = (uint8_t)(0xb0 + i);
+        for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
+        mbedtls_sha256(raw, sizeof raw, hash, 0);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, "
+                               "expires_at_ms) SELECT ?, id, id, 1, 9000000000000 FROM users WHERE subject='local:pat';",
+                           -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        CHECK(sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        snprintf(path, sizeof path, "/account/reset?t=%s&redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s",
+                 hex, ch);
+        CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "name=\"redirect_uri\" value=\"http://127.0.0.1:5/cb\"") != NULL &&
+              strstr(resp, "name=\"nonce\"") != NULL);
+        snprintf(path, sizeof path, "/account/reset?t=%s&redirect_uri=https%%3A%%2F%%2Fevil.example%%2Fcb&nonce=%s",
+                 hex, ch);
+        CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 400);
+        snprintf(path, sizeof path, "/account/reset?t=%s&redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb", hex);
+        CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 400);
+        snprintf(body, sizeof body, "t=%s&redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s"
+                 "&password=pw-again&confirm=pw-again", hex, ch);
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
+        snprintf(loc, sizeof loc, "Location: ../signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&set=1\r\n",
+                 ch);
+        CHECK(strstr(resp, loc) != NULL);
+        snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&set=1", ch);
+        CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Your new password is set") != NULL);
+        CHECK(web_signin(port, pin, "pat", "pw-again", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+    }
+
     /* The per-account limiter stands in front of the page as of the frame. */
     for (int i = 0; i < 5; i++)
         CHECK(web_signin(port, pin, "zed", "wrong", ch, tok, sizeof tok, resp, sizeof resp) == 200);

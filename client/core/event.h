@@ -115,7 +115,7 @@ enum {
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
-    OC_EV_CREDENTIAL_RESET,/* a CREDENTIAL_RESET: user_id, body=the link's token */
+    OC_EV_CREDENTIAL_RESET,/* a CREDENTIAL_RESET: user_id, body=the reset's token */
     /* One outstanding invite (message_id=invite_id, op=role,
      * server_time=expires_at, user_id=created_by); END terminates a list; REVOKED is
      * the ack. No token: only its hash is stored, so a list cannot carry one. */
