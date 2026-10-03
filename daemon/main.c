@@ -19,6 +19,7 @@
 #include "invite_mail.h"
 #include "listen.h"
 #include "netloop.h"
+#include "oidcrp.h"
 #include "push.h"
 #include "unfurl.h"
 #include "tls.h"
@@ -574,6 +575,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
 
+    /* Direct connections (AUTH.md §8.5): the operator's own providers, each a
+     * source. Who may join is the same rule set the relay's sign-ins answer to,
+     * read here too when there is no relay. */
+    oc_oidcrp *rp = NULL;
+    if (cfg->n_connect > 0) {
+        if (!want_relay) {
+            char why[256];
+            if (oc_dbwriter_configure_join_rules(db, cfg->oidc.allow, why, sizeof why) != 0) {
+                fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW: %s\n", why);
+                oc_dbwriter_stop(db); return 1;
+            }
+        }
+        const char *iss[OC_OIDC_MAX_CONNECT];
+        for (int i = 0; i < cfg->n_connect; i++) iss[i] = cfg->connect[i].issuer;
+        oc_dbwriter_set_direct_issuers(db, iss, cfg->n_connect);
+        rp = oc_oidcrp_start(cfg->connect, cfg->n_connect, db);
+        if (!rp) { fprintf(stderr, "openchimed: cannot start: the sign-in provider worker\n"); oc_dbwriter_stop(db); return 1; }
+        oc_netloop_set_direct(rp, cfg->connect, cfg->n_connect);
+        for (int i = 0; i < cfg->n_connect; i++)
+            fprintf(stderr, "openchimed: sign-in with %s (%s) as oidc-%d\n", cfg->connect[i].label,
+                    cfg->connect[i].issuer, i + 1);
+    }
+
     /* The federated services on the enrollment (ARCH-85): started now when the
      * binding is already active, or by the claim once the daemon serves. A box
      * that is not enrolled has neither. */
@@ -724,6 +748,7 @@ int main(int argc, char **argv) {
     free(fed.privkey);
     free(fed.audience);
     oc_unfurler_stop(unfurler);
+    oc_oidcrp_stop(rp);
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);
 

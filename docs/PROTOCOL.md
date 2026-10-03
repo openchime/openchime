@@ -181,7 +181,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 21** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 22** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -308,7 +308,7 @@ not listed.
 | Field       | Type | Notes                                                          |
 |-------------|------|----------------------------------------------------------------|
 | `n_sources` | u8   | At most 8; a larger count is a malformed frame.                |
-| `id`        | str  | Per source. What `AUTH` and `AUTH_BEGIN` name it by: `local`, `relay`. |
+| `id`        | str  | Per source. What `AUTH` and `AUTH_BEGIN` name it by: `local`, `relay`, `oidc-1` to `oidc-4`. |
 | `kind`      | u8   | Per source. `1` local (username + password), `2` relay, `3` oidc (the operator's own provider). Kinds `2` and `3` are browser sign-ins (§4.2a). |
 | `label`     | str  | Per source. Text for the control.                              |
 
@@ -321,8 +321,9 @@ A `method` discriminator selects the credential the payload carries (ARCH-59 for
 |--------------|------|----------------------------------------------------------------|
 | `method`     | u8   | `0x01` local, `0x02` oidc, `0x04` session.                     |
 | `source`     | str  | The `id` of the challenge entry being used; empty for `session`. |
-| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — an ES256 JWT: the central-issued one (AUTH.md §8.3), or with source `local` the daemon's own (AUTH.md §8.10); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — an ES256 JWT: the central-issued one (AUTH.md §8.3), or with source `local` the daemon's own (AUTH.md §8.10); with an `oidc-<n>` source, the authorization code the provider sent back (AUTH.md §8.5); **session** — the 32-byte session token from a prior `AUTH_OK`. |
 | `proof`      | str  | **oidc** — the verifier whose hash the client sent as `challenge` in `AUTH_BEGIN` (AUTH.md §8.2). Empty otherwise. |
+| `state`      | str  | **oidc** with an `oidc-<n>` source — the `state` the provider sent back, naming the sign-in `AUTH_BEGIN` began. Empty otherwise. Since version 22. |
 
 The daemon rejects on any mismatch with an `ERROR`: `AUTH_INVALID_TOKEN`
 (bad/expired/wrong-audience/replayed token, a verifier that is not the token's, or
@@ -331,7 +332,11 @@ REQ-191), `AUTH_NOT_ALLOWED` (a valid identity no join rule or invite admits), o
 `AUTH_REQUIRED` (a source this deployment does not offer). The `oidc` credential
 is a JWT some issuer the daemon trusts signed — the relay's, verified against its
 pinned keys (AUTH.md §3), or the daemon's own for a local account (AUTH.md
-§8.10) — never a raw *provider* token. A **local** credential, a password in the
+§8.10) — or, for a direct connection, a code the daemon exchanges itself; never a
+raw *provider* token from the client. A direct connection's `state` matching no
+sign-in, or a verifier that is not its challenge's, is `AUTH_INVALID_TOKEN` and the
+code goes nowhere; a provider that cannot be reached is
+`AUTH_SOURCE_UNAVAILABLE`. A **local** credential, a password in the
 frame, is refused with `AUTH_SOURCE_UNAVAILABLE` unless the daemon runs with the
 test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a local account signs in in the
 browser.
@@ -352,7 +357,7 @@ The daemon answers `AUTH_REDIRECT`:
 
 | Field           | Type | Notes                                                      |
 |-----------------|------|------------------------------------------------------------|
-| `authorize_url` | str  | For a relay source, the whole URL to open; the client opens it only if it is `https` (plain `http` to loopback, for development), and neither builds nor parses it. For the `local` source, a **path** on the daemon's own sign-in pages, `/signin?redirect_uri=…&nonce=…`: the client opens it at the daemon's own `https` origin when a trusted authority vouched for its certificate, and through its loopback tunnel otherwise (AUTH.md §8.10). |
+| `authorize_url` | str  | For a relay source or a direct connection, the whole URL to open; the client opens it only if it is `https` (plain `http` to loopback, for development), and neither builds nor parses it. For the `local` source, a **path** on the daemon's own sign-in pages, `/signin?redirect_uri=…&nonce=…`: the client opens it at the daemon's own `https` origin when a trusted authority vouched for its certificate, and through its loopback tunnel otherwise (AUTH.md §8.10). |
 
 or a non-fatal `ERROR`: `AUTH_SOURCE_UNAVAILABLE` (no such source, or the box is
 enrolled nowhere to send a browser), `AUTH_INVALID_TOKEN` (a `redirect_uri` that is

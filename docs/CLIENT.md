@@ -48,7 +48,11 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   per-attempt verifier and its challenge, from the operating system's random
   source with no weaker fallback, and the **loopback listener**: `127.0.0.1` on a
   kernel-chosen port, one `GET` accepted on a path carrying a per-attempt secret,
-  everything else answered 404 and ignored. Given no password, the network thread
+  everything else answered 404 and ignored. For a direct connection's provider
+  (AUTH.md §8.5), which matches its registered redirect, the redirect has no
+  path and the callback is `/`, with the daemon's `state` in the secret's place;
+  that listener takes `[::1]` at the same port as well, so a redirect the daemon
+  writes as `localhost` arrives whichever address the browser resolves it to. Given no password, the network thread
   takes the source asked for (`oc_client_start_signin`), else the first browser
   source the challenge offers, else local accounts, sends `AUTH_BEGIN`, checks
   the daemon's URL is `https` (or `http` to loopback), publishes it as
@@ -83,8 +87,9 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   The Win32 sign-in card asks at the same point — when step 1 resolves the
   workspace — and **collects no password**: step 2 says the username and password
   go into the workspace's own page, and its Sign in opens the browser for local
-  accounts, beside a button in the daemon's words for a browser source; a
-  workspace with no local accounts goes straight to its browser source. "Have an
+  accounts, beside a button in the daemon's words for each browser source — the
+  relay, and each of the operator's own providers; a workspace with no local
+  accounts and one browser source goes straight to it. "Have an
   invite? Create an account" asks only for the invitation, to fill in the sign-up
   page, and Change password opens the password page. The workspace book takes the
   account's name from the roster once it lists the signed-in user. While the browser is open the card says so, with
@@ -693,7 +698,9 @@ takes a bracketed IPv6 address as an address, as it does an IPv4 one.
 stored session token, the TUI shows a modal **Sign in** dialog — the workspace
 and *Remember me*, **no password** (AUTH.md §8.10). Enter signs in to local
 accounts with a **device code** (§8.11); Ctrl+B takes the workspace's browser
-source where it has one. The code's screen shows where to go and the code, the
+source where it has one. A direct connection's provider needs a browser on the
+same machine, since its answer comes back to this machine's loopback; a terminal
+without one signs in to a local account by device code. The code's screen shows where to go and the code, the
 URL as a QR code (`tuikit/tk_qr.c`, qrcodegen, half blocks, light modules white
 on black so any terminal's colours read the same) where the terminal has room,
 the daemon's fingerprint where the browser will warn about its certificate, and

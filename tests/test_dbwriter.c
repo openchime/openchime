@@ -1003,6 +1003,75 @@ static void test_set_email(void) {
     cleanup_db(path);
 }
 
+/* A direct connection's sign-in, as its worker hands it to the writer. */
+static uint64_t direct_signin(oc_dbwriter *w, uint64_t conn, const char *iss, const char *subject,
+                              const char *email, int verified, int *err) {
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn);
+    oc_direct_auth *d = calloc(1, sizeof *d);
+    snprintf(d->iss, sizeof d->iss, "%s", iss);
+    snprintf(d->sub, sizeof d->sub, "%s|%s", iss, subject);
+    snprintf(d->email, sizeof d->email, "%s", email);
+    snprintf(d->idp, sizeof d->idp, "oidc");
+    d->email_verified = verified;
+    j->method = OC_AUTH_OIDC;
+    j->direct = d;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t uid = r && r->type == OC_RES_AUTH_OK ? r->user_id : 0;
+    if (err) *err = r && r->type != OC_RES_AUTH_OK ? r->err_code : 0;
+    oc_dbres_free(r);
+    return uid;
+}
+
+/* Direct connections and the relay (AUTH.md §8.4-§8.5): a direct connection's
+ * issuer is not delivered by the relay; a direct sign-in links nobody by
+ * address, and a relay sign-in links nobody a direct connection knows. */
+static void test_direct_identities(void) {
+    const char *path = "build/test_dbwriter_direct.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-direct") == 0);
+    CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", is.pem, "") == 0);
+    char why[128];
+    CHECK(oc_dbwriter_configure_join_rules(w, "domain:acme.example", why, sizeof why) == 0);
+    const char *ISS[1] = { "https://sso.acme.example" };
+    oc_dbwriter_set_direct_issuers(w, ISS, 1);
+    uint8_t role; int err;
+    const char *KIM = "\"email\":\"kim@acme.example\",\"email_verified\":true,\"idp\":\"google\"";
+    /* Kim, by the relay's Google. */
+    uint64_t kim = oidc_signin(w, &is, 1, "https://accounts.google.com|kim-g", "x1", KIM, &role, &err);
+    CHECK(kim != 0);
+    /* The same address through the direct connection is somebody new: no link. */
+    uint64_t kd = direct_signin(w, 2, ISS[0], "kim-d", "kim@acme.example", 1, &err);
+    CHECK(kd != 0 && kd != kim);
+    CHECK(direct_signin(w, 3, ISS[0], "kim-d", "kim@acme.example", 1, &err) == kd);   /* and is again */
+    /* The relay may not deliver the direct connection's issuer. */
+    CHECK(oidc_signin(w, &is, 4, "https://sso.acme.example|kim-d", "x2", KIM, &role, &err) == 0 &&
+          err == OC_ERR_AUTH_NOT_ALLOWED);
+    /* A relay identity new to the workspace, with an address only the direct
+     * connection's person has verified: not linked to them. */
+    const char *PAT = "\"email\":\"pat@acme.example\",\"email_verified\":true,\"idp\":\"microsoft\"";
+    uint64_t pd = direct_signin(w, 5, ISS[0], "pat-d", "pat@acme.example", 1, &err);
+    CHECK(pd != 0);
+    uint64_t pr = oidc_signin(w, &is, 6, "https://login.microsoftonline.com/t/v2.0|pat-m", "x3", PAT, &role, &err);
+    CHECK(pr != 0 && pr != pd);
+    /* A worker's refusal is answered as one. */
+    oc_job *j = oc_job_new(OC_JOB_AUTH, 7);
+    oc_direct_auth *d = calloc(1, sizeof *d);
+    d->err = OC_ERR_AUTH_INVALID_TOKEN;
+    snprintf(d->reason, sizeof d->reason, "signature");
+    j->method = OC_AUTH_OIDC; j->direct = d;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Who may join by OIDC (AUTH.md §8.4): default deny, the rules speak only to a
  * new identity, the owner rule creates an owner and restores one. */
 static void test_oidc_join_rules(void) {
@@ -7406,6 +7475,7 @@ int run_dbwriter_tests(void) {
     test_auth_and_send();
     test_oidc_auth();
     test_oidc_join_rules();
+    test_direct_identities();
     test_oidc_no_downgrade();
     test_set_email();
     test_oidc_link();

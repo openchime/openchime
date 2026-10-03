@@ -64,6 +64,7 @@ to stderr; prefer the `OPENCHIME_` name.
 | `OPENCHIME_OIDC_PUBKEY` *(alias)* | *(none)* | Central's pinned ES256 public keys, inline PEM — one block, or several during a rotation; a token's `kid` chooses among them. |
 | `OPENCHIME_OIDC_PUBKEY_FILE` *(alias)* | *(none)* | The same, read from a file. |
 | `OPENCHIME_OIDC_EMAIL_LINK` | `provider-only` | `provider-only` \| `any`. Whether a sign-in by emailed code may join an account that signs in with a provider — Google or Microsoft — on the same verified address (AUTH.md §8.4). `provider-only` refuses it with `AUTH_USE_PROVIDER`; `any` links it. Any other value stops the boot. |
+| `OPENCHIME_OIDC_CONNECT_<n>` | *(none)* | A direct connection to the operator's own OpenID Connect provider, `n` 1 to 4 (AUTH.md §8.5; docs/SSO.md): `label=<text>;issuer=https://…;client_id=<id>;secret_file=<path>;subject=sub\|oid;redirect=127.0.0.1\|localhost`. `label`, `issuer` and `client_id` are required; no `secret_file` makes a public client, PKCE alone; `subject` defaults to `sub` and `redirect` to `127.0.0.1`. A field it does not know, an `issuer` not `https`, or a secret file it cannot read stops the boot. |
 | `OPENCHIME_OIDC_ALLOW` | *(none)* | Who may join by OIDC: a comma-separated list of `owner:<email>`, `subject:<issuer>\|<subject>`, `tenant:google:<hosted domain>`, `tenant:microsoft:<tenant id>` and `domain:<domain>` rules (AUTH.md §8.4). Empty admits nobody new; a rule the daemon does not understand stops the boot. |
 
 ## Outbound TLS

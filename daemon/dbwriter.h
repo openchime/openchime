@@ -258,6 +258,20 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
 #define OC_SEC_PASSKEY_ASK  3   /* a code: a passkey may be added (WEB_OK, step_pw 3) */
 #define OC_SEC_PASSKEY_ADD  4   /* a passkey's registration (WEB_OK, step_pw 4) */
 
+/* A direct connection's sign-in (AUTH.md §8.5), as its worker hands it over:
+ * the provider's checked identity, or why there is none (`err`, an OC_ERR_*,
+ * and `reason` for the audit). */
+typedef struct {
+    uint16_t err;
+    char     reason[48];
+    char     iss[256];        /* the provider's issuer */
+    char     sub[520];        /* "<issuer>|<subject>": sub, or oid where the connection says */
+    char     email[256], name[256];
+    char     tenant[256];     /* Google's hd, Microsoft's tid */
+    char     idp[32];         /* google, microsoft, or oidc */
+    int      email_verified;
+} oc_direct_auth;
+
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
 
@@ -317,6 +331,9 @@ typedef struct oc_job {
      * signature, an attestation object. */
     char           wa_rp[256], wa_origin[300], wa_challenge[48];
     char          *wa_cred, *wa_cd, *wa_ad, *wa_sig, *wa_att;
+    /* AUTH from a direct connection's worker (heap, or NULL): the identity it
+     * checked, in place of a token. */
+    oc_direct_auth *direct;
 
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */
@@ -1272,6 +1289,9 @@ void oc_dbwriter_set_local_mfa(oc_dbwriter *w, int policy);
  * Before serving. */
 void oc_dbwriter_set_session_policy(oc_dbwriter *w, uint64_t ttl_ms, uint64_t idle_ms);
 int  oc_dbwriter_local_mfa(oc_dbwriter *w);
+/* The issuers of this deployment's direct connections (AUTH.md §8.5): the relay
+ * does not deliver their identities, and links nobody to them. Before serving. */
+void oc_dbwriter_set_direct_issuers(oc_dbwriter *w, const char *const *issuers, int n);
 
 /* Which sources are on (OC_AUTH_* bits), and what AUTH_BEGIN builds the relay's
  * authorize URL from. For the net loop; set before serving and never after. */

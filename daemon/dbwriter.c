@@ -88,6 +88,8 @@ struct oc_dbwriter {
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             email_link_any;          /* an emailed code may stand in for a provider */
     oc_ratelimit   *step_rl;                 /* wrong second-step codes, per account */
+    char            direct_iss[4][256];      /* the direct connections' issuers (AUTH.md §8.5) */
+    int             n_direct_iss;
     uint8_t         factor_key[OC_FACTOR_KEY_LEN];
     int             have_factor_key;         /* without it no step can be passed */
     int             local_mfa;               /* OC_MFA_*: when the second step is asked */
@@ -256,6 +258,7 @@ static void job_free(oc_job *j) {
     free(j->proof);
     free(j->email);
     free(j->wa_cred); free(j->wa_cd); free(j->wa_ad); free(j->wa_sig); free(j->wa_att);
+    free(j->direct);
     free(j->sq_from);
     free(j->sq_in);
     free(j->username);
@@ -1336,6 +1339,114 @@ static void submit_to_reader(oc_dbwriter *w, oc_job *j);
 
 static oc_dbres *web_finish(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uint64_t uid);
 
+/* An OIDC identity whose token has been checked, from the relay (`src`
+ * "relay") or a direct connection ("direct"), admitted (AUTH.md §8.4): found
+ * by its identity -- or by an older account's subject, or linked by a verified
+ * address -- or created if the join rules or an invitation admit it. NULL with
+ * `*uid_out`/`*role_out` set on success (uid 0 is a refusal the caller turns
+ * into one), or `r` filled as the refusal. */
+static oc_dbres *oidc_admit(oc_dbwriter *w, const oc_job *j, oc_dbres *r, const oc_jwt_claims *claims,
+                            const char *src, uint64_t *uid_out, uint8_t *role_out, char *how, size_t howcap) {
+    sqlite3 *db = w->db;
+    int direct = strcmp(src, "direct") == 0;
+    /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
+    char subject[OC_JWT_MAX_FIELD * 2 + 8];
+    snprintf(subject, sizeof subject, "oidc:%s|%s", claims->iss, claims->sub);
+    /* Who may join (AUTH.md §8.4). The rules speak only to an identity this
+     * workspace has not seen — a known one signs in without them — except the
+     * owner rule, which also restores an owner to a workspace left with none. */
+    oc_join_verdict verdict = oc_join_rules_eval(w->join_rules, claims->sub, claims->idp, claims->tenant,
+                                                 claims->email, claims->email_verified);
+    char issuer[OC_JWT_MAX_FIELD];
+    const char *person = NULL;
+    if (!split_identity(claims->sub, issuer, sizeof issuer, &person)) {
+        char why[48];
+        snprintf(why, sizeof why, "source=%s reason=subject", src);
+        return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", claims->email, why);
+    }
+    /* A provider this deployment connects to directly speaks for its people
+     * itself: the relay does not deliver its identities (AUTH.md §8.4). */
+    if (!direct)
+        for (int i = 0; i < w->n_direct_iss; i++)
+            if (strcmp(issuer, w->direct_iss[i]) == 0)
+                return oidc_refuse(w, j, r, OC_ERR_AUTH_NOT_ALLOWED, "auth.denied", claims->email,
+                                   "source=relay reason=direct-issuer");
+    /* An account from before identities were rows is found by the string it was
+     * filed under, and gets its row at this sign-in. */
+    uint64_t uid = identity_user(db, issuer, person);
+    if (!uid) uid = user_by_subject(db, subject);
+    /* A new way in for someone already here: an identity not seen before,
+     * whose provider verified an address a member's provider verified too, is
+     * that member -- Google one day, an emailed code the next, one account.
+     * Nothing below refuses what the checks above let through, so this comes
+     * after them: it never admits an identity the relay may not deliver. */
+    int linked = 0;
+    /* A direct connection is the operator's own and links nobody by address:
+     * it and the relay are never one person on an email's word. */
+    if (!uid && !direct && claims->email_verified && claims->email[0])
+        linked = (uid = user_by_verified_email(db, claims->email)) != 0;
+    if (linked && w->n_direct_iss) {
+        /* Nor the other way: a relay sign-in links to no one a direct
+         * connection knows. */
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "SELECT issuer FROM user_identities WHERE user_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        while (linked && sqlite3_step(st) == SQLITE_ROW) {
+            const char *iss = (const char *)sqlite3_column_text(st, 0);
+            for (int i = 0; iss && i < w->n_direct_iss; i++)
+                if (strcmp(iss, w->direct_iss[i]) == 0) { linked = 0; uid = 0; }
+        }
+        sqlite3_finalize(st);
+    }
+    /* ...but never downward: an emailed code proves only the mailbox, so it
+     * does not stand in for a provider -- and its second factor -- the person
+     * already signs in with, unless the workspace allows it. An emailed code
+     * for an address is always the same identity, so one that would link is
+     * one onto a provider's. The other way, a provider for someone known by
+     * emailed code, is the stronger proof and links. */
+    if (linked && strcmp(claims->idp, "email") == 0 && !w->email_link_any) {
+        char why[48];
+        snprintf(why, sizeof why, "source=%s idp=email reason=downgrade", src);
+        return oidc_refuse(w, j, r, OC_ERR_AUTH_USE_PROVIDER, "auth.denied", claims->email, why);
+    }
+    int known = uid != 0;
+    /* An invite bound to this verified address admits it where no rule does,
+     * and says what role it joins with. */
+    uint8_t invited_role = OC_ROLE_MEMBER;
+    int invited = 0;
+    if (!known && verdict == OC_JOIN_DENY && claims->email_verified && claims->email[0])
+        invited = invite_for_email(db, claims->email, &invited_role);
+    if (invited) verdict = OC_JOIN_MEMBER;
+    if (!known && verdict == OC_JOIN_DENY) {
+        char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
+        snprintf(detail, sizeof detail, "source=%s idp=%s tenant=%s", src, claims->idp, claims->tenant);
+        return oidc_refuse(w, j, r, OC_ERR_AUTH_NOT_ALLOWED, "auth.denied", claims->email, detail);
+    }
+    snprintf(how, howcap, "source=%s idp=%s", src, claims->idp);
+    /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
+     * user past the workspace limit (an existing user still logs in). */
+    if (!known && user_slots_full(db, subject, strlen(subject), w->max_users)) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
+    }
+    if (!known) uid = create_oidc_user(db, subject, claims->email, claims->name);
+    if (uid) identity_touch(db, uid, issuer, person, claims);
+    if (linked) {
+        char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
+        snprintf(detail, sizeof detail, "source=%s idp=%s tenant=%s", src, claims->idp, claims->tenant);
+        audit_actor(db, OC_AUDIT_SECURITY, "auth.subject_linked", uid, uid, NULL, 1, detail);
+    }
+    if (uid && invited) {
+        consume_email_invite(db, claims->email);
+        if (invited_role != OC_ROLE_MEMBER) set_role(db, uid, invited_role);
+    }
+    if (uid && verdict == OC_JOIN_OWNER && !user_disabled(db, uid) &&
+        (!known || count_active_owners(db) == 0))
+        set_role(db, uid, OC_ROLE_OWNER);
+    *uid_out = uid;
+    if (uid) *role_out = get_role(db, uid);   /* membership ensured on the common path */
+    return NULL;
+}
+
 static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
@@ -1347,7 +1458,29 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     int fresh = 1;   /* mint a new session unless this is a session re-auth */
     char how[OC_JWT_MAX_SHORT + 32] = "source=local";   /* what auth.success records */
 
-    if (j->method == OC_AUTH_LOCAL) {
+    if (j->direct) {
+        /* A direct connection (AUTH.md §8.5): its worker exchanged the code and
+         * checked the provider's token; what is left is who may join. */
+        const oc_direct_auth *d = j->direct;
+        if (d->err) {
+            char why[96];
+            snprintf(why, sizeof why, "source=direct reason=%s", d->reason[0] ? d->reason : "exchange");
+            return oidc_refuse(w, j, r, d->err, "auth.failed", d->email[0] ? d->email : NULL, why);
+        }
+        oc_jwt_claims claims;
+        memset(&claims, 0, sizeof claims);
+        if (strlen(d->sub) >= sizeof claims.sub)
+            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", NULL, "source=direct reason=subject");
+        snprintf(claims.iss, sizeof claims.iss, "%s", d->iss);
+        memcpy(claims.sub, d->sub, strlen(d->sub) + 1);   /* checked to fit above */
+        snprintf(claims.email, sizeof claims.email, "%s", d->email);
+        snprintf(claims.name, sizeof claims.name, "%s", d->name);
+        snprintf(claims.tenant, sizeof claims.tenant, "%s", d->tenant);
+        snprintf(claims.idp, sizeof claims.idp, "%s", d->idp);
+        claims.email_verified = d->email_verified;
+        oc_dbres *refused = oidc_admit(w, j, r, &claims, "direct", &uid, &role, how, sizeof how);
+        if (refused) return refused;
+    } else if (j->method == OC_AUTH_LOCAL) {
         if (!(w->auth_methods & OC_AUTH_LOCAL)) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
         }
@@ -1470,76 +1603,8 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
             return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", claims.email,
                                "source=relay reason=replayed");
         }
-        /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
-        char subject[OC_JWT_MAX_FIELD * 2 + 8];
-        snprintf(subject, sizeof subject, "oidc:%s|%s", claims.iss, claims.sub);
-        /* Who may join (AUTH.md §8.4). The rules speak only to an identity this
-         * workspace has not seen — a known one signs in without them — except the
-         * owner rule, which also restores an owner to a workspace left with none. */
-        oc_join_verdict verdict = oc_join_rules_eval(w->join_rules, claims.sub, claims.idp, claims.tenant,
-                                                     claims.email, claims.email_verified);
-        char issuer[OC_JWT_MAX_FIELD];
-        const char *person = NULL;
-        if (!split_identity(claims.sub, issuer, sizeof issuer, &person)) {
-            return oidc_refuse(w, j, r, OC_ERR_AUTH_INVALID_TOKEN, "auth.failed", claims.email,
-                               "source=relay reason=subject");
-        }
-        /* An account from before identities were rows is found by the string it was
-         * filed under, and gets its row at this sign-in. */
-        uid = identity_user(db, issuer, person);
-        if (!uid) uid = user_by_subject(db, subject);
-        /* A new way in for someone already here: an identity not seen before,
-         * whose provider verified an address a member's provider verified too, is
-         * that member -- Google one day, an emailed code the next, one account.
-         * Nothing below refuses what the checks above let through, so this comes
-         * after them: it never admits an identity the relay may not deliver. */
-        int linked = 0;
-        if (!uid && claims.email_verified && claims.email[0])
-            linked = (uid = user_by_verified_email(db, claims.email)) != 0;
-        /* ...but never downward: an emailed code proves only the mailbox, so it
-         * does not stand in for a provider -- and its second factor -- the person
-         * already signs in with, unless the workspace allows it. An emailed code
-         * for an address is always the same identity, so one that would link is
-         * one onto a provider's. The other way, a provider for someone known by
-         * emailed code, is the stronger proof and links. */
-        if (linked && strcmp(claims.idp, "email") == 0 && !w->email_link_any) {
-            return oidc_refuse(w, j, r, OC_ERR_AUTH_USE_PROVIDER, "auth.denied", claims.email,
-                               "source=relay idp=email reason=downgrade");
-        }
-        int known = uid != 0;
-        /* An invite bound to this verified address admits it where no rule does,
-         * and says what role it joins with. */
-        uint8_t invited_role = OC_ROLE_MEMBER;
-        int invited = 0;
-        if (!known && verdict == OC_JOIN_DENY && claims.email_verified && claims.email[0])
-            invited = invite_for_email(db, claims.email, &invited_role);
-        if (invited) verdict = OC_JOIN_MEMBER;
-        if (!known && verdict == OC_JOIN_DENY) {
-            char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
-            snprintf(detail, sizeof detail, "source=relay idp=%s tenant=%s", claims.idp, claims.tenant);
-            return oidc_refuse(w, j, r, OC_ERR_AUTH_NOT_ALLOWED, "auth.denied", claims.email, detail);
-        }
-        snprintf(how, sizeof how, "source=relay idp=%s", claims.idp);
-        /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
-         * user past the workspace limit (an existing user still logs in). */
-        if (!known && user_slots_full(db, subject, strlen(subject), w->max_users)) {
-            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
-        }
-        if (!known) uid = create_oidc_user(db, subject, claims.email, claims.name);
-        if (uid) identity_touch(db, uid, issuer, person, &claims);
-        if (linked) {
-            char detail[OC_JWT_MAX_FIELD + OC_JWT_MAX_SHORT + 48];
-            snprintf(detail, sizeof detail, "source=relay idp=%s tenant=%s", claims.idp, claims.tenant);
-            audit_actor(db, OC_AUDIT_SECURITY, "auth.subject_linked", uid, uid, NULL, 1, detail);
-        }
-        if (uid && invited) {
-            consume_email_invite(db, claims.email);
-            if (invited_role != OC_ROLE_MEMBER) set_role(db, uid, invited_role);
-        }
-        if (uid && verdict == OC_JOIN_OWNER && !user_disabled(db, uid) &&
-            (!known || count_active_owners(db) == 0))
-            set_role(db, uid, OC_ROLE_OWNER);
-        if (uid) role = get_role(db, uid);   /* membership ensured on the common path */
+        oc_dbres *refused = oidc_admit(w, j, r, &claims, "relay", &uid, &role, how, sizeof how);
+        if (refused) return refused;
     } else if (j->method == OC_AUTH_SESSION) {
         /* A session token is 32 random bytes, so guessing one is hopeless — but the
          * limiter is per source, and a source hammering any door is the same source. */
@@ -9897,6 +9962,11 @@ void oc_dbwriter_set_session_policy(oc_dbwriter *w, uint64_t ttl_ms, uint64_t id
     __atomic_store_n(&g_session_idle_ms, idle_ms, __ATOMIC_RELAXED);
 }
 int  oc_dbwriter_local_mfa(oc_dbwriter *w) { return w->local_mfa; }
+void oc_dbwriter_set_direct_issuers(oc_dbwriter *w, const char *const *issuers, int n) {
+    w->n_direct_iss = 0;
+    for (int i = 0; i < n && i < 4; i++)
+        snprintf(w->direct_iss[w->n_direct_iss++], sizeof w->direct_iss[0], "%s", issuers[i]);
+}
 
 void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32) {
     w->have_factor_key = key32 != NULL;

@@ -212,6 +212,65 @@ int oc_config_load(char *err, size_t errcap) {
     c->oidc.issuer    = env_or2("OPENCHIME_OIDC_ISSUER",   "OC_OIDC_ISSUER",   NULL);
     c->oidc.audience  = env_or2("OPENCHIME_OIDC_AUDIENCE", "OC_OIDC_AUDIENCE", NULL);
     c->oidc.allow     = getenv("OPENCHIME_OIDC_ALLOW");
+    /* Direct connections (AUTH.md §8.5): OPENCHIME_OIDC_CONNECT_1 to _4, in
+     * order. Anything not understood stops the boot -- a typo in how people
+     * sign in must not quietly become nobody signing in. */
+    c->n_connect = 0;
+    for (int n = 1; n <= OC_OIDC_MAX_CONNECT; n++) {
+        char name[40];
+        snprintf(name, sizeof name, "OPENCHIME_OIDC_CONNECT_%d", n);
+        const char *spec = getenv(name);
+        if (!spec || !spec[0]) continue;
+        oc_oidc_connect *k = &c->connect[c->n_connect];
+        memset(k, 0, sizeof *k);
+        char secret_file[512] = "";
+        const char *p = spec;
+        while (*p) {
+            const char *e = strchr(p, ';');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            const char *eq = memchr(p, '=', len);
+            if (len) {
+                if (!eq) { snprintf(err, errcap, "%s: \"%.*s\" is not key=value", name, (int)len, p); return -1; }
+                size_t kl = (size_t)(eq - p), vl = len - kl - 1;
+                const char *v = eq + 1;
+                char *dst = NULL; size_t cap = 0;
+                if (kl == 5 && !strncmp(p, "label", 5)) { dst = k->label; cap = sizeof k->label; }
+                else if (kl == 6 && !strncmp(p, "issuer", 6)) { dst = k->issuer; cap = sizeof k->issuer; }
+                else if (kl == 9 && !strncmp(p, "client_id", 9)) { dst = k->client_id; cap = sizeof k->client_id; }
+                else if (kl == 11 && !strncmp(p, "secret_file", 11)) { dst = secret_file; cap = sizeof secret_file; }
+                else if (kl == 7 && !strncmp(p, "subject", 7)) {
+                    if (vl == 3 && !strncmp(v, "oid", 3)) k->subject_oid = 1;
+                    else if (!(vl == 3 && !strncmp(v, "sub", 3))) { snprintf(err, errcap, "%s: subject is sub or oid", name); return -1; }
+                } else if (kl == 8 && !strncmp(p, "redirect", 8)) {
+                    if (vl == 9 && !strncmp(v, "localhost", 9)) k->localhost = 1;
+                    else if (!(vl == 9 && !strncmp(v, "127.0.0.1", 9))) { snprintf(err, errcap, "%s: redirect is 127.0.0.1 or localhost", name); return -1; }
+                } else { snprintf(err, errcap, "%s: unknown key \"%.*s\"", name, (int)kl, p); return -1; }
+                if (dst) {
+                    if (vl >= cap) { snprintf(err, errcap, "%s: %.*s is too long", name, (int)kl, p); return -1; }
+                    memcpy(dst, v, vl); dst[vl] = '\0';
+                }
+            }
+            p = e ? e + 1 : p + len;
+        }
+        if (!k->label[0] || !k->client_id[0] || strncmp(k->issuer, "https://", 8) != 0) {
+            snprintf(err, errcap, "%s needs label, an https issuer and client_id", name);
+            return -1;
+        }
+        if (secret_file[0]) {
+            char *sec = read_file(secret_file);
+            if (!sec) { snprintf(err, errcap, "%s: cannot read %s", name, secret_file); return -1; }
+            size_t sl = strlen(sec);
+            while (sl && (sec[sl - 1] == '\n' || sec[sl - 1] == '\r')) sec[--sl] = '\0';
+            if (!sl || sl >= sizeof k->secret) {
+                memset(sec, 0, sl); free(sec);
+                snprintf(err, errcap, "%s: the secret is empty or too long", name);
+                return -1;
+            }
+            memcpy(k->secret, sec, sl + 1);
+            memset(sec, 0, sl); free(sec);
+        }
+        c->n_connect++;
+    }
     /* Whether an emailed code may sign into a person known by a provider (AUTH.md
      * §8.4). Off unless asked for; a value that is neither word stops the boot. */
     {

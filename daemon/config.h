@@ -39,6 +39,18 @@ typedef enum {
 } oc_deploy_mode;
 
 /* Where the certificate the daemon presents comes from (TLS.md, "Certificates"). */
+/* A direct connection (AUTH.md §8.5), from OPENCHIME_OIDC_CONNECT_<n>:
+ * `label=…;issuer=…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. */
+#define OC_OIDC_MAX_CONNECT 4
+typedef struct {
+    char label[64];
+    char issuer[256];
+    char client_id[256];
+    char secret[512];        /* "" for a public client: PKCE alone */
+    int  subject_oid;        /* subject=oid: Microsoft's tenant-wide id, as the relay uses */
+    int  localhost;          /* redirect=localhost: the provider matches that name */
+} oc_oidc_connect;
+
 typedef enum {
     OC_TLS_SRC_SELF    = 0,   /* its own self-signed certificate, made at first run */
     OC_TLS_SRC_FILE    = 1,   /* the operator's, OPENCHIME_TLS_CERT / _KEY */
@@ -85,6 +97,8 @@ typedef struct {
     const char *auth_mode;          /* "local" | "oidc" */
     struct { const char *issuer, *audience, *pubkey, *allow;          /* pubkey resolved */
              int email_link_any; } oidc;  /* OPENCHIME_OIDC_EMAIL_LINK=any */
+    oc_oidc_connect connect[OC_OIDC_MAX_CONNECT];   /* direct connections, in order */
+    int             n_connect;
     const char *bootstrap_users;
 
     /* Federated enrollment (CP-8). */

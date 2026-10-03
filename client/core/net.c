@@ -107,6 +107,9 @@ struct oc_net {
     char          verifier[OC_SIGNIN_VERIFIER_LEN + 1];
     char          source_id[64];
     char         *oidc_token;
+    /* A direct connection's (AUTH.md §8.5): the provider sends back a code -- held
+     * in oidc_token -- and the state the daemon began the sign-in with. */
+    char          oidc_state[128];
     atomic_int    signin_cancel;
     char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
@@ -2456,6 +2459,7 @@ static void signin_forget(oc_net *n) {
     oc_signin_wipe(n->verifier, sizeof n->verifier);
     if (n->oidc_token) { oc_signin_wipe(n->oidc_token, strlen(n->oidc_token)); free(n->oidc_token); }
     n->oidc_token = NULL;
+    oc_signin_wipe(n->oidc_state, sizeof n->oidc_state);
 }
 
 /* Ask a workspace how it signs people in, before anyone has typed anything
@@ -2766,7 +2770,8 @@ static int run_connection(oc_net *n, int reconnecting,
 
             signin_forget(n);
             char redirect[160], challenge[OC_SIGNIN_CHALLENGE_LEN + 1];
-            n->loopback = oc_loopback_open(redirect, sizeof redirect);
+            n->loopback = src->kind == OC_SOURCE_OIDC ? oc_loopback_open_provider(redirect, sizeof redirect)
+                                                      : oc_loopback_open(redirect, sizeof redirect);
             if (!n->loopback || oc_signin_verifier(n->verifier, challenge) != 0) {
                 signin_forget(n);
                 push_err(n->to_ui, "could not start a browser sign-in on this computer");
@@ -2834,7 +2839,7 @@ static int run_connection(oc_net *n, int reconnecting,
             /* What the browser brought back, with the verifier only this client
              * holds (AUTH.md §8.2). Both are spent here, whatever the answer. */
             oc_auth a = { OC_AUTH_OIDC, oc_slice_str(n->source_id), oc_slice_str(n->oidc_token),
-                          oc_slice_str(n->verifier) };
+                          oc_slice_str(n->verifier), oc_slice_str(n->oidc_state) };
             er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
             if (er == OC_OK && write_all(&conn, fd, buf, w.len, &n->stop) != 0) er = OC_E_OVERFLOW;
             oc_signin_wipe(buf, sizeof buf);
@@ -2842,7 +2847,7 @@ static int run_connection(oc_net *n, int reconnecting,
             if (er != OC_OK) goto drop;
             w.len = 0;
         } else if (reconnecting && *have_sess) {
-            oc_auth a = { OC_AUTH_SESSION, { NULL, 0 }, { sess, OC_SESSION_TOKEN_LEN }, { NULL, 0 } };
+            oc_auth a = { OC_AUTH_SESSION, { NULL, 0 }, { sess, OC_SESSION_TOKEN_LEN }, { NULL, 0 }, { NULL, 0 } };
             er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
         } else {
             const char *cred = n->token ? n->token : "";
@@ -2863,7 +2868,7 @@ static int run_connection(oc_net *n, int reconnecting,
             } else {
                 uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
                 if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
-                oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 } };
+                oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
                 er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
             }
         }
@@ -3845,7 +3850,12 @@ static void *net_thread(void *arg) {
             oc_loopback_close(n->loopback);
             n->loopback = NULL;
             if (n->stop) break;
-            if (lr == OC_LOOPBACK_OK && oc_query_get(query, "token", tok, sizeof tok) == 1) {
+            n->oidc_state[0] = '\0';
+            /* The relay sends a token; a direct connection's provider, a code and
+             * the state the daemon began with -- presented the same way. */
+            if (lr == OC_LOOPBACK_OK && (oc_query_get(query, "token", tok, sizeof tok) == 1 ||
+                                         (oc_query_get(query, "code", tok, sizeof tok) == 1 &&
+                                          oc_query_get(query, "state", n->oidc_state, sizeof n->oidc_state) == 1))) {
                 n->oidc_token = strdup(tok);
                 oc_signin_wipe(tok, sizeof tok);
                 oc_signin_wipe(query, sizeof query);
