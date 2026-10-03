@@ -3146,7 +3146,9 @@ static void test_web_signin(int port) {
         CHECK(strstr(resp, "Password set") != NULL);
         CHECK(web_signin(port, pin, "pat", "pw-reset", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
-        CHECK(strstr(resp, "isn&#39;t good any more") != NULL);
+        /* Spent: said of the reset, which was a link here and is a code typed on
+         * the sign-in card elsewhere -- the words must be true of both. */
+        CHECK(strstr(resp, "This reset isn&#39;t good any more") != NULL && strstr(resp, "link") == NULL);
     }
 
     /* Opened by the person's own client, the reset page carries its sign-in and,
@@ -3188,6 +3190,10 @@ static void test_web_signin(int port) {
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Your new password is set") != NULL);
         CHECK(web_signin(port, pin, "pat", "pw-again", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        /* The code again, as a client sends it: spent, and said so without
+         * calling it a link. */
+        CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "This reset isn&#39;t good any more") != NULL && strstr(resp, "link") == NULL);
     }
 
     /* The per-account limiter stands in front of the page as of the frame. */
