@@ -52,6 +52,13 @@ typedef struct { char host[256]; int port; char domain[256]; char fingerprint[96
  * agrees on the default instead of each calling getenv() and getting NULL. */
 const char *oc_default_suffix(void);
 
+/* Does the hosted suffix belong beside what has been typed so far? Only a bare
+ * name takes it (`acme` -> `acme.<suffix>`), so a frontend that shows the suffix
+ * as a hint beside its workspace field shows it for that and for an empty field
+ * -- never beside an address, a `:port`, a scheme or path, a dotted name or
+ * `localhost`, which resolve as typed. 1 or 0; 0 whenever `suffix` is empty. */
+int oc_workspace_takes_suffix(const char *typed, const char *suffix);
+
 /* Normalize a workspace to a DNS domain: strip a leading scheme (`x://`) and any
  * trailing `:port`/path; a bare name (no dot) gets `.<suffix>` appended when a
  * non-empty suffix is given (`acme` -> `acme.openchime.example`), while a name

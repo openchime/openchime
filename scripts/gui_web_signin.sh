@@ -254,7 +254,12 @@ WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
 disown
 await_shown
 drive menu 80
+# The hosted suffix goes beside a bare name, and beside nothing that already
+# names a host and port.
+drive siws acme
+grep -qx 'sisuffix shown=1' <<<"$(state w4s)" || fail "no hosted suffix beside a bare name"
 drive siws "$WS"
+grep -qx 'sisuffix shown=0' <<<"$(state w4a)" || fail "the hosted suffix beside the address $WS"
 drive sisubmit
 trust_cert
 sleep 2

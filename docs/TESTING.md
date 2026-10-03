@@ -233,7 +233,11 @@ framework, and OpenChime follows suit.
   literal form (`192.0.2.7`, `:port`, `[v6]`, `[v6]:port`, a bare v6, a zone)
   resolves to its canonical host and port with **the SRV, DNS and `.well-known`
   counters (`oc_resolve_counts`) unmoved**, malformed forms are refused, keys fold
-  spellings, and `oc_hostport` and `oc_addr_is_loopback` hold to their tables; a
+  spellings, and `oc_hostport`, `oc_addr_is_loopback` and
+  `oc_workspace_takes_suffix` — the hosted suffix beside a bare name or nothing
+  typed, never beside an address, a port, a dotted name or `localhost` — hold to
+  their tables (`scripts/gui_web_signin.sh` checks the Win32 field shows it for
+  `acme` and not for the daemon's address); a
   client resolves `[::1]:<port>`, signs in and sends over IPv6 with nothing else
   looked up; the call engine picks the relay's family IPv4 first and IPv6 when
   that is all there is, starts on the connection when it has no UDP, and dana, on

@@ -2425,6 +2425,7 @@ static rectf g_si_adv_link;
 static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text */
 static ULONGLONG g_si_started;    /* GetTickCount64 when the attempt began */
 static HWND  g_si_e_ws, g_si_e_user, g_si_e_pass;   /* native EDIT children */
+static int   g_si_suffix_shown; /* the hosted suffix, drawn beside the field last frame */
 static rectf g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
 /* How the workspace signs people in (AUTH.md §8.1), asked of it at step 1: a
  * password form, a browser button, or both. */
@@ -2456,6 +2457,7 @@ static void signin_set_advanced(HWND hwnd, int on);
 static void signin_begin(HWND hwnd, const char *ws, const char *user);
 static void signin_poll(HWND hwnd);
 static void layout_signin(HWND hwnd);
+static int  si_suffix_applies(void);   /* fwd: the hosted suffix beside the field */
 typedef struct { float x0, y0, w, h, fx, fw, fields_y; } si_geom;
 static si_geom si_layout(float W, float H);
 
@@ -10671,6 +10673,7 @@ static void draw_signin(gfx *rt, float W, float H) {
 
     /* Field chrome. The EDITs are placed on these same rects by layout_signin. */
     const char *labels[1] = { "Workspace" }; int nfields = g_si_step == 1 ? 1 : 0;
+    g_si_suffix_shown = 0;
     if (g_si_step == 2) {
         draw_text(rt, "Your username and password go into the workspace's own sign-in page, "
                       "which opens in your browser.", g_meta_w, rf(fx, y, fx + fw, y + SI_NOTE_H - 6),
@@ -10682,8 +10685,12 @@ static void draw_signin(gfx *rt, float W, float H) {
         rectf box = rf(fx, y + 20, fx + fw, y + 52);
         fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
         stroke_round(rt, box, OC_R_CONTROL, g_si_err[0] ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
-        /* Hosted mode: the service suffix is chrome, not something to type. */
-        if (g_si_step == 1 && !g_si_advanced) {
+        /* Hosted mode: the service suffix is chrome, not something to type --
+         * and only beside what it would be added to. An address, a port or a
+         * dotted name is reached as typed, and the suffix after it read as part
+         * of the name. */
+        if (g_si_step == 1 && si_suffix_applies()) {
+            g_si_suffix_shown = 1;
             char suf[80]; snprintf(suf, sizeof suf, ".%s", oc_default_suffix());
             g_meta->align = ST_ALIGN_RIGHT;
             draw_text(rt, suf, g_meta, rf(fx, y + 20, fx + fw - 12, y + 52), OC_COL_MUTED);
@@ -22026,6 +22033,16 @@ static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /* Place the sign-in EDITs over the field chrome draw_signin() paints. The two
  * must agree on geometry, so both derive it from the same card maths — keep the
  * pad/step offsets here in step with that function. */
+/* The hosted suffix beside the workspace field: not in advanced mode, and only
+ * beside what it would be added to (oc_workspace_takes_suffix). */
+static void si_get(HWND e, char *out, size_t cap);   /* fwd */
+static int si_suffix_applies(void) {
+    if (g_si_advanced || !g_si_e_ws) return 0;
+    char typed[320];
+    si_get(g_si_e_ws, typed, sizeof typed);
+    return oc_workspace_takes_suffix(typed, oc_default_suffix());
+}
+
 static void layout_signin(HWND hwnd) {
     if (!g_si_e_ws) return;
     int on = (g_view == VIEW_SIGNIN && !g_si_connecting && !modal_open());
@@ -22044,8 +22061,9 @@ static void layout_signin(HWND hwnd) {
     int ex = (int)(g.fx + 12), ew = (int)(g.fw - 24), eh = 20;
     if (g_si_step == 1) {
         /* Leave room for the ".openchime.io" chip the painter draws at the right
-         * edge of the box, so typed text can never run under it. */
-        int sw = g_si_advanced ? 0 : (int)(8 + 7.0 * (double)(strlen(oc_default_suffix()) + 1));
+         * edge of the box, so typed text can never run under it -- while it is
+         * drawn, which depends on what has been typed (si_suffix_applies). */
+        int sw = !si_suffix_applies() ? 0 : (int)(8 + 7.0 * (double)(strlen(oc_default_suffix()) + 1));
         MoveWindow(g_si_e_ws, PX(ex), PX(y + 20 + 6), PX(ew - sw), PX(eh), TRUE);
     } else {
         MoveWindow(g_si_e_user, PX(ex), PX(y + 20 + 6), PX(ew), PX(eh), TRUE);
@@ -28392,6 +28410,7 @@ static void test_dump(const char *path) {
     /* Native children are invisible to `shot` (that renders Direct2D only), so
      * they are reported here instead — otherwise the one class of bug the
      * harness cannot see is the one that reaches the user. */
+    fprintf(f, "sisuffix shown=%d\n", g_si_suffix_shown);
     fprintf(f, "natives re=%d find=%d ffind=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
             (g_ed_box.right > g_ed_box.left), g_find && IsWindowVisible(g_find),
             g_ffind && IsWindowVisible(g_ffind),
@@ -30889,6 +30908,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         layout_signin(hwnd);      /* the card is centred, so it moves with the window */
         return 0;
     case WM_COMMAND:
+        /* The suffix comes and goes with what is typed, and the field's width
+         * with it. */
+        if (g_si_e_ws && (HWND)lp == g_si_e_ws && HIWORD(wp) == EN_CHANGE) {
+            layout_signin(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_pal_edit && (HWND)lp == g_pal_edit && HIWORD(wp) == EN_CHANGE) {
             g_pal_sel = 0;
             InvalidateRect(hwnd, NULL, FALSE);

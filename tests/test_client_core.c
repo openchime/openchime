@@ -1647,6 +1647,24 @@ static void test_resolve_literals(void) {
 
 static void test_resolve(void) {
     char d[256];
+    /* The suffix hint goes beside a bare name, or nothing typed yet -- and beside
+     * nothing that already names a host or a port. */
+    {
+        static const struct { const char *t; int want; } SUF[] = {
+            { "", 1 }, { "acme", 1 }, { "acme-eu", 1 }, { "localhost-eu", 1 },
+            { "172.24.206.100:8551", 0 }, { "172.24.206.100", 0 }, { "127.0.0.1", 0 },
+            { "[::1]:8443", 0 }, { "::1", 0 }, { "acme:8443", 0 }, { "chat.acme.com", 0 },
+            { "acme.", 0 }, { "localhost", 0 }, { "LocalHost", 0 }, { "localhost:8443", 0 },
+            { "openchime://acme", 0 }, { "acme/x", 0 },
+        };
+        for (size_t i = 0; i < sizeof SUF / sizeof SUF[0]; i++) {
+            if (oc_workspace_takes_suffix(SUF[i].t, "openchime.example") != SUF[i].want)
+                printf("  takes_suffix(%s) != %d\n", SUF[i].t, SUF[i].want);
+            CHECK(oc_workspace_takes_suffix(SUF[i].t, "openchime.example") == SUF[i].want);
+        }
+        CHECK(oc_workspace_takes_suffix("acme", "") == 0);
+        CHECK(oc_workspace_takes_suffix("acme", NULL) == 0);
+    }
     /* Bare name gets the suffix; a dotted name passes through; no suffix = as-is. */
     CHECK(oc_resolve_domain("acme", "openchime.example", d, sizeof d) == 0 &&
           strcmp(d, "acme.openchime.example") == 0);
