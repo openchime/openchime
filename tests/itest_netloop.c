@@ -2201,6 +2201,23 @@ static int between(const char *page, const char *after, const char *until, char 
     return 1;
 }
 
+/* `src`, as a page at `path` names it, resolved to the path a browser asks for:
+ * absolute as it is, else beside the page, each "../" one level up. */
+static int page_ref(const char *path, const char *src, char *out, size_t cap) {
+    if (src[0] == '/') return snprintf(out, cap, "%s", src) < (int)cap ? 0 : -1;
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) return -1;
+    slash[1] = '\0';
+    while (strncmp(src, "../", 3) == 0) {
+        src += 3;
+        size_t n = strlen(dir);
+        if (n > 1) { dir[n - 1] = '\0'; slash = strrchr(dir, '/'); slash[1] = '\0'; }
+    }
+    return snprintf(out, cap, "%s%s", dir, src) < (int)cap ? 0 : -1;
+}
+
 /* RFC 4648 base32 back to bytes, as an authenticator reads a typed key. */
 static size_t base32_bytes(const char *in, uint8_t *out, size_t cap) {
     uint32_t buf = 0; int bits = 0; size_t n = 0;
@@ -2954,6 +2971,8 @@ static void test_web_signin(int port) {
         CHECK(strstr(resp, "script-src 'self'") != NULL);
         char sri[80];
         CHECK(between(resp, "integrity=\"", "\"", sri, sizeof sri));
+        static char pkpage[32768];
+        snprintf(pkpage, sizeof pkpage, "%s", resp);
         wa_key k;
         CHECK(wa_key_new(&k, 0x5a) == 0);
         uint8_t auth[512], att[800], sig[128];
@@ -2967,8 +2986,12 @@ static void test_web_signin(int port) {
         CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Passkey added") != NULL);
 
-        /* The script the page named, and the hash it named it by. */
-        CHECK(web_call(port, pin, "GET", "/webauthn.js", NULL, NULL, NULL, resp, sizeof resp) == 200);
+        /* The script the page named -- at the path it names, from where the page
+         * is -- and the hash it named it by. */
+        char src[128], url[192];
+        CHECK(between(pkpage, "<script src=\"", "\"", src, sizeof src));
+        CHECK(page_ref("/account/security", src, url, sizeof url) == 0);
+        CHECK(web_call(port, pin, "GET", url, NULL, NULL, NULL, resp, sizeof resp) == 200);
         {
             const char *js = strstr(resp, "\r\n\r\n");
             uint8_t h[32]; char want[80]; size_t ol = 0;
@@ -2982,8 +3005,14 @@ static void test_web_signin(int port) {
             }
         }
 
-        /* Sign in: the step offers the passkey, and it answers. */
+        /* Sign in: the step offers the passkey -- its script found from /signin
+         * and, after a wrong code, from /signin/verify -- and it answers. */
         CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(between(resp, "<script src=\"", "\"", src, sizeof src) && page_ref("/signin", src, url, sizeof url) == 0);
+        CHECK(ticket_of(resp, ticket, sizeof ticket));
+        CHECK(web_verify(port, pin, ticket, "000000", tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(between(resp, "<script src=\"", "\"", src, sizeof src) && page_ref("/signin/verify", src, url, sizeof url) == 0);
+        CHECK(web_call(port, pin, "GET", url, NULL, NULL, NULL, pkpage, sizeof pkpage) == 200);
         CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") != NULL &&
               between(resp, "data-challenge=\"", "\"", challenge, sizeof challenge));
         k.count = 1;
