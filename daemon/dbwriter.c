@@ -80,7 +80,12 @@ struct oc_dbwriter {
     int             oidc_enabled;
     char           *oidc_issuer;
     char           *oidc_audience;
-    char           *oidc_pubkey_pem;
+    char           *oidc_pubkey_pem;         /* pinned: OPENCHIME_OIDC_PUBKEY */
+    /* What relay tokens are verified against: the pinned keys and the ones the
+     * relay last published (relaykeys.h), swapped whole under keys_mu, which is
+     * all another thread touches. */
+    pthread_mutex_t keys_mu;
+    char           *oidc_keyset_pem;
     char           *relay_origin;            /* where the relay is ("" if nowhere) */
     struct oc_seen_jti *seen_jti;            /* relay and local tokens already used (AUTH.md §8.2) */
     oc_local_issuer *local_iss;              /* this daemon's issuer for local accounts (§8.10) */
@@ -1580,10 +1585,12 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
         }
         oc_jwt_claims claims;
+        pthread_mutex_lock(&w->keys_mu);
         oc_jwt_result jr = oc_jwt_verify(j->token, j->token_len,
-                                         w->oidc_pubkey_pem, strlen(w->oidc_pubkey_pem) + 1,
+                                         w->oidc_keyset_pem, strlen(w->oidc_keyset_pem) + 1,
                                          w->oidc_issuer, w->oidc_audience,
                                          dbw_now_ms() / 1000u, &claims);
+        pthread_mutex_unlock(&w->keys_mu);
         if (jr != OC_JWT_OK) {
             char reason[48];
             snprintf(reason, sizeof reason, "source=relay reason=%s", jwt_reason(jr));
@@ -9906,11 +9913,16 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *relay_origin) {
     if (!issuer || !audience || !pubkey_pem) return -1;
     free(w->oidc_issuer); free(w->oidc_audience);
-    free(w->oidc_pubkey_pem); free(w->relay_origin);
+    free(w->oidc_pubkey_pem); free(w->oidc_keyset_pem); free(w->relay_origin);
     w->oidc_issuer     = strdup(issuer);
     w->oidc_audience   = strdup(audience);
     w->oidc_pubkey_pem = strdup(pubkey_pem);
     w->relay_origin    = strdup(relay_origin ? relay_origin : "");
+    pthread_mutex_lock(&w->keys_mu);
+    free(w->oidc_keyset_pem);
+    w->oidc_keyset_pem = strdup(pubkey_pem);
+    pthread_mutex_unlock(&w->keys_mu);
+    if (!w->oidc_keyset_pem) return -1;
     if (!w->seen_jti) w->seen_jti = calloc(1, sizeof *w->seen_jti);
     if (!w->seen_jti) return -1;
     if (!w->oidc_issuer || !w->oidc_audience || !w->oidc_pubkey_pem || !w->relay_origin)
@@ -9920,6 +9932,21 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
      * say (oc_dbwriter_set_local_enabled). */
     w->auth_methods |= OC_AUTH_OIDC;
     return 0;
+}
+
+void oc_dbwriter_set_relay_keys(oc_dbwriter *w, const char *fetched_pem) {
+    if (!w || !fetched_pem || !w->oidc_pubkey_pem) return;
+    size_t a = strlen(w->oidc_pubkey_pem), b = strlen(fetched_pem);
+    char *set = malloc(a + 1 + b + 1);
+    if (!set) return;
+    memcpy(set, w->oidc_pubkey_pem, a);
+    set[a] = '\n';
+    memcpy(set + a + 1, fetched_pem, b + 1);
+    pthread_mutex_lock(&w->keys_mu);
+    char *old = w->oidc_keyset_pem;
+    w->oidc_keyset_pem = set;
+    pthread_mutex_unlock(&w->keys_mu);
+    free(old);
 }
 
 void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on) {
@@ -10298,6 +10325,7 @@ static int local_issuer_load(oc_dbwriter *w) {
 oc_dbwriter *oc_dbwriter_start(const char *path) {
     oc_dbwriter *w = calloc(1, sizeof *w);
     if (!w) return NULL;
+    pthread_mutex_init(&w->keys_mu, NULL);
     w->evfd = -1;
     w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
     w->idem_retention_ms = OC_IDEM_RETENTION_MS;
@@ -10308,6 +10336,7 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->local_mfa = OC_MFA_OPTIONAL;
     if (!w->auth_rl || !w->source_rl || !w->step_rl) {
         oc_ratelimit_free(w->auth_rl); oc_ratelimit_free(w->source_rl); oc_ratelimit_free(w->step_rl);
+        pthread_mutex_destroy(&w->keys_mu);
         free(w); return NULL;
     }
 
@@ -10389,6 +10418,7 @@ fail:
     sqlite3_close(w->db);
     oc_local_issuer_close(w->local_iss);
     free(w->seen_jti);
+    pthread_mutex_destroy(&w->keys_mu);
     free(w);
     return NULL;
 }
@@ -10417,7 +10447,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
         for (oc_job *j = w->readers[i].head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
     free(w->oidc_issuer); free(w->oidc_audience);
-    free(w->oidc_pubkey_pem); free(w->relay_origin);
+    free(w->oidc_pubkey_pem); free(w->oidc_keyset_pem); free(w->relay_origin);
     free(w->seen_jti);
     oc_local_issuer_close(w->local_iss);
     oc_join_rules_free(w->join_rules);
@@ -10428,5 +10458,6 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     if (w->evfd >= 0) close(w->evfd);
     for (int i = 0; i < OC_DB_READERS; i++) sqlite3_close(w->readers[i].rdb);
     sqlite3_close(w->db);
+    pthread_mutex_destroy(&w->keys_mu);
     free(w);
 }

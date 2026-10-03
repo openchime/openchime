@@ -539,6 +539,13 @@ works. Nothing proves the shipped *image* works (§3.2).
   code for a Google user's address is refused with `AUTH_USE_PROVIDER` and makes
   no identity; Microsoft for a person known by emailed code links; with
   `OPENCHIME_OIDC_EMAIL_LINK=any` the emailed code links too.
+- **The relay's published keys (`test_relaykeys`; `test_dbwriter`
+  `test_relay_published_keys`):** a JWKS yields its P-256 signing keys as PEM and
+  passes over another curve or type, a key for encryption or another algorithm,
+  and a point off the curve; at most eight are taken and none is cut short. A
+  published key is trusted beside the pinned one, the next set retires it, and the
+  pinned key survives every set. The worker asks again when the relay is down and
+  hands the writer what it answers.
 - **Direct connections (`test_idtoken`; `test_dbwriter`
   `test_direct_identities`; `itest_netloop` `test_direct_signin`):** ID tokens
   signed in the test with RSA, RSA-PSS and P-256 keys pass, and each of a wrong

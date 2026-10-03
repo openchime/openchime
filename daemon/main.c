@@ -21,6 +21,7 @@
 #include "netloop.h"
 #include "oidcrp.h"
 #include "push.h"
+#include "relaykeys.h"
 #include "unfurl.h"
 #include "tls.h"
 #include "totp.h"
@@ -543,6 +544,7 @@ int main(int argc, char **argv) {
     /* The relay source (AUTH.md §3): pin central's ES256 keys + issuer/audience.
      * An enrolled box (CP-8) uses its daemon-generated audience automatically, and
      * the relay is at the origin it enrolled with (§8.3). */
+    oc_relaykeys *relay_keys = NULL;
     if (want_relay) {
         const char *iss = cfg->oidc.issuer;
         const char *aud = enroll_audience ? enroll_audience : cfg->oidc.audience;
@@ -573,6 +575,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW is empty: nobody new may join "
                             "by OIDC except through an invite\n");
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
+        /* Enrolled with central: its published keys too, so a rotation reaches
+         * this box without its operator (AUTH.md §3.3). */
+        if (origin[0]) {
+            char url[300];
+            snprintf(url, sizeof url, "%s/oidc/jwks", origin);
+            relay_keys = oc_relaykeys_start(url, db);
+            if (!relay_keys) fprintf(stderr, "openchimed: the relay's published keys will not be read\n");
+        }
     }
 
     /* Direct connections (AUTH.md §8.5): the operator's own providers, each a
@@ -749,6 +759,7 @@ int main(int argc, char **argv) {
     free(fed.audience);
     oc_unfurler_stop(unfurler);
     oc_oidcrp_stop(rp);
+    oc_relaykeys_stop(relay_keys);
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);
 

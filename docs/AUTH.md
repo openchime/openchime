@@ -245,8 +245,8 @@ flow itself — how the id is proposed and bound — is a control-plane concern,
 out of scope for this doc.)
 
 **The issuer above is illustrative, not normative.** It is a string the daemon
-compares with `strcmp` and never dereferences — there is no JWKS fetch and no
-discovery document, because the key is pinned in configuration (§3.4). Any
+compares with `strcmp` and never dereferences — there is no discovery document,
+because the keys are pinned in configuration (§3.4). Any
 value both sides agree on works, and an implementer should not read the example
 as a URL that has to resolve, or as requiring a particular subdomain.
 
@@ -258,8 +258,9 @@ The daemon validates it by **pinning both the keys and the algorithm**
 - it verifies the signature with mbedTLS (ES256 = ECDSA-P256, which mbedTLS
   supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
 - it chooses the key by the header's `kid` — the signing key's RFC 7638
-  thumbprint, which it computes for each key it pins — and refuses a token whose
-  `kid` is absent or names none of them (§8.3);
+  thumbprint, which it computes for each key it holds — and refuses a token whose
+  `kid` is absent or names none of them (§8.3). The keys it holds are the pinned
+  ones and, on an enrolled box, the ones the relay publishes (§3.4);
 - it checks `iss` (central) and `aud` (== this workspace's configured opaque id —
   not its hostname — so a token minted for one workspace cannot be replayed at
   another);
@@ -285,6 +286,14 @@ targets the high-frequency message path, not the auth bootstrap.)
   and this workspace's **`audience` id** — the opaque registered id described in
   §3.3. A self-hoster enabling relay-OIDC enrolls their workspace with central
   once, after which central will mint tokens for that audience.
+- **An enrolled box follows a rotation by itself.** It reads
+  `<relay origin>/oidc/jwks` at boot and daily — every minute while it gets no
+  good answer — over HTTPS verified with the built-in roots, and trusts the ES256
+  P-256 signing keys there beside the pinned ones. Each answer replaces the last;
+  none removes a pinned key, which is the floor whatever central publishes. So
+  central rotates by publishing the next key, signing with it a day later, and
+  dropping the old one after that, and no box's operator does anything. A box
+  that is not enrolled — no `OPENCHIME_ENROLL_URL` — has only its pinned keys.
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
   *new logins* need central up, and the message path never does. Local mode has

@@ -16,6 +16,7 @@ int run_auth_tests(void);
 int run_jwt_tests(void);
 int run_joinrules_tests(void);
 int run_idtoken_tests(void);
+int run_relaykeys_tests(void);
 int run_totp_tests(void);
 int run_webauthn_tests(void);
 int run_proxyproto_tests(void);
@@ -214,6 +215,7 @@ int main(void) {
     total += SUITE(run_jwt_tests);
     total += SUITE(run_joinrules_tests);
     total += SUITE(run_idtoken_tests);
+    total += SUITE(run_relaykeys_tests);
     total += SUITE(run_totp_tests);
     total += SUITE(run_webauthn_tests);
     total += SUITE(run_proxyproto_tests);
