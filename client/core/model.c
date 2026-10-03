@@ -2443,11 +2443,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         set_signin_provider(m, e->body);
         break;
     case OC_EV_WORKSPACE_MOVED:
-        if (e->body) {
-            char buf[320];
-            snprintf(buf, sizeof buf, "This workspace has moved to %s; it is used from now on.", e->body);
-            set_status(m, buf);
-        }
+        /* Formatted straight into the status line, which is the one bound that
+         * matters: a larger scratch buffer copied into it only moves the cut. */
+        if (e->body)
+            snprintf(m->status, sizeof m->status, "This workspace has moved to %s; it is used from now on.", e->body);
         break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
