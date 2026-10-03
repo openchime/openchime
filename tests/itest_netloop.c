@@ -4790,6 +4790,16 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
      * client must never have to infer "no pause" from silence. */
     CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
     { oc_snooze sn0; CHECK(oc_decode_snooze(&p, &sn0) == OC_OK && sn0.until_ms == 0); }
+    /* The owner, connected all along, is told of the new member unasked: a
+     * USER_LIST of one, sent before the newcomer's AUTH_OK, so it is the next
+     * frame here -- the roster gains them without a reconnect. */
+    {
+        CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_USER_LIST);
+        oc_user_list_entry je[4]; uint16_t jn = 0;
+        CHECK(oc_decode_user_list(&p, je, 4, &jn) == OC_OK && jn == 1);
+        CHECK(je[0].user_id == unh && je[0].role == OC_ROLE_MEMBER && !je[0].disabled &&
+              je[0].display_name.len == 7 && memcmp(je[0].display_name.ptr, "newhire", 7) == 0);
+    }
 
     /* Owner promotes the new hire to admin: owner acks, the hire is pushed the
      * new role on their live connection. */

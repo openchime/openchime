@@ -773,6 +773,13 @@ static uint64_t next_credential_version(sqlite3 *db) {
     return v;
 }
 
+/* The account the job in hand created, or 0. Set by the two statements that
+ * make a user row -- register_local and create_oidc_user, which every way in
+ * goes through -- and read once the job is done, so whatever the job was, the
+ * new member is announced to everyone connected (writer_loop). The writer's
+ * own thread only. */
+static __thread uint64_t g_joined_uid;
+
 static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
                                const char *password, size_t plen,
                                uint8_t role, uint32_t iterations) {
@@ -796,7 +803,7 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
     sqlite3_bind_text(st, 2, username, (int)ulen, SQLITE_TRANSIENT);   /* display name = login name */
     sqlite3_bind_text(st, 3, u8_to_role(role), -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
-    sqlite3_step(st);
+    int made = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) > 0;
     sqlite3_finalize(st);
 
     uint64_t uid = 0;
@@ -826,6 +833,7 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
 
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     ensure_default_membership(db, uid);
+    if (made) g_joined_uid = uid;
     return uid;
 }
 
@@ -1327,7 +1335,10 @@ static uint64_t create_oidc_user(sqlite3 *db, const char *legacy,
     sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
     int ok = (sqlite3_step(st) == SQLITE_DONE);
     sqlite3_finalize(st);
-    return ok ? (uint64_t)sqlite3_last_insert_rowid(db) : 0;
+    if (!ok) return 0;
+    uint64_t uid = (uint64_t)sqlite3_last_insert_rowid(db);
+    g_joined_uid = uid;
+    return uid;
 }
 
 static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
@@ -2514,21 +2525,16 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
 
 /* --- Admin ops (REQ-033, tenant-level; owner/admin) --------------------- */
 
-/* Enumerate every tenant user. Available to any authenticated user (a client
- * needs the roster to address messages and pick op targets). */
-static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
-    oc_dbres *r = calloc(1, sizeof *r);
-    if (!r) return NULL;
-    r->conn_id = j->conn_id;
-    r->type = OC_RES_USER_LIST;
-
+/* The roster's rows: everyone, or (`only` non-zero) the one user. */
+static void user_rows(sqlite3 *db, uint64_t only, oc_dbres *r) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
         "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
         "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(voice_id,'') "
-        "FROM users ORDER BY id;", -1, &st, NULL);
+        "FROM users WHERE ?1 = 0 OR id = ?1 ORDER BY id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)only);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
     while (arr && sqlite3_step(st) == SQLITE_ROW) {
@@ -2560,6 +2566,16 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     r->ulist = arr;
     r->n_ulist = n;
+}
+
+/* Enumerate every tenant user. Available to any authenticated user (a client
+ * needs the roster to address messages and pick op targets). */
+static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_USER_LIST;
+    user_rows(db, 0, r);
     return r;
 }
 
@@ -9906,7 +9922,14 @@ static void *writer_loop(void *arg) {
         pthread_mutex_unlock(&w->mu);
 
         w->auth_deferred = 0;
+        g_joined_uid = 0;
         oc_dbres *r = process_write(w, j);
+        /* A member who did not exist before this job: their roster row rides on
+         * its result, for everyone connected, whatever the job answers. */
+        if (g_joined_uid && r && !r->ulist) {
+            user_rows(w->db, g_joined_uid, r);
+            r->joined = r->n_ulist != 0;
+        }
         for (oc_dbres *q = r; q; q = q->next) q->gen = j->gen;
         if (!w->auth_deferred) job_free(j);   /* else the auth pool has it (process_auth) */
         push_result(w, r);

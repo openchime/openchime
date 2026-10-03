@@ -856,6 +856,13 @@ carries it to whoever opened the card. `voice_id` **is** here: everyone hears th
 same voice for the same author (REQ-292), so it is a name decoration like the
 pronouns beside it, and empty means the daemon has not chosen one yet.
 
+The daemon also sends a `USER_LIST` unasked, to every signed-in connection, the
+moment an account is created — an invitation redeemed, a first sign-in through a
+provider, an account made on the daemon's pages: a list of one, the new member.
+A client folds every `USER_LIST` into its roster entry by entry, so this adds the
+newcomer to every open People list and member picker without waiting for a
+`LIST_USERS`.
+
 Because this is a repeated list, an added field shifts **every** entry after the
 first — which is why adding one always raises the protocol version rather than
 riding along. `title`, `timezone` and the status fields are here, and not only on

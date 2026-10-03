@@ -5153,9 +5153,42 @@ static void close_revoked(int ep, conn **conns, const oc_dbres *r) {
     }
 }
 
+/* A USER_LIST of `r`'s rows into g_enc; its length. */
+static size_t encode_user_list(const oc_dbres *r) {
+    size_t n = r->n_ulist > OC_USER_LIST_MAX ? OC_USER_LIST_MAX : r->n_ulist;
+    oc_user_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+    if (n && !ents) n = 0;
+    for (size_t i = 0; i < n; i++) {
+        ents[i].user_id = r->ulist[i].user_id;
+        ents[i].role = r->ulist[i].role;
+        ents[i].disabled = r->ulist[i].disabled;
+        ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
+        ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
+        ents[i].avatar_id = r->ulist[i].avatar_id;
+        ents[i].title = oc_slice_str(r->ulist[i].title ? r->ulist[i].title : "");
+        ents[i].timezone = oc_slice_str(r->ulist[i].timezone ? r->ulist[i].timezone : "");
+        ents[i].status_emoji = oc_slice_str(r->ulist[i].status_emoji ? r->ulist[i].status_emoji : "");
+        ents[i].status_text = oc_slice_str(r->ulist[i].status_text ? r->ulist[i].status_text : "");
+        ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
+        ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
+        ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
+    }
+    oc_wbuf w;
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    oc_user_list ul = { (uint16_t)n, ents };
+    oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &ul);
+    free(ents);
+    return w.len;
+}
+
 static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) {
     (void)dbw;
     oc_wbuf w;
+    /* Somebody joined -- by invitation, a first sign-in, an account made on the
+     * pages: everyone connected learns them now, not at their next LIST_USERS.
+     * Before the answer, so the newcomer's own first connection, not signed in
+     * yet, is not sent a row its own roster request brings anyway. */
+    if (r->joined) send_to_all_authed(ep, conns, g_enc, encode_user_list(r));
     switch (r->type) {
     case OC_RES_AUTH_OK: {
         conn *c = find_by_id(conns, r->conn_id);
@@ -5670,29 +5703,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_USER_LIST: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        size_t n = r->n_ulist > OC_USER_LIST_MAX ? OC_USER_LIST_MAX : r->n_ulist;
-        oc_user_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
-        if (n && !ents) n = 0;
-        for (size_t i = 0; i < n; i++) {
-            ents[i].user_id = r->ulist[i].user_id;
-            ents[i].role = r->ulist[i].role;
-            ents[i].disabled = r->ulist[i].disabled;
-            ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
-            ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
-            ents[i].avatar_id = r->ulist[i].avatar_id;      /* */
-            ents[i].title = oc_slice_str(r->ulist[i].title ? r->ulist[i].title : "");
-            ents[i].timezone = oc_slice_str(r->ulist[i].timezone ? r->ulist[i].timezone : "");
-            ents[i].status_emoji = oc_slice_str(r->ulist[i].status_emoji ? r->ulist[i].status_emoji : "");
-            ents[i].status_text = oc_slice_str(r->ulist[i].status_text ? r->ulist[i].status_text : "");
-            ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
-            ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
-            ents[i].voice_id = oc_slice_str(r->ulist[i].voice_id ? r->ulist[i].voice_id : "");
-        }
-        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
-        oc_user_list ul = { (uint16_t)n, ents };
-        oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &ul);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
-        free(ents);
+        send_bytes(ep, conns, c->fd, g_enc, encode_user_list(r));
         break;
     }
     case OC_RES_INVITE_OK: {
