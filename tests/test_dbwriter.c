@@ -30,7 +30,8 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
         oc_dbres *r = oc_dbwriter_next_result(w);
         if (r) return r;
         clock_gettime(CLOCK_MONOTONIC, &t);
-        if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000 > 5000) return NULL;
+        /* Only a guard against a hang: a loaded machine can take seconds. */
+        if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000 > 30000) return NULL;
         struct pollfd pf = { oc_dbwriter_eventfd(w), POLLIN, 0 };
         if (poll(&pf, 1, 10) > 0) {           /* readable: drain it, or it stays so */
             uint64_t v; ssize_t rd = read(pf.fd, &v, sizeof v); (void)rd;
@@ -4324,29 +4325,39 @@ static void test_idem_pruning(void) {
     cleanup_db(path);
     oc_dbwriter *w = start_db(path);
     CHECK(w != NULL);
-    /* Tiny retention + prune-every-write so the test can observe it. */
-    /* A generous retention window: the "still deduplicated" checks below do
-     * several async round-trips that must land inside it, so a tight window
-     * (e.g. 50 ms) races the clock on a slow/loaded CI runner. */
-    oc_dbwriter_set_idem_retention(w, 600 /*ms*/, 0 /*interval*/);
+    /* Prune on every write. Each step below only gets more certain the slower
+     * the machine: a mapping is aged by waiting after it is written, and the
+     * window is widened again before anything must survive it. */
+    oc_dbwriter_set_idem_retention(w, 3600000 /*ms*/, 0 /*interval*/);
 
     uint64_t uid = reg(w, "pr-user", "pw", OC_ROLE_MEMBER);
     CHECK(uid != 0);
 
-    uint8_t tokA[OC_IDEM_LEN], tokB[OC_IDEM_LEN];
+    uint8_t tokA[OC_IDEM_LEN], tokB[OC_IDEM_LEN], tokC[OC_IDEM_LEN];
     memset(tokA, 0xA1, sizeof tokA);
     memset(tokB, 0xB2, sizeof tokB);
+    memset(tokC, 0xC3, sizeof tokC);
 
     uint64_t m1 = send_msg(w, uid, tokA, "first");
     CHECK(m1 != 0);
     /* Fresh token is still deduplicated. */
     CHECK(send_msg(w, uid, tokA, "first-again") == m1);
 
-    usleep(800000);    /* age tokA past the 600 ms retention */
+    usleep(50000);    /* tokA is now at least 50 ms old */
 
-    /* A new send triggers the prune, dropping tokA's aged mapping. */
+    /* A write under a 20 ms window prunes tokA's aged mapping. */
+    oc_dbwriter_set_idem_retention(w, 20, 0);
+    uint64_t mc = send_msg(w, uid, tokC, "prune");
+    CHECK(mc > m1);
+    /* The writer prunes after it answers; one more job is taken only once that
+     * prune is done. */
+    uint8_t tokD[OC_IDEM_LEN];
+    memset(tokD, 0xD4, sizeof tokD);
+    CHECK(send_msg(w, uid, tokD, "after-prune") > mc);
+    oc_dbwriter_set_idem_retention(w, 3600000, 0);
+
     uint64_t m2 = send_msg(w, uid, tokB, "second");
-    CHECK(m2 > m1);
+    CHECK(m2 > mc);
 
     /* tokA is no longer deduplicated -> a retry allocates a fresh id. */
     uint64_t m3 = send_msg(w, uid, tokA, "first-retry");
@@ -7733,6 +7744,9 @@ static void test_actions(void) {
     CHECK(r && r->type == OC_RES_DELETE_OK);
     oc_dbres_free(r);
     CHECK(!action_row(path, act, NULL, NULL, NULL, 0));
+    /* Longer than the window an earlier test gave its own writer: this writer
+     * still has the full one. */
+    usleep(120000);
     r = del_or_restore(w, OC_JOB_RESTORE, alice, act);
     CHECK(r && r->type == OC_RES_RESTORE_OK && live_action(r, act, 6, 7));
     oc_dbres_free(r);
