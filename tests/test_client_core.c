@@ -2645,20 +2645,27 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     pthread_mutex_unlock(&g_tap.mu);
     CHECK(big > 10 && bad == 0);                              /* the screen went as SFrame, in fragments */
 
-    /* A tenth of everything lost on the way to the relay: the picture keeps coming. */
+    /* A tenth of everything lost on the way to the relay: the picture keeps
+     * coming. The loss stays on until three more frames have arrived through
+     * it, erik has asked again for what was lost and dana has sent it --
+     * however long that takes on this machine -- so what is measured is
+     * recovery, not how many frames fit in a fixed time. */
     oc_call_engine_stats(eb, &st);
     uint32_t nacks0 = st.view_nacks;
     int got0 = wb.frames;
+    uint64_t lossy = mono_ms();
     __atomic_store_n(&g_tap.drop_pm, 100, __ATOMIC_RELEASE);
-    uint64_t until = mono_ms() + 1500;
-    CALL_WAIT(3000, ({ watch(eb, &wb); mono_ms() > until; }));
+    oc_call_stats sa;
+    int through = CALL_WAIT(20000, ({ watch(eb, &wb); oc_call_engine_stats(eb, &st); oc_call_engine_stats(ea, &sa);
+                                      wb.frames - got0 >= 3 && st.view_nacks > nacks0 && sa.share_resent > 0; }));
     __atomic_store_n(&g_tap.drop_pm, 0, __ATOMIC_RELEASE);
     oc_call_engine_stats(eb, &st);
-    oc_call_stats sa; oc_call_engine_stats(ea, &sa);
-    printf("  at 10%% loss for 1.5 s: erik has %d more frames, %u NACKs, dana resent %u, %u PLIs, %u given up;"
-           " dana's rate %d kbps at %dx%d\n", wb.frames - got0, st.view_nacks - nacks0, sa.share_resent,
-           st.view_plis, st.view_skipped, sa.share_kbps, sa.share_width, sa.share_height);
-    CHECK(wb.frames - got0 >= 3 && st.view_nacks > nacks0 && sa.share_resent > 0 && wb.rising && wb.bad == 0);
+    oc_call_engine_stats(ea, &sa);
+    printf("  at 10%% loss: erik has %d more frames in %llu ms, %u NACKs, dana resent %u, %u PLIs, %u given up;"
+           " dana's rate %d kbps at %dx%d\n", wb.frames - got0, (unsigned long long)(mono_ms() - lossy),
+           st.view_nacks - nacks0, sa.share_resent, st.view_plis, st.view_skipped, sa.share_kbps,
+           sa.share_width, sa.share_height);
+    CHECK(through && wb.rising && wb.bad == 0);
 
     /* faye joins late: a keyframe comes for her. */
     uint64_t joined = mono_ms();
