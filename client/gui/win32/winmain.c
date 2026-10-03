@@ -12756,9 +12756,53 @@ static const oc_modal_spec *modal_current(void);
  * the size of a three-field sign-up. Checks and choices are drawn with the same
  * chips the rest of the app uses rather than native BUTTONs: a radio button is
  * fine, but two idioms on one card is what this whole item was about. */
-/* A multi-line field's box: five lines of the form's text, which is room to see
- * a paragraph and its shape without the card outgrowing a small window. */
-#define FORM_MULTI_H (UIS(22.0f) * 5.0f + UIS(8.0f))
+/* A multi-line field's box: five lines of the form's text at least, which is
+ * room to see a paragraph and its shape -- and as many more as the value it
+ * opens with takes, up to FORM_MULTI_MAX. A value shown to be read and copied
+ * (an invitation, a reset to send) is read in the field, and a fixed five lines
+ * left the reset code itself below the fold, found only by scrolling a box
+ * that did not look as if it scrolled. */
+#define FORM_MULTI_MIN 5
+#define FORM_MULTI_MAX 16
+
+/* How many lines `s` takes wrapped into `w` -- text_height's count. */
+static int text_lines(const char *s, fmtw *fmt, float w) {
+    if (!s || !s[0] || !fmt || !fmt->f || w <= 0) return 0;
+    st_layout *l = st_layout_create(g_st, fmt->f, s, strlen(s), w, 4000.0f, fmt->align);
+    if (!l) return 0;
+    st_metrics m;
+    st_layout_metrics(l, &m);
+    st_layout_destroy(l);
+    return m.lines;
+}
+
+/* The lines each multi-line field's EDIT wrapped its opening value into, counted
+ * by the EDIT itself once it had its width (form_dialog); 0 until then. Taken
+ * once, so the box does not change height under someone typing in it. */
+static int g_form_lines[FORM_MAX_FIELDS];
+
+/* `w` is the row's width. The count is the EDIT's own where it has one; before
+ * the EDIT is placed it is estimated in the UI face the EDIT is given
+ * (form_font) at the width it will have -- the box FORM_BOX_INSET in from each
+ * side, the EDIT 9 in from that (layout_natives) -- with a line to spare, since
+ * two engines wrap a long word differently. */
+static float form_multi_h(const oc_field *f, float w) {
+    /* The EDIT's own line pitch where its font exists; the five-line floor is
+     * the box this field always had. */
+    float lh = g_form_font_lh > 0 ? DIPF(g_form_font_lh) : UIS(22.0f);
+    float floor_h = UIS(22.0f) * (float)FORM_MULTI_MIN + UIS(8.0f);
+    int lines = FORM_MULTI_MIN;
+    if (f && f->value[0]) {
+        int i = (g_form_f && f >= g_form_f && f < g_form_f + g_form_n) ? (int)(f - g_form_f) : -1;
+        int n = (i >= 0 && g_form_lines[i] > 0)
+              ? g_form_lines[i]
+              : text_lines(f->value, g_ui, w - 2 * FORM_BOX_INSET - 18.0f - UIS(8.0f)) + 1;
+        if (n > lines) lines = n;
+        if (lines > FORM_MULTI_MAX) lines = FORM_MULTI_MAX;
+    }
+    float h = lh * (float)lines + UIS(12.0f);
+    return h > floor_h ? h : floor_h;
+}
 
 /* The room a text field's hint takes below its box: its wrapped height, and
  * never less than the one line every hint was given before it wrapped. */
@@ -12793,7 +12837,7 @@ static float form_rowh(const oc_field *f, float w) {
      * single line lost the half of a sentence that said what to do. */
     float hint = (f->hint && f->hint[0]) ? form_hint_h(f->hint, w) : 0;
     if (f->kind == FF_MULTILINE)
-        return UIS(22.0f) + FORM_MULTI_H + (hint > 0 ? hint + UIS(6.0f) : UIS(6.0f));
+        return UIS(22.0f) + form_multi_h(f, w) + (hint > 0 ? hint + UIS(6.0f) : UIS(6.0f));
     return UIS(54.0f) + hint;
 }
 
@@ -12900,7 +12944,7 @@ static void draw_form(gfx *rt, rectf body) {
                       rf(box.right - 22, box.top + 5, box.right - 6, box.bottom), OC_COL_FAINT);
         } else {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
-            float bh = f->kind == FF_MULTILINE ? FORM_MULTI_H : 28.0f;
+            float bh = f->kind == FF_MULTILINE ? form_multi_h(f, body.right - body.left) : 28.0f;
             rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
                            body.right - FORM_BOX_INSET, y + 22 + bh);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
@@ -25647,8 +25691,25 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
      * fields — the same class of bug as a predicate whose default is a real
      * answer. */
     g_form_sel_field = -1; g_form_sel_scroll = 0;
+    memset(g_form_lines, 0, sizeof g_form_lines);
     modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
     layout_natives(owner);
+    /* A multi-line field is as tall as its value's lines, and only the EDIT,
+     * placed at its width, can say how many it wraps them into: count them, then
+     * paint and place once more at that height. */
+    {
+        int counted = 0;
+        for (int i = 0; i < n; i++)
+            if (f[i].kind == FF_MULTILINE && g_form_edit[i] && f[i].value[0]) {
+                g_form_lines[i] = (int)SendMessageW(g_form_edit[i], EM_GETLINECOUNT, 0, 0);
+                counted = 1;
+            }
+        if (counted) {
+            InvalidateRect(owner, NULL, FALSE);
+            UpdateWindow(owner);
+            layout_natives(owner);
+        }
+    }
     g_form_focus = -1; g_form_focus_btn = 0;
     for (int i = 0; i < n; i++)
         if (g_form_edit[i]) { SetFocus(g_form_edit[i]); SendMessageW(g_form_edit[i], EM_SETSEL, 0, -1); break; }
@@ -28195,6 +28256,16 @@ static void test_dump(const char *path) {
         fprintf(f, "  formfield %d kind=%d edit=%d r=%.0f,%.0f,%.0f,%.0f value=\"%s\"\n",
                 i, g_form_f[i].kind, g_form_edit[i] ? 1 : 0,
                 fr.left, fr.top, fr.right, fr.bottom, cur);
+        /* A multi-line field's lines, as the EDIT itself wraps them, against how
+         * many its box shows: "all of it is visible" is lines <= shown. */
+        if (g_form_f[i].kind == FF_MULTILINE && g_form_edit[i]) {
+            RECT er; SendMessageW(g_form_edit[i], EM_GETRECT, 0, (LPARAM)&er);
+            int lhp = g_form_font_lh > 0 ? g_form_font_lh : 1;
+            fprintf(f, "  formlines %d lines=%d shown=%d first=%d\n", i,
+                    (int)SendMessageW(g_form_edit[i], EM_GETLINECOUNT, 0, 0),
+                    (int)((er.bottom - er.top) / lhp),
+                    (int)SendMessageW(g_form_edit[i], EM_GETFIRSTVISIBLELINE, 0, 0));
+        }
     }
     fprintf(f, "formsel open=%d field=%d scroll=%d rows=%d panel=%.0f,%.0f,%.0f,%.0f\n",
             g_form_sel_field >= 0, g_form_sel_field, g_form_sel_scroll, g_n_form_sel_rows,
