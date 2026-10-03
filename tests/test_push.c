@@ -141,7 +141,7 @@ static void test_sign_verify(void) {
     const char *body = "{\"notifications\":[]}";
     long ts = 1750000000L;
     char sig_b64[512];
-    CHECK(oc_push_sign(pk, aud, body, ts, sig_b64, sizeof sig_b64) == 0);
+    CHECK(oc_push_sign(pk, "POST", "/api/machine/push/notify", aud, body, ts, sig_b64, sizeof sig_b64) == 0);
 
     uint8_t sig[160];
     size_t siglen = 0;
@@ -158,10 +158,28 @@ static void test_sign_verify(void) {
     char hex[65];
     for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", bh[i]);
     char canon[640];
-    int cn = snprintf(canon, sizeof canon, "openchime-machine-v1|%s|%ld|%s", aud, ts, hex);
+    int cn = snprintf(canon, sizeof canon, "openchime-machine-v2|POST|/api/machine/push/notify|%s|%ld|%s", aud, ts, hex);
     uint8_t h[32];
     mbedtls_sha256((const unsigned char *)canon, (size_t)cn, h, 0);
     CHECK(mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, h, sizeof h, sig, siglen) == 0);
+
+    /* Good for that endpoint and method only: not another path, not another
+     * method, and not as the method-and-path-blind v1 string. */
+    static const char *const OTHER[] = {
+        "openchime-machine-v2|POST|/api/machine/invite/notify|%s|%ld|%s",
+        "openchime-machine-v2|PUT|/api/machine/push/notify|%s|%ld|%s",
+        "openchime-machine-v1|%s|%ld|%s",
+    };
+    for (size_t i = 0; i < sizeof OTHER / sizeof OTHER[0]; i++) {
+        char co[640];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+        int on = snprintf(co, sizeof co, OTHER[i], aud, ts, hex);
+#pragma GCC diagnostic pop
+        uint8_t ho[32];
+        mbedtls_sha256((const unsigned char *)co, (size_t)on, ho, 0);
+        CHECK(mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, ho, sizeof ho, sig, siglen) != 0);
+    }
 
     /* A tampered body (different hash) must not verify against the same signature. */
     uint8_t bh2[32];
@@ -169,7 +187,8 @@ static void test_sign_verify(void) {
     char hex2[65];
     for (int i = 0; i < 32; i++) snprintf(hex2 + i * 2, 3, "%02x", bh2[i]);
     char canon2[640];
-    int cn2 = snprintf(canon2, sizeof canon2, "openchime-machine-v1|%s|%ld|%s", aud, ts, hex2);
+    int cn2 = snprintf(canon2, sizeof canon2, "openchime-machine-v2|POST|/api/machine/push/notify|%s|%ld|%s",
+                       aud, ts, hex2);
     uint8_t h2[32];
     mbedtls_sha256((const unsigned char *)canon2, (size_t)cn2, h2, 0);
     CHECK(mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, h2, sizeof h2, sig, siglen) != 0);

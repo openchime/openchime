@@ -82,10 +82,14 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
 int oc_push_collect_call(sqlite3 *db, uint64_t channel_id, uint64_t inviter, uint64_t invitee,
                          uint64_t now_ms, oc_push_target *out, int max);
 
-/* Sign the CP-12 canonical string for `body` with the enrollment key ->
- * base64(DER ECDSA) into sig_b64. Returns 0 on success. */
-int oc_push_sign(const char *privkey_pem, const char *audience, const char *body,
-                 long ts, char *sig_b64, size_t sig_cap);
+/* Sign a machine request with the enrollment key: the canonical string
+ * openchime-machine-v2|<METHOD>|<path>|<aud>|<ts>|<sha256hex(body)>, so the
+ * signature is good for that one endpoint and method (AUTH.md §8.7). `path` is
+ * the request's path and query as sent. base64(DER ECDSA) into sig_b64; 0 on
+ * success. The request carries OC_MACHINE_SIG_VERSION_HEADER beside it. */
+#define OC_MACHINE_SIG_VERSION_HEADER "X-OpenChime-Signature-Version: 2\r\n"
+int oc_push_sign(const char *privkey_pem, const char *method, const char *path, const char *audience,
+                 const char *body, long ts, char *sig_b64, size_t sig_cap);
 
 /* Build the contentless notify JSON body from targets. Returns 0 on success. */
 int oc_push_build_body(uint64_t channel_id, const oc_push_target *targets, int n,

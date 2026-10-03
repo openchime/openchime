@@ -242,6 +242,7 @@ static int post_signed(push_ctx *ctx, const char *path, const char *audience, lo
         "POST %s HTTP/1.1\r\nHost: %s\r\n"
         "Content-Type: application/json\r\n"
         "X-OpenChime-Audience: %s\r\nX-OpenChime-Timestamp: %ld\r\nX-OpenChime-Signature: %s\r\n"
+        OC_MACHINE_SIG_VERSION_HEADER
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
         path, ctx->endpoint, audience, ts, sig, blen);
     if (n < 0 || n >= (int)sizeof head ||
@@ -323,7 +324,7 @@ int oc_machine_http_post(oc_machine_http *h, const char *path, const char *audie
     if (!h || !path || !audience || !privkey_pem || !body || !status) return -1;
     long ts = (long)time(NULL);
     char sig[512];
-    if (oc_push_sign(privkey_pem, audience, body, ts, sig, sizeof sig) != 0) return -1;
+    if (oc_push_sign(privkey_pem, "POST", path, audience, body, ts, sig, sizeof sig) != 0) return -1;
     char resp[1024];
     size_t rlen = 0;
     return post_signed(&h->ctx, path, audience, ts, sig, body, status, resp, sizeof resp, &rlen);
@@ -509,8 +510,8 @@ int oc_push_collect_call(sqlite3 *db, uint64_t channel_id, uint64_t inviter, uin
     return collect(db, channel_id, inviter, 0, 0, invitee, 0, now_ms, out, max);
 }
 
-int oc_push_sign(const char *privkey_pem, const char *audience, const char *body,
-                 long ts, char *sig_b64, size_t sig_cap) {
+int oc_push_sign(const char *privkey_pem, const char *method, const char *path, const char *audience,
+                 const char *body, long ts, char *sig_b64, size_t sig_cap) {
     push_rng rng;
     if (rng_init(&rng) != 0) { rng_free(&rng); return -1; }
 
@@ -525,8 +526,8 @@ int oc_push_sign(const char *privkey_pem, const char *audience, const char *body
     char hex[65];
     for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", bh[i]);
 
-    char canon[640];
-    int cn = snprintf(canon, sizeof canon, "openchime-machine-v1|%s|%ld|%s", audience, ts, hex);
+    char canon[1024];
+    int cn = snprintf(canon, sizeof canon, "openchime-machine-v2|%s|%s|%s|%ld|%s", method, path, audience, ts, hex);
     if (cn < 0 || cn >= (int)sizeof canon) goto done;
 
     uint8_t h[32];
@@ -632,7 +633,10 @@ static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
 
     long ts = (long)nowsec;
     char sig[512];
-    if (oc_push_sign(p->privkey, p->audience, body, ts, sig, sizeof sig) != 0) { free(body); return; }
+    if (oc_push_sign(p->privkey, "POST", "/api/machine/push/notify", p->audience, body, ts, sig, sizeof sig) != 0) {
+        free(body);
+        return;
+    }
 
     int status = 0;
     char resp[8192];
