@@ -690,7 +690,7 @@ static void test_forward_frame(void) {
      * replayed on backfill. Populated and empty, per TESTING.md 2.2. */
     {
         oc_forward in = { 1001, 7, 3, 909, 42, oc_slice_str("the original text"), 2,
-                          oc_slice_str("report.txt") };
+                          oc_slice_str("report.txt"), 0 };
         ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
         oc_forward out;
         CHECK(oc_decode_forward(&p, &out) == OC_OK);
@@ -699,16 +699,102 @@ static void test_forward_frame(void) {
         CHECK(slice_eq_str(out.src_excerpt, "the original text"));
         CHECK(out.n_attach == 2);
         CHECK(slice_eq_str(out.src_attach_name, "report.txt"));
+        CHECK(out.src_action == 0);
     }
     {
         /* An empty excerpt is ordinary: a message can be nothing but a file. */
-        oc_forward in = { 1002, 7, 3, 910, 42, oc_slice_str(""), 0, oc_slice_str("") };
+        oc_forward in = { 1002, 7, 3, 910, 42, oc_slice_str(""), 0, oc_slice_str(""), 0 };
         ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
         oc_forward out;
         CHECK(oc_decode_forward(&p, &out) == OC_OK);
         CHECK(out.src_excerpt.len == 0 && out.n_attach == 0);
         CHECK(out.src_attach_name.len == 0);
         CHECK(out.src_message == 910);
+    }
+    {
+        /* A forward of an action (REQ-058): the excerpt is its text, and the
+         * flag is the last byte, so a dropped one fails the decode. */
+        oc_forward in = { 1003, 7, 3, 911, 42, oc_slice_str("is away"), 0, oc_slice_str(""), 1 };
+        ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
+        oc_forward out;
+        CHECK(oc_decode_forward(&p, &out) == OC_OK);
+        CHECK(out.src_action == 1 && slice_eq_str(out.src_excerpt, "is away"));
+    }
+}
+
+/* ACTION (REQ-058, ARCH-115), and the action byte every excerpt frame carries.
+ * Each excerpt's flag is the LAST field it writes, so the cases set it to 1:
+ * a decoder that forgot it would read short and fail rather than pass on a 0
+ * it never read. */
+static void test_action_frames(void) {
+    {
+        oc_action in = { 1001, 7, 42, oc_slice_str("GitHub CI"), 4, 7 };
+        ROUNDTRIP(oc_encode_action(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ACTION, h, p);
+        oc_action out;
+        CHECK(oc_decode_action(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.actor_id == 42);
+        CHECK(slice_eq_str(out.actor_name, "GitHub CI"));
+        CHECK(out.text_start == 4 && out.text_len == 7);
+    }
+    {
+        /* Not (or no longer) an action: text_len 0, and no name. */
+        oc_action in = { 1002, 7, 0, oc_slice_str(""), 0, 0 };
+        ROUNDTRIP(oc_encode_action(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ACTION, h, p);
+        oc_action out;
+        CHECK(oc_decode_action(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1002 && out.text_len == 0 && out.actor_name.len == 0);
+    }
+    {
+        oc_pinned_msg in = { 1001, 7, 42, 5, 43, 6, oc_slice_str("is away"), oc_slice_str(""), 1 };
+        ROUNDTRIP(oc_encode_pinned_msg(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PINNED_MSG, h, p);
+        oc_pinned_msg out;
+        CHECK(oc_decode_pinned_msg(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && slice_eq_str(out.body, "is away") && out.pinned_by == 43);
+    }
+    {
+        oc_saved_msg in = { 1001, 7, 42, 5, 6, oc_slice_str("is away"), oc_slice_str("a.txt"), 1 };
+        ROUNDTRIP(oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SAVED_MSG, h, p);
+        oc_saved_msg out;
+        CHECK(oc_decode_saved_msg(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && slice_eq_str(out.body, "is away") && slice_eq_str(out.attach_name, "a.txt"));
+    }
+    {
+        oc_activity_entry in = { 1, 1001, 7, 42, 5, oc_slice_str("waves at @dana"), 1 };
+        ROUNDTRIP(oc_encode_activity_entry(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ACTIVITY_ENTRY, h, p);
+        oc_activity_entry out;
+        CHECK(oc_decode_activity_entry(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && out.actor_id == 42 && slice_eq_str(out.text, "waves at @dana"));
+    }
+    {
+        oc_thread_summary in = { 0 };
+        in.root_id = 900; in.channel_id = 1; in.root_author = 2;
+        in.preview = oc_slice_str("is away"); in.action = 1;
+        ROUNDTRIP(oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_SUMMARY, h, p);
+        oc_thread_summary out = { 0 };
+        CHECK(oc_decode_thread_summary(&p, &out) == OC_OK);
+        CHECK(out.action == 1 && slice_eq_str(out.preview, "is away"));
+    }
+    {
+        oc_channel_list_entry ents[2] = {
+            { .channel_id = 1, .name = oc_slice_str("general"), .kind = OC_CHANNEL_KIND,
+              .preview = oc_slice_str("is away"), .preview_author = 42, .preview_action = 1 },
+            { .channel_id = 2, .name = oc_slice_str("random"), .kind = OC_CHANNEL_KIND,
+              .preview = oc_slice_str("/me"), .preview_author = 43, .preview_action = 0 },
+        };
+        oc_channel_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_LIST, h, p);
+        oc_channel_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_channel_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2 && out[0].preview_action == 1 && out[0].preview_author == 42);
+        CHECK(out[1].preview_action == 0 && slice_eq_str(out[1].preview, "/me"));
+    }
+    {
+        oc_search_result_entry ents[1] = { { 1001, 7, 42, 5, oc_slice_str("is away"), 1 } };
+        oc_search_results in = { 1, ents, 0 };
+        ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
+        oc_search_result_entry out[1]; uint16_t n = 0; uint8_t trunc = 9;
+        CHECK(oc_decode_search_results(&p, out, 1, &n, &trunc) == OC_OK);
+        CHECK(n == 1 && out[0].action == 1 && trunc == 0);
     }
 }
 
@@ -1052,8 +1138,8 @@ static void test_search_frames(void) {
     }
     {
         oc_search_result_entry ents[2] = {
-            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ...") },
-            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again") },
+            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ..."), 0 },
+            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again"), 0 },
         };
         oc_search_results in = { 2, ents, 1 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
@@ -2305,6 +2391,7 @@ int run_protocol_tests(void) {
     test_reaction_frames();
     test_unfurl_frame();
     test_forward_frame();
+    test_action_frames();
     test_thread_frames();
     test_thread_list_frames();
     test_mark_all_read_frame();

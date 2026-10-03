@@ -146,8 +146,14 @@
  * 4: USER_LIST carries each user's avatar attachment id. A frame LAYOUT
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
- * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 22u
+ * "connection lost" (ARCH-61 ships the two together).
+ *
+ * 23: actions (REQ-058, ARCH-115). ACTION (0x00FC) is a new frame, which alone
+ * would need no bump; but every excerpt the daemon builds now says whether its
+ * message is an action -- CHANNEL_LIST's preview_action, SEARCH_RESULTS,
+ * ACTIVITY_ENTRY, THREAD_SUMMARY, PINNED_MSG, SAVED_MSG and FORWARD's
+ * src_action -- and each is a byte appended to a layout. */
+#define OC_PROTOCOL_VERSION 23u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -434,6 +440,12 @@ typedef enum {
      * sends or expects it. */
     OC_MSG_UNFURL           = 0x00D7, /* S->C, a URL's fetched preview */
     OC_MSG_FORWARD          = 0x00D9, /* S->C, a forwarded message's source (REQ-057) */
+    /* An action (REQ-058, ARCH-115): the daemon's record that a message
+     * describes what its author is doing. Follows the BROADCAST, THREAD_REPLY,
+     * MSG_EDITED or MSG_RESTORED it belongs to, and is replayed on backfill,
+     * history and LIST_THREAD, as FORWARD is. text_len 0 says the message is
+     * not (or no longer) an action. */
+    OC_MSG_ACTION           = 0x00FC, /* S->C, a message's action */
     /* A video message's media facts (REQ-162, ARCH-110): after both uploads and
      * before the SEND that links the video, the client names the poster and
      * reports the duration and size. The daemon checks what it can — owner,
@@ -959,7 +971,10 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; u
                  /* The first attachment's filename, or empty. An attachment-only
                   * message has no body at all, so without this a pinned file
                   * rendered as a blank row in the pins list. */
-                 oc_slice attach_name; } oc_pinned_msg;
+                 oc_slice attach_name;
+                 /* 1 when the message is an action (REQ-058): body is then its
+                  * action text, the "/me" already gone. */
+                 uint8_t action; } oc_pinned_msg;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
 /* A link unfurl (REQ-222, ARCH-105): fan-out on fetch completion, and the
  * backfill replay entry. `title`/`descr` are what the daemon's fetcher
@@ -975,7 +990,15 @@ typedef struct { uint64_t message_id; uint64_t channel_id;
 typedef struct { uint64_t message_id; uint64_t channel_id;
                  uint64_t src_channel; uint64_t src_message; uint64_t src_author;
                  oc_slice src_excerpt; uint16_t n_attach;
-                 oc_slice src_attach_name; } oc_forward;
+                 oc_slice src_attach_name;
+                 /* 1 when the source was an action (REQ-058): src_excerpt is
+                  * then its action text, and a card reads "<author> <text>". */
+                 uint8_t src_action; } oc_forward;
+/* A message's action (REQ-058, ARCH-115). actor_name is a webhook's label, or
+ * empty for the actor's current name; text_start/text_len are BYTES into the
+ * message's body. text_len 0: not an action. */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t actor_id;
+                 oc_slice actor_name; uint32_t text_start; uint32_t text_len; } oc_action;
 
 /* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
  * follow the LIST_PINS shape — stream the entries, then a terminator — because
@@ -1047,13 +1070,17 @@ typedef struct { uint64_t message_id; uint8_t op; } oc_save_item;
 typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; } oc_saved_updated;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
                  uint64_t server_time; uint64_t saved_at; oc_slice body;
-                 oc_slice attach_name; } oc_saved_msg;
+                 oc_slice attach_name;
+                 uint8_t action;   /* as oc_pinned_msg's (REQ-058) */ } oc_saved_msg;
 typedef struct { uint32_t count; } oc_saved;
 
 /* Activity (REQ-139). `actor_id` is who did the thing; `text` is the message
  * body for a mention or reply, and the emoji for a reaction. */
 typedef struct { uint8_t kind; uint64_t message_id; uint64_t channel_id;
-                 uint64_t actor_id; uint64_t at; oc_slice text; } oc_activity_entry;
+                 uint64_t actor_id; uint64_t at; oc_slice text;
+                 /* 1 when the message is an action (REQ-058): text is its
+                  * action text and actor_id its actor. */
+                 uint8_t action; } oc_activity_entry;
 typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
 /* CHANNEL_INFO is the channel-state frame: the ack for create/join/leave/
  * invite/remove, and (ARCH-93) the fan-out when a topic/name/archive changes.
@@ -1085,6 +1112,9 @@ typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t 
                  /* The newest top-level message, for a scannable list: a client
                   * that caches nothing (ARCH-88) has no other way to show one. */
                  oc_slice preview; uint64_t preview_author;
+                 /* 1 when that message is an action (REQ-058): preview is then
+                  * its action text, read "<preview_author> <preview>". */
+                 uint8_t preview_action;
                  uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
 /* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
@@ -1231,6 +1261,7 @@ typedef struct {
     uint32_t reply_count, unread;
     uint8_t  following;
     oc_slice preview;
+    uint8_t  action;   /* the root is an action; preview is its text (REQ-058) */
 } oc_thread_summary;
 typedef struct { uint8_t filter; } oc_list_threads;
 typedef struct { uint32_t count; } oc_threads;
@@ -1522,7 +1553,10 @@ typedef struct {
     uint64_t after_ms, before_ms;   /* 0 = unbounded; resolved by the CLIENT, which
                                      * knows the user's timezone */
 } oc_search;
-typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet; } oc_search_result_entry;
+/* `action` 1: the message is an action and the snippet is cut from its action
+ * text (REQ-058). */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet;
+                 uint8_t action; } oc_search_result_entry;
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
@@ -1577,6 +1611,7 @@ oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m);
 oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m);
 oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m);
 oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m);
+oc_result oc_encode_action(oc_wbuf *w, uint16_t version, const oc_action *m);
 oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_attach_media_set *m);
 oc_result oc_encode_attach_media_ok(oc_wbuf *w, uint16_t version, const oc_attach_media_ok *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
@@ -1854,6 +1889,7 @@ oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
 oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
 oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
+oc_result oc_decode_action(oc_rbuf *p, oc_action *m);
 oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m);
 oc_result oc_decode_attach_media_ok(oc_rbuf *p, oc_attach_media_ok *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);

@@ -28,7 +28,7 @@ follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0040** (§3ae) what a forward points at; **0041** (§3af) a video message's media row;
 **0048** (§3am) user groups, and membership through them; **0049** (§3an) a
 CA-issued TLS certificate and the ACME account behind it; **0050** (§3ao) the
-daemon's issuer for its local accounts.
+daemon's issuer for its local accounts; **0056** (§3au) actions.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -1404,6 +1404,38 @@ COSE public key, the signature counter it last gave, and the relying party —
 the workspace name — it was made for, which it answers on and nowhere else.
 Public keys only; nothing here signs anything.
 ---
+
+## 3au. Migration 0056 — actions (REQ-058, ARCH-115)
+
+```sql
+CREATE TABLE actions (
+  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  actor_id      INTEGER NOT NULL REFERENCES users(id),
+  actor_name    TEXT,
+  text_start    INTEGER NOT NULL,
+  text_len      INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL);
+ALTER TABLE forwards ADD COLUMN src_action INTEGER NOT NULL DEFAULT 0 CHECK (src_action IN (0,1));
+```
+
+*Its own table, keyed on the message*, as `forwards` (§3ae) is: almost no message
+is an action, and the body stays exactly what was typed (REQ-054). One row per
+message; `channel_id` is denormalised as in `mentions` (§3q) and `pins` (§3r).
+`text_start` and `text_len` are **bytes** of the body. `actor_name` is a webhook's
+label and NULL otherwise, so the actor's current name is used and a rename follows.
+
+*Written from the body as it stands*, inside the transaction of every write that
+sets one — send, reply, webhook post, edit, restore — by one function that
+replaces whatever was there, so an edit that adds or removes `/me` needs nothing
+of its own. A delete removes the row with the body; a removed member's DMs take
+theirs with them, before their messages.
+
+*The backfill* states `shared/action.c`'s rule in SQL over existing messages,
+reading each body as text first — most writers store a blob, and a blob never
+equals a text literal — and a test holds the two to the same answers on the same
+bodies, stored both ways. A forward's `src_action` is backfilled by asking the
+same question of its excerpt, which then keeps only the action text.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

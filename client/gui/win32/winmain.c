@@ -5134,6 +5134,9 @@ static int groups_with(const oc_msg *prev, const oc_msg *cur) {
     /* A call event (REQ-304) is a line of history, not a message: it never
      * joins a run of its author's messages, before or after. */
     if (prev->kind != OC_MSG_KIND_MESSAGE || cur->kind != OC_MSG_KIND_MESSAGE) return 0;
+    /* Nor does an action (REQ-058): it is a sentence about its author, and one
+     * left without the header beside it would name nobody. */
+    if (prev->action.present || cur->action.present) return 0;
     if (prev->author_id != cur->author_id) return 0;
     if (prev->deleted || cur->deleted) return 0;
     uint64_t dt = cur->server_time > prev->server_time
@@ -5141,10 +5144,59 @@ static int groups_with(const oc_msg *prev, const oc_msg *cur) {
     return dt <= 5u * 60u * 1000u;                     /* within 5 minutes */
 }
 
-/* The literal text of a message body (tombstone / empty handled). */
+/* An action's line as it is read, "<name> <text>" (REQ-058, ARCH-115), kept
+ * per message so the pointer body_text hands out stays put while a caller lays
+ * it out, hit-tests it and copies from it. Keyed by the message, the action
+ * text and the name -- by content, not by the body's address, which an edit
+ * can hand straight back -- so an edit or a rename makes a new line. */
+enum { ACT_LINES = 32 };
+static struct { uint64_t mid; char *text; char name[64]; char *line; } g_act_line[ACT_LINES];
+static unsigned g_act_next;
+
+static const char *action_name(const oc_msg *msg) {
+    if (msg->action.actor_name[0]) return msg->action.actor_name;
+    if (msg->author_name[0]) return msg->author_name;
+    const char *nm = oc_model_user_name(model(), msg->author_id);
+    return (nm && nm[0]) ? nm : "someone";
+}
+
+static const char *action_line(const oc_msg *msg) {
+    const char *nm = action_name(msg);
+    const char *text = msg->body + msg->action.start;
+    for (unsigned i = 0; i < ACT_LINES; i++)
+        if (g_act_line[i].line && g_act_line[i].mid == msg->message_id &&
+            strcmp(g_act_line[i].text, text) == 0 && strcmp(g_act_line[i].name, nm) == 0)
+            return g_act_line[i].line;
+    unsigned k = g_act_next++ % ACT_LINES;
+    size_t cap = strlen(nm) + 1 + msg->action.len + 1;
+    char *line = malloc(cap), *copy = strdup(text);
+    if (!line || !copy) { free(line); free(copy); return msg->body; }
+    oc_model_line(model(), msg->author_id, nm, 1, text, line, cap);
+    free(g_act_line[k].line);
+    free(g_act_line[k].text);
+    g_act_line[k].mid = msg->message_id;
+    g_act_line[k].text = copy;
+    snprintf(g_act_line[k].name, sizeof g_act_line[k].name, "%s", nm);
+    g_act_line[k].line = line;
+    return line;
+}
+
+/* The text of a message as the transcript shows it (tombstone / empty
+ * handled). An action shows as its line, and everything that lays a body out,
+ * hit-tests it, selects in it or copies from it reads this one function, so
+ * the positions they trade are the same text's. */
 static const char *body_text(const oc_msg *msg) {
+    if (!msg->deleted && msg->action.present && msg->body) return action_line(msg);
     return msg->deleted ? "(message deleted)"
          : (msg->body && msg->body[0]) ? msg->body : " ";
+}
+
+/* Bytes of body_text that are the actor's name and the space after it: the
+ * markup in an action is the author's, not the name's, so the scanners start
+ * past it (REQ-058). 0 for anything else. */
+static size_t body_lead(const oc_msg *msg) {
+    if (msg->deleted || !msg->action.present || !msg->body) return 0;
+    return strlen(action_name(msg)) + 1;
 }
 
 /* Is there any text to show? An attachment-only message has none — body_text()
@@ -5246,7 +5298,9 @@ static const char *rt_mono_family(void) { return "Consolas"; }
  * scanner returns are applied as they are, with no offset transcoding to get
  * subtly wrong. `dim_delims` asks for block markers to be dimmed; inline
  * delimiters are always collapsed (st_range_hide). */
-static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int editing) {
+/* `base`: where u8 starts in the layout's text -- past an action's name
+ * (REQ-058), else 0. */
+static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int editing, size_t base) {
     oc_rt_span sp[OC_RT_MAX];
     size_t n, i;
     if (!lay || !u8 || !blen) return;
@@ -5254,7 +5308,7 @@ static void apply_richtext(st_layout *lay, const char *u8, size_t blen, int edit
     if (n > OC_RT_MAX) n = OC_RT_MAX;
     for (i = 0; i < n; i++) {
         uint16_t st = sp[i].style;
-        size_t at = sp[i].start, len = sp[i].len;
+        size_t at = base + sp[i].start, len = sp[i].len;
         if (st & OC_RT_DELIM) {
             /* A labelled link's `](address)` stays in view while it is being
              * written -- the author sees where it goes -- and is hidden once
@@ -5377,16 +5431,25 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     if (edit_len)
         st_range_color(lay, edit_at, edit_len, OC_COL_FAINT, 1.0f);
     if (!msg->deleted) {
+        /* An action (REQ-058) reads "<name> <text>": the name is bold, and the
+         * markup scanners below see only the author's text, past it -- `lead`
+         * is that one offset, added wherever a span lands in the layout. */
+        size_t lead = body_lead(msg);
+        if (lead > blen) lead = blen;
+        if (lead) st_range_weight(lay, 0, lead - 1, 700);
+        const char *ab = b;
+        b += lead;
+        blen -= lead;
         /* Formatting first (REQ-220), so a @mention inside *bold* still ends
          * up with the accent rather than the delimiter's faint colour. */
-        apply_richtext(lay, b, blen, 0);
+        apply_richtext(lay, b, blen, 0, lead);
         /* @mentions (REQ-221) — the daemon's own scanner, byte offsets. */
         oc_mention mm[OC_MENTION_MAX];
         size_t nm = oc_mention_scan(b, blen, mm, OC_MENTION_MAX);
         if (nm > OC_MENTION_MAX) nm = OC_MENTION_MAX;
         for (size_t i = 0; i < nm; i++) {
-            st_range_color(lay, mm[i].start, mm[i].len, OC_COL_ACCENT, 1.0f);
-            st_range_weight(lay, mm[i].start, mm[i].len, 600);
+            st_range_color(lay, lead + mm[i].start, mm[i].len, OC_COL_ACCENT, 1.0f);
+            st_range_weight(lay, lead + mm[i].start, mm[i].len, 600);
         }
         /* #channel references (shared/mention.h). Styled like a mention, and for
          * the same reason -- it is a reference to something in the workspace,
@@ -5398,8 +5461,8 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         for (size_t i = 0; i < ncr; i++) {
             if (pos_in_link(b, blen, cr[i].start)) continue;
             if (!chanref_resolve(cr[i].name)) continue;
-            st_range_color(lay, cr[i].start, cr[i].len, OC_COL_ACCENT, 1.0f);
-            st_range_weight(lay, cr[i].start, cr[i].len, 600);
+            st_range_color(lay, lead + cr[i].start, cr[i].len, OC_COL_ACCENT, 1.0f);
+            st_range_weight(lay, lead + cr[i].start, cr[i].len, 600);
         }
         /* My keywords (REQ-135), through the daemon's matcher (ARCH-103). */
         const oc_model *km = model();
@@ -5409,8 +5472,8 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
                 size_t hs = 0, hl = 0;
                 if (!oc_keyword_match(b + off, blen - off, km->kw_terms[k], &hs, &hl)) break;
                 size_t at = off + hs;
-                st_range_color(lay, at, hl, OC_COL_ACCENT, 1.0f);
-                st_range_weight(lay, at, hl, 600);
+                st_range_color(lay, lead + at, hl, OC_COL_ACCENT, 1.0f);
+                st_range_weight(lay, lead + at, hl, 600);
                 off = at + (hl ? hl : 1);
             }
         }
@@ -5420,11 +5483,13 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
         int nr = emoji_runs(b, runs, MLAY_BOXES);
         float side = g_body->line_h > 4 ? g_body->line_h - 4 : 18.0f;
         for (int i = 0; i < nr; i++) {
-            st_range_box(lay, runs[i].at, runs[i].len, side, side, side * 0.85f,
+            st_range_box(lay, lead + runs[i].at, runs[i].len, side, side, side * 0.85f,
                          (uint32_t)i + 1);
             best->box_aid[i] = runs[i].aid;
         }
         best->nbox = nr;
+        b = ab;                 /* the whole line again, for what follows */
+        blen += lead;
     }
 
     st_metrics m;
@@ -5624,7 +5689,9 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         snprintf(line, sizeof line, "Forwarded from %s", (who && who[0]) ? who : "someone");
         draw_text(rt, line, g_ui_b, rf(ix, ly, right, ly + LINE_H), OC_COL_MUTED);
         ly += LINE_H;
-        draw_text(rt, (f->excerpt && f->excerpt[0]) ? f->excerpt : "(no text)",
+        char said[512];   /* a forwarded action reads "<author> <text>" (REQ-058) */
+        oc_model_line(m, f->src_author, NULL, f->src_action, f->excerpt ? f->excerpt : "", said, sizeof said);
+        draw_text(rt, said[0] ? said : "(no text)",
                   g_meta, rf(ix, ly, right, ly + LINE_H), OC_COL_TEXT);
         ly += LINE_H;
         if (f->n_attach) {
@@ -6437,7 +6504,9 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
         snprintf(head, sizeof head, "%s  ·  %s  ·  %s",
                  (au && au[0]) ? au : "user", (ch && ch->name) ? ch->name : "channel", when);
         draw_text(rt, head, g_meta, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
-        draw_text_hl(rt, r->snippet ? r->snippet : "", g_ui,
+        char said[512];   /* an action reads "<name> <text>" (REQ-058) */
+        oc_model_line(m, r->author_id, NULL, r->action, r->snippet ? r->snippet : "", said, sizeof said);
+        draw_text_hl(rt, said, g_ui,
                      rf(body.left + 20, y + 20, body.right - 16, y + 46), OC_COL_TEXT,
                      m->search_query);
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 16, y + rowh), OC_COL_BORDER);
@@ -7820,7 +7889,7 @@ static void draw_pinlist(gfx *rt, const oc_model *m, rectf reg) {
         /* An attachment-only message has no body; naming the file is the only
          * thing that makes such a row mean anything. */
         char prev[256];
-        if (pr->body && pr->body[0]) snprintf(prev, sizeof prev, "%s", pr->body);
+        if (pr->body && pr->body[0]) oc_model_line(m, pr->author_id, NULL, pr->action, pr->body, prev, sizeof prev);
         else if (pr->attach_name[0]) snprintf(prev, sizeof prev, "\U0001F4CE %s", pr->attach_name);
         else                         snprintf(prev, sizeof prev, "%s", "");
         draw_text(rt, prev, g_ui,
@@ -14434,7 +14503,11 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
         /* The preview, prefixed the way the reference does it so you can tell
          * whose turn it is at a glance. */
         char prev[160] = "";
-        if (best->preview[0])
+        if (best->preview[0] && best->preview_action)
+            /* An action names its actor, you included: "You: is away" and
+             * "You is away" are both wrong (REQ-058). */
+            oc_model_line(m, best->preview_author, NULL, 1, best->preview, prev, sizeof prev);
+        else if (best->preview[0])
             snprintf(prev, sizeof prev, "%s%s",
                      best->preview_author == m->user_id ? "You: " : "", best->preview);
         draw_text(rt, prev[0] ? prev : "No messages yet", g_meta,
@@ -14702,7 +14775,9 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
                                                  : (peer && peer[0]) ? peer : "a conversation");
         draw_text(rt, whereline, g_meta, rf(row.left + 64, y + 24, row.right - 8, y + 42),
                   OC_COL_FAINT);
-        draw_text(rt, a->text ? a->text : "", g_meta_w,
+        char said[512];   /* an action reads "<name> <text>" (REQ-058) */
+        oc_model_line(m, a->actor_id, NULL, a->action, a->text ? a->text : "", said, sizeof said);
+        draw_text(rt, said, g_meta_w,
                   rf(row.left + 12, y + 44, row.right - 8, y + 72), OC_COL_MUTED);
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
@@ -16507,7 +16582,9 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
                   rf(card.left + 52, card.top + 28, card.right - UIS(140), card.top + 48),
                   OC_COL_TEXT);
-        draw_text(rt, t->preview ? t->preview : "", g_meta_w,
+        char said[512];   /* an action root reads "<name> <text>" (REQ-058) */
+        oc_model_line(m, t->root_author, NULL, t->action, t->preview ? t->preview : "", said, sizeof said);
+        draw_text(rt, said, g_meta_w,
                   rf(card.left + 52, card.top + 46, card.right - UIS(140), card.top + 84),
                   OC_COL_MUTED);
 
@@ -16773,7 +16850,9 @@ static void draw_drafts(gfx *rt, const oc_model *m, rectf reg) {
             if (oc_localtime_r(&t, &tv))
                 strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
         }
-        draw_msgish_row(rt, m, row, sr->channel_id, sr->snippet, when,
+        char said[512];   /* an action reads "<name> <text>" (REQ-058) */
+        oc_model_line(m, sr->author_id, NULL, sr->action, sr->snippet ? sr->snippet : "", said, sizeof said);
+        draw_msgish_row(rt, m, row, sr->channel_id, said, when,
                         OC_ICON_SEND, OC_COL_MUTED, NULL);
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
             g_listrows[g_n_listrows].row = row;
@@ -16838,7 +16917,7 @@ static void draw_later(gfx *rt, const oc_model *m, rectf reg) {
                  (ch && ch->name && ch->name[0]) ? ch->name : "", when);
         draw_text(rt, head, g_ui, rf(row.left + 40, y + 4, row.right - 110, y + 24), OC_COL_TEXT);
         char prev[200];
-        if (sv->body && sv->body[0])       snprintf(prev, sizeof prev, "%s", sv->body);
+        if (sv->body && sv->body[0])       oc_model_line(m, sv->author_id, NULL, sv->action, sv->body, prev, sizeof prev);
         else if (sv->attach_name[0])       snprintf(prev, sizeof prev, "\U0001F4CE %s", sv->attach_name);
         else                               prev[0] = '\0';
         draw_text(rt, prev, g_meta, rf(row.left + 40, y + 24, row.right - 110, y + 46),
@@ -18030,7 +18109,7 @@ static st_layout *ed_layout(float w) {
      * transcript styles, over the same bytes. Plain mode shows the markup as
      * written and restyles nothing. */
     if (g_pref_richtext)
-        apply_richtext(g_ed_layout, u8, bytes, 1);
+        apply_richtext(g_ed_layout, u8, bytes, 1, 0);
     /* Mark the @mentions AS YOU TYPE, through the daemon's own scanner, and
      * only the ones that RESOLVE — lighting up "@al" mid-word would promise a
      * notification that is not going to happen. */
@@ -19180,9 +19259,12 @@ static void a11y_publish_scene(const oc_model *m) {
         if (msg->deleted)
             snprintf(it->name, sizeof it->name, "%s, %s, message deleted",
                      who ? who : "someone", when);
-        else
+        else {
+            char said[1024];   /* an action is read as "<name> <text>" (REQ-058) */
+            oc_model_msg_preview(m, msg, said, sizeof said);
             snprintf(it->name, sizeof it->name, "%s, %s: %s",
-                     who ? who : "someone", when, msg->body ? msg->body : "");
+                     who ? who : "someone", when, said);
+        }
     }
 
     /* The composer, and its text, so it can be read back rather than only typed
@@ -24069,6 +24151,12 @@ static int link_at(int ri, int x, int y, char *out, size_t cap) {
     if (!l) return 0;
     pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
     if (!inside) return 0;
+    {   /* An action's name is not the author's text: the spans start past it
+         * (REQ-058), exactly as body_layout scanned them. */
+        size_t lead = body_lead(msg);
+        if (lead > blen || pos < lead) return 0;
+        u8 += lead; blen -= lead; pos -= lead;
+    }
 
     /* Byte offsets both sides now — the span comparison is direct. */
     n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
@@ -24127,6 +24215,11 @@ static uint64_t chanref_at(int ri, int x, int y) {
     if (!l) return 0;
     pos = st_hit_point(l->lay, lx, ly, &inside, &trailing);
     if (!inside) return 0;
+    {   /* Past an action's name, as body_layout scanned it (REQ-058). */
+        size_t lead = body_lead(msg);
+        if (lead > blen || pos < lead) return 0;
+        u8 += lead; blen -= lead; pos -= lead;
+    }
 
     n = oc_chanref_scan(u8, blen, cr, OC_CHANREF_MAX);
     if (n > OC_CHANREF_MAX) n = OC_CHANREF_MAX;
@@ -27625,6 +27718,19 @@ static void test_dump(const char *path) {
                         dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
                         dc->msgs[i].attach[k].reclaimed);
     }
+    /* Actions in the open conversation (REQ-058): the record the daemon sent,
+     * and the line the transcript draws from it -- the two a harness compares. */
+    {
+        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        if (dc) for (size_t i = 0; i < dc->n_msgs; i++)
+            if (dc->msgs[i].action.present)
+                fprintf(f, "  action msg=%llu start=%u len=%u actor=\"%s\" line=\"%s\" grouped=%d\n",
+                        (unsigned long long)dc->msgs[i].message_id,
+                        dc->msgs[i].action.start, dc->msgs[i].action.len,
+                        dc->msgs[i].action.actor_name, body_text(&dc->msgs[i]),
+                        i ? groups_with(&dc->msgs[i - 1], &dc->msgs[i]) : 0);
+        if (dc) fprintf(f, "preview action=%d text=\"%s\"\n", dc->preview_action, dc->preview);
+    }
     /* Talking mode (REQ-291-295). `has_audio` is the line that matters: a player
      * that opened no speaker still runs, still ends, and still moves on to the
      * next message, so a machine where the device would not open looks from
@@ -30083,11 +30189,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (lm && !lm->deleted && lm->author_id != wm->user_id) {
                             const char *who = lm->author_name[0] ? lm->author_name
                                             : oc_model_user_name(wm, lm->author_id);
-                            char say[OC_ACC_NAME_MAX];
+                            char say[OC_ACC_NAME_MAX], said[OC_ACC_NAME_MAX];
+                            oc_model_msg_preview(wm, lm, said, sizeof said);   /* REQ-058 */
                             snprintf(say, sizeof say, "%s in %s: %s",
                                      who ? who : "someone",
-                                     c->name ? c->name : "a conversation",
-                                     lm->body ? lm->body : "");
+                                     c->name ? c->name : "a conversation", said);
                             oc_a11y_announce(say);
                         }
                     }
@@ -30163,7 +30269,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         snprintf(title, sizeof title, "%s",
                                  (who && who[0]) ? who : (one_to_one ? "Direct message" : label));
                         char lprev[160] = "";
-                        if (last) oc_model_msg_preview(last, lprev, sizeof lprev);
+                        if (last) oc_model_msg_preview(wm, last, lprev, sizeof lprev);
                         if (g_pref_notify == NOTIFY_FULL && lprev[0])
                             snprintf(body, sizeof body, "%s", lprev);
                         else
@@ -30230,7 +30336,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             }
                             snprintf(title, sizeof title, "%s", (who && who[0]) ? who : label);
                             if (g_pref_notify == NOTIFY_FULL && n->body[0])
-                                snprintf(body, sizeof body, "%s", n->body);
+                                /* A reply that is an action reads "<name>
+                                 * <text>" (REQ-058). */
+                                oc_model_line(wm, n->author_id, NULL, n->action, n->body, body, sizeof body);
                             else
                                 snprintf(body, sizeof body, "New reply");
                             notify_deliver(title, body, source, (uint64_t)wi, c->channel_id,

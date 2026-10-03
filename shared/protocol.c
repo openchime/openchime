@@ -575,6 +575,18 @@ oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m) {
     oc_w_str(w, m->src_excerpt);
     oc_w_u16(w, m->n_attach);
     oc_w_str(w, m->src_attach_name);
+    oc_w_u8(w, m->src_action);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_action(oc_wbuf *w, uint16_t version, const oc_action *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ACTION);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->actor_id);
+    oc_w_str(w, m->actor_name);
+    oc_w_u32(w, m->text_start);
+    oc_w_u32(w, m->text_len);
     return oc_frame_end(w, off);
 }
 
@@ -594,6 +606,7 @@ oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg
     oc_w_u64(w, m->pinned_at);
     oc_w_str(w, m->body);
     oc_w_str(w, m->attach_name);
+    oc_w_u8(w, m->action);
     return oc_frame_end(w, off);
 }
 
@@ -789,6 +802,7 @@ oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *
     oc_w_u64(w, m->message_id); oc_w_u64(w, m->channel_id); oc_w_u64(w, m->author_id);
     oc_w_u64(w, m->server_time); oc_w_u64(w, m->saved_at);
     oc_w_str(w, m->body); oc_w_str(w, m->attach_name);
+    oc_w_u8(w, m->action);
     return oc_frame_end(w, off);
 }
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m) {
@@ -814,6 +828,7 @@ oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activi
     size_t off = oc_frame_begin(w, version, OC_MSG_ACTIVITY_ENTRY);
     oc_w_u8(w, m->kind); oc_w_u64(w, m->message_id); oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->actor_id); oc_w_u64(w, m->at); oc_w_str(w, m->text);
+    oc_w_u8(w, m->action);
     return oc_frame_end(w, off);
 }
 oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m) {
@@ -876,6 +891,7 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_u64(w, m->entries[i].created_at);
         oc_w_str(w, m->entries[i].preview);
         oc_w_u64(w, m->entries[i].preview_author);
+        oc_w_u8(w, m->entries[i].preview_action);
         {
             uint16_t np = m->entries[i].n_peers > OC_MAX_GROUP_DM + 1
                         ? (uint16_t)(OC_MAX_GROUP_DM + 1) : m->entries[i].n_peers;
@@ -1116,6 +1132,7 @@ oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread
     oc_w_u32(w, m->unread);
     oc_w_u8(w, m->following);
     oc_w_str(w, m->preview);
+    oc_w_u8(w, m->action);
     return oc_frame_end(w, off);
 }
 
@@ -1129,6 +1146,7 @@ oc_result oc_decode_thread_summary(oc_rbuf *p, oc_thread_summary *m) {
     m->unread = oc_r_u32(p);
     m->following = oc_r_u8(p);
     m->preview = oc_r_str(p);
+    m->action = oc_r_u8(p);
     return r_done(p);
 }
 
@@ -2272,6 +2290,7 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
         oc_w_u64(w, m->entries[i].author_id);
         oc_w_u64(w, m->entries[i].server_time);
         oc_w_str(w, m->entries[i].snippet);
+        oc_w_u8(w, m->entries[i].action);
     }
     oc_w_u8(w, m->truncated);   /* 1 if more matches exist past the cap */
     return oc_frame_end(w, off);
@@ -2590,6 +2609,17 @@ oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m) {
     m->src_excerpt = oc_r_str(p);
     m->n_attach = oc_r_u16(p);
     m->src_attach_name = oc_r_str(p);
+    m->src_action = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_action(oc_rbuf *p, oc_action *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->actor_id = oc_r_u64(p);
+    m->actor_name = oc_r_str(p);
+    m->text_start = oc_r_u32(p);
+    m->text_len = oc_r_u32(p);
     return r_done(p);
 }
 
@@ -2607,6 +2637,7 @@ oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m) {
     m->pinned_at   = oc_r_u64(p);
     m->body        = oc_r_str(p);
     m->attach_name = oc_r_str(p);
+    m->action      = oc_r_u8(p);
     return r_done(p);
 }
 
@@ -2787,6 +2818,7 @@ oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m) {
     m->message_id = oc_r_u64(p); m->channel_id = oc_r_u64(p); m->author_id = oc_r_u64(p);
     m->server_time = oc_r_u64(p); m->saved_at = oc_r_u64(p);
     m->body = oc_r_str(p); m->attach_name = oc_r_str(p);
+    m->action = oc_r_u8(p);
     return r_done(p);
 }
 oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m) {
@@ -2796,6 +2828,7 @@ oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m) {
 oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m) {
     m->kind = oc_r_u8(p); m->message_id = oc_r_u64(p); m->channel_id = oc_r_u64(p);
     m->actor_id = oc_r_u64(p); m->at = oc_r_u64(p); m->text = oc_r_str(p);
+    m->action = oc_r_u8(p);
     return r_done(p);
 }
 oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m) {
@@ -2846,6 +2879,7 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         uint64_t created = oc_r_u64(p);
         oc_slice prev = oc_r_str(p);
         uint64_t prev_a = oc_r_u64(p);
+        uint8_t prev_act = oc_r_u8(p);
         uint16_t np = oc_r_u16(p);
         if (np > OC_MAX_GROUP_DM + 1) return OC_E_MALFORMED;
         uint64_t peers[OC_MAX_GROUP_DM + 1];
@@ -2866,6 +2900,7 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
             entries[i].created_at = created;
             entries[i].preview = prev;
             entries[i].preview_author = prev_a;
+            entries[i].preview_action = prev_act;
         }
     }
     return r_done(p);
@@ -3322,12 +3357,14 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
         uint64_t author = oc_r_u64(p);
         uint64_t ts = oc_r_u64(p);
         oc_slice snip = oc_r_str(p);
+        uint8_t act = oc_r_u8(p);
         if (i < cap) {
             entries[i].message_id = mid;
             entries[i].channel_id = ch;
             entries[i].author_id = author;
             entries[i].server_time = ts;
             entries[i].snippet = snip;
+            entries[i].action = act;
         }
     }
     uint8_t trunc = oc_r_u8(p);

@@ -4,6 +4,7 @@
 
 #include "migrate.h"
 #include "check.h"
+#include "action.h"
 
 #include <string.h>
 
@@ -101,7 +102,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 55);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys */
+    CHECK(oc_schema_version(db) == 56);   /* + reactions/threads/FTS/cursors/identity/attachments/webhooks/notify/client_settings/enrollment/mute/drafts/scheduled/snooze/schedule/keywords/threads/upload-idempotency/forwards/video-media/read-aloud/call-events/identities/invite-address/channel-description/credential-version/user-groups/tls-certificate/local-issuer/alerts/delete-holds/second-step/credential-resets/passkeys/actions */
 
     const char *tables[] = { "drafts", "scheduled_messages", "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -109,7 +110,7 @@ static void test_embedded_schema(void) {
                              "messages_fts", "delivery_cursors", "server_identity",
                              "attachments", "webhooks", "notification_prefs",
                              "client_settings", "audit_log", "rendered_audio",
-                             "user_identities" };
+                             "user_identities", "actions" };
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
     }
@@ -182,6 +183,81 @@ static void test_identity_backfill(void) {
     sqlite3_close(db);
 }
 
+/* 0056 states shared/action.c's rule in SQL to backfill existing messages; the
+ * two must give the same answer for every body, so each fixture is asked of
+ * both. A call event and a tombstone are never actions; a webhook's label is
+ * kept; a forward's excerpt is asked the same question. */
+static void test_action_backfill(void) {
+    static const char *const bodies[] = {
+        "/me is away", "/me    waves", "/me waves  ", "/me waves\nand leaves", "/me /me",
+        "/me \xC3\xA9tudie", "\xC3\xA9 /me x", "/me", "/me ", "/me    ", "/me \nwaves", "/me \twaves",
+        "/me \r\nwaves", "/me\twaves", "/mewaves", "/mex waves", " /me waves", "/ME waves",
+        "me waves", "", "plain text",
+    };
+    const int n = (int)(sizeof bodies / sizeof bodies[0]);
+    sqlite3 *db = open_mem();
+    char *err = NULL;
+    CHECK(oc_migrate(db, OC_MIGRATIONS, 55, &err) == SQLITE_OK);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO users(id,subject,created_at_ms) VALUES(1,'local:ada',1);"
+        "INSERT INTO channels(id,kind,name,is_public,created_at_ms) VALUES(1,'channel','general',1,1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    /* Each body twice: as a blob, the way the send path stores it, and as text,
+     * the way a restore does. A blob never equals a text literal, so a rule
+     * that forgot the first would pass on the second alone. */
+    sqlite3_prepare_v2(db, "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) VALUES(?,1,1,?,?);",
+                       -1, &st, NULL);
+    for (int i = 0; i < 2 * n; i++) {
+        const char *b = bodies[i % n];
+        sqlite3_bind_int(st, 1, i + 1);
+        if (i < n) sqlite3_bind_blob(st, 2, b, (int)strlen(b), SQLITE_STATIC);
+        else       sqlite3_bind_text(st, 2, b, -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, 3, 100 + i);
+        CHECK(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    CHECK(sqlite3_exec(db,
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,author_name) "
+        "  VALUES(901,1,1,'/me deploys',5,'GitHub CI');"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,kind) VALUES(902,1,1,'/me called',6,1);"
+        "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,deleted_at_ms) VALUES(903,1,1,NULL,7,8);"
+        "INSERT INTO forwards(message_id,src_channel,src_message,src_author,excerpt,n_attach) VALUES"
+        "  (1,1,901,1,'/me   deploys',0),(2,1,902,1,'/me',0),(3,1,903,1,'plain',0),"
+        "  (4,1,901,1,CAST('/me ships' AS BLOB),0);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(oc_migrate(db, OC_MIGRATIONS, OC_MIGRATIONS_COUNT, &err) == SQLITE_OK);
+
+    sqlite3_prepare_v2(db, "SELECT text_start, text_len, actor_id, actor_name IS NULL, created_at_ms "
+                           "FROM actions WHERE message_id=?;", -1, &st, NULL);
+    for (int i = 0; i < 2 * n; i++) {
+        uint32_t ws = 0, wl = 0;
+        int want = oc_action_parse(bodies[i % n], strlen(bodies[i % n]), &ws, &wl);
+        sqlite3_bind_int(st, 1, i + 1);
+        int got = sqlite3_step(st) == SQLITE_ROW;
+        int same = got == want && (!got || ((uint32_t)sqlite3_column_int(st, 0) == ws &&
+                                            (uint32_t)sqlite3_column_int(st, 1) == wl &&
+                                            sqlite3_column_int(st, 2) == 1 && sqlite3_column_int(st, 3) == 1 &&
+                                            sqlite3_column_int(st, 4) == 100 + i));
+        if (!same) printf("    backfill disagrees with the rule on body %d\n", i);
+        CHECK(same);
+        sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM actions WHERE message_id=901 AND actor_name='GitHub CI' "
+                     "AND text_start=4 AND text_len=7;") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM actions WHERE message_id IN (902,903);") == 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM forwards WHERE message_id=1 AND src_action=1 AND excerpt='deploys';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM forwards WHERE message_id=2 AND src_action=0 AND excerpt='/me';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM forwards WHERE message_id=3 AND src_action=0 AND excerpt='plain';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM forwards WHERE message_id=4 AND src_action=1 AND excerpt='ships';") == 1);
+    /* One row per message. */
+    CHECK(sqlite3_exec(db, "INSERT INTO actions(message_id,channel_id,actor_id,text_start,text_len,created_at_ms) "
+                           "VALUES(1,1,1,4,1,0);", NULL, NULL, NULL) != SQLITE_OK);
+    sqlite3_close(db);
+}
+
 int run_migrate_tests(void) {
     printf("test_migrate: fresh apply, idempotent rerun, resume, rollback,\n");
     printf("              embedded core schema\n");
@@ -191,5 +267,6 @@ int run_migrate_tests(void) {
     test_failure_rolls_back();
     test_embedded_schema();
     test_identity_backfill();
+    test_action_backfill();
     return failures;
 }

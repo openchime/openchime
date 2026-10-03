@@ -181,7 +181,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 22** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 23** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -737,8 +737,10 @@ Each entry, in wire order:
 `channel_id` (u64) · `name` (str) · `is_public` (u8) · `joined` (u8) ·
 `kind` (u8 — `0` channel, `1` DM) · `last_message_at` (u64) · `unread` (u32) ·
 `peer_id` (u64) · `topic` (str) · `archived` (u8) · `created_at` (u64) ·
-`preview` (str) · `preview_author` (u64) · `n_peers` (u16) followed by `n_peers` ×
-`u64` participant ids.
+`preview` (str) · `preview_author` (u64) · `preview_action` (u8) · `n_peers` (u16)
+followed by `n_peers` × `u64` participant ids. `preview_action` is `1` when the
+newest message is an action (REQ-058, §5.16l): `preview` is then its action
+text, read beside `preview_author`.
 
 Nothing here is optional: every field is written for every entry, so a decoder
 that stops early desynchronises the whole repeated list rather than losing one
@@ -1027,8 +1029,9 @@ history — a list of bare ids would turn opening it into a fetch storm.
 | `server_time` | u64  | When it was sent.                                       |
 | `pinned_by`   | u64  | Who pinned it (`0` if that account is gone).            |
 | `pinned_at`   | u64  | When it was pinned.                                     |
-| `body`        | str  | The message body.                                       |
+| `body`        | str  | The message body — an action's text when `action` is `1`. |
 | `attach_name` | str  | The first attachment's filename, or empty. An attachment-only message has no body at all, so without this a pinned file rendered as a blank row. |
+| `action`      | u8   | `1` when the message is an action (REQ-058, §5.16l).     |
 
 **`PINS` (server → client), msg_type `0x0039`** `{ channel_id: u64, count: u32 }`
 terminates the response; `count` is how many `PINNED_MSG` frames preceded it.
@@ -1118,7 +1121,8 @@ saved does not reshuffle when you click again.
 **`LIST_SAVED` (`0x0064`)** (no body) streams **`SAVED_MSG` (`0x0065`)** newest
 save first, then **`SAVED` (`0x0066`)** `{ count: u32 }`. Each entry carries the
 message body and its first attachment's name, like a pin — a saved message is
-usually far outside loaded history. Entries whose channel you have since left are
+usually far outside loaded history — and, last, an `action` byte (REQ-058,
+§5.16l): `1` when the message is an action, its body then being the action text. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
 
 ### Drafts (REQ-223, ARCH-101)
@@ -1166,6 +1170,7 @@ read as `0`, so a client that sends no filter keeps working.
 | `actor_id`   | u64  | Who did it — never you: a feed of your own doings is noise. |
 | `at`         | u64  | When.                                                      |
 | `text`       | str  | The message body for a mention or reply; the **emoji** for a reaction. |
+| `action`     | u8   | `1` when the message is an action (REQ-058, §5.16l): `text` is its action text and `actor_id` its actor. |
 
 The feed is a **union of three queries** over existing rows, not a maintained
 list (ARCH-95). `seen_at` is the watermark **as it was before this call** — the
@@ -1328,7 +1333,7 @@ first:
 | Field       | Type            | Notes                                                |
 |-------------|-----------------|------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                   |
-| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match). |
+| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match), `action` (u8 — `1` when the message is an action and the snippet is cut from its text, REQ-058). |
 | `truncated` | u8              | 1 if more matches exist past the cap (`limit`).      |
 
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
@@ -2269,7 +2274,9 @@ and an explicit unfollow outranks having replied.
 
 **`THREAD_SUMMARY` (S → C), `0x00D2`** — One thread's aggregate row: its root, its activity, my unread count and whether I follow it. (REQ-062, ARCH-104)
 
-    root_id (u64), channel_id (u64), root_author (u64), root_at (u64), last_reply_at (u64), reply_count (u32), unread (u32), following (u8), preview (str)
+    root_id (u64), channel_id (u64), root_author (u64), root_at (u64), last_reply_at (u64), reply_count (u32), unread (u32), following (u8), preview (str), action (u8)
+
+`action` is `1` when the root is an action (REQ-058, §5.16l): `preview` is then its action text.
 
 **`SET_THREAD_FOLLOW` (C → S), `0x00D4`** — Follow or unfollow one thread explicitly. (REQ-062, ARCH-104)
 
@@ -2292,7 +2299,10 @@ fanned to the channel's members immediately behind the `BROADCAST` it describes.
 
     message_id (u64), channel_id (u64), src_channel (u64), src_message (u64),
     src_author (u64), src_excerpt (str), n_attach (u16),
-    src_attach_name (str)
+    src_attach_name (str), src_action (u8)
+
+`src_action` is `1` when the original was an action (REQ-058, §5.16l): the
+excerpt is then its action text, and a card reads "`<src_author>` `<excerpt>`".
 
 `message_id`/`channel_id` name the forward itself; the rest describe the
 original. Every field is **resolved by the daemon**, never taken from the
@@ -2326,6 +2336,37 @@ class the reaction and pin replays exist to prevent. An **edit drops the
 message's stored unfurls** and re-fetches from the new body, so a removed URL's
 preview cannot be replayed. Always on — there is no switch. Adding the frame
 needed no protocol-version bump; a peer that does not know it never expects it.
+
+### 5.16l Actions (REQ-058, ARCH-115)
+
+**`ACTION` (S → C), `0x00FC`** — whether a message is an action: one that begins
+`/me`, one or more spaces, then text, and reads "Ada Starr is away".
+
+    message_id (u64), channel_id (u64), actor_id (u64), actor_name (str),
+    text_start (u32), text_len (u32)
+
+The body stays what was typed; this is the daemon's record beside it
+(`actions`, SCHEMA.md §3au). `text_start` and `text_len` are **bytes** of the
+body that are the action text. `actor_name` is a webhook's label, or empty for
+the actor's current name, so a rename follows. **`text_len` 0 means "not an
+action"**, which is how an edit or a restore unmakes one.
+
+**Every live message frame is followed by exactly one `ACTION`** — `BROADCAST`
+(a send, a webhook post, a call event), `THREAD_REPLY`, `MSG_EDITED` and
+`MSG_RESTORED` — action or not, with only the message's own `FORWARD` allowed
+between them. A client holds the message frame, its attachments and its forward
+until that `ACTION` arrives and hands them on together, so nothing that shows a
+message — a toast, a preview — ever sees it without its answer. **A replay sends
+only the actions there are**: backfill (§6.2) and history (§6.3) after their
+forwards, and `LIST_THREAD` (§5.10) before its `THREAD` terminator, so a client
+releases a replayed message unpaired at the next frame and applies the action
+when it comes.
+
+Every excerpt the daemon builds of a message says whether it is an action, and
+is then cut from the action text: `CHANNEL_LIST`'s `preview_action`,
+`SEARCH_RESULTS`, `ACTIVITY_ENTRY`, `THREAD_SUMMARY`, `PINNED_MSG`, `SAVED_MSG`
+and `FORWARD`'s `src_action`. A client never decides for itself whether text is
+an action.
 
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
@@ -2963,6 +3004,7 @@ this table cannot silently gain a shared value.
 | `0x00F9` | `ALERT_ACK` | C → S | owner/admin: acknowledge one, or all |
 | `0x00FA` | `RESTORE` | C → S | take back a delete you made, while it is held |
 | `0x00FB` | `MSG_RESTORED` | S → C | a deleted message, whole again (`BROADCAST`'s layout) |
+| `0x00FC` | `ACTION` | S → C | whether a message is an action (REQ-058); after every live message frame, and replayed |
 
 ## 10. Connection state machine
 

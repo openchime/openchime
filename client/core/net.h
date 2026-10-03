@@ -146,4 +146,16 @@ void oc_net_stop(oc_net *n);
  * Safe from the UI thread: the net thread only ever publishes a count here. */
 int oc_net_outbox_pending(oc_net *n);
 
+/* The frame dispatch with no connection behind it: bytes in, the events a live
+ * connection would hand the UI out on `to_ui`. It exists so that what the
+ * network thread promises about ORDER can be proven one frame at a time --
+ * above all that a live message is held until its ACTION and handed on with it
+ * (REQ-058, ARCH-115), which a real socket delivers in one read and so never
+ * shows. `feed` returns -1 where a connection would be dropped; `free` hands on
+ * whatever is still held, as a closing connection does. */
+typedef struct oc_net_frames oc_net_frames;
+oc_net_frames *oc_net_frames_new(oc_queue *to_ui);
+int          oc_net_frames_push(oc_net_frames *f, const uint8_t *bytes, size_t len);
+void         oc_net_frames_free(oc_net_frames *f);
+
 #endif /* OC_NET_H */

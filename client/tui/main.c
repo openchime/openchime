@@ -245,21 +245,43 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         if (oc_localtime_r(&t, &tmv))
             strftime(stamp, sizeof stamp, (g_cfg && !g_cfg->time_24h) ? "%I:%M%p" : "%H:%M", &tmv);
     }
-    msg_nick(nick, sizeof nick, m, me, ch);
-    snprintf(line, sizeof line, "%s  %s", stamp, nick);
-    if (m->edited && !m->deleted) {
-        size_t l = strlen(line);
-        snprintf(line + l, sizeof line - l, " (edited)");
+    /* An action (REQ-058) is one line, "HH:MM  * Ada is away", in place of a
+     * header and a body. Its actor is named, never "you": "you is away" is
+     * not a sentence. */
+    if (m->action.present && !m->deleted && m->body) {
+        char who[80];
+        if (m->action.actor_name[0])  snprintf(who, sizeof who, "%s", m->action.actor_name);
+        else if (m->author_name[0])   snprintf(who, sizeof who, "%s", m->author_name);
+        else {
+            const char *nm = ch ? name_for(ch, m->author_id) : "someone";
+            if (strcmp(nm, "someone") != 0) snprintf(who, sizeof who, "%s", nm);
+            else snprintf(who, sizeof who, "user%llu", (unsigned long long)m->author_id);
+        }
+        char said[1024];
+        oc_model_line(NULL, m->author_id, who, 1, m->body + m->action.start, said, sizeof said);
+        char *al = malloc(strlen(stamp) + strlen(said) + 16);
+        if (al) {
+            sprintf(al, "%s  * %s%s", stamp, said, m->edited ? " (edited)" : "");
+            wrap_push(r, al, nick_color(m->author_id), width, 4);
+            free(al);
+        }
+    } else {
+        msg_nick(nick, sizeof nick, m, me, ch);
+        snprintf(line, sizeof line, "%s  %s", stamp, nick);
+        if (m->edited && !m->deleted) {
+            size_t l = strlen(line);
+            snprintf(line + l, sizeof line - l, " (edited)");
+        }
+        char *hdr = malloc(strlen(line) + 1);
+        if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
+        if (m->deleted) {                     /* tombstone: no body, no reactions */
+            char *d = malloc(sizeof "    [message deleted]");
+            if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
+            for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
+            return;
+        }
+        wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
     }
-    char *hdr = malloc(strlen(line) + 1);
-    if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
-    if (m->deleted) {                     /* tombstone: no body, no reactions */
-        char *d = malloc(sizeof "    [message deleted]");
-        if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
-        for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
-        return;
-    }
-    wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
     for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
         const oc_attachment *a = &m->attach[k];
         char al[256];
@@ -382,7 +404,9 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
         snprintf(line, sizeof line, "#%s  %s  user%llu:", cn, stamp, (unsigned long long)s->author_id);
         char *hd = malloc(strlen(line) + 1);
         if (hd) { strcpy(hd, line); rows_push(r, hd, TB_CYAN); }
-        wrap_push(r, s->snippet ? s->snippet : "", TB_DEFAULT, width, 4);
+        char said[1024];   /* an action reads "<name> <text>" (REQ-058) */
+        oc_model_line(m, s->author_id, NULL, s->action, s->snippet ? s->snippet : "", said, sizeof said);
+        wrap_push(r, said, TB_DEFAULT, width, 4);
     }
 }
 
