@@ -380,9 +380,16 @@ token on reconnect), the daemon then does the same thing:
   (`AUTH{method=session}`); the daemon hashes and looks it up, and resumes
   without a full re-auth. The session lifetime is the daemon's to set (REQ-181) —
   it is not tied to a provider token's expiry.
+- **Lifetime (REQ-181):** a session lives `OPENCHIME_SESSION_DAYS` (30) from
+  its sign-in, and with `OPENCHIME_SESSION_IDLE_DAYS` set, one unused that long
+  is refused — and deleted — at its next use. "Unused" is measured: a session's
+  `last_seen_ms` is written at its sign-in and then, while its connection sends
+  anything, at most hourly, in one batched writer job, so it costs nothing per
+  message.
 - **Revocation (REQ-182):** signing out deletes the session of this device
-  alone, or of every device the user has (`LOGOUT`'s scope), and a password
-  change deletes them all. Each connection on a deleted session is closed at
+  alone, or of every device the user has (`LOGOUT`'s scope), or one other device
+  picked from the sessions list (`REVOKE_SESSION`); a password change deletes
+  them all. Each connection on a deleted session is closed at
   once — it is authenticated in memory, so the row alone would not stop it — and
   re-presenting the token fails. This local revocation is exactly what a stateless provider JWT cannot
   provide, and is the reason the daemon issues its own sessions.

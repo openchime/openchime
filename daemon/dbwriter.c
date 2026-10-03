@@ -543,6 +543,9 @@ void oc_dbres_free(oc_dbres *r) {
 /* Session lifetime — the daemon's own expiry, no longer tied to a provider
  * token (REQ-181, AUTH.md §4). */
 #define OC_SESSION_TTL_MS (30ull * 24 * 60 * 60 * 1000)
+/* The session policy (REQ-181), set before serving and read on the writer. */
+static uint64_t g_session_ttl_ms = OC_SESSION_TTL_MS;
+static uint64_t g_session_idle_ms;   /* 0: never refused for being idle */
 
 /* Invite-token lifetime (AUTH.md §2): the invitee must redeem within this window. */
 #define OC_INVITE_TTL_MS (7ull * 24 * 60 * 60 * 1000)
@@ -823,7 +826,7 @@ static int mint_session(sqlite3 *db, uint64_t user_id,
     if (oc_rand_bytes(token, sizeof token) != 0) return -1;
     if (oc_sha256(token, sizeof token, hash) != 0) return -1;
 
-    uint64_t now = dbw_now_ms(), expiry = now + OC_SESSION_TTL_MS;
+    uint64_t now = dbw_now_ms(), expiry = now + __atomic_load_n(&g_session_ttl_ms, __ATOMIC_RELAXED);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "INSERT INTO sessions(token_hash,user_id,created_at_ms,expires_at_ms,last_seen_ms) "
@@ -855,14 +858,15 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT s.user_id, s.expires_at_ms, u.role, s.id FROM sessions s "
-        "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?;", -1, &st, NULL);
+        "SELECT s.user_id, s.expires_at_ms, u.role, s.id, COALESCE(s.last_seen_ms, s.created_at_ms) "
+        "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?;", -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
-    uint64_t uid = 0, exp = 0; uint8_t role = OC_ROLE_MEMBER;
+    uint64_t uid = 0, exp = 0, seen = 0; uint8_t role = OC_ROLE_MEMBER;
     if (sqlite3_step(st) == SQLITE_ROW) {
         uid  = (uint64_t)sqlite3_column_int64(st, 0);
         exp  = (uint64_t)sqlite3_column_int64(st, 1);
         role = role_to_u8((const char *)sqlite3_column_text(st, 2));
+        seen = (uint64_t)sqlite3_column_int64(st, 4);
         /* The session's own id, so SESSION_LIST can mark which row is this device
          * (REQ-182). Reported through the out-param below rather than a global. */
         if (out_session_id) *out_session_id = (uint64_t)sqlite3_column_int64(st, 3);
@@ -870,6 +874,17 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
     sqlite3_finalize(st);
     if (uid == 0) return 0;
     if (exp != 0 && dbw_now_ms() >= exp) return 0;   /* expired */
+    /* Unused for longer than the workspace allows (REQ-181): gone, as though
+     * signed out. `last_seen_ms` moves while a session is in use (sessions_seen),
+     * so this is idleness, not age. */
+    uint64_t idle = __atomic_load_n(&g_session_idle_ms, __ATOMIC_RELAXED);
+    if (idle && dbw_now_ms() - seen >= idle) {
+        sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE token_hash=?;", -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return 0;
+    }
 
     sqlite3_prepare_v2(db, "UPDATE sessions SET last_seen_ms=? WHERE token_hash=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
@@ -2016,6 +2031,39 @@ static oc_dbres *process_enable_user(oc_dbwriter *w, const oc_job *j) {
     r->role = target_role;
     r->disabled = 0;
     return r;
+}
+
+/* Sign one of the asker's own sessions out (REQ-182): its row goes -- the
+ * delete is scoped to the asker, so another's session id does nothing -- and
+ * the list comes back without it; its connection closes (`revoked_session`). */
+static oc_dbres *process_list_sessions(sqlite3 *db, const oc_job *j);
+static oc_dbres *process_revoke_session(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE id=? AND user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    int gone = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    if (gone) audit_actor(db, OC_AUDIT_SECURITY, "session.revoke", j->user_id, 0, "one", 1, NULL);
+    oc_dbres *r = process_list_sessions(db, j);
+    if (r && gone) { r->user_id = j->user_id; r->revoked_session = j->target_user_id; }
+    return r;
+}
+
+/* Sessions in use since their last mark (REQ-181): seen now. One statement per
+ * batch, which the net loop sends at most hourly per connection. */
+static oc_dbres *process_sessions_seen(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE sessions SET last_seen_ms=? WHERE id=?;", -1, &st, NULL);
+    uint64_t now = dbw_now_ms();
+    for (uint16_t i = 0; i < j->n_grp_uids; i++) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->grp_uids[i]);
+        sqlite3_step(st);
+        sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    return NULL;
 }
 
 /* The live reset a link's token names: its account and whether it clears the
@@ -9009,6 +9057,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_RESET_CREDENTIAL) return process_reset_credential(w->db, j);
     if (j->type == OC_JOB_RESET_REDEEM)  return process_reset_redeem(w, j);
     if (j->type == OC_JOB_ENABLE_USER)   return process_enable_user(w, j);
+    if (j->type == OC_JOB_REVOKE_SESSION) return process_revoke_session(w->db, j);
+    if (j->type == OC_JOB_SESSIONS_SEEN) return process_sessions_seen(w->db, j);
     if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
     if (j->type == OC_JOB_REGISTER)      return process_register(w, j);
     if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);
@@ -9704,6 +9754,11 @@ int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
 
 void oc_dbwriter_set_email_link(oc_dbwriter *w, int any) { w->email_link_any = any != 0; }
 void oc_dbwriter_set_local_mfa(oc_dbwriter *w, int policy) { w->local_mfa = policy; }
+void oc_dbwriter_set_session_policy(oc_dbwriter *w, uint64_t ttl_ms, uint64_t idle_ms) {
+    (void)w;
+    __atomic_store_n(&g_session_ttl_ms, ttl_ms ? ttl_ms : OC_SESSION_TTL_MS, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_session_idle_ms, idle_ms, __ATOMIC_RELAXED);
+}
 int  oc_dbwriter_local_mfa(oc_dbwriter *w) { return w->local_mfa; }
 
 void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32) {

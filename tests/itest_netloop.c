@@ -1862,6 +1862,84 @@ static void test_reset_frame(int port, const uint8_t *pin) {
     client_close(&a); client_close(&b);
 }
 
+/* The ids of the sessions the signed-in `c` sees, and which is its own. */
+static int session_list_read(client *c, uint64_t *ids, int cap, int *mine) {
+    oc_header hdr; oc_rbuf p;
+    for (int i = 0; i < 16; i++) {
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type != OC_MSG_SESSION_LIST) continue;
+        oc_session_entry e[OC_MAX_SESSIONS]; uint16_t n = 0;
+        if (oc_decode_session_list(&p, e, OC_MAX_SESSIONS, &n) != OC_OK) return -1;
+        for (uint16_t k = 0; k < n && k < cap; k++) { ids[k] = e[k].session_id; if (e[k].current) *mine = k; }
+        return n;
+    }
+    return -1;
+}
+
+static int session_ids(client *c, uint64_t *ids, int cap, int *mine) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    if (oc_encode_list_sessions(&w, OC_PROTOCOL_VERSION) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
+    return session_list_read(c, ids, cap, mine);
+}
+
+/* One device signed out on its own (REQ-182): its connection closes, the list
+ * comes back without it, the asker's own goes on, and a session id that is not
+ * the asker's does nothing. Sessions in use have last_seen_ms written in
+ * batches; one not in use is left alone (REQ-181). */
+static void test_revoke_one_session(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(signed_in(&a, port, pin, "sid", "pw-sid") == 0);
+    CHECK(signed_in(&b, port, pin, "sid", "pw-sid") == 0);
+    uint64_t ids[8]; int mine = -1;
+    CHECK(session_ids(&a, ids, 8, &mine) == 2 && mine >= 0);
+    uint64_t other = ids[mine == 0 ? 1 : 0];
+    /* Another user's real session, named by its id: untouched. */
+    client al;
+    uint64_t alids[8]; int almine = -1;
+    CHECK(signed_in(&al, port, pin, "alice", "pw-alice") == 0);
+    CHECK(session_ids(&al, alids, 8, &almine) >= 1 && almine >= 0);
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_revoke_session rs = { alids[almine] };   /* alice's, not sid's */
+    CHECK(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    CHECK(session_list_read(&a, ids, 8, &mine) == 2);     /* the answer: the list, both still there */
+    CHECK(peer_closed(&b) == 0);
+    CHECK(peer_closed(&al) == 0);
+    int almine2 = -1;
+    CHECK(session_ids(&al, alids, 8, &almine2) >= 1 && almine2 >= 0);   /* her row is still there */
+    client_close(&al);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    rs.session_id = other;
+    CHECK(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    CHECK(peer_closed(&b) == 1);
+    CHECK(session_list_read(&a, ids, 8, &mine) == 1 && mine == 0);
+    client_close(&b);
+
+    /* In use: last_seen_ms moves once the interval is up; idle: it stays. */
+    oc_netloop_set_seen_ms(300);
+    client idle;
+    CHECK(signed_in(&idle, port, pin, "sid", "pw-sid") == 0);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open("build/itest_netloop.db", &db) == SQLITE_OK);
+    sqlite3_busy_timeout(db, 5000);
+    CHECK(sqlite3_exec(db, "UPDATE sessions SET last_seen_ms=1 WHERE user_id=(SELECT id FROM users WHERE subject='local:sid');",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    usleep(400000);
+    CHECK(session_ids(&a, ids, 8, &mine) == 2);         /* a frame: a is in use */
+    int moved = 0;
+    for (int i = 0; i < 40 && !moved; i++) {
+        usleep(100000);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sessions WHERE last_seen_ms > 1 AND "
+                               "user_id=(SELECT id FROM users WHERE subject='local:sid');", -1, &st, NULL);
+        if (sqlite3_step(st) == SQLITE_ROW) moved = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    CHECK(moved == 1);                                   /* a's, and not the idle one's */
+    sqlite3_close(db);
+    oc_netloop_set_seen_ms(0);
+    client_close(&a); client_close(&idle);
+}
+
 /* A device token is checked on the wire: one no device issues -- too long, with
  * a quote or a NUL -- is refused rather than cut short or stored (ARCH-85). */
 static void test_device_token_wire(int port, const uint8_t *pin) {
@@ -5303,6 +5381,7 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "carol",     "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "roy",       "pw-roy",   OC_ROLE_MEMBER, 2048) != 0);
     g_ned = oc_dbwriter_register_local(dbw, "ned",     "pw-ned",   OC_ROLE_MEMBER, 2048);
+    CHECK(oc_dbwriter_register_local(dbw, "sid",       "pw-sid",   OC_ROLE_MEMBER, 2048) != 0);
     CHECK(g_ned != 0);
     uint64_t flooder = oc_dbwriter_register_local(dbw, "flooder", "pw", OC_ROLE_MEMBER, 2048);
     for (int i = 0; i < 100; i++) {   /* a crowd, for test_login_bound and the groups tests */
@@ -5368,6 +5447,7 @@ int run_netloop_tests(void) {
         test_device_token_wire(arg.port, pin);
         test_unauthed_closed(arg.port, pin);
         test_reset_frame(arg.port, pin);
+        test_revoke_one_session(arg.port, pin);
         test_groups_vertical(arg.port, pin);
         test_groups_unasked(arg.port, pin);
         test_http_stack(arg.port + 128, arg.port + 129);

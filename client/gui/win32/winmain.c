@@ -1914,6 +1914,8 @@ static rectf g_srch_more_btn;   /* next page of search results */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
 static int g_await_reset;       /* a reset link asked for: show it once (AUTH.md §2) */
 static int      g_sessions_open;   /* REQ-182 */
+static struct { rectf r; uint64_t sid; } g_sess_rows[32];   /* each other device's "Sign out" */
+static int      g_n_sess_rows;
 static int      g_confirm_open;
 static int      g_confirm_act;
 static uint64_t g_confirm_id;
@@ -14766,6 +14768,7 @@ static void draw_sessions(gfx *rt, const oc_model *m, rectf body) {
         return;
     }
     float rowh = UIS(52);
+    g_n_sess_rows = 0;
     ovl_use(OVL_SESSIONS);
     float y = ovl_begin(rt, body, (float)m->n_sessions * rowh + 12);
     for (size_t i = 0; i < m->n_sessions; i++) {
@@ -14791,6 +14794,17 @@ static void draw_sessions(gfx *rt, const oc_model *m, rectf body) {
         if (exp[0]) snprintf(sub + strlen(sub), sizeof sub - strlen(sub), "%s", exp);
         draw_text(rt, sub, g_meta, rf(body.left + 8, y + 24, body.right - 8, y + 44),
                   OC_COL_FAINT);
+        if (!sr->current && g_n_sess_rows < 32) {   /* another device: signed out on its own */
+            rectf b = rf(body.right - 100, y + 12, body.right - 8, y + 40);
+            fill_round(rt, b, OC_R_CONTROL, in_rect(b, g_mouse_x, g_mouse_y) ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            g_ui->align = ST_ALIGN_CENTER;
+            draw_text(rt, "Sign out", g_ui, rf(b.left, b.top + 1, b.right, b.bottom), OC_COL_TEXT);
+            g_ui->align = ST_ALIGN_LEFT;
+            g_sess_rows[g_n_sess_rows].r = b;
+            g_sess_rows[g_n_sess_rows].sid = sr->session_id;
+            g_n_sess_rows++;
+        }
         fill(rt, rf(body.left + 8, y + rowh - 1, body.right - 8, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
@@ -23049,6 +23063,12 @@ static int on_click(HWND hwnd, int x, int y) {
                              "Anyone holding this invite's token will no longer be able to "
                              "use it. It cannot be un-revoked \u2014 mint a new one instead.",
                              "Revoke");
+                return 1;
+            }
+    if (g_sessions_open)
+        for (int i = 0; i < g_n_sess_rows; i++)
+            if (in_rect(g_sess_rows[i].r, x, y)) {
+                oc_client_revoke_session(g_client, g_sess_rows[i].sid);
                 return 1;
             }
     if (g_browse_open) {

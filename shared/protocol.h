@@ -333,6 +333,7 @@ typedef enum {
      * MSG_EDITED is both the edit's ack and its broadcast. */
     OC_MSG_GET_CHANNEL_DESCRIPTION = 0x008C, /* C->S {channel_id} */
     OC_MSG_CHANNEL_DESCRIPTION     = 0x008D, /* S->C {channel_id, description} */
+    OC_MSG_REVOKE_SESSION          = 0x008E, /* C->S {session_id}: sign one of your devices out */
     OC_MSG_SET_NOTIFY_PREF  = 0x0090, /* C->S, set a channel's notification level (REQ-130) */
     /* 0x0091 was SET_DND, REQ-131's single quiet window. REQ-136 replaced it
      * with a schedule (0x00CC) that states ALLOWED hours, so the op is retired
@@ -1474,6 +1475,9 @@ typedef struct { uint64_t user_id; oc_slice token; } oc_credential_reset;
  * (disabled 0), and for a local account a CREDENTIAL_RESET too -- removal took
  * its password, so the link is how it gets one. */
 typedef struct { uint64_t user_id; } oc_enable_user;
+/* Sign one of your own sessions out (REQ-182): its row goes and its connection
+ * closes. Answered with a fresh SESSION_LIST. */
+typedef struct { uint64_t session_id; } oc_revoke_session;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
 /* An outstanding invite, identified by a server-side id rather than its
@@ -1782,6 +1786,7 @@ oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_us
 oc_result oc_encode_reset_credential(oc_wbuf *w, uint16_t version, const oc_reset_credential *m);
 oc_result oc_encode_credential_reset(oc_wbuf *w, uint16_t version, const oc_credential_reset *m);
 oc_result oc_encode_enable_user(oc_wbuf *w, uint16_t version, const oc_enable_user *m);
+oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke_session *m);
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
 oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
 oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
@@ -1973,6 +1978,7 @@ oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
 oc_result oc_decode_reset_credential(oc_rbuf *p, oc_reset_credential *m);
 oc_result oc_decode_credential_reset(oc_rbuf *p, oc_credential_reset *m);
 oc_result oc_decode_enable_user(oc_rbuf *p, oc_enable_user *m);
+oc_result oc_decode_revoke_session(oc_rbuf *p, oc_revoke_session *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
 oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);

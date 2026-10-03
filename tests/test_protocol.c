@@ -981,6 +981,12 @@ static void test_admin_frames(void) {
         CHECK(oc_decode_remove_user(&p, &out) == OC_OK);
         CHECK(out.user_id == 42);
     }
+    {   /* One of your sessions signed out (REQ-182). */
+        oc_revoke_session in = { 77 };
+        ROUNDTRIP(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REVOKE_SESSION, h, p);
+        oc_revoke_session out;
+        CHECK(oc_decode_revoke_session(&p, &out) == OC_OK && out.session_id == 77);
+    }
     {   /* A removed member brought back (REQ-033). */
         oc_enable_user in = { 43 };
         ROUNDTRIP(oc_encode_enable_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ENABLE_USER, h, p);

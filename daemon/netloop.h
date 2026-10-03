@@ -54,6 +54,12 @@ void oc_netloop_set_call_grace_ms(uint64_t ms);
 #define OC_UNAUTHED_MS 60000u
 void oc_netloop_set_unauthed_ms(uint64_t ms);
 
+/* A session in use has its last_seen_ms written at most this often (REQ-181),
+ * so an idle limit measures disuse and costs nothing per message. A test's knob
+ * for a shorter interval (0 restores it). Any thread. */
+#define OC_SESSION_SEEN_MS (60u * 60u * 1000u)
+void oc_netloop_set_seen_ms(uint64_t ms);
+
 /* Hold a connection's presence changes to OC_PRESENCE_RATE_MAX per `ms` rather
  * than per ten seconds (0 restores it); a test's knob, so the deferred last word
  * can be seen without waiting out the window. Any thread. */

@@ -2134,6 +2134,11 @@ client never offers an action that would fail.
 
     invite_id (u64)
 
+**`REVOKE_SESSION` (C → S), `0x008E`** `{ session_id: u64 }` — sign one of your
+own sessions out (REQ-182): its row goes, any connection on it closes, and the
+answer is `SESSION_LIST` without it. A session id that is not the caller's
+changes nothing.
+
 **`LIST_SESSIONS` (C → S), `0x0075`** — Ask for the caller's own active sessions. (REQ-182)
 
     (empty)
@@ -2858,6 +2863,7 @@ this table cannot silently gain a shared value.
 | `0x008B` | `MARK_ALL_READ` | C → S | advance every membership's cursor (§5.4) |
 | `0x008C` | `GET_CHANNEL_DESCRIPTION` | C → S | a channel's long-form description (§5.4) |
 | `0x008D` | `CHANNEL_DESCRIPTION` | S → C | the answer, and the fan-out of a change |
+| `0x008E` | `REVOKE_SESSION` | C → S | sign one of your own sessions out; answered with `SESSION_LIST` |
 | `0x0090` | `SET_NOTIFY_PREF` | C → S | set a channel's notification level (REQ-130) |
 | `0x0092` | `LIST_NOTIFY_PREFS` | C → S | request all notification settings |
 | `0x0093` | `NOTIFY_PREFS` | S → C | DND + per-channel levels (also a sync push) |

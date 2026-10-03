@@ -562,6 +562,13 @@ works. Nothing proves the shipped *image* works (§3.2).
   `test_reset_frame`):** only a removed member, only by whoever may remove them,
   not at the seat cap; with a reset link on which they sign in again; over the
   wire, removed then back, the owner gets the link.
+- **Sessions (`test_dbwriter` `test_session_policy`, `itest_netloop`
+  `test_revoke_one_session`):** a session lives the configured days; one unused
+  past the idle limit is refused and deleted at its next use, one marked in use
+  goes on; one device signed out on its own closes its connection and leaves
+  the asker's, another user's session id changes nothing; a connection in use
+  has its session's last_seen_ms written once the interval is up, an idle one
+  does not (REQ-181, REQ-182).
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).

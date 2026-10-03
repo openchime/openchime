@@ -1211,6 +1211,16 @@ void oc_client_list_sessions(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+/* REQ-182: sign one of them out. */
+void oc_client_revoke_session(oc_client *c, uint64_t session_id) {
+    if (!c || !session_id) return;
+    oc_model_sessions_begin(&c->model);   /* the answer is the list again */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REVOKE_SESSION);
+    if (!cmd) return;
+    cmd->message_id = session_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* the exact channel census for the Files view. */
 void oc_client_list_file_channels(oc_client *c) {
     if (!c) return;
