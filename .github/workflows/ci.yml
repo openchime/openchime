@@ -263,7 +263,8 @@ jobs:
             third_party/opus-1.6.1-win
             third_party/speexdsp-1.2.1-win
             third_party/sdl3-3.4.14-win
-          key: vendor-win-ubuntu-24.04-${{ hashFiles('scripts/build_mbedtls_windows.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_sdl3_windows.sh') }}
+            third_party/mbedtls-3.6.2
+          key: vendor-win-ubuntu-24.04-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_mbedtls_windows.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_sdl3_windows.sh') }}
       - name: Cross-build the vendored Windows mbedTLS
         run: scripts/build_mbedtls_windows.sh
       # libvpx and libopus for the Win32 client's video messages (ARCH-110).
@@ -279,3 +280,8 @@ jobs:
       # builds under mingw.
       - name: Compile the Windows front-ends
         run: make windows-tui windows-gui
+      # This runner's gcc is newer than the build job's, and at -O2 it raises
+      # warnings (format-truncation among them) that gcc 11 and clang do not,
+      # so the Linux terminal client is built here too.
+      - name: The terminal client builds with this runner's gcc
+        run: gcc --version | head -1 && make tui
