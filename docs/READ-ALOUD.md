@@ -46,6 +46,7 @@ listener gets the same text.
 | A quoted line | "Quote:" once per quote, then the text |
 | Emoji and `:shortcodes:` | dropped |
 | A line break | the end of a sentence |
+| An action, `/me is away` (REQ-058) | the actor's name, then the action — "Ada Starr is away" |
 
 Numbers, times, currency, ordinals and common abbreviations are expanded to words by
 ttskit (TTSKIT.md §4), not here. A message that leaves nothing to say — a bare attachment,

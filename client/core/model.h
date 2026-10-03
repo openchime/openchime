@@ -73,7 +73,19 @@ typedef struct {
     char    *excerpt;      /* heap; a snapshot taken when the forward was sent */
     char    *attach_name;  /* heap; the first file's name, "" = none */
     uint16_t n_attach;
+    uint8_t  src_action;   /* the source was an action: excerpt is its text (REQ-058) */
 } oc_msg_forward;
+
+/* A message's action (REQ-058, ARCH-115), as the daemon recorded it: the body
+ * stays what was typed, and `start`/`len` are the BYTES of it that are the
+ * action text. `actor_name` is a webhook's label, "" for the author's own name.
+ * A client never decides this for itself; it is set and cleared only by what
+ * the daemon sends. */
+typedef struct {
+    uint8_t  present;
+    uint32_t start, len;
+    char     actor_name[64];
+} oc_msg_action;
 
 typedef struct {
     char    *body;         /* heap */
@@ -105,6 +117,7 @@ typedef struct {
     uint8_t        n_unfurls, cap_unfurls;
     /* The forward reference (REQ-057), NULL unless this message is a forward. */
     oc_msg_forward *forward;
+    oc_msg_action   action;   /* REQ-058 */
 } oc_msg;
 
 /* How many live thread replies can be waiting for the toast pass at once. The
@@ -126,6 +139,7 @@ typedef struct {
     uint64_t author_id;
     uint8_t  mentioned;
     uint8_t  keyword_hit;
+    uint8_t  action;       /* the reply is an action: body is its text (REQ-058) */
     char     body[256];    /* NUL-terminated excerpt, for the toast */
 } oc_thread_notice;
 
@@ -163,6 +177,7 @@ typedef struct {
      * live by BROADCAST — otherwise it would be right only at connect. */
     char     preview[128];
     uint64_t preview_author;
+    uint8_t  preview_action;   /* preview is an action's text (REQ-058) */
     uint64_t high_water;   /* dedup mark: ignore message_id <= this (ARCH-45) */
     uint64_t read_marker;  /* high_water as of the last mark-read; drives unread */
     int      unread;       /* messages from others since the last mark-read */
@@ -242,7 +257,8 @@ typedef struct {
 typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
 
 /* One full-text search hit (REQ-080). */
-typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet; } oc_search_result;
+typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet;
+                 uint8_t action; /* the snippet is an action's text (REQ-058) */ } oc_search_result;
 
 /* One reactor entry (from LIST_REACTIONS -> REACTIONS, REQ-071): who reacted
  * with which emoji on the inspected message. */
@@ -254,6 +270,7 @@ typedef struct {
     uint64_t message_id, author_id, server_time, pinned_by, pinned_at;
     char    *body;                /* heap */
     char     attach_name[128];    /* first attachment, "" if none */
+    uint8_t  action;              /* body is an action's text (REQ-058) */
 } oc_pinned_row;
 
 /* One member of a CHANNEL (REQ-031) — distinct from oc_member, which is the
@@ -289,6 +306,7 @@ typedef struct {
     uint64_t message_id, channel_id, author_id, server_time, saved_at;
     char    *body;                 /* heap */
     char     attach_name[128];
+    uint8_t  action;               /* body is an action's text (REQ-058) */
 } oc_saved_view;
 
 /* One draft (REQ-223, ARCH-101). Keyed by the conversation, not by time: there
@@ -311,6 +329,7 @@ typedef struct {
     uint32_t reply_count, unread;
     uint8_t  following;
     char    *preview;     /* heap */
+    uint8_t  action;      /* the root is an action; preview is its text (REQ-058) */
     uint32_t gen;
 } oc_thread_view;
 
@@ -332,6 +351,7 @@ typedef struct {
     uint8_t  kind;
     uint64_t message_id, channel_id, actor_id, at;
     char    *text;                 /* heap */
+    uint8_t  action;               /* text is an action's text (REQ-058) */
 } oc_activity_view;
 
 /* One incoming-webhook entry (from LIST_WEBHOOKS -> WEBHOOK_LIST, REQ-170): the
@@ -960,7 +980,14 @@ uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *
 /* What a message says in a one-line summary — a sidebar row, a toast, the
  * activity feed: its text, or for a message that is only a file, what the file
  * is ("🎥 Video message (1:05)" for a video message, REQ-165). */
-void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap);
+/* One line for a message as a person reads it: "<name> <text>" for an action
+ * (REQ-058, ARCH-115), else the text. `name` overrides the roster name (a
+ * webhook's label); NULL or "" looks `author_id` up. Every surface that shows an
+ * excerpt, a toast or a screen-reader string goes through this, so an action
+ * reads the same everywhere. */
+void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int action,
+                   const char *text, char *out, size_t cap);
+void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap);
 /* "m:ss" for a duration in milliseconds (h:mm:ss past an hour). */
 void oc_model_format_duration(uint32_t ms, char *out, size_t cap);
 

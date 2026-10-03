@@ -456,6 +456,19 @@ where one exists.
   reclamation counts on (ARCH-77/78) — or duplicating the bytes. Naming rather
   than offering is also what a recipient who cannot read the source needs: a
   download button would fail for exactly the people most likely to press it.
+- **REQ-058.** A user has been able to **describe what they are doing in the
+  third person**: a message that begins `/me`, one or more spaces, then text —
+  `/me is away` — has read as **Ada Starr is away** everywhere it appears: the
+  transcript, previews, search, activity, threads, pins, saved items, forwards,
+  notifications, the screen reader and read-aloud. The name is the person's
+  current one, so a rename follows; a webhook's action is told in its label. Sends,
+  thread replies, webhook posts and scheduled messages have all qualified; an edit
+  has made or unmade one, a delete has removed it and a restore has brought it back.
+  **The daemon records an action as its own object (ARCH-115)** beside a body that
+  stays exactly what was typed (REQ-054), and every surface reads that object — no
+  client has ever decided for itself whether text is an action. An action has
+  never been grouped under the message before it, so it is never left without a
+  visible author, and in the transcript it names its actor rather than "you".
 
 ### 2.2 Threads
 

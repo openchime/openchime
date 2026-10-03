@@ -197,6 +197,7 @@ enum {
      * the same url if the daemon re-fetched: the fold is an upsert. */
     OC_EV_UNFURL,
     OC_EV_FORWARD,
+    OC_EV_ACTION,     /* a message's action (REQ-058): its own frame, or a replay's */
     /* Read-aloud (REQ-291-295, ARCH-111). TTS_INFO replaces what the client knows
      * about the daemon's speech: a BEGIN, then one VOICE per voice, as the emoji
      * and settings lists do. body on BEGIN is the model version, topic the
@@ -318,6 +319,15 @@ typedef struct {
     uint64_t src_channel, src_message;
     uint16_t src_n_attach;
     char     src_attach_name[128];   /* the first file's name; "" = none */
+    /* An action (REQ-058, ARCH-115). On ACTION: the record itself. On MESSAGE,
+     * EDIT, RESTORE and THREAD_REPLY: the action the daemon paired with the
+     * message, set by the net thread before the event is handed over, so the
+     * model never holds a live message without it (`action_known` 1). On an
+     * excerpt event (CHANNEL, SEARCH, ACTIVITY, THREAD, PINNED, SAVED,
+     * FORWARD): 1 in `action` when the excerpt is an action's text. */
+    uint8_t  action, action_known;
+    uint32_t action_start, action_len;
+    char     actor_name[64];
     uint32_t reply_count, unread_count;
     uint8_t  following;
     /* REQ-289: the profile fields carried on a USER entry. `emoji` and

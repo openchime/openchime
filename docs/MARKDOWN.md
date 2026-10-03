@@ -85,6 +85,14 @@ never a rewritten string. The body a client renders is byte-identical to the bod
 the daemon stored, which keeps search (FTS5 over the raw body), mention offsets
 (migration 0021's byte spans) and message editing all addressing the same text.
 
+**A leading `/me` is not markup.** A body that begins `/me`, one or more spaces,
+then text is an **action** (REQ-058, ARCH-115): the daemon decides it, records it
+beside the body and tells every client, which shows the actor's name and then the
+action text — `/me is away` reads "Ada Starr is away". The parser above runs over
+the action text only, never over the name in front of it, so the author's own
+formatting applies exactly as it would in any message and a name is never styled
+as if it were markup.
+
 ## 4. Where we deliberately differ from Slack
 
 Recorded so the divergences are choices rather than drift.

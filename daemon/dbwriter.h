@@ -708,6 +708,7 @@ typedef struct oc_thread_row {
     uint32_t reply_count, unread;
     uint8_t  following;
     char    *preview;
+    uint8_t  action;   /* the root is an action; preview is its text (REQ-058) */
 } oc_thread_row;
 
 /* One custom emoji (REQ-072). */
@@ -722,6 +723,7 @@ typedef struct oc_emoji_row {
 typedef struct {
     uint64_t message_id, channel_id, author_id, created_at, saved_at;
     char    *body, *attach_name;   /* heap */
+    uint8_t  action;               /* body is the action text (REQ-058) */
 } oc_saved_row;
 
 /* One activity item (REQ-139). `text` is the message body for a mention or a
@@ -730,6 +732,7 @@ typedef struct {
     uint8_t  kind;
     uint64_t message_id, channel_id, actor_id, at;
     char    *text;                 /* heap */
+    uint8_t  action;               /* text is the action text (REQ-058) */
 } oc_activity_row;
 
 /* One row of a channel's member roster (REQ-031). */
@@ -752,6 +755,7 @@ typedef struct {
     uint64_t message_id, author_id, created_at_ms, pinned_by, pinned_at;
     char    *body;         /* heap; NULL for a tombstoned message */
     char    *attach_name;  /* heap; first attachment's filename, else NULL */
+    uint8_t  action;       /* body is the action text (REQ-058) */
 } oc_pin_row;
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
@@ -780,6 +784,7 @@ typedef struct {
     uint16_t n_peers;
     char    *preview;       /* heap; newest top-level body, truncated */
     uint64_t preview_author;
+    uint8_t  preview_action;   /* preview is the action text (REQ-058) */
     uint64_t groups[OC_MAX_CHANNEL_GROUPS];   /* the channel's groups (REQ-309) */
     uint16_t n_groups;
 } oc_channel_row;
@@ -898,6 +903,9 @@ typedef struct {
     uint8_t  saved;
     uint64_t saved_at;
     uint8_t  kind;         /* OC_MSG_KIND_*: a call event is drawn as history (REQ-304) */
+    /* SEARCH only: the snippet in `body` is cut from an action's text
+     * (REQ-058). A replay carries actions on their own frames instead. */
+    uint8_t  action;
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -985,9 +993,19 @@ typedef struct oc_dbres {
      * drift the way reactions once did. */
     struct oc_replay_forward { uint64_t message_id, channel_id,
                                         src_channel, src_message, src_author;
-                               char *excerpt, *attach_name; uint16_t n_attach; }
+                               char *excerpt, *attach_name; uint16_t n_attach;
+                               uint8_t src_action; }
                   *rfwd;
     size_t         n_rfwd;
+    /* Actions (REQ-058, ARCH-115), on the forward's pattern above: the object
+     * travels on its own ACTION frame, one array serves the live result and the
+     * replay. text_len 0 is an entry saying "not an action" -- what an edit or
+     * restore sends when the body no longer is one. actor_name is heap, NULL
+     * for the actor's current name. */
+    struct oc_replay_action { uint64_t message_id, channel_id, actor_id;
+                              char *actor_name; uint32_t text_start, text_len; }
+                  *ract;
+    size_t         n_ract;
     char          *unf_url;    /* heap; UNFURL_STORED */
     char          *unf_title;  /* heap */
     char          *unf_descr;  /* heap */

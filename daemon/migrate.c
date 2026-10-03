@@ -1187,6 +1187,50 @@ static const char MIGRATION_0055[] =
     ");"
     "CREATE INDEX webauthn_credentials_user ON webauthn_credentials(user_id);";
 
+static const char MIGRATION_0056[] =
+    /* Actions (REQ-058, ARCH-115): a message that begins "/me" describes what its
+     * author is doing, and the daemon records that as its own object beside the
+     * message, whose body stays what was typed. One row per message, keyed on
+     * it, as a forward is. actor_name is a webhook's label; NULL means the
+     * actor's current name, so a rename follows. text_start and text_len are
+     * BYTES into the body.
+     *
+     * The backfill states shared/action.c's rule in SQL -- "/me", one or more
+     * spaces, then a byte that is not whitespace -- and a test holds the two to
+     * the same answers. A body is stored as a blob by most writers and as text
+     * by some, and a blob never equals a text literal, so each is read as text
+     * first. Spaces are single bytes, so counting characters across the run of
+     * them counts bytes; the lengths are taken as blobs. A call event (kind 1)
+     * is never an action, and a tombstone has no body. */
+    "CREATE TABLE actions ("
+    "  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  actor_id      INTEGER NOT NULL REFERENCES users(id),"
+    "  actor_name    TEXT,"
+    "  text_start    INTEGER NOT NULL,"
+    "  text_len      INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "INSERT INTO actions(message_id, channel_id, actor_id, actor_name, text_start, text_len, created_at_ms)"
+    "  SELECT id, channel_id, author_id, NULLIF(author_name, ''), s, length(CAST(b AS BLOB)) - s, created_at_ms"
+    "  FROM (SELECT id, channel_id, author_id, author_name, b, created_at_ms,"
+    "               3 + length(substr(b, 4)) - length(ltrim(substr(b, 4), ' ')) AS s,"
+    "               substr(ltrim(substr(b, 4), ' '), 1, 1) AS first"
+    "        FROM (SELECT *, CAST(body AS TEXT) AS b FROM messages"
+    "              WHERE kind = 0 AND body IS NOT NULL)"
+    "        WHERE substr(b, 1, 4) = '/me ')"
+    "  WHERE first <> '' AND first NOT IN (char(9), char(10), char(13));"
+    /* A forward of an action says so, and its excerpt is the action's text, so
+     * the card can read "<name> <text>". The excerpt is the snapshot of the
+     * source's opening bytes, so the rule is asked of the excerpt itself. */
+    "ALTER TABLE forwards ADD COLUMN src_action INTEGER NOT NULL DEFAULT 0 CHECK (src_action IN (0,1));"
+    "UPDATE forwards SET src_action = 1,"
+    "    excerpt = substr(CAST(excerpt AS TEXT),"
+    "                     4 + length(substr(CAST(excerpt AS TEXT), 4))"
+    "                       - length(ltrim(substr(CAST(excerpt AS TEXT), 4), ' ')))"
+    "  WHERE substr(CAST(excerpt AS TEXT), 1, 4) = '/me '"
+    "    AND substr(ltrim(substr(CAST(excerpt AS TEXT), 4), ' '), 1, 1) NOT IN ('', char(9), char(10), char(13));";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1243,6 +1287,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 53, MIGRATION_0053 },
     { 54, MIGRATION_0054 },
     { 55, MIGRATION_0055 },
+    { 56, MIGRATION_0056 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

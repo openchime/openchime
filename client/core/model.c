@@ -67,6 +67,24 @@ static void msg_tombstone(oc_msg *msg) {
     msg->pinned_by = msg->pinned_at = 0;
     msg->saved = 0;
     msg->saved_at = 0;
+    memset(&msg->action, 0, sizeof msg->action);   /* no body, no action (REQ-058) */
+}
+
+/* Set a message's action from what the daemon sent (REQ-058, ARCH-115): an
+ * ACTION frame, or the one the net thread paired with a live message. An event
+ * that carries no answer leaves the message as it was. The span is checked
+ * against the body the model holds, so a frame that disagreed with it can only
+ * clear an action, never point outside the text. */
+static void msg_set_action(oc_msg *msg, const oc_ev *e) {
+    if (!e->action_known) return;
+    memset(&msg->action, 0, sizeof msg->action);
+    if (!e->action || msg->deleted || !msg->body) return;
+    size_t blen = strlen(msg->body);
+    if (e->action_len == 0 || e->action_start > blen || e->action_len > blen - e->action_start) return;
+    msg->action.present = 1;
+    msg->action.start   = e->action_start;
+    msg->action.len     = e->action_len;
+    snprintf(msg->action.actor_name, sizeof msg->action.actor_name, "%s", e->actor_name);
 }
 
 /* A tombstone that was taken back (REQ-052): the body again. Whatever the
@@ -159,10 +177,26 @@ void oc_model_format_duration(uint32_t ms, char *out, size_t cap) {
     else           snprintf(out, cap, "%u:%02u", s / 60, s % 60);
 }
 
-void oc_model_msg_preview(const oc_msg *msg, char *out, size_t cap) {
+void oc_model_line(const oc_model *m, uint64_t author_id, const char *name, int action,
+                   const char *text, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!text) text = "";
+    if (!action) { snprintf(out, cap, "%s", text); return; }
+    const char *who = (name && name[0]) ? name : oc_model_user_name(m, author_id);
+    snprintf(out, cap, "%s %s", who ? who : "", text);
+}
+
+void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_t cap) {
     if (!out || !cap) return;
     out[0] = '\0';
     if (!msg) return;
+    if (msg->action.present && msg->body) {
+        oc_model_line(m, msg->author_id,
+                      msg->action.actor_name[0] ? msg->action.actor_name : msg->author_name,
+                      1, msg->body + msg->action.start, out, cap);
+        return;
+    }
     if (msg->body && msg->body[0]) { snprintf(out, cap, "%s", msg->body); return; }
     if (!msg->n_attach) return;
     const oc_attachment *a = &msg->attach[0];
@@ -617,6 +651,7 @@ static void thread_apply(oc_model *m, const oc_ev *e) {
     t->unread        = e->unread_count;
     t->following     = e->following;
     t->preview       = e->body ? strdup(e->body) : NULL;
+    t->action        = e->action;   /* REQ-058 */
     t->gen           = m->thread_gen;
     /* An unfollowed thread leaves the list the moment it is unfollowed: the view
      * is "threads I am in", and staying visible would make the button look
@@ -855,7 +890,7 @@ static void thread_append(oc_model *m, uint64_t message_id, uint64_t author_id,
 
 /* Append a search hit, stealing ownership of `*snippet` (NULL on success). */
 static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
-                          uint64_t author_id, uint64_t server_time, char **snippet) {
+                          uint64_t author_id, uint64_t server_time, uint8_t action, char **snippet) {
     for (size_t i = 0; i < m->n_search; i++)
         if (m->search_results[i].message_id == message_id) return;   /* dedup */
     if (m->n_search == m->cap_search) {
@@ -867,6 +902,7 @@ static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
     oc_search_result *sr = &m->search_results[m->n_search++];
     sr->message_id = message_id; sr->channel_id = channel_id;
     sr->author_id = author_id; sr->server_time = server_time;
+    sr->action = action;
     sr->snippet = *snippet; *snippet = NULL;
 }
 
@@ -990,7 +1026,7 @@ static void attach_to_msg(oc_model *m, const oc_ev *e) {
                 const oc_msg *msg = &c->msgs[i];
                 if ((!msg->body || !msg->body[0]) && msg->n_attach == 1 &&
                     msg->message_id >= c->high_water && c->preview_author == msg->author_id)
-                    oc_model_msg_preview(msg, c->preview, sizeof c->preview);
+                    oc_model_msg_preview(m, msg, c->preview, sizeof c->preview);
                 return;
             }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
@@ -1367,7 +1403,12 @@ static void notice_push(oc_model *m, const oc_ev *e) {
         size_t blen = strlen(e->body);
         n->mentioned   = (uint8_t)(oc_model_mentions_me(m, e->body, blen) != 0);
         n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
-        snprintf(n->body, sizeof n->body, "%s", e->body);
+        /* An action keeps its action text, flagged, for "<name> <text>"
+         * (REQ-058); the net thread paired it with the reply before this. */
+        int act = e->action_known && e->action && e->action_len &&
+                  e->action_start <= blen && e->action_len <= blen - e->action_start;
+        n->action = (uint8_t)act;
+        snprintf(n->body, sizeof n->body, "%s", act ? e->body + e->action_start : e->body);
     }
 }
 
@@ -1536,6 +1577,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             if (e->preview) {
                 snprintf(c->preview, sizeof c->preview, "%s", e->preview);
                 c->preview_author = e->preview_author;
+                c->preview_action = e->action;   /* REQ-058 */
             }
             free(c->topic);
             c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
@@ -1561,11 +1603,18 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * newer than what we last previewed, so a backfill replaying older
          * history cannot rewind the sidebar to an old line. */
         if (c && e->body && e->message_id >= c->high_water) {
-            snprintf(c->preview, sizeof c->preview, "%s", e->body);
+            /* An action previews as its action text, flagged, read beside its
+             * author (REQ-058); the net thread paired the two before this. */
+            size_t blen = strlen(e->body);
+            int act = e->action_known && e->action && e->action_len &&
+                      e->action_start <= blen && e->action_len <= blen - e->action_start;
+            snprintf(c->preview, sizeof c->preview, "%s", act ? e->body + e->action_start : e->body);
             c->preview_author = e->author_id;
+            c->preview_action = (uint8_t)act;
         }
         if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time,
                                 e->msg_kind, &e->body)) {
+            msg_set_action(&c->msgs[c->n_msgs - 1], e);
             /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
              * the pause left out — they say when to interrupt you, not whether
              * a message mattered, and a badge that emptied itself overnight
@@ -1769,6 +1818,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         sv->author_id  = e->author_id;  sv->server_time = e->server_time;
         sv->saved_at   = e->pinned_at;
         sv->body = e->body ? strdup(e->body) : NULL;
+        sv->action = e->action;   /* REQ-058 */
         snprintf(sv->attach_name, sizeof sv->attach_name, "%s", e->author_name);
         break;
     }
@@ -1915,6 +1965,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         av->channel_id = e->channel_id; av->actor_id = e->user_id;
         av->at = e->server_time;
         av->text = e->body ? strdup(e->body) : NULL;
+        av->action = e->action;   /* REQ-058 */
         break;
     }
     case OC_EV_ACTIVITY_END:
@@ -1971,6 +2022,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         pr->pinned_by   = e->user_id;
         pr->pinned_at   = e->pinned_at;
         pr->body        = e->body ? strdup(e->body) : NULL;
+        pr->action      = e->action;   /* REQ-058 */
         snprintf(pr->attach_name, sizeof pr->attach_name, "%s", e->author_name);
         break;
     }
@@ -1989,6 +2041,27 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 }
             }
         }
+        break;
+    }
+    case OC_EV_ACTION: {
+        /* An action on its own frame (REQ-058): a replay's, or one for a
+         * message the net thread was not holding. Applied wherever the message
+         * is -- the channel's list and an open thread -- and, when it is the
+         * channel's newest, to the preview the sidebar reads. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        for (size_t i = 0; c && i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) {
+                oc_msg *msg = &c->msgs[i];
+                msg_set_action(msg, e);
+                if (i + 1 == c->n_msgs && msg->body && c->preview_author == msg->author_id) {
+                    snprintf(c->preview, sizeof c->preview, "%s",
+                             msg->action.present ? msg->body + msg->action.start : msg->body);
+                    c->preview_action = msg->action.present;
+                }
+                break;
+            }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) { msg_set_action(&m->thread_msgs[i], e); break; }
         break;
     }
     case OC_EV_FORWARD: {
@@ -2013,6 +2086,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         msg->forward->src_message = e->src_message;
         msg->forward->src_author  = e->author_id;
         msg->forward->n_attach    = e->src_n_attach;
+        msg->forward->src_action  = e->action;   /* REQ-058 */
         msg->forward->excerpt     = e->body;   /* steal, like an edit does */
         e->body = NULL;
         break;
@@ -2059,6 +2133,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     /* The previews described the OLD body; the daemon dropped
                      * its rows and re-fetches, so the model matches (REQ-222). */
                     msg_clear_unfurls(&c->msgs[i]);
+                    /* And the action it may now be, or no longer is (REQ-058). */
+                    msg_set_action(&c->msgs[i], e);
                     break;
                 }
             }
@@ -2086,9 +2162,17 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * as ATTACH events and fold on as for any message. */
         oc_channel *c = oc_model_channel(m, e->channel_id);
         for (size_t i = 0; c && i < c->n_msgs; i++)
-            if (c->msgs[i].message_id == e->message_id) { msg_untombstone(&c->msgs[i], e->body); break; }
+            if (c->msgs[i].message_id == e->message_id) {
+                msg_untombstone(&c->msgs[i], e->body);
+                msg_set_action(&c->msgs[i], e);   /* back with its body (REQ-058) */
+                break;
+            }
         for (size_t i = 0; i < m->n_thread_msgs; i++)
-            if (m->thread_msgs[i].message_id == e->message_id) { msg_untombstone(&m->thread_msgs[i], e->body); break; }
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_untombstone(&m->thread_msgs[i], e->body);
+                msg_set_action(&m->thread_msgs[i], e);
+                break;
+            }
         break;
     }
     case OC_EV_THREAD_REPLY:
@@ -2105,8 +2189,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             for (size_t i = 0; i < m->n_threads; i++)
                 if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
         }
-        if (m->thread_open && e->parent_id == m->thread_parent)
+        if (m->thread_open && e->parent_id == m->thread_parent) {
+            size_t before = m->n_thread_msgs;
             thread_append(m, e->message_id, e->author_id, e->server_time, &e->body);
+            if (m->n_thread_msgs > before) msg_set_action(&m->thread_msgs[m->n_thread_msgs - 1], e);
+        }
         break;
     case OC_EV_THREAD_END:
         /* The replay is done; anything arriving from here is live. */
@@ -2117,7 +2204,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_SEARCH_RESULT:
         if (m->search_open) {
-            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, &e->body);
+            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, e->action, &e->body);
             if (e->status) m->search_truncated = 1;
         }
         break;

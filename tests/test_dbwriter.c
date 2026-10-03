@@ -7508,6 +7508,240 @@ static void test_restore(void) {
     cleanup_db(path);
 }
 
+/* Actions (REQ-058, ARCH-115): every writer records the object from the body as
+ * it stands, every live result answers whether its message is one, both
+ * replays carry them, and every excerpt the daemon builds says so and is cut
+ * from the action's text. */
+static int action_row(const char *path, uint64_t mid, uint32_t *start, uint32_t *len, char *name, size_t cap) {
+    sqlite3 *raw = NULL;
+    int found = 0;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return 0;
+    sqlite3_stmt *q = NULL;
+    sqlite3_prepare_v2(raw, "SELECT text_start, text_len, COALESCE(actor_name,'') FROM actions WHERE message_id=?1;",
+                       -1, &q, NULL);
+    sqlite3_bind_int64(q, 1, (sqlite3_int64)mid);
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        found = 1;
+        if (start) *start = (uint32_t)sqlite3_column_int(q, 0);
+        if (len)   *len   = (uint32_t)sqlite3_column_int(q, 1);
+        if (name)  snprintf(name, cap, "%s", (const char *)sqlite3_column_text(q, 2));
+    }
+    sqlite3_finalize(q);
+    sqlite3_close(raw);
+    return found;
+}
+
+/* The one answer a live result carries: present with this span, or "not". */
+static int live_action(const oc_dbres *r, uint64_t mid, uint32_t start, uint32_t len) {
+    return r && r->n_ract == 1 && r->ract[0].message_id == mid &&
+           r->ract[0].text_start == start && r->ract[0].text_len == len;
+}
+
+static int replay_has_action(const oc_dbres *r, uint64_t mid, uint32_t start, uint32_t len) {
+    for (size_t i = 0; r && i < r->n_ract; i++)
+        if (r->ract[i].message_id == mid) return r->ract[i].text_start == start && r->ract[i].text_len == len;
+    return 0;
+}
+
+static void test_actions(void) {
+    const char *path = "build/test_dbwriter_actions.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "act-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "act-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* SEND: an action and an ordinary message, each answered. */
+    oc_job *j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; memset(j->idem, 0xC1, OC_IDEM_LEN);
+    oc_job_set_body(j, "/me   is away", 13);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    uint64_t act = r ? r->message_id : 0;
+    CHECK(live_action(r, act, 6, 7));
+    oc_dbres_free(r);
+    uint32_t st = 0, ln = 0; char nm[64] = "x";
+    CHECK(action_row(path, act, &st, &ln, nm, sizeof nm) && st == 6 && ln == 7 && nm[0] == '\0');
+
+    j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; memset(j->idem, 0xC2, OC_IDEM_LEN);
+    oc_job_set_body(j, "plain words", 11);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    uint64_t plain = r ? r->message_id : 0;
+    CHECK(live_action(r, plain, 0, 0));                 /* answered, as "not" */
+    oc_dbres_free(r);
+    CHECK(!action_row(path, plain, NULL, NULL, NULL, 0));
+
+    /* EDIT: makes one, changes it, unmakes it -- each answered. */
+    r = do_edit(w, alice, OC_DEFAULT_CHANNEL, plain, "/me waves");
+    CHECK(r && r->type == OC_RES_EDIT_OK && live_action(r, plain, 4, 5));
+    oc_dbres_free(r);
+    CHECK(action_row(path, plain, &st, &ln, NULL, 0) && st == 4 && ln == 5);
+    r = do_edit(w, alice, OC_DEFAULT_CHANNEL, plain, "/me  waves back");
+    CHECK(r && live_action(r, plain, 5, 10));
+    oc_dbres_free(r);
+    CHECK(action_row(path, plain, &st, &ln, NULL, 0) && st == 5 && ln == 10);
+    r = do_edit(w, alice, OC_DEFAULT_CHANNEL, plain, "no longer");
+    CHECK(r && live_action(r, plain, 0, 0));
+    oc_dbres_free(r);
+    CHECK(!action_row(path, plain, NULL, NULL, NULL, 0));
+
+    /* REPLY: a reply can be one, and a thread's replay carries it. */
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, act, "/me nods");
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    uint64_t rep = r ? r->message_id : 0;
+    CHECK(live_action(r, rep, 4, 4));
+    oc_dbres_free(r);
+    r = list_thread_r(w, bob, OC_DEFAULT_CHANNEL, act);
+    CHECK(r && r->n_thread == 1 && replay_has_action(r, rep, 4, 4));
+    oc_dbres_free(r);
+
+    /* WEBHOOK: told in its label. */
+    j = oc_job_new(OC_JOB_CREATE_WEBHOOK, 8);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->ch_name = strdup("Deploy Bot");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_CREATED);
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    if (r) memcpy(tok, r->session_token, sizeof tok);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 10);
+    oc_job_set_token(j, tok, sizeof tok);
+    oc_job_set_body(j, "/me ships v2", 12);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);
+    uint64_t hook = r ? r->message_id : 0;
+    CHECK(live_action(r, hook, 4, 8) && r->ract[0].actor_name && strcmp(r->ract[0].actor_name, "Deploy Bot") == 0);
+    oc_dbres_free(r);
+    CHECK(action_row(path, hook, NULL, NULL, nm, sizeof nm) && strcmp(nm, "Deploy Bot") == 0);
+
+    /* SCHEDULED: fires through the send path, so it is recorded there too. */
+    r = sched_new(w, bob, OC_DEFAULT_CHANNEL, 1, "/me is late");
+    CHECK(r && r->type == OC_RES_SCHEDULED);
+    oc_dbres_free(r);
+    r = sched_fire(w);
+    CHECK(r != NULL);
+    oc_dbres_free(r);
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *q = NULL;
+        sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM actions a JOIN messages m ON m.id=a.message_id "
+                                "WHERE CAST(m.body AS TEXT)='/me is late' AND a.text_start=4 AND a.text_len=7;",
+                           -1, &q, NULL);
+        CHECK(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 1);
+        sqlite3_finalize(q);
+        sqlite3_close(raw);
+    }
+
+    /* Both replays carry the action, and only the ones there are. */
+    r = backfill(w, bob, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && replay_has_action(r, act, 6, 7) && replay_has_action(r, hook, 4, 8));
+    for (size_t i = 0; r && i < r->n_ract; i++) CHECK(r->ract[i].text_len != 0);
+    oc_dbres_free(r);
+    r = history_around(w, bob, OC_DEFAULT_CHANNEL, act, 20);
+    CHECK(r && replay_has_action(r, act, 6, 7));
+    oc_dbres_free(r);
+
+    /* Excerpts: each flagged, each cut from the action's text. */
+    r = pin(w, alice, OC_DEFAULT_CHANNEL, act, OC_PIN_ADD); oc_dbres_free(r);
+    r = list_pins(w, alice, OC_DEFAULT_CHANNEL);
+    int pinned = 0;
+    for (size_t i = 0; r && i < r->n_plist; i++)
+        if (r->plist[i].message_id == act)
+            pinned = r->plist[i].action == 1 && r->plist[i].body && strcmp(r->plist[i].body, "is away") == 0;
+    CHECK(pinned);
+    oc_dbres_free(r);
+    r = save_item(w, bob, act, OC_SAVE_ADD); oc_dbres_free(r);
+    r = list_saved(w, bob);
+    CHECK(r && r->n_slist == 1 && r->slist[0].action == 1 && r->slist[0].body &&
+          strcmp(r->slist[0].body, "is away") == 0);
+    oc_dbres_free(r);
+    r = search(w, bob, "away", 10);
+    int found = 0;
+    for (size_t i = 0; r && i < r->n_search; i++)
+        if (r->search[i].message_id == act)
+            found = r->search[i].action == 1 && r->search[i].body_len == 7 &&
+                    memcmp(r->search[i].body, "is away", 7) == 0;
+    CHECK(found);
+    oc_dbres_free(r);
+    r = list_threads_r(w, bob, OC_THREADF_ALL);
+    int th = 0;
+    for (size_t i = 0; r && i < r->n_threads; i++)
+        if (r->threads[i].root_id == act)
+            th = r->threads[i].action == 1 && r->threads[i].preview && strcmp(r->threads[i].preview, "is away") == 0;
+    CHECK(th);
+    oc_dbres_free(r);
+    /* The newest message here is the scheduled action, so the channel's
+     * preview is one. */
+    r = list_channels(w, bob);
+    int prev = 0;
+    for (size_t i = 0; r && i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == OC_DEFAULT_CHANNEL)
+            prev = r->chlist[i].preview_action == 1 && r->chlist[i].preview &&
+                   strcmp(r->chlist[i].preview, "is late") == 0;
+    CHECK(prev);
+    oc_dbres_free(r);
+    /* Activity: a reply under something alice wrote, which is an action. */
+    r = list_activity(w, alice);
+    int acted = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].message_id == rep)
+            acted = r->alist[i].action == 1 && r->alist[i].text && strcmp(r->alist[i].text, "nods") == 0;
+    CHECK(acted);
+    oc_dbres_free(r);
+
+    /* A forward of an action says so, and quotes its text. */
+    {
+        uint8_t idem[OC_IDEM_LEN]; memset(idem, 0xC7, sizeof idem);
+        j = oc_job_new(OC_JOB_SEND, 1);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; memcpy(j->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(j, "see this", 8);
+        j->src_channel = OC_DEFAULT_CHANNEL; j->src_message = act;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->n_rfwd == 1 && r->rfwd[0].src_action == 1 && r->rfwd[0].excerpt &&
+              strcmp(r->rfwd[0].excerpt, "is away") == 0);
+        oc_dbres_free(r);
+    }
+
+    /* Read aloud: the actor, then the action. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        CHECK(sqlite3_exec(raw, "UPDATE users SET display_name='Ada Starr' WHERE subject='local:act-alice';",
+                           NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+        j = oc_job_new(OC_JOB_TTS_LOOKUP, 77);
+        j->user_id = bob; j->message_id = act;
+        j->tts_model_version = strdup("test");
+        j->tts_voices = strdup("v1");
+        j->tts_lang = strdup("en-US");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_TTS_META && r->tts_text && strcmp(r->tts_text, "Ada Starr is away") == 0);
+        if (r && r->tts_text && strcmp(r->tts_text, "Ada Starr is away") != 0) printf("    said \"%s\"\n", r->tts_text);
+        oc_dbres_free(r);
+    }
+
+    /* DELETE takes it with the body; RESTORE brings it back, and answers. */
+    r = del_or_restore(w, OC_JOB_DELETE, alice, act);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    CHECK(!action_row(path, act, NULL, NULL, NULL, 0));
+    r = del_or_restore(w, OC_JOB_RESTORE, alice, act);
+    CHECK(r && r->type == OC_RES_RESTORE_OK && live_action(r, act, 6, 7));
+    oc_dbres_free(r);
+    CHECK(action_row(path, act, &st, &ln, NULL, 0) && st == 6 && ln == 7);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
@@ -7528,6 +7762,7 @@ int run_dbwriter_tests(void) {
     test_oidc_link();
     test_alerts();
     test_restore();
+    test_actions();
     test_oidc_limits_and_audit();
     test_auth_rate_limit();
     test_source_rate_limit();

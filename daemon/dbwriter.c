@@ -7,6 +7,7 @@
  * the net thread via an eventfd.
  */
 
+#include "action.h"       /* what makes a message an action (ARCH-115) */
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "speakable.h"    /* what read-aloud says for a body (ARCH-111) */
 #include "voice_pick.h"   /* a default read-aloud voice (REQ-292) */
@@ -407,7 +408,7 @@ static void fill_replay_unfurls(sqlite3 *db, oc_dbres *r) {
 static void append_forward(sqlite3 *db, oc_dbres *r, uint64_t message_id, uint64_t channel_id) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT src_channel, src_message, src_author, excerpt, n_attach, attach_name "
+            "SELECT src_channel, src_message, src_author, excerpt, n_attach, attach_name, src_action "
             "FROM forwards WHERE message_id=?1;", -1, &st, NULL) != SQLITE_OK)
         return;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
@@ -426,6 +427,7 @@ static void append_forward(sqlite3 *db, oc_dbres *r, uint64_t message_id, uint64
             f->excerpt     = strdup(ex ? ex : "");
             f->n_attach    = (uint16_t)sqlite3_column_int(st, 4);
             f->attach_name = strdup(an ? an : "");
+            f->src_action  = (uint8_t)sqlite3_column_int(st, 6);
             r->n_rfwd++;
         }
     }
@@ -436,6 +438,84 @@ static void append_forward(sqlite3 *db, oc_dbres *r, uint64_t message_id, uint64
 static void fill_replay_forwards(sqlite3 *db, oc_dbres *r) {
     for (size_t i = 0; i < r->n_replay; i++)
         append_forward(db, r, r->replay[i].message_id, r->replay[i].channel_id);
+}
+
+/* Record whether message `mid` is an action (REQ-058, ARCH-115), from the row
+ * as it stands: any earlier answer is replaced, so send, edit and restore all
+ * call this one function and an edit that adds or removes "/me" needs nothing
+ * of its own. The caller holds the transaction. A call event is never an
+ * action, and a tombstone has no body to be one. */
+static void store_action(sqlite3 *db, uint64_t mid) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM actions WHERE message_id=?1;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO actions(message_id, channel_id, actor_id, actor_name, text_start, text_len, created_at_ms) "
+            "SELECT id, channel_id, author_id, NULLIF(author_name, ''), ?2, ?3, created_at_ms "
+            "FROM messages WHERE id=?1;", -1, &st, NULL) != SQLITE_OK)
+        return;
+    sqlite3_stmt *q = NULL;
+    uint32_t start = 0, tlen = 0;
+    int is = 0;
+    if (sqlite3_prepare_v2(db, "SELECT body FROM messages WHERE id=?1 AND kind=0 AND body IS NOT NULL;",
+                           -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(q, 1, (sqlite3_int64)mid);
+        if (sqlite3_step(q) == SQLITE_ROW)
+            is = oc_action_parse((const char *)sqlite3_column_blob(q, 0), (size_t)sqlite3_column_bytes(q, 0),
+                                 &start, &tlen);
+        sqlite3_finalize(q);
+    }
+    if (is) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int64(st, 2, start);
+        sqlite3_bind_int64(st, 3, tlen);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Append message `mid`'s action, read back from the table (REQ-058, ARCH-115).
+ * One function for the live result and both replays, as append_forward is.
+ * With `always`, a message that is not an action still gets an entry, with
+ * text_len 0. Every LIVE message frame -- send, reply, webhook post, edit,
+ * restore -- is followed by exactly one, so a client can hold the message until
+ * its action arrives and hand both on together: an edit or a restore has to be
+ * able to say "no longer", and a toast must never see a message without its
+ * answer. A replay sends only the actions there are. */
+static void append_action(sqlite3 *db, oc_dbres *r, uint64_t mid, uint64_t channel_id, int always) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT actor_id, actor_name, text_start, text_len FROM actions WHERE message_id=?1;",
+            -1, &st, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    int row = sqlite3_step(st) == SQLITE_ROW;
+    if (row || always) {
+        struct oc_replay_action *g = realloc(r->ract, (r->n_ract + 1) * sizeof *g);
+        if (g) {
+            r->ract = g;
+            struct oc_replay_action *a = &g[r->n_ract++];
+            memset(a, 0, sizeof *a);
+            a->message_id = mid;
+            a->channel_id = channel_id;
+            if (row) {
+                const char *nm = (const char *)sqlite3_column_text(st, 1);
+                a->actor_id   = (uint64_t)sqlite3_column_int64(st, 0);
+                a->actor_name = nm ? strdup(nm) : NULL;
+                a->text_start = (uint32_t)sqlite3_column_int64(st, 2);
+                a->text_len   = (uint32_t)sqlite3_column_int64(st, 3);
+            }
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+/* Actions for a replayed window (REQ-058). */
+static void fill_replay_actions(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_replay; i++)
+        append_action(db, r, r->replay[i].message_id, r->replay[i].channel_id, 0);
 }
 
 static void group_row_free(oc_group_row *g);
@@ -471,6 +551,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->runfurl);
     for (size_t i = 0; i < r->n_rfwd; i++) { free(r->rfwd[i].excerpt); free(r->rfwd[i].attach_name); }
     free(r->rfwd);
+    for (size_t i = 0; i < r->n_ract; i++) free(r->ract[i].actor_name);
+    free(r->ract);
     free(r->unf_url);
     free(r->unf_title);
     free(r->unf_descr);
@@ -2956,6 +3038,11 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db,
+        "DELETE FROM actions WHERE channel_id IN (SELECT channel_id FROM channel_members "
+        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
         "DELETE FROM messages WHERE channel_id IN (SELECT channel_id FROM channel_members "
         "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
         -1, &st, NULL);
@@ -4041,7 +4128,10 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
             /* The FIRST file's name, which is what a card can show; the count
              * beside it covers the rest ("report.txt and 2 more"). */
             "       COALESCE((SELECT a.filename FROM attachments a "
-            "                 WHERE a.message_id = m.id ORDER BY a.id LIMIT 1), '') "
+            "                 WHERE a.message_id = m.id ORDER BY a.id LIMIT 1), ''), "
+            /* An action's excerpt is its action text, and the forward says so
+             * (REQ-058): the card reads "<author> <text>". */
+            "       (SELECT ac.text_start FROM actions ac WHERE ac.message_id = m.id) "
             "FROM messages m WHERE m.id=?1 AND m.channel_id=?2 "
             "  AND m.deleted_at_ms IS NULL;", -1, &st, NULL) != SQLITE_OK)
         return;
@@ -4051,10 +4141,14 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
     char excerpt[OC_FORWARD_EXCERPT_MAX + 1];
     char aname[256] = "";
     size_t ex_len = 0;
-    int found = 0;
+    int found = 0, src_action = 0;
     if (sqlite3_step(st) == SQLITE_ROW) {
         const unsigned char *b = sqlite3_column_text(st, 1);
         size_t bl = (size_t)sqlite3_column_bytes(st, 1);
+        if (sqlite3_column_type(st, 4) != SQLITE_NULL) {
+            size_t ts = (size_t)sqlite3_column_int64(st, 4);
+            if (b && ts < bl) { b += ts; bl -= ts; src_action = 1; }
+        }
         author   = (uint64_t)sqlite3_column_int64(st, 0);
         n_attach = (uint64_t)sqlite3_column_int64(st, 2);
         const char *an = (const char *)sqlite3_column_text(st, 3);
@@ -4075,8 +4169,8 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
 
     sqlite3_prepare_v2(db,
         "INSERT INTO forwards(message_id, src_channel, src_message, src_author, "
-        "                     excerpt, n_attach, attach_name) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?);", -1, &st, NULL);
+        "                     excerpt, n_attach, attach_name, src_action) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->src_channel);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)j->src_message);
@@ -4084,6 +4178,7 @@ static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
     sqlite3_bind_text (st, 5, excerpt, (int)ex_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)n_attach);
     sqlite3_bind_text (st, 7, aname, -1, SQLITE_STATIC);
+    sqlite3_bind_int  (st, 8, src_action);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
@@ -4164,6 +4259,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
 
     /* What this message forwards, if anything (REQ-057). */
     store_forward(db, mid, j);
+    store_action(db, mid);   /* REQ-058 */
 
     /* The draft this message came from is gone (REQ-223, ARCH-101), in the same
      * transaction as the send. Server-side rather than a client courtesy: a
@@ -4180,6 +4276,10 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     /* Read the reference back rather than echoing what was asked for: what the
      * channel is told is what actually landed in the table, or nothing. */
     append_forward(db, r, mid, j->channel_id);
+    /* Always, action or not: the client pairs a live message with the ACTION
+     * that follows it, so a toast or a preview never sees one without the
+     * other (REQ-058, ARCH-115). */
+    append_action(db, r, mid, j->channel_id, 1);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, j->channel_id, r);
     return r;
@@ -4226,6 +4326,9 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
 
     uint64_t ts = dbw_now_ms();
     sqlite3_stmt *st = NULL;
+    /* One transaction: the body and the action it may make (REQ-058) change
+     * together or not at all. */
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
     sqlite3_prepare_v2(db,
         "UPDATE messages SET body=?, edited_at_ms=? WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_blob(st, 1, j->body, (int)j->body_len, SQLITE_STATIC);
@@ -4234,6 +4337,7 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
 
@@ -4245,10 +4349,14 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    /* An edit can make an action or unmake one (REQ-058). */
+    store_action(db, j->message_id);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     r->type = OC_RES_EDIT_OK;
     r->author_id = author;
     r->server_time = ts;   /* edited_at_ms */
+    append_action(db, r, j->message_id, j->channel_id, 1);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, j->channel_id, r);
     return r;
@@ -4424,6 +4532,8 @@ static oc_dbres *process_restore(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM deleted_holds WHERE message_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+    /* The action comes back with the body that made it (REQ-058). */
+    store_action(db, j->message_id);
     if (author != j->user_id)
         audit_actor(db, OC_AUDIT_MODERATION, "message.restore", j->user_id, j->message_id, NULL, 1,
                     "moderator delete undone");
@@ -4436,6 +4546,7 @@ static oc_dbres *process_restore(sqlite3 *db, const oc_job *j) {
     if (sqlite3_step(st) == SQLITE_ROW) r->server_time = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     load_message_attachments(db, j->message_id, r->attach, &r->n_attach);
+    append_action(db, r, j->message_id, j->channel_id, 1);
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -4493,6 +4604,9 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     /* A tombstone has no links to preview either (REQ-052/222). */
     sqlite3_prepare_v2(db, "DELETE FROM unfurls WHERE message_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+
+    /* Nor a body to be an action (REQ-058); a restore re-derives it. */
+    store_action(db, j->message_id);
 
     /* A tombstone has no body to react to; drop its reactions (REQ-052/070). */
     sqlite3_prepare_v2(db, "DELETE FROM reactions WHERE message_id=?;", -1, &st, NULL);
@@ -4809,11 +4923,15 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "  c.topic, c.archived_at_ms, c.created_at_ms, "
         /* The newest top-level message, for the list preview. Tombstones are
          * skipped: "(deleted)" is not a useful thing to show as the latest
-         * activity, and the row below it usually is. */
-        "  (SELECT substr(COALESCE(x.body,''),1,?2) FROM messages x "
+         * activity, and the row below it usually is. An action's preview is its
+         * action text, flagged, so the client reads "<author> <text>" (REQ-058). */
+        "  (SELECT substr(COALESCE(x.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=x.id),0),?2) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1), "
         "  COALESCE((SELECT x.author_id FROM messages x "
+        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     ORDER BY x.id DESC LIMIT 1),0), "
+        "  COALESCE((SELECT EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=x.id) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
         "     ORDER BY x.id DESC LIMIT 1),0) "
         "FROM channels c WHERE "
@@ -4853,6 +4971,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         const unsigned char *pv = sqlite3_column_text(st, 11);
         arr[n].preview         = (pv && pv[0]) ? strdup((const char *)pv) : NULL;
         arr[n].preview_author  = (uint64_t)sqlite3_column_int64(st, 12);
+        arr[n].preview_action  = (uint8_t)(sqlite3_column_int(st, 13) != 0);
         arr[n].n_peers         = 0;
         n++;
     }
@@ -5597,8 +5716,10 @@ static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT s.message_id, m.channel_id, m.author_id, m.created_at_ms, s.created_at_ms, m.body, "
-        "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id ORDER BY a.id LIMIT 1) "
+        /* An action travels as its action text, flagged (REQ-058). */
+        "SELECT s.message_id, m.channel_id, m.author_id, m.created_at_ms, s.created_at_ms, substr(m.body,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)), "
+        "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id ORDER BY a.id LIMIT 1), "
+        "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
         "  FROM saved_items s JOIN messages m ON m.id = s.message_id "
         " WHERE s.user_id=?1 AND m.deleted_at_ms IS NULL "
         /* Still gated on membership: leaving a channel should not keep leaking
@@ -5621,6 +5742,7 @@ static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
         const unsigned char *an = sqlite3_column_text(st, 6);
         arr[n].body = b ? strdup((const char *)b) : NULL;
         arr[n].attach_name = an ? strdup((const char *)an) : NULL;
+        arr[n].action = (uint8_t)(sqlite3_column_int(st, 7) != 0);
         n++;
     }
     sqlite3_finalize(st);
@@ -5668,7 +5790,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
     if (j->act_filter != OC_ACTF_INVOLVED) {
         static const char *USQL =
             "SELECT ?5 AS kind, m.id, m.channel_id, m.author_id, m.created_at_ms, "
-            "       substr(COALESCE(m.body,''),1,?2) AS text "
+            "       substr(COALESCE(m.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
             "  FROM messages m "
             "  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 "
             "  JOIN channels c ON c.id = m.channel_id "
@@ -5699,6 +5821,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
             uarr[un].at         = (uint64_t)sqlite3_column_int64(st, 4);
             const unsigned char *t = sqlite3_column_text(st, 5);
             uarr[un].text = t ? strdup((const char *)t) : NULL;
+            uarr[un].action = (uint8_t)(sqlite3_column_int(st, 6) != 0);   /* REQ-058 */
             un++;
         }
         sqlite3_finalize(st);
@@ -5710,11 +5833,11 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
     }
 
     static const char *SQL =
-        "SELECT kind, message_id, channel_id, actor_id, at, text FROM ("
+        "SELECT kind, message_id, channel_id, actor_id, at, text, act FROM ("
         /* --- mentions of me --- */
         "  SELECT 0 AS kind, mn.message_id AS message_id, mn.channel_id AS channel_id, "
         "         m.author_id AS actor_id, m.created_at_ms AS at, "
-        "         substr(COALESCE(m.body,''),1,?2) AS text "
+        "         substr(COALESCE(m.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0),?2) AS text, EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) AS act "
         "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
         /* Mine -- by name, keyword or group (0, 4, 5) -- or a broadcast
          * (1, 2, 3), named as push.c names them: `kind <> 0` also let in
@@ -5735,7 +5858,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "                        AND c.kind <> 'dm') ) "
         "  UNION ALL "
         /* --- reactions to what I wrote --- */
-        "  SELECT 1, rx.message_id, m.channel_id, rx.user_id, rx.created_at_ms, rx.emoji "
+        "  SELECT 1, rx.message_id, m.channel_id, rx.user_id, rx.created_at_ms, rx.emoji, 0 "
         "    FROM reactions rx JOIN messages m ON m.id = rx.message_id "
         "   WHERE m.author_id = ?1 AND rx.user_id <> ?1 AND m.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
@@ -5743,7 +5866,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "  UNION ALL "
         /* --- replies under something I wrote --- */
         "  SELECT 2, c.id, c.channel_id, c.author_id, c.created_at_ms, "
-        "         substr(COALESCE(c.body,''),1,?2) "
+        "         substr(COALESCE(c.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=c.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=c.id) "
         "    FROM messages c JOIN messages p ON p.id = c.parent_id "
         "   WHERE p.author_id = ?1 AND c.author_id <> ?1 AND c.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
@@ -5765,6 +5888,7 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         arr[n].at         = (uint64_t)sqlite3_column_int64(st, 4);
         const unsigned char *t = sqlite3_column_text(st, 5);
         arr[n].text = t ? strdup((const char *)t) : NULL;
+        arr[n].action = (uint8_t)(sqlite3_column_int(st, 6) != 0);   /* REQ-058 */
         n++;
     }
     sqlite3_finalize(st);
@@ -5882,11 +6006,13 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT p.message_id, m.author_id, m.created_at_ms, "
-        "       COALESCE(p.pinned_by,0), p.created_at_ms, m.body, "
+        "       COALESCE(p.pinned_by,0), p.created_at_ms, substr(m.body,1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id),0)), "
         /* An attachment-only message has no body, so the list needs something
          * to show for it or the row renders blank. */
         "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id "
-        "         ORDER BY a.id LIMIT 1) "
+        "         ORDER BY a.id LIMIT 1), "
+        /* An action travels as its action text, flagged (REQ-058). */
+        "       EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=m.id) "
         "  FROM pins p JOIN messages m ON m.id = p.message_id "
         " WHERE p.channel_id=? AND m.deleted_at_ms IS NULL "
         " ORDER BY p.created_at_ms DESC LIMIT ?;", -1, &st, NULL);
@@ -5905,6 +6031,7 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
         arr[n].body = b ? strdup((const char *)b) : NULL;
         const unsigned char *an = sqlite3_column_text(st, 6);
         arr[n].attach_name = an ? strdup((const char *)an) : NULL;
+        arr[n].action = (uint8_t)(sqlite3_column_int(st, 7) != 0);
         n++;
     }
     sqlite3_finalize(st);
@@ -6122,6 +6249,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
      * this deletes nothing; it is here so the day one does, the clear already
      * works and is not a second thing to remember. */
     drop_draft(db, j->user_id, j->channel_id, j->parent_id);
+    store_action(db, mid);   /* a reply can be an action too (REQ-058) */
 
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
@@ -6132,6 +6260,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->server_time = ts;
     r->parent_id = root;
     r->reply_count = count;
+    append_action(db, r, mid, j->channel_id, 1);   /* always: the client pairs them (ARCH-115) */
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, j->channel_id, r);
     /* Asked AFTER the reply is committed, so the author of the reply being
@@ -6184,6 +6313,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     r->thread = arr;
     r->n_thread = n;
     r->truncated = (n >= OC_BACKFILL_MAX);
+    for (size_t i = 0; i < n; i++) append_action(db, r, arr[i].message_id, j->channel_id, 0);   /* REQ-058 */
     return r;
 }
 
@@ -6243,7 +6373,8 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
      * would silently return zero rows. */
     char sql[2048];
     int k = snprintf(sql, sizeof sql,
-        "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, %s "
+        "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, %s, "
+        "       (SELECT ac.text_start FROM actions ac WHERE ac.message_id=m.id) "
         "FROM %s messages m %s "
         "JOIN channels c ON c.id = m.channel_id "
         "WHERE m.deleted_at_ms IS NULL "
@@ -6317,6 +6448,18 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         m->server_time = (uint64_t)sqlite3_column_int64(st, 3);
         const unsigned char *snip = sqlite3_column_text(st, 4);
         int slen = sqlite3_column_bytes(st, 4);
+        /* An action's snippet is cut from its action text (REQ-058). A snippet
+         * that starts where the body does still holds the "/me" and its spaces,
+         * which are exactly text_start bytes; one cut from further in has none. */
+        if (sqlite3_column_type(st, 5) != SQLITE_NULL) {
+            int ts = sqlite3_column_int(st, 5);
+            m->action = 1;
+            if (snip && ts > 3 && slen > ts && memcmp(snip, "/me", 3) == 0) {
+                int sp = 3;
+                while (sp < ts && snip[sp] == ' ') sp++;
+                if (sp == ts) { snip += ts; slen -= ts; }
+            }
+        }
         if (snip && slen > 0) { m->body = malloc((size_t)slen); if (m->body) { memcpy(m->body, snip, (size_t)slen); m->body_len = (size_t)slen; } }
         n++;
     }
@@ -6630,6 +6773,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     fill_replay_forwards(db, r);
+    fill_replay_actions(db, r);
     return r;
 }
 
@@ -6769,6 +6913,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     fill_replay_forwards(db, r);
+    fill_replay_actions(db, r);
     return r;
 }
 
@@ -6880,6 +7025,9 @@ static oc_dbres *process_call_event(sqlite3 *db, const oc_job *j) {
     r->author_id = j->user_id;
     r->server_time = ts;
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    /* A call event is never an action, and says so like every live message
+     * frame does: the client pairs each with the ACTION behind it (ARCH-115). */
+    append_action(db, r, r->message_id, j->channel_id, 1);
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -7251,6 +7399,9 @@ static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
     /* Post as the webhook's label (display-name override, REQ-170), falling back
      * to the creator's identity if the webhook was created without a label. */
     uint64_t ts = dbw_now_ms();
+    /* The message and the action it may be (REQ-058) land together; an action
+     * a webhook posts is told in its label, as the message is. */
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
     sqlite3_prepare_v2(db,
         "INSERT INTO messages(channel_id, author_id, body, created_at_ms, author_name) VALUES(?, ?, ?, ?, ?);",
         -1, &st, NULL);
@@ -7262,10 +7413,17 @@ static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
     else           sqlite3_bind_null(st, 5);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) { free(label_dup); r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        free(label_dup); r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    uint64_t mid = (uint64_t)sqlite3_last_insert_rowid(db);
+    store_action(db, mid);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     r->type = OC_RES_WEBHOOK_POSTED;
-    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);
+    r->message_id = mid;
+    append_action(db, r, mid, cid, 1);   /* always: the client pairs them (ARCH-115) */
     r->channel_id = cid;
     r->author_id = creator;
     r->author_name = label_dup;   /* transferred; freed by oc_dbres_free */
@@ -7770,6 +7928,7 @@ static void thread_row_from(sqlite3_stmt *st, oc_thread_row *t) {
     t->following    = (uint8_t)sqlite3_column_int(st, 7);
     const unsigned char *p = sqlite3_column_text(st, 8);
     t->preview      = strdup(p ? (const char *)p : "");
+    t->action       = (uint8_t)(sqlite3_column_int(st, 9) != 0);
 }
 
 /* The one query the product did not have: every thread I am in, across every
@@ -7799,7 +7958,8 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)) AS unread, "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1) AS following, "
-        "       substr(COALESCE(r.body,''),1,?2) "
+        /* An action root previews as its action text, flagged (REQ-058). */
+        "       substr(COALESCE(r.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r "
         "  JOIN channel_members cm ON cm.channel_id = r.channel_id AND cm.user_id = ?1 "
         " WHERE r.parent_id IS NULL AND r.deleted_at_ms IS NULL "
@@ -7845,7 +8005,8 @@ static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbr
         "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)), "
         "       COALESCE((SELECT tf.state FROM thread_follows tf "
         "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1), "
-        "       substr(COALESCE(r.body,''),1,?2) "
+        /* An action root previews as its action text, flagged (REQ-058). */
+        "       substr(COALESCE(r.body,''),1+COALESCE((SELECT ac.text_start FROM actions ac WHERE ac.message_id=r.id),0),?2), EXISTS(SELECT 1 FROM actions ac WHERE ac.message_id=r.id) "
         "  FROM messages r WHERE r.id = ?3;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &st, NULL) != SQLITE_OK) return;
@@ -8999,8 +9160,12 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT m.channel_id, m.author_id, m.deleted_at_ms IS NOT NULL, m.body,"
-            "       COALESCE(u.voice_id,''), COALESCE(u.pronouns,''), m.kind"
+            "       COALESCE(u.voice_id,''), COALESCE(u.pronouns,''), m.kind,"
+            /* An action (REQ-058) is said as its actor doing it: the name
+             * first, then the action text. */
+            "       ac.text_start, COALESCE(ac.actor_name, u.display_name, '')"
             "  FROM messages m LEFT JOIN users u ON u.id = m.author_id"
+            "  LEFT JOIN actions ac ON ac.message_id = m.id"
             " WHERE m.id = ?1;", -1, &st, NULL) != SQLITE_OK)
         return r;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
@@ -9017,6 +9182,12 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
     snprintf(pronouns, sizeof pronouns, "%s", (const char *)sqlite3_column_text(st, 5));
     /* A call event (REQ-304) is not something its author said: nothing to read. */
     if (sqlite3_column_int(st, 6) != OC_MSG_KIND_MESSAGE) body_len = 0;
+    char actor[128] = "";
+    if (sqlite3_column_type(st, 7) != SQLITE_NULL) {
+        size_t ts = (size_t)sqlite3_column_int64(st, 7);
+        if (ts < body_len) { body += ts; body_len -= ts; }
+        snprintf(actor, sizeof actor, "%s", (const char *)sqlite3_column_text(st, 8));
+    }
     char *body_copy = body_len ? malloc(body_len) : NULL;
     if (body_copy) memcpy(body_copy, body, body_len);
     sqlite3_finalize(st);
@@ -9032,7 +9203,16 @@ static oc_dbres *process_tts_lookup(sqlite3 *db, const oc_job *j) {
 
     speak_names sn = { db, cid, "" };
     char *speak = malloc(OC_SPEAK_MAX + 1);
-    size_t n = speak && body_copy ? oc_speakable(body_copy, body_len, speak_resolve, &sn, speak, OC_SPEAK_MAX + 1) : 0;
+    size_t n = 0;
+    if (speak && body_copy) {
+        /* The actor's name, then the action, as one text: one rendering, and its
+         * handle changes when either does. */
+        size_t pre = 0;
+        if (actor[0]) pre = (size_t)snprintf(speak, OC_SPEAK_MAX + 1, "%s ", actor);
+        if (pre > OC_SPEAK_MAX / 2) pre = 0;
+        size_t said = oc_speakable(body_copy, body_len, speak_resolve, &sn, speak + pre, OC_SPEAK_MAX + 1 - pre);
+        n = said ? pre + said : 0;
+    }
     free(body_copy);
     if (n == 0) {
         free(speak);

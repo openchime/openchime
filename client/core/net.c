@@ -387,7 +387,75 @@ typedef struct {
     const char  *host;        /* where the relay is, for a call (CALLS.md §4) */
     char        *rekey;       /* the stored key, rewritten when the workspace moves (288 bytes) */
     char        *sni;         /* the name the next connection sends (oc_net.ws_key, 288 bytes) */
+    /* A live message waiting for its action (REQ-058, ARCH-115). The daemon
+     * follows every live message frame with exactly one ACTION, so the frame,
+     * its attachments and its forward are held here until that ACTION arrives
+     * and then handed on as one: nothing downstream ever sees the message
+     * without the answer. Anything unrelated releases the hold unpaired --
+     * a replay's messages, whose actions come later on their own. */
+    oc_queue    *held;
+    uint64_t     held_id;
+    int          holding;
 } disp_ctx;
+
+/* Hand on whatever is held, in the order it arrived. */
+static void held_release(disp_ctx *ctx, oc_queue *to_ui) {
+    if (!ctx->held) return;
+    void *e;
+    while ((e = oc_queue_try_pop(ctx->held)) != NULL) oc_queue_push(to_ui, e);
+    ctx->holding = 0;
+    ctx->held_id = 0;
+}
+
+/* Where a message-bearing frame's events go: held, keyed by its message, when
+ * there is somewhere to hold them. */
+static oc_queue *held_begin(disp_ctx *ctx, oc_queue *to_ui, uint64_t message_id) {
+    if (!ctx->held) return to_ui;
+    held_release(ctx, to_ui);
+    ctx->holding = 1;
+    ctx->held_id = message_id;
+    return ctx->held;
+}
+
+/* Fill an event's action fields from an ACTION frame. */
+static void ev_set_action(oc_ev *e, const oc_action *ac) {
+    e->action_known = 1;
+    e->action       = ac->text_len > 0;
+    e->action_start = ac->text_start;
+    e->action_len   = ac->text_len;
+    size_t n = ac->actor_name.len < sizeof e->actor_name - 1 ? ac->actor_name.len : sizeof e->actor_name - 1;
+    if (n) memcpy(e->actor_name, ac->actor_name.ptr, n);
+    e->actor_name[n] = '\0';
+}
+
+static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx);
+
+struct oc_net_frames { oc_framebuf fb; oc_queue held; disp_ctx ctx; };
+
+oc_net_frames *oc_net_frames_new(oc_queue *to_ui) {
+    oc_net_frames *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    oc_framebuf_init(&f->fb);
+    oc_queue_init(&f->held);
+    f->ctx.to_ui   = to_ui;
+    f->ctx.fd      = -1;
+    f->ctx.version = OC_PROTOCOL_VERSION;
+    f->ctx.held    = &f->held;
+    return f;
+}
+
+int oc_net_frames_push(oc_net_frames *f, const uint8_t *bytes, size_t len) {
+    if (!f || oc_framebuf_push(&f->fb, bytes, len) != 0) return -1;
+    return dispatch(&f->fb, f->ctx.to_ui, &f->ctx);
+}
+
+void oc_net_frames_free(oc_net_frames *f) {
+    if (!f) return;
+    held_release(&f->ctx, f->ctx.to_ui);
+    oc_queue_destroy(&f->held);
+    oc_framebuf_free(&f->fb);
+    free(f);
+}
 
 /* The call engine queued media for the connection: end this thread's wait. */
 static void net_wake(void *w) { oc_wake_signal((oc_wake *)w); }
@@ -827,9 +895,34 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (cr > 0) continue;
         }
 
-        if (hdr.msg_type == OC_MSG_BROADCAST) {
+        /* A held message waits only for its own ACTION, with its forward
+         * allowed in between; any other frame means it was not live. */
+        if (ctx->holding && hdr.msg_type != OC_MSG_ACTION && hdr.msg_type != OC_MSG_FORWARD)
+            held_release(ctx, to_ui);
+
+        if (hdr.msg_type == OC_MSG_ACTION) {
+            oc_action ac;
+            if (oc_decode_action(&p, &ac) != OC_OK) return -1;
+            if (ctx->holding && ac.message_id == ctx->held_id) {
+                /* The held message is the first thing held. */
+                oc_ev *m = ctx->held->head ? (oc_ev *)ctx->held->head->item : NULL;
+                if (m) ev_set_action(m, &ac);
+                held_release(ctx, to_ui);
+            } else {
+                if (ctx->holding) held_release(ctx, to_ui);
+                oc_ev *e = oc_ev_new(OC_EV_ACTION);
+                if (e) {
+                    e->channel_id = ac.channel_id;
+                    e->message_id = ac.message_id;
+                    e->author_id  = ac.actor_id;
+                    ev_set_action(e, &ac);
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_BROADCAST) {
             oc_broadcast b;
             if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            oc_queue *out = held_begin(ctx, to_ui, b.message_id);
             oc_ev *e = oc_ev_new(OC_EV_MESSAGE);
             if (e) {
                 e->channel_id = b.channel_id;
@@ -845,9 +938,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 }
                 e->body = malloc(b.body.len + 1);
                 if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
-                oc_queue_push(to_ui, e);
+                oc_queue_push(out, e);
                 /* Trailing attachment metadata (REQ-140): fold each onto the message. */
-                push_attachments(to_ui, b.channel_id, b.message_id, b.attach, b.n_attach);
+                push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
             }
             if (ctx && ctx->hw) hwtab_note(ctx->hw, b.channel_id, b.message_id);
             /* Cache the message so a relaunch shows it instantly (ARCH-45/46). */
@@ -865,6 +958,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
              * tombstone, then its files folded on as a BROADCAST's are. */
             oc_broadcast b;
             if (oc_decode_broadcast(&p, &b) != OC_OK) return -1;
+            oc_queue *out = held_begin(ctx, to_ui, b.message_id);
             oc_ev *e = oc_ev_new(OC_EV_RESTORE);
             if (e) {
                 e->channel_id = b.channel_id;
@@ -873,8 +967,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->server_time = b.server_time;
                 e->body = malloc(b.body.len + 1);
                 if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
-                oc_queue_push(to_ui, e);
-                push_attachments(to_ui, b.channel_id, b.message_id, b.attach, b.n_attach);
+                oc_queue_push(out, e);
+                push_attachments(out, b.channel_id, b.message_id, b.attach, b.n_attach);
             }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
             oc_channel_list_entry ents[OC_CHANNEL_LIST_PAGE]; uint16_t count = 0;
@@ -899,6 +993,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->archived = ents[i].archived;
                 e->created_at = ents[i].created_at;
                 e->preview_author = ents[i].preview_author;
+                e->action = ents[i].preview_action;   /* REQ-058 */
                 e->preview = malloc(ents[i].preview.len + 1);
                 if (e->preview) {
                     if (ents[i].preview.len) memcpy(e->preview, ents[i].preview.ptr, ents[i].preview.len);
@@ -1125,6 +1220,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->message_id = sm.message_id; e->channel_id = sm.channel_id;
                     e->author_id = sm.author_id;   e->server_time = sm.server_time;
                     e->pinned_at = sm.saved_at;
+                    e->action = sm.action;   /* REQ-058 */
                     size_t an = sm.attach_name.len < sizeof e->author_name - 1
                               ? sm.attach_name.len : sizeof e->author_name - 1;
                     memcpy(e->author_name, sm.attach_name.ptr, an);
@@ -1205,6 +1301,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->status = ae.kind; e->message_id = ae.message_id;
                     e->channel_id = ae.channel_id; e->user_id = ae.actor_id;
                     e->server_time = ae.at;
+                    e->action = ae.action;   /* REQ-058 */
                     e->body = malloc(ae.text.len + 1);
                     if (e->body) { if (ae.text.len) memcpy(e->body, ae.text.ptr, ae.text.len);
                                    e->body[ae.text.len] = '\0'; }
@@ -1241,6 +1338,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = pm.server_time;
                     e->user_id     = pm.pinned_by;
                     e->pinned_at   = pm.pinned_at;
+                    e->action      = pm.action;   /* REQ-058 */
                     size_t an = pm.attach_name.len < sizeof e->author_name - 1
                               ? pm.attach_name.len : sizeof e->author_name - 1;
                     memcpy(e->author_name, pm.attach_name.ptr, an);
@@ -1262,6 +1360,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_FORWARD) {
             oc_forward fw;
             if (oc_decode_forward(&p, &fw) == OC_OK) {
+                /* The held message's own forward waits with it; any other
+                 * releases the hold first. */
+                if (ctx->holding && fw.message_id != ctx->held_id) held_release(ctx, to_ui);
+                oc_queue *out = ctx->holding ? ctx->held : to_ui;
                 oc_ev *e = oc_ev_new(OC_EV_FORWARD);
                 if (e) {
                     e->channel_id   = fw.channel_id;
@@ -1270,6 +1372,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->src_message  = fw.src_message;
                     e->author_id    = fw.src_author;
                     e->src_n_attach = fw.n_attach;
+                    e->action       = fw.src_action;   /* REQ-058 */
                     if (fw.src_attach_name.len < sizeof e->src_attach_name) {
                         memcpy(e->src_attach_name, fw.src_attach_name.ptr,
                                fw.src_attach_name.len);
@@ -1280,7 +1383,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                         memcpy(e->body, fw.src_excerpt.ptr, fw.src_excerpt.len);
                         e->body[fw.src_excerpt.len] = '\0';
                     }
-                    oc_queue_push(to_ui, e);
+                    oc_queue_push(out, e);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_UNFURL) {
@@ -1325,13 +1428,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_MSG_EDITED) {
             oc_msg_edited me;
             if (oc_decode_msg_edited(&p, &me) == OC_OK) {
+                oc_queue *out = held_begin(ctx, to_ui, me.message_id);
                 oc_ev *e = oc_ev_new(OC_EV_EDIT);
                 if (e) {
                     e->channel_id = me.channel_id;
                     e->message_id = me.message_id;
                     e->body = malloc(me.body.len + 1);
                     if (e->body) { memcpy(e->body, me.body.ptr, me.body.len); e->body[me.body.len] = '\0'; }
-                    oc_queue_push(to_ui, e);
+                    oc_queue_push(out, e);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_MSG_DELETED) {
@@ -1343,6 +1447,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
             if (oc_decode_thread_reply(&p, &tr) == OC_OK) {
+                oc_queue *out = held_begin(ctx, to_ui, tr.message_id);
                 oc_ev *e = oc_ev_new(OC_EV_THREAD_REPLY);
                 if (e) {
                     e->channel_id = tr.channel_id;
@@ -1354,8 +1459,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->participant = tr.participant;
                     e->body = malloc(tr.body.len + 1);
                     if (e->body) { memcpy(e->body, tr.body.ptr, tr.body.len); e->body[tr.body.len] = '\0'; }
-                    oc_queue_push(to_ui, e);
-                    push_attachments(to_ui, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
+                    oc_queue_push(out, e);
+                    push_attachments(out, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_THREAD) {
@@ -1387,6 +1492,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->message_id = se[i].message_id;
                 e->author_id = se[i].author_id;
                 e->server_time = se[i].server_time;
+                e->action = se[i].action;   /* REQ-058 */
                 e->body = malloc(se[i].snippet.len + 1);
                 if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -1438,6 +1544,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->reply_count = ts.reply_count;
                     e->unread_count= ts.unread;
                     e->following   = ts.following;
+                    e->action      = ts.action;   /* REQ-058 */
                     e->body = malloc(ts.preview.len + 1);
                     if (e->body) {
                         if (ts.preview.len) memcpy(e->body, ts.preview.ptr, ts.preview.len);
@@ -2992,10 +3099,13 @@ static int run_connection(oc_net *n, int reconnecting,
     /* Serve: interleave reading server frames with sending queued user actions.
      * An in-flight attachment transfer (upload/download) is driven by both. */
     *served = 1;
+    oc_queue heldq;
+    oc_queue_init(&heldq);
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
                      cs ? cs->workspace : NULL, n->client_type, negotiated, &n->xq, &n->stt,
-                     &n->calls, n->host, cs ? cs->workspace : NULL, n->ws_key[0] ? n->ws_key : NULL };
+                     &n->calls, n->host, cs ? cs->workspace : NULL, n->ws_key[0] ? n->ws_key : NULL,
+                     &heldq, 0, 0 };
     /* Call media on the connection (PROTOCOL.md §5.17) is queued by the call
      * engine's threads, which wake this one to write it rather than leave it
      * for the next 50 ms poll. Without a wake it still goes, at that pace. */
@@ -3011,7 +3121,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 /* Going on purpose: out of any call now, so the daemon holds no
                  * seat for a rejoin that will not come. */
                 oc_callsig_quit(&n->calls, ctx_write, &ctx, n->to_ui);
-                oc_cmd_free(c); rc = RC_STOP; goto drop;
+                oc_cmd_free(c); rc = RC_STOP; goto served_end;
             }
             if (c->type >= OC_CMD_CALL_JOIN && c->type <= OC_CMD_CALL_SHARE) {
                 (void)oc_callsig_command(&n->calls, c, cs ? cs->store : NULL, cs ? cs->workspace : NULL,
@@ -3652,7 +3762,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (cs) cs->logged_out = 1;
                 oc_cmd_free(c);
                 rc = RC_STOP;
-                goto drop;
+                goto served_end;
             }
             oc_cmd_free(c);
         }
@@ -3679,6 +3789,11 @@ static int run_connection(oc_net *n, int reconnecting,
             }
         }
     }
+served_end:
+    /* A message still waiting for its action when the connection goes is
+     * handed on as it stands; the next connection's backfill brings the rest. */
+    held_release(&ctx, n->to_ui);
+    oc_queue_destroy(&heldq);
 
 drop:
     /* The daemon holds a closed connection's seat in its call for a rejoin

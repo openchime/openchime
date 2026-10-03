@@ -836,6 +836,25 @@ static void fanout_members(int ep, conn **conns, const uint64_t *m, size_t n,
     }
 }
 
+/* Encode one action entry (REQ-058, ARCH-115) into `w`. */
+static int encode_action_entry(oc_wbuf *w, const struct oc_replay_action *a) {
+    oc_action ac = { a->message_id, a->channel_id, a->actor_id,
+                     oc_slice_str(a->actor_name ? a->actor_name : ""), a->text_start, a->text_len };
+    return oc_encode_action(w, OC_PROTOCOL_VERSION, &ac) == OC_OK;
+}
+
+/* A result's actions, to its members, right behind the frame they describe:
+ * BROADCAST, THREAD_REPLY, MSG_EDITED or MSG_RESTORED (REQ-058). The array is
+ * the one the replays read, so live and reloaded state come from the same rows. */
+static void fanout_actions(int ep, conn **conns, const oc_dbres *r) {
+    for (size_t i = 0; i < r->n_ract; i++) {
+        oc_wbuf w;
+        oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+        if (!encode_action_entry(&w, &r->ract[i])) break;
+        fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
+    }
+}
+
 /* Write `buf` to every connection `uid` holds but the one `except_conn` names. */
 static void send_to_user(int ep, conn **conns, uint64_t uid, uint64_t except_conn,
                          const uint8_t *buf, size_t len) {
@@ -5352,11 +5371,13 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                                   r->rfwd[i].src_author,
                                   oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
                                   r->rfwd[i].n_attach,
-                                  oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+                                  oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : ""),
+                                  r->rfwd[i].src_action };
                 if (oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) != OC_OK) break;
                 size_t flen = w.len;
                 fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, flen);
             }
+            fanout_actions(ep, conns, r);   /* REQ-058 */
             oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
@@ -5400,6 +5421,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &m);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        /* Whether the new body is an action, always -- an edit can unmake one
+         * (REQ-058). */
+        fanout_actions(ep, conns, r);
         /* The writer dropped the old body's unfurls; re-fetch for the new one
          * (REQ-222). The store step re-validates presence, so a URL the edit
          * removed cannot come back. */
@@ -5420,8 +5444,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, 0, body, 0, {{0}}, {0} };
         broadcast_set_attach(&b, r->attach, r->n_attach);
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
-        if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK)
+        if (oc_encode_msg_restored(&w, OC_PROTOCOL_VERSION, &b) == OC_OK) {
             fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, w.len);
+            fanout_actions(ep, conns, r);   /* the action came back with its body (REQ-058) */
+        }
         break;
     }
     case OC_RES_EDIT_ERR:
@@ -5570,6 +5596,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 e->created_at = cr->created_at;
                 e->preview = oc_slice_str(cr->preview ? cr->preview : "");
                 e->preview_author = cr->preview_author;
+                e->preview_action = cr->preview_action;
                 e->n_peers = cr->n_peers;                     /* REQ-056 */
                 for (uint16_t q = 0; q < cr->n_peers; q++) e->peers[q] = cr->peers[q];
             }
@@ -5783,7 +5810,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_pinned_msg pm = { pr->message_id, r->channel_id, pr->author_id,
                                  pr->created_at_ms, pr->pinned_by, pr->pinned_at,
                                  oc_slice_str(pr->body ? pr->body : ""),
-                                 oc_slice_str(pr->attach_name ? pr->attach_name : "") };
+                                 oc_slice_str(pr->attach_name ? pr->attach_name : ""), pr->action };
             oc_encode_pinned_msg(&w, OC_PROTOCOL_VERSION, &pm);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -5835,7 +5862,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_saved_msg sm = { sr->message_id, sr->channel_id, sr->author_id,
                                 sr->created_at, sr->saved_at,
                                 oc_slice_str(sr->body ? sr->body : ""),
-                                oc_slice_str(sr->attach_name ? sr->attach_name : "") };
+                                oc_slice_str(sr->attach_name ? sr->attach_name : ""), sr->action };
             oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &sm);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -5854,7 +5881,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
             oc_activity_entry ae = { ar->kind, ar->message_id, ar->channel_id,
                                      ar->actor_id, ar->at,
-                                     oc_slice_str(ar->text ? ar->text : "") };
+                                     oc_slice_str(ar->text ? ar->text : ""), ar->action };
             oc_encode_activity_entry(&w, OC_PROTOCOL_VERSION, &ae);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -6001,6 +6028,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                     if (in_thread) send_bytes(ep, conns, c->fd, g_enc_participant, in_len);
                     else           send_bytes(ep, conns, c->fd, g_enc,   out_len);
                 }
+            fanout_actions(ep, conns, r);   /* REQ-058 */
             /* And the notify decision, which a reply never produced at all
              * (REQ-061): the root goes with it, so the emitter can notify the
              * thread's PARTICIPANTS and not merely whoever the channel level
@@ -6068,6 +6096,12 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
+        /* The replies' actions, before the terminator, so a client has them by
+         * the time it is told the thread is complete (REQ-058). */
+        for (size_t i = 0; i < r->n_ract && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (encode_action_entry(&w, &r->ract[i])) send_bytes(ep, conns, fd, g_enc, w.len);
+        }
         if (!conns[fd]) break;
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_thread th = { r->parent_id, (uint32_t)r->n_thread, r->truncated };
@@ -6088,6 +6122,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             ents[i].server_time = r->search[i].server_time;
             ents[i].snippet.ptr = r->search[i].body;
             ents[i].snippet.len = r->search[i].body_len;
+            ents[i].action = r->search[i].action;   /* REQ-058 */
         }
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_search_results sr = { (uint16_t)n, ents, r->truncated };
@@ -6462,6 +6497,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        fanout_actions(ep, conns, r);   /* a webhook can post an action too (REQ-058) */
         /* ...then 200 the webhook sender and close its HTTP connection. */
         conn *hc = find_by_id(conns, r->conn_id);
         if (hc) {
@@ -6737,7 +6773,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
                                      t->root_at, t->last_reply_at, t->reply_count,
                                      t->unread, t->following,
-                                     oc_slice_str(t->preview ? t->preview : "") };
+                                     oc_slice_str(t->preview ? t->preview : ""), t->action };
             oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -6757,7 +6793,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
                                  t->root_at, t->last_reply_at, t->reply_count,
                                  t->unread, t->following,
-                                 oc_slice_str(t->preview ? t->preview : "") };
+                                 oc_slice_str(t->preview ? t->preview : ""), t->action };
         oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
         size_t len = w.len;
         send_to_user(ep, conns, r->user_id, 0, g_enc, len);
@@ -7090,6 +7126,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, blen);
+        fanout_actions(ep, conns, r);   /* "not an action", as every live message is answered (ARCH-115) */
         break;
     }
     case OC_RES_UNFURL_STORED: {
@@ -7115,9 +7152,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
  * The frames a BACKFILL_OK becomes, one at a time, in the order they always
  * went: each missed message as a BROADCAST (and a THREAD_META after one with
  * replies, REQ-060), then the pins, this user's saved marks, the reactions, the
- * link previews and the forwards for them -- a BROADCAST carries none of those,
- * so a replay without them loses each on reload -- then BACKFILL_DONE. */
-enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_REACT, BF_UNFURL, BF_FWD, BF_DONE, BF_END };
+ * link previews, the forwards and the actions for them -- a BROADCAST carries
+ * none of those, so a replay without them loses each on reload -- then
+ * BACKFILL_DONE. */
+enum { BF_MSG, BF_META, BF_PIN, BF_SAVED, BF_REACT, BF_UNFURL, BF_FWD, BF_ACT, BF_DONE, BF_END };
 
 /* Encode the head result's next frame into g_enc: its length, or 0 when the
  * result has no frames left. */
@@ -7190,15 +7228,22 @@ static size_t backfill_next(conn *c) {
             return w.len;
         }
         case BF_FWD: {
-            if (i >= r->n_rfwd) { c->bf_phase = BF_DONE; c->bf_i = 0; continue; }
+            if (i >= r->n_rfwd) { c->bf_phase = BF_ACT; c->bf_i = 0; continue; }
             c->bf_i = i + 1;
             oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
                               r->rfwd[i].src_channel, r->rfwd[i].src_message,
                               r->rfwd[i].src_author,
                               oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
                               r->rfwd[i].n_attach,
-                              oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+                              oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : ""),
+                              r->rfwd[i].src_action };
             oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw);
+            return w.len;
+        }
+        case BF_ACT: {
+            if (i >= r->n_ract) { c->bf_phase = BF_DONE; c->bf_i = 0; continue; }
+            c->bf_i = i + 1;
+            if (!encode_action_entry(&w, &r->ract[i])) continue;
             return w.len;
         }
         case BF_DONE: {

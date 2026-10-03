@@ -53,6 +53,7 @@ int run_richtext_tests(void);
 int run_url_tests(void);
 int run_sock_tests(void);
 int run_speakable_tests(void);
+int run_action_tests(void);
 int run_ttskit_tests(void);
 int run_tts_worker_tests(void);
 int run_voice_pick_tests(void);
@@ -253,6 +254,7 @@ int main(void) {
     total += SUITE(run_url_tests);
     total += SUITE(run_sock_tests);
     total += SUITE(run_speakable_tests);
+    total += SUITE(run_action_tests);
     total += SUITE(run_ttskit_tests);
     total += SUITE(run_tts_worker_tests);
     total += SUITE(run_voice_pick_tests);

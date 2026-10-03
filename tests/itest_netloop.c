@@ -292,7 +292,10 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
             hdr->msg_type != OC_MSG_CHANNEL_GROUPS &&  /* beside every CHANNEL_INFO (REQ-309) */
             hdr->msg_type != OC_MSG_GROUP_INFO &&      /* the groups, unasked after a sign-in's */
             hdr->msg_type != OC_MSG_GROUPS_END &&      /*   user list (REQ-307) */
-            hdr->msg_type != OC_MSG_ALERTS_SUMMARY)    /* an owner's or admin's, at sign-in (REQ-263) */
+            hdr->msg_type != OC_MSG_ALERTS_SUMMARY &&  /* an owner's or admin's, at sign-in (REQ-263) */
+            /* Every live message frame is followed by its ACTION (REQ-058,
+             * ARCH-115); the action verticals read them with read_frame_raw. */
+            hdr->msg_type != OC_MSG_ACTION)
             return 0;
     }
 }
@@ -684,6 +687,120 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     client_close(&b);
     client_close(&c);
     client_close(&d);
+}
+
+static int read_type(client *c, uint16_t type, oc_header *hdr, oc_rbuf *p);   /* below */
+
+/* The next frame on the wire, raw, must be the ACTION for `mid`: the daemon
+ * follows every live message frame with exactly one, and the client relies on
+ * nothing coming between them (REQ-058, ARCH-115). */
+static int next_is_action(client *c, uint64_t mid, uint32_t start, uint32_t len) {
+    oc_header hdr; oc_rbuf p;
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_ACTION) return 0;
+    oc_action ac;
+    if (oc_decode_action(&p, &ac) != OC_OK) return 0;
+    return ac.message_id == mid && ac.text_start == start && ac.text_len == len;
+}
+
+/* Actions over the wire (REQ-058, ARCH-115): a send, an edit that makes and
+ * unmakes one, a reply, a thread's replay and a backfill, each with the ACTION
+ * where the client expects it. */
+static void test_action_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* alice: "/me waves". bob gets the BROADCAST and, next, its ACTION. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0}; s.channel_id = 1; memset(s.idem, 0x81, OC_IDEM_SIZE);
+    s.body = oc_slice_str("/me waves");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    uint64_t act = bc.message_id;
+    CHECK(next_is_action(&b, act, 4, 5));
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0);   /* the author too */
+    CHECK(next_is_action(&a, act, 4, 5));
+
+    /* An ordinary message is answered too: "not an action". */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    memset(s.idem, 0x82, OC_IDEM_SIZE); s.body = oc_slice_str("hello");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_BROADCAST, &hdr, &p) == 0);
+    CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    uint64_t plain = bc.message_id;
+    CHECK(next_is_action(&b, plain, 0, 0));
+    CHECK(read_type(&a, OC_MSG_BROADCAST, &hdr, &p) == 0 && next_is_action(&a, plain, 0, 0));
+
+    /* An edit makes one, and another unmakes it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e = { 1, plain, oc_slice_str("/me hi") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_MSG_EDITED, &hdr, &p) == 0 && next_is_action(&b, plain, 4, 2));
+    CHECK(read_type(&a, OC_MSG_MSG_EDITED, &hdr, &p) == 0 && next_is_action(&a, plain, 4, 2));
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e2 = { 1, plain, oc_slice_str("hi") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e2) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&b, OC_MSG_MSG_EDITED, &hdr, &p) == 0 && next_is_action(&b, plain, 0, 0));
+    CHECK(read_type(&a, OC_MSG_MSG_EDITED, &hdr, &p) == 0 && next_is_action(&a, plain, 0, 0));
+
+    /* bob replies with one: the THREAD_REPLY, then its ACTION. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send_reply sr = {0}; sr.channel_id = 1; memset(sr.idem, 0x83, OC_IDEM_SIZE);
+    sr.parent_id = act; sr.body = oc_slice_str("/me nods");
+    CHECK(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_THREAD_REPLY, &hdr, &p) == 0);
+    oc_thread_reply tr; CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
+    uint64_t rep = tr.message_id;
+    CHECK(next_is_action(&a, rep, 4, 4));
+    CHECK(read_type(&b, OC_MSG_THREAD_REPLY, &hdr, &p) == 0 && next_is_action(&b, rep, 4, 4));
+
+    /* alice opens the thread: the reply, its action, then the terminator. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_thread lt = { 1, act };
+    CHECK(oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_type(&a, OC_MSG_THREAD_REPLY, &hdr, &p) == 0);
+    CHECK(next_is_action(&a, rep, 4, 4));
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD);
+
+    /* A reconnect's backfill replays the action -- and only real ones. */
+    client c;
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(do_handshake(&c) == 0);
+    uint64_t uc = 0;
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { 1, 0 };
+    oc_backfill_request req = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    int saw = 0, empty = 0;
+    for (int i = 0; i < 3000; i++) {
+        CHECK(read_frame_raw(&c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_ACTION) {
+            oc_action ac; CHECK(oc_decode_action(&p, &ac) == OC_OK);
+            if (ac.message_id == act) saw = ac.text_start == 4 && ac.text_len == 5;
+            if (ac.text_len == 0) empty++;
+        } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
+    }
+    CHECK(saw == 1);
+    CHECK(empty == 0);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&c);
 }
 
 /* Presence + typing over the wire (REQ-120/121): a connecting user is announced
@@ -5896,6 +6013,7 @@ int run_netloop_tests(void) {
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
+        test_action_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
         test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);

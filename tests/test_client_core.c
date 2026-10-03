@@ -4195,10 +4195,135 @@ static void test_browser_signin(int port) {
     unlink("build/test_core_browser.db-shm");
 }
 
+/* The pairing the net thread promises (REQ-058, ARCH-115), one frame at a time,
+ * which no real socket can show: it delivers a message and its ACTION in one
+ * read. A live message -- its attachments and forward with it -- is held until
+ * its ACTION and handed over with the action on it; anything unrelated releases
+ * it unpaired; an ACTION for something not held stands on its own. */
+static size_t frame_of_broadcast(uint8_t *buf, size_t cap, uint64_t mid, const char *body, int with_file) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_broadcast b = { mid, 1, 42, 1000, OC_MSG_KIND_MESSAGE, oc_slice_str(body), 0, {{0}}, {0} };
+    if (with_file) {
+        b.n_attach = 1;
+        b.attach[0].id = 9;
+        b.attach[0].filename = oc_slice_str("a.txt");
+        b.attach[0].mime = oc_slice_str("text/plain");
+        b.attach[0].size = 3;
+    }
+    b.author_name = oc_slice_str("");
+    return oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b) == OC_OK ? w.len : 0;
+}
+static size_t frame_of_action(uint8_t *buf, size_t cap, uint64_t mid, uint32_t start, uint32_t len) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_action a = { mid, 1, 42, oc_slice_str(""), start, len };
+    return oc_encode_action(&w, OC_PROTOCOL_VERSION, &a) == OC_OK ? w.len : 0;
+}
+static size_t frame_of_forward(uint8_t *buf, size_t cap, uint64_t mid) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_forward fw = { mid, 1, 1, 5, 42, oc_slice_str("x"), 0, oc_slice_str(""), 0 };
+    return oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) == OC_OK ? w.len : 0;
+}
+static size_t frame_of_meta(uint8_t *buf, size_t cap, uint64_t mid) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_thread_meta tm = { mid, 2, 2000 };
+    return oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm) == OC_OK ? w.len : 0;
+}
+
+static void test_action_pairing(void) {
+    oc_queue q; oc_queue_init(&q);
+    oc_net_frames *f = oc_net_frames_new(&q);
+    CHECK(f != NULL);
+    uint8_t buf[1024]; size_t n;
+    oc_ev *e;
+
+    /* A message with a file, then its forward: nothing yet. */
+    n = frame_of_broadcast(buf, sizeof buf, 100, "/me waves", 1);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    n = frame_of_forward(buf, sizeof buf, 100);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    /* Its ACTION: the message first, the action on it, then what waited. */
+    n = frame_of_action(buf, sizeof buf, 100, 4, 5);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 100 && e->action_known &&
+          e->action && e->action_start == 4 && e->action_len == 5);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_ATTACHMENT && e->message_id == 100);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_FORWARD && e->message_id == 100);
+    oc_ev_free(e);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+
+    /* "Not an action" pairs the same way. */
+    n = frame_of_broadcast(buf, sizeof buf, 101, "hello", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    n = frame_of_action(buf, sizeof buf, 101, 0, 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 101 && e->action_known && !e->action);
+    oc_ev_free(e);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+
+    /* A replay's message is followed by something else: released unpaired,
+     * and the other frame after it, in order. */
+    n = frame_of_broadcast(buf, sizeof buf, 102, "/me old", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    n = frame_of_meta(buf, sizeof buf, 102);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 102 && !e->action_known);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_THREAD_META);
+    oc_ev_free(e);
+    /* ...and its action arrives later on its own. */
+    n = frame_of_action(buf, sizeof buf, 102, 4, 3);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_ACTION && e->message_id == 102 && e->action && e->action_len == 3);
+    oc_ev_free(e);
+
+    /* An ACTION for another message releases what is held, then stands alone. */
+    n = frame_of_broadcast(buf, sizeof buf, 103, "x", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    n = frame_of_action(buf, sizeof buf, 99, 4, 1);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 103 && !e->action_known);
+    oc_ev_free(e);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_ACTION && e->message_id == 99);
+    oc_ev_free(e);
+
+    /* Both in one read pair just the same; and a hold still open when the
+     * connection goes is handed on as it stands. */
+    size_t n1 = frame_of_broadcast(buf, sizeof buf, 104, "/me two", 0);
+    size_t n2 = frame_of_action(buf + n1, sizeof buf - n1, 104, 4, 3);
+    CHECK(n1 && n2 && oc_net_frames_push(f, buf, n1 + n2) == 0);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 104 && e->action && e->action_len == 3);
+    oc_ev_free(e);
+    n = frame_of_broadcast(buf, sizeof buf, 105, "left", 0);
+    CHECK(n && oc_net_frames_push(f, buf, n) == 0);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    oc_net_frames_free(f);
+    e = oc_queue_try_pop(&q);
+    CHECK(e && e->type == OC_EV_MESSAGE && e->message_id == 105);
+    oc_ev_free(e);
+    CHECK(oc_queue_try_pop(&q) == NULL);
+    oc_queue_destroy(&q);
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, .well-known metadata, a published fingerprint, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, catch-up, channel description, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox, a channel list past one frame\n");
 
     test_group_dm_title();
+    test_action_pairing();
     test_groups_model();
     test_sidebar();
     test_new_channel_takes_the_default_level();
@@ -4363,6 +4488,64 @@ int run_client_core_tests(void) {
 
         /* The message carries dana's display name (= her login name), live. */
         CHECK(channel_has_named(oc_client_model(b), 1, "hello from the core", "dana"));
+
+        /* Actions (REQ-058, ARCH-115). The net thread holds a live message
+         * until its ACTION and hands both over together, so the FIRST moment
+         * erik's model holds dana's "/me" message, its action is already on
+         * it -- never a tick with the message and without the answer. */
+        {
+            oc_client_send(a, 1, "/me is away");
+            int paired = -1;
+            uint64_t amid = 0;
+            for (int i = 0; i < 500 && paired < 0; i++) {
+                oc_client_tick(b);
+                amid = message_id_of(oc_client_model(b), 1, "/me is away");
+                const oc_msg *am = amid ? find_msg(oc_client_model(b), 1, amid) : NULL;
+                if (am) paired = am->action.present && am->action.start == 4 && am->action.len == 7;
+                else { struct timespec ts = { 0, 10 * 1000 * 1000 }; nanosleep(&ts, NULL); }
+            }
+            CHECK(paired == 1);
+            const oc_model *bm = oc_client_model(b);
+            const oc_channel *bc = oc_model_channel((oc_model *)bm, 1);
+            CHECK(bc && bc->preview_action == 1 && strcmp(bc->preview, "is away") == 0);
+            char line[128];
+            oc_model_msg_preview(bm, find_msg(bm, 1, amid), line, sizeof line);
+            CHECK(strcmp(line, "dana is away") == 0);
+            /* The formatter: a name given wins, none looks the author up, and
+             * a non-action is its text alone. */
+            oc_model_line(bm, oc_model_user_id(bm, "dana"), NULL, 1, "waves", line, sizeof line);
+            CHECK(strcmp(line, "dana waves") == 0);
+            oc_model_line(bm, oc_model_user_id(bm, "dana"), "Deploy Bot", 1, "ships", line, sizeof line);
+            CHECK(strcmp(line, "Deploy Bot ships") == 0);
+            oc_model_line(bm, oc_model_user_id(bm, "dana"), NULL, 0, "/me is away", line, sizeof line);
+            CHECK(strcmp(line, "/me is away") == 0);
+
+            /* An edit unmakes it: the new body and no action, together. */
+            oc_client_edit(a, 1, amid, "back now");
+            paired = -1;
+            for (int i = 0; i < 500 && paired < 0; i++) {
+                oc_client_tick(b);
+                const oc_msg *am = find_msg(oc_client_model(b), 1, amid);
+                if (am && am->body && strcmp(am->body, "back now") == 0) paired = !am->action.present;
+                else { struct timespec ts = { 0, 10 * 1000 * 1000 }; nanosleep(&ts, NULL); }
+            }
+            CHECK(paired == 1);
+            /* And another makes one again, its span with it. */
+            oc_client_edit(a, 1, amid, "/me  is back");
+            paired = -1;
+            for (int i = 0; i < 500 && paired < 0; i++) {
+                oc_client_tick(b);
+                const oc_msg *am = find_msg(oc_client_model(b), 1, amid);
+                if (am && am->body && strcmp(am->body, "/me  is back") == 0)
+                    paired = am->action.present && am->action.start == 5 && am->action.len == 7;
+                else { struct timespec ts = { 0, 10 * 1000 * 1000 }; nanosleep(&ts, NULL); }
+            }
+            CHECK(paired == 1);
+            /* A tombstone has no body to be an action. */
+            oc_client_delete(a, 1, amid);
+            CHECK(WAIT_FOR(b, find_msg(m, 1, amid) && find_msg(m, 1, amid)->deleted &&
+                              !find_msg(m, 1, amid)->action.present));
+        }
 
         /* erik signals typing in channel 1; dana sees erik (and only erik) typing
          * (the server relays to other members, so dana's own view excludes her). */
@@ -4777,7 +4960,7 @@ int run_client_core_tests(void) {
                     CHECK(strncmp(va->filename, "dana-video-", 11) == 0 && strlen(va->filename) == 11 + 14 + 4 &&
                           strcmp(va->filename + 25, ".mp4") == 0);
                     char prev[96];
-                    oc_model_msg_preview(vm, prev, sizeof prev);
+                    oc_model_msg_preview(oc_client_model(b), vm, prev, sizeof prev);
                     CHECK(strcmp(prev, "\xF0\x9F\x8E\xA5 Video message (1:05)") == 0);
 
                     uint64_t vid = va->id, pid = va->poster_id;
