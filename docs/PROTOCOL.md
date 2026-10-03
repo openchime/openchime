@@ -297,7 +297,8 @@ people in with; the client MUST authenticate before sending any messaging frame.
 messaging frame received before `AUTH_OK` is answered with `ERROR AUTH_REQUIRED`
 (fatal). A refused `AUTH` is a fatal `ERROR` and the daemon closes the connection
 after it; a connection not signed in within 60 seconds of being accepted is
-closed. Full design in [AUTH.md](./AUTH.md); the exchange is its §8.1.
+closed, the 60 seconds starting again at each answered poll of a device code
+that is still live (§4.2c). Full design in [AUTH.md](./AUTH.md); the exchange is its §8.1.
 
 ### 4.1 `AUTH_CHALLENGE` (server → client), msg_type `0x0012`
 

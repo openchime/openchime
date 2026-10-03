@@ -203,7 +203,8 @@ typedef struct conn_s {
     int          authed;
     uint64_t     user_id;
     uint64_t     session_id;   /* REQ-182: which sessions row this conn uses */
-    uint64_t     accepted_ms;  /* when accepted: one not signed in soon after closes */
+    uint64_t     accepted_ms;  /* when accepted, or last polled a live device code: one
+                                * not signed in soon after closes */
     uint64_t     seen_ms;      /* when its session's last_seen_ms was last written */
     int          used;         /* a frame since then: the session is in use */
     char         source[46]; /* peer IP string, for per-source rate limiting */
@@ -2033,7 +2034,13 @@ static void handle_device_poll(conn *c, const oc_auth_device_poll *dp) {
     memcpy(dcode, dp->device_code.ptr, OC_DEVICE_CODE_LEN); dcode[OC_DEVICE_CODE_LEN] = '\0';
     char *tok = NULL;
     unsigned interval = OC_DEVICE_INTERVAL_S;
-    switch (oc_devcodes_poll(g_devcodes, dcode, now_ms(), &tok, &interval)) {
+    int st = oc_devcodes_poll(g_devcodes, dcode, now_ms(), &tok, &interval);
+    /* Waiting on a live code is not idling: the person may take longer to
+     * approve than a connection is given to sign in, and closing it would only
+     * make the client dial again -- or lose the token it has just collected, if
+     * the close lands before its AUTH. The code's own life bounds the wait. */
+    if (st == OC_DEV_PENDING || st == OC_DEV_SLOW || st == OC_DEV_TOKEN) c->accepted_ms = now_ms();
+    switch (st) {
     case OC_DEV_PENDING: send_auth_error(c, OC_ERR_AUTH_PENDING, "not approved yet"); break;
     case OC_DEV_SLOW: {
         char why[48];

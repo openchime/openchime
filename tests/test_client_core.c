@@ -4041,6 +4041,28 @@ static void test_device_client(int port) {
         CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
         oc_client_stop(c);
 
+        /* An approval slower than a connection is given to sign in (REQ-191:
+         * three seconds here, with the code good for its full ten minutes): the
+         * poll keeps the connection, so the approval signs in on it and nothing
+         * is said meanwhile. The daemon used to close it, and the client called
+         * that "could not reach the server", which ended a terminal's wait
+         * though the code was still good. */
+        oc_netloop_set_unauthed_ms(3000);
+        c = oc_client_start_device("web.openchime.test", "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
+        CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
+        snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
+        snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
+        for (int k = 0; k < 2; k++) {                   /* six seconds: twice the limit */
+            uint64_t past = oc_model_now_ms() + 3000;
+            CHECK(WAIT_FOR(c, oc_model_now_ms() >= past));
+        }
+        CHECK(oc_client_model(c)->error_seq == 0 && oc_client_model(c)->device_code[0] != '\0');
+        CHECK(device_approve(url, code, "lia", "pw-lia") == 0);
+        CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(c)->error_seq == 0);                     /* nothing was said */
+        oc_client_stop(c);
+        oc_netloop_set_unauthed_ms(0);
+
         __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
         pthread_join(th, NULL);
         oc_netloop_set_device_interval_s(0);
