@@ -243,8 +243,11 @@ static void passkey_button(pg *p, const oc_page *pp) {
     raw(p, "</button>\n");
 }
 
+/* By its absolute path: the pages that load it sit at different depths, and a
+ * passkey is offered only on the workspace's own name, never under the
+ * tunnel's prefix. */
 static void passkey_script(pg *p) {
-    raw(p, "<script src=\"webauthn.js\" integrity=\""); raw(p, oc_webauthn_js_integrity()); raw(p, "\"></script>\n");
+    raw(p, "<script src=\"/webauthn.js\" integrity=\""); raw(p, oc_webauthn_js_integrity()); raw(p, "\"></script>\n");
 }
 
 char *oc_page_render(const oc_page *pp, size_t *len) {

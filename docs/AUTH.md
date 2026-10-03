@@ -900,8 +900,9 @@ origin>` (browsers hold a form's redirect to `form-action`),
 `Cache-Control: no-store` and `Referrer-Policy: same-origin` — no other site is
 told a page's URL, and the page's own posts carry its origin (under
 `no-referrer` a browser sends `Origin: null`, which the check below refuses).
-Every URL on a
-page is relative, so the same pages serve both ways in. A post must be a form
+Every URL on a page is relative, so the same pages serve both ways in — but the
+passkey script's, `/webauthn.js`, which only the workspace's own name serves a
+page for. A post must be a form
 whose `Origin` is `https://` + its `Host`, and a sign-in's `redirect_uri` must be
 loopback and its `nonce` a challenge. A refusal shows the form again and never
 says which half of a credential was wrong.
