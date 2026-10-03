@@ -60,6 +60,12 @@ void oc_netloop_set_unauthed_ms(uint64_t ms);
 #define OC_SESSION_SEEN_MS (60u * 60u * 1000u)
 void oc_netloop_set_seen_ms(uint64_t ms);
 
+/* The names a passkey may be made for (AUTH.md §8.6): the workspace's own,
+ * comma-separated, when its certificate is one a CA vouches for -- never a
+ * self-signed daemon's, nor the loopback tunnel's. NULL or "": none. Before
+ * serving. */
+void oc_netloop_set_passkey_names(const char *names);
+
 /* Hold a connection's presence changes to OC_PRESENCE_RATE_MAX per `ms` rather
  * than per ten seconds (0 restores it); a test's knob, so the deferred last word
  * can be seen without waiting out the window. Any thread. */

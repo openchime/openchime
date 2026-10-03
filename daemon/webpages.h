@@ -22,7 +22,9 @@ typedef enum {
     OC_SEC_CONFIRM,      /* the first code again, after a wrong one */
     OC_SEC_CODES,        /* on: the recovery codes, once */
     OC_SEC_ON,           /* already on: a code turns it off */
-    OC_SEC_OFF           /* turned off */
+    OC_SEC_OFF,          /* turned off */
+    OC_SEC_PASSKEY,      /* on, the code given: a passkey to add */
+    OC_SEC_PASSKEY_DONE  /* a passkey added */
 } oc_sec_screen;
 
 typedef struct {
@@ -53,6 +55,13 @@ typedef struct {
     const char  *codes;
     /* RESET (AUTH.md §2): the one-time link's token. */
     const char  *reset;
+    /* A passkey (AUTH.md §8.6), offered only on the workspace's own trusted
+     * name: 1 to answer with one (STEP), 2 to add one (SECURITY's PASSKEY
+     * screen); the ceremony's challenge and relying party, the credentials
+     * already there (base64url, comma-separated), and the person's handle and
+     * name for a new one. */
+    int          pk_mode;
+    const char  *pk_challenge, *pk_rp, *pk_creds, *pk_user, *pk_name;
 } oc_page;
 
 /* The page, malloc'd, its length in *len. NULL on no memory. */
@@ -70,6 +79,14 @@ const char *oc_page_unavailable(size_t *len);
  * to form-action too). `redirect_uri` may be NULL. Returns 0, -1 if `cap` is
  * too small. */
 int oc_page_headers(const char *redirect_uri, char *out, size_t cap);
+/* The same, for a page that runs the one script the daemon serves (a passkey's,
+ * `script-src 'self'`) when `scripts`. */
+int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t cap);
+
+/* The passkey script (AUTH.md §8.6), served at /webauthn.js, and its SRI
+ * value ("sha256-<base64>") for the page that loads it. */
+const char *oc_webauthn_js(size_t *len);
+const char *oc_webauthn_js_integrity(void);
 
 /* `in`/`n` with &, <, >, " and ' escaped, appended at `*o` in `out`. -1 if it
  * does not fit. */

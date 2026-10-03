@@ -2,6 +2,9 @@
 
 #include "qrcodegen.h"
 
+#include <mbedtls/base64.h>
+#include <mbedtls/sha256.h>
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +150,77 @@ static void qr_svg(pg *p, const char *text) {
     raw(p, "\"/></svg>\n");
 }
 
+/* The passkey script (AUTH.md §8.6): the one script any page runs, and only a
+ * page on the workspace's trusted name that offers a passkey. It reads the
+ * ceremony from the button's data attributes, asks the browser, and posts the
+ * answer with the form it sits in; it fetches nothing and builds no markup. */
+static const char WEBAUTHN_JS[] =
+    "(function(){\n"
+    "function b64u(b){var s='',a=new Uint8Array(b);for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);"
+    "return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}\n"
+    "function unb(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';"
+    "var r=atob(s),a=new Uint8Array(r.length);for(var i=0;i<r.length;i++)a[i]=r.charCodeAt(i);return a;}\n"
+    "function ids(s){return (s||'').split(',').filter(Boolean).map(function(c){return {type:'public-key',id:unb(c)};});}\n"
+    "var el=document.getElementById('passkey');\n"
+    "if(!el||!window.PublicKeyCredential)return;\n"
+    "el.hidden=false;\n"
+    "el.addEventListener('click',function(){\n"
+    "var d=el.dataset,f=el.form;\n"
+    "if(d.mode==='create'){navigator.credentials.create({publicKey:{challenge:unb(d.challenge),"
+    "rp:{id:d.rp,name:'OpenChime'},user:{id:unb(d.user),name:d.name,displayName:d.name},"
+    "pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],"
+    "authenticatorSelection:{userVerification:'preferred'},attestation:'none',excludeCredentials:ids(d.creds)}})"
+    ".then(function(c){f.pk_cd.value=b64u(c.response.clientDataJSON);f.pk_att.value=b64u(c.response.attestationObject);f.submit();})"
+    ".catch(function(){});}\n"
+    "else{navigator.credentials.get({publicKey:{challenge:unb(d.challenge),rpId:d.rp,"
+    "allowCredentials:ids(d.creds),userVerification:'preferred'}})"
+    ".then(function(c){f.pk_cred.value=b64u(c.rawId);f.pk_cd.value=b64u(c.response.clientDataJSON);"
+    "f.pk_ad.value=b64u(c.response.authenticatorData);f.pk_sig.value=b64u(c.response.signature);f.submit();})"
+    ".catch(function(){});}\n"
+    "});\n"
+    "})();\n";
+
+const char *oc_webauthn_js(size_t *len) { *len = sizeof WEBAUTHN_JS - 1; return WEBAUTHN_JS; }
+
+const char *oc_webauthn_js_integrity(void) {
+    static char sri[64];
+    if (!sri[0]) {
+        uint8_t h[32]; size_t ol = 0;
+        char b[48];
+        if (mbedtls_sha256((const unsigned char *)WEBAUTHN_JS, sizeof WEBAUTHN_JS - 1, h, 0) == 0 &&
+            mbedtls_base64_encode((unsigned char *)b, sizeof b, &ol, h, sizeof h) == 0)
+            snprintf(sri, sizeof sri, "sha256-%.*s", (int)ol, b);
+    }
+    return sri;
+}
+
+/* The passkey button and the fields its answer fills, in the form it posts. */
+static void passkey_button(pg *p, const oc_page *pp) {
+    raw(p, "<input type=\"hidden\" name=\"pk_cd\" value=\"\">\n");
+    if (pp->pk_mode == 1) {
+        raw(p, "<input type=\"hidden\" name=\"pk_cred\" value=\"\">\n<input type=\"hidden\" name=\"pk_ad\" value=\"\">\n"
+               "<input type=\"hidden\" name=\"pk_sig\" value=\"\">\n");
+    } else {
+        raw(p, "<input type=\"hidden\" name=\"pk_att\" value=\"\">\n");
+    }
+    raw(p, "<button type=\"button\" id=\"passkey\" hidden data-mode=\"");
+    raw(p, pp->pk_mode == 2 ? "create" : "get");
+    raw(p, "\" data-challenge=\""); esc(p, pp->pk_challenge);
+    raw(p, "\" data-rp=\""); esc(p, pp->pk_rp);
+    raw(p, "\" data-creds=\""); esc(p, pp->pk_creds);
+    if (pp->pk_mode == 2) {
+        raw(p, "\" data-user=\""); esc(p, pp->pk_user);
+        raw(p, "\" data-name=\""); esc(p, pp->pk_name);
+    }
+    raw(p, "\" style=\"background:none;color:inherit;border:1px solid #c4c8cf;margin-top:.6rem\">");
+    raw(p, pp->pk_mode == 2 ? "Add a passkey" : "Use a passkey");
+    raw(p, "</button>\n");
+}
+
+static void passkey_script(pg *p) {
+    raw(p, "<script src=\"webauthn.js\" integrity=\""); raw(p, oc_webauthn_js_integrity()); raw(p, "\"></script>\n");
+}
+
 char *oc_page_render(const oc_page *pp, size_t *len) {
     pg p = { 0 };
     const char *user = pp->username ? pp->username : "";
@@ -236,7 +310,10 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         raw(&p, "\">\n");
         hidden(&p, "ticket", pp->ticket);
         field(&p, "code", "Code", "text", "one-time-code", "", 1);
-        raw(&p, "<button type=\"submit\">Continue</button>\n</form>\n");
+        raw(&p, "<button type=\"submit\">Continue</button>\n");
+        if (pp->pk_mode == 1) passkey_button(&p, pp);
+        raw(&p, "</form>\n");
+        if (pp->pk_mode == 1) passkey_script(&p);
         break;
     case OC_PAGE_SECURITY:
         open_page(&p, "Two-step sign-in \xE2\x80\x94 OpenChime");
@@ -273,14 +350,30 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             raw(&p, "</pre>\n<p>You can close this tab.</p>\n");
             break;
         case OC_SEC_ON:
-            raw(&p, "<p>Two-step sign-in is on. To turn it off, enter a code from your authenticator app or "
-                    "a recovery code.</p>\n");
+            raw(&p, "<p>Two-step sign-in is on. Enter a code from your authenticator app or a recovery code "
+                    "to turn it off");
+            raw(&p, pp->pk_rp && pp->pk_rp[0] ? ", or to add a passkey.</p>\n" : ".</p>\n");
             message(&p, pp->message);
             raw(&p, "<form method=\"post\" action=\"security\">\n");
             hidden(&p, "ticket", pp->ticket);
-            hidden(&p, "action", "remove");
             field(&p, "code", "Code", "text", "one-time-code", "", 1);
-            raw(&p, "<button type=\"submit\">Turn off</button>\n</form>\n");
+            if (pp->pk_rp && pp->pk_rp[0])
+                raw(&p, "<button type=\"submit\" name=\"action\" value=\"passkey\">Add a passkey</button>\n");
+            raw(&p, "<button type=\"submit\" name=\"action\" value=\"remove\">Turn off</button>\n</form>\n");
+            break;
+        case OC_SEC_PASSKEY:
+            raw(&p, "<p>Add a passkey for this workspace: your device asks you to confirm. A passkey works here, "
+                    "at this address; after the workspace is renamed, add it again.</p>\n");
+            message(&p, pp->message);
+            raw(&p, "<form method=\"post\" action=\"security\">\n");
+            hidden(&p, "ticket", pp->ticket);
+            hidden(&p, "action", "passkey_add");
+            passkey_button(&p, pp);
+            raw(&p, "</form>\n");
+            passkey_script(&p);
+            break;
+        case OC_SEC_PASSKEY_DONE:
+            raw(&p, "<p>Passkey added. Signing in here can use it in place of a code. You can close this tab.</p>\n");
             break;
         case OC_SEC_OFF:
             raw(&p, "<p>Two-step sign-in is off. You can close this tab.</p>\n");
@@ -341,6 +434,10 @@ const char *oc_page_invalid(size_t *len) { *len = sizeof INVALID - 1; return INV
 const char *oc_page_unavailable(size_t *len) { *len = sizeof UNAVAILABLE - 1; return UNAVAILABLE; }
 
 int oc_page_headers(const char *redirect_uri, char *out, size_t cap) {
+    return oc_page_headers_ex(redirect_uri, 0, out, cap);
+}
+
+int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t cap) {
     /* The callback's origin: scheme://host:port of a loopback redirect, which the
      * caller has checked. IPv6 loopback cannot be written in a policy's host
      * grammar, so there the policy does not name form targets at all -- the
@@ -357,12 +454,12 @@ int oc_page_headers(const char *redirect_uri, char *out, size_t cap) {
     }
     int v6 = redirect_uri && strncmp(redirect_uri, "http://[::1]", 12) == 0;
     int n = snprintf(out, cap,
-        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; %s"
         "frame-ancestors 'none'; base-uri 'none'%s%s%s\r\n"
         "X-Frame-Options: DENY\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "Cache-Control: no-store\r\n"
         "Referrer-Policy: no-referrer\r\n",
-        v6 ? "" : "; form-action 'self'", cb[0] ? " " : "", cb);
+        scripts ? "script-src 'self'; " : "", v6 ? "" : "; form-action 'self'", cb[0] ? " " : "", cb);
     return n < 0 || (size_t)n >= cap ? -1 : 0;
 }

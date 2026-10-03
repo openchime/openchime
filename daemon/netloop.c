@@ -25,6 +25,7 @@
 #include "http.h"
 #include "webpages.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
+#include "jwt.h"         /* oc_base64url_encode: a passkey ceremony's challenge */
 #include "webstep.h"     /* a local account's second step (AUTH.md §8.6) */
 #include "e2e_hpke.h"  /* oc_e2e_wipe */
 #include "protocol.h"
@@ -184,6 +185,7 @@ typedef struct web_req {
     char redirect_uri[512], nonce[48], username[128], invite[80];
     char user_code[16];          /* DEVICE: the code being approved */
     char step[OC_STEP_TICKET_LEN + 1];   /* a second step's: the ticket it is for */
+    char rp[256], origin[300];           /* reached on a passkey's trusted name: which */
 } web_req;
 
 typedef struct conn_s {
@@ -3816,6 +3818,7 @@ static const oc_http_route TLS_ROUTES[] = {
     { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
+    { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
     { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
     { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
@@ -3921,10 +3924,11 @@ static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
 /* --- the sign-in pages (AUTH.md §8.10) ------------------------------------- */
 
 /* A page with its headers: the policy names the sign-in's callback. */
-static void web_reply(conn *c, int status, const char *html, size_t len, const char *redirect_uri,
-                      const char *location) {
+/* `scripts`: the page runs the passkey script (AUTH.md §8.6). */
+static void web_reply_ex(conn *c, int status, const char *html, size_t len, const char *redirect_uri,
+                         const char *location, int scripts) {
     char extra[1024], hdr[1536];
-    if (oc_page_headers(redirect_uri, extra, sizeof extra) != 0) extra[0] = '\0';
+    if (oc_page_headers_ex(redirect_uri, scripts, extra, sizeof extra) != 0) extra[0] = '\0';
     if (location) {
         size_t el = strlen(extra);
         int n = snprintf(extra + el, sizeof extra - el, "Location: %s\r\n", location);
@@ -3936,11 +3940,16 @@ static void web_reply(conn *c, int status, const char *html, size_t len, const c
     if (len) out_append(c, (const uint8_t *)html, len);
 }
 
+static void web_reply(conn *c, int status, const char *html, size_t len, const char *redirect_uri,
+                      const char *location) {
+    web_reply_ex(c, status, html, len, redirect_uri, location, 0);
+}
+
 static void web_page(conn *c, int status, const oc_page *pg) {
     size_t len = 0;
     char *html = oc_page_render(pg, &len);
     if (!html) { http_reply(c, 500, "text/plain", "error\n", 6); return; }
-    web_reply(c, status, html, len, pg->redirect_uri, NULL);
+    web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, pg->pk_mode != 0);
     free(html);
 }
 
@@ -3962,7 +3971,43 @@ static int field_get(const char *q, const char *key, char *out, size_t cap) {
 
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
 static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);               /* fwd */
+
+/* The names a passkey may be made for, and the one this request came to: set
+ * per request by on_web_page, read by the page handlers it calls. */
+static char g_pk_names[1024];
+static __thread char g_req_rp[256], g_req_origin[300];
+void oc_netloop_set_passkey_names(const char *names) {
+    snprintf(g_pk_names, sizeof g_pk_names, "%s", names ? names : "");
+}
+
+/* Whether `req` came to one of the passkey names: its Host's name, and the
+ * origin a browser there names (https, and the port unless 443). */
+static int passkey_rp(const oc_http_req *req, char rp[256], char origin[300]) {
+    rp[0] = origin[0] = '\0';
+    if (!req->host || !req->host_len || req->host_len >= 255 || !g_pk_names[0]) return 0;
+    char host[256];
+    memcpy(host, req->host, req->host_len); host[req->host_len] = '\0';
+    for (char *h = host; *h; h++) if (*h >= 'A' && *h <= 'Z') *h = (char)(*h - 'A' + 'a');
+    char name[256];
+    snprintf(name, sizeof name, "%s", host);
+    char *colon = strrchr(name, ':');
+    if (colon && !strchr(name, ']')) *colon = '\0';
+    const char *p = g_pk_names;
+    while (*p) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && n == strlen(name) && strncasecmp(p, name, n) == 0) {
+            snprintf(rp, 256, "%s", name);
+            int port443 = !colon || strcmp(colon + 1, "443") == 0;
+            snprintf(origin, 300, "https://%s", port443 ? name : host);
+            return 1;
+        }
+        p = e ? e + 1 : p + n;
+    }
+    return 0;
+}
 static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw); /* fwd */
+static int pk_challenge(char out[48]);                                         /* fwd */
 static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw);    /* fwd */
 
 static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
@@ -3976,6 +4021,16 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     else if (plen == 14 && memcmp(req->path, "/signin/verify", 14) == 0) kind = OC_PAGE_STEP;
     else if (plen == 17 && memcmp(req->path, "/account/security", 17) == 0) kind = OC_PAGE_SECURITY;
     else if (plen == 14 && memcmp(req->path, "/account/reset", 14) == 0) kind = OC_PAGE_RESET;
+    else if (plen == 12 && memcmp(req->path, "/webauthn.js", 12) == 0) {
+        /* The passkey script: static, the one a page runs (AUTH.md §8.6). */
+        size_t jl;
+        const char *js = oc_webauthn_js(&jl);
+        char hdr[512];
+        size_t hn = oc_http_head_ex(hdr, sizeof hdr, 200, "text/javascript; charset=utf-8", jl,
+                                    "X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n");
+        if (hn) { out_append(c, (const uint8_t *)hdr, hn); out_append(c, (const uint8_t *)js, jl); }
+        return -1;
+    }
     else { http_reply(c, 404, "text/plain", "not found\n", 10); return -1; }
     size_t len;
     if (!oc_dbwriter_local_browser(dbw)) {
@@ -3984,6 +4039,7 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         return -1;
     }
     int post = req->method_len == 4 && memcmp(req->method, "POST", 4) == 0;
+    passkey_rp(req, g_req_rp, g_req_origin);
 
     /* The fields: the query's for a GET, the form's for a POST. */
     char q[WEB_MAX_BODY + 1];
@@ -4000,10 +4056,20 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         memcpy(q, qm ? qm + 1 : "", ql);
         q[ql] = '\0';
     }
-    if (kind == OC_PAGE_DEVICE) return on_device_page(c, post, q, dbw);
-    if (kind == OC_PAGE_STEP) return on_step_page(c, q, dbw);
-    if (kind == OC_PAGE_SECURITY) return on_security_page(c, post, q, dbw);
-    if (kind == OC_PAGE_RESET) return on_reset_page(c, post, q, dbw);
+    int sub = -2;
+    if (kind == OC_PAGE_DEVICE) sub = on_device_page(c, post, q, dbw);
+    else if (kind == OC_PAGE_STEP) sub = on_step_page(c, q, dbw);
+    else if (kind == OC_PAGE_SECURITY) sub = on_security_page(c, post, q, dbw);
+    else if (kind == OC_PAGE_RESET) sub = on_reset_page(c, post, q, dbw);
+    if (sub != -2) {
+        /* A page waiting on the writer remembers the trusted name it was reached
+         * at, unless its ticket already said (a step's). */
+        if (sub == 0 && c->web && !c->web->rp[0]) {
+            snprintf(c->web->rp, sizeof c->web->rp, "%s", g_req_rp);
+            snprintf(c->web->origin, sizeof c->web->origin, "%s", g_req_origin);
+        }
+        return sub;
+    }
     web_req *w = calloc(1, sizeof *w);
     if (!w) { http_reply(c, 500, "text/plain", "error\n", 6); return -1; }
     w->kind = kind;
@@ -4060,12 +4126,15 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         oc_e2e_wipe(cbuf, sizeof cbuf);
         j->method = OC_AUTH_LOCAL;
         j->web = kind == OC_PAGE_PASSWORD ? OC_WEB_PASSWORD : OC_WEB_SIGNIN;
+        snprintf(j->wa_rp, sizeof j->wa_rp, "%s", g_req_rp);   /* its passkeys, if any here */
         if (kind == OC_PAGE_PASSWORD && !(j->pf_new_pw = strdup(pass))) goto fail;
     }
     memcpy(j->source, c->source, sizeof j->source);
     snprintf(j->web_nonce, sizeof j->web_nonce, "%s", w->nonce);
     oc_dbwriter_submit(dbw, j);
     j = NULL;
+    snprintf(w->rp, sizeof w->rp, "%s", g_req_rp);
+    snprintf(w->origin, sizeof w->origin, "%s", g_req_origin);
     c->web = w; w = NULL;
     c->http_pending = 1;
     rc = 0;
@@ -4143,6 +4212,7 @@ static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     oc_e2e_wipe(cbuf, sizeof cbuf);
     j->method = OC_AUTH_LOCAL;
     j->web = OC_WEB_SIGNIN;
+    snprintf(j->wa_rp, sizeof j->wa_rp, "%s", g_req_rp);
     memcpy(j->source, c->source, sizeof j->source);
     snprintf(j->web_nonce, sizeof j->web_nonce, "%s", info.challenge);
     w->kind = OC_PAGE_DEVICE;
@@ -4164,9 +4234,12 @@ out:
  * -1 to close. */
 static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
     char ticket[OC_STEP_TICKET_LEN + 8] = "", code[64] = "";
+    static __thread char cred[400], cd[2800], ad[1400], sig[800];
     oc_step_ticket t;
     size_t len;
     if (field_get(q, "ticket", ticket, sizeof ticket) || field_get(q, "code", code, sizeof code) ||
+        field_get(q, "pk_cred", cred, sizeof cred) || field_get(q, "pk_cd", cd, sizeof cd) ||
+        field_get(q, "pk_ad", ad, sizeof ad) || field_get(q, "pk_sig", sig, sizeof sig) ||
         !g_websteps || !oc_websteps_get(g_websteps, ticket, now_ms(), &t)) {
         const char *b = oc_page_invalid(&len);
         web_reply(c, 400, b, len, NULL, NULL);
@@ -4184,6 +4257,18 @@ static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
     j->user_id = t.uid;
     j->auth_version = t.version;
     j->web = t.page == OC_PAGE_PASSWORD ? OC_WEB_PASSWORD : OC_WEB_SIGNIN;
+    if (cd[0] && t.challenge[0]) {
+        /* A passkey's answer, checked against the ceremony the ticket holds. */
+        snprintf(j->wa_rp, sizeof j->wa_rp, "%s", t.rp);
+        snprintf(j->wa_origin, sizeof j->wa_origin, "%s", t.origin);
+        snprintf(j->wa_challenge, sizeof j->wa_challenge, "%s", t.challenge);
+        if (!(j->wa_cred = strdup(cred)) || !(j->wa_cd = strdup(cd)) || !(j->wa_ad = strdup(ad)) ||
+            !(j->wa_sig = strdup(sig))) {
+            oc_job_free(j); free(w); oc_e2e_wipe(&t, sizeof t);
+            http_reply(c, 500, "text/plain", "error\n", 6);
+            return -1;
+        }
+    }
     snprintf(j->web_nonce, sizeof j->web_nonce, "%s", t.nonce);
     if (t.pw) {
         j->pw_derived = 1;
@@ -4196,6 +4281,8 @@ static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
     snprintf(w->redirect_uri, sizeof w->redirect_uri, "%s", t.redirect_uri);
     snprintf(w->nonce, sizeof w->nonce, "%s", t.nonce);
     snprintf(w->user_code, sizeof w->user_code, "%s", t.user_code);
+    snprintf(w->rp, sizeof w->rp, "%s", t.rp);
+    snprintf(w->origin, sizeof w->origin, "%s", t.origin);
     memcpy(w->step, ticket, OC_STEP_TICKET_LEN);   /* found, so exactly this long */
     w->step[OC_STEP_TICKET_LEN] = '\0';
     oc_e2e_wipe(&t, sizeof t);
@@ -4211,6 +4298,7 @@ static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
  * Returns 0 to keep, -1 to close. */
 static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     char user[128] = "", pass[512] = "", ticket[OC_STEP_TICKET_LEN + 8] = "", code[64] = "", action[16] = "";
+    static __thread char pk_cd[2800], pk_att[5600];
     oc_page pg = { .kind = OC_PAGE_SECURITY, .redirect_uri = "", .nonce = "", .username = user,
                    .invite = "", .message = "", .user_code = "", .sec = OC_SEC_SIGNIN };
     size_t len;
@@ -4222,7 +4310,8 @@ static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) 
     }
     if (field_get(q, "username", user, sizeof user) || field_get(q, "password", pass, sizeof pass) ||
         field_get(q, "ticket", ticket, sizeof ticket) || field_get(q, "code", code, sizeof code) ||
-        field_get(q, "action", action, sizeof action)) {
+        field_get(q, "action", action, sizeof action) || field_get(q, "pk_cd", pk_cd, sizeof pk_cd) ||
+        field_get(q, "pk_att", pk_att, sizeof pk_att)) {
         const char *b = oc_page_invalid(&len);
         web_reply(c, 400, b, len, NULL, NULL);
         goto out;
@@ -4233,9 +4322,13 @@ static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) 
     if (!w) goto fail;
     w->kind = OC_PAGE_SECURITY;
     snprintf(w->username, sizeof w->username, "%s", user);
-    if (strcmp(action, "confirm") == 0 || strcmp(action, "remove") == 0) {
+    int add = strcmp(action, "passkey_add") == 0;
+    if (strcmp(action, "confirm") == 0 || strcmp(action, "remove") == 0 || strcmp(action, "passkey") == 0 || add) {
         oc_step_ticket t;
-        if (!g_websteps || !oc_websteps_get(g_websteps, ticket, now_ms(), &t) || t.page != OC_PAGE_SECURITY) {
+        /* Adding a passkey needs the ticket a code earned, and a ceremony. */
+        if (!g_websteps || !oc_websteps_get(g_websteps, ticket, now_ms(), &t) || t.page != OC_PAGE_SECURITY ||
+            (add && (t.stage != 1 || !t.challenge[0] || !pk_cd[0] || !pk_att[0])) ||
+            (strcmp(action, "passkey") == 0 && !t.rp[0])) {
             free(w);
             const char *b = oc_page_invalid(&len);
             web_reply(c, 400, b, len, NULL, NULL);
@@ -4245,10 +4338,20 @@ static int on_security_page(conn *c, int post, const char *q, oc_dbwriter *dbw) 
         if (!j || oc_job_set_token(j, code, strlen(code)) != 0) goto fail;
         j->user_id = t.uid;
         j->auth_version = t.version;
-        j->scope = action[0] == 'c' ? 1 : 2;
+        j->scope = action[0] == 'c' ? OC_SEC_CONFIRM_TOTP : action[0] == 'r' ? OC_SEC_TURN_OFF :
+                   add ? OC_SEC_PASSKEY_ADD : OC_SEC_PASSKEY_ASK;
+        snprintf(j->wa_rp, sizeof j->wa_rp, "%s", t.rp);
+        if (add) {
+            snprintf(j->wa_origin, sizeof j->wa_origin, "%s", t.origin);
+            snprintf(j->wa_challenge, sizeof j->wa_challenge, "%s", t.challenge);
+            if (!(j->wa_cd = strdup(pk_cd)) || !(j->wa_att = strdup(pk_att))) goto fail;
+        }
         memcpy(w->step, ticket, OC_STEP_TICKET_LEN);
         w->step[OC_STEP_TICKET_LEN] = '\0';
-        w->redirect_uri[0] = action[0];   /* which screen a wrong code returns to */
+        w->redirect_uri[0] = add ? 'a' : action[0];   /* which screen a wrong code returns to */
+        snprintf(w->rp, sizeof w->rp, "%s", t.rp);
+        snprintf(w->origin, sizeof w->origin, "%s", t.origin);
+        snprintf(w->username, sizeof w->username, "%s", t.user);
         oc_e2e_wipe(&t, sizeof t);
     } else {
         uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
@@ -4327,6 +4430,9 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
         t.page = OC_PAGE_SECURITY;
         t.uid = r->user_id;
         t.version = r->step_version;
+        snprintf(t.rp, sizeof t.rp, "%s", w->rp);           /* passkeys only on a trusted name */
+        snprintf(t.origin, sizeof t.origin, "%s", w->origin);
+        snprintf(t.user, sizeof t.user, "%s", w->username);
         char key[OC_SRC_LEN];
         oc_source_key(c->source, key, sizeof key);
         int put = g_websteps ? oc_websteps_put(g_websteps, key, &t, now_ms(), w->step) : -1;
@@ -4336,7 +4442,7 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
             return;
         }
         char uri[400] = "";
-        if (r->step_pw) pg.sec = OC_SEC_ON;
+        if (r->step_pw) { pg.sec = OC_SEC_ON; pg.pk_rp = w->rp; }
         else {
             /* otpauth's label is "issuer:account"; the name is the username, whose
              * characters a URI path takes as they are but for these. */
@@ -4359,8 +4465,41 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
         oc_e2e_wipe(uri, sizeof uri);
         return;
     }
+    if (r->type == OC_RES_WEB_OK && r->step_pw == OC_SEC_PASSKEY_ASK) {
+        /* The code was right: a new ticket, allowed to add a passkey, and the
+         * ceremony for it. The person's handle is their id; it names nobody. */
+        oc_step_ticket t, old;
+        int had = g_websteps && oc_websteps_get(g_websteps, w->step, now_ms(), &old);
+        if (g_websteps) oc_websteps_drop(g_websteps, w->step);
+        memset(&t, 0, sizeof t);
+        if (had) t = old;
+        t.stage = 1;
+        char key[OC_SRC_LEN], handle[24];
+        oc_source_key(c->source, key, sizeof key);
+        uint8_t hb[8];
+        for (int i = 0; i < 8; i++) hb[i] = (uint8_t)(r->user_id >> (56 - 8 * i));
+        oc_base64url_encode(hb, sizeof hb, handle);
+        if (r->pk_creds && strlen(r->pk_creds) < sizeof t.creds) snprintf(t.creds, sizeof t.creds, "%s", r->pk_creds);
+        if (!had || pk_challenge(t.challenge) != 0 || oc_websteps_put(g_websteps, key, &t, now_ms(), w->step) != 0) {
+            size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL);
+            oc_e2e_wipe(&t, sizeof t); oc_e2e_wipe(&old, sizeof old);
+            return;
+        }
+        pg.sec = OC_SEC_PASSKEY;
+        pg.ticket = w->step;
+        pg.pk_mode = 2;
+        pg.pk_challenge = t.challenge;
+        pg.pk_rp = t.rp;
+        pg.pk_creds = t.creds;
+        pg.pk_user = handle;
+        pg.pk_name = t.user[0] ? t.user : "OpenChime";
+        web_page(c, 200, &pg);
+        oc_e2e_wipe(&t, sizeof t); oc_e2e_wipe(&old, sizeof old);
+        return;
+    }
     if (r->type == OC_RES_WEB_OK) {
         if (g_websteps) oc_websteps_drop(g_websteps, w->step);
+        if (r->step_pw == OC_SEC_PASSKEY_ADD) { pg.sec = OC_SEC_PASSKEY_DONE; web_page(c, 200, &pg); return; }
         pg.sec = r->body && r->body_len ? OC_SEC_CODES : OC_SEC_OFF;
         pg.codes = r->body ? (const char *)r->body : "";
         web_page(c, 200, &pg);
@@ -4381,7 +4520,14 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
     else if (r->err_code == OC_ERR_INTERNAL) { status = 500; pg.message = "Something went wrong. Try again."; }
     else left = g_websteps ? oc_websteps_fail(g_websteps, w->step, now_ms()) : 0;
     if (left <= 0) { size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL); return; }
+    if (w->redirect_uri[0] == 'a') {
+        /* The passkey was not taken: the ticket is spent; start again from the code. */
+        if (g_websteps) oc_websteps_drop(g_websteps, w->step);
+        size_t len; const char *b = oc_page_invalid(&len); web_reply(c, 400, b, len, NULL, NULL);
+        return;
+    }
     pg.sec = w->redirect_uri[0] == 'c' ? OC_SEC_CONFIRM : OC_SEC_ON;
+    if (pg.sec == OC_SEC_ON) pg.pk_rp = w->rp;
     web_page(c, status, &pg);
 }
 
@@ -4389,7 +4535,30 @@ static void security_result(conn *c, web_req *w, const oc_dbres *r) {
 static void step_page(conn *c, int status, const web_req *w, const char *action, const char *msg) {
     oc_page pg = { .kind = OC_PAGE_STEP, .redirect_uri = w->redirect_uri, .nonce = "", .username = "",
                    .invite = "", .message = msg, .user_code = "", .ticket = w->step, .action = action };
+    /* A passkey too, where the ticket was earned on a trusted name and the
+     * account has one there (AUTH.md §8.6). */
+    oc_step_ticket t;
+    if (g_websteps && oc_websteps_get(g_websteps, w->step, now_ms(), &t) && t.challenge[0] && t.creds[0]) {
+        pg.pk_mode = 1;
+        pg.pk_challenge = t.challenge;
+        pg.pk_rp = t.rp;
+        pg.pk_creds = t.creds;
+        web_page(c, status, &pg);
+        oc_e2e_wipe(&t, sizeof t);
+        return;
+    }
     web_page(c, status, &pg);
+}
+
+/* A passkey ceremony's challenge: 32 random bytes, base64url. 0 or -1. */
+static int pk_challenge(char out[48]) {
+    uint8_t raw[32];
+    char enc[48];
+    if (oc_rand_bytes(raw, sizeof raw) != 0) return -1;
+    size_t n = oc_base64url_encode(raw, sizeof raw, enc);
+    if (n == 0 || n >= 48) return -1;
+    memcpy(out, enc, n + 1);
+    return 0;
 }
 
 /* A page's check came back: a sign-in or sign-up goes on to the client's
@@ -4425,6 +4594,13 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
             t.pw_iters = r->step_iters;
             memcpy(t.pw_salt, r->step_salt, sizeof t.pw_salt);
             memcpy(t.pw_hash, r->step_hash, sizeof t.pw_hash);
+        }
+        /* Reached on a trusted name, with passkeys there: one may answer. */
+        if (w->rp[0] && r->pk_creds && r->pk_creds[0] && strlen(r->pk_creds) < sizeof t.creds &&
+            pk_challenge(t.challenge) == 0) {
+            snprintf(t.rp, sizeof t.rp, "%s", w->rp);
+            snprintf(t.origin, sizeof t.origin, "%s", w->origin);
+            snprintf(t.creds, sizeof t.creds, "%s", r->pk_creds);
         }
         char key[OC_SRC_LEN];
         oc_source_key(c->source, key, sizeof key);

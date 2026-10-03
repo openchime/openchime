@@ -21,6 +21,9 @@
 #include "devicecodes.h"
 #include <mbedtls/sha256.h>
 #include "totp.h"          /* a second step's codes, as an authenticator makes them */
+#include "jwt.h"           /* oc_base64url_encode */
+#include "wa_fixture.h"    /* a passkey, as a browser's authenticator answers */
+#include <mbedtls/base64.h>
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -2137,6 +2140,8 @@ static void test_web_signin(int port) {
     CHECK(oc_dbwriter_register_local(dbw2, "zed", "pw-zed", OC_ROLE_MEMBER, 2048) != 0);
     uint64_t sam = oc_dbwriter_register_local(dbw2, "sam", "pw-sam", OC_ROLE_MEMBER, 2048);
     CHECK(oc_dbwriter_register_local(dbw2, "kim", "pw-kim", OC_ROLE_MEMBER, 2048) != 0);
+    uint64_t pia = oc_dbwriter_register_local(dbw2, "pia", "pw-pia", OC_ROLE_MEMBER, 2048);
+    CHECK(pia != 0);
     CHECK(sam != 0);
     uint8_t fkey[OC_FACTOR_KEY_LEN];
     memset(fkey, 0x5a, sizeof fkey);
@@ -2455,6 +2460,184 @@ static void test_web_signin(int port) {
         CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 404);
         CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OPTIONAL);
+    }
+
+    /* Passkeys (AUTH.md §8.6), on the workspace's trusted name only: added on the
+     * security page once a code allows it, then answering a sign-in's step --
+     * once per signature, and never off that name. */
+    {
+        oc_netloop_set_passkey_names("web.test");
+        char ticket[64], challenge[64], body[16000], b64[2000], b64b[4000];
+        {   /* Pia: TOTP on, with one recovery code */
+            uint8_t secret[OC_TOTP_SECRET_LEN], sealed[OC_TOTP_SEALED_LEN], row[48], buf[26];
+            memset(secret, 0x44, sizeof secret);
+            CHECK(oc_factor_seal(fkey, pia, secret, sealed) == 0);
+            memset(row, 0x45, 16);
+            memcpy(buf, row, 16); memcpy(buf + 16, "KLMNP23456", 10);
+            mbedtls_sha256(buf, sizeof buf, row + 16, 0);
+            sqlite3 *db = NULL;
+            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            sqlite3_busy_timeout(db, 5000);
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(db, "INSERT INTO local_totp(user_id, secret, confirmed_at_ms) VALUES(?, ?, 1);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)pia);
+            sqlite3_bind_blob(st, 2, sealed, sizeof sealed, SQLITE_STATIC);
+            CHECK(sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st);
+            sqlite3_prepare_v2(db, "INSERT INTO local_recovery(user_id, code_hash) VALUES(?, ?);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)pia);
+            sqlite3_bind_blob(st, 2, row, sizeof row, SQLITE_STATIC);
+            CHECK(sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st);
+            sqlite3_close(db);
+        }
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
+                       "username=pia&password=pw-pia", resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "value=\"passkey\"") != NULL && ticket_of(resp, ticket, sizeof ticket));
+        /* A wrong code allows nothing; nor does a ticket no code allowed. */
+        snprintf(body, sizeof body, "ticket=%s&action=passkey&code=000000", ticket);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "data-mode=\"create\"") == NULL && strstr(resp, "That code isn&#39;t right") != NULL);
+        snprintf(body, sizeof body, "ticket=%s&action=passkey_add&pk_cd=e30&pk_att=oA", ticket);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 400);
+        snprintf(body, sizeof body, "ticket=%s&action=passkey&code=KLMNP23456", ticket);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && between(resp, "data-challenge=\"", "\"", challenge, sizeof challenge));
+        CHECK(strstr(resp, "data-rp=\"web.test\"") && strstr(resp, "data-mode=\"create\""));
+        CHECK(strstr(resp, "script-src 'self'") != NULL);
+        char sri[80];
+        CHECK(between(resp, "integrity=\"", "\"", sri, sizeof sri));
+        wa_key k;
+        CHECK(wa_key_new(&k, 0x5a) == 0);
+        uint8_t auth[512], att[800], sig[128];
+        char cd[512];
+        size_t al = wa_auth(&k, "web.test", 0x41, 1, auth);
+        size_t atl = wa_attestation(auth, al, att);
+        size_t cdl = wa_client(cd, sizeof cd, "webauthn.create", challenge, "https://web.test");
+        oc_base64url_encode((const uint8_t *)cd, cdl, b64);
+        oc_base64url_encode(att, atl, b64b);
+        snprintf(body, sizeof body, "ticket=%s&action=passkey_add&pk_cd=%s&pk_att=%s", ticket, b64, b64b);
+        CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "Passkey added") != NULL);
+
+        /* The script the page named, and the hash it named it by. */
+        CHECK(web_call(port, pin, "GET", "/webauthn.js", NULL, NULL, NULL, resp, sizeof resp) == 200);
+        {
+            const char *js = strstr(resp, "\r\n\r\n");
+            uint8_t h[32]; char want[80]; size_t ol = 0;
+            CHECK(js != NULL);
+            if (js) {
+                js += 4;
+                mbedtls_sha256((const unsigned char *)js, strlen(js), h, 0);
+                memcpy(want, "sha256-", 7);
+                mbedtls_base64_encode((unsigned char *)want + 7, sizeof want - 7, &ol, h, sizeof h);
+                CHECK(strcmp(want, sri) == 0);
+            }
+        }
+
+        /* Sign in: the step offers the passkey, and it answers. */
+        CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") != NULL &&
+              between(resp, "data-challenge=\"", "\"", challenge, sizeof challenge));
+        k.count = 1;
+        al = wa_auth(&k, "web.test", 0x05, 0, auth);
+        cdl = wa_client(cd, sizeof cd, "webauthn.get", challenge, "https://web.test");
+        size_t sl = wa_sign(&k, auth, al, cd, cdl, sig, sizeof sig);
+        char cid[64], ecd[800], ead[200], esig[200];
+        oc_base64url_encode(k.id, sizeof k.id, cid);
+        oc_base64url_encode((const uint8_t *)cd, cdl, ecd);
+        oc_base64url_encode(auth, al, ead);
+        oc_base64url_encode(sig, sl, esig);
+        snprintf(body, sizeof body, "ticket=%s&code=&pk_cred=%s&pk_cd=%s&pk_ad=%s&pk_sig=%s", ticket, cid, ecd, ead, esig);
+        CHECK(web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
+        CHECK(token_of(resp, tok, sizeof tok) && tok[0]);
+        /* The same answer again, against a new ceremony: refused (its challenge,
+         * and its counter, are spent). */
+        CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket));
+        snprintf(body, sizeof body, "ticket=%s&code=&pk_cred=%s&pk_cd=%s&pk_ad=%s&pk_sig=%s", ticket, cid, ecd, ead, esig);
+        CHECK(web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+        CHECK(strstr(resp, "That code isn&#39;t right") != NULL);
+
+        /* A passkey stored for another name does not answer here, even within a
+         * ceremony this name's passkey opened. */
+        {
+            wa_key o;
+            CHECK(wa_key_new(&o, 0x6c) == 0);
+            uint8_t ocose[200];
+            size_t ocl = wa_cose(&o, ocose);
+            sqlite3 *db = NULL;
+            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            sqlite3_busy_timeout(db, 5000);
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(db, "INSERT INTO webauthn_credentials(user_id, cred_id, cose_key, rp_id, created_at_ms) "
+                                   "VALUES(?, ?, ?, 'other.test', 1);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)pia);
+            sqlite3_bind_blob(st, 2, o.id, sizeof o.id, SQLITE_STATIC);
+            sqlite3_bind_blob(st, 3, ocose, (int)ocl, SQLITE_STATIC);
+            CHECK(sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st);
+            CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+            CHECK(ticket_of(resp, ticket, sizeof ticket) && between(resp, "data-challenge=\"", "\"", challenge, sizeof challenge));
+            CHECK(strstr(resp, "data-creds=\"") != NULL);
+            o.count = 3;
+            al = wa_auth(&o, "web.test", 0x05, 0, auth);
+            cdl = wa_client(cd, sizeof cd, "webauthn.get", challenge, "https://web.test");
+            sl = wa_sign(&o, auth, al, cd, cdl, sig, sizeof sig);
+            char ocid[64];
+            oc_base64url_encode(o.id, sizeof o.id, ocid);
+            oc_base64url_encode((const uint8_t *)cd, cdl, ecd);
+            oc_base64url_encode(auth, al, ead);
+            oc_base64url_encode(sig, sl, esig);
+            snprintf(body, sizeof body, "ticket=%s&code=&pk_cred=%s&pk_cd=%s&pk_ad=%s&pk_sig=%s", ticket, ocid, ecd, ead, esig);
+            CHECK(web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+            CHECK(sqlite3_exec(db, "DELETE FROM webauthn_credentials WHERE rp_id='other.test';", NULL, NULL, NULL) == SQLITE_OK);
+            wa_key_free(&o);
+            CHECK(sqlite3_exec(db, "UPDATE webauthn_credentials SET rp_id='other.test';", NULL, NULL, NULL) == SQLITE_OK);
+            CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+            CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") == NULL);
+            k.count = 9;
+            al = wa_auth(&k, "web.test", 0x05, 0, auth);
+            cdl = wa_client(cd, sizeof cd, "webauthn.get", challenge, "https://web.test");
+            sl = wa_sign(&k, auth, al, cd, cdl, sig, sizeof sig);
+            oc_base64url_encode((const uint8_t *)cd, cdl, ecd);
+            oc_base64url_encode(auth, al, ead);
+            oc_base64url_encode(sig, sl, esig);
+            snprintf(body, sizeof body, "ticket=%s&code=&pk_cred=%s&pk_cd=%s&pk_ad=%s&pk_sig=%s", ticket, cid, ecd, ead, esig);
+            CHECK(web_call(port, pin, "POST", "/signin/verify", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+            CHECK(sqlite3_exec(db, "UPDATE webauthn_credentials SET rp_id='web.test';", NULL, NULL, NULL) == SQLITE_OK);
+            sqlite3_close(db);
+        }
+        /* Another trusted name than the one asked at: none is offered. */
+        oc_netloop_set_passkey_names("other.test");
+        CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") == NULL);
+        /* Off the trusted name -- the tunnel's, a self-signed daemon's -- none is offered. */
+        oc_netloop_set_passkey_names("");
+        CHECK(web_signin(port, pin, "pia", "pw-pia", ch, tok, sizeof tok, resp, sizeof resp) == 200);
+        CHECK(ticket_of(resp, ticket, sizeof ticket) && strstr(resp, "id=\"passkey\"") == NULL);
+        CHECK(strstr(resp, "script-src") == NULL);
+        /* Turning the step off takes the passkeys with it. */
+        {
+            uint8_t psecret[OC_TOTP_SECRET_LEN];
+            memset(psecret, 0x44, sizeof psecret);
+            char pcode[8];
+            snprintf(pcode, sizeof pcode, "%06u", oc_totp_code(psecret, sizeof psecret, (uint64_t)time(NULL) / OC_TOTP_STEP_S));
+            CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM,
+                           "username=pia&password=pw-pia", resp, sizeof resp) == 200 && ticket_of(resp, ticket, sizeof ticket));
+            snprintf(body, sizeof body, "ticket=%s&action=remove&code=%s", ticket, pcode);
+            CHECK(web_call(port, pin, "POST", "/account/security", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+            CHECK(strstr(resp, "Two-step sign-in is off") != NULL);
+            sqlite3 *db = NULL;
+            CHECK(sqlite3_open("build/itest_web.db", &db) == SQLITE_OK);
+            sqlite3_busy_timeout(db, 5000);
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM webauthn_credentials;", -1, &st, NULL);
+            CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+            sqlite3_finalize(st);
+            sqlite3_close(db);
+        }
+        wa_key_free(&k);
     }
 
     /* The reset page (AUTH.md §2): the link's form; the new password, set once. */

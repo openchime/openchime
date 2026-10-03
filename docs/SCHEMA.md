@@ -1380,6 +1380,29 @@ CREATE TABLE credential_resets (
 A one-time link to set a local account's password, kept as the SHA-256 of its
 token: a day to live, spent once (`consumed_at_ms`), and whether using it also
 turns the account's second step off.
+
+## 3at. Migration 0055 — passkeys (AUTH.md §8.6)
+
+```sql
+CREATE TABLE webauthn_credentials (
+  id              INTEGER PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  cred_id         BLOB NOT NULL UNIQUE,
+  cose_key        BLOB NOT NULL,
+  sign_count      INTEGER NOT NULL DEFAULT 0,
+  rp_id           TEXT NOT NULL,
+  name            TEXT NOT NULL DEFAULT '',
+  created_at_ms   INTEGER NOT NULL,
+  last_used_at_ms INTEGER
+);
+CREATE INDEX webauthn_credentials_user ON webauthn_credentials(user_id);
+```
+
+### `webauthn_credentials`
+A passkey that answers a local account's second step: the credential's id, its
+COSE public key, the signature counter it last gave, and the relying party —
+the workspace name — it was made for, which it answers on and nowhere else.
+Public keys only; nothing here signs anything.
 ---
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)

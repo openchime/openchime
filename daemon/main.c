@@ -506,6 +506,17 @@ int main(int argc, char **argv) {
     }
     oc_dbwriter_set_local_enabled(db, want_local);
     oc_dbwriter_set_local_mfa(db, cfg->local_mfa);
+    /* Passkeys only where a CA vouches for the name (AUTH.md §8.6): a
+     * self-signed daemon is reached through the loopback tunnel, where a
+     * passkey would bind to 127.0.0.1. */
+    if (cfg->tls_src.source != OC_TLS_SRC_SELF) {
+        char names[1024];
+        snprintf(names, sizeof names, "%s%s%s",
+                 cfg->workspace_address ? cfg->workspace_address : "",
+                 cfg->workspace_address && cfg->workspace_address[0] && cfg->tls_src.names && cfg->tls_src.names[0] ? "," : "",
+                 cfg->tls_src.names ? cfg->tls_src.names : "");
+        oc_netloop_set_passkey_names(names);
+    }
     oc_dbwriter_set_session_policy(db, (uint64_t)cfg->session_days * 86400000ull,
                                    (uint64_t)cfg->session_idle_days * 86400000ull);
 

@@ -19,7 +19,7 @@
 #define OC_STEP_TTL_MS     (5u * 60u * 1000u)
 #define OC_STEP_TRIES      5
 #define OC_STEP_MAX        256
-#define OC_STEP_PER_SOURCE 8
+#define OC_STEP_PER_SOURCE 32   /* an office behind one address signs in at once */
 #define OC_STEP_TICKET_LEN 43    /* base64url of 32 random bytes */
 
 /* What a ticket stands for. `page` is the page it finishes (oc_page_kind). */
@@ -31,6 +31,12 @@ typedef struct {
     int      pw;                             /* a password change's new key */
     uint32_t pw_iters;
     uint8_t  pw_salt[16], pw_hash[32];
+    /* A passkey (AUTH.md §8.6), on the trusted name the page was reached at: its
+     * relying party and origin, the ceremony's challenge (base64url), and the
+     * person's username; `stage` 1 once a code has allowed adding one. */
+    char     rp[256], origin[300], challenge[48], user[128];
+    char     creds[720];                     /* its passkeys there, base64url, comma-separated */
+    int      stage;
 } oc_step_ticket;
 
 typedef struct oc_websteps oc_websteps;

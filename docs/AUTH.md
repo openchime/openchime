@@ -663,6 +663,21 @@ once (only salted hashes are kept). On, the same page turns it off with a code
 or a recovery code, which removes the secret and the codes. Wrong codes count
 as a sign-in step's do.
 
+**Passkeys** (WebAuthn) answer the step in place of a code, as a second
+factor: an account adds one on `/account/security` once a code from its
+authenticator or a recovery code allows it, so a password alone never adds a
+way past the step. They are offered only on the workspace's own name where a CA
+vouches for its certificate — the workspace address, or an ACME or operator's
+certificate name — never through the loopback tunnel, where a passkey would
+bind to `127.0.0.1`. The relying party is that name and the origin
+`https://<name>`; attestation is `none`; ES256 and RS256 keys are taken; a
+signature counter that is not zero must rise. The one script a page runs,
+`/webauthn.js`, is served by the daemon and named by its SRI hash, and only a
+page that offers a passkey allows scripts (`script-src 'self'`). A passkey is
+bound to its name, so one made before a rename does not answer after it; the
+page says to add it again. Turning the step off, or a reset that clears it,
+removes them. Passkey-only accounts, with no password, are not offered.
+
 **Policy** is `OPENCHIME_LOCAL_MFA`: `optional` (the default) asks for the step
 where one is set up; `required` also refuses the sign-in of an account with none
 until it sets one up — the page says where; `off` asks for none and closes the

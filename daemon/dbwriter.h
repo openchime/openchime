@@ -252,6 +252,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* A local account's own address (`pf_name` the address): PROFILE_INFO, or
         * PROFILE_ERR. */
        OC_JOB_SET_EMAIL = 131 };
+/* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
+#define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
+#define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
+#define OC_SEC_PASSKEY_ASK  3   /* a code: a passkey may be added (WEB_OK, step_pw 3) */
+#define OC_SEC_PASSKEY_ADD  4   /* a passkey's registration (WEB_OK, step_pw 4) */
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -306,6 +311,12 @@ typedef struct oc_job {
     uint8_t        pw_salt[16];             /* OC_PW_SALT_LEN */
     uint8_t        pw_hash[32];             /* OC_PW_HASH_LEN */
     char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
+    /* A passkey (AUTH.md §8.6): the trusted name it is for -- its relying party
+     * and origin -- the ceremony's challenge, and what the browser answered,
+     * each base64url: a credential id, client data, authenticator data, a
+     * signature, an attestation object. */
+    char           wa_rp[256], wa_origin[300], wa_challenge[48];
+    char          *wa_cred, *wa_cd, *wa_ad, *wa_sig, *wa_att;
 
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */
@@ -882,6 +893,9 @@ typedef struct oc_dbres {
      * password change's new key, held for the step that finishes it. */
     uint64_t       step_version;
     int            step_pw;
+    /* WEB_STEP2, and SECURITY's passkey screens: the account's passkeys on the
+     * job's relying party, base64url, comma-separated (heap, or NULL). */
+    char          *pk_creds;
     uint32_t       step_iters;
     uint8_t        step_salt[16], step_hash[32];
     /* LOGOUT_OK, WEB_OK, PROFILE_UPDATED: the user's sessions were revoked, so
