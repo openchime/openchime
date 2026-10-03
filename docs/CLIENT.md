@@ -954,8 +954,12 @@ in every editor that has both; Esc still cancels from anywhere. A native EDIT
 keeps its lines as CRLF, so the value is converted on the way in and back to LF
 on the way out. There is no scrollbar: native scrollbars are non-client paint
 the drawn scene cannot supply, and came out as a solid black bar — the field
-follows the caret instead, and the wheel and the arrows reach every line. A
-channel's description is its first user.
+follows the caret instead, and the wheel and the arrows reach every line. The
+box is five lines at least and grows to the value it opens with, up to sixteen
+(`form_multi_h`): the EDIT counts the lines it wraps that value into once it has
+its width, and the form is painted and placed again at that height, so a text
+shown to be read and sent — an invitation, a reset with its code — is all on
+screen, since nothing about the field says that it scrolls. A channel's description is its first user.
 
 **Text gets the height its glyphs need, not a round number.** A rect written as
 `y + 80` is three lines at 100% and not two at the largest text size on a scaled

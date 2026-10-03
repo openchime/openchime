@@ -15,6 +15,9 @@
 #     top;
 #   - switching channel puts the pane back at its own top.
 #
+# And, last, that a reset's dialog shows the whole message to send, its code
+# included, without scrolling.
+#
 # Its own daemon on its own port, bootstrapped with sixty people: enough that the
 # pane holds well under half of them at any window size this drives.
 set -uo pipefail
@@ -142,6 +145,32 @@ scrolled() { [ "$(mem scroll)" != 0 ]; }
 check "scrolled down in #general" waitfor 5 scrolled
 "$DRIVE" channel 2 >/dev/null
 check "#quiet's roster starts at the top" waitfor 10 at_top
+
+say "== a reset shows its code without scrolling"
+# The owner resets a member: the dialog holds the message to send them, and
+# the reset code is in it -- all of it shown, none of it below the field's
+# fold. The dump's formlines are the EDIT's own count against what its box
+# shows.
+"$DRIVE" channel 1 >/dev/null
+for _ in $(seq 1 80); do wheel 1; done
+snap
+r="$(grep '^memrow ' "$D" | sed -n 3p | grep -o 'r=[0-9,]*' | cut -d= -f2)"
+IFS=, read -r l t rr b <<< "$r"
+"$DRIVE" rclick $(( (l + rr) / 2 )) $(( (t + b) / 2 )) >/dev/null
+reset_row() { snap; grep -q '^  menurow cmd=15 ' "$D"; }
+check "the member menu offers a reset" waitfor 5 reset_row
+r="$(grep '^  menurow cmd=15 ' "$D" | grep -o 'r=[0-9,]*' | cut -d= -f2)"
+IFS=, read -r l t rr b <<< "$r"
+"$DRIVE" click $(( (l + rr) / 2 )) $(( (t + b) / 2 )) >/dev/null
+dialog_up() { snap; grep -q '^  formlines 0 ' "$D"; }
+check "the reset dialog opens" waitfor 10 dialog_up
+"$DRIVE" shotfull members_reset >/dev/null
+fl="$(grep -m1 '^  formlines 0 ' "$D")"
+n_lines="$(grep -o 'lines=[0-9]*' <<< "$fl" | cut -d= -f2)"
+n_shown="$(grep -o 'shown=[0-9]*' <<< "$fl" | cut -d= -f2)"
+all_shown() { [ -n "$n_lines" ] && [ "$n_lines" -gt 5 ] && [ "$n_lines" -le "$n_shown" ] && grep -q ' first=0$' <<< "$fl"; }
+check "all of the message is shown ($n_lines lines, $n_shown shown)" all_shown
+"$DRIVE" key esc >/dev/null
 rm -f "$D"
 
 say ""

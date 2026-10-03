@@ -1364,7 +1364,10 @@ first screen never showed, and answers a click by opening that person's profile;
 that the offset stops at both ends rather than running past them; and that
 switching channel puts the pane back at its own top. It reads the dump's
 `members n= rows= scroll= max=` line and the `memrow uid= r=` lines, and drives
-the `wheel` verb in detents of 120.
+the `wheel` verb in detents of 120. Last, the owner's "Reset password…" on a
+member opens the reset to send with all of it shown: the dump's `formlines` line
+is the field's own wrapped line count against the lines its box shows, and the
+first one visible.
 
 **Counting the people is the check; reading the bottom row is not.** A first
 version asserted that the last drawn row was a real member and that the offset
