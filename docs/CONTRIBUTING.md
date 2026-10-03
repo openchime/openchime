@@ -104,7 +104,8 @@ machines at once:
   (`make test-rest`, with `check-opcodes` and `check-refs`).
 - **`thread-sanitizer`** — the suites that start threads, under
   ThreadSanitizer (`make test-tsan`); their only run in CI.
-- **`windows`** — cross-compiles the Windows TUI + GUI.
+- **`windows`** — cross-compiles the Windows TUI + GUI, and builds the Linux
+  TUI with that runner's newer gcc, which warns where gcc 11 and clang do not.
 - **`pr policy`** and **`guard`** — the pull request's title and body, and the
   attribution guard ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
   The guard has **no `paths-ignore`**, so it runs on every push including

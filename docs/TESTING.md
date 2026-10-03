@@ -674,7 +674,9 @@ Jobs, on three machines at once:
   prerequisites are `check-opcodes` and `check-refs`.
 - **`thread-sanitizer`** — `make test-tsan` (§2.4).
 - **`windows`** — the Windows cross-compile of the TUI and GUI, so the ported
-  client stays building.
+  client stays building, and the Linux TUI built with that runner's gcc, newer
+  than the `build` job's, which raises warnings at `-O2` that gcc 11 and clang
+  do not.
 
 The three, with the pull request's policy check and the attribution guard, are
 required checks on `staging`. Everything runs non-interactively and
