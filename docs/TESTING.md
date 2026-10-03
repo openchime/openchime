@@ -523,6 +523,11 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **Someone joins (`itest_netloop` `test_admin_vertical`):** with the owner
   connected, an invitation redeemed on a second connection reaches the owner as
   an unasked `USER_LIST` of exactly the new member, before anything else.
+- **What the browser is told (`test_signin`, `test_client_core`
+  `test_browser_signin`):** the listener holds the callback until it is
+  answered, and answers once; the tab says "You are signed in" only after the
+  daemon has accepted the token, and for a person the join rules refuse, "You
+  are not signed in" with the client's words for why.
 - **Removing a member (`test_dbwriter`, `test_remove_user_integrations`):** the
   member's webhook posts nothing, even turned back on, and their push device
   tokens are gone (REQ-033, REQ-170).

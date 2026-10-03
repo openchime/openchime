@@ -83,6 +83,7 @@ struct oc_loopback {
     char tpath[64];    /* "/p/<secret>": the tunnel's pages, when there is one */
     int  tunnel;
     oc_tunnel_target t;
+    int  held;         /* the callback's browser connection, unanswered, or -1 */
 };
 
 /* A test's knob: skip IPv4 loopback, as a host without it would. */
@@ -130,6 +131,7 @@ oc_loopback *oc_loopback_open(char *redirect_uri, size_t cap) {
     oc_loopback *lb = calloc(1, sizeof *lb);
     if (!lb) return NULL;
     lb->fd6 = -1;
+    lb->held = -1;
     b64url(raw, sizeof raw, lb->secret);
     /* IPv4 loopback, which every host has; IPv6 loopback on one that does not.
      * The daemon accepts either as a redirect (AUTH.md §8.1). */
@@ -173,6 +175,7 @@ oc_loopback *oc_loopback_open_provider(char *redirect_uri, size_t cap) {
 
 void oc_loopback_close(oc_loopback *lb) {
     if (!lb) return;
+    oc_loopback_answer(lb, OC_LOOPBACK_UNKNOWN, NULL);   /* a tab still waiting is told something true */
     if (lb->fd >= 0) oc_closesock(lb->fd);
     if (lb->fd6 >= 0) oc_closesock(lb->fd6);
     oc_signin_wipe(lb, sizeof *lb);
@@ -191,10 +194,16 @@ int oc_loopback_tunnel_base(const oc_loopback *lb, char *out, size_t cap) {
     return n < 0 || (size_t)n >= cap ? -1 : 0;
 }
 
+/* A tab closed while it waited for its answer is a peer gone mid-write: that
+ * must not raise SIGPIPE and end the client (Winsock never raises it). */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 static int send_all(int fd, const char *s, size_t n) {
     size_t off = 0;
     while (off < n) {
-        int w = (int)send(fd, s + off, (int)(n - off), 0);
+        int w = (int)send(fd, s + off, (int)(n - off), MSG_NOSIGNAL);
         if (w > 0) { off += (size_t)w; continue; }
         if (w < 0 && oc_sock_wouldblock() && oc_poll(fd, 1, 1000) > 0) continue;
         return -1;
@@ -202,13 +211,13 @@ static int send_all(int fd, const char *s, size_t n) {
     return 0;
 }
 
-static const char PAGE_OK[] =
+/* The callback's page: written once the daemon has answered the sign-in, so
+ * it says what happened rather than what was hoped. */
+static const char PAGE_HEAD[] =
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
     "Referrer-Policy: no-referrer\r\nConnection: close\r\n\r\n"
     "<!doctype html><meta charset=utf-8><title>OpenChime</title>"
-    "<body style=\"font:16px system-ui,sans-serif;margin:4em auto;max-width:28em\">"
-    "<h1 style=\"font-size:1.3em\">You are signed in</h1>"
-    "<p>You can close this tab and go back to OpenChime.</p>";
+    "<body style=\"font:16px system-ui,sans-serif;margin:4em auto;max-width:28em\">";
 static const char PAGE_404[] =
     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static const char PAGE_502[] =
@@ -420,8 +429,7 @@ static int serve_one(oc_loopback *lb, int fd, char *query, size_t qcap) {
         const char *q = r->target[pl] == '?' ? r->target + pl + 1 : "";
         if (strlen(q) >= qcap) { send_all(fd, PAGE_404, sizeof PAGE_404 - 1); ours = -1; goto out; }
         memcpy(query, q, strlen(q) + 1);
-        send_all(fd, PAGE_OK, sizeof PAGE_OK - 1);
-        ours = 1;
+        ours = 1;   /* answered by oc_loopback_answer, once the outcome is known */
     } else if (lb->tunnel && host_ok && (strcmp(r->method, "GET") == 0 || strcmp(r->method, "POST") == 0) &&
                strncmp(r->target, lb->tpath, tl) == 0 && tunnel_page(r->target + tl)) {
         tunnel_forward(lb, fd, r, r->target + tl);
@@ -453,8 +461,17 @@ static oc_loopback_result serve(oc_loopback *lb, int timeout_ms, const atomic_in
         if (c < 0) continue;
         oc_sock_setnonblock(c);
         int ours = want_callback ? serve_one(lb, c, query, qcap) : serve_one(lb, c, scratch, sizeof scratch);
-        oc_closesock(c);
-        if (want_callback && ours == 1) return OC_LOOPBACK_OK;
+        if (want_callback && ours == 1) {
+            oc_loopback_answer(lb, OC_LOOPBACK_UNKNOWN, NULL);   /* an earlier tab, never answered */
+            lb->held = c;
+            return OC_LOOPBACK_OK;
+        }
+        if (ours == 1) {   /* a callback nobody is waiting for */
+            lb->held = c;
+            oc_loopback_answer(lb, OC_LOOPBACK_UNKNOWN, NULL);
+        } else {
+            oc_closesock(c);
+        }
         if (want_callback && ours < 0) return OC_LOOPBACK_ERROR;
     }
 }
@@ -469,4 +486,40 @@ oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const atomi
 oc_loopback_result oc_loopback_serve(oc_loopback *lb, int timeout_ms, const atomic_int *cancel) {
     if (!lb) return OC_LOOPBACK_ERROR;
     return serve(lb, timeout_ms, cancel, NULL, 0, 0);
+}
+
+/* HTML-escaped `s` to the browser. */
+static void send_text(int fd, const char *s) {
+    char out[1024];
+    size_t o = 0;
+    for (; s && *s && o + 6 < sizeof out; s++) {
+        const char *e = *s == '<' ? "&lt;" : *s == '>' ? "&gt;" : *s == '&' ? "&amp;"
+                      : *s == '"' ? "&quot;" : *s == '\'' ? "&#39;" : NULL;
+        if (e) { memcpy(out + o, e, strlen(e)); o += strlen(e); }
+        else out[o++] = *s;
+    }
+    send_all(fd, out, o);
+}
+
+void oc_loopback_answer(oc_loopback *lb, oc_loopback_outcome outcome, const char *why) {
+    if (!lb || lb->held < 0) return;
+    int fd = lb->held;
+    lb->held = -1;
+    send_all(fd, PAGE_HEAD, sizeof PAGE_HEAD - 1);
+    if (outcome == OC_LOOPBACK_SIGNED_IN) {
+        static const char B[] = "<h1 style=\"font-size:1.3em\">You are signed in</h1>"
+                                "<p>You can close this tab and go back to OpenChime.</p>";
+        send_all(fd, B, sizeof B - 1);
+    } else if (outcome == OC_LOOPBACK_REFUSED) {
+        static const char H[] = "<h1 style=\"font-size:1.3em\">You are not signed in</h1><p>";
+        static const char T[] = "</p><p>You can close this tab and go back to OpenChime.</p>";
+        send_all(fd, H, sizeof H - 1);
+        send_text(fd, why && why[0] ? why : "The workspace did not accept this sign-in.");
+        send_all(fd, T, sizeof T - 1);
+    } else {
+        static const char B[] = "<h1 style=\"font-size:1.3em\">Go back to OpenChime</h1>"
+                                "<p>You can close this tab. OpenChime shows how the sign-in went.</p>";
+        send_all(fd, B, sizeof B - 1);
+    }
+    oc_closesock(fd);
 }

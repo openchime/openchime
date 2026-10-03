@@ -220,7 +220,9 @@ it over on.
 6. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
 
-The client half of this is the browser launch and the loopback listener.
+The client half of this is the browser launch and the loopback listener. The
+listener answers the browser only once the daemon has answered `AUTH`, so the
+page the person is left on says whether they are signed in — and, if not, why.
 
 ### 3.3 The identity token — an ES256 JWT (ARCH-57)
 

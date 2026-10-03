@@ -76,7 +76,11 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   daemon's interval — longer on `AUTH_SLOW_DOWN` — and presents the token when it
   comes; a dropped connection keeps the code and polls on. When the
   browser comes back it connects again and presents the token with the verifier,
-  then wipes both. `oc_client_cancel_signin` and a five-minute timeout end the
+  then wipes both. The browser's request is held unanswered meanwhile
+  (`oc_loopback_answer`): its page says "You are signed in" once the daemon has
+  accepted the token, "You are not signed in" with the client's own words for a
+  refusal or a connection that never got that far, and only "Go back to
+  OpenChime" when the client stops first — never a success it does not know of. `oc_client_cancel_signin` and a five-minute timeout end the
   wait; a refused sign-in reaches `last_error` worded by its code — as does
   every other refusal, in the client's own words for the reason code
   (`oc_error_text`), never the server's free text.
