@@ -61,6 +61,7 @@ typedef struct {
     char aud[FAKE_MAX][128];
     long ts[FAKE_MAX];
     char sig[FAKE_MAX][256];
+    char ver[FAKE_MAX][8];
     char body[FAKE_MAX][512];
 } fake_central;
 
@@ -116,6 +117,7 @@ static void *fake_central_thread(void *arg) {
         header_value(buf, "X-OpenChime-Audience:", f->aud[i], sizeof f->aud[i]);
         header_value(buf, "X-OpenChime-Timestamp:", ts, sizeof ts);
         header_value(buf, "X-OpenChime-Signature:", f->sig[i], sizeof f->sig[i]);
+        header_value(buf, "X-OpenChime-Signature-Version:", f->ver[i], sizeof f->ver[i]);
         f->ts[i] = strtol(ts, NULL, 10);
         if (head_end && total >= head_end)
             snprintf(f->body[i], sizeof f->body[i], "%s", buf + head_end);
@@ -146,7 +148,7 @@ static int fake_listen(int *port) {
 }
 
 /* Does `sig_b64` verify over central's canonical string for `body`? */
-static int signature_holds(const char *pk_pem, const char *aud, long ts, const char *body,
+static int signature_holds(const char *pk_pem, const char *path, const char *aud, long ts, const char *body,
                            const char *sig_b64) {
     uint8_t sig[160]; size_t siglen = 0;
     if (mbedtls_base64_decode(sig, sizeof sig, &siglen, (const unsigned char *)sig_b64,
@@ -161,7 +163,7 @@ static int signature_holds(const char *pk_pem, const char *aud, long ts, const c
         char hex[65];
         for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", bh[i]);
         char canon[640];
-        int cn = snprintf(canon, sizeof canon, "openchime-machine-v1|%s|%ld|%s", aud, ts, hex);
+        int cn = snprintf(canon, sizeof canon, "openchime-machine-v2|POST|%s|%s|%ld|%s", path, aud, ts, hex);
         uint8_t h[32];
         mbedtls_sha256((const unsigned char *)canon, (size_t)cn, h, 0);
         ok = mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, h, sizeof h, sig, siglen) == 0;
@@ -214,10 +216,12 @@ static void test_report(void) {
             CHECK(strcmp(f->path[i], "/api/machine/invite/notify") == 0);
             CHECK(strcmp(f->aud[i], aud) == 0);
             CHECK(strcmp(f->body[i], want) == 0);
-            CHECK(signature_holds(pk, aud, f->ts[i], f->body[i], f->sig[i]));
+            CHECK(strcmp(f->ver[i], "2") == 0);
+            CHECK(signature_holds(pk, f->path[i], aud, f->ts[i], f->body[i], f->sig[i]));
         }
-        /* A signature is over the body it came with, not over any body. */
-        CHECK(!signature_holds(pk, aud, f->ts[0], "{\"inviteId\":\"x\"}", f->sig[0]));
+        /* A signature is over the body and the endpoint it came with, not any other. */
+        CHECK(!signature_holds(pk, f->path[0], aud, f->ts[0], "{\"inviteId\":\"x\"}", f->sig[0]));
+        CHECK(!signature_holds(pk, "/api/machine/push/notify", aud, f->ts[0], f->body[0], f->sig[0]));
     }
 
     /* A refusal is final, whichever one: asked again, central says the same. */

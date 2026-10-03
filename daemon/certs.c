@@ -83,12 +83,12 @@ static int signed_post(const char *origin, const char *path, const char *aud, co
                        const char *body, oc_https_resp *r, char *err, size_t errcap) {
     long ts = (long)time(NULL);
     char sig[256];
-    if (oc_push_sign(key, aud, body, ts, sig, sizeof sig) != 0) {
+    if (oc_push_sign(key, "POST", path, aud, body, ts, sig, sizeof sig) != 0) {
         snprintf(err, errcap, "could not sign the request to central"); return -1;
     }
     char hdr[700], url[600];
     snprintf(hdr, sizeof hdr, "X-OpenChime-Audience: %s\r\nX-OpenChime-Timestamp: %ld\r\n"
-                              "X-OpenChime-Signature: %s\r\n", aud, ts, sig);
+                              "X-OpenChime-Signature: %s\r\n" OC_MACHINE_SIG_VERSION_HEADER, aud, ts, sig);
     snprintf(url, sizeof url, "%s%s", origin, path);
     return oc_https_request("POST", url, "application/json", body, strlen(body), hdr, 30000, r, err, errcap);
 }

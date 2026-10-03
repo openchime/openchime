@@ -363,7 +363,7 @@ mobile push (REQ-132/133). The daemon owns a device-token registry
 (`REGISTER_DEVICE_TOKEN`); a committed SEND drives an off-hot-path worker that selects
 recipients (members − author, level=ALL, not in DND, holding a token), signs a
 **contentless** batch with the enrollment key — the same request-signature scheme
-central verifies (`openchime-machine-v1|<aud>|<ts>|<sha256(body)>`) — and POSTs it to
+central verifies (§8.7) — and POSTs it to
 the gateway, which relays to APNs/FCM and returns stale tokens to prune. Absent in
 self-hosted stand-alone (no enrollment / no `OPENCHIME_PUSH_URL`).
 
@@ -785,13 +785,16 @@ Central checks the ticket — single use, short-lived — and the signature, sto
 the public key and activates. The ticket is the authorization the operator's
 paste is in the self-hosted flow; the private key still never leaves the box.
 
-Requests the daemon makes afterwards — push batches and invitation reports — are
-each signed on their own with the same key. The canonical string is
-`openchime-machine-v1|<aud>|<unix_ts>|<sha256hex(body)>`, the body hash the
-lowercase hex SHA-256 of the exact request body; the signature is ASN.1-DER
+Requests the daemon makes afterwards — push batches, invitation reports and
+certificates through central — are each signed on their own with the same key.
+The canonical string is
+`openchime-machine-v2|<METHOD>|<path>|<aud>|<unix_ts>|<sha256hex(body)>`: the
+method, the path and query as sent, and the lowercase hex SHA-256 of the exact
+request body, so a signature is good for one request to one endpoint and cannot
+be replayed at another that takes the same body. The signature is ASN.1-DER
 ECDSA P-256 over the SHA-256 of that string, base64. The request carries it in
-three headers — `X-OpenChime-Audience`, `X-OpenChime-Timestamp` (unix seconds)
-and `X-OpenChime-Signature`. Central verifies it against the stored public key,
+four headers — `X-OpenChime-Audience`, `X-OpenChime-Timestamp` (unix seconds),
+`X-OpenChime-Signature` and `X-OpenChime-Signature-Version: 2`. Central verifies it against the stored public key,
 refuses a timestamp more than 300 seconds from its own clock, and requires the
 binding to be active. The string names neither the method nor the path, so the
 freshness window is what bounds a replay.

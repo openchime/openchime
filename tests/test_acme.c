@@ -438,13 +438,15 @@ static void central_request(int fd, const char *path, const char *head, const ch
     if ((h = strcasestr(head, "X-OpenChime-Audience: "))) sscanf(h + 22, "%127[^\r]", aud);
     if ((h = strcasestr(head, "X-OpenChime-Timestamp: "))) sscanf(h + 23, "%31[^\r]", ts);
     if ((h = strcasestr(head, "X-OpenChime-Signature: "))) sscanf(h + 23, "%255[^\r]", sig64);
+    char ver[8] = "";
+    if ((h = strcasestr(head, "X-OpenChime-Signature-Version: "))) sscanf(h + 31, "%7[^\r]", ver);
     uint8_t bh[32]; mbedtls_sha256((const unsigned char *)body, strlen(body), bh, 0);
     char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", bh[i]);
-    char canon[640]; int cn = snprintf(canon, sizeof canon, "openchime-machine-v1|%s|%s|%s", aud, ts, hex);
+    char canon[900]; int cn = snprintf(canon, sizeof canon, "openchime-machine-v2|POST|%s|%s|%s|%s", path, aud, ts, hex);
     uint8_t hh[32]; mbedtls_sha256((const unsigned char *)canon, (size_t)cn, hh, 0);
     uint8_t sig[160]; size_t sl = 0;
     mbedtls_pk_context kp; mbedtls_pk_init(&kp);
-    int ok = !strcmp(aud, g_fake.central_aud) &&
+    int ok = !strcmp(ver, "2") && !strcmp(aud, g_fake.central_aud) &&
              mbedtls_base64_decode(sig, sizeof sig, &sl, (const unsigned char *)sig64, strlen(sig64)) == 0 &&
              mbedtls_pk_parse_key(&kp, (const unsigned char *)g_fake.central_pub, strlen(g_fake.central_pub) + 1, NULL, 0, NULL, NULL) == 0 &&
              mbedtls_pk_verify(&kp, MBEDTLS_MD_SHA256, hh, 32, sig, sl) == 0;
