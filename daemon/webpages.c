@@ -94,6 +94,9 @@ static const char STYLE[] =
     "a{color:#1264a3}\n"
     "pre,code{font:15px/1.6 ui-monospace,Consolas,monospace}\n"
     ".qr{display:block;margin:1rem auto}\n"
+    ".acts{display:flex;gap:.6rem;margin-top:1rem}\n"
+    ".acts a,.acts button{flex:1;box-sizing:border-box;margin:0;padding:.6rem;font-weight:600;text-align:center;"
+    "text-decoration:none;color:inherit;background:none;border:1px solid #c4c8cf;border-radius:8px}\n"
     "@media (prefers-color-scheme:dark){body{background:#1a1d21;color:#e8e9ea}"
     "main{background:#222529;border-color:#3a3d42}p{color:#a6a9ad}input{border-color:#4a4e54}"
     ".msg{background:#3b1f1d;color:#f2b8b5}a{color:#6cb3f0}}\n"
@@ -182,15 +185,38 @@ static const char WEBAUTHN_JS[] =
 
 const char *oc_webauthn_js(size_t *len) { *len = sizeof WEBAUTHN_JS - 1; return WEBAUTHN_JS; }
 
+/* A script's SRI value, "sha256-<base64>", into `sri`. */
+static void integrity(const char *js, size_t n, char sri[64]) {
+    uint8_t h[32]; size_t ol = 0;
+    char b[48];
+    if (mbedtls_sha256((const unsigned char *)js, n, h, 0) == 0 &&
+        mbedtls_base64_encode((unsigned char *)b, sizeof b, &ol, h, sizeof h) == 0)
+        snprintf(sri, 64, "sha256-%.*s", (int)ol, b);
+}
+
 const char *oc_webauthn_js_integrity(void) {
     static char sri[64];
-    if (!sri[0]) {
-        uint8_t h[32]; size_t ol = 0;
-        char b[48];
-        if (mbedtls_sha256((const unsigned char *)WEBAUTHN_JS, sizeof WEBAUTHN_JS - 1, h, 0) == 0 &&
-            mbedtls_base64_encode((unsigned char *)b, sizeof b, &ol, h, sizeof h) == 0)
-            snprintf(sri, sizeof sri, "sha256-%.*s", (int)ol, b);
-    }
+    if (!sri[0]) integrity(WEBAUTHN_JS, sizeof WEBAUTHN_JS - 1, sri);
+    return sri;
+}
+
+/* The recovery codes' copy button (AUTH.md §8.6): shown only where the
+ * clipboard can take the codes, it copies the page's own list; it fetches
+ * nothing and builds no markup. */
+static const char CODES_JS[] =
+    "(function(){\n"
+    "var b=document.getElementById('copy'),c=document.getElementById('codes');\n"
+    "if(!b||!c||!navigator.clipboard)return;\n"
+    "b.hidden=false;\n"
+    "b.addEventListener('click',function(){navigator.clipboard.writeText(c.textContent).then(function(){"
+    "b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},2000);},function(){});});\n"
+    "})();\n";
+
+const char *oc_codes_js(size_t *len) { *len = sizeof CODES_JS - 1; return CODES_JS; }
+
+const char *oc_codes_js_integrity(void) {
+    static char sri[64];
+    if (!sri[0]) integrity(CODES_JS, sizeof CODES_JS - 1, sri);
     return sri;
 }
 
@@ -345,9 +371,19 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             break;
         case OC_SEC_CODES:
             raw(&p, "<p>Two-step sign-in is on. Keep these recovery codes somewhere safe: each signs you in "
-                    "once if you lose your phone. They are not shown again.</p>\n<pre>");
+                    "once if you lose your phone. They are not shown again.</p>\n<pre id=\"codes\">");
             esc(&p, pp->codes);
-            raw(&p, "</pre>\n<p>You can close this tab.</p>\n");
+            raw(&p, "</pre>\n");
+            /* Saved as a file the page itself holds, so nothing is fetched. */
+            raw(&p, "<div class=\"acts\"><a href=\"data:text/plain;charset=utf-8,");
+            qval(&p, "OpenChime recovery codes");
+            if (user[0]) { qval(&p, " for "); qval(&p, user); }
+            qval(&p, ". Each signs you in once.\n\n");
+            qval(&p, pp->codes);
+            raw(&p, "\" download=\"openchime-recovery-codes.txt\">Download</a>"
+                    "<button type=\"button\" id=\"copy\" hidden>Copy</button></div>\n");
+            raw(&p, "<script src=\"../codes.js\" integrity=\""); raw(&p, oc_codes_js_integrity());
+            raw(&p, "\"></script>\n<p>You can close this tab.</p>\n");
             break;
         case OC_SEC_ON:
             raw(&p, "<p>Two-step sign-in is on. Enter a code from your authenticator app or a recovery code "
