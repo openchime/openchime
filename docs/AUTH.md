@@ -122,8 +122,10 @@ authority.
   `ERROR` and the connection is closed, so another try is a new connection the
   limiters count afresh; and one not signed in within 60 seconds of being
   accepted (`OC_UNAUTHED_MS`) is closed, whether it is still in its TLS
-  handshake, never said `HELLO`, or is waiting on a device code (§8.11, which
-  polls on from a new connection).
+  handshake or never said `HELLO`. A connection polling a device code that is
+  still live (§8.11) is waiting, not idle: each answered poll starts its 60
+  seconds again, so an approval that takes longer signs in on the connection
+  that waited, and the code's own life bounds how long that can be.
   The per-source counter stands in front of **every** source: a refused relay
   token and a wrong session token count against the address they came from, the
   check runs before any signature work, and a refused relay sign-in is audited as

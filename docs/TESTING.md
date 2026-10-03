@@ -442,7 +442,9 @@ only with the verifier, a refusal, the user code refused as a device code, the
 cap, the lookup limiter (429) and — on a second loop with a short life — expiry.
 `test_client_core` (`test_device_client`): the whole client at a self-signed
 daemon (the fingerprint shown) and at a test-root daemon (none, and its own
-name), approval signing it in, cancel and expiry. `test_tkqr`: the QR code's size,
+name), approval signing it in, cancel and expiry, and an approval slower than a
+connection is given to sign in (a short `unauthed_ms`) signing in on the
+connection that polled, with nothing said meanwhile. `test_tkqr`: the QR code's size,
 quiet zone and finder pattern as half blocks. Mutation proofs cover the slow
 down, expiry, the refusal, the lookup limiter, the per-source cap, polling by the
 user code, single collection and the challenge binding. `scripts/tui_device.sh`
