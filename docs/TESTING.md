@@ -1365,8 +1365,11 @@ pane holds. It asserts that only what fits is drawn and the pane says the rest i
 below it; that the wheel reaches **every** member, counted as the distinct people
 drawn on the way down (sixty of sixty); that the bottom row is then somebody the
 first screen never showed, and answers a click by opening that person's profile;
-that the offset stops at both ends rather than running past them; and that
-switching channel puts the pane back at its own top. It reads the dump's
+that the offset stops at both ends rather than running past them; that an
+owner's menu on a member, which carries "Reset password and two-step sign-in…",
+cuts none of its items (the dump's `menurow … cut=` says whether a label was wider
+than its row as drawn); and that switching channel puts the pane back at its own
+top. It reads the dump's
 `members n= rows= scroll= max=` line and the `memrow uid= r=` lines, and drives
 the `wheel` verb in detents of 120.
 
