@@ -13559,7 +13559,13 @@ static void modal_enter(HWND hwnd, int *flag) {
      * list you were working in. The your-account modals below do set VIEW_HOME,
      * because they are not about the current view at all. */
     /* Scheduling is about the conversation you are in, so it keeps you there too. */
-    int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open);
+    /* And the sign-in card keeps its place under ANY dialog. The attempt a dialog
+     * starts from it -- a reset code, an invitation -- is watched only while the
+     * card is the view (signin_poll), so moving to Home on the way in left OK
+     * with an attempt nobody watched: no browser, an empty Home, and a client
+     * still waiting on the browser. */
+    int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open) ||
+                    g_view == VIEW_SIGNIN;
     int prev_view = g_view;
     /* A modal covers the window; it is not about the profile beside it. Edit
      * profile is opened FROM your own card, and saving it should leave that card
@@ -13593,6 +13599,9 @@ static void modal_enter(HWND hwnd, int *flag) {
     g_more_open = 0;
     *flag = 1;
     g_view = keep_view ? prev_view : VIEW_HOME;
+    /* The card's own field is native, so it is hidden under the dialog here, as
+     * modal_finish puts it back. */
+    if (g_view == VIEW_SIGNIN) layout_signin(g_main_hwnd);
     const oc_modal_spec *s = modal_current();
     if (s->snapshot) s->snapshot();
     /* Repaint NOW, so the frame's geometry exists before any click can arrive:
@@ -21941,7 +21950,7 @@ static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * pad/step offsets here in step with that function. */
 static void layout_signin(HWND hwnd) {
     if (!g_si_e_ws) return;
-    int on = (g_view == VIEW_SIGNIN && !g_si_connecting && !g_confirm_open);
+    int on = (g_view == VIEW_SIGNIN && !g_si_connecting && !modal_open());
     ShowWindow(g_si_e_ws,   (on && g_si_step == 1) ? SW_SHOW : SW_HIDE);
     /* No credentials are typed here any more (AUTH.md §8.10): the fields stay
      * hidden, and the page in the browser asks. */
@@ -29323,6 +29332,32 @@ static void test_poll(HWND hwnd) {
             }
         }
         test_ack("ok");
+    } else if (!strcmp(verb, "clickform")) {
+        /* `clickform x y` -- `click`, acked FIRST: for a click that opens a real
+         * form, whose nested message loop would hold an ack sent afterwards until
+         * the dialog closed. The commands that follow run inside that loop, so a
+         * harness fills the open dialog (`formtype`) and answers it (`key enter`)
+         * as a person does -- where `formnext` answers it without ever opening it,
+         * and so cannot see what opening it does to the window behind. */
+        int x = 0, y = 0;
+        if (sscanf(arg, "%d %d", &x, &y) != 2) { test_ack("err"); }
+        else {
+            test_ack("ok");
+            LPARAM pos = MAKELPARAM(PX(x), PX(y));
+            SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+        }
+    } else if (!strcmp(verb, "formtype")) {
+        /* `formtype <field> <text>` -- into the open form's field, through the
+         * control, as the dirfind verb sets its box. */
+        int fi = -1, used = 0;
+        if (sscanf(arg, "%d %n", &fi, &used) < 1 || !g_form_open || fi < 0 ||
+            fi >= FORM_MAX_FIELDS || !g_form_edit[fi]) { test_ack("err"); }
+        else {
+            WCHAR w[512]; to_w(arg + used, w, 512);
+            SetWindowTextW(g_form_edit[fi], w);
+            test_ack("ok");
+        }
     } else if (!strcmp(verb, "form")) {
         /* Drive the generic form. The ack goes FIRST, because the form runs
          * a nested message loop: acking afterwards would make the harness wait for a

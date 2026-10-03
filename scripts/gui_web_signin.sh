@@ -10,14 +10,18 @@
 # browser, from the URL the client publishes under the test hook.
 #
 #   1. The first owner signs up with the setup token: "Have an invite?", the
-#      token, the sign-up page, signed in.
+#      token typed into its dialog, the sign-up page, signed in.
 #   2. Change password opens the password page; the password is changed there.
 #   3. The workspace forgotten -- session and trust -- and signed in to again:
 #      the certificate asked about again, the old password refused on the page,
 #      the new one signing in.
-#   4. A reset (AUTH.md §2): forgotten again, "Have a reset code?" takes the
-#      code, the reset page opens through this client's own tunnel, sets the
-#      password and goes on to the sign-in, which signs in with it.
+#   4. A reset (AUTH.md §2): forgotten again, "Have a reset code?" cancelled
+#      and the card still there, then the code typed into it, the reset page
+#      opening through this client's own tunnel, setting the password and going
+#      on to the sign-in, which signs in with it.
+#
+# Both dialogs are the real ones, opened by a click on the card's link and
+# answered with Enter, and the card is checked to stay the view under them.
 #
 #   scripts/gui_web_signin.sh            # builds nothing; run `make windows-gui` first
 set -euo pipefail
@@ -61,6 +65,42 @@ trust_cert() {
     read -r _ _ _ _ l t r b <<<"$line"
     drive click "$(( (l + r) * 48 / dpi ))" "$(( (t + b) * 48 / dpi ))"
 }
+# The sign-in card's own dialogs, opened and answered as a person does: the
+# link clicked, the dialog up OVER THE CARD (the attempt it starts is watched
+# only while the card is the view), the value typed into its field, Enter.
+# `formnext` would answer without opening it, which is how a dialog that took
+# the card away went unnoticed.
+await_form() {
+    for _ in $(seq 1 50); do
+        S="$(state wf)"; grep -q '^modal=form ' <<<"$S" && return 0; sleep 0.1
+    done
+    return 1
+}
+real_dialog() {   # x y value shot-name
+    drive clickform "$1" "$2"
+    await_form || fail "the dialog did not open"
+    grep -q '^view=100 ' <<<"$S" || fail "the dialog took the sign-in card away: $(grep '^view=' <<<"$S")"
+    drive formtype 0 "$3"
+    drive shotfull "$4"
+    drive key enter
+    for _ in $(seq 1 50); do S="$(state wd)"; grep -q '^modal=none ' <<<"$S" && break; sleep 0.1; done
+    grep -q '^modal=none ' <<<"$S" || fail "the dialog did not close on Enter"
+    grep -q '^view=100 ' <<<"$S" || fail "OK took the sign-in card away: $(grep '^view=' <<<"$S")"
+    grep -q '^signin step=2 connecting=1 browser=1 ' <<<"$S" ||
+        fail "OK did not start the sign-in in the browser: $(grep '^signin ' <<<"$S")"
+}
+# The window, on screen. A client with workspaces in its book starts hidden and
+# shows once their settings arrive or a grace period ends, which takes longer
+# the more it has to start; until then nothing is painted and the card's
+# controls have no places to click. Waited for, not slept for.
+await_shown() {
+    for _ in $(seq 1 100); do
+        S="$(state ws0 2>/dev/null || true)"
+        grep -q '^startup visible=1 ' <<<"$S" && return 0
+        sleep 0.2
+    done
+    fail "the window was never shown"
+}
 # Percent-encode for a form body.
 enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
 qget() { python3 -c 'import sys,urllib.parse as u;print(u.parse_qs(u.urlparse(sys.argv[1]).query).get(sys.argv[2],[""])[0])' "$1" "$2"; }
@@ -81,7 +121,7 @@ browser() {   # url form-action body
     local base="${url%%\?*}"; base="${base%/*}"
     local origin; origin="$(python3 -c 'import sys,urllib.parse as u;p=u.urlparse(sys.argv[1]);print(p.scheme+"://"+p.netloc)' "$url")"
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$WIN_DIR\\web.ps1" \
-        -Get "$url" -Post "$base/$action" -Origin "$origin" -Body "$body" 2>&1 | tr -d '\r'
+        -Get "$url" -Post "$base/$action" -Origin "$origin" -Body "$body" 2>&1 | tr -d '\r' || true
 }
 
 cleanup() {
@@ -97,19 +137,33 @@ cleanup() {
 for p in $(pgrep -x openchimed || true); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$PORT" && kill "$p" 2>/dev/null
 done
+# A daemon told to stop takes a moment to let go of the port; one started into
+# it fails to bind, and the client then reaches the old one on its way out.
+for _ in $(seq 1 50); do
+    (exec 3<>"/dev/tcp/$ADDR/$PORT") 2>/dev/null || break
+    exec 3<&- 3>&-; sleep 0.2
+done
 rm -rf "$D"; mkdir -p "$D/blobs"
 env -u OPENCHIME_TEST_PASSWORD_AUTH OPENCHIME_DB_PATH="$D/db" OPENCHIME_TLS_CERT="$D/cert.pem" \
     OPENCHIME_TLS_KEY="$D/key.pem" OPENCHIME_BLOB_DIR="$D/blobs" OPENCHIME_PROTO_PORT="$PORT" \
     OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Web Sign-in" OPENCHIME_DEPLOYMENT_MODE=standalone \
+    OPENCHIME_TTS=0 OPENCHIME_STT=0 \
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &
 disown
 TOKEN=""
-for _ in $(seq 1 50); do
+for _ in $(seq 1 150); do     # the speech models load first: seconds on a busy host
     TOKEN="$(sed -n 's/.*first-run setup token.*: \([0-9a-f]\{64\}\).*/\1/p' "$D/daemon.log" | head -1)"
     [ -n "$TOKEN" ] && break; sleep 0.2
 done
 [ -n "$TOKEN" ] || fail "the daemon printed no setup token"
 grep -q 'OPENCHIME_TEST_PASSWORD_AUTH' "$D/daemon.log" && fail "the daemon has the test knob on"
+# The token is printed before the listener is up (the speech models load in
+# between), so wait for the port the client will ask, not for the log.
+for _ in $(seq 1 150); do
+    (exec 3<>"/dev/tcp/$ADDR/$PORT") 2>/dev/null && { exec 3<&- 3>&-; break; }
+    sleep 0.2
+done
+(exec 3<>"/dev/tcp/$ADDR/$PORT") 2>/dev/null || fail "the daemon is not listening on $PORT"
 
 # --- the client, with no credentials -----------------------------------------
 "$HERE/scripts/gui_drive.sh" kill >/dev/null 2>&1 || true
@@ -117,7 +171,7 @@ rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack" "$LIN_DIR/signin_url.txt"
 WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
     setsid "$EXE" >/dev/null 2>&1 < /dev/null &
 disown
-sleep 3
+await_shown
 
 # 1. The owner signs up with the setup token.
 drive menu 80                                    # Add a workspace (the card, over any other)
@@ -128,10 +182,9 @@ sleep 2
 S="$(state w1)"
 [ "$(field "$S" step)" = 2 ] || fail "no second step: $(grep '^signin' <<<"$S")"
 drive shotfull web-1-card
-drive formnext "$TOKEN"
 read -r IX IY < <(center "$(field "$S" invite)")
 rm -f "$LIN_DIR/signin_url.txt"
-drive click "$IX" "$IY"
+real_dialog "$IX" "$IY" "$TOKEN" web-1-invite
 URL="$(await_url)" || fail "the client published no sign-up URL"
 case "$URL" in http://127.0.0.1:*/p/*/signin\?*invite=$TOKEN*) ;; *) fail "not a tunnel URL with the invitation: $URL" ;; esac
 R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
@@ -158,7 +211,7 @@ rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
 WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
     setsid "$EXE" >/dev/null 2>&1 < /dev/null &
 disown
-sleep 3
+await_shown
 drive menu 80
 drive siws "$WS"
 drive sisubmit
@@ -199,7 +252,7 @@ rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
 WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
     setsid "$EXE" >/dev/null 2>&1 < /dev/null &
 disown
-sleep 3
+await_shown
 drive menu 80
 drive siws "$WS"
 drive sisubmit
@@ -209,10 +262,16 @@ S="$(state w4)"
 [ "$(field "$S" step)" = 2 ] || fail "no second step: $(grep '^signin' <<<"$S")"
 [ "$(field "$S" reset)" != "0,0,0,0" ] || fail "no reset-code link on the card"
 drive shotfull web-4-card
-drive formnext "$RESET"
 read -r XX XY < <(center "$(field "$S" reset)")
+# Cancel first: the card is still there to use afterwards.
+drive clickform "$XX" "$XY"
+await_form || fail "the reset-code dialog did not open"
+drive key esc
+S="$(state w4c)"
+grep -q '^view=100 ' <<<"$S" || fail "Cancel in the reset-code dialog left the card: $(grep '^view=' <<<"$S")"
+[ "$(field "$(grep '^signin ' <<<"$S")" step)" = 2 ] || fail "Cancel in the reset-code dialog lost step 2"
 rm -f "$LIN_DIR/signin_url.txt"
-drive click "$XX" "$XY"
+real_dialog "$XX" "$XY" "$RESET" web-4-reset
 URL="$(await_url)" || fail "the client published no reset URL"
 case "$URL" in http://127.0.0.1:*/p/*/account/reset\?t=$RESET\&redirect_uri=*) ;;
                *) fail "not a tunnel reset URL: $URL" ;; esac

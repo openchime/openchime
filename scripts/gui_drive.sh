@@ -12,6 +12,8 @@
 # Commands: shot <winpath> | send <text> | channel <name> | click x y |
 #           rclick x y | members | scroll <dy> | size w h | dump <winpath> |
 #           formnext <v1>|<v2>|... (arm the next modal form) |
+#           clickform x y (a click that opens a form; acked first) |
+#           formtype <field> <text> (into the open form) |
 #           search [query] | find <text> | key [ctrl+|alt+|shift+]<key> |
 #           keyup <key> | mousedown x y | mouseup x y |
 #           dictate ptt-down|ptt-up|free-on|free-off |
