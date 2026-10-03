@@ -74,7 +74,7 @@ static void qval(pg *p, const char *s) {
 static const char HEAD[] =
     "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-    "<meta name=\"referrer\" content=\"no-referrer\">\n<title>";
+    "<meta name=\"referrer\" content=\"same-origin\">\n<title>";
 static const char STYLE[] =
     "</title>\n<style>\n"
     ":root{color-scheme:light dark}\n"
@@ -495,7 +495,7 @@ int oc_page_headers_ex(const char *redirect_uri, int scripts, char *out, size_t 
         "X-Frame-Options: DENY\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "Cache-Control: no-store\r\n"
-        "Referrer-Policy: no-referrer\r\n",
+        "Referrer-Policy: same-origin\r\n",
         scripts ? "script-src 'self'; " : "", v6 ? "" : "; form-action 'self'", cb[0] ? " " : "", cb);
     return n < 0 || (size_t)n >= cap ? -1 : 0;
 }

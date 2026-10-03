@@ -897,7 +897,10 @@ cookies and no state kept between requests, with
 frame-ancestors 'none'; base-uri 'none'; form-action 'self' <the callback's
 origin>` (browsers hold a form's redirect to `form-action`),
 `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
-`Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Every URL on a
+`Cache-Control: no-store` and `Referrer-Policy: same-origin` — no other site is
+told a page's URL, and the page's own posts carry its origin (under
+`no-referrer` a browser sends `Origin: null`, which the check below refuses).
+Every URL on a
 page is relative, so the same pages serve both ways in. A post must be a form
 whose `Origin` is `https://` + its `Host`, and a sign-in's `redirect_uri` must be
 loopback and its `nonce` a challenge. A refusal shows the form again and never
