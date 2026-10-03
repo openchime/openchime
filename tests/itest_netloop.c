@@ -2582,7 +2582,10 @@ static void test_web_signin(int port) {
     CHECK(strstr(resp, "Content-Security-Policy: default-src 'none'") != NULL);
     CHECK(strstr(resp, "form-action 'self' http://127.0.0.1:5\r\n") != NULL);
     CHECK(strstr(resp, "X-Frame-Options: DENY") && strstr(resp, "Cache-Control: no-store") &&
-          strstr(resp, "Referrer-Policy: no-referrer"));
+          strstr(resp, "Referrer-Policy: same-origin\r\n"));
+    /* Not no-referrer: under it a browser posts the form with "Origin: null",
+     * which the origin check below refuses. */
+    CHECK(strstr(resp, "<meta name=\"referrer\" content=\"same-origin\">") != NULL);
     CHECK(strstr(resp, "autocomplete=\"current-password\"") != NULL);
     CHECK(strstr(resp, "action=\"signin\"") != NULL);                    /* relative: direct or tunnel */
     /* Not a sign-in's link: the redirect is not loopback, or there is no challenge. */

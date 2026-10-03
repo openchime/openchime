@@ -73,8 +73,8 @@ const char *oc_page_invalid(size_t *len);
 const char *oc_page_unavailable(size_t *len);
 
 /* The headers every page carries (http.h's `extra`), into `out`: no framing,
- * no caching, no referrer, and a policy that runs nothing and posts forms only
- * to the page's own origin -- and, for a sign-in, to the client's loopback
+ * no caching, no referrer to another site, and a policy that runs nothing and
+ * posts forms only to the page's own origin -- and, for a sign-in, to the client's loopback
  * callback, which the post's redirect lands on (browsers hold a form's redirect
  * to form-action too). `redirect_uri` may be NULL. Returns 0, -1 if `cap` is
  * too small. */
