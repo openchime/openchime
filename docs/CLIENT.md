@@ -382,7 +382,8 @@ model; translate input to intents }, stop.
     the workspace's page for setting up or turning off a TOTP second step the same
     way (AUTH.md §8.6); the terminal client's launcher has it too.
   - **admin / user management** — a member menu's "Reset password…" (or with
-    their two-step sign-in too) shows the reset to send them, copied to the
+    their two-step sign-in too; the menu widens to its longest item, measured
+    in the text it is drawn in, so neither is cut) shows the reset to send them, copied to the
     clipboard (`oc_model_reset_text`: the workspace, the code to enter on the
     sign-in card, and the page's link only where a CA vouches for the
     certificate, since a tunnel's works on this computer alone; AUTH.md §2);

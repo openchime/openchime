@@ -2296,7 +2296,8 @@ static int menu_about(int kind, uint64_t target) {
 }
 static rectf g_menu_emoji[8];         /* per-glyph hit-boxes in MK_EMOJIROW */
 static int   g_n_menu_emoji;
-static struct { float top, bot; int cmd, kind; const char *label; } g_mirows[28];
+/* `cut`: the row's label did not fit the row, as last drawn -- for the dump. */
+static struct { float top, bot; int cmd, kind, cut; const char *label; } g_mirows[28];
 static int   g_n_mirows;
 /* The pause-notifications flyout (the app's one submenu): its own state, on
  * the More-flyout pattern — g_menu stays a single panel. */
@@ -4239,6 +4240,32 @@ static float menu_item_h(int kind) {
          : kind == MK_SUB ? 36.0f : 11.0f;
 }
 
+/* A label's row: 16 in from the panel's left, 12 short of its right, and a
+ * submenu's chevron beside it -- the numbers draw_menu draws with. */
+#define MI_TEXT_L   16.0f
+#define MI_TEXT_R   12.0f
+#define MI_CHEVRON  20.0f
+
+/* Widen the open menu to its longest label, up to `maxw`: a width fixed at the
+ * call site cut "Reset password and two-step sign-in..." in the member menu,
+ * and any label at a larger text size. Called once the items are added and
+ * before the panel is placed. Never narrower than the width it was given. */
+static void menu_fit(float maxw) {
+    float need = g_menu_w;
+    for (int i = 0; i < g_n_mi; i++) {
+        float w = 0;
+        if (g_mi[i].kind == MK_ITEM || g_mi[i].kind == MK_SUB)
+            w = MI_TEXT_L + text_width(g_mi[i].label, g_ui) + MI_TEXT_R +
+                (g_mi[i].kind == MK_SUB ? MI_CHEVRON : 0.0f);
+        else if (g_mi[i].kind == MK_SECTION)
+            w = MI_TEXT_L + text_width(g_mi[i].label, g_meta) + 10.0f;
+        w = ceilf(w) + 1.0f;   /* a fraction short still trims the last glyph */
+        if (w > need) need = w;
+    }
+    if (need > maxw) need = maxw;
+    if (need > g_menu_w) g_menu_w = need;
+}
+
 static void draw_menu(gfx *rt) {
     g_n_mirows = 0;
     if (!g_menu) return;
@@ -4347,6 +4374,7 @@ static void draw_menu(gfx *rt) {
                 g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
                 g_mirows[g_n_mirows].cmd = g_mi[i].cmd;
                 g_mirows[g_n_mirows].kind = MK_STATUSROW;
+                g_mirows[g_n_mirows].cut = 0;
                 g_mirows[g_n_mirows].label = g_mi[i].label;
                 g_n_mirows++;
             }
@@ -4358,7 +4386,9 @@ static void draw_menu(gfx *rt) {
             if (lit)
                 fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), OC_R_CONTROL, OC_COL_HOVER);
             uint32_t col = g_mi[i].danger ? OC_COL_DANGER : OC_COL_TEXT;
-            draw_text(rt, g_mi[i].label, g_ui, rf(x + 16, cy, panel.right - 12, cy + ih), col);
+            rectf lr = rf(x + MI_TEXT_L, cy, panel.right - MI_TEXT_R -
+                          (g_mi[i].kind == MK_SUB ? MI_CHEVRON : 0.0f), cy + ih);
+            draw_text(rt, g_mi[i].label, g_ui, rf(x + MI_TEXT_L, cy, panel.right - MI_TEXT_R, cy + ih), col);
             if (g_mi[i].kind == MK_SUB) {
                 g_meta->align = ST_ALIGN_RIGHT;
                 draw_text(rt, "\xE2\x80\xBA", g_meta,
@@ -4369,6 +4399,7 @@ static void draw_menu(gfx *rt) {
                 g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
                 g_mirows[g_n_mirows].cmd = g_mi[i].cmd;
                 g_mirows[g_n_mirows].kind = g_mi[i].kind;
+                g_mirows[g_n_mirows].cut = text_width(g_mi[i].label, g_ui) > lr.right - lr.left;
                 g_mirows[g_n_mirows].label = g_mi[i].label;
                 g_n_mirows++;
             }
@@ -22437,6 +22468,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
         RECT rc; GetClientRect(hwnd, &rc);
         float H = DIPF(rc.bottom), W = DIPF(rc.right);
+        menu_fit(W - 16);
         if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
         if (g_menu_y < 8) g_menu_y = 8;
         if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
@@ -27973,9 +28005,9 @@ static void test_dump(const char *path) {
     fprintf(f, "profilemenu open=%d sub=%d\n",
             g_menu == MENU_PROFILE, g_sub_open != 0);
     for (int i = 0; i < g_n_mirows && g_menu; i++)
-        fprintf(f, "  menurow cmd=%d kind=%d r=%.0f,%.0f,%.0f,%.0f\n",
+        fprintf(f, "  menurow cmd=%d kind=%d r=%.0f,%.0f,%.0f,%.0f cut=%d\n",
                 g_mirows[i].cmd, g_mirows[i].kind,
-                g_menu_x, g_mirows[i].top, g_menu_x + g_menu_w, g_mirows[i].bot);
+                g_menu_x, g_mirows[i].top, g_menu_x + g_menu_w, g_mirows[i].bot, g_mirows[i].cut);
     for (int i = 0; i < g_n_subrows && g_sub_open; i++)
         fprintf(f, "  subrow cmd=%d r=%.0f,%.0f,%.0f,%.0f\n",
                 g_subrows[i].cmd, g_sub_panel.left, g_subrows[i].top,

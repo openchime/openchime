@@ -13,6 +13,7 @@
 #     reached and is a row that answers a click;
 #   - it stops at the end rather than scrolling into nothing, and the top is the
 #     top;
+#   - an owner's menu on a member is wide enough for its longest item;
 #   - switching channel puts the pane back at its own top.
 #
 # Its own daemon on its own port, bootstrapped with sixty people: enough that the
@@ -132,6 +133,20 @@ stops() { [ "$(mem scroll)" = "$(mem max)" ]; }
 check "past the end it stays at the end" waitfor 5 stops
 for _ in $(seq 1 80); do wheel 1; done
 check "and back at the top it stays there" waitfor 5 at_top
+
+say "== the member menu fits its longest item"
+# An owner's menu on a member carries both resets, and the longer one --
+# "Reset password and two-step sign-in..." -- was cut at the menu's fixed width.
+snap
+r="$(grep '^memrow ' "$D" | sed -n 3p | grep -o 'r=[0-9,]*' | cut -d= -f2)"
+IFS=, read -r l t rr b <<< "$r"
+"$DRIVE" rclick $(( (l + rr) / 2 )) $(( (t + b) / 2 )) >/dev/null
+has_resets() { snap; grep -q '^  menurow cmd=16 ' "$D"; }
+check "the menu offers the reset with two-step sign-in" waitfor 5 has_resets
+"$DRIVE" shot members_menu >/dev/null
+none_cut() { ! grep '^  menurow ' "$D" | grep -q ' cut=1$'; }
+check "no item is cut ($(grep -c '^  menurow .* cut=1$' "$D") cut)" none_cut
+"$DRIVE" key esc >/dev/null
 
 say "== another channel starts at its own top"
 "$DRIVE" mkchan quiet >/dev/null
