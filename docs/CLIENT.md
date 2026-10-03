@@ -701,7 +701,11 @@ one spelling (`inet_ntop`'s), which is also its credential-store key, and text
 that shows a host and port (`oc_hostport`) brackets an IPv6 one. Loopback
 (`oc_addr_is_loopback`) is `127.0.0.0/8`, `::1` in any spelling, an
 IPv4-mapped `127.x` and `localhost`. The Win32 sign-in form's advanced mode
-takes a bracketed IPv6 address as an address, as it does an IPv4 one.
+takes a bracketed IPv6 address as an address, as it does an IPv4 one. Outside
+advanced mode the form shows the suffix beside its workspace field only while
+what is typed would get it — nothing yet, or a bare name — and never beside an
+address, a `:port`, a dotted name or `localhost`
+(`oc_workspace_takes_suffix`).
 
 **The local login box (REQ-020 local mode).** With no credential and no
 stored session token, the TUI shows a modal **Sign in** dialog — the workspace

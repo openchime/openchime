@@ -151,6 +151,19 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
     return 0;
 }
 
+int oc_workspace_takes_suffix(const char *typed, const char *suffix) {
+    if (!suffix || !*suffix) return 0;
+    if (!typed || !*typed) return 1;
+    /* Anything that names more than a label is taken as typed. */
+    if (strpbrk(typed, ".:/[]")) return 0;
+    /* And the rest is exactly what resolution would suffix: a bare name, but not
+     * `localhost`. */
+    char d[256], bare[256];
+    if (oc_resolve_domain(typed, suffix, d, sizeof d) != 0 ||
+        oc_resolve_domain(typed, NULL, bare, sizeof bare) != 0) return 0;
+    return strcmp(d, bare) != 0;
+}
+
 int oc_hostport(const char *host, int port, char *out, size_t cap) {
     if (!host || !out || cap == 0) return -1;
     int n = strchr(host, ':') ? snprintf(out, cap, "[%s]:%d", host, port)
