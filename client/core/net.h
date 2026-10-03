@@ -57,6 +57,10 @@ void oc_net_trust_cert(oc_net *n, const unsigned char fp[32]);
  * local accounts. Before the first connection. */
 void oc_net_set_signin_source(oc_net *n, const char *source_id);
 
+/* 1 when the daemon's pages open directly, its certificate vouched for by a
+ * trusted authority -- so a link to one works from any browser -- else 0. */
+int oc_net_pages_direct(oc_net *n);
+
 /* One of the daemon's own pages -- `page` "account/password", `query` its
  * query or NULL -- as the browser should open it (AUTH.md §8.10): the daemon's
  * own https origin when a trusted authority vouched for its certificate, else a
@@ -109,6 +113,13 @@ oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int por
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui);
+/* As oc_net_start_signin to a local account, opening first the page that sets
+ * a new password with the reset's token `reset` (hex), which goes on to the
+ * sign-in (AUTH.md §2). */
+oc_net *oc_net_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                           const char *store_path, oc_secret *secret,
+                           int pin_only, const unsigned char *published_pin,
+                           oc_queue *to_ui, oc_queue *from_ui);
 /* As oc_net_start_signin, signing in to a local account with a device code
  * (AUTH.md §8.11): OC_EV_AUTH_DEVICE carries the code and where to enter it,
  * and the thread polls until it is approved, refused or runs out. */

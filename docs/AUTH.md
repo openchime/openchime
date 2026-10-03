@@ -77,7 +77,10 @@ authority.
   page (§8.10). Email delivery is never required.
 - **Resetting a password:** an owner or admin makes a one-time link for a local
   account (`RESET_CREDENTIAL`; who may reset whom is who may remove whom) and
-  sends it to its person, who sets a new password on `/account/reset`. The link
+  sends it to its person, who sets a new password on `/account/reset`: by its
+  link where a CA vouches for the workspace's certificate, or by entering its
+  code on the sign-in card, whose client opens the page through its own tunnel
+  and carries a sign-in the page goes on to once the password is set. The link
   is kept as the SHA-256 of its token, is good for a day and once; using it
   stores the new password under a new version, signs the account out on every
   device, and — if the reset said so — turns its second step off (§8.6), for a

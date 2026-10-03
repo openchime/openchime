@@ -426,7 +426,10 @@ the tunnel's certificate and `Host` checks, the page's limiter and the subject.
 credentials, against a knob-free self-signed daemon at the WSL address —
 certificate trusted, sign-up through the tunnel with the setup token, password
 changed on its page, and, the workspace forgotten, the old password refused and
-the new one signing in; PowerShell plays the browser from `signin_url.txt`.
+the new one signing in; then, forgotten again, a reset's code entered on the
+card, the reset page opened through the client's own tunnel, the password set
+and the sign-in it goes on to signing in; PowerShell plays the browser from
+`signin_url.txt`.
 
 **A device code** (AUTH.md §8.11), also with the knob off: `test_protocol`
 round-trips its four frames. `test_devicecodes` drives the table alone — pending,
@@ -581,10 +584,14 @@ works. Nothing proves the shipped *image* works (§3.2).
   admin no owner; the link sets a new password once, within its day, signs the
   account out everywhere and clears its second step when asked; over the wire an
   owner gets a 64-hex token and a member `FORBIDDEN`; the page refuses a token of
-  the wrong shape, a mismatch, and a spent link.
+  the wrong shape, a mismatch, and a spent link; opened with a sign-in's
+  redirect it carries it and, the password set, goes on to that sign-in, and a
+  redirect not a sign-in's is no link. `test_client_core`: the reset text names
+  the workspace and the code, and a link only where given; a reset sign-in opens
+  the reset page through the client's tunnel.
 - **Bringing a member back (`test_dbwriter` `test_enable_user`, `itest_netloop`
   `test_reset_frame`):** only a removed member, only by whoever may remove them,
-  not at the seat cap; with a reset link on which they sign in again; over the
+  not at the seat cap; with a reset with which they sign in again; over the
   wire, removed then back, the owner gets the link.
 - **Sessions (`test_dbwriter` `test_session_policy`, `itest_netloop`
   `test_revoke_one_session`):** a session lives the configured days; one unused

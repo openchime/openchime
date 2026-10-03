@@ -15,6 +15,9 @@
 #   3. The workspace forgotten -- session and trust -- and signed in to again:
 #      the certificate asked about again, the old password refused on the page,
 #      the new one signing in.
+#   4. A reset (AUTH.md §2): forgotten again, "Have a reset code?" takes the
+#      code, the reset page opens through this client's own tunnel, sets the
+#      password and goes on to the sign-in, which signs in with it.
 #
 #   scripts/gui_web_signin.sh            # builds nothing; run `make windows-gui` first
 set -euo pipefail
@@ -175,5 +178,53 @@ for _ in $(seq 1 50); do S="$(state w3)"; grep -q '^authed=1' <<<"$S" && break; 
 grep -q '^authed=1' <<<"$S" || fail "not signed in with the new password"
 echo "ok: old password refused on the page, new one signed in"
 
+# 4. A reset, made as RESET_CREDENTIAL makes one (its hash kept, a day to run),
+#    entered on the sign-in card as the code the administrator sent.
+RESET="$(python3 - "$D/db" <<'PY'
+import hashlib, os, sqlite3, sys, time
+raw = os.urandom(32)
+db = sqlite3.connect(sys.argv[1], timeout=5)
+now = int(time.time() * 1000)
+db.execute("INSERT INTO credential_resets(token_hash, user_id, created_by, created_at_ms, expires_at_ms) "
+           "SELECT ?, id, id, ?, ? FROM users WHERE subject='local:owen'",
+           (hashlib.sha256(raw).digest(), now, now + 86400000))
+db.commit()
+print(raw.hex())
+PY
+)"
+[ ${#RESET} = 64 ] || fail "no reset made"
+drive wsforget "$WS"
+"$HERE/scripts/gui_drive.sh" kill >/dev/null 2>&1 || true
+rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
+WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
+    setsid "$EXE" >/dev/null 2>&1 < /dev/null &
+disown
+sleep 3
+drive menu 80
+drive siws "$WS"
+drive sisubmit
+trust_cert
+sleep 2
+S="$(state w4)"
+[ "$(field "$S" step)" = 2 ] || fail "no second step: $(grep '^signin' <<<"$S")"
+[ "$(field "$S" reset)" != "0,0,0,0" ] || fail "no reset-code link on the card"
+drive shotfull web-4-card
+drive formnext "$RESET"
+read -r XX XY < <(center "$(field "$S" reset)")
+rm -f "$LIN_DIR/signin_url.txt"
+drive click "$XX" "$XY"
+URL="$(await_url)" || fail "the client published no reset URL"
+case "$URL" in http://127.0.0.1:*/p/*/account/reset\?t=$RESET\&redirect_uri=*) ;;
+               *) fail "not a tunnel reset URL: $URL" ;; esac
+R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
+OUTP="$(browser "$URL" reset "t=$RESET&password=pw-reset&confirm=pw-reset&redirect_uri=$(enc "$R")&nonce=$N")"
+grep -q 'Your new password is set' <<<"$OUTP" || fail "the reset did not go on to the sign-in: $OUTP"
+SIGNIN="${URL%%/account/reset*}/signin?redirect_uri=$(enc "$R")&nonce=$N"
+OUTP="$(browser "$SIGNIN" signin "username=owen&password=pw-reset&redirect_uri=$(enc "$R")&nonce=$N")"
+grep -q 'You are signed in' <<<"$OUTP" || fail "the new password did not sign in: $OUTP"
+for _ in $(seq 1 50); do S="$(state w5)"; grep -q '^authed=1' <<<"$S" && break; sleep 0.2; done
+grep -q '^authed=1' <<<"$S" || fail "not signed in after the reset"
+echo "ok: reset code entered, password set on the page, signed in"
+
 cleanup
-echo "PASS: local sign-in in the browser (sign-up, password change, sign-in)"
+echo "PASS: local sign-in in the browser (sign-up, password change, sign-in, reset)"

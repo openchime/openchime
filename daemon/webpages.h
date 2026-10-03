@@ -34,7 +34,8 @@ typedef struct {
     const char  *username;       /* prefilled, or "" */
     const char  *invite;         /* SIGNUP: the invitation, prefilled, or "" */
     const char  *message;        /* why the form is back, or "" */
-    int          done;           /* PASSWORD: it was changed. DEVICE: approved */
+    int          done;           /* PASSWORD: it was changed. DEVICE: approved.
+                                  * SIGNIN: a new password was just set */
     /* DEVICE (AUTH.md §8.11): the code, once one is found -- "" asks for it --
      * where the request came from and how long ago, and whether it was denied. */
     const char  *user_code;

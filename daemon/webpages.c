@@ -257,6 +257,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
     case OC_PAGE_SIGNIN:
         open_page(&p, "Sign in \xE2\x80\x94 OpenChime");
         raw(&p, "<h1>Sign in</h1>\n<p>to your OpenChime workspace</p>\n");
+        if (pp->done) raw(&p, "<p>Your new password is set. Sign in with it.</p>\n");
         message(&p, pp->message);
         raw(&p, "<form method=\"post\" action=\"signin\">\n");
         hidden(&p, "redirect_uri", pp->redirect_uri);
@@ -425,10 +426,15 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             raw(&p, "<h1>Password set</h1>\n<p>Sign in with your new password. You can close this tab.</p>\n");
             break;
         }
-        raw(&p, "<h1>Set a new password</h1>\n<p>An administrator sent you this link. It works once, for a day.</p>\n");
+        raw(&p, "<h1>Set a new password</h1>\n<p>An administrator sent you this reset. It works once, for a "
+                    "day.</p>\n");
         message(&p, pp->message);
         raw(&p, "<form method=\"post\" action=\"reset\">\n");
         hidden(&p, "t", pp->reset);
+        if (pp->redirect_uri && pp->redirect_uri[0]) {   /* a sign-in to go on to */
+            hidden(&p, "redirect_uri", pp->redirect_uri);
+            hidden(&p, "nonce", pp->nonce);
+        }
         field(&p, "password", "New password", "password", "new-password", "", 1);
         field(&p, "confirm", "New password again", "password", "new-password", "", 0);
         raw(&p, "<button type=\"submit\">Set password</button>\n</form>\n");

@@ -70,13 +70,13 @@ oc_client *oc_client_start_verified(const char *workspace_key, const char *host,
 
 static oc_client *client_start(const char *workspace_key, const char *host, int port,
                                const char *cred, const char *source_id, const char *invite, int device,
-                               const char *store_path, oc_secret *secret,
+                               int reset, const char *store_path, oc_secret *secret,
                                int remember, const char *published_fingerprint);
 
 oc_client *oc_client_start_device(const char *workspace_key, const char *host, int port,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint) {
-    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, store_path, secret,
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, store_path, secret,
                         remember, published_fingerprint);
 }
 
@@ -84,13 +84,20 @@ oc_client *oc_client_start_signin(const char *workspace_key, const char *host, i
                                   const char *cred, const char *source_id, const char *invite,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint) {
-    return client_start(workspace_key, host, port, cred, source_id, invite, 0, store_path, secret,
+    return client_start(workspace_key, host, port, cred, source_id, invite, 0, 0, store_path, secret,
+                        remember, published_fingerprint);
+}
+
+oc_client *oc_client_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
+                                 const char *store_path, oc_secret *secret,
+                                 int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, store_path, secret,
                         remember, published_fingerprint);
 }
 
 static oc_client *client_start(const char *workspace_key, const char *host, int port,
                                const char *cred, const char *source_id, const char *invite, int device,
-                               const char *store_path, oc_secret *secret,
+                               int reset, const char *store_path, oc_secret *secret,
                                int remember, const char *published_fingerprint) {
     oc_client *c = calloc(1, sizeof *c);
     if (!c) return NULL;
@@ -104,6 +111,8 @@ static oc_client *client_start(const char *workspace_key, const char *host, int 
                oc_wellknown_fingerprint_bytes(published_fingerprint, pin) == 0;
     c->net = device ? oc_net_start_device(workspace_key, host, port, store_path, secret, !remember,
                                           have ? pin : NULL, &c->events, &c->cmds)
+           : reset  ? oc_net_start_reset(workspace_key, host, port, invite, store_path, secret, !remember,
+                                         have ? pin : NULL, &c->events, &c->cmds)
                     : oc_net_start_signin(workspace_key, host, port, cred, source_id, invite, store_path, secret,
                                           !remember, have ? pin : NULL, &c->events, &c->cmds);
     if (!c->net) {
@@ -1416,6 +1425,10 @@ void oc_client_logout(oc_client *c, uint8_t scope) {
 
 int oc_client_outbox_pending(oc_client *c) {
     return c ? oc_net_outbox_pending(c->net) : 0;
+}
+
+int oc_client_pages_direct(oc_client *c) {
+    return c ? oc_net_pages_direct(c->net) : 0;
 }
 
 int oc_client_open_page(oc_client *c, const char *page, const char *query, char *url, size_t cap) {

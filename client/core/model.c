@@ -827,6 +827,29 @@ size_t oc_model_invitation_text(const oc_model *m, const char *address, char *ou
     return (size_t)n < cap ? (size_t)n : cap - 1;
 }
 
+size_t oc_model_reset_text(const oc_model *m, const char *address, const char *link, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!m->reset_token[0]) return 0;
+    const char *name = m->workspace_name[0] ? m->workspace_name : NULL;
+    int n = snprintf(out, cap,
+        "Your OpenChime password for %s%s%s was reset.\n"
+        "\n"
+        "Workspace: %s\n"
+        "Set a new one: in the OpenChime app, open the workspace, choose \"Have a reset code?\" "
+        "and enter this code.\n"
+        "Reset code: %s\n"
+        "%s%s%s"
+        "It works once, for a day. Setting a new password signs you out everywhere.\n",
+        name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+        address && address[0] ? address : "(the address you were given)",
+        m->reset_token,
+        link && link[0] ? "Or open this link in a browser: " : "", link && link[0] ? link : "",
+        link && link[0] ? "\n" : "");
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (size_t)n < cap ? (size_t)n : cap - 1;
+}
+
 void oc_model_invites_begin(oc_model *m) {
     oc_model_close_invites(m);
     m->invites_open = 1;

@@ -1912,7 +1912,7 @@ static ULONGLONG g_flash_until;
 /* Per-row action buttons: enable/disable, rotate, delete. */
 static rectf g_srch_more_btn;   /* next page of search results */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
-static int g_await_reset;       /* a reset link asked for: show it once (AUTH.md §2) */
+static int g_await_reset;       /* a reset asked for: show it once (AUTH.md §2) */
 static int      g_sessions_open;   /* REQ-182 */
 static struct { rectf r; uint64_t sid; } g_sess_rows[32];   /* each other device's "Sign out" */
 static int      g_n_sess_rows;
@@ -2404,6 +2404,7 @@ static char  g_si_invite[128];
  * account's name once the roster lists it (remember_tick). */
 static char  g_remember_ws[256];
 static rectf g_si_invite_link;
+static rectf g_si_reset_link;  /* "Have a reset code?" */
 static rectf g_si_cancel;      /* overlay sign-in: back to the live workspace */
 static char  g_si_ws[256];        /* the workspace string as typed */
 static char  g_si_host[256];      /* resolved host (step 1 output) */
@@ -2432,6 +2433,7 @@ static uint32_t g_si_opened_seq;     /* the model's signin_seq whose URL was ope
 static rectf    g_si_browser_btn[8]; /* step 2: one per browser source, as g_si_src */
 static rectf    g_si_wait_cancel;    /* while waiting for the browser */
 static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite);
+static void signin_start_reset(HWND hwnd, const char *reset);
 
 /* How many browser sources: the relay, and each of the operator's own providers. */
 static int si_browser_count(void) {
@@ -10555,6 +10557,7 @@ static si_geom si_layout(float W, float H) {
                  + 40.0f + 24.0f                      /* button + bottom pad */
                  + (g_si_step == 2 ? 50.0f * (float)si_browser_count() : 0.0f)   /* browser buttons */
                  + (g_si_step == 2 ? 26.0f + 22.0f : 0.0f)   /* back + signup links */
+                 + (g_si_step == 2 && si_has_local() ? 22.0f : 0.0f)   /* reset-code link */
                  + (g_si_overlay ? 24.0f : 0.0f);            /* cancel row */
     g.h  = head + body;
     g.y0 = (H - g.h) / 2; if (g.y0 < 24) g.y0 = 24;
@@ -10717,10 +10720,16 @@ static void draw_signin(gfx *rt, float W, float H) {
         g_si_invite_link = rf(fx, y + 22, fx + fw, y + 42);
         draw_text(rt, "Have an invite? Create an account", g_meta,
                   g_si_invite_link, OC_COL_MUTED);
+        /* An administrator's reset is a code, entered here: this app opens the
+         * page that takes it through its own connection (AUTH.md §2). */
+        g_si_reset_link = si_has_local() ? rf(fx, y + 44, fx + fw, y + 64) : rf(0, 0, 0, 0);
+        if (si_has_local())
+            draw_text(rt, "Have a reset code? Set a new password", g_meta, g_si_reset_link, OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
     } else {
         g_si_back = rf(0, 0, 0, 0);
         g_si_invite_link = rf(0, 0, 0, 0);
+        g_si_reset_link = rf(0, 0, 0, 0);
     }
 
     /* A way out, when there is somewhere to go back to. Esc does it too, but a
@@ -22444,11 +22453,11 @@ static void member_menu_run(HWND hwnd, int cmd) {
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
     case 13: oc_client_remove_user(g_client, uid); break;
-    case 17:   /* back, with a reset link to set their password (REQ-033) */
+    case 17:   /* back, with a reset to set their password (REQ-033) */
         g_await_reset = 1;
         oc_client_enable_user(g_client, uid);
         break;
-    case 15: case 16:   /* a one-time link for them, shown once it comes (AUTH.md §2) */
+    case 15: case 16:   /* a one-time reset for them, shown once it comes (AUTH.md §2) */
         g_await_reset = 1;
         oc_client_reset_credential(g_client, uid, cmd == 16);
         break;
@@ -23351,6 +23360,25 @@ static int on_click(HWND hwnd, int x, int y) {
             snprintf(g_si_invite, sizeof g_si_invite, "%s", f[0].value);
             signin_start_browser(hwnd, OC_SOURCE_ID_LOCAL, g_si_invite[0] ? g_si_invite : NULL);
             g_si_invite[0] = '\0';
+            return 1;
+        }
+        if (pt_in(g_si_reset_link, x, y)) {
+            oc_field f[1] = {
+                { FF_TEXT, "Reset code", "The code your administrator sent you. It works once, for a day.", "" },
+            };
+            if (!form_dialog(hwnd, "Set a new password", f, 1)) return 1;
+            char code[80]; size_t n = 0;
+            for (const char *q = f[0].value; *q && n + 1 < sizeof code; q++)
+                if (!isspace((unsigned char)*q)) code[n++] = (char)tolower((unsigned char)*q);
+            code[n] = '\0';
+            int hex = n == 64;
+            for (size_t i = 0; hex && i < n; i++) hex = isxdigit((unsigned char)code[i]) != 0;
+            if (!hex) {
+                snprintf(g_si_err, sizeof g_si_err, "that isn't a reset code \u2014 it is 64 letters and digits");
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+            signin_start_reset(hwnd, code);
             return 1;
         }
         if (pt_in(g_si_remember_box, x, y) ||
@@ -25282,14 +25310,28 @@ redraw:
 
 /* Sign in through the browser: the core asks the daemon for the URL and waits on
  * its loopback listener; the poll opens the URL when the model carries it. */
+static void signin_start(HWND hwnd, const char *source_id, const char *invite, const char *reset);
+
 static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite) {
+    signin_start(hwnd, source_id, invite, NULL);
+}
+
+/* A local account an administrator reset: the browser opens first on the page
+ * that sets the new password, which goes on to this sign-in. */
+static void signin_start_reset(HWND hwnd, const char *reset) {
+    signin_start(hwnd, OC_SOURCE_ID_LOCAL, NULL, reset);
+}
+
+static void signin_start(HWND hwnd, const char *source_id, const char *invite, const char *reset) {
     g_si_err[0] = '\0';
     snprintf(g_host, sizeof g_host, "%s", g_si_host);
     g_port = g_si_port;
     ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
     g_cred[0] = '\0';
-    g_si_client = oc_client_start_signin(g_cur_ws, g_host, g_port, "", source_id, invite,
-                                         store_path(), g_secret, g_si_remember, g_si_fp);
+    g_si_client = reset ? oc_client_start_reset(g_cur_ws, g_host, g_port, reset, store_path(), g_secret,
+                                                g_si_remember, g_si_fp)
+                        : oc_client_start_signin(g_cur_ws, g_host, g_port, "", source_id, invite,
+                                                 store_path(), g_secret, g_si_remember, g_si_fp);
     if (!g_si_client) {
         snprintf(g_si_err, sizeof g_si_err, "could not start the client");
         InvalidateRect(hwnd, NULL, FALSE);
@@ -25648,6 +25690,31 @@ static void show_invitation(HWND owner, const oc_model *m) {
         : "Send it to the person you invited. The token works once and is not shown again "
           "\u2014 make a new invite if it is lost.";
     form_dialog(owner, m->invite_email[0] ? "Invitation created" : "Invite created", f, 1);
+}
+
+/* A reset, to send its person: the workspace and the code they enter in their
+ * own app, which opens the page through its own connection -- and the page's
+ * link too where a browser anywhere can reach it. A link through this client's
+ * tunnel would work only here, so it is never the one sent. */
+static void show_reset(HWND owner, const oc_model *m) {
+    char link[1200] = "";
+    if (oc_client_pages_direct(g_client)) {
+        char q[96];
+        snprintf(q, sizeof q, "t=%s", m->reset_token);
+        if (oc_client_open_page(g_client, "account/reset", q, link, sizeof link) != 0) link[0] = '\0';
+    }
+    oc_field f[1] = { { FF_MULTILINE, "Password reset \u2014 copied to your clipboard", "", "" } };
+    if (!oc_model_reset_text(m, g_cur_ws, link[0] ? link : NULL, f[0].value, sizeof f[0].value)) return;
+    char crlf[2 * sizeof f[0].value]; size_t o = 0;
+    for (const char *q = f[0].value; *q && o + 2 < sizeof crlf; q++) {
+        if (*q == '\n') crlf[o++] = '\r';
+        crlf[o++] = *q;
+    }
+    crlf[o] = '\0';
+    copy_to_clipboard(owner, crlf);
+    f[0].hint = "Send it to them. It works once, for a day, and is not shown again \u2014 reset them "
+                "again if it is lost.";
+    form_dialog(owner, "Password reset", f, 1);
 }
 
 /* text_prompt() is gone: every flow that used it now has a form
@@ -27898,9 +27965,11 @@ static void test_dump(const char *path) {
      * exactly the bug this design exists to prevent. */
     fprintf(f, "host=\"%s\"\n", g_host);
     /* The sign-in card's controls, in scene units, for a harness to click. */
-    fprintf(f, "signin step=%d connecting=%d browser=%d btn=%.0f,%.0f,%.0f,%.0f invite=%.0f,%.0f,%.0f,%.0f\n",
+    fprintf(f, "signin step=%d connecting=%d browser=%d btn=%.0f,%.0f,%.0f,%.0f invite=%.0f,%.0f,%.0f,%.0f "
+               "reset=%.0f,%.0f,%.0f,%.0f\n",
             g_si_step, g_si_connecting, g_si_browser, g_si_btn.left, g_si_btn.top, g_si_btn.right, g_si_btn.bottom,
-            g_si_invite_link.left, g_si_invite_link.top, g_si_invite_link.right, g_si_invite_link.bottom);
+            g_si_invite_link.left, g_si_invite_link.top, g_si_invite_link.right, g_si_invite_link.bottom,
+            g_si_reset_link.left, g_si_reset_link.top, g_si_reset_link.right, g_si_reset_link.bottom);
     fprintf(f, "profilemenu open=%d sub=%d\n",
             g_menu == MENU_PROFILE, g_sub_open != 0);
     for (int i = 0; i < g_n_mirows && g_menu; i++)
@@ -30609,13 +30678,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_await_invite = 0;
                 show_invitation(hwnd, m);
             }
-            if (g_await_reset && m->reset_token[0]) {      /* show the reset link once */
+            if (g_await_reset && m->reset_token[0]) {      /* show the reset once */
                 g_await_reset = 0;
-                char q[96], url[1200];
-                snprintf(q, sizeof q, "t=%s", m->reset_token);
-                if (oc_client_open_page(g_client, "account/reset", q, url, sizeof url) == 0)
-                    show_secret(hwnd, "Password reset", "Link to send them", url,
-                                "It works once, for a day. Using it signs them out everywhere.");
+                show_reset(hwnd, m);
             }
             if (g_await_webhook && m->webhook_token[0]) {  /* show the minted webhook token once */
                 g_await_webhook = 0;

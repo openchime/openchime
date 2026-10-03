@@ -1101,6 +1101,12 @@ void oc_model_invite_asked(oc_model *m, const char *email);
  * and when it expires. Plain text, lines ended by "\n". Returns the length
  * written (truncated to fit `cap`), 0 when there is no invite to describe. */
 size_t oc_model_invitation_text(const oc_model *m, const char *address, char *out, size_t cap);
+/* The reset to hand its person, for the last CREDENTIAL_RESET: the workspace's
+ * name and `address`, the code to enter in the app's sign-in ("Have a reset
+ * code?"), and `link` -- the page itself, where a browser can reach it from
+ * anywhere -- unless NULL. Plain text, lines ended by "\n". Returns the length
+ * written (truncated to fit `cap`), 0 when there is no reset to describe. */
+size_t oc_model_reset_text(const oc_model *m, const char *address, const char *link, char *out, size_t cap);
 
 /* Workspace facts (WORKSPACE_INFO). deployment mode name: "standalone" /
  * "federated" / "managed". workspace_name is "" until a name is configured. */
