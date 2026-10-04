@@ -80,7 +80,7 @@ make -C "$HERE" windows-gui >/dev/null 2>&1 || { say "  FAIL gui build"; exit 1;
 
 # --- 1. a workspace that resolves, with a credential ---------------------------
 say "1. a reachable workspace"
-launch "127.0.0.1:$OC_DEV_PORT" "alice:pw"
+launch "$("$DRIVE" devaddr)" "alice:pw"
 signed_in() { [ "$(key_of "$d" authed)" = "1" ]; }
 if wait_for signed_in; then ok "signs in"; else fail "never signed in"; fi
 [ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" || fail "window is not visible"

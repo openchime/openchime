@@ -4,6 +4,7 @@
 # rendered by the app itself (Direct2D DC render target), so no screen-scraping.
 #
 #   scripts/gui_drive.sh launch [ws] [user:pass]   # start the client with the hook on
+#   scripts/gui_drive.sh devaddr                   # the workspace `launch` defaults to
 #   scripts/gui_drive.sh <cmd...>                  # send one command, wait for ack
 #   scripts/gui_drive.sh shotfull <name>           # WHOLE window, children included
 #   scripts/gui_drive.sh shot <name>               # D2D scene only (no children)
@@ -32,12 +33,54 @@ OC_DEV_PORT="${OC_DEV_PORT:-8443}"
 
 mkdir -p "$LIN_DIR" "$OUT"
 
+# Where the Windows client reaches a daemon this machine runs. Under WSL2 that is
+# the WSL machine's own address: a Windows process reaches a WSL listener at
+# 127.0.0.1 only where localhost forwarding is on, and without it the client sat
+# on "could not reach the server" and every script built on `launch` failed its
+# first check. Anywhere else -- the daemon on the Windows host itself, say --
+# 127.0.0.1. OC_DEV_HOST overrides both.
+dev_host() {
+  if [ -n "${OC_DEV_HOST:-}" ]; then printf '%s\n' "$OC_DEV_HOST"; return; fi
+  local a=""
+  if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+    a="$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+  fi
+  printf '%s\n' "${a:-127.0.0.1}"
+}
+
+# A daemon reached at an address that is not loopback presents its self-signed
+# certificate, and the client asks whether to trust it (ARCH-10). The dev daemon
+# is the one this harness started, so the harness answers for the person: Trust
+# and connect, found in the accessibility list in pixels and clicked in scene
+# units -- the same click gui_web_signin.sh makes. Done when the client signs in,
+# or when there is no question to answer.
+trust_dev_cert() {
+  local S line dpi l t r b
+  "$0" restore >/dev/null 2>&1 || true      # a window never shown has no buttons to find
+  for _ in $(seq 1 100); do
+    "$0" dump launch-trust >/dev/null 2>&1 || true
+    S="$(cat "$LIN_DIR/launch-trust.txt" 2>/dev/null || true)"
+    grep -q '^authed=1' <<<"$S" && return 0
+    if grep -q '^confirm open=1 act=13' <<<"$S" &&
+       line="$(grep '^a11yitem modal.button.trust and connect ' <<<"$S")"; then
+      dpi="$(sed -n 's/.* dpi=\([0-9]*\).*/\1/p' <<<"$S" | head -1)"
+      read -r _ _ _ _ l t r b <<<"$line"
+      [ "${dpi:-0}" -gt 0 ] && "$0" click "$(( (l + r) * 48 / dpi ))" "$(( (t + b) * 48 / dpi ))" >/dev/null 2>&1
+    fi
+    sleep 0.2
+  done
+  return 0                                  # the caller's own checks say what happened
+}
+
 case "${1:-}" in
+  devaddr)
+    # The default workspace `launch` uses, for a script that names it itself.
+    printf '%s:%s\n' "$(dev_host)" "$OC_DEV_PORT"; exit 0 ;;
   launch)
     # The default follows OC_DEV_PORT, so pointing a run at a second dev daemon
     # (a smoke run that must not touch the workspace you are using) does not also
     # require repeating the address on the command line.
-    ws="${2:-127.0.0.1:$OC_DEV_PORT}"; cred="${3:-alice:pw}"
+    ws="${2:-$(dev_host):$OC_DEV_PORT}"; cred="${3:-alice:pw}"
 
     # --- Build BOTH sides, then restart the daemon on the new binary. ---------
     #
@@ -65,8 +108,13 @@ case "${1:-}" in
       # no explanation. Ask what the client will ask.
       listening=0
       (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; listening=1; }
-      dpid=$(pgrep -f "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" | head -1 || true)
-      [ -z "$dpid" ] && dpid=$(pgrep -x openchimed | head -1 || true)
+      # Named in its environment: the port is not on its command line.
+      dpid=""
+      for p in $(pgrep -x openchimed || true); do
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" && { dpid=$p; break; }
+      done
+      # Only the daemon on THIS port is ours to restart: falling back to any
+      # openchimed stopped whichever daemon another run happened to have up.
       stale=1
       if [ "$listening" = "1" ] && [ -n "$dpid" ]; then
         started=$(stat -c %Y "/proc/$dpid" 2>/dev/null || echo 0)
@@ -74,7 +122,15 @@ case "${1:-}" in
         [ "$started" -ge "$built" ] && stale=0
       fi
       if [ "$stale" = "1" ]; then
-        [ -n "$dpid" ] && { kill "$dpid" 2>/dev/null || true; sleep 1; }
+        if [ -n "$dpid" ]; then
+          kill "$dpid" 2>/dev/null || true
+          # Gone from the port before the next binds it, or the new one fails to
+          # bind and the wait below finds the old one on its way out.
+          for _ in $(seq 1 40); do
+            (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null || break
+            exec 3<&- 3>&-; sleep 0.25
+          done
+        fi
         mkdir -p "$OC_DEV_DIR"
         env OPENCHIME_DB_PATH="$OC_DEV_DIR/db" \
             OPENCHIME_TLS_CERT="$OC_DEV_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_DEV_DIR/key.pem" \
@@ -86,11 +142,16 @@ case "${1:-}" in
             OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_DEV_DIR/daemon.log" 2>&1 < /dev/null &
         disown
-        # Wait for the listener rather than sleeping a guess.
-        for _ in $(seq 1 40); do
-          (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; break; }
+        # Wait for the listener rather than sleeping a guess -- and long enough:
+        # the bootstrap accounts are hashed before it listens, so a fixture of
+        # sixty people (gui_members.sh) takes half a minute, and a client started
+        # before then fails its one attempt and never tries again.
+        up=0
+        for _ in $(seq 1 360); do
+          (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; up=1; break; }
           sleep 0.25
         done
+        [ "$up" = 1 ] || { echo "the daemon is not listening on :$OC_DEV_PORT" >&2; exit 1; }
         echo "daemon restarted (was stale or absent)" >&2
       fi
     fi
@@ -120,7 +181,12 @@ case "${1:-}" in
     # OPENCHIME_TEST_CAPTURE=synthetic|synthetic-camera|denied, and the rest.
     WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_MIC_ECHO:OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_VIDEO_CAP_MS:OPENCHIME_TEST_SCREEN_GONE_MS" OPENCHIME_TEST_DIR="$WIN_DIR" \
         setsid "$EXE" "$ws" "$cred" >/dev/null 2>&1 < /dev/null &
-    disown; sleep 3; echo "launched"; exit 0 ;;
+    disown; sleep 3
+    case "$ws" in
+      127.*|localhost|localhost:*|\[::1\]*) ;;
+      *) [ -n "$cred" ] && trust_dev_cert ;;
+    esac
+    echo "launched"; exit 0 ;;
   kill)
     # Graceful first, for the reason the launch path gives.
     powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
