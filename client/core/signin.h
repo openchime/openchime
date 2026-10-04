@@ -78,6 +78,9 @@ typedef struct {
 void oc_loopback_set_tunnel(oc_loopback *lb, const oc_tunnel_target *t);
 /* "http://127.0.0.1:<port>/p/<secret>": a page's path goes after it. */
 int  oc_loopback_tunnel_base(const oc_loopback *lb, char *out, size_t cap);
+/* A test's knob: the tunnel's two budgets -- reaching the daemon with the
+ * request, and waiting for its answer -- in ms; 0 keeps a default. */
+void oc_loopback_tunnel_times(int send_ms, int answer_ms);
 /* Carry pages only -- no callback is awaited -- until `timeout_ms` passes or
  * `cancel` is set: a page opened on its own (the password page). */
 oc_loopback_result oc_loopback_serve(oc_loopback *lb, int timeout_ms, const atomic_int *cancel);

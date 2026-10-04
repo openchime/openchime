@@ -873,8 +873,12 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
   certificate the client's own connection accepted — over TLS with ALPN
   `http/1.1`, as the daemon's origin: its `Host`, and for a post from the
   tunnel's own page its `Origin`. A post from any other page keeps its own
-  `Origin`, which the daemon refuses. It closes after the callback, on cancel,
-  or after five minutes (ten, for a page opened on its own).
+  `Origin`, which the daemon refuses. Each request gets fifteen seconds to reach
+  the daemon and hand it over, and then waits for the answer on a budget of its
+  own — up to two minutes, for as long as the browser is still connected — since
+  a page that sets a password derives hashes before it answers, which on a busy
+  server is longer than any fixed few seconds. It closes after the callback, on
+  cancel, or after five minutes (ten, for a page opened on its own).
 
 The person signs in on the page; the daemon checks the password on the same
 staged path as §2 — the limiters, the pool, the credential's version, the audit

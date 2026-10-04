@@ -202,7 +202,12 @@ URL="$(await_url)" || fail "no password page URL"
 case "$URL" in http://127.0.0.1:*/p/*/account/password*) ;; *) fail "not a tunnel password URL: $URL" ;; esac
 OUTP="$(browser "$URL" password "username=owen&current=pw-owen&password=pw-new&confirm=pw-new")"
 grep -q 'Password changed' <<<"$OUTP" || fail "the password was not changed: $OUTP"
-echo "ok: password changed on its page"
+# The change signs every device out, this one too: the client goes to the
+# sign-in card and says why.
+for _ in $(seq 1 50); do S="$(state w2s)"; grep -q '^view=100 ' <<<"$S" && break; sleep 0.2; done
+grep -q '^view=100 ' <<<"$S" || fail "the client did not go to sign-in after the change: $(grep '^view=' <<<"$S")"
+grep -q 'si_err="You were signed out of ' <<<"$S" || fail "the sign-in does not say why: $(grep '^startup' <<<"$S")"
+echo "ok: password changed on its page, the client back at sign-in"
 
 # 3. Forget the workspace -- its session and the trust -- and sign in again.
 drive wsforget "$WS"

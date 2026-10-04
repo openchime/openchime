@@ -66,6 +66,7 @@ static void *cancel_thread(void *arg) { (void)arg; usleep(150000); g_cancel = 1;
 static oc_tls_server g_fd_srv;
 static int g_fd_listen = -1, g_fd_port;
 static atomic_int g_fd_stop;
+static atomic_int g_fd_slow_ms;   /* a password post is answered this late, as a busy daemon answers it */
 
 static void *fake_daemon(void *arg) {
     (void)arg;
@@ -98,6 +99,8 @@ static void *fake_daemon(void *arg) {
                 if (rs2 != OC_TLS_OK && rs2 != OC_TLS_WANT_READ) break;
                 if (n == 0 && rs2 == OC_TLS_OK) break;
             }
+            if (st == OC_TLS_OK && strncmp(req, "POST /account/password ", 23) == 0)
+                usleep((useconds_t)atomic_load(&g_fd_slow_ms) * 1000u);
             if (st == OC_TLS_OK) {
                 char resp[9000];
                 int n = snprintf(resp, sizeof resp, "HTTP/1.1 303 See Other\r\nLocation: /signup?x=1\r\n"
@@ -213,6 +216,22 @@ static void test_tunnel(void) {
             snprintf(req, sizeof req, "GET /p/not-the-secret/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", lport);
             http_raw(lport, req, out, sizeof out);
             CHECK(strstr(out, "HTTP/1.1 404") == out);
+            /* A slow answer is waited for: reaching the daemon has a budget of its
+             * own, and the daemon deriving a password's hash past it is not a
+             * daemon that cannot be reached. Here the budget to reach it is
+             * 200 ms and the answer takes 600. */
+            atomic_store(&g_fd_slow_ms, 600);
+            oc_loopback_tunnel_times(200, 0);
+            snprintf(req, sizeof req, "POST %s/account/password HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                     "Origin: http://127.0.0.1:%d\r\nContent-Length: 3\r\n\r\np=q", tp, lport, lport);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 303") == out && strstr(out, "POST /account/password HTTP/1.1\r\n"));
+            /* ...for as long as the answer's own budget, and no longer. */
+            oc_loopback_tunnel_times(200, 300);
+            http_raw(lport, req, out, sizeof out);
+            CHECK(strstr(out, "HTTP/1.1 502") == out);
+            oc_loopback_tunnel_times(0, 0);
+            atomic_store(&g_fd_slow_ms, 0);
         } else {
             snprintf(req, sizeof req, "GET %s/signin HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", tp, lport);
             http_raw(lport, req, out, sizeof out);
