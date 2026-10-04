@@ -310,6 +310,30 @@ static int tunnel_page(const char *p) {
     return 0;
 }
 
+/* How long the tunnel gives a request. Two budgets, not one: reaching the
+ * daemon and handing it the request is quick or broken, so it gets a few
+ * seconds; the ANSWER is the daemon's work, and a page that sets a password
+ * derives a hash or two before it says anything -- seconds on a busy server.
+ * One fifteen-second budget for the lot cut that off and showed "could not
+ * reach the server" for a change the daemon went on to make. The answer is
+ * waited for as long as the browser is still there to take it, up to two
+ * minutes. A test sets shorter ones (0 keeps a default). */
+#define TUNNEL_SEND_MS    15000
+#define TUNNEL_ANSWER_MS 120000
+static int g_tunnel_send_ms, g_tunnel_answer_ms;
+void oc_loopback_tunnel_times(int send_ms, int answer_ms) {
+    g_tunnel_send_ms = send_ms;
+    g_tunnel_answer_ms = answer_ms;
+}
+
+/* The browser has hung up: what the tunnel is waiting for has nobody to go to. */
+static int browser_gone(int bfd) {
+    if (oc_poll(bfd, 0, 0) <= 0) return 0;
+    char b;
+    int n = (int)recv(bfd, &b, 1, MSG_PEEK);
+    return n == 0 || (n < 0 && !oc_sock_wouldblock());
+}
+
 static int tls_io_wait(int fd, oc_tls_status st, uint64_t until) {
     uint64_t now = oc_model_now_ms();
     if (now >= until) return -1;
@@ -333,7 +357,7 @@ static void tunnel_forward(oc_loopback *lb, int bfd, breq *r, const char *page) 
     int ok = 0;
     char *resp = NULL;
     size_t rl = 0;
-    uint64_t until = oc_model_now_ms() + 15000;
+    uint64_t until = oc_model_now_ms() + (uint64_t)(g_tunnel_send_ms > 0 ? g_tunnel_send_ms : TUNNEL_SEND_MS);
     if (oc_tls_client_init_verify(&cli, alpn) != 0) { oc_closesock(fd); send_all(bfd, PAGE_502, sizeof PAGE_502 - 1); return; }
     if (oc_tls_conn_init(&conn, &cli.conf, fd) != 0) goto out_cli;
     oc_tls_conn_defer_verify(&conn);
@@ -375,16 +399,25 @@ static void tunnel_forward(oc_loopback *lb, int bfd, breq *r, const char *page) 
         }
         oc_signin_wipe(head, sizeof head);
     }
-    /* The answer, to the daemon's close. */
+    /* The answer, to the daemon's close -- on the answer's own budget, and in
+     * short waits, so a browser that has given up is not waited for. */
     size_t cap = 64 * 1024;
     if (!(resp = malloc(cap + 1))) goto out;
+    uint64_t answer_until = oc_model_now_ms() +
+                            (uint64_t)(g_tunnel_answer_ms > 0 ? g_tunnel_answer_ms : TUNNEL_ANSWER_MS);
     for (;;) {
         if (rl >= cap) goto out;
         size_t got = 0;
         oc_tls_status st = oc_tls_read(&conn, resp + rl, cap - rl, &got);
         rl += got;
         if (st == OC_TLS_OK && got) continue;
-        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) { if (tls_io_wait(fd, st, until) != 0) goto out; continue; }
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) {
+            uint64_t now = oc_model_now_ms();
+            if (now >= answer_until || browser_gone(bfd)) goto out;
+            uint64_t slice = now + 500 < answer_until ? now + 500 : answer_until;
+            if (tls_io_wait(fd, st, slice) != 0 && oc_model_now_ms() >= answer_until) goto out;
+            continue;
+        }
         break;
     }
     resp[rl] = '\0';

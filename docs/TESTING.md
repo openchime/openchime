@@ -417,8 +417,9 @@ once and only with its verifier, a forged token, `Origin` and a non-loopback
 redirect refused, a password change, a removed member, the three frames refused,
 and the account limiter in front of the page. `test_signin`: the tunnel against a
 fake daemon — the pages only, its own `Host` only, `Host`, `Origin` and a
-`Location` rewritten to the daemon's origin, and a certificate other than the
-accepted one refused. `test_client_core` (`test_local_browser`): the whole client
+`Location` rewritten to the daemon's origin, a certificate other than the
+accepted one refused, and an answer slower than the budget for reaching the
+daemon waited for — but not past the answer's own budget. `test_client_core` (`test_local_browser`): the whole client
 both ways in — **directly**, at a daemon a test root vouches for, with a browser
 that verifies the root and the name; and **through the tunnel**, at a
 self-signed daemon on loopback — sign-up with the setup token, the password
