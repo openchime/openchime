@@ -51,13 +51,26 @@ typedef enum {
     OC_LOOPBACK_ERROR     = -3
 } oc_loopback_result;
 
-/* Serve until ONE GET arrives on the secret path, answer it with a page saying
- * the tab can be closed, and copy its query string (after the '?', undecoded)
- * into `query`. Requests for any other path or method are answered 404 and
- * ignored, so a port scanner or a second tab ends nothing. `cancel` (may be
- * NULL) is polled; set it non-zero from another thread to stop. */
+/* Serve until ONE GET arrives on the secret path and copy its query string
+ * (after the '?', undecoded) into `query`. That request is left unanswered --
+ * the browser keeps waiting -- until oc_loopback_answer says how the sign-in
+ * went, because only the daemon knows that: a page answered at once could only
+ * guess. Requests for any other path or method are answered 404 and ignored,
+ * so a port scanner or a second tab ends nothing. `cancel` (may be NULL) is
+ * polled; set it non-zero from another thread to stop. */
 oc_loopback_result oc_loopback_wait(oc_loopback *lb, int timeout_ms, const atomic_int *cancel,
                                     char *query, size_t qcap);
+
+typedef enum {
+    OC_LOOPBACK_UNKNOWN   = 0,   /* the outcome is not known here: "go back to OpenChime" */
+    OC_LOOPBACK_SIGNED_IN = 1,   /* the daemon accepted the sign-in */
+    OC_LOOPBACK_REFUSED   = 2    /* it did not; `why` says why, in the person's words */
+} oc_loopback_outcome;
+
+/* Answer the browser tab whose callback oc_loopback_wait returned, and close it.
+ * Nothing once it has been answered; oc_loopback_close answers one still
+ * waiting with OC_LOOPBACK_UNKNOWN, so no tab is left hanging or told a guess. */
+void oc_loopback_answer(oc_loopback *lb, oc_loopback_outcome outcome, const char *why);
 
 void oc_loopback_close(oc_loopback *lb);
 

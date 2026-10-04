@@ -263,6 +263,9 @@ int run_signin_tests(void) {
         CHECK(pthread_create(&th, NULL, browser_thread, &b) == 0);
         char query[256];
         CHECK(oc_loopback_wait(lb, 5000, NULL, query, sizeof query) == OC_LOOPBACK_OK);
+        /* The tab waits for the outcome; it is told once there is one. */
+        oc_loopback_answer(lb, OC_LOOPBACK_SIGNED_IN, NULL);
+        oc_loopback_answer(lb, OC_LOOPBACK_REFUSED, "again");   /* answered already: nothing */
         pthread_join(th, NULL);
         CHECK(strcmp(query, "token=aaa.bbb.ccc&x=a%20b+c") == 0);
         CHECK(strstr(b.first, "404") != NULL);    /* not a GET */

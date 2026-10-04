@@ -105,6 +105,9 @@ struct oc_net {
      * the token to present on the next connection. Net thread only, but for
      * `signin_cancel`, which the UI thread sets. */
     oc_loopback  *loopback;
+    /* The browser tab that brought the token back, kept waiting until the daemon
+     * has accepted or refused it, so its page says which (signin_answer). */
+    oc_loopback  *answer_lb;
     char          verifier[OC_SIGNIN_VERIFIER_LEN + 1];
     char          source_id[64];
     char         *oidc_token;
@@ -2561,6 +2564,14 @@ static int page_url(oc_net *n, oc_loopback *lb, const char *path, char *out, siz
     return w < 0 || (size_t)w >= cap ? -1 : 0;
 }
 
+/* Tell the waiting browser tab how its sign-in went, and let it go. */
+static void signin_answer(oc_net *n, oc_loopback_outcome outcome, const char *why) {
+    if (!n->answer_lb) return;
+    oc_loopback_answer(n->answer_lb, outcome, why);
+    oc_loopback_close(n->answer_lb);
+    n->answer_lb = NULL;
+}
+
 static void signin_forget(oc_net *n) {
     oc_loopback_close(n->loopback);
     n->loopback = NULL;
@@ -2997,11 +3008,14 @@ static int run_connection(oc_net *n, int reconnecting,
             if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
             /* A password in a frame, where the daemon takes one only on its own
              * pages (AUTH.md §8.10): say where it goes instead. */
-            push_err(n->to_ui, sent_password && code == OC_ERR_AUTH_SOURCE_UNAVAILABLE
-                                   ? "this workspace takes passwords on its sign-in page, in the browser"
-                                   : auth_error_text(code, reconnecting));
+            const char *why = sent_password && code == OC_ERR_AUTH_SOURCE_UNAVAILABLE
+                                ? "this workspace takes passwords on its sign-in page, in the browser"
+                                : auth_error_text(code, reconnecting);
+            push_err(n->to_ui, why);
+            signin_answer(n, OC_LOOPBACK_REFUSED, why);   /* the browser hears it too */
             rc = RC_FATAL; goto drop;
         }
+        signin_answer(n, OC_LOOPBACK_SIGNED_IN, NULL);
         oc_auth_ok ok;
         oc_decode_auth_ok(&p, &ok);
         if (ok.session_token.len == OC_SESSION_TOKEN_LEN) {   /* fresh token (first auth) */
@@ -3925,6 +3939,9 @@ static void *net_thread(void *arg) {
         }
         int served = 0;
         int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served, &cs);
+        /* A browser still waiting got no answer from the daemon: the connection
+         * that was to present its token never got that far. */
+        signin_answer(n, OC_LOOPBACK_REFUSED, "OpenChime could not reach the workspace to finish signing in.");
         push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
         if (cs.store && cs.logged_out) oc_store_clear_session(cs.store, workspace);
         /* Distinguish "unreachable" from "login failed" (REQ-011): a drop before
@@ -3969,7 +3986,8 @@ static void *net_thread(void *arg) {
                 lr = oc_loopback_wait(n->loopback, 1000, &n->signin_cancel, query, sizeof query);
                 if (lr != OC_LOOPBACK_TIMEOUT) break;
             }
-            oc_loopback_close(n->loopback);
+            /* The tab that came back waits on this listener for its answer. */
+            n->answer_lb = n->loopback;
             n->loopback = NULL;
             if (n->stop) break;
             n->oidc_state[0] = '\0';
@@ -3986,9 +4004,11 @@ static void *net_thread(void *arg) {
             char why[200] = "";
             if (lr == OC_LOOPBACK_OK) oc_query_get(query, "error", why, sizeof why);
             signin_forget(n);
-            push_err(n->to_ui, lr == OC_LOOPBACK_CANCELLED ? "sign-in cancelled"
+            const char *said = lr == OC_LOOPBACK_CANCELLED ? "sign-in cancelled"
                              : lr == OC_LOOPBACK_TIMEOUT   ? "sign-in timed out — try again"
-                             : why[0] ? why : "the browser sign-in did not finish");
+                             : why[0] ? why : "the browser sign-in did not finish";
+            signin_answer(n, OC_LOOPBACK_REFUSED, said);
+            push_err(n->to_ui, said);
             break;
         }
         if (rc == RC_FATAL) {
@@ -4056,6 +4076,7 @@ static void *net_thread(void *arg) {
         reconnecting = 1;
     }
 
+    signin_answer(n, OC_LOOPBACK_UNKNOWN, NULL);   /* stopped with a tab still waiting */
     oc_store_close(opened);
     obox_free(&outbox);
     hwtab_free(&hw);

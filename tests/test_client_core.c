@@ -3238,20 +3238,32 @@ static void count_book_cb(void *ctx, const char *workspace, const char *label,
     (*(int *)ctx)++;
 }
 
-/* GET `url_path_and_query` from 127.0.0.1:port; returns the status code. */
+/* The page the client's listener last answered the browser with, whole. */
+static char g_browser_page[4096];
+
+/* GET `url_path_and_query` from 127.0.0.1:port, reading the answer to its close
+ * into g_browser_page; returns the status code. The listener answers once the
+ * daemon has, so this waits that long. */
 static int browser_get(int port, const char *target) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+    struct timeval to = { 20, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
     int status = 0;
+    size_t got = 0;
+    g_browser_page[0] = '\0';
     if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
         char req[9000];
         int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", target);
         ssize_t w = write(fd, req, (size_t)n); (void)w;
-        char buf[64];
-        ssize_t r = read(fd, buf, sizeof buf - 1);
-        if (r > 12) { buf[r] = '\0'; status = atoi(buf + 9); }
+        ssize_t r;
+        while (got < sizeof g_browser_page - 1 &&
+               (r = read(fd, g_browser_page + got, sizeof g_browser_page - 1 - got)) > 0)
+            got += (size_t)r;
+        g_browser_page[got] = '\0';
+        if (got > 12) status = atoi(g_browser_page + 9);
     }
     close(fd);
     return status;
@@ -4123,6 +4135,9 @@ static void test_browser_signin(int port) {
         CHECK(strncmp(m->signin_url, "https://central.example/oidc/authorize?workspace=ws_browser_test&", 65) == 0);
         CHECK(m->signin_seq == 1 && !m->authed);
         CHECK(browser_complete(m, &is, "https://accounts.google.com|dana", "b1", DANA, NULL) == 0);
+        /* The tab was answered after the daemon accepted the token, not before:
+         * by then the client is signed in, and the page says so. */
+        CHECK(strstr(g_browser_page, "You are signed in") != NULL);
         CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
         CHECK(oc_client_model(c)->signin_url[0] == '\0');
         oc_client_stop(c);
@@ -4251,6 +4266,11 @@ static void test_browser_signin(int port) {
         CHECK(WAIT_FOR(c, m->signin_url[0] != '\0'));
         CHECK(browser_complete(oc_client_model(c), &is, "https://accounts.google.com|stranger", "b3",
                                STRANGER, NULL) == 0);
+        /* The browser is not told it is signed in: it waits for the daemon's
+         * refusal and says it, in the same words the client does. */
+        CHECK(strstr(g_browser_page, "You are signed in") == NULL);
+        CHECK(strstr(g_browser_page, "You are not signed in") != NULL &&
+              strstr(g_browser_page, "this account isn&#39;t allowed in this workspace") != NULL);
         CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
         CHECK(strcmp(oc_client_model(c)->last_error, "this account isn't allowed in this workspace") == 0);
         oc_client_stop(c);
