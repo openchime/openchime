@@ -85,7 +85,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
@@ -274,14 +274,34 @@ STT_SRC   += daemon/tts_data.c
 endif
 endif
 
+# --- Summaries in the daemon (ARCH-116) -----------------------------------------
+# On by default: llama.cpp, built from pinned source as one static archive
+# (scripts/build_llamacpp.sh), runs the summary model inside openchimed on one
+# thread. The model itself is DATA, fetched on first use when an operator turns
+# summaries on (OPENCHIME_SUMMARY=local), never shipped. Everything else of
+# summaries -- the pieces, prompts, checks, storage and worker -- is plain C in
+# DAEMON_SRC, so `make test` drives it with a stub model. `make SUM=0` builds
+# without llama.cpp; summaries are then never available.
+SUM ?= 1
+LLAMA_DIR := third_party/llamacpp-0.5.0
+LLAMA_A   := $(LLAMA_DIR)/lib/libllamacpp.a
+ifeq ($(SUM),1)
+SUM_SRC   := daemon/sum_llama.c
+SUM_DEPS  := $(LLAMA_A)
+SUM_FLAGS := -DOC_SUM -I$(LLAMA_DIR)/include
+SUM_LIBS  := $(LLAMA_A)
+TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl
+SUM_CXX   := $(if $(filter 1,$(TTS) $(STT)),,$(TTS_CXXLIB) -lm)
+endif
+
 # ONNX Runtime and its C++ runtime, once, for whichever speech features are in.
 ifneq ($(filter 1,$(TTS) $(STT)),)
 TTS_CXXLIB ?= -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl
 ORT_LIBS  := $(ORT_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SQLITE_O) $(CC_STAMP)
-	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(ORT_LIBS) $(LDFLAGS)
+$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(CC_STAMP)
+	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
 
 # The data directory, and its manifest written by the daemon just built -- so the
 # version it names is exactly the version compiled in. Rebuilt whenever the daemon
@@ -303,6 +323,17 @@ all: $(TTS_DATA) $(STT_DATA)
 
 $(ORT_A): daemon/ort.ops.config
 	scripts/build_onnxruntime.sh
+$(LLAMA_A): scripts/build_llamacpp.sh
+	scripts/build_llamacpp.sh
+
+# The summary evaluation tool (docs/SUMMARIES.md §7): the daemon's summary code
+# outside the daemon. Development only; not built by `all`, never installed.
+SUMEVAL_SRC := scripts/sumeval.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c \
+               daemon/sum_llama.c daemon/json.c daemon/migrate.c shared/speakable.c shared/richtext.c \
+               shared/mention.c shared/url.c
+build/sumeval: $(SUMEVAL_SRC) $(LLAMA_A) $(SQLITE_O) $(HDRS) | build
+	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) -I$(LLAMA_DIR)/include -o $@ $(SUMEVAL_SRC) $(SQLITE_O) $(LLAMA_A) \
+	    -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl -lpthread -lm
 $(KITTEN) build/kitten/voices.npz: scripts/build_kitten.sh scripts/tts_convert.c
 	scripts/build_kitten.sh
 build/moonshine/.done: scripts/build_moonshine.sh
@@ -344,14 +375,14 @@ RELEASE_CC ?= /opt/zig/zig cc -target x86_64-linux-gnu.2.34
 # as well: -Werror makes any warning clang raises and gcc does not fatal.
 RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
                        $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
-check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
-	@for f in $(SRC) $(TTS_SRC) $(STT_SRC); do \
-	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) -c -o /dev/null $$f || exit 1; \
+check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A)
+	@for f in $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC); do \
+	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -c -o /dev/null $$f || exit 1; \
 	done
 	@for f in $(RELEASE_CC_TEST_SRC); do \
 	  $(RELEASE_CC) $(CFLAGS) $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) \
 	    -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen -c -o /dev/null $$f || exit 1; \
-	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
+	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI.

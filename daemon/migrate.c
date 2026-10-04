@@ -1231,6 +1231,47 @@ static const char MIGRATION_0056[] =
     "  WHERE substr(CAST(excerpt AS TEXT), 1, 4) = '/me '"
     "    AND substr(ltrim(substr(CAST(excerpt AS TEXT), 4), ' '), 1, 1) NOT IN ('', char(9), char(10), char(13));";
 
+static const char MIGRATION_0057[] =
+    /* Channel and DM summaries (REQ-310, ARCH-116, docs/SUMMARIES.md). A summary
+     * is a tree: chunk summaries of whole messages, a thread's summary over its
+     * chunks when it is too big for one, sections over a long list of children,
+     * and the summary of a period on top. Every node lists what it was built
+     * from in summary_inputs -- a message (with its edited-at stamp at build
+     * time, so a late result after an edit is refused) or another node -- so a
+     * change to a message deletes exactly the nodes built on it, up the tree.
+     * `ikey` names a node's inputs, so the same chunk is found again rather than
+     * rebuilt; `version` names the model, prompts and constants it was built
+     * with. body is the stored JSON (SUMMARIES.md §3). An id is never reused,
+     * so a client can tell a rebuilt summary from the one it holds. */
+    "CREATE TABLE summary_nodes ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  channel_id     INTEGER NOT NULL,"
+    "  kind           INTEGER NOT NULL CHECK (kind IN (0,1,2,3)),"
+    "  ikey           TEXT NOT NULL,"
+    "  root_id        INTEGER,"
+    "  first_msg_id   INTEGER,"
+    "  last_msg_id    INTEGER,"
+    "  start_ms       INTEGER NOT NULL,"
+    "  end_ms         INTEGER NOT NULL,"
+    "  tz_offset_min  INTEGER NOT NULL DEFAULT 0,"
+    "  version        TEXT NOT NULL,"
+    "  body           BLOB NOT NULL,"
+    "  tokens_in      INTEGER NOT NULL DEFAULT 0,"
+    "  cpu_ms         INTEGER NOT NULL DEFAULT 0,"
+    "  created_at_ms  INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX idx_sum_nodes_ikey ON summary_nodes(ikey, version);"
+    "CREATE INDEX idx_sum_nodes_period ON summary_nodes(channel_id, kind, start_ms, end_ms, tz_offset_min);"
+    "CREATE TABLE summary_inputs ("
+    "  parent_id    INTEGER NOT NULL REFERENCES summary_nodes(id) ON DELETE CASCADE,"
+    "  ord          INTEGER NOT NULL,"
+    "  child_kind   INTEGER NOT NULL CHECK (child_kind IN (0,1)),"
+    "  child_id     INTEGER NOT NULL,"
+    "  child_stamp  INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (parent_id, ord)"
+    ");"
+    "CREATE INDEX idx_sum_inputs_child ON summary_inputs(child_kind, child_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1288,6 +1329,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 54, MIGRATION_0054 },
     { 55, MIGRATION_0055 },
     { 56, MIGRATION_0056 },
+    { 57, MIGRATION_0057 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -12,6 +12,7 @@
 #ifndef OPENCHIME_DBWRITER_H
 #define OPENCHIME_DBWRITER_H
 
+#include "sum_worker.h"   /* summaries: the worker's batch and answer (ARCH-116) */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -251,7 +252,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SESSIONS_SEEN = 130,
        /* A local account's own address (`pf_name` the address): PROFILE_INFO, or
         * PROFILE_ERR. */
-       OC_JOB_SET_EMAIL = 131 };
+       OC_JOB_SET_EMAIL = 131,
+       /* Summaries (REQ-310, ARCH-116): find a period's summary, or say what
+        * the worker must build; and store what the worker built. */
+       OC_JOB_SUMMARY_LOOKUP = 132,
+       OC_JOB_SUMMARY_STORE = 133 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -540,6 +545,14 @@ typedef struct oc_job {
     /* ALERT_* (REQ-263): heap strings; the entry acknowledged. */
     char          *alert_key, *alert_message;
     uint64_t       alert_id;
+    /* SUMMARY_LOOKUP (REQ-310): the request as sent, and the version current
+     * summaries are built with (heap). SUMMARY_STORE: the worker's batch,
+     * borrowed -- the worker waits on it until the writer is done. */
+    uint32_t       sum_req;
+    uint8_t        sum_scope;
+    uint64_t       sum_start, sum_end;
+    char          *sum_version;
+    struct oc_sum_batch *sum_batch;
 } oc_job;
 
 /* CALL_AUTH's question: a join (perhaps starting, with invitations) or an
@@ -674,7 +687,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * code, `body` its base32. */
        OC_RES_WEB_SECURITY = 111,
        /* A reset link made: `user_id` the account, `body` the token, hex. */
-       OC_RES_CREDENTIAL_RESET = 112 };
+       OC_RES_CREDENTIAL_RESET = 112,
+       /* SUMMARY: the answer to a SUMMARIZE (sum_status, sum_body); SUMMARY_NEED:
+        * nothing stored yet -- the span, for the worker to build. */
+       OC_RES_SUMMARY = 113, OC_RES_SUMMARY_NEED = 114 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1258,6 +1274,14 @@ typedef struct oc_dbres {
         char     key[OC_MAX_ALERT_KEY + 1], message[OC_MAX_ALERT_MESSAGE + 1];
     }                      *alert_rows;
     size_t                  n_alert_rows;
+    /* SUMMARY / SUMMARY_NEED (REQ-310): the request, the span resolved for the
+     * reader, and on SUMMARY the answer (heap strings). */
+    uint32_t                sum_req;
+    uint8_t                 sum_status;
+    uint64_t                sum_id;
+    int64_t                 sum_start, sum_end;
+    int                     sum_tz;
+    char                   *sum_body, *sum_version;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -1435,6 +1459,11 @@ void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token);
 
 /* Hand a job to the writer (transfers ownership; the writer frees it). */
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
+/* Store a summary batch through the writer and wait for it (the summary
+ * worker's sink, ARCH-116): 0 stored, 1 refused because a message changed, -1.
+ * The answer, when someone waits, comes back to the net loop as OC_RES_SUMMARY.
+ * With `a` NULL it instead removes nodes nothing uses (oc_sum_collect). */
+int        oc_dbwriter_sum_store(oc_dbwriter *w, const oc_sum_answer *a, oc_sum_new *nodes, int n);
 /* Pop the next completed result, or NULL when drained. Caller frees it. */
 oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);
 void       oc_dbres_free(oc_dbres *r);

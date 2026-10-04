@@ -384,6 +384,24 @@ int oc_config_load(char *err, size_t errcap) {
      * refused at startup by main.c rather than quietly falling back. */
     c->tts.lang      = env_or2("OPENCHIME_TTS_LANG", NULL, "en-US");
 
+    /* Summaries (REQ-310, ARCH-116): off unless the operator asks. "local" runs
+     * the model inside the daemon, fetched on first start; "cloud" names a model
+     * and a key for a hosted one. Anything else is a mistake worth stopping on.
+     * Whether it actually comes on is decided at startup (main.c): a model that
+     * will not load or answer leaves summaries off. */
+    {
+        const char *m = env_or2("OPENCHIME_SUMMARY", NULL, "off");
+        if (!strcmp(m, "off")) c->summary.mode = OC_SUMMARY_OFF;
+        else if (!strcmp(m, "local")) c->summary.mode = OC_SUMMARY_LOCAL;
+        else if (!strcmp(m, "cloud")) c->summary.mode = OC_SUMMARY_CLOUD;
+        else {
+            snprintf(err, errcap, "OPENCHIME_SUMMARY must be off, local or cloud, not '%s'", m);
+            return -1;
+        }
+        c->summary.model   = env_or2("OPENCHIME_SUMMARY_MODEL", NULL, "");
+        c->summary.api_key = env_or2("OPENCHIME_SUMMARY_API_KEY", NULL, "");
+    }
+
     /* Voice input (ARCH-112). Its language is the recognizer's own; there is no
      * second model to choose between, so it has no language setting. */
     c->stt.enabled   = env_int("OPENCHIME_STT", NULL, 1) != 0;

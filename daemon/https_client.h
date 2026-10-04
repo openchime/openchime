@@ -13,6 +13,7 @@
 #define OPENCHIME_HTTPS_CLIENT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     int    status;          /* the HTTP status, 0 if none was read */
@@ -35,5 +36,13 @@ int oc_https_request(const char *method, const char *url, const char *ctype,
 int oc_https_header(const oc_https_resp *r, const char *name, char *out, size_t cap);
 
 void oc_https_resp_free(oc_https_resp *r);
+
+/* GET `url` into the file at `path` (created or truncated), following up to
+ * five redirects, refusing more than `max_bytes`, hashing what is written:
+ * its SHA-256 into `sha256`. For files too big to hold in memory (the summary
+ * model, ARCH-116). `stop` (may be NULL), once set, ends the download. 0, or -1
+ * with `err` saying why. */
+int oc_https_download(const char *url, const char *path, uint64_t max_bytes, int timeout_ms,
+                      const volatile int *stop, unsigned char sha256[32], char *err, size_t errcap);
 
 #endif /* OPENCHIME_HTTPS_CLIENT_H */

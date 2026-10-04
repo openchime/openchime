@@ -111,6 +111,7 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73) | https://opus-codec.org | BSD-3-Clause |
 | **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
+| **llama.cpp** (with ggml) | 0.5.0 | Running the summary model, built from source **CPU only and static** (no OpenMP, no tools, no network code) | Daemon (summaries ARCH-116) | https://github.com/ggml-org/llama.cpp | MIT |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: eight files — the frontend, encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
@@ -192,6 +193,24 @@ operator config (`daemon/ort.ops.config`) is the union of both models':
   checks at startup. `make STT=0` builds a daemon without voice input.
 
 Moonshine's MIT notice travels with every package through `packaging/licenses.sh`.
+
+**The summary model's engine** (ARCH-116) is llama.cpp, the second C++
+dependency, built the same way:
+
+- `scripts/build_llamacpp.sh` fetches the v0.5.0 **source** tarball
+  (SHA-256-verified) and builds `libllama` and ggml with CMake: CPU only, static,
+  no OpenMP (it would add libgomp to the daemon's runtime), no tools, examples,
+  server or network code; x86-64 compiled for x86-64-v3 (AVX2), arm64 for its
+  baseline. The archives are merged into one
+  `third_party/llamacpp-0.5.0/lib/libllamacpp.a` beside `llama.h` and the ggml
+  headers. It needs CMake 3.14+ and a C++17 compiler, and takes a few minutes. The
+  daemon links it with the same static C++ runtime as ONNX Runtime. `make SUM=0`
+  builds without it.
+- **The model is never shipped**: the daemon fetches it on first use from a pinned
+  address and checks a pinned SHA-256 (SUMMARIES.md §6). It is Qwen3.5 0.8B
+  (Apache-2.0), 4-bit GGUF.
+
+llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.
 
 **speexdsp** is fetched by `scripts/build_speexdsp.sh` — `native` for `make test`,
 `windows` for the Win32 client — SHA-256-verified and refusing an unpinned bump,

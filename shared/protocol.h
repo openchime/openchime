@@ -506,6 +506,12 @@ typedef enum {
      * whole, in BROADCAST's layout, replacing its tombstone. */
     OC_MSG_RESTORE              = 0x00FA, /* C->S { channel_id, message_id } */
     OC_MSG_MSG_RESTORED         = 0x00FB, /* S->C, BROADCAST's layout */
+    /* A summary of a channel or DM (REQ-310, ARCH-116, SUMMARIES.md): the
+     * client names the span -- unread, the last seven days, a range, the daily
+     * recap -- and the daemon answers once it is built, which on a small
+     * machine may take minutes. Only when the "summarize" capability was sent. */
+    OC_MSG_SUMMARIZE            = 0x00FD, /* C->S */
+    OC_MSG_SUMMARY              = 0x00FE, /* S->C, the answer to one SUMMARIZE */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -999,6 +1005,18 @@ typedef struct { uint64_t message_id; uint64_t channel_id;
  * message's body. text_len 0: not an action. */
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t actor_id;
                  oc_slice actor_name; uint32_t text_start; uint32_t text_len; } oc_action;
+/* SUMMARIZE (REQ-310): which span of a channel or DM to summarize. scope
+ * OC_SUM_UNREAD (from the reader's place to now), OC_SUM_WEEK (the last seven
+ * days, today included), OC_SUM_RANGE ([start_ms, end_ms)), OC_SUM_DAILY (the
+ * day before today, or every day since the reader was last about). Days are the
+ * reader's, by their time zone. req_id is echoed on the answer. */
+enum { OC_SUM_UNREAD = 0, OC_SUM_WEEK = 1, OC_SUM_RANGE = 2, OC_SUM_DAILY = 3 };
+typedef struct { uint32_t req_id; uint64_t channel_id; uint8_t scope; uint64_t start_ms; uint64_t end_ms; } oc_summarize;
+/* SUMMARY: status OC_SUM_OK with the span summarized and the summary as JSON
+ * (SUMMARIES.md §3) in body; otherwise body is a sentence saying why. */
+enum { OC_SUM_OK = 0, OC_SUM_UNAVAILABLE = 1, OC_SUM_FORBIDDEN = 2, OC_SUM_FAILED = 3 };
+typedef struct { uint32_t req_id; uint8_t status; uint64_t summary_id; uint64_t channel_id;
+                 uint64_t start_ms; uint64_t end_ms; oc_slice version; oc_slice body; } oc_summary;
 
 /* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
  * follow the LIST_PINS shape — stream the entries, then a terminator — because
@@ -1454,6 +1472,7 @@ typedef struct { oc_slice model_version; uint8_t count;
 #define OC_CAP_STT "stt"   /* speak a message and have it land as text */
 #define OC_CAP_CALLS "calls" /* talk in a call (REQ-150, REQ-301) */
 #define OC_CAP_CALLS_TCP "calls-tcp" /* call media over the connection (CALL_MEDIA) */
+#define OC_CAP_SUMMARIZE "summarize" /* summaries of a channel or DM (REQ-310) */
 typedef struct { uint8_t count; oc_slice names[OC_CAP_MAX]; } oc_capabilities;
 typedef struct { uint64_t message_id; } oc_audio_get;
 /* Hear voice `voice_id` (an id TTS_INFO listed) say TTS_INFO's preview sentence.
@@ -1612,6 +1631,8 @@ oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updat
 oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m);
 oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m);
 oc_result oc_encode_action(oc_wbuf *w, uint16_t version, const oc_action *m);
+oc_result oc_encode_summarize(oc_wbuf *w, uint16_t version, const oc_summarize *m);
+oc_result oc_encode_summary(oc_wbuf *w, uint16_t version, const oc_summary *m);
 oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_attach_media_set *m);
 oc_result oc_encode_attach_media_ok(oc_wbuf *w, uint16_t version, const oc_attach_media_ok *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
@@ -1890,6 +1911,8 @@ oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
 oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
 oc_result oc_decode_action(oc_rbuf *p, oc_action *m);
+oc_result oc_decode_summarize(oc_rbuf *p, oc_summarize *m);
+oc_result oc_decode_summary(oc_rbuf *p, oc_summary *m);
 oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m);
 oc_result oc_decode_attach_media_ok(oc_rbuf *p, oc_attach_media_ok *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);

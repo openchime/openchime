@@ -1394,6 +1394,41 @@ where one exists.
   tenant's own box to be recognized, and nothing in the recognition chain has been
   under a copyleft licence (ARCH-112).
 
+### 6.6 Summaries
+
+*Design: [SUMMARIES.md](./SUMMARIES.md).*
+
+- **REQ-310.** A user has been able to **summarize a channel or DM** they can
+  read, over one of four spans: what they have not read, the last seven days, a range
+  they choose, and a daily recap of the day before (or of every day since they were
+  last about, up to a week). Days have been the reader's own, by their time zone. A
+  summary has said what happened in short structured parts — an overview, decisions
+  and who made them, actions and who has them, open or done, problems, and key facts —
+  each part citing the messages it came from. Messages from integrations, call events
+  and deleted messages have not been summarized.
+- **REQ-311.** A summary has been **made on the server, by a small model, from small
+  pieces**: a channel cut into chunks of whole messages (a whole thread where it
+  fits), each summarized, then rolled up — a big thread into one summary, many
+  pieces into sections, sections into the span asked for. Every piece has been kept
+  and reused by every later summary that covers it. Nothing a model wrote has been
+  kept that cited a message or person not in its piece, or stated a number its
+  sources do not contain. The work has run only in the machine's idle time, on one
+  core, and has paused while the machine's CPU was busy, its memory low or its people
+  busy with it; a summary someone is waiting for has been made first, and recent days
+  of active conversations have been summarized ahead of being asked.
+- **REQ-312.** A summary has been **kept current**: a message sent, edited,
+  deleted or restored has removed every summary built on it, and the next request has
+  built them again from what is there now. A summary made by an older model or prompt
+  has been served until the new one was made.
+- **REQ-313.** Summaries have been **absent unless the operator turns them on**: off
+  by default; *local* runs the model inside the daemon, fetched on first start from a
+  pinned address and checked against a pinned SHA-256, kept beside the database and
+  never shipped in a package; a model that cannot be fetched, loaded or made to
+  answer has left summaries off, said why in the log, and left the rest of the server
+  running. Where summaries are off, no client has shown them. In local mode no message
+  text has left the tenant's own box to be summarized, and nothing in the summary
+  chain has been under a copyleft licence (ARCH-116).
+
 ---
 
 ## 7. Integrations
@@ -2279,4 +2314,6 @@ feature.*
 - **REQ-275.** *(Excluded by decision)* A **first-party bot/assistant and an MCP (Model Context Protocol)
   server surface** have not been provided beyond the third-party app platform
   (REQ-172). OpenChime ships no built-in assistant and exposes no MCP server; such
-  a thing could be built as an installed app, but is not a core feature.
+  a thing could be built as an installed app, but is not a core feature. Summaries
+  of a channel or DM (REQ-310) are a core feature and are not an assistant: they
+  answer no questions, take no actions and post nothing.

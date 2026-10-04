@@ -122,6 +122,12 @@ void oc_netloop_set_tts(const struct oc_tts_engine *engine);
 struct oc_stt_engine;
 void oc_netloop_set_stt(const struct oc_stt_engine *engine);
 
+/* Wire the summary worker (REQ-310, ARCH-116). Set only when summaries are on
+ * and the model answered at startup; NULL (the default) means the daemon
+ * advertises no "summarize" and answers SUMMARIZE with OC_SUM_UNAVAILABLE. */
+struct oc_sum_worker;
+void oc_netloop_set_summary(struct oc_sum_worker *w);
+
 /* What the loop's turns cost, for the load harness and the tests that hold the
  * loop to a bound. A turn is the work between one epoll_wait returning and the
  * next being called; waiting is not counted. Durations go into a histogram of

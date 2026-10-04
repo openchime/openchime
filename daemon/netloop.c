@@ -15,6 +15,7 @@
 #include "xferpool.h"
 #ifdef OC_TTS
 #include "tts_worker.h"
+#include "sum_worker.h"
 #endif
 #ifdef OC_STT
 #include "stt_mentions.h"
@@ -321,6 +322,8 @@ static __thread oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69
  * voice model; a test passes a stub), and the worker exists only when the
  * operator left the feature on. */
 static const oc_tts_engine *g_tts_engine;
+/* The summary worker (ARCH-116): NULL when summaries are off. */
+static oc_sum_worker *g_sum;
 static __thread oc_tts_worker       *g_tts;
 /* Renders in flight, so two listeners asking for the same message at the same
  * moment cost one render: the first submits, the rest wait on the same handle. */
@@ -1221,6 +1224,11 @@ void oc_netloop_set_ready(void (*ready)(void *ctx), void *ctx) {
 
 /* Link-unfurl worker (REQ-222, ARCH-105), NULL = unfurls disabled. */
 static oc_unfurler *g_unfurler;
+
+/* Set from the thread that brings summaries up once the model has answered, and
+ * read by the loop: published atomically. */
+void oc_netloop_set_summary(struct oc_sum_worker *w) { __atomic_store_n(&g_sum, w, __ATOMIC_RELEASE); }
+static oc_sum_worker *sum_worker(void) { return __atomic_load_n(&g_sum, __ATOMIC_ACQUIRE); }
 
 void oc_netloop_set_tts(const struct oc_tts_engine *engine) {
 #ifdef OC_TTS
@@ -2279,6 +2287,25 @@ static void download_pump(conn *c) {
 /* Defined below with the HTTP webhook path; declared here for the redeem path. */
 static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap);
 
+/* A SUMMARY frame to one connection (REQ-310). */
+static void send_summary(int ep, conn **conns, conn *c, uint32_t req, uint8_t status, uint64_t channel,
+                         uint64_t id, int64_t start, int64_t end, const char *version, const char *body) {
+    oc_summary sm;
+    memset(&sm, 0, sizeof sm);
+    sm.req_id = req;
+    sm.status = status;
+    sm.summary_id = id;
+    sm.channel_id = channel;
+    sm.start_ms = (uint64_t)start;
+    sm.end_ms = (uint64_t)end;
+    sm.version = oc_slice_str(version ? version : "");
+    sm.body = oc_slice_str(body ? body : "");
+    oc_wbuf w;
+    oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+    if (oc_encode_summary(&w, OC_PROTOCOL_VERSION, &sm) != OC_OK) return;
+    send_bytes(ep, conns, c->fd, g_enc, w.len);
+}
+
 static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
     const uint8_t *frame; size_t flen;
     for (;;) {
@@ -2439,6 +2466,29 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->channel_id = e.channel_id;
             j->message_id = e.message_id;
             if (oc_job_set_body(j, e.body.ptr, e.body.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SUMMARIZE) {
+            /* A summary (REQ-310): the reader finds a stored one or names the
+             * span; the worker builds what is missing (OC_RES_SUMMARY_NEED). */
+            oc_summarize sm;
+            if (oc_decode_summarize(&p, &sm) != OC_OK) return -1;
+            oc_sum_worker *sw = sum_worker();
+            if (!sw) {
+                send_summary(ep, conns, c, sm.req_id, OC_SUM_UNAVAILABLE, sm.channel_id, 0, 0, 0, "",
+                             "Summaries are not turned on.");
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_SUMMARY_LOOKUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = sm.channel_id;
+            j->sum_req = sm.req_id;
+            j->sum_scope = sm.scope;
+            j->sum_start = sm.start_ms;
+            j->sum_end = sm.end_ms;
+            j->sum_version = strdup(oc_sum_worker_version(sw));
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -5259,6 +5309,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             memset(&caps, 0, sizeof caps);
 #ifdef OC_TTS
             if (g_tts && g_tts_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_TTS);
+            if (sum_worker()) caps.names[caps.count++] = oc_slice_str(OC_CAP_SUMMARIZE);
 #endif
 #ifdef OC_STT
             if (g_stt && g_stt_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_STT);
@@ -6399,6 +6450,26 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         x->in_flight = 1;
         oc_xferpool_submit(g_xfers, j);
         update_interest(ep, c);
+        break;
+    }
+    case OC_RES_SUMMARY: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        const char *why = r->sum_status == OC_SUM_FORBIDDEN ? "You cannot read that conversation."
+                        : r->sum_status == OC_SUM_FAILED && !r->sum_body ? "The summary could not be made."
+                        : r->sum_body;
+        send_summary(ep, conns, c, r->sum_req, r->sum_status, r->channel_id, r->sum_id, r->sum_start,
+                     r->sum_end, r->sum_version, why);
+        break;
+    }
+    case OC_RES_SUMMARY_NEED: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_sum_worker *sw = sum_worker();
+        if (!sw || oc_sum_worker_request(sw, r->conn_id, r->sum_req, (int64_t)r->channel_id,
+                                            r->sum_start, r->sum_end, r->sum_tz) != 0)
+            send_summary(ep, conns, c, r->sum_req, OC_SUM_UNAVAILABLE, r->channel_id, 0, r->sum_start,
+                         r->sum_end, "", "Too many summaries are being made; try again shortly.");
         break;
     }
     case OC_RES_STORAGE_STATUS: {

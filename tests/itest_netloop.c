@@ -15,6 +15,7 @@
 #include "tts_render.h"
 #include "stt_render.h"
 #include "check.h"
+#include "sum_worker.h"
 #include "sqlite3.h"
 #include "signin.h"       /* a verifier and its challenge, as a client makes them */
 #include "localissuer.h"   /* a token the daemon did not sign, to refuse */
@@ -328,6 +329,7 @@ static int do_handshake(client *c) {
 static int      g_auth_stt;
 static uint32_t g_auth_stt_max_ms;
 
+static int g_auth_summarize;   /* the last sign-in was told "summarize" (REQ-310) */
 static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
@@ -351,8 +353,12 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
         oc_capabilities cp;
         if (oc_decode_capabilities(&p, &cp) != OC_OK) return -1;
         g_auth_stt = 0;
-        for (uint8_t k = 0; k < cp.count; k++)
+        g_auth_summarize = 0;
+        for (uint8_t k = 0; k < cp.count; k++) {
             if (cp.names[k].len == 3 && memcmp(cp.names[k].ptr, OC_CAP_STT, 3) == 0) g_auth_stt = 1;
+            if (cp.names[k].len == strlen(OC_CAP_SUMMARIZE) &&
+                memcmp(cp.names[k].ptr, OC_CAP_SUMMARIZE, cp.names[k].len) == 0) g_auth_summarize = 1;
+        }
     }
     /* Then read-aloud's voices, sent whether or not it is offered. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_TTS_INFO) return -1;
@@ -3481,6 +3487,175 @@ static void test_voice_input_absent(int port, int by_env) {
     unlink("build/itest_stt_off.db-shm");
 }
 
+/* Summaries over the wire (REQ-310, ARCH-116): the "summarize" capability is
+ * told only when the worker is wired; a SUMMARIZE is built by the worker (a stub
+ * model here) and answered with SUMMARY; asked again it comes from the store
+ * without the model; an edit purges it and the next request builds again; with
+ * no worker the answer is UNAVAILABLE. Its own daemon and database, so the
+ * shared one's channel history does not enter the summary. */
+typedef struct { int calls; } sum_stub;
+static void *sstub_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
+static void sstub_close(void *h) { (void)h; }
+static int sstub_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+                     oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)system; (void)user; (void)grammar; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
+    __atomic_add_fetch(&((sum_stub *)h)->calls, 1, __ATOMIC_RELAXED);
+    if (st) memset(st, 0, sizeof *st);
+    *out = strdup("{\"overview\":\"P1 set the ship date.\",\"decisions\":[{\"text\":\"Ship on Friday\","
+                  "\"by\":[\"P1\"],\"refs\":[\"m1\"]}],\"actions\":[],\"problems\":[],\"facts\":[]}");
+    return 0;
+}
+static int sq_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
+static int sq_mem(void *c, uint64_t *m) { (void)c; *m = 1u << 20; return 0; }
+static int sq_net(void *c, uint64_t *n) { (void)c; *n = 0; return 0; }
+static uint64_t sq_now(void *c) { (void)c; static uint64_t t; t += SUM_LOAD_SAMPLE_MS; return t; }
+static oc_dbwriter *g_sum_dbw;
+static int sq_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    (void)ctx;
+    return oc_dbwriter_sum_store(g_sum_dbw, a, nodes, n);
+}
+
+static int summarize_await(client *c, uint32_t req, uint8_t scope, oc_summary *out, char *body, size_t cap) {
+    uint8_t buf[128];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_summarize sm = { req, OC_DEFAULT_CHANNEL, scope, 0, 0 };
+    if (oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &sm) != OC_OK || send_frame(c, buf, w.len) != 0) return -1;
+    for (int i = 0; i < 50; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) return -1;
+        if (hdr.msg_type != OC_MSG_SUMMARY) continue;
+        if (oc_decode_summary(&p, out) != OC_OK || out->req_id != req) return -1;
+        snprintf(body, cap, "%.*s", (int)out->body.len, (const char *)out->body.ptr);
+        return 0;
+    }
+    return -1;
+}
+
+static void test_summaries(int port) {
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+    unlink("build/itest_sum.db");
+    unlink("build/itest_sum.db-wal");
+    unlink("build/itest_sum.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_sum.db");
+    CHECK(dbw2 != NULL);
+    CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
+    g_sum_dbw = dbw2;
+    sum_stub stub = {0};
+    static oc_sum_engine eng;
+    eng.ctx = &stub; eng.version = "stub"; eng.open = sstub_open; eng.close = sstub_close; eng.run = sstub_run;
+    static oc_sum_probe quiet = { sq_cpu, sq_mem, sq_net, sq_now, NULL };
+    oc_sum_worker_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.db_path = "build/itest_sum.db";
+    cfg.engine = &eng;
+    cfg.probe = &quiet;
+    cfg.sink.store = sq_store;
+    char err[256] = "";
+    oc_sum_worker *wk = oc_sum_worker_start(&cfg, err, sizeof err);
+    CHECK(wk != NULL);
+    oc_netloop_set_summary(wk);
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    client a;
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_summarize == 1);
+
+    /* One message to summarize. */
+    uint8_t buf[256];
+    oc_wbuf w;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s = {0};
+    s.channel_id = OC_DEFAULT_CHANNEL;
+    memset(s.idem, 0x5a, OC_IDEM_SIZE);
+    s.body = oc_slice_str("We ship on Friday.");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint64_t mid = 0;
+    for (int i = 0; i < 20 && !mid; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); mid = ack.message_id; }
+    }
+    CHECK(mid != 0);
+
+    oc_summary sm;
+    char body[4096];
+    CHECK(summarize_await(&a, 7, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
+    CHECK(sm.status == OC_SUM_OK && sm.summary_id != 0 && sm.end_ms > sm.start_ms);
+    CHECK(strstr(body, "Ship on Friday") != NULL && strstr(body, "\"people\"") != NULL);
+    int calls = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
+    CHECK(calls >= 1);
+    uint64_t first = sm.summary_id;
+
+    /* Again: from the store, the model not asked. */
+    CHECK(summarize_await(&a, 8, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
+    CHECK(sm.status == OC_SUM_OK && sm.summary_id == first);
+    CHECK(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == calls);
+
+    /* An edit purges it; the next request builds again. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e = { OC_DEFAULT_CHANNEL, mid, oc_slice_str("We ship on Monday.") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    int edited = 0;
+    for (int i = 0; i < 20 && !edited; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        edited = hdr.msg_type == OC_MSG_MSG_EDITED;
+    }
+    CHECK(edited);
+    CHECK(summarize_await(&a, 9, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
+    CHECK(sm.status == OC_SUM_OK && sm.summary_id != first);
+    CHECK(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) > calls);
+
+    /* A channel the reader cannot read is refused. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_summarize no = { 10, 999999, OC_SUM_WEEK, 0, 0 };
+    CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &no) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    int refused = 0;
+    for (int i = 0; i < 50 && !refused; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        if (read_frame(&a, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_SUMMARY && oc_decode_summary(&p, &sm) == OC_OK && sm.req_id == 10)
+            refused = sm.status == OC_SUM_FORBIDDEN ? 1 : -1;
+    }
+    CHECK(refused == 1);
+
+    /* Without the worker: no capability, and SUMMARIZE is unavailable. */
+    oc_netloop_set_summary(NULL);
+    CHECK(summarize_await(&a, 11, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
+    CHECK(sm.status == OC_SUM_UNAVAILABLE);
+    client_close(&a);
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_summarize == 0);
+    client_close(&a);
+
+    stop_loop(&arg2, th2);
+    oc_sum_worker_stop(wk);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unlink("build/itest_sum.db");
+    unlink("build/itest_sum.db-wal");
+    unlink("build/itest_sum.db-shm");
+}
+
 /* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
  * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
  * /webhook/<token>; the channel member receives the message as a BROADCAST and
@@ -6181,6 +6356,7 @@ int run_netloop_tests(void) {
     if (failures == 0) {
         test_voice_input_absent(arg.port + 124, 1);
         test_voice_input_absent(arg.port + 125, 0);
+        test_summaries(arg.port + 127);
         test_web_signin(arg.port + 128);
         test_device_signin(arg.port + 130);
         test_direct_signin(arg.port + 131);
