@@ -13,7 +13,16 @@
 #include <string.h>
 #include <time.h>
 
+/* llama.cpp's headers repeat three typedefs, which C99 does not allow and
+ * Clang reports as an error under -Werror; it is their headers, not this code. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wtypedef-redefinition"
+#endif
 #include "llama.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 /* Ask the gate every this many tokens. */
 #define SUM_CHECK_TOKENS 16
