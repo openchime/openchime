@@ -81,7 +81,7 @@ say "build"
 make -C "$HERE" >/dev/null 2>&1 || { say "  FAIL daemon build"; exit 1; }
 make -C "$HERE" windows-gui >/dev/null 2>&1 || { say "  FAIL gui build"; exit 1; }
 
-OC_DRIVE_NO_BUILD=1 "$DRIVE" launch "127.0.0.1:$OC_DEV_PORT" "alice:pw" >/dev/null 2>&1
+OC_DRIVE_NO_BUILD=1 "$DRIVE" launch "$("$DRIVE" devaddr)" "alice:pw" >/dev/null 2>&1
 signed_in() { [ "$(key_of "$d" authed)" = "1" ]; }
 wait_for signed_in || { say "  FAIL never signed in"; exit 1; }
 

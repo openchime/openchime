@@ -1098,6 +1098,19 @@ real time three times in a single day before the guard existed.
 skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
 
+**The client is pointed at the address Windows reaches the daemon at.** Under
+WSL2 that is the WSL machine's own address (eth0's), not 127.0.0.1, which reaches
+a WSL listener only where localhost forwarding is on; elsewhere it is 127.0.0.1,
+and `OC_DEV_HOST` overrides either. `gui_drive.sh devaddr` prints the workspace
+`launch` defaults to, for a script that names it. At an address that is not
+loopback the dev daemon's self-signed certificate is asked about (ARCH-10), and
+`launch` answers Trust and connect for it — the daemon is the one the harness
+started — before it returns. It starts the client only once the daemon listens,
+waiting up to ninety seconds: the bootstrap accounts are hashed first, which for
+`gui_members.sh`'s sixty people is half a minute, and a client whose first attempt
+finds nothing there does not try again. Only the daemon on `OC_DEV_PORT` — found
+by its environment — is restarted.
+
 **Video messages drive on a synthetic camera.** Launch with
 `WSLENV=OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_AUDIO OPENCHIME_TEST_CAPTURE=synthetic
 OPENCHIME_TEST_AUDIO=synthetic scripts/gui_drive.sh launch` (add
