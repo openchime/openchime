@@ -29,6 +29,8 @@
 #include "srccount.h"   /* oc_source_key */
 #include "totp.h"
 #include "webauthn.h"
+#include "sum_store.h"    /* summaries purged with what they say (ARCH-116) */
+#include "sum_worker.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -303,6 +305,7 @@ static void job_free(oc_job *j) {
     free(j->unf_url);
     free(j->unf_title);
     free(j->unf_descr);
+    free(j->sum_version);
     free(j->call_uids);
     free(j->grp_handle); free(j->grp_name); free(j->grp_desc); free(j->grp_uids);
     free(j);
@@ -532,6 +535,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
     free(r->tts_text); free(r->tts_blob_key);
+    free(r->sum_body); free(r->sum_version);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
     free(r->call_uids);
@@ -3013,6 +3017,21 @@ static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
  * revoke access — sessions, channel memberships, and local password. The row
  * survives so their authored messages keep a valid author. Owner/admin only; an
  * admin cannot remove an admin/owner, and the last owner cannot be removed. */
+/* A message changed (sent, edited, deleted, restored): every summary built on
+ * it, or on its thread, or covering its moment, goes (REQ-310, ARCH-116). In
+ * the transaction that changed it, so a summary never outlives what it says. */
+static void sum_purge_msg(sqlite3 *db, uint64_t message_id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT channel_id, COALESCE(parent_id, id), created_at_ms FROM messages WHERE id=?1;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        oc_sum_purge(db, sqlite3_column_int64(st, 0), (int64_t)message_id, sqlite3_column_int64(st, 1),
+                     sqlite3_column_int64(st, 2));
+    sqlite3_finalize(st);
+}
+
 static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -3110,6 +3129,10 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db,
         "DELETE FROM drafts WHERE channel_id NOT IN (SELECT id FROM channels);", -1, &st, NULL);
+    sqlite3_step(st); sqlite3_finalize(st);
+    /* Summaries of the DMs that went with them (REQ-310). */
+    sqlite3_prepare_v2(db,
+        "DELETE FROM summary_nodes WHERE channel_id NOT IN (SELECT id FROM channels);", -1, &st, NULL);
     sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
@@ -4284,6 +4307,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
      * leave the sent text sitting in the composer of every other device. */
     drop_draft(db, j->user_id, j->channel_id, 0);
 
+    sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     r->type = OC_RES_SEND_OK;
@@ -4368,6 +4392,7 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     /* An edit can make an action or unmake one (REQ-058). */
     store_action(db, j->message_id);
+    sum_purge_msg(db, j->message_id);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     r->type = OC_RES_EDIT_OK;
@@ -4530,6 +4555,7 @@ static oc_dbres *process_restore(oc_dbwriter *w, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { free(body); r->type = OC_RES_RESTORE_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    sum_purge_msg(db, j->message_id);
     for (char *p = ids; *p; ) {
         long long aid = strtoll(p, &p, 10);
         if (aid > 0) {
@@ -4603,6 +4629,7 @@ static oc_dbres *process_delete(oc_dbwriter *w, const oc_job *j) {
     if (rc != SQLITE_DONE) {
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    sum_purge_msg(db, j->message_id);
     /* Detach the attachments (REQ-052). The row is not deleted and the blob is
      * not deleted here: setting message_id NULL makes them *orphans*, which is
      * exactly the state the storage-maintenance orphan sweep already collects
@@ -6269,6 +6296,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     drop_draft(db, j->user_id, j->channel_id, j->parent_id);
     store_action(db, mid);   /* a reply can be an action too (REQ-058) */
 
+    sum_purge_msg(db, mid);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     uint32_t count = 0;
@@ -9415,11 +9443,15 @@ static int is_read_job(int type) {
            type == OC_JOB_STORAGE_STATUS || type == OC_JOB_ALERTS_LIST ||
            type == OC_JOB_AUDIT_QUERY ||
            type == OC_JOB_TTS_LOOKUP || type == OC_JOB_TTS_PREVIEW ||
-           type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS;
+           type == OC_JOB_STT_PREP || type == OC_JOB_LIST_GROUPS ||
+           type == OC_JOB_SUMMARY_LOOKUP;
 }
+
+static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j);
 
 /* Dispatch a read-only job against `rdb`. */
 static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
+    if (j->type == OC_JOB_SUMMARY_LOOKUP) return process_summary_lookup(rdb, j);
     if (j->type == OC_JOB_BACKFILL)       return process_backfill(rdb, j);
     if (j->type == OC_JOB_HISTORY)        return process_history(rdb, j);
     if (j->type == OC_JOB_SEARCH)         return process_search(rdb, j);
@@ -9453,6 +9485,156 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     return NULL;
 }
 
+/* --- summaries (REQ-310, ARCH-116) ------------------------------------------------ */
+
+/* The worker's batch: it waits on `cv` until the writer has stored it. */
+struct oc_sum_batch {
+    pthread_mutex_t      mu;
+    pthread_cond_t       cv;
+    int                  done, rc;
+    const oc_sum_answer *a;
+    oc_sum_new          *nodes;
+    int                  n;
+};
+
+static oc_dbres *sum_answer(uint64_t conn_id, uint32_t req, uint8_t status, uint64_t channel) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_SUMMARY;
+    r->conn_id = conn_id;
+    r->sum_req = req;
+    r->sum_status = status;
+    r->channel_id = channel;
+    return r;
+}
+
+static oc_dbres *process_summary_store(sqlite3 *db, const oc_job *j) {
+    struct oc_sum_batch *b = j->sum_batch;
+    const oc_sum_answer *a = b->a;
+    oc_dbres *r = NULL;
+    int rc;
+    if (!a) {
+        /* No answer: the worker's housekeeping, nodes nothing uses any more. */
+        static const oc_sum_answer nobody;
+        rc = oc_sum_collect(db, (int64_t)dbw_now_ms(), (int64_t)SUM_KEEP_MS) < 0 ? -1 : 0;
+        a = &nobody;
+    } else {
+        rc = b->n ? oc_sum_store(db, a->channel, a->version, b->nodes, b->n) : 0;
+    }
+    if (a->conn_id && rc != 1) {
+        int ok = a->ok && rc == 0;
+        r = sum_answer(a->conn_id, a->req_id, ok ? OC_SUM_OK : OC_SUM_FAILED, (uint64_t)a->channel);
+        if (r) {
+            r->sum_start = a->start_ms;
+            r->sum_end = a->end_ms;
+            r->sum_tz = a->tz_offset_min;
+            r->sum_id = ok ? (uint64_t)(b->n ? b->nodes[b->n - 1].id : a->summary_id) : 0;
+            r->sum_body = strdup(ok ? a->body : (a->err ? a->err : "The summary could not be made."));
+            r->sum_version = strdup(a->version ? a->version : "");
+        }
+    }
+    if (!r) {
+        r = calloc(1, sizeof *r);
+        if (r) r->type = OC_RES_OK;
+    }
+    pthread_mutex_lock(&b->mu);
+    b->rc = rc;
+    b->done = 1;
+    pthread_cond_signal(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+    return r;
+}
+
+int oc_dbwriter_sum_store(oc_dbwriter *w, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    struct oc_sum_batch b;
+    memset(&b, 0, sizeof b);
+    pthread_mutex_init(&b.mu, NULL);
+    pthread_cond_init(&b.cv, NULL);
+    b.a = a;
+    b.nodes = nodes;
+    b.n = n;
+    oc_job *j = oc_job_new(OC_JOB_SUMMARY_STORE, 0);
+    if (!j) { pthread_mutex_destroy(&b.mu); pthread_cond_destroy(&b.cv); return -1; }
+    j->sum_batch = &b;
+    oc_dbwriter_submit(w, j);
+    pthread_mutex_lock(&b.mu);
+    while (!b.done) pthread_cond_wait(&b.cv, &b.mu);
+    pthread_mutex_unlock(&b.mu);
+    pthread_mutex_destroy(&b.mu);
+    pthread_cond_destroy(&b.cv);
+    return b.rc;
+}
+
+/* A SUMMARIZE: who may read the channel, the span as the reader means it, and
+ * the summary if one is stored (an older version's too: it is served while the
+ * worker makes the new one). */
+static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
+    if (!channel_read_access(rdb, j->channel_id, j->user_id))
+        return sum_answer(j->conn_id, j->sum_req, OC_SUM_FORBIDDEN, j->channel_id);
+    int tz = 0;
+    int64_t seen = 0, now = (int64_t)dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(rdb, "SELECT COALESCE(tz_offset_min,0), COALESCE(activity_seen_ms,0) FROM users WHERE id=?1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        if (sqlite3_step(st) == SQLITE_ROW) { tz = sqlite3_column_int(st, 0); seen = sqlite3_column_int64(st, 1); }
+    }
+    sqlite3_finalize(st);
+    const int64_t day = 86400000;
+    int64_t today = oc_sum_day_start(now, tz), start = 0, end = 0;
+    switch (j->sum_scope) {
+    case OC_SUM_WEEK:
+        start = today - 6 * day; end = today + day;
+        break;
+    case OC_SUM_DAILY:
+        end = today;
+        start = today - day;
+        /* Every day since the reader was last about, up to a week. */
+        if (seen && seen < start) start = oc_sum_day_start(seen, tz);
+        if (start < today - 7 * day) start = today - 7 * day;
+        break;
+    case OC_SUM_RANGE:
+        start = (int64_t)j->sum_start; end = (int64_t)j->sum_end;
+        if (end <= start || end - start > 31 * day)
+            return sum_answer(j->conn_id, j->sum_req, OC_SUM_FAILED, j->channel_id);
+        break;
+    default: {   /* OC_SUM_UNREAD: from the reader's place to the end of today */
+        start = today - 7 * day;
+        if (sqlite3_prepare_v2(rdb,
+                "SELECT m.created_at_ms FROM delivery_cursors c JOIN messages m ON m.id=c.message_id "
+                "WHERE c.user_id=?1 AND c.channel_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                int64_t c = sqlite3_column_int64(st, 0) + 1;
+                if (c > start) start = c;
+            }
+        }
+        sqlite3_finalize(st);
+        end = today + day;
+        break;
+    }
+    }
+    int64_t id = 0;
+    char *body = NULL, version[160] = "";
+    if (oc_sum_find_period(rdb, (int64_t)j->channel_id, start, end, tz, j->sum_version ? j->sum_version : "", 1,
+                           &id, &body, version, sizeof version)) {
+        oc_dbres *r = sum_answer(j->conn_id, j->sum_req, OC_SUM_OK, j->channel_id);
+        if (r) {
+            r->sum_id = (uint64_t)id;
+            r->sum_start = start; r->sum_end = end; r->sum_tz = tz;
+            r->sum_body = oc_sum_client_body(rdb, body);
+            r->sum_version = strdup(version);
+            if (!r->sum_body) r->sum_status = OC_SUM_FAILED;
+        }
+        free(body);
+        return r;
+    }
+    oc_dbres *r = sum_answer(j->conn_id, j->sum_req, OC_SUM_OK, j->channel_id);
+    if (r) { r->type = OC_RES_SUMMARY_NEED; r->sum_start = start; r->sum_end = end; r->sum_tz = tz; }
+    return r;
+}
+
 /* Dispatch a write (or auth) job against the single write connection. */
 static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j);
 
@@ -9471,6 +9653,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_LOGOUT)        return process_logout(w->db, j);
     if (j->type == OC_JOB_EDIT)          return process_edit(w->db, j);
     if (j->type == OC_JOB_UNFURL_STORE)  return process_unfurl_store(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_STORE) return process_summary_store(w->db, j);
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);

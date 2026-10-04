@@ -56,6 +56,7 @@ int run_speakable_tests(void);
 int run_action_tests(void);
 int run_ttskit_tests(void);
 int run_tts_worker_tests(void);
+int run_summary_tests(void);
 int run_voice_pick_tests(void);
 int run_tts_data_tests(void);
 int run_stt_tests(void);
@@ -257,6 +258,7 @@ int main(void) {
     total += SUITE(run_action_tests);
     total += SUITE(run_ttskit_tests);
     total += SUITE(run_tts_worker_tests);
+    total += SUITE(run_summary_tests);
     total += SUITE(run_voice_pick_tests);
     total += SUITE(run_tts_data_tests);
     total += SUITE(run_stt_tests);

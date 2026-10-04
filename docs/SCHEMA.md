@@ -1437,6 +1437,55 @@ equals a text literal — and a test holds the two to the same answers on the sa
 bodies, stored both ways. A forward's `src_action` is backfilled by asking the
 same question of its excerpt, which then keeps only the action text.
 
+## 3av. Migration 0057 — summaries (REQ-310–313, ARCH-116)
+
+```sql
+CREATE TABLE summary_nodes (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id     INTEGER NOT NULL,
+  kind           INTEGER NOT NULL CHECK (kind IN (0,1,2,3)),  -- chunk, thread, section, period
+  ikey           TEXT NOT NULL,
+  root_id        INTEGER,
+  first_msg_id   INTEGER,
+  last_msg_id    INTEGER,
+  start_ms       INTEGER NOT NULL,
+  end_ms         INTEGER NOT NULL,
+  tz_offset_min  INTEGER NOT NULL DEFAULT 0,
+  version        TEXT NOT NULL,
+  body           BLOB NOT NULL,
+  tokens_in      INTEGER NOT NULL DEFAULT 0,
+  cpu_ms         INTEGER NOT NULL DEFAULT 0,
+  created_at_ms  INTEGER NOT NULL);
+CREATE INDEX idx_sum_nodes_ikey ON summary_nodes(ikey, version);
+CREATE INDEX idx_sum_nodes_period ON summary_nodes(channel_id, kind, start_ms, end_ms, tz_offset_min);
+CREATE TABLE summary_inputs (
+  parent_id    INTEGER NOT NULL REFERENCES summary_nodes(id) ON DELETE CASCADE,
+  ord          INTEGER NOT NULL,
+  child_kind   INTEGER NOT NULL CHECK (child_kind IN (0,1)),  -- a message, a node
+  child_id     INTEGER NOT NULL,
+  child_stamp  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (parent_id, ord));
+CREATE INDEX idx_sum_inputs_child ON summary_inputs(child_kind, child_id);
+```
+
+*A summary is a tree* (SUMMARIES.md §2): chunk summaries over messages, a big
+thread's summary over its chunks, sections over a long list, a period on top.
+Each node is a row, and `summary_inputs` lists what it was built from, in order:
+a message with the `edited_at_ms` it had when read (`child_stamp`, 0 never
+edited), or another node. `ikey` names a node's inputs, so the same chunk is
+found again rather than made again; `version` names the model, prompts and
+constants it was made with. `body` is the stored JSON (SUMMARIES.md §3).
+`AUTOINCREMENT`, so an id is never reused and a client can tell a rebuilt summary
+from the one it holds.
+
+*Purged in the writer's transaction* (`oc_sum_purge`): a send, reply, edit,
+delete or restore deletes, through `idx_sum_inputs_child` and one recursive
+query, every node built on the message or its thread's root and every period
+whose span holds the message's time, then everything built on those; the cascade
+takes their inputs. Removing a member's DMs removes their nodes. *Stored by the
+writer only if its messages are unchanged* (the stamps) and its node inputs still
+exist. *Collected in idle time*: nodes nothing is built on, unused for 30 days.
+
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.

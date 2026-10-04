@@ -358,9 +358,10 @@ jobs:
         with:
           path: |
             third_party/onnxruntime-1.30.0
+            third_party/llamacpp-0.5.0
             build/kitten
             build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'scripts/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c', 'scripts/build_moonshine.sh') }}
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build_onnxruntime.sh', 'scripts/build_llamacpp.sh', 'scripts/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c', 'scripts/build_moonshine.sh') }}
 
       # zig's bundled Clang compiles for a baseline CPU with 512-bit vectors off,
       # so ONNX Runtime's AVX-512 kernels (which enable AVX-512 per file) need
@@ -383,6 +384,8 @@ jobs:
           done
           mv /tmp/zig-ort-c++ /tmp/zig-ort-cxx
           CC=/tmp/zig-ort-cc CXX=/tmp/zig-ort-cxx scripts/build_onnxruntime.sh
+          # The summary model's engine (ARCH-116), with the same compilers.
+          CC=/tmp/zig-ort-cc CXX=/tmp/zig-ort-cxx scripts/build_llamacpp.sh
           scripts/build_kitten.sh
           scripts/build_moonshine.sh
           # A fresh checkout stamps every source file with the time of the checkout,
@@ -392,7 +395,7 @@ jobs:
           # script's stamp, so it would not match and a from-source build would start
           # under a compiler it was never meant for. What this step produced or
           # restored is current by definition; say so in the one language make reads.
-          find third_party/onnxruntime-1.30.0 build/kitten build/moonshine -type f -exec touch {} +
+          find third_party/onnxruntime-1.30.0 third_party/llamacpp-0.5.0 build/kitten build/moonshine -type f -exec touch {} +
 
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.

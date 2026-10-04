@@ -1631,7 +1631,9 @@ would fail (REQ-295). `tts` is present exactly when read-aloud is running — bu
 in, turned on, and its voice data found and verified against its manifest. `stt`
 is present exactly when voice input (§5.14c) is running, on the same terms for the
 recognizer's data. `calls` is present when the audio relay is up to carry calls
-(§5.17).
+(§5.17). `summarize` is present when summaries are on and their model answered at
+startup (§5.16m); a daemon that brings them up after a client signed in tells it
+at its next sign-in.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -2376,6 +2378,37 @@ is then cut from the action text: `CHANNEL_LIST`'s `preview_action`,
 and `FORWARD`'s `src_action`. A client never decides for itself whether text is
 an action.
 
+### 5.16m Summaries (REQ-310–313, ARCH-116)
+
+Only when the daemon sent the **`summarize`** capability (§4.2): summaries are
+off unless the operator turns them on, and a daemon whose model did not load
+does not send it.
+
+**`SUMMARIZE` (C → S), `0x00FD`** — summarize a channel or DM the person can read.
+
+    req_id (u32), channel_id (u64), scope (u8), start_ms (u64), end_ms (u64)
+
+`scope` 0 **unread** (from the message last read to the end of the reader's
+today), 1 **week** (the reader's last seven days, today included), 2 **range**
+(`[start_ms, end_ms)`, at most 31 days; ignored otherwise), 3 **daily** (the
+reader's yesterday, or every day since they were last about, up to a week). Days
+are the reader's, by their time-zone offset.
+
+**`SUMMARY` (S → C), `0x00FE`** — the answer, once, to one `SUMMARIZE`.
+
+    req_id (u32), status (u8), summary_id (u64), channel_id (u64),
+    start_ms (u64), end_ms (u64), version (str), body (lstr)
+
+`status` 0 **ok**: `body` is the summary as JSON (SUMMARIES.md §3) — an
+overview, decisions, actions, problems and facts, each citing message ids, and
+the names of the people it mentions — and `start_ms`/`end_ms` the span it covers.
+1 **unavailable** (summaries are off, or too many are being made), 2
+**forbidden** (the person cannot read the conversation), 3 **failed**; `body` is
+then a sentence saying why. A summary not yet made is made before the answer,
+which on a small machine may take minutes; the connection carries on meanwhile.
+`summary_id` changes whenever the summary is rebuilt — after a message in the
+span is sent, edited, deleted or restored — and never names another.
+
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
@@ -3013,6 +3046,8 @@ this table cannot silently gain a shared value.
 | `0x00FA` | `RESTORE` | C → S | take back a delete you made, while it is held |
 | `0x00FB` | `MSG_RESTORED` | S → C | a deleted message, whole again (`BROADCAST`'s layout) |
 | `0x00FC` | `ACTION` | S → C | whether a message is an action (REQ-058); after every live message frame, and replayed |
+| `0x00FD` | `SUMMARIZE` | C → S | summarize a channel or DM over a span (REQ-310) |
+| `0x00FE` | `SUMMARY` | S → C | the answer to one `SUMMARIZE`: the summary as JSON, or why not |
 
 ## 10. Connection state machine
 

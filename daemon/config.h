@@ -51,6 +51,8 @@ typedef struct {
     int  localhost;          /* redirect=localhost: the provider matches that name */
 } oc_oidc_connect;
 
+enum { OC_SUMMARY_OFF = 0, OC_SUMMARY_LOCAL = 1, OC_SUMMARY_CLOUD = 2 };
+
 typedef enum {
     OC_TLS_SRC_SELF    = 0,   /* its own self-signed certificate, made at first run */
     OC_TLS_SRC_FILE    = 1,   /* the operator's, OPENCHIME_TLS_CERT / _KEY */
@@ -135,6 +137,10 @@ typedef struct {
      * long the model stays loaded with nothing to hear, `rate` how many segments
      * a connection may send a minute, and `max_secs` the longest segment. */
     struct { int enabled, queue, idle_secs, rate, max_secs; } stt;
+    /* Summaries of channels and DMs (REQ-310, ARCH-116): OPENCHIME_SUMMARY is
+     * off, local or cloud; for cloud, OPENCHIME_SUMMARY_MODEL names the hosted
+     * model and OPENCHIME_SUMMARY_API_KEY is its key. */
+    struct { int mode; const char *model, *api_key; } summary;
     /* Calls (REQ-305): the most people in one call, 2 to OC_MAX_CALL_PARTICIPANTS. */
     int call_max;
     /* How many files one LIST_FILES page carries (REQ-143). The wire's maximum

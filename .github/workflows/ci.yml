@@ -107,11 +107,12 @@ jobs:
             third_party/libvpx-1.17.0
             third_party/opus-1.6.1
             third_party/speexdsp-1.2.1
-          key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
+            third_party/llamacpp-0.5.0
+          key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_llamacpp.sh') }}
       - name: Build the daemon and the e2e client
         run: make && make build/e2e_client
-      # Only the C runtime may be dynamic. ONNX Runtime, its C++ runtime,
-      # mbedTLS, libopus and SQLite are all inside the binary, so anything else
+      # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
+      # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
       # appearing here is a dependency that crept back in.
       - name: The daemon links statically
         run: |

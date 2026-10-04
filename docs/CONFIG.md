@@ -218,6 +218,27 @@ No audio is kept: a segment is freed once answered.
 
 ---
 
+
+## Summaries
+
+Summaries of channels and DMs (REQ-310–313, ARCH-116, SUMMARIES.md). Off unless
+turned on. With `local`, the first start fetches the model (about 530 MB) into
+`summary/` beside the database, checks its SHA-256, and has it answer one small
+question; any failure leaves summaries off with the reason logged, and the rest
+of the daemon runs on. A daemon built with `make SUM=0` has no summaries whatever
+these say.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCHIME_SUMMARY` | `off` | `off`, `local` or `cloud`. `local` runs the model inside the daemon. `cloud` is accepted and leaves summaries off. Anything else stops the boot. |
+| `OPENCHIME_SUMMARY_MODEL` | *(none)* | For `cloud`: the hosted model's name. |
+| `OPENCHIME_SUMMARY_API_KEY` | *(none)* | For `cloud`: its key. Never logged. |
+
+**What it costs.** Summaries run only in idle time, on one core, at the lowest
+scheduling priority, and pause while the machine's CPU is busy or its memory low
+(SUMMARIES.md §5). The model is memory-mapped: about 0.5 GB of file pages while
+loaded, plus about 0.4 GB of working memory, released after five minutes unused.
+
 ## Database-held state
 
 None of this is set by an operator directly; the daemon writes it and reads it
@@ -277,6 +298,7 @@ accepts, and any other stops it with exit status 2.
 |---|---|---|
 | `TTS` | `1` | `0` builds without read-aloud; `OPENCHIME_TTS*` then have no effect. |
 | `STT` | `1` | `0` builds without voice input; `OPENCHIME_STT*` then have no effect. |
+| `SUM` | `1` | `0` builds without llama.cpp; summaries are then never on, whatever `OPENCHIME_SUMMARY` says. |
 | `OC_VERSION` | *(unset: `dev`)* | The release number `--version` prints; the release workflow sets it (ARCH-20). |
 
 ---

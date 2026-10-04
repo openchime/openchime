@@ -11,14 +11,15 @@
 # be its own kind of wrong. Read-aloud (ARCH-111) is built into the daemon by
 # default, and with it ONNX Runtime, the Kitten voice model and data derived from
 # CMUdict; voice input (ARCH-112) likewise, with ONNX Runtime and Moonshine. A
-# daemon built with `make TTS=0` or `STT=0` is described with the same here.
+# daemon built with `make TTS=0`, `STT=0` or `SUM=0` is described with the same here.
 #
-#   [TTS=0] [STT=0] licenses.sh <mbedtls-dir>
+#   [TTS=0] [STT=0] [SUM=0] licenses.sh <mbedtls-dir>
 set -euo pipefail
 
 MBEDTLS_DIR="${1:?usage: licenses.sh <mbedtls-dir>}"
 TTS="${TTS:-1}"
 STT="${STT:-1}"
+SUM="${SUM:-1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 emit() {
@@ -115,4 +116,9 @@ if [ "$TTS" = 1 ]; then
 fi
 if [ "$STT" = 1 ]; then
   emit "Moonshine Tiny Streaming -- MIT License" "${root}/build/moonshine/LICENSE"
+fi
+# The summary model's engine (ARCH-116). The model itself is not in the package:
+# it is fetched on first use, with its own licence (Apache-2.0).
+if [ "$SUM" = 1 ]; then
+  emit "llama.cpp 0.5.0 (with ggml) -- MIT License" "${root}/third_party/llamacpp-0.5.0/LICENSE"
 fi

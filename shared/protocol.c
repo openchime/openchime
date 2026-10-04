@@ -590,6 +590,29 @@ oc_result oc_encode_action(oc_wbuf *w, uint16_t version, const oc_action *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_summarize(oc_wbuf *w, uint16_t version, const oc_summarize *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SUMMARIZE);
+    oc_w_u32(w, m->req_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->scope);
+    oc_w_u64(w, m->start_ms);
+    oc_w_u64(w, m->end_ms);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_summary(oc_wbuf *w, uint16_t version, const oc_summary *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SUMMARY);
+    oc_w_u32(w, m->req_id);
+    oc_w_u8(w, m->status);
+    oc_w_u64(w, m->summary_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->start_ms);
+    oc_w_u64(w, m->end_ms);
+    oc_w_str(w, m->version);
+    oc_w_lstr(w, m->body);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_PINS);
     oc_w_u64(w, m->channel_id);
@@ -2620,6 +2643,27 @@ oc_result oc_decode_action(oc_rbuf *p, oc_action *m) {
     m->actor_name = oc_r_str(p);
     m->text_start = oc_r_u32(p);
     m->text_len = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summarize(oc_rbuf *p, oc_summarize *m) {
+    m->req_id = oc_r_u32(p);
+    m->channel_id = oc_r_u64(p);
+    m->scope = oc_r_u8(p);
+    m->start_ms = oc_r_u64(p);
+    m->end_ms = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summary(oc_rbuf *p, oc_summary *m) {
+    m->req_id = oc_r_u32(p);
+    m->status = oc_r_u8(p);
+    m->summary_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->start_ms = oc_r_u64(p);
+    m->end_ms = oc_r_u64(p);
+    m->version = oc_r_str(p);
+    m->body = oc_r_lstr(p);
     return r_done(p);
 }
 

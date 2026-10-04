@@ -14,6 +14,9 @@
 #include "tls.h"
 #include "url.h"    /* oc_url_authority, oc_url_hostheader */
 
+#include <fcntl.h>
+#include <mbedtls/sha256.h>
+
 /* A response larger than this is not an ACME object or a certificate chain. */
 #define RESP_MAX (1024 * 1024)
 
@@ -218,4 +221,155 @@ void oc_https_resp_free(oc_https_resp *r) {
     free(r->head); free(r->body);
     r->head = r->body = NULL;
     r->body_len = 0;
+}
+
+/* --- a file, streamed to disk (the summary model's first-setup fetch) --------- */
+
+/* Connect and send a GET for `url`; the connection is left open for reading. */
+static int get_open(const char *url, int timeout_ms, hconn *c, int *have_cli, char *host, size_t hcap,
+                    char *err, size_t errcap) {
+    int tls;
+    char port[8], hosthdr[300];
+    const char *p = url;
+    if (!strncmp(p, "https://", 8)) { tls = 1; p += 8; snprintf(port, sizeof port, "443"); }
+    else if (!strncmp(p, "http://", 7)) { tls = 0; p += 7; snprintf(port, sizeof port, "80"); }
+    else { fail(err, errcap, "not an http(s) URL: %s", url); return -1; }
+    size_t alen = strcspn(p, "/?#");
+    if (oc_url_authority(p, alen, host, hcap, port, sizeof port) != 0) { fail(err, errcap, "bad address in %s", url); return -1; }
+    const char *path = p[alen] ? p + alen : "/";
+    if (!tls && strcmp(host, "127.0.0.1") && strcmp(host, "::1") && strcmp(host, "localhost")) {
+        fail(err, errcap, "refusing plain http to %s", host);
+        return -1;
+    }
+    int def = (tls && !strcmp(port, "443")) || (!tls && !strcmp(port, "80"));
+    if (oc_url_hostheader(host, def ? NULL : port, hosthdr, sizeof hosthdr) != 0) { fail(err, errcap, "bad host %s", host); return -1; }
+    memset(c, 0, sizeof *c);
+    c->fd = oc_connect_any(host, atoi(port), OC_CONNECT_PER_ADDR_MS);
+    if (c->fd < 0) { fail(err, errcap, "could not connect to %s:%s", host, port); return -1; }
+    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (tls) {
+        *have_cli = oc_tls_client_init_ca(&c->cli) == 0;
+        if (!*have_cli || oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) { fail(err, errcap, "TLS setup failed"); return -1; }
+        c->tls = 1;
+        if (oc_tls_conn_set_hostname(&c->conn, host) != 0) { fail(err, errcap, "TLS setup failed"); return -1; }
+        for (;;) {
+            oc_tls_status st = oc_tls_handshake(&c->conn);
+            if (st == OC_TLS_OK) break;
+            if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
+            fail(err, errcap, "TLS handshake with %s failed%s", host,
+                 oc_tls_conn_cert_rejected(&c->conn) ? " (certificate not trusted)" : "");
+            return -1;
+        }
+    }
+    char head[4096];
+    int n = snprintf(head, sizeof head, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: openchimed\r\n"
+                     "Accept: */*\r\nConnection: close\r\n\r\n", path, hosthdr);
+    if (n < 0 || (size_t)n >= sizeof head) { fail(err, errcap, "request too long"); return -1; }
+    if (hwrite(c, head, (size_t)n) != 0) { fail(err, errcap, "could not send to %s", host); return -1; }
+    return 0;
+}
+
+static void get_close(hconn *c, int have_cli) {
+    if (c->tls) oc_tls_conn_free(&c->conn);
+    if (have_cli) oc_tls_client_free(&c->cli);
+    if (c->fd > 0) close(c->fd);
+}
+
+int oc_https_download(const char *url, const char *path, uint64_t max_bytes, int timeout_ms,
+                      const volatile int *stop, unsigned char sha256[32], char *err, size_t errcap) {
+    char cur[2048];
+    snprintf(cur, sizeof cur, "%s", url);
+    for (int hop = 0; hop < 6; hop++) {
+        hconn c;
+        int have_cli = 0, rc = -1, fd = -1;
+        char host[256];
+        memset(&c, 0, sizeof c);
+        c.fd = -1;
+        if (get_open(cur, timeout_ms, &c, &have_cli, host, sizeof host, err, errcap) != 0) { get_close(&c, have_cli); return -1; }
+        /* The head, then the body straight to the file. */
+        char buf[65536];
+        size_t len = 0;
+        char *end = NULL;
+        while (!end) {
+            if (len == sizeof buf - 1) { fail(err, errcap, "headers too long from %s", host); goto done; }
+            long got = hread(&c, buf + len, sizeof buf - 1 - len);
+            if (got <= 0) { fail(err, errcap, "read from %s failed", host); goto done; }
+            len += (size_t)got;
+            buf[len] = '\0';
+            end = strstr(buf, "\r\n\r\n");
+        }
+        if (strncmp(buf, "HTTP/1.", 7) != 0) { fail(err, errcap, "not an HTTP response"); goto done; }
+        int status = atoi(buf + 9);
+        oc_https_resp hr;
+        memset(&hr, 0, sizeof hr);
+        *end = '\0';
+        hr.head = buf;
+        if (status >= 300 && status < 400) {
+            char loc[2048];
+            if (!oc_https_header(&hr, "Location", loc, sizeof loc)) { fail(err, errcap, "a redirect without a place"); goto done; }
+            if (loc[0] == '/') {
+                /* Relative: same scheme and host. */
+                const char *sch = strstr(cur, "://");
+                size_t pre = sch ? (size_t)(strchr(sch + 3, '/') ? strchr(sch + 3, '/') - cur : (long)strlen(cur)) : 0;
+                char nu[sizeof cur];
+                size_t ll = strlen(loc);
+                if (pre + ll + 1 > sizeof nu) { fail(err, errcap, "a redirect too long"); goto done; }
+                memcpy(nu, cur, pre);
+                memcpy(nu + pre, loc, ll + 1);
+                memcpy(cur, nu, pre + ll + 1);
+            } else {
+                snprintf(cur, sizeof cur, "%s", loc);
+            }
+            get_close(&c, have_cli);
+            continue;
+        }
+        if (status != 200) { fail(err, errcap, "%s answered %d", host, status); goto done; }
+        char te[64];
+        if (oc_https_header(&hr, "Transfer-Encoding", te, sizeof te) && strcasestr(te, "chunked")) {
+            fail(err, errcap, "%s sent the file chunked, which is not supported", host);
+            goto done;
+        }
+        char cl[32];
+        uint64_t want = oc_https_header(&hr, "Content-Length", cl, sizeof cl) ? strtoull(cl, NULL, 10) : 0;
+        if (want > max_bytes) { fail(err, errcap, "the file is larger than expected"); goto done; }
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { fail(err, errcap, "cannot write %s", path); goto done; }
+        mbedtls_sha256_context sh;
+        mbedtls_sha256_init(&sh);
+        mbedtls_sha256_starts(&sh, 0);
+        uint64_t total = 0;
+        char *b = end + 4;
+        size_t have = len - (size_t)(b - buf);
+        for (;;) {
+            if (have) {
+                total += have;
+                if (total > max_bytes) { fail(err, errcap, "the file is larger than expected"); mbedtls_sha256_free(&sh); goto done; }
+                mbedtls_sha256_update(&sh, (const unsigned char *)b, have);
+                for (size_t off = 0; off < have; ) {
+                    ssize_t wn = write(fd, b + off, have - off);
+                    if (wn <= 0) { fail(err, errcap, "writing %s failed", path); mbedtls_sha256_free(&sh); goto done; }
+                    off += (size_t)wn;
+                }
+            }
+            if (want && total >= want) break;
+            if (stop && *stop) { fail(err, errcap, "stopped"); mbedtls_sha256_free(&sh); goto done; }
+            long got = hread(&c, buf, sizeof buf);
+            if (got < 0) { fail(err, errcap, "read from %s failed", host); mbedtls_sha256_free(&sh); goto done; }
+            if (got == 0) break;
+            b = buf;
+            have = (size_t)got;
+        }
+        mbedtls_sha256_finish(&sh, sha256);
+        mbedtls_sha256_free(&sh);
+        if (want && total != want) { fail(err, errcap, "the download from %s stopped short", host); goto done; }
+        rc = 0;
+    done:
+        if (fd >= 0 && close(fd) != 0 && rc == 0) { fail(err, errcap, "writing %s failed", path); rc = -1; }
+        get_close(&c, have_cli);
+        return rc;
+    }
+    fail(err, errcap, "too many redirects");
+    return -1;
 }

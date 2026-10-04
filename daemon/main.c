@@ -14,6 +14,8 @@
 #include "audio.h"
 #include "certs.h"
 #include "config.h"
+#include "sum_fetch.h"
+#include "sum_worker.h"
 #include "dbwriter.h"
 #include "enroll.h"
 #include "invite_mail.h"
@@ -274,6 +276,100 @@ static void on_serving(void *ctx) {
 #ifndef OC_VERSION
 #define OC_VERSION "dev"
 #endif
+
+/* --- summaries (REQ-310, ARCH-116) ---------------------------------------------
+ * Brought up on a thread of their own, after the daemon is serving: the first
+ * start fetches the model (half a gigabyte), and every start loads it and has it
+ * answer one small question before anyone is told summaries exist. Anything
+ * that fails leaves summaries off, with a line saying why. */
+typedef struct {
+    pthread_t      thread;
+    int            started;
+    oc_dbwriter   *db;
+    const char    *db_path;
+    oc_sum_worker *worker;
+} sum_up;
+
+static int sum_sink_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    return oc_dbwriter_sum_store(((sum_up *)ctx)->db, a, nodes, n);
+}
+
+static void sum_sink_collect(void *ctx) { oc_dbwriter_sum_store(((sum_up *)ctx)->db, NULL, NULL, 0); }
+
+static int sum_net_bytes(uint64_t *bytes) {
+    oc_netloop_stats st;
+    oc_netloop_stats_get(&st);
+    *bytes = st.bytes_read;
+    return 0;
+}
+
+#ifdef OC_SUM
+/* The model answers one small question under its grammar, or it is no use. */
+static int sum_probe(const oc_sum_engine *e, char *err, size_t errcap) {
+    void *h = e->open(e->ctx, err, errcap);
+    if (!h) return -1;
+    oc_sum_msg m = { 1, 0, 1, 0, 0, "Sam", "The release is ready; I will ship it today.", };
+    oc_sum_cut cut;
+    oc_sum_buf prompt = {0}, g = {0};
+    oc_sum_ids ids;
+    int rc = -1;
+    char *out = NULL;
+    if (oc_sum_cut_build(&m, 1, SUM_THRESHOLD_TOKENS, SUM_GAP_MS, &cut) == 0 && cut.n == 1 &&
+        oc_sum_render_chunk("release", &m, &cut.pieces[0].chunks[0], &prompt, &ids) == 0 &&
+        oc_sum_grammar(&ids, 0, SUM_MAX_ITEMS, &g) == 0 &&
+        e->run(h, OC_SUM_SYSTEM_LEAF, prompt.p, g.p, SUM_MAX_OUT, NULL, NULL, &out, NULL, err, errcap) == 0) {
+        oc_sum_buf kept = {0};
+        rc = oc_sum_check(out, strlen(out), &ids, 0, &kept, NULL) >= 0 ? 0 : -1;
+        if (rc != 0) snprintf(err, errcap, "the model's answer was not a summary");
+        oc_sum_buf_free(&kept);
+    }
+    free(out);
+    oc_sum_buf_free(&prompt);
+    oc_sum_buf_free(&g);
+    oc_sum_ids_free(&ids);
+    oc_sum_cut_free(&cut);
+    e->close(h);
+    return rc;
+}
+#endif
+
+static void *sum_bring_up(void *arg) {
+    sum_up *u = arg;
+#ifdef OC_SUM
+    char dir[1024], path[1200], err[300] = "";
+    oc_sum_model_dir(u->db_path, dir, sizeof dir);
+    if (oc_sum_model_ensure(dir, OC_SUM_MODEL_FILE, OC_SUM_MODEL_URL, OC_SUM_MODEL_SHA256, OC_SUM_MODEL_BYTES,
+                            (const volatile int *)&g_stop, path, sizeof path, err, sizeof err) != 0) {
+        fprintf(stderr, "openchimed: summaries are off: %s\n", err);
+        return NULL;
+    }
+    const oc_sum_engine *e = oc_sum_llama_engine(path, OC_SUM_MODEL_NAME, SUM_CTX_TOKENS);
+    if (g_stop || sum_probe(e, err, sizeof err) != 0) {
+        if (!g_stop) fprintf(stderr, "openchimed: summaries are off: the model did not answer: %s\n", err);
+        return NULL;
+    }
+    oc_sum_probe_set_net(sum_net_bytes);
+    oc_sum_worker_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.db_path = u->db_path;
+    cfg.engine = e;
+    cfg.sink.store = sum_sink_store;
+    cfg.sink.collect = sum_sink_collect;
+    cfg.sink.ctx = u;
+    cfg.background = 1;
+    u->worker = oc_sum_worker_start(&cfg, err, sizeof err);
+    if (!u->worker) { fprintf(stderr, "openchimed: summaries are off: %s\n", err); return NULL; }
+    oc_netloop_set_summary(u->worker);
+    fprintf(stderr, "openchimed: summaries on (local model %s)\n", OC_SUM_MODEL_NAME);
+#else
+    (void)u;
+    (void)sum_sink_store;
+    (void)sum_sink_collect;
+    (void)sum_net_bytes;
+    fprintf(stderr, "openchimed: summaries are off: this daemon was built without them (SUM=0)\n");
+#endif
+    return NULL;
+}
 
 int main(int argc, char **argv) {
     /* The only argument the daemon takes. Everything else is configuration, and
@@ -739,6 +835,19 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Summaries, when the operator turned them on (REQ-310): brought up beside
+     * the loop, which serves meanwhile. */
+    sum_up sumu;
+    memset(&sumu, 0, sizeof sumu);
+    sumu.db = db;
+    sumu.db_path = db_path;
+    if (cfg->summary.mode == OC_SUMMARY_LOCAL) {
+        sumu.started = pthread_create(&sumu.thread, NULL, sum_bring_up, &sumu) == 0;
+        if (!sumu.started) fprintf(stderr, "openchimed: summaries are off: cannot start their thread\n");
+    } else if (cfg->summary.mode == OC_SUMMARY_CLOUD) {
+        fprintf(stderr, "openchimed: summaries are off: OPENCHIME_SUMMARY=cloud is not available in this build\n");
+    }
+
     /* Serve the binary protocol until a shutdown signal. */
     int served = oc_netloop_run(proto_port, &tls, db, &g_stop);
     if (audio_udp >= 0) close(audio_udp);
@@ -761,6 +870,10 @@ int main(int argc, char **argv) {
     oc_oidcrp_stop(rp);
     oc_relaykeys_stop(relay_keys);
     oc_tls_server_free(&tls);
+    /* Summaries before the writer: the worker may be waiting on it. */
+    oc_netloop_set_summary(NULL);
+    if (sumu.started) pthread_join(sumu.thread, NULL);
+    oc_sum_worker_stop(sumu.worker);
     oc_dbwriter_stop(db);
 
     /* THE EXIT CODE IS THE POINT. `oc_netloop_run` returning -1 means the
