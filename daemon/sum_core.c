@@ -557,9 +557,9 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out) {
     oc_sum_buf_printf(out,
         "\nSummarize these lines in at most %zu words. Begin with \"Overview:\" and what happened. "
         "Then write the headings Decisions:, Actions:, Problems: and Facts:. Under each, write one "
-        "line per item that starts with \"- \" and ends with the numbers of the lines it comes "
-        "from, each in brackets. An action gives who does it (or Team), a colon, what they do, "
-        "then (open) or (done). A problem ends with (open) or (resolved). Facts are numbers, "
+        "line per item that starts with \"- \". End every line with the numbers of the lines it "
+        "comes from, each in brackets, like this: \"- Ship on Friday [2][5]\". An action gives "
+        "who does it (or Team), a colon, what they do, then (open) or (done). A problem ends with (open) or (resolved). Facts are numbers, "
         "dates, tickets, customers and releases. Leave a heading empty when nothing belongs "
         "under it.\n",
         budget);

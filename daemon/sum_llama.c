@@ -30,7 +30,7 @@
  * extend a sequence already written, longer than the allowed length, is
  * penalized by multiplier * base^(length - allowed). It stops greedy decoding
  * looping without penalizing the names and line numbers a summary repeats
- * (SUMMARIES.md §6). Lines, colons, quotes and asterisks break sequences. */
+ * (SUMMARIES.md §6). Colons, quotes and asterisks break sequences. */
 #define SUM_DRY_MULTIPLIER   0.8f
 #define SUM_DRY_BASE         1.75f
 #define SUM_DRY_ALLOWED      2
@@ -131,6 +131,17 @@ static int l_run(void *vh, const char *system, const char *user, int max_out,
         cap = (size_t)pl + 1;
         llama_chat_apply_template(h->tmpl, msgs, 2, true, prompt, (int32_t)cap);
     }
+    /* A model that thinks before it answers (its template has <think>): the
+     * empty thought its own template writes when thinking is not asked for,
+     * which the library's built-in formats leave out. */
+    if (h->tmpl && strstr(h->tmpl, "<think>")) {
+        static const char NO_THINK[] = "<think>\n\n</think>\n\n";
+        char *np = realloc(prompt, (size_t)pl + sizeof NO_THINK);
+        if (!np) { free(prompt); snprintf(err, errcap, "out of memory"); return -1; }
+        prompt = np;
+        memcpy(prompt + pl, NO_THINK, sizeof NO_THINK);
+        pl += (int)sizeof NO_THINK - 1;
+    }
 
     int ntok_cap = pl + 16;
     llama_token *tok = malloc((size_t)ntok_cap * sizeof *tok);
@@ -148,7 +159,8 @@ static int l_run(void *vh, const char *system, const char *user, int max_out,
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
     struct llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    static const char *breakers[] = { "\n", ":", "\"", "*" };
+    /* Not the line break: a line repeated in a list is the repetition to stop. */
+    static const char *breakers[] = { ":", "\"", "*" };
     /* Over the whole context: the library takes a count (its callers' -1 for
      * "the context" means nothing to it, and 0 turns DRY off). */
     llama_sampler_chain_add(smpl, llama_sampler_init_dry(h->vocab, SUM_DRY_MULTIPLIER, SUM_DRY_BASE, SUM_DRY_ALLOWED,

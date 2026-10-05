@@ -381,6 +381,10 @@ static int s_run(void *h, const char *system, const char *user, int max_out,
     if (s->grow) {
         oc_sum_buf_puts(&b, "Overview:");
         for (const char *p = user; (p = strchr(p, '[')) != NULL; p++) {
+            /* Only the numbered lines, not the example in the instructions. */
+            const char *b0 = p;
+            while (b0 > user && b0[-1] == ' ') b0--;
+            if (b0 > user && b0[-1] != '\n') continue;
             const char *e = strchr(p, '\n');
             const char *t = strchr(p, ']');
             if (t && e && t < e) { oc_sum_buf_puts(&b, " "); oc_sum_buf_add(&b, t + 2, (size_t)(e - t - 2)); oc_sum_buf_puts(&b, " and more words"); }

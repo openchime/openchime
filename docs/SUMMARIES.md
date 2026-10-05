@@ -226,7 +226,13 @@ repeat itself, so llama.cpp's DRY sampler runs before the choice at its publishe
 defaults (multiplier 0.8, base 1.75, allowed length 2): a token that would extend
 a sequence already written is penalized, more steeply the longer the sequence.
 It does not penalize single tokens a summary must repeat — names, line numbers,
-headings — and line breaks, colons, quotes and asterisks end a sequence.
+headings. Colons, quotes and asterisks end a sequence; a line break does not, so
+a line repeated in a list is penalized.
+
+**Prompt format.** The model's own chat format, as llama.cpp knows it. For a
+model that thinks before answering (Qwen3.5 does), the prompt ends with the empty
+thought its own template writes when thinking is not asked for, so it answers
+straight away.
 
 **The model** (`daemon/sum_fetch.h`). Qwen3.5 0.8B, 4-bit (`Q4_K_M`), Apache-2.0:
 about 530 MB on disk. On the first start with summaries on, the daemon fetches it
