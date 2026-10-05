@@ -16,6 +16,7 @@
 #include "netloop.h"
 #include "config.h"
 #include "dbwriter.h"
+#include "sum_worker.h"   /* the daemon summarizes with a stub model here */
 #include "protocol.h"
 #include "tls.h"
 #include "tts_render.h"
@@ -510,6 +511,107 @@ static void test_invitation_text(void) {
     char small[24];
     CHECK(oc_model_invitation_text(&m, "acme.example", small, sizeof small) == sizeof small - 1);
     oc_model_free(&m);
+}
+
+/* A summary in the model (REQ-310): the body read into an overview and items,
+ * each with the messages it came from; only the answer to the open request
+ * lands; a refusal keeps its sentence; and it is offered only with the
+ * "summarize" capability. */
+static void summary_answer(oc_model *m, uint32_t req, uint8_t status, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_SUMMARY;
+    e.req_id = req;
+    e.status = status;
+    e.channel_id = 10;
+    e.span_start = 1000;
+    e.span_end = 2000;
+    e.body = body ? strdup(body) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_summary_model(void) {
+    static const char BODY[] =
+        "{\"summary\":{\"overview\":\"Ann asked Bob about \\\"6701\\\".\",\"refs\":[100,101],"
+        "\"decisions\":[{\"text\":\"Ship Friday\",\"by\":[],\"refs\":[101]}],"
+        "\"actions\":[{\"who\":11,\"what\":\"look at 6701\",\"refs\":[100,101],\"status\":\"open\"},"
+        "{\"who\":0,\"what\":\"test it\",\"refs\":[101]},{\"what\":\"QA team: check stores\",\"refs\":[100]}],"
+        "\"problems\":[{\"text\":\"slow uploads\",\"refs\":[100],\"status\":\"resolved\"}],"
+        "\"facts\":[{\"text\":\"Caf\\u00e9 \\ud83d\\ude00\",\"refs\":[]}]},"
+        "\"people\":{\"11\":\"Bob\"}}";
+    oc_summary_view v;
+    CHECK(oc_summary_view_parse(BODY, strlen(BODY), &v) == 0);
+    CHECK(!strcmp(v.overview, "Ann asked Bob about \"6701\".") && v.n_refs == 2 && v.refs[1] == 101);
+    CHECK(v.n_items == 6);
+    if (v.n_items == 6) {
+        CHECK(v.items[0].kind == OC_SUMI_DECISION && !strcmp(v.items[0].text, "Ship Friday") && !v.items[0].who);
+        CHECK(v.items[1].kind == OC_SUMI_ACTION && !strcmp(v.items[1].who, "Bob") &&
+              !strcmp(v.items[1].status, "open") && v.items[1].n_refs == 2);
+        CHECK(!strcmp(v.items[2].who, "Team") && v.items[2].status[0] == '\0');      /* no status given */
+        CHECK(v.items[3].who == NULL && !strcmp(v.items[3].text, "QA team: check stores"));
+        CHECK(v.items[4].kind == OC_SUMI_PROBLEM && !strcmp(v.items[4].status, "resolved"));
+        CHECK(v.items[5].kind == OC_SUMI_FACT && !strcmp(v.items[5].text, "Caf\xc3\xa9 \xf0\x9f\x98\x80") &&
+              v.items[5].n_refs == 0);
+    }
+    oc_summary_view_free(&v);
+    CHECK(oc_summary_view_parse("not json", 8, &v) == -1 && v.n_items == 0);
+    CHECK(oc_summary_view_parse("{\"people\":{}}", 13, &v) == -1);
+
+    oc_model m; oc_model_init(&m);
+    /* Nothing open: an answer is dropped. */
+    summary_answer(&m, 1, OC_SUM_OK, BODY);
+    CHECK(!m.summary_open && m.summary.n_items == 0);
+    oc_model_summary_begin(&m, 10, OC_SUM_WEEK, 0, 0, 2);
+    CHECK(m.summary_open && m.summary_loading && m.summary_req == 2);
+    /* An answer to an earlier request is not this one. */
+    summary_answer(&m, 1, OC_SUM_OK, BODY);
+    CHECK(m.summary_loading && m.summary.n_items == 0);
+    summary_answer(&m, 2, OC_SUM_OK, BODY);
+    CHECK(!m.summary_loading && m.summary_status == OC_SUM_OK && m.summary.n_items == 6 &&
+          m.summary_start == 1000 && m.summary_end == 2000);
+    /* A refusal keeps the daemon's sentence. */
+    oc_model_summary_begin(&m, 10, OC_SUM_UNREAD, 0, 0, 3);
+    CHECK(m.summary.n_items == 0);
+    summary_answer(&m, 3, OC_SUM_FORBIDDEN, "You cannot read this conversation.");
+    CHECK(m.summary_status == OC_SUM_FORBIDDEN && m.summary_error &&
+          !strcmp(m.summary_error, "You cannot read this conversation."));
+    /* An OK body that is not a summary is a failure, said plainly. */
+    oc_model_summary_begin(&m, 10, OC_SUM_UNREAD, 0, 0, 4);
+    summary_answer(&m, 4, OC_SUM_OK, "garbage");
+    CHECK(m.summary_status == OC_SUM_FAILED && m.summary_error);
+    oc_model_close_summary(&m);
+    CHECK(!m.summary_open && !m.summary_error);
+    /* Offered only where the daemon says so. */
+    CHECK(oc_model_summarize_available(&m) == 0);
+    caps_fold(&m, "tts,summarize");
+    CHECK(oc_model_summarize_available(&m) == 1);
+    caps_fold(&m, "tts");
+    CHECK(oc_model_summarize_available(&m) == 0);
+    oc_model_free(&m);
+}
+
+/* The daemon's summarizer for the live test: a stub model and a quiet
+ * machine, so a summary is made at once. */
+static int core_sum_calls;
+static void *csum_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
+static void csum_close(void *h) { (void)h; }
+static int csum_run(void *h, const char *system, const char *user, int max_out, oc_sum_gate_fn gate, void *gctx,
+                    char **out, oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)h; (void)system; (void)user; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
+    __atomic_add_fetch(&core_sum_calls, 1, __ATOMIC_RELAXED);
+    if (st) memset(st, 0, sizeof *st);
+    *out = strdup("Overview: The ship date was set.\nDecisions:\n- [1] Ship on Friday\nActions:\nProblems:\nFacts:\n");
+    return 0;
+}
+static int csum_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
+static int csum_mem(void *c, uint64_t *m) { (void)c; *m = 1u << 20; return 0; }
+static int csum_net(void *c, uint64_t *n) { (void)c; *n = 0; return 0; }
+static uint64_t csum_now(void *c) { (void)c; static uint64_t t; t += SUM_LOAD_SAMPLE_MS; return t; }
+static oc_dbwriter *g_csum_dbw;
+static int csum_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    (void)ctx;
+    return oc_dbwriter_sum_store(g_csum_dbw, a, nodes, n);
 }
 
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
@@ -4451,6 +4553,7 @@ int run_client_core_tests(void) {
     test_reset_text();
     test_addressable_targets();
     test_pins();
+    test_summary_model();
     test_resolve();
     test_resolve_literals();
     test_wellknown_parse();
@@ -4505,6 +4608,24 @@ int run_client_core_tests(void) {
     /* The daemon this test drives speaks with a stub voice (ARCH-111). */
     oc_netloop_set_tts(&CORE_TTS);
     oc_netloop_set_stt(&CORE_STT);
+
+    /* ...and summarizes with a stub model (REQ-310). */
+    static oc_sum_engine csum_eng = { &core_sum_calls, "stub", csum_open, csum_close, csum_run, NULL };
+    static oc_sum_probe csum_quiet = { csum_cpu, csum_mem, csum_net, csum_now, NULL };
+    oc_sum_worker *csum = NULL;
+    {
+        g_csum_dbw = dbw;
+        oc_sum_worker_cfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.db_path = "build/itest_core.db";
+        cfg.engine = &csum_eng;
+        cfg.probe = &csum_quiet;
+        cfg.sink.store = csum_store;
+        char err[256] = "";
+        csum = oc_sum_worker_start(&cfg, err, sizeof err);
+        CHECK(csum != NULL);
+        oc_netloop_set_summary(csum);
+    }
 
     /* A relay, and the tap in front of it that the daemon advertises (calls). */
     {
@@ -4738,6 +4859,30 @@ int run_client_core_tests(void) {
             CHECK(WAIT_FOR(b, (ch = oc_model_channel((oc_model *)oc_client_model(b), 1)) &&
                               ch->description &&
                               strcmp(ch->description, "What this channel is for.") == 0));
+        }
+
+        /* A summary (REQ-310): offered because the daemon summarizes; asked
+         * for, it opens loading and fills with what the daemon made; asked
+         * again, it comes from what the daemon stored, the model not asked;
+         * closed, it is gone. */
+        {
+            CHECK(WAIT_FOR(a, oc_model_summarize_available(m)));
+            uint32_t req = oc_client_summarize(a, 1, OC_SUM_WEEK, 0, 0);
+            CHECK(req != 0);
+            const oc_model *am = oc_client_model(a);
+            CHECK(am->summary_open && am->summary_channel == 1);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading));
+            CHECK(am->summary_status == OC_SUM_OK && am->summary.n_items == 1 &&
+                  am->summary.items[0].kind == OC_SUMI_DECISION &&
+                  !strcmp(am->summary.items[0].text, "Ship on Friday") && am->summary.items[0].n_refs >= 1 &&
+                  am->summary_end > am->summary_start);
+            int calls = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            uint32_t again = oc_client_summarize(a, 1, OC_SUM_WEEK, 0, 0);
+            CHECK(again != req);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
+            CHECK(__atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) == calls);
+            oc_client_close_summary(a);
+            CHECK(!am->summary_open && am->summary.n_items == 0);
         }
 
         /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana
@@ -5719,6 +5864,8 @@ int run_client_core_tests(void) {
 
     __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
+    oc_netloop_set_summary(NULL);
+    oc_sum_worker_stop(csum);
     oc_netloop_set_audio(-1, 0);
     __atomic_store_n(&g_tap.stop, 1, __ATOMIC_RELEASE);
     pthread_join(g_tap_th, NULL);

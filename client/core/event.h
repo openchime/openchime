@@ -268,7 +268,12 @@ enum {
     /* The workspace moved (WORKSPACE_ADDRESS): what was kept is filed under the
      * new key, in `body`, and the next connection dials it. A frontend showing the
      * workspace by its old key relabels it. */
-    OC_EV_WORKSPACE_MOVED
+    OC_EV_WORKSPACE_MOVED,
+    /* SUMMARY (REQ-310): the answer to one SUMMARIZE, named by `req_id`.
+     * `status` is OC_SUM_*; `body` the summary as JSON when OK, otherwise a
+     * sentence saying why. `channel_id`, `span_start`/`span_end` and
+     * `summary_id` as the daemon sent them. */
+    OC_EV_SUMMARY
 };
 
 typedef struct {
@@ -370,6 +375,8 @@ typedef struct {
     uint8_t  msg_kind;    /* MESSAGE: OC_MSG_KIND_* (a call event, REQ-304) */
     uint8_t *der;         /* heap; CERT_UNTRUSTED: the certificate (DER) */
     size_t    der_len;
+    uint32_t req_id;      /* SUMMARY: the request it answers */
+    uint64_t summary_id, span_start, span_end;   /* SUMMARY */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -521,6 +528,7 @@ enum {
     OC_CMD_GROUP_REMOVE_MEMBERS,
     OC_CMD_CHANNEL_ADD_GROUP,
     OC_CMD_CHANNEL_REMOVE_GROUP,
+    OC_CMD_SUMMARIZE,      /* summarize `channel_id` over `scope` (REQ-310), as `req_id` */
     OC_CMD_QUIT
 };
 
@@ -570,6 +578,11 @@ typedef struct {
     /* CALL_JOIN / CALL_INVITE: the people asked. Inline, capped by the wire. */
     uint64_t uids[OC_MAX_CALL_INVITES];
     uint16_t n_uids;
+    /* SUMMARIZE: the request's id, and its span (OC_SUM_UNREAD...; start and
+     * end only for a range). */
+    uint32_t req_id;
+    uint8_t  scope;
+    uint64_t start_ms, end_ms;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);
