@@ -31,6 +31,13 @@ int oc_sum_model_ensure(const char *dir, const char *file, const char *url, cons
                         uint64_t max_bytes, const volatile int *stop, char *out, size_t cap, char *err,
                         size_t errcap);
 
+/* Whether this CPU can run the local model. On x86-64 it is built for
+ * x86-64-v3 (scripts/build_llamacpp.sh), and a CPU without AVX2, FMA, F16C or
+ * BMI2 would stop the whole daemon at the first such instruction; elsewhere
+ * every CPU can. `supports` answers for a feature name ("avx2", ...); NULL asks
+ * the CPU itself (a test passes its own). 1, or 0 with a reason. */
+int oc_sum_cpu_ok(int (*supports)(const char *feature), char *err, size_t errcap);
+
 /* `dir` for a database at `db_path`: "<its directory>/summary". */
 void oc_sum_model_dir(const char *db_path, char *out, size_t cap);
 

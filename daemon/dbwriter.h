@@ -1461,8 +1461,7 @@ void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token);
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
 /* Store a summary batch through the writer and wait for it (the summary
  * worker's sink, ARCH-116): 0 stored, 1 refused because a message changed, -1.
- * The answer, when someone waits, comes back to the net loop as OC_RES_SUMMARY.
- * With `a` NULL it instead removes nodes nothing uses (oc_sum_collect). */
+ * The answer, when someone waits, comes back to the net loop as OC_RES_SUMMARY. */
 int        oc_dbwriter_sum_store(oc_dbwriter *w, const oc_sum_answer *a, oc_sum_new *nodes, int n);
 /* Pop the next completed result, or NULL when drained. Caller frees it. */
 oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);

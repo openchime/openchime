@@ -9512,15 +9512,7 @@ static oc_dbres *process_summary_store(sqlite3 *db, const oc_job *j) {
     struct oc_sum_batch *b = j->sum_batch;
     const oc_sum_answer *a = b->a;
     oc_dbres *r = NULL;
-    int rc;
-    if (!a) {
-        /* No answer: the worker's housekeeping, nodes nothing uses any more. */
-        static const oc_sum_answer nobody;
-        rc = oc_sum_collect(db, (int64_t)dbw_now_ms(), (int64_t)SUM_KEEP_MS) < 0 ? -1 : 0;
-        a = &nobody;
-    } else {
-        rc = b->n ? oc_sum_store(db, a->channel, a->version, b->nodes, b->n) : 0;
-    }
+    int rc = b->n ? oc_sum_store(db, a->channel, a->version, b->nodes, b->n) : 0;
     if (a->conn_id && rc != 1) {
         int ok = a->ok && rc == 0;
         r = sum_answer(a->conn_id, a->req_id, ok ? OC_SUM_OK : OC_SUM_FAILED, (uint64_t)a->channel);
@@ -9589,17 +9581,16 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
     case OC_SUM_DAILY:
         end = today;
         start = today - day;
-        /* Every day since the reader was last about, up to a week. */
+        /* Every day since the reader was last about. */
         if (seen && seen < start) start = oc_sum_day_start(seen, tz);
-        if (start < today - 7 * day) start = today - 7 * day;
         break;
     case OC_SUM_RANGE:
         start = (int64_t)j->sum_start; end = (int64_t)j->sum_end;
-        if (end <= start || end - start > 31 * day)
+        if (end <= start)
             return sum_answer(j->conn_id, j->sum_req, OC_SUM_FAILED, j->channel_id);
         break;
-    default: {   /* OC_SUM_UNREAD: from the reader's place to the end of today */
-        start = today - 7 * day;
+    default: {   /* OC_SUM_UNREAD: from the reader's place to now */
+        start = 0;
         if (sqlite3_prepare_v2(rdb,
                 "SELECT m.created_at_ms FROM delivery_cursors c JOIN messages m ON m.id=c.message_id "
                 "WHERE c.user_id=?1 AND c.channel_id=?2;", -1, &st, NULL) == SQLITE_OK) {
@@ -9611,7 +9602,7 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
             }
         }
         sqlite3_finalize(st);
-        end = today + day;
+        end = now + 1;
         break;
     }
     }

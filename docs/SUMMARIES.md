@@ -11,102 +11,146 @@ channel or DM the person can read, over one of four spans (PROTOCOL.md §5.16m):
 
 | Scope | Span |
 |---|---|
-| Unread | From the message the reader last read to the end of their today |
+| Unread | From the message the reader last read to now |
 | Week | The last seven of the reader's days, today included |
-| Range | `[start_ms, end_ms)` as given, at most 31 days |
-| Daily | The reader's yesterday, or every day since they were last about, up to a week |
+| Range | `[start_ms, end_ms)` as given |
+| Daily | The reader's yesterday, or every day since they were last about |
 
 Days are the reader's, by the time-zone offset their client reports
 (`users.tz_offset_min`). The answer is the summary as JSON (§3); a summary not
 yet made is made while the request waits.
 
-## 2. From messages to a summary
+## 2. One summarize step, recursively
 
 **What is summarized.** People's messages: not integration posts
 (`author_name` set), not call events (`kind` other than 0), not deleted ones.
 Markup is reduced to plain text by the same code read-aloud uses
-(`shared/speakable.c`).
+(`shared/speakable.c`), whole: a summary never reads a message cut short.
 
-**Units.** A top-level message with no replies is a unit; so is a whole thread,
-root and replies, placed at its **last** reply. A thread therefore belongs to the
-period of its last activity.
-
-**Chunks** (`daemon/sum_core.c`). Units, in order of their place, are grouped
-into chunks of whole messages. A new chunk starts when the next unit is more
-than `SUM_GAP_MS` after the last, or would take the chunk past
-`SUM_THRESHOLD_TOKENS`. A thread bigger than the limit is cut into chunks of its
-own, whole messages each. Size is one estimate for every model — a token per
-four bytes of rendered text — so where pieces are cut never depends on the model,
-and appending messages never moves an earlier cut.
-
-**The tree** (`daemon/sum_worker.c`). Each chunk is summarized. A big thread's
-chunks are rolled up into a thread summary. A day's chunk and thread summaries
-are rolled up into the day's. A longer span is its days rolled up. Wherever a
-list of summaries is longer than `SUM_THRESHOLD_TOKENS`, it is cut into sections,
-each rolled up, and the sections rolled up in turn. A day with nothing to say
-adds nothing to a rollup.
-
-**What the model reads.** A chunk:
+**One step.** Every summary at every level is made the same way
+(`daemon/sum_worker.c`, `summarize`): numbered lines go in, a summary comes out.
+The same system prompt, the same instructions, the same grammar rules, the same
+decoding and the same checks, whatever the lines are. At the bottom a line is a
+message:
 
 ```
-Chat excerpt from #support (times UTC). People: P1 Ann, P2 Bob.
-Indented lines are replies in a thread.
+Messages from #support, oldest first. Indented lines are replies in a thread.
 
-[m1] P1 (Fri 04 Sep 12:04): Ticket 6701 is open; Bob please look.
-  [m2] P2 (Fri 04 Sep 12:10): On it.
+[1] Ann: Ticket 6701 is open; Bob please look.
+  [2] Bob: On it.
 ```
 
-A rollup lists each child's overview and items, numbered `i1`, `i2`, …, with
-the people they name as `P#`. Each prompt ends with a line saying what each field
-holds.
-
-**What the model writes.** One shape at every level, held to it by a GBNF
-grammar generated for the piece (`oc_sum_grammar`), which admits only the
-piece's own `P#` and `m#` (or `i#`), at most `SUM_MAX_ITEMS` items of each kind
-and `SUM_TEXT_MAX` characters of text, so an answer fits its budget of
-`SUM_MAX_OUT` tokens; one that still runs past it is asked for again with room
-for one item of each kind, rather than losing the piece:
+Above it, a line is one line of a child summary — its overview, or one of its
+items — and stands for the messages that line cited:
 
 ```
-{"overview": "...",
- "decisions": [{"text": "...", "by": ["P1"], "refs": ["m1"]}],
- "actions":   [{"who": "P2" | "team", "what": "...", "refs": ["m1"], "status": "open" | "done"}],
- "problems":  [{"text": "...", "refs": ["m2"], "status": "open" | "resolved"}],
- "facts":     [{"text": "...", "refs": ["m1"]}]}
+Summaries of consecutive parts of #support, oldest first.
+
+On Fri 04 Sep:
+[1] Overview: Ann asked Bob about ticket 6701.
+[2] Action (open): Bob: look at ticket 6701
+[3] Fact: Ticket 6701
 ```
 
-**The check** (`oc_sum_check`). An item is dropped when a ref is not one of the
-piece's, a person is not one of its people, or a run of digits in its text appears
-in none of the sources it cites; a repeat of a kept item is dropped too. `P#` in
-text becomes the person's name. What is kept is stored with real ids (§3).
+Lines carry no clock times. A chunk's lines are the same for every reader, so its
+summary is shared; where a span is put together, each child is headed with its
+date in the reader's zone, and that summary is the reader's zone's.
+
+**The one size limit.** `SUM_THRESHOLD_TOKENS` (`daemon/sum_core.h`) is the
+only limit on size, and the recursion is the only way anything bigger is
+handled. Size is one estimate for every model — a token per four bytes of text —
+so where things are cut never depends on the model.
+
+**Chunks.** A channel's messages are grouped into units: a top-level message
+with no replies, or a whole thread (root and replies) placed at its **last**
+reply, so a thread belongs to the period of its last activity. Units, in order,
+are grouped into chunks of whole messages; a new chunk starts when the next unit
+is more than `SUM_GAP_MS` after the last, or would take the chunk past the limit.
+A cut always begins at the first message after the last quiet gap before what is
+wanted (`oc_sum_anchor`), so every cut over the same messages makes the same
+chunks and finds them again.
+
+**The recursion** (`reduce`). Given summaries to put together: if their lines
+fit the limit, summarize them once. If not, cut them, in order, into sections
+whose lines fit, summarize each section, and put the section summaries through
+the recursion again. A child that fits, alone in its section, goes up as it is
+— unless every section is one child, when only summarizing them gets shorter.
+Each level must come out shorter than what went in; one that does not stops the
+build, and the failure is reported with what the model wrote. Nothing is ever
+cut to make it fit.
+
+The recursion makes three things:
+
+- **A thread too big for a chunk**: its own chunks of whole messages, each
+  summarized, then put together.
+- **A message too big for a chunk**: its text split into parts at paragraphs,
+  then lines, then sentences, then words, and only as a last resort mid-word
+  (never mid-character); each part summarized, then put together. No byte of the
+  message is lost.
+- **A span**: the summaries of the chunks and threads whose last activity is in
+  it, put together. A span of one piece is that piece's summary.
+
+**What the model writes.** Plain text under fixed headings; any heading may be
+empty:
+
+```
+Overview: <what happened>
+Decisions:
+- <text> [3][7]
+Actions:
+- <who>: <what> (open|done) [5]
+Problems:
+- <text> (open|resolved) [9]
+Facts:
+- <text> [2]
+```
+
+The grammar (`oc_sum_grammar`) holds it to the headings and the line shape, to
+citations of line numbers that exist, and to actions given to someone named in
+the lines or to the team. It sets no counts and no lengths. The model writes text
+rather than JSON because holding a model to JSON while it writes lowers what it
+writes, most of all in small models; code turns the text into the stored shape.
+
+The prompt asks for at most 30% (`SUM_WORDS_PCT`) of the lines' words: a word
+budget is the length instruction small models follow best, and written chat
+summaries run at 20–30% of the conversation. It is guidance only; no answer is
+cut.
+
+**The check** (`oc_sum_parse`). A bullet is dropped when it cites a line that is
+not there, gives an action to someone not in the lines, states a run of digits
+none of its cited lines contains, or repeats one already kept; the overview is
+dropped when it states a number no line contains. Nothing else is dropped. Each
+kept item cites the message ids its lines stand for.
 
 ## 3. The stored shape, and what clients get
 
-A node's `body` is the checked shape with message ids for refs and user ids for
-people (`who` 0 is the team):
+A node's `body` is the checked summary with message ids for refs and user ids
+for people (`who` 0 is the team):
 
 ```
 {"overview": "Ann asked Bob about ticket 6701.",
- "decisions": [{"text": "...", "by": [10], "refs": [100]}],
- "actions":   [{"who": 11, "what": "look at ticket 6701", "refs": [100], "status": "open"}],
- "problems":  [...], "facts": [...]}
+ "decisions": [{"text": "...", "by": [], "refs": [100]}],
+ "actions":   [{"who": 11, "what": "look at ticket 6701", "refs": [100, 101], "status": "open"}],
+ "problems":  [{"text": "...", "refs": [...], "status": "open"}],
+ "facts":     [{"text": "Ticket 6701", "refs": [100]}]}
 ```
 
-A rollup's refs are the union of the message ids its cited items cite, so every
-item at every level points at messages. A client is sent
+Every item at every level points at messages. A client is sent
 `{"summary": <body>, "people": {"<user id>": "<display name>", …}}`.
 
 ## 4. Storage, reuse and purging
 
 `summary_nodes` holds one row per node: its channel, kind (chunk, thread,
-section, period), `ikey` (a hash of its inputs), span, time-zone offset (periods),
+section, period), `ikey`, span, time-zone offset (where its input carried dates),
 `version`, body, and the prompt tokens and CPU time it cost. `summary_inputs`
 lists each node's inputs in order: a message with the `edited_at_ms` it had when
 read, or another node (SCHEMA.md migration 0057).
 
-**Reuse.** A chunk or rollup is found again by its `ikey` and `version`; a period
-by channel, span, offset and `version`. Building a span asks the model only for
-what is not stored.
+**Reuse.** A chunk's `ikey` is made from its messages as read; any other node's
+from its children's keys (and the zone, when dated), so the same children give
+the same key however they were made. A node is found again by `ikey` and
+`version`; a period by channel, span, zone and `version`. Building anything asks
+the model only for what is not stored.
 
 **Version.** `version` names the model, `SUM_PROMPT_VERSION` and the two
 constants. A period made by an older version is served until the new one is made;
@@ -122,9 +166,6 @@ new nodes to the writer in one batch (`OC_JOB_SUMMARY_STORE`). The writer stores
 them only if every message is still there with the stamp it was read with and
 every node input still exists; otherwise the worker builds again.
 
-**Housekeeping.** Nodes nothing is built on, unused for `SUM_KEEP_MS` (30 days),
-are deleted in idle time.
-
 ## 5. The worker and the load gate
 
 One thread (`daemon/sum_worker.c`), set to `SCHED_IDLE` and nice 19, so the
@@ -133,10 +174,18 @@ on first use and unloaded after `SUM_UNLOAD_IDLE_MS` without work. One model cal
 at a time, computing on one thread.
 
 **Requests first.** A SUMMARIZE with no stored answer goes on the worker's queue
-(`SUM_QUEUE_MAX`). With the queue empty and the machine quiet for
-`SUM_IDLE_SETTLE_MS`, the worker looks every `SUM_IDLE_SCAN_MS` for channels
-with messages in the last `SUM_IDLE_DAYS` days and builds their past days, in
-each member's time zone, that have no summary of the current version.
+(`SUM_QUEUE_MAX`) and is made while the reader waits.
+
+**Idle work.** With the queue empty and the machine quiet for
+`SUM_IDLE_SETTLE_MS`, the worker, in this order:
+
+1. summarizes the chunks a changed message left unsummarized — every purge tells
+   the worker the channel and moment (`oc_sum_on_change`);
+2. summarizes every channel's chunks, the newest first, a day at a time, back to
+   each channel's first message;
+3. makes again the periods of whole days someone asked for that a change has
+   since purged;
+4. rebuilds the periods an older version made.
 
 **The gate** (`daemon/sum_load.c`). Asked before each piece and every 16 tokens
 while the model writes:
@@ -155,17 +204,30 @@ pushing the machine.
 ## 6. The model
 
 **Engine.** llama.cpp, from pinned source, CPU only, one static archive
-(`scripts/build_llamacpp.sh`; VENDORS.md). On x86-64 it targets x86-64-v3 (AVX2).
-The context is `SUM_CTX_TOKENS`: one piece, the prompt and the answer. The model
-file is memory-mapped. Decoding is greedy, with the presence penalty the model's
-card recommends.
+(`scripts/build_llamacpp.sh`; VENDORS.md). On x86-64 it targets x86-64-v3
+(AVX2, FMA, F16C, BMI2); before anything from llama.cpp runs, the daemon checks
+the CPU has them (`oc_sum_cpu_ok`), and on one that does not, local summaries
+are off with the reason logged. The model file is memory-mapped.
+
+**Context.** `SUM_CTX_TOKENS`, three times the size limit: the prompt, one input
+of up to the limit, and an answer up to the same size again. An answer may use
+whatever the context has left; one that fills it without ending is a failure,
+logged with what was written.
+
+**Decoding.** Greedy: for summarizing, the most likely word is the most faithful
+choice, and sampling raises what a model invents. Greedy decoding on its own can
+repeat itself, so llama.cpp's DRY sampler runs before the choice at its published
+defaults (multiplier 0.8, base 1.75, allowed length 2): a token that would extend
+a sequence already written is penalized, more steeply the longer the sequence.
+It does not penalize single tokens a summary must repeat — names, line numbers,
+headings — and line breaks, colons, quotes and asterisks end a sequence.
 
 **The model** (`daemon/sum_fetch.h`). Qwen3.5 0.8B, 4-bit (`Q4_K_M`), Apache-2.0:
 about 530 MB on disk. On the first start with summaries on, the daemon fetches it
 from its pinned address into `summary/` beside the database, checks it against
 the pinned SHA-256, and writes a marker; later starts check the marker and the
-size. Then the model answers one small question under its grammar. Any failure
-leaves summaries off with a line in the log saying why.
+size, then load the model. Any failure leaves summaries off with a line in the
+log saying why.
 
 ## 7. Evaluating
 
@@ -178,13 +240,15 @@ enters the repository.
 make build/sumeval
 build/sumeval init dev.db
 scripts/slack_to_db.py <export dir> dev.db
-build/sumeval run dev.db <model.gguf> <channel> <start_ms> <end_ms> [threshold] [gap_minutes]
+build/sumeval run dev.db <model.gguf> <channel> <start_ms> <end_ms> [threshold] [gap_minutes] [tree.md]
 ```
 
 `run` prints the summary as a client receives it, then one line of measurements:
-nodes stored, CPU seconds, wall seconds and peak memory. Varying the model and
-the two constants is how they are chosen; people read the summaries side by side
-and judge them.
+nodes stored, model calls, CPU seconds, wall seconds and peak memory. With
+`tree.md`, every model call — the prompt, the answer as written, and what was
+stored — is written there in the order made, to see what each level did. Varying
+the model and the two constants is how they are chosen; people read the
+summaries side by side and judge them.
 
 ## 8. Settings
 
@@ -194,5 +258,6 @@ and judge them.
 | `OPENCHIME_SUMMARY_MODEL` | For `cloud`: the hosted model's name. |
 | `OPENCHIME_SUMMARY_API_KEY` | For `cloud`: its key. |
 
-Everything else — the size limit, the gap, the gate's thresholds — is a constant
-in the code (`daemon/sum_core.h`, `daemon/sum_load.h`, `daemon/sum_worker.h`).
+Everything else — the size limit, the gap, the word budget, the gate's
+thresholds — is a constant in the code (`daemon/sum_core.h`, `daemon/sum_load.h`,
+`daemon/sum_worker.h`).

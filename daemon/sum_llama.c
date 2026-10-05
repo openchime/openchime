@@ -26,9 +26,14 @@
 
 /* Ask the gate every this many tokens. */
 #define SUM_CHECK_TOKENS 16
-/* The presence penalty, over this many recent tokens (the model card's 1.5). */
-#define SUM_PRESENCE_PENALTY 1.5f
-#define SUM_PENALTY_LAST_N   256
+/* DRY ("don't repeat yourself") at its published defaults: a token that would
+ * extend a sequence already written, longer than the allowed length, is
+ * penalized by multiplier * base^(length - allowed). It stops greedy decoding
+ * looping without penalizing the names and line numbers a summary repeats
+ * (SUMMARIES.md §6). Lines, colons, quotes and asterisks break sequences. */
+#define SUM_DRY_MULTIPLIER   0.8f
+#define SUM_DRY_BASE         1.75f
+#define SUM_DRY_ALLOWED      2
 /* Tokens read per step of the prompt. */
 #define SUM_UBATCH 128
 
@@ -133,7 +138,9 @@ static int l_run(void *vh, const char *system, const char *user, const char *gra
     int nt = llama_tokenize(h->vocab, prompt, pl, tok, ntok_cap, true, true);
     free(prompt);
     if (nt < 0) { free(tok); snprintf(err, errcap, "the prompt does not tokenize"); return -1; }
-    if (nt + max_out > h->n_ctx) {
+    /* The answer may use whatever the context has left. */
+    if (max_out <= 0) max_out = h->n_ctx - nt;
+    if (max_out <= 0 || nt + max_out > h->n_ctx) {
         free(tok);
         snprintf(err, errcap, "the prompt is %d tokens, too long for a context of %d", nt, h->n_ctx);
         return -1;
@@ -149,10 +156,9 @@ static int l_run(void *vh, const char *system, const char *user, const char *gra
         return -1;
     }
     if (gram) llama_sampler_chain_add(smpl, gram);
-    /* Greedy decoding on a small model repeats itself; a presence penalty over
-     * the recent tokens, as the model's card recommends, breaks the loop. */
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(h->vocab), SUM_PENALTY_LAST_N,
-                                                               1.0f, 0.0f, SUM_PRESENCE_PENALTY));
+    static const char *breakers[] = { "\n", ":", "\"", "*" };
+    llama_sampler_chain_add(smpl, llama_sampler_init_dry(h->vocab, SUM_DRY_MULTIPLIER, SUM_DRY_BASE, SUM_DRY_ALLOWED,
+                                                         -1, breakers, sizeof breakers / sizeof *breakers));
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
     int rc = -1;
@@ -174,7 +180,12 @@ static int l_run(void *vh, const char *system, const char *user, const char *gra
 
     int produced = 0;
     for (;;) {
-        if (produced >= max_out) { snprintf(err, errcap, "the answer ran past %d tokens", max_out); goto done; }
+        if (produced >= max_out) {
+            snprintf(err, errcap, "the answer filled the model's context (%d tokens) without ending", h->n_ctx);
+            *out = o;           /* as far as it got, for the log */
+            o = NULL;
+            goto done;
+        }
         if (gate && produced % SUM_CHECK_TOKENS == 0 && gate(gate_ctx) != 0) {
             snprintf(err, errcap, "stopped");
             goto done;
@@ -197,19 +208,6 @@ static int l_run(void *vh, const char *system, const char *user, const char *gra
         if (llama_decode(h->ctx, llama_batch_get_one(&t, 1)) != 0) {
             snprintf(err, errcap, "the model stopped mid-answer");
             goto done;
-        }
-        /* The grammar is complete once the closing brace of the root object
-         * is out: the next token could only end the answer. */
-        if (gram && on && o[on - 1] == '}') {
-            int depth = 0, in_str = 0;
-            for (size_t k = 0; k < on; k++) {
-                char ch = o[k];
-                if (in_str) { if (ch == '\\') k++; else if (ch == '"') in_str = 0; continue; }
-                if (ch == '"') in_str = 1;
-                else if (ch == '{' || ch == '[') depth++;
-                else if (ch == '}' || ch == ']') depth--;
-            }
-            if (depth == 0) break;
         }
     }
     if (st) st->output_tokens = (uint32_t)produced;

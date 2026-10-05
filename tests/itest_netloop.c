@@ -3501,8 +3501,7 @@ static int sstub_run(void *h, const char *system, const char *user, const char *
     (void)system; (void)user; (void)grammar; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
     __atomic_add_fetch(&((sum_stub *)h)->calls, 1, __ATOMIC_RELAXED);
     if (st) memset(st, 0, sizeof *st);
-    *out = strdup("{\"overview\":\"P1 set the ship date.\",\"decisions\":[{\"text\":\"Ship on Friday\","
-                  "\"by\":[\"P1\"],\"refs\":[\"m1\"]}],\"actions\":[],\"problems\":[],\"facts\":[]}");
+    *out = strdup("Overview: The ship date was set.\nDecisions:\n- Ship on Friday [1]\nActions:\nProblems:\nFacts:\n");
     return 0;
 }
 static int sq_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }

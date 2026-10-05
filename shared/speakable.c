@@ -73,12 +73,8 @@ static void say_host(sbuf *b, const char *u, size_t n) {
     space(b);
 }
 
-size_t oc_speakable(const char *body, size_t len, oc_speak_name_fn resolve, void *ctx,
+static size_t speak(const char *body, size_t len, oc_speak_name_fn resolve, void *ctx,
                     char *out, size_t cap) {
-    if (!out || cap == 0) return 0;
-    out[0] = '\0';
-    if (!body || len == 0) return 0;
-    if (cap > OC_SPEAK_MAX + 1) cap = OC_SPEAK_MAX + 1;
     sbuf b = { out, 0, cap };
 
     oc_rt_span spans[OC_RT_MAX];
@@ -196,4 +192,21 @@ int oc_speakable_segments(const char *text, size_t len, size_t max_chars,
         at = cut;
     }
     return n;
+}
+
+size_t oc_speakable(const char *body, size_t len, oc_speak_name_fn resolve, void *ctx,
+                    char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!body || len == 0) return 0;
+    if (cap > OC_SPEAK_MAX + 1) cap = OC_SPEAK_MAX + 1;
+    return speak(body, len, resolve, ctx, out, cap);
+}
+
+size_t oc_speakable_full(const char *body, size_t len, oc_speak_name_fn resolve, void *ctx,
+                         char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!body || len == 0) return 0;
+    return speak(body, len, resolve, ctx, out, cap);
 }

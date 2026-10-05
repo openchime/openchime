@@ -37,6 +37,12 @@ typedef const char *(*oc_speak_name_fn)(void *ctx, const char *name);
 size_t oc_speakable(const char *body, size_t len, oc_speak_name_fn resolve, void *ctx,
                     char *out, size_t cap);
 
+/* The same, without the OC_SPEAK_MAX cut: the whole message, for a reader that
+ * must not lose any of it (a summary). `cap` of twice `len` plus 64 always
+ * holds it. */
+size_t oc_speakable_full(const char *body, size_t len, oc_speak_name_fn resolve, void *ctx,
+                         char *out, size_t cap);
+
 /* Split speakable text into segments of at most `max_chars`, at sentence ends
  * where possible, so a long message synthesizes in pieces. Writes up to `max`
  * (start, length) pairs and returns how many there are. */

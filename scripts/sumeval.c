@@ -5,13 +5,15 @@
  *
  *   sumeval init <db>
  *       an empty database at the daemon's schema, for scripts/slack_to_db.py
- *   sumeval run <db> <model.gguf> <channel> <start_ms> <end_ms> [threshold] [gap_minutes]
+ *   sumeval run <db> <model.gguf> <channel> <start_ms> <end_ms> [threshold] [gap_minutes] [tree.md]
  *       summarize [start, end) of the channel named, print the summary as
- *       clients read it, then one line of measurements: model calls, tokens,
- *       CPU time, wall time and peak memory
+ *       clients read it, then one line of measurements: nodes stored, model
+ *       calls, CPU time, wall time and peak memory. With tree.md, every model
+ *       call -- the prompt, the answer as written, and the summary it became --
+ *       is written there, in the order made, to see what each level did
  *
  * The real worker code builds the summary (oc_sum_build_now): the same
- * pieces, prompts, grammar, checks and rollups as the daemon, stored in the
+ * pieces, prompt, grammar, checks and recursion as the daemon, stored in the
  * database given, so a second run reuses what the first made. Runs on one
  * thread, ungated. Built by `make build/sumeval`.
  */
@@ -46,6 +48,17 @@ static int sink_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int 
     return 0;
 }
 
+typedef struct { FILE *f; int n; } tree;
+
+static void trace(void *ctx, const char *prompt, const char *answer, const char *body) {
+    tree *t = ctx;
+    t->n++;
+    if (!t->f) return;
+    fprintf(t->f, "## Call %d\n\n### Prompt\n\n```\n%s```\n\n### Answer\n\n```\n%s\n```\n\n### Stored\n\n```\n%s\n```\n\n",
+            t->n, prompt, answer, body ? body : "(failed)");
+    fflush(t->f);
+}
+
 static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -64,13 +77,15 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc < 7 || strcmp(argv[1], "run") != 0) {
-        fprintf(stderr, "usage: sumeval init <db> | sumeval run <db> <model.gguf> <channel> <start_ms> <end_ms> [threshold] [gap_minutes]\n");
+        fprintf(stderr, "usage: sumeval init <db> | sumeval run <db> <model.gguf> <channel> <start_ms> <end_ms> [threshold] [gap_minutes] [tree.md]\n");
         return 2;
     }
     const char *dbp = argv[2], *model = argv[3], *chan = argv[4];
     int64_t start = atoll(argv[5]), end = atoll(argv[6]);
     size_t threshold = argc > 7 ? (size_t)atoi(argv[7]) : SUM_THRESHOLD_TOKENS;
     uint64_t gap = argc > 8 ? (uint64_t)atoi(argv[8]) * 60000u : SUM_GAP_MS;
+    tree t = { argc > 9 ? fopen(argv[9], "w") : NULL, 0 };
+    if (argc > 9 && !t.f) { fprintf(stderr, "sumeval: cannot write %s\n", argv[9]); return 1; }
 
     sink_ctx s = {0};
     if (sqlite3_open(dbp, &s.db) != SQLITE_OK) { fprintf(stderr, "sumeval: cannot open %s\n", dbp); return 1; }
@@ -86,7 +101,7 @@ int main(int argc, char **argv) {
     const char *base = strrchr(model, '/');
     char version[128];
     snprintf(version, sizeof version, "%s", base ? base + 1 : model);
-    int ctx_tokens = (int)threshold + 1024 + SUM_MAX_OUT;
+    int ctx_tokens = 3 * (int)threshold;      /* as SUM_CTX_TOKENS, for this threshold */
     oc_sum_worker_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.db_path = dbp;
@@ -95,6 +110,8 @@ int main(int argc, char **argv) {
     cfg.sink.ctx = &s;
     cfg.threshold = threshold;
     cfg.gap_ms = gap;
+    cfg.trace = trace;
+    cfg.trace_ctx = &t;
 
     double t0 = now_s();
     char err[256] = "";
@@ -104,10 +121,11 @@ int main(int argc, char **argv) {
     getrusage(RUSAGE_SELF, &ru);
     if (rc != 0) fprintf(stderr, "sumeval: %s\n", err);
     if (s.answer) printf("%s\n", s.answer);
-    printf("MEASURE model=%s threshold=%zu gap_min=%llu nodes_stored=%d cpu_s=%.1f wall_s=%.1f maxrss_mb=%ld\n",
-           version, threshold, (unsigned long long)(gap / 60000u), s.stored,
+    printf("MEASURE model=%s threshold=%zu gap_min=%llu nodes_stored=%d model_calls=%d cpu_s=%.1f wall_s=%.1f maxrss_mb=%ld\n",
+           version, threshold, (unsigned long long)(gap / 60000u), s.stored, t.n,
            (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6, t1 - t0, ru.ru_maxrss / 1024);
     free(s.answer);
+    if (t.f) fclose(t.f);
     sqlite3_close(s.db);
     return rc == 0 ? 0 : 1;
 }

@@ -88,9 +88,14 @@ void oc_sum_new_free(oc_sum_new *nodes, int n);
  * transaction that changed the message. */
 int oc_sum_purge(sqlite3 *db, int64_t channel, int64_t msg_id, int64_t root_id, int64_t created_ms);
 
-/* Remove nodes nothing is built on any more and nobody has needed for
- * `max_age_ms`. Returns how many. */
-int oc_sum_collect(sqlite3 *db, int64_t now_ms, int64_t max_age_ms);
+/* Called, from the writer's thread, for every message a purge was for: the
+ * summary worker wakes to summarize again. NULL (the default) calls nothing. */
+void oc_sum_on_change(void (*fn)(int64_t channel, int64_t at_ms));
+
+/* Where a cut that must include `start_ms` begins: the first message after the
+ * last quiet gap (longer than `gap_ms`) before it, so that every cut covering
+ * `start_ms` makes the same chunks from there on and they are found again. */
+int64_t oc_sum_anchor(sqlite3 *db, int64_t channel, int64_t start_ms, uint64_t gap_ms);
 
 /* A stable name for a list of inputs ("<tag>:" and 16 hex digits). */
 void oc_sum_ikey(char tag, const oc_sum_input *in, int n, char *out, size_t cap);

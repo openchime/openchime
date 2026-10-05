@@ -1631,7 +1631,7 @@ would fail (REQ-295). `tts` is present exactly when read-aloud is running — bu
 in, turned on, and its voice data found and verified against its manifest. `stt`
 is present exactly when voice input (§5.14c) is running, on the same terms for the
 recognizer's data. `calls` is present when the audio relay is up to carry calls
-(§5.17). `summarize` is present when summaries are on and their model answered at
+(§5.17). `summarize` is present when summaries are on and their model loaded at
 startup (§5.16m); a daemon that brings them up after a client signed in tells it
 at its next sign-in.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
@@ -2388,11 +2388,10 @@ does not send it.
 
     req_id (u32), channel_id (u64), scope (u8), start_ms (u64), end_ms (u64)
 
-`scope` 0 **unread** (from the message last read to the end of the reader's
-today), 1 **week** (the reader's last seven days, today included), 2 **range**
-(`[start_ms, end_ms)`, at most 31 days; ignored otherwise), 3 **daily** (the
-reader's yesterday, or every day since they were last about, up to a week). Days
-are the reader's, by their time-zone offset.
+`scope` 0 **unread** (from the message last read to now), 1 **week** (the
+reader's last seven days, today included), 2 **range** (`[start_ms, end_ms)`;
+ignored otherwise), 3 **daily** (the reader's yesterday, or every day since they
+were last about). Days are the reader's, by their time-zone offset.
 
 **`SUMMARY` (S → C), `0x00FE`** — the answer, once, to one `SUMMARIZE`.
 

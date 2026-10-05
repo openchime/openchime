@@ -26,6 +26,8 @@ static int cmp_msg(const void *a, const void *b) {
  * integration's post (a webhook signs with its own name). */
 #define PEOPLE " deleted_at_ms IS NULL AND kind=0 AND author_name IS NULL "
 
+static void (*g_changed)(int64_t channel, int64_t at_ms);
+
 int oc_sum_load_window(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t end_ms, oc_sum_window *w) {
     memset(w, 0, sizeof *w);
     sqlite3_stmt *st = NULL;
@@ -95,10 +97,14 @@ int oc_sum_load_window(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t e
             m->edited_ms = sqlite3_column_int64(rows, 4);
             const char *body = (const char *)sqlite3_column_blob(rows, 5);
             size_t blen = (size_t)sqlite3_column_bytes(rows, 5);
-            char speak[OC_SPEAK_MAX + 1];
-            size_t sl = body ? oc_speakable(body, blen, NULL, NULL, speak, sizeof speak) : 0;
+            /* The whole message: a summary must not lose any of it. */
+            size_t scap = 2 * blen + 64;
+            char *speak = malloc(scap);
+            if (!speak) goto done;
+            size_t sl = body ? oc_speakable_full(body, blen, NULL, NULL, speak, scap) : 0;
             speak[sl] = '\0';
-            m->text = strdup(sl ? speak : "(an attachment)");
+            m->text = sl ? speak : strdup("(an attachment)");
+            if (!sl) free(speak);
             m->author = strdup((const char *)sqlite3_column_text(rows, 6));
             if (!m->text || !m->author) { free((char *)m->text); free((char *)m->author); goto done; }
             w->n++;
@@ -278,19 +284,35 @@ int oc_sum_purge(sqlite3 *db, int64_t channel, int64_t msg_id, int64_t root_id, 
     sqlite3_bind_int64(st, 4, created_ms);
     int rc = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
     sqlite3_finalize(st);
+    void (*hook)(int64_t, int64_t) = __atomic_load_n(&g_changed, __ATOMIC_ACQUIRE);
+    if (hook) hook(channel, created_ms);
     return rc;
 }
 
-int oc_sum_collect(sqlite3 *db, int64_t now_ms, int64_t max_age_ms) {
+void oc_sum_on_change(void (*fn)(int64_t channel, int64_t at_ms)) {
+    __atomic_store_n(&g_changed, fn, __ATOMIC_RELEASE);
+}
+
+int64_t oc_sum_anchor(sqlite3 *db, int64_t channel, int64_t start_ms, uint64_t gap_ms) {
     sqlite3_stmt *st = NULL;
+    int64_t at = start_ms;
     if (sqlite3_prepare_v2(db,
-            "DELETE FROM summary_nodes WHERE created_at_ms < ?1 AND "
-            "id NOT IN (SELECT child_id FROM summary_inputs WHERE child_kind=1);", -1, &st, NULL) != SQLITE_OK)
-        return -1;
-    sqlite3_bind_int64(st, 1, now_ms - max_age_ms);
-    int rc = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
+            "SELECT created_at_ms FROM messages WHERE channel_id=?1 AND created_at_ms<?2 AND" PEOPLE
+            "ORDER BY created_at_ms DESC;", -1, &st, NULL) != SQLITE_OK)
+        return start_ms;
+    sqlite3_bind_int64(st, 1, channel);
+    sqlite3_bind_int64(st, 2, start_ms);
+    /* Back from `start` to the first quiet gap: every cut that starts at or
+     * before it agrees from it on. */
+    int64_t later = start_ms;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int64_t t = sqlite3_column_int64(st, 0);
+        if ((uint64_t)(later - t) > gap_ms) break;
+        at = t;
+        later = t;
+    }
     sqlite3_finalize(st);
-    return rc;
+    return at;
 }
 
 void oc_sum_ikey(char tag, const oc_sum_input *in, int n, char *out, size_t cap) {

@@ -28,8 +28,10 @@ typedef struct oc_sum_engine {
     void *(*open)(void *ctx, char *err, size_t errcap);
     void  (*close)(void *handle);
     /* Answer `user` under `system`, held to `grammar` (GBNF, root rule "root"),
-     * writing at most `max_out` tokens. The answer, NUL-terminated, into a heap
-     * string at *out. 0, or -1 with a reason (or abandoned by the gate). */
+     * writing at most `max_out` tokens (0: whatever the context has left). The
+     * answer, NUL-terminated, into a heap string at *out. 0, or -1 with a reason
+     * (or abandoned by the gate); an answer that filled the context is left at
+     * *out as far as it got, for the log. */
     int   (*run)(void *handle, const char *system, const char *user, const char *grammar,
                  int max_out, oc_sum_gate_fn gate, void *gate_ctx, char **out,
                  oc_sum_run_stats *st, char *err, size_t errcap);
