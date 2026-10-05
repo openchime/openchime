@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include "oc_port.h"     /* oc_localtime_r */
+#include "protocol.h"    /* OC_SUM_* */
 
 /* jsmn's implementation, private to this file: the daemon carries its own copy
  * (daemon/jwt.c), and the test program links both, so its two public functions
@@ -216,4 +220,63 @@ out:
     free(d.t);
     if (rc != 0) oc_summary_view_free(out);
     return rc;
+}
+
+/* One local date "YYYY-MM-DD" at `*p`: the time its day starts; *p moves past it. */
+static int read_date(const char **p, time_t *out) {
+    int y, mo, d, n = 0;
+    while (**p == ' ') (*p)++;
+    if (sscanf(*p, "%4d-%2d-%2d%n", &y, &mo, &d, &n) != 3 || mo < 1 || mo > 12 || d < 1 || d > 31) return -1;
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1 || tm.tm_mday != d) return -1;   /* 2026-02-30 is not a day */
+    *out = t;
+    *p += n;
+    return 0;
+}
+
+int oc_summary_range_parse(const char *text, uint64_t *start_ms, uint64_t *end_ms) {
+    if (!text) return -1;
+    const char *p = text;
+    time_t a, b;
+    if (read_date(&p, &a) != 0) return -1;
+    while (*p == ' ' || *p == '-') p++;
+    if (!strncmp(p, "to ", 3)) p += 3;
+    if (read_date(&p, &b) != 0) return -1;
+    while (*p == ' ') p++;
+    if (*p || b < a) return -1;
+    /* The day after the second, by the calendar (a day is not always 24 hours). */
+    struct tm tm;
+    if (!oc_localtime_r(&b, &tm)) return -1;
+    tm.tm_mday += 1;
+    tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    time_t e = mktime(&tm);
+    if (e == (time_t)-1) return -1;
+    *start_ms = (uint64_t)a * 1000u;
+    *end_ms = (uint64_t)e * 1000u;
+    return 0;
+}
+
+void oc_summary_span_label(uint8_t scope, uint64_t start_ms, uint64_t end_ms, char *out, size_t cap) {
+    if (scope == OC_SUM_UNREAD) { snprintf(out, cap, "Unread"); return; }
+    if (scope == OC_SUM_WEEK) { snprintf(out, cap, "Last 7 days"); return; }
+    if (scope == OC_SUM_DAILY) { snprintf(out, cap, "Since yesterday"); return; }
+    char a[16] = "", b[16] = "";
+    time_t ts = (time_t)(start_ms / 1000), te = (time_t)((end_ms ? end_ms - 1 : 0) / 1000);
+    struct tm tm;
+    if (oc_localtime_r(&ts, &tm)) strftime(a, sizeof a, "%Y-%m-%d", &tm);
+    if (oc_localtime_r(&te, &tm)) strftime(b, sizeof b, "%Y-%m-%d", &tm);
+    if (!strcmp(a, b)) snprintf(out, cap, "%s", a);
+    else snprintf(out, cap, "%s to %s", a, b);
+}
+
+const char *oc_summary_kind_heading(uint8_t kind) {
+    static const char *const H[4] = { "Decisions", "Actions", "Problems", "Facts" };
+    return kind < 4 ? H[kind] : "";
 }

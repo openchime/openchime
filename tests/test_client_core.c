@@ -558,6 +558,22 @@ static void test_summary_model(void) {
     CHECK(oc_summary_view_parse("not json", 8, &v) == -1 && v.n_items == 0);
     CHECK(oc_summary_view_parse("{\"people\":{}}", 13, &v) == -1);
 
+    /* A typed range is two local dates, the second day whole. */
+    uint64_t rs = 0, re = 0;
+    CHECK(oc_summary_range_parse("2026-09-04 2026-09-14", &rs, &re) == 0 && re > rs);
+    CHECK(re - rs >= 11ull * 86400000 - 3600000 && re - rs <= 11ull * 86400000 + 3600000);
+    char lab[48];
+    oc_summary_span_label(OC_SUM_RANGE, rs, re, lab, sizeof lab);
+    CHECK(!strcmp(lab, "2026-09-04 to 2026-09-14"));
+    CHECK(oc_summary_range_parse("2026-09-04 to 2026-09-04", &rs, &re) == 0);
+    oc_summary_span_label(OC_SUM_RANGE, rs, re, lab, sizeof lab);
+    CHECK(!strcmp(lab, "2026-09-04"));
+    CHECK(oc_summary_range_parse("2026-09-14 2026-09-04", &rs, &re) == -1);   /* backwards */
+    CHECK(oc_summary_range_parse("2026-02-30 2026-03-01", &rs, &re) == -1);   /* no such day */
+    CHECK(oc_summary_range_parse("last week", &rs, &re) == -1);
+    oc_summary_span_label(OC_SUM_WEEK, 0, 0, lab, sizeof lab);
+    CHECK(!strcmp(lab, "Last 7 days"));
+
     oc_model m; oc_model_init(&m);
     /* Nothing open: an answer is dropped. */
     summary_answer(&m, 1, OC_SUM_OK, BODY);

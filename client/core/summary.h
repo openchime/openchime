@@ -41,4 +41,16 @@ typedef struct {
 int  oc_summary_view_parse(const char *json, size_t len, oc_summary_view *out);
 void oc_summary_view_free(oc_summary_view *v);
 
+/* A range the person typed as two local dates, "2026-09-04 2026-09-14" (or
+ * with "to" between), into [start of the first day, start of the day after
+ * the second) in ms. 0, or -1 when it is not two dates in order. */
+int  oc_summary_range_parse(const char *text, uint64_t *start_ms, uint64_t *end_ms);
+
+/* What a span is called: "Unread", "Last 7 days", "Since yesterday", or the
+ * range's local dates. `scope` is OC_SUM_*; start and end matter for a range. */
+void oc_summary_span_label(uint8_t scope, uint64_t start_ms, uint64_t end_ms, char *out, size_t cap);
+
+/* What an item kind is called, as a heading: "Decisions", ... */
+const char *oc_summary_kind_heading(uint8_t kind);
+
 #endif
