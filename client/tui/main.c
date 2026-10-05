@@ -686,7 +686,7 @@ static void draw_help(int W, int H) {
         { NULL, NULL },
         { NULL, "Everything else" },
         { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
-        { "Summaries",  "Ctrl+K · Summarize…, or Enter on a channel: ↑/↓ item · Enter goes to it" },
+        { "Summaries",  "Ctrl+K · Summarize, or Enter on a channel: ↑/↓ item · Enter goes to it" },
     };
     int n = (int)(sizeof R / sizeof R[0]);
     const tk_theme *th = tk_theme_active();
@@ -818,7 +818,7 @@ static void menu_build_channel(int joined, int summarize) {
     g_nmenu = 0;
     if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
     g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
-    if (summarize) g_menu[g_nmenu++] = (menuitem){ "Summarize…",  ACT_SUMMARIZE };
+    if (summarize) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
@@ -850,7 +850,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
     { "Session", "Help",                NULL, "?",  ACT_HELP },
     { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
-    { "Channel", "Summarize…",          NULL, NULL, ACT_SUMMARIZE },
+    { "Channel", "Summarize",           NULL, NULL, ACT_SUMMARIZE },
 };
 /* The launcher as it is now: summaries only where the daemon makes them
  * (REQ-313), and a way back to the open one for this conversation. */
@@ -871,7 +871,7 @@ static void menu_build_summary_span(void) {
     g_menu[g_nmenu++] = (menuitem){ "Unread",           ACT_SUM_UNREAD };
     g_menu[g_nmenu++] = (menuitem){ "Last 7 days",      ACT_SUM_WEEK };
     g_menu[g_nmenu++] = (menuitem){ "Since yesterday",  ACT_SUM_DAILY };
-    g_menu[g_nmenu++] = (menuitem){ "Dates…",           ACT_SUM_RANGE };
+    g_menu[g_nmenu++] = (menuitem){ "Dates",            ACT_SUM_RANGE };
 }
 
 /* ---- sidebar (shared with the GUI via the core) ----------------------------
@@ -2819,7 +2819,7 @@ int main(int argc, char **argv) {
                     }
                     else if (id == ACT_SUM_RANGE) {
                         prompt_kind = PROMPT_SUMRANGE;
-                        prompt_title = "Summarize from … to … (YYYY-MM-DD YYYY-MM-DD)";
+                        prompt_title = "Summarize: the first and last day (YYYY-MM-DD YYYY-MM-DD)";
                         tk_input_init(&prompt_input, 0, "2026-09-04 2026-09-14");
                     }
                 }

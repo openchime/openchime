@@ -145,6 +145,17 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   management, files, drafts, scheduling, custom emoji, profile and status,
   notification settings, admin and storage. This document does not enumerate
   them; read the header. A frontend uses only this facade.
+- **Summaries (REQ-310–313).** `oc_client_summarize(channel, scope, start, end)`
+  asks for one, over the scopes of `SUMMARIZE` (unread, the last 7 days, since
+  yesterday, or two local dates `oc_summary_range_parse` reads), and returns the
+  request's id — the first request in the core that carries one. The model holds
+  one open summary: loading until its `SUMMARY` arrives, then its status and, when
+  it is one, the body read by `client/core/summary.c` into an overview and items,
+  each with its kind, text, owner, status and the message ids it came from. An
+  answer to anything but the open request is dropped, and closing forgets it:
+  a summary is shown to the person who asked and kept nowhere, as Slack's are.
+  Frontends offer it only where `oc_model_summarize_available` (the `summarize`
+  capability), and close it when the conversation changes.
 
 - **Transfers queue** (REQ-140/162). A connection runs one transfer at a time,
   as the daemon requires, so the net thread keeps a FIFO of transfer commands —
@@ -313,6 +324,16 @@ model; translate input to intents }, stop.
   left of the unread count; members never see it. The launcher's "Daemon alerts"
   lists them, newest first, each with its state, count and message; `a`
   acknowledges the one selected, `A` all of them.
+  **Summaries (REQ-310):** where the daemon makes them, the launcher's
+  "Summarize" and the channel menu's offer the span — Unread, Last 7 days, Since
+  yesterday, or Dates, typed as two days — and open the summary over the
+  conversation: "Summarizing…" while the daemon makes it (minutes, on a small
+  server, for one not made yet), then the overview and the decisions, actions,
+  problems and facts, each with how many messages it came from. ↑/↓ selects an
+  item and Enter goes to its first message, selecting it in the conversation and
+  fetching the history around it when it is not loaded; the launcher's "Back to
+  the summary" reopens it while you stay in the conversation. Esc, or moving to
+  another conversation, forgets it.
   **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
   signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
   frame, rendering only the active one — so a workspace you aren't looking at
@@ -498,6 +519,20 @@ model; translate input to intents }, stop.
   - The composer offers groups beside people after `@`, and colours a group's handle as it does a name.
   - A message naming a group I am in tints and toasts as one naming me.
   - People lists the groups above the roster, and a profile card lists a person's groups.
+
+  **Summaries (REQ-310)**, where the daemon makes them: the channel menu's
+  **Summarize** and the palette's "Summarize this conversation" ask which span —
+  Unread, Last 7 days, Since yesterday, or Dates, the first and last day typed into
+  the form, which asks again with the field in red when they are not two days in
+  order. The summary opens in the context pane, beside the conversation, under a
+  **SUMMARY** header: "Summarizing…" until it arrives, then the overview and the
+  decisions, actions, problems and facts, each with its owner and status where
+  given and how many messages it came from. Clicking an item goes to its first
+  message in the transcript, which scrolls to it and flashes it, as a pin does;
+  the pane stays. The pane scrolls; its back arrow or close forgets the summary,
+  and so does moving to another conversation. Each item is a list item in the
+  accessibility tree (`summary.item.<n>`), invoked as a click; the harness verb
+  `summary <scope>` asks without the form and `summary close` closes it.
 - **Linux GUI:** the **same portable client** (ARCH-80) — the shared
   app layer over SDL3, with a FreeType/fontconfig text backend and a small
   native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit
