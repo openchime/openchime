@@ -10313,9 +10313,11 @@ static void draw_summary_pane(gfx *rt, const oc_model *m, rectf reg) {
     y += 30;
     const char *say = NULL;
     uint32_t say_col = OC_COL_FAINT;
-    if (m->summary_loading)
-        say = "Summarizing\u2026 On this server a summary not made yet can take a few minutes.";
-    else if (m->summary_status != OC_SUM_OK) { say = m->summary_error ? m->summary_error : "No summary."; say_col = OC_COL_DANGER; }
+    char wait[96];
+    if (m->summary_loading) {
+        oc_summary_wait_text(m->summary_position, wait, sizeof wait);
+        say = wait;
+    } else if (m->summary_status != OC_SUM_OK) { say = m->summary_error ? m->summary_error : "No summary."; say_col = OC_COL_DANGER; }
     else if (!m->summary.overview[0] && !m->summary.n_items) say = "Nothing to summarize in this span.";
     if (say) {
         float h = text_height(say, g_body, w);

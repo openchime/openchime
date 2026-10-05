@@ -273,7 +273,10 @@ enum {
      * `status` is OC_SUM_*; `body` the summary as JSON when OK, otherwise a
      * sentence saying why. `channel_id`, `span_start`/`span_end` and
      * `summary_id` as the daemon sent them. */
-    OC_EV_SUMMARY
+    OC_EV_SUMMARY,
+    /* SUMMARY_QUEUED: where the SUMMARIZE named by `req_id` stands; `count` is
+     * how many requests are ahead of it, 0 once it is being made. */
+    OC_EV_SUMMARY_QUEUED
 };
 
 typedef struct {

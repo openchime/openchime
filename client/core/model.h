@@ -475,6 +475,7 @@ typedef struct {
     uint8_t   summary_scope;     /* OC_SUM_UNREAD... */
     uint8_t   summary_status;
     uint32_t  summary_req;
+    int32_t   summary_position;  /* requests ahead of it while loading; -1 until told */
     uint64_t  summary_channel;
     uint64_t  summary_start, summary_end;   /* the span: asked for, then as covered */
     char     *summary_error;

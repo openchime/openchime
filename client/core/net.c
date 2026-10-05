@@ -1076,6 +1076,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED) {
+            oc_summary_queued sq;
+            if (oc_decode_summary_queued(&p, &sq) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY_QUEUED);
+                if (e) {
+                    e->req_id = sq.req_id;
+                    e->count = sq.position;
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_DESCRIPTION) {
             oc_channel_description cd;
             if (oc_decode_channel_description(&p, &cd) == OC_OK) {

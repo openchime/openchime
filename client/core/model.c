@@ -595,6 +595,7 @@ void oc_model_close_summary(oc_model *m) {
     m->summary_error = NULL;
     m->summary_open = m->summary_loading = m->summary_scope = m->summary_status = 0;
     m->summary_req = 0;
+    m->summary_position = -1;
     m->summary_channel = m->summary_start = m->summary_end = 0;
 }
 
@@ -608,6 +609,7 @@ void oc_model_summary_begin(oc_model *m, uint64_t channel_id, uint8_t scope, uin
     m->summary_start = start_ms;
     m->summary_end = end_ms;
     m->summary_req = req_id;
+    m->summary_position = -1;
 }
 
 void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id) {
@@ -2094,6 +2096,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
+    case OC_EV_SUMMARY_QUEUED:
+        if (m->summary_open && m->summary_loading && e->req_id == m->summary_req)
+            m->summary_position = (int32_t)e->count;
+        break;
     case OC_EV_PINS_END:
         if (m->pinlist_open && m->pinlist_channel == e->channel_id)
             m->pinlist_loading = 0;

@@ -1376,7 +1376,9 @@ static void draw_summary(const oc_model *m, int W, int H, int sel) {
     if (cw < 20) cw = 20;
     rows_t r = {0};
     if (m->summary_loading) {
-        wrap_words_push(&r, "Summarizing… On this server a summary not made yet can take a few minutes.", th->muted, cw, 0);
+        char wait[96];
+        oc_summary_wait_text(m->summary_position, wait, sizeof wait);
+        wrap_words_push(&r, wait, th->muted, cw, 0);
     } else if (m->summary_status != OC_SUM_OK) {
         wrap_words_push(&r, m->summary_error ? m->summary_error : "No summary.", TB_RED | TB_BOLD, cw, 0);
     } else if (!m->summary.overview[0] && !m->summary.n_items) {

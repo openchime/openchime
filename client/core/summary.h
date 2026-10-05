@@ -50,6 +50,11 @@ int  oc_summary_range_parse(const char *text, uint64_t *start_ms, uint64_t *end_
  * range's local dates. `scope` is OC_SUM_*; start and end matter for a range. */
 void oc_summary_span_label(uint8_t scope, uint64_t start_ms, uint64_t end_ms, char *out, size_t cap);
 
+/* What the pane says while a summary is coming: `position` is how many requests
+ * are ahead of it (SUMMARY_QUEUED), 0 once it is being made, -1 before the
+ * daemon has said. */
+void oc_summary_wait_text(int32_t position, char *out, size_t cap);
+
 /* What an item kind is called, as a heading: "Decisions", ... */
 const char *oc_summary_kind_heading(uint8_t kind);
 

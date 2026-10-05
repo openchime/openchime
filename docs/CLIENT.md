@@ -327,8 +327,9 @@ model; translate input to intents }, stop.
   **Summaries (REQ-310):** where the daemon makes them, the launcher's
   "Summarize" and the channel menu's offer the span — Unread, Last 7 days, Since
   yesterday, or Dates, typed as two days — and open the summary over the
-  conversation: "Summarizing…" while the daemon makes it (minutes, on a small
-  server, for one not made yet), then the overview and the decisions, actions,
+  conversation: while the daemon makes it (minutes, on a small server, for one
+  not made yet) its place in the daemon's queue, "Waiting: 2 requests ahead of
+  yours" or "Summarizing now…", then the overview and the decisions, actions,
   problems and facts, each with how many messages it came from. ↑/↓ selects an
   item and Enter goes to its first message, selecting it in the conversation and
   fetching the history around it when it is not loaded; the launcher's "Back to
@@ -525,7 +526,8 @@ model; translate input to intents }, stop.
   Unread, Last 7 days, Since yesterday, or Dates, the first and last day typed into
   the form, which asks again with the field in red when they are not two days in
   order. The summary opens in the context pane, beside the conversation, under a
-  **SUMMARY** header: "Summarizing…" until it arrives, then the overview and the
+  **SUMMARY** header: its place in the daemon's queue until it arrives, as the
+  TUI says it, then the overview and the
   decisions, actions, problems and facts, each with its owner and status where
   given and how many messages it came from. Clicking an item goes to its first
   message in the transcript, which scrolls to it and flashes it, as a pin does;

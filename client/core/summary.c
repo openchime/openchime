@@ -276,6 +276,15 @@ void oc_summary_span_label(uint8_t scope, uint64_t start_ms, uint64_t end_ms, ch
     else snprintf(out, cap, "%s to %s", a, b);
 }
 
+void oc_summary_wait_text(int32_t position, char *out, size_t cap) {
+    if (position < 0)
+        snprintf(out, cap, "Summarizing\u2026 On this server a summary not made yet can take a few minutes.");
+    else if (position == 0)
+        snprintf(out, cap, "Summarizing now\u2026 This can take a few minutes.");
+    else
+        snprintf(out, cap, "Waiting: %d request%s ahead of yours.", (int)position, position == 1 ? "" : "s");
+}
+
 const char *oc_summary_kind_heading(uint8_t kind) {
     static const char *const H[4] = { "Decisions", "Actions", "Problems", "Facts" };
     return kind < 4 ? H[kind] : "";

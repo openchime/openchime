@@ -579,7 +579,30 @@ static void test_summary_model(void) {
     summary_answer(&m, 1, OC_SUM_OK, BODY);
     CHECK(!m.summary_open && m.summary.n_items == 0);
     oc_model_summary_begin(&m, 10, OC_SUM_WEEK, 0, 0, 2);
-    CHECK(m.summary_open && m.summary_loading && m.summary_req == 2);
+    CHECK(m.summary_open && m.summary_loading && m.summary_req == 2 && m.summary_position == -1);
+    /* Its place in the daemon's queue follows SUMMARY_QUEUED; another request's
+     * place is not its own. */
+    {
+        oc_ev q;
+        memset(&q, 0, sizeof q);
+        q.type = OC_EV_SUMMARY_QUEUED;
+        q.req_id = 2;
+        q.count = 2;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_position == 2);
+        char wt[96];
+        oc_summary_wait_text(m.summary_position, wt, sizeof wt);
+        CHECK(!strcmp(wt, "Waiting: 2 requests ahead of yours."));
+        q.req_id = 1;
+        q.count = 0;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_position == 2);
+        q.req_id = 2;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_position == 0);
+        oc_summary_wait_text(1, wt, sizeof wt);
+        CHECK(!strcmp(wt, "Waiting: 1 request ahead of yours."));
+    }
     /* An answer to an earlier request is not this one. */
     summary_answer(&m, 1, OC_SUM_OK, BODY);
     CHECK(m.summary_loading && m.summary.n_items == 0);
@@ -628,6 +651,10 @@ static oc_dbwriter *g_csum_dbw;
 static int csum_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
     (void)ctx;
     return oc_dbwriter_sum_store(g_csum_dbw, a, nodes, n);
+}
+static int csum_take(void *ctx, int64_t row) {
+    (void)ctx;
+    return oc_dbwriter_sum_take(g_csum_dbw, row);
 }
 
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
@@ -4637,6 +4664,7 @@ int run_client_core_tests(void) {
         cfg.engine = &csum_eng;
         cfg.probe = &csum_quiet;
         cfg.sink.store = csum_store;
+        cfg.sink.take = csum_take;
         char err[256] = "";
         csum = oc_sum_worker_start(&cfg, err, sizeof err);
         CHECK(csum != NULL);
