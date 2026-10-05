@@ -44,7 +44,7 @@
  * Guidance to the model only; no answer is ever cut. */
 #define SUM_WORDS_PCT 30
 /* Bumped whenever the prompt, the shape or how an answer is read change. */
-#define SUM_PROMPT_VERSION "s3"
+#define SUM_PROMPT_VERSION "s4"
 
 /* One message as the core sees it: plain text (oc_speakable_full), its author's
  * name, and its thread (parent_id: the root's id, 0 for a top-level message). */

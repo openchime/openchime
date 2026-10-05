@@ -92,19 +92,22 @@ The recursion makes three things:
 
 **What the model writes.** Plain text under fixed headings; any heading may be
 empty. The prompt lays the answer out as a template — each heading on its own
-line, with one placeholder item under it ending in `[line number]` — because a
-small model follows a form it can see better than rules written as prose:
+line, with one placeholder item under it starting with `[line number]` — because
+a small model follows a form it can see better than rules written as prose. The
+numbers come first, as they do in the lines it reads, so the model picks its
+lines before it writes the item; asked for them at the end, it left them out of
+most answers:
 
 ```
 Overview: <what happened>
 Decisions:
-- <text> [3][7]
+- [3][7] <text>
 Actions:
-- <who>: <what> (open|done) [5]
+- [5] <who>: <what> (open|done)
 Problems:
-- <text> (open|resolved) [9]
+- [9] <text> (open|resolved)
 Facts:
-- <text> [2]
+- [2] <text>
 ```
 
 Nothing holds the model to this while it writes. Holding a model to JSON, or to

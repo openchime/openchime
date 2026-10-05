@@ -556,18 +556,18 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out) {
     }
     oc_sum_buf_printf(out,
         "\nSummarize these lines. Write at most %zu words of text; headings and line numbers do "
-        "not count. Answer in exactly this form, one item to a line, every item ending with the "
+        "not count. Answer in exactly this form, one item to a line, every item starting with the "
         "numbers of the lines it comes from:\n"
         "\n"
         "Overview: <what happened>\n"
         "Decisions:\n"
-        "- <what was decided> [line number]\n"
+        "- [line number] <what was decided>\n"
         "Actions:\n"
-        "- <who, or Team>: <what they do> (open) [line number]\n"
+        "- [line number] <who, or Team>: <what they do> (open)\n"
         "Problems:\n"
-        "- <what went wrong> (open) [line number]\n"
+        "- [line number] <what went wrong> (open)\n"
         "Facts:\n"
-        "- <a number, date, ticket, customer or release> [line number]\n"
+        "- [line number] <a number, date, ticket, customer or release>\n"
         "\n"
         "An action is (open) or (done); a problem is (open) or (resolved). Write as many items "
         "under a heading as the lines give, or none.\n",
