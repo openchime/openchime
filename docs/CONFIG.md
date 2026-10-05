@@ -224,7 +224,7 @@ No audio is kept: a segment is freed once answered.
 Summaries of channels and DMs (REQ-310–313, ARCH-116, SUMMARIES.md). Off unless
 turned on. With `local`, the daemon first checks the CPU can run the model (on
 x86-64: AVX2, FMA, F16C and BMI2); the first start then fetches the model (about
-530 MB) into `summary/` beside the database and checks its SHA-256, and every
+1.3 GB) into `summary/` beside the database and checks its SHA-256, and every
 start loads it. Any failure leaves summaries off with the reason logged, and the
 rest of the daemon runs on: on a CPU without those instructions, `local` is
 always off. A daemon built with `make SUM=0` has no summaries whatever these say.

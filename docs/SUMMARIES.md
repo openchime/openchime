@@ -234,8 +234,8 @@ model that thinks before answering (Qwen3.5 does), the prompt ends with the empt
 thought its own template writes when thinking is not asked for, so it answers
 straight away.
 
-**The model** (`daemon/sum_fetch.h`). Qwen3.5 0.8B, 4-bit (`Q4_K_M`), Apache-2.0:
-about 530 MB on disk. On the first start with summaries on, the daemon fetches it
+**The model** (`daemon/sum_fetch.h`). Qwen3.5 2B, 4-bit (`Q4_K_M`), Apache-2.0:
+about 1.3 GB on disk. On the first start with summaries on, the daemon fetches it
 from its pinned address into `summary/` beside the database, checks it against
 the pinned SHA-256, and writes a marker; later starts check the marker and the
 size, then load the model. Any failure leaves summaries off with a line in the

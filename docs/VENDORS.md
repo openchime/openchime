@@ -207,7 +207,7 @@ dependency, built the same way:
   daemon links it with the same static C++ runtime as ONNX Runtime. `make SUM=0`
   builds without it.
 - **The model is never shipped**: the daemon fetches it on first use from a pinned
-  address and checks a pinned SHA-256 (SUMMARIES.md §6). It is Qwen3.5 0.8B
+  address and checks a pinned SHA-256 (SUMMARIES.md §6). It is Qwen3.5 2B
   (Apache-2.0), 4-bit GGUF.
 
 llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.
