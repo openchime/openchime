@@ -23,7 +23,7 @@ typedef struct req {
     uint32_t    req_id;
     int64_t     channel, start_ms, end_ms;
     int         tz;
-    struct req *next;
+    int64_t     row;              /* summary_requests.id, 0 for idle work */
 } req;
 
 /* One build: the connection, the engine, the gate and the nodes made so far. */
@@ -34,6 +34,7 @@ typedef struct {
     void        **engine;         /* the open handle, opened on first need */
     oc_sum_load  *gate;           /* NULL: no gate */
     volatile int *stopping;
+    volatile int *yield;          /* idle work: set when a request is waiting */
     oc_sum_new   *nodes;
     int           n_nodes, cap_nodes;
     int64_t       channel;
@@ -64,8 +65,7 @@ struct oc_sum_worker {
     pthread_t         thread;
     pthread_mutex_t   mu;
     pthread_cond_t    cv;
-    req              *head, *tail;
-    int               queued;
+    volatile int      pending;        /* a request was queued: stop idle work */
     change           *changes;        /* under mu */
     int               n_changes, cap_changes;
     volatile int      stopping;
@@ -110,6 +110,8 @@ int64_t oc_sum_day_start(int64_t t, int tz) {
 static int gate_fn(void *vctx) {
     build *b = vctx;
     if (*b->stopping) return 1;
+    /* Idle work gives way to a request someone is waiting on. */
+    if (b->yield && __atomic_load_n(b->yield, __ATOMIC_ACQUIRE)) return 1;
     if (!b->gate) return 0;
     while (oc_sum_load_busy(b->gate)) {
         if (*b->stopping) return 1;
@@ -721,9 +723,10 @@ char *oc_sum_client_body(sqlite3 *db, const char *body) {
 }
 
 static void build_init(build *b, const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *version, void **engine,
-                       oc_sum_load *gate, volatile int *stopping, int64_t channel) {
+                       oc_sum_load *gate, volatile int *stopping, volatile int *yield, int64_t channel) {
     memset(b, 0, sizeof *b);
     b->cfg = cfg; b->db = db; b->version = version; b->engine = engine; b->gate = gate; b->stopping = stopping;
+    b->yield = yield;
     b->channel = channel;
     snprintf(b->where, sizeof b->where, "the channel");
 }
@@ -736,16 +739,18 @@ static void build_done(build *b) {
 }
 
 /* Build one period and hand it to the sink; built again once if a message
- * changed while it was being built. */
+ * changed while it was being built. `yield` (idle work only) stops it when a
+ * request is waiting. */
 static int run_build(const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *version, void **engine,
-                     oc_sum_load *gate, volatile int *stopping, const req *r, char *err, size_t errcap) {
+                     oc_sum_load *gate, volatile int *stopping, volatile int *yield, const req *r, char *err,
+                     size_t errcap) {
     for (int attempt = 0; attempt < 2; attempt++) {
         build b;
-        build_init(&b, cfg, db, version, engine, gate, stopping, r->channel);
+        build_init(&b, cfg, db, version, engine, gate, stopping, yield, r->channel);
         ref top;
         oc_sum_answer a;
         memset(&a, 0, sizeof a);
-        a.conn_id = r->conn_id; a.req_id = r->req_id; a.channel = r->channel;
+        a.conn_id = r->conn_id; a.req_id = r->req_id; a.channel = r->channel; a.request_id = r->row;
         a.start_ms = r->start_ms; a.end_ms = r->end_ms; a.tz_offset_min = r->tz; a.version = version;
         if (build_period(&b, r->start_ms, r->end_ms, r->tz, &top) != 0) {
             snprintf(err, errcap, "%s", b.err[0] ? b.err : "the summary could not be made");
@@ -773,10 +778,10 @@ static int run_build(const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *vers
 /* Summarize the chunks of [start, end) and store them, with nobody waiting.
  * 0, 1 when a message changed meanwhile, or -1. */
 static int run_chunks(const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *version, void **engine,
-                      oc_sum_load *gate, volatile int *stopping, int64_t channel, int64_t start, int64_t end,
-                      char *err, size_t errcap) {
+                      oc_sum_load *gate, volatile int *stopping, volatile int *yield, int64_t channel, int64_t start,
+                      int64_t end, char *err, size_t errcap) {
     build b;
-    build_init(&b, cfg, db, version, engine, gate, stopping, channel);
+    build_init(&b, cfg, db, version, engine, gate, stopping, yield, channel);
     ref *kids = NULL;
     int nk = 0;
     int rc = build_pieces(&b, start, end, &kids, &nk);
@@ -815,8 +820,8 @@ int oc_sum_build_now(const oc_sum_worker_cfg *cfg, int64_t channel, int64_t star
     oc_sum_version(cfg->engine, cfg->threshold, cfg->gap_ms, version, sizeof version);
     void *engine = NULL;
     volatile int stopping = 0;
-    req r = { 0, 0, channel, start_ms, end_ms, tz_offset_min, NULL };
-    int rc = run_build(cfg, db, version, &engine, NULL, &stopping, &r, err, errcap);
+    req r = { 0, 0, channel, start_ms, end_ms, tz_offset_min, 0 };
+    int rc = run_build(cfg, db, version, &engine, NULL, &stopping, NULL, &r, err, errcap);
     if (engine) cfg->engine->close(engine);
     sqlite3_close(db);
     return rc;
@@ -830,7 +835,7 @@ int oc_sum_chunks_now(const oc_sum_worker_cfg *cfg, int64_t channel, int64_t sta
     oc_sum_version(cfg->engine, cfg->threshold, cfg->gap_ms, version, sizeof version);
     void *engine = NULL;
     volatile int stopping = 0;
-    int rc = run_chunks(cfg, db, version, &engine, NULL, &stopping, channel, start_ms, end_ms, err, errcap);
+    int rc = run_chunks(cfg, db, version, &engine, NULL, &stopping, NULL, channel, start_ms, end_ms, err, errcap);
     if (engine) cfg->engine->close(engine);
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
@@ -899,16 +904,18 @@ static void remember_period(oc_sum_worker *w, const req *r) {
     w->asked[w->n_asked++] = k;
 }
 
-/* Every channel with people's messages, newest activity first, each to be
- * summarized from now back to its first message. */
+/* Every channel with people's messages in the last SUM_BACKGROUND_DAYS, newest
+ * activity first, each to be summarized from now back to the window's start.
+ * Older spans are made when someone asks for them. */
 static void fill_load(oc_sum_worker *w) {
     sqlite3_stmt *st = NULL;
     w->filled = 1;
     if (sqlite3_prepare_v2(w->db,
             "SELECT channel_id, MIN(created_at_ms), MAX(created_at_ms) FROM messages "
-            "WHERE deleted_at_ms IS NULL AND kind=0 AND author_name IS NULL "
+            "WHERE deleted_at_ms IS NULL AND kind=0 AND author_name IS NULL AND created_at_ms>=?1 "
             "GROUP BY channel_id ORDER BY 3 DESC;", -1, &st, NULL) != SQLITE_OK)
         return;
+    sqlite3_bind_int64(st, 1, wall_ms() - (int64_t)SUM_BACKGROUND_DAYS * DAY_MS);
     int cap = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (w->n_fill == cap) {
@@ -924,6 +931,34 @@ static void fill_load(oc_sum_worker *w) {
     sqlite3_finalize(st);
 }
 
+/* Idle work that failed because a request arrived: not a failure, and done
+ * again later. */
+static int yielded(oc_sum_worker *w, int rc) {
+    return rc < 0 && __atomic_load_n(&w->pending, __ATOMIC_ACQUIRE);
+}
+
+/* The oldest request in the queue (summary_requests), if any. */
+static int next_request(oc_sum_worker *w, req *out) {
+    sqlite3_stmt *st = NULL;
+    int got = 0;
+    if (sqlite3_prepare_v2(w->db,
+            "SELECT id, conn_id, req_id, channel_id, start_ms, end_ms, tz_offset_min FROM summary_requests "
+            "WHERE state='queued' ORDER BY id LIMIT 1;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        memset(out, 0, sizeof *out);
+        out->row = sqlite3_column_int64(st, 0);
+        out->conn_id = (uint64_t)sqlite3_column_int64(st, 1);
+        out->req_id = (uint32_t)sqlite3_column_int64(st, 2);
+        out->channel = sqlite3_column_int64(st, 3);
+        out->start_ms = sqlite3_column_int64(st, 4);
+        out->end_ms = sqlite3_column_int64(st, 5);
+        out->tz = sqlite3_column_int(st, 6);
+        got = 1;
+    }
+    sqlite3_finalize(st);
+    return got;
+}
+
 /* One step of idle work. 1 if there was something to do. */
 static int idle_step(oc_sum_worker *w, void **engine) {
     char err[600];
@@ -931,9 +966,9 @@ static int idle_step(oc_sum_worker *w, void **engine) {
     /* What a change left unsummarized. */
     change c;
     if (take_change(w, &c)) {
-        int rc = run_chunks(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, c.channel, c.at, wall_ms() + 1,
-                            err, sizeof err);
-        if (rc == 1) on_change(c.channel, c.at);         /* changed again meanwhile */
+        int rc = run_chunks(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &w->pending, c.channel, c.at,
+                            wall_ms() + 1, err, sizeof err);
+        if (rc == 1 || yielded(w, rc)) on_change(c.channel, c.at);   /* changed again, or to do again */
         else if (rc < 0 && !w->stopping) fprintf(stderr, "summary: channel %lld: %s\n", (long long)c.channel, err);
         return 1;
     }
@@ -944,8 +979,9 @@ static int idle_step(oc_sum_worker *w, void **engine) {
     if (best >= 0) {
         backfill *f = &w->fill[best];
         int64_t from = f->cursor - DAY_MS;
-        int rc = run_chunks(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, f->channel, from, f->cursor,
-                            err, sizeof err);
+        int rc = run_chunks(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &w->pending, f->channel, from,
+                            f->cursor, err, sizeof err);
+        if (yielded(w, rc)) return 1;                    /* the same day, after the request */
         if (rc < 0 && !w->stopping) fprintf(stderr, "summary: channel %lld: %s\n", (long long)f->channel, err);
         if (rc != 1) f->cursor = from;
         if (f->cursor <= f->first) w->fill[best] = w->fill[--w->n_fill];
@@ -960,8 +996,9 @@ static int idle_step(oc_sum_worker *w, void **engine) {
             free(body);
             continue;
         }
-        req r = { 0, 0, k->channel, k->start, k->end, k->tz, NULL };
-        if (run_build(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &r, err, sizeof err) != 0) {
+        req r = { 0, 0, k->channel, k->start, k->end, k->tz, 0 };
+        int rc = run_build(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &w->pending, &r, err, sizeof err);
+        if (rc != 0 && !yielded(w, rc)) {
             if (!w->stopping) fprintf(stderr, "summary: channel %lld, background: %s\n", (long long)k->channel, err);
             w->asked[i] = w->asked[--w->n_asked];   /* not again until asked again */
         }
@@ -979,10 +1016,11 @@ static int idle_step(oc_sum_worker *w, void **engine) {
         sqlite3_bind_text(st, 1, v, -1, SQLITE_STATIC);
         if (sqlite3_step(st) == SQLITE_ROW) {
             req r = { 0, 0, sqlite3_column_int64(st, 0), sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2),
-                      sqlite3_column_int(st, 3), NULL };
+                      sqlite3_column_int(st, 3), 0 };
             sqlite3_finalize(st);
             st = NULL;
-            if (run_build(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &r, err, sizeof err) != 0 && !w->stopping)
+            int rc = run_build(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &w->pending, &r, err, sizeof err);
+            if (rc != 0 && !yielded(w, rc) && !w->stopping)
                 fprintf(stderr, "summary: channel %lld, rebuilding: %s\n", (long long)r.channel, err);
             did = 1;
         }
@@ -1009,21 +1047,25 @@ static void *run(void *arg) {
     char err[600];
     for (;;) {
         pthread_mutex_lock(&w->mu);
-        if (!w->head && !w->stopping && !ready) {
+        if (!w->pending && !w->stopping && !ready) {
             struct timespec until;
             clock_gettime(CLOCK_MONOTONIC, &until);
             until.tv_sec += 2;
             pthread_cond_timedwait(&w->cv, &w->mu, &until);
         }
         if (w->stopping) { pthread_mutex_unlock(&w->mu); break; }
-        req *r = w->head;
-        if (r) {
-            w->head = r->next;
-            if (!w->head) w->tail = NULL;
-            w->queued--;
-        }
         if (w->n_changes) idle_left = 1;
         pthread_mutex_unlock(&w->mu);
+        /* The queue is the table; the flag only says to look now and to stop
+         * idle work. Cleared before looking, so a request queued meanwhile
+         * sets it again. */
+        __atomic_store_n(&w->pending, 0, __ATOMIC_RELEASE);
+        req rq, *r = NULL;
+        if (w->cfg.sink.take && next_request(w, &rq)) {
+            int t = w->cfg.sink.take(w->cfg.sink.ctx, rq.row);
+            if (t == 1) r = &rq;
+            else { __atomic_store_n(&w->pending, 1, __ATOMIC_RELEASE); continue; }   /* gone: look again */
+        }
 
         int busy = oc_sum_load_busy(&w->gate);
         if (engine && (oc_sum_load_should_unload(&w->gate) ||
@@ -1035,10 +1077,16 @@ static void *run(void *arg) {
         if (r) {
             /* Someone is waiting: build now (the gate still pauses it). */
             remember_period(w, r);
-            if (run_build(&w->cfg, w->db, w->version, &engine, &w->gate, &w->stopping, r, err, sizeof err) != 0)
-                fprintf(stderr, "summary: channel %lld: %s\n", (long long)r->channel, err);
+            uint64_t t0 = mono_ms();
+            fprintf(stderr, "summary: request %lld started: channel %lld, %lld..%lld\n", (long long)r->row,
+                    (long long)r->channel, (long long)r->start_ms, (long long)r->end_ms);
+            if (run_build(&w->cfg, w->db, w->version, &engine, &w->gate, &w->stopping, NULL, r, err, sizeof err) != 0)
+                fprintf(stderr, "summary: request %lld failed after %llus: %s\n", (long long)r->row,
+                        (unsigned long long)((mono_ms() - t0) / 1000), err);
+            else
+                fprintf(stderr, "summary: request %lld answered after %llus\n", (long long)r->row,
+                        (unsigned long long)((mono_ms() - t0) / 1000));
             last_used = mono_ms();
-            free(r);
             continue;
         }
         ready = w->cfg.background && idle_left && !busy && oc_sum_load_settled(&w->gate);
@@ -1089,16 +1137,6 @@ void oc_sum_worker_stop(oc_sum_worker *w) {
     pthread_cond_broadcast(&w->cv);
     pthread_mutex_unlock(&w->mu);
     pthread_join(w->thread, NULL);
-    for (req *r = w->head; r; ) {
-        req *nx = r->next;
-        oc_sum_answer a;
-        memset(&a, 0, sizeof a);
-        a.conn_id = r->conn_id; a.req_id = r->req_id; a.channel = r->channel;
-        a.err = "the daemon is stopping";
-        if (r->conn_id) w->cfg.sink.store(w->cfg.sink.ctx, &a, NULL, 0);
-        free(r);
-        r = nx;
-    }
     sqlite3_close(w->db);
     pthread_mutex_destroy(&w->mu);
     pthread_cond_destroy(&w->cv);
@@ -1108,18 +1146,10 @@ void oc_sum_worker_stop(oc_sum_worker *w) {
     free(w);
 }
 
-int oc_sum_worker_request(oc_sum_worker *w, uint64_t conn_id, uint32_t req_id, int64_t channel,
-                          int64_t start_ms, int64_t end_ms, int tz_offset_min) {
-    req *r = calloc(1, sizeof *r);
-    if (!r) return -1;
-    r->conn_id = conn_id; r->req_id = req_id; r->channel = channel;
-    r->start_ms = start_ms; r->end_ms = end_ms; r->tz = tz_offset_min;
+void oc_sum_worker_wake(oc_sum_worker *w) {
+    if (!w) return;
     pthread_mutex_lock(&w->mu);
-    if (w->queued >= SUM_QUEUE_MAX || w->stopping) { pthread_mutex_unlock(&w->mu); free(r); return -1; }
-    if (w->tail) w->tail->next = r; else w->head = r;
-    w->tail = r;
-    w->queued++;
+    __atomic_store_n(&w->pending, 1, __ATOMIC_RELEASE);
     pthread_cond_signal(&w->cv);
     pthread_mutex_unlock(&w->mu);
-    return 0;
 }

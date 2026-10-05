@@ -200,16 +200,31 @@ kernel gives it CPU only when nothing else wants it. It holds the engine, loaded
 on first use and unloaded after `SUM_UNLOAD_IDLE_MS` without work. One model call
 at a time, computing on one thread.
 
-**Requests first.** A SUMMARIZE with no stored answer goes on the worker's queue
-(`SUM_QUEUE_MAX`) and is made while the reader waits.
+**Requests first.** A SUMMARIZE with no stored answer is a row of
+`summary_requests` (SCHEMA.md §3aw): `queued` until the worker takes it,
+`running` while it is made, deleted when it is answered or its connection
+closes, and every row deleted at start, since the connections were the last
+run's. The writer adds the row; the worker takes the oldest through its own
+connection and has the writer mark it running; the store that answers it deletes
+it. At most `SUM_QUEUE_MAX` (64) wait; more are told to try again shortly.
+Each request is told where it is — `SUMMARY_QUEUED` (PROTOCOL.md §5.16m), how
+many are ahead of it, 0 when it is being made — when it joins and whenever the
+queue moves, and a line in the log marks it queued, started and answered with
+how long it took. `SELECT * FROM summary_requests` shows the queue as it is.
+
+**A request stops idle work.** The writer adding a row wakes the worker and sets
+a flag; the gate, asked between prompt batches and every 16 tokens, stops idle
+work (never another request) when it is set. What idle work was writing is
+dropped and done again later; nothing of it was stored.
 
 **Idle work.** With the queue empty and the machine quiet for
 `SUM_IDLE_SETTLE_MS`, the worker, in this order:
 
 1. summarizes the chunks a changed message left unsummarized — every purge tells
    the worker the channel and moment (`oc_sum_on_change`);
-2. summarizes every channel's chunks, the newest first, a day at a time, back to
-   each channel's first message;
+2. summarizes every channel's chunks of the last `SUM_BACKGROUND_DAYS` (7, the
+   longest span offered as a preset), the newest first, a day at a time; older
+   spans are made when someone asks for them;
 3. makes again the periods of whole days someone asked for that a change has
    since purged;
 4. rebuilds the periods an older version made.

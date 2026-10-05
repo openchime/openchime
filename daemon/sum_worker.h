@@ -10,12 +10,14 @@
  * all made that way, and every node already stored is reused. New nodes go to
  * the writer in one batch.
  *
- * Requests someone is waiting on come first. When there are none and the
+ * Requests someone is waiting on come first: they are rows of
+ * summary_requests, taken oldest first, and one arriving stops any idle work
+ * in progress (which is done again later). When there are none and the
  * machine has been quiet a while, it summarizes what a changed message left
- * unsummarized, then every channel's chunks from the newest back, then the
- * periods people asked for before that a change has since purged, then the
- * periods an older model or prompt made. The load gate (sum_load.h) pauses it
- * whenever the machine is busy.
+ * unsummarized, then every channel's chunks of the last SUM_BACKGROUND_DAYS
+ * from the newest back, then the periods people asked for before that a
+ * change has since purged, then the periods an older model or prompt made.
+ * The load gate (sum_load.h) pauses it whenever the machine is busy.
  *
  * It reads through its own read-only connection; it never writes the database
  * itself: the sink does, through the writer.
@@ -30,17 +32,22 @@
 #include "sum_load.h"
 #include "sum_store.h"
 
-/* How many requests may wait; and how long the model stays loaded unused. */
+/* How many requests may wait (summary_requests); and how long the model stays
+ * loaded unused. */
 #define SUM_QUEUE_MAX       64
 #define SUM_UNLOAD_IDLE_MS  (5u * 60u * 1000u)
 /* The model's context: the prompt, one input of up to the threshold, and an
  * answer up to the same size again. */
 #define SUM_CTX_TOKENS      (3 * SUM_THRESHOLD_TOKENS)
+/* How far back idle work summarizes each channel ahead of time: the longest
+ * span offered as a preset. Older spans are made when someone asks. */
+#define SUM_BACKGROUND_DAYS 7
 
 /* The answer to one request, or a batch the worker made on its own. */
 typedef struct {
     uint64_t    conn_id;      /* 0: nobody is waiting */
     uint32_t    req_id;
+    int64_t     request_id;   /* its row in summary_requests, 0 for none */
     int64_t     channel, start_ms, end_ms;
     int         tz_offset_min;
     int         ok;
@@ -57,6 +64,9 @@ typedef struct {
  * -1. Runs on the worker's thread. */
 typedef struct {
     int  (*store)(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n);
+    /* Mark queued request `row` running: 1, or 0 when it is no longer queued
+     * (its connection closed). NULL: requests are not taken from the queue. */
+    int  (*take)(void *ctx, int64_t row);
     void *ctx;
 } oc_sum_sink;
 
@@ -84,9 +94,9 @@ oc_sum_worker *oc_sum_worker_start(const oc_sum_worker_cfg *cfg, char *err, size
  * with an error. */
 void oc_sum_worker_stop(oc_sum_worker *w);
 
-/* Queue a request someone is waiting on. 0, or -1 when the queue is full. */
-int oc_sum_worker_request(oc_sum_worker *w, uint64_t conn_id, uint32_t req_id, int64_t channel,
-                          int64_t start_ms, int64_t end_ms, int tz_offset_min);
+/* A request was added to the queue (summary_requests, by the writer): the
+ * worker takes it next, stopping any idle work in progress to do so. */
+void oc_sum_worker_wake(oc_sum_worker *w);
 
 /* The version every new node is stored with. */
 const char *oc_sum_worker_version(const oc_sum_worker *w);

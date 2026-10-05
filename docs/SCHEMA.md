@@ -1488,6 +1488,30 @@ takes their inputs. Removing a member's DMs removes their nodes. *Stored by the
 writer only if its messages are unchanged* (the stamps) and its node inputs still
 exist.
 
+## 3aw. Migration 0058 — the summary queue (REQ-311, ARCH-116)
+
+```sql
+CREATE TABLE summary_requests (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  conn_id        INTEGER NOT NULL,
+  req_id         INTEGER NOT NULL,
+  user_id        INTEGER NOT NULL,
+  channel_id     INTEGER NOT NULL,
+  start_ms       INTEGER NOT NULL,
+  end_ms         INTEGER NOT NULL,
+  tz_offset_min  INTEGER NOT NULL DEFAULT 0,
+  state          TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','running')),
+  created_at_ms  INTEGER NOT NULL,
+  started_at_ms  INTEGER
+);
+CREATE INDEX idx_sum_requests_conn ON summary_requests(conn_id);
+```
+
+The summaries someone is waiting on (SUMMARIES.md §5): a SUMMARIZE with no stored
+answer, in the order asked (`id`). The writer adds a row, marks the one the worker
+takes `running`, and deletes it when it is answered or its connection closes. A
+connection id belongs to one run of the daemon, so every row is deleted at start.
+
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.

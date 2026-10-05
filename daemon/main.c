@@ -294,6 +294,10 @@ static int sum_sink_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, 
     return oc_dbwriter_sum_store(((sum_up *)ctx)->db, a, nodes, n);
 }
 
+static int sum_sink_take(void *ctx, int64_t row) {
+    return oc_dbwriter_sum_take(((sum_up *)ctx)->db, row);
+}
+
 static int sum_net_bytes(uint64_t *bytes) {
     oc_netloop_stats st;
     oc_netloop_stats_get(&st);
@@ -329,6 +333,7 @@ static void *sum_bring_up(void *arg) {
     cfg.db_path = u->db_path;
     cfg.engine = e;
     cfg.sink.store = sum_sink_store;
+    cfg.sink.take = sum_sink_take;
     cfg.sink.ctx = u;
     cfg.background = 1;
     u->worker = oc_sum_worker_start(&cfg, err, sizeof err);
@@ -338,6 +343,7 @@ static void *sum_bring_up(void *arg) {
 #else
     (void)u;
     (void)sum_sink_store;
+    (void)sum_sink_take;
     (void)sum_net_bytes;
     fprintf(stderr, "openchimed: summaries are off: this daemon was built without them (SUM=0)\n");
 #endif

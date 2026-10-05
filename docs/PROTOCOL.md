@@ -2408,6 +2408,16 @@ which on a small machine may take minutes; the connection carries on meanwhile.
 `summary_id` changes whenever the summary is rebuilt — after a message in the
 span is sent, edited, deleted or restored — and never names another.
 
+**`SUMMARY_QUEUED` (S → C), `0x0100`** — where a `SUMMARIZE` that is being made
+is in the daemon's queue.
+
+    req_id (u32), position (u16)
+
+`position` is how many requests are ahead of it; 0, it is being made now. Sent
+when the request joins the queue and again whenever the queue moves, until its
+`SUMMARY`. A request answered from a stored summary gets none. A new frame, so no
+version bump: a client that does not know it waits for the `SUMMARY` as before.
+
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media flows over UDP to
@@ -3047,6 +3057,7 @@ this table cannot silently gain a shared value.
 | `0x00FC` | `ACTION` | S → C | whether a message is an action (REQ-058); after every live message frame, and replayed |
 | `0x00FD` | `SUMMARIZE` | C → S | summarize a channel or DM over a span (REQ-310) |
 | `0x00FE` | `SUMMARY` | S → C | the answer to one `SUMMARIZE`: the summary as JSON, or why not |
+| `0x0100` | `SUMMARY_QUEUED` | S → C | where one `SUMMARIZE` is in the queue: how many are ahead of it |
 
 ## 10. Connection state machine
 

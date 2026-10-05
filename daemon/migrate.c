@@ -1272,6 +1272,28 @@ static const char MIGRATION_0057[] =
     ");"
     "CREATE INDEX idx_sum_inputs_child ON summary_inputs(child_kind, child_id);";
 
+static const char MIGRATION_0058[] =
+    /* The summaries someone is waiting on (REQ-311, SUMMARIES.md §5): the
+     * worker's queue, kept where it can be seen. A row is a SUMMARIZE with no
+     * stored answer -- `queued` until the worker takes it, `running` while it
+     * is made -- and is deleted when it is answered or its connection closes.
+     * Connection ids belong to one run of the daemon, so every row is deleted
+     * at start. Its order is `id`: requests are made in the order they came. */
+    "CREATE TABLE summary_requests ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  conn_id        INTEGER NOT NULL,"
+    "  req_id         INTEGER NOT NULL,"
+    "  user_id        INTEGER NOT NULL,"
+    "  channel_id     INTEGER NOT NULL,"
+    "  start_ms       INTEGER NOT NULL,"
+    "  end_ms         INTEGER NOT NULL,"
+    "  tz_offset_min  INTEGER NOT NULL DEFAULT 0,"
+    "  state          TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','running')),"
+    "  created_at_ms  INTEGER NOT NULL,"
+    "  started_at_ms  INTEGER"
+    ");"
+    "CREATE INDEX idx_sum_requests_conn ON summary_requests(conn_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1330,6 +1352,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 55, MIGRATION_0055 },
     { 56, MIGRATION_0056 },
     { 57, MIGRATION_0057 },
+    { 58, MIGRATION_0058 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

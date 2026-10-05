@@ -1416,7 +1416,10 @@ where one exists.
   the database and reused by every later summary built on the same pieces. The work
   has run single-threaded, in idle time, and has paused while the machine's CPU was
   busy or its memory low; a summary someone asked for has been made while they
-  waited.
+  waited, ahead of and interrupting any work no one was waiting on, in the order
+  asked, with the asker told how many requests were ahead of theirs. Work no one
+  asked for has gone back no further than the last seven days. The queue of
+  requests has been kept in the database, where it can be seen.
 - **REQ-312.** A summary has been **kept current**: a message sent, edited,
   deleted or restored has removed every summary built on it, recursively, and they
   have been made again from what is there now. A summary made by an older model or

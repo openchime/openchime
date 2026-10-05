@@ -613,6 +613,13 @@ oc_result oc_encode_summary(oc_wbuf *w, uint16_t version, const oc_summary *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_summary_queued(oc_wbuf *w, uint16_t version, const oc_summary_queued *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SUMMARY_QUEUED);
+    oc_w_u32(w, m->req_id);
+    oc_w_u16(w, m->position);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_PINS);
     oc_w_u64(w, m->channel_id);
@@ -2664,6 +2671,12 @@ oc_result oc_decode_summary(oc_rbuf *p, oc_summary *m) {
     m->end_ms = oc_r_u64(p);
     m->version = oc_r_str(p);
     m->body = oc_r_lstr(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summary_queued(oc_rbuf *p, oc_summary_queued *m) {
+    m->req_id = oc_r_u32(p);
+    m->position = oc_r_u16(p);
     return r_done(p);
 }
 

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "check.h"
@@ -602,6 +603,129 @@ static void test_recursion(void) {
     drop_db(path);
 }
 
+/* --- the queue, and idle work giving way to it -------------------------------------- */
+
+/* A model that is busy until the gate tells it to stop, once; after that it
+ * answers at once. */
+static volatile int g_q_hold, g_q_stopped, g_q_calls;
+static void *q_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
+static void q_close(void *h) { (void)h; }
+static int q_run(void *h, const char *system, const char *user, int max_out, oc_sum_gate_fn gate, void *gctx,
+                 char **out, oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)h; (void)system; (void)user; (void)max_out;
+    __atomic_add_fetch(&g_q_calls, 1, __ATOMIC_ACQ_REL);
+    if (st) memset(st, 0, sizeof *st);
+    while (__atomic_load_n(&g_q_hold, __ATOMIC_ACQUIRE)) {
+        if (gate && gate(gctx)) {
+            __atomic_store_n(&g_q_hold, 0, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&g_q_stopped, 1, __ATOMIC_ACQ_REL);
+            snprintf(err, cap, "stopped");
+            return -1;
+        }
+        struct timespec ts = { 0, 2 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    *out = strdup("Overview: They talked.\nDecisions:\n- [1] agreed\nActions:\nProblems:\nFacts:\n");
+    return 0;
+}
+/* A quiet machine whose clock runs fast, so idle work starts at once. */
+static int q_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
+static int q_mem(void *c, uint64_t *m) { (void)c; *m = 1u << 20; return 0; }
+static int q_net(void *c, uint64_t *n) { (void)c; *n = 0; return 0; }
+static uint64_t q_now(void *c) { (void)c; static uint64_t t; t += 20000; return t; }
+
+typedef struct { sqlite3 *db; volatile int answered, answered_ok; } qsink;
+static int q_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    qsink *k = ctx;
+    int rc = n ? oc_sum_store(k->db, a->channel, a->version, nodes, n) : 0;
+    if (a->conn_id && rc != 1) {
+        char sql[96];
+        snprintf(sql, sizeof sql, "DELETE FROM summary_requests WHERE id=%lld;", (long long)a->request_id);
+        sqlite3_exec(k->db, sql, NULL, NULL, NULL);
+        __atomic_store_n(&k->answered_ok, a->ok && rc == 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&k->answered, 1, __ATOMIC_RELEASE);
+    }
+    return rc;
+}
+static int q_take(void *ctx, int64_t row) {
+    qsink *k = ctx;
+    char sql[128];
+    snprintf(sql, sizeof sql, "UPDATE summary_requests SET state='running' WHERE id=%lld AND state='queued';",
+             (long long)row);
+    sqlite3_exec(k->db, sql, NULL, NULL, NULL);
+    return sqlite3_changes(k->db) == 1;
+}
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int wait_for(volatile int *v, int want_at_least, int seconds) {
+    for (int i = 0; i < seconds * 100; i++) {
+        if (__atomic_load_n(v, __ATOMIC_ACQUIRE) >= want_at_least) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* Idle work summarizes what is recent and leaves the old for when someone asks;
+ * a request in the queue (summary_requests) stops idle work mid-answer and is
+ * made, and the idle work is done after. */
+static void test_queue(void) {
+    const char *path = "/tmp/oc_test_summary_queue.db";
+    drop_db(path);
+    sqlite3 *db = fresh_db(path);
+    CHECK(db != NULL);
+    if (!db) return;
+    int64_t now = now_ms();
+    add_msg(db, 1, 0, 10, now - 3600000, "We should ship on Friday.");
+    add_msg(db, 2, 0, 11, now - 3600000 + MIN, "Agreed.");
+    add_msg(db, 3, 0, 10, now - 30ll * 86400000, "An old note from last month.");
+    static oc_sum_engine eng = { NULL, "queue", q_open, q_close, q_run, NULL };
+    eng.ctx = &eng;
+    static oc_sum_probe quiet = { q_cpu, q_mem, q_net, q_now, NULL };
+    qsink k = { db, 0, 0 };
+    oc_sum_worker_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.db_path = path;
+    cfg.engine = &eng;
+    cfg.probe = &quiet;
+    cfg.sink.store = q_store;
+    cfg.sink.take = q_take;
+    cfg.sink.ctx = &k;
+    cfg.background = 1;
+    __atomic_store_n(&g_q_hold, 1, __ATOMIC_RELEASE);
+    char err[256] = "";
+    oc_sum_worker *w = oc_sum_worker_start(&cfg, err, sizeof err);
+    CHECK(w != NULL);
+    if (!w) { sqlite3_close(db); return; }
+    /* Idle work starts on the recent conversation, and the model is busy. */
+    CHECK(wait_for(&g_q_calls, 1, 20));
+    /* Someone asks: their request joins the queue, and the worker is told. */
+    char sql[256];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO summary_requests (conn_id, req_id, user_id, channel_id, start_ms, end_ms, created_at_ms) "
+             "VALUES (5, 9, 10, 1, %lld, %lld, %lld);", (long long)(now - 86400000), (long long)(now + 1),
+             (long long)now);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    oc_sum_worker_wake(w);
+    CHECK(wait_for(&k.answered, 1, 20));
+    CHECK(g_q_stopped == 1 && k.answered_ok);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_requests;") == 0);
+    oc_sum_worker_stop(w);
+    /* What idle work was doing was made for the request; the old note is left
+     * for whoever asks for last month. */
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_inputs i JOIN summary_nodes n ON n.id=i.parent_id "
+                          "WHERE n.kind=0 AND i.child_kind=0 AND i.child_id=1;") == 1);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_inputs i JOIN summary_nodes n ON n.id=i.parent_id "
+                          "WHERE n.kind=0 AND i.child_kind=0 AND i.child_id=3;") == 0);
+    sqlite3_close(db);
+    drop_db(path);
+}
+
 int run_summary_tests(void) {
     test_cut();
     test_parse();
@@ -611,5 +735,6 @@ int run_summary_tests(void) {
     test_gate();
     test_build();
     test_recursion();
+    test_queue();
     return failures;
 }
