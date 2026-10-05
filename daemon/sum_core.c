@@ -555,13 +555,22 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out) {
         oc_sum_buf_puts(out, "\n");
     }
     oc_sum_buf_printf(out,
-        "\nSummarize these lines in at most %zu words. Begin with \"Overview:\" and what happened. "
-        "Then write the headings Decisions:, Actions:, Problems: and Facts:. Under each, write one "
-        "line per item that starts with \"- \". End every line with the numbers of the lines it "
-        "comes from, each in brackets, like this: \"- <text> [line number][line number]\". An "
-        "action gives who does it (or Team), a colon, what they do, then (open) or (done). A "
-        "problem ends with (open) or (resolved). Facts are numbers, dates, tickets, customers and "
-        "releases. Leave a heading empty when nothing belongs under it.\n",
+        "\nSummarize these lines. Write at most %zu words of text; headings and line numbers do "
+        "not count. Answer in exactly this form, one item to a line, every item ending with the "
+        "numbers of the lines it comes from:\n"
+        "\n"
+        "Overview: <what happened>\n"
+        "Decisions:\n"
+        "- <what was decided> [line number]\n"
+        "Actions:\n"
+        "- <who, or Team>: <what they do> (open) [line number]\n"
+        "Problems:\n"
+        "- <what went wrong> (open) [line number]\n"
+        "Facts:\n"
+        "- <a number, date, ticket, customer or release> [line number]\n"
+        "\n"
+        "An action is (open) or (done); a problem is (open) or (resolved). Write as many items "
+        "under a heading as the lines give, or none.\n",
         budget);
     return out->oom ? -1 : 0;
 }

@@ -373,7 +373,7 @@ static int s_run(void *h, const char *system, const char *user, int max_out,
     if (st) memset(st, 0, sizeof *st);
     s->calls++;
     if (system != OC_SUM_SYSTEM) s->other_system++;
-    if (!strstr(user, "Begin with \"Overview:\"")) s->other_prompt++;
+    if (!strstr(user, "Answer in exactly this form")) s->other_prompt++;
     if (strstr(user, "Messages from")) s->leaf++;
     else if (strstr(user, "Summaries of consecutive parts")) s->rollup++;
     else if (strstr(user, "One long message")) s->part++;

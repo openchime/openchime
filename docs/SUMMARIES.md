@@ -91,7 +91,9 @@ The recursion makes three things:
   it, put together. A span of one piece is that piece's summary.
 
 **What the model writes.** Plain text under fixed headings; any heading may be
-empty:
+empty. The prompt lays the answer out as a template — each heading on its own
+line, with one placeholder item under it ending in `[line number]` — because a
+small model follows a form it can see better than rules written as prose:
 
 ```
 Overview: <what happened>
@@ -114,10 +116,12 @@ case or in markdown; citations as `[3]`, `[3][7]`, `[3, 7]` or `[1-4]`, or the
 same in parentheses, anywhere in a bullet; a status anywhere in it; under a
 heading, each line a bullet, with or without its mark.
 
-The prompt asks for at most 30% (`SUM_WORDS_PCT`) of the lines' words: a word
-budget is the length instruction small models follow best, and written chat
-summaries run at 20–30% of the conversation. It is guidance only; no answer is
-cut.
+The prompt asks for at most 30% (`SUM_WORDS_PCT`) of the lines' words of text,
+not counting headings and line numbers: a word budget is the length instruction
+small models follow best, and written chat summaries run at 20–30% of the
+conversation. Counted against the whole answer, the budget left no room for the
+headings, bullets and citations, and a model squeezed each heading's items onto
+one line without them. It is guidance only; no answer is cut.
 
 **The check** (`oc_sum_parse`). A bullet is dropped when it cites no line or a
 line that is not there (a number in parentheses that is not a line is read as
