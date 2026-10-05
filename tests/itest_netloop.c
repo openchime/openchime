@@ -3637,9 +3637,18 @@ static void test_summaries(int port) {
     {
         __atomic_store_n(&stub.hold, 1, __ATOMIC_RELEASE);
         int c0 = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
-        uint64_t far = 86400000ull * 365;
-        oc_summarize q1 = { 30, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, 1000, far };
-        oc_summarize q2 = { 31, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, 2000, far };
+        /* A new message, so the first request needs the model (held) and does
+         * not come whole from the store; both spans take it in. */
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s2 = {0};
+        s2.channel_id = OC_DEFAULT_CHANNEL;
+        memset(s2.idem, 0x5b, OC_IDEM_SIZE);
+        s2.body = oc_slice_str("And the notes go out on Thursday.");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+        oc_summarize q1 = { 30, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 2 * 86400000ull, now_ms + 86400000ull };
+        oc_summarize q2 = { 31, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 2 * 86400000ull + 1000, now_ms + 86400000ull };
         oc_wbuf_init(&w, buf, sizeof buf);
         CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q1) == OC_OK);
         CHECK(send_frame(&a, buf, w.len) == 0);
