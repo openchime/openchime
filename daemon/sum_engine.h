@@ -35,6 +35,12 @@ typedef struct oc_sum_engine {
     int   (*run)(void *handle, const char *system, const char *user, int max_out,
                  oc_sum_gate_fn gate, void *gate_ctx, char **out, oc_sum_run_stats *st,
                  char *err, size_t errcap);
+    /* Go on from the answer `run` just wrote, in the same conversation: ask
+     * `user` as the next turn, the answer held to `grammar` (GBNF, root rule
+     * "root"). The first conversation is not read again. As `run`; -1 too when
+     * there is no finished answer to go on from. NULL: the engine cannot. */
+    int   (*more)(void *handle, const char *user, const char *grammar, oc_sum_gate_fn gate,
+                  void *gate_ctx, char **out, oc_sum_run_stats *st, char *err, size_t errcap);
 } oc_sum_engine;
 
 /* The local engine over the GGUF file at `path` (borrowed), with a context of

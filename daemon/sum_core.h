@@ -44,7 +44,7 @@
  * Guidance to the model only; no answer is ever cut. */
 #define SUM_WORDS_PCT 30
 /* Bumped whenever the prompt, the shape or how an answer is read change. */
-#define SUM_PROMPT_VERSION "s4"
+#define SUM_PROMPT_VERSION "s5"
 
 /* One message as the core sees it: plain text (oc_speakable_full), its author's
  * name, and its thread (parent_id: the root's id, 0 for a top-level message). */
@@ -160,23 +160,40 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out);
 
 /* Read an answer against its lines and people, and write the stored summary
  * into `out`:
- *   {"overview":"...","decisions":[{"text":"...","by":[],"refs":[<msg ids>]}],
+ *   {"overview":"...","refs":[<msg ids>],
+ *    "decisions":[{"text":"...","by":[],"refs":[...]}],
  *    "actions":[{"who":<user id, 0 the team>,"what":"...","refs":[...],"status":"open|done"}],
  *    "problems":[{"text":"...","refs":[...],"status":"open|resolved"}],
  *    "facts":[{"text":"...","refs":[...]}]}
+ * The top-level refs are every message the lines stand for: what the overview
+ * stands for. An action's "who" is there only when it is the team or someone in
+ * the lines (by full name, or a first name only one of them has); otherwise the
+ * name stays in "what". A status is there only when the model wrote one.
+ *
  * The model writes freely, and the answer is read as written: a heading may be
  * on a line of its own or inside one, in any case; citations may be "[3]",
  * "[3][7]", "[3, 7]" or "[1-4]", or the same in parentheses, anywhere in the
- * bullet; a status anywhere in it. Under a heading, each line is a bullet.
- * A bullet is dropped when it cites no line or a line not there, gives an
- * action no one in the lines or the team, lacks the status its heading asks
- * for, states a number none of its cited lines contains, or repeats one
- * already kept; the overview, when it cites a line not there or states a
- * number no line contains. Returns how many items were kept (0 is a valid,
- * empty summary), or -1 when the answer has no heading at all. `dropped` (may
- * be NULL) counts what was dropped. */
-int oc_sum_parse(const char *answer, const oc_sum_lines *l, const oc_sum_people *people, oc_sum_buf *out,
-                 int *dropped);
+ * item; a status anywhere in it. Under a heading, each line is an item, and one
+ * that says there is nothing ("None") is no item. A bracketed number that is
+ * not a line is ignored.
+ *
+ * An item with no line numbers takes those `cites` gave it -- the answer to the
+ * follow-up (oc_sum_followup), "<k>: [3][5]" for the k-th such item -- or else
+ * stands for every line. When `ask` is given, each item still without line
+ * numbers is added to it, "<k>. <Kind>: <text>", for the follow-up.
+ *
+ * An item is dropped only when it states a number none of its lines contains,
+ * or repeats one already kept; the overview, when it states a number no line
+ * contains. Returns how many items were kept (0 is a valid, empty summary), or
+ * -1 when the answer has no heading at all. `dropped` (may be NULL) counts what
+ * was dropped. */
+int oc_sum_parse(const char *answer, const char *cites, const oc_sum_lines *l, const oc_sum_people *people,
+                 oc_sum_buf *out, oc_sum_buf *ask, int *dropped);
+
+/* The follow-up for the items `ask` lists (from oc_sum_parse), `n_items` of
+ * them, over `n_lines` lines: the question, and a grammar holding the answer to
+ * one line of line numbers per item. 0 or -1. */
+int oc_sum_followup(const char *ask, int n_items, int n_lines, oc_sum_buf *question, oc_sum_buf *grammar);
 
 /* 1 when a stored body says nothing: no overview, no items. */
 int oc_sum_body_empty(const char *body);

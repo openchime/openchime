@@ -126,22 +126,34 @@ conversation. Counted against the whole answer, the budget left no room for the
 headings, bullets and citations, and a model squeezed each heading's items onto
 one line without them. It is guidance only; no answer is cut.
 
-**The check** (`oc_sum_parse`). A bullet is dropped when it cites no line or a
-line that is not there (a number in parentheses that is not a line is read as
-text), gives an action to someone not in the lines or the team, lacks the status
-its heading asks for, states a run of digits none of its cited lines contains,
-or repeats one already kept; the overview is dropped when it cites a line not
-there or states a number no line contains. An answer with no heading at all is a
-failure, logged with what was written. Nothing else is dropped. Each
-kept item cites the message ids its lines stand for.
+**Items without line numbers.** When the answer has items with no line
+numbers, the model is asked once more, in the same conversation, so it reads
+nothing again: the items, numbered, and "for each, the numbers of the lines it
+comes from". That short answer is held to a grammar of item numbers and line
+numbers that exist; holding a few numbers to a shape cannot trap the model the
+way holding free text did. An item still without line numbers stands for every
+line of its call. A citation of a line that is not there is ignored.
+
+**The check** (`oc_sum_parse`). Only what is invented or repeated is dropped: an
+item stating a run of digits none of its lines contains, or repeating one
+already kept; the overview, when it states a number no line contains. An item
+that says there is nothing ("None", "N/A") is no item. An action's owner is
+matched to the team or to someone in the lines, by full name or by a first name
+only one of them has; an owner who matches no one stays in the action's text. A
+status the model did not write is left out, not guessed. An answer with no
+heading at all is a failure, logged with what was written. Each kept item cites
+the message ids its lines stand for.
 
 ## 3. The stored shape, and what clients get
 
 A node's `body` is the checked summary with message ids for refs and user ids
-for people (`who` 0 is the team):
+for people (`who` 0 is the team). The top-level `refs` are every message the
+summary's lines stand for, which is what the overview stands for. `who` is
+there only when the owner is the team or someone in the lines; `status` only
+when the model gave one:
 
 ```
-{"overview": "Ann asked Bob about ticket 6701.",
+{"overview": "Ann asked Bob about ticket 6701.", "refs": [100, 101],
  "decisions": [{"text": "...", "by": [], "refs": [100]}],
  "actions":   [{"who": 11, "what": "look at ticket 6701", "refs": [100, 101], "status": "open"}],
  "problems":  [{"text": "...", "refs": [...], "status": "open"}],

@@ -97,29 +97,46 @@ static void test_parse(void) {
         "Facts:\n"
         "- Ticket 6701 [1]\n";
     int dropped = 0;
-    int kept = oc_sum_parse(ans, &l, &pp, &out, &dropped);
-    /* Kept: the first action and the fact. Dropped: the repeat, the person not
-     * there, the invented number, the line not there. */
-    CHECK(kept == 2);
-    CHECK(dropped == 4);
-    CHECK(out.p && strstr(out.p, "\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\""));
-    CHECK(out.p && strstr(out.p, "\"overview\":\"Ann asked Bob about ticket 6701.\""));
+    oc_sum_buf ask = {0};
+    int kept = oc_sum_parse(ans, NULL, &l, &pp, &out, &ask, &dropped);
+    /* Dropped: only the repeat and the invented number. Kept: the action, the
+     * one given to someone not in the lines (the name stays in its text), the
+     * problem citing a line not there (that citation ignored: it stands for
+     * every line, and is asked about), and the fact. */
+    CHECK(kept == 4);
+    CHECK(dropped == 2);
+    CHECK(out.p && strstr(out.p, "\"overview\":\"Ann asked Bob about ticket 6701.\",\"refs\":[100,101]"));
+    CHECK(out.p && strstr(out.p, "{\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\"}"));
+    CHECK(out.p && strstr(out.p, "{\"what\":\"Carol: someone invented\",\"refs\":[100],\"status\":\"open\"}"));
+    CHECK(out.p && strstr(out.p, "\"problems\":[{\"text\":\"cites nothing real\",\"refs\":[100,101],\"status\":\"open\"}]"));
     CHECK(out.p && strstr(out.p, "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100]}]"));
     CHECK(out.p && strstr(out.p, "\"decisions\":[]"));
+    CHECK(ask.p && !strcmp(ask.p, "1. Problem: cites nothing real\n"));
     oc_sum_buf_free(&out);
-    /* An overview stating a number no line has is dropped, the bullets kept. */
-    CHECK(oc_sum_parse("Overview: 42 tickets.\nDecisions:\n- look [1]\nActions:\nProblems:\nFacts:\n", &l, &pp, &out,
-                       &dropped) == 1);
+    /* The follow-up's line numbers go to the item it was asked about. */
+    oc_sum_buf q = {0}, fg = {0};
+    CHECK(oc_sum_followup(ask.p, 1, l.n, &q, &fg) == 0);
+    CHECK(strstr(q.p, "1. Problem: cites nothing real") && strstr(fg.p, "k ::= \"1\"\n") &&
+          strstr(fg.p, "id ::= \"1\" | \"2\"\n"));
+    CHECK(oc_sum_parse(ans, "1: [2]\n", &l, &pp, &out, NULL, NULL) == 4);
+    CHECK(out.p && strstr(out.p, "\"problems\":[{\"text\":\"cites nothing real\",\"refs\":[101],\"status\":\"open\"}]"));
+    oc_sum_buf_free(&out);
+    oc_sum_buf_free(&ask);
+    oc_sum_buf_free(&q);
+    oc_sum_buf_free(&fg);
+    /* An overview stating a number no line has is dropped, the items kept. */
+    CHECK(oc_sum_parse("Overview: 42 tickets.\nDecisions:\n- look [1]\nActions:\nProblems:\nFacts:\n", NULL, &l, &pp,
+                       &out, NULL, &dropped) == 1);
     CHECK(out.p && strstr(out.p, "\"overview\":\"\"") && dropped == 1);
     oc_sum_buf_free(&out);
-    CHECK(oc_sum_parse("not a summary", &l, &pp, &out, NULL) == -1);
+    CHECK(oc_sum_parse("not a summary", NULL, &l, &pp, &out, NULL, NULL) == -1);
     oc_sum_buf_free(&out);
 
     /* Written freely, it is read as written: headings inside a line and in
-     * markdown, citations in parentheses, ranges and lists, a status anywhere,
-     * a bullet with no mark. Kept: the decision, the action and the fact.
-     * Dropped: a line citing nothing, an action with no status, a problem that
-     * runs on into numbers its line does not hold. */
+     * markdown, citations in parentheses, ranges and lists, a status anywhere
+     * or none, an item with no mark, "N/A" for nothing. Kept: the decision, the
+     * two actions and the fact. Dropped: the repeat of Ann's action, and a
+     * problem that runs on into numbers its line does not hold. */
     const char *free_ans =
         "Here is the summary.\n"
         "**Overview:** Ann asked Bob about ticket 6701 [1]. Decisions: - Bob looks first (1-2)\n"
@@ -129,15 +146,25 @@ static void test_parse(void) {
         "- Ann: wait [1]\n"
         "Problems: - nothing (open) [1] - (3) - (4) - (5)\n"
         "## Facts:\n"
-        "1. Ticket 6701 [1, 2]\n";
-    kept = oc_sum_parse(free_ans, &l, &pp, &out, &dropped);
-    CHECK(kept == 3);
-    CHECK(dropped == 3);
+        "1. Ticket 6701 [1, 2]\n"
+        "- N/A\n";
+    kept = oc_sum_parse(free_ans, NULL, &l, &pp, &out, NULL, &dropped);
+    CHECK(kept == 4);
+    CHECK(dropped == 2);
     CHECK(out.p && strstr(out.p, "\"overview\":\"Ann asked Bob about ticket 6701.\""));
     CHECK(out.p && strstr(out.p, "\"decisions\":[{\"text\":\"Bob looks first\",\"by\":[],\"refs\":[100,101]}]"));
     CHECK(out.p && strstr(out.p, "\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\""));
+    CHECK(out.p && strstr(out.p, "{\"who\":10,\"what\":\"wait\",\"refs\":[100,101]}"));
     CHECK(out.p && strstr(out.p, "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100,101]}]"));
     oc_sum_buf_free(&out);
+
+    /* A first name only one person in the lines has is that person. */
+    oc_sum_people two = {0};
+    CHECK(oc_sum_people_add(&two, 20, "Cassi Vincent") == 0 && oc_sum_people_add(&two, 21, "Carla Smith") == 0);
+    CHECK(oc_sum_parse("Overview: x\nActions:\n- [1] Cassi: call Whitney\n", NULL, &l, &two, &out, NULL, NULL) == 1);
+    CHECK(out.p && strstr(out.p, "{\"who\":20,\"what\":\"call Whitney\",\"refs\":[100]}"));
+    oc_sum_buf_free(&out);
+    oc_sum_people_free(&two);
 
     /* A stored summary reads back as lines, each standing for its messages;
      * the overview for all of them. */
@@ -361,7 +388,7 @@ static void test_gate(void) {
  * short summary citing line 1. In "grow" mode it answers with all its input
  * again, which never gets shorter. */
 typedef struct {
-    int calls, leaf, rollup, part, other_system, other_prompt, grow;
+    int calls, leaf, rollup, part, other_system, other_prompt, grow, uncited, follow;
 } stub;
 static void *s_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void s_close(void *h) { (void)h; }
@@ -391,9 +418,22 @@ static int s_run(void *h, const char *system, const char *user, int max_out,
         }
         oc_sum_buf_puts(&b, "\nDecisions:\nActions:\nProblems:\nFacts:\n");
     } else {
-        oc_sum_buf_puts(&b, "Overview: They talked.\nDecisions:\n- agreed [1]\nActions:\nProblems:\nFacts:\n");
+        oc_sum_buf_puts(&b, s->uncited ? "Overview: They talked.\nDecisions:\n- agreed\nActions:\nProblems:\nFacts:\n"
+                                       : "Overview: They talked.\nDecisions:\n- agreed [1]\nActions:\nProblems:\nFacts:\n");
     }
     *out = b.p;
+    return 0;
+}
+
+/* The follow-up: line 1 for the one item asked about. */
+static int s_more(void *h, const char *user, const char *grammar, oc_sum_gate_fn gate, void *gctx, char **out,
+                  oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)err; (void)cap; (void)gctx;
+    stub *s = h;
+    if (gate && gate(gctx)) return -1;
+    if (st) memset(st, 0, sizeof *st);
+    if (strstr(user, "1. Decision: agreed") && strstr(grammar, "root ::= item+")) s->follow++;
+    *out = strdup("1: [1]\n");
     return 0;
 }
 
@@ -445,7 +485,7 @@ static void test_build(void) {
     add_msg(db, 3, 0, 11, 5 * 3600000, "Lunch?");
     add_msg(db, 4, 0, 10, 30 * 3600000, "Shipped.");
     stub s = {0};
-    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run };
+    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run, s_more };
     sink k = { db, 0, "", "" };
     oc_sum_worker_cfg cfg;
     setup(&cfg, path, &e, &k, SUM_THRESHOLD_TOKENS);
@@ -478,7 +518,14 @@ static void test_build(void) {
     CHECK(s.calls == before + 2);
     before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll, 3 * 86400000ll, 0, err, sizeof err) == 0);
-    CHECK(s.calls == before + 1 && s.leaf == 6);
+    CHECK(s.calls == before + 1 && s.leaf == 6 && s.follow == 0);
+    /* Items with no line numbers are asked about once, in the same
+     * conversation, and take the lines the answer gives. */
+    sqlite3_exec(db, "DELETE FROM summary_inputs; DELETE FROM summary_nodes;", NULL, NULL, NULL);
+    s.uncited = 1;
+    CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll, 3 * 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.follow == 3);   /* two chunks and the day */
+    CHECK(strstr(k.last, "\"decisions\":[{\"text\":\"agreed\",\"by\":[],\"refs\":[5]}]") != NULL);
     sqlite3_close(db);
     drop_db(path);
 }
@@ -495,7 +542,7 @@ static void test_recursion(void) {
     for (int i = 0; i < 20; i++)       /* twenty conversations an hour apart */
         add_msg(db, id++, 0, 10 + (i & 1), (int64_t)i * 3600000 + 60000, "A short note about the plan for today.");
     stub s = {0};
-    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run };
+    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run, s_more };
     sink k = { db, 0, "", "" };
     oc_sum_worker_cfg cfg;
     setup(&cfg, path, &e, &k, 40);
@@ -535,7 +582,7 @@ static void test_recursion(void) {
     /* A level that does not get shorter stops the build, reported, not cut. */
     stub g = {0};
     g.grow = 1;
-    oc_sum_engine ge = { &g, "grow", s_open, s_close, s_run };
+    oc_sum_engine ge = { &g, "grow", s_open, s_close, s_run, s_more };
     oc_sum_worker_cfg gc;
     setup(&gc, path, &ge, &k, 40);
     CHECK(oc_sum_build_now(&gc, 1, 0, 86400000ll, 0, err, sizeof err) == -1);

@@ -229,7 +229,10 @@ static int ensure_engine(build *b) {
     return 0;
 }
 
-/* Summarize `l`: the prompt, the model's answer, and the answer read back. The stored summary (heap), or NULL with b->err set. */
+/* Summarize `l`: the prompt, the model's answer, and the answer read back. Items
+ * the model gave no line numbers are asked about once, in the same
+ * conversation; those still without stand for every line. The stored summary
+ * (heap), or NULL with b->err set. */
 static char *summarize(build *b, const char *intro, const oc_sum_lines *l, const oc_sum_people *pp,
                        uint32_t *tokens, uint32_t *cpu) {
     if (ensure_engine(b) != 0) return NULL;
@@ -240,31 +243,62 @@ static char *summarize(build *b, const char *intro, const oc_sum_lines *l, const
         snprintf(b->err, sizeof b->err, "out of memory");
         return NULL;
     }
-    char *raw = NULL, err[256] = "", *body = NULL;
-    oc_sum_run_stats st;
+    char *raw = NULL, *more = NULL, err[256] = "", *body = NULL;
+    oc_sum_run_stats st, st2;
     memset(&st, 0, sizeof st);
+    memset(&st2, 0, sizeof st2);
+    oc_sum_buf out = {0}, ask = {0}, q = {0}, g = {0};
     int rc = e->run(*b->engine, OC_SUM_SYSTEM, prompt.p, 0, gate_fn, b, &raw, &st, err, sizeof err);
     b->calls++;
-    if (rc == 0) {
-        oc_sum_buf out = {0};
-        int dropped = 0;
-        if (oc_sum_parse(raw, l, pp, &out, &dropped) < 0) {
-            oc_sum_buf_free(&out);
-            snprintf(b->err, sizeof b->err, "the model's answer was not a summary");
-            fprintf(stderr, "summary: the answer that was not a summary:\n%s\n", raw ? raw : "");
-        } else {
-            body = out.p;
-        }
-    } else {
+    if (rc != 0) {
         snprintf(b->err, sizeof b->err, "the model gave no answer: %s", err);
         if (raw && *raw && !*b->stopping && strcmp(err, "stopped") != 0)
             fprintf(stderr, "summary: the answer as far as it got:\n%s\n", raw);
+        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw ? raw : "", NULL);
+        goto done;
     }
-    if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw ? raw : "", body);
+    int dropped = 0;
+    if (oc_sum_parse(raw, NULL, l, pp, &out, &ask, &dropped) < 0) {
+        snprintf(b->err, sizeof b->err, "the model's answer was not a summary");
+        fprintf(stderr, "summary: the answer that was not a summary:\n%s\n", raw ? raw : "");
+        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw, NULL);
+        goto done;
+    }
+    if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw, out.p);
+    if (ask.n && e->more) {
+        int n_items = 0;
+        for (size_t i = 0; i < ask.n; i++) n_items += ask.p[i] == '\n';
+        if (oc_sum_followup(ask.p, n_items, l->n, &q, &g) != 0) { snprintf(b->err, sizeof b->err, "out of memory"); goto done; }
+        rc = e->more(*b->engine, q.p, g.p, gate_fn, b, &more, &st2, err, sizeof err);
+        if (rc != 0 && (*b->stopping || !strcmp(err, "stopped"))) {
+            snprintf(b->err, sizeof b->err, "the model gave no answer: %s", err);
+            goto done;
+        }
+        if (rc != 0) fprintf(stderr, "summary: the follow-up gave no line numbers: %s\n", err);
+        else {
+            oc_sum_buf again = {0};
+            if (oc_sum_parse(raw, more, l, pp, &again, NULL, &dropped) < 0) {
+                oc_sum_buf_free(&again);
+                snprintf(b->err, sizeof b->err, "out of memory");
+                goto done;
+            }
+            oc_sum_buf_free(&out);
+            out = again;
+        }
+        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, q.p, more ? more : "", out.p);
+    }
+    body = out.p;
+    out.p = NULL;
+done:
     free(raw);
+    free(more);
+    oc_sum_buf_free(&out);
+    oc_sum_buf_free(&ask);
+    oc_sum_buf_free(&q);
+    oc_sum_buf_free(&g);
     oc_sum_buf_free(&prompt);
-    if (tokens) *tokens = st.prompt_tokens;
-    if (cpu) *cpu = st.cpu_ms;
+    if (tokens) *tokens = st.prompt_tokens + st2.prompt_tokens;
+    if (cpu) *cpu = st.cpu_ms + st2.cpu_ms;
     return body;
 }
 
