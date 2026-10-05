@@ -229,23 +229,21 @@ static int ensure_engine(build *b) {
     return 0;
 }
 
-/* Summarize `l`: the prompt, the model held to the grammar, and the answer read
- * back. The stored summary (heap), or NULL with b->err set. */
+/* Summarize `l`: the prompt, the model's answer, and the answer read back. The stored summary (heap), or NULL with b->err set. */
 static char *summarize(build *b, const char *intro, const oc_sum_lines *l, const oc_sum_people *pp,
                        uint32_t *tokens, uint32_t *cpu) {
     if (ensure_engine(b) != 0) return NULL;
     const oc_sum_engine *e = b->cfg->engine;
-    oc_sum_buf prompt = {0}, g = {0};
-    if (oc_sum_prompt(intro, l, &prompt) != 0 || oc_sum_grammar(l->n, pp, &g) != 0) {
+    oc_sum_buf prompt = {0};
+    if (oc_sum_prompt(intro, l, &prompt) != 0) {
         oc_sum_buf_free(&prompt);
-        oc_sum_buf_free(&g);
         snprintf(b->err, sizeof b->err, "out of memory");
         return NULL;
     }
     char *raw = NULL, err[256] = "", *body = NULL;
     oc_sum_run_stats st;
     memset(&st, 0, sizeof st);
-    int rc = e->run(*b->engine, OC_SUM_SYSTEM, prompt.p, g.p, 0, gate_fn, b, &raw, &st, err, sizeof err);
+    int rc = e->run(*b->engine, OC_SUM_SYSTEM, prompt.p, 0, gate_fn, b, &raw, &st, err, sizeof err);
     b->calls++;
     if (rc == 0) {
         oc_sum_buf out = {0};
@@ -265,7 +263,6 @@ static char *summarize(build *b, const char *intro, const oc_sum_lines *l, const
     if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw ? raw : "", body);
     free(raw);
     oc_sum_buf_free(&prompt);
-    oc_sum_buf_free(&g);
     if (tokens) *tokens = st.prompt_tokens;
     if (cpu) *cpu = st.cpu_ms;
     return body;

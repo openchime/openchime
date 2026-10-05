@@ -12,9 +12,9 @@
  *     thread where it fits; a big thread into chunks of its own);
  *   - splitting one message too big for a chunk into parts;
  *   - the lines a chunk, a part or a stored summary reads as;
- *   - the prompt, and the grammar that holds a model to the answer's shape and
- *     to the line numbers and people of its input;
- *   - reading an answer back, dropping a bullet that cites a line not there,
+ *   - the prompt;
+ *   - reading an answer back, as the model wrote it, dropping a bullet that
+ *     cites no line or a line not there, is not the shape asked for,
  *     names a person not there, states a number its lines do not contain, or
  *     repeats one already kept, and writing the stored summary with the message
  *     and user ids its lines stand for.
@@ -43,7 +43,7 @@
  * written chat summaries run at 20-30% of the conversation (SUMMARIES.md §2).
  * Guidance to the model only; no answer is ever cut. */
 #define SUM_WORDS_PCT 30
-/* Bumped whenever the prompt, the shape or the grammar change. */
+/* Bumped whenever the prompt, the shape or how an answer is read change. */
 #define SUM_PROMPT_VERSION "s2"
 
 /* One message as the core sees it: plain text (oc_speakable_full), its author's
@@ -158,23 +158,23 @@ extern const char *const OC_SUM_SYSTEM;
  * what to write, within SUM_WORDS_PCT of the lines' words. 0 or -1. */
 int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out);
 
-/* The GBNF grammar for an answer over `n_lines` lines: the headings in order,
- * bullets that end in citations of existing line numbers, actions given to one
- * of `people` or the team. No counts and no lengths. 0 or -1. */
-int oc_sum_grammar(int n_lines, const oc_sum_people *people, oc_sum_buf *out);
-
 /* Read an answer against its lines and people, and write the stored summary
  * into `out`:
  *   {"overview":"...","decisions":[{"text":"...","by":[],"refs":[<msg ids>]}],
  *    "actions":[{"who":<user id, 0 the team>,"what":"...","refs":[...],"status":"open|done"}],
  *    "problems":[{"text":"...","refs":[...],"status":"open|resolved"}],
  *    "facts":[{"text":"...","refs":[...]}]}
- * A bullet is dropped when it cites a line not there, gives an action to
- * someone not there, states a number none of its cited lines contains, or
- * repeats one already kept; the overview, when it states a number no line
- * contains. Returns how many items were kept (0 is a valid, empty summary), or
- * -1 when the answer is not the shape at all. `dropped` (may be NULL) counts
- * what was dropped. */
+ * The model writes freely, and the answer is read as written: a heading may be
+ * on a line of its own or inside one, in any case; citations may be "[3]",
+ * "[3][7]", "[3, 7]" or "[1-4]", or the same in parentheses, anywhere in the
+ * bullet; a status anywhere in it. Under a heading, each line is a bullet.
+ * A bullet is dropped when it cites no line or a line not there, gives an
+ * action no one in the lines or the team, lacks the status its heading asks
+ * for, states a number none of its cited lines contains, or repeats one
+ * already kept; the overview, when it cites a line not there or states a
+ * number no line contains. Returns how many items were kept (0 is a valid,
+ * empty summary), or -1 when the answer has no heading at all. `dropped` (may
+ * be NULL) counts what was dropped. */
 int oc_sum_parse(const char *answer, const oc_sum_lines *l, const oc_sum_people *people, oc_sum_buf *out,
                  int *dropped);
 

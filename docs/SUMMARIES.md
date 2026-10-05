@@ -29,8 +29,8 @@ Markup is reduced to plain text by the same code read-aloud uses
 
 **One step.** Every summary at every level is made the same way
 (`daemon/sum_worker.c`, `summarize`): numbered lines go in, a summary comes out.
-The same system prompt, the same instructions, the same grammar rules, the same
-decoding and the same checks, whatever the lines are. At the bottom a line is a
+The same system prompt, the same instructions, the same decoding and the same
+checks, whatever the lines are. At the bottom a line is a
 message:
 
 ```
@@ -105,21 +105,27 @@ Facts:
 - <text> [2]
 ```
 
-The grammar (`oc_sum_grammar`) holds it to the headings and the line shape, to
-citations of line numbers that exist, and to actions given to someone named in
-the lines or to the team. It sets no counts and no lengths. The model writes text
-rather than JSON because holding a model to JSON while it writes lowers what it
-writes, most of all in small models; code turns the text into the stored shape.
+Nothing holds the model to this while it writes. Holding a model to JSON, or to
+any grammar, while it writes lowers what it writes, most of all in small models;
+and a small model held to a line shape writes a status or a citation of its own
+inside the line, cannot end it, and writes on until its context is full. Code
+reads the answer as written: a heading on its own line or inside one, in any
+case or in markdown; citations as `[3]`, `[3][7]`, `[3, 7]` or `[1-4]`, or the
+same in parentheses, anywhere in a bullet; a status anywhere in it; under a
+heading, each line a bullet, with or without its mark.
 
 The prompt asks for at most 30% (`SUM_WORDS_PCT`) of the lines' words: a word
 budget is the length instruction small models follow best, and written chat
 summaries run at 20–30% of the conversation. It is guidance only; no answer is
 cut.
 
-**The check** (`oc_sum_parse`). A bullet is dropped when it cites a line that is
-not there, gives an action to someone not in the lines, states a run of digits
-none of its cited lines contains, or repeats one already kept; the overview is
-dropped when it states a number no line contains. Nothing else is dropped. Each
+**The check** (`oc_sum_parse`). A bullet is dropped when it cites no line or a
+line that is not there (a number in parentheses that is not a line is read as
+text), gives an action to someone not in the lines or the team, lacks the status
+its heading asks for, states a run of digits none of its cited lines contains,
+or repeats one already kept; the overview is dropped when it cites a line not
+there or states a number no line contains. An answer with no heading at all is a
+failure, logged with what was written. Nothing else is dropped. Each
 kept item cites the message ids its lines stand for.
 
 ## 3. The stored shape, and what clients get

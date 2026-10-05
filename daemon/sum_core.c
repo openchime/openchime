@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "sum_core.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -536,7 +537,7 @@ int oc_sum_body_overview(const char *body, char *out, size_t cap) {
     return rc;
 }
 
-/* --- the prompt and the grammar ----------------------------------------------------- */
+/* --- the prompt ---------------------------------------------------------------------- */
 
 const char *const OC_SUM_SYSTEM =
     "You summarize a team's chat for someone catching up on it. You write only what the lines "
@@ -565,40 +566,6 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out) {
     return out->oom ? -1 : 0;
 }
 
-/* A GBNF string literal of `s`. */
-static void gbnf_lit(oc_sum_buf *g, const char *s) {
-    oc_sum_buf_puts(g, "\"");
-    for (; *s; s++) {
-        if (*s == '"' || *s == '\\') oc_sum_buf_printf(g, "\\%c", *s);
-        else if (*s == '\n' || *s == '\r') oc_sum_buf_puts(g, " ");
-        else oc_sum_buf_add(g, s, 1);
-    }
-    oc_sum_buf_puts(g, "\"");
-}
-
-int oc_sum_grammar(int n_lines, const oc_sum_people *people, oc_sum_buf *g) {
-    oc_sum_buf_puts(g,
-        "root ::= \"Overview: \" ov \"\\n\" \"Decisions:\\n\" dec* \"Actions:\\n\" act* "
-        "\"Problems:\\n\" prob* \"Facts:\\n\" fact*\n"
-        "ov ::= [^\\n]+\n"
-        "txt ::= [^\\n\\[]+\n"
-        "cites ::= \" \" ( \"[\" id \"]\" )+\n"
-        "dec ::= \"- \" txt cites \"\\n\"\n"
-        "act ::= \"- \" who \": \" txt \" (\" ( \"open\" | \"done\" ) \")\" cites \"\\n\"\n"
-        "prob ::= \"- \" txt \" (\" ( \"open\" | \"resolved\" ) \")\" cites \"\\n\"\n"
-        "fact ::= \"- \" txt cites \"\\n\"\n"
-        "who ::= \"Team\"");
-    for (int i = 0; i < people->n; i++) {
-        oc_sum_buf_puts(g, " | ");
-        gbnf_lit(g, people->name[i]);
-    }
-    oc_sum_buf_puts(g, "\nid ::= ");
-    if (n_lines < 1) n_lines = 1;
-    for (int i = 1; i <= n_lines; i++) oc_sum_buf_printf(g, "%s\"%d\"", i > 1 ? " | " : "", i);
-    oc_sum_buf_puts(g, "\n");
-    return g->oom ? -1 : 0;
-}
-
 /* --- reading an answer --------------------------------------------------------------- */
 
 /* Every run of digits in `text` must occur in one of the lines cited. */
@@ -618,55 +585,145 @@ static int numbers_ok(const char *text, const oc_sum_lines *l, const int *cited,
     return 1;
 }
 
-/* Strip the citations "[3][7]" off the end of `s` (in place), into `cited`
- * (0-based line indices). Returns how many, or -1 when one is not a line. */
-static int take_cites(char *s, const oc_sum_lines *l, int **cited) {
-    int n = 0, cap = 0;
-    *cited = NULL;
-    size_t len = strlen(s);
-    while (len && s[len - 1] == ' ') s[--len] = '\0';
-    while (len && s[len - 1] == ']') {
-        size_t o = len - 1;
-        while (o && s[o - 1] != '[') o--;
-        if (!o) break;
-        long v = 0;
-        int digits = 0;
-        for (size_t k = o; k < len - 1; k++) {
-            if (s[k] < '0' || s[k] > '9') { digits = -1; break; }
-            v = v * 10 + (s[k] - '0');
-            digits++;
-        }
-        if (digits <= 0) break;
-        if (v < 1 || v > l->n) { free(*cited); *cited = NULL; return -1; }
-        if (n == cap) {
-            int nc = cap ? cap * 2 : 4;
-            int *nv = realloc(*cited, (size_t)nc * sizeof *nv);
-            if (!nv) { free(*cited); *cited = NULL; return -1; }
-            *cited = nv;
-            cap = nc;
-        }
-        (*cited)[n++] = (int)v - 1;
-        len = o - 1;
-        s[len] = '\0';
-        while (len && s[len - 1] == ' ') s[--len] = '\0';
-    }
-    /* Read from the end: put them back in the order written. */
-    for (int a = 0, z = n - 1; a < z; a++, z--) { int t = (*cited)[a]; (*cited)[a] = (*cited)[z]; (*cited)[z] = t; }
-    return n;
-}
+/* The headings, as a model may write them: on a line of their own or inside one,
+ * in any case, in markdown or not. */
+static const char *const HEADS[5] = { "overview", "decisions", "actions", "problems", "facts" };
 
-/* `s` ends with " (word)" for one of `words`: strip it, and return its index. */
-static int take_status(char *s, const char *const *words, int n) {
-    size_t len = strlen(s);
-    for (int i = 0; i < n; i++) {
-        size_t wl = strlen(words[i]);
-        if (len >= wl + 3 && s[len - wl - 3] == ' ' && s[len - wl - 2] == '(' && s[len - 1] == ')' &&
-            !strncmp(s + len - wl - 1, words[i], wl)) {
-            s[len - wl - 3] = '\0';
-            return i;
-        }
+/* A heading at `p`, not inside a word: its index, with *after just past its
+ * colon; or -1. */
+static int heading_at(const char *start, const char *p, char **after) {
+    if (p > start && isalnum((unsigned char)p[-1])) return -1;
+    for (int h = 0; h < 5; h++) {
+        size_t n = strlen(HEADS[h]);
+        if (strncasecmp(p, HEADS[h], n) != 0) continue;
+        const char *q = p + n;
+        while (*q == '*') q++;
+        if (*q != ':') continue;
+        q++;
+        while (*q == '*') q++;
+        *after = (char *)q;
+        return h;
     }
     return -1;
+}
+
+typedef struct { int *v; int n, cap; } ints;
+
+static int ints_add(ints *a, int v) {
+    for (int i = 0; i < a->n; i++) if (a->v[i] == v) return 0;
+    if (a->n == a->cap) {
+        int nc = a->cap ? a->cap * 2 : 8;
+        int *nv = realloc(a->v, (size_t)nc * sizeof *nv);
+        if (!nv) return -1;
+        a->v = nv;
+        a->cap = nc;
+    }
+    a->v[a->n++] = v;
+    return 0;
+}
+
+/* Take the citations out of `s`, in place, wherever they are: "[3]", "[3][7]",
+ * "[3, 7]", "[1-4]", and the same in parentheses. Into `cited`: 0-based lines,
+ * once each, in the order written. A bracketed number that is not a line is a
+ * citation of what is not there: -1. A parenthesized one is text, left as it
+ * is. 0, or -1 (also out of memory). */
+static int take_cites(char *s, const oc_sum_lines *l, ints *cited) {
+    char *w = s;
+    for (char *p = s; *p; ) {
+        if (*p == '[' || *p == '(') {
+            char close = *p == '[' ? ']' : ')';
+            char *e = p + 1;
+            int digits = 0;
+            while (*e && (isdigit((unsigned char)*e) || *e == ' ' || *e == ',' || *e == '-')) {
+                if (isdigit((unsigned char)*e)) digits = 1;
+                e++;
+            }
+            if (digits && *e == close) {
+                ints got = {0};
+                int ok = 1;
+                for (char *q = p + 1; q < e && ok; ) {
+                    if (!isdigit((unsigned char)*q)) { q++; continue; }
+                    long a = strtol(q, &q, 10), z = a;
+                    while (*q == ' ') q++;
+                    if (*q == '-') {
+                        q++;
+                        while (*q == ' ') q++;
+                        if (isdigit((unsigned char)*q)) z = strtol(q, &q, 10);
+                    }
+                    if (a < 1 || z < a || z > l->n) { ok = 0; break; }
+                    for (long v = a; v <= z && ok; v++) if (ints_add(&got, (int)v - 1) != 0) ok = -1;
+                }
+                if (ok == 1) {
+                    for (int i = 0; i < got.n; i++)
+                        if (ints_add(cited, got.v[i]) != 0) { free(got.v); return -1; }
+                    free(got.v);
+                    p = e + 1;
+                    continue;
+                }
+                free(got.v);
+                if (ok < 0 || close == ']') return -1;
+            }
+        }
+        *w++ = *p++;
+    }
+    *w = '\0';
+    return 0;
+}
+
+/* Take every "(open)", "(done)" and "(resolved)" out of `s`, in place, in any
+ * case: the first one's index in STATUS, or -1 when there is none. */
+static const char *const STATUS[3] = { "open", "done", "resolved" };
+static int take_status(char *s) {
+    int first = -1;
+    char *w = s;
+    for (char *p = s; *p; ) {
+        if (*p == '(') {
+            int hit = -1;
+            for (int k = 0; k < 3 && hit < 0; k++) {
+                size_t n = strlen(STATUS[k]);
+                if (!strncasecmp(p + 1, STATUS[k], n) && p[1 + n] == ')') hit = k;
+            }
+            if (hit >= 0) {
+                if (first < 0) first = hit;
+                p += strlen(STATUS[hit]) + 2;
+                continue;
+            }
+        }
+        *w++ = *p++;
+    }
+    *w = '\0';
+    return first;
+}
+
+/* `s` with runs of spaces made one, no space before punctuation (where a
+ * citation was taken out), and the bullet marks, numbering and stray
+ * punctuation left at either end taken off. */
+static char *tidy(char *s) {
+    char *w = s;
+    int sp = 0;
+    for (char *p = s; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            if (!sp) *w++ = ' ';
+            sp = 1;
+        } else {
+            if (sp && strchr(".,;:!?)", *p) && w > s) w--;
+            *w++ = *p;
+            sp = 0;
+        }
+    }
+    *w = '\0';
+    for (;;) {
+        while (*s == ' ') s++;
+        if ((*s == '-' || *s == '*' || *s == '#') && !isdigit((unsigned char)s[1])) { s++; continue; }
+        if (!strncmp(s, "\xe2\x80\xa2", 3)) { s += 3; continue; }
+        const char *d = s;
+        while (isdigit((unsigned char)*d)) d++;
+        if (d > s && (*d == '.' || *d == ')') && d[1] == ' ') { s = (char *)d + 2; continue; }
+        break;
+    }
+    size_t n = strlen(s);
+    while (n && strchr(" -*#,;:", s[n - 1])) s[--n] = '\0';
+    return s;
 }
 
 typedef struct { char **v; int n, cap; } seen;
@@ -698,113 +755,137 @@ int oc_sum_parse(const char *answer, const oc_sum_lines *l, const oc_sum_people 
                  int *dropped) {
     static const char *const OPEN_DONE[2] = { "open", "done" };
     static const char *const OPEN_RES[2] = { "open", "resolved" };
-    static const char *const HEADS[4] = { "Decisions:", "Actions:", "Problems:", "Facts:" };
     if (dropped) *dropped = 0;
-    if (!answer || strncmp(answer, "Overview:", 9) != 0) return -1;
+    if (!answer) return -1;
+    char *a = strdup(answer);
+    if (!a) return -1;
+    /* Where each heading is, and where what it heads begins. */
+    typedef struct { int h; char *at, *body; } mark;
+    mark *m = NULL;
+    int nm = 0, cm = 0;
+    for (char *p = a; *p; ) {
+        char *after;
+        int h = heading_at(a, p, &after);
+        if (h < 0) { p++; continue; }
+        if (nm == cm) {
+            int nc = cm ? cm * 2 : 16;
+            mark *nv = realloc(m, (size_t)nc * sizeof *nv);
+            if (!nv) { free(m); free(a); return -1; }
+            m = nv;
+            cm = nc;
+        }
+        m[nm++] = (mark){ h, p, after };
+        p = after;
+    }
+    if (!nm) { free(m); free(a); return -1; }
+    for (int i = 1; i < nm; i++) *m[i].at = '\0';
+
     oc_sum_buf items[4] = { {0}, {0}, {0}, {0} };
     int count[4] = { 0, 0, 0, 0 };
     seen kept[4] = { {0}, {0}, {0}, {0} };
-    int section = -1, drop = 0, total = 0, rc = -1;
+    int drop = 0, total = 0, rc = -1;
     char *overview = NULL;
-    int *all = malloc((size_t)(l->n ? l->n : 1) * sizeof *all);
-    if (!all) return -1;
-    for (int i = 0; i < l->n; i++) all[i] = i;
+    ints all = {0};
+    for (int i = 0; i < l->n; i++) if (ints_add(&all, i) != 0) goto out;
 
-    const char *p = answer;
-    while (*p) {
-        const char *e = strchr(p, '\n');
-        size_t len = e ? (size_t)(e - p) : strlen(p);
-        char *line = malloc(len + 1);
-        if (!line) goto out;
-        memcpy(line, p, len);
-        line[len] = '\0';
-        p = e ? e + 1 : p + len;
-        while (len && (line[len - 1] == ' ' || line[len - 1] == '\r')) line[--len] = '\0';
-
-        int head = -1;
-        for (int h = 0; h < 4; h++) if (!strcmp(line, HEADS[h])) head = h;
-        if (head >= 0) { section = head; free(line); continue; }
-        if (section < 0 && !strncmp(line, "Overview:", 9)) {
-            char *t = line + 9;
-            while (*t == ' ') t++;
-            int *c = NULL;
-            int nc = take_cites(t, l, &c);
-            free(c);
+    for (int i = 0; i < nm; i++) {
+        if (m[i].h == 0) {
+            /* The first overview with something in it. */
+            if (overview && *overview) continue;
+            ints c = {0};
+            int bad = take_cites(m[i].body, l, &c);
+            free(c.v);
+            take_status(m[i].body);
+            char *t = tidy(m[i].body);
             free(overview);
-            overview = nc < 0 ? NULL : strdup(t);
-            if (overview && !numbers_ok(overview, l, all, l->n)) { free(overview); overview = NULL; drop++; }
-            free(line);
+            overview = NULL;
+            if (bad || !numbers_ok(t, l, all.v, all.n)) { drop++; continue; }
+            if (!(overview = strdup(t))) goto out;
             continue;
         }
-        if (section < 0 || strncmp(line, "- ", 2) != 0) { free(line); continue; }
-        char *t = line + 2;
-        int *cited = NULL;
-        int nc = take_cites(t, l, &cited);
-        if (nc <= 0) { drop++; free(cited); free(line); continue; }
-        int status = 0;
-        int64_t who = 0;
-        if (section == 1 || section == 2) {
-            status = take_status(t, section == 1 ? OPEN_DONE : OPEN_RES, 2);
-            if (status < 0) { drop++; free(cited); free(line); continue; }
-        }
-        char *text = t;
-        if (section == 1) {
-            char *colon = strstr(t, ": ");
-            if (!colon) { drop++; free(cited); free(line); continue; }
-            *colon = '\0';
-            int found = !strcmp(t, "Team");
-            for (int k = 0; k < people->n && !found; k++)
-                if (!strcmp(t, people->name[k])) { found = 1; who = people->id[k]; }
-            if (!found) { drop++; free(cited); free(line); continue; }
-            text = colon + 2;
-        }
-        while (*text == ' ') text++;
-        if (!*text || !numbers_ok(text, l, cited, nc)) { drop++; free(cited); free(line); continue; }
-        /* A repeat of a kept bullet (for an action, the same person too). */
-        char key[64];
-        snprintf(key, sizeof key, "%lld|", (long long)who);
-        oc_sum_buf k = {0};
-        oc_sum_buf_puts(&k, key);
-        oc_sum_buf_puts(&k, text);
-        if (k.oom || seen_has(&kept[section], k.p)) {
-            int oom = k.oom;
-            oc_sum_buf_free(&k);
-            free(cited);
-            free(line);
-            if (oom) goto out;
-            drop++;
-            continue;
-        }
-        if (seen_add(&kept[section], k.p) != 0) { oc_sum_buf_free(&k); free(cited); free(line); goto out; }
-        oc_sum_buf_free(&k);
-        /* The message ids its lines stand for. */
-        int64_t *refs = NULL;
-        int nr = 0, cr = 0;
-        for (int c = 0; c < nc; c++)
-            if (add_unique(&refs, &nr, &cr, l->v[cited[c]].refs, l->v[cited[c]].n_refs) != 0) {
-                free(refs); free(cited); free(line);
-                goto out;
+        int section = m[i].h - 1;
+        for (char *line = m[i].body; line; ) {
+            char *e = strchr(line, '\n');
+            if (e) *e = '\0';
+            char *next = e ? e + 1 : NULL;
+            ints cited = {0};
+            if (take_cites(line, l, &cited) != 0) { drop++; free(cited.v); line = next; continue; }
+            int status = take_status(line);
+            char *text = tidy(line);
+            if (!cited.n) {
+                if (*text || status >= 0) drop++;
+                free(cited.v);
+                line = next;
+                continue;
             }
-        oc_sum_buf *b = &items[section];
-        oc_sum_buf_puts(b, count[section] ? ",{" : "{");
-        if (section == 1) {
-            oc_sum_buf_printf(b, "\"who\":%lld,\"what\":", (long long)who);
-        } else {
-            oc_sum_buf_puts(b, "\"text\":");
+            int64_t who = 0;
+            int ok = 1;
+            if (section == 1) {
+                /* "who: what", done or open. */
+                char *colon = strchr(text, ':');
+                ok = colon != NULL && (status == 0 || status == 1);
+                if (ok) {
+                    *colon = '\0';
+                    char *name = tidy(text);
+                    int found = !strcasecmp(name, "Team");
+                    for (int k = 0; k < people->n && !found; k++)
+                        if (!strcasecmp(name, people->name[k])) { found = 1; who = people->id[k]; }
+                    ok = found;
+                    text = tidy(colon + 1);
+                }
+            } else if (section == 2) {
+                /* Open or resolved. */
+                ok = status == 0 || status == 2;
+                status = status == 2;
+            }
+            if (!ok || !*text || !numbers_ok(text, l, cited.v, cited.n)) {
+                drop++;
+                free(cited.v);
+                line = next;
+                continue;
+            }
+            /* A repeat of a kept bullet (for an action, the same person too). */
+            oc_sum_buf k = {0};
+            oc_sum_buf_printf(&k, "%lld|", (long long)who);
+            oc_sum_buf_puts(&k, text);
+            if (k.oom || seen_has(&kept[section], k.p)) {
+                int oom = k.oom;
+                oc_sum_buf_free(&k);
+                free(cited.v);
+                if (oom) goto out;
+                drop++;
+                line = next;
+                continue;
+            }
+            if (seen_add(&kept[section], k.p) != 0) { oc_sum_buf_free(&k); free(cited.v); goto out; }
+            oc_sum_buf_free(&k);
+            /* The message ids its lines stand for. */
+            int64_t *refs = NULL;
+            int nr = 0, cr = 0;
+            for (int c = 0; c < cited.n; c++)
+                if (add_unique(&refs, &nr, &cr, l->v[cited.v[c]].refs, l->v[cited.v[c]].n_refs) != 0) {
+                    free(refs);
+                    free(cited.v);
+                    goto out;
+                }
+            oc_sum_buf *b = &items[section];
+            oc_sum_buf_puts(b, count[section] ? ",{" : "{");
+            if (section == 1) oc_sum_buf_printf(b, "\"who\":%lld,\"what\":", (long long)who);
+            else oc_sum_buf_puts(b, "\"text\":");
+            oc_sum_buf_json(b, text);
+            if (section == 0) oc_sum_buf_puts(b, ",\"by\":[]");
+            oc_sum_buf_puts(b, ",\"refs\":[");
+            for (int x = 0; x < nr; x++) oc_sum_buf_printf(b, "%s%lld", x ? "," : "", (long long)refs[x]);
+            oc_sum_buf_puts(b, "]");
+            if (section == 1) oc_sum_buf_printf(b, ",\"status\":\"%s\"", OPEN_DONE[status]);
+            if (section == 2) oc_sum_buf_printf(b, ",\"status\":\"%s\"", OPEN_RES[status]);
+            oc_sum_buf_puts(b, "}");
+            count[section]++;
+            total++;
+            free(refs);
+            free(cited.v);
+            line = next;
         }
-        oc_sum_buf_json(b, text);
-        if (section == 0) oc_sum_buf_puts(b, ",\"by\":[]");
-        oc_sum_buf_puts(b, ",\"refs\":[");
-        for (int x = 0; x < nr; x++) oc_sum_buf_printf(b, "%s%lld", x ? "," : "", (long long)refs[x]);
-        oc_sum_buf_puts(b, "]");
-        if (section == 1) oc_sum_buf_printf(b, ",\"status\":\"%s\"", OPEN_DONE[status]);
-        if (section == 2) oc_sum_buf_printf(b, ",\"status\":\"%s\"", OPEN_RES[status]);
-        oc_sum_buf_puts(b, "}");
-        count[section]++;
-        total++;
-        free(refs);
-        free(cited);
-        free(line);
     }
     oc_sum_buf_puts(out, "{\"overview\":");
     oc_sum_buf_json(out, overview ? overview : "");
@@ -819,7 +900,9 @@ int oc_sum_parse(const char *answer, const oc_sum_lines *l, const oc_sum_people 
 out:
     for (int s = 0; s < 4; s++) { oc_sum_buf_free(&items[s]); seen_free(&kept[s]); }
     free(overview);
-    free(all);
+    free(all.v);
+    free(m);
+    free(a);
     if (dropped) *dropped = drop;
     return rc;
 }

@@ -27,14 +27,14 @@ typedef struct oc_sum_engine {
     /* Load the model: a handle, or NULL with a reason. */
     void *(*open)(void *ctx, char *err, size_t errcap);
     void  (*close)(void *handle);
-    /* Answer `user` under `system`, held to `grammar` (GBNF, root rule "root"),
-     * writing at most `max_out` tokens (0: whatever the context has left). The
-     * answer, NUL-terminated, into a heap string at *out. 0, or -1 with a reason
+    /* Answer `user` under `system`, writing at most `max_out` tokens (0:
+     * whatever the context has left). The answer, NUL-terminated, into a heap
+     * string at *out. 0, or -1 with a reason
      * (or abandoned by the gate); an answer that filled the context is left at
      * *out as far as it got, for the log. */
-    int   (*run)(void *handle, const char *system, const char *user, const char *grammar,
-                 int max_out, oc_sum_gate_fn gate, void *gate_ctx, char **out,
-                 oc_sum_run_stats *st, char *err, size_t errcap);
+    int   (*run)(void *handle, const char *system, const char *user, int max_out,
+                 oc_sum_gate_fn gate, void *gate_ctx, char **out, oc_sum_run_stats *st,
+                 char *err, size_t errcap);
 } oc_sum_engine;
 
 /* The local engine over the GGUF file at `path` (borrowed), with a context of

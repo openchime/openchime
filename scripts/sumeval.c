@@ -13,7 +13,7 @@
  *       is written there, in the order made, to see what each level did
  *
  * The real worker code builds the summary (oc_sum_build_now): the same
- * pieces, prompt, grammar, checks and recursion as the daemon, stored in the
+ * pieces, prompt, checks and recursion as the daemon, stored in the
  * database given, so a second run reuses what the first made. Runs on one
  * thread, ungated. Built by `make build/sumeval`.
  */

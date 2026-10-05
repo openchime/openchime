@@ -107,7 +107,7 @@ static void l_close(void *vh) {
     free(h);
 }
 
-static int l_run(void *vh, const char *system, const char *user, const char *grammar, int max_out,
+static int l_run(void *vh, const char *system, const char *user, int max_out,
                  oc_sum_gate_fn gate, void *gate_ctx, char **out, oc_sum_run_stats *st, char *err,
                  size_t errcap) {
     llama_handle *h = vh;
@@ -148,14 +148,6 @@ static int l_run(void *vh, const char *system, const char *user, const char *gra
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
     struct llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    struct llama_sampler *gram = grammar ? llama_sampler_init_grammar(h->vocab, grammar, "root") : NULL;
-    if (grammar && !gram) {
-        llama_sampler_free(smpl);
-        free(tok);
-        snprintf(err, errcap, "the grammar does not parse");
-        return -1;
-    }
-    if (gram) llama_sampler_chain_add(smpl, gram);
     static const char *breakers[] = { "\n", ":", "\"", "*" };
     /* Over the whole context: the library takes a count (its callers' -1 for
      * "the context" means nothing to it, and 0 turns DRY off). */

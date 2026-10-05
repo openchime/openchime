@@ -3496,9 +3496,9 @@ static void test_voice_input_absent(int port, int by_env) {
 typedef struct { int calls; } sum_stub;
 static void *sstub_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void sstub_close(void *h) { (void)h; }
-static int sstub_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+static int sstub_run(void *h, const char *system, const char *user, int max_out,
                      oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
-    (void)system; (void)user; (void)grammar; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
+    (void)system; (void)user; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
     __atomic_add_fetch(&((sum_stub *)h)->calls, 1, __ATOMIC_RELAXED);
     if (st) memset(st, 0, sizeof *st);
     *out = strdup("Overview: The ship date was set.\nDecisions:\n- Ship on Friday [1]\nActions:\nProblems:\nFacts:\n");

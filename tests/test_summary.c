@@ -63,7 +63,7 @@ static void test_cut(void) {
     oc_sum_cut_free(&c);
 }
 
-/* --- lines, the prompt, the grammar and reading an answer ---------------------- */
+/* --- lines, the prompt and reading an answer ----------------------------------- */
 
 static void test_parse(void) {
     oc_sum_msg m[] = {
@@ -80,15 +80,10 @@ static void test_parse(void) {
 
     /* The prompt numbers the lines, carries no clock times, and asks for 30% of
      * their words (11 words: at most 4). */
-    oc_sum_buf prompt = {0}, g = {0}, out = {0};
+    oc_sum_buf prompt = {0}, out = {0};
     CHECK(oc_sum_prompt("Messages from #support.", &l, &prompt) == 0);
     CHECK(strstr(prompt.p, "[1] Ann: Ticket") && strstr(prompt.p, "  [2] Bob: On it.") && strstr(prompt.p, "at most 4 words"));
     CHECK(!strstr(prompt.p, "00:"));
-    /* The grammar: only these line numbers and these people; no counts. */
-    CHECK(oc_sum_grammar(l.n, &pp, &g) == 0);
-    CHECK(strstr(g.p, "id ::= \"1\" | \"2\"\n") && strstr(g.p, "who ::= \"Team\" | \"Ann\" | \"Bob\""));
-    CHECK(!strstr(g.p, "{0,") && !strstr(g.p, "{1,"));
-
     const char *ans =
         "Overview: Ann asked Bob about ticket 6701.\n"
         "Decisions:\n"
@@ -120,6 +115,30 @@ static void test_parse(void) {
     CHECK(oc_sum_parse("not a summary", &l, &pp, &out, NULL) == -1);
     oc_sum_buf_free(&out);
 
+    /* Written freely, it is read as written: headings inside a line and in
+     * markdown, citations in parentheses, ranges and lists, a status anywhere,
+     * a bullet with no mark. Kept: the decision, the action and the fact.
+     * Dropped: a line citing nothing, an action with no status, a problem that
+     * runs on into numbers its line does not hold. */
+    const char *free_ans =
+        "Here is the summary.\n"
+        "**Overview:** Ann asked Bob about ticket 6701 [1]. Decisions: - Bob looks first (1-2)\n"
+        "Actions:\n"
+        "- bob: (open) look at ticket 6701 (1, 2)\n"
+        "- Ann: wait\n"
+        "- Ann: wait [1]\n"
+        "Problems: - nothing (open) [1] - (3) - (4) - (5)\n"
+        "## Facts:\n"
+        "1. Ticket 6701 [1, 2]\n";
+    kept = oc_sum_parse(free_ans, &l, &pp, &out, &dropped);
+    CHECK(kept == 3);
+    CHECK(dropped == 3);
+    CHECK(out.p && strstr(out.p, "\"overview\":\"Ann asked Bob about ticket 6701.\""));
+    CHECK(out.p && strstr(out.p, "\"decisions\":[{\"text\":\"Bob looks first\",\"by\":[],\"refs\":[100,101]}]"));
+    CHECK(out.p && strstr(out.p, "\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\""));
+    CHECK(out.p && strstr(out.p, "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100,101]}]"));
+    oc_sum_buf_free(&out);
+
     /* A stored summary reads back as lines, each standing for its messages;
      * the overview for all of them. */
     oc_sum_lines up = {0};
@@ -140,7 +159,6 @@ static void test_parse(void) {
     oc_sum_people_free(&upp);
 
     oc_sum_buf_free(&prompt);
-    oc_sum_buf_free(&g);
     oc_sum_lines_free(&l);
     oc_sum_people_free(&pp);
     oc_sum_cut_free(&c);
@@ -339,15 +357,15 @@ static void test_gate(void) {
 /* --- the whole build, over a stub model ----------------------------------------- */
 
 /* The stub: every call is checked to be the one summarize step -- the same
- * system prompt and the same grammar rules at every level -- and answers with a
+ * system prompt and the same instructions at every level -- and answers with a
  * short summary citing line 1. In "grow" mode it answers with all its input
  * again, which never gets shorter. */
 typedef struct {
-    int calls, leaf, rollup, part, other_system, other_grammar, grow;
+    int calls, leaf, rollup, part, other_system, other_prompt, grow;
 } stub;
 static void *s_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void s_close(void *h) { (void)h; }
-static int s_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+static int s_run(void *h, const char *system, const char *user, int max_out,
                  oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
     (void)max_out; (void)err; (void)cap;
     stub *s = h;
@@ -355,7 +373,7 @@ static int s_run(void *h, const char *system, const char *user, const char *gram
     if (st) memset(st, 0, sizeof *st);
     s->calls++;
     if (system != OC_SUM_SYSTEM) s->other_system++;
-    if (strncmp(grammar, "root ::= \"Overview: \" ov", 24) != 0) s->other_grammar++;
+    if (!strstr(user, "Begin with \"Overview:\"")) s->other_prompt++;
     if (strstr(user, "Messages from")) s->leaf++;
     else if (strstr(user, "Summaries of consecutive parts")) s->rollup++;
     else if (strstr(user, "One long message")) s->part++;
@@ -432,7 +450,7 @@ static void test_build(void) {
      * makes the two days' summary -- the same step every time. */
     CHECK(oc_sum_build_now(&cfg, 1, 0, 2 * 86400000ll, 0, err, sizeof err) == 0);
     CHECK(s.calls == 4 && s.leaf == 3 && s.rollup == 1);
-    CHECK(s.other_system == 0 && s.other_grammar == 0);
+    CHECK(s.other_system == 0 && s.other_prompt == 0);
     CHECK(strstr(k.last, "\"summary\":") && strstr(k.last, "agreed"));
     /* Again: everything is found, nothing is asked. */
     int before = s.calls;
@@ -479,7 +497,7 @@ static void test_recursion(void) {
     setup(&cfg, path, &e, &k, 40);
     char err[600] = "";
     CHECK(oc_sum_build_now(&cfg, 1, 0, 86400000ll, 0, err, sizeof err) == 0);
-    CHECK(s.leaf == 20 && s.rollup > 4 && s.other_system == 0 && s.other_grammar == 0);
+    CHECK(s.leaf == 20 && s.rollup > 4 && s.other_system == 0 && s.other_prompt == 0);
     /* Three levels at least: a section built from sections. */
     CHECK(count_where(db, "SELECT COUNT(*) FROM summary_inputs i JOIN summary_nodes p ON p.id=i.parent_id "
                           "JOIN summary_nodes c ON c.id=i.child_id WHERE i.child_kind=1 AND p.kind=2 AND c.kind=2;") > 0);
