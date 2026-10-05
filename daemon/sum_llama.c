@@ -157,8 +157,10 @@ static int l_run(void *vh, const char *system, const char *user, const char *gra
     }
     if (gram) llama_sampler_chain_add(smpl, gram);
     static const char *breakers[] = { "\n", ":", "\"", "*" };
+    /* Over the whole context: the library takes a count (its callers' -1 for
+     * "the context" means nothing to it, and 0 turns DRY off). */
     llama_sampler_chain_add(smpl, llama_sampler_init_dry(h->vocab, SUM_DRY_MULTIPLIER, SUM_DRY_BASE, SUM_DRY_ALLOWED,
-                                                         -1, breakers, sizeof breakers / sizeof *breakers));
+                                                         h->n_ctx, breakers, sizeof breakers / sizeof *breakers));
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
     int rc = -1;
