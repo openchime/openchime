@@ -1401,33 +1401,35 @@ where one exists.
 - **REQ-310.** A user has been able to **summarize a channel or DM** they can
   read, over one of four spans: what they have not read, the last seven days, a range
   they choose, and a daily recap of the day before (or of every day since they were
-  last about, up to a week). Days have been the reader's own, by their time zone. A
-  summary has said what happened in short structured parts — an overview, decisions
-  and who made them, actions and who has them, open or done, problems, and key facts —
-  each part citing the messages it came from. Messages from integrations, call events
-  and deleted messages have not been summarized.
-- **REQ-311.** A summary has been **made on the server, by a small model, from small
-  pieces**: a channel cut into chunks of whole messages (a whole thread where it
-  fits), each summarized, then rolled up — a big thread into one summary, many
-  pieces into sections, sections into the span asked for. Every piece has been kept
-  and reused by every later summary that covers it. Nothing a model wrote has been
-  kept that cited a message or person not in its piece, or stated a number its
-  sources do not contain. The work has run only in the machine's idle time, on one
-  core, and has paused while the machine's CPU was busy, its memory low or its people
-  busy with it; a summary someone is waiting for has been made first, and recent days
-  of active conversations have been summarized ahead of being asked.
+  last about). Days have been the reader's own, by their time zone. A summary has
+  been structured fields and text — an overview, decisions, actions with who has
+  them, open or done, problems, open or resolved, and key facts — each item citing
+  the messages it came from. Messages from bots and integrations, call events and
+  deleted messages have not been summarized.
+- **REQ-311.** A summary has been **made recursively, from small pieces**: a channel
+  cut into chunks of whole messages (a whole thread where it fits) under one size
+  limit, a constant in the code; a thread or a message too big for a chunk cut into
+  pieces, each summarized, and the summaries summarized again until one remains; a
+  span made by feeding the summaries of its chunks back into the same summarizing,
+  cut into sections and summarized again for as long as they do not fit. A thread
+  has belonged to the period of its last activity. Every summary has been kept in
+  the database and reused by every later summary built on the same pieces. The work
+  has run single-threaded, in idle time, and has paused while the machine's CPU was
+  busy or its memory low; a summary someone asked for has been made while they
+  waited, ahead of and interrupting any work no one was waiting on, in the order
+  asked, with the asker told how many requests were ahead of theirs. Work no one
+  asked for has gone back no further than the last seven days. The queue of
+  requests has been kept in the database, where it can be seen.
 - **REQ-312.** A summary has been **kept current**: a message sent, edited,
-  deleted or restored has removed every summary built on it, and the next request has
-  built them again from what is there now. A summary made by an older model or prompt
-  has been served until the new one was made.
-- **REQ-313.** Summaries have been **absent unless the operator turns them on**: off
-  by default; *local* runs the model inside the daemon, fetched on first start from a
-  pinned address and checked against a pinned SHA-256, kept beside the database and
-  never shipped in a package; a model that cannot be fetched, loaded or made to
-  answer has left summaries off, said why in the log, and left the rest of the server
-  running. Where summaries are off, no client has shown them. In local mode no message
-  text has left the tenant's own box to be summarized, and nothing in the summary
-  chain has been under a copyleft licence (ARCH-116).
+  deleted or restored has removed every summary built on it, recursively, and they
+  have been made again from what is there now. A summary made by an older model or
+  prompt has been kept and served until the new one was made.
+- **REQ-313.** Summaries have been **absent unless the operator turns them on**:
+  `OPENCHIME_SUMMARY` off (the default), local or cloud. *Local* runs one known,
+  open-licensed model inside the daemon, fetched on first setup. A model that cannot
+  be fetched or loaded, or a CPU that cannot run it, has left summaries off, said why
+  in the log, and left the rest of the server running. Where summaries are off, no
+  client has shown them (ARCH-116).
 
 ---
 

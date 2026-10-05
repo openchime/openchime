@@ -1468,12 +1468,14 @@ CREATE TABLE summary_inputs (
 CREATE INDEX idx_sum_inputs_child ON summary_inputs(child_kind, child_id);
 ```
 
-*A summary is a tree* (SUMMARIES.md §2): chunk summaries over messages, a big
-thread's summary over its chunks, sections over a long list, a period on top.
+*A summary is a tree* (SUMMARIES.md §2): chunk summaries over messages (or
+over the parts of a message too big for a chunk), a big thread's summary over its
+chunks, sections over a list too long for one summary, a period on top.
 Each node is a row, and `summary_inputs` lists what it was built from, in order:
 a message with the `edited_at_ms` it had when read (`child_stamp`, 0 never
-edited), or another node. `ikey` names a node's inputs, so the same chunk is
-found again rather than made again; `version` names the model, prompts and
+edited), or another node. `ikey` names a node's inputs — a chunk's messages as
+read, or the keys of a node's children — so the same node is found again rather
+than made again; `version` names the model, prompts and
 constants it was made with. `body` is the stored JSON (SUMMARIES.md §3).
 `AUTOINCREMENT`, so an id is never reused and a client can tell a rebuilt summary
 from the one it holds.
@@ -1484,7 +1486,31 @@ query, every node built on the message or its thread's root and every period
 whose span holds the message's time, then everything built on those; the cascade
 takes their inputs. Removing a member's DMs removes their nodes. *Stored by the
 writer only if its messages are unchanged* (the stamps) and its node inputs still
-exist. *Collected in idle time*: nodes nothing is built on, unused for 30 days.
+exist.
+
+## 3aw. Migration 0058 — the summary queue (REQ-311, ARCH-116)
+
+```sql
+CREATE TABLE summary_requests (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  conn_id        INTEGER NOT NULL,
+  req_id         INTEGER NOT NULL,
+  user_id        INTEGER NOT NULL,
+  channel_id     INTEGER NOT NULL,
+  start_ms       INTEGER NOT NULL,
+  end_ms         INTEGER NOT NULL,
+  tz_offset_min  INTEGER NOT NULL DEFAULT 0,
+  state          TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','running')),
+  created_at_ms  INTEGER NOT NULL,
+  started_at_ms  INTEGER
+);
+CREATE INDEX idx_sum_requests_conn ON summary_requests(conn_id);
+```
+
+The summaries someone is waiting on (SUMMARIES.md §5): a SUMMARIZE with no stored
+answer, in the order asked (`id`). The writer adds a row, marks the one the worker
+takes `running`, and deletes it when it is answered or its connection closes. A
+connection id belongs to one run of the daemon, so every row is deleted at start.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

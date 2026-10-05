@@ -256,7 +256,15 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Summaries (REQ-310, ARCH-116): find a period's summary, or say what
         * the worker must build; and store what the worker built. */
        OC_JOB_SUMMARY_LOOKUP = 132,
-       OC_JOB_SUMMARY_STORE = 133 };
+       OC_JOB_SUMMARY_STORE = 133,
+       /* The queue of summaries someone waits on (summary_requests): QUEUE adds
+        * the request (`sum_*`, channel_id, user_id, conn_id); TAKE marks row
+        * `sum_row` running for the worker, which waits on `sum_batch`; DROP
+        * deletes conn_id's queued rows. Each answers with every waiting
+        * request's place (OC_RES_SUMMARY_QUEUE). */
+       OC_JOB_SUMMARY_QUEUE = 134,
+       OC_JOB_SUMMARY_TAKE = 135,
+       OC_JOB_SUMMARY_DROP = 136 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -551,6 +559,8 @@ typedef struct oc_job {
     uint32_t       sum_req;
     uint8_t        sum_scope;
     uint64_t       sum_start, sum_end;
+    int            sum_tz;
+    int64_t        sum_row;
     char          *sum_version;
     struct oc_sum_batch *sum_batch;
 } oc_job;
@@ -690,7 +700,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_CREDENTIAL_RESET = 112,
        /* SUMMARY: the answer to a SUMMARIZE (sum_status, sum_body); SUMMARY_NEED:
         * nothing stored yet -- the span, for the worker to build. */
-       OC_RES_SUMMARY = 113, OC_RES_SUMMARY_NEED = 114 };
+       OC_RES_SUMMARY = 113, OC_RES_SUMMARY_NEED = 114,
+       /* The summary queue moved: `sum_places` holds where each request in it
+        * now is (also on a SUMMARY the queue moved with). On a QUEUE that was
+        * refused because the queue is full, `sum_status` is UNAVAILABLE. */
+       OC_RES_SUMMARY_QUEUE = 115 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1282,6 +1296,10 @@ typedef struct oc_dbres {
     int64_t                 sum_start, sum_end;
     int                     sum_tz;
     char                   *sum_body, *sum_version;
+    /* Every request waiting on a summary, and how many are ahead of it (0: it
+     * is being made). Heap. */
+    struct oc_sum_place { uint64_t conn_id; uint32_t req_id; uint16_t position; } *sum_places;
+    size_t                  n_sum_places;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -1461,9 +1479,11 @@ void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token);
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
 /* Store a summary batch through the writer and wait for it (the summary
  * worker's sink, ARCH-116): 0 stored, 1 refused because a message changed, -1.
- * The answer, when someone waits, comes back to the net loop as OC_RES_SUMMARY.
- * With `a` NULL it instead removes nodes nothing uses (oc_sum_collect). */
+ * The answer, when someone waits, comes back to the net loop as OC_RES_SUMMARY. */
 int        oc_dbwriter_sum_store(oc_dbwriter *w, const oc_sum_answer *a, oc_sum_new *nodes, int n);
+/* Mark queued request `row` running for the worker, and wait: 1 taken, 0 when
+ * it is no longer queued (its connection closed), -1. */
+int        oc_dbwriter_sum_take(oc_dbwriter *w, int64_t row);
 /* Pop the next completed result, or NULL when drained. Caller frees it. */
 oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);
 void       oc_dbres_free(oc_dbres *r);

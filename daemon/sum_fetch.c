@@ -78,3 +78,34 @@ int oc_sum_model_ensure(const char *dir, const char *file, const char *url, cons
     fprintf(stderr, "summary: model fetched and checked\n");
     return 0;
 }
+
+/* __builtin_cpu_supports takes only a literal: one per feature asked. */
+static int cpu_supports(const char *f) {
+#if defined(__x86_64__)
+    __builtin_cpu_init();
+    if (!strcmp(f, "avx2")) return __builtin_cpu_supports("avx2");
+    if (!strcmp(f, "fma"))  return __builtin_cpu_supports("fma");
+    if (!strcmp(f, "f16c")) return __builtin_cpu_supports("f16c");
+    if (!strcmp(f, "bmi2")) return __builtin_cpu_supports("bmi2");
+#else
+    (void)f;
+#endif
+    return 0;
+}
+
+int oc_sum_cpu_ok(int (*supports)(const char *feature), char *err, size_t errcap) {
+#if defined(__x86_64__)
+    static const char *const need[] = { "avx2", "fma", "f16c", "bmi2" };
+    if (!supports) supports = cpu_supports;
+    for (size_t i = 0; i < sizeof need / sizeof *need; i++)
+        if (!supports(need[i])) {
+            snprintf(err, errcap, "this CPU has no %s, which the local model needs (x86-64-v3)", need[i]);
+            return 0;
+        }
+#else
+    (void)supports;
+    (void)err;
+    (void)errcap;
+#endif
+    return 1;
+}

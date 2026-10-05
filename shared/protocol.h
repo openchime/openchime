@@ -512,6 +512,7 @@ typedef enum {
      * machine may take minutes. Only when the "summarize" capability was sent. */
     OC_MSG_SUMMARIZE            = 0x00FD, /* C->S */
     OC_MSG_SUMMARY              = 0x00FE, /* S->C, the answer to one SUMMARIZE */
+    OC_MSG_SUMMARY_QUEUED       = 0x0100, /* S->C, where one SUMMARIZE is in the queue */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -1017,6 +1018,10 @@ typedef struct { uint32_t req_id; uint64_t channel_id; uint8_t scope; uint64_t s
 enum { OC_SUM_OK = 0, OC_SUM_UNAVAILABLE = 1, OC_SUM_FORBIDDEN = 2, OC_SUM_FAILED = 3 };
 typedef struct { uint32_t req_id; uint8_t status; uint64_t summary_id; uint64_t channel_id;
                  uint64_t start_ms; uint64_t end_ms; oc_slice version; oc_slice body; } oc_summary;
+/* SUMMARY_QUEUED: a SUMMARIZE the daemon is making, and how many requests are
+ * ahead of it (0: it is being made now). Sent when it is queued and whenever
+ * the queue moves; its SUMMARY ends it. */
+typedef struct { uint32_t req_id; uint16_t position; } oc_summary_queued;
 
 /* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
  * follow the LIST_PINS shape — stream the entries, then a terminator — because
@@ -1633,6 +1638,7 @@ oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m);
 oc_result oc_encode_action(oc_wbuf *w, uint16_t version, const oc_action *m);
 oc_result oc_encode_summarize(oc_wbuf *w, uint16_t version, const oc_summarize *m);
 oc_result oc_encode_summary(oc_wbuf *w, uint16_t version, const oc_summary *m);
+oc_result oc_encode_summary_queued(oc_wbuf *w, uint16_t version, const oc_summary_queued *m);
 oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_attach_media_set *m);
 oc_result oc_encode_attach_media_ok(oc_wbuf *w, uint16_t version, const oc_attach_media_ok *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
@@ -1913,6 +1919,7 @@ oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
 oc_result oc_decode_action(oc_rbuf *p, oc_action *m);
 oc_result oc_decode_summarize(oc_rbuf *p, oc_summarize *m);
 oc_result oc_decode_summary(oc_rbuf *p, oc_summary *m);
+oc_result oc_decode_summary_queued(oc_rbuf *p, oc_summary_queued *m);
 oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m);
 oc_result oc_decode_attach_media_ok(oc_rbuf *p, oc_attach_media_ok *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);

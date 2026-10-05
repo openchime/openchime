@@ -819,6 +819,7 @@ static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id);
 /* Drop a closed connection from any audio call it was in (REQ-152). Defined
  * below; declared here for conn_close. */
 static void call_conn_closed(int ep, conn **conns, uint64_t conn_id);
+static void sum_conn_closed(uint64_t conn_id);
 /* Append + flush to a connection (closes it on error). Defined below; declared
  * here for the call roster helpers. */
 static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len);
@@ -902,6 +903,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     conns[fd] = NULL;
     if (was_authed) presence_offline_if_gone(ep, conns, uid);
     call_conn_closed(ep, conns, cid);   /* leave any call; roster remaining (REQ-152) */
+    if (was_authed) sum_conn_closed(cid);
 }
 
 static conn *find_by_id(conn **conns, uint64_t id) {
@@ -1074,8 +1076,9 @@ typedef struct {
 } call_t;
 static __thread call_t  *g_calls;   /* OC_MAX_CALLS, the loop's own */
 static __thread uint64_t g_next_call_id;
-/* The writer, for the one job a call raises with no frame behind it: the
- * missed-call line when a call ends, which can happen as a connection closes. */
+/* The writer, for the jobs raised with no frame behind them: the missed-call
+ * line when a call ends, and taking a connection's summary requests out of the
+ * queue -- both of which can happen as a connection closes. */
 static __thread oc_dbwriter *g_call_dbw;
 
 /* Call media (REQ-150/151, ARCH-18/73): the UDP socket the relay runs on and
@@ -1229,6 +1232,13 @@ static oc_unfurler *g_unfurler;
  * read by the loop: published atomically. */
 void oc_netloop_set_summary(struct oc_sum_worker *w) { __atomic_store_n(&g_sum, w, __ATOMIC_RELEASE); }
 static oc_sum_worker *sum_worker(void) { return __atomic_load_n(&g_sum, __ATOMIC_ACQUIRE); }
+
+/* A closed connection: nobody waits on its summary requests now. */
+static void sum_conn_closed(uint64_t conn_id) {
+    if (!sum_worker() || !g_call_dbw) return;
+    oc_job *j = oc_job_new(OC_JOB_SUMMARY_DROP, conn_id);
+    if (j) oc_dbwriter_submit(g_call_dbw, j);
+}
 
 void oc_netloop_set_tts(const struct oc_tts_engine *engine) {
 #ifdef OC_TTS
@@ -2286,6 +2296,20 @@ static void download_pump(conn *c) {
  * via deliver_result. */
 /* Defined below with the HTTP webhook path; declared here for the redeem path. */
 static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap);
+
+/* Each request waiting on a summary, where it now is in the queue: a
+ * SUMMARY_QUEUED to its connection (REQ-311). */
+static void send_places(int ep, conn **conns, const oc_dbres *r) {
+    for (size_t i = 0; i < r->n_sum_places; i++) {
+        conn *c = oc_idmap_get(&g_by_id, r->sum_places[i].conn_id);
+        if (!c) continue;
+        oc_summary_queued q = { r->sum_places[i].req_id, r->sum_places[i].position };
+        uint8_t buf[32];
+        oc_wbuf w;
+        oc_wbuf_init(&w, buf, sizeof buf);
+        if (oc_encode_summary_queued(&w, OC_PROTOCOL_VERSION, &q) == OC_OK) send_bytes(ep, conns, c->fd, buf, w.len);
+    }
+}
 
 /* A SUMMARY frame to one connection (REQ-310). */
 static void send_summary(int ep, conn **conns, conn *c, uint32_t req, uint8_t status, uint64_t channel,
@@ -6460,16 +6484,47 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                         : r->sum_body;
         send_summary(ep, conns, c, r->sum_req, r->sum_status, r->channel_id, r->sum_id, r->sum_start,
                      r->sum_end, r->sum_version, why);
+        send_places(ep, conns, r);   /* the queue moved up */
         break;
     }
     case OC_RES_SUMMARY_NEED: {
+        /* Nothing stored: into the queue, through the writer (summary_requests). */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_sum_worker *sw = sum_worker();
-        if (!sw || oc_sum_worker_request(sw, r->conn_id, r->sum_req, (int64_t)r->channel_id,
-                                            r->sum_start, r->sum_end, r->sum_tz) != 0)
+        if (!sum_worker()) {
             send_summary(ep, conns, c, r->sum_req, OC_SUM_UNAVAILABLE, r->channel_id, 0, r->sum_start,
-                         r->sum_end, "", "Too many summaries are being made; try again shortly.");
+                         r->sum_end, "", "Summaries are not turned on.");
+            break;
+        }
+        oc_job *j = oc_job_new(OC_JOB_SUMMARY_QUEUE, r->conn_id);
+        if (!j) break;
+        j->user_id = c->user_id;
+        j->channel_id = r->channel_id;
+        j->sum_req = r->sum_req;
+        j->sum_start = (uint64_t)r->sum_start;
+        j->sum_end = (uint64_t)r->sum_end;
+        j->sum_tz = r->sum_tz;
+        oc_dbwriter_submit(dbw, j);
+        break;
+    }
+    case OC_RES_SUMMARY_QUEUE: {
+        /* The queue moved: a request joined it (r->conn_id set), or one was
+         * taken, or a closed connection's left it. */
+        if (r->conn_id && r->sum_status == OC_SUM_UNAVAILABLE) {
+            conn *c = find_by_id(conns, r->conn_id);
+            if (c)
+                send_summary(ep, conns, c, r->sum_req, OC_SUM_UNAVAILABLE, r->channel_id, 0, r->sum_start,
+                             r->sum_end, "", "Too many summaries are being made; try again shortly.");
+            break;
+        }
+        if (r->conn_id) {
+            for (size_t i = 0; i < r->n_sum_places; i++)
+                if (r->sum_places[i].conn_id == r->conn_id && r->sum_places[i].req_id == r->sum_req)
+                    fprintf(stderr, "summary: request queued: channel %llu, position %u\n",
+                            (unsigned long long)r->channel_id, (unsigned)r->sum_places[i].position);
+            oc_sum_worker_wake(sum_worker());
+        }
+        send_places(ep, conns, r);
         break;
     }
     case OC_RES_STORAGE_STATUS: {

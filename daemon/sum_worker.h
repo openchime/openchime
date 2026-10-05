@@ -2,13 +2,22 @@
  * OpenChime — the summary worker (REQ-310, ARCH-116, docs/SUMMARIES.md §5).
  *
  * One thread, at the lowest priority the kernel has (SCHED_IDLE, nice 19), with
- * one model call at a time on one core. It builds a period's summary from the
- * bottom up -- chunk summaries, a big thread's summary, sections, the period --
- * reusing every node already stored, and hands the new nodes to the writer in
- * one batch. Requests someone is waiting on come first; when there are none and
- * the machine has been quiet a while, it summarizes recent days of active
- * channels ahead of being asked, and rebuilds what an older model or prompt
- * made. The load gate (sum_load.h) pauses it whenever the machine is busy.
+ * one model call at a time on one core. Everything it makes goes through one
+ * summarize step and one recursion: what fits SUM_THRESHOLD_TOKENS is
+ * summarized once; what does not is cut into sections that fit, each
+ * summarized, and the section summaries go through the same recursion. A
+ * message too big for a chunk, a thread too big for a chunk and a period are
+ * all made that way, and every node already stored is reused. New nodes go to
+ * the writer in one batch.
+ *
+ * Requests someone is waiting on come first: they are rows of
+ * summary_requests, taken oldest first, and one arriving stops any idle work
+ * in progress (which is done again later). When there are none and the
+ * machine has been quiet a while, it summarizes what a changed message left
+ * unsummarized, then every channel's chunks of the last SUM_BACKGROUND_DAYS
+ * from the newest back, then the periods people asked for before that a
+ * change has since purged, then the periods an older model or prompt made.
+ * The load gate (sum_load.h) pauses it whenever the machine is busy.
  *
  * It reads through its own read-only connection; it never writes the database
  * itself: the sink does, through the writer.
@@ -23,23 +32,22 @@
 #include "sum_load.h"
 #include "sum_store.h"
 
-/* How many requests may wait; and how long the model stays loaded unused. */
+/* How many requests may wait (summary_requests); and how long the model stays
+ * loaded unused. */
 #define SUM_QUEUE_MAX       64
 #define SUM_UNLOAD_IDLE_MS  (5u * 60u * 1000u)
-/* Background work: how many past days of an active channel to summarize ahead,
- * how often to look for them, and how long an unused node is kept. */
-#define SUM_IDLE_DAYS       7
-#define SUM_IDLE_SCAN_MS    (10u * 60u * 1000u)
-#define SUM_KEEP_MS         (30ull * 24u * 3600u * 1000u)
-/* A model's answer is at most this many tokens; the context is sized for the
- * largest piece plus the prompt plus the answer. */
-#define SUM_MAX_OUT         2048
-#define SUM_CTX_TOKENS      (SUM_THRESHOLD_TOKENS + 1024 + SUM_MAX_OUT)
+/* The model's context: the prompt, one input of up to the threshold, and an
+ * answer up to the same size again. */
+#define SUM_CTX_TOKENS      (3 * SUM_THRESHOLD_TOKENS)
+/* How far back idle work summarizes each channel ahead of time: the longest
+ * span offered as a preset. Older spans are made when someone asks. */
+#define SUM_BACKGROUND_DAYS 7
 
 /* The answer to one request, or a batch the worker made on its own. */
 typedef struct {
     uint64_t    conn_id;      /* 0: nobody is waiting */
     uint32_t    req_id;
+    int64_t     request_id;   /* its row in summary_requests, 0 for none */
     int64_t     channel, start_ms, end_ms;
     int         tz_offset_min;
     int         ok;
@@ -51,14 +59,21 @@ typedef struct {
 
 /* Where the worker's results go. `store` writes the batch (which may be empty)
  * and answers the request when `a->conn_id` is set; when the batch is not empty
- * its last node is the period answered. It returns 0, 1 if refused because a
- * message changed meanwhile (the worker builds again), or -1. `collect` removes
- * nodes unused for SUM_KEEP_MS. Both run on the worker's thread. */
+ * and a period was asked for, its last node is that period. It returns 0, 1 if
+ * refused because a message changed meanwhile (the worker builds again), or
+ * -1. Runs on the worker's thread. */
 typedef struct {
     int  (*store)(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n);
-    void (*collect)(void *ctx);
+    /* Mark queued request `row` running: 1, or 0 when it is no longer queued
+     * (its connection closed). NULL: requests are not taken from the queue. */
+    int  (*take)(void *ctx, int64_t row);
     void *ctx;
 } oc_sum_sink;
+
+/* Every model call, for the evaluation tool: the prompt, the answer as the model
+ * wrote it (or as far as it got), and the stored summary it became (NULL when
+ * it failed). */
+typedef void (*oc_sum_trace_fn)(void *ctx, const char *prompt, const char *answer, const char *body);
 
 typedef struct {
     const char          *db_path;
@@ -68,6 +83,8 @@ typedef struct {
     int                  background; /* summarize ahead when idle */
     size_t               threshold;  /* SUM_THRESHOLD_TOKENS, varied by the evaluation tool */
     uint64_t             gap_ms;     /* SUM_GAP_MS, likewise */
+    oc_sum_trace_fn      trace;      /* NULL: none */
+    void                *trace_ctx;
 } oc_sum_worker_cfg;
 
 typedef struct oc_sum_worker oc_sum_worker;
@@ -77,9 +94,9 @@ oc_sum_worker *oc_sum_worker_start(const oc_sum_worker_cfg *cfg, char *err, size
  * with an error. */
 void oc_sum_worker_stop(oc_sum_worker *w);
 
-/* Queue a request someone is waiting on. 0, or -1 when the queue is full. */
-int oc_sum_worker_request(oc_sum_worker *w, uint64_t conn_id, uint32_t req_id, int64_t channel,
-                          int64_t start_ms, int64_t end_ms, int tz_offset_min);
+/* A request was added to the queue (summary_requests, by the writer): the
+ * worker takes it next, stopping any idle work in progress to do so. */
+void oc_sum_worker_wake(oc_sum_worker *w);
 
 /* The version every new node is stored with. */
 const char *oc_sum_worker_version(const oc_sum_worker *w);
@@ -88,6 +105,11 @@ const char *oc_sum_worker_version(const oc_sum_worker *w);
  * no gate: for the evaluation tool. The answer goes to the sink. 0 or -1. */
 int oc_sum_build_now(const oc_sum_worker_cfg *cfg, int64_t channel, int64_t start_ms, int64_t end_ms,
                      int tz_offset_min, char *err, size_t errcap);
+
+/* Summarize every chunk of `channel` whose last activity is in [start, end), on
+ * the calling thread, as idle work does: for the tests. 0 or -1. */
+int oc_sum_chunks_now(const oc_sum_worker_cfg *cfg, int64_t channel, int64_t start_ms, int64_t end_ms,
+                      char *err, size_t errcap);
 
 /* Where the local day holding `t` starts, for a zone `tz_offset_min` east of UTC. */
 int64_t oc_sum_day_start(int64_t t, int tz_offset_min);

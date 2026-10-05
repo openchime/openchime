@@ -3493,16 +3493,21 @@ static void test_voice_input_absent(int port, int by_env) {
  * without the model; an edit purges it and the next request builds again; with
  * no worker the answer is UNAVAILABLE. Its own daemon and database, so the
  * shared one's channel history does not enter the summary. */
-typedef struct { int calls; } sum_stub;
+typedef struct { int calls; volatile int hold; } sum_stub;
 static void *sstub_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void sstub_close(void *h) { (void)h; }
-static int sstub_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+static int sstub_run(void *h, const char *system, const char *user, int max_out,
                      oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
-    (void)system; (void)user; (void)grammar; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
+    (void)system; (void)user; (void)max_out; (void)err; (void)cap;
     __atomic_add_fetch(&((sum_stub *)h)->calls, 1, __ATOMIC_RELAXED);
+    /* Held: the model is busy, as a real one is for minutes. */
+    while (__atomic_load_n(&((sum_stub *)h)->hold, __ATOMIC_ACQUIRE)) {
+        if (gate && gate(gctx)) return -1;
+        struct timespec ts = { 0, 5 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
     if (st) memset(st, 0, sizeof *st);
-    *out = strdup("{\"overview\":\"P1 set the ship date.\",\"decisions\":[{\"text\":\"Ship on Friday\","
-                  "\"by\":[\"P1\"],\"refs\":[\"m1\"]}],\"actions\":[],\"problems\":[],\"facts\":[]}");
+    *out = strdup("Overview: The ship date was set.\nDecisions:\n- Ship on Friday [1]\nActions:\nProblems:\nFacts:\n");
     return 0;
 }
 static int sq_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
@@ -3513,6 +3518,10 @@ static oc_dbwriter *g_sum_dbw;
 static int sq_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
     (void)ctx;
     return oc_dbwriter_sum_store(g_sum_dbw, a, nodes, n);
+}
+static int sq_take(void *ctx, int64_t row) {
+    (void)ctx;
+    return oc_dbwriter_sum_take(g_sum_dbw, row);
 }
 
 static int summarize_await(client *c, uint32_t req, uint8_t scope, oc_summary *out, char *body, size_t cap) {
@@ -3555,6 +3564,7 @@ static void test_summaries(int port) {
     cfg.engine = &eng;
     cfg.probe = &quiet;
     cfg.sink.store = sq_store;
+    cfg.sink.take = sq_take;
     char err[256] = "";
     oc_sum_worker *wk = oc_sum_worker_start(&cfg, err, sizeof err);
     CHECK(wk != NULL);
@@ -3620,6 +3630,89 @@ static void test_summaries(int port) {
     CHECK(summarize_await(&a, 9, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
     CHECK(sm.status == OC_SUM_OK && sm.summary_id != first);
     CHECK(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) > calls);
+
+    /* The queue (summary_requests): while the model is busy with one request,
+     * a second is told it has one ahead of it; then it is made, and told so,
+     * and answered. */
+    {
+        __atomic_store_n(&stub.hold, 1, __ATOMIC_RELEASE);
+        int c0 = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
+        /* A new message, so the first request needs the model (held) and does
+         * not come whole from the store; both spans take it in. */
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s2 = {0};
+        s2.channel_id = OC_DEFAULT_CHANNEL;
+        memset(s2.idem, 0x5b, OC_IDEM_SIZE);
+        s2.body = oc_slice_str("And the notes go out on Thursday.");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+        oc_summarize q1 = { 30, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 2 * 86400000ull, now_ms + 86400000ull };
+        oc_summarize q2 = { 31, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 2 * 86400000ull + 1000, now_ms + 86400000ull };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q1) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        int saw1 = 0, saw2 = 0, two_ahead1 = 0, made2 = 0, answered = 0;
+        for (int i = 0; i < 60 && !saw1; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a, &hdr, &p) != 0) break;
+            oc_summary_queued qq;
+            if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED && oc_decode_summary_queued(&p, &qq) == OC_OK && qq.req_id == 30)
+                saw1 = 1;
+        }
+        CHECK(saw1);
+        /* The first is being made (held): the second waits behind it. */
+        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
+            struct timespec ts = { 0, 10 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q2) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        for (int i = 0; i < 60 && !saw2; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a, &hdr, &p) != 0) break;
+            oc_summary_queued qq;
+            if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED && oc_decode_summary_queued(&p, &qq) == OC_OK && qq.req_id == 31) {
+                saw2 = 1;
+                two_ahead1 = qq.position == 1;
+            }
+        }
+        CHECK(saw2 && two_ahead1);
+        sqlite3 *qdb = NULL;
+        CHECK(sqlite3_open_v2("build/itest_sum.db", &qdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        sqlite3_stmt *qs = NULL;
+        int rows = -1;
+        if (sqlite3_prepare_v2(qdb, "SELECT COUNT(*) FROM summary_requests;", -1, &qs, NULL) == SQLITE_OK &&
+            sqlite3_step(qs) == SQLITE_ROW)
+            rows = sqlite3_column_int(qs, 0);
+        sqlite3_finalize(qs);
+        CHECK(rows == 2);   /* the queue, as a table */
+        __atomic_store_n(&stub.hold, 0, __ATOMIC_RELEASE);
+        for (int i = 0; i < 200 && answered < 2; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a, &hdr, &p) != 0) break;
+            oc_summary_queued qq;
+            oc_summary sa;
+            if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED && oc_decode_summary_queued(&p, &qq) == OC_OK &&
+                qq.req_id == 31 && qq.position == 0)
+                made2 = 1;
+            if (hdr.msg_type == OC_MSG_SUMMARY && oc_decode_summary(&p, &sa) == OC_OK &&
+                (sa.req_id == 30 || sa.req_id == 31) && sa.status == OC_SUM_OK)
+                answered++;
+        }
+        CHECK(made2 && answered == 2);
+        rows = -1;
+        if (sqlite3_prepare_v2(qdb, "SELECT COUNT(*) FROM summary_requests;", -1, &qs, NULL) == SQLITE_OK &&
+            sqlite3_step(qs) == SQLITE_ROW)
+            rows = sqlite3_column_int(qs, 0);
+        sqlite3_finalize(qs);
+        CHECK(rows == 0);   /* answered: out of the queue */
+        sqlite3_close(qdb);
+    }
 
     /* A channel the reader cannot read is refused. */
     oc_wbuf_init(&w, buf, sizeof buf);

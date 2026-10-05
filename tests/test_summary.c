@@ -5,11 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "check.h"
 #include "migrate.h"
 #include "sum_core.h"
+#include "sum_fetch.h"
 #include "sum_load.h"
 #include "sum_store.h"
 #include "sum_worker.h"
@@ -62,45 +64,188 @@ static void test_cut(void) {
     oc_sum_cut_free(&c);
 }
 
-/* --- rendering, the grammar and the check -------------------------------------- */
+/* --- lines, the prompt and reading an answer ----------------------------------- */
 
-static void test_check(void) {
+static void test_parse(void) {
     oc_sum_msg m[] = {
         { 100, 0, 10, 0, 0, "Ann", "Ticket 6701 is open; Bob please look.", },
         { 101, 100, 11, MIN, 0, "Bob", "On it.", },
     };
     oc_sum_cut c;
-    oc_sum_cut_build(m, 2, 1000, 45 * MIN, &c);
-    oc_sum_buf prompt = {0}, g = {0}, out = {0};
-    oc_sum_ids ids;
-    CHECK(oc_sum_render_chunk("support", m, &c.pieces[0].chunks[0], &prompt, &ids) == 0);
-    CHECK(prompt.p && strstr(prompt.p, "P1 Ann") && strstr(prompt.p, "[m2] P2"));
-    CHECK(oc_sum_grammar(&ids, 0, SUM_MAX_ITEMS, &g) == 0 && strstr(g.p, "\"\\\"m2\\\"\"") && !strstr(g.p, "\"\\\"m3\\\"\""));
+    CHECK(oc_sum_cut_build(m, 2, 1000, 45 * MIN, &c) == 0);
+    oc_sum_lines l = {0};
+    oc_sum_people pp = {0};
+    CHECK(oc_sum_chunk_lines(m, &c.pieces[0].chunks[0], &l, &pp) == 0);
+    CHECK(l.n == 2 && !strcmp(l.v[0].text, "Ann: Ticket 6701 is open; Bob please look.") && l.v[1].indent == 1);
+    CHECK(pp.n == 2 && pp.id[1] == 11 && !strcmp(pp.name[1], "Bob"));
 
+    /* The prompt numbers the lines, carries no clock times, and asks for 30% of
+     * their words (11 words: at most 4). */
+    oc_sum_buf prompt = {0}, out = {0};
+    CHECK(oc_sum_prompt("Messages from #support.", &l, &prompt) == 0);
+    CHECK(strstr(prompt.p, "[1] Ann: Ticket") && strstr(prompt.p, "  [2] Bob: On it.") && strstr(prompt.p, "at most 4 words"));
+    CHECK(!strstr(prompt.p, "00:"));
     const char *ans =
-        "{\"overview\":\"P1 asked P2 about ticket 6701.\","
-        "\"decisions\":[],"
-        "\"actions\":[{\"who\":\"P2\",\"what\":\"look at ticket 6701\",\"refs\":[\"m1\"],\"status\":\"open\"},"
-        "{\"who\":\"P2\",\"what\":\"look at ticket 6701\",\"refs\":[\"m1\"],\"status\":\"open\"},"
-        "{\"who\":\"P9\",\"what\":\"someone invented\",\"refs\":[\"m1\"],\"status\":\"open\"}],"
-        "\"problems\":[{\"text\":\"ticket 9999 is broken\",\"refs\":[\"m1\"],\"status\":\"open\"},"
-        "{\"text\":\"cites nothing real\",\"refs\":[\"m7\"],\"status\":\"open\"}],"
-        "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[\"m1\"]}]}";
+        "Overview: Ann asked Bob about ticket 6701.\n"
+        "Decisions:\n"
+        "Actions:\n"
+        "- Bob: look at ticket 6701 (open) [1][2]\n"
+        "- Bob: look at ticket 6701 (open) [1]\n"
+        "- Carol: someone invented (open) [1]\n"
+        "Problems:\n"
+        "- ticket 9999 is broken (open) [1]\n"
+        "- cites nothing real (open) [7]\n"
+        "Facts:\n"
+        "- Ticket 6701 [1]\n";
     int dropped = 0;
-    int kept = oc_sum_check(ans, strlen(ans), &ids, 0, &out, &dropped);
-    /* Kept: one action (the repeat dropped), the fact. Dropped: the repeat, the
-     * unknown person, the invented number, the unknown ref. */
-    CHECK(kept == 2);
-    CHECK(dropped == 4);
-    CHECK(out.p && strstr(out.p, "\"who\":11") && strstr(out.p, "\"refs\":[100]"));
-    /* The model's ids read as names. */
-    CHECK(out.p && strstr(out.p, "Ann asked Bob about ticket 6701."));
-    CHECK(oc_sum_check("not json", 8, &ids, 0, &out, NULL) == -1);
-    oc_sum_buf_free(&prompt);
-    oc_sum_buf_free(&g);
+    oc_sum_buf ask = {0};
+    int kept = oc_sum_parse(ans, NULL, &l, &pp, &out, &ask, &dropped);
+    /* Dropped: only the repeat and the invented number. Kept: the action, the
+     * one given to someone not in the lines (the name stays in its text), the
+     * problem citing a line not there (that citation ignored: it stands for
+     * every line, and is asked about), and the fact. */
+    CHECK(kept == 4);
+    CHECK(dropped == 2);
+    CHECK(out.p && strstr(out.p, "\"overview\":\"Ann asked Bob about ticket 6701.\",\"refs\":[100,101]"));
+    CHECK(out.p && strstr(out.p, "{\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\"}"));
+    CHECK(out.p && strstr(out.p, "{\"what\":\"Carol: someone invented\",\"refs\":[100],\"status\":\"open\"}"));
+    CHECK(out.p && strstr(out.p, "\"problems\":[{\"text\":\"cites nothing real\",\"refs\":[100,101],\"status\":\"open\"}]"));
+    CHECK(out.p && strstr(out.p, "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100]}]"));
+    CHECK(out.p && strstr(out.p, "\"decisions\":[]"));
+    CHECK(ask.p && !strcmp(ask.p, "1. Problem: cites nothing real\n"));
     oc_sum_buf_free(&out);
-    oc_sum_ids_free(&ids);
+    /* The follow-up's line numbers go to the item it was asked about. */
+    oc_sum_buf q = {0}, fg = {0};
+    CHECK(oc_sum_followup(ask.p, 1, l.n, &q, &fg) == 0);
+    CHECK(strstr(q.p, "1. Problem: cites nothing real") && strstr(fg.p, "root ::= \"1:\" cites \"\\n\"\n") &&
+          strstr(fg.p, "id ::= \"1\" | \"2\"\n"));
+    CHECK(oc_sum_parse(ans, "1: [2]\n", &l, &pp, &out, NULL, NULL) == 4);
+    CHECK(out.p && strstr(out.p, "\"problems\":[{\"text\":\"cites nothing real\",\"refs\":[101],\"status\":\"open\"}]"));
+    oc_sum_buf_free(&out);
+    oc_sum_buf_free(&ask);
+    oc_sum_buf_free(&q);
+    oc_sum_buf_free(&fg);
+    /* An overview stating a number no line has is dropped, the items kept. */
+    CHECK(oc_sum_parse("Overview: 42 tickets.\nDecisions:\n- look [1]\nActions:\nProblems:\nFacts:\n", NULL, &l, &pp,
+                       &out, NULL, &dropped) == 1);
+    CHECK(out.p && strstr(out.p, "\"overview\":\"\"") && dropped == 1);
+    oc_sum_buf_free(&out);
+    CHECK(oc_sum_parse("not a summary", NULL, &l, &pp, &out, NULL, NULL) == -1);
+    oc_sum_buf_free(&out);
+
+    /* Written freely, it is read as written: headings inside a line and in
+     * markdown, citations in parentheses, ranges and lists, a status anywhere
+     * or none, an item with no mark, "N/A" for nothing. Kept: the decision, the
+     * two actions and the fact. Dropped: the repeat of Ann's action, and a
+     * problem that runs on into numbers its line does not hold. */
+    const char *free_ans =
+        "Here is the summary.\n"
+        "**Overview:** Ann asked Bob about ticket 6701 [1]. Decisions: - Bob looks first (1-2)\n"
+        "Actions:\n"
+        "- bob: (open) look at ticket 6701 (1, 2)\n"
+        "- Ann: wait\n"
+        "- Ann: wait [1]\n"
+        "Problems: - nothing (open) [1] - (3) - (4) - (5)\n"
+        "## Facts:\n"
+        "1. Ticket 6701 [1, 2]\n"
+        "- N/A\n";
+    kept = oc_sum_parse(free_ans, NULL, &l, &pp, &out, NULL, &dropped);
+    CHECK(kept == 4);
+    CHECK(dropped == 2);
+    CHECK(out.p && strstr(out.p, "\"overview\":\"Ann asked Bob about ticket 6701.\""));
+    CHECK(out.p && strstr(out.p, "\"decisions\":[{\"text\":\"Bob looks first\",\"by\":[],\"refs\":[100,101]}]"));
+    CHECK(out.p && strstr(out.p, "\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\""));
+    CHECK(out.p && strstr(out.p, "{\"who\":10,\"what\":\"wait\",\"refs\":[100,101]}"));
+    CHECK(out.p && strstr(out.p, "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100,101]}]"));
+    oc_sum_buf_free(&out);
+
+    /* A kind copied from a roll-up's lines is not part of the item; an item
+     * whose words all appear in one already kept is a repeat. */
+    CHECK(oc_sum_parse("Overview: x\nDecisions:\n- [1] Decision: ship it\nActions:\n- [1] Action (open): Bob: look\n"
+                       "Facts:\n- [1] Deployed after business hours ET.\n- [2] deployed after business hours\n",
+                       NULL, &l, &pp, &out, NULL, &dropped) == 3);
+    CHECK(dropped == 1);
+    CHECK(out.p && strstr(out.p, "{\"text\":\"ship it\",") &&
+          strstr(out.p, "{\"who\":11,\"what\":\"look\",\"refs\":[100],\"status\":\"open\"}") &&
+          strstr(out.p, "\"facts\":[{\"text\":\"Deployed after business hours ET.\",\"refs\":[100]}]"));
+    oc_sum_buf_free(&out);
+
+    /* A first name only one person in the lines has is that person. */
+    oc_sum_people two = {0};
+    CHECK(oc_sum_people_add(&two, 20, "Cassi Vincent") == 0 && oc_sum_people_add(&two, 21, "Carla Smith") == 0);
+    CHECK(oc_sum_parse("Overview: x\nActions:\n- [1] Cassi: call Whitney\n", NULL, &l, &two, &out, NULL, NULL) == 1);
+    CHECK(out.p && strstr(out.p, "{\"who\":20,\"what\":\"call Whitney\",\"refs\":[100]}"));
+    oc_sum_buf_free(&out);
+    oc_sum_people_free(&two);
+
+    /* A stored summary reads back as lines, each standing for its messages;
+     * the overview for all of them. */
+    oc_sum_lines up = {0};
+    oc_sum_people upp = {0};
+    const char *body =
+        "{\"overview\":\"Bob took the ticket.\",\"decisions\":[],"
+        "\"actions\":[{\"who\":11,\"what\":\"look at ticket 6701\",\"refs\":[100,101],\"status\":\"open\"}],"
+        "\"problems\":[],\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100]}]}";
+    CHECK(oc_sum_body_lines(body, NULL, NULL, "On Fri 04 Sep:", &up, &upp) == 0);
+    CHECK(up.n == 3);
+    if (up.n == 3) {
+        CHECK(!strcmp(up.v[0].text, "Overview: Bob took the ticket.") && up.v[0].n_refs == 2 && up.v[0].label);
+        CHECK(!strcmp(up.v[1].text, "Action (open): someone: look at ticket 6701") && !up.v[1].label);
+        CHECK(!strcmp(up.v[2].text, "Fact: Ticket 6701") && up.v[2].n_refs == 1 && up.v[2].refs[0] == 100);
+    }
+    CHECK(upp.n == 1 && upp.id[0] == 11);
+    oc_sum_lines_free(&up);
+    oc_sum_people_free(&upp);
+
+    oc_sum_buf_free(&prompt);
+    oc_sum_lines_free(&l);
+    oc_sum_people_free(&pp);
     oc_sum_cut_free(&c);
+}
+
+/* A message too big for a chunk splits at paragraphs, then lines, sentences and
+ * words, and loses nothing. */
+static void test_split(void) {
+    static char text[6000];
+    text[0] = '\0';
+    for (int p = 0; p < 6; p++) {
+        for (int s = 0; s < 8; s++) strcat(text, "This sentence is about twenty-five bytes. ");
+        strcat(text, "\n\n");
+    }
+    char **parts = NULL;
+    int n = 0;
+    CHECK(oc_sum_split_text(text, 100, &parts, &n) == 0);
+    CHECK(n >= 4);
+    size_t total = 0;
+    oc_sum_buf joined = {0};
+    for (int i = 0; i < n; i++) {
+        CHECK(strlen(parts[i]) <= 100 * SUM_BYTES_PER_TOKEN);
+        total += strlen(parts[i]);
+        oc_sum_buf_puts(&joined, parts[i]);
+    }
+    CHECK(total == strlen(text) && !strcmp(joined.p, text));
+    /* Whole paragraphs where they fit. */
+    CHECK(n > 0 && strstr(parts[0], "\n\n") != NULL);
+    oc_sum_buf_free(&joined);
+    oc_sum_parts_free(parts, n);
+    /* One word longer than a part: cut, never inside a character. */
+    static char word[900];
+    memset(word, 0, sizeof word);
+    for (int i = 0; i + 2 < (int)sizeof word - 1; i += 2) { word[i] = (char)0xC3; word[i + 1] = (char)0xA9; }
+    CHECK(oc_sum_split_text(word, 50, &parts, &n) == 0);
+    for (int i = 0; i < n; i++) CHECK(((unsigned char)parts[i][0] & 0xC0) != 0x80);
+    oc_sum_parts_free(parts, n);
+}
+
+/* The CPU check: local summaries only where the model's instructions exist. */
+static int has_all(const char *f) { (void)f; return 1; }
+static int no_avx2(const char *f) { return strcmp(f, "avx2") != 0; }
+static void test_cpu(void) {
+    char err[128] = "";
+    CHECK(oc_sum_cpu_ok(has_all, err, sizeof err) == 1);
+#if defined(__x86_64__)
+    CHECK(oc_sum_cpu_ok(no_avx2, err, sizeof err) == 0 && strstr(err, "avx2"));
+#endif
 }
 
 /* --- the store, its guard and the purge ---------------------------------------- */
@@ -250,34 +395,95 @@ static void test_gate(void) {
 
 /* --- the whole build, over a stub model ----------------------------------------- */
 
-typedef struct { int calls, rollups; } stub;
+/* The stub: every call is checked to be the one summarize step -- the same
+ * system prompt and the same instructions at every level -- and answers with a
+ * short summary citing line 1. In "grow" mode it answers with all its input
+ * again, which never gets shorter. */
+typedef struct {
+    int calls, leaf, rollup, part, other_system, other_prompt, grow, uncited, follow;
+} stub;
 static void *s_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void s_close(void *h) { (void)h; }
-static int s_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+static int s_run(void *h, const char *system, const char *user, int max_out,
                  oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
-    (void)user; (void)grammar; (void)max_out; (void)err; (void)cap;
+    (void)max_out; (void)err; (void)cap;
     stub *s = h;
     if (gate && gate(gctx)) return -1;
     if (st) memset(st, 0, sizeof *st);
     s->calls++;
-    int roll = system == OC_SUM_SYSTEM_ROLLUP;
-    s->rollups += roll;
-    char buf[512];
-    snprintf(buf, sizeof buf,
-             "{\"overview\":\"P1 talked.\",\"decisions\":[{\"text\":\"%s\",\"by\":[\"P1\"],\"refs\":[\"%s\"]}],"
-             "\"actions\":[],\"problems\":[],\"facts\":[]}", roll ? "agreed overall" : "agreed", roll ? "i1" : "m1");
-    *out = strdup(buf);
+    if (system != OC_SUM_SYSTEM) s->other_system++;
+    if (!strstr(user, "Answer in exactly this form")) s->other_prompt++;
+    if (strstr(user, "Messages from")) s->leaf++;
+    else if (strstr(user, "Summaries of consecutive parts")) s->rollup++;
+    else if (strstr(user, "One long message")) s->part++;
+    oc_sum_buf b = {0};
+    if (s->grow) {
+        oc_sum_buf_puts(&b, "Overview:");
+        for (const char *p = user; (p = strchr(p, '[')) != NULL; p++) {
+            /* Only the numbered lines, not the example in the instructions. */
+            const char *b0 = p;
+            while (b0 > user && b0[-1] == ' ') b0--;
+            if (b0 > user && b0[-1] != '\n') continue;
+            const char *e = strchr(p, '\n');
+            const char *t = strchr(p, ']');
+            if (t && e && t < e) { oc_sum_buf_puts(&b, " "); oc_sum_buf_add(&b, t + 2, (size_t)(e - t - 2)); oc_sum_buf_puts(&b, " and more words"); }
+        }
+        oc_sum_buf_puts(&b, "\nDecisions:\nActions:\nProblems:\nFacts:\n");
+    } else {
+        oc_sum_buf_puts(&b, s->uncited ? "Overview: They talked.\nDecisions:\n- agreed\nActions:\nProblems:\nFacts:\n"
+                                       : "Overview: They talked.\nDecisions:\n- agreed [1]\nActions:\nProblems:\nFacts:\n");
+    }
+    *out = b.p;
     return 0;
 }
 
-typedef struct { sqlite3 *db; int stores; char last[2048]; int refused; } sink;
+/* The follow-up: line 1 for the one item asked about. */
+static int s_more(void *h, const char *user, const char *grammar, oc_sum_gate_fn gate, void *gctx, char **out,
+                  oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)err; (void)cap; (void)gctx;
+    stub *s = h;
+    if (gate && gate(gctx)) return -1;
+    if (st) memset(st, 0, sizeof *st);
+    if (strstr(user, "1. Decision: agreed") && strstr(grammar, "root ::= \"1:\" cites")) s->follow++;
+    *out = strdup("1: [1]\n");
+    return 0;
+}
+
+typedef struct { sqlite3 *db; int stores; char last[4096]; char err[600]; } sink;
 static int k_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
     sink *k = ctx;
     k->stores++;
-    if (!a->ok) { k->refused++; return 0; }
+    if (!a->ok) { snprintf(k->err, sizeof k->err, "%s", a->err ? a->err : ""); return 0; }
     int rc = n ? oc_sum_store(k->db, a->channel, a->version, nodes, n) : 0;
-    if (rc == 0) snprintf(k->last, sizeof k->last, "%s", a->body ? a->body : "");
+    if (rc == 0 && a->body) snprintf(k->last, sizeof k->last, "%s", a->body);
     return rc;
+}
+
+static void setup(oc_sum_worker_cfg *cfg, const char *path, oc_sum_engine *e, sink *k, size_t threshold) {
+    memset(cfg, 0, sizeof *cfg);
+    cfg->db_path = path;
+    cfg->engine = e;
+    cfg->sink.store = k_store;
+    cfg->sink.ctx = k;
+    cfg->threshold = threshold;
+    cfg->gap_ms = SUM_GAP_MS;
+}
+
+static int count_where(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    int n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void drop_db(const char *path) {
+    char p[160];
+    unlink(path);
+    snprintf(p, sizeof p, "%s-wal", path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s-shm", path);
+    unlink(p);
 }
 
 static void test_build(void) {
@@ -291,91 +497,244 @@ static void test_build(void) {
     add_msg(db, 3, 0, 11, 5 * 3600000, "Lunch?");
     add_msg(db, 4, 0, 10, 30 * 3600000, "Shipped.");
     stub s = {0};
-    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run };
-    sink k = { db, 0, "", 0 };
+    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run, s_more };
+    sink k = { db, 0, "", "" };
     oc_sum_worker_cfg cfg;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.db_path = path;
-    cfg.engine = &e;
-    cfg.sink.store = k_store;
-    cfg.sink.ctx = &k;
-    cfg.threshold = SUM_THRESHOLD_TOKENS;
-    cfg.gap_ms = SUM_GAP_MS;
-    char err[256] = "";
-    /* Two days: two chunks and a rollup for the first day, one chunk for the
-     * second, and the rollup of the two days. */
+    setup(&cfg, path, &e, &k, SUM_THRESHOLD_TOKENS);
+    char err[600] = "";
+    /* Three chunks, summarized; their summaries fit, so one more call over them
+     * makes the two days' summary -- the same step every time. */
     CHECK(oc_sum_build_now(&cfg, 1, 0, 2 * 86400000ll, 0, err, sizeof err) == 0);
-    CHECK(s.calls == 5 && s.rollups == 2);
-    CHECK(strstr(k.last, "\"summary\":") && strstr(k.last, "agreed overall") && strstr(k.last, "\"10\":\"Ann\""));
-    int stored = count_nodes(db);
-    CHECK(stored >= 6);
+    CHECK(s.calls == 4 && s.leaf == 3 && s.rollup == 1);
+    CHECK(s.other_system == 0 && s.other_prompt == 0);
+    CHECK(strstr(k.last, "\"summary\":") && strstr(k.last, "agreed"));
     /* Again: everything is found, nothing is asked. */
     int before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 0, 2 * 86400000ll, 0, err, sizeof err) == 0);
     CHECK(s.calls == before);
-    /* An edit on day two purges its pieces and the whole; day one is reused. */
+    /* The first day alone: its two chunks are reused, one call puts them together. */
+    before = s.calls;
+    CHECK(oc_sum_build_now(&cfg, 1, 0, 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.calls == before + 1);
+    /* An edit on day two purges its chunk and the two days; day one is reused. */
     sqlite3_exec(db, "UPDATE messages SET edited_at_ms=7, body=CAST('Shipped late.' AS BLOB) WHERE id=4;", NULL, NULL, NULL);
     CHECK(oc_sum_purge(db, 1, 4, 4, 30 * 3600000) >= 2);
     before = s.calls;
     CHECK(oc_sum_build_now(&cfg, 1, 0, 2 * 86400000ll, 0, err, sizeof err) == 0);
-    CHECK(s.calls == before + 2);   /* day two's chunk, and the two days' rollup */
+    CHECK(s.calls == before + 2);   /* day two's chunk, and the two days */
+    /* Idle work makes the chunks; a request then only puts them together. */
+    add_msg(db, 5, 0, 10, 50 * 3600000, "Next week.");
+    add_msg(db, 6, 0, 11, 55 * 3600000, "Sure.");
+    before = s.calls;
+    CHECK(oc_sum_chunks_now(&cfg, 1, 2 * 86400000ll, 3 * 86400000ll, err, sizeof err) == 0);
+    CHECK(s.calls == before + 2);
+    before = s.calls;
+    CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll, 3 * 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.calls == before + 1 && s.leaf == 6 && s.follow == 0);
+    /* Items with no line numbers are asked about once, in the same
+     * conversation, and take the lines the answer gives. */
+    sqlite3_exec(db, "DELETE FROM summary_inputs; DELETE FROM summary_nodes;", NULL, NULL, NULL);
+    s.uncited = 1;
+    CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll, 3 * 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.follow == 3);   /* two chunks and the day */
+    CHECK(strstr(k.last, "\"decisions\":[{\"text\":\"agreed\",\"by\":[],\"refs\":[5]}]") != NULL);
     sqlite3_close(db);
-    unlink(path);
-    char wal[128];
-    snprintf(wal, sizeof wal, "%s-wal", path);
-    unlink(wal);
-    snprintf(wal, sizeof wal, "%s-shm", path);
-    unlink(wal);
+    drop_db(path);
 }
 
-/* An answer that runs past its budget is asked again, with room for one item
- * of each kind, and the piece is kept. */
-static int over_calls;
-static int o_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
-                 oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
-    (void)h; (void)system; (void)user; (void)max_out; (void)gate; (void)gctx;
-    if (st) memset(st, 0, sizeof *st);
-    over_calls++;
-    if (strstr(grammar, "){0,2}")) {   /* the full grammar: three of a kind */
-        snprintf(err, cap, "the answer ran past 2048 tokens");
-        return -1;
-    }
-    *out = strdup("{\"overview\":\"short\",\"decisions\":[],\"actions\":[],\"problems\":[],\"facts\":[]}");
-    return 0;
-}
-
-static void test_retry(void) {
-    const char *path = "/tmp/oc_test_summary_retry.db";
+/* The recursion: with a small threshold, a day of many chunks becomes sections,
+ * sections of sections, and one summary; a thread too big for a chunk and a
+ * message too big for one are summarized the same way. */
+static void test_recursion(void) {
+    const char *path = "/tmp/oc_test_summary_recursion.db";
     sqlite3 *db = fresh_db(path);
     CHECK(db != NULL);
     if (!db) return;
-    add_msg(db, 1, 0, 10, 3600000, "One thing.");
-    static int handle;   /* the stub's open returns its context: any non-NULL */
-    oc_sum_engine e = { &handle, "over", s_open, s_close, o_run };
-    sink k = { db, 0, "", 0 };
+    int64_t id = 1;
+    for (int i = 0; i < 20; i++)       /* twenty conversations an hour apart */
+        add_msg(db, id++, 0, 10 + (i & 1), (int64_t)i * 3600000 + 60000, "A short note about the plan for today.");
+    stub s = {0};
+    oc_sum_engine e = { &s, "stub", s_open, s_close, s_run, s_more };
+    sink k = { db, 0, "", "" };
+    oc_sum_worker_cfg cfg;
+    setup(&cfg, path, &e, &k, 40);
+    char err[600] = "";
+    CHECK(oc_sum_build_now(&cfg, 1, 0, 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.leaf == 20 && s.rollup > 4 && s.other_system == 0 && s.other_prompt == 0);
+    /* Three levels at least: a section built from sections. */
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_inputs i JOIN summary_nodes p ON p.id=i.parent_id "
+                          "JOIN summary_nodes c ON c.id=i.child_id WHERE i.child_kind=1 AND p.kind=2 AND c.kind=2;") > 0);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE kind=3;") == 1);
+    /* Nothing was cut short: every stored body is whole JSON. */
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE json_valid(body)=0;") == 0);
+
+    /* A thread too big for a chunk. */
+    for (int i = 0; i < 6; i++)
+        add_msg(db, 100 + i, i ? 100 : 0, 10 + (i & 1), 2 * 86400000ll + i * MIN, "A longer reply in a busy thread, with a few more words in it.");
+    s.leaf = s.rollup = 0;
+    CHECK(oc_sum_build_now(&cfg, 1, 2 * 86400000ll, 3 * 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.leaf >= 2 && s.rollup >= 1);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE kind=1 AND root_id=100;") >= 1 ||
+          count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE kind=2 AND root_id=100;") >= 1);
+
+    /* A message too big for a chunk: parts, then the parts together. */
+    static char big[1200];
+    big[0] = '\0';
+    while (strlen(big) + 40 < sizeof big) strcat(big, "One sentence of a very long message. ");
+    add_msg(db, 200, 0, 10, 4 * 86400000ll, big);
+    s.part = s.rollup = 0;
+    CHECK(oc_sum_build_now(&cfg, 1, 4 * 86400000ll, 5 * 86400000ll, 0, err, sizeof err) == 0);
+    CHECK(s.part >= 4 && s.rollup >= 1);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE ikey LIKE 'q:%';") == s.part);
+    /* Every part's node is built on the message, so an edit purges them all. */
+    sqlite3_exec(db, "UPDATE messages SET edited_at_ms=9 WHERE id=200;", NULL, NULL, NULL);
+    CHECK(oc_sum_purge(db, 1, 200, 200, 4 * 86400000ll) >= s.part + 1);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_nodes WHERE ikey LIKE 'q:%';") == 0);
+
+    /* A level that does not get shorter stops the build, reported, not cut. */
+    stub g = {0};
+    g.grow = 1;
+    oc_sum_engine ge = { &g, "grow", s_open, s_close, s_run, s_more };
+    oc_sum_worker_cfg gc;
+    setup(&gc, path, &ge, &k, 40);
+    CHECK(oc_sum_build_now(&gc, 1, 0, 86400000ll, 0, err, sizeof err) == -1);
+    CHECK(strstr(err, "did not get shorter") != NULL);
+    sqlite3_close(db);
+    drop_db(path);
+}
+
+/* --- the queue, and idle work giving way to it -------------------------------------- */
+
+/* A model that is busy until the gate tells it to stop, once; after that it
+ * answers at once. */
+static volatile int g_q_hold, g_q_stopped, g_q_calls;
+static void *q_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
+static void q_close(void *h) { (void)h; }
+static int q_run(void *h, const char *system, const char *user, int max_out, oc_sum_gate_fn gate, void *gctx,
+                 char **out, oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)h; (void)system; (void)user; (void)max_out;
+    __atomic_add_fetch(&g_q_calls, 1, __ATOMIC_ACQ_REL);
+    if (st) memset(st, 0, sizeof *st);
+    while (__atomic_load_n(&g_q_hold, __ATOMIC_ACQUIRE)) {
+        if (gate && gate(gctx)) {
+            __atomic_store_n(&g_q_hold, 0, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&g_q_stopped, 1, __ATOMIC_ACQ_REL);
+            snprintf(err, cap, "stopped");
+            return -1;
+        }
+        struct timespec ts = { 0, 2 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    *out = strdup("Overview: They talked.\nDecisions:\n- [1] agreed\nActions:\nProblems:\nFacts:\n");
+    return 0;
+}
+/* A quiet machine whose clock runs fast, so idle work starts at once. */
+static int q_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
+static int q_mem(void *c, uint64_t *m) { (void)c; *m = 1u << 20; return 0; }
+static int q_net(void *c, uint64_t *n) { (void)c; *n = 0; return 0; }
+static uint64_t q_now(void *c) { (void)c; static uint64_t t; t += 20000; return t; }
+
+typedef struct { sqlite3 *db; volatile int answered, answered_ok; } qsink;
+static int q_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
+    qsink *k = ctx;
+    int rc = n ? oc_sum_store(k->db, a->channel, a->version, nodes, n) : 0;
+    if (a->conn_id && rc != 1) {
+        char sql[96];
+        snprintf(sql, sizeof sql, "DELETE FROM summary_requests WHERE id=%lld;", (long long)a->request_id);
+        sqlite3_exec(k->db, sql, NULL, NULL, NULL);
+        __atomic_store_n(&k->answered_ok, a->ok && rc == 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&k->answered, 1, __ATOMIC_RELEASE);
+    }
+    return rc;
+}
+static int q_take(void *ctx, int64_t row) {
+    qsink *k = ctx;
+    char sql[128];
+    snprintf(sql, sizeof sql, "UPDATE summary_requests SET state='running' WHERE id=%lld AND state='queued';",
+             (long long)row);
+    sqlite3_exec(k->db, sql, NULL, NULL, NULL);
+    return sqlite3_changes(k->db) == 1;
+}
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int wait_for(volatile int *v, int want_at_least, int seconds) {
+    for (int i = 0; i < seconds * 100; i++) {
+        if (__atomic_load_n(v, __ATOMIC_ACQUIRE) >= want_at_least) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* Idle work summarizes what is recent and leaves the old for when someone asks;
+ * a request in the queue (summary_requests) stops idle work mid-answer and is
+ * made, and the idle work is done after. */
+static void test_queue(void) {
+    const char *path = "/tmp/oc_test_summary_queue.db";
+    drop_db(path);
+    sqlite3 *db = fresh_db(path);
+    CHECK(db != NULL);
+    if (!db) return;
+    int64_t now = now_ms();
+    add_msg(db, 1, 0, 10, now - 3600000, "We should ship on Friday.");
+    add_msg(db, 2, 0, 11, now - 3600000 + MIN, "Agreed.");
+    add_msg(db, 3, 0, 10, now - 30ll * 86400000, "An old note from last month.");
+    static oc_sum_engine eng = { NULL, "queue", q_open, q_close, q_run, NULL };
+    eng.ctx = &eng;
+    static oc_sum_probe quiet = { q_cpu, q_mem, q_net, q_now, NULL };
+    qsink k = { db, 0, 0 };
     oc_sum_worker_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.db_path = path;
-    cfg.engine = &e;
-    cfg.sink.store = k_store;
+    cfg.engine = &eng;
+    cfg.probe = &quiet;
+    cfg.sink.store = q_store;
+    cfg.sink.take = q_take;
     cfg.sink.ctx = &k;
-    cfg.threshold = SUM_THRESHOLD_TOKENS;
-    cfg.gap_ms = SUM_GAP_MS;
+    cfg.background = 1;
+    __atomic_store_n(&g_q_hold, 1, __ATOMIC_RELEASE);
     char err[256] = "";
-    over_calls = 0;
-    CHECK(oc_sum_build_now(&cfg, 1, 0, 86400000ll, 0, err, sizeof err) == 0);
-    CHECK(over_calls == 2);
-    CHECK(strstr(k.last, "short") != NULL);
+    oc_sum_worker *w = oc_sum_worker_start(&cfg, err, sizeof err);
+    CHECK(w != NULL);
+    if (!w) { sqlite3_close(db); return; }
+    /* Idle work starts on the recent conversation, and the model is busy. */
+    CHECK(wait_for(&g_q_calls, 1, 20));
+    /* Someone asks: their request joins the queue, and the worker is told. */
+    char sql[256];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO summary_requests (conn_id, req_id, user_id, channel_id, start_ms, end_ms, created_at_ms) "
+             "VALUES (5, 9, 10, 1, %lld, %lld, %lld);", (long long)(now - 86400000), (long long)(now + 1),
+             (long long)now);
+    CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    oc_sum_worker_wake(w);
+    CHECK(wait_for(&k.answered, 1, 20));
+    CHECK(g_q_stopped == 1 && k.answered_ok);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_requests;") == 0);
+    oc_sum_worker_stop(w);
+    /* What idle work was doing was made for the request; the old note is left
+     * for whoever asks for last month. */
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_inputs i JOIN summary_nodes n ON n.id=i.parent_id "
+                          "WHERE n.kind=0 AND i.child_kind=0 AND i.child_id=1;") == 1);
+    CHECK(count_where(db, "SELECT COUNT(*) FROM summary_inputs i JOIN summary_nodes n ON n.id=i.parent_id "
+                          "WHERE n.kind=0 AND i.child_kind=0 AND i.child_id=3;") == 0);
     sqlite3_close(db);
-    unlink(path);
+    drop_db(path);
 }
 
 int run_summary_tests(void) {
     test_cut();
-    test_check();
+    test_parse();
+    test_split();
+    test_cpu();
     test_store();
     test_gate();
     test_build();
-    test_retry();
+    test_recursion();
+    test_queue();
     return failures;
 }

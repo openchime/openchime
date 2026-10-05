@@ -535,7 +535,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
     free(r->tts_text); free(r->tts_blob_key);
-    free(r->sum_body); free(r->sum_version);
+    free(r->sum_body); free(r->sum_version); free(r->sum_places);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
     free(r->call_uids);
@@ -9492,10 +9492,119 @@ struct oc_sum_batch {
     pthread_mutex_t      mu;
     pthread_cond_t       cv;
     int                  done, rc;
-    const oc_sum_answer *a;
+    const oc_sum_answer *a;       /* STORE */
     oc_sum_new          *nodes;
     int                  n;
 };
+
+static oc_dbres *sum_answer(uint64_t conn_id, uint32_t req, uint8_t status, uint64_t channel);
+
+/* Where every request in the queue is: the one being made first (0), then the
+ * rest in the order they came, each with how many are ahead of it. */
+static int sum_places(sqlite3 *db, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT conn_id, req_id FROM summary_requests ORDER BY state='running' DESC, id;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    size_t cap = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (r->n_sum_places == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            struct oc_sum_place *nv = realloc(r->sum_places, nc * sizeof *nv);
+            if (!nv) break;
+            r->sum_places = nv;
+            cap = nc;
+        }
+        struct oc_sum_place *pl = &r->sum_places[r->n_sum_places];
+        pl->conn_id = (uint64_t)sqlite3_column_int64(st, 0);
+        pl->req_id = (uint32_t)sqlite3_column_int64(st, 1);
+        pl->position = r->n_sum_places > 0xFFFF ? 0xFFFF : (uint16_t)r->n_sum_places;
+        r->n_sum_places++;
+    }
+    sqlite3_finalize(st);
+    return 0;
+}
+
+static oc_dbres *places_result(sqlite3 *db) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_SUMMARY_QUEUE;
+    sum_places(db, r);
+    return r;
+}
+
+/* A request with no stored answer joins the queue, unless it is full. */
+static oc_dbres *process_summary_queue(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM summary_requests;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW)
+        n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (n >= SUM_QUEUE_MAX) {
+        oc_dbres *r = sum_answer(j->conn_id, j->sum_req, OC_SUM_UNAVAILABLE, j->channel_id);
+        if (r) {
+            r->type = OC_RES_SUMMARY_QUEUE;
+            r->sum_start = (int64_t)j->sum_start;
+            r->sum_end = (int64_t)j->sum_end;
+        }
+        return r;
+    }
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO summary_requests (conn_id, req_id, user_id, channel_id, start_ms, end_ms, tz_offset_min, "
+            "created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->conn_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->sum_req);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)j->sum_start);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)j->sum_end);
+        sqlite3_bind_int(st, 7, j->sum_tz);
+        sqlite3_bind_int64(st, 8, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = places_result(db);
+    if (r) { r->conn_id = j->conn_id; r->sum_req = j->sum_req; r->channel_id = j->channel_id; }
+    return r;
+}
+
+static oc_dbres *process_summary_take(sqlite3 *db, const oc_job *j) {
+    struct oc_sum_batch *b = j->sum_batch;
+    int taken = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE summary_requests SET state='running', started_at_ms=?2 "
+                               "WHERE id=?1 AND state='queued';", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->sum_row);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+        if (sqlite3_step(st) == SQLITE_DONE) taken = sqlite3_changes(db) == 1;
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = places_result(db);
+    pthread_mutex_lock(&b->mu);
+    b->rc = taken;
+    b->done = 1;
+    pthread_cond_signal(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+    return r;
+}
+
+static oc_dbres *process_summary_drop(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    int gone = 0;
+    if (sqlite3_prepare_v2(db, "DELETE FROM summary_requests WHERE conn_id=?1 AND state='queued';", -1, &st,
+                           NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->conn_id);
+        if (sqlite3_step(st) == SQLITE_DONE) gone = sqlite3_changes(db);
+    }
+    sqlite3_finalize(st);
+    if (!gone) {
+        oc_dbres *r = calloc(1, sizeof *r);
+        if (r) r->type = OC_RES_OK;
+        return r;
+    }
+    return places_result(db);
+}
 
 static oc_dbres *sum_answer(uint64_t conn_id, uint32_t req, uint8_t status, uint64_t channel) {
     oc_dbres *r = calloc(1, sizeof *r);
@@ -9512,16 +9621,17 @@ static oc_dbres *process_summary_store(sqlite3 *db, const oc_job *j) {
     struct oc_sum_batch *b = j->sum_batch;
     const oc_sum_answer *a = b->a;
     oc_dbres *r = NULL;
-    int rc;
-    if (!a) {
-        /* No answer: the worker's housekeeping, nodes nothing uses any more. */
-        static const oc_sum_answer nobody;
-        rc = oc_sum_collect(db, (int64_t)dbw_now_ms(), (int64_t)SUM_KEEP_MS) < 0 ? -1 : 0;
-        a = &nobody;
-    } else {
-        rc = b->n ? oc_sum_store(db, a->channel, a->version, b->nodes, b->n) : 0;
-    }
+    int rc = b->n ? oc_sum_store(db, a->channel, a->version, b->nodes, b->n) : 0;
     if (a->conn_id && rc != 1) {
+        /* Answered: out of the queue. */
+        if (a->request_id) {
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(db, "DELETE FROM summary_requests WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(st, 1, (sqlite3_int64)a->request_id);
+                sqlite3_step(st);
+            }
+            sqlite3_finalize(st);
+        }
         int ok = a->ok && rc == 0;
         r = sum_answer(a->conn_id, a->req_id, ok ? OC_SUM_OK : OC_SUM_FAILED, (uint64_t)a->channel);
         if (r) {
@@ -9531,6 +9641,7 @@ static oc_dbres *process_summary_store(sqlite3 *db, const oc_job *j) {
             r->sum_id = ok ? (uint64_t)(b->n ? b->nodes[b->n - 1].id : a->summary_id) : 0;
             r->sum_body = strdup(ok ? a->body : (a->err ? a->err : "The summary could not be made."));
             r->sum_version = strdup(a->version ? a->version : "");
+            sum_places(db, r);
         }
     }
     if (!r) {
@@ -9543,6 +9654,24 @@ static oc_dbres *process_summary_store(sqlite3 *db, const oc_job *j) {
     pthread_cond_signal(&b->cv);
     pthread_mutex_unlock(&b->mu);
     return r;
+}
+
+int oc_dbwriter_sum_take(oc_dbwriter *w, int64_t row) {
+    struct oc_sum_batch b;
+    memset(&b, 0, sizeof b);
+    pthread_mutex_init(&b.mu, NULL);
+    pthread_cond_init(&b.cv, NULL);
+    oc_job *j = oc_job_new(OC_JOB_SUMMARY_TAKE, 0);
+    if (!j) { pthread_mutex_destroy(&b.mu); pthread_cond_destroy(&b.cv); return -1; }
+    j->sum_batch = &b;
+    j->sum_row = row;
+    oc_dbwriter_submit(w, j);
+    pthread_mutex_lock(&b.mu);
+    while (!b.done) pthread_cond_wait(&b.cv, &b.mu);
+    pthread_mutex_unlock(&b.mu);
+    pthread_mutex_destroy(&b.mu);
+    pthread_cond_destroy(&b.cv);
+    return b.rc;
 }
 
 int oc_dbwriter_sum_store(oc_dbwriter *w, const oc_sum_answer *a, oc_sum_new *nodes, int n) {
@@ -9589,17 +9718,16 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
     case OC_SUM_DAILY:
         end = today;
         start = today - day;
-        /* Every day since the reader was last about, up to a week. */
+        /* Every day since the reader was last about. */
         if (seen && seen < start) start = oc_sum_day_start(seen, tz);
-        if (start < today - 7 * day) start = today - 7 * day;
         break;
     case OC_SUM_RANGE:
         start = (int64_t)j->sum_start; end = (int64_t)j->sum_end;
-        if (end <= start || end - start > 31 * day)
+        if (end <= start)
             return sum_answer(j->conn_id, j->sum_req, OC_SUM_FAILED, j->channel_id);
         break;
-    default: {   /* OC_SUM_UNREAD: from the reader's place to the end of today */
-        start = today - 7 * day;
+    default: {   /* OC_SUM_UNREAD: from the reader's place to now */
+        start = 0;
         if (sqlite3_prepare_v2(rdb,
                 "SELECT m.created_at_ms FROM delivery_cursors c JOIN messages m ON m.id=c.message_id "
                 "WHERE c.user_id=?1 AND c.channel_id=?2;", -1, &st, NULL) == SQLITE_OK) {
@@ -9611,7 +9739,7 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
             }
         }
         sqlite3_finalize(st);
-        end = today + day;
+        end = now + 1;
         break;
     }
     }
@@ -9654,6 +9782,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_EDIT)          return process_edit(w->db, j);
     if (j->type == OC_JOB_UNFURL_STORE)  return process_unfurl_store(w->db, j);
     if (j->type == OC_JOB_SUMMARY_STORE) return process_summary_store(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_QUEUE) return process_summary_queue(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_TAKE)  return process_summary_take(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_DROP)  return process_summary_drop(w->db, j);
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
@@ -10747,6 +10878,8 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
         fprintf(stderr, "dbwriter: migration failed: %s\n", err ? err : "?");
         sqlite3_free(err); goto fail;
     }
+    /* The summary queue's connections died with the last run (migration 0058). */
+    sqlite3_exec(w->db, "DELETE FROM summary_requests;", NULL, NULL, NULL);
     if (local_issuer_load(w) != 0) {
         fprintf(stderr, "dbwriter: the local issuer could not be made\n");
         goto fail;

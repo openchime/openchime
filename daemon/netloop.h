@@ -123,7 +123,7 @@ struct oc_stt_engine;
 void oc_netloop_set_stt(const struct oc_stt_engine *engine);
 
 /* Wire the summary worker (REQ-310, ARCH-116). Set only when summaries are on
- * and the model answered at startup; NULL (the default) means the daemon
+ * and the model loaded at startup; NULL (the default) means the daemon
  * advertises no "summarize" and answers SUMMARIZE with OC_SUM_UNAVAILABLE. */
 struct oc_sum_worker;
 void oc_netloop_set_summary(struct oc_sum_worker *w);

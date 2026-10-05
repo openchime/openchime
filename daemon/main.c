@@ -279,9 +279,9 @@ static void on_serving(void *ctx) {
 
 /* --- summaries (REQ-310, ARCH-116) ---------------------------------------------
  * Brought up on a thread of their own, after the daemon is serving: the first
- * start fetches the model (half a gigabyte), and every start loads it and has it
- * answer one small question before anyone is told summaries exist. Anything
- * that fails leaves summaries off, with a line saying why. */
+ * start fetches the model (half a gigabyte), and every start checks the CPU can
+ * run it and loads it before anyone is told summaries exist. Anything that fails
+ * leaves summaries off, with a line saying why. */
 typedef struct {
     pthread_t      thread;
     int            started;
@@ -294,7 +294,9 @@ static int sum_sink_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, 
     return oc_dbwriter_sum_store(((sum_up *)ctx)->db, a, nodes, n);
 }
 
-static void sum_sink_collect(void *ctx) { oc_dbwriter_sum_store(((sum_up *)ctx)->db, NULL, NULL, 0); }
+static int sum_sink_take(void *ctx, int64_t row) {
+    return oc_dbwriter_sum_take(((sum_up *)ctx)->db, row);
+}
 
 static int sum_net_bytes(uint64_t *bytes) {
     oc_netloop_stats st;
@@ -303,40 +305,14 @@ static int sum_net_bytes(uint64_t *bytes) {
     return 0;
 }
 
-#ifdef OC_SUM
-/* The model answers one small question under its grammar, or it is no use. */
-static int sum_probe(const oc_sum_engine *e, char *err, size_t errcap) {
-    void *h = e->open(e->ctx, err, errcap);
-    if (!h) return -1;
-    oc_sum_msg m = { 1, 0, 1, 0, 0, "Sam", "The release is ready; I will ship it today.", };
-    oc_sum_cut cut;
-    oc_sum_buf prompt = {0}, g = {0};
-    oc_sum_ids ids;
-    int rc = -1;
-    char *out = NULL;
-    if (oc_sum_cut_build(&m, 1, SUM_THRESHOLD_TOKENS, SUM_GAP_MS, &cut) == 0 && cut.n == 1 &&
-        oc_sum_render_chunk("release", &m, &cut.pieces[0].chunks[0], &prompt, &ids) == 0 &&
-        oc_sum_grammar(&ids, 0, SUM_MAX_ITEMS, &g) == 0 &&
-        e->run(h, OC_SUM_SYSTEM_LEAF, prompt.p, g.p, SUM_MAX_OUT, NULL, NULL, &out, NULL, err, errcap) == 0) {
-        oc_sum_buf kept = {0};
-        rc = oc_sum_check(out, strlen(out), &ids, 0, &kept, NULL) >= 0 ? 0 : -1;
-        if (rc != 0) snprintf(err, errcap, "the model's answer was not a summary");
-        oc_sum_buf_free(&kept);
-    }
-    free(out);
-    oc_sum_buf_free(&prompt);
-    oc_sum_buf_free(&g);
-    oc_sum_ids_free(&ids);
-    oc_sum_cut_free(&cut);
-    e->close(h);
-    return rc;
-}
-#endif
-
 static void *sum_bring_up(void *arg) {
     sum_up *u = arg;
 #ifdef OC_SUM
     char dir[1024], path[1200], err[300] = "";
+    if (!oc_sum_cpu_ok(NULL, err, sizeof err)) {
+        fprintf(stderr, "openchimed: summaries are off: %s\n", err);
+        return NULL;
+    }
     oc_sum_model_dir(u->db_path, dir, sizeof dir);
     if (oc_sum_model_ensure(dir, OC_SUM_MODEL_FILE, OC_SUM_MODEL_URL, OC_SUM_MODEL_SHA256, OC_SUM_MODEL_BYTES,
                             (const volatile int *)&g_stop, path, sizeof path, err, sizeof err) != 0) {
@@ -344,17 +320,20 @@ static void *sum_bring_up(void *arg) {
         return NULL;
     }
     const oc_sum_engine *e = oc_sum_llama_engine(path, OC_SUM_MODEL_NAME, SUM_CTX_TOKENS);
-    if (g_stop || sum_probe(e, err, sizeof err) != 0) {
-        if (!g_stop) fprintf(stderr, "openchimed: summaries are off: the model did not answer: %s\n", err);
+    /* The model must load; the worker loads it again when first needed. */
+    void *h = g_stop ? NULL : e->open(e->ctx, err, sizeof err);
+    if (!h) {
+        if (!g_stop) fprintf(stderr, "openchimed: summaries are off: the model did not load: %s\n", err);
         return NULL;
     }
+    e->close(h);
     oc_sum_probe_set_net(sum_net_bytes);
     oc_sum_worker_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.db_path = u->db_path;
     cfg.engine = e;
     cfg.sink.store = sum_sink_store;
-    cfg.sink.collect = sum_sink_collect;
+    cfg.sink.take = sum_sink_take;
     cfg.sink.ctx = u;
     cfg.background = 1;
     u->worker = oc_sum_worker_start(&cfg, err, sizeof err);
@@ -364,7 +343,7 @@ static void *sum_bring_up(void *arg) {
 #else
     (void)u;
     (void)sum_sink_store;
-    (void)sum_sink_collect;
+    (void)sum_sink_take;
     (void)sum_net_bytes;
     fprintf(stderr, "openchimed: summaries are off: this daemon was built without them (SUM=0)\n");
 #endif

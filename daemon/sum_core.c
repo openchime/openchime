@@ -2,12 +2,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include "sum_core.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <time.h>
 
 #include "json.h"
 
@@ -238,153 +238,300 @@ void oc_sum_cut_free(oc_sum_cut *c) {
     memset(c, 0, sizeof *c);
 }
 
-/* --- ids --------------------------------------------------------------------- */
+/* --- lines and people ----------------------------------------------------------- */
 
-void oc_sum_ids_free(oc_sum_ids *ids) {
-    for (int i = 0; i < ids->n_person; i++) free(ids->person_name[i]);
-    free(ids->person);
-    free(ids->person_name);
-    free(ids->msg);
-    free(ids->msg_text);
-    for (int i = 0; i < ids->n_item; i++) { free(ids->item_text[i]); free(ids->item_refs[i]); }
-    free(ids->item_text);
-    free(ids->item_refs);
-    free(ids->item_nrefs);
-    memset(ids, 0, sizeof *ids);
+int oc_sum_lines_add(oc_sum_lines *l, const char *text, int indent, const char *label,
+                     const int64_t *refs, int n_refs) {
+    if (l->n == l->cap) {
+        int nc = l->cap ? l->cap * 2 : 32;
+        oc_sum_line *nv = realloc(l->v, (size_t)nc * sizeof *nv);
+        if (!nv) return -1;
+        l->v = nv;
+        l->cap = nc;
+    }
+    oc_sum_line *x = &l->v[l->n];
+    memset(x, 0, sizeof *x);
+    x->text = strdup(text ? text : "");
+    x->label = label ? strdup(label) : NULL;
+    x->refs = malloc((size_t)(n_refs > 0 ? n_refs : 1) * sizeof *x->refs);
+    if (!x->text || (label && !x->label) || !x->refs) {
+        free(x->text); free(x->label); free(x->refs);
+        return -1;
+    }
+    if (n_refs > 0) memcpy(x->refs, refs, (size_t)n_refs * sizeof *refs);
+    x->n_refs = n_refs > 0 ? n_refs : 0;
+    x->indent = indent;
+    l->n++;
+    return 0;
 }
 
-static int person_of(oc_sum_ids *ids, int64_t uid, const char *name) {
-    for (int i = 0; i < ids->n_person; i++) if (ids->person[i] == uid) return i + 1;
-    int64_t *np = realloc(ids->person, (size_t)(ids->n_person + 1) * sizeof *np);
-    if (!np) return -1;
-    ids->person = np;
-    char **nn = realloc(ids->person_name, (size_t)(ids->n_person + 1) * sizeof *nn);
+void oc_sum_lines_free(oc_sum_lines *l) {
+    for (int i = 0; i < l->n; i++) { free(l->v[i].text); free(l->v[i].label); free(l->v[i].refs); }
+    free(l->v);
+    memset(l, 0, sizeof *l);
+}
+
+size_t oc_sum_lines_tokens(const oc_sum_lines *l) {
+    size_t bytes = 0;
+    for (int i = 0; i < l->n; i++)
+        bytes += 8 + strlen(l->v[i].text) + (l->v[i].label ? strlen(l->v[i].label) + 2 : 0);
+    return bytes / SUM_BYTES_PER_TOKEN + 1;
+}
+
+int oc_sum_people_add(oc_sum_people *p, int64_t id, const char *name) {
+    for (int i = 0; i < p->n; i++) if (p->id[i] == id) return 0;
+    int64_t *ni = realloc(p->id, (size_t)(p->n + 1) * sizeof *ni);
+    if (!ni) return -1;
+    p->id = ni;
+    char **nn = realloc(p->name, (size_t)(p->n + 1) * sizeof *nn);
     if (!nn) return -1;
-    ids->person_name = nn;
-    ids->person_name[ids->n_person] = strdup(name && *name ? name : "someone");
-    if (!ids->person_name[ids->n_person]) return -1;
-    ids->person[ids->n_person] = uid;
-    return ++ids->n_person;
+    p->name = nn;
+    p->name[p->n] = strdup(name && *name ? name : "someone");
+    if (!p->name[p->n]) return -1;
+    p->id[p->n++] = id;
+    return 0;
 }
 
-static void when(int64_t ms, char *out, size_t cap) {
-    time_t t = (time_t)(ms / 1000);
-    struct tm tm;
-    gmtime_r(&t, &tm);
-    strftime(out, cap, "%a %d %b %H:%M", &tm);
+void oc_sum_people_free(oc_sum_people *p) {
+    for (int i = 0; i < p->n; i++) free(p->name[i]);
+    free(p->id);
+    free(p->name);
+    memset(p, 0, sizeof *p);
 }
 
-static const char *const LINE_FIELDS =
-    "Fields: overview = two or three sentences on what happened. decisions = things agreed or "
-    "decided, with who decided (by). actions = follow-ups someone committed to or was asked to do: "
-    "who does it and what, open or done. problems = things broken, blocked or worrying, open or "
-    "resolved. facts = important numbers, dates, tickets, names of customers or releases. Every "
-    "item cites (refs) the ids it comes from. Leave a list empty when there is nothing for it.";
+size_t oc_sum_words(const char *s) {
+    size_t n = 0;
+    int in = 0;
+    for (; s && *s; s++) {
+        int sp = *s == ' ' || *s == '\n' || *s == '\t' || *s == '\r';
+        if (!sp && !in) n++;
+        in = !sp;
+    }
+    return n;
+}
 
-const char *const OC_SUM_SYSTEM_LEAF =
-    "You extract what happened in an excerpt of a team chat, for someone who was away. "
-    "People are P1, P2, ...; messages are m1, m2, .... Use only the people and messages listed. "
-    "Every item must cite the messages it comes from. State only what the messages say; never "
-    "guess names, numbers or outcomes. Keep each text short.";
-
-const char *const OC_SUM_SYSTEM_ROLLUP =
-    "You merge summaries of consecutive parts of a team chat into one, for someone who was away. "
-    "People are P1, P2, ...; the parts' items are i1, i2, .... Keep every decision and every "
-    "action still open. Combine items that say the same thing. Mark an action done when a later "
-    "part says it was done. Every item must cite the items (i#) it comes from. State only what "
-    "the items say. Keep each text short.";
-
-int oc_sum_render_chunk(const char *channel, const oc_sum_msg *msgs, const oc_sum_chunk *c,
-                        oc_sum_buf *out, oc_sum_ids *ids) {
-    memset(ids, 0, sizeof *ids);
-    ids->msg = malloc((size_t)(c->n ? c->n : 1) * sizeof *ids->msg);
-    ids->msg_text = malloc((size_t)(c->n ? c->n : 1) * sizeof *ids->msg_text);
-    if (!ids->msg || !ids->msg_text) return -1;
-    int *pid = malloc((size_t)(c->n ? c->n : 1) * sizeof *pid);
-    if (!pid) return -1;
+int oc_sum_chunk_lines(const oc_sum_msg *msgs, const oc_sum_chunk *c, oc_sum_lines *l, oc_sum_people *people) {
+    oc_sum_buf t = {0};
     for (int k = 0; k < c->n; k++) {
         const oc_sum_msg *m = &msgs[c->idx[k]];
-        pid[k] = person_of(ids, m->author_id, m->author);
-        if (pid[k] < 0) { free(pid); return -1; }
+        const char *who = m->author && *m->author ? m->author : "someone";
+        t.n = 0;
+        oc_sum_buf_printf(&t, "%s: ", who);
+        oc_sum_buf_puts(&t, m->text ? m->text : "");
+        if (t.oom || oc_sum_lines_add(l, t.p, m->parent_id != 0, NULL, &m->id, 1) != 0 ||
+            oc_sum_people_add(people, m->author_id, who) != 0) {
+            oc_sum_buf_free(&t);
+            return -1;
+        }
     }
-    oc_sum_buf_printf(out, "Chat excerpt from #%s (times UTC). People:", channel && *channel ? channel : "chat");
-    for (int i = 0; i < ids->n_person; i++)
-        oc_sum_buf_printf(out, "%s P%d %s", i ? "," : "", i + 1, ids->person_name[i]);
-    oc_sum_buf_puts(out, ".\nIndented lines are replies in a thread.\n\n");
-    size_t cap = (size_t)SUM_THRESHOLD_TOKENS * SUM_BYTES_PER_TOKEN;
-    for (int k = 0; k < c->n; k++) {
-        const oc_sum_msg *m = &msgs[c->idx[k]];
-        char t[32];
-        when(m->created_ms, t, sizeof t);
-        ids->msg[ids->n_msg] = m->id;
-        ids->msg_text[ids->n_msg] = m->text ? m->text : "";
-        ids->n_msg++;
-        size_t tl = m->text ? strlen(m->text) : 0;
-        oc_sum_buf_printf(out, "%s[m%d] P%d (%s): ", m->parent_id ? "  " : "", ids->n_msg, pid[k], t);
-        oc_sum_buf_add(out, m->text ? m->text : "", tl < cap ? tl : cap);
-        oc_sum_buf_puts(out, "\n");
-    }
-    oc_sum_buf_printf(out, "\n%s\n", LINE_FIELDS);
-    free(pid);
-    return out->oom ? -1 : 0;
+    oc_sum_buf_free(&t);
+    return 0;
 }
 
-/* --- reading a stored body ------------------------------------------------------ */
+/* --- splitting one message too big for a chunk ------------------------------------ */
+
+typedef struct { char **v; int n, cap; } parts;
+
+static int part_add(parts *p, const char *s, size_t n) {
+    if (p->n == p->cap) {
+        int nc = p->cap ? p->cap * 2 : 8;
+        char **nv = realloc(p->v, (size_t)nc * sizeof *nv);
+        if (!nv) return -1;
+        p->v = nv;
+        p->cap = nc;
+    }
+    char *x = malloc(n + 1);
+    if (!x) return -1;
+    memcpy(x, s, n);
+    x[n] = '\0';
+    p->v[p->n++] = x;
+    return 0;
+}
+
+/* Paragraphs, lines, sentences, words: the largest unit that fits wins. */
+static const char *const SEPS[] = { "\n\n", "\n", ". ", " " };
+#define N_SEPS ((int)(sizeof SEPS / sizeof *SEPS))
+
+static int split_at(const char *s, size_t n, size_t max, int level, parts *out) {
+    if (n <= max) return part_add(out, s, n);
+    if (level == N_SEPS) {
+        /* No separator left: cut at `max`, backed off to a character's start. */
+        size_t at = max;
+        while (at > 1 && ((unsigned char)s[at] & 0xC0) == 0x80) at--;
+        if (part_add(out, s, at) != 0) return -1;
+        return split_at(s + at, n - at, max, level, out);
+    }
+    const char *sep = SEPS[level];
+    size_t sl = strlen(sep);
+    /* Segments end just after each separator; adjacent ones are joined while
+     * they fit, and one that does not fit alone is split at the next level. */
+    size_t start = 0, run = 0;
+    while (start + run < n) {
+        size_t e = start + run, cut = n;
+        for (size_t k = e; k + sl <= n; k++)
+            if (!memcmp(s + k, sep, sl)) { cut = k + sl; break; }
+        if (cut - start <= max) { run = cut - start; continue; }
+        if (run) {
+            if (part_add(out, s + start, run) != 0) return -1;
+            start += run;
+            run = 0;
+            continue;
+        }
+        if (split_at(s + start, cut - start, max, level + 1, out) != 0) return -1;
+        start = cut;
+    }
+    if (run) return part_add(out, s + start, run);
+    return 0;
+}
+
+int oc_sum_split_text(const char *text, size_t max_tokens, char ***out, int *n) {
+    parts p = {0};
+    size_t max = max_tokens * SUM_BYTES_PER_TOKEN;
+    if (max < 16) max = 16;
+    if (split_at(text ? text : "", text ? strlen(text) : 0, max, 0, &p) != 0) {
+        oc_sum_parts_free(p.v, p.n);
+        return -1;
+    }
+    *out = p.v;
+    *n = p.n;
+    return 0;
+}
+
+void oc_sum_parts_free(char **v, int n) {
+    for (int i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+/* --- a stored summary as lines ---------------------------------------------------- */
 
 static const char *const KINDS[4] = { "decisions", "actions", "problems", "facts" };
 
-typedef struct {
-    char    text[SUM_TEXT_MAX * 2 + 1];
-    int64_t who;              /* actions: user id, 0 for the team */
-    int64_t by[4];
-    int     n_by;
-    int64_t refs[32];
-    int     n_refs;
-    int     open;             /* actions/problems: 1 open, 0 done/resolved */
-} item;
+/* The string at token `i`, unescaped, on the heap; NULL if not a string. */
+static char *json_dup(const oc_json *d, int i) {
+    if (i < 0 || d->t[i].type != JSMN_STRING) return NULL;
+    size_t cap = (size_t)(d->t[i].end - d->t[i].start) + 1;
+    char *s = malloc(cap);
+    if (s && oc_json_str(d, i, s, cap) != 0) { free(s); s = NULL; }
+    return s;
+}
 
-static int read_i64_array(const oc_json *d, int arr, int64_t *out, int cap) {
+/* The integers of the array at token `arr`, on the heap (*out), and how many. */
+static int json_ids(const oc_json *d, int arr, int64_t **out) {
+    *out = NULL;
     if (arr < 0 || d->t[arr].type != JSMN_ARRAY) return 0;
+    int64_t *v = malloc((size_t)(d->t[arr].size ? d->t[arr].size : 1) * sizeof *v);
+    if (!v) return -1;
     int n = 0, i = arr + 1;
-    for (int k = 0; k < d->t[arr].size; k++) {
-        uint64_t v;
-        if (n < cap && oc_json_u64(d, i, &v) == 0) out[n++] = (int64_t)v;
-        i = oc_json_skip(d, i);
+    for (int k = 0; k < d->t[arr].size; k++, i = oc_json_skip(d, i)) {
+        uint64_t x;
+        if (oc_json_u64(d, i, &x) == 0) v[n++] = (int64_t)x;
     }
+    *out = v;
     return n;
 }
 
-/* The items of one kind of a stored body (already parsed into `d`). */
-static int stored_items(const oc_json *d, int kind, item *out, int cap) {
-    int arr = oc_json_get(d, 0, KINDS[kind]);
-    if (arr < 0 || d->t[arr].type != JSMN_ARRAY) return 0;
-    int n = 0, i = arr + 1;
-    for (int k = 0; k < d->t[arr].size && n < cap; k++) {
-        item *it = &out[n];
-        memset(it, 0, sizeof *it);
-        const char *tk = kind == 1 ? "what" : "text";
-        if (oc_json_get_str(d, i, tk, it->text, sizeof it->text) == 0) {
-            if (kind == 0) it->n_by = read_i64_array(d, oc_json_get(d, i, "by"), it->by, 4);
-            if (kind == 1) {
-                uint64_t w = 0;
-                if (oc_json_u64(d, oc_json_get(d, i, "who"), &w) == 0) it->who = (int64_t)w;
-            }
-            it->n_refs = read_i64_array(d, oc_json_get(d, i, "refs"), it->refs, 32);
-            char st[16] = "";
-            oc_json_get_str(d, i, "status", st, sizeof st);
-            it->open = !strcmp(st, "open");
-            n++;
+static int add_unique(int64_t **v, int *n, int *cap, const int64_t *add, int na) {
+    for (int a = 0; a < na; a++) {
+        int dup = 0;
+        for (int k = 0; k < *n && !dup; k++) dup = (*v)[k] == add[a];
+        if (dup) continue;
+        if (*n == *cap) {
+            int nc = *cap ? *cap * 2 : 16;
+            int64_t *nv = realloc(*v, (size_t)nc * sizeof *nv);
+            if (!nv) return -1;
+            *v = nv;
+            *cap = nc;
         }
-        i = oc_json_skip(d, i);
+        (*v)[(*n)++] = add[a];
     }
-    return n;
+    return 0;
+}
+
+int oc_sum_body_lines(const char *body, oc_sum_name_fn name, void *ctx, const char *label,
+                      oc_sum_lines *l, oc_sum_people *people) {
+    oc_json d;
+    if (!body || oc_json_parse(&d, body, strlen(body)) != 0) return -1;
+    if (d.t[0].type != JSMN_OBJECT) { oc_json_free(&d); return -1; }
+    int rc = -1, first = l->n;
+    oc_sum_buf t = {0};
+    int64_t *all = NULL;
+    int n_all = 0, c_all = 0;
+    /* The overview stands for every message its summary's lines stood for, or
+     * else for everything its items cite. */
+    if ((n_all = json_ids(&d, oc_json_get(&d, 0, "refs"), &all)) < 0) { n_all = 0; goto out; }
+    c_all = n_all;
+    for (int kind = 0; kind < 4 && !n_all; kind++) {
+        int arr = oc_json_get(&d, 0, KINDS[kind]);
+        if (arr < 0 || d.t[arr].type != JSMN_ARRAY) continue;
+        int i = arr + 1;
+        for (int k = 0; k < d.t[arr].size; k++, i = oc_json_skip(&d, i)) {
+            int64_t *r = NULL;
+            int nr = json_ids(&d, oc_json_get(&d, i, "refs"), &r);
+            if (nr < 0 || add_unique(&all, &n_all, &c_all, r, nr) != 0) { free(r); goto out; }
+            free(r);
+        }
+    }
+    char *ov = json_dup(&d, oc_json_get(&d, 0, "overview"));
+    if (ov && *ov) {
+        t.n = 0;
+        oc_sum_buf_printf(&t, "Overview: %s", ov);
+        if (t.oom || oc_sum_lines_add(l, t.p, 0, label, all, n_all) != 0) { free(ov); goto out; }
+    }
+    free(ov);
+    for (int kind = 0; kind < 4; kind++) {
+        int arr = oc_json_get(&d, 0, KINDS[kind]);
+        if (arr < 0 || d.t[arr].type != JSMN_ARRAY) continue;
+        int i = arr + 1;
+        for (int k = 0; k < d.t[arr].size; k++, i = oc_json_skip(&d, i)) {
+            char *text = json_dup(&d, oc_json_get(&d, i, kind == 1 ? "what" : "text"));
+            char st[16] = "";
+            oc_json_get_str(&d, i, "status", st, sizeof st);
+            int64_t *r = NULL;
+            int nr = json_ids(&d, oc_json_get(&d, i, "refs"), &r);
+            if (!text || nr < 0) { free(text); free(r); if (nr < 0) goto out; continue; }
+            t.n = 0;
+            switch (kind) {
+            case 0: oc_sum_buf_printf(&t, "Decision: %s", text); break;
+            case 1: {
+                /* No "who": the text names whoever it is. */
+                int wi = oc_json_get(&d, i, "who");
+                uint64_t who = 0;
+                if (wi >= 0) oc_json_u64(&d, wi, &who);
+                const char *nm = who && name ? name(ctx, (int64_t)who) : NULL;
+                if (who && (!nm || !*nm)) nm = "someone";
+                if (who && oc_sum_people_add(people, (int64_t)who, nm) != 0) { free(text); free(r); goto out; }
+                oc_sum_buf_puts(&t, "Action");
+                if (*st) oc_sum_buf_printf(&t, " (%s)", st);
+                if (wi >= 0) oc_sum_buf_printf(&t, ": %s: %s", who ? nm : "Team", text);
+                else oc_sum_buf_printf(&t, ": %s", text);
+                break;
+            }
+            case 2:
+                oc_sum_buf_puts(&t, "Problem");
+                if (*st) oc_sum_buf_printf(&t, " (%s)", st);
+                oc_sum_buf_printf(&t, ": %s", text);
+                break;
+            default: oc_sum_buf_printf(&t, "Fact: %s", text);
+            }
+            free(text);
+            int add = t.oom ? -1 : oc_sum_lines_add(l, t.p, 0, l->n == first ? label : NULL, r, nr);
+            free(r);
+            if (add != 0) goto out;
+        }
+    }
+    rc = 0;
+out:
+    free(all);
+    oc_sum_buf_free(&t);
+    oc_json_free(&d);
+    return rc;
 }
 
 int oc_sum_body_empty(const char *body) {
     oc_json d;
     if (!body || oc_json_parse(&d, body, strlen(body)) != 0) return 1;
-    char ov[8] = "";
-    int empty = oc_json_get_str(&d, 0, "overview", ov, sizeof ov) != 0 || !ov[0];
+    int ov = oc_json_get(&d, 0, "overview");
+    int empty = ov < 0 || d.t[ov].type != JSMN_STRING || d.t[ov].end == d.t[ov].start;
     for (int kind = 0; kind < 4 && empty; kind++) {
         int arr = oc_json_get(&d, 0, KINDS[kind]);
         if (arr >= 0 && d.t[arr].type == JSMN_ARRAY && d.t[arr].size > 0) empty = 0;
@@ -401,321 +548,535 @@ int oc_sum_body_overview(const char *body, char *out, size_t cap) {
     return rc;
 }
 
-size_t oc_sum_rollup_tokens(const oc_sum_child *kids, int n) {
-    size_t bytes = 0;
-    for (int i = 0; i < n; i++) bytes += 48 + (kids[i].body ? strlen(kids[i].body) * 3 / 4 : 0);
-    return bytes / SUM_BYTES_PER_TOKEN + 1;
-}
+/* --- the prompt ---------------------------------------------------------------------- */
 
-static int add_item(oc_sum_ids *ids, const char *text, const int64_t *refs, int n_refs) {
-    int k = ids->n_item;
-    char **nt = realloc(ids->item_text, (size_t)(k + 1) * sizeof *nt);
-    if (!nt) return -1;
-    ids->item_text = nt;
-    int64_t **nr = realloc(ids->item_refs, (size_t)(k + 1) * sizeof *nr);
-    if (!nr) return -1;
-    ids->item_refs = nr;
-    int *nn = realloc(ids->item_nrefs, (size_t)(k + 1) * sizeof *nn);
-    if (!nn) return -1;
-    ids->item_nrefs = nn;
-    ids->item_text[k] = strdup(text);
-    ids->item_refs[k] = malloc((size_t)(n_refs ? n_refs : 1) * sizeof **ids->item_refs);
-    if (!ids->item_text[k] || !ids->item_refs[k]) { free(ids->item_text[k]); free(ids->item_refs[k]); return -1; }
-    memcpy(ids->item_refs[k], refs, (size_t)n_refs * sizeof *refs);
-    ids->item_nrefs[k] = n_refs;
-    ids->n_item++;
-    return k + 1;
-}
+const char *const OC_SUM_SYSTEM =
+    "You summarize a team's chat for someone catching up on it. You write only what the lines "
+    "you are given say.";
 
-int oc_sum_render_rollup(const char *channel, const oc_sum_child *kids, int n, oc_sum_name_fn name,
-                         void *ctx, oc_sum_buf *out, oc_sum_ids *ids) {
-    memset(ids, 0, sizeof *ids);
-    oc_sum_buf lines = {0};
-    item *its = malloc(sizeof *its * SUM_MAX_ITEMS);
-    if (!its) return -1;
-    int rc = -1;
-    for (int c = 0; c < n; c++) {
-        oc_json d;
-        if (!kids[c].body || oc_json_parse(&d, kids[c].body, strlen(kids[c].body)) != 0) continue;
-        char ov[SUM_TEXT_MAX * 3 + 1] = "";
-        oc_json_get_str(&d, 0, "overview", ov, sizeof ov);
-        char a[32], b[32];
-        when(kids[c].start_ms, a, sizeof a);
-        when(kids[c].end_ms, b, sizeof b);
-        oc_sum_buf_printf(&lines, "Part %d (%s to %s): %s\n", c + 1, a, b, ov);
-        for (int kind = 0; kind < 4; kind++) {
-            int m = stored_items(&d, kind, its, SUM_MAX_ITEMS);
-            for (int k = 0; k < m; k++) {
-                int iid = add_item(ids, its[k].text, its[k].refs, its[k].n_refs);
-                if (iid < 0) { oc_json_free(&d); goto out; }
-                switch (kind) {
-                case 0: {
-                    oc_sum_buf_printf(&lines, "  [i%d] Decision", iid);
-                    for (int x = 0; x < its[k].n_by; x++) {
-                        int p = person_of(ids, its[k].by[x], name ? name(ctx, its[k].by[x]) : NULL);
-                        if (p < 0) { oc_json_free(&d); goto out; }
-                        oc_sum_buf_printf(&lines, "%sP%d", x ? "," : " by ", p);
-                    }
-                    oc_sum_buf_printf(&lines, ": %s\n", its[k].text);
-                    break;
-                }
-                case 1: {
-                    if (its[k].who) {
-                        int p = person_of(ids, its[k].who, name ? name(ctx, its[k].who) : NULL);
-                        if (p < 0) { oc_json_free(&d); goto out; }
-                        oc_sum_buf_printf(&lines, "  [i%d] Action for P%d (%s): %s\n", iid, p,
-                                          its[k].open ? "open" : "done", its[k].text);
-                    } else {
-                        oc_sum_buf_printf(&lines, "  [i%d] Action for the team (%s): %s\n", iid,
-                                          its[k].open ? "open" : "done", its[k].text);
-                    }
-                    break;
-                }
-                case 2:
-                    oc_sum_buf_printf(&lines, "  [i%d] Problem (%s): %s\n", iid,
-                                      its[k].open ? "open" : "resolved", its[k].text);
-                    break;
-                default:
-                    oc_sum_buf_printf(&lines, "  [i%d] Fact: %s\n", iid, its[k].text);
-                }
-            }
-        }
-        oc_json_free(&d);
+int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out) {
+    size_t words = 0;
+    for (int i = 0; i < l->n; i++) words += oc_sum_words(l->v[i].text);
+    size_t budget = (words * SUM_WORDS_PCT + 99) / 100;
+    oc_sum_buf_printf(out, "%s\n\n", intro);
+    for (int i = 0; i < l->n; i++) {
+        if (l->v[i].label) oc_sum_buf_printf(out, "%s\n", l->v[i].label);
+        oc_sum_buf_printf(out, "%s[%d] ", l->v[i].indent ? "  " : "", i + 1);
+        oc_sum_buf_puts(out, l->v[i].text);
+        oc_sum_buf_puts(out, "\n");
     }
-    oc_sum_buf_printf(out, "Summaries of consecutive parts of #%s, oldest first. People:",
-                      channel && *channel ? channel : "chat");
-    for (int i = 0; i < ids->n_person; i++)
-        oc_sum_buf_printf(out, "%s P%d %s", i ? "," : "", i + 1, ids->person_name[i]);
-    if (!ids->n_person) oc_sum_buf_puts(out, " none named");
-    oc_sum_buf_puts(out, ".\n\n");
-    if (lines.p) oc_sum_buf_add(out, lines.p, lines.n);
-    oc_sum_buf_printf(out, "\n%s\n", LINE_FIELDS);
-    rc = out->oom || lines.oom ? -1 : 0;
-out:
-    free(its);
-    oc_sum_buf_free(&lines);
-    return rc;
+    oc_sum_buf_printf(out,
+        "\nSummarize these lines. Write at most %zu words of text; headings and line numbers do "
+        "not count. Answer in exactly this form, one item to a line, every item starting with the "
+        "numbers of the lines it comes from:\n"
+        "\n"
+        "Overview: <what happened>\n"
+        "Decisions:\n"
+        "- [line number] <what was decided>\n"
+        "Actions:\n"
+        "- [line number] <who, or Team>: <what they do> (open)\n"
+        "Problems:\n"
+        "- [line number] <what went wrong> (open)\n"
+        "Facts:\n"
+        "- [line number] <a number, date, ticket, customer or release>\n"
+        "\n"
+        "An action is (open) or (done); a problem is (open) or (resolved). Write as many items "
+        "under a heading as the lines give, or none.\n",
+        budget);
+    return out->oom ? -1 : 0;
 }
 
-/* --- the grammar -------------------------------------------------------------- */
+/* --- the follow-up ------------------------------------------------------------------ */
 
-int oc_sum_grammar(const oc_sum_ids *ids, int rollup, int max_items, oc_sum_buf *g) {
-    if (max_items < 1 || max_items > SUM_MAX_ITEMS) max_items = SUM_MAX_ITEMS;
-    oc_sum_buf_printf(g,
-        "root ::= \"{\" ws \"\\\"overview\\\":\" ws str \",\" ws \"\\\"decisions\\\":\" ws decs \",\" ws "
-        "\"\\\"actions\\\":\" ws acts \",\" ws \"\\\"problems\\\":\" ws probs \",\" ws \"\\\"facts\\\":\" ws facts ws \"}\"\n"
-        "decs ::= \"[\" ws ( dec ( \",\" ws dec ){0,%d} )? ws \"]\"\n"
-        "dec ::= \"{\" ws \"\\\"text\\\":\" ws str \",\" ws \"\\\"by\\\":\" ws people \",\" ws \"\\\"refs\\\":\" ws refs ws \"}\"\n"
-        "acts ::= \"[\" ws ( act ( \",\" ws act ){0,%d} )? ws \"]\"\n"
-        "act ::= \"{\" ws \"\\\"who\\\":\" ws who \",\" ws \"\\\"what\\\":\" ws str \",\" ws \"\\\"refs\\\":\" ws refs \",\" ws "
-        "\"\\\"status\\\":\" ws ( \"\\\"open\\\"\" | \"\\\"done\\\"\" ) ws \"}\"\n"
-        "probs ::= \"[\" ws ( prob ( \",\" ws prob ){0,%d} )? ws \"]\"\n"
-        "prob ::= \"{\" ws \"\\\"text\\\":\" ws str \",\" ws \"\\\"refs\\\":\" ws refs \",\" ws "
-        "\"\\\"status\\\":\" ws ( \"\\\"open\\\"\" | \"\\\"resolved\\\"\" ) ws \"}\"\n"
-        "facts ::= \"[\" ws ( fact ( \",\" ws fact ){0,%d} )? ws \"]\"\n"
-        "fact ::= \"{\" ws \"\\\"text\\\":\" ws str \",\" ws \"\\\"refs\\\":\" ws refs ws \"}\"\n"
-        "people ::= \"[\" ws ( person ( \",\" ws person ){0,3} )? ws \"]\"\n"
-        "who ::= person | \"\\\"team\\\"\"\n"
-        "refs ::= \"[\" ws ref ( \",\" ws ref ){0,%d} ws \"]\"\n"
-        "str ::= \"\\\"\" [^\"\\\\\\n\\r\\t]{1,%d} \"\\\"\"\n"
-        "ws ::= [ \\n]{0,2}\n",
-        max_items - 1, max_items - 1, max_items - 1, max_items - 1, SUM_MAX_REFS - 1,
-        SUM_TEXT_MAX);
-    oc_sum_buf_puts(g, "person ::= ");
-    if (!ids->n_person) oc_sum_buf_puts(g, "\"\\\"P1\\\"\"");
-    for (int i = 0; i < ids->n_person; i++) oc_sum_buf_printf(g, "%s\"\\\"P%d\\\"\"", i ? " | " : "", i + 1);
-    oc_sum_buf_puts(g, "\nref ::= ");
-    int nref = rollup ? ids->n_item : ids->n_msg;
-    char tag = rollup ? 'i' : 'm';
-    if (!nref) oc_sum_buf_printf(g, "\"\\\"%c1\\\"\"", tag);
-    for (int i = 0; i < nref; i++) oc_sum_buf_printf(g, "%s\"\\\"%c%d\\\"\"", i ? " | " : "", tag, i + 1);
+int oc_sum_followup(const char *ask, int n_items, int n_lines, oc_sum_buf *q, oc_sum_buf *g) {
+    oc_sum_buf_puts(q, "These items from your summary have no line numbers:\n\n");
+    oc_sum_buf_puts(q, ask);
+    oc_sum_buf_puts(q, "\nFor each item, write its number, a colon, and the numbers of the lines it comes "
+                       "from, each in brackets, one item to a line, like this: "
+                       "\"<item number>: [line number][line number]\".\n");
+    /* Each item once, in order, and then the answer ends. */
+    oc_sum_buf_puts(g, "root ::=");
+    for (int i = 1; i <= (n_items < 1 ? 1 : n_items); i++) oc_sum_buf_printf(g, " \"%d:\" cites \"\\n\"", i);
+    oc_sum_buf_puts(g, "\ncites ::= ( \" [\" id \"]\" )+\nid ::= ");
+    for (int i = 1; i <= (n_lines < 1 ? 1 : n_lines); i++) oc_sum_buf_printf(g, "%s\"%d\"", i > 1 ? " | " : "", i);
     oc_sum_buf_puts(g, "\n");
-    return g->oom ? -1 : 0;
+    return q->oom || g->oom ? -1 : 0;
 }
 
-/* --- checking an answer -------------------------------------------------------- */
+/* --- reading an answer --------------------------------------------------------------- */
 
-/* The id an "X12" string names (1-based), or 0 when it is not one of ours. */
-static int short_id(const char *s, char tag, int max) {
-    if (s[0] != tag) return 0;
-    char *end;
-    long v = strtol(s + 1, &end, 10);
-    if (*end || v < 1 || v > max) return 0;
-    return (int)v;
-}
-
-/* Every run of digits in `text` must occur in one of `src`. */
-static int numbers_ok(const char *text, const char *const *src, int n) {
+/* Every run of digits in `text` must occur in one of the lines cited. */
+static int numbers_ok(const char *text, const oc_sum_lines *l, const int *cited, int nc) {
     for (const char *p = text; *p; ) {
         if (*p < '0' || *p > '9') { p++; continue; }
         const char *s = p;
         while (*p >= '0' && *p <= '9') p++;
         size_t len = (size_t)(p - s);
-        char run[32];
-        if (len >= sizeof run) return 0;
-        memcpy(run, s, len);
-        run[len] = '\0';
         int found = 0;
-        for (int k = 0; k < n && !found; k++) if (src[k] && strstr(src[k], run)) found = 1;
+        for (int k = 0; k < nc && !found; k++) {
+            for (const char *q = l->v[cited[k]].text; *q && !found; q++)
+                if (!strncmp(q, s, len)) found = 1;
+        }
         if (!found) return 0;
     }
     return 1;
 }
 
+/* The headings, as a model may write them: on a line of their own or inside one,
+ * in any case, in markdown or not. */
+static const char *const HEADS[5] = { "overview", "decisions", "actions", "problems", "facts" };
 
-/* The model's own ids in a text, as a reader should see them: P3 becomes the
- * person's name, a cited m7 or i7 is dropped. Written into `out`. */
-static void readable(const char *in, const oc_sum_ids *ids, char *out, size_t cap) {
-    size_t n = 0;
-    for (const char *p = in; *p && n + 1 < cap; ) {
-        int boundary = p == in || !((p[-1] >= 'A' && p[-1] <= 'Z') || (p[-1] >= 'a' && p[-1] <= 'z') ||
-                                    (p[-1] >= '0' && p[-1] <= '9'));
-        if (boundary && (*p == 'P' || *p == 'm' || *p == 'i') && p[1] >= '1' && p[1] <= '9') {
-            const char *q = p + 1;
-            long v = 0;
-            while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-            int after = !((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z'));
-            if (after && *p == 'P' && v >= 1 && v <= ids->n_person) {
-                const char *nm = ids->person_name[v - 1];
-                size_t l = strlen(nm);
-                if (n + l + 1 >= cap) break;
-                memcpy(out + n, nm, l);
-                n += l;
-                p = q;
-                continue;
-            }
-            if (after && *p != 'P') {
-                while (n && out[n - 1] == ' ' && (*q == ' ' || *q == ',' || *q == '.' || *q == ')')) n--;
-                if (n && out[n - 1] == '(' && *q == ')') { n--; q++; }
-                p = q;
-                continue;
-            }
-        }
-        out[n++] = *p++;
+/* A heading at `p`, not inside a word: its index, with *after just past its
+ * colon; or -1. */
+static int heading_at(const char *start, const char *p, char **after) {
+    if (p > start && isalnum((unsigned char)p[-1])) return -1;
+    for (int h = 0; h < 5; h++) {
+        size_t n = strlen(HEADS[h]);
+        if (strncasecmp(p, HEADS[h], n) != 0) continue;
+        const char *q = p + n;
+        while (*q == '*') q++;
+        if (*q != ':') continue;
+        q++;
+        while (*q == '*') q++;
+        *after = (char *)q;
+        return h;
     }
-    out[n] = '\0';
+    return -1;
 }
 
-int oc_sum_check(const char *json, size_t len, const oc_sum_ids *ids, int rollup, oc_sum_buf *out,
-                 int *dropped) {
-    oc_json d;
-    int drop = 0, kept = 0;
-    if (dropped) *dropped = 0;
-    if (!json || oc_json_parse(&d, json, len) != 0) return -1;
-    if (d.t[0].type != JSMN_OBJECT) { oc_json_free(&d); return -1; }
-    int nref = rollup ? ids->n_item : ids->n_msg;
-    /* All the source texts, for the overview's number check. */
-    const char **all = malloc((size_t)(nref ? nref : 1) * sizeof *all);
-    if (!all) { oc_json_free(&d); return -1; }
-    for (int i = 0; i < nref; i++) all[i] = rollup ? ids->item_text[i] : ids->msg_text[i];
+typedef struct { int *v; int n, cap; } ints;
 
-    char raw[SUM_TEXT_MAX * 2 + 1], text[SUM_TEXT_MAX * 4 + 1];
-    oc_sum_buf_puts(out, "{\"overview\":");
-    if (oc_json_get_str(&d, 0, "overview", raw, sizeof raw) != 0) raw[0] = '\0';
-    readable(raw, ids, text, sizeof text);
-    if (!numbers_ok(text, all, nref)) text[0] = '\0';
-    oc_sum_buf_json(out, text);
-    for (int kind = 0; kind < 4; kind++) {
-        oc_sum_buf_printf(out, ",\"%s\":[", KINDS[kind]);
-        int arr = oc_json_get(&d, 0, KINDS[kind]);
-        int first = 1;
-        /* The texts kept so far, so a repeat is dropped (code merges what is
-         * the same; the model is asked only for what is alike). */
-        char kept_text[SUM_MAX_ITEMS * 2][SUM_TEXT_MAX * 4 + 1];
-        int n_kept = 0;
-        if (arr >= 0 && d.t[arr].type == JSMN_ARRAY) {
-            int i = arr + 1;
-            for (int k = 0; k < d.t[arr].size; k++, i = oc_json_skip(&d, i)) {
-                if (d.t[i].type != JSMN_OBJECT) { drop++; continue; }
-                if (oc_json_get_str(&d, i, kind == 1 ? "what" : "text", raw, sizeof raw) != 0 || !raw[0]) {
-                    drop++;
+static int ints_add(ints *a, int v) {
+    for (int i = 0; i < a->n; i++) if (a->v[i] == v) return 0;
+    if (a->n == a->cap) {
+        int nc = a->cap ? a->cap * 2 : 8;
+        int *nv = realloc(a->v, (size_t)nc * sizeof *nv);
+        if (!nv) return -1;
+        a->v = nv;
+        a->cap = nc;
+    }
+    a->v[a->n++] = v;
+    return 0;
+}
+
+/* Take the citations out of `s`, in place, wherever they are: "[3]", "[3][7]",
+ * "[3, 7]", "[1-4]", and the same in parentheses. Into `cited`: 0-based lines,
+ * once each, in the order written. A bracketed number that is not a line is
+ * taken out and ignored; a parenthesized one is text, left as it is. 0, or -1
+ * when out of memory. */
+static int take_cites(char *s, const oc_sum_lines *l, ints *cited) {
+    char *w = s;
+    for (char *p = s; *p; ) {
+        if (*p == '[' || *p == '(') {
+            char close = *p == '[' ? ']' : ')';
+            char *e = p + 1;
+            int digits = 0;
+            while (*e && (isdigit((unsigned char)*e) || *e == ' ' || *e == ',' || *e == '-')) {
+                if (isdigit((unsigned char)*e)) digits = 1;
+                e++;
+            }
+            if (digits && *e == close) {
+                ints got = {0};
+                int ok = 1;
+                for (char *q = p + 1; q < e && ok; ) {
+                    if (!isdigit((unsigned char)*q)) { q++; continue; }
+                    long a = strtol(q, &q, 10), z = a;
+                    while (*q == ' ') q++;
+                    if (*q == '-') {
+                        q++;
+                        while (*q == ' ') q++;
+                        if (isdigit((unsigned char)*q)) z = strtol(q, &q, 10);
+                    }
+                    if (a < 1 || z < a || z > l->n) { ok = 0; break; }
+                    for (long v = a; v <= z && ok; v++) if (ints_add(&got, (int)v - 1) != 0) ok = -1;
+                }
+                if (ok == 1) {
+                    for (int i = 0; i < got.n; i++)
+                        if (ints_add(cited, got.v[i]) != 0) { free(got.v); return -1; }
+                    free(got.v);
+                    p = e + 1;
                     continue;
                 }
-                readable(raw, ids, text, sizeof text);
-                /* refs: every one ours; the message ids they stand for. */
-                int ra = oc_json_get(&d, i, "refs");
-                if (ra < 0 || d.t[ra].type != JSMN_ARRAY || d.t[ra].size == 0) { drop++; continue; }
-                int64_t real[64];
-                int nreal = 0, bad = 0;
-                const char *srcs[SUM_MAX_REFS * 2];
-                int nsrc = 0;
-                int ri = ra + 1;
-                for (int r = 0; r < d.t[ra].size; r++, ri = oc_json_skip(&d, ri)) {
-                    char s[16];
-                    int v = oc_json_str(&d, ri, s, sizeof s) == 0 ? short_id(s, rollup ? 'i' : 'm', nref) : 0;
-                    if (!v) { bad = 1; break; }
-                    if (nsrc < (int)(sizeof srcs / sizeof *srcs)) srcs[nsrc++] = all[v - 1];
-                    if (rollup) {
-                        for (int x = 0; x < ids->item_nrefs[v - 1] && nreal < 64; x++) {
-                            int dup = 0;
-                            for (int y = 0; y < nreal; y++) if (real[y] == ids->item_refs[v - 1][x]) dup = 1;
-                            if (!dup) real[nreal++] = ids->item_refs[v - 1][x];
-                        }
-                    } else if (nreal < 64) {
-                        int dup = 0;
-                        for (int y = 0; y < nreal; y++) if (real[y] == ids->msg[v - 1]) dup = 1;
-                        if (!dup) real[nreal++] = ids->msg[v - 1];
-                    }
-                }
-                if (bad || !numbers_ok(text, srcs, nsrc)) { drop++; continue; }
-                int repeat = 0;
-                for (int x = 0; x < n_kept && !repeat; x++) if (!strcasecmp(kept_text[x], text)) repeat = 1;
-                if (repeat) { drop++; continue; }
-                if (n_kept < SUM_MAX_ITEMS * 2) snprintf(kept_text[n_kept++], sizeof kept_text[0], "%s", text);
-                /* people */
-                int64_t who = 0, by[4];
-                int nby = 0;
-                if (kind == 1) {
-                    char s[16] = "";
-                    if (oc_json_get_str(&d, i, "who", s, sizeof s) != 0) { drop++; continue; }
-                    if (strcmp(s, "team") != 0) {
-                        int p = short_id(s, 'P', ids->n_person);
-                        if (!p) { drop++; continue; }
-                        who = ids->person[p - 1];
-                    }
-                }
-                if (kind == 0) {
-                    int pa = oc_json_get(&d, i, "by");
-                    if (pa >= 0 && d.t[pa].type == JSMN_ARRAY) {
-                        int pi = pa + 1;
-                        for (int r = 0; r < d.t[pa].size; r++, pi = oc_json_skip(&d, pi)) {
-                            char s[16];
-                            int p = oc_json_str(&d, pi, s, sizeof s) == 0 ? short_id(s, 'P', ids->n_person) : 0;
-                            if (!p) { bad = 1; break; }
-                            if (nby < 4) by[nby++] = ids->person[p - 1];
-                        }
-                    }
-                    if (bad) { drop++; continue; }
-                }
-                char st[16] = "";
-                oc_json_get_str(&d, i, "status", st, sizeof st);
-                /* Write the kept item with real ids. */
-                oc_sum_buf_puts(out, first ? "{" : ",{");
-                first = 0;
-                oc_sum_buf_puts(out, kind == 1 ? "\"who\":" : "\"text\":");
-                if (kind == 1) {
-                    oc_sum_buf_printf(out, "%lld,\"what\":", (long long)who);
-                }
-                oc_sum_buf_json(out, text);
-                if (kind == 0) {
-                    oc_sum_buf_puts(out, ",\"by\":[");
-                    for (int x = 0; x < nby; x++) oc_sum_buf_printf(out, "%s%lld", x ? "," : "", (long long)by[x]);
-                    oc_sum_buf_puts(out, "]");
-                }
-                oc_sum_buf_puts(out, ",\"refs\":[");
-                for (int x = 0; x < nreal; x++) oc_sum_buf_printf(out, "%s%lld", x ? "," : "", (long long)real[x]);
-                oc_sum_buf_puts(out, "]");
-                if (kind == 1) oc_sum_buf_printf(out, ",\"status\":\"%s\"", strcmp(st, "done") ? "open" : "done");
-                if (kind == 2) oc_sum_buf_printf(out, ",\"status\":\"%s\"", strcmp(st, "resolved") ? "open" : "resolved");
-                oc_sum_buf_puts(out, "}");
-                kept++;
+                free(got.v);
+                if (ok < 0) return -1;
+                if (close == ']') { p = e + 1; continue; }
             }
         }
+        *w++ = *p++;
+    }
+    *w = '\0';
+    return 0;
+}
+
+/* Take every "(open)", "(done)" and "(resolved)" out of `s`, in place, in any
+ * case: the first one's index in STATUS, or -1 when there is none. */
+static const char *const STATUS[3] = { "open", "done", "resolved" };
+/* What one item of each section is called in the lines a roll-up reads. */
+static const char *const SECTION_NAME[4] = { "Decision", "Action", "Problem", "Fact" };
+static int take_status(char *s) {
+    int first = -1;
+    char *w = s;
+    for (char *p = s; *p; ) {
+        if (*p == '(') {
+            int hit = -1;
+            for (int k = 0; k < 3 && hit < 0; k++) {
+                size_t n = strlen(STATUS[k]);
+                if (!strncasecmp(p + 1, STATUS[k], n) && p[1 + n] == ')') hit = k;
+            }
+            if (hit >= 0) {
+                if (first < 0) first = hit;
+                p += strlen(STATUS[hit]) + 2;
+                continue;
+            }
+        }
+        *w++ = *p++;
+    }
+    *w = '\0';
+    return first;
+}
+
+/* `s` with runs of spaces made one, no space before punctuation (where a
+ * citation was taken out), and the bullet marks, numbering and stray
+ * punctuation left at either end taken off. */
+static char *tidy(char *s) {
+    char *w = s;
+    int sp = 0;
+    for (char *p = s; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            if (!sp) *w++ = ' ';
+            sp = 1;
+        } else {
+            if (sp && strchr(".,;:!?)", *p) && w > s) w--;
+            *w++ = *p;
+            sp = 0;
+        }
+    }
+    *w = '\0';
+    for (;;) {
+        while (*s == ' ') s++;
+        if ((*s == '-' || *s == '*' || *s == '#') && !isdigit((unsigned char)s[1])) { s++; continue; }
+        if (!strncmp(s, "\xe2\x80\xa2", 3)) { s += 3; continue; }
+        const char *d = s;
+        while (isdigit((unsigned char)*d)) d++;
+        if (d > s && (*d == '.' || *d == ')') && d[1] == ' ') { s = (char *)d + 2; continue; }
+        break;
+    }
+    size_t n = strlen(s);
+    while (n && strchr(" -*#,;:", s[n - 1])) s[--n] = '\0';
+    return s;
+}
+
+typedef struct { char **v; int n, cap; } seen;
+
+/* `t` as a repeat key: its words, lower case, without punctuation, each
+ * followed by a space. Heap, or NULL. */
+static char *repeat_key(int64_t who, const char *t) {
+    oc_sum_buf k = {0};
+    oc_sum_buf_printf(&k, "%lld| ", (long long)who);
+    for (const char *p = t; *p; ) {
+        while (*p && !isalnum((unsigned char)*p) && !((unsigned char)*p & 0x80)) p++;
+        if (!*p) break;
+        while (*p && (isalnum((unsigned char)*p) || ((unsigned char)*p & 0x80))) {
+            char c = (char)tolower((unsigned char)*p++);
+            oc_sum_buf_add(&k, &c, 1);
+        }
+        oc_sum_buf_puts(&k, " ");
+    }
+    if (k.oom) { oc_sum_buf_free(&k); return NULL; }
+    return k.p;
+}
+
+/* A repeat: every word of `t` is in an item already kept for the same person
+ * ("Deployed tonight" after "Deployed tonight after hours"). */
+static int seen_has(const seen *s, const char *t) {
+    const char *bar = strchr(t, '|');
+    size_t who = bar ? (size_t)(bar - t) : 0;
+    for (int i = 0; i < s->n; i++) {
+        if (strncmp(s->v[i], t, who + 1) != 0) continue;
+        int all = 1;
+        for (const char *w = t + who + 2; *w && all; ) {
+            const char *e = strchr(w, ' ');
+            size_t n = (size_t)(e - w);
+            char word[256];
+            if (n + 3 > sizeof word) { all = 0; break; }
+            word[0] = ' ';
+            memcpy(word + 1, w, n);
+            word[n + 1] = ' ';
+            word[n + 2] = '\0';
+            if (!strstr(s->v[i] + who + 1, word)) all = 0;
+            w = e + 1;
+        }
+        if (all) return 1;
+    }
+    return 0;
+}
+
+static int seen_add(seen *s, const char *t) {
+    if (s->n == s->cap) {
+        int nc = s->cap ? s->cap * 2 : 8;
+        char **nv = realloc(s->v, (size_t)nc * sizeof *nv);
+        if (!nv) return -1;
+        s->v = nv;
+        s->cap = nc;
+    }
+    s->v[s->n] = strdup(t);
+    return s->v[s->n] ? (s->n++, 0) : -1;
+}
+
+static void seen_free(seen *s) {
+    for (int i = 0; i < s->n; i++) free(s->v[i]);
+    free(s->v);
+    memset(s, 0, sizeof *s);
+}
+
+/* An item that says there is nothing: "None", "N/A", ... */
+static int says_nothing(const char *t) {
+    static const char *const NOTHING[] = { "none", "n/a", "na", "nothing", "none reported", "no",
+                                           "not applicable", "none noted", "none mentioned" };
+    size_t n = strlen(t);
+    while (n && (t[n - 1] == '.' || t[n - 1] == '!')) n--;
+    for (size_t i = 0; i < sizeof NOTHING / sizeof *NOTHING; i++)
+        if (strlen(NOTHING[i]) == n && !strncasecmp(t, NOTHING[i], n)) return 1;
+    return 0;
+}
+
+/* Who `name` is: the team (0), someone in the lines by full name, or by a first
+ * name only one of them has. 1 with *who set, or 0. */
+static int find_who(const char *name, const oc_sum_people *people, int64_t *who) {
+    *who = 0;
+    if (!strcasecmp(name, "Team")) return 1;
+    for (int k = 0; k < people->n; k++)
+        if (!strcasecmp(name, people->name[k])) { *who = people->id[k]; return 1; }
+    int found = 0;
+    size_t n = strlen(name);
+    for (int k = 0; k < people->n; k++) {
+        const char *nm = people->name[k];
+        if (!strncasecmp(nm, name, n) && nm[n] == ' ') {
+            if (found) return 0;
+            found = 1;
+            *who = people->id[k];
+        }
+    }
+    return found;
+}
+
+/* The line numbers a follow-up gave each item asked about: "2: [3][5]", one
+ * item to a line. */
+typedef struct { ints *v; int n; } given;
+
+static int read_given(const char *text, const oc_sum_lines *l, given *g) {
+    memset(g, 0, sizeof *g);
+    if (!text) return 0;
+    char *t = strdup(text);
+    if (!t) return -1;
+    int rc = 0;
+    for (char *line = t; line && rc == 0; ) {
+        char *e = strchr(line, '\n');
+        if (e) *e = '\0';
+        char *q = line;
+        while (*q == ' ' || *q == '-') q++;
+        if (isdigit((unsigned char)*q)) {
+            long k = strtol(q, &q, 10);
+            if (*q == ':' || *q == '.') q++;
+            if (k >= 1 && k <= 100000) {
+                if (k > g->n) {
+                    ints *nv = realloc(g->v, (size_t)k * sizeof *nv);
+                    if (!nv) { rc = -1; break; }
+                    memset(nv + g->n, 0, (size_t)(k - g->n) * sizeof *nv);
+                    g->v = nv;
+                    g->n = (int)k;
+                }
+                if (!g->v[k - 1].n && take_cites(q, l, &g->v[k - 1]) != 0) rc = -1;
+            }
+        }
+        line = e ? e + 1 : NULL;
+    }
+    free(t);
+    return rc;
+}
+
+static void given_free(given *g) {
+    for (int i = 0; i < g->n; i++) free(g->v[i].v);
+    free(g->v);
+    memset(g, 0, sizeof *g);
+}
+
+int oc_sum_parse(const char *answer, const char *cites, const oc_sum_lines *l, const oc_sum_people *people,
+                 oc_sum_buf *out, oc_sum_buf *ask, int *dropped) {
+    if (dropped) *dropped = 0;
+    if (!answer) return -1;
+    char *a = strdup(answer);
+    if (!a) return -1;
+    /* Where each heading is, and where what it heads begins. */
+    typedef struct { int h; char *at, *body; } mark;
+    mark *m = NULL;
+    int nm = 0, cm = 0;
+    for (char *p = a; *p; ) {
+        char *after;
+        int h = heading_at(a, p, &after);
+        if (h < 0) { p++; continue; }
+        if (nm == cm) {
+            int nc = cm ? cm * 2 : 16;
+            mark *nv = realloc(m, (size_t)nc * sizeof *nv);
+            if (!nv) { free(m); free(a); return -1; }
+            m = nv;
+            cm = nc;
+        }
+        m[nm++] = (mark){ h, p, after };
+        p = after;
+    }
+    if (!nm) { free(m); free(a); return -1; }
+    for (int i = 1; i < nm; i++) *m[i].at = '\0';
+
+    oc_sum_buf items[4] = { {0}, {0}, {0}, {0} };
+    int count[4] = { 0, 0, 0, 0 };
+    seen kept[4] = { {0}, {0}, {0}, {0} };
+    int drop = 0, total = 0, rc = -1, uncited = 0;
+    char *overview = NULL;
+    ints all = {0};
+    int64_t *all_refs = NULL;
+    int n_all = 0, c_all = 0;
+    given g = {0};
+    for (int i = 0; i < l->n; i++)
+        if (ints_add(&all, i) != 0 || add_unique(&all_refs, &n_all, &c_all, l->v[i].refs, l->v[i].n_refs) != 0)
+            goto out;
+    if (read_given(cites, l, &g) != 0) goto out;
+
+    for (int i = 0; i < nm; i++) {
+        if (m[i].h == 0) {
+            /* The first overview with something in it. */
+            if (overview && *overview) continue;
+            ints c = {0};
+            int bad = take_cites(m[i].body, l, &c);
+            free(c.v);
+            if (bad) goto out;
+            take_status(m[i].body);
+            char *t = tidy(m[i].body);
+            free(overview);
+            overview = NULL;
+            if (says_nothing(t)) continue;
+            if (!numbers_ok(t, l, all.v, all.n)) { drop++; continue; }
+            if (!(overview = strdup(t))) goto out;
+            continue;
+        }
+        int section = m[i].h - 1;
+        for (char *line = m[i].body; line; ) {
+            char *e = strchr(line, '\n');
+            if (e) *e = '\0';
+            char *next = e ? e + 1 : NULL;
+            ints cited = {0};
+            if (take_cites(line, l, &cited) != 0) { free(cited.v); goto out; }
+            int status = take_status(line);
+            char *text = tidy(line);
+            /* A summary line's kind, copied from the lines a roll-up reads
+             * ("Decision: ...", "Action: ..."), is not part of the item. */
+            for (int k = 0; k < 4; k++) {
+                size_t n = strlen(SECTION_NAME[k]);
+                if (!strncasecmp(text, SECTION_NAME[k], n) && text[n] == ':') { text = tidy(text + n + 1); break; }
+            }
+            if (!*text || says_nothing(text)) { free(cited.v); line = next; continue; }
+            /* No line numbers: those a follow-up gave it, or else every line. */
+            if (!cited.n) {
+                uncited++;
+                if (uncited <= g.n && g.v[uncited - 1].n) {
+                    cited = g.v[uncited - 1];
+                    g.v[uncited - 1] = (ints){0};
+                } else if (ask) {
+                    oc_sum_buf_printf(ask, "%d. %s: %s\n", uncited, SECTION_NAME[section], text);
+                }
+            }
+            const int *cv = cited.n ? cited.v : all.v;
+            int cn = cited.n ? cited.n : all.n;
+            /* An action: "who: what", the who someone in the lines or the team;
+             * anyone else stays in the text. */
+            int64_t who = -1;
+            if (section == 1) {
+                char *colon = strchr(text, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *name = tidy(text);
+                    int64_t w;
+                    if (find_who(name, people, &w)) { who = w; text = tidy(colon + 1); }
+                    else *colon = ':';
+                }
+            }
+            /* Statuses: an action's open or done, a problem's open or resolved;
+             * none, or the other kind's, is no status. */
+            const char *st = NULL;
+            if (section == 1 && (status == 0 || status == 1)) st = STATUS[status];
+            if (section == 2 && (status == 0 || status == 2)) st = STATUS[status];
+            if (!*text || !numbers_ok(text, l, cv, cn)) {
+                drop++;
+                free(cited.v);
+                line = next;
+                continue;
+            }
+            /* A repeat of a kept item (for an action, the same person too). */
+            char *key = repeat_key(who, text);
+            if (!key) { free(cited.v); goto out; }
+            if (seen_has(&kept[section], key)) {
+                free(key);
+                free(cited.v);
+                drop++;
+                line = next;
+                continue;
+            }
+            if (seen_add(&kept[section], key) != 0) { free(key); free(cited.v); goto out; }
+            free(key);
+            /* The message ids its lines stand for. */
+            int64_t *refs = NULL;
+            int nr = 0, cr = 0;
+            for (int c = 0; c < cn; c++)
+                if (add_unique(&refs, &nr, &cr, l->v[cv[c]].refs, l->v[cv[c]].n_refs) != 0) {
+                    free(refs);
+                    free(cited.v);
+                    goto out;
+                }
+            oc_sum_buf *b = &items[section];
+            oc_sum_buf_puts(b, count[section] ? ",{" : "{");
+            if (section == 1) {
+                if (who >= 0) oc_sum_buf_printf(b, "\"who\":%lld,", (long long)who);
+                oc_sum_buf_puts(b, "\"what\":");
+            } else {
+                oc_sum_buf_puts(b, "\"text\":");
+            }
+            oc_sum_buf_json(b, text);
+            if (section == 0) oc_sum_buf_puts(b, ",\"by\":[]");
+            oc_sum_buf_puts(b, ",\"refs\":[");
+            for (int x = 0; x < nr; x++) oc_sum_buf_printf(b, "%s%lld", x ? "," : "", (long long)refs[x]);
+            oc_sum_buf_puts(b, "]");
+            if (st) oc_sum_buf_printf(b, ",\"status\":\"%s\"", st);
+            oc_sum_buf_puts(b, "}");
+            count[section]++;
+            total++;
+            free(refs);
+            free(cited.v);
+            line = next;
+        }
+    }
+    /* The overview stands for every message the lines stand for. */
+    oc_sum_buf_puts(out, "{\"overview\":");
+    oc_sum_buf_json(out, overview ? overview : "");
+    oc_sum_buf_puts(out, ",\"refs\":[");
+    for (int x = 0; x < n_all; x++) oc_sum_buf_printf(out, "%s%lld", x ? "," : "", (long long)all_refs[x]);
+    oc_sum_buf_puts(out, "]");
+    for (int s = 0; s < 4; s++) {
+        oc_sum_buf_printf(out, ",\"%s\":[", KINDS[s]);
+        if (items[s].p) oc_sum_buf_add(out, items[s].p, items[s].n);
         oc_sum_buf_puts(out, "]");
+        if (items[s].oom) out->oom = 1;
     }
     oc_sum_buf_puts(out, "}");
-    free(all);
-    oc_json_free(&d);
+    if (ask && ask->oom) out->oom = 1;
+    rc = out->oom ? -1 : total;
+out:
+    for (int s = 0; s < 4; s++) { oc_sum_buf_free(&items[s]); seen_free(&kept[s]); }
+    free(overview);
+    free(all.v);
+    free(all_refs);
+    given_free(&g);
+    free(m);
+    free(a);
     if (dropped) *dropped = drop;
-    return out->oom ? -1 : kept;
+    return rc;
 }
