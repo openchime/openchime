@@ -44,7 +44,7 @@
  * Guidance to the model only; no answer is ever cut. */
 #define SUM_WORDS_PCT 30
 /* Bumped whenever the prompt, the shape or how an answer is read change. */
-#define SUM_PROMPT_VERSION "s5"
+#define SUM_PROMPT_VERSION "s6"
 
 /* One message as the core sees it: plain text (oc_speakable_full), its author's
  * name, and its thread (parent_id: the root's id, 0 for a top-level message). */
@@ -174,7 +174,8 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out);
  * on a line of its own or inside one, in any case; citations may be "[3]",
  * "[3][7]", "[3, 7]" or "[1-4]", or the same in parentheses, anywhere in the
  * item; a status anywhere in it. Under a heading, each line is an item, and one
- * that says there is nothing ("None") is no item. A bracketed number that is
+ * that says there is nothing ("None") is no item. A kind copied from the lines a
+ * roll-up reads ("Decision: ...") is taken off. A bracketed number that is
  * not a line is ignored.
  *
  * An item with no line numbers takes those `cites` gave it -- the answer to the
@@ -183,7 +184,8 @@ int oc_sum_prompt(const char *intro, const oc_sum_lines *l, oc_sum_buf *out);
  * numbers is added to it, "<k>. <Kind>: <text>", for the follow-up.
  *
  * An item is dropped only when it states a number none of its lines contains,
- * or repeats one already kept; the overview, when it states a number no line
+ * or repeats one already kept (all its words in one kept under the same
+ * heading for the same person); the overview, when it states a number no line
  * contains. Returns how many items were kept (0 is a valid, empty summary), or
  * -1 when the answer has no heading at all. `dropped` (may be NULL) counts what
  * was dropped. */

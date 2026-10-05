@@ -711,6 +711,8 @@ static int take_cites(char *s, const oc_sum_lines *l, ints *cited) {
 /* Take every "(open)", "(done)" and "(resolved)" out of `s`, in place, in any
  * case: the first one's index in STATUS, or -1 when there is none. */
 static const char *const STATUS[3] = { "open", "done", "resolved" };
+/* What one item of each section is called in the lines a roll-up reads. */
+static const char *const SECTION_NAME[4] = { "Decision", "Action", "Problem", "Fact" };
 static int take_status(char *s) {
     int first = -1;
     char *w = s;
@@ -766,8 +768,46 @@ static char *tidy(char *s) {
 
 typedef struct { char **v; int n, cap; } seen;
 
+/* `t` as a repeat key: its words, lower case, without punctuation, each
+ * followed by a space. Heap, or NULL. */
+static char *repeat_key(int64_t who, const char *t) {
+    oc_sum_buf k = {0};
+    oc_sum_buf_printf(&k, "%lld| ", (long long)who);
+    for (const char *p = t; *p; ) {
+        while (*p && !isalnum((unsigned char)*p) && !((unsigned char)*p & 0x80)) p++;
+        if (!*p) break;
+        while (*p && (isalnum((unsigned char)*p) || ((unsigned char)*p & 0x80))) {
+            char c = (char)tolower((unsigned char)*p++);
+            oc_sum_buf_add(&k, &c, 1);
+        }
+        oc_sum_buf_puts(&k, " ");
+    }
+    if (k.oom) { oc_sum_buf_free(&k); return NULL; }
+    return k.p;
+}
+
+/* A repeat: every word of `t` is in an item already kept for the same person
+ * ("Deployed tonight" after "Deployed tonight after hours"). */
 static int seen_has(const seen *s, const char *t) {
-    for (int i = 0; i < s->n; i++) if (!strcasecmp(s->v[i], t)) return 1;
+    const char *bar = strchr(t, '|');
+    size_t who = bar ? (size_t)(bar - t) : 0;
+    for (int i = 0; i < s->n; i++) {
+        if (strncmp(s->v[i], t, who + 1) != 0) continue;
+        int all = 1;
+        for (const char *w = t + who + 2; *w && all; ) {
+            const char *e = strchr(w, ' ');
+            size_t n = (size_t)(e - w);
+            char word[256];
+            if (n + 3 > sizeof word) { all = 0; break; }
+            word[0] = ' ';
+            memcpy(word + 1, w, n);
+            word[n + 1] = ' ';
+            word[n + 2] = '\0';
+            if (!strstr(s->v[i] + who + 1, word)) all = 0;
+            w = e + 1;
+        }
+        if (all) return 1;
+    }
     return 0;
 }
 
@@ -861,8 +901,6 @@ static void given_free(given *g) {
     memset(g, 0, sizeof *g);
 }
 
-static const char *const SECTION_NAME[4] = { "Decision", "Action", "Problem", "Fact" };
-
 int oc_sum_parse(const char *answer, const char *cites, const oc_sum_lines *l, const oc_sum_people *people,
                  oc_sum_buf *out, oc_sum_buf *ask, int *dropped) {
     if (dropped) *dropped = 0;
@@ -930,6 +968,12 @@ int oc_sum_parse(const char *answer, const char *cites, const oc_sum_lines *l, c
             if (take_cites(line, l, &cited) != 0) { free(cited.v); goto out; }
             int status = take_status(line);
             char *text = tidy(line);
+            /* A summary line's kind, copied from the lines a roll-up reads
+             * ("Decision: ...", "Action: ..."), is not part of the item. */
+            for (int k = 0; k < 4; k++) {
+                size_t n = strlen(SECTION_NAME[k]);
+                if (!strncasecmp(text, SECTION_NAME[k], n) && text[n] == ':') { text = tidy(text + n + 1); break; }
+            }
             if (!*text || says_nothing(text)) { free(cited.v); line = next; continue; }
             /* No line numbers: those a follow-up gave it, or else every line. */
             if (!cited.n) {
@@ -968,20 +1012,17 @@ int oc_sum_parse(const char *answer, const char *cites, const oc_sum_lines *l, c
                 continue;
             }
             /* A repeat of a kept item (for an action, the same person too). */
-            oc_sum_buf k = {0};
-            oc_sum_buf_printf(&k, "%lld|", (long long)who);
-            oc_sum_buf_puts(&k, text);
-            if (k.oom || seen_has(&kept[section], k.p)) {
-                int oom = k.oom;
-                oc_sum_buf_free(&k);
+            char *key = repeat_key(who, text);
+            if (!key) { free(cited.v); goto out; }
+            if (seen_has(&kept[section], key)) {
+                free(key);
                 free(cited.v);
-                if (oom) goto out;
                 drop++;
                 line = next;
                 continue;
             }
-            if (seen_add(&kept[section], k.p) != 0) { oc_sum_buf_free(&k); free(cited.v); goto out; }
-            oc_sum_buf_free(&k);
+            if (seen_add(&kept[section], key) != 0) { free(key); free(cited.v); goto out; }
+            free(key);
             /* The message ids its lines stand for. */
             int64_t *refs = NULL;
             int nr = 0, cr = 0;

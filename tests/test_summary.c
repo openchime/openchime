@@ -158,6 +158,17 @@ static void test_parse(void) {
     CHECK(out.p && strstr(out.p, "\"facts\":[{\"text\":\"Ticket 6701\",\"refs\":[100,101]}]"));
     oc_sum_buf_free(&out);
 
+    /* A kind copied from a roll-up's lines is not part of the item; an item
+     * whose words all appear in one already kept is a repeat. */
+    CHECK(oc_sum_parse("Overview: x\nDecisions:\n- [1] Decision: ship it\nActions:\n- [1] Action (open): Bob: look\n"
+                       "Facts:\n- [1] Deployed after business hours ET.\n- [2] deployed after business hours\n",
+                       NULL, &l, &pp, &out, NULL, &dropped) == 3);
+    CHECK(dropped == 1);
+    CHECK(out.p && strstr(out.p, "{\"text\":\"ship it\",") &&
+          strstr(out.p, "{\"who\":11,\"what\":\"look\",\"refs\":[100],\"status\":\"open\"}") &&
+          strstr(out.p, "\"facts\":[{\"text\":\"Deployed after business hours ET.\",\"refs\":[100]}]"));
+    oc_sum_buf_free(&out);
+
     /* A first name only one person in the lines has is that person. */
     oc_sum_people two = {0};
     CHECK(oc_sum_people_add(&two, 20, "Cassi Vincent") == 0 && oc_sum_people_add(&two, 21, "Carla Smith") == 0);

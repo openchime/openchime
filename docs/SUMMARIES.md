@@ -136,8 +136,10 @@ line of its call. A citation of a line that is not there is ignored.
 
 **The check** (`oc_sum_parse`). Only what is invented or repeated is dropped: an
 item stating a run of digits none of its lines contains, or repeating one
-already kept; the overview, when it states a number no line contains. An item
-that says there is nothing ("None", "N/A") is no item. An action's owner is
+already kept (every word of it, ignoring case and punctuation, in one kept under
+the same heading for the same person); the overview, when it states a number no line contains. An item
+that says there is nothing ("None", "N/A") is no item, and a kind copied from
+the lines a roll-up reads ("Decision:", "Action:") is not part of an item. An action's owner is
 matched to the team or to someone in the lines, by full name or by a first name
 only one of them has; an owner who matches no one stays in the action's text. A
 status the model did not write is left out, not guessed. An answer with no
