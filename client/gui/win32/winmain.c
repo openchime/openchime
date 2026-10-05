@@ -9520,6 +9520,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Storage usage",           60 },
     { "Audit log",               61 },
     { "Manage groups",           87 },
+    { "Summarize this conversation", 88 },
     { "Toggle unreads only in the sidebar", 85 },
     { "Reconnect now",           2  },
     { "Add a workspace",         80 },
@@ -9565,7 +9566,8 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
      * cancel it. A list whose top item undoes the thing you started is worse than a
      * shorter list. */
     for (size_t i = 0; !g_fwd_mid && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
-        if (pal_match(PALETTE[i].label, q)) {
+        if (PALETTE[i].cmd == 88 && !(m && g_sel && oc_model_summarize_available(m))) continue;   /* REQ-313 */
+        else if (pal_match(PALETTE[i].label, q)) {
             hit[nh].label = PALETTE[i].label; hit[nh].kind = "Action";
             hit[nh].cmd = PALETTE[i].cmd; hit[nh].cid = 0; nh++;
         }
@@ -10280,12 +10282,129 @@ static int toast_click(int x, int y) {
 
 /* What the context pane is currently showing. MEMBERS is the resting state; the
  * others are pushed on top of it and pop back with the header's back arrow. */
-enum { RP_MEMBERS = 0, RP_PROFILE, RP_REACTORS };
+enum { RP_MEMBERS = 0, RP_PROFILE, RP_REACTORS, RP_SUMMARY };
 static int      g_rp_mode;
 static rectf g_rp_back, g_rp_close;
 
 static void rp_push(int mode) { g_rp_mode = mode; g_show_members = 1; }
-static void rp_pop(void) { g_rp_mode = RP_MEMBERS; g_profile_uid = 0; }
+/* Leaving the summary forgets it: it is shown to the asker and kept nowhere. */
+static void rp_pop(void) {
+    if (g_rp_mode == RP_SUMMARY && g_client) oc_client_close_summary(g_client);
+    g_rp_mode = RP_MEMBERS;
+    g_profile_uid = 0;
+}
+
+/* The summary pane (REQ-310): the overview, then decisions, actions, problems
+ * and facts. Each item is a row that goes to its first message in the
+ * transcript beside it -- the reason it is in the context pane rather than over
+ * the conversation. Scrolls, clipped to itself, like the About pane. */
+static struct { rectf r; uint64_t mid; size_t item; } g_sumrows[128];
+static int   g_n_sumrows;
+static float g_sum_scroll, g_sum_max;
+
+static void draw_summary_pane(gfx *rt, const oc_model *m, rectf reg) {
+    g_n_sumrows = 0;
+    gfx_clip_push(rt, gr(reg));
+    float x = reg.left + 16, w = reg.right - reg.left - 28;
+    float y = reg.top + 4 - g_sum_scroll;
+    char span[48];
+    oc_summary_span_label(m->summary_scope, m->summary_start, m->summary_end, span, sizeof span);
+    draw_text(rt, span, g_ui, rf(x, y, x + w, y + 24), OC_COL_TEXT);
+    y += 30;
+    const char *say = NULL;
+    uint32_t say_col = OC_COL_FAINT;
+    char wait[96];
+    if (m->summary_loading) {
+        oc_summary_wait_text(m->summary_position, wait, sizeof wait);
+        say = wait;
+    } else if (m->summary_status != OC_SUM_OK) { say = m->summary_error ? m->summary_error : "No summary."; say_col = OC_COL_DANGER; }
+    else if (!m->summary.overview[0] && !m->summary.n_items) say = "Nothing to summarize in this span.";
+    if (say) {
+        float h = text_height(say, g_body, w);
+        draw_text(rt, say, g_body, rf(x, y, x + w, y + h), say_col);
+        y += h + 8;
+    } else {
+        if (m->summary.overview[0]) {
+            float h = text_height(m->summary.overview, g_body, w);
+            draw_text(rt, m->summary.overview, g_body, rf(x, y, x + w, y + h), OC_COL_TEXT);
+            y += h + 12;
+        }
+        for (uint8_t k = 0; k < 4; k++) {
+            int any = 0;
+            for (size_t i = 0; i < m->summary.n_items; i++) {
+                const oc_summary_item *it = &m->summary.items[i];
+                if (it->kind != k) continue;
+                if (!any) {
+                    char head[24];
+                    snprintf(head, sizeof head, "%s", oc_summary_kind_heading(k));
+                    for (char *c = head; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+                    draw_text(rt, head, g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+                    y += 22;
+                    any = 1;
+                }
+                size_t cap = strlen(it->text) + (it->who ? strlen(it->who) : 0) + 32;
+                char *line = malloc(cap);
+                if (!line) continue;
+                snprintf(line, cap, "%s%s%s%s%s%s", it->who ? it->who : "", it->who ? ": " : "", it->text,
+                         it->status[0] ? " (" : "", it->status, it->status[0] ? ")" : "");
+                char note[48];
+                snprintf(note, sizeof note, "%zu message%s", it->n_refs, it->n_refs == 1 ? "" : "s");
+                float h = text_height(line, g_body, w - 8);
+                rectf row = rf(x - 6, y - 3, x + w + 4, y + h + 22);
+                if (it->n_refs && in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+                draw_text(rt, line, g_body, rf(x, y, x + w - 8, y + h), OC_COL_TEXT);
+                draw_text(rt, note, g_meta, rf(x, y + h + 1, x + w, y + h + 19), OC_COL_MUTED);
+                free(line);
+                if (it->n_refs && row.bottom > reg.top && row.top < reg.bottom &&
+                    g_n_sumrows < (int)(sizeof g_sumrows / sizeof g_sumrows[0])) {
+                    rectf vis = row;
+                    if (vis.top < reg.top) vis.top = reg.top;
+                    if (vis.bottom > reg.bottom) vis.bottom = reg.bottom;
+                    g_sumrows[g_n_sumrows].r = vis;
+                    g_sumrows[g_n_sumrows].mid = it->refs[0];
+                    g_sumrows[g_n_sumrows].item = i;
+                    g_n_sumrows++;
+                }
+                y += h + 28;
+            }
+            if (any) y += 6;
+        }
+    }
+    gfx_clip_pop(rt);
+    float content = y + g_sum_scroll - reg.top;
+    float view = reg.bottom - reg.top;
+    g_sum_max = content > view ? content - view : 0;
+    if (g_sum_scroll > g_sum_max) g_sum_scroll = g_sum_max;
+}
+
+/* Ask for a summary of `cid` (REQ-310): which span, then the pane, beside the
+ * conversation so its items can be gone to. */
+static void summarize_ask(HWND hwnd, uint64_t cid) {
+    const oc_model *m = model();
+    if (!g_client || !m || !cid || !oc_model_summarize_available(m)) return;
+    oc_field f[2] = {
+        { FF_CHOICE, "Summarize", "Unread|Last 7 days|Since yesterday|Dates", "1" },
+        { FF_TEXT,   "Dates", "For Dates: the first and last day, YYYY-MM-DD YYYY-MM-DD", "" },
+    };
+    for (;;) {
+        if (!form_dialog(hwnd, "Summarize", f, 2)) return;
+        int pick = atoi(f[0].value);
+        uint64_t rs = 0, re = 0;
+        if (pick == 3 && oc_summary_range_parse(f[1].value, &rs, &re) != 0) {
+            g_form_err_field = 1;   /* ask again, with the dates field saying why */
+            continue;
+        }
+        static const uint8_t SC[4] = { OC_SUM_UNREAD, OC_SUM_WEEK, OC_SUM_DAILY, OC_SUM_RANGE };
+        if (pick < 0 || pick > 3) return;
+        if (cid != g_sel) select_channel(cid);
+        if (oc_client_summarize(g_client, cid, SC[pick], rs, re)) {
+            g_sum_scroll = 0;
+            rp_push(RP_SUMMARY);
+            layout_composer(hwnd);
+        }
+        return;
+    }
+}
 
 /* Close the profile, if one is open. "Which profile is showing" is two
  * variables, the pane's mode and the user id, and they change together or not
@@ -10345,8 +10464,17 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
     /* One header for every mode: a title, a back arrow when there is somewhere
      * to go back to, and a close. Without the back arrow, opening a person's
      * card stranded you — the list you came from was gone. */
+    /* A summary is of the conversation it was asked in, only while you are in
+     * it (as Slack's are). */
+    if (m->summary_open && m->summary_channel != g_sel && g_client) {
+        if (g_rp_mode == RP_SUMMARY) rp_pop();
+        else oc_client_close_summary(g_client);
+    }
+    if (g_rp_mode == RP_SUMMARY && !m->summary_open) rp_pop();
+    g_n_sumrows = 0;
     const char *title = g_rp_mode == RP_PROFILE  ? "PROFILE"
-                      : g_rp_mode == RP_REACTORS ? "REACTIONS" : "MEMBERS";
+                      : g_rp_mode == RP_REACTORS ? "REACTIONS"
+                      : g_rp_mode == RP_SUMMARY  ? "SUMMARY" : "MEMBERS";
     g_rp_back = g_rp_mode == RP_MEMBERS ? rf(0, 0, 0, 0) : rf(x0 + 8, 8, x0 + 30, 30);
     if (g_rp_mode != RP_MEMBERS) {
         if (g_chrome_hover == 5) fill_round(rt, g_rp_back, OC_R_CONTROL, OC_COL_HOVER);
@@ -10375,6 +10503,7 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
     }
     if (g_rp_mode == RP_PROFILE)  { mem_hits_clear(); draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
     if (g_rp_mode == RP_REACTORS) { mem_hits_clear(); draw_reactors_list(rt, m, rf(x0, 40, W, H)); return; }
+    if (g_rp_mode == RP_SUMMARY)  { mem_hits_clear(); draw_summary_pane(rt, m, rf(x0, 40, W, H)); return; }
 
     float y = 40;
     mem_hits_clear();
@@ -19187,7 +19316,8 @@ enum {
     AT_FTRAY,         /* payload: upload-tray chip index — remove it, or cancel its post */
     AT_ADMTAB,        /* payload: Admin tab index */
     AT_TOAST,         /* payload: toast id * 2, + 1 for its close */
-    AT_ALERTACK       /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
+    AT_ALERTACK,      /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
+    AT_SUMITEM        /* payload: summary pane row index — go to its message */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -19721,6 +19851,20 @@ static void a11y_publish_scene(const oc_model *m) {
         snprintf(nm, sizeof nm, "%s %d, %s", g_rxn_chip[i].emoji, g_rxn_chip[i].count,
                  g_rxn_chip[i].mine ? "yours: press to take it back" : "press to react");
         acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_rxn_chip[i].r, ATOK(AT_REACTCHIP, (uint64_t)i));
+    }
+    /* The summary pane's items: each goes to its message (REQ-310). Named by
+     * the item's text, as drawn. */
+    if (g_show_members && g_rp_mode == RP_SUMMARY && m && m->summary_open) {
+        for (int row = 0; row < g_n_sumrows && n < OC_ACC_MAX; row++) {
+            size_t i = g_sumrows[row].item;
+            if (i >= m->summary.n_items) continue;
+            const oc_summary_item *si = &m->summary.items[i];
+            char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "summary.item.%zu", i);
+            snprintf(nm, sizeof nm, "%s: %s%s%s", oc_summary_kind_heading(si->kind), si->who ? si->who : "",
+                     si->who ? ", " : "", si->text);
+            acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_sumrows[row].r, ATOK(AT_SUMITEM, (uint64_t)row));
+        }
     }
     if (g_view == VIEW_DRAFTS) {
         static const char *DT_AID[DTAB_COUNT] = { "drafts", "scheduled", "sent" };
@@ -23903,6 +24047,14 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
     if (files_click(hwnd, x, y)) return 1;
+    /* A summary item: go to its first message, the pane staying open. */
+    if (g_show_members && g_rp_mode == RP_SUMMARY)
+        for (int i = 0; i < g_n_sumrows; i++)
+            if (in_rect(g_sumrows[i].r, x, y)) {
+                g_jump_mid = g_sumrows[i].mid;
+                g_jump_deadline = GetTickCount64() + 1500;
+                return 1;
+            }
     /* Rows of the open pins overlay. */
     for (int i = 0; i < g_n_pinrows; i++) {
         if (in_rect(g_pinrows[i].unpin, x, y)) {
@@ -27032,6 +27184,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     const oc_model *m = model();
     if (cmd >= CC_MUTE && cmd <= CC_LAST) { call_cmd(hwnd, cmd); return; }
     switch (cmd) {
+    case 88: if (g_sel) summarize_ask(hwnd, g_sel); break;   /* REQ-310 */
     case 1: {   /* the wire has always carried is_public; now so does the UI. */
         oc_field f[2] = {
             { FF_TEXT,   "Channel name", "Lower-case, no spaces. Names are unique.", "" },
@@ -27488,6 +27641,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
                                                       : "Add to Starred");
         mi_item(31, c->muted ? "Unmute" : "Mute");
         mi_item(2, "Mark as read");
+        if (oc_model_summarize_available(m)) mi_item(23, "Summarize");   /* REQ-310 */
         /* Notification levels FLATTENED out of a submenu, with the current
          * one ticked — the same reasoning as the member role: the useful part of a
          * three-way choice is seeing which one is set. */
@@ -27637,6 +27791,7 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
+    case 23: summarize_ask(hwnd, cid); break;
     default:
         if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
             if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
@@ -29874,6 +30029,17 @@ static void test_poll(HWND hwnd) {
         layout_composer(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
+    } else if (!strcmp(verb, "summary")) {
+        /* "summary <scope>" asks for this conversation's summary over that span
+         * (0 unread, 1 last 7 days, 3 since yesterday), bypassing the form as
+         * "chup" does; "summary close" closes it. */
+        if (!strcmp(arg, "close")) { if (g_rp_mode == RP_SUMMARY) rp_pop(); test_ack("ok"); }
+        else if (g_client && g_sel && oc_client_summarize(g_client, g_sel, (uint8_t)atoi(arg), 0, 0)) {
+            g_sum_scroll = 0;
+            rp_push(RP_SUMMARY);
+            layout_composer(hwnd);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "pins")) {
         const oc_model *pm = model();
         if (pm && pm->pinlist_open) oc_client_close_pins(g_client);
@@ -31045,6 +31211,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+            if (mw > 0 && g_show_members && g_rp_mode == RP_SUMMARY &&
+                (float)wpt.x >= cw - mw && (float)wpt.y >= 40.0f) {
+                g_sum_scroll -= dy;
+                if (g_sum_scroll < 0) g_sum_scroll = 0;
+                if (g_sum_scroll > g_sum_max) g_sum_scroll = g_sum_max;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
         }
         if (transcript_shell()
             && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
@@ -31699,6 +31873,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case AT_ALERTACK:
             if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && (int)arg < g_n_alertrows && g_client)
                 oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
+            break;
+        case AT_SUMITEM:
+            if (g_show_members && g_rp_mode == RP_SUMMARY && (int)arg < g_n_sumrows) {
+                g_jump_mid = g_sumrows[arg].mid;
+                g_jump_deadline = GetTickCount64() + 1500;
+            }
             break;
         case AT_WSMGR:
             if (g_wsmgr_open && (int)arg < g_n_wsmgr_hits)

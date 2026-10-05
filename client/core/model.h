@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "event.h"
+#include "summary.h"
 
 /* One emoji's aggregate on a message: the running count and whether we reacted. */
 /* One of the daemon's voices (ARCH-111): the id a profile stores, and the name a
@@ -464,6 +465,21 @@ typedef struct {
     uint8_t   pinlist_loading;   /* asked, terminator not yet seen */
     oc_pinned_row *pins;
     size_t    n_pins, cap_pins;
+    /* The open summary (REQ-310): one conversation over one span, asked as
+     * `summary_req`. Shown to the person who asked and kept nowhere: closing it
+     * forgets it, and an answer to anything but the open request is dropped.
+     * While `summary_loading`, nothing has come back; then `summary_status` is
+     * OC_SUM_*, with `summary` when OK and `summary_error` (heap) otherwise. */
+    uint8_t   summary_open;
+    uint8_t   summary_loading;
+    uint8_t   summary_scope;     /* OC_SUM_UNREAD... */
+    uint8_t   summary_status;
+    uint32_t  summary_req;
+    int32_t   summary_position;  /* requests ahead of it while loading; -1 until told */
+    uint64_t  summary_channel;
+    uint64_t  summary_start, summary_end;   /* the span: asked for, then as covered */
+    char     *summary_error;
+    oc_summary_view summary;
     /* The selected channel's own member roster (REQ-031) and shared files
      * (REQ-143). Both are per-channel views, refreshed on open rather than
      * cached: a client stores nothing (ARCH-88) and a stale roster is worse
@@ -910,6 +926,12 @@ void oc_model_close_reactlist(oc_model *m);
 void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id);
 void oc_model_close_pinlist(oc_model *m);
 
+/* Begin / end a summary (REQ-310). Begin forgets any open one and waits for
+ * the answer to request `req_id`. */
+void oc_model_summary_begin(oc_model *m, uint64_t channel_id, uint8_t scope, uint64_t start_ms,
+                            uint64_t end_ms, uint32_t req_id);
+void oc_model_close_summary(oc_model *m);
+
 /* A channel's own member roster (REQ-031) and shared files (REQ-143). */
 void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id);
 void oc_model_filelist_begin(oc_model *m, uint64_t channel_id);
@@ -1127,6 +1149,9 @@ uint8_t         oc_model_tts_available(const oc_model *m);
 uint8_t         oc_model_stt_available(const oc_model *m);
 /* The daemon offers calls: its relay is up (REQ-150). */
 uint8_t         oc_model_calls_available(const oc_model *m);
+/* The daemon summarizes conversations (the "summarize" capability, REQ-313):
+ * without it, a frontend shows nothing of summaries. */
+uint8_t         oc_model_summarize_available(const oc_model *m);
 /* The oldest push-to-talk words spoken into (channel_id, thread_root): 1 and a
  * malloc'd string the caller frees, or 0 if none are waiting. Words for another
  * conversation stay until asked for there. */

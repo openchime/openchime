@@ -228,6 +228,7 @@ void oc_model_free(oc_model *m) {
     for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
     free(m->search_results);
     free(m->reactors);
+    oc_model_close_summary(m);
     for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
     free(m->pins);
     free(m->chanmem);
@@ -481,6 +482,9 @@ int oc_model_has_capability(const oc_model *m, const char *name) {
 uint8_t     oc_model_tts_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_TTS); }
 uint8_t     oc_model_stt_available(const oc_model *m)   { return (uint8_t)oc_model_has_capability(m, OC_CAP_STT); }
 uint8_t     oc_model_calls_available(const oc_model *m) { return (uint8_t)oc_model_has_capability(m, OC_CAP_CALLS); }
+uint8_t     oc_model_summarize_available(const oc_model *m) {
+    return (uint8_t)oc_model_has_capability(m, OC_CAP_SUMMARIZE);
+}
 
 int oc_model_stt_take_words(oc_model *m, uint64_t channel_id, uint64_t thread_root, char **text) {
     for (uint8_t i = 0; i < m->n_stt_words; i++) {
@@ -583,6 +587,29 @@ void oc_model_close_pinlist(oc_model *m) {
     m->pinlist_open = 0;
     m->pinlist_loading = 0;
     m->pinlist_channel = 0;
+}
+
+void oc_model_close_summary(oc_model *m) {
+    oc_summary_view_free(&m->summary);
+    free(m->summary_error);
+    m->summary_error = NULL;
+    m->summary_open = m->summary_loading = m->summary_scope = m->summary_status = 0;
+    m->summary_req = 0;
+    m->summary_position = -1;
+    m->summary_channel = m->summary_start = m->summary_end = 0;
+}
+
+void oc_model_summary_begin(oc_model *m, uint64_t channel_id, uint8_t scope, uint64_t start_ms,
+                            uint64_t end_ms, uint32_t req_id) {
+    oc_model_close_summary(m);
+    m->summary_open = 1;
+    m->summary_loading = 1;
+    m->summary_channel = channel_id;
+    m->summary_scope = scope;
+    m->summary_start = start_ms;
+    m->summary_end = end_ms;
+    m->summary_req = req_id;
+    m->summary_position = -1;
 }
 
 void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id) {
@@ -2049,6 +2076,30 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(pr->attach_name, sizeof pr->attach_name, "%s", e->author_name);
         break;
     }
+    case OC_EV_SUMMARY: {
+        /* Only the answer to the open request: an abandoned or replaced one is
+         * dropped, as the daemon still makes it and keeps it for next time. */
+        if (!m->summary_open || !m->summary_loading || e->req_id != m->summary_req) break;
+        m->summary_loading = 0;
+        m->summary_status = e->status;
+        if (e->status == OC_SUM_OK) {
+            const char *b = e->body ? e->body : "";
+            if (oc_summary_view_parse(b, strlen(b), &m->summary) == 0) {
+                m->summary_start = e->span_start;
+                m->summary_end = e->span_end;
+                break;
+            }
+            m->summary_status = OC_SUM_FAILED;
+            m->summary_error = strdup("The summary could not be read.");
+        } else {
+            m->summary_error = strdup(e->body && *e->body ? e->body : "No summary.");
+        }
+        break;
+    }
+    case OC_EV_SUMMARY_QUEUED:
+        if (m->summary_open && m->summary_loading && e->req_id == m->summary_req)
+            m->summary_position = (int32_t)e->count;
+        break;
     case OC_EV_PINS_END:
         if (m->pinlist_open && m->pinlist_channel == e->channel_id)
             m->pinlist_loading = 0;

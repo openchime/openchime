@@ -686,6 +686,7 @@ static void draw_help(int W, int H) {
         { NULL, NULL },
         { NULL, "Everything else" },
         { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
+        { "Summaries",  "Ctrl+K · Summarize, or Enter on a channel: ↑/↓ item · Enter goes to it" },
     };
     int n = (int)(sizeof R / sizeof R[0]);
     const tk_theme *th = tk_theme_active();
@@ -782,7 +783,9 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
        ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
-       ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY };
+       ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY,
+       /* summaries (REQ-310): ask, pick the span, or go back to the open one */
+       ACT_SUMMARIZE, ACT_SUM_UNREAD, ACT_SUM_WEEK, ACT_SUM_DAILY, ACT_SUM_RANGE, ACT_SUM_BACK };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
 static int      g_nmenu;
@@ -811,10 +814,11 @@ static void menu_build_member(int is_self) {
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
 }
-static void menu_build_channel(int joined) {
+static void menu_build_channel(int joined, int summarize) {
     g_nmenu = 0;
     if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
     g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
+    if (summarize) g_menu[g_nmenu++] = (menuitem){ "Summarize",   ACT_SUMMARIZE };
     g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
@@ -846,7 +850,29 @@ static const tk_pal_item g_launcher_items[] = {
     { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
     { "Session", "Help",                NULL, "?",  ACT_HELP },
     { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
+    { "Channel", "Summarize",           NULL, NULL, ACT_SUMMARIZE },
 };
+/* The launcher as it is now: summaries only where the daemon makes them
+ * (REQ-313), and a way back to the open one for this conversation. */
+static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 1];
+static int launcher_build(const oc_model *m, uint64_t cid) {
+    int n = 0;
+    for (size_t i = 0; i < sizeof g_launcher_items / sizeof *g_launcher_items; i++) {
+        if (g_launcher_items[i].id == ACT_SUMMARIZE && !oc_model_summarize_available(m)) continue;
+        g_launcher_now[n++] = g_launcher_items[i];
+    }
+    if (m->summary_open && cid && m->summary_channel == cid)
+        g_launcher_now[n++] = (tk_pal_item){ "Channel", "Back to the summary", NULL, NULL, ACT_SUM_BACK };
+    return n;
+}
+/* The spans a summary can cover (PROTOCOL.md SUMMARIZE). */
+static void menu_build_summary_span(void) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "Unread",           ACT_SUM_UNREAD };
+    g_menu[g_nmenu++] = (menuitem){ "Last 7 days",      ACT_SUM_WEEK };
+    g_menu[g_nmenu++] = (menuitem){ "Since yesterday",  ACT_SUM_DAILY };
+    g_menu[g_nmenu++] = (menuitem){ "Dates",            ACT_SUM_RANGE };
+}
 
 /* ---- sidebar (shared with the GUI via the core) ----------------------------
  * Grouping, filtering, sorting and collapse come from oc_model_sidebar so this
@@ -1330,6 +1356,70 @@ static void draw_alerts(const oc_model *m, int W, int H, int sel) {
         snprintf(msg, sizeof msg, "    %s", a->message);
         tk_text(r.x, y + 1, r.x + r.w, msg, a->acked ? th->muted : th->fg, th->bg);
     }
+}
+
+/* The open summary (REQ-310): the overview, then decisions, actions, problems
+ * and facts, each item with how many messages it came from. Up/down selects
+ * an item; Enter goes to its first message; Esc closes and forgets it. While
+ * the daemon makes it, says so: on a small server that can take minutes. */
+static void draw_summary(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    char span[48], title[320], name[96];
+    oc_summary_span_label(m->summary_scope, m->summary_start, m->summary_end, span, sizeof span);
+    const oc_channel *ch = oc_model_channel((oc_model *)m, m->summary_channel);
+    if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name(m, ch->peer_id);
+        snprintf(name, sizeof name, "@%s", pn[0] ? pn : "dm");
+    } else snprintf(name, sizeof name, "#%s", ch && ch->name ? ch->name : "…");
+    snprintf(title, sizeof title, "Summary of %s · %s  ·  ↑↓ select · Enter go to message · Esc closes", name, span);
+    int cw = W - 10 > 96 ? 96 : W - 10;
+    if (cw < 20) cw = 20;
+    rows_t r = {0};
+    if (m->summary_loading) {
+        char wait[96];
+        oc_summary_wait_text(m->summary_position, wait, sizeof wait);
+        wrap_words_push(&r, wait, th->muted, cw, 0);
+    } else if (m->summary_status != OC_SUM_OK) {
+        wrap_words_push(&r, m->summary_error ? m->summary_error : "No summary.", TB_RED | TB_BOLD, cw, 0);
+    } else if (!m->summary.overview[0] && !m->summary.n_items) {
+        wrap_words_push(&r, "Nothing to summarize in this span.", th->muted, cw, 0);
+    } else {
+        if (m->summary.overview[0]) wrap_words_push(&r, m->summary.overview, th->fg, cw, 0);
+        for (uint8_t k = 0; k < 4; k++) {
+            int any = 0;
+            for (size_t i = 0; i < m->summary.n_items; i++) {
+                const oc_summary_item *it = &m->summary.items[i];
+                if (it->kind != k) continue;
+                if (!any) {
+                    rows_push(&r, strdup(""), th->fg);
+                    rows_push(&r, strdup(oc_summary_kind_heading(k)), th->accent2 | TB_BOLD);
+                    any = 1;
+                }
+                size_t cap = strlen(it->text) + (it->who ? strlen(it->who) : 0) + 64;
+                char *line = malloc(cap);
+                if (!line) continue;
+                snprintf(line, cap, "%s %s%s%s%s%s%s · %zu message%s", (int)i == sel ? "\xe2\x96\xb8" : "\xe2\x80\xa2",
+                         it->who ? it->who : "", it->who ? ": " : "", it->text,
+                         it->status[0] ? " (" : "", it->status, it->status[0] ? ")" : "",
+                         it->n_refs, it->n_refs == 1 ? "" : "s");
+                size_t first = r.n;
+                wrap_words_push(&r, line, (int)i == sel ? (th->accent | TB_BOLD) : th->fg, cw, 2);
+                free(line);
+                for (size_t j = first; j < r.n; j++) r.v[j].mi = (int)i;
+            }
+        }
+    }
+    int rows = (int)r.n;
+    if (rows > H - 8) rows = H - 8;
+    if (rows < 1) rows = 1;
+    tk_rect box = modal_frame(W, H, cw, rows, title);
+    /* Keep the selected item in view. */
+    int start = 0, last = -1;
+    for (int i = 0; i < (int)r.n; i++) if (r.v[i].mi == sel && sel >= 0) last = i;
+    if (last >= box.h) start = last - box.h + 1;
+    for (int i = 0; i < box.h && start + i < (int)r.n; i++)
+        tk_text(box.x, box.y + i, box.x + box.w, r.v[start + i].s, r.v[start + i].fg, th->bg);
+    rows_free(&r);
 }
 
 /* ---- workspace switcher (REQ-013) -------------------------------------------
@@ -2178,6 +2268,10 @@ int main(int argc, char **argv) {
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int alerts_open = 0, asel = 0;            /* the daemon's critical failures (REQ-263) */
+    int summary_ui = 0, ssel = 0;             /* the open summary's overlay (REQ-310) */
+    uint64_t jump_mid = 0;                    /* a summary item's message, being found */
+    time_t jump_since = 0;
+    int jump_asked = 0;
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int ac_idx = 0;                           /* autocomplete cycle index */
@@ -2202,7 +2296,7 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW, PROMPT_INVITE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW, PROMPT_INVITE, PROMPT_SUMRANGE };
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -2314,7 +2408,23 @@ int main(int argc, char **argv) {
         if (focus < m->n_channels) {
             uint64_t cid = m->channels[focus].channel_id;
             oc_client_backfill(cl, cid);
-            if (cid != last_focus_cid) { scroll = 0; msg_sel = -1; last_focus_cid = cid; g_hold_unread = 0; }
+            if (cid != last_focus_cid) {
+                scroll = 0; msg_sel = -1; last_focus_cid = cid; g_hold_unread = 0;
+                /* A summary is of the conversation it was asked in, and only while
+                 * you stay there (as Slack's are). */
+                if (m->summary_open && m->summary_channel != cid) { oc_client_close_summary(cl); summary_ui = 0; }
+                jump_mid = 0;
+            }
+            /* Going to a summary item's message: select it once it is loaded,
+             * asking for the history around it if it is not. */
+            if (jump_mid) {
+                const oc_channel *jc = &m->channels[focus];
+                int found = -1;
+                for (size_t k = 0; k < jc->n_msgs && found < 0; k++) if (jc->msgs[k].message_id == jump_mid) found = (int)k;
+                if (found >= 0) { panel = 2; msg_sel = found; jump_mid = 0; }
+                else if (!jump_asked) { oc_client_history_around(cl, cid, jump_mid, 40); jump_asked = 1; }
+                else if (time(NULL) - jump_since > 5) jump_mid = 0;   /* not in this conversation's history */
+            }
             if (cid != g_hold_unread) oc_client_mark_read(cl, cid);
         }
 
@@ -2347,6 +2457,7 @@ int main(int argc, char **argv) {
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
         if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
+        if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
         tb_present();
 
         struct tb_event ev;
@@ -2357,7 +2468,7 @@ int main(int argc, char **argv) {
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
             else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open &&
-                     !alerts_open) {
+                     !alerts_open && !summary_ui) {
                 int Wm = tb_width(); int chw, memw, msgx, msgw;
                 layout(Wm, &chw, &memw, &msgx, &msgw);
                 int prow = ev.y - 2;           /* first panel content row */
@@ -2451,6 +2562,22 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (summary_ui) {                      /* the summary: select an item, go to it, close */
+            const oc_model *sm = oc_client_model(cl);
+            int n = sm->summary_open && !sm->summary_loading ? (int)sm->summary.n_items : 0;
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (ev.key == TB_KEY_ESC || !sm->summary_open) { summary_ui = 0; oc_client_close_summary(cl); }
+            else if (ev.key == TB_KEY_ARROW_DOWN) { if (ssel + 1 < n) ssel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)   { if (ssel > 0) ssel--; }
+            else if (ev.key == TB_KEY_ENTER && ssel < n && sm->summary.items[ssel].n_refs) {
+                /* Kept while you stay in the conversation: Ctrl+K goes back to it. */
+                jump_mid = sm->summary.items[ssel].refs[0];
+                jump_since = time(NULL);
+                jump_asked = 0;
+                summary_ui = 0;
+            }
+            continue;
+        }
         if (alerts_open) {                     /* daemon alerts: select, acknowledge, close */
             const oc_model *am = oc_client_model(cl);
             int n = (int)am->n_srvalerts;
@@ -2494,6 +2621,13 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_SUMRANGE && *v) {
+                    uint64_t rs, re;
+                    if (oc_summary_range_parse(v, &rs, &re) != 0) {
+                        prompt_kind = PROMPT_SUMRANGE;     /* stay open, and say what it takes */
+                        prompt_title = "Two dates, the first not after the second: YYYY-MM-DD YYYY-MM-DD";
+                    } else if (oc_client_summarize(cl, act_cid, OC_SUM_RANGE, rs, re)) { summary_ui = 1; ssel = 0; }
+                }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
                      * provider; blank for a token, where it has password accounts.
@@ -2585,6 +2719,12 @@ int main(int argc, char **argv) {
                 else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                 else if (id == ACT_HELP)    help_open = 1;
                 else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                else if (id == ACT_SUMMARIZE && act_cid) {
+                    menu_build_summary_span();
+                    act_title = "Summarize";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
+                else if (id == ACT_SUM_BACK) { summary_ui = 1; ssel = 0; }
             }
             continue;
         }
@@ -2669,6 +2809,21 @@ int main(int argc, char **argv) {
                     else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
                     else if (id == ACT_HELP)    help_open = 1;
                     else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                    /* summaries: the span, then the summary */
+                    else if (id == ACT_SUMMARIZE) {
+                        menu_build_summary_span();
+                        act_title = "Summarize";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
+                    else if (id == ACT_SUM_UNREAD || id == ACT_SUM_WEEK || id == ACT_SUM_DAILY) {
+                        uint8_t sc = id == ACT_SUM_UNREAD ? OC_SUM_UNREAD : id == ACT_SUM_WEEK ? OC_SUM_WEEK : OC_SUM_DAILY;
+                        if (oc_client_summarize(cl, act_cid, sc, 0, 0)) { summary_ui = 1; ssel = 0; }
+                    }
+                    else if (id == ACT_SUM_RANGE) {
+                        prompt_kind = PROMPT_SUMRANGE;
+                        prompt_title = "Summarize: the first and last day (YYYY-MM-DD YYYY-MM-DD)";
+                        tk_input_init(&prompt_input, 0, "2026-09-04 2026-09-14");
+                    }
                 }
             }
             continue;
@@ -2696,7 +2851,7 @@ int main(int argc, char **argv) {
         if (ev.key == TB_KEY_CTRL_K) {         /* global action launcher (tuikit tk_palette) */
             const oc_model *mm = oc_client_model(cl);
             act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
-            tk_palette_set(&launcher, g_launcher_items, (int)(sizeof g_launcher_items / sizeof *g_launcher_items));
+            tk_palette_set(&launcher, g_launcher_now, launcher_build(mm, act_cid));
             launcher_open = 1;
             continue;
         }
@@ -2765,7 +2920,7 @@ int main(int argc, char **argv) {
                         oc_sb_set_collapsed(&g_sb, g_sb_hdr, (uint8_t)!oc_sb_collapsed_of(&g_sb, g_sb_hdr));
                         sidebar_opts_save(cl);
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
-                        menu_build_channel(mm->channels[focus].joined);
+                        menu_build_channel(mm->channels[focus].joined, oc_model_summarize_available(mm));
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
@@ -2868,7 +3023,7 @@ int main(int argc, char **argv) {
         } else if (ev.ch == ':' && clen == 0) {   /* : opens the action launcher */
             const oc_model *mm = oc_client_model(cl);
             act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
-            tk_palette_set(&launcher, g_launcher_items, (int)(sizeof g_launcher_items / sizeof *g_launcher_items));
+            tk_palette_set(&launcher, g_launcher_now, launcher_build(mm, act_cid));
             launcher_open = 1;
         } else if (ev.ch != 0) {
             /* A typed codepoint: append its UTF-8 encoding to the composer. */

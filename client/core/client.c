@@ -33,6 +33,7 @@ struct oc_client {
     oc_queue events;   /* net -> UI (oc_ev) */
     oc_queue cmds;     /* UI -> net (oc_cmd) */
     oc_model model;
+    uint32_t next_req; /* SUMMARIZE's request ids; the UI thread's alone */
 };
 
 oc_client *oc_client_start(const char *host, int port, const char *cred) {
@@ -642,6 +643,27 @@ void oc_client_close_files(oc_client *c) {
 
 void oc_client_close_pins(oc_client *c) {
     if (c) oc_model_close_pinlist(&c->model);
+}
+
+uint32_t oc_client_summarize(oc_client *c, uint64_t channel_id, uint8_t scope, uint64_t start_ms, uint64_t end_ms) {
+    if (!c || !channel_id || scope > OC_SUM_DAILY) return 0;
+    if (++c->next_req == 0) c->next_req = 1;
+    uint32_t req = c->next_req;
+    if (scope != OC_SUM_RANGE) start_ms = end_ms = 0;
+    oc_model_summary_begin(&c->model, channel_id, scope, start_ms, end_ms, req);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARIZE);
+    if (!cmd) { oc_model_close_summary(&c->model); return 0; }
+    cmd->channel_id = channel_id;
+    cmd->req_id = req;
+    cmd->scope = scope;
+    cmd->start_ms = start_ms;
+    cmd->end_ms = end_ms;
+    oc_queue_push(&c->cmds, cmd);
+    return req;
+}
+
+void oc_client_close_summary(oc_client *c) {
+    if (c) oc_model_close_summary(&c->model);
 }
 
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id) {

@@ -1057,6 +1057,35 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY) {
+            oc_summary sm;
+            if (oc_decode_summary(&p, &sm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY);
+                if (e) {
+                    e->req_id = sm.req_id;
+                    e->status = sm.status;
+                    e->summary_id = sm.summary_id;
+                    e->channel_id = sm.channel_id;
+                    e->span_start = sm.start_ms;
+                    e->span_end = sm.end_ms;
+                    e->body = malloc(sm.body.len + 1);
+                    if (e->body) {
+                        memcpy(e->body, sm.body.ptr, sm.body.len);
+                        e->body[sm.body.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED) {
+            oc_summary_queued sq;
+            if (oc_decode_summary_queued(&p, &sq) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY_QUEUED);
+                if (e) {
+                    e->req_id = sq.req_id;
+                    e->count = sq.position;
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_DESCRIPTION) {
             oc_channel_description cd;
             if (oc_decode_channel_description(&p, &cd) == OC_OK) {
@@ -3484,6 +3513,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_get_channel_description gd = { c->channel_id };
                 if (oc_encode_get_channel_description(&w, OC_PROTOCOL_VERSION, &gd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARIZE) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summarize sm = { c->req_id, c->channel_id, c->scope, c->start_ms, c->end_ms };
+                if (oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_MARK_ALL_READ) {

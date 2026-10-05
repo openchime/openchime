@@ -20,6 +20,11 @@ Days are the reader's, by the time-zone offset their client reports
 (`users.tz_offset_min`). The answer is the summary as JSON (§3); a summary not
 yet made is made while the request waits.
 
+In the TUI and the Windows client (CLIENT.md §2–3), a summary is asked for from
+the conversation's menu or the launcher, shown only to the person who asked, and
+forgotten when they close it or leave the conversation. Each item goes to the
+first message it came from.
+
 ## 2. One summarize step, recursively
 
 **What is summarized.** People's messages: not integration posts
