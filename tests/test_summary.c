@@ -116,7 +116,7 @@ static void test_parse(void) {
     /* The follow-up's line numbers go to the item it was asked about. */
     oc_sum_buf q = {0}, fg = {0};
     CHECK(oc_sum_followup(ask.p, 1, l.n, &q, &fg) == 0);
-    CHECK(strstr(q.p, "1. Problem: cites nothing real") && strstr(fg.p, "k ::= \"1\"\n") &&
+    CHECK(strstr(q.p, "1. Problem: cites nothing real") && strstr(fg.p, "root ::= \"1:\" cites \"\\n\"\n") &&
           strstr(fg.p, "id ::= \"1\" | \"2\"\n"));
     CHECK(oc_sum_parse(ans, "1: [2]\n", &l, &pp, &out, NULL, NULL) == 4);
     CHECK(out.p && strstr(out.p, "\"problems\":[{\"text\":\"cites nothing real\",\"refs\":[101],\"status\":\"open\"}]"));
@@ -432,7 +432,7 @@ static int s_more(void *h, const char *user, const char *grammar, oc_sum_gate_fn
     stub *s = h;
     if (gate && gate(gctx)) return -1;
     if (st) memset(st, 0, sizeof *st);
-    if (strstr(user, "1. Decision: agreed") && strstr(grammar, "root ::= item+")) s->follow++;
+    if (strstr(user, "1. Decision: agreed") && strstr(grammar, "root ::= \"1:\" cites")) s->follow++;
     *out = strdup("1: [1]\n");
     return 0;
 }

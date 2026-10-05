@@ -594,9 +594,10 @@ int oc_sum_followup(const char *ask, int n_items, int n_lines, oc_sum_buf *q, oc
     oc_sum_buf_puts(q, "\nFor each item, write its number, a colon, and the numbers of the lines it comes "
                        "from, each in brackets, one item to a line, like this: "
                        "\"<item number>: [line number][line number]\".\n");
-    oc_sum_buf_puts(g, "root ::= item+\nitem ::= k \":\" ( \" [\" id \"]\" )+ \"\\n\"\nk ::= ");
-    for (int i = 1; i <= (n_items < 1 ? 1 : n_items); i++) oc_sum_buf_printf(g, "%s\"%d\"", i > 1 ? " | " : "", i);
-    oc_sum_buf_puts(g, "\nid ::= ");
+    /* Each item once, in order, and then the answer ends. */
+    oc_sum_buf_puts(g, "root ::=");
+    for (int i = 1; i <= (n_items < 1 ? 1 : n_items); i++) oc_sum_buf_printf(g, " \"%d:\" cites \"\\n\"", i);
+    oc_sum_buf_puts(g, "\ncites ::= ( \" [\" id \"]\" )+\nid ::= ");
     for (int i = 1; i <= (n_lines < 1 ? 1 : n_lines); i++) oc_sum_buf_printf(g, "%s\"%d\"", i > 1 ? " | " : "", i);
     oc_sum_buf_puts(g, "\n");
     return q->oom || g->oom ? -1 : 0;

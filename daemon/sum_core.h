@@ -192,7 +192,8 @@ int oc_sum_parse(const char *answer, const char *cites, const oc_sum_lines *l, c
 
 /* The follow-up for the items `ask` lists (from oc_sum_parse), `n_items` of
  * them, over `n_lines` lines: the question, and a grammar holding the answer to
- * one line of line numbers per item. 0 or -1. */
+ * one line of line numbers for each item, once each, in order, and no more.
+ * 0 or -1. */
 int oc_sum_followup(const char *ask, int n_items, int n_lines, oc_sum_buf *question, oc_sum_buf *grammar);
 
 /* 1 when a stored body says nothing: no overview, no items. */
