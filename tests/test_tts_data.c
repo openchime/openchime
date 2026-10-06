@@ -28,7 +28,7 @@ int run_tts_data_tests(void) {
     char sys[256], exe[256], exev[256], env[256], out[512], err[256];
     snprintf(sys, sizeof sys, "%s/system", root);
     snprintf(exe, sizeof exe, "%s/bin", root);
-    snprintf(exev, sizeof exev, "%s/bin/voices", root);
+    snprintf(exev, sizeof exev, "%s/bin/tts", root);
     snprintf(env, sizeof env, "%s/configured", root);
     mkdir(sys, 0700); mkdir(exe, 0700); mkdir(exev, 0700); mkdir(env, 0700);
 

@@ -46,7 +46,7 @@ int oc_data_dir_find(const char *var, const char *env, const char *system_dir, c
 
 int oc_tts_data_dir(const char *env, const char *system_dir, const char *exe_dir,
                     char *out, size_t cap, char *err, size_t errcap) {
-    return oc_data_dir_find("OPENCHIME_TTS_DATA_DIR", env, system_dir, exe_dir, "voices",
+    return oc_data_dir_find("OPENCHIME_TTS_DATA_DIR", env, system_dir, exe_dir, "tts",
                             out, cap, err, errcap);
 }
 

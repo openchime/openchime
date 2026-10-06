@@ -36,12 +36,12 @@ install -D -m 0755 "$BINARY"                                  "$stage/usr/bin/op
 # Read-aloud's data, if it was built beside the binary: the voice model and the
 # pronunciation data the daemon verifies against its manifest at startup. A build
 # without read-aloud has none, and its package simply offers no read-aloud.
-VOICES="$(dirname "$BINARY")/voices"
-if [ -f "$VOICES/manifest" ]; then
+TTS="$(dirname "$BINARY")/tts"
+if [ -f "$TTS/manifest" ]; then
   mkdir -p "$stage/usr/share/openchime"
-  cp -r "$VOICES" "$stage/usr/share/openchime/voices"
-  find "$stage/usr/share/openchime/voices" -type d -exec chmod 0755 {} +
-  find "$stage/usr/share/openchime/voices" -type f -exec chmod 0644 {} +
+  cp -r "$TTS" "$stage/usr/share/openchime/tts"
+  find "$stage/usr/share/openchime/tts" -type d -exec chmod 0755 {} +
+  find "$stage/usr/share/openchime/tts" -type f -exec chmod 0644 {} +
 fi
 # Voice input's recognizer data, the same way (ARCH-112).
 STT="$(dirname "$BINARY")/stt"

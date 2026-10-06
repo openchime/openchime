@@ -26,10 +26,10 @@ chmod 0755 "$stage"
 # under flat names it can predict.
 install -m 0755 "$BINARY"                                      "$stage/openchimed"
 # Read-aloud's data, when it was built beside the binary (see build-deb.sh).
-with_voices=0
-if [ -f "$(dirname "$BINARY")/voices/manifest" ]; then
-  cp -r "$(dirname "$BINARY")/voices" "$stage/voices"
-  with_voices=1
+with_tts=0
+if [ -f "$(dirname "$BINARY")/tts/manifest" ]; then
+  cp -r "$(dirname "$BINARY")/tts" "$stage/tts"
+  with_tts=1
 fi
 # And voice input's recognizer data (ARCH-112).
 with_stt=0
@@ -50,7 +50,7 @@ rpmbuild -bb \
   --define "_topdir ${topdir}" \
   --define "_version ${VERSION}" \
   --define "_bindir_src ${stage}" \
-  --define "_with_voices ${with_voices}" \
+  --define "_with_tts ${with_tts}" \
   --define "_with_stt ${with_stt}" \
   --define "dist %{nil}" \
   "$root/packaging/rpm/openchimed.spec" >/dev/null

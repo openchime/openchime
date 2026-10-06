@@ -177,7 +177,7 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
   linked against ONNX Runtime's **prebuilt** full release (also pinned; a build tool
   on the build machine only, `build_onnxruntime.sh converter`). The converted file is
   not byte-reproducible, so its input and the converter are what is pinned.
-- `make` assembles the converted model, the voices and ttskit's data into `voices/` beside
+- `make` assembles the converted model, the voices and ttskit's data into `tts/` beside
   `openchimed`. `make TTS=0` builds a daemon without any of it.
 
 ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
