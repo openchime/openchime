@@ -422,7 +422,7 @@ jobs:
           # Read-aloud's and voice input's data travel beside the binary, where
           # `make` assembled them and wrote their manifests; every package takes
           # them from there.
-          cp -r voices "$DIST/voices"
+          cp -r tts "$DIST/tts"
           cp -r stt "$DIST/stt"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
           "./$DIST/openchimed" --version
@@ -502,8 +502,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
           /usr/bin/openchimed --version
-          # The package put the voices where an installed daemon looks, and they
-          # verify: a render by the installed binary, from the installed data.
+          # The package put read-aloud's data where an installed daemon looks, and it
+          # verifies: a render by the installed binary, from the installed data.
           /usr/bin/openchimed --tts-say expr-voice-2-f "The package speaks." /tmp/installed-check.wav
           # And the recognizer's data, the same way.
           heard="$(/usr/bin/openchimed --stt-hear /tmp/installed-check.wav)"

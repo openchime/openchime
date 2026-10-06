@@ -223,9 +223,9 @@ run: $(BIN) $(TUI_BIN)
 # --- Read-aloud in the daemon (ARCH-111) ---------------------------------------
 # On by default: the daemon carries its own speech synthesis. ttskit and a minimal
 # ONNX Runtime built from source as one static archive are compiled in; the voice
-# model, its voices and the pronunciation data are DATA, assembled into voices/
+# model, its voices and the pronunciation data are DATA, assembled into tts/
 # beside the binary with a manifest the daemon checks at startup. Absent or
-# mismatched data turns read-aloud off rather than stopping the daemon. voices/
+# mismatched data turns read-aloud off rather than stopping the daemon. tts/
 # beside openchimed is the same layout the tarball ships, so a source build finds
 # its data the way an extracted release does. The first build compiles ONNX
 # Runtime (about 20 minutes) and fetches the model; both are kept under
@@ -240,7 +240,7 @@ KITTEN    := build/kitten/kitten.ort
 ifeq ($(TTS),1)
 TTS_SRC   := daemon/tts.c daemon/tts_render.c daemon/tts_worker.c daemon/tts_kitten.c daemon/tts_kitten_tokens.c daemon/tts_data.c $(TTSKIT_SRC)
 TTS_DEPS  := $(ORT_A) $(OPUS_A) $(wildcard ttskit/*.h)
-TTS_DATA  := voices/manifest
+TTS_DATA  := tts/manifest
 TTS_FLAGS := -DOC_TTS $(TTSKIT_INC) -I$(ORT_DIR)/include -I$(OPUS_DIR)/include
 # ONNX Runtime is C++: its standard library and runtime support are linked in
 # statically, not required of the host. That is GCC's libstdc++ by default; the
@@ -306,11 +306,11 @@ $(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS)
 # The data directory, and its manifest written by the daemon just built -- so the
 # version it names is exactly the version compiled in. Rebuilt whenever the daemon
 # is, which is whenever that version could have changed.
-voices/manifest: $(BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin
-	mkdir -p voices/en-US
-	cp $(KITTEN) build/kitten/voices.npz voices/
-	cp ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin voices/en-US/
-	$(abspath $(BIN)) --tts-manifest voices
+tts/manifest: $(BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin
+	mkdir -p tts/en-US
+	cp $(KITTEN) build/kitten/voices.npz tts/
+	cp ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin tts/en-US/
+	$(abspath $(BIN)) --tts-manifest tts
 # Voice input's data directory, the same way: Moonshine's files and a manifest
 # written by the daemon just built.
 stt/manifest: $(BIN) build/moonshine/.done

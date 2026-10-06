@@ -29,10 +29,11 @@ dir="$stage/$name"
 mkdir -p "$dir"
 
 install -m 0755 "$BINARY"                                   "$dir/openchimed"
-# Voices beside the binary: an extracted tarball runs with read-aloud as it
-# stands, because the daemon looks beside itself when nothing is installed.
-VOICES="$(dirname "$BINARY")/voices"
-[ -f "$VOICES/manifest" ] && cp -r "$VOICES" "$dir/voices"
+# Read-aloud's data in tts/ beside the binary: an extracted tarball runs with
+# read-aloud as it stands, because the daemon looks beside itself when nothing is
+# installed.
+TTS="$(dirname "$BINARY")/tts"
+[ -f "$TTS/manifest" ] && cp -r "$TTS" "$dir/tts"
 # And voice input's recognizer data in stt/, for the same reason.
 STT="$(dirname "$BINARY")/stt"
 [ -f "$STT/manifest" ] && cp -r "$STT" "$dir/stt"
@@ -54,10 +55,10 @@ set -eu
 cd "$(dirname "$0")"
 
 install -D -m 0755 openchimed         /usr/bin/openchimed
-if [ -d voices ]; then
+if [ -d tts ]; then
     mkdir -p /usr/share/openchime
-    rm -rf /usr/share/openchime/voices
-    cp -r voices /usr/share/openchime/voices
+    rm -rf /usr/share/openchime/tts
+    cp -r tts /usr/share/openchime/tts
 fi
 if [ -d stt ]; then
     mkdir -p /usr/share/openchime
@@ -95,7 +96,7 @@ OpenChime daemon ${VERSION} (linux-${ARCH})
   sudo ./install.sh
 
 Requires glibc 2.34 or newer. Everything else -- including TLS and SQLite --
-is statically linked, read-aloud's voice data is in voices/ and voice input's
+is statically linked, read-aloud's voice data is in tts/ and voice input's
 recognizer in stt/ beside the binary, so there is nothing further to fetch. That makes this the
 offline install: no package repository, no network.
 

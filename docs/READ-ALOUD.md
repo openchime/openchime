@@ -91,8 +91,8 @@ and nothing to fetch.
   (`daemon/ort.ops.config`). The daemon is under 9 MB.
 - **What is beside it.** The Kitten mini model converted to ONNX Runtime's `.ort` format, its
   voices, and ttskit's `en-US` lexicon and guesser — about 108 MB — in a data directory: the
-  first of `OPENCHIME_TTS_DATA_DIR`, `/usr/share/openchime/voices` (where the packages put it)
-  and `voices/` beside the executable (where the tarball and a source build put it). They are
+  first of `OPENCHIME_TTS_DATA_DIR`, `/usr/share/openchime/tts` (where the packages put it)
+  and `tts/` beside the executable (where the tarball and a source build put it). They are
   mapped and used in place: ONNX Runtime reads the weights straight from the file's pages and
   ttskit binary-searches its tables there, so they cost disk, and memory only for the pages a
   render touches — the same as when they were embedded, which is why moving them changed the

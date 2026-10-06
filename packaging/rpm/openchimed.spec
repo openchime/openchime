@@ -65,9 +65,9 @@ install -D -m 0755 %{_bindir_src}/openchimed          %{buildroot}%{_bindir}/ope
 install -D -m 0644 %{_bindir_src}/openchimed.service  %{buildroot}%{_unitdir}/openchimed.service
 install -D -m 0600 %{_bindir_src}/openchimed.env      %{buildroot}%{_sysconfdir}/openchime/openchimed.env
 install -D -m 0644 %{_bindir_src}/copyright           %{buildroot}%{_datadir}/licenses/openchimed/copyright
-%if 0%{?_with_voices}
+%if 0%{?_with_tts}
 mkdir -p %{buildroot}%{_datadir}/openchime
-cp -r %{_bindir_src}/voices %{buildroot}%{_datadir}/openchime/voices
+cp -r %{_bindir_src}/tts %{buildroot}%{_datadir}/openchime/tts
 %endif
 %if 0%{?_with_stt}
 mkdir -p %{buildroot}%{_datadir}/openchime
@@ -77,8 +77,8 @@ cp -r %{_bindir_src}/stt %{buildroot}%{_datadir}/openchime/stt
 %files
 %{_bindir}/openchimed
 %{_unitdir}/openchimed.service
-%if 0%{?_with_voices}
-%{_datadir}/openchime/voices
+%if 0%{?_with_tts}
+%{_datadir}/openchime/tts
 %endif
 %if 0%{?_with_stt}
 %{_datadir}/openchime/stt
