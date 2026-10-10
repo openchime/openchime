@@ -37,6 +37,12 @@ if [ -f "$(dirname "$BINARY")/stt/manifest" ]; then
   cp -r "$(dirname "$BINARY")/stt" "$stage/stt"
   with_stt=1
 fi
+# And the web client the daemon serves (docs/WEB.md).
+with_web=0
+if [ -f "$(dirname "$BINARY")/web/openchime.wasm" ]; then
+  cp -r "$(dirname "$BINARY")/web" "$stage/web"
+  with_web=1
+fi
 install -m 0644 "$root/packaging/debian/openchimed.service"    "$stage/openchimed.service"
 install -m 0600 "$root/packaging/openchimed.env"               "$stage/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"                 > "$stage/copyright"
@@ -52,6 +58,7 @@ rpmbuild -bb \
   --define "_bindir_src ${stage}" \
   --define "_with_tts ${with_tts}" \
   --define "_with_stt ${with_stt}" \
+  --define "_with_web ${with_web}" \
   --define "dist %{nil}" \
   "$root/packaging/rpm/openchimed.spec" >/dev/null
 

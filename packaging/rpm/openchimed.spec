@@ -73,6 +73,10 @@ cp -r %{_bindir_src}/tts %{buildroot}%{_datadir}/openchime/tts
 mkdir -p %{buildroot}%{_datadir}/openchime
 cp -r %{_bindir_src}/stt %{buildroot}%{_datadir}/openchime/stt
 %endif
+%if 0%{?_with_web}
+mkdir -p %{buildroot}%{_datadir}/openchime
+cp -r %{_bindir_src}/web %{buildroot}%{_datadir}/openchime/web
+%endif
 
 %files
 %{_bindir}/openchimed
@@ -82,6 +86,9 @@ cp -r %{_bindir_src}/stt %{buildroot}%{_datadir}/openchime/stt
 %endif
 %if 0%{?_with_stt}
 %{_datadir}/openchime/stt
+%endif
+%if 0%{?_with_web}
+%{_datadir}/openchime/web
 %endif
 # noreplace is the %config form that preserves an operator's edits across an
 # upgrade, writing any new version alongside as .rpmnew. It is the RPM

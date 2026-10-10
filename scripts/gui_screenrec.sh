@@ -27,8 +27,20 @@
 # gives. Not in CI: the daemon cannot run on a Windows runner.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRIVE="$HERE/scripts/gui_drive.sh"
+# The driver: the Windows client's, or the web client's with
+# OC_GUI_DRIVE=scripts/web_drive.sh (docs/TESTING.md). The checks that are
+# the Windows platform's alone (UI Automation, its own windows) run there only.
+DRIVE="${OC_GUI_DRIVE:-$HERE/scripts/gui_drive.sh}"
+PLAT=win32; [ -n "${OC_GUI_DRIVE:-}" ] && PLAT=web
+OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
+# Files the client is given (a microphone's clip): on the Windows share for the
+# Windows client, in the fixture directory for the web client, which the
+# driver carries onto the page.
 LIN_DIR='/mnt/c/Windows/Temp/octest'
+WIN_DIR='C:\Windows\Temp\octest'
+# The screen the harness records: Windows names its first monitor, a browser
+# offers the one its picker chooses.
+SCREEN_ID=screen:0; [ "$PLAT" = web ] && SCREEN_ID=display
 START=$SECONDS
 fails=0
 checks=0
@@ -60,7 +72,7 @@ drive() {
   fi
   return 0
 }
-snap() { "$DRIVE" dump screenrec >/dev/null 2>&1; cat "$LIN_DIR/screenrec.txt" 2>/dev/null; }
+snap() { "$DRIVE" dump screenrec 2>/dev/null | tail -n +2; }
 line() { snap | grep "^$1"; }
 key_of() { printf '%s' "$1" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2 | tr -d '"'; }
 check() {
@@ -95,14 +107,14 @@ say "== what can be recorded"
 drive vm open
 sleep 1
 screens=$(snap | grep '^vmscreen')
-check "a screen is listed" sh -c "printf '%s' \"\$1\" | grep -q 'kind=1 id=\"screen:0\"'" _ "$screens"
-check "OpenChime's own window is listed" sh -c "printf '%s' \"\$1\" | grep -q 'kind=2 .*name=\"OpenChime\"'" _ "$screens"
+check "a screen is listed" sh -c "printf '%s' \"\$1\" | grep -q 'kind=1 id=\"$SCREEN_ID\"'" _ "$screens"
+[ "$PLAT" = win32 ] && check "OpenChime's own window is listed" sh -c "printf '%s' \"\$1\" | grep -q 'kind=2 .*name=\"OpenChime\"'" _ "$screens"
 
 say "== the screen, with the camera boxed top left, and the computer's sound"
-drive vm "source screen:0"
+drive vm "source $SCREEN_ID"
 drive vm "corner tl"
 drive vm "sound on"
-check "the choices took" wait_key vmsrc src screen:0
+check "the choices took" wait_key vmsrc src "$SCREEN_ID"
 d=$(line vmsrc)
 check "top left, sound on" test "$(key_of "$d" corner)" = 3 -a "$(key_of "$d" sound)" = 1
 check "the preview is running" wait_key vm= recphase 0
@@ -113,7 +125,7 @@ check "the preview is running" wait_key vm= recphase 0
 sleep 1
 drive shot screenrec_preview
 d=$(line vmsrc)
-colour=$(python3 - "$LIN_DIR/screenrec_preview.bmp" "$(key_of "$d" vbox)" "$(key_of "$d" frame_w)" "$(key_of "$d" frame_h)" <<'PY'
+colour=$(python3 - "$OUT/screenrec_preview.bmp" "$(key_of "$d" vbox)" "$(key_of "$d" frame_w)" "$(key_of "$d" frame_h)" <<'PY'
 import sys, colorsys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
@@ -137,6 +149,7 @@ check "the camera box, top left, shows the camera's colour bars (${colour:-0} hu
 
 say "== recording"
 drive vm record
+if [ "$PLAT" = win32 ]; then
 check "the card steps aside for the recording bar" wait_key vmsrc away 1 6000
 d=$(line vmsrc)
 check "the recording bar is up" test "$(key_of "$d" bar)" = 1
@@ -144,14 +157,20 @@ check "and kept out of the capture" test "$(key_of "$d" excluded)" = 1
 bar=$(uia_bar)
 check "UI Automation finds the bar counting down, with Cancel and Discard ($bar)" \
   sh -c "printf '%s' \"\$1\" | grep -q 'bar=1 text=\"Recording in.*buttons=Cancel,Discard'" _ "$bar"
+fi
 check "it is recording" wait_key vm= recphase 2 6000
 sleep 1
+if [ "$PLAT" = win32 ]; then
 bar=$(uia_bar)
 check "then with the time, and Stop and Discard ($bar)" \
   sh -c "printf '%s' \"\$1\" | grep -q 'bar=1 text=\".*Recording  0:0.*buttons=Stop,Discard'" _ "$bar"
 sleep 2
 press=$(uia_bar -Press Stop)
 check "Stop, pressed through UI Automation" sh -c "printf '%s' \"\$1\" | grep -q 'pressed Stop'" _ "$press"
+else
+sleep 2
+drive vm stop
+fi
 check "the card comes back to review" wait_key vm= recphase 4 10000
 d=$(line vmsrc)
 check "the bar is gone" test "$(key_of "$d" bar)" = 0 -a "$(key_of "$d" away)" = 0
@@ -191,6 +210,7 @@ print("%d %d" % (amp(440), amp(660)))')
     test "${a440:-0}" -ge 4000 -a "${a660:-0}" -ge 3000
 fi
 
+if [ "$PLAT" = win32 ]; then
 say "== a window, until it closes"
 powershell.exe -NoProfile -Command "Start-Process notepad" >/dev/null 2>&1
 sleep 2
@@ -213,6 +233,7 @@ if [ -n "$np" ]; then
   check "what came before is kept (${ms} ms)" test "${ms:-0}" -ge 500
   drive vm discard
 fi
+fi   # a window: the Windows client's alone; a browser's picker is its own
 
 [ "${1:-}" = "--kill" ] && "$DRIVE" kill >/dev/null 2>&1
 echo

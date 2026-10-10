@@ -5,6 +5,8 @@
  * thread and drives it with blocking TLS clients. */
 
 #include "netloop.h"
+#include "webapp.h"
+#include "oc_port.h"      /* oc_mkdir */
 #include "audio.h"
 #include "config.h"
 #include "dbwriter.h"
@@ -326,10 +328,12 @@ static int do_handshake(client *c) {
 }
 
 /* What the last do_auth was told of voice input: the capability, and the cap. */
-static int      g_auth_stt;
-static uint32_t g_auth_stt_max_ms;
+/* Atomic: the load test's clients sign in side by side and each records what
+ * it was told; the single-client tests read it afterwards. */
+static _Atomic int      g_auth_stt;
+static _Atomic uint32_t g_auth_stt_max_ms;
 
-static int g_auth_summarize;   /* the last sign-in was told "summarize" (REQ-310) */
+static _Atomic int g_auth_summarize;   /* the last sign-in was told "summarize" (REQ-310) */
 static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
     uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
@@ -6389,6 +6393,29 @@ static void test_http_stack(int port, int hport) {
     if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
 
+    /* The web client the daemon serves (webapp.h): the page and the loader
+     * are compiled in, the wasm beside the binary -- stood in for by a small
+     * file -- is read once, and its routes join both sites; without one the
+     * sites are as they were. */
+    {
+        char werr[256] = "";
+        CHECK(!oc_webapp_load("build/no-such-dir", werr, sizeof werr));
+        CHECK(!oc_webapp_is_redirect("http://x/app/", 13, "x"));
+        oc_mkdir("build/itest_webapp");
+        oc_mkdir("build/itest_webapp/web");
+        FILE *f;
+        f = fopen("build/itest_webapp/web/openchime.wasm", "wb"); CHECK(f); if (f) { fwrite("\0asm", 1, 4, f); fclose(f); }
+        CHECK(oc_webapp_load("build/itest_webapp", werr, sizeof werr));
+        CHECK(oc_webapp_loaded());
+        /* The redirect a browser sign-in may name: the page's own origin at
+         * /app/ exactly, for the Host its connection was upgraded with. */
+        CHECK(oc_webapp_is_redirect("https://chat.example:8443/app/", 30, "chat.example:8443"));
+        CHECK(!oc_webapp_is_redirect("http://127.0.0.1:8080/app/", 26, "127.0.0.1:8080"));   /* https only */
+        CHECK(!oc_webapp_is_redirect("https://chat.example:8443/app/x", 31, "chat.example:8443"));
+        CHECK(!oc_webapp_is_redirect("https://chat.example:8443/app/", 30, "other.example"));
+        CHECK(!oc_webapp_is_redirect("https://chat.example:8443/app/", 30, ""));
+    }
+
     oc_netloop_set_health_port(hport);
     struct loop_arg arg2;
     arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
@@ -6402,9 +6429,13 @@ static void test_http_stack(int port, int hport) {
           strstr(resp, "Content-Type: text/plain\r\n"));
     CHECK(plain_exchange(hport, "GET /healthz?probe=1 HTTP/1.0\r\n\r\n", resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "\r\n\r\nOK"));
+    /* The web client is the TLS port's (below): in the clear the landing page
+     * stands, app or no app. */
     CHECK(plain_exchange(hport, "GET / HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 &&
           strstr(resp, "text/html") && strstr(resp, "An OpenChime workspace is running here."));
+    CHECK(plain_exchange(hport, "GET /app/ HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace is running here."));
     CHECK(plain_exchange(hport, "POST /anything/else HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi",
                          resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace"));
@@ -6414,7 +6445,31 @@ static void test_http_stack(int port, int hport) {
     /* The TLS port's HTTP side: what it does not serve, it refuses there. */
     client h;
     CHECK(http_client_open(&h, port, pin2) == 0);
-    const char *r1 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    /* ...but with the web client served (webapp.h) its front door is the
+     * client: "/" sends a browser to /app/, which comes with the isolation
+     * headers wasm threads need, the loader and the wasm under it. */
+    const char *r0 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(write_all(&h.conn, (const uint8_t *)r0, strlen(r0)) == 0);
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 302 ", 13) == 0 && strstr(resp, "Location: /app/\r\n"));
+    client_close(&h);
+    CHECK(http_client_open(&h, port, pin2) == 0);
+    const char *ra = "GET /app/ HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(write_all(&h.conn, (const uint8_t *)ra, strlen(ra)) == 0);
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "text/html") &&
+          strstr(resp, "Cross-Origin-Opener-Policy: same-origin\r\n") &&
+          strstr(resp, "Cross-Origin-Embedder-Policy: require-corp\r\n") &&
+          strstr(resp, "<canvas id=\"canvas\""));
+    client_close(&h);
+    CHECK(http_client_open(&h, port, pin2) == 0);
+    const char *rw = "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(write_all(&h.conn, (const uint8_t *)rw, strlen(rw)) == 0);
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n"));
+    client_close(&h);
+    CHECK(http_client_open(&h, port, pin2) == 0);
+    const char *r1 = "GET /nothing-here HTTP/1.1\r\nHost: x\r\n\r\n";
     CHECK(write_all(&h.conn, (const uint8_t *)r1, strlen(r1)) == 0);
     http_read_response(&h, resp, sizeof resp);
     CHECK(strncmp(resp, "HTTP/1.1 404 ", 13) == 0);
@@ -6448,6 +6503,101 @@ static void test_http_stack(int port, int hport) {
     if (a >= 0) close(a);
     if (b >= 0) close(b);
     throttle_checks(port, pin2);
+
+    /* The WebSocket transport (ioloop.c, the browser client's): the upgrade on
+     * /ws is answered 101 with the key's accept value and the offered
+     * subprotocol echoed; a masked binary frame carrying HELLO is answered with
+     * WELCOME and AUTH_CHALLENGE, each in a frame of its own; a ping is
+     * answered with a pong; a frame that is not masked ends the connection. */
+    {
+        usleep(300000);   /* the closes above are counted out of the per-address cap */
+        int ws = plain_connect(hport);
+        CHECK(ws >= 0);
+        if (ws >= 0) {
+            const char *up = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+                             "Sec-WebSocket-Protocol: binary, base64\r\n\r\n";
+            CHECK(send(ws, up, strlen(up), 0) == (ssize_t)strlen(up));
+            static uint8_t rb[65536]; size_t got = 0; const uint8_t *body = NULL;
+            for (int tries = 0; tries < 200 && !body; tries++) {
+                ssize_t r = recv(ws, rb + got, sizeof rb - got, MSG_DONTWAIT);
+                if (r > 0) { got += (size_t)r; rb[got] = 0; body = (const uint8_t *)strstr((char *)rb, "\r\n\r\n"); if (body) body += 4; }
+                else usleep(10000);
+            }
+            CHECK(body != NULL);
+            CHECK(strncmp((char *)rb, "HTTP/1.1 101 ", 13) == 0);
+            CHECK(strstr((char *)rb, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != NULL);
+            CHECK(strstr((char *)rb, "Sec-WebSocket-Protocol: binary\r\n") != NULL);
+            /* HELLO, masked, as a client must send it. */
+            uint8_t hb[128]; oc_wbuf hw; oc_wbuf_init(&hw, hb, sizeof hb);
+            oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("itest-ws") };
+            CHECK(oc_encode_hello(&hw, &h) == OC_OK);
+            uint8_t fr[160]; size_t fl = 0;
+            fr[fl++] = 0x82; fr[fl++] = (uint8_t)(0x80 | hw.len);
+            uint8_t mask[4] = { 0x12, 0x34, 0x56, 0x78 };
+            memcpy(fr + fl, mask, 4); fl += 4;
+            for (size_t i = 0; i < hw.len; i++) fr[fl++] = hb[i] ^ mask[i & 3];
+            CHECK(send(ws, fr, fl, 0) == (ssize_t)fl);
+            /* WELCOME then AUTH_CHALLENGE come back in unmasked binary frames; a
+             * WebSocket frame carries whatever one send held, so the protocol
+             * frames are read out of the payloads as one stream, as a client's
+             * frame buffer reads them. */
+            size_t have = got - (size_t)(body - rb);
+            memmove(rb, body, have); got = have;
+            static uint8_t stream[65536]; size_t slen = 0, at = 0;
+            int seen = 0; uint16_t types[2] = { 0, 0 };
+            for (int tries = 0; tries < 300 && seen < 2; tries++) {
+                while (got - at >= 2) {
+                    uint8_t b0 = rb[at], b1 = rb[at + 1];
+                    size_t hl = 2, plen = b1 & 0x7f;
+                    CHECK((b1 & 0x80) == 0);                    /* server frames are unmasked */
+                    if (plen == 126) { if (got - at < 4) break; plen = ((size_t)rb[at + 2] << 8) | rb[at + 3]; hl = 4; }
+                    if (got - at < hl + plen) break;
+                    CHECK((b0 & 0x0f) == 0x2);
+                    if (slen + plen <= sizeof stream) { memcpy(stream + slen, rb + at + hl, plen); slen += plen; }
+                    at += hl + plen;
+                }
+                size_t sat = 0; seen = 0;
+                while (slen - sat >= OC_HEADER_SIZE) {
+                    size_t flen = ((size_t)stream[sat] << 24) | ((size_t)stream[sat + 1] << 16) |
+                                  ((size_t)stream[sat + 2] << 8) | stream[sat + 3];
+                    if (slen - sat < 4 + flen) break;          /* length counts version, type and payload */
+                    if (seen < 2) types[seen] = (uint16_t)((stream[sat + 6] << 8) | stream[sat + 7]);
+                    seen++;
+                    sat += 4 + flen;
+                }
+                if (seen >= 2) break;
+                ssize_t r = recv(ws, rb + got, sizeof rb - got, MSG_DONTWAIT);
+                if (r > 0) got += (size_t)r; else usleep(10000);
+            }
+            CHECK(seen >= 2);
+            CHECK(types[0] == OC_MSG_WELCOME);
+            CHECK(types[1] == OC_MSG_AUTH_CHALLENGE);
+            /* A ping with a payload comes back as a pong with the same payload. */
+            uint8_t ping[16] = { 0x89, 0x84, 1, 2, 3, 4 };
+            const uint8_t pp[4] = { 'p', 'i', 'n', 'g' };
+            for (int i = 0; i < 4; i++) ping[6 + i] = pp[i] ^ ping[2 + (i & 3)];
+            CHECK(send(ws, ping, 10, 0) == 10);
+            uint8_t pong[8]; size_t pg = 0;
+            for (int tries = 0; tries < 200 && pg < 6; tries++) {
+                ssize_t r = recv(ws, pong + pg, 6 - pg, MSG_DONTWAIT);
+                if (r > 0) pg += (size_t)r; else usleep(10000);
+            }
+            CHECK(pg == 6 && pong[0] == 0x8A && pong[1] == 4 && memcmp(pong + 2, "ping", 4) == 0);
+            /* An unmasked frame is not a browser's: the connection ends. */
+            uint8_t bad[4] = { 0x82, 0x02, 0, 0 };
+            CHECK(send(ws, bad, 4, 0) == 4);
+            int closed = 0;
+            for (int tries = 0; tries < 300 && !closed; tries++) {
+                ssize_t r = recv(ws, rb, sizeof rb, MSG_DONTWAIT);
+                if (r == 0) closed = 1;
+                else if (r < 0) usleep(10000);   /* anything still queued is read past */
+            }
+            CHECK(closed);
+            close(ws);
+        }
+        usleep(100000);   /* the close is counted out before the cap is tested below */
+    }
 
     stop_loop(&arg2, th2);
     /* The health port was the loop's: with the loop gone, nobody answers it. */

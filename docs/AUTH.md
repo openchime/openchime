@@ -882,6 +882,14 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
   server is longer than any fixed few seconds. It closes after the callback, on
   cancel, or after five minutes (ten, for a page opened on its own).
 
+- **To itself**, for the web client the daemon serves (WEB.md): the page is
+  already on the daemon's origin, so its redirect is its own address,
+  `https://<host>/app/` exactly, which the daemon accepts in place of a
+  loopback address when `<host>` is the `Host` the page's WebSocket was
+  upgraded with (`daemon/webapp.h`). The browser leaves the client for the
+  sign-in page and comes back to it with the token on the address, and the
+  client resumes from what it kept in the tab's session storage.
+
 The person signs in on the page; the daemon checks the password on the same
 staged path as §2 — the limiters, the pool, the credential's version, the audit
 — and answers `303` to `redirect_uri?token=<jwt>`. The client presents

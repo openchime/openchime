@@ -24,16 +24,6 @@
 
 #include "sdltext.h"
 
-typedef struct {
-    void *user;
-    /* `bgra` is premultiplied, `stride` bytes per row, (px_w, px_h) pixels.
-     * (dip_x, dip_y) is where st_draw was asked to place the layout, in DIPs;
-     * the pixel dimensions already include the context scale. The buffer is
-     * valid only for the duration of the call. */
-    void (*blit)(void *user, const void *bgra, int stride,
-                 int px_w, int px_h, float dip_x, float dip_y);
-} st_sink;
-
 /* `sink` may be NULL for a context used only to measure and hit-test (or one
  * that draws exclusively through st_dwrite_draw_rt). */
 st_ctx *st_dwrite_create(const st_sink *sink);

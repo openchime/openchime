@@ -405,6 +405,25 @@ jobs:
       # glibc 2.39 headers, which redirect strtol to __isoc23_strtol -- a 2.38
       # symbol that does not exist in the 2.34 stubs, so the link fails. libc
       # headers come from zig; the sqlite header is copied out on its own.
+      # The web client's toolchain (docs/WEB.md): the daemon is never built
+      # without the client it serves -- the page and loader are compiled into it
+      # (daemon/webapp.h), so `make` needs emcc. The two wasm libraries are built
+      # once by their scripts and cached, keyed by the scripts and the emsdk.
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.8
+          actions-cache-folder: emsdk-cache
+      - name: Restore the wasm libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build_mbedtls_wasm.sh', 'scripts/build_sdl3_wasm.sh', 'scripts/build_media_wasm.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
       - name: Build the daemon (glibc 2.34)
         run: |
           set -euo pipefail
@@ -424,6 +443,9 @@ jobs:
           # them from there.
           cp -r tts "$DIST/tts"
           cp -r stt "$DIST/stt"
+          # And the web client's wasm (docs/WEB.md): the page and loader are
+          # inside the binary; this is the one file it serves from beside itself.
+          cp -r web "$DIST/web"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
           "./$DIST/openchimed" --version
           # Read-aloud works from what ships: a render from the stripped file,

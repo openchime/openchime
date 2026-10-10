@@ -104,6 +104,9 @@ static inline int oc_poll_wake(int fd, int want_write, const oc_wake *w, int tim
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#ifdef __EMSCRIPTEN__
+#  include <emscripten/threading.h>
+#endif
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -121,12 +124,30 @@ static inline int  oc_sock_setblock(int fd) {
     return fl < 0 ? -1 : fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
 }
 static inline int  oc_sock_inprogress(void)    { return errno == EINPROGRESS || errno == EINTR; }
+/* poll(2), or its browser stand-in: Emscripten's poll reports what is ready
+ * and never waits, so a timeout is a loop of short sleeps around it -- on the
+ * network thread, where a sleep costs nothing anyone sees. */
+static inline int oc_poll_fds(struct pollfd *p, int n, int timeout_ms) {
+#ifdef __EMSCRIPTEN__
+    /* The thread's own blocking sleep, not the runtime's (which under Asyncify
+     * would try to unwind a worker's stack): this runs on the network thread. */
+    int waited = 0;
+    for (;;) {
+        int r = poll(p, (nfds_t)n, 0);
+        if (r != 0 || timeout_ms == 0 || (timeout_ms > 0 && waited >= timeout_ms)) return r;
+        emscripten_thread_sleep(2);
+        waited += 2;
+    }
+#else
+    return poll(p, (nfds_t)n, timeout_ms);
+#endif
+}
 static inline int  oc_poll(int fd, int want_write, int timeout_ms) {
     struct pollfd p;
     p.fd = fd;
     p.events = (short)(want_write ? POLLOUT : POLLIN);
     p.revents = 0;
-    return poll(&p, 1, timeout_ms);
+    return oc_poll_fds(&p, 1, timeout_ms);
 }
 
 /* A wake: a pipe another thread writes a byte to. */
@@ -159,7 +180,7 @@ static inline int oc_poll_wake(int fd, int want_write, const oc_wake *w, int tim
     struct pollfd p[2];
     p[0].fd = fd; p[0].events = (short)(want_write ? POLLOUT : POLLIN); p[0].revents = 0;
     p[1].fd = w->rd; p[1].events = POLLIN; p[1].revents = 0;
-    int n = poll(p, 2, timeout_ms);
+    int n = oc_poll_fds(p, 2, timeout_ms);
     if (n <= 0) return n;
     return (p[0].revents ? 1 : 0) | (p[1].revents ? 2 : 0);
 }

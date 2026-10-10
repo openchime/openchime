@@ -1,4 +1,5 @@
-/* The audio device layer over miniaudio (audio_dev.h). */
+/* The audio device layer (audio_dev.h): what is the same on every platform,
+ * over the backend that owns the devices (audio_backend.h). */
 #define _POSIX_C_SOURCE 200809L
 #include "audio_dev.h"
 #include "oc_media.h"
@@ -9,33 +10,7 @@
 #include <string.h>
 #include <time.h>
 
-/* miniaudio is vendored as one header; its implementation is compiled here and
- * nowhere else. Only device I/O is wanted — no decoders, graph or engine. Its
- * own code is not held to this tree's warning set, so the warnings it trips are
- * silenced for the include alone. */
-#define MA_NO_DECODING
-#define MA_NO_ENCODING
-#define MA_NO_GENERATION
-#define MA_NO_RESOURCE_MANAGER
-#define MA_NO_NODE_GRAPH
-#define MA_NO_ENGINE
-#define MINIAUDIO_IMPLEMENTATION
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
-#pragma GCC diagnostic ignored "-Wtype-limits"
-#pragma GCC diagnostic ignored "-Wcast-function-type"
-#endif
-#include "../../../third_party/miniaudio/miniaudio.h"
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
+#include "audio_backend.h"
 
 /* ---- a single-producer, single-consumer ring of int16 samples ---------------------- */
 
@@ -169,10 +144,7 @@ struct oc_audio_dev {
     int           capture;
     int           synthetic;
     int           rate, channels;
-    ma_context    ctx;
-    int           have_ctx;
-    ma_device     dev;
-    int           have_dev;
+    void         *impl;               /* the backend's (audio_backend.h) */
     ring          ring;
     /* Capture timing: the clock time of the first captured sample, and the count
      * of frames pushed since. Sample k was captured at base + k/rate. */
@@ -271,9 +243,11 @@ static int peak(const int16_t *s, size_t n) {
     return p > 32767 ? 32767 : p;
 }
 
-static void capture_cb(ma_device *dev, void *out, const void *in, ma_uint32 frames) {
-    (void)out;
-    oc_audio_dev *d = dev->pUserData;
+int    oc_audio_dev_rate(const oc_audio_dev *d) { return d->rate; }
+int    oc_audio_dev_channels(const oc_audio_dev *d) { return d->channels; }
+void **oc_audio_dev_impl(oc_audio_dev *d) { return &d->impl; }
+
+void oc_audio_dev_capture_in(oc_audio_dev *d, const int16_t *in, size_t frames) {
     if (!in || frames == 0) return;
     if (atomic_load(&d->pushed) == 0 && atomic_load(&d->base_us) == 0)
         atomic_store(&d->base_us, oc_media_clock_us() - (int64_t)frames * 1000000 / d->rate);
@@ -304,9 +278,7 @@ static void capture_cb(ma_device *dev, void *out, const void *in, ma_uint32 fram
     atomic_store(&d->level, peak(in, n));
 }
 
-static void playback_cb(ma_device *dev, void *out, const void *in, ma_uint32 frames) {
-    (void)in;
-    oc_audio_dev *d = dev->pUserData;
+void oc_audio_dev_playback_out(oc_audio_dev *d, int16_t *out, size_t frames) {
     int16_t *o = out;
     size_t n = (size_t)frames * (size_t)d->channels;
     take_flush(d);
@@ -330,45 +302,8 @@ int oc_audio_list(int capture, oc_audio_device *out, int cap) {
         out->is_default = 1;
         return 1;
     }
-    ma_context ctx;
-    if (ma_context_init(NULL, 0, NULL, &ctx) != MA_SUCCESS) return OC_AUDIO_FAILED;
-    ma_device_info *play, *capt;
-    ma_uint32 np, nc;
-    if (ma_context_get_devices(&ctx, &play, &np, &capt, &nc) != MA_SUCCESS) {
-        ma_context_uninit(&ctx);
-        return OC_AUDIO_FAILED;
-    }
-    ma_device_info *list = capture ? capt : play;
-    ma_uint32 n = capture ? nc : np;
-    int count = 0;
-    for (ma_uint32 i = 0; i < n && count < cap; i++, count++) {
-        oc_audio_device *o = &out[count];
-        memset(o, 0, sizeof *o);
-        /* The id is the raw ma_device_id bytes, hex-encoded, so it survives as a string. */
-        const unsigned char *raw = (const unsigned char *)&list[i].id;
-        _Static_assert(sizeof o->id > sizeof list[i].id * 2, "device id must fit hex-encoded");
-        /* Trailing zero bytes are left off; parse_id zero-fills them back. */
-        size_t len = sizeof list[i].id;
-        while (len > 0 && raw[len - 1] == 0) len--;
-        for (size_t k = 0; k < len; k++) snprintf(o->id + 2 * k, 3, "%02x", raw[k]);
-        snprintf(o->name, sizeof o->name, "%s", list[i].name);
-        o->is_default = list[i].isDefault ? 1 : 0;
-    }
-    ma_context_uninit(&ctx);
-    return count;
-}
-
-static int parse_id(const char *hex, ma_device_id *id) {
-    memset(id, 0, sizeof *id);
-    size_t n = strlen(hex);
-    if (n % 2 || n / 2 > sizeof *id) return -1;
-    unsigned char *raw = (unsigned char *)id;
-    for (size_t k = 0; k < n / 2; k++) {
-        unsigned v;
-        if (sscanf(hex + 2 * k, "%2x", &v) != 1) return -1;
-        raw[k] = (unsigned char)v;
-    }
-    return 0;
+    const oc_audio_backend *b = oc_audio_platform_backend();
+    return b ? b->list(capture, out, cap) : 0;
 }
 
 static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rate, int channels, int *err) {
@@ -407,35 +342,9 @@ static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rat
         return d;
     }
 
-    if (ma_context_init(NULL, 0, NULL, &d->ctx) != MA_SUCCESS) { oc_audio_close(d); *err = OC_AUDIO_FAILED; return NULL; }
-    d->have_ctx = 1;
-    ma_device_id dev_id;
-    int have_id = id && *id && parse_id(id, &dev_id) == 0;
-    ma_device_config cfg = ma_device_config_init(loopback ? ma_device_type_loopback
-                                                 : capture ? ma_device_type_capture : ma_device_type_playback);
-    if (capture) {
-        /* A loopback device is named by the OUTPUT it listens to; NULL is the default. */
-        cfg.capture.pDeviceID = have_id ? &dev_id : NULL;
-        cfg.capture.format = ma_format_s16;
-        cfg.capture.channels = (ma_uint32)channels;
-        cfg.dataCallback = capture_cb;
-    } else {
-        cfg.playback.pDeviceID = have_id ? &dev_id : NULL;
-        cfg.playback.format = ma_format_s16;
-        cfg.playback.channels = (ma_uint32)channels;
-        cfg.dataCallback = playback_cb;
-    }
-    cfg.sampleRate = (ma_uint32)rate;
-    cfg.periodSizeInMilliseconds = 10;
-    cfg.pUserData = d;
-    ma_result r = ma_device_init(&d->ctx, &cfg, &d->dev);
-    if (r != MA_SUCCESS) {
-        oc_audio_close(d);
-        *err = r == MA_ACCESS_DENIED ? OC_AUDIO_DENIED : r == MA_NO_DEVICE ? OC_AUDIO_NODEVICE : OC_AUDIO_FAILED;
-        return NULL;
-    }
-    d->have_dev = 1;
-    if (ma_device_start(&d->dev) != MA_SUCCESS) { oc_audio_close(d); *err = OC_AUDIO_FAILED; return NULL; }
+    const oc_audio_backend *b = oc_audio_platform_backend();
+    int rc = b ? b->open(d, capture, loopback, id && *id ? id : NULL) : OC_AUDIO_NODEVICE;
+    if (rc != OC_AUDIO_OK) { oc_audio_close(d); *err = rc; return NULL; }
     *err = OC_AUDIO_OK;
     return d;
 }
@@ -579,8 +488,7 @@ int oc_audio_level(oc_audio_dev *d) { return atomic_load(&d->level); }
 
 void oc_audio_close(oc_audio_dev *d) {
     if (!d) return;
-    if (d->have_dev) ma_device_uninit(&d->dev);
-    if (d->have_ctx) ma_context_uninit(&d->ctx);
+    if (d->impl) { const oc_audio_backend *b = oc_audio_platform_backend(); if (b) b->close(d); }
     if (d->ref_slot >= 0) atomic_store(&g_ref[d->ref_slot].used, 0);
     if (d->owns_mic) atomic_store(&g_capture_open, 0);
     free(d->syn_clip);

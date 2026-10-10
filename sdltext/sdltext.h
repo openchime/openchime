@@ -61,7 +61,20 @@ typedef struct {
 
 /* ---- lifecycle ---- */
 
+/* Where a backend delivers pixels: `bgra` is premultiplied, `stride` bytes a
+ * row, (px_w, px_h) pixels; (dip_x, dip_y) is where st_draw was asked to place
+ * the layout, in DIPs. The buffer is valid for the call only. A backend is
+ * created by its own constructor (st_dwrite.h, st_canvas.h); the platform
+ * layer chooses which. */
+typedef struct {
+    void *user;
+    void (*blit)(void *user, const void *bgra, int stride,
+                 int px_w, int px_h, float dip_x, float dip_y);
+} st_sink;
+
 void st_ctx_destroy(st_ctx *);
+/* Whether the system has a font family of that name. */
+int  st_family_present(st_ctx *, const char *family);
 /* DPI x zoom. Layout geometry stays in DIPs; a raster-path backend renders at
  * this scale so glyphs are sharp at any DPI. */
 void st_ctx_set_scale(st_ctx *, float scale);

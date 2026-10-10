@@ -16,6 +16,13 @@
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 #  include <windns.h>
+#elif defined(__EMSCRIPTEN__)
+   /* A browser has no resolver to ask for SRV: the workspace is reached at the
+    * address the page was given (CLIENT.md §4). */
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <netdb.h>
+#  include <sys/socket.h>
 #else
 #  include <arpa/inet.h>
 #  include <resolv.h>
@@ -240,7 +247,12 @@ int oc_workspace_key(const char *workspace, const char *suffix, char *out, size_
     return (n < 0 || (size_t)n >= cap) ? -1 : 0;
 }
 
-#ifndef _WIN32
+#if defined(__EMSCRIPTEN__)
+int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostcap, int *port) {
+    (void)answer; (void)len; (void)host; (void)hostcap; (void)port;
+    return -1;
+}
+#elif !defined(_WIN32)
 int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostcap, int *port) {
     if (!answer || len <= 0 || !host || hostcap == 0 || !port) return -1;
     ns_msg msg;
@@ -300,6 +312,9 @@ static int srv_lookup(const char *domain, char *host, size_t hostcap, int *port)
     }
     if (recs) DnsFree(recs, DnsFreeRecordList);
     return found ? 0 : -1;
+#elif defined(__EMSCRIPTEN__)
+    (void)host; (void)hostcap; (void)port;
+    return -1;
 #else
     unsigned char ans[NS_PACKETSZ];
     int len = res_query(qname, ns_c_in, ns_t_srv, ans, sizeof ans);

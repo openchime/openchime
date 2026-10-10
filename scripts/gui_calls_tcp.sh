@@ -13,7 +13,9 @@
 # is going. Its own daemon on its own port, wiped each run.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PAIR="$HERE/scripts/gui_pair.sh"
+# The pair driver: the Windows clients', or the web clients' with
+# OC_GUI_PAIR=scripts/web_pair.sh (docs/TESTING.md).
+PAIR="${OC_GUI_PAIR:-$HERE/scripts/gui_pair.sh}"
 fails=0
 
 export OC_PAIR_PORT="${OC_PAIR_PORT:-9630}"

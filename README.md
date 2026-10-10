@@ -173,6 +173,15 @@ by `make test` (`tests/test_client_core.c`). A standalone compile check:
 make core
 ```
 
+The **web client** (`docs/WEB.md`) is the same graphical client -- one
+portable application over a per-platform directory (`client/gui/app/`,
+`client/gui/platform/`) -- compiled for the browser with Emscripten, with text
+through a canvas backend and the protocol inside a WebSocket. **The daemon
+serves it**: open the workspace's address in a browser, sign in on the daemon's
+own page, and the client is there -- the page and loader are compiled into the
+daemon and the wasm ships beside it, so a daemon always serves the client that
+matches it. Building the daemon therefore needs Emscripten (`make`).
+
 One frontend is a **TUI** (`make tui`, built on the in-tree `tuikit`
 toolbox over termbox2 + utf8proc, ARCH-83), built on the host like the daemon and
 also shipping on Windows (ARCH-81). It is menu- and screen-driven — panels, context

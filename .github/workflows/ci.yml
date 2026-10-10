@@ -109,6 +109,25 @@ jobs:
             third_party/speexdsp-1.2.1
             third_party/llamacpp-0.5.0
           key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_llamacpp.sh') }}
+      # The web client's toolchain (docs/WEB.md): the daemon is never built
+      # without the client it serves -- the page and loader are compiled into it
+      # (daemon/webapp.h), so `make` needs emcc. The two wasm libraries are built
+      # once by their scripts and cached, keyed by the scripts and the emsdk.
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.8
+          actions-cache-folder: emsdk-cache
+      - name: Restore the wasm libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build_mbedtls_wasm.sh', 'scripts/build_sdl3_wasm.sh', 'scripts/build_media_wasm.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
       - name: Build the daemon and the e2e client
         run: make && make build/e2e_client
       # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
@@ -215,6 +234,25 @@ jobs:
             third_party/opus-1.6.1
             third_party/speexdsp-1.2.1
           key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
+      # The web client's toolchain (docs/WEB.md): the daemon is never built
+      # without the client it serves -- the page and loader are compiled into it
+      # (daemon/webapp.h), so `make` needs emcc. The two wasm libraries are built
+      # once by their scripts and cached, keyed by the scripts and the emsdk.
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.8
+          actions-cache-folder: emsdk-cache
+      - name: Restore the wasm libraries
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/wasm/mbedtls
+            build/wasm/sdl3
+            build/wasm/libvpx
+            build/wasm/opus
+            build/wasm/speexdsp
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build_mbedtls_wasm.sh', 'scripts/build_sdl3_wasm.sh', 'scripts/build_media_wasm.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
       - name: Test under ThreadSanitizer
         run: make test-ci PART=threads
 

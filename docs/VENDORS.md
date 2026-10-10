@@ -277,8 +277,8 @@ upstream's own stability contract for a base OS.
 
 ## 6. Windows cross-compile artifacts
 
-The native Win32 GUI lives at `client/gui/win32/` (ARCH-82, pure Win32 +
-Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
+The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
+`client/gui/platform/win32/`. Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 | Item | Version | Note | License |
 |------|---------|------|---------|

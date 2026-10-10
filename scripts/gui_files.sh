@@ -16,8 +16,14 @@
 # to see paging; a real daemon pages at two hundred.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRIVE="$HERE/scripts/gui_drive.sh"
+# The driver: the Windows client's, or the web client's with
+# OC_GUI_DRIVE=scripts/web_drive.sh (docs/TESTING.md).
+DRIVE="${OC_GUI_DRIVE:-$HERE/scripts/gui_drive.sh}"
+PLAT=win32; [ -n "${OC_GUI_DRIVE:-}" ] && PLAT=web
 LIN_DIR='/mnt/c/Windows/Temp/octest'
+WIN_DIR='C:\Windows\Temp\octest'
+# A file's path as the client under test names it (see gui_uploads.sh).
+cpath() { if [ "$PLAT" = web ]; then printf '%s/%s' "$LIN_DIR" "$1"; else printf '%s\\%s' "$WIN_DIR" "$1"; fi; }
 START=$SECONDS
 fails=0
 checks=0
@@ -48,7 +54,7 @@ kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run
 rm -rf "$OC_DEV_DIR"
 
 D="/tmp/oc-files-dump.txt"
-snap() { "$DRIVE" dump files >/dev/null 2>&1; cp "$LIN_DIR/files.txt" "$D" 2>/dev/null; }
+snap() { "$DRIVE" dump files 2>/dev/null | tail -n +2 > "$D"; }
 f() { snap; grep -m1 '^files ' "$D" | grep -o "\b$1=[^ ]*" | head -1 | cut -d= -f2; }
 waitfor() {  # waitfor <secs> <command...>
   local secs="$1" t=0; shift
@@ -67,9 +73,8 @@ for _ in $(seq 1 80); do snap; grep -q 'authed=1' "$D" && break; sleep 0.25; don
 "$DRIVE" size 1200 820 >/dev/null
 "$DRIVE" channel 1 >/dev/null
 for i in 1 2 3; do
-  p="/mnt/c/Windows/Temp/octest/paged$i.txt"
-  printf 'file %d\n' "$i" > "$p"
-  "$DRIVE" upload "C:\\Windows\\Temp\\octest\\paged$i.txt" >/dev/null
+  printf 'file %d\n' "$i" > "$LIN_DIR/paged$i.txt"
+  "$DRIVE" upload "$(cpath paged$i.txt)" >/dev/null
   sleep 1
 done
 "$DRIVE" view files >/dev/null

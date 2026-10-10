@@ -48,6 +48,23 @@ int oc_http_parse_head(const char *buf, size_t len, oc_http_req *req) {
             continue;
         }
         if (!h[i].name) continue;                       /* a folded continuation line */
+        if (ci_eq(h[i].name, h[i].name_len, "upgrade")) {
+            if (h[i].value_len == 9 && ci_eq(h[i].value, 9, "websocket")) req->upgrade_ws = 1;
+            continue;
+        }
+        if (ci_eq(h[i].name, h[i].name_len, "sec-websocket-key")) {
+            req->ws_key = h[i].value; req->ws_key_len = h[i].value_len;
+            continue;
+        }
+        if (ci_eq(h[i].name, h[i].name_len, "sec-websocket-protocol")) {
+            /* The first one offered is the one taken (ioloop.c echoes it). */
+            const char *v = h[i].value; size_t vl = h[i].value_len;
+            while (vl && (*v == ' ' || *v == '\t')) { v++; vl--; }
+            size_t k = 0;
+            while (k < vl && v[k] != ',' && v[k] != ' ' && v[k] != '\t') k++;
+            if (k && !req->ws_proto) { req->ws_proto = v; req->ws_proto_len = k; }
+            continue;
+        }
         if (ci_eq(h[i].name, h[i].name_len, "content-length")) {
             if (h[i].value_len == 0 || h[i].value_len > 19) return -1;
             size_t v = 0;
@@ -141,6 +158,7 @@ const oc_http_route *oc_http_route_find(const oc_http_site *site, const oc_http_
 static const char *reason(int status) {
     switch (status) {
     case 200: return "OK";
+    case 302: return "Found";
     case 303: return "See Other";
     case 400: return "Bad Request";
     case 403: return "Forbidden";

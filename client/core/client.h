@@ -16,6 +16,14 @@
 #include "model.h"
 #include "secret.h"
 
+/* A browser sign-in's result (net.h), for oc_client_start_signin_result. */
+#ifndef OC_SIGNIN_RESULT_DEFINED
+#define OC_SIGNIN_RESULT_DEFINED
+typedef struct {
+    const char *source_id, *verifier, *token, *state;
+} oc_signin_result;
+#endif
+
 typedef struct oc_client oc_client;
 
 /* Start the core: spawn the network thread and connect to host:port. `cred`
@@ -74,6 +82,13 @@ oc_client *oc_client_start_signin(const char *workspace_key, const char *host, i
 oc_client *oc_client_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
                                  const char *store_path, oc_secret *secret,
                                  int remember, const char *published_fingerprint);
+/* As oc_client_start_signin, resuming a browser sign-in whose result this
+ * process did not wait for (oc_signin_result, net.h): the web client, after
+ * the browser comes back to it with the token. */
+oc_client *oc_client_start_signin_result(const char *workspace_key, const char *host, int port,
+                                         const oc_signin_result *result,
+                                         const char *store_path, oc_secret *secret,
+                                         int remember, const char *published_fingerprint);
 /* A local account, signed in to with a device code (AUTH.md §8.11), for a
  * client with no browser of its own: model->device_url and device_code say
  * where to enter which code, from any device; device_fp is the daemon's

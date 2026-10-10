@@ -20,7 +20,15 @@
 # gives. Not in CI, as the smoke is not: the daemon cannot run on a Windows runner.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRIVE="$HERE/scripts/gui_drive.sh"
+# The driver: the Windows client's, or the web client's with
+# OC_GUI_DRIVE=scripts/web_drive.sh (docs/TESTING.md). The checks that are
+# the Windows platform's alone (UI Automation, its own windows) run there only.
+DRIVE="${OC_GUI_DRIVE:-$HERE/scripts/gui_drive.sh}"
+PLAT=win32; [ -n "${OC_GUI_DRIVE:-}" ] && PLAT=web
+OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
+# Files the client is given (a microphone's clip): on the Windows share for the
+# Windows client, in the fixture directory for the web client, which the
+# driver carries onto the page.
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 WIN_DIR='C:\Windows\Temp\octest'
 START=$SECONDS
@@ -45,7 +53,8 @@ kill_dev_daemon() {
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
       grep -qx "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" && kill "$p" 2>/dev/null
   done
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  # A daemon with the speech models loaded takes a few seconds to go.
+  for _ in $(seq 1 60); do
     (exec 3<>/dev/tcp/127.0.0.1/"$OC_DEV_PORT") 2>/dev/null || return 0
     exec 3<&- 3>&-; sleep 0.3
   done
@@ -67,7 +76,7 @@ drive() {
   return 0
 }
 
-snap() { "$DRIVE" dump voice >/dev/null 2>&1; cat "$LIN_DIR/voice.txt" 2>/dev/null; }
+snap() { "$DRIVE" dump voice 2>/dev/null | tail -n +2; }
 dict() { snap | grep '^dictate '; }
 key_of() { printf '%s' "$1" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2; }
 ed_text() { snap | grep '^ed len=' | sed 's/.* text="\(.*\)"$/\1/'; }
@@ -130,7 +139,8 @@ HOLD=$(clip_secs)
 # --- launch against a daemon with voice input on --------------------------
 fresh_fixture
 export OPENCHIME_TEST_AUDIO=synthetic
-export OPENCHIME_TEST_MIC="$WIN_DIR\\voice-mic.wav"
+if [ "$PLAT" = web ]; then export OPENCHIME_TEST_MIC="$LIN_DIR/voice-mic.wav"
+else export OPENCHIME_TEST_MIC="$WIN_DIR\\voice-mic.wav"; fi
 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep -q 'authed=1 connected=1'; do
   [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_DEV_PORT"; exit 1; }
@@ -155,6 +165,7 @@ check "letting go closes it" wait_dict on 0
 check "the words land in the composer" heard_in_composer
 check "and nothing was sent" test "$(msgs_in general)" = "$before"
 
+if [ "$PLAT" = win32 ]; then
 say "== push to talk, by UI Automation"
 drive type ""
 uia() { powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$HERE/scripts/uia_invoke.ps1")" -Aid "$1" 2>&1 | grep -q '^uia_invoke: OK'; }
@@ -163,6 +174,7 @@ check "the session is push to talk" wait_dict mode 0
 sleep "$HOLD"
 check "invoking it again stops" uia composer.mic
 check "the words land in the composer" heard_in_composer
+fi
 
 say "== push to talk, by the mouse"
 drive type ""
@@ -222,7 +234,7 @@ drive channel general
 drive key ctrl+shift+space
 drive keyup space
 check "no session opens" test "$(key_of "$(dict)" on)" = 0
-blocked() { snap | grep '^toast\[' | grep -q 'Microphone blocked by Windows privacy settings'; }
+blocked() { snap | grep '^toast\[' | grep -q 'Microphone blocked'; }
 check "and the user is told it is blocked, and where to allow it" blocked
 
 # --- off in the daemon ------------------------------------------------------------
