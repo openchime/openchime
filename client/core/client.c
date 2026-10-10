@@ -143,12 +143,18 @@ static void listen_pump(oc_client *c) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+static int summary_send(oc_client *c);
+
 void oc_client_tick(oc_client *c) {
     if (!c) return;
     oc_ev *e;
     while ((e = oc_queue_try_pop(&c->events)) != NULL) {
         oc_model_apply(&c->model, e);
         oc_ev_free(e);
+    }
+    if (c->model.summary_resend && c->model.authed) {
+        c->model.summary_resend = 0;
+        if (c->model.summary_open && c->model.summary_loading) summary_send(c);
     }
     listen_pump(c);
 }
@@ -645,25 +651,101 @@ void oc_client_close_pins(oc_client *c) {
     if (c) oc_model_close_pinlist(&c->model);
 }
 
+/* The open summary's request, as asked: sent when it is asked for, and again
+ * on a new connection while it is still waiting, since the daemon drops what a
+ * closed connection was waiting for. */
+static void summary_leave(oc_client *c, int type);
+
+static int summary_send(oc_client *c) {
+    oc_model *m = &c->model;
+    if (m->summary_notice) {
+        /* Opened from a notice: asked for that again. */
+        oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARY_OPEN);
+        if (!cmd) return -1;
+        cmd->req_id = m->summary_req;
+        cmd->message_id = m->summary_notice;
+        oc_queue_push(&c->cmds, cmd);
+        return 0;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARIZE);
+    if (!cmd) return -1;
+    cmd->channel_id = m->summary_channel;
+    cmd->req_id = m->summary_req;
+    cmd->scope = m->summary_scope;
+    cmd->start_ms = m->summary_scope == OC_SUM_RANGE ? m->summary_start : 0;
+    cmd->end_ms = m->summary_scope == OC_SUM_RANGE ? m->summary_end : 0;
+    oc_queue_push(&c->cmds, cmd);
+    return 0;
+}
+
 uint32_t oc_client_summarize(oc_client *c, uint64_t channel_id, uint8_t scope, uint64_t start_ms, uint64_t end_ms) {
-    if (!c || !channel_id || scope > OC_SUM_DAILY) return 0;
+    if (!c || !channel_id || scope > OC_SUM_TODAY) return 0;
+    /* One still being made goes on unwatched: its person is told when it is. */
+    summary_leave(c, OC_CMD_SUMMARY_DETACH);
     if (++c->next_req == 0) c->next_req = 1;
     uint32_t req = c->next_req;
     if (scope != OC_SUM_RANGE) start_ms = end_ms = 0;
     oc_model_summary_begin(&c->model, channel_id, scope, start_ms, end_ms, req);
-    oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARIZE);
-    if (!cmd) { oc_model_close_summary(&c->model); return 0; }
-    cmd->channel_id = channel_id;
-    cmd->req_id = req;
-    cmd->scope = scope;
-    cmd->start_ms = start_ms;
-    cmd->end_ms = end_ms;
-    oc_queue_push(&c->cmds, cmd);
+    if (summary_send(c) != 0) { oc_model_close_summary(&c->model); return 0; }
     return req;
 }
 
+uint32_t oc_client_summary_retry(oc_client *c) {
+    if (!c) return 0;
+    const oc_model *m = &c->model;
+    if (!m->summary_open || m->summary_loading || m->summary_status == OC_SUM_OK ||
+        m->summary_status == OC_SUM_FORBIDDEN)
+        return 0;
+    return oc_client_summarize(c, m->summary_channel, m->summary_scope, m->summary_start, m->summary_end);
+}
+
+/* The open summary's request, told to the daemon by `type` (DETACH or
+ * CANCEL) while it is still being made, and the pane closed. */
+static void summary_leave(oc_client *c, int type) {
+    oc_model *m = &c->model;
+    if (m->summary_open && m->summary_loading && !m->summary_notice && m->summary_req) {
+        oc_cmd *cmd = oc_cmd_new(type);
+        if (cmd) { cmd->req_id = m->summary_req; oc_queue_push(&c->cmds, cmd); }
+    }
+    oc_model_close_summary(m);
+}
+
+/* Closing a summary still being made stops watching it: it goes on, and the
+ * daemon tells its person when it is made (SUMMARY_READY). */
 void oc_client_close_summary(oc_client *c) {
-    if (c) oc_model_close_summary(&c->model);
+    if (c) summary_leave(c, OC_CMD_SUMMARY_DETACH);
+}
+
+void oc_client_summary_detach(oc_client *c) {
+    if (c) summary_leave(c, OC_CMD_SUMMARY_DETACH);
+}
+
+void oc_client_summary_cancel(oc_client *c) {
+    if (c) summary_leave(c, OC_CMD_SUMMARY_CANCEL);
+}
+
+uint32_t oc_client_summary_open_notice(oc_client *c, uint64_t notice_id, uint64_t channel_id, uint8_t scope) {
+    if (!c || !notice_id) return 0;
+    oc_model *m = &c->model;
+    const oc_summary_notice *n = oc_model_summary_notice(m, notice_id);
+    uint64_t ch = n ? n->channel_id : channel_id, start = n ? n->start_ms : 0, end = n ? n->end_ms : 0;
+    uint8_t sc = n ? n->scope : scope;
+    if (!ch) return 0;
+    summary_leave(c, OC_CMD_SUMMARY_DETACH);
+    if (++c->next_req == 0) c->next_req = 1;
+    uint32_t req = c->next_req;
+    oc_model_summary_begin(m, ch, sc, start, end, req);
+    m->summary_notice = notice_id;
+    oc_model_summary_notice_drop(m, notice_id);
+    if (summary_send(c) != 0) { oc_model_close_summary(m); return 0; }
+    return req;
+}
+
+void oc_client_summary_dismiss(oc_client *c, uint64_t notice_id) {
+    if (!c || !notice_id) return;
+    oc_model_summary_notice_drop(&c->model, notice_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SUMMARY_DISMISS);
+    if (cmd) { cmd->message_id = notice_id; oc_queue_push(&c->cmds, cmd); }
 }
 
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id) {

@@ -1233,9 +1233,20 @@ static oc_unfurler *g_unfurler;
 void oc_netloop_set_summary(struct oc_sum_worker *w) { __atomic_store_n(&g_sum, w, __ATOMIC_RELEASE); }
 static oc_sum_worker *sum_worker(void) { return __atomic_load_n(&g_sum, __ATOMIC_ACQUIRE); }
 
+/* Summaries are configured and coming up (the model fetched, checked, loaded):
+ * offered meanwhile, their requests queued for the worker to take when it
+ * starts. If they fail to come up, every waiting request is answered. */
+static int g_sum_starting, g_sum_failed_pending;
+void oc_netloop_summary_starting(void) { __atomic_store_n(&g_sum_starting, 1, __ATOMIC_RELEASE); }
+void oc_netloop_summary_failed(void) {
+    __atomic_store_n(&g_sum_starting, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_sum_failed_pending, 1, __ATOMIC_RELEASE);
+}
+static int sum_offered(void) { return sum_worker() || __atomic_load_n(&g_sum_starting, __ATOMIC_ACQUIRE); }
+
 /* A closed connection: nobody waits on its summary requests now. */
 static void sum_conn_closed(uint64_t conn_id) {
-    if (!sum_worker() || !g_call_dbw) return;
+    if (!sum_offered() || !g_call_dbw) return;
     oc_job *j = oc_job_new(OC_JOB_SUMMARY_DROP, conn_id);
     if (j) oc_dbwriter_submit(g_call_dbw, j);
 }
@@ -2303,7 +2314,9 @@ static void send_places(int ep, conn **conns, const oc_dbres *r) {
     for (size_t i = 0; i < r->n_sum_places; i++) {
         conn *c = oc_idmap_get(&g_by_id, r->sum_places[i].conn_id);
         if (!c) continue;
-        oc_summary_queued q = { r->sum_places[i].req_id, r->sum_places[i].position };
+        /* While summaries come up, every request waits for them. */
+        oc_summary_queued q = { r->sum_places[i].req_id,
+                                sum_worker() ? r->sum_places[i].position : (uint16_t)OC_SUM_POS_STARTING };
         uint8_t buf[32];
         oc_wbuf w;
         oc_wbuf_init(&w, buf, sizeof buf);
@@ -2499,7 +2512,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_summarize sm;
             if (oc_decode_summarize(&p, &sm) != OC_OK) return -1;
             oc_sum_worker *sw = sum_worker();
-            if (!sw) {
+            if (!sum_offered()) {
                 send_summary(ep, conns, c, sm.req_id, OC_SUM_UNAVAILABLE, sm.channel_id, 0, 0, 0, "",
                              "Summaries are not turned on.");
                 continue;
@@ -2512,7 +2525,42 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->sum_scope = sm.scope;
             j->sum_start = sm.start_ms;
             j->sum_end = sm.end_ms;
-            j->sum_version = strdup(oc_sum_worker_version(sw));
+            /* While summaries come up there is no version yet: nothing stored
+             * is found, and the request is queued for the worker. */
+            j->sum_version = strdup(sw ? oc_sum_worker_version(sw) : "");
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SUMMARY_DETACH || hdr.msg_type == OC_MSG_SUMMARY_CANCEL) {
+            /* The asker stops watching a request (it goes on, and they are told
+             * when it is made), or cancels it. */
+            oc_summary_req sr;
+            if (oc_decode_summary_req(&p, &sr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_SUMMARY_DETACH ? OC_JOB_SUMMARY_DETACH
+                                                                         : OC_JOB_SUMMARY_CANCEL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->sum_req = sr.req_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SUMMARY_OPEN || hdr.msg_type == OC_MSG_SUMMARY_DISMISS) {
+            /* A notice opened (answered as SUMMARY) or dismissed: the person's
+             * own, whether summaries are on now or not. */
+            oc_summary_open so = {0};
+            if (hdr.msg_type == OC_MSG_SUMMARY_OPEN) {
+                if (oc_decode_summary_open(&p, &so) != OC_OK) return -1;
+            } else {
+                oc_summary_dismiss sd;
+                if (oc_decode_summary_dismiss(&p, &sd) != OC_OK) return -1;
+                so.notice_id = sd.notice_id;
+            }
+            oc_job *j = oc_job_new(hdr.msg_type == OC_MSG_SUMMARY_OPEN ? OC_JOB_SUMMARY_OPEN : OC_JOB_SUMMARY_SEEN,
+                                   c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->sum_req = so.req_id;
+            j->sum_notice = so.notice_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -5333,8 +5381,9 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             memset(&caps, 0, sizeof caps);
 #ifdef OC_TTS
             if (g_tts && g_tts_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_TTS);
-            if (sum_worker()) caps.names[caps.count++] = oc_slice_str(OC_CAP_SUMMARIZE);
 #endif
+            /* Offered while they come up, too: a request then waits in the queue. */
+            if (sum_offered()) caps.names[caps.count++] = oc_slice_str(OC_CAP_SUMMARIZE);
 #ifdef OC_STT
             if (g_stt && g_stt_engine) caps.names[caps.count++] = oc_slice_str(OC_CAP_STT);
 #endif
@@ -5417,6 +5466,16 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;
         }
+        /* Summaries made while they were away, not yet seen (REQ-310). */
+        for (size_t i = 0; i < r->n_sum_notices && conns[fd]; i++) {
+            const struct oc_sum_notice_row *sn = &r->sum_notices[i];
+            oc_summary_ready rd = { sn->id, sn->channel_id, sn->scope, sn->status, sn->start_ms, sn->end_ms,
+                                    sn->made_at_ms };
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            if (oc_encode_summary_ready(&w, OC_PROTOCOL_VERSION, &rd) == OC_OK)
+                send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        if (!conns[fd]) break;
 
         /* The calls there are, as the Calls section lists them (REQ-303): one
          * CALL_STATE for each this user may hear about. */
@@ -6477,8 +6536,33 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         break;
     }
     case OC_RES_SUMMARY: {
-        conn *c = find_by_id(conns, r->conn_id);
-        if (!c) break;
+        conn *c = r->conn_id ? find_by_id(conns, r->conn_id) : NULL;
+        /* A cancelled request being made: the worker stops it. */
+        if (r->sum_row) oc_sum_worker_cancel(sum_worker(), r->sum_row);
+        if (r->sum_notice) {
+            /* A request made: to the connection watching it, if it still is
+             * (and then seen); otherwise told to its person as a notice, on
+             * every connection they have. */
+            if (c && c->authed && c->user_id == r->sum_user) {
+                send_summary(ep, conns, c, r->sum_req, r->sum_status, r->channel_id, r->sum_id, r->sum_start,
+                             r->sum_end, r->sum_version, r->sum_body ? r->sum_body : "");
+                oc_job *j = oc_job_new(OC_JOB_SUMMARY_SEEN, 0);
+                if (j) { j->user_id = r->sum_user; j->sum_notice = r->sum_notice; oc_dbwriter_submit(dbw, j); }
+            } else {
+                oc_summary_ready rd = { r->sum_notice, r->channel_id, r->sum_scope, r->sum_status,
+                                        (uint64_t)r->sum_start, (uint64_t)r->sum_end, r->sum_made_at };
+                uint8_t buf[64];
+                oc_wbuf w;
+                oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_summary_ready(&w, OC_PROTOCOL_VERSION, &rd) == OC_OK)
+                    send_to_user(ep, conns, r->sum_user, 0, buf, w.len);
+                fprintf(stderr, "summary: notice %llu for user %llu\n", (unsigned long long)r->sum_notice,
+                        (unsigned long long)r->sum_user);
+            }
+            send_places(ep, conns, r);
+            break;
+        }
+        if (!c) { send_places(ep, conns, r); break; }
         const char *why = r->sum_status == OC_SUM_FORBIDDEN ? "You cannot read that conversation."
                         : r->sum_status == OC_SUM_FAILED && !r->sum_body ? "The summary could not be made."
                         : r->sum_body;
@@ -6491,7 +6575,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         /* Nothing stored: into the queue, through the writer (summary_requests). */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        if (!sum_worker()) {
+        if (!sum_offered()) {
             send_summary(ep, conns, c, r->sum_req, OC_SUM_UNAVAILABLE, r->channel_id, 0, r->sum_start,
                          r->sum_end, "", "Summaries are not turned on.");
             break;
@@ -6504,6 +6588,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         j->sum_start = (uint64_t)r->sum_start;
         j->sum_end = (uint64_t)r->sum_end;
         j->sum_tz = r->sum_tz;
+        j->sum_scope = r->sum_scope;
         oc_dbwriter_submit(dbw, j);
         break;
     }
@@ -6527,6 +6612,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         send_places(ep, conns, r);
         break;
     }
+    case OC_RES_SUMMARY_FAILALL:
+        /* Summaries did not come up: each request that waited is told so. */
+        for (size_t i = 0; i < r->n_sum_places; i++) {
+            conn *c = find_by_id(conns, r->sum_places[i].conn_id);
+            if (c)
+                send_summary(ep, conns, c, r->sum_places[i].req_id, OC_SUM_UNAVAILABLE, 0, 0, 0, 0, "",
+                             "Summaries could not be started on this server.");
+        }
+        break;
     case OC_RES_STORAGE_STATUS: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
@@ -8212,6 +8306,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         maybe_run_maintenance(dbw);
         maybe_fire_scheduled(dbw);
         expire_snoozes(ep, conns);
+        if (__atomic_exchange_n(&g_sum_failed_pending, 0, __ATOMIC_ACQ_REL)) {
+            oc_job *j = oc_job_new(OC_JOB_SUMMARY_FAIL, 0);
+            if (j) oc_dbwriter_submit(dbw, j);
+        }
         close_unauthed(ep, conns);
         sessions_seen(conns, dbw);
         flush_deferred_presence(ep, conns);

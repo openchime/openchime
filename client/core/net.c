@@ -1086,6 +1086,21 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_SUMMARY_READY) {
+            oc_summary_ready rd;
+            if (oc_decode_summary_ready(&p, &rd) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SUMMARY_READY);
+                if (e) {
+                    e->summary_id = rd.notice_id;
+                    e->channel_id = rd.channel_id;
+                    e->sum_scope = rd.scope;
+                    e->status = rd.status;
+                    e->span_start = rd.start_ms;
+                    e->span_end = rd.end_ms;
+                    e->made_at = rd.made_at_ms;
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_DESCRIPTION) {
             oc_channel_description cd;
             if (oc_decode_channel_description(&p, &cd) == OC_OK) {
@@ -3519,6 +3534,25 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_summarize sm = { c->req_id, c->channel_id, c->scope, c->start_ms, c->end_ms };
                 if (oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARY_DETACH || c->type == OC_CMD_SUMMARY_CANCEL) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summary_req sr = { c->req_id };
+                if (oc_encode_summary_req(&w, OC_PROTOCOL_VERSION, c->type == OC_CMD_SUMMARY_DETACH
+                        ? OC_MSG_SUMMARY_DETACH : OC_MSG_SUMMARY_CANCEL, &sr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARY_OPEN) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summary_open so = { c->req_id, c->message_id };
+                if (oc_encode_summary_open(&w, OC_PROTOCOL_VERSION, &so) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SUMMARY_DISMISS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_summary_dismiss sd = { c->message_id };
+                if (oc_encode_summary_dismiss(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_MARK_ALL_READ) {

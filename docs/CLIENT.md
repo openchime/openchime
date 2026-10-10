@@ -146,16 +146,37 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   notification settings, admin and storage. This document does not enumerate
   them; read the header. A frontend uses only this facade.
 - **Summaries (REQ-310–313).** `oc_client_summarize(channel, scope, start, end)`
-  asks for one, over the scopes of `SUMMARIZE` (unread, the last 7 days, since
-  yesterday, or two local dates `oc_summary_range_parse` reads), and returns the
-  request's id — the first request in the core that carries one. The model holds
-  one open summary: loading until its `SUMMARY` arrives, then its status and, when
-  it is one, the body read by `client/core/summary.c` into an overview and items,
-  each with its kind, text, owner, status and the message ids it came from. An
-  answer to anything but the open request is dropped, and closing forgets it:
-  a summary is shown to the person who asked and kept nowhere, as Slack's are.
-  Frontends offer it only where `oc_model_summarize_available` (the `summarize`
-  capability), and close it when the conversation changes.
+  asks for one, over the five scopes of `SUMMARIZE` (unread, today, since
+  yesterday, the last 7 days, or a range of days), and returns the request's id
+  — the first request in the core that carries one. The model holds one open
+  summary: loading, with its place in the daemon's queue, until its `SUMMARY`
+  arrives, then its status and, when it is one, the body read by
+  `client/core/summary.c` into the overview; topics (a title, who was in it, how
+  many messages it rests on, what happened, and details each with the message
+  ids it came from); what needs attention; the titles of further topics; who
+  posted and how many messages the span holds; and the cited messages
+  themselves. An answer to anything but the open
+  request is dropped, and closing forgets it: a summary is shown to the person
+  who asked and kept nowhere, as Slack's are. The same file has what both
+  frontends draw from: each span's name, the dates a span covers ("Sep 28 - Oct
+  5"), the waiting lines, the posters as their hover reads, a citation's "Today
+  at 11:22 AM", the posters' names in a text (drawn as mentions), and the custom
+  range picker (`oc_sumcal`: two months, the first day then the last, nothing
+  after today). Frontends offer it only where `oc_model_summarize_available`
+  (the `summarize` capability), and close it when the conversation changes.
+  A connection lost while it waits asks again once signed in (the daemon drops
+  what a closed connection waited for). One that was not made has a headline
+  for why (`oc_summary_fail_title`: unavailable, refused, or failed) over the
+  daemon's own sentence, and, unless it was refused, `oc_client_summary_retry`
+  asks again for the same span. Closing one still being made, or
+  `oc_client_summary_detach`, stops watching it: it goes on, and the daemon
+  tells this person when it is made (`SUMMARY_READY`), as a notice the model
+  keeps (`sum_notices`, each once however often told) until it is opened
+  (`oc_client_summary_open_notice`: the summary as it was made fills the open
+  summary) or dismissed; `oc_model_summary_notice_take` gives each new one to
+  the frontend once, for a toast, and `oc_summary_notice_title` words it.
+  `oc_client_summary_cancel` cancels one being made. Activity lists notices as
+  kind 4.
 
 - **Transfers queue** (REQ-140/162). A connection runs one transfer at a time,
   as the daemon requires, so the net thread keeps a FIFO of transfer commands —
@@ -324,17 +345,32 @@ model; translate input to intents }, stop.
   left of the unread count; members never see it. The launcher's "Daemon alerts"
   lists them, newest first, each with its state, count and message; `a`
   acknowledges the one selected, `A` all of them.
-  **Summaries (REQ-310):** where the daemon makes them, the launcher's
-  "Summarize" and the channel menu's offer the span — Unread, Last 7 days, Since
-  yesterday, or Dates, typed as two days — and open the summary over the
-  conversation: while the daemon makes it (minutes, on a small server, for one
-  not made yet) its place in the daemon's queue, "Waiting: 2 requests ahead of
-  yours" or "Summarizing now…", then the overview and the decisions, actions,
-  problems and facts, each with how many messages it came from. ↑/↓ selects an
-  item and Enter goes to its first message, selecting it in the conversation and
-  fetching the history around it when it is not loaded; the launcher's "Back to
-  the summary" reopens it while you stay in the conversation. Esc, or moving to
-  another conversation, forgets it.
+  **Summaries (REQ-310):** where the daemon makes them, "Summarize ▾" at the
+  right of the conversation's title (a click, with the mouse on), the launcher's
+  "Summarize" and the channel menu's offer the span — Unread, Today, Since
+  yesterday, Last 7 days, Custom date range. The custom range is a card: Start
+  and End fields that take a typed date, and two months side by side, the
+  arrows moving the day, Enter picking the first day and then the last, PgUp/PgDn
+  changing month, Tab going round the fields and buttons, and Summarize doing
+  nothing until both days are picked. The summary opens over the conversation:
+  while the daemon makes it (minutes, on a small server, for one not made yet)
+  what it is summarizing and its place in the daemon's queue; then the dates,
+  how many messages and who posted, the overview, and each topic — its title,
+  who was in it and how many messages, what happened, and under "More details"
+  its details, each ending in its citations, [n] — then "Needs attention"
+  (actions and questions, cited the same way) and "More topics". ↑/↓ selects a
+  topic, a detail or an item that needs attention; the selected detail shows
+  the message it cites under it (who, where, its first lines, when); Space, or
+  Enter on a topic, shows or hides its details; Enter on a detail or an item
+  goes to its message, selecting it in
+  the conversation and fetching the history around it when it is not loaded.
+  Posters' names are drawn in the mention colour. The launcher's "Back to the
+  summary" reopens it while you stay in the conversation. While it is made, n
+  asks to be told when it is ready and c cancels it; Esc closes it and it goes
+  on. A summary made while you were away is shown in the header (✦ n ready)
+  and on the status line, and the launcher's "Summaries ready (n)" lists them:
+  Enter opens one in its conversation, d dismisses it. One not made says why,
+  and r asks again. Esc, or moving to another conversation, forgets it.
   **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
   signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
   frame, rendering only the active one — so a workspace you aren't looking at
@@ -521,20 +557,45 @@ model; translate input to intents }, stop.
   - A message naming a group I am in tints and toasts as one naming me.
   - People lists the groups above the roster, and a profile card lists a person's groups.
 
-  **Summaries (REQ-310)**, where the daemon makes them: the channel menu's
-  **Summarize** and the palette's "Summarize this conversation" ask which span —
-  Unread, Last 7 days, Since yesterday, or Dates, the first and last day typed into
-  the form, which asks again with the field in red when they are not two days in
-  order. The summary opens in the context pane, beside the conversation, under a
-  **SUMMARY** header: its place in the daemon's queue until it arrives, as the
-  TUI says it, then the overview and the
-  decisions, actions, problems and facts, each with its owner and status where
-  given and how many messages it came from. Clicking an item goes to its first
-  message in the transcript, which scrolls to it and flashes it, as a pin does;
-  the pane stays. The pane scrolls; its back arrow or close forgets the summary,
-  and so does moving to another conversation. Each item is a list item in the
-  accessibility tree (`summary.item.<n>`), invoked as a click; the harness verb
-  `summary <scope>` asks without the form and `summary close` closes it.
+  **Summaries (REQ-310)**, where the daemon makes them: **Summarize** in the
+  conversation's header opens a menu of the spans — Unread, Today, Since
+  yesterday, Last 7 days, Custom date range — and the channel menu's
+  **Summarize** and the palette's "Summarize this conversation" open the same
+  menu. Custom date range is a card, "Summarize custom date range": Start and
+  End fields that take a typed date, and two months side by side with ‹ ›, today
+  ringed, days after today faint and not taken, the first click the first day
+  and the second the last, the range between tinted; Summarize stays grey until
+  both days are picked. The summary opens in the context pane, beside the
+  conversation, under a **SUMMARY** header. While the daemon makes it: what it is
+  summarizing ("Summarizing unreads in #pf-alerts"), its place in the daemon's
+  queue, and three placeholder lines. Then, as Slack's: "Summary of #channel",
+  the dates, and on the right the message count and the posters' faces (each
+  named on hover); the overview; each topic's title, with a chevron that shows
+  or hides its details ("Less detail"/"More detail"), who was in it and how many
+  messages, what happened, and under "More details" its details, each ending in
+  its citations, [n], numbered through the summary; "Needs attention", its
+  actions and questions cited the same way; and "More topics", the titles that
+  did not fit. Hovering a citation shows the message as a card — face, who, where,
+  its first four lines, when; clicking it goes to the message in the
+  transcript, which scrolls to it and flashes it, as a pin does; the pane stays.
+  Posters' names are drawn as mentions. Under the summary: "AI-generated
+  summarization may be inaccurate." One not made keeps the header and says why,
+  with **Try again** unless it was refused. While it is made, **Notify me when
+  ready** closes the pane and lets it go on, and **Cancel** stops it; closing
+  the pane is the same as Notify me. When one made while you were not watching
+  is ready, a toast says so ("Your summary of #kudos (Today) is ready") with
+  **View**, and stays until it is opened or closed (`OC_FB_NOTICE`), which opens it beside its conversation; one not made says so with
+  **Try again**. Activity lists them with the sparkles icon; clicking one opens
+  it. The pane scrolls; its back arrow or close
+  forgets the summary, and so does moving to another conversation. The header's
+  Summarize (`header.summarize`), each topic's chevron (`summary.topic.<t>`),
+  each citation (`summary.cite.<n>`) and each pickable day of the range card
+  (`sumrange.day.<yyyymmdd>`, with `sumrange.prev`/`.next`) are buttons in the
+  accessibility tree, invoked as a click. Harness verbs: `summenu` opens the
+  menu, `summary <scope>` asks without it and `summary close` closes it,
+  `sumrange [<first> <last>]` opens the range card (and picks those days),
+  `sumtoggle <t>` shows or hides a topic's details, and `sumcite <n>` goes to a
+  citation's message (`sumcite <n> hover` shows its card).
 - **Linux GUI:** the **same portable client** (ARCH-80) — the shared
   app layer over SDL3, with a FreeType/fontconfig text backend and a small
   native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: the client self-draws everything a toolkit

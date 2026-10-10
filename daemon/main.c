@@ -287,6 +287,7 @@ typedef struct {
     int            started;
     oc_dbwriter   *db;
     const char    *db_path;
+    const oc_config *cfg;          /* the hosted model's API, name and key */
     oc_sum_worker *worker;
 } sum_up;
 
@@ -305,28 +306,17 @@ static int sum_net_bytes(uint64_t *bytes) {
     return 0;
 }
 
-static void *sum_bring_up(void *arg) {
-    sum_up *u = arg;
-#ifdef OC_SUM
-    char dir[1024], path[1200], err[300] = "";
-    if (!oc_sum_cpu_ok(NULL, err, sizeof err)) {
-        fprintf(stderr, "openchimed: summaries are off: %s\n", err);
-        return NULL;
-    }
-    oc_sum_model_dir(u->db_path, dir, sizeof dir);
-    if (oc_sum_model_ensure(dir, OC_SUM_MODEL_FILE, OC_SUM_MODEL_URL, OC_SUM_MODEL_SHA256, OC_SUM_MODEL_BYTES,
-                            (const volatile int *)&g_stop, path, sizeof path, err, sizeof err) != 0) {
-        fprintf(stderr, "openchimed: summaries are off: %s\n", err);
-        return NULL;
-    }
-    const oc_sum_engine *e = oc_sum_llama_engine(path, OC_SUM_MODEL_NAME, SUM_CTX_TOKENS);
-    /* The model must load; the worker loads it again when first needed. */
-    void *h = g_stop ? NULL : e->open(e->ctx, err, sizeof err);
-    if (!h) {
-        if (!g_stop) fprintf(stderr, "openchimed: summaries are off: the model did not load: %s\n", err);
-        return NULL;
-    }
-    e->close(h);
+/* Summaries stay off: why, in the log, and the loop told, so what waited for
+ * them is answered. */
+static void *sum_off(const char *fmt, const char *why) {
+    fprintf(stderr, fmt, why);
+    oc_netloop_summary_failed();
+    return NULL;
+}
+
+/* The worker over `e`, and the loop told summaries exist. */
+static void *sum_start(sum_up *u, const oc_sum_engine *e, const char *what) {
+    char err[300] = "";
     oc_sum_probe_set_net(sum_net_bytes);
     oc_sum_worker_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -337,17 +327,48 @@ static void *sum_bring_up(void *arg) {
     cfg.sink.ctx = u;
     cfg.background = 1;
     u->worker = oc_sum_worker_start(&cfg, err, sizeof err);
-    if (!u->worker) { fprintf(stderr, "openchimed: summaries are off: %s\n", err); return NULL; }
+    if (!u->worker) return sum_off("openchimed: summaries are off: %s\n", err);
     oc_netloop_set_summary(u->worker);
-    fprintf(stderr, "openchimed: summaries on (local model %s)\n", OC_SUM_MODEL_NAME);
-#else
-    (void)u;
-    (void)sum_sink_store;
-    (void)sum_sink_take;
-    (void)sum_net_bytes;
-    fprintf(stderr, "openchimed: summaries are off: this daemon was built without them (SUM=0)\n");
-#endif
+    fprintf(stderr, "openchimed: summaries on (%s)\n", what);
     return NULL;
+}
+
+static void *sum_bring_up(void *arg) {
+    sum_up *u = arg;
+    char err[300] = "";
+    const oc_sum_engine *e;
+    char what[400];
+    if (u->cfg->summary.mode == OC_SUMMARY_CLOUD) {
+        /* A hosted model: it must answer before anyone is told summaries exist
+         * (opening asks it a one-line prompt). */
+        e = oc_sum_cloud_engine(u->cfg->summary.url, u->cfg->summary.model, u->cfg->summary.api_key);
+        if (!e->open(e->ctx, err, sizeof err))
+            return sum_off("openchimed: summaries are off: the hosted model did not answer: %s\n", err);
+        snprintf(what, sizeof what, "hosted model %s at %s", u->cfg->summary.model, u->cfg->summary.url);
+        return sum_start(u, e, what);
+    }
+#ifdef OC_SUM
+    char dir[1024], path[1200];
+    if (!oc_sum_cpu_ok(NULL, err, sizeof err)) return sum_off("openchimed: summaries are off: %s\n", err);
+    oc_sum_model_dir(u->db_path, dir, sizeof dir);
+    if (oc_sum_model_ensure(dir, OC_SUM_MODEL_FILE, OC_SUM_MODEL_URL, OC_SUM_MODEL_SHA256, OC_SUM_MODEL_BYTES,
+                            (const volatile int *)&g_stop, path, sizeof path, err, sizeof err) != 0)
+        return sum_off("openchimed: summaries are off: %s\n", err);
+    e = oc_sum_llama_engine(path, OC_SUM_MODEL_NAME, SUM_CTX_TOKENS);
+    /* The model must load; the worker loads it again when first needed. */
+    void *h = g_stop ? NULL : e->open(e->ctx, err, sizeof err);
+    if (!h) {
+        if (g_stop) return NULL;
+        return sum_off("openchimed: summaries are off: the model did not load: %s\n", err);
+    }
+    e->close(h);
+    snprintf(what, sizeof what, "local model %s", OC_SUM_MODEL_NAME);
+    return sum_start(u, e, what);
+#else
+    (void)e;
+    (void)what;
+    return sum_off("openchimed: summaries are off: %s\n", "this daemon was built without the local model (SUM=0)");
+#endif
 }
 
 int main(int argc, char **argv) {
@@ -820,11 +841,18 @@ int main(int argc, char **argv) {
     memset(&sumu, 0, sizeof sumu);
     sumu.db = db;
     sumu.db_path = db_path;
-    if (cfg->summary.mode == OC_SUMMARY_LOCAL) {
+    sumu.cfg = cfg;
+    if (cfg->summary.mode != OC_SUMMARY_OFF) {
+        /* Offered from the start: a request made while the model loads waits
+         * in the queue for it. A build without the local model has nothing to
+         * bring up for it, and offers nothing. */
+#ifndef OC_SUM
+        if (cfg->summary.mode == OC_SUMMARY_CLOUD)
+#endif
+            oc_netloop_summary_starting();
         sumu.started = pthread_create(&sumu.thread, NULL, sum_bring_up, &sumu) == 0;
+        if (!sumu.started) oc_netloop_summary_failed();
         if (!sumu.started) fprintf(stderr, "openchimed: summaries are off: cannot start their thread\n");
-    } else if (cfg->summary.mode == OC_SUMMARY_CLOUD) {
-        fprintf(stderr, "openchimed: summaries are off: OPENCHIME_SUMMARY=cloud is not available in this build\n");
     }
 
     /* Serve the binary protocol until a shutdown signal. */

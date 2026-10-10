@@ -620,6 +620,38 @@ oc_result oc_encode_summary_queued(oc_wbuf *w, uint16_t version, const oc_summar
     return oc_frame_end(w, off);
 }
 
+/* DETACH and CANCEL share the one field. */
+oc_result oc_encode_summary_req(oc_wbuf *w, uint16_t version, uint16_t type, const oc_summary_req *m) {
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u32(w, m->req_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_summary_ready(oc_wbuf *w, uint16_t version, const oc_summary_ready *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SUMMARY_READY);
+    oc_w_u64(w, m->notice_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->scope);
+    oc_w_u8(w, m->status);
+    oc_w_u64(w, m->start_ms);
+    oc_w_u64(w, m->end_ms);
+    oc_w_u64(w, m->made_at_ms);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_summary_open(oc_wbuf *w, uint16_t version, const oc_summary_open *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SUMMARY_OPEN);
+    oc_w_u32(w, m->req_id);
+    oc_w_u64(w, m->notice_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_summary_dismiss(oc_wbuf *w, uint16_t version, const oc_summary_dismiss *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SUMMARY_DISMISS);
+    oc_w_u64(w, m->notice_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_PINS);
     oc_w_u64(w, m->channel_id);
@@ -2677,6 +2709,33 @@ oc_result oc_decode_summary(oc_rbuf *p, oc_summary *m) {
 oc_result oc_decode_summary_queued(oc_rbuf *p, oc_summary_queued *m) {
     m->req_id = oc_r_u32(p);
     m->position = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summary_req(oc_rbuf *p, oc_summary_req *m) {
+    m->req_id = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summary_ready(oc_rbuf *p, oc_summary_ready *m) {
+    m->notice_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->scope = oc_r_u8(p);
+    m->status = oc_r_u8(p);
+    m->start_ms = oc_r_u64(p);
+    m->end_ms = oc_r_u64(p);
+    m->made_at_ms = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summary_open(oc_rbuf *p, oc_summary_open *m) {
+    m->req_id = oc_r_u32(p);
+    m->notice_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_summary_dismiss(oc_rbuf *p, oc_summary_dismiss *m) {
+    m->notice_id = oc_r_u64(p);
     return r_done(p);
 }
 

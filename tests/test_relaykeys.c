@@ -136,6 +136,7 @@ int run_relaykeys_tests(void) {
     const char *path = "build/test_relaykeys.db";
     unlink(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     CHECK(oc_dbwriter_configure_oidc(w, "https://auth.openchime.io", "acme.example", a.pem, "") == 0);
     char url[96];

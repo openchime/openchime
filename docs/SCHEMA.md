@@ -1511,6 +1511,61 @@ The summaries someone is waiting on (SUMMARIES.md §5): a SUMMARIZE with no stor
 answer, in the order asked (`id`). The writer adds a row, marks the one the worker
 takes `running`, and deletes it when it is answered or its connection closes. A
 connection id belongs to one run of the daemon, so every row is deleted at start.
+Remade by migration 0059 (§3ax): a request now outlives its connection.
+
+## 3ax. Migration 0059 — summaries owned by their asker, and notices (REQ-310–311, ARCH-116)
+
+```sql
+DROP TABLE summary_requests;
+CREATE TABLE summary_requests (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  conn_id        INTEGER NOT NULL DEFAULT 0,
+  req_id         INTEGER NOT NULL DEFAULT 0,
+  user_id        INTEGER NOT NULL,
+  channel_id     INTEGER NOT NULL,
+  scope          INTEGER NOT NULL DEFAULT 2,
+  start_ms       INTEGER NOT NULL,
+  end_ms         INTEGER NOT NULL,
+  tz_offset_min  INTEGER NOT NULL DEFAULT 0,
+  state          TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','running')),
+  created_at_ms  INTEGER NOT NULL,
+  started_at_ms  INTEGER
+);
+CREATE INDEX idx_sum_requests_conn ON summary_requests(conn_id);
+CREATE INDEX idx_sum_requests_user ON summary_requests(user_id);
+CREATE TABLE summary_notices (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id        INTEGER NOT NULL,
+  channel_id     INTEGER NOT NULL,
+  scope          INTEGER NOT NULL,
+  start_ms       INTEGER NOT NULL,
+  end_ms         INTEGER NOT NULL,
+  tz_offset_min  INTEGER NOT NULL DEFAULT 0,
+  status         INTEGER NOT NULL,
+  body           TEXT,
+  reason         TEXT,
+  made_at_ms     INTEGER NOT NULL,
+  seen_at_ms     INTEGER
+);
+CREATE INDEX idx_sum_notices_user ON summary_notices(user_id, seen_at_ms);
+```
+
+**`summary_requests`** is the queue again, its rows now its askers'. `conn_id`
+and `req_id` are the connection watching a request and the id it asked by, 0
+when nobody watches: its connection closed, or its person detached
+(`SUMMARY_DETACH`). At start every row is queued again, watched by nobody, so a
+request outlives the daemon. A request is deleted when answered or cancelled.
+The same person asking for the same channel, scope, zone and start (and, for a
+range, end) joins the row already there. `scope` is the span asked for
+(OC_SUM_*).
+
+**`summary_notices`** holds what a request left for its person: the summary as it
+was sent (`body`, the client body, SUMMARIES.md §3) when made, or why it was not
+(`reason`), with `status` as `SUMMARY`'s. Every finished request leaves one; one
+given live to the connection watching it is seen at once (`seen_at_ms`). Unseen,
+it is told on every sign-in; seen, it is deleted a day later
+(`SUM_NOTICE_KEEP_MS`, by the storage sweep). The involved Activity feed lists a
+person's notices as kind 4.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

@@ -196,6 +196,7 @@ static void run_maint(oc_dbwriter *w, uint64_t grace_ms, uint64_t max_age_ms, in
 static void test_daemon(void) {
     unlink(DBPATH); unlink(DBPATH "-wal"); unlink(DBPATH "-shm");
     oc_dbwriter *w = oc_dbwriter_start(DBPATH);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return;
     uint64_t alice = oc_dbwriter_register_local(w, "vm-alice", "pw", OC_ROLE_OWNER, 1000);

@@ -6,9 +6,9 @@ argument-hint: (none — operates on the current feature branch)
 Finish the current feature branch and raise its pull request. Refuse — report
 and do nothing else — if any step below fails.
 
-This is the whole local sequence, and it is budgeted at 3 minutes. Run
+This is the whole local sequence, and it is budgeted at 2 minutes. Run
 **exactly** these steps, in this order, and nothing else. In particular: **no
-`make test-tsan`, no `make CC=clang …`, no Windows builds, no `make clean`, no
+`make test-ci`, no `make CC=clang …`, no Windows builds, no `make clean`, no
 `make check-release-cc`, no re-runs of the suite.** CI runs the sanitizer, the
 release compiler and the Windows builds on the pull request, and staging requires them to pass before a
 merge (docs/CONTRIBUTING.md). Duplicating them here only spends time.

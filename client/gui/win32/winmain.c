@@ -288,7 +288,8 @@ static float g_composer_h = 142.0f;
 static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
 #define ROW_H       UIS(32.0f)     /* a sidebar channel row */
 #define AVA         UIS(36.0f)     /* transcript avatar diameter */
-#define LINE_H      UIS(19.0f)     /* an extra (reaction/attach/thread) line */
+#define LINE_H      UIS(19.0f)     /* an extra (reaction/attach) line */
+#define REPLY_ROW_H UIS(26.0f)     /* the "N replies" row under a thread's parent */
 /* The right-hand CONTEXT pane. It holds what is true about *people* in this
  * conversation — the member list, and a person's card when you open one. Your
  * OWN account (preferences, shortcuts, workspaces, notification settings) is a
@@ -2038,6 +2039,7 @@ static int g_notify_open, g_keys_open;
  * which fills the one and refocuses the other. */
 static int   g_status_open;
 static int   g_sch_open;              /* the send-later date and time card */
+static int   g_sr_open;               /* a summary's custom date range (REQ-310) */
 static int   g_status_clear;                 /* chip index 0..4 */
 static rectf g_status_emoji_btn, g_status_erect;
 static rectf g_status_chip_hits[5];
@@ -2121,6 +2123,7 @@ static rectf g_memchip;           /* header member-count chip */
  * aloud right now. The player BORROWS the bytes, so they are held here for as
  * long as it runs and freed with it. */
 static rectf      g_listen_btn;
+static rectf      g_sum_hdr_btn;    /* the header's Summarize (REQ-310) */
 static oc_player *g_listen_player;
 /* A voice's audition, played while choosing a voice (REQ-292). Separate from the
  * listen player: hearing a sample must not disturb a channel being read aloud. */
@@ -2135,6 +2138,9 @@ static rectf g_ws_dot;            /* workspace connection dot */
 static int g_tab_hover = -1;
 /* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
 static struct { rectf r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
+/* The "N replies" row under each thread parent on screen: a click opens the thread. */
+static struct { rectf r; uint64_t mid; } g_rephits[128];
+static int g_n_rephits;
 static int g_n_chips;
 /* The strip that appears on the message under the pointer: the quick reactions,
  * one press each (REQ-070). Its cells are hit-tested like a chip and toggle the
@@ -2245,7 +2251,8 @@ static int g_n_moreflyrows;
  * 200+, 900+) and a message's "Edit = 21" would have collided with a notification
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
-       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD, MENU_DRAFT };
+       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD, MENU_DRAFT,
+       MENU_SUMMARIZE };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box (it predates the flyout below and stays a row — six separate rows
  * would bury the rest of the message actions).
@@ -2505,6 +2512,11 @@ static struct { uint64_t cid, root; char to[256]; char body[DRAFT_TEXT_MAX * 3];
 /* The message a Delete took away, for its toast's Undo: the daemon holds it a
  * short while and gives it back to whoever deleted it (REQ-052). */
 static struct { uint64_t cid, mid; } g_undo_delete;
+/* The summary notices a toast offers to open (View) or ask again (Try again):
+ * a toast's action is FBA_SUMMARY + its slot here. */
+#define FBA_SUMMARY 1000
+static oc_summary_notice g_sum_toasts[8];
+static unsigned g_sum_toast_next;
 
 /* Spoken as each toast and banner appears (ARCH-99): politely, or -- for a
  * failure and an error banner -- assertively, so a screen reader interrupts. */
@@ -2514,6 +2526,8 @@ static void fb_say(const char *text, int assertive) {
 }
 static uint64_t fb_now(void) { return (uint64_t)GetTickCount64(); }
 static void toast_action_run(int action);   /* fwd */
+static void summary_open_notice(HWND hwnd, uint64_t id, uint64_t cid, uint8_t scope);   /* fwd */
+static void summarize_start(HWND hwnd, uint64_t cid, uint8_t scope, uint64_t rs, uint64_t re);   /* fwd */
 /* The four kinds, by what the message is (feedback.h). */
 static uint32_t fb_confirm(const char *text) { return oc_fb_show(&g_fb, OC_FB_CONFIRM, text, NULL, 0, fb_now()); }
 static uint32_t fb_failed(const char *text)  { return oc_fb_show(&g_fb, OC_FB_FAILED, text, NULL, 0, fb_now()); }
@@ -2919,6 +2933,10 @@ static void fill_round(gfx *rt, rectf r, float rad, uint32_t rgb) {
 /* Rounded fill with alpha — for translucent overlays (Slack-style selection). */
 static void fill_round_a(gfx *rt, rectf r, float rad, uint32_t rgb, float a) {
     gfx_fill_round(rt, gr(r), rad, rgb, a);
+}
+
+static void fill_rect_a(gfx *rt, rectf r, uint32_t rgb, float a) {
+    gfx_fill(rt, gr(r), rgb, a);
 }
 
 static void stroke_round(gfx *rt, rectf r, float rad,
@@ -3618,6 +3636,16 @@ static void draft_flush(uint64_t cid) {
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n < 0) n = 0;
     if (cid == g_draft_sent_cid && lstrcmpW(w, g_draft_sent) == 0) return;   /* unchanged */
+    if (n == 0) {
+        /* Nothing typed and nothing stored: there is no draft to write or to
+         * clear, so no request. Leaving every conversation used to write an
+         * empty draft for it. */
+        const oc_model *dm = model();
+        int stored = 0;
+        if (dm) for (size_t i = 0; i < dm->n_drafts; i++)
+            if (dm->drafts[i].channel_id == cid && dm->drafts[i].thread_root == 0) { stored = 1; break; }
+        if (!stored) { g_draft_sent_cid = cid; g_draft_sent[0] = 0; g_draft_dirty = 0; return; }
+    }
     int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
@@ -4896,7 +4924,6 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
     size_t nrows = oc_model_sidebar(m, &o, rows, rows_cap);
 
     float top = HEADER_H + 46, bot = h - call_strip_h(m);
-    g_sb_view = bot - top;
     /* The "Empty" placeholders occupy rows too, so they count toward the scrollable
      * height — otherwise the list is short by one row per empty section and the last
      * conversation is unreachable, which is the old unreachable-conversation bug all over again. */
@@ -4905,10 +4932,6 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
         if (rows[ri].is_header && !oc_sb_collapsed_of(&g_sb, rows[ri].section) &&
             (ri + 1 >= nrows || rows[ri + 1].is_header)) nplace++;
     g_sb_content = (float)(nrows + nplace) * ROW_H;
-    /* Clamp before drawing, so a resize or a collapse cannot strand the list. */
-    float maxscroll = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
-    if (g_sb_scroll > maxscroll) g_sb_scroll = maxscroll;
-    if (g_sb_scroll < 0) g_sb_scroll = 0;
 
     float sx0 = RAIL_W + 8, sx1 = RAIL_W + SIDEBAR_W - 8;
 
@@ -4995,9 +5018,21 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
         top = draw_calls_section(rt, m, top, sx0, sx1);
         fill(rt, rf(sx0 + 6, top - 4, sx1 - 6, top - 3), OC_COL_BORDER);
     }
+    /* The view is what is left below the shelf and Calls: measured HERE, once
+     * they have taken their rows. Measured at the sidebar's top it was too tall
+     * by their height, so the scroll stopped that far short of the last
+     * conversation. Clamped before drawing, so a resize or a collapse cannot
+     * strand the list. */
+    g_sb_view = bot - top;
+    float maxscroll = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
+    if (g_sb_scroll > maxscroll) g_sb_scroll = maxscroll;
+    if (g_sb_scroll < 0) g_sb_scroll = 0;
     float y = top - g_sb_scroll;
     g_n_rows = 0;
     g_sb_kebab = rf(0, 0, 0, 0);
+    /* Rows scroll under the shelf and Calls, never over them: a row half past
+     * the top is clipped, not drawn across "No calls". */
+    gfx_clip_push(rt, gr(rf(RAIL_W, top, RAIL_W + SIDEBAR_W, bot)));
 
     for (size_t ri = 0; ri < nrows; ri++) {
         const oc_sidebar_row *r = &rows[ri];
@@ -5150,6 +5185,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
         }
     }
 
+    gfx_clip_pop(rt);
     /* Scrollbar, only when there is overflow — the reason channels past the fold
      * used to be unreachable. */
     if (maxscroll > 0) {
@@ -5623,7 +5659,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         else
             extra++;
     }
-    if (msg->reply_count) extra++;
+    if (msg->reply_count) thumbs += REPLY_ROW_H;
     for (int i = 0; i < msg->n_unfurls; i++)
         thumbs += unfurl_card_h(&msg->unfurls[i]) + UNFURL_GAP;
     if (msg->forward) thumbs += forward_card_h(msg->forward) + FWD_GAP;
@@ -5921,11 +5957,29 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
     }
 
     if (msg->reply_count) {
+        /* The thread's row, as Slack draws it: a thread mark, the count in the
+         * link colour, and on hover the row lights and says what a click does.
+         * A click opens the thread (on_click); so does a double-click on the
+         * message itself (WM_LBUTTONDBLCLK). */
         char line[64];
-        snprintf(line, sizeof line, "\xE2\x86\xB3 %u %s", msg->reply_count,
-                 msg->reply_count == 1 ? "reply" : "replies");
-        draw_text(rt, line, g_meta, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
-        by += LINE_H;
+        snprintf(line, sizeof line, "%u %s", msg->reply_count, msg->reply_count == 1 ? "reply" : "replies");
+        rectf row = rf(tx - UIS(6.0f), by + UIS(2.0f), x0 + content_w + AVA + 12, by + REPLY_ROW_H - UIS(2.0f));
+        int hov = in_rect(row, g_mouse_x, g_mouse_y) && !pointer_blocked();
+        if (hov) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+        float ic = UIS(16.0f), iy = row.top + ((row.bottom - row.top) - ic) / 2;
+        draw_lucide(rt, OC_ICON_MESSAGE, rf(row.left + UIS(6.0f), iy, row.left + UIS(6.0f) + ic, iy + ic), OC_COL_ACCENT);
+        float lx = row.left + UIS(6.0f) + ic + UIS(6.0f);
+        draw_text(rt, line, g_ui_b, rf(lx, row.top, row.right, row.bottom), OC_COL_ACCENT);
+        if (hov) {
+            float lw = text_width(line, g_ui_b);
+            draw_text(rt, "View thread", g_meta, rf(lx + lw + UIS(10.0f), row.top, row.right, row.bottom), OC_COL_MUTED);
+        }
+        if (g_n_rephits < (int)(sizeof g_rephits / sizeof g_rephits[0])) {
+            g_rephits[g_n_rephits].r = row;
+            g_rephits[g_n_rephits].mid = msg->message_id;
+            g_n_rephits++;
+        }
+        by += REPLY_ROW_H;
     }
 
     /* Reactions LAST, under everything the message carries. Drawn between the
@@ -6141,6 +6195,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * only one of the two lists is drawn per frame — resetting only on `capture`
      * would leave the thread's chips pointing at stale rectangles. */
     g_n_chips = 0;
+    g_n_rephits = 0;
     g_n_hrx = 0;
     g_hrx_mid = 0;
     if (capture) {
@@ -6153,10 +6208,12 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
+        int divided = 0;   /* a day or "New" divider sits right above this row */
         if (sep[i]) {
             if (y + SEP_H >= reg.top && y <= reg.bottom)
                 draw_day_sep(rt, msgs[first + i].server_time, reg, y);
             y += SEP_H;
+            divided = 1;
         }
         /* The "New" divider sits above the first message past the marker. */
         if (capture && g_unread_from && g_unread_chan == g_sel &&
@@ -6171,6 +6228,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
                 g_meta->align = ST_ALIGN_LEFT;
             }
             y += SEP_H;
+            divided = 1;
         }
         if (msgs[first + i].kind == OC_MSG_KIND_CALL) {
             if (y + heights[i] >= reg.top && y <= reg.bottom)
@@ -6196,8 +6254,11 @@ static void draw_msglist(gfx *rt, const oc_model *m,
             if (row_hot && !msgs[first + i].deleted && g_n_quick > 0 && !pointer_blocked()) {
                 float cell = UIS(26.0f), pad = UIS(3.0f);
                 float sw = (cell + pad) * (float)g_n_quick + pad;
+                /* Straddling the row's top edge, as every chat client places
+                 * it; inside the row when a divider is above, or the strip sat
+                 * on the day's label. */
                 float sx = reg.right - UIS(16) - sw, sy = y - UIS(10);
-                if (sy < reg.top) sy = reg.top;
+                if (divided || sy < reg.top + UIS(4)) sy = y + UIS(4);
                 if (sx < reg.left + UIS(8)) sx = reg.left + UIS(8);
                 rectf strip = rf(sx, sy, sx + sw, sy + cell + pad * 2);
                 fill_round(rt, strip, OC_R_CONTROL, OC_COL_BASE);
@@ -9241,6 +9302,8 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
     }
     if (c && oc_model_calls_available(m)) right_used += UIS(58);     /* the call button */
     if (c && c->kind != OC_CHANNEL_KIND_DM) right_used += UIS(42);  /* Add people */
+    if (c && oc_model_summarize_available(m))                       /* Summarize */
+        right_used += UIS(38) + text_width("Summarize", g_meta) + UIS(12);
     float title_r = x0 + w - right_used - UIS(12);
     if (title_r < x0 + UIS(80)) title_r = x0 + UIS(80);   /* never nothing at all */
 
@@ -9327,6 +9390,24 @@ static void draw_header(gfx *rt, const oc_model *m, float x0, float w) {
         statr = g_listen_btn.left - 12;
     } else {
         g_listen_btn = rf(0, 0, 0, 0);
+    }
+    /* Summarize (REQ-310): the spans, in a menu under it -- only where the
+     * daemon summarizes, so a client against one that does not has no dead
+     * control. Lit while its menu is open. */
+    if (m && c && oc_model_summarize_available(m)) {
+        float sw = UIS(38) + text_width("Summarize", g_meta);
+        g_sum_hdr_btn = rf(statr - sw, 13, statr, HEADER_H - 13);
+        int hot = in_rect(g_sum_hdr_btn, g_mouse_x, g_mouse_y) || g_menu == MENU_SUMMARIZE;
+        if (hot) fill_round(rt, g_sum_hdr_btn, OC_R_CONTROL, OC_COL_HOVER);
+        stroke_round(rt, g_sum_hdr_btn, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        uint32_t scol = hot ? OC_COL_TEXT : OC_COL_MUTED;
+        draw_lucide(rt, OC_ICON_SPARKLES, rf(g_sum_hdr_btn.left + 6, g_sum_hdr_btn.top + 5,
+                                             g_sum_hdr_btn.left + 22, g_sum_hdr_btn.bottom - 5), scol);
+        draw_text(rt, "Summarize", g_meta, rf(g_sum_hdr_btn.left + 28, g_sum_hdr_btn.top,
+                                              g_sum_hdr_btn.right, g_sum_hdr_btn.bottom), scol);
+        statr = g_sum_hdr_btn.left - 12;
+    } else {
+        g_sum_hdr_btn = rf(0, 0, 0, 0);
     }
 
     if (ulbl[0]) {
@@ -10194,8 +10275,9 @@ static void draw_toasts(gfx *rt, float W, float H) {
     for (int k = g_fb.n - 1; k >= 0; k--) {                    /* newest at the edge */
         const oc_fb_toast *t = &g_fb.t[k];
         uint32_t tint = t->kind == OC_FB_FAILED ? OC_COL_DANGER
-                      : t->kind == OC_FB_CONFIRM ? OC_COL_ONLINE : OC_COL_NOTICE;
-        int icon = t->kind == OC_FB_FAILED ? OC_ICON_ALERT : t->kind == OC_FB_CONFIRM ? OC_ICON_CHECK
+                      : t->kind == OC_FB_CONFIRM || t->kind == OC_FB_NOTICE ? OC_COL_ONLINE : OC_COL_NOTICE;
+        int icon = t->kind == OC_FB_FAILED ? OC_ICON_ALERT
+                 : t->kind == OC_FB_CONFIRM || t->kind == OC_FB_NOTICE ? OC_ICON_CHECK
                  : t->kind == OC_FB_UNDO ? OC_ICON_UNDO : OC_ICON_INFO;
         float aw = t->action[0] ? text_width(t->action, g_meta) + UIS(24.0f) : 0;
         float tl = left + UIS(40.0f), tr = left + cw - UIS(36.0f) - (aw ? aw + UIS(8.0f) : 0);
@@ -10258,6 +10340,16 @@ static void toast_action_run(int action) {
     } else if (action == FBA_UNDO_DELETE && g_undo_delete.mid && g_client) {
         oc_client_restore_message(g_client, g_undo_delete.cid, g_undo_delete.mid);
         g_undo_delete.cid = g_undo_delete.mid = 0;
+    } else if (action >= FBA_SUMMARY && action < FBA_SUMMARY + 8 && g_client) {
+        /* A summary notice: View opens it; Try again asks for its span anew. */
+        const oc_summary_notice n = g_sum_toasts[action - FBA_SUMMARY];
+        if (!n.id) return;
+        g_sum_toasts[action - FBA_SUMMARY].id = 0;
+        if (n.status == OC_SUM_OK) summary_open_notice(g_main_hwnd, n.id, n.channel_id, n.scope);
+        else {
+            oc_client_summary_dismiss(g_client, n.id);
+            summarize_start(g_main_hwnd, n.channel_id, n.scope, n.start_ms, n.end_ms);
+        }
     }
 }
 
@@ -10294,81 +10386,341 @@ static void rp_pop(void) {
     g_profile_uid = 0;
 }
 
-/* The summary pane (REQ-310): the overview, then decisions, actions, problems
- * and facts. Each item is a row that goes to its first message in the
- * transcript beside it -- the reason it is in the context pane rather than over
- * the conversation. Scrolls, clipped to itself, like the About pane. */
-static struct { rectf r; uint64_t mid; size_t item; } g_sumrows[128];
-static int   g_n_sumrows;
+/* The summary pane (REQ-310), laid out as Slack's: "Summary of #channel", the
+ * dates, and on the right how many messages and who posted (each named on
+ * hover); then each topic -- its title, what happened, and under "More details"
+ * its details, each citing its messages as [n]. A topic's chevron shows and
+ * hides its details. Hovering an [n] shows the message (draw_summary_float);
+ * clicking it goes there in the transcript beside the pane. While the daemon
+ * makes it: what it is summarizing, where the request stands, and placeholder
+ * lines. Scrolls, clipped to itself, like the About pane. */
+enum { SH_TOGGLE = 1, SH_CITE, SH_RETRY, SH_NOTIFY, SH_CANCEL };
+static struct { rectf r; int kind, topic, num; uint64_t mid; } g_sumhits[256];
+static int   g_n_sumhits;
 static float g_sum_scroll, g_sum_max;
+static rectf g_sum_count_r, g_sum_people_r;
+static int   g_sum_force_cite;              /* the harness's "hover" over [n] */
+/* Which topics have their details hidden, for the summary they were hidden in. */
+static unsigned char *g_sum_closed;
+static size_t   g_sum_closed_n;
+static uint32_t g_sum_closed_req;
+
+static int sum_closed(const oc_model *m, size_t t) {
+    if (g_sum_closed_req != m->summary_req || g_sum_closed_n != m->summary.n_topics) {
+        free(g_sum_closed);
+        g_sum_closed = calloc(m->summary.n_topics ? m->summary.n_topics : 1, 1);
+        g_sum_closed_n = g_sum_closed ? m->summary.n_topics : 0;
+        g_sum_closed_req = m->summary_req;
+    }
+    return t < g_sum_closed_n && g_sum_closed[t];
+}
+
+static void sum_toggle(const oc_model *m, int t) {
+    sum_closed(m, (size_t)t);
+    if (t >= 0 && (size_t)t < g_sum_closed_n) g_sum_closed[t] ^= 1;
+}
+
+/* The conversation a summary is of: "#name", or "@name" for a DM. */
+static void conv_where(const oc_model *m, uint64_t cid, char *out, size_t cap) {
+    const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
+    if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name(m, ch->peer_id);
+        snprintf(out, cap, "@%s", pn && pn[0] ? pn : "dm");
+    } else snprintf(out, cap, "#%s", ch && ch->name ? ch->name : "\xE2\x80\xA6");
+}
+
+static void sum_where(const oc_model *m, char *out, size_t cap) { conv_where(m, m->summary_channel, out, cap); }
+
+typedef struct { size_t off, len; } sum_span;
+#define SUM_CITES 16   /* citations drawn on one line at most */
+
+/* `s` wrapped to `w` at (x, y): the posters' names in the mention style, the
+ * spans `links` in the accent, each link's rect into `hits`. `weight` 0 keeps
+ * the format's. The height it took. */
+static float sum_rich(gfx *rt, const char *s, fmtw *fmt, float x, float y, float w, uint32_t rgb, int weight,
+                      const oc_summary_view *v, const sum_span *links, int nl, rectf *hits) {
+    if (!s || !s[0] || !fmt || !fmt->f) return 0;
+    size_t len = strlen(s);
+    st_layout *l = st_layout_create(g_st, fmt->f, s, len, w, 4000.0f, ST_ALIGN_LEFT);
+    if (!l) return 0;
+    if (weight) st_range_weight(l, 0, len, weight);
+    oc_summary_mention mn[32];
+    size_t nm = v ? oc_summary_mentions(v, s, mn, 32) : 0;
+    for (size_t k = 0; k < nm; k++) {
+        st_range_color(l, mn[k].start, mn[k].len, OC_COL_ACCENT, 1.0f);
+        st_range_weight(l, mn[k].start, mn[k].len, weight > 600 ? weight : 600);
+    }
+    for (int k = 0; k < nl; k++) st_range_color(l, links[k].off, links[k].len, OC_COL_ACCENT, 1.0f);
+    st_metrics mt;
+    st_layout_metrics(l, &mt);
+    for (int k = 0; k < nl; k++) {
+        st_rect hr[2];
+        int nr = st_hit_range(l, links[k].off, links[k].len, hr, 2);
+        hits[k] = nr > 0 ? rf(x + hr[0].x - 2, y + hr[0].y, x + hr[0].x + hr[0].w + 2, y + hr[0].y + hr[0].h)
+                         : rf(0, 0, 0, 0);
+    }
+    st_draw(g_st, l, 0, 0, rgb, 1.0f);
+    if (g_cap_tex) {
+        float sc = gfx_scale(rt);
+        gfx_rect dst = { x + g_cap_dx, y + g_cap_dy, (float)g_cap_w / sc, (float)g_cap_h / sc };
+        gfx_ink(rt, rgb, ST_RASTER_PAD, ST_RASTER_PAD);
+        gfx_tex_draw(rt, g_cap_tex, dst, 0.0f, 1.0f);
+        gfx_tex_destroy(g_cap_tex);
+        g_cap_tex = NULL;
+    }
+    st_layout_destroy(l);
+    return mt.h;
+}
+
+static void sum_hit(int kind, rectf r, rectf reg, int topic, int num, uint64_t mid) {
+    if (r.right <= r.left || r.bottom <= reg.top || r.top >= reg.bottom) return;
+    if (g_n_sumhits >= (int)(sizeof g_sumhits / sizeof g_sumhits[0])) return;
+    if (r.top < reg.top) r.top = reg.top;
+    if (r.bottom > reg.bottom) r.bottom = reg.bottom;
+    g_sumhits[g_n_sumhits].r = r;
+    g_sumhits[g_n_sumhits].kind = kind;
+    g_sumhits[g_n_sumhits].topic = topic;
+    g_sumhits[g_n_sumhits].num = num;
+    g_sumhits[g_n_sumhits].mid = mid;
+    g_n_sumhits++;
+}
+
+static void mem_button(gfx *rt, rectf b, const char *label, int danger, int dimmed);
 
 static void draw_summary_pane(gfx *rt, const oc_model *m, rectf reg) {
-    g_n_sumrows = 0;
+    g_n_sumhits = 0;
+    g_sum_count_r = g_sum_people_r = rf(0, 0, 0, 0);
     gfx_clip_push(rt, gr(reg));
     float x = reg.left + 16, w = reg.right - reg.left - 28;
     float y = reg.top + 4 - g_sum_scroll;
-    char span[48];
-    oc_summary_span_label(m->summary_scope, m->summary_start, m->summary_end, span, sizeof span);
-    draw_text(rt, span, g_ui, rf(x, y, x + w, y + 24), OC_COL_TEXT);
-    y += 30;
-    const char *say = NULL;
-    uint32_t say_col = OC_COL_FAINT;
-    char wait[96];
+    char where[96];
+    sum_where(m, where, sizeof where);
+    const oc_summary_view *v = &m->summary;
     if (m->summary_loading) {
-        oc_summary_wait_text(m->summary_position, wait, sizeof wait);
-        say = wait;
-    } else if (m->summary_status != OC_SUM_OK) { say = m->summary_error ? m->summary_error : "No summary."; say_col = OC_COL_DANGER; }
-    else if (!m->summary.overview[0] && !m->summary.n_items) say = "Nothing to summarize in this span.";
-    if (say) {
-        float h = text_height(say, g_body, w);
-        draw_text(rt, say, g_body, rf(x, y, x + w, y + h), say_col);
-        y += h + 8;
-    } else {
-        if (m->summary.overview[0]) {
-            float h = text_height(m->summary.overview, g_body, w);
-            draw_text(rt, m->summary.overview, g_body, rf(x, y, x + w, y + h), OC_COL_TEXT);
-            y += h + 12;
+        /* What it is summarizing, where the request stands, and the lines a
+         * summary will fill. */
+        char t1[200], t2[96];
+        oc_summary_wait_title(m->summary_scope, m->summary_start, m->summary_end, where, t1, sizeof t1);
+        oc_summary_wait_text(m->summary_position, t2, sizeof t2);
+        float bw = w * 0.82f, bx = x + (w - bw) / 2;
+        float yy = reg.top + (reg.bottom - reg.top) * 0.36f - g_sum_scroll;
+        /* Wrapped, not cut: the channel's name is the point of it. */
+        yy += sum_rich(rt, t1, g_body, bx, yy, bw, OC_COL_TEXT, 600, NULL, NULL, 0, NULL) + 4;
+        float h2 = text_height(t2, g_body, bw);
+        draw_text(rt, t2, g_body, rf(bx, yy, bx + bw, yy + h2), OC_COL_MUTED);
+        yy += h2 + 14;
+        for (int k = 0; k < 3; k++) {
+            float lw = k == 2 ? bw * 0.62f : bw;
+            fill_round_a(rt, rf(bx, yy, bx + lw, yy + 8), 4.0f, OC_COL_ACCENT, 0.28f);
+            yy += 18;
         }
-        for (uint8_t k = 0; k < 4; k++) {
-            int any = 0;
-            for (size_t i = 0; i < m->summary.n_items; i++) {
-                const oc_summary_item *it = &m->summary.items[i];
-                if (it->kind != k) continue;
-                if (!any) {
-                    char head[24];
-                    snprintf(head, sizeof head, "%s", oc_summary_kind_heading(k));
-                    for (char *c = head; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
-                    draw_text(rt, head, g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
-                    y += 22;
-                    any = 1;
-                }
-                size_t cap = strlen(it->text) + (it->who ? strlen(it->who) : 0) + 32;
-                char *line = malloc(cap);
-                if (!line) continue;
-                snprintf(line, cap, "%s%s%s%s%s%s", it->who ? it->who : "", it->who ? ": " : "", it->text,
-                         it->status[0] ? " (" : "", it->status, it->status[0] ? ")" : "");
-                char note[48];
-                snprintf(note, sizeof note, "%zu message%s", it->n_refs, it->n_refs == 1 ? "" : "s");
-                float h = text_height(line, g_body, w - 8);
-                rectf row = rf(x - 6, y - 3, x + w + 4, y + h + 22);
-                if (it->n_refs && in_rect(row, g_mouse_x, g_mouse_y)) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
-                draw_text(rt, line, g_body, rf(x, y, x + w - 8, y + h), OC_COL_TEXT);
-                draw_text(rt, note, g_meta, rf(x, y + h + 1, x + w, y + h + 19), OC_COL_MUTED);
-                free(line);
-                if (it->n_refs && row.bottom > reg.top && row.top < reg.bottom &&
-                    g_n_sumrows < (int)(sizeof g_sumrows / sizeof g_sumrows[0])) {
-                    rectf vis = row;
-                    if (vis.top < reg.top) vis.top = reg.top;
-                    if (vis.bottom > reg.bottom) vis.bottom = reg.bottom;
-                    g_sumrows[g_n_sumrows].r = vis;
-                    g_sumrows[g_n_sumrows].mid = it->refs[0];
-                    g_sumrows[g_n_sumrows].item = i;
-                    g_n_sumrows++;
-                }
-                y += h + 28;
+        /* Nobody need wait: told when it is ready instead, or not made. */
+        yy += 10;
+        const char *nl = "Notify me when ready";
+        float nw = text_width(nl, g_meta) + 24, cw = text_width("Cancel", g_meta) + 24;
+        rectf nb = rf(bx, yy, bx + nw, yy + 28), cb = rf(nb.right + 8, yy, nb.right + 8 + cw, yy + 28);
+        mem_button(rt, nb, nl, 0, 0);
+        mem_button(rt, cb, "Cancel", 0, 0);
+        sum_hit(SH_NOTIFY, nb, reg, -1, 0, 0);
+        sum_hit(SH_CANCEL, cb, reg, -1, 0, 0);
+        yy += 36;
+        y = yy;
+    } else if (m->summary_status != OC_SUM_OK || (!v->n_topics && !v->overview[0])) {
+        /* The same header as a summary, then what happened in its place; one
+         * that was not made says why, and, unless it was refused, offers to
+         * ask again. */
+        char line[200];
+        snprintf(line, sizeof line, "Summary of %s", where);
+        float h = text_height(line, g_title, w);
+        draw_text(rt, line, g_title, rf(x, y, x + w, y + h), OC_COL_TEXT);
+        y += h + 2;
+        if (m->summary_end > m->summary_start) {
+            char dates[48];
+            oc_summary_dates(m->summary_start, m->summary_end, dates, sizeof dates);
+            h = text_height(dates, g_meta, w);
+            draw_text(rt, dates, g_meta, rf(x, y, x + w, y + h), OC_COL_MUTED);
+            y += h;
+        }
+        y += 14;
+        if (m->summary_status != OC_SUM_OK) {
+            const char *head = oc_summary_fail_title(m->summary_status);
+            y += sum_rich(rt, head, g_body, x, y, w, OC_COL_DANGER, 600, NULL, NULL, 0, NULL) + 4;
+            const char *why = m->summary_error && *m->summary_error ? m->summary_error : NULL;
+            if (why) {
+                h = text_height(why, g_body, w);
+                draw_text(rt, why, g_body, rf(x, y, x + w, y + h), OC_COL_MUTED);
+                y += h + 12;
             }
-            if (any) y += 6;
+            if (m->summary_status != OC_SUM_FORBIDDEN) {
+                rectf b = rf(x, y, x + 96, y + 28);
+                mem_button(rt, b, "Try again", 0, 0);
+                sum_hit(SH_RETRY, b, reg, -1, 0, 0);
+                y += 36;
+            }
+        } else {
+            const char *say = v->count ? "Nothing to summarize in this span: its threads go on past it."
+                                       : "No messages in this span.";
+            h = text_height(say, g_body, w);
+            draw_text(rt, say, g_body, rf(x, y, x + w, y + h), OC_COL_FAINT);
+            y += h + 8;
         }
+    } else {
+        char line[200];
+        snprintf(line, sizeof line, "Summary of %s", where);
+        float h = text_height(line, g_title, w);
+        draw_text(rt, line, g_title, rf(x, y, x + w, y + h), OC_COL_TEXT);
+        y += h + 2;
+        /* The dates on the left; on the right, who posted and how much. */
+        char dates[48], cnt[24], ppl[16];
+        oc_summary_dates(m->summary_start, m->summary_end, dates, sizeof dates);
+        snprintf(cnt, sizeof cnt, "%llu", (unsigned long long)v->count);
+        snprintf(ppl, sizeof ppl, "%u", (unsigned)v->n_posters);
+        float rowh = 24, right = x + w;
+        float pw = text_width(ppl, g_meta);
+        int na = v->n_posters < 3 ? (int)v->n_posters : 3;
+        float aw = na ? 18 + (na - 1) * 12 : 0;
+        g_sum_people_r = rf(right - pw - 6 - aw - 4, y, right, y + rowh);
+        draw_text(rt, ppl, g_meta, rf(right - pw, y, right, y + rowh), OC_COL_MUTED);
+        for (int k = na - 1; k >= 0; k--) {
+            float ax = right - pw - 6 - aw + k * 12;
+            rectf ab = rf(ax, y + 3, ax + 18, y + 21);
+            fill_round(rt, rf(ab.left - 1.5f, ab.top - 1.5f, ab.right + 1.5f, ab.bottom + 1.5f), 5.0f, OC_COL_BASE);
+            draw_user_avatar(rt, m, v->posters[k].id, v->posters[k].name, ab, g_meta);
+        }
+        float cw2 = text_width(cnt, g_meta);
+        float cr = g_sum_people_r.left - 14;
+        g_sum_count_r = rf(cr - cw2 - 22, y, cr, y + rowh);
+        draw_lucide(rt, OC_ICON_MESSAGE, rf(g_sum_count_r.left, y + 4, g_sum_count_r.left + 16, y + 20), OC_COL_MUTED);
+        draw_text(rt, cnt, g_meta, rf(cr - cw2, y, cr, y + rowh), OC_COL_MUTED);
+        draw_text(rt, dates, g_meta, rf(x, y, g_sum_count_r.left - 8, y + rowh), OC_COL_MUTED);
+        y += rowh + 8;
+        fill(rt, rf(x, y, x + w, y + 1), OC_COL_BORDER);
+        y += 10;
+        int num = 0;
+        /* The overview: the bottom line first. */
+        if (v->overview[0]) {
+            sum_span osp[SUM_CITES] = { { 0, 0 } };
+            rectf ohr[SUM_CITES];
+            int no = 0;
+            size_t cap = strlen(v->overview) + 16 + v->n_refs * 10;
+            char *os = malloc(cap);
+            if (os) {
+                size_t at = (size_t)snprintf(os, cap, "%s", v->overview);
+                int first = num + 1;
+                for (size_t k = 0; k < v->n_refs && at < cap && no < SUM_CITES; k++) {
+                    int wr = snprintf(os + at, cap - at, " [%d]", ++num);
+                    if (wr < 0) break;
+                    osp[no].off = at + 1; osp[no].len = (size_t)wr - 1; no++;
+                    at += (size_t)wr;
+                }
+                y += sum_rich(rt, os, g_body, x, y, w, OC_COL_TEXT, 600, v, osp, no, ohr) + 4;
+                for (int k = 0; k < no; k++) sum_hit(SH_CITE, ohr[k], reg, -1, first + k, v->refs[k]);
+                free(os);
+            }
+        }
+        for (size_t t = 0; t < v->n_topics; t++) {
+            const oc_summary_topic *tp = &v->topics[t];
+            int closed = sum_closed(m, t);
+            y += 10;
+            /* The chevron: the details shown or hidden. */
+            rectf tg = rf(x + w - 22, y, x + w, y + 22);
+            int hot = in_rect(tg, g_mouse_x, g_mouse_y);
+            if (hot) fill_round(rt, tg, OC_R_CONTROL, OC_COL_HOVER);
+            stroke_round(rt, tg, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+            draw_lucide(rt, closed ? OC_ICON_CHEVRON_DOWN : OC_ICON_CHEVRON_UP, rf(tg.left + 3, tg.top + 3, tg.right - 3, tg.bottom - 3),
+                        hot ? OC_COL_TEXT : OC_COL_MUTED);
+            sum_hit(SH_TOGGLE, tg, reg, (int)t, 0, 0);
+            float th = tp->title[0] ? sum_rich(rt, tp->title, g_body, x, y, w - 30, OC_COL_TEXT, 700, v, NULL, 0, NULL) : 0;
+            y += (th > 22 ? th : 22) + 2;
+            /* Who was in it, and how many messages it rests on. */
+            char meta[200];
+            size_t mw = 0;
+            meta[0] = '\0';
+            for (size_t k = 0; k < tp->n_people && k < 3 && mw < sizeof meta; k++)
+                mw += (size_t)snprintf(meta + mw, sizeof meta - mw, "%s%s", k ? ", " : "", tp->people[k]);
+            if (tp->n_people > 3 && mw < sizeof meta) mw += (size_t)snprintf(meta + mw, sizeof meta - mw, " +%zu", tp->n_people - 3);
+            if (tp->count && mw < sizeof meta)
+                snprintf(meta + mw, sizeof meta - mw, "%s%llu message%s", mw ? "  \xC2\xB7  " : "",
+                         (unsigned long long)tp->count, tp->count == 1 ? "" : "s");
+            if (meta[0]) {
+                draw_text(rt, meta, g_meta, rf(x, y, x + w, y + 18), OC_COL_MUTED);
+                y += 20;
+            }
+            if (tp->text[0]) y += sum_rich(rt, tp->text, g_body, x, y, w, OC_COL_TEXT, 0, v, NULL, 0, NULL) + 4;
+            if (closed) {
+                for (size_t d = 0; d < tp->n_details; d++) num += (int)tp->details[d].n_refs;
+                continue;
+            }
+            if (tp->n_details) {
+                draw_text(rt, "More details", g_meta, rf(x, y, x + w, y + 20), OC_COL_MUTED);
+                y += 22;
+            }
+            for (size_t d = 0; d < tp->n_details; d++) {
+                const oc_summary_detail *dt = &tp->details[d];
+                size_t cap = strlen(dt->text) + 16 + dt->n_refs * 10;
+                char *s = malloc(cap);
+                sum_span sp[SUM_CITES] = { { 0, 0 } };
+                rectf hr[SUM_CITES];
+                int ns = 0;
+                if (!s) continue;
+                size_t at = (size_t)snprintf(s, cap, "%s", dt->text);
+                int first = num + 1;
+                for (size_t k = 0; k < dt->n_refs && at < cap; k++) {
+                    int wr = snprintf(s + at, cap - at, " [%d]", ++num);
+                    if (wr < 0) break;
+                    if (ns < SUM_CITES) { sp[ns].off = at + 1; sp[ns].len = (size_t)wr - 1; ns++; }
+                    at += (size_t)wr;
+                }
+                draw_text(rt, "\xE2\x80\xA2", g_body, rf(x + 4, y, x + 18, y + 22), OC_COL_TEXT);
+                float dh = sum_rich(rt, s, g_body, x + 18, y, w - 18, OC_COL_TEXT, 0, v, sp, ns, hr);
+                for (int k = 0; k < ns; k++)
+                    sum_hit(SH_CITE, hr[k], reg, (int)t, first + k, dt->refs[k]);
+                free(s);
+                y += dh + 6;
+            }
+        }
+        /* What needs attention: actions someone has, questions not answered. */
+        if (v->n_attention) {
+            y += 12;
+            draw_text(rt, "Needs attention", g_ui_b, rf(x, y, x + w, y + 22), OC_COL_TEXT);
+            y += 26;
+            for (size_t a = 0; a < v->n_attention; a++) {
+                const oc_summary_attention *at = &v->attention[a];
+                size_t cap = strlen(at->text) + 40 + at->n_refs * 10;
+                char *as = malloc(cap);
+                sum_span asp[SUM_CITES] = { { 0, 0 } };
+                rectf ahr[SUM_CITES];
+                int na = 0;
+                if (!as) continue;
+                size_t off = (size_t)snprintf(as, cap, "%s: %s", at->question ? "Question" : "Action", at->text);
+                int first = num + 1;
+                for (size_t k = 0; k < at->n_refs && off < cap && na < SUM_CITES; k++) {
+                    int wr = snprintf(as + off, cap - off, " [%d]", ++num);
+                    if (wr < 0) break;
+                    asp[na].off = off + 1; asp[na].len = (size_t)wr - 1; na++;
+                    off += (size_t)wr;
+                }
+                draw_text(rt, "\xE2\x80\xA2", g_body, rf(x + 4, y, x + 18, y + 22), OC_COL_TEXT);
+                float ah = sum_rich(rt, as, g_body, x + 18, y, w - 18, OC_COL_TEXT, 0, v, asp, na, ahr);
+                for (int k = 0; k < na; k++) sum_hit(SH_CITE, ahr[k], reg, -1, first + k, at->refs[k]);
+                free(as);
+                y += ah + 6;
+            }
+        }
+        /* Topics that did not fit, by title. */
+        if (v->n_more) {
+            char more[800];
+            size_t mw = (size_t)snprintf(more, sizeof more, "More topics: ");
+            for (size_t k = 0; k < v->n_more && mw < sizeof more; k++)
+                mw += (size_t)snprintf(more + mw, sizeof more - mw, "%s%s", k ? ", " : "", v->more[k]);
+            y += 8;
+            y += sum_rich(rt, more, g_body, x, y, w, OC_COL_MUTED, 0, NULL, NULL, 0, NULL) + 4;   /* g_meta trims to one line */
+        }
+        y += 10;
+        fill(rt, rf(x, y, x + w, y + 1), OC_COL_BORDER);
+        y += 8;
+        draw_text(rt, "AI-generated summarization may be inaccurate.", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+        y += 24;
     }
     gfx_clip_pop(rt);
     float content = y + g_sum_scroll - reg.top;
@@ -10377,32 +10729,133 @@ static void draw_summary_pane(gfx *rt, const oc_model *m, rectf reg) {
     if (g_sum_scroll > g_sum_max) g_sum_scroll = g_sum_max;
 }
 
-/* Ask for a summary of `cid` (REQ-310): which span, then the pane, beside the
- * conversation so its items can be gone to. */
-static void summarize_ask(HWND hwnd, uint64_t cid) {
+static void draw_tip(gfx *rt, rectf b, const char *name, const char *chord, float lim0, float lim1);   /* fwd */
+static void draw_tip_below(gfx *rt, rectf b, const char *name, float lim0, float lim1);                 /* fwd */
+
+/* Over the pane, after it: the name of what the pointer rests on -- the
+ * message count, the posters, a chevron -- and a citation's message, as
+ * Slack's hover card shows it: who, where, the first lines, when. */
+static void draw_summary_float(gfx *rt, const oc_model *m, float W, float H) {
+    if (!g_show_members || g_rp_mode != RP_SUMMARY || !m || !m->summary_open || m->summary_loading) return;
+    const oc_summary_view *v = &m->summary;
+    char tip[600];
+    if (in_rect(g_sum_count_r, g_mouse_x, g_mouse_y)) {
+        snprintf(tip, sizeof tip, "%llu message%s", (unsigned long long)v->count, v->count == 1 ? "" : "s");
+        draw_tip_below(rt, g_sum_count_r, tip, 0, W);
+        return;
+    }
+    if (in_rect(g_sum_people_r, g_mouse_x, g_mouse_y)) {
+        oc_summary_posters_text(v, tip, sizeof tip);
+        if (tip[0]) draw_tip_below(rt, g_sum_people_r, tip, 0, W);
+        return;
+    }
+    int hit = -1;
+    for (int i = 0; i < g_n_sumhits; i++) {
+        int on = g_sum_force_cite ? (g_sumhits[i].kind == SH_CITE && g_sumhits[i].num == g_sum_force_cite)
+                                  : in_rect(g_sumhits[i].r, g_mouse_x, g_mouse_y);
+        if (on) { hit = i; break; }
+    }
+    if (hit < 0) return;
+    if (g_sumhits[hit].kind == SH_TOGGLE) {
+        draw_tip(rt, g_sumhits[hit].r, sum_closed(m, (size_t)g_sumhits[hit].topic) ? "More detail" : "Less detail", NULL, 0, W);
+        return;
+    }
+    const oc_summary_source *src = oc_summary_source_of(v, g_sumhits[hit].mid);
+    if (!src) return;
+    rectf a = g_sumhits[hit].r;
+    float cw = 340, pad = 14;
+    float x0 = a.left - 40;
+    if (x0 + cw > W - 8) x0 = W - 8 - cw;
+    if (x0 < 8) x0 = 8;
+    /* The message, to four lines at most. */
+    float tw = cw - 2 * pad, lh = g_body->line_h > 4.0f ? g_body->line_h : 20.0f;
+    char body[400];
+    snprintf(body, sizeof body, "%s", src->text);
+    while (strlen(body) > 4 && text_height(body, g_body, tw) > 4 * lh + 1) {
+        size_t n = strlen(body);
+        if (n > 4 && !strcmp(body + n - 3, "\xE2\x80\xA6")) n -= 3;
+        n = n * 9 / 10;
+        while (n > 0 && body[n] != ' ') n--;
+        if (!n) break;
+        snprintf(body + n, sizeof body - n, "%s", "\xE2\x80\xA6");
+    }
+    if (strlen(src->text) >= sizeof body - 1 && !strstr(body, "\xE2\x80\xA6")) {
+        size_t n = strlen(body);
+        snprintf(body + (n > 4 ? n - 4 : 0), 5, "%s", "\xE2\x80\xA6");
+    }
+    char where[96], place[128], when[48];
+    sum_where(m, where, sizeof where);
+    if (src->parent) snprintf(place, sizeof place, "Thread in %s", where);
+    else snprintf(place, sizeof place, "%s", where);
+    oc_summary_when(src->at, (uint64_t)time(NULL) * 1000u, g_pref_time24, when, sizeof when);
+    float bh = text_height(body, g_body, tw);
+    float ch = pad + 40 + 10 + bh + 10 + 18 + pad;
+    float y0 = a.bottom + 6;
+    if (y0 + ch > H - 8) y0 = a.top - 6 - ch;
+    if (y0 < 8) y0 = 8;
+    rectf card = rf(x0, y0, x0 + cw, y0 + ch);
+    fill_round(rt, rf(card.left + 1, card.top + 3, card.right + 1, card.bottom + 3), OC_R_CONTROL + 2, OC_COL_RAIL);
+    fill_round(rt, card, OC_R_CONTROL + 2, OC_COL_BASE);
+    stroke_round(rt, card, OC_R_CONTROL + 2, OC_COL_BORDER, 1.0f);
+    float cx = card.left + pad, cy = card.top + pad;
+    draw_user_avatar(rt, m, src->author_id, src->author, rf(cx, cy, cx + 36, cy + 36), g_ui_b);
+    draw_text(rt, src->author, g_ui_b, rf(cx + 46, cy - 1, card.right - pad, cy + 19), OC_COL_TEXT);
+    draw_text(rt, place, g_meta, rf(cx + 46, cy + 19, card.right - pad, cy + 39), OC_COL_MUTED);
+    cy += 50;
+    draw_text(rt, body, g_body, rf(cx, cy, cx + tw, cy + bh), OC_COL_TEXT);
+    cy += bh + 10;
+    draw_text(rt, when, g_meta, rf(cx, cy, cx + tw, cy + 18), OC_COL_MUTED);
+}
+
+/* What a click on the pane's hit `i` does, the same from the mouse and from an
+ * automation invoke. */
+static void summary_hit_run(HWND hwnd, int i) {
+    const oc_model *m = model();
+    if (!m || i < 0 || i >= g_n_sumhits) return;
+    if (g_sumhits[i].kind == SH_TOGGLE) sum_toggle(m, g_sumhits[i].topic);
+    else if (g_sumhits[i].kind == SH_RETRY) {
+        if (g_client && oc_client_summary_retry(g_client)) g_sum_scroll = 0;
+    } else if (g_sumhits[i].kind == SH_NOTIFY || g_sumhits[i].kind == SH_CANCEL) {
+        int notify = g_sumhits[i].kind == SH_NOTIFY;
+        if (g_client) {
+            if (notify) oc_client_summary_detach(g_client);
+            else oc_client_summary_cancel(g_client);
+        }
+        rp_pop();
+        layout_composer(hwnd);
+        fb_confirm(notify ? "We'll let you know when your summary is ready." : "Summary canceled.");
+    } else {
+        g_jump_mid = g_sumhits[i].mid;
+        g_jump_deadline = GetTickCount64() + 1500;
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Ask for a summary of `cid` over `scope` (REQ-310), and open the pane beside
+ * the conversation so its citations can be gone to. */
+static void summarize_start(HWND hwnd, uint64_t cid, uint8_t scope, uint64_t rs, uint64_t re) {
     const oc_model *m = model();
     if (!g_client || !m || !cid || !oc_model_summarize_available(m)) return;
-    oc_field f[2] = {
-        { FF_CHOICE, "Summarize", "Unread|Last 7 days|Since yesterday|Dates", "1" },
-        { FF_TEXT,   "Dates", "For Dates: the first and last day, YYYY-MM-DD YYYY-MM-DD", "" },
-    };
-    for (;;) {
-        if (!form_dialog(hwnd, "Summarize", f, 2)) return;
-        int pick = atoi(f[0].value);
-        uint64_t rs = 0, re = 0;
-        if (pick == 3 && oc_summary_range_parse(f[1].value, &rs, &re) != 0) {
-            g_form_err_field = 1;   /* ask again, with the dates field saying why */
-            continue;
-        }
-        static const uint8_t SC[4] = { OC_SUM_UNREAD, OC_SUM_WEEK, OC_SUM_DAILY, OC_SUM_RANGE };
-        if (pick < 0 || pick > 3) return;
-        if (cid != g_sel) select_channel(cid);
-        if (oc_client_summarize(g_client, cid, SC[pick], rs, re)) {
-            g_sum_scroll = 0;
-            rp_push(RP_SUMMARY);
-            layout_composer(hwnd);
-        }
-        return;
+    if (cid != g_sel) select_channel(cid);
+    if (oc_client_summarize(g_client, cid, scope, rs, re)) {
+        g_sum_scroll = 0;
+        g_sum_force_cite = 0;
+        rp_push(RP_SUMMARY);
+        layout_composer(hwnd);
+    }
+}
+
+/* Open a summary notice (REQ-310): in its conversation, the summary as it was
+ * made, in the pane beside it. */
+static void summary_open_notice(HWND hwnd, uint64_t id, uint64_t cid, uint8_t scope) {
+    const oc_model *m = model();
+    if (!g_client || !m || !id || !cid) return;
+    if (cid != g_sel) select_channel(cid);
+    if (oc_client_summary_open_notice(g_client, id, cid, scope)) {
+        g_sum_scroll = 0;
+        g_sum_force_cite = 0;
+        rp_push(RP_SUMMARY);
+        layout_composer(hwnd);
     }
 }
 
@@ -10471,7 +10924,7 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         else oc_client_close_summary(g_client);
     }
     if (g_rp_mode == RP_SUMMARY && !m->summary_open) rp_pop();
-    g_n_sumrows = 0;
+    g_n_sumhits = 0;
     const char *title = g_rp_mode == RP_PROFILE  ? "PROFILE"
                       : g_rp_mode == RP_REACTORS ? "REACTIONS"
                       : g_rp_mode == RP_SUMMARY  ? "SUMMARY" : "MEMBERS";
@@ -12485,7 +12938,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
-           g_status_open || g_sch_open;
+           g_status_open || g_sch_open || g_sr_open;
 }
 
 static rectf g_modal_card;
@@ -12683,6 +13136,8 @@ enum { MODAL_SM = 0, MODAL_LG };
 #define MODAL_MAX_BTNS 4
 
 typedef struct { const char *label; uint8_t kind; int cmd; } oc_mbtn;
+/* The open modal's button that cannot be pressed yet (grey, takes nothing), or -1. */
+static int g_modal_off_cmd = -1;
 typedef struct {
     const char *title;
     const char *subtitle;                  /* optional; NULL or "" for none */
@@ -12817,6 +13272,17 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
             float bw = btn_width(b->label);
             rectf r = rf(bx - bw, foot_top + 14, bx, foot_top + 46);
             int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
+            if (b->cmd == g_modal_off_cmd) {
+                /* Not yet: drawn, named for a reader, and no target for a click
+                 * or Enter. */
+                fill_round(rt, r, OC_R_CONTROL, OC_COL_INPUT);
+                stroke_round(rt, r, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+                g_ui->align = ST_ALIGN_CENTER;
+                draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom), OC_COL_FAINT);
+                g_ui->align = ST_ALIGN_LEFT;
+                bx = r.left - 10;
+                continue;
+            }
             if (b->kind == MB_DANGER_PRIMARY) {
                 fill_round(rt, r, OC_R_CONTROL, OC_COL_DANGER);
                 if (hot) stroke_round(rt, r, OC_R_CONTROL, OC_COL_TEXT, 1.0f);
@@ -13219,6 +13685,7 @@ static void form_collect(int save) {
 
 static void draw_browse(gfx *rt, const oc_model *m, rectf body);   /* fwd */
 static void draw_sched_custom(gfx *rt, rectf body);                /* fwd */
+static void draw_sumrange(gfx *rt, rectf body);                    /* fwd */
 static void draw_sessions(gfx *rt, const oc_model *m, rectf body); /* fwd */
 
 /* The form's photo column: the avatar as everyone sees it, and the two actions on
@@ -13295,6 +13762,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_sessions_open) draw_sessions(rt, m, body);
     else if (g_status_open) draw_status_body(rt, body);
     else if (g_sch_open)    draw_sched_custom(rt, body);
+    else if (g_sr_open)     draw_sumrange(rt, body);
     else if (g_form_open && g_form_side.on) {
         /* Two columns: the fields get everything left of the photo column. The
          * column is drawn first, though an open select list is bounded by the
@@ -13406,7 +13874,9 @@ static int   g_sch_min;                     /* the chosen minute of that day, in
 static int   g_sch_err;                     /* Schedule was refused: the time had passed */
 static float g_sch_tscroll;                 /* the slot list's scroll, in DIPs */
 static rectf g_sch_prev, g_sch_next, g_sch_tlist;
-static struct { rectf r; int y, m, d, on; } g_sch_days[42];
+/* A day a calendar card drew (cal_month_draw): where, which, whether it can be picked. */
+typedef struct { rectf r; int y, m, d, on; } calday;
+static calday g_sch_days[42];
 static int   g_n_sch_days;
 static struct { rectf r; int min, on; } g_sch_times[48];
 static int   g_n_sch_times;
@@ -13441,6 +13911,80 @@ static int sch_days_in(int y, int m) {
     int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     return D[m] + (m == 1 && leap);
 }
+
+/* ---- one month of a calendar, as both date cards draw it --------------------
+ * Weekday initials, then the month's days in rows of seven, Sunday first.
+ * `look` says of each day whether it can be picked and how it is marked: 2
+ * chosen on its own, 3 the first day of a range, 4 its last, 1 inside it, 0
+ * none of these. A range is one band through its rows, with a pill at each
+ * end; today is ringed. Each day's cell goes into `out` (42 at most). */
+typedef int (*calday_fn)(int y, int m, int d, int *on, void *ctx);
+
+/* How many rows of seven the month takes: five most months, six now and then, four once a decade. */
+static int cal_rows(int yr, int mon) {
+    struct tm first; memset(&first, 0, sizeof first);
+    first.tm_year = yr - 1900; first.tm_mon = mon; first.tm_mday = 1;
+    first.tm_hour = 12; first.tm_isdst = -1;
+    mktime(&first);
+    return (first.tm_wday + sch_days_in(yr, mon) + 6) / 7;
+}
+
+static void cal_month_draw(gfx *rt, float cx, float y, int yr, int mon, const char *const ini[7],
+                           calday_fn look, void *ctx, calday *out, int *n_out) {
+    time_t nowt = time(NULL); struct tm nv; int ty = 0, tm_ = 0, td = 0;
+    if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tm_ = nv.tm_mon; td = nv.tm_mday; }
+    int oa = g_meta->align;
+    g_meta->align = ST_ALIGN_CENTER;
+    for (int i = 0; i < 7; i++)
+        draw_text(rt, ini[i], g_meta, rf(cx + i * SCH_CELL_W, y, cx + (i + 1) * SCH_CELL_W, y + UIS(20.0f)),
+                  OC_COL_FAINT);
+    y += UIS(22.0f);
+    struct tm first; memset(&first, 0, sizeof first);
+    first.tm_year = yr - 1900; first.tm_mon = mon; first.tm_mday = 1;
+    first.tm_hour = 12; first.tm_isdst = -1;
+    mktime(&first);
+    int lead = first.tm_wday, n = sch_days_in(yr, mon);
+    for (int d = 1; d <= n; d++) {
+        int slot = lead + d - 1, row = slot / 7, col = slot % 7;
+        rectf c = rf(cx + col * SCH_CELL_W + UIS(2.0f), y + row * SCH_CELL_H + UIS(2.0f),
+                     cx + (col + 1) * SCH_CELL_W - UIS(2.0f), y + (row + 1) * SCH_CELL_H - UIS(2.0f));
+        int on = 0;
+        int mark = look(yr, mon, d, &on, ctx);
+        int today = yr == ty && mon == tm_ && d == td;
+        int chosen = mark >= 2;
+        /* The band: the cell's full width, so neighbours join into one bar; it
+         * stops at a row's ends, at the month's ends, and halfway under the pills. */
+        if (mark == 1 || mark == 3 || mark == 4) {
+            float bl = cx + col * SCH_CELL_W, br = cx + (col + 1) * SCH_CELL_W;
+            if (mark == 3) bl = (bl + br) / 2;
+            if (mark == 4) br = (bl + br) / 2;
+            rectf band = rf(bl, c.top, br, c.bottom);
+            int lend = col == 0 || d == 1, rend = col == 6 || d == n;
+            if ((lend || rend) && mark == 1) {
+                /* Round only the end that is one: the rounded bar clipped to
+                 * that half, a square half for the side that goes on. The two
+                 * halves do not overlap, so the tint stays even. */
+                float mid = (band.left + band.right) / 2;
+                rectf rl = rf(band.left, band.top, lend ? mid : band.left, band.bottom);
+                rectf rr = rf(rend ? mid : band.right, band.top, band.right, band.bottom);
+                if (lend) { gfx_clip_push(rt, gr(rl)); fill_round_a(rt, band, OC_R_CONTROL, OC_COL_ACCENT, 0.18f); gfx_clip_pop(rt); }
+                if (rend) { gfx_clip_push(rt, gr(rr)); fill_round_a(rt, band, OC_R_CONTROL, OC_COL_ACCENT, 0.18f); gfx_clip_pop(rt); }
+                fill_rect_a(rt, rf(lend ? mid : band.left, band.top, rend ? mid : band.right, band.bottom), OC_COL_ACCENT, 0.18f);
+            } else fill_rect_a(rt, band, OC_COL_ACCENT, 0.18f);
+        }
+        if (chosen)         fill_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT);
+        else if (!mark && on && in_rect(c, g_mouse_x, g_mouse_y)) fill_round(rt, c, OC_R_CONTROL, OC_COL_HOVER);
+        if (today && !chosen) stroke_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT, 1.0f);
+        char num[4]; snprintf(num, sizeof num, "%d", d);
+        draw_text(rt, num, g_meta, c, chosen ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
+        if (*n_out < 42) {
+            out[*n_out].r = c; out[*n_out].y = yr; out[*n_out].m = mon; out[*n_out].d = d; out[*n_out].on = on;
+            (*n_out)++;
+        }
+    }
+    g_meta->align = oa;
+}
+
 
 /* "Tuesday, September 15 at 9:00 AM" — in the user's own time format. */
 static void sch_describe(uint64_t at, char *out, size_t cap) {
@@ -13481,10 +14025,18 @@ static float sched_custom_body_h(void) {
     return UIS(30.0f) + UIS(22.0f) + 6 * SCH_CELL_H + UIS(14.0f) + UIS(44.0f);
 }
 
+/* A day of the send-later card: open while its last slot is still ahead;
+ * chosen when it is the day picked. */
+static int sch_look(int y, int m, int d, int *on, void *ctx) {
+    (void)ctx;
+    *on = sch_future(sch_ms(y, m, d, 23 * 60 + 30));
+    return y == g_sch_y && m == g_sch_m && d == g_sch_d ? 2 : 0;
+}
+
 static void draw_sched_custom(gfx *rt, rectf body) {
     g_n_sch_days = 0; g_n_sch_times = 0;
-    time_t nowt = time(NULL); struct tm nv; int ty = 0, tm_ = 0, td = 0;
-    if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tm_ = nv.tm_mon; td = nv.tm_mday; }
+    time_t nowt = time(NULL); struct tm nv; int ty = 0, tm_ = 0;
+    if (oc_localtime_r(&nowt, &nv)) { ty = nv.tm_year + 1900; tm_ = nv.tm_mon; }
 
     /* The calendar: month title with previous/next, weekday initials, six rows. */
     float cx = body.left, y = body.top + UIS(2.0f);
@@ -13506,37 +14058,7 @@ static void draw_sched_custom(gfx *rt, rectf body) {
     }
     y += UIS(30.0f);
     static const char *const INI[7] = { "S", "M", "T", "W", "T", "F", "S" };
-    g_meta->align = ST_ALIGN_CENTER;
-    for (int i = 0; i < 7; i++)
-        draw_text(rt, INI[i], g_meta, rf(cx + i * SCH_CELL_W, y, cx + (i + 1) * SCH_CELL_W, y + UIS(20.0f)),
-                  OC_COL_FAINT);
-    y += UIS(22.0f);
-    struct tm first; memset(&first, 0, sizeof first);
-    first.tm_year = g_sch_vy - 1900; first.tm_mon = g_sch_vm; first.tm_mday = 1;
-    first.tm_hour = 12; first.tm_isdst = -1;
-    mktime(&first);
-    int lead = first.tm_wday, n = sch_days_in(g_sch_vy, g_sch_vm);
-    for (int d = 1; d <= n; d++) {
-        int slot = lead + d - 1, row = slot / 7, col = slot % 7;
-        rectf c = rf(cx + col * SCH_CELL_W + UIS(2.0f), y + row * SCH_CELL_H + UIS(2.0f),
-                     cx + (col + 1) * SCH_CELL_W - UIS(2.0f), y + (row + 1) * SCH_CELL_H - UIS(2.0f));
-        /* A day is open while its last slot is still ahead. */
-        int on = sch_future(sch_ms(g_sch_vy, g_sch_vm, d, 23 * 60 + 30));
-        int sel = g_sch_vy == g_sch_y && g_sch_vm == g_sch_m && d == g_sch_d;
-        int today = g_sch_vy == ty && g_sch_vm == tm_ && d == td;
-        if (sel)       fill_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT);
-        else if (on && in_rect(c, g_mouse_x, g_mouse_y)) fill_round(rt, c, OC_R_CONTROL, OC_COL_HOVER);
-        if (today && !sel) stroke_round(rt, c, OC_R_CONTROL, OC_COL_ACCENT, 1.0f);
-        char num[4]; snprintf(num, sizeof num, "%d", d);
-        draw_text(rt, num, g_meta, c, sel ? 0xFFFFFF : on ? OC_COL_TEXT : OC_COL_FAINT);
-        if (g_n_sch_days < 42) {
-            g_sch_days[g_n_sch_days].r = c; g_sch_days[g_n_sch_days].y = g_sch_vy;
-            g_sch_days[g_n_sch_days].m = g_sch_vm; g_sch_days[g_n_sch_days].d = d;
-            g_sch_days[g_n_sch_days].on = on;
-            g_n_sch_days++;
-        }
-    }
-    g_meta->align = ST_ALIGN_LEFT;
+    cal_month_draw(rt, cx, y, g_sch_vy, g_sch_vm, INI, sch_look, NULL, g_sch_days, &g_n_sch_days);
 
     /* The slots of the chosen day, scrolling inside their own box. */
     /* Inset from the body's right edge: the body is clipped to itself, and a
@@ -13621,6 +14143,241 @@ static int sched_custom_click(HWND hwnd, int x, int y) {
     return in_rect(g_modal_card, x, y);
 }
 
+/* ---- the custom range a summary is of (REQ-310) ------------------------------
+ *
+ * "Summarize custom date range", as Slack's: Start and End fields that take a
+ * typed date, and two months side by side to pick from -- the first click the
+ * first day, the second the last. Days after today are faint and take no
+ * click; Summarize stays grey until both days are picked. */
+static oc_sumcal g_sr_cal;
+static uint64_t  g_sr_cid;
+static HWND      g_sr_edit[2];
+static WNDPROC   g_sr_prev_proc[2];
+static rectf     g_sr_erect[2], g_sr_prev, g_sr_next;
+static calday    g_sr_days[84];
+static int       g_n_sr_days;
+static const char *g_sr_err;
+
+static uint64_t sr_day(int y, int m, int d) { return sch_ms(y, m, d, 0); }
+
+static int sr_look(int y, int m, int d, int *on, void *ctx) {
+    (void)ctx;
+    uint64_t day = sr_day(y, m, d);
+    *on = day && day <= g_sr_cal.today;
+    if (!day) return 0;
+    if (g_sr_cal.start && g_sr_cal.end && g_sr_cal.start != g_sr_cal.end) {
+        if (day == g_sr_cal.start) return 3;
+        if (day == g_sr_cal.end) return 4;
+        if (day > g_sr_cal.start && day < g_sr_cal.end) return 1;
+        return 0;
+    }
+    return day == g_sr_cal.start || day == g_sr_cal.end ? 2 : 0;
+}
+
+/* The fields, from the days picked. */
+static void sr_fields_show(void) {
+    for (int k = 0; k < 2; k++) {
+        if (!g_sr_edit[k]) continue;
+        char t[16]; WCHAR w[16];
+        oc_summary_day_text(k ? g_sr_cal.end : g_sr_cal.start, t, sizeof t);
+        MultiByteToWideChar(CP_UTF8, 0, t, -1, w, 16);
+        SetWindowTextW(g_sr_edit[k], w);
+    }
+}
+
+/* What was typed into the fields, taken as the days picked where it is one. */
+static void sr_fields_read(void) {
+    g_sr_err = NULL;
+    for (int k = 0; k < 2; k++) {
+        if (!g_sr_edit[k]) continue;
+        WCHAR w[32]; char t[64];
+        GetWindowTextW(g_sr_edit[k], w, 32);
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, t, sizeof t, NULL, NULL);
+        if (!t[0]) { if (k) g_sr_cal.end = 0; else g_sr_cal.start = 0; continue; }
+        uint64_t d;
+        if (oc_summary_date_parse(t, &d) != 0) { if (strlen(t) >= 10) g_sr_err = "A date is written YYYY-MM-DD."; continue; }
+        if (d > g_sr_cal.today) { g_sr_err = "That day has not happened yet."; continue; }
+        if (k) g_sr_cal.end = d; else g_sr_cal.start = d;
+    }
+    if (g_sr_cal.start && g_sr_cal.end && g_sr_cal.end < g_sr_cal.start) {
+        g_sr_err = "The end date is before the start date.";
+        g_sr_cal.end = 0;
+    }
+}
+
+static LRESULT CALLBACK sr_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    int k = hwnd == g_sr_edit[1];
+    if (msg == WM_KEYDOWN && modal_open()) {
+        if (wp == VK_RETURN) { sr_fields_read(); menu_dispatch(GetParent(hwnd), 310); return 0; }
+        if (wp == VK_ESCAPE) { modal_finish(0); return 0; }
+        if (wp == VK_TAB) { SetFocus(g_sr_edit[!k]); return 0; }
+    }
+    if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == '\t')) return 0;   /* no beep */
+    LRESULT r = CallWindowProcW(g_sr_prev_proc[k], hwnd, msg, wp, lp);
+    if (msg == WM_CHAR || (msg == WM_KEYDOWN && (wp == VK_DELETE || wp == VK_BACK))) {
+        sr_fields_read();
+        InvalidateRect(GetParent(hwnd), NULL, FALSE);
+    }
+    return r;
+}
+
+static void sumrange_open(HWND hwnd, uint64_t cid) {
+    oc_sumcal_init(&g_sr_cal, (uint64_t)time(NULL) * 1000u);
+    oc_sumcal_shift(&g_sr_cal, -1);          /* this month on the right, as Slack's */
+    g_sr_cid = cid;
+    g_sr_err = NULL;
+    static const WCHAR *const CUE[2] = { L"Start date (ex. 2026-10-05)", L"End date (ex. 2026-10-05)" };
+    for (int k = 0; k < 2; k++) {
+        if (!g_sr_edit[k]) {
+            g_sr_edit[k] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
+                                           (HMENU)(INT_PTR)(0xF8 + k), GetModuleHandleW(NULL), NULL);
+            if (g_sr_edit[k]) {
+                SendMessageW(g_sr_edit[k], EM_SETCUEBANNER, TRUE, (LPARAM)CUE[k]);
+                g_sr_prev_proc[k] = (WNDPROC)SetWindowLongPtrW(g_sr_edit[k], GWLP_WNDPROC, (LONG_PTR)sr_edit_proc);
+            }
+        }
+        if (g_sr_edit[k]) {
+            HFONT ff = form_font();
+            SendMessageW(g_sr_edit[k], WM_SETFONT, ff ? (WPARAM)ff : (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SetWindowTextW(g_sr_edit[k], L"");
+        }
+    }
+    modal_enter(hwnd, &g_sr_open);
+    if (g_sr_edit[0]) { ShowWindow(g_sr_edit[0], SW_SHOW); SetFocus(g_sr_edit[0]); }
+}
+
+/* The card's rows, top to bottom: a label and a field over each month, the
+ * month titles with the arrows beside them, the weekday initials, the days,
+ * and one line that says what is picked (or what is wrong with it). The grid
+ * is as tall as the taller month on view, not always six rows. */
+#define SR_LABEL_H   UIS(20.0f)
+#define SR_FIELD_H   UIS(38.0f)
+#define SR_GAP_H     UIS(20.0f)
+#define SR_TITLE_H   UIS(28.0f)
+#define SR_WDAY_H    UIS(22.0f)
+#define SR_LINE_H    UIS(24.0f)
+#define SR_MONTH_GAP UIS(32.0f)
+
+static int sr_rows(void) {
+    int rows = 0;
+    for (int which = 0; which < 2; which++) {
+        int yr, mo; uint64_t cells[42];
+        oc_sumcal_month(&g_sr_cal, which, &yr, &mo, cells);
+        int r = cal_rows(yr, mo - 1);
+        if (r > rows) rows = r;
+    }
+    return rows;
+}
+
+static float sumrange_body_h(void) {
+    return UIS(2.0f) + SR_LABEL_H + SR_FIELD_H + SR_GAP_H + SR_TITLE_H + UIS(6.0f) + SR_WDAY_H
+         + sr_rows() * SCH_CELL_H + UIS(12.0f) + SR_LINE_H + UIS(4.0f);
+}
+
+/* "Tue, Sep 15 – Tue, Sep 29, 2026 · 15 days", or the one day. */
+static void sr_range_text(char *out, size_t cap) {
+    uint64_t a = g_sr_cal.start, b = g_sr_cal.end;
+    if (a && b && b < a) { uint64_t t = a; a = b; b = t; }
+    if (!a) a = b;
+    if (!a) { out[0] = 0; return; }
+    time_t ta = (time_t)(a / 1000), tb = (time_t)((b ? b : a) / 1000);
+    struct tm da, db;
+    if (!oc_localtime_r(&ta, &da) || !oc_localtime_r(&tb, &db)) { out[0] = 0; return; }
+    char A[48], B[48];
+    snprintf(A, sizeof A, "%.3s, %.3s %d", SCH_WDAYS[da.tm_wday], SCH_MONTHS[da.tm_mon], da.tm_mday);
+    if (da.tm_year != db.tm_year) snprintf(A + strlen(A), sizeof A - strlen(A), ", %d", da.tm_year + 1900);
+    snprintf(B, sizeof B, "%.3s, %.3s %d, %d", SCH_WDAYS[db.tm_wday], SCH_MONTHS[db.tm_mon], db.tm_mday, db.tm_year + 1900);
+    if (!b || a == b) { snprintf(out, cap, "%s \xC2\xB7 1 day", B); return; }
+    int days = (int)((tb - ta + 43200) / 86400) + 1;
+    snprintf(out, cap, "%s \xE2\x80\x93 %s \xC2\xB7 %d days", A, B, days);
+}
+
+static void draw_sumrange(gfx *rt, rectf body) {
+    g_n_sr_days = 0;
+    float y = body.top + UIS(2.0f);
+    float gap = SR_MONTH_GAP, mw = 7 * SCH_CELL_W;
+    float x0 = body.left + ((body.right - body.left) - (2 * mw + gap)) / 2;
+    if (x0 < body.left) x0 = body.left;
+    /* A label and a field over each month; the EDIT sits right of the icon. */
+    static const char *const LABEL[2] = { "Start date", "End date" };
+    for (int k = 0; k < 2; k++) {
+        float fx = x0 + k * (mw + gap);
+        draw_text(rt, LABEL[k], g_meta, rf(fx + UIS(2.0f), y, fx + mw, y + SR_LABEL_H), OC_COL_MUTED);
+        rectf b = rf(fx, y + SR_LABEL_H, fx + mw, y + SR_LABEL_H + SR_FIELD_H);
+        int focused = g_sr_edit[k] && GetFocus() == g_sr_edit[k];
+        fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
+        stroke_round(rt, b, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 2.0f : 1.0f);
+        float ih = UIS(16.0f), iy = (b.top + b.bottom) / 2 - ih / 2;
+        draw_lucide(rt, OC_ICON_CALENDAR, rf(b.left + UIS(11.0f), iy, b.left + UIS(11.0f) + ih, iy + ih), OC_COL_MUTED);
+        g_sr_erect[k] = rf(b.left + UIS(34.0f), b.top, b.right, b.bottom);
+    }
+    y += SR_LABEL_H + SR_FIELD_H + SR_GAP_H;
+    /* Month titles, centred over their grids; the arrows at the outer ends of
+     * the same row, each a round button the size of a day. */
+    static const char *const INI[7] = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
+    int rows = sr_rows();
+    for (int which = 0; which < 2; which++) {
+        int yr, mo;
+        uint64_t cells[42];
+        oc_sumcal_month(&g_sr_cal, which, &yr, &mo, cells);
+        float cx = x0 + which * (mw + gap);
+        char title[40]; snprintf(title, sizeof title, "%s %d", SCH_MONTHS[mo - 1], yr);
+        int oa = g_ui_b->align;
+        g_ui_b->align = ST_ALIGN_CENTER;
+        draw_text(rt, title, g_ui_b, rf(cx + SCH_CELL_W, y, cx + mw - SCH_CELL_W, y + SR_TITLE_H), OC_COL_TEXT);
+        g_ui_b->align = oa;
+        cal_month_draw(rt, cx, y + SR_TITLE_H + UIS(6.0f), yr, mo - 1, INI, sr_look, NULL, g_sr_days, &g_n_sr_days);
+    }
+    {
+        float d = SCH_CELL_H - UIS(4.0f), ty = y + (SR_TITLE_H - d) / 2;
+        g_sr_prev = rf(x0 + UIS(2.0f), ty, x0 + UIS(2.0f) + d, ty + d);
+        g_sr_next = rf(x0 + 2 * mw + gap - UIS(2.0f) - d, ty, x0 + 2 * mw + gap - UIS(2.0f), ty + d);
+        for (int k = 0; k < 2; k++) {
+            rectf b = k ? g_sr_next : g_sr_prev;
+            int hov = in_rect(b, g_mouse_x, g_mouse_y);
+            if (hov) fill_round(rt, b, d / 2, OC_COL_HOVER);
+            stroke_round(rt, b, d / 2, OC_COL_BORDER, 1.0f);
+            int oa = g_ui_b->align;
+            g_ui_b->align = ST_ALIGN_CENTER;
+            draw_text(rt, k ? "\xE2\x80\xBA" : "\xE2\x80\xB9", g_ui_b, rf(b.left, b.top - UIS(1.0f), b.right, b.bottom - UIS(1.0f)),
+                      hov ? OC_COL_TEXT : OC_COL_MUTED);
+            g_ui_b->align = oa;
+        }
+    }
+    y += SR_TITLE_H + UIS(6.0f) + SR_WDAY_H + rows * SCH_CELL_H + UIS(12.0f);
+    /* What is picked, in words; the hint before anything is; the error over both. */
+    rectf line = rf(x0 + UIS(2.0f), y, x0 + 2 * mw + gap, y + SR_LINE_H);
+    if (g_sr_err) draw_text(rt, g_sr_err, g_ui, line, OC_COL_DANGER);
+    else {
+        char t[128]; sr_range_text(t, sizeof t);
+        if (!t[0]) draw_text(rt, "Pick the first day, then the last, or type them as YYYY-MM-DD.", g_meta, line, OC_COL_MUTED);
+        else if (!g_sr_cal.end || !g_sr_cal.start) {
+            char u[160]; snprintf(u, sizeof u, "%s \xC2\xB7 now pick the %s day", t, g_sr_cal.start ? "last" : "first");
+            draw_text(rt, u, g_meta, line, OC_COL_MUTED);
+        } else draw_text(rt, t, g_ui, line, OC_COL_TEXT);
+    }
+}
+
+/* A click on the card. Returns 1 for any click inside it. */
+static int sumrange_click(HWND hwnd, int x, int y) {
+    if (in_rect(g_sr_prev, x, y) || in_rect(g_sr_next, x, y)) {
+        oc_sumcal_shift(&g_sr_cal, in_rect(g_sr_prev, x, y) ? -1 : 1);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    for (int k = 0; k < 2; k++)
+        if (in_rect(g_sr_erect[k], x, y) && g_sr_edit[k]) { SetFocus(g_sr_edit[k]); return 1; }
+    for (int i = 0; i < g_n_sr_days; i++)
+        if (g_sr_days[i].on && in_rect(g_sr_days[i].r, x, y)) {
+            oc_sumcal_pick(&g_sr_cal, sr_day(g_sr_days[i].y, g_sr_days[i].m, g_sr_days[i].d));
+            g_sr_err = NULL;
+            sr_fields_show();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 1;
+        }
+    return in_rect(g_modal_card, x, y);
+}
+
 static float status_want_h(void) {
     float rows = UIS(4.0f) + UIS(46.0f) + UIS(24.0f)
                + (float)g_n_status_suggs * UIS(32.0f)
@@ -13631,7 +14388,19 @@ static float status_want_h(void) {
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
     memset(&sp, 0, sizeof sp);
-    if (g_sch_open) {
+    g_modal_off_cmd = -1;
+    if (g_sr_open) {
+        /* Summarize is a COMMAND, as Schedule is, and grey until both days are
+         * picked: there is nothing to summarize before that. */
+        uint64_t rs, re;
+        sp.title = "Summarize custom date range";
+        sp.size = MODAL_LG;
+        sp.want_h = (MODAL_TITLE_H + sumrange_body_h() + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
+        sp.buttons[0] = (oc_mbtn){ "Cancel",    MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Summarize", MB_PRIMARY, 310 };
+        if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) g_modal_off_cmd = 310;
+        sp.n_buttons = 2;
+    } else if (g_sch_open) {
         /* Schedule is a COMMAND, not MODAL_OK: it validates first, and a time
          * that has passed keeps the card open with the reason, which a plain OK
          * (close, then commit) cannot do. Enter reaches it the same way. */
@@ -13778,7 +14547,7 @@ static void modal_enter(HWND hwnd, int *flag) {
      * card is the view (signin_poll), so moving to Home on the way in left OK
      * with an attempt nobody watched: no browser, an empty Home, and a client
      * still waiting on the browser. */
-    int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open) ||
+    int keep_view = (flag == &g_confirm_open) || (flag == &g_sch_open) || (flag == &g_sr_open) ||
                     g_view == VIEW_SIGNIN;
     int prev_view = g_view;
     /* A modal covers the window; it is not about the profile beside it. Edit
@@ -13835,6 +14604,7 @@ static void modal_finish(int save) {
     g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
     if (g_pick_open && picker_floats()) picker_close(NULL);
     if (g_status_edit) ShowWindow(g_status_edit, SW_HIDE);
+    for (int k = 0; k < 2; k++) if (g_sr_edit[k]) ShowWindow(g_sr_edit[k], SW_HIDE);
     const oc_modal_spec *s = modal_current();
     /* A confirmation's "commit" is its action. Handled here rather than through
      * spec->commit so the action can take the window handle. */
@@ -13843,7 +14613,7 @@ static void modal_finish(int save) {
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
-    g_confirm_open = g_sessions_open = g_status_open = g_sch_open = 0;
+    g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
     if (g_view == VIEW_SIGNIN) layout_signin(g_main_hwnd);   /* its fields, back */
     /* Back to the dialog this one was opened from (g_modal_stack). Its snapshot
@@ -14093,6 +14863,18 @@ static void layout_natives(HWND hwnd) {
             search_edit_place(g_pick_edit, g_pick_box);
         } else {
             ShowWindow(g_pick_edit, SW_HIDE);
+        }
+    }
+    for (int k = 0; k < 2; k++) {
+        /* The range card's fields, as the status field: the card owns them. */
+        if (!g_sr_edit[k]) continue;
+        rectf b = g_sr_erect[k];
+        if (g_sr_open && b.right > b.left) {
+            ShowWindow(g_sr_edit[k], SW_SHOW);
+            MoveWindow(g_sr_edit[k], PX(b.left + 2), PX(b.top + 9),
+                       PX(b.right - b.left - 12), PX(b.bottom - b.top - 18), TRUE);
+        } else {
+            ShowWindow(g_sr_edit[k], SW_HIDE);
         }
     }
     if (g_status_edit) {
@@ -14916,6 +15698,13 @@ static uint8_t act_wire_filter(void) {
     }
 }
 
+/* A row's key: its message, or for a summary notice the notice marked by the
+ * top bit, so the two kinds of id never meet in the selection or the hover. */
+#define ACT_NOTICE_BIT (1ull << 63)
+static uint64_t act_key(const oc_activity_view *a) {
+    return a->kind == OC_ACT_SUMMARY ? (a->message_id | ACT_NOTICE_BIT) : a->message_id;
+}
+
 static int act_passes(const oc_activity_view *a) {
     switch (g_act_filter) {
         case AF_MENTIONS:  return a->kind == OC_ACT_MENTION;
@@ -14967,11 +15756,44 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         if (!act_passes(a)) continue;
         shown++;
         rectf row = rf(x0 + 6, y, x1 - 6, y + UIS(74));
-        if (g_act_selected == a->message_id)      fill_round(rt, row, OC_R_CONTROL, OC_COL_SELECT);
-        else if (g_listrow_hover == a->message_id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
+        uint64_t key = act_key(a);
+        if (g_act_selected == key)      fill_round(rt, row, OC_R_CONTROL, OC_COL_SELECT);
+        else if (g_listrow_hover == key) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         /* Arrived since you last opened the feed — all the watermark buys us. */
         if (a->at > m->activity_seen)
             fill(rt, rf(row.left, row.top + 6, row.left + 3, row.bottom - 6), OC_COL_ACCENT);
+
+        if (a->kind == OC_ACT_SUMMARY) {
+            /* A summary the reader asked for, made while they were away: the
+             * sparkles, where, and which span; clicking opens it. */
+            int okd = a->action == OC_SUM_OK;
+            char where[96], span[48], line[160];
+            conv_where(m, a->channel_id, where, sizeof where);
+            snprintf(span, sizeof span, "%s", oc_summary_scope_name((uint8_t)atoi(a->text ? a->text : "")));
+            char when[24]; rel_time(a->at, when, sizeof when);
+            draw_lucide(rt, OC_ICON_SPARKLES, rf(row.left + 17, y + 12, row.left + 35, y + 30), OC_COL_ACCENT);
+            draw_text(rt, okd ? "Summary" : "Summary not made", g_ui_b,
+                      rf(row.left + 46, y + 4, row.right - 56, y + 24), OC_COL_TEXT);
+            g_meta->align = ST_ALIGN_RIGHT;
+            draw_text(rt, when, g_meta,
+                      baseline_align(rf(row.left + 46, y + 4, row.right - 56, y + 24),
+                                     g_ui_b, g_meta, row.left + 46, row.right - 8),
+                      OC_COL_FAINT);
+            g_meta->align = ST_ALIGN_LEFT;
+            snprintf(line, sizeof line, "%s in %s", span, where);
+            draw_text(rt, line, g_meta, rf(row.left + 46, y + 24, row.right - 8, y + 42), OC_COL_FAINT);
+            draw_text(rt, okd ? "Ready to read." : "Couldn't summarize. Open it to try again.", g_meta_w,
+                      rf(row.left + 12, y + 44, row.right - 8, y + 72), OC_COL_MUTED);
+            if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+                g_listrows[g_n_listrows].row = row;
+                g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+                g_listrows[g_n_listrows].mid = key;
+                g_listrows[g_n_listrows].cid = a->channel_id;
+                g_n_listrows++;
+            }
+            y += UIS(78);
+            continue;
+        }
 
         const char *who = oc_model_user_name((oc_model *)m, a->actor_id);
         draw_user_avatar(rt, m, a->actor_id, (who && who[0]) ? who : "?",
@@ -17303,6 +18125,8 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             if (tb.right > tb.left)
                 draw_tip_below(rt, tb, g_chtip == 1 ? "Add people" : "Add a group", 0, W);
         }
+        /* The summary pane's hover names and citation card, over everything. */
+        draw_summary_float(rt, m, W, H);
     } else {
         g_n_ac = 0;
         /* A modal's picker belongs to the modal, not the composer, and the
@@ -19236,6 +20060,28 @@ static void ed_draw(gfx *rt, rectf box) {
 /* The send-later menu (REQ-224). One builder, called by the chevron's click and
  * by an automation invoke, because two copies of a menu's items are two things
  * to keep in step — and the automation route exists to exercise the real one. */
+/* The spans a summary can be of (REQ-310), in the order the menu lists them. */
+static const uint8_t SUM_MENU_SCOPE[6] = { 0, OC_SUM_UNREAD, OC_SUM_TODAY, OC_SUM_DAILY, OC_SUM_WEEK, OC_SUM_RANGE };
+
+/* The Summarize menu, under `a` and right-aligned to it: one span a row; the
+ * last opens the custom range. About conversation `cid`. */
+static void sum_menu_open(rectf a, uint64_t cid) {
+    g_n_mi = 0;
+    for (int k = 1; k <= 5; k++) mi_item(k, oc_summary_scope_name(SUM_MENU_SCOPE[k]));
+    g_menu = MENU_SUMMARIZE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 220;
+    g_menu_target = cid;
+    g_menu_x = a.right - g_menu_w;
+    if (g_menu_x < 8) g_menu_x = 8;
+    g_menu_y = a.bottom + 4;
+}
+
+/* A row of the Summarize menu: a span, or the custom range's card. */
+static void sum_menu_run(HWND hwnd, int cmd) {
+    if (cmd < 1 || cmd > 5 || !g_menu_target) return;
+    if (SUM_MENU_SCOPE[cmd] == OC_SUM_RANGE) sumrange_open(hwnd, g_menu_target);
+    else summarize_start(hwnd, g_menu_target, SUM_MENU_SCOPE[cmd], 0, 0);
+}
+
 static void sched_menu_open(float x, float y) {
     /* Presets are DURATIONS from now, plus a fixed morning — the two ways people
      * actually name a send time. "Tomorrow morning" is 09:00 local because a
@@ -19317,7 +20163,8 @@ enum {
     AT_ADMTAB,        /* payload: Admin tab index */
     AT_TOAST,         /* payload: toast id * 2, + 1 for its close */
     AT_ALERTACK,      /* payload: Admin > Alerts hit-box index — acknowledge it (or all) */
-    AT_SUMITEM        /* payload: summary pane row index — go to its message */
+    AT_SUMITEM,       /* payload: a citation's number (go to its message), or 100000 + a topic (show/hide its details) */
+    AT_SUMCAL         /* payload: 1 previous month, 2 next, else a day as YYYYMMDD — the summary range card */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -19576,6 +20423,8 @@ static void a11y_publish_scene(const oc_model *m) {
 
     /* Talking mode's toggle, with its state in the name: a button that reads
      * "Read aloud" whether it is on or off tells a listener nothing. */
+    if (g_sum_hdr_btn.right > g_sum_hdr_btn.left && n < OC_ACC_MAX)
+        acc_push(items, &n, OC_ACC_BUTTON, "header.summarize", "Summarize", g_sum_hdr_btn, ATOK(AT_MENU, 88));
     if (g_listen_btn.right > g_listen_btn.left && n < OC_ACC_MAX) {
         int on = oc_model_listening_channel(m) == g_sel;
         acc_push(items, &n, OC_ACC_BUTTON, "header.listen",
@@ -19852,18 +20701,38 @@ static void a11y_publish_scene(const oc_model *m) {
                  g_rxn_chip[i].mine ? "yours: press to take it back" : "press to react");
         acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_rxn_chip[i].r, ATOK(AT_REACTCHIP, (uint64_t)i));
     }
-    /* The summary pane's items: each goes to its message (REQ-310). Named by
-     * the item's text, as drawn. */
+    /* The summary pane (REQ-310): each topic's chevron, named by its title and
+     * whether its details show, and each citation, named by its number and the
+     * message it goes to. Ids and invokes both by identity -- topic, citation
+     * number -- never by where the row happens to be. */
     if (g_show_members && g_rp_mode == RP_SUMMARY && m && m->summary_open) {
-        for (int row = 0; row < g_n_sumrows && n < OC_ACC_MAX; row++) {
-            size_t i = g_sumrows[row].item;
-            if (i >= m->summary.n_items) continue;
-            const oc_summary_item *si = &m->summary.items[i];
+        for (int i = 0; i < g_n_sumhits && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
-            snprintf(aid, sizeof aid, "summary.item.%zu", i);
-            snprintf(nm, sizeof nm, "%s: %s%s%s", oc_summary_kind_heading(si->kind), si->who ? si->who : "",
-                     si->who ? ", " : "", si->text);
-            acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_sumrows[row].r, ATOK(AT_SUMITEM, (uint64_t)row));
+            if (g_sumhits[i].kind == SH_NOTIFY || g_sumhits[i].kind == SH_CANCEL) {
+                int notify = g_sumhits[i].kind == SH_NOTIFY;
+                acc_push(items, &n, OC_ACC_BUTTON, notify ? "summary.notify" : "summary.cancel",
+                         notify ? "Notify me when ready" : "Cancel", g_sumhits[i].r,
+                         ATOK(AT_SUMITEM, notify ? 200001ull : 200002ull));
+                continue;
+            }
+            if (g_sumhits[i].kind == SH_RETRY) {
+                acc_push(items, &n, OC_ACC_BUTTON, "summary.retry", "Try again", g_sumhits[i].r,
+                         ATOK(AT_SUMITEM, 200000ull));
+                continue;
+            }
+            if (g_sumhits[i].kind == SH_TOGGLE) {
+                int t = g_sumhits[i].topic;
+                if (t < 0 || (size_t)t >= m->summary.n_topics) continue;
+                snprintf(aid, sizeof aid, "summary.topic.%d", t);
+                snprintf(nm, sizeof nm, "%s, details %s", m->summary.topics[t].title[0] ? m->summary.topics[t].title : "Topic",
+                         sum_closed(m, (size_t)t) ? "hidden" : "shown");
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sumhits[i].r, ATOK(AT_SUMITEM, 100000ull + (uint64_t)t));
+            } else {
+                const oc_summary_source *src = oc_summary_source_of(&m->summary, g_sumhits[i].mid);
+                snprintf(aid, sizeof aid, "summary.cite.%d", g_sumhits[i].num);
+                snprintf(nm, sizeof nm, "Source %d%s%s", g_sumhits[i].num, src ? ": " : "", src ? src->author : "");
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sumhits[i].r, ATOK(AT_SUMITEM, (uint64_t)g_sumhits[i].num));
+            }
         }
     }
     if (g_view == VIEW_DRAFTS) {
@@ -20025,6 +20894,20 @@ modal_items:
                 snprintf(aid, sizeof aid, "status.clear.%d", k);
                 acc_push(items, &n, OC_ACC_TAB, aid, STATUS_CLEARS[k],
                          g_status_chip_hits[k], ATOK(AT_STATUSCHIP, k));
+            }
+        }
+        /* The summary range card (REQ-310): ids from the date, as the schedule
+         * card's are. */
+        if (g_sr_open) {
+            acc_push(items, &n, OC_ACC_BUTTON, "sumrange.prev", "Previous month", g_sr_prev, ATOK(AT_SUMCAL, 1));
+            acc_push(items, &n, OC_ACC_BUTTON, "sumrange.next", "Next month", g_sr_next, ATOK(AT_SUMCAL, 2));
+            for (int i = 0; i < g_n_sr_days && n < OC_ACC_MAX; i++) {
+                if (!g_sr_days[i].on) continue;
+                char aid[OC_ACC_AID_MAX], nm[48];
+                int ymd = g_sr_days[i].y * 10000 + (g_sr_days[i].m + 1) * 100 + g_sr_days[i].d;
+                snprintf(aid, sizeof aid, "sumrange.day.%d", ymd);
+                snprintf(nm, sizeof nm, "%s %d", SCH_MONTHS[g_sr_days[i].m], g_sr_days[i].d);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, nm, g_sr_days[i].r, ATOK(AT_SUMCAL, (uint64_t)ymd));
             }
         }
         /* The schedule card: ids from the DATE and the TIME, never the cell's
@@ -22929,6 +23812,7 @@ static int permalink_follow(HWND hwnd, const char *text) {
 static void menu_run_kind(HWND hwnd, int kind, int cmd) {
     if (kind == MENU_THREAD)       thread_menu_run(hwnd, cmd);
     else if (kind == MENU_SCHED)   sched_menu_run(hwnd, cmd);
+    else if (kind == MENU_SUMMARIZE) sum_menu_run(hwnd, cmd);
     else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
     else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
     else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
@@ -23197,6 +24081,7 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;   /* the card swallows what nothing above claimed */
         }
         if (g_sch_open && sched_custom_click(hwnd, x, y)) return 1;
+        if (g_sr_open && sumrange_click(hwnd, x, y)) return 1;
         if (g_notify_open) {
             /* The time dropdown is above everything else in this overlay, so it
              * gets the click first — otherwise a row underneath it takes one that
@@ -23825,6 +24710,17 @@ static int on_click(HWND hwnd, int x, int y) {
                  * The conversation opens beside it, jumped to that message —
                  * fetch-around (ARCH-96) reaches it even years back. */
                 g_act_selected = g_listrows[i].mid;
+                if (g_listrows[i].mid & ACT_NOTICE_BIT) {
+                    /* A summary notice: opened beside its conversation. */
+                    uint64_t id = g_listrows[i].mid & ~ACT_NOTICE_BIT;
+                    uint8_t scope = OC_SUM_RANGE;
+                    const oc_model *am = model();
+                    for (size_t k = 0; am && k < am->n_activity; k++)
+                        if (am->activity[k].kind == OC_ACT_SUMMARY && am->activity[k].message_id == id)
+                            scope = (uint8_t)atoi(am->activity[k].text ? am->activity[k].text : "");
+                    summary_open_notice(hwnd, id, g_listrows[i].cid, scope);
+                    return 1;
+                }
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
                 g_jump_deadline = GetTickCount64() + 1500;
@@ -23938,6 +24834,12 @@ static int on_click(HWND hwnd, int x, int y) {
      * stale list is worse than a moment's load. */
     for (int t = 0; t < TAB_COUNT; t++)
         if (in_rect(g_tab_r[t], x, y)) { select_tab(t); return 1; }
+    /* The header's Summarize: its spans, in a menu under it (REQ-310). */
+    if (in_rect(g_sum_hdr_btn, x, y) && g_sel) {
+        sum_menu_open(g_sum_hdr_btn, g_sel);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
     /* Talking mode on or off for the conversation on screen (REQ-291). */
     if (in_rect(g_listen_btn, x, y)) {
         const oc_model *lm = model();
@@ -24026,6 +24928,13 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
     }
+    /* The replies row under a thread's parent opens the thread (REQ-060).
+     * Tested before the message rows, which cover the same pixels. */
+    for (int i = 0; i < g_n_rephits; i++)
+        if (in_rect(g_rephits[i].r, x, y)) {
+            if (g_client) { g_scroll = 0; oc_client_open_thread(g_client, g_sel, g_rephits[i].mid); }
+            return 1;
+        }
     /* A reaction chip: +1 it, or undo it if it is already yours (REQ-070).
      * Tested before the message rows, which cover the same pixels. */
     for (int i = 0; i < g_n_chips; i++)
@@ -24047,12 +24956,12 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
     if (files_click(hwnd, x, y)) return 1;
-    /* A summary item: go to its first message, the pane staying open. */
+    /* The summary pane: a chevron shows or hides a topic's details; a citation
+     * goes to its message, the pane staying open. */
     if (g_show_members && g_rp_mode == RP_SUMMARY)
-        for (int i = 0; i < g_n_sumrows; i++)
-            if (in_rect(g_sumrows[i].r, x, y)) {
-                g_jump_mid = g_sumrows[i].mid;
-                g_jump_deadline = GetTickCount64() + 1500;
+        for (int i = 0; i < g_n_sumhits; i++)
+            if (in_rect(g_sumhits[i].r, x, y)) {
+                summary_hit_run(hwnd, i);
                 return 1;
             }
     /* Rows of the open pins overlay. */
@@ -27184,7 +28093,13 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     const oc_model *m = model();
     if (cmd >= CC_MUTE && cmd <= CC_LAST) { call_cmd(hwnd, cmd); return; }
     switch (cmd) {
-    case 88: if (g_sel) summarize_ask(hwnd, g_sel); break;   /* REQ-310 */
+    case 88:     /* REQ-310: the header's Summarize menu, from the palette too */
+        if (g_sel) {
+            rectf a = g_sum_hdr_btn;
+            if (a.right <= a.left) { RECT cr; GetClientRect(hwnd, &cr); a = rf(0, 40, DIPF(cr.right) - 16, 40); }
+            sum_menu_open(a, g_sel);
+        }
+        break;
     case 1: {   /* the wire has always carried is_public; now so does the UI. */
         oc_field f[2] = {
             { FF_TEXT,   "Channel name", "Lower-case, no spaces. Names are unique.", "" },
@@ -27321,6 +28236,16 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         const oc_model *m65 = model();
         if (m65) { g_view = VIEW_HOME; profile_open(m65->user_id); }
         break; }
+    case 310:   /* the custom range card's Summarize (REQ-310) */
+        if (!g_sr_open) break;
+        {
+            uint64_t rs, re;
+            if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) { InvalidateRect(hwnd, NULL, FALSE); break; }
+            modal_finish(0);
+            g_modal_closed_by = "save";
+            summarize_start(hwnd, g_sr_cid, OC_SUM_RANGE, rs, re);
+        }
+        break;
     case 304:   /* the custom send-later card's Schedule */
         if (!g_sch_open) break;
         {
@@ -27791,7 +28716,7 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
-    case 23: summarize_ask(hwnd, cid); break;
+    case 23: sum_menu_open(rf(g_menu_x, g_menu_y - 4, g_menu_x + 220, g_menu_y - 4), cid); break;
     default:
         if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
             if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
@@ -28280,6 +29205,21 @@ static void test_dump(const char *path) {
                 g_memrows[i].via);
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
+    /* The summary (REQ-310): the pane's state, what it drew, and the range card. */
+    if (m) {
+        uint64_t rs = 0, re = 0;
+        int ready = oc_sumcal_range(&g_sr_cal, &rs, &re) == 0;
+        fprintf(f, "summary open=%d loading=%d status=%d scope=%d position=%d topics=%zu posters=%zu count=%llu "
+                   "sources=%zu hits=%d hdrbtn=%.0f,%.0f,%.0f,%.0f rangecard=%d range=%llu..%llu\n",
+                m->summary_open, m->summary_loading, m->summary_status, m->summary_scope, (int)m->summary_position,
+                m->summary.n_topics, m->summary.n_posters, (unsigned long long)m->summary.count,
+                m->summary.n_sources, g_n_sumhits, g_sum_hdr_btn.left, g_sum_hdr_btn.top, g_sum_hdr_btn.right,
+                g_sum_hdr_btn.bottom, g_sr_open, (unsigned long long)(ready ? rs : 0), (unsigned long long)(ready ? re : 0));
+        fprintf(f, "sumnotices n=%zu", m->n_sum_notices);
+        for (size_t i = 0; i < m->n_sum_notices; i++)
+            fprintf(f, " %llu:%d", (unsigned long long)m->sum_notices[i].id, m->sum_notices[i].status);
+        fprintf(f, "\n");
+    }
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
     /* The three scale inputs ARCH-97 keeps apart, plus the product the font table
      * actually uses — so "the text did not change size" is one line to check. */
@@ -30029,16 +30969,67 @@ static void test_poll(HWND hwnd) {
         layout_composer(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
+    } else if (!strcmp(verb, "summenu")) {
+        /* The header's Summarize menu, open (REQ-310). */
+        if (g_sel && g_sum_hdr_btn.right > g_sum_hdr_btn.left) {
+            sum_menu_open(g_sum_hdr_btn, g_sel);
+            InvalidateRect(hwnd, NULL, FALSE);
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "sumrange")) {
+        /* "sumrange" opens the custom range card; "sumrange <first> <last>"
+         * picks those days in it, as two clicks would. */
+        if (!g_sr_open && g_sel) sumrange_open(hwnd, g_sel);
+        char a1[16] = "", a2[16] = "";
+        uint64_t d1, d2;
+        if (sscanf(arg, "%15s %15s", a1, a2) == 2 && oc_summary_date_parse(a1, &d1) == 0 &&
+            oc_summary_date_parse(a2, &d2) == 0) {
+            oc_sumcal_pick(&g_sr_cal, d1);
+            oc_sumcal_pick(&g_sr_cal, d2);
+            sr_fields_show();
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        test_ack(g_sr_open ? "ok" : "err");
+    } else if (!strcmp(verb, "sumtoggle")) {
+        /* "sumtoggle <topic>" shows or hides a topic's details. */
+        const oc_model *tm2 = model();
+        if (tm2 && tm2->summary_open) { sum_toggle(tm2, atoi(arg)); InvalidateRect(hwnd, NULL, FALSE); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "sumnotify") || !strcmp(verb, "sumcancel")) {
+        /* The waiting pane's Notify me when ready / Cancel, as clicked. */
+        int want = !strcmp(verb, "sumnotify") ? SH_NOTIFY : SH_CANCEL, done = 0;
+        for (int i = 0; i < g_n_sumhits && !done; i++)
+            if (g_sumhits[i].kind == want) { summary_hit_run(hwnd, i); done = 1; }
+        InvalidateRect(hwnd, NULL, FALSE);
+        test_ack(done ? "ok" : "err");
+    } else if (!strcmp(verb, "sumopen")) {
+        /* "sumopen <notice>" opens a summary notice, as its toast's View does;
+         * "sumopen" alone, the newest the model holds. */
+        const oc_model *om = model();
+        uint64_t id = (uint64_t)strtoull(arg, NULL, 10);
+        const oc_summary_notice *sn = NULL;
+        if (om && !id && om->n_sum_notices) sn = &om->sum_notices[om->n_sum_notices - 1];
+        else if (om) sn = oc_model_summary_notice(om, id);
+        if (sn) { summary_open_notice(hwnd, sn->id, sn->channel_id, sn->scope); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "sumcite")) {
+        /* "sumcite <n> hover" shows citation n's card as the pointer would;
+         * "sumcite <n>" goes to its message; "sumcite 0" clears the hover. */
+        int num = atoi(arg);
+        g_sum_force_cite = strstr(arg, "hover") ? num : 0;
+        if (!strstr(arg, "hover"))
+            for (int i = 0; i < g_n_sumhits; i++)
+                if (g_sumhits[i].kind == SH_CITE && g_sumhits[i].num == num) { summary_hit_run(hwnd, i); break; }
+        InvalidateRect(hwnd, NULL, FALSE);
+        test_ack("ok");
     } else if (!strcmp(verb, "summary")) {
         /* "summary <scope>" asks for this conversation's summary over that span
-         * (0 unread, 1 last 7 days, 3 since yesterday), bypassing the form as
-         * "chup" does; "summary close" closes it. */
+         * (0 unread, 4 today, 3 since yesterday, 1 last 7 days), bypassing the
+         * menu as "chup" does; "summary close" closes it. */
         if (!strcmp(arg, "close")) { if (g_rp_mode == RP_SUMMARY) rp_pop(); test_ack("ok"); }
-        else if (g_client && g_sel && oc_client_summarize(g_client, g_sel, (uint8_t)atoi(arg), 0, 0)) {
-            g_sum_scroll = 0;
-            rp_push(RP_SUMMARY);
-            layout_composer(hwnd);
-            test_ack("ok");
+        else if (g_client && g_sel) {
+            summarize_start(hwnd, g_sel, (uint8_t)atoi(arg), 0, 0);
+            test_ack(g_rp_mode == RP_SUMMARY ? "ok" : "err");
         } else test_ack("err");
     } else if (!strcmp(verb, "pins")) {
         const oc_model *pm = model();
@@ -30321,6 +31312,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
+            /* The conversation on screen, scrolled to its end, in the window
+             * the user is looking at, is read: what the badge counted has been
+             * seen. Opening a channel marks it read before its history has
+             * arrived (nothing is loaded yet), so without this the history then
+             * counted itself unread under the reader's eyes, and the row went
+             * bold with a number while they were in it. */
+            if (g_sel && transcript_shell() && g_scroll == 0 && !g_edit_msg &&
+                GetForegroundWindow() == hwnd) {
+                const oc_model *vm = model();
+                const oc_channel *vc = vm && vm->authed ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
+                if (vc && vc->unread > 0 && vc->high_water > vc->read_marker)
+                    oc_client_mark_read(g_client, g_sel);
+            }
             ftray_tick(hwnd);        /* uploads in the composer's tray */
             nt_tick();               /* the notification window expires on this tick too */
             call_tick(hwnd);         /* a start waiting on a member list */
@@ -30771,6 +31775,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                   }
                 }
                 g_notify_primed = 1;
+            }
+            /* Summaries made while their asker was not watching (REQ-310): a
+             * toast each, in the app -- View opens it, or for one not made,
+             * Try again asks for its span anew. Told at sign-in too: that is
+             * how someone who closed the app hears of it. */
+            if (g_client) {
+                oc_model *sm = (oc_model *)model();
+                oc_summary_notice sn;
+                while (sm && oc_model_summary_notice_take(sm, &sn)) {
+                    unsigned slot = g_sum_toast_next++ % 8;
+                    g_sum_toasts[slot] = sn;
+                    char where[96], title[200];
+                    conv_where(sm, sn.channel_id, where, sizeof where);
+                    oc_summary_notice_title(sn.status, sn.scope, sn.start_ms, sn.end_ms, where, title, sizeof title);
+                    oc_fb_show(&g_fb, sn.status == OC_SUM_OK ? OC_FB_NOTICE : OC_FB_FAILED, title,
+                               sn.status == OC_SUM_OK ? "View" : "Try again", FBA_SUMMARY + (int)slot, fb_now());
+                }
             }
             /* The overlay badge, deliberately OUTSIDE the toast preference:
              * turning toasts off says "do not interrupt me", not "tell me
@@ -31277,6 +32298,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDBLCLK: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
         g_dbl_ms = GetTickCount64(); g_dbl_x = mx; g_dbl_y = my;
+        /* A double-click on a message that has replies opens its thread, as the
+         * replies row under it does; one without replies falls through to the
+         * word selection. */
+        if (!window_is_covered() && !any_overlay(model()) && transcript_shell() && g_client) {
+            int r = msgrow_at(mx, my);
+            const oc_model *dm = model();
+            const oc_channel *dc = dm ? oc_model_channel((oc_model *)dm, g_sel) : NULL;
+            const oc_msg *dmsg = r >= 0 && dc ? find_msg(dc, g_msgrows[r].mid) : NULL;
+            if (dmsg && dmsg->reply_count && !dmsg->deleted) {
+                g_dbl_ms = 0;
+                g_scroll = 0; oc_client_open_thread(g_client, g_sel, dmsg->message_id);
+                InvalidateRect(hwnd, NULL, FALSE); return 0;
+            }
+        }
         if (!window_is_covered() &&
             !(g_view == VIEW_NEWMSG && in_rect(g_tgt_list, (float)mx, (float)my)) &&
             ed_select_word(hwnd, (float)mx, (float)my)) {
@@ -31370,6 +32405,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (mx != g_mouse_x || g_mouse_y != my) {
             g_mouse_x = mx; g_mouse_y = my;
             if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
+        }
+        {   /* The header's Summarize and the summary pane (REQ-310): what the
+             * pointer is on decides a fill, a name or a citation's card. */
+            static int sum_last = -2;
+            int sh = -1;
+            float fx = (float)mx, fy = (float)my;
+            if (in_rect(g_sum_hdr_btn, fx, fy)) sh = 1000;
+            else if (g_show_members && g_rp_mode == RP_SUMMARY) {
+                if (in_rect(g_sum_count_r, fx, fy)) sh = 1001;
+                else if (in_rect(g_sum_people_r, fx, fy)) sh = 1002;
+                else for (int i = 0; i < g_n_sumhits; i++) if (in_rect(g_sumhits[i].r, fx, fy)) { sh = i; break; }
+            }
+            if (sh != sum_last) { sum_last = sh; InvalidateRect(hwnd, NULL, FALSE); }
         }
         {   /* Shelf hover (REQ-228) — gated exactly as the CLICK is, or
              * the two disagree: a row that glows but refuses the click is the
@@ -31875,10 +32923,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_srvalert_ack(g_client, g_alertrows[arg].id);
             break;
         case AT_SUMITEM:
-            if (g_show_members && g_rp_mode == RP_SUMMARY && (int)arg < g_n_sumrows) {
-                g_jump_mid = g_sumrows[arg].mid;
-                g_jump_deadline = GetTickCount64() + 1500;
-            }
+            if (g_show_members && g_rp_mode == RP_SUMMARY)
+                for (int i = 0; i < g_n_sumhits; i++)
+                    if ((arg == 200000 && g_sumhits[i].kind == SH_RETRY) ||
+                        (arg == 200001 && g_sumhits[i].kind == SH_NOTIFY) ||
+                        (arg == 200002 && g_sumhits[i].kind == SH_CANCEL) ||
+                        (arg >= 100000 && arg < 200000 && g_sumhits[i].kind == SH_TOGGLE &&
+                         (uint64_t)g_sumhits[i].topic == arg - 100000) ||
+                        (arg < 100000 && g_sumhits[i].kind == SH_CITE && (uint64_t)g_sumhits[i].num == arg)) {
+                        summary_hit_run(hwnd, i);
+                        break;
+                    }
             break;
         case AT_WSMGR:
             if (g_wsmgr_open && (int)arg < g_n_wsmgr_hits)
@@ -31906,6 +32961,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_status_open && (int)arg < 5) {
                 g_status_clear = (int)arg;
                 InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        case AT_SUMCAL:
+            /* The same path a click takes, at the control's recorded centre. */
+            if (g_sr_open) {
+                rectf r = arg == 1 ? g_sr_prev : arg == 2 ? g_sr_next : rf(0, 0, 0, 0);
+                for (int i = 0; arg > 2 && i < g_n_sr_days; i++)
+                    if ((uint64_t)(g_sr_days[i].y * 10000 + (g_sr_days[i].m + 1) * 100 + g_sr_days[i].d) == arg)
+                        r = g_sr_days[i].r;
+                if (r.right > r.left) sumrange_click(hwnd, (int)((r.left + r.right) / 2), (int)((r.top + r.bottom) / 2));
             }
             break;
         case AT_SCHED:

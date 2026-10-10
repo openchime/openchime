@@ -6,10 +6,14 @@
  *   demo_client <host> <port> <user> <pass> token <apns|fcm> <device-token>
  *   demo_client <host> <port> <user> <pass> send  <channel_id> <text...>
  *   demo_client <host> <port> <user> <pass> reply <channel_id> <parent_id> <text...>
+ *   demo_client <host> <port> <user> <pass> summarize <channel_id> <start_ms> <end_ms>
  *
  * `token` registers a push device token (so a later SEND has someone to notify);
  * `send` posts a message (which, if the daemon is enrolled + OC_PUSH_URL is set,
- * drives the push emitter). Exits 0 on success. Not part of `make test`.
+ * drives the push emitter); `summarize` asks for a summary of a custom range and
+ * waits for it however long it takes, as a client does: the body (JSON) on
+ * stdout, and on stderr each queue position and then one line of status and
+ * seconds (the summary trials, scripts/sumpod.sh). Exits 0 on success. Not part of `make test`.
  */
 
 #include "protocol.h"
@@ -21,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FAIL(msg) do { fprintf(stderr, "demo_client: FAIL %s\n", (msg)); return -1; } while (0)
@@ -204,15 +209,50 @@ static int cmd_reply(client *c, uint64_t channel_id, uint64_t parent_id, const c
     FAIL("no reply ack");
 }
 
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* Summarize [start, end) of a channel and wait for the answer. */
+static int cmd_summarize(client *c, uint64_t channel_id, uint64_t start_ms, uint64_t end_ms) {
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_summarize m = { 1, channel_id, OC_SUM_RANGE, start_ms, end_ms };
+    double t0 = now_s();
+    if (oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &m) != OC_OK || write_all(&c->conn, buf, w.len) != 0)
+        FAIL("summarize");
+    for (;;) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) FAIL("read while waiting for the summary");
+        if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED) {
+            oc_summary_queued q;
+            if (oc_decode_summary_queued(&p, &q) != OC_OK) FAIL("decode queued");
+            fprintf(stderr, "demo_client: queued position %u at %.1f s\n", q.position, now_s() - t0);
+        } else if (hdr.msg_type == OC_MSG_SUMMARY) {
+            oc_summary s;
+            if (oc_decode_summary(&p, &s) != OC_OK) FAIL("decode summary");
+            if (s.req_id != 1) continue;
+            fwrite(s.body.ptr, 1, s.body.len, stdout);
+            printf("\n");
+            fprintf(stderr, "demo_client: summary status %u in %.1f s, span %llu-%llu, version %.*s\n", s.status,
+                    now_s() - t0, (unsigned long long)s.start_ms, (unsigned long long)s.end_ms,
+                    (int)s.version.len, (const char *)s.version.ptr);
+            return s.status == OC_SUM_OK ? 0 : -1;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr,
             "usage: %s <host> <port> <user> <pass> token <apns|fcm> <device-token>\n"
             "       %s <host> <port> <user> <pass> send  <channel_id> <text...>\n"
             "       %s <host> <port> <user> <pass> reply <channel_id> <parent> <text...>\n"
+            "       %s <host> <port> <user> <pass> summarize <channel_id> <start_ms> <end_ms>\n"
             "       %s <host> <port> --oidc <jwt>   whoami\n"
             "       %s <host> <port> --oidc <jwt>   send <channel_id> <text...>\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *host = argv[1]; int port = atoi(argv[2]);
@@ -241,6 +281,9 @@ int main(int argc, char **argv) {
         rc = cmd_send(&c, strtoull(argv[6], NULL, 10), argv[7]);
     } else if (strcmp(cmd, "reply") == 0 && argc >= 9) {
         rc = cmd_reply(&c, strtoull(argv[6], NULL, 10), strtoull(argv[7], NULL, 10), argv[8]);
+    } else if (strcmp(cmd, "summarize") == 0 && argc >= 9) {
+        rc = cmd_summarize(&c, strtoull(argv[6], NULL, 10), strtoull(argv[7], NULL, 10),
+                           strtoull(argv[8], NULL, 10));
     } else {
         fprintf(stderr, "demo_client: unknown or malformed command\n");
         rc = -1;

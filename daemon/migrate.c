@@ -1294,6 +1294,59 @@ static const char MIGRATION_0058[] =
     ");"
     "CREATE INDEX idx_sum_requests_conn ON summary_requests(conn_id);";
 
+/* 0060: nothing to the schema. The step marks the point from which the writer
+ * indexes mentions for messages that have none (dbwriter's index_mentions at
+ * start): a workspace loaded from an export (scripts/slack_to_db.py) holds its
+ * messages but no `mentions` rows, so the server's unread count, which reads
+ * that table, said 0 where the client, which reads the text, counted the
+ * @channel and @name lines. A database that is already past this step has had
+ * its messages scanned once. */
+static const char MIGRATION_0060[] = "SELECT 1;";
+
+static const char MIGRATION_0059[] =
+    /* A summary is its asker's, not their connection's (REQ-311, SUMMARIES.md
+     * §5). The queue is made again -- its rows were only ever a run's -- with
+     * `conn_id` the connection watching the request, 0 when none is (it closed,
+     * or its person asked to be told instead); a row now outlives its
+     * connection and the daemon, and is deleted when answered or cancelled.
+     * `scope` is the span asked for, so asking again joins the request. */
+    "DROP TABLE summary_requests;"
+    "CREATE TABLE summary_requests ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  conn_id        INTEGER NOT NULL DEFAULT 0,"
+    "  req_id         INTEGER NOT NULL DEFAULT 0,"
+    "  user_id        INTEGER NOT NULL,"
+    "  channel_id     INTEGER NOT NULL,"
+    "  scope          INTEGER NOT NULL DEFAULT 2,"
+    "  start_ms       INTEGER NOT NULL,"
+    "  end_ms         INTEGER NOT NULL,"
+    "  tz_offset_min  INTEGER NOT NULL DEFAULT 0,"
+    "  state          TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','running')),"
+    "  created_at_ms  INTEGER NOT NULL,"
+    "  started_at_ms  INTEGER"
+    ");"
+    "CREATE INDEX idx_sum_requests_conn ON summary_requests(conn_id);"
+    "CREATE INDEX idx_sum_requests_user ON summary_requests(user_id);"
+    /* What a summary made while its asker was not watching left for them: the
+     * summary as it was sent (`body`, the client body), or why it was not made
+     * (`reason`). Told on every connection they have and again at sign-in
+     * until seen; deleted a day after it was seen. */
+    "CREATE TABLE summary_notices ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id        INTEGER NOT NULL,"
+    "  channel_id     INTEGER NOT NULL,"
+    "  scope          INTEGER NOT NULL,"
+    "  start_ms       INTEGER NOT NULL,"
+    "  end_ms         INTEGER NOT NULL,"
+    "  tz_offset_min  INTEGER NOT NULL DEFAULT 0,"
+    "  status         INTEGER NOT NULL,"
+    "  body           TEXT,"
+    "  reason         TEXT,"
+    "  made_at_ms     INTEGER NOT NULL,"
+    "  seen_at_ms     INTEGER"
+    ");"
+    "CREATE INDEX idx_sum_notices_user ON summary_notices(user_id, seen_at_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -1353,6 +1406,8 @@ const oc_migration OC_MIGRATIONS[] = {
     { 56, MIGRATION_0056 },
     { 57, MIGRATION_0057 },
     { 58, MIGRATION_0058 },
+    { 59, MIGRATION_0059 },
+    { 60, MIGRATION_0060 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

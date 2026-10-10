@@ -16,12 +16,16 @@
 #include <stdint.h>
 
 /* The model this daemon summarizes with: open-licensed (Apache-2.0), a 4-bit
- * GGUF file. */
+ * GGUF file. A development build may pin another, all five together, by a
+ * header given to the compiler with -include (the summary trials,
+ * scripts/sumpod.sh). */
+#ifndef OC_SUM_MODEL_NAME
 #define OC_SUM_MODEL_NAME   "qwen3.5-2b-q4_k_m"
 #define OC_SUM_MODEL_FILE   "Qwen3.5-2B-Q4_K_M.gguf"
 #define OC_SUM_MODEL_URL    "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf"
 #define OC_SUM_MODEL_SHA256 "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
 #define OC_SUM_MODEL_BYTES  1280835840ull
+#endif
 
 /* Make sure the model is in `dir` (created if need be): its path into `out`.
  * `url` and `sha256_hex` are normally the pinned ones above (a test passes its

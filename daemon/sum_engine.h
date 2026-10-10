@@ -19,6 +19,14 @@ typedef int (*oc_sum_gate_fn)(void *ctx);
 typedef struct {
     uint32_t prompt_tokens, output_tokens;
     uint32_t cpu_ms;            /* the worker thread's CPU time for this answer */
+    /* Where the time went (SUMMARIES.md §6): reading the prompt, writing the
+     * answer, and the whole call as the worker waited for it -- for a hosted
+     * model that includes the network and the server's queue, and reading and
+     * writing are as the server reports them (0 when it does not). */
+    uint32_t read_ms, write_ms, wall_ms;
+    /* A hosted model's server asked for a pause (429) or failed (5xx): how
+     * many times the request was sent again, and how long was waited in all. */
+    uint32_t retries, wait_ms;
 } oc_sum_run_stats;
 
 typedef struct oc_sum_engine {
@@ -27,24 +35,25 @@ typedef struct oc_sum_engine {
     /* Load the model: a handle, or NULL with a reason. */
     void *(*open)(void *ctx, char *err, size_t errcap);
     void  (*close)(void *handle);
-    /* Answer `user` under `system`, writing at most `max_out` tokens (0:
-     * whatever the context has left). The answer, NUL-terminated, into a heap
-     * string at *out. 0, or -1 with a reason
-     * (or abandoned by the gate); an answer that filled the context is left at
-     * *out as far as it got, for the log. */
-    int   (*run)(void *handle, const char *system, const char *user, int max_out,
+    /* Answer `user` under `system`, held to `grammar` (GBNF, root rule "root";
+     * NULL: free), writing at most `max_out` tokens (0: whatever the context
+     * has left). The answer, NUL-terminated, into a heap string at *out. 0, or
+     * -1 with a reason (or abandoned by the gate); an answer that reached
+     * `max_out` is left at *out as far as it got, for the log. */
+    int   (*run)(void *handle, const char *system, const char *user, const char *grammar, int max_out,
                  oc_sum_gate_fn gate, void *gate_ctx, char **out, oc_sum_run_stats *st,
                  char *err, size_t errcap);
-    /* Go on from the answer `run` just wrote, in the same conversation: ask
-     * `user` as the next turn, the answer held to `grammar` (GBNF, root rule
-     * "root"). The first conversation is not read again. As `run`; -1 too when
-     * there is no finished answer to go on from. NULL: the engine cannot. */
-    int   (*more)(void *handle, const char *user, const char *grammar, oc_sum_gate_fn gate,
-                  void *gate_ctx, char **out, oc_sum_run_stats *st, char *err, size_t errcap);
+    int   remote;               /* the model runs elsewhere: this machine's load does not hold it */
 } oc_sum_engine;
 
 /* The local engine over the GGUF file at `path` (borrowed), with a context of
  * `n_ctx` tokens, on one thread. Exists only in a daemon built with SUM=1. */
 const oc_sum_engine *oc_sum_llama_engine(const char *path, const char *version, int n_ctx);
+
+/* The hosted engine: each answer is one request to the chat-completions
+ * endpoint under `url` (an OpenAI-style API; https, or http to a loopback
+ * address), asking for `model`, with `api_key` (may be empty) as its bearer
+ * token, in the fields every such API reads. All three are borrowed. */
+const oc_sum_engine *oc_sum_cloud_engine(const char *url, const char *model, const char *api_key);
 
 #endif

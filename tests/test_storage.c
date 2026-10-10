@@ -299,6 +299,7 @@ int run_storage_tests(void) {
     /* --- the pass, against a real database --------------------------------- */
     unlink(DBPATH); unlink(DBPATH "-wal"); unlink(DBPATH "-shm");
     oc_dbwriter *w = oc_dbwriter_start(DBPATH);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return failures;
 

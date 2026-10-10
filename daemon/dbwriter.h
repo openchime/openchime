@@ -264,7 +264,18 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * request's place (OC_RES_SUMMARY_QUEUE). */
        OC_JOB_SUMMARY_QUEUE = 134,
        OC_JOB_SUMMARY_TAKE = 135,
-       OC_JOB_SUMMARY_DROP = 136 };
+       OC_JOB_SUMMARY_DROP = 136,
+       /* Summaries did not come up: every waiting request is deleted and
+        * answered (OC_RES_SUMMARY_FAILALL). */
+       OC_JOB_SUMMARY_FAIL = 137,
+       /* A request its asker stopped watching (DETACH: conn_id's req `sum_req`),
+        * or cancelled (CANCEL); a notice opened (OPEN: `sum_notice`, answered
+        * as SUMMARY to `sum_req`), or seen (SEEN: dismissed, or its summary
+        * delivered live). */
+       OC_JOB_SUMMARY_DETACH = 138,
+       OC_JOB_SUMMARY_CANCEL = 139,
+       OC_JOB_SUMMARY_OPEN = 140,
+       OC_JOB_SUMMARY_SEEN = 141 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -561,6 +572,7 @@ typedef struct oc_job {
     uint64_t       sum_start, sum_end;
     int            sum_tz;
     int64_t        sum_row;
+    uint64_t       sum_notice;
     char          *sum_version;
     struct oc_sum_batch *sum_batch;
 } oc_job;
@@ -704,7 +716,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The summary queue moved: `sum_places` holds where each request in it
         * now is (also on a SUMMARY the queue moved with). On a QUEUE that was
         * refused because the queue is full, `sum_status` is UNAVAILABLE. */
-       OC_RES_SUMMARY_QUEUE = 115 };
+       OC_RES_SUMMARY_QUEUE = 115,
+       /* Every request that was waiting when summaries failed to come up, in
+        * `sum_places`, now deleted: each is told summaries are unavailable. */
+       OC_RES_SUMMARY_FAILALL = 116 };
 
 /* One user group (REQ-307). Heap strings and member array. */
 typedef struct oc_group_row {
@@ -1300,6 +1315,16 @@ typedef struct oc_dbres {
      * is being made). Heap. */
     struct oc_sum_place { uint64_t conn_id; uint32_t req_id; uint16_t position; } *sum_places;
     size_t                  n_sum_places;
+    /* A finished request's notice (SUMMARY: `sum_notice` for `sum_user`, sent
+     * live to conn_id if it still watches, else told as SUMMARY_READY); a
+     * cancelled one's running row (`sum_row`, for the worker to stop). */
+    uint64_t                sum_notice, sum_user, sum_made_at;
+    uint8_t                 sum_scope;
+    int64_t                 sum_row;
+    /* AUTH_OK: the person's notices not yet seen, oldest first. Heap. */
+    struct oc_sum_notice_row { uint64_t id, channel_id, start_ms, end_ms, made_at_ms; uint8_t scope, status; }
+                           *sum_notices;
+    size_t                  n_sum_notices;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -1319,6 +1344,10 @@ int  oc_dbwriter_eventfd(oc_dbwriter *w);
 /* Set the registered-user cap (CP-7, OPENCHIME_MAX_USERS); <=0 = unlimited. Call
  * once before serving. */
 void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
+
+/* PBKDF2 rounds for new password keys, a register job given 0, and the check
+ * an unknown name gets; 0 = OC_PW_ITERATIONS. Tests only. Call before serving. */
+void oc_dbwriter_set_pw_iterations(oc_dbwriter *w, uint32_t iterations);
 
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,

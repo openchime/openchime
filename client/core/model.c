@@ -210,6 +210,7 @@ void oc_model_msg_preview(const oc_model *m, const oc_msg *msg, char *out, size_
 }
 
 void oc_model_free(oc_model *m) {
+    free(m->sum_notices);
     free(m->chanmem_via);
     for (size_t i = 0; i < m->n_groups; i++) free(m->groups[i]);
     free(m->groups);
@@ -596,7 +597,34 @@ void oc_model_close_summary(oc_model *m) {
     m->summary_open = m->summary_loading = m->summary_scope = m->summary_status = 0;
     m->summary_req = 0;
     m->summary_position = -1;
+    m->summary_resend = 0;
+    m->summary_notice = 0;
     m->summary_channel = m->summary_start = m->summary_end = 0;
+}
+
+int oc_model_summary_notice_take(oc_model *m, oc_summary_notice *out) {
+    for (size_t i = 0; m && i < m->n_sum_notices; i++)
+        if (!m->sum_notices[i].toasted) {
+            m->sum_notices[i].toasted = 1;
+            *out = m->sum_notices[i];
+            return 1;
+        }
+    return 0;
+}
+
+const oc_summary_notice *oc_model_summary_notice(const oc_model *m, uint64_t id) {
+    for (size_t i = 0; m && i < m->n_sum_notices; i++)
+        if (m->sum_notices[i].id == id) return &m->sum_notices[i];
+    return NULL;
+}
+
+void oc_model_summary_notice_drop(oc_model *m, uint64_t id) {
+    for (size_t i = 0; m && i < m->n_sum_notices; i++)
+        if (m->sum_notices[i].id == id) {
+            memmove(&m->sum_notices[i], &m->sum_notices[i + 1], (m->n_sum_notices - i - 1) * sizeof *m->sum_notices);
+            m->n_sum_notices--;
+            return;
+        }
 }
 
 void oc_model_summary_begin(oc_model *m, uint64_t channel_id, uint8_t scope, uint64_t start_ms,
@@ -2096,6 +2124,27 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
+    case OC_EV_SUMMARY_READY: {
+        /* Told again at every sign-in until seen: kept once. */
+        if (oc_model_summary_notice(m, e->summary_id)) break;
+        if (m->n_sum_notices == m->cap_sum_notices) {
+            size_t nc = m->cap_sum_notices ? m->cap_sum_notices * 2 : 8;
+            oc_summary_notice *nv = realloc(m->sum_notices, nc * sizeof *nv);
+            if (!nv) break;
+            m->sum_notices = nv;
+            m->cap_sum_notices = nc;
+        }
+        oc_summary_notice *n = &m->sum_notices[m->n_sum_notices++];
+        memset(n, 0, sizeof *n);
+        n->id = e->summary_id;
+        n->channel_id = e->channel_id;
+        n->start_ms = e->span_start;
+        n->end_ms = e->span_end;
+        n->made_at_ms = e->made_at;
+        n->scope = e->sum_scope;
+        n->status = (uint8_t)e->status;
+        break;
+    }
     case OC_EV_SUMMARY_QUEUED:
         if (m->summary_open && m->summary_loading && e->req_id == m->summary_req)
             m->summary_position = (int32_t)e->count;
@@ -2589,6 +2638,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * listed here may have ended meanwhile. */
         m->n_calls = 0;
         m->call_pending = 0;
+        /* The daemon drops a closed connection's waiting summary: it is asked
+         * for again once signed in (oc_client_tick), and waits from the start. */
+        if (m->summary_open && m->summary_loading) {
+            m->summary_resend = 1;
+            m->summary_position = -1;
+        }
         break;
     case OC_EV_CALL_STATE:
         if (e->call) call_state_fold(m, e->call);

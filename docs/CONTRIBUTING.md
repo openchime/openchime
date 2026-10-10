@@ -40,7 +40,7 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 
 ## Before a pull request — the minimal set
 
-Locally, and in about 3 minutes, a pull request needs exactly this, which
+Locally, and in about 2 minutes, a pull request needs exactly this, which
 `/oc-feature-finish` runs:
 
 1. `make && make test` — zero warnings, every suite passing.
@@ -51,8 +51,7 @@ Locally, and in about 3 minutes, a pull request needs exactly this, which
 That is all. **The thread sanitizer, the release compiler, the Windows builds
 and the end-to-end run are CI's**, on the pull request, and staging will not merge
 until they pass; running them locally as well repeats the gate and costs the
-time the gate exists to save. Run one locally only to chase a failure CI
-reported, and then only for what failed (`OC_TEST_ONLY=<suite> make test-tsan`).
+time the gate exists to save. `make test-ci` refuses to run outside CI.
 
 ## Commits
 
@@ -101,9 +100,9 @@ machines at once:
   it and drives it over TLS with the e2e client; compiles every Linux
   translation unit with the release's clang under `-Werror`
   (`check-release-cc`); runs the suites that start no threads
-  (`make test-rest`, with `check-opcodes` and `check-refs`).
+  (`make test-ci PART=plain`, with `check-opcodes` and `check-refs`).
 - **`thread-sanitizer`** — the suites that start threads, under
-  ThreadSanitizer (`make test-tsan`); their only run in CI.
+  ThreadSanitizer (`make test-ci PART=threads`); their only run in CI.
 - **`windows`** — cross-compiles the Windows TUI + GUI, and builds the Linux
   TUI with that runner's newer gcc, which warns where gcc 11 and clang do not.
 - **`pr policy`** and **`guard`** — the pull request's title and body, and the

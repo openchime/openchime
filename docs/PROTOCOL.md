@@ -1072,9 +1072,10 @@ joined_at: u64 }` in join order, then **`MEMBERS` (`0x003C`)**
 Membership has been stored since migration 0001, but nothing on the wire listed
 it, so a client showing "members" beside a channel name could only show the
 **tenant** roster — right only while the workspace has one channel everyone is
-in. Enumerating a channel **requires being a member of it**; otherwise this is a
-way to discover who is in a private channel you were never invited to
-(`NOT_A_MEMBER`).
+in. Enumerating a channel **requires being able to read it** — being in it, or
+its being public — as reading its messages does; otherwise this is a way to
+discover who is in a private channel you were never invited to
+(`NOT_A_MEMBER`). `LIST_FILES` and `LIST_PINS` follow the same rule.
 
 **`LIST_FILES` (client → server), msg_type `0x003D`**
 `{ channel_id: u64, before_ms: u64, before_id: u64 }` streams
@@ -1172,15 +1173,16 @@ read as `0`, so a client that sends no filter keeps working.
 
 | Field        | Type | Notes                                                     |
 |--------------|------|------------------------------------------------------------|
-| `kind`       | u8   | `0` mention · `1` reaction to your message · `2` reply under your thread · `3` unread (only in an unread answer) |
-| `message_id` | u64  | What to jump to.                                           |
+| `kind`       | u8   | `0` mention · `1` reaction to your message · `2` reply under your thread · `3` unread (only in an unread answer) · `4` a summary you asked for, made while you were not watching (§5.16m) |
+| `message_id` | u64  | What to jump to; for kind `4`, the summary notice (`SUMMARY_OPEN`). |
 | `channel_id` | u64  | Where it happened.                                         |
 | `actor_id`   | u64  | Who did it — never you: a feed of your own doings is noise. |
 | `at`         | u64  | When.                                                      |
-| `text`       | str  | The message body for a mention or reply; the **emoji** for a reaction. |
-| `action`     | u8   | `1` when the message is an action (REQ-058, §5.16l): `text` is its action text and `actor_id` its actor. |
+| `text`       | str  | The message body for a mention or reply; the **emoji** for a reaction; for kind `4`, the summary's scope in digits. |
+| `action`     | u8   | `1` when the message is an action (REQ-058, §5.16l): `text` is its action text and `actor_id` its actor. For kind `4`, the summary's status (`0` made). |
 
-The feed is a **union of three queries** over existing rows, not a maintained
+The feed is a **union of four queries** over existing rows (the fourth, the
+person's summary notices), not a maintained
 list (ARCH-95). `seen_at` is the watermark **as it was before this call** — the
 server stamps the current time as part of answering, so a client compares each
 `at` against it to mark what is new. That is deliberately coarser than per-item
@@ -2381,17 +2383,21 @@ an action.
 ### 5.16m Summaries (REQ-310–313, ARCH-116)
 
 Only when the daemon sent the **`summarize`** capability (§4.2): summaries are
-off unless the operator turns them on, and a daemon whose model did not load
-does not send it.
+off unless the operator turns them on. It is sent while the model is still
+coming up, too — a request then waits in the queue until it is ready — and a
+daemon whose model did not come up stops sending it, answering whatever waited
+UNAVAILABLE.
 
 **`SUMMARIZE` (C → S), `0x00FD`** — summarize a channel or DM the person can read.
 
     req_id (u32), channel_id (u64), scope (u8), start_ms (u64), end_ms (u64)
 
-`scope` 0 **unread** (from the message last read to now), 1 **week** (the
-reader's last seven days, today included), 2 **range** (`[start_ms, end_ms)`;
-ignored otherwise), 3 **daily** (the reader's yesterday, or every day since they
-were last about). Days are the reader's, by their time-zone offset.
+`scope` 0 **unread** (from the message last read to now), 4 **today** (the
+reader's today, up to now), 3 **since yesterday** (the reader's yesterday and
+today, up to now), 1 **last 7 days** (the reader's last seven days, today
+included), 2 **custom range** (`[start_ms, end_ms)`; ignored otherwise). Days
+are the reader's, by their time-zone offset. A daemon reads a scope it does not
+know as unread.
 
 **`SUMMARY` (S → C), `0x00FE`** — the answer, once, to one `SUMMARIZE`.
 
@@ -2399,24 +2405,73 @@ were last about). Days are the reader's, by their time-zone offset.
     start_ms (u64), end_ms (u64), version (str), body (lstr)
 
 `status` 0 **ok**: `body` is the summary as JSON (SUMMARIES.md §3) — an
-overview, decisions, actions, problems and facts, each citing message ids, and
-the names of the people it mentions — and `start_ms`/`end_ms` the span it covers.
+overview; topics, each a title, who was in it, how many messages it rests on,
+what happened and details; what needs attention; titles of further topics —
+every part citing message ids; who posted in the span and how many messages it
+holds; and the cited messages as plain text — and `start_ms`/`end_ms` the span
+it covers. Its size is fixed by the standard (SUMMARIES.md §1), whatever the
+span.
 1 **unavailable** (summaries are off, or too many are being made), 2
 **forbidden** (the person cannot read the conversation), 3 **failed**; `body` is
 then a sentence saying why. A summary not yet made is made before the answer,
 which on a small machine may take minutes; the connection carries on meanwhile.
 `summary_id` changes whenever the summary is rebuilt — after a message in the
 span is sent, edited, deleted or restored — and never names another.
+4 **cancelled**: the asker cancelled it (`SUMMARY_CANCEL`); `body` says so.
+
+A request is its asker's, not their connection's: it outlives the connection and
+the daemon. Its `SUMMARY` goes to the connection that asked while that
+connection still watches it; a request nobody watches — its asker detached
+(`SUMMARY_DETACH`), or their connection closed, or the daemon restarted — is
+made all the same and told as a notice (`SUMMARY_READY`). The same span asked
+for again by the same person joins the request already waiting, and the new
+asker watches it.
 
 **`SUMMARY_QUEUED` (S → C), `0x0100`** — where a `SUMMARIZE` that is being made
 is in the daemon's queue.
 
     req_id (u32), position (u16)
 
-`position` is how many requests are ahead of it; 0, it is being made now. Sent
+`position` is how many requests are ahead of it; 0, it is being made now;
+`0xFFFF`, summaries are still coming up (the model being fetched or loaded) and
+it waits for them. Sent
 when the request joins the queue and again whenever the queue moves, until its
 `SUMMARY`. A request answered from a stored summary gets none. A new frame, so no
 version bump: a client that does not know it waits for the `SUMMARY` as before.
+
+**`SUMMARY_DETACH` (C → S), `0x0101`** `{ req_id: u32 }` — stop watching this
+connection's request `req_id` ("notify me when ready", or the summary closed
+while it was made). It goes on, and is told as a notice when made.
+
+**`SUMMARY_CANCEL` (C → S), `0x0102`** `{ req_id: u32 }` — cancel this
+connection's request `req_id`: out of the queue, or, being made, stopped at its
+next pause. Answered `SUMMARY` status 4; nothing of it is kept or told. One
+already answered is left as it was.
+
+**`SUMMARY_READY` (S → C), `0x0103`** — a summary made while its asker was not
+watching: a notice.
+
+    notice_id (u64), channel_id (u64), scope (u8), status (u8),
+    start_ms (u64), end_ms (u64), made_at_ms (u64)
+
+`status` as `SUMMARY`'s (0 made, else not). Sent to every connection the person
+has when it is made, and again on every sign-in (after `AUTH_OK`) until the
+notice is seen. A summary given live to the connection watching it is seen at
+once. A notice is kept until seen, then a day (SUMMARIES.md §5).
+
+**`SUMMARY_OPEN` (C → S), `0x0104`** `{ req_id: u32, notice_id: u64 }` — the
+notice's summary as it was made, answered as `SUMMARY` to `req_id`: status 0 and
+the body, or the status and sentence of one not made; status 1, "This summary is
+no longer kept.", for a notice gone or not the person's. The notice is seen.
+
+**`SUMMARY_DISMISS` (C → S), `0x0105`** `{ notice_id: u64 }` — the notice seen,
+unopened.
+
+A notice is in the person's Activity (`LIST_ACTIVITY`, the involved filter) as kind 4 **summary**: `message_id` the notice, `channel_id` its
+conversation, `at` when it was made, `text` its scope in digits, `action` its
+status. The five frames are new, so no version bump; kind 4 is a new value in an
+existing field, which a client that does not know it shows as it shows any
+unknown kind.
 
 ### 5.17 Calls (REQ-150-152, REQ-161, REQ-301-305, ARCH-73, ARCH-86/87, ARCH-113)
 
@@ -3058,6 +3113,11 @@ this table cannot silently gain a shared value.
 | `0x00FD` | `SUMMARIZE` | C → S | summarize a channel or DM over a span (REQ-310) |
 | `0x00FE` | `SUMMARY` | S → C | the answer to one `SUMMARIZE`: the summary as JSON, or why not |
 | `0x0100` | `SUMMARY_QUEUED` | S → C | where one `SUMMARIZE` is in the queue: how many are ahead of it |
+| `0x0101` | `SUMMARY_DETACH` | C → S | stop watching a request: told as a notice when made |
+| `0x0102` | `SUMMARY_CANCEL` | C → S | cancel a request |
+| `0x0103` | `SUMMARY_READY` | S → C | a summary made while its asker was not watching (a notice) |
+| `0x0104` | `SUMMARY_OPEN` | C → S | a notice's summary, as it was made |
+| `0x0105` | `SUMMARY_DISMISS` | C → S | a notice seen, unopened |
 
 ## 10. Connection state machine
 

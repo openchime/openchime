@@ -225,15 +225,20 @@ Summaries of channels and DMs (REQ-310–313, ARCH-116, SUMMARIES.md). Off unles
 turned on. With `local`, the daemon first checks the CPU can run the model (on
 x86-64: AVX2, FMA, F16C and BMI2); the first start then fetches the model (about
 1.3 GB) into `summary/` beside the database and checks its SHA-256, and every
-start loads it. Any failure leaves summaries off with the reason logged, and the
-rest of the daemon runs on: on a CPU without those instructions, `local` is
-always off. A daemon built with `make SUM=0` has no summaries whatever these say.
+start loads it. Summaries are offered while this happens, requests waiting until
+the model is ready. Any failure leaves summaries off with the reason logged,
+what waited is told so, and the rest of the daemon runs on: on a CPU without those instructions, `local` is
+always off. With `cloud`, the API must answer a one-line prompt at startup; a
+model that reasons before answering is told not to through whichever field its
+API honours, or summaries are off (SUMMARIES.md §6). A daemon built with `make
+SUM=0` has no local model; `cloud` still works.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_SUMMARY` | `off` | `off`, `local` or `cloud`. `local` runs the model inside the daemon. `cloud` is accepted and leaves summaries off. Anything else stops the boot. |
-| `OPENCHIME_SUMMARY_MODEL` | *(none)* | For `cloud`: the hosted model's name. |
-| `OPENCHIME_SUMMARY_API_KEY` | *(none)* | For `cloud`: its key. Never logged. |
+| `OPENCHIME_SUMMARY` | `off` | `off`, `local` or `cloud`. `local` runs the model inside the daemon. `cloud` sends each of the summary's model calls to a hosted OpenAI-style API (SUMMARIES.md §6); the prompts and the span's messages leave the box. Anything else stops the boot. |
+| `OPENCHIME_SUMMARY_URL` | *(none)* | For `cloud`, required (the boot stops without it): the API's base, e.g. `https://models.example.com/v1`. https, or http to a loopback address. |
+| `OPENCHIME_SUMMARY_MODEL` | *(none)* | For `cloud`, required (the boot stops without it): the model's name there. |
+| `OPENCHIME_SUMMARY_API_KEY` | *(none)* | For `cloud`: its key, sent as a bearer token. Never logged. |
 
 **What it costs.** Summaries run only in idle time, on one core, at the lowest
 scheduling priority, and pause while the machine's CPU is busy or its memory low
@@ -299,7 +304,7 @@ accepts, and any other stops it with exit status 2.
 |---|---|---|
 | `TTS` | `1` | `0` builds without read-aloud; `OPENCHIME_TTS*` then have no effect. |
 | `STT` | `1` | `0` builds without voice input; `OPENCHIME_STT*` then have no effect. |
-| `SUM` | `1` | `0` builds without llama.cpp; summaries are then never on, whatever `OPENCHIME_SUMMARY` says. |
+| `SUM` | `1` | `0` builds without llama.cpp: no local model (`OPENCHIME_SUMMARY=local` leaves summaries off); `cloud` still works. |
 | `OC_VERSION` | *(unset: `dev`)* | The release number `--version` prints; the release workflow sets it (ARCH-20). |
 
 ---
