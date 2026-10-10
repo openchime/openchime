@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenChime web (core)</title>
+<style>
+body{background:#14161a;color:#d8dee9;font:15px/1.5 ui-monospace,Consolas,monospace;margin:0;padding:24px}
+h1{font:600 18px system-ui,sans-serif;margin:0 0 12px}
+pre{white-space:pre-wrap;margin:0}
+.ok{color:#a3be8c}.bad{color:#bf616a}
+</style>
+</head>
+<body>
+<h1>OpenChime web client, step one: the core</h1>
+<p id="where"></p>
+<pre id="log"></pre>
+<script>
+  // The page is given the workspace in its query: ?host=127.0.0.1&port=18084&user=alice&pass=pw
+  // The core dials host:port; Emscripten turns that socket into one WebSocket at
+  // `ws` (default ws(s)://host:port/ws, wss when the page is https), where the
+  // daemon carries the protocol in frames (daemon/ioloop.c).
+  const q = new URLSearchParams(location.search);
+  const host = q.get('host') || location.hostname;
+  const port = parseInt(q.get('port') || (location.protocol === 'https:' ? '443' : '8080'), 10);
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = q.get('ws') || `${scheme}://${host}:${port}/ws`;
+  const cred = `${q.get('user') || ''}:${q.get('pass') || ''}`;
+  const log = document.getElementById('log');
+  document.getElementById('where').textContent = `workspace ${host}:${port} via ${ws}`;
+  function say(t, cls) { const d = document.createElement('div'); if (cls) d.className = cls; d.textContent = t; log.appendChild(d); }
+  var Module = {
+    websocket: { url: ws, subprotocol: 'binary' },
+    print: (t) => { say(t, t.includes('signed in') ? 'ok' : undefined); console.log(t); },
+    printErr: (t) => { say(t, 'bad'); console.error(t); },
+    onRuntimeInitialized: () => {
+      say('runtime up');
+      const rc = Module.ccall('oc_web_start', 'number', ['string', 'number', 'string'], [host, port, cred]);
+      if (rc !== 0) say('start failed', 'bad');
+    },
+  };
+</script>
+<script src="openchime-core.js"></script>
+</body>
+</html>

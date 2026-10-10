@@ -106,7 +106,7 @@ them without trusting either device's own timestamps.
 | macOS | AVFoundation `AVCaptureVideoDataOutput` | 420YpCbCr8BiPlanar | — |
 | iOS | AVCaptureSession, the same output plus orientation | 420YpCbCr8BiPlanar | — |
 | Android | Camera2 through the NDK, `AImageReader` | YUV_420_888 with row and pixel strides | — |
-| Web | `getUserMedia` → `MediaStreamTrackProcessor` → `VideoFrame.copyTo` | I420 | — |
+| Web | `getUserMedia` into a `<video>`, each decoded frame (`requestVideoFrameCallback`) drawn to a canvas and read back; screens and windows through `getDisplayMedia`, the browser's own picker, fitted as WGC's are | RGBA | `client/gui/platform/web/cap_web.c` |
 | Tests | a synthetic source: moving bars, a frame counter, a denied mode; and a synthetic 2560×1600 screen of text that changes five times a second | I420 | `capture.c` |
 
 **The Windows reader runs asynchronously.** A blocking `ReadSample` on a camera

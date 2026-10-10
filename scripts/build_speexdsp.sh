@@ -11,6 +11,7 @@
 set -euo pipefail
 
 TARGET="${1:-native}"
+FETCH_ONLY=0
 SPEEXDSP_VERSION="${SPEEXDSP_VERSION:-1.2.1}"
 
 # Known-good SHA-256 of the release tarball Xiph publishes. Override both
@@ -30,9 +31,10 @@ mkdir -p third_party
 cd third_party
 
 case "${TARGET}" in
+  fetch)   DEST="speexdsp-${SPEEXDSP_VERSION}"; FETCH_ONLY=1 ;;   # the sources alone, for another toolchain (build_media_wasm.sh)
   native)  DEST="speexdsp-${SPEEXDSP_VERSION}";     HOST="" ;;
   windows) DEST="speexdsp-${SPEEXDSP_VERSION}-win"; HOST="--host=x86_64-w64-mingw32" ;;
-  *) echo "build_speexdsp: target is native or windows, not ${TARGET}" >&2; exit 2 ;;
+  *) echo "build_speexdsp: target is native, windows or fetch, not ${TARGET}" >&2; exit 2 ;;
 esac
 
 TARBALL="speexdsp-${SPEEXDSP_VERSION}.tar.gz"
@@ -54,6 +56,7 @@ if [ ! -f "${DEST}/lib/libspeexdsp.a" ]; then
     tar -xzf "${TARBALL}" -C "${DEST}/src" --strip-components=1
     rm -f "${TARBALL}"
   fi
+  if [ "${FETCH_ONLY}" = 1 ]; then echo "build_speexdsp: sources in third_party/${DEST}/src"; exit 0; fi
   echo "build_speexdsp: building ${DEST} (static, floating point)"
   mkdir -p "${DEST}/build"
   (

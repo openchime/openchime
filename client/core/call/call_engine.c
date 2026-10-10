@@ -899,6 +899,11 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
      * goes by the connection instead, when the client offers that, rather than
      * not at all. */
     int s = -1;
+#ifdef __EMSCRIPTEN__
+    /* A browser has no UDP: the call rides the connection from the start
+     * (WEB.md), and no socket is opened that could only pretend. */
+    (void)host; (void)port;
+#else
     if (oc_call_relay_addr(host, port, &e->relay, &e->relay_len) == 0) {
         s = (int)socket(e->relay.ss_family, SOCK_DGRAM, 0);
         if (s >= 0) {
@@ -909,6 +914,7 @@ static int m_start(void *ctx, const char *host, uint16_t port, const uint8_t *to
             setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsz, sizeof bufsz);
         }
     }
+#endif
     if (s < 0 && !e->tcp_send) return -1;
     e->sock = s;
     memcpy(e->token, token, token_len);

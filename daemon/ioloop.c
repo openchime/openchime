@@ -6,6 +6,8 @@
 #include "netloop.h"    /* oc_netloop_stats_note_read */
 #include "protocol.h"
 
+#include <mbedtls/base64.h>
+#include <mbedtls/sha1.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -25,7 +27,15 @@
 #define IO_READ_BUDGET (256u * 1024u)
 #define IO_MAX_FD      4096   /* as the event loop's table (netloop.c) */
 
-typedef struct io_chunk { struct io_chunk *next; size_t len, off; uint8_t data[]; } io_chunk;
+/* `skip` bytes at the front are the transport's own (a WebSocket frame header,
+ * the upgrade answer): written to the socket but not counted as the loop's
+ * output, whose `written` the loop compares with what it sent. */
+typedef struct io_chunk { struct io_chunk *next; size_t len, off, skip; uint8_t data[]; } io_chunk;
+
+/* The largest WebSocket frame taken from a browser: a protocol frame and its
+ * header, with room for an attachment chunk; anything larger is a peer that is
+ * not ours. */
+#define IO_WS_MAX_FRAME (OC_MAX_FRAME_SIZE + 64u)
 
 enum { S_PROXY, S_HOLD, S_HANDSHAKE, S_OPEN, S_DONE };
 
@@ -53,6 +63,14 @@ typedef struct {
     size_t      need;            /* HTTP: head + body, once the head is read */
     uint64_t    deadline;        /* HTTP: when an unfinished request is answered 408 */
     int         http_done;       /* HTTP: answered, or reported to the loop */
+    /* WebSocket (RFC 6455): after an upgrade on an OC_HTTP_WS route the
+     * connection carries the binary protocol inside binary frames -- the
+     * browser client's only way onto the wire. `win` gathers frames as they
+     * come; their payloads go into `fb` exactly as TLS plaintext does, and
+     * every send is wrapped in a frame of its own. */
+    int         ws;
+    uint8_t    *win;
+    size_t      wlen, wcap;
     oc_io_event *closed_ev;      /* CLOSED, made at adoption so reporting it cannot fail */
 } io_conn;
 
@@ -277,25 +295,166 @@ static oc_tls_status conn_write(io_conn *c, const uint8_t *buf, size_t len, size
 
 static void flush(io_thread *t, io_conn *c);   /* below */
 
+/* Queue `len` bytes to write, `skip` of them the transport's own (io_chunk). */
+static int queue_raw(io_conn *c, const uint8_t *a, size_t alen, const uint8_t *b, size_t blen,
+                     size_t skip) {
+    io_chunk *k = malloc(sizeof *k + alen + blen);
+    if (!k) return -1;
+    k->next = NULL; k->len = alen + blen; k->off = 0; k->skip = skip;
+    if (alen) memcpy(k->data, a, alen);
+    if (blen) memcpy(k->data + alen, b, blen);
+    if (c->ot) c->ot->next = k; else c->oh = k;
+    c->ot = k;
+    c->queued += k->len;
+    if (c->queued > OC_IO_SOFT) c->above_soft = 1;
+    return 0;
+}
+
+/* A server-to-client WebSocket frame header (unmasked, FIN set) for a payload
+ * of `len`; returns its length (2, 4 or 10). */
+static size_t ws_header(uint8_t out[10], int opcode, size_t len) {
+    out[0] = (uint8_t)(0x80 | (opcode & 0x0f));
+    if (len < 126) { out[1] = (uint8_t)len; return 2; }
+    if (len < 65536) { out[1] = 126; out[2] = (uint8_t)(len >> 8); out[3] = (uint8_t)len; return 4; }
+    out[1] = 127;
+    for (int i = 0; i < 8; i++) out[2 + i] = (uint8_t)((uint64_t)len >> (56 - 8 * i));
+    return 10;
+}
+
+/* Queue one WebSocket frame carrying `data`. */
+static int ws_queue(io_conn *c, int opcode, const uint8_t *data, size_t len) {
+    uint8_t h[10];
+    size_t hl = ws_header(h, opcode, len);
+    return queue_raw(c, h, hl, data, len, hl);
+}
+
 /* Answer an HTTP connection here and finish it once the answer is written: a
  * route that touches no state, or a refusal. Nothing more is read from it. */
-static void http_answer(io_thread *t, io_conn *c, int status, const char *ctype,
-                        const char *body, size_t blen) {
+static void http_answer_ex(io_thread *t, io_conn *c, int status, const char *ctype,
+                           const char *body, size_t blen, const char *extra) {
     c->http_done = 1;
     c->deadline = 0;
     free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;
     char head[OC_HTTP_HEAD_MAX];
-    size_t hl = oc_http_head(head, sizeof head, status, ctype, blen);
-    io_chunk *k = hl ? malloc(sizeof *k + hl + blen) : NULL;
-    if (!k) { finish(t, c); return; }
-    k->next = NULL; k->len = hl + blen; k->off = 0;
-    memcpy(k->data, head, hl);
-    if (blen) memcpy(k->data + hl, body, blen);
-    if (c->ot) c->ot->next = k; else c->oh = k;
-    c->ot = k;
-    c->queued += k->len;
+    size_t hl = oc_http_head_ex(head, sizeof head, status, ctype, blen, extra);
+    if (!hl || queue_raw(c, (const uint8_t *)head, hl, (const uint8_t *)body, blen, 0) != 0) {
+        finish(t, c); return;
+    }
     c->close_after = 1;
     flush(t, c);
+}
+static void http_answer(io_thread *t, io_conn *c, int status, const char *ctype,
+                        const char *body, size_t blen) {
+    http_answer_ex(t, c, status, ctype, body, blen, NULL);
+}
+
+
+static void http_refuse(io_thread *t, io_conn *c, int status);   /* below */
+
+/* The WebSocket opening handshake (RFC 6455 §4.2.2) on an OC_HTTP_WS route: the
+ * key answered with its accept value, the first subprotocol offered echoed
+ * (a browser drops a connection whose offer went unanswered), and from the
+ * next byte the connection is the binary protocol in frames. The loop hears
+ * OPENED again, this time as a protocol peer, as it would for an oc/1 ALPN. */
+static void ws_open(io_thread *t, io_conn *c, const oc_http_req *req) {
+    if (!req->upgrade_ws || !req->ws_key || req->ws_key_len == 0 || req->ws_key_len > 64 ||
+        req->method_len != 3 || memcmp(req->method, "GET", 3) != 0) {
+        http_refuse(t, c, 400); return;
+    }
+    static const char GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    unsigned char cat[64 + sizeof GUID], sha[20], acc[32];
+    memcpy(cat, req->ws_key, req->ws_key_len);
+    memcpy(cat + req->ws_key_len, GUID, sizeof GUID - 1);
+    size_t olen = 0;
+    if (mbedtls_sha1(cat, req->ws_key_len + sizeof GUID - 1, sha) != 0 ||
+        mbedtls_base64_encode(acc, sizeof acc, &olen, sha, sizeof sha) != 0) {
+        http_refuse(t, c, 500); return;
+    }
+    char head[OC_HTTP_HEAD_MAX];
+    int n = snprintf(head, sizeof head,
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %.*s\r\n"
+        "%s%.*s%s"
+        "\r\n",
+        (int)olen, acc,
+        req->ws_proto ? "Sec-WebSocket-Protocol: " : "", (int)req->ws_proto_len,
+        req->ws_proto ? req->ws_proto : "", req->ws_proto ? "\r\n" : "");
+    if (n < 0 || (size_t)n >= sizeof head ||
+        queue_raw(c, (const uint8_t *)head, (size_t)n, NULL, 0, (size_t)n) != 0) {
+        finish(t, c); return;
+    }
+    /* The Host the page came from rides along: the loop checks a browser
+     * sign-in's redirect against it (webapp.h). Taken before the request's
+     * buffer, which it points into, is let go. */
+    oc_io_event *e = ev_new(OC_IO_OPENED, c, (const uint8_t *)req->host, req->host_len < 255 ? req->host_len : 0);
+    if (e) { e->http = 0; memcpy(e->source, c->source, sizeof e->source); }
+    c->http_done = 1;
+    c->deadline = 0;
+    free(c->hin); c->hin = NULL; c->hlen = c->hcap = 0;
+    c->http = 0;
+    c->ws = 1;
+    if (post_or_finish(t, c, e) != 0) return;
+    flush(t, c);
+}
+
+/* A WebSocket connection's bytes (RFC 6455 §5): frames gathered, a binary or
+ * continuation frame's payload unmasked into the frame buffer as TLS plaintext
+ * would be, a ping answered, a close or anything else the end. A client's
+ * frames are masked, by the standard; one that is not is not a browser. */
+static void ws_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n) {
+    if (c->wlen + n > c->wcap) {
+        size_t nc = c->wcap ? c->wcap : 4096;
+        while (nc < c->wlen + n) nc *= 2;
+        if (nc > IO_WS_MAX_FRAME * 2) { finish(t, c); return; }
+        uint8_t *g = realloc(c->win, nc);
+        if (!g) { finish(t, c); return; }
+        c->win = g; c->wcap = nc;
+    }
+    memcpy(c->win + c->wlen, chunk, n);
+    c->wlen += n;
+    for (;;) {
+        if (c->wlen < 2) return;
+        uint8_t b0 = c->win[0], b1 = c->win[1];
+        int fin = b0 & 0x80, op = b0 & 0x0f, masked = b1 & 0x80;
+        uint64_t len = b1 & 0x7f;
+        size_t hdr = 2;
+        if (b0 & 0x70) { finish(t, c); return; }          /* reserved bits: no extension agreed */
+        if (!masked) { finish(t, c); return; }
+        if (len == 126) {
+            if (c->wlen < 4) return;
+            len = ((uint64_t)c->win[2] << 8) | c->win[3]; hdr = 4;
+        } else if (len == 127) {
+            if (c->wlen < 10) return;
+            len = 0;
+            for (int i = 0; i < 8; i++) len = (len << 8) | c->win[2 + i];
+            hdr = 10;
+        }
+        if (len > IO_WS_MAX_FRAME) { finish(t, c); return; }
+        size_t whole = hdr + 4 + (size_t)len;
+        if (c->wlen < whole) return;
+        const uint8_t *mask = c->win + hdr;
+        uint8_t *payload = c->win + hdr + 4;
+        for (size_t i = 0; i < len; i++) payload[i] ^= mask[i & 3];
+        (void)fin;   /* the protocol's frames delimit themselves: fragments are one stream */
+        if (op == 0x2 || op == 0x0) {
+            if (len && oc_framebuf_push(&c->fb, payload, (size_t)len) != 0) { finish(t, c); return; }
+            const uint8_t *frame; size_t flen; int r;
+            while ((r = oc_framebuf_next(&c->fb, &frame, &flen)) == 1)
+                if (post_or_finish(t, c, ev_new(OC_IO_FRAME, c, frame, flen)) != 0) return;
+            if (r < 0) { finish(t, c); return; }
+        } else if (op == 0x9) {
+            if (ws_queue(c, 0xA, payload, (size_t)len) != 0) { finish(t, c); return; }
+        } else if (op == 0xA) {
+            /* a pong: nothing to do */
+        } else {
+            /* close (0x8), text (0x1) or an opcode we do not speak */
+            finish(t, c); return;
+        }
+        memmove(c->win, c->win + whole, c->wlen - whole);
+        c->wlen -= whole;
+    }
 }
 
 static void http_refuse(io_thread *t, io_conn *c, int status) {
@@ -340,7 +499,14 @@ static void http_bytes(io_thread *t, io_conn *c, const uint8_t *chunk, size_t n)
 
     const oc_http_route *rt = c->route;
     if (oc_http_parse(c->hin, c->hlen, rt->max_body, &req) != 1) { http_refuse(t, c, 400); return; }
-    if (rt->kind == OC_HTTP_STATIC) { http_answer(t, c, 200, rt->ctype, rt->body, rt->body_len); return; }
+    if (rt->kind == OC_HTTP_WS) { ws_open(t, c, &req); return; }
+    if (rt->kind == OC_HTTP_STATIC) { http_answer_ex(t, c, 200, rt->ctype, rt->body, rt->body_len, rt->extra); return; }
+    if (rt->kind == OC_HTTP_REDIRECT) {
+        char loc[OC_HTTP_HEAD_MAX / 2];
+        snprintf(loc, sizeof loc, "Location: %s\r\nCache-Control: no-store\r\n", rt->body);
+        http_answer_ex(t, c, 302, "text/plain", "", 0, loc);
+        return;
+    }
 
     c->http_done = 1;
     c->deadline = 0;
@@ -380,7 +546,11 @@ static void flush(io_thread *t, io_conn *c) {
         oc_tls_status st = conn_write(c, k->data + k->off, k->len - k->off, &n);
         if (st == OC_TLS_WANT_WRITE || st == OC_TLS_WANT_READ) break;
         if (st != OC_TLS_OK) { finish(t, c); return; }
-        k->off += n; c->queued -= n; c->written += n;
+        /* Counted as written: the loop's bytes, not the transport's own. */
+        size_t off0 = k->off;
+        k->off += n; c->queued -= n;
+        size_t p0 = off0 > k->skip ? off0 - k->skip : 0, p1 = k->off > k->skip ? k->off - k->skip : 0;
+        c->written += p1 - p0;
         if (k->off == k->len) { c->oh = k->next; if (!c->oh) c->ot = NULL; free(k); }
     }
     if (c->queued != before) {
@@ -408,6 +578,7 @@ static void read_some(io_thread *t, io_conn *c) {
         if (st != OC_TLS_OK || !n) { finish(t, c); break; }
         got_turn += n;
         c->rb_left = n < c->rb_left ? c->rb_left - n : 0;
+        if (c->ws) { ws_bytes(t, c, chunk, n); continue; }
         if (c->http) { http_bytes(t, c, chunk, n); continue; }
         if (oc_framebuf_push(&c->fb, chunk, n) != 0) { finish(t, c); break; }
         const uint8_t *frame; size_t flen; int r;
@@ -484,6 +655,7 @@ static void conn_free(io_thread *t, io_conn *c) {
     if (!c->plain) oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
     free(c->hin);
+    free(c->win);
     oc_io_event_free(c->closed_ev);
     close(c->fd);
     t->conns[c->fd] = NULL;
@@ -534,14 +706,10 @@ static void apply(io_thread *t, io_cmd *m) {
     if (m->kind == C_SEND) {
         if (c->state == S_DONE) return;
         if (m->len) {
-            io_chunk *k = malloc(sizeof *k + m->len);
-            if (!k) { finish(t, c); return; }
-            k->next = NULL; k->len = m->len; k->off = 0;
-            memcpy(k->data, m->data, m->len);
-            if (c->ot) c->ot->next = k; else c->oh = k;
-            c->ot = k;
-            c->queued += m->len;
-            if (c->queued > OC_IO_SOFT) c->above_soft = 1;
+            /* On a WebSocket, each send is one binary frame (ws_queue). */
+            int rc = c->ws ? ws_queue(c, 0x2, m->data, m->len)
+                           : queue_raw(c, m->data, m->len, NULL, 0, 0);
+            if (rc != 0) { finish(t, c); return; }
         }
         if (m->flag) c->close_after = 1;
         flush(t, c);

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenChime web (drawing)</title>
+<style>
+html,body{margin:0;height:100%;background:#fff}
+canvas{display:block;width:100vw;height:100vh}
+#note{position:fixed;right:12px;bottom:8px;font:12px system-ui,sans-serif;color:#6b7280;background:#fff8;padding:4px 8px;border-radius:6px}
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0"></canvas>
+<div id="note">oc_gfx over SDL3 under Emscripten: text lands once sdltext has a canvas backend</div>
+<script>
+  var Module = { canvas: document.getElementById('canvas'), print: (t) => console.log(t), printErr: (t) => console.error(t) };
+</script>
+<script src="gfx-demo.js"></script>
+</body>
+</html>

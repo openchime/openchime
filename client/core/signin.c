@@ -53,6 +53,12 @@ static size_t b64url(const uint8_t *in, size_t n, char *out) {
     return o;
 }
 
+void oc_signin_stash(const char *source, const char *verifier) { (void)source; (void)verifier; }
+int  oc_signin_unstash(char *source, size_t scap, char *verifier, size_t vcap) {
+    (void)source; (void)scap; (void)verifier; (void)vcap;
+    return 0;
+}
+
 void oc_signin_wipe(void *p, size_t n) {
     volatile unsigned char *v = (volatile unsigned char *)p;
     while (n--) *v++ = 0;

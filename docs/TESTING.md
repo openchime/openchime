@@ -667,6 +667,32 @@ works. Nothing proves the shipped *image* works (§3.2).
   the loop stops nothing answers the health port. The webhook post itself is
   `test_webhook_vertical`, unchanged.
 
+### 3.4 The web client (`make web-test`, local)
+
+The browser build (WEB.md) has two checks, run where Emscripten and a Chromium
+are present (a developer's box today; a CI job once the runner has them):
+
+- **`make web-gfx-test`** — the gfx backend's own pixel test
+  (`client/gui/gfx/gfx_test_win.c`) compiled to wasm over the SDL3 built for
+  it, run under Node with SDL's dummy video driver: the same assertions as the
+  Windows run, exit code the failure count.
+- **`scripts/webtest.sh`** — a daemon on a fresh database with one bootstrapped
+  owner, the built page served with the two cross-origin-isolation headers
+  wasm threads need (`scripts/webdev.py`), and a headless Chromium loading it.
+  The page's core connects through the WebSocket transport, signs in with the
+  password and receives the channel list; the test reads `oc-web: signed in`
+  and the channel count from the browser's console log and fails on anything
+  else within thirty seconds. Then the client itself (`openchime.html`, the
+  Windows application compiled for the browser) is loaded the same way; the
+  page polls its test hook until the model reads `authed=1 connected=1` and
+  takes the client's own screenshot (`shot`, through `gfx_readback` as on
+  Windows), which is left in `build/webtest/gui.bmp` beside the daemon log and
+  the browser logs.
+
+The WebSocket transport itself is covered natively, in `itest_netloop`'s HTTP
+stack scenario: the upgrade's accept value and echoed subprotocol, HELLO's
+answer in frames, a ping's pong, and an unmasked frame ending the connection.
+
 ---
 
 ## 4. Continuous integration

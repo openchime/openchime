@@ -29,11 +29,34 @@ client/core/   the app-core — frontend-agnostic, headless-testable C:
                net thread + session + credential store + the view-model
                (channels, messages, roster, presence, unread) + reducers
 client/tui/    terminal frontend over the core
-client/gui/win32/  the native Win32 GUI over the same core    (reference client)
-client/shared/ assets shared by graphical frontends (baked Lucide icon paths)
-[further desktops]  the same portable GUI layer + a per-platform
-                    text backend and native shim
+client/gui/app/       the graphical application, portable: SDL3 for the window and
+                      input, oc_gfx for drawing, sdltext for text (ARCH-80)
+client/gui/gfx/       oc_gfx, the primitives over the SDL renderer (ARCH-107)
+client/gui/platform/  platform.h -- what a platform supplies -- and one directory
+                      implementing it per platform: win32/ (the reference), web/;
+                      linux/ and mac/ are the next two
+client/shared/ assets and services shared by the TUI and the GUI: icons, the
+               OS notification backends, the credential store backends
+sdltext/       portable text layout and hit-testing, one backend per platform
+               (DirectWrite, the browser's canvas; FreeType and Core Text next)
 ```
+
+**The platform contract** (`client/gui/platform/platform.h`) is the whole of
+what the application asks of an operating system beyond SDL: crash reports
+and the breadcrumb ring, the single-instance handoff, the window's caption,
+corners and capture exclusion, the taskbar badge and progress, the tray, the
+file pickers, the certificate viewer, autostart and the URL scheme, the
+notification sound, idle time, the clipboard's images and files, image
+decoding, and the text backend. Everything else -- the window, its events,
+timers, the cursor, clipboard text, the drawn text fields -- is SDL and the
+application's own. A platform that cannot do one of them answers "not
+available" and the application carries on, so a new platform starts from
+stubs (the web directory is the model) and earns each capability. What the
+platform has to say asynchronously (a URL handed over by a second launch, a
+tray click, an accessibility invoke) arrives as one SDL user event, so the
+application has one inbox. The accessibility tree is published through
+`client/gui/platform/a11y.h` the same way: UIA on Windows, nothing yet on the
+web.
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
 frontend is pure view + input — it renders the view-model and emits intents. Get
@@ -491,15 +514,16 @@ model; translate input to intents }, stop.
   `REMOVE_FROM_CHANNEL` and `REDEEM_INVITE` are core entry points
   (`oc_client_channel_invite` / `_channel_kick` / `_redeem_invite`) and the Win32
   client surfaces all three.
-- **Windows (`client/gui/win32/`):** **Win32 in pure C** over the
-  core — the portable rendering stack (ARCH-80) for the custom surfaces
-  (message transcript, sidebar, rails, **the composer**, and every menu): an
-  **SDL3 renderer wrapping the client's own native window**, primitives through
-  **oc_gfx** (ARCH-107), text shaped by **DirectWrite through sdltext**
-  (ARCH-106), inline images decoded by **WIC** — and **native controls where
-  they still earn their keep**: `EDIT` boxes (find, search, files-search,
-  sign-in, palette, the form fields), the file picker, and the window frame.
-  No WinUI, no .NET, no C++. The composer and every menu are
+- **Windows (`client/gui/app/` over `client/gui/platform/win32/`):** the
+  portable application (ARCH-80) for every surface (message transcript,
+  sidebar, rails, **the composer**, every text field and every menu): an
+  **SDL3 window and renderer**, primitives through **oc_gfx** (ARCH-107),
+  text shaped by **DirectWrite through sdltext** (ARCH-106), inline images
+  decoded by **WIC** behind the platform contract -- and the platform's own
+  where it still earns its keep: the file picker, the certificate viewer, the
+  taskbar, the tray, UIA. The text fields were native `EDIT` boxes once and are
+  drawn now (see "The text fields are drawn"); nothing in the application
+  names a Win32 call. No WinUI, no .NET, no C++. The composer and every menu are
   drawn into the scene (ARCH-98), so **`RichEdit`,
   `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the
   client**. The **Windows TUI** (ARCH-81) validates the core port —
@@ -610,7 +634,10 @@ model; translate input to intents }, stop.
   a shim for what the browser provides: text drawn through the canvas, an ARIA tree
   mirroring the accessibility tree, the credential store, notifications, file
   pickers and media capture. Nothing is installed: the browser loads it from the
-  workspace.
+  workspace. The transport, the core in a browser, the drawing layer, a canvas
+  text backend and the Windows client compiled for the browser against a Win32
+  shim exist (`make web`, `make web-test`); the platform interface, images,
+  persistence and sign-in by redirect are the steps after, in [WEB.md](./WEB.md).
 
 ## 4. The wire layer (reused, already tested)
 
@@ -846,93 +873,93 @@ The core + TUI build on the host (a `make tui` target linking `client/core/*.c` 
 no container, no external build system. termbox2 and utf8proc are **vendored as
 committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
 v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources with
-zero transitive dependencies (ARCH-75). Native GUIs build with their platform
-toolchains over the core; release artifacts come from CI/CD, never a dev machine.
+zero transitive dependencies (ARCH-75). The GUI is one application
+(`client/gui/app/`) compiled over a platform directory: `make windows-gui`
+cross-compiles it with mingw over `client/gui/platform/win32/` and the SDL3
+and mbedTLS built for Windows; a Linux or macOS build is the same sources over
+their own platform directory once it exists. Release artifacts come from
+CI/CD, never a dev machine.
+The web build (`make web`, [WEB.md](./WEB.md)) needs Emscripten on the PATH and
+builds mbedTLS and SDL3 for wasm once into `build/wasm/`, beside the native trees.
 
-## Native children over the drawn scene (Win32)
+## The text fields are drawn (every platform)
 
-A native child window — the find/search/files-search/palette boxes, the sign-in
-fields, the form fields — composites **above** the rendered scene. There is no
-z-order to lose and nothing can be drawn over one. (The composer is deliberately NOT
-one of these — it is part of the scene, ARCH-98, which removes this whole class
-of bug for it rather than managing it.) A child left visible while the
-surface it belongs to is not drawn therefore appears as a bare control floating
-over whatever *is* drawn, which reads as corruption rather than as a bug.
+The find, search, files-search and people boxes, the palette, the emoji
+search, the sign-in fields, the status card's field, the summary range's two
+dates and a form's fields are **drawn fields** (`field` in `app.c`): a UTF-8
+buffer with a caret and a selection, measured and hit-tested through sdltext,
+drawn into the rect the view hands it, with a placeholder, a password mode,
+a multi-line mode for a form's description, an IME composition shown inline,
+and the keys every field has (the arrows, Home and End, word steps, Ctrl+A,
+copy, cut and paste through SDL's clipboard). Each owner adds its own keys
+through a hook -- Enter submits the search, Esc closes the picker, Tab moves
+between the sign-in fields -- and a change hook, which is what the native
+`EN_CHANGE` was. The composer is the same idea with its own, richer editor
+(ARCH-98).
 
-This is a recurring failure class, so the rule is written
-down: **every native child's visibility is decided in `layout_natives()`**, from
-three shared predicates —
+They were native `EDIT` children once. A child window composited **above**
+the rendered scene, so a control left visible while its surface was not drawn
+floated over whatever was -- the recurring failure class the rule below was
+written for -- and a native control is the one thing a second platform
+cannot reuse. Drawn, a field is part of the scene: z-order is paint order,
+the harness's screenshot sees it, and the web client draws it the same way.
 
-- `sidebar_kind()` — what the second column currently holds (channels · DMs ·
+**Every field's visibility is still decided in one place, `layout_natives()`**
+(the name kept so the rule's history reads), from three shared predicates --
+
+- `sidebar_kind()` -- what the second column currently holds (channels · DMs ·
   activity). Anything that depends on the column's *content* asks this, not
-  `view_has_sidebar()`, which only says whether a column exists. Conflating the
-  two is how a find box leaks into views it does not belong in.
-- `main_is_conversation()` — whether the middle column is something you can type
+  `view_has_sidebar()`, which only says whether a column exists.
+- `main_is_conversation()` -- whether the middle column is something you can type
   into. The DMs view has a sidebar but shows an index until you pick someone.
-- `window_is_covered()` — whether a modal, the palette, the lightbox, a menu or
+- `window_is_covered()` -- whether a modal, the palette, the lightbox, a menu or
   the sign-in card owns the whole window.
 
-**And the drawing must ask the same question as the control.** Hiding an input
-while still painting its box and buttons produces a field you cannot type into,
-which is its own defect — `main_is_conversation()` decides both the field's rect
-and its focus.
+A hidden field is not drawn, takes no click and gives up the keyboard. **And
+the drawing must ask the same question as the field**: a box painted around a
+field that is hidden is a field you cannot type into. A new view or overlay
+has to name itself in one of those predicates. It cannot silently inherit
+another surface's fields.
 
-A new view or overlay has to name itself in one of those predicates. It cannot
-silently inherit another surface's children.
+*A predicate whose default is a real answer* is the trap this fix walked into
+itself: `sidebar_kind()` returns `NONE` for a view with no second column, and
+`NONE` is the enum's zero -- a fallback that is a real answer (`CHANNELS`, say)
+hands that answer to every view its author has not thought about.
 
-**Two traps this fix walked into itself, both worth keeping in mind.**
+**The keyboard has one owner.** `g_focus` is the drawn field with the
+keyboard, or NULL for the window itself (the composer, the menus, the
+shortcuts) -- what `SetFocus`/`GetFocus` did for the native children, as one
+variable. A press outside every field returns the keyboard to the window, as
+clicking a native window did; the shortcuts (`accel_dispatch`) run before any
+field sees a key, as they always have.
 
-*A predicate whose default is a real answer.* `sidebar_kind()` returns `NONE`
-for a view with no second column, and `NONE` is the enum's zero — a fallback
-that is a real answer (`CHANNELS`, say) hands that answer to every view its
-author has not thought about.
-
-*The harness must see what the user sees.* **`shot` composites the native
-children on top of the drawn scene** (see "Seeing the whole
-window" below), so a screenshot shows what the user sees — a capture that
-rendered the scene alone would make a stray native child invisible to
-verification. The dump reports each
-child's `IsWindowVisible` alongside the three predicates as well, because a
-boolean is a better assertion than an image when what you want to know is
-*whether* a control is shown. Read `re=` with the self-drawn composer in mind: the composer has no
-child window, so that field reports whether its **rect is non-empty**,
-not a child's visibility. Every other flag is still an `IsWindowVisible`:
+The dump reports each field's visibility beside the three predicates, because
+a boolean is a better assertion than an image when what you want to know is
+*whether* a control is shown. Read `re=` with the composer in mind: it reports
+whether the composer's **rect is non-empty**; every other flag is a field's
+`visible`:
 
 ```
 natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
 ```
 
 **The six search boxes are one control.** Find a conversation, search messages,
-search files, search people, Jump to (Ctrl+K) and search emoji are each a native
-EDIT over chrome the client draws, and all six are built the same way:
-
-- **The app's text.** Each wears `form_font()` — the UI family at `FONT_UI`
-  times the text scale, the font the form fields use — never the stock dialog
-  font, which is a fixed 11 px face that ignores the DPI and the text size.
-  `search_fonts_sync()`, on the paint path, hands every box the new font when a
-  text-size or DPI change rebuilds it. `form_font()` keeps the previous font
-  alive until the rebuild after, so no box is ever left holding a deleted one,
-  and returns none before the text engine exists, since it asks the engine which
-  family is installed.
-- **One shape.** `search_box_draw()` draws the chrome — `SEARCH_BOX_H` tall,
-  following the text scale, with the glyph centred — and `search_edit_place()`
-  puts the EDIT after the glyph, exactly the font's line height, centred top to
-  bottom. What sits below a box is measured from its bottom.
-
-The dump reports each box so this is checked rather than looked at, in device
-pixels (`uifont` is whether it wears `form_font()`):
+search files, search people, Jump to (Ctrl+K) and search emoji are each a
+field over chrome the client draws, and all six are built the same way:
+`search_box_draw()` draws the chrome -- `SEARCH_BOX_H` tall, following the text
+scale, with the glyph centred -- and `search_text_box()` is where the field's
+text goes, after the glyph, up to the right inset. The field wears the UI
+token (`g_ui`), so it follows the text size and the DPI as everything else
+does. The dump reports each box so this is checked rather than looked at, in
+device pixels:
 
 ```
-searchbox find made=1 vis=1 uifont=1 lf=-14 face="Segoe UI Variable Text" lh=19 edit=112,67,224,86 box=80,62,234,92
+searchbox find made=1 vis=1 ... edit=112,67,224,86 box=80,62,234,92 text=""
 ```
 
-`scripts/gui_search_boxes.sh` opens each box at the default text size, the
-largest, and 200% DPI, and checks the font, the face, the line height, the
-centring, and that all six share one size.
-
-A new gated child (the Files view's "Search files" box, `g_ffind`, is the
-model) is gated on the view it belongs to — never on a predicate that merely
-happens to be true there — and checked across all views from the dump before it
+A new gated field (the Files view's "Search files" box, `g_ffind`, is the
+model) is gated on the view it belongs to -- never on a predicate that merely
+happens to be true there -- and checked across all views from the dump before it
 is shown to anybody.
 
 ## Check CI after pushing
@@ -945,7 +972,7 @@ test` does not. Read the run's result before asking for a merge.
 
 ## Shortcuts belong in the message loop, not a window proc
 
-`SHORTCUTS[]` in winmain.c drives **both** the sheet (Ctrl+/) and the keys, and
+`SHORTCUTS[]` in app.c drives **both** the sheet (Ctrl+/) and the keys, and
 `accel_dispatch()` runs from the message loop before any window sees the message.
 
 This is not tidiness. The main window almost never has focus — a native child
@@ -968,7 +995,7 @@ focus.
 
 ## Modals: one frame, explicit commit
 
-Every modal is drawn by `modal_frame()` (winmain.c) from an `oc_modal_spec`. The
+Every modal is drawn by `modal_frame()` (app.c) from an `oc_modal_spec`. The
 frame owns the scrim, the card, the title bar with its close button, the footer
 rule and the button row; a caller draws only content and decides none of that.
 One frame, four callers:
@@ -1425,7 +1452,7 @@ card and a DPI × zoom × text-size matrix lived here once; it took seven minute
 which meant it was skipped, which meant it caught nothing. Verifying a feature
 is done by driving it — by hand through `scripts/gui_drive.sh`, or with a
 harness scoped to that feature — not by making the boot check longer. A new view
-or overlay is added to the predicates in `winmain.c`; it does not get a line
+or overlay is added to the predicates in `app.c`; it does not get a line
 here.
 
 It is not in CI: the daemon is epoll-based so it is
@@ -1433,34 +1460,15 @@ Linux-only, and GitHub's Windows runners cannot host it (no Linux containers). A
 hosted run needs a self-hosted Windows box. Run it and read it — the
 same discipline as reading CI.
 
-## Seeing the whole window (Win32 harness)
+## Seeing the whole window (the harness)
 
-`scripts/gui_drive.sh shot <name>` produces one image of the entire application,
-drawn scene **and** native children. Two obvious routes do not work,
-recorded so nobody re-walks them:
-
-| Route | D2D content | Native children |
-|---|---|---|
-| Re-render the scene into a DC target | ✓ | **✗** |
-| `PrintWindow(PW_RENDERFULLCONTENT)` | **✗ — blank** | ✓ |
-
-The first misses children because they are separate windows. The second returns a
-blank client area because our `WM_PAINT` renders through a D2D **HWND** target
-straight to the screen and never touches the HDC Windows supplies.
-
-So `test_shot` does what the window does: render the scene, then walk
-`EnumChildWindows` and blit each visible child on top, at its real position.
-`EnumChildWindows` rather than a list of handles, because a list is one more place
-a seventh child must be registered, and forgetting is this area's recurring
-failure. Each child is asked twice — `PrintWindow` first, then `WM_PRINTCLIENT` —
-because neither works for every control class: `PrintWindow` on a *child*
-returns an empty box for some classes, while `WM_PRINTCLIENT` is what a control
-implements for this purpose.
-
-**A control that paints itself must handle `WM_PRINTCLIENT` too.** A string
-drawn only to `GetDC(hwnd)` exists on screen and nowhere else — no capture can
-check it. Any self-painted native control needs the `WM_PAINT`/`WM_PRINTCLIENT`
-pair.
+`scripts/gui_drive.sh shot <name>` produces one image of the entire
+application: the scene is rendered and read back from the renderer
+(`gfx_readback`), on every platform the same way. Every field is drawn now,
+so what the renderer holds is the whole application; there is no second
+route to composite and no control a capture cannot see. (The native children
+that needed `PrintWindow` and `WM_PRINTCLIENT` composited on top are gone with
+the children; that history is in git.)
 
 ## Typography (graphical clients) — ARCH-97
 

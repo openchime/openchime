@@ -19,6 +19,13 @@
 #include <mbedtls/platform_util.h>
 #include <mbedtls/sha256.h>
 
+/* A plain connection's send (oc_tls_conn_init_plain): no SIGPIPE where the flag exists. */
+#ifdef MSG_NOSIGNAL
+#  define OC_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define OC_SEND_FLAGS 0
+#endif
+
 /* --- Non-blocking socket BIO ------------------------------------------- */
 
 /* Suppress SIGPIPE at the syscall so a peer vanishing mid-write can't kill the
@@ -613,7 +620,15 @@ int oc_tls_client_init_verify(oc_tls_client *c, const char **alpn) {
 
 void oc_tls_conn_defer_verify(oc_tls_conn *c) { c->defer = 1; }
 
+int oc_tls_conn_init_plain(oc_tls_conn *c, int fd) {
+    memset(c, 0, sizeof *c);
+    c->fd = fd;
+    c->plain = 1;
+    return 0;
+}
+
 int oc_tls_conn_ca_trusted(const oc_tls_conn *c) {
+    if (c->plain) return 0;
     uint32_t vr = mbedtls_ssl_get_verify_result(&c->ssl);
     return vr == 0 && c->ip_ok;
 }
@@ -633,6 +648,7 @@ int oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd) {
     int rc;
     mbedtls_ssl_init(&c->ssl);
     c->fd = fd;
+    c->plain = 0;
     c->keep = NULL;
     c->expect_ip_len = 0;
     c->bundle = NULL;
@@ -646,6 +662,7 @@ int oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd) {
 
 int oc_tls_conn_set_hostname(oc_tls_conn *c, const char *host) {
     c->expect_ip_len = 0;
+    if (c->plain) return 0;
     if (host) {
         /* An address, bracketed or not, is matched against the certificate's
          * iPAddress SANs after the handshake rather than sent as SNI, which
@@ -685,6 +702,7 @@ static int peer_names_ip(oc_tls_conn *c) {
 }
 
 void oc_tls_conn_free(oc_tls_conn *c) {
+    if (c->plain) return;
     mbedtls_ssl_free(&c->ssl);
     bundle_put(c->bundle);
     c->bundle = NULL;
@@ -702,6 +720,7 @@ void oc_tls_session_free(oc_tls_session *s) {
 }
 
 int oc_tls_conn_resume(oc_tls_conn *c, oc_tls_session *s) {
+    if (c->plain) return 0;
     c->keep = s;
     if (s->have && mbedtls_ssl_set_session(&c->ssl, &s->s) != 0) oc_tls_session_free(s);
     return 0;
@@ -723,6 +742,7 @@ int oc_tls_conn_cert_rejected(const oc_tls_conn *c) {
 
 oc_tls_status oc_tls_handshake(oc_tls_conn *c) {
     int rc;
+    if (c->plain) return OC_TLS_OK;
     while ((rc = mbedtls_ssl_handshake(&c->ssl)) == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
         take_ticket(c);
     if (rc != 0) return status_of(rc);
@@ -749,6 +769,12 @@ oc_tls_status oc_tls_read(oc_tls_conn *c, void *buf, size_t len, size_t *n) {
      * on the socket here would wait for nothing: while TLS holds data it has
      * not processed, go straight on (a few rounds at most). */
     int rc;
+    if (c->plain) {
+        ssize_t r = recv(c->fd, buf, len, 0);
+        if (r > 0) { *n = (size_t)r; return OC_TLS_OK; }
+        if (r == 0) return OC_TLS_CLOSED;
+        return oc_sock_wouldblock() ? OC_TLS_WANT_READ : OC_TLS_ERROR;
+    }
     for (int rounds = 0;; rounds++) {
         rc = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, len);
         if (rc == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) { take_ticket(c); continue; }
@@ -761,11 +787,17 @@ oc_tls_status oc_tls_read(oc_tls_conn *c, void *buf, size_t len, size_t *n) {
 }
 
 size_t oc_tls_pending(const oc_tls_conn *c) {
+    if (c->plain) return 0;
     return mbedtls_ssl_get_bytes_avail(&c->ssl);
 }
 
 oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *n) {
     int rc;
+    if (c->plain) {
+        ssize_t r = send(c->fd, buf, len, OC_SEND_FLAGS);
+        if (r >= 0) { *n = (size_t)r; return OC_TLS_OK; }
+        return oc_sock_wouldblock() ? OC_TLS_WANT_WRITE : OC_TLS_ERROR;
+    }
     while ((rc = mbedtls_ssl_write(&c->ssl, (const unsigned char *)buf, len)) == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
         take_ticket(c);
     if (rc >= 0) { *n = (size_t)rc; return OC_TLS_OK; }
@@ -773,11 +805,13 @@ oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *
 }
 
 int oc_tls_peer_fingerprint(const oc_tls_conn *c, uint8_t out[OC_TLS_FINGERPRINT_LEN]) {
+    if (c->plain) return -1;
     const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&c->ssl);
     return sha256_der(peer, out);
 }
 
 int oc_tls_peer_der(const oc_tls_conn *c, const uint8_t **der, size_t *len) {
+    if (c->plain) return -1;
     const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&c->ssl);
     if (!peer || !peer->raw.p) return -1;
     *der = peer->raw.p;
@@ -786,5 +820,6 @@ int oc_tls_peer_der(const oc_tls_conn *c, const uint8_t **der, size_t *len) {
 }
 
 const char *oc_tls_alpn_selected(const oc_tls_conn *c) {
+    if (c->plain) return OC_ALPN_PROTO;
     return mbedtls_ssl_get_alpn_protocol(&c->ssl);
 }

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenChime</title>
+<style>
+html,body{margin:0;height:100%;background:#fff;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh;outline:none}
+#status{position:fixed;left:12px;bottom:8px;font:12px system-ui,sans-serif;color:#6b7280;background:#fff8;padding:4px 8px;border-radius:6px}
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0"></canvas>
+<div id="status">loading…</div>
+<script>
+  // The client: ?host=…&port=…&user=…&pass=… signs in straight away; without them
+  // the sign-in view opens. The core dials host:port; Emscripten turns that into
+  // one WebSocket at ws(s)://host:port/ws, the daemon's transport.
+  const q = new URLSearchParams(location.search);
+  const host = q.get('host') || location.hostname;
+  const port = q.get('port') || location.port || (location.protocol === 'https:' ? '443' : '80');
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const status = document.getElementById('status');
+  // The test hook (OPENCHIME_TEST_DIR, TESTING.md), on the page's filesystem,
+  // when the page is opened with ?hook=1: ocHook('verb args') answers the ack,
+  // and ?shot=<ms> logs the client's own screenshot as SHOT:<base64 BMP> after
+  // that many milliseconds -- what scripts/webtest.sh reads.
+  // ?hook=1 is kept for the tab: the sign-in leaves the page and comes back
+  // to /app/ without the query, and the harness still wants the hook there.
+  if (q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }
+  let hookKept = false; try { hookKept = sessionStorage.getItem('oc.hook') === '1'; } catch (e) {}
+  const hookOn = q.get('hook') === '1' || hookKept || q.has('shot') || q.has('cmd');
+  window.ocHook = (cmd, wait) => new Promise((res) => { FS.writeFile('/t\\cmd', cmd); setTimeout(() => { let a = ''; try { a = FS.readFile('/t\\ack', { encoding: 'utf8' }); } catch (e) { a = '(no ack)'; } res(a); }, wait || 600); });
+  window.ocShot = async () => { await ocHook('shot /shot.bmp', 1500); const b = FS.readFile('/shot.bmp'); let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
+  // The command line. Served by the daemon (WEB.md) the page is
+  // `openchime --signin <host:port>`: the workspace is the page's own origin,
+  // and the client signs in on the daemon's pages and comes back here with the
+  // token (?token=, which the client takes off the address). The dev
+  // quick-launch ?host=&port=&user=&pass= (or ?ws=) is the test harness's
+  // `openchime <workspace> <user:pass>` (OPENCHIME_TEST_PASSWORD_AUTH).
+  const args = [];
+  { let ws = q.get('ws') || q.get('host') || '';
+    if (q.get('host') && q.get('port')) ws = q.get('host') + ':' + q.get('port');
+    if (ws && q.get('user')) { args.push(ws); args.push((q.get('user') || '') + ':' + (q.get('pass') || '')); }
+    else args.push('--signin', ws || `${host}:${port}`); }
+  var Module = {
+    arguments: args,
+    // The test knobs the native harness sets in the environment (TESTING.md)
+    // are the page's ?env=NAME=value (repeatable); ?mic=<url> puts a WAV on the
+    // page's filesystem at /mic.wav for OPENCHIME_TEST_MIC.
+    preRun: [() => {
+      if (q.has('stats')) ENV.OC_WEB_STATS = '1';
+      if (hookOn) { ENV.OPENCHIME_TEST_DIR = '/t'; try { FS.mkdir('/t'); } catch (e) {} }
+      for (const kv of q.getAll('env')) { const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1); }
+      if (q.get('mic')) {
+        addRunDependency('mic');
+        fetch(q.get('mic')).then((r) => r.arrayBuffer()).then((b) => { FS.writeFile('/mic.wav', new Uint8Array(b)); removeRunDependency('mic'); })
+          .catch((e) => { console.error('mic: ' + e); removeRunDependency('mic'); });
+      }
+    }],
+    canvas: document.getElementById('canvas'),
+    websocket: { url: q.get('ws') || `${scheme}://${host}:${port}/ws`, subprotocol: 'binary' },
+    print: (t) => console.log(t),
+    printErr: (t) => console.error(t),
+    onRuntimeInitialized: () => {
+      status.textContent = 'OpenChime on the web'; setTimeout(() => status.remove(), 6000);
+      // ?open=openchime://... : a permalink for the running client, as a second
+      // launch hands one over on a desktop.
+      if (q.get('open')) setTimeout(() => Module.ccall('oc_web_handoff', null, ['string', 'string'], ['url', q.get('open')]), 4000);
+    },
+  };
+  if (q.has('cmd')) setTimeout(async () => console.log('ACK:' + (await ocHook(q.get('cmd')))), parseInt(q.get('at') || '6000', 10));
+  // ?script=verb@ms|verb@ms…: each verb at its time after the client is signed
+  // in, its ACK logged; then, after the last, DUMP: of the model -- the web
+  // test's way of recording a video message end to end.
+  if (q.has('script')) (async () => {
+    const t0 = Date.now(); let line = '';
+    while (Date.now() - t0 < 60000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { await ocHook('dump /dump.txt', 1200); line = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]; } catch (e) { line = ''; }
+      if (line.includes('authed=1')) break;
+    }
+    const start = Date.now();
+    for (const step of q.get('script').split('|')) {
+      const [verb, at] = step.split('@');
+      const wait = start + parseInt(at || '0', 10) - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      console.log('ACK ' + verb + ': ' + (await ocHook(verb, 1200)));
+    }
+    await ocHook('dump /dump.txt', 1500);
+    try { console.log('DUMPALL:' + btoa(unescape(encodeURIComponent(FS.readFile('/dump.txt', { encoding: 'utf8' }))))); } catch (e) { console.log('DUMP-ERR:' + e); }
+  })();
+  if (q.has('dumpat')) setTimeout(async () => { await ocHook('dump /dump.txt', 1200); try { console.log('DUMP:' + FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]); } catch (e) { console.log('DUMP-ERR:' + e); } }, parseInt(q.get('dumpat'), 10));
+  // ?wait=authed&shot=1: poll the model until it is signed in (or 60 s pass),
+  // log that line as DUMP:, then the screenshot -- the test's whole exchange.
+  if (q.get('wait') === 'authed') (async () => {
+    const t0 = Date.now(); let line = '';
+    while (Date.now() - t0 < 60000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { await ocHook('dump /dump.txt', 1200); line = FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]; } catch (e) { line = ''; }
+      if (line.includes('authed=1')) break;
+    }
+    console.log('DUMP:' + line);
+    if (q.has('shot')) { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }
+  })();
+  else if (q.has('shot')) setTimeout(async () => { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }, parseInt(q.get('shot'), 10));
+</script>
+<script src="openchime.js"></script>
+</body>
+</html>

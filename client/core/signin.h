@@ -27,6 +27,15 @@ int oc_signin_verifier(char verifier[OC_SIGNIN_VERIFIER_LEN + 1],
 /* Wipe a secret in a way the compiler may not remove. */
 void oc_signin_wipe(void *p, size_t n);
 
+/* The web client (WEB.md): a browser sign-in leaves the page and comes back
+ * to it as a new page. What only this client holds -- the PKCE verifier and
+ * the source signed in with -- is stashed in the tab's session storage on the
+ * way out and taken back, once, on the way in (signin_web.c). Natively there
+ * is nothing to stash: the listener hears the result in this process, and
+ * oc_signin_unstash is 0. */
+void oc_signin_stash(const char *source, const char *verifier);
+int  oc_signin_unstash(char *source, size_t scap, char *verifier, size_t vcap);
+
 typedef struct oc_loopback oc_loopback;
 
 /* Listen on 127.0.0.1, port chosen by the kernel, and write the redirect to give

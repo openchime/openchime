@@ -28,6 +28,12 @@ typedef struct {
     int         is_form;                     /* ...application/x-www-form-urlencoded */
     const char *host;   size_t host_len;     /* the Host header; NULL if none */
     const char *origin; size_t origin_len;   /* the Origin header; NULL if none */
+    /* A WebSocket opening handshake (RFC 6455 §4): `Upgrade: websocket` with
+     * its key, and the first subprotocol it asked for, if any. The route of
+     * kind OC_HTTP_WS takes it; every other route ignores these. */
+    int         upgrade_ws;
+    const char *ws_key;   size_t ws_key_len;
+    const char *ws_proto; size_t ws_proto_len;
     size_t      head_len;                    /* request line + headers + blank line */
     size_t      content_length;              /* declared; 0 when absent */
 } oc_http_req;
@@ -55,7 +61,11 @@ int oc_http_webhook_text(const oc_http_req *req, const char **out, size_t *outle
 
 typedef enum {
     OC_HTTP_STATIC,   /* answered on the I/O thread with `body`, no loop involved */
-    OC_HTTP_LOOP      /* reported to the event loop, which answers (it touches state) */
+    OC_HTTP_LOOP,     /* reported to the event loop, which answers (it touches state) */
+    OC_HTTP_WS,       /* a WebSocket upgrade: from here the connection carries the
+                       * binary protocol in WebSocket frames (ioloop.c), for the
+                       * browser client, which has no socket of its own */
+    OC_HTTP_REDIRECT  /* a 302 to `body` (the Location), answered on the I/O thread */
 } oc_http_kind;
 
 typedef struct {
@@ -67,6 +77,7 @@ typedef struct {
     const char  *ctype;       /* OC_HTTP_STATIC: the answer */
     const char  *body;
     size_t       body_len;
+    const char  *extra;       /* OC_HTTP_STATIC: headers added to the answer ("A: b\r\n"), or NULL */
 } oc_http_route;
 
 /* What one listener serves: its routes, in order, and what a path none of them
@@ -87,7 +98,7 @@ const oc_http_route *oc_http_route_find(const oc_http_site *site, const oc_http_
 /* Write a response head -- status line, Content-Type, Content-Length and
  * `Connection: close` -- into `out`. Returns its length, or 0 if `cap` is too
  * small. OC_HTTP_HEAD_MAX always suffices for a Content-Type under 64 bytes. */
-#define OC_HTTP_HEAD_MAX 256u
+#define OC_HTTP_HEAD_MAX 512u
 size_t oc_http_head(char *out, size_t cap, int status, const char *ctype, size_t body_len);
 /* The same with `extra` -- whole header lines, each ending "\r\n", or NULL --
  * after Content-Type: a Location, the pages' security headers. */

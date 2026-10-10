@@ -13,21 +13,17 @@
  * RichEdit composer, menus, dialogs) and the members pane land in later phases.
  */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#define COBJMACROS            /* C-style COM: Interface_Method(obj, ...) */
-#include <windows.h>
-#include <windowsx.h>         /* GET_X_LPARAM / GET_Y_LPARAM */
-#include <shellapi.h>         /* CommandLineToArgvW, Shell_NotifyIconW */
-#include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
-#include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
-#include <shobjidl.h>         /* ITaskbarList3: the overlay badge (REQ-138) */
-#include <wincrypt.h>         /* the certificate a trust question shows */
-#include <cryptuiapi.h>       /* ...and Windows' viewer for it (loaded at run time) */
-#include <wincodec.h>       /* WIC: decode an inline image from memory */
-#include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
-#include "a11y.h"           /* the UIA provider (REQ-269, ARCH-99) */
+/* ---- the platform seam (ARCH-80; client/gui/platform/platform.h) ----------
+ * This file is the portable application: SDL3 for the window, input, timers,
+ * cursors and clipboard text; oc_gfx for drawing; sdltext for text; and the
+ * platform contract for what only a platform can do. Nothing below names a
+ * platform API. */
+#include <SDL3/SDL.h>         /* the window, input, timers, clipboard text (ARCH-80) */
+#include <SDL3/SDL_main.h>    /* main() is the entry on every platform */
+#include "platform.h"         /* what the platform supplies (one directory each) */
+#include "keys.h"             /* OCK_* key names, mapped from SDL once */
+#include "a11y.h"             /* the accessibility tree the platform exposes (REQ-269) */
+
 
 /* ceilf/roundf, in the text metrics below. Without it they were implicitly
  * declared as returning INT, so every baseline and line height was computed by
@@ -42,9 +38,16 @@
 #include <time.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <ctype.h>
+#ifdef __EMSCRIPTEN__
+#  include <emscripten.h>     /* the loop yields to the page (WEB.md) */
+#endif
+#include <dirent.h>          /* the crash rings a previous run left */
+#include <sys/stat.h>        /* what the attachment tray is handed */
 
 #include "client.h"
 #include "net.h"          /* oc_net_probe: how a workspace signs people in */
+#include "signin.h"       /* a browser sign-in resumed from its result (the web client) */
 #include "secret_os.h"
 #include "model.h"
 #include "notify.h"
@@ -56,11 +59,9 @@
 #include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
-#include "openchime_res.h"    /* IDI_APPICON */
 #include "theme.h"
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
-#include <mmsystem.h>       /* PlaySoundW, the notification sound (REQ-138) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
 #include "oc_capture.h"       /* video messages: the camera list (REQ-163) */
 #include "oc_recorder.h"      /* ...recording (REQ-162) */
@@ -72,7 +73,6 @@
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
-#include "st_dwrite.h"        /* its DirectWrite backend, chosen here */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
  * hit-box and layout computation in this file speaks it; gr() converts at the
@@ -90,7 +90,7 @@ static gfx_rect gr(rectf r) {
  * changes only the next draw through this wrapper, never a shared kernel
  * object. */
 enum { PARA_TOP = 0, PARA_MID, PARA_BOT };
-typedef struct {
+typedef struct fmtw {
     st_format *f;
     int   align;      /* ST_ALIGN_* */
     int   para;       /* PARA_* — vertical placement inside the draw rect */
@@ -100,14 +100,192 @@ typedef struct {
     float baseline;   /* pinned baseline within the line box; 0 = unpinned */
 } fmtw;
 
-/* Same story for the taskbar: CLSID_TaskbarList is in libuuid, its ITaskbarList3
- * interface id is not in every toolchain's table. */
-static const GUID OC_CLSID_TaskbarList =
-    { 0x56fdf344, 0xfd6d, 0x11d0, { 0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90 } };
-static const GUID OC_IID_ITaskbarList3 =
-    { 0xea1afb91, 0x9e28, 0x4b86, { 0x90, 0xe9, 0x9e, 0x9f, 0x8a, 0x5e, 0xef, 0xaf } };
+/* UTF-16 is the composer's unit (the a11y publisher and every IME speak it);
+ * sdltext speaks bytes. The type is spelled out so the file is the same on a
+ * platform whose oc_wch is four bytes. */
+typedef uint16_t oc_wch;
 
-#define TIMER_TICK 1
+/* Integer rectangles and points in device pixels, the unit windows and the
+ * accessibility tree are measured in. */
+typedef struct { int32_t left, top, right, bottom; } irect;
+typedef struct { int32_t x, y; } ipoint;
+#define OC_PATH_MAX 1024
+
+/* A window this application draws: the main one, and the small ones a
+ * notification, a recording or a share puts up beside it. Every event names
+ * the window it is for; every drawing call names the gfx it draws through. */
+typedef struct oc_win {
+    SDL_Window   *sdl;
+    SDL_Renderer *ren;
+    gfx          *g;
+} oc_win;
+
+/* The tick, in ms: the GUI analogue of the TUI's poll loop. */
+#define TICK_MS 30
+
+/* The clock every age and debounce in this file is measured against. */
+static uint64_t now_ms(void) { return SDL_GetTicks(); }
+
+/* The window needs painting. Coalesced: the loop paints once when the queue
+ * is empty, however many places asked. */
+static int g_dirty;
+static void invalidate(void) { g_dirty = 1; }
+
+/* UTF-8 <-> UTF-16 (the composer's unit). to_w returns the unit count without
+ * the terminator; to_u8 the byte count without it. Both always terminate. */
+static int to_w(const char *s, oc_wch *out, int cap) {
+    int n = 0;
+    if (cap <= 0) return 0;
+    if (!s) { out[0] = 0; return 0; }
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p && n < cap - 1) {
+        uint32_t cp; int len;
+        if      (*p < 0x80)              { cp = *p; len = 1; }
+        else if ((*p & 0xE0) == 0xC0)    { cp = *p & 0x1F; len = 2; }
+        else if ((*p & 0xF0) == 0xE0)    { cp = *p & 0x0F; len = 3; }
+        else if ((*p & 0xF8) == 0xF0)    { cp = *p & 0x07; len = 4; }
+        else { p++; continue; }
+        int ok = 1;
+        for (int i = 1; i < len; i++) {
+            if ((p[i] & 0xC0) != 0x80) { ok = 0; break; }
+            cp = (cp << 6) | (p[i] & 0x3F);
+        }
+        if (!ok) { p++; continue; }
+        p += len;
+        if (cp >= 0x10000) {
+            if (n + 2 > cap - 1) break;
+            cp -= 0x10000;
+            out[n++] = (oc_wch)(0xD800 + (cp >> 10));
+            out[n++] = (oc_wch)(0xDC00 + (cp & 0x3FF));
+        } else out[n++] = (oc_wch)cp;
+    }
+    out[n] = 0;
+    return n;
+}
+static int to_u8n(const oc_wch *w, int wn, char *out, size_t cap) {
+    size_t o = 0;
+    if (!cap) return 0;
+    for (int i = 0; i < wn && w[i]; i++) {
+        uint32_t cp = w[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < wn && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (w[i + 1] - 0xDC00); i++;
+        } else if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+        int len = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (o + (size_t)len >= cap) break;
+        if      (len == 1) out[o++] = (char)cp;
+        else if (len == 2) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+        else if (len == 3) { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+        else { out[o++] = (char)(0xF0 | (cp >> 18)); out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+    }
+    out[o] = 0;
+    return (int)o;
+}
+static int to_u8(const oc_wch *w, char *out, size_t cap) { return to_u8n(w, 0x7FFFFFFF, out, cap); }
+static int wlen(const oc_wch *w) { int n = 0; if (w) while (w[n]) n++; return n; }
+static int wcmp(const oc_wch *a, const oc_wch *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)*a - (int)*b;
+}
+static void wcpyn(oc_wch *d, const oc_wch *s, int cap) {
+    int i = 0;
+    if (cap <= 0) return;
+    while (s[i] && i < cap - 1) { d[i] = s[i]; i++; }
+    d[i] = 0;
+}
+
+/* ---- the drawn text fields ----------------------------------------------
+ * Every box you type a line into -- the sidebar filter, search, the palette,
+ * the emoji search, the sign-in fields, a form's fields -- is drawn here, with
+ * sdltext for its measurement, exactly as the composer is (ARCH-98). They were
+ * native EDIT children once; a child window composited over the scene punched
+ * through every overlay drawn above it, and a native control is the one thing
+ * a second platform cannot reuse. The chrome around a field (its box, border
+ * and icon) stays with the view that draws it; the field draws its text,
+ * selection and caret into the rect the view hands it. */
+#define FIELD_BUF 2048
+typedef struct field {
+    char   buf[FIELD_BUF];          /* UTF-8 */
+    int    len, caret, anchor;      /* bytes; the selection is [min, max) */
+    int    multi, password;
+    int    visible, enabled;
+    int    maxlen;                  /* bytes the text may grow to */
+    rectf  box;                     /* the text rect it was last placed in (DIPs) */
+    float  scroll;                  /* single-line: DIPs scrolled left; multi: scrolled up */
+    const char *placeholder;
+    int  (*key)(struct field *, int key, int ctrl, int shift);   /* the owner's keys; 1 = taken */
+    void (*changed)(struct field *);
+    struct fmtw *fmt;               /* NULL: the UI token */
+    char   comp[128]; int comp_len; /* an IME composition in progress */
+    uint64_t blink;                 /* the caret's phase reference */
+    int    dragging;
+    int    lines;                   /* multi: wrapped lines at the last draw */
+} field;
+static void  field_init(field *f, const char *placeholder, int multi, int password);
+static void  field_draw(gfx *rt, field *f, rectf box, uint32_t ink);
+static void  field_set(field *f, const char *utf8);
+static void  field_select_all(field *f);
+static void  field_show(field *f, int on);
+static int   field_mouse(field *f, int kind, float x, float y);   /* 0 down, 1 move, 2 up, 3 double */
+static int   field_key(field *f, int key, int ctrl, int shift);
+static int   field_text_input(field *f, const char *utf8);
+static void  field_editing(field *f, const char *utf8);
+static int   field_hit(const field *f, float x, float y);
+static int   fields_mouse(int kind, float x, float y);   /* every visible field, in z-order */
+static int   field_line_count(field *f, float w);
+
+/* Who has the keyboard: a drawn field, or NULL for the window itself (the
+ * composer, the menus, the shortcuts). What SetFocus/GetFocus did for the
+ * native children, as one variable. */
+static field *g_focus;
+static void   focus_set(field *f);
+
+/* The main window and the keyboard's view of it. */
+static int g_win_focused;        /* the OS gave this window the keyboard */
+static int g_quit;               /* the loop ends */
+
+/* Modifier state, as the handlers read it. The harness may hold a synthetic
+ * chord (g_synth_mods), see mod_down. */
+static int mod_down(int key);
+
+/* The window's client area in device pixels (what the scene is laid out in,
+ * before DIPF). */
+static void client_rect(oc_win *w, irect *rc) {
+    int pw = 0, ph = 0;
+    if (w && w->sdl) SDL_GetWindowSizeInPixels(w->sdl, &pw, &ph);
+    rc->left = rc->top = 0; rc->right = pw; rc->bottom = ph;
+}
+
+/* UTF-16 units a UTF-8 byte range needs (surrogate pairs count two). */
+static int to_w_count(const char *s, int bytes) {
+    int n = 0;
+    for (int i = 0; i < bytes && s[i]; ) {
+        unsigned char c = (unsigned char)s[i];
+        int len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+        n += len == 4 ? 2 : 1;
+        i += len;
+    }
+    return n;
+}
+
+#ifdef _WIN32
+#  include <process.h>
+#  define oc_getpid _getpid
+#else
+#  include <unistd.h>
+#  define oc_getpid getpid
+#endif
+
+/* The loop and the harness's synthetic input, defined with the loop at the end. */
+static void pump(void);
+static void paint_now(void);
+static void synth_mouse(oc_win *hwnd, int kind, int x_dip, int y_dip);
+static void synth_key(oc_win *hwnd, int key, int up, int alt);
+static void synth_char(oc_win *hwnd, oc_wch ch);
+static void synth_wheel(oc_win *hwnd, int x_dip, int y_dip, int delta);
+static void fields_create(void);
+static uint32_t g_app_evtype;      /* the app's own posts to itself: the trust question's resume */
+enum { APP_EV_TRUST_RESUME = 1 };
+
 
 /* Layout metrics (device pixels; per-monitor DPI is a later phase). */
 /* ---- DPI ------------------------------------------------------------------
@@ -122,30 +300,7 @@ static const GUID OC_IID_ITaskbarList3 =
  * Without any of this the process is DPI-unaware and Windows bitmap-stretches
  * the whole window on a scaled display — the app shipped blurry on any modern
  * laptop. */
-static UINT g_dpi = 96;
-/* Loaded dynamically: both are Windows 10 1607/1703, newer than the _WIN32_WINNT
- * this builds against, and neither is worth raising the floor for. Missing them
- * simply means the older SetProcessDPIAware path and a fixed 96. */
-static void dpi_declare_awareness(void) {
-    HMODULE u32 = GetModuleHandleW(L"user32.dll");
-    typedef BOOL (WINAPI *setctx_t)(HANDLE);
-    setctx_t setctx = u32 ? (setctx_t)(void *)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : NULL;
-    /* -4 == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: per-monitor, and the
-     * system scales the non-client area (title bar) to match. */
-    if (setctx && setctx((HANDLE)-4)) return;
-    SetProcessDPIAware();          /* system-DPI aware: right on one monitor */
-}
-
-static UINT dpi_for_window(HWND hwnd) {
-    HMODULE u32 = GetModuleHandleW(L"user32.dll");
-    typedef UINT (WINAPI *getdpi_t)(HWND);
-    getdpi_t getdpi = u32 ? (getdpi_t)(void *)GetProcAddress(u32, "GetDpiForWindow") : NULL;
-    if (getdpi) { UINT d = getdpi(hwnd); if (d >= 48 && d <= 480) return d; }
-    HDC dc = GetDC(hwnd);
-    UINT d = dc ? (UINT)GetDeviceCaps(dc, LOGPIXELSX) : 96;
-    if (dc) ReleaseDC(hwnd, dc);
-    return (d >= 48 && d <= 480) ? d : 96;
-}
+static unsigned g_dpi = 96;    /* 96 x the window's display scale (SDL), as DIPs need it */
 #define PX(v)   ((int)((float)(v) * (float)g_dpi / 96.0f + 0.5f))   /* DIP -> device */
 #define DIPF(v) ((float)(v) * 96.0f / (float)g_dpi)                 /* device -> DIP */
 
@@ -506,7 +661,7 @@ typedef struct {
  * border with it, so the problem is shown where it is (REQ-263). -1: none.
  * Set by the caller asking again; form_dialog clears it as it returns. */
 static int g_form_err_field = -1;
-static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
+static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n);
 
 /* The form is drawn on the modal frame like every other sheet, so its
  * state has to be visible to the painter, the click router and layout_natives —
@@ -531,18 +686,11 @@ static char       g_form_last[320];
  * our card is not the one control in the app wearing the stock shell font (ARCH-97
  * — the platform owns the family, we own the scale). Rebuilt whenever the scale
  * changes, which is why form_font() is a function and not a one-shot global. */
-static HFONT      g_form_font;
-static float      g_form_font_scale;
-/* The font before the last rebuild, kept until the next one: an EDIT is handed
- * the new font right after a rebuild, and deleting the old one first would leave
- * it drawing with a dead handle in between. */
-static HFONT      g_form_font_prev;
-static int        g_form_font_lh;       /* its line height, in device pixels */
 static int        g_form_done, g_form_result;         /* the nested loop's exit */
 static char       g_form_title[128];
 static oc_field  *g_form_f;                           /* the CALLER's array */
 static int        g_form_n;
-static HWND       g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD only */
+static field     *g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD / FF_MULTILINE only */
 static rectf g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
 /* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
 static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
@@ -833,7 +981,7 @@ static char       g_host[256];
 static int        g_port;
 static char       g_cur_ws[256];        /* the workspace string we connected with */
 
-/* The rendering stack (ARCH-80): an SDL window whose HWND this file subclasses
+/* The rendering stack (ARCH-80): an SDL window whose oc_win *this file subclasses
  * (so WM_GETOBJECT, the tray, IME and every input path keep their Win32
  * handling), an SDL renderer drawn through oc_gfx, and an sdltext context on
  * the DirectWrite backend. There is no render-target-owned state to lose —
@@ -847,8 +995,9 @@ static st_ctx       *g_st;
  * here, we make a texture and either draw it now or hand it to the text cache.
  * One slot — the UI thread draws one layout at a time. */
 /* Declared here rather than beside the test hook: the notification window
- * (below) needs the shell's HWND to restore it, and is defined earlier. */
-static HWND g_main_hwnd;
+ * (below) needs the shell's oc_win *to restore it, and is defined earlier. */
+static oc_win  g_main_win;
+static oc_win *g_main = &g_main_win;
 
 /* sdltext rasterizes into a bitmap two DIPs wider and taller than the ink, so
  * antialiasing at the edges has somewhere to go (st_draw). Anything measuring a
@@ -866,7 +1015,7 @@ static float    g_cap_dx, g_cap_dy;   /* ink offset, DIPs — aligned layouts */
  * A single index rather than a struct per target: the cache is the only thing
  * that has to split, and threading a context through every draw call would
  * touch several hundred call sites to say what one variable says. */
-enum { TXT_TARGET_MAIN = 0, TXT_TARGET_TOAST = 1, TXT_TARGET_COUNT };
+enum { TXT_TARGET_MAIN = 0, TXT_TARGET_TOAST = 1, TXT_TARGET_RECBAR = 2, TXT_TARGET_SHAREBAR = 3, TXT_TARGET_COUNT };
 static int   g_txt_target;
 static gfx  *g_gfx_for[TXT_TARGET_COUNT];
 static void cap_blit(void *user, const void *bgra, int stride, int pw, int ph,
@@ -952,20 +1101,20 @@ static int  g_ed_focus;
 static int  ed_len(void);
 static int  ed_caret_pos(void);
 static int  ed_focused(void);
-static int  ed_get(WCHAR *out, int cap);
-static void ed_set(const WCHAR *s);
+static int  ed_get(oc_wch *out, int cap);
+static void ed_set(const oc_wch *s);
 static void ed_clear(void);
-static void ed_insert(const WCHAR *s);
-static void ed_replace_range(int a, int b, const WCHAR *s);
+static void ed_insert(const oc_wch *s);
+static void ed_replace_range(int a, int b, const oc_wch *s);
 static void ed_select_all(void);
-static void ed_focus(HWND hwnd);
+static void ed_focus(oc_win *hwnd);
 static int  ed_has_sel(void);
 static int  ed_lines(float w);
 static void ed_draw(gfx *rt, rectf box);
 static void ed_invalidate_layout(void);   /* fwd — prefs re-draw the field */
 static float ed_line_h(void);             /* fwd — the field's REAL line height */
 static void ed_mode_changed(void);        /* fwd — the editor preference flips */
-static DWORD    g_last_typing;
+static uint32_t    g_last_typing;
 
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
 /* Sidebar rows come from the shared core helper (oc_model_sidebar), so the GUI
@@ -982,7 +1131,7 @@ static int   g_pick_hover = -1;       /* emoji-picker cell under the pointer */
 static rectf g_sb_kebab;
 static int   g_sb_menu_sec = -1;
 static int   g_sb_settings_pending;   /* waiting for the synced prefs after auth */
-static void open_section_menu(HWND hwnd, int sec);
+static void open_section_menu(oc_win *hwnd, int sec);
 static void sidebar_opts_save(void);
 static void sidebar_opts_load(const oc_model *m);
 #define SB_SETTING_KEY "sidebar"
@@ -1026,26 +1175,33 @@ static int g_prefs_pending;        /* fold the synced values in once they land *
  * differently-scaled monitor is handled by WM_DPICHANGED afterwards. */
 static int g_win_x = -1, g_win_y, g_win_w, g_win_h, g_win_max;
 static int g_geom_applied;         /* only restore once per run */
-static ULONGLONG g_geom_deadline;  /* show anyway if the bucket never lands */
-static ULONGLONG g_geom_dirty_at;  /* geometry changed; save once it settles */
+static uint64_t g_geom_deadline;  /* show anyway if the bucket never lands */
+static uint64_t g_geom_dirty_at;  /* geometry changed; save once it settles */
 
 /* Read the window's placement into the globals. Returns 1 if it changed.
  * Separate from saving because WM_EXITSIZEMOVE only fires for INTERACTIVE
  * drags — a programmatic move never sends it, and the geometry would then be
  * whatever it was at the last drag. */
-static int geom_capture(HWND hwnd) {
-    WINDOWPLACEMENT wp; wp.length = sizeof wp;
-    if (!GetWindowPlacement(hwnd, &wp)) return 0;
-    if (wp.showCmd == SW_SHOWMINIMIZED) return 0;   /* never persist minimised */
+static int geom_capture(oc_win *hwnd) {
+    if (!hwnd || !hwnd->sdl) return 0;
+    SDL_WindowFlags fl = SDL_GetWindowFlags(hwnd->sdl);
+    if (fl & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) return 0;   /* never persist minimised */
+    int x, y, w, h;
+    SDL_GetWindowPosition(hwnd->sdl, &x, &y);
+    SDL_GetWindowSize(hwnd->sdl, &w, &h);
     /* Nor a place no monitor shows: a window parked off-screen (by a test harness,
      * or on a display since unplugged) saved there comes back invisible. */
-    if (!MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONULL)) return 0;
-    int mx = (wp.showCmd == SW_SHOWMAXIMIZED);
-    RECT *n = &wp.rcNormalPosition;
-    int w = n->right - n->left, h = n->bottom - n->top;
-    if (mx == g_win_max && n->left == g_win_x && n->top == g_win_y &&
-        w == g_win_w && h == g_win_h) return 0;
-    g_win_max = mx; g_win_x = n->left; g_win_y = n->top; g_win_w = w; g_win_h = h;
+    { SDL_Rect r = { x, y, w, h }; if (!SDL_GetDisplayForRect(&r)) return 0; }
+    int mx = (fl & SDL_WINDOW_MAXIMIZED) != 0;
+    if (mx) {
+        /* The normal rect is what is restored; a maximised window reports the
+         * monitor's. Only the flag moves. */
+        if (mx == g_win_max) return 0;
+        g_win_max = mx;
+        return 1;
+    }
+    if (mx == g_win_max && x == g_win_x && y == g_win_y && w == g_win_w && h == g_win_h) return 0;
+    g_win_max = mx; g_win_x = x; g_win_y = y; g_win_w = w; g_win_h = h;
     return 1;
 }
 /* 24, not 16: Appearance alone is 3 + 4 + 4 + 2 + 2 = 15 chips, and a table that
@@ -1099,9 +1255,9 @@ static float g_thr_scroll, g_thr_scroll_max;
  * copy it happens to hold and clobber a newer one from somewhere else. */
 enum { DRAFT_TEXT_MAX = 4001 };       /* ED_MAX + 1, asserted where ED_MAX is defined */
 static uint64_t g_draft_sent_cid;
-static WCHAR    g_draft_sent[DRAFT_TEXT_MAX];
+static oc_wch    g_draft_sent[DRAFT_TEXT_MAX];
 static int       g_draft_dirty;       /* the composer has changed since the last write */
-static ULONGLONG g_draft_touch_ms;    /* when it last changed, for the debounce */
+static uint64_t g_draft_touch_ms;    /* when it last changed, for the debounce */
 #define DRAFT_DEBOUNCE_MS 2000
 
 /* ---- OS notifications (REQ-138) ------------------------------------
@@ -1116,7 +1272,6 @@ static ULONGLONG g_draft_touch_ms;    /* when it last changed, for the debounce 
  *
  * Nothing is raised while the window is foreground — a notification for a
  * message you are looking at is noise. */
-static int to_w(const char *s, WCHAR *out, int cap);   /* fwd */
 
 enum { NOTIFY_OFF = 0, NOTIFY_COUNT = 1, NOTIFY_FULL = 2 };
 static int  g_pref_notify = NOTIFY_FULL;
@@ -1160,45 +1315,14 @@ static int  g_tray_live;
 static struct { int slot; uint64_t cid, seen; } g_notify_hw[128];
 static int  g_n_notify_hw;
 static int  g_notify_primed;   /* the first tick after auth only records */
-static NOTIFYICONDATAW g_tray;
-#define TRAY_UID 1
-/* The tray icon's own callback. WM_APP rather than WM_USER: WM_USER+n is
- * per-window-class space that a subclass may already be using, WM_APP+n is the
- * application's. */
-#define WM_APP_TRAY (WM_APP + 1)
-/* A trusted certificate's sign-in step, run again once the question that asked
- * about it has finished closing (cert_trust_run). */
-#define WM_APP_TRUST_RESUME (WM_APP + 2)
 /* Closing the window HIDES it (REQ-138): a chat client that stops notifying the
  * moment you close it has stopped doing the one thing it is for. Said once, the
  * first time, because an app that vanishes without a word reads as a crash. */
 /* START WITH WINDOWS. Read live from the registry rather than mirrored into the
  * settings bucket: the installer writes a startup shortcut too, and a copy of
  * this in two places is a copy that can disagree. The registry IS the setting. */
-#define OC_RUN_KEY   L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-#define OC_RUN_VALUE L"OpenChime"
-static int startup_enabled(void) {
-    HKEY k; int on = 0;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, OC_RUN_KEY, 0, KEY_READ, &k) == ERROR_SUCCESS) {
-        on = RegQueryValueExW(k, OC_RUN_VALUE, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
-        RegCloseKey(k);
-    }
-    return on;
-}
-static void startup_set(int on) {
-    HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, OC_RUN_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL)
-        != ERROR_SUCCESS) return;
-    if (on) {
-        WCHAR exe[MAX_PATH], q[MAX_PATH + 4];
-        if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
-            _snwprintf(q, MAX_PATH + 4, L"\"%s\"", exe);
-            RegSetValueExW(k, OC_RUN_VALUE, 0, REG_SZ, (const BYTE *)q,
-                           (DWORD)((wcslen(q) + 1) * sizeof(WCHAR)));
-        }
-    } else RegDeleteValueW(k, OC_RUN_VALUE);
-    RegCloseKey(k);
-}
+static int  startup_enabled(void) { return oc_plat_autostart_get(); }
+static void startup_set(int on)   { oc_plat_autostart_set(on); }
 
 /* WHAT THE CLOSE BUTTON DOES. Defaulting to Quit is a deliberate reversal:
  * hiding was unconditional when it shipped, and close meaning close is what
@@ -1242,30 +1366,6 @@ static int dnd_active(const oc_model *m) {
                            present, enabled, ds, de, local_min, weekday);
 }
 
-static void tray_init(HWND hwnd) {
-    memset(&g_tray, 0, sizeof g_tray);
-    g_tray.cbSize = sizeof g_tray;
-    g_tray.hWnd = hwnd;
-    g_tray.uID = TRAY_UID;
-    /* NIF_MESSAGE is what makes it a control rather than a mailbox: without a
-     * callback the icon could raise balloons and take no clicks, so there was no
-     * way back to a hidden window and no way to quit from it. */
-    g_tray.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
-    g_tray.uCallbackMessage = WM_APP_TRAY;
-    g_tray.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
-    if (!g_tray.hIcon) g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    lstrcpynW(g_tray.szTip, L"OpenChime", 128);
-    g_tray_live = Shell_NotifyIconW(NIM_ADD, &g_tray) ? 1 : 0;
-    /* Version 4 behaviour, and it is not optional: without NIM_SETVERSION the
-     * shell never sends NIN_BALLOONUSERCLICK at all, so a balloon stays a
-     * poster however carefully its click is handled. */
-    if (g_tray_live) { g_tray.uVersion = NOTIFYICON_VERSION_4;
-                       Shell_NotifyIconW(NIM_SETVERSION, &g_tray); }
-}
-
-static void tray_done(void) {
-    if (g_tray_live) { Shell_NotifyIconW(NIM_DELETE, &g_tray); g_tray_live = 0; }
-}
 
 static int g_toasts_raised;      /* observable by the harness; see test_dump */
 static int g_osn_withdrawn;      /* notifications taken back on read; likewise */
@@ -1328,13 +1428,9 @@ static int sound_choice_for(int is_priority, int is_dm) {
  * fewer thing to get wrong and the only way the sound obeys Focus Assist. */
 static void sound_play(int v) {
     if (v < 0 || v >= SNDV_COUNT || !SNDV[v].alias) return;
-    WCHAR w[96];
-    MultiByteToWideChar(CP_UTF8, 0, SNDV[v].alias, -1, w, 96);
-    /* ALIAS, not a filename: this is a registered system event, so a user who
-     * has silenced notification sounds is silenced here too. ASYNC so a
-     * notification never blocks the tick; NODEFAULT so an unknown alias is
-     * silence rather than the generic ding, which would be a worse lie. */
-    PlaySoundW(w, NULL, SND_ASYNC | SND_ALIAS | SND_NODEFAULT);
+    /* A registered system event by name, so a user who has silenced
+     * notification sounds is silenced here too (the platform plays it). */
+    oc_plat_sound(SNDV[v].alias);
 }
 
 /* A notice from the app itself rather than about a conversation -- no key, no
@@ -1362,15 +1458,9 @@ static void toast_action_perform(char *payload);   /* fwd — defined with the
  * which it can arrive: an <input>'s text reaches a COM activator and nothing
  * else. Protocol activation, which carries the toast body's own click, cannot. */
 static void toast_action_cb(const char *arg, const char *reply) {
-    HWND h = FindWindowW(L"OpenChimeWin", NULL);
-    if (!h) return;
     char payload[1200];
     snprintf(payload, sizeof payload, "%s\n%s", arg ? arg : "", reply ? reply : "");
-    COPYDATASTRUCT cds;
-    cds.dwData = OC_COPYDATA_ACTION;
-    cds.cbData = (DWORD)(strlen(payload) + 1);
-    cds.lpData = payload;
-    SendMessageW(h, WM_COPYDATA, 0, (LPARAM)&cds);
+    oc_plat_handoff("action", payload);
 }
 
 /* Deliver one notification (REQ-138). ONE call site, three backends, and a
@@ -1392,7 +1482,7 @@ static void toast_action_cb(const char *arg, const char *reply) {
  * once in a while, not at every message. */
 #define OSN_TRACK 64
 #define OSN_SOUND_GAP_MS 5000
-static struct { uint64_t ws, cid; int raised; ULONGLONG sound_at; } g_osn_track[OSN_TRACK];
+static struct { uint64_t ws, cid; int raised; uint64_t sound_at; } g_osn_track[OSN_TRACK];
 static int osn_track_slot(uint64_t ws, uint64_t cid) {
     int free_i = -1, oldest = 0;
     for (int i = 0; i < OSN_TRACK; i++) {
@@ -1419,7 +1509,7 @@ static void notify_deliver(const char *title, const char *body, const char *sour
     if (g_pref_deliver == DELIVER_NONE) return;
     int tk = channel_id ? osn_track_slot(ws_slot, channel_id) : -1;
     if (tk >= 0 && snd != SNDV_SILENT) {
-        ULONGLONG now = GetTickCount64();
+        uint64_t now = now_ms();
         if (g_osn_track[tk].sound_at && now - g_osn_track[tk].sound_at < OSN_SOUND_GAP_MS) snd = SNDV_SILENT;
         else g_osn_track[tk].sound_at = now;
     }
@@ -1508,168 +1598,31 @@ enum { FLASH_NEVER = 0, FLASH_IDLE = 1, FLASH_ALWAYS = 2 };
 static int  g_pref_flash = FLASH_IDLE;
 static int  g_flashes_raised;       /* observable by the harness; see test_dump */
 static int  g_badge_shown = -1;     /* overlay count last applied; -1 = never */
-static ITaskbarList3 *g_taskbar;
-static int  g_taskbar_dead;         /* creation failed once; stop retrying */
-static UINT g_taskbar_created_msg;  /* "TaskbarButtonCreated" (shell restart) */
-
-/* A 32-bit icon for the overlay: the sidebar badge's notice-coloured disc with
- * the count in white, drawn by hand at SM_CXSMICON. GDI text zeroes the alpha
- * byte of every 32bpp pixel it touches, so the glyphs are rendered first as a
- * grayscale mask (white on black; ANTIALIASED_QUALITY, because ClearType would
- * leave colour fringes in the mask), and disc, text and alpha are then composed
- * per pixel — the disc's coverage from a 4x4 supersample rather than a sqrt,
- * which nothing else in this file needs. */
-static HICON badge_icon(int count) {
-    int s = GetSystemMetrics(SM_CXSMICON);
-    if (s < 16) s = 16;
-    BITMAPINFO bi;
-    ZeroMemory(&bi, sizeof bi);
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = s; bi.bmiHeader.biHeight = -s;   /* top-down */
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    HDC mem = CreateCompatibleDC(NULL);
-    void *bits = NULL;
-    HBITMAP dib = mem ? CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
-    if (!dib || !bits) {
-        if (dib) DeleteObject(dib);
-        if (mem) DeleteDC(mem);
-        return NULL;
-    }
-    HGDIOBJ oldbm = SelectObject(mem, dib);
-    char t[4];
-    if (count < 0)      t[0] = '\0';           /* the dot tier: a disc and nothing in it */
-    else if (count > 9) snprintf(t, sizeof t, "9+");
-    else                snprintf(t, sizeof t, "%d", count);
-    WCHAR wt[4];
-    to_w(t, wt, 4);
-    HFONT font = CreateFontW(-(s * (count > 9 ? 10 : 12) / 16), 0, 0, 0, FW_BOLD,
-                             0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HGDIOBJ oldf = SelectObject(mem, font);
-    SetTextColor(mem, RGB(255, 255, 255));
-    SetBkMode(mem, TRANSPARENT);
-    RECT tr = { 0, 0, s, s };
-    DrawTextW(mem, wt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    GdiFlush();
-    uint32_t disc = OC_COL_NOTICE;
-    unsigned dr = (disc >> 16) & 0xFF, dg = (disc >> 8) & 0xFF, db = disc & 0xFF;
-    uint32_t *px = (uint32_t *)bits;
-    for (int y = 0; y < s; y++) {
-        for (int x = 0; x < s; x++) {
-            /* Subsample centres in 1/8-pixel units: pixel x covers
-             * [8x, 8x+8), samples at 8x + 2k + 1; the disc's centre is 4s and
-             * its radius (4s - 2), a quarter pixel in from the icon edge. */
-            int hits = 0;
-            for (int sy = 0; sy < 4; sy++)
-                for (int sx = 0; sx < 4; sx++) {
-                    int ddx = 8 * x + 2 * sx + 1 - 4 * s;
-                    int ddy = 8 * y + 2 * sy + 1 - 4 * s;
-                    if (ddx * ddx + ddy * ddy <= (4 * s - 2) * (4 * s - 2)) hits++;
-                }
-            unsigned a  = (unsigned)(hits * 255 / 16);
-            unsigned tc = (px[y * s + x] >> 8) & 0xFF;      /* text coverage */
-            unsigned r8 = (dr * (255 - tc) + 255 * tc) / 255;
-            unsigned g8 = (dg * (255 - tc) + 255 * tc) / 255;
-            unsigned b8 = (db * (255 - tc) + 255 * tc) / 255;
-            px[y * s + x] = (a << 24) | (r8 << 16) | (g8 << 8) | b8;
-        }
-    }
-    SelectObject(mem, oldf);
-    DeleteObject(font);
-    SelectObject(mem, oldbm);
-    /* ICONINFO requires a mask even though the 32bpp alpha supersedes it; a
-     * zeroed one, because CreateBitmap with no bits is uninitialised memory. */
-    int mrow = ((s + 15) / 16) * 2;
-    uint8_t *mb = calloc((size_t)mrow * s, 1);
-    HBITMAP mask = mb ? CreateBitmap(s, s, 1, 1, mb) : NULL;
-    free(mb);
-    ICONINFO ii = { TRUE, 0, 0, mask, dib };
-    HICON ic = mask ? CreateIconIndirect(&ii) : NULL;
-    if (mask) DeleteObject(mask);
-    DeleteObject(dib);
-    DeleteDC(mem);
-    return ic;
-}
-
-/* Apply `count` to the taskbar button (0 clears; anything past 9 renders as
- * "9+"), creating the ITaskbarList3 on first use — COM is already initialised
- * for WIC. The description string carries the number for a screen reader,
- * since the overlay's pixels cannot. */
-static HRESULT g_taskbar_hr;    /* the failing step's answer; see test_dump */
-static ITaskbarList3 *taskbar_obj(void) {
-    if (g_taskbar_dead) return NULL;
-    if (!g_taskbar) {
-        g_taskbar_hr = CoCreateInstance(&OC_CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
-                                        &OC_IID_ITaskbarList3, (void **)&g_taskbar);
-        if (SUCCEEDED(g_taskbar_hr) && g_taskbar)
-            g_taskbar_hr = ITaskbarList3_HrInit(g_taskbar);
-        if (FAILED(g_taskbar_hr) || !g_taskbar) {
-            if (g_taskbar) { ITaskbarList3_Release(g_taskbar); g_taskbar = NULL; }
-            g_taskbar_dead = 1;         /* no ITaskbarList3: live without a badge */
-            return NULL;
-        }
-    }
-    return g_taskbar;
-}
 
 /* Uploads on their way fill the taskbar button, so a long one can be watched
- * from another window; none clears it. Applied only when the figure moves. */
-static void ftray_taskbar(HWND hwnd, uint64_t done, uint64_t total) {
-    static uint64_t shown_done = UINT64_MAX, shown_total = UINT64_MAX;
-    uint64_t d = total ? done * 1000 / total : 0, t = total ? 1000 : 0;
-    if (d == shown_done && t == shown_total) return;
-    ITaskbarList3 *tb = taskbar_obj();
-    if (!tb) return;
-    if (!t) ITaskbarList3_SetProgressState(tb, hwnd, TBPF_NOPROGRESS);
-    else {
-        if (shown_total != 1000) ITaskbarList3_SetProgressState(tb, hwnd, TBPF_NORMAL);
-        ITaskbarList3_SetProgressValue(tb, hwnd, d, t);
-    }
-    shown_done = d; shown_total = t;
+ * from another window; none clears it. */
+static void ftray_taskbar(oc_win *hwnd, uint64_t done, uint64_t total) {
+    oc_plat_progress(hwnd->sdl, done, total);
 }
 
-static void taskbar_badge_apply(HWND hwnd, int count) {
+static void taskbar_badge_apply(oc_win *hwnd, int count) {
     /* A failed apply is retried, but not at tick rate: the caller re-enters
-     * every ~30ms while the count disagrees with what was applied, and
-     * rebuilding a DIB, a font and an icon 33 times a second is the wrong
-     * response to the low-GDI condition that most likely caused the miss. */
-    static ULONGLONG backoff;
-    if (backoff && GetTickCount64() < backoff) return;
+     * every ~30ms while the count disagrees with what was applied. */
+    static uint64_t backoff;
+    if (backoff && now_ms() < backoff) return;
     backoff = 0;
-    if (!taskbar_obj()) return;
-    HICON ic = NULL;
-    WCHAR alt[24] = L"";
-    if (count != 0) {
-        ic = badge_icon(count);
-        if (!ic) { backoff = GetTickCount64() + 1000; return; }
-        char a[32];
-        if (count < 0)      snprintf(a, sizeof a, "Unread messages");
-        else if (count > 9) snprintf(a, sizeof a, "9+ for you");
-        else                snprintf(a, sizeof a, "%d for you", count);
-        to_w(a, alt, 32);
-    }
-    if (SUCCEEDED(ITaskbarList3_SetOverlayIcon(g_taskbar, hwnd, ic,
-                                               count != 0 ? alt : NULL)))
-        g_badge_shown = count;
-    else
-        backoff = GetTickCount64() + 1000;
-    if (ic) DestroyIcon(ic);
+    if (oc_plat_badge(hwnd->sdl, count, OC_COL_NOTICE)) g_badge_shown = count;
+    else backoff = now_ms() + 1000;
 }
 
 /* Flash the taskbar button for a message that NAMES you (REQ-286), until the
- * window comes forward. "When idle" is the split the always case forces —
+ * window comes forward. "When idle" is the split the always case forces --
  * essential when you have stepped away, intrusive when you are typing in the
- * next window — read as no keyboard or mouse input for thirty seconds. */
-static void taskbar_flash(HWND hwnd) {
+ * next window -- read as no keyboard or mouse input for thirty seconds. */
+static void taskbar_flash(oc_win *hwnd) {
     if (g_pref_flash == FLASH_NEVER) return;
-    if (g_pref_flash == FLASH_IDLE) {
-        LASTINPUTINFO li = { sizeof li, 0 };
-        if (GetLastInputInfo(&li) && GetTickCount() - li.dwTime < 30000) return;
-    }
-    FLASHWINFO fi = { sizeof fi, hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0 };
-    FlashWindowEx(&fi);
+    if (g_pref_flash == FLASH_IDLE && oc_plat_idle_ms() < 30000) return;
+    SDL_FlashWindow(hwnd->sdl, SDL_FLASH_UNTIL_FOCUSED);
     g_flashes_raised++;
 }
 
@@ -1690,7 +1643,7 @@ enum { THUMB_CACHE = 32 };
  * the renderer's device resets — same shape the D2D cache had, one target
  * dance lighter: an SDL texture draws into every render pass, screenshots
  * included, so the per-shot bitmap machinery is gone. */
-static struct { uint64_t id; gfx_tex *tex; UINT w, h; uint8_t *px; UINT stride; } g_thumbs[THUMB_CACHE];
+static struct { uint64_t id; gfx_tex *tex; unsigned w, h; uint8_t *px; unsigned stride; } g_thumbs[THUMB_CACHE];
 static int      g_n_thumbs;
 static int g_thumbs_off;                        /* a capture suppresses FETCHES only */
 static uint64_t g_thumb_missing[THUMB_CACHE];   /* asked for, nothing came back */
@@ -1734,14 +1687,14 @@ static rectf        g_vm_card, g_vm_seek, g_vm_close, g_vm_vbox;
 static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
 static int          g_n_vm_btns;
 static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H);   /* fwd */
-static void vm_command(HWND hwnd, int cmd);                                     /* fwd */
-static void vm_pick_device(HWND hwnd, int camera, int ix);                      /* fwd */
-static int  vm_click(HWND hwnd, int x, int y);                                  /* fwd */
-static void vm_open_player(HWND hwnd, const oc_attachment *at);                 /* fwd */
+static void vm_command(oc_win *hwnd, int cmd);                                     /* fwd */
+static void vm_pick_device(oc_win *hwnd, int camera, int ix);                      /* fwd */
+static int  vm_click(oc_win *hwnd, int x, int y);                                  /* fwd */
+static void vm_open_player(oc_win *hwnd, const oc_attachment *at);                 /* fwd */
 static int  vm_take_bytes(uint64_t id, uint8_t *d, size_t n);                   /* fwd */
-static void listen_set(HWND hwnd, int on);                                     /* fwd */
+static void listen_set(oc_win *hwnd, int on);                                     /* fwd */
 static void listen_drop_player(void);                                           /* fwd */
-static void vm_tick(HWND hwnd, const oc_model *m);                              /* fwd */
+static void vm_tick(oc_win *hwnd, const oc_model *m);                              /* fwd */
 /* Whether this machine has a camera, asked once: enumerating capture devices is
  * not something to do per frame. */
 static int g_have_camera = -1;
@@ -1758,8 +1711,7 @@ static int is_video_msg(const oc_attachment *a) {
 static uint64_t g_thumb_hover;
 static struct { rectf r; int attach_ix; uint64_t mid; } g_thumb_dl[32];
 static int      g_n_thumb_dl;
-static ULONGLONG g_thumb_deadline;
-static IWICImagingFactory *g_wic;
+static uint64_t g_thumb_deadline;
 
 /* Only what WIC will actually decode, and only from the server's declared mime —
  * guessing from the filename would mean fetching whatever someone chose to call
@@ -1770,7 +1722,7 @@ static int mime_is_image(const char *mime) {
                     strcmp(mime, "image/webp") == 0);
 }
 
-static gfx_tex *thumb_get(gfx *rt, uint64_t id, UINT *w, UINT *h) {
+static gfx_tex *thumb_get(gfx *rt, uint64_t id, unsigned *w, unsigned *h) {
     (void)rt;
     for (int i = 0; i < g_n_thumbs; i++) {
         if (g_thumbs[i].id != id) continue;
@@ -1819,12 +1771,12 @@ static uint64_t avatar_of(const oc_model *m, uint64_t uid) {
  * It shares the thumbnail cache and its single-fetch-in-flight rule, so avatars and
  * inline images cannot fight each other for the one transfer slot.
  * `square` draws a rounded square instead (the sidebar's DM rows and the rail). */
-static gfx_tex *thumb_get(gfx *rt, uint64_t id, UINT *w, UINT *h);  /* fwd */
+static gfx_tex *thumb_get(gfx *rt, uint64_t id, unsigned *w, unsigned *h);  /* fwd */
 static int thumb_failed(uint64_t id);                                                  /* fwd */
 
 static int draw_avatar_image(gfx *rt, uint64_t aid, rectf box,
                              float radius, int square) {
-    UINT iw = 0, ih = 0;
+    unsigned iw = 0, ih = 0;
     gfx_tex *bmp = aid ? thumb_get(rt, aid, &iw, &ih) : NULL;
     if (!bmp || !iw || !ih) return 0;
     float bw = box.right - box.left, bh = box.bottom - box.top;
@@ -1847,7 +1799,7 @@ static void avatar_want(uint64_t aid);
 /* paging older history. One request in flight at a time, and a
  * remembered "we reached the top" so we stop asking a channel that has no more. */
 static uint64_t g_hist_pending_chan, g_hist_before;
-static ULONGLONG g_hist_deadline;
+static uint64_t g_hist_deadline;
 static uint64_t g_hist_exhausted[32];
 static int g_n_hist_exhausted;
 
@@ -1906,9 +1858,9 @@ static struct { rectf r; uint64_t cid; } g_browse_rows[64];
 static int       g_n_browse_rows;
 static int       g_pal_accepting;      /* inside palette_accept: see palette_close */
 static uint64_t  g_jump_fetched;        /* the id we already fetched around, so we ask once */
-static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appear */
+static uint64_t g_jump_deadline;       /* GetTickCount64 by which it must appear */
 static uint64_t  g_flash_mid;           /* message to tint */
-static ULONGLONG g_flash_until;
+static uint64_t g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 /* Per-row action buttons: enable/disable, rotate, delete. */
 static rectf g_srch_more_btn;   /* next page of search results */
@@ -2011,7 +1963,7 @@ static uint64_t g_audit_oldest;     /* the oldest entry paged in, for load-older
  * mouse-only today; this is the same catalogue reached by keyboard, plus
  * channel and DM quick-switch so Ctrl+K also answers "take me to X". */
 static int   g_pal_open, g_pal_sel;
-static HWND  g_pal_edit;
+static field *g_pal_edit;
 static rectf g_pal_panel, g_pal_box;
 /* A palette hit is either a menu command or a channel to select, never both. */
 static struct { rectf r; int cmd; uint64_t cid; } g_pal_rows[12];
@@ -2054,7 +2006,7 @@ static rectf g_notify_kw_btn, g_notify_vip_btn;
  * "turn off replies" targets. */
 static char        g_dir_filter[80];     /* the People pane's search text (REQ-289) */
 static rectf g_dir_search_box;
-static HWND        g_dir_edit;
+static field      *g_dir_edit;
 static int         g_threads_unread;
 static rectf g_threads_unread_btn;
 static rectf g_thread_follow_hit[32];
@@ -2090,7 +2042,7 @@ static rectf g_grp_plus;
  * at the top of the window, where the toolbar's above-the-button tips would
  * have no room -- on the toolbar's dwell. 0 none, 1 Add people, 2 Add a group. */
 static int         g_chtip = 0;
-static ULONGLONG   g_chtip_since;
+static uint64_t   g_chtip_since;
 static int         g_chtip_shown;
 enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
 /* The Drafts pane's own tabs (REQ-228), Slack's three. Numbered separately from
@@ -2128,7 +2080,7 @@ static oc_player *g_listen_player;
 /* A voice's audition, played while choosing a voice (REQ-292). Separate from the
  * listen player: hearing a sample must not disturb a channel being read aloud. */
 static oc_player *g_preview_player;
-static ULONGLONG  g_preview_asked_ms;   /* when the sample was asked for */
+static uint64_t  g_preview_asked_ms;   /* when the sample was asked for */
 static uint32_t   g_preview_wait_ms;    /* how long the last one took, for the dump */
 static uint8_t   *g_preview_bytes;
 static uint8_t   *g_listen_bytes;
@@ -2165,9 +2117,9 @@ static int g_n_pinrows;
 static uint64_t g_hover_pinrow;
 static rectf g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
 static rectf g_hdr_compose;               /* channel-column header compose button */
-static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
-static HWND     g_ffind;                /* "Search files" box, Files view only (native EDIT) */
-static HWND     g_srch;                 /* search-overlay query box (native EDIT) */
+static field   *g_find;                 /* "Find a conversation" filter box */
+static field   *g_ffind;                /* "Search files" box, Files view only */
+static field   *g_srch;                 /* search-overlay query box */
 
 /* Composer autocomplete. The candidate list is rebuilt from the text up
  * to the caret on every change; the popover renders above the composer and the
@@ -2192,7 +2144,7 @@ static int      g_pick_quick_slot = -1; /* PICK_QUICK: the slot being chosen for
 static int picker_floats(void) {
     return g_pick_target == PICK_STATUS || g_pick_target == PICK_QUICK;
 }
-static HWND     g_pick_edit;        /* native search box */
+static field   *g_pick_edit;        /* its search box */
 static float    g_pick_scroll;
 static rectf g_pick_panel, g_pick_box;
 static struct { rectf r; const char *emoji; } g_pick_cells[256];
@@ -2211,7 +2163,6 @@ static float    g_srch_scroll;          /* search-results scroll offset, px */
 static float    g_srch_max;             /* its maximum, computed at paint */
 static rectf g_srch_box;          /* the query field's chrome, for layout_search */
 static char     g_find_filter[64];      /* current filter text (lowercased) */
-static HBRUSH   g_find_brush;           /* dark bg for the find box */
 static rectf g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
 /* The pointer, in DIPs, updated from WM_MOUSEMOVE. The file tracked a dozen
@@ -2219,7 +2170,7 @@ static int g_view = VIEW_HOME;          /* current primary view (rail selection)
  * itself, so shared chrome — the modal frame's buttons — had nothing to ask. */
 static int g_mouse_x = -1, g_mouse_y = -1;
 /* The last double-click, for counting a third one. */
-static ULONGLONG g_dbl_ms;
+static uint64_t g_dbl_ms;
 static int g_dbl_x, g_dbl_y;
 static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
 /* Rail item hit-boxes, captured during paint. `act` >=0 is a VIEW_*, <0 a NAV_*. */
@@ -2335,8 +2286,8 @@ static int g_n_wss, g_ws_active = -1;
 static int ws_find(const char *ws);   /* fwd */
 static int g_logging_out;            /* a LOGOUT is in flight */
 static int g_forget_after_logout;    /* remove the entry once that sign-out lands */
-static void switch_workspace(HWND hwnd, const char *ws, const char *cred);   /* fwd */
-static void signin_begin_known(HWND hwnd, const char *ws, const char *user); /* fwd */
+static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred);   /* fwd */
+static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user); /* fwd */
 static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
 
@@ -2365,7 +2316,7 @@ static int         g_fmt_hover = -1;
  * Armed by the hover machine, shown after the pointer RESTS — a tip that
  * chases every pass over the bar is noise, not help. */
 #define FMT_TIP_MS 500
-static ULONGLONG   g_fmt_hover_since;   /* tick when g_fmt_hover last changed */
+static uint64_t   g_fmt_hover_since;   /* tick when g_fmt_hover last changed */
 static int         g_fmt_tip_shown;     /* dwell crossed; repainted once */
 /* The ACTION row's tooltips, on the same dwell: which button the pointer rests
  * on (ACT_*, -1 none) and since when. */
@@ -2373,7 +2324,7 @@ enum { ACT_ATTACH = 0, ACT_VIDEO, ACT_EMOJI, ACT_MENTION, ACT_MIC, ACT_FREETALK,
        ACT_SCHEDULE, ACT_NM_ATTACH, ACT_NM_EMOJI, ACT_NM_MENTION, ACT_NM_SEND, ACT_NM_SCHEDULE,
        ACT_COUNT };
 static int         g_act_hover = -1;
-static ULONGLONG   g_act_hover_since;
+static uint64_t   g_act_hover_since;
 static int         g_act_tip_shown;
 /* Which half of the composer's send split-button the pointer is over:
  * 0 neither, 1 Send, 2 the "send later" dropdown. */
@@ -2430,8 +2381,8 @@ static int   g_si_remember = 1;   /* gates whether the session token is persiste
 static int   g_si_advanced;
 static rectf g_si_adv_link;
 static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text */
-static ULONGLONG g_si_started;    /* GetTickCount64 when the attempt began */
-static HWND  g_si_e_ws, g_si_e_user, g_si_e_pass;   /* native EDIT children */
+static uint64_t g_si_started;    /* GetTickCount64 when the attempt began */
+static field *g_si_e_ws, *g_si_e_user, *g_si_e_pass;   /* the card's fields */
 static int   g_si_suffix_shown; /* the hosted suffix, drawn beside the field last frame */
 static rectf g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
 /* How the workspace signs people in (AUTH.md §8.1), asked of it at step 1: a
@@ -2442,8 +2393,8 @@ static int      g_si_browser;        /* the attempt in flight is a browser sign-
 static uint32_t g_si_opened_seq;     /* the model's signin_seq whose URL was opened */
 static rectf    g_si_browser_btn[8]; /* step 2: one per browser source, as g_si_src */
 static rectf    g_si_wait_cancel;    /* while waiting for the browser */
-static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite);
-static void signin_start_reset(HWND hwnd, const char *reset);
+static void signin_start_browser(oc_win *hwnd, const char *source_id, const char *invite);
+static void signin_start_reset(oc_win *hwnd, const char *reset);
 
 /* How many browser sources: the relay, and each of the operator's own providers. */
 static int si_browser_count(void) {
@@ -2457,13 +2408,13 @@ static int si_has_local(void) {
     return 0;
 }
 /* Defined with the rest of the flow, below the core wiring they depend on. */
-static void signin_submit(HWND hwnd);
-static void signin_cancel(HWND hwnd);
-static void signin_back(HWND hwnd);
-static void signin_set_advanced(HWND hwnd, int on);
-static void signin_begin(HWND hwnd, const char *ws, const char *user);
-static void signin_poll(HWND hwnd);
-static void layout_signin(HWND hwnd);
+static void signin_submit(oc_win *hwnd);
+static void signin_cancel(oc_win *hwnd);
+static void signin_back(oc_win *hwnd);
+static void signin_set_advanced(oc_win *hwnd, int on);
+static void signin_begin(oc_win *hwnd, const char *ws, const char *user);
+static void signin_poll(oc_win *hwnd);
+static void layout_signin(oc_win *hwnd);
 static int  si_suffix_applies(void);   /* fwd: the hosted suffix beside the field */
 typedef struct { float x0, y0, w, h, fx, fw, fields_y; } si_geom;
 static si_geom si_layout(float W, float H);
@@ -2524,10 +2475,10 @@ static void fb_say(const char *text, int assertive) {
     if (assertive) oc_a11y_announce_assertive(text);
     else           oc_a11y_announce(text);
 }
-static uint64_t fb_now(void) { return (uint64_t)GetTickCount64(); }
+static uint64_t fb_now(void) { return (uint64_t)now_ms(); }
 static void toast_action_run(int action);   /* fwd */
-static void summary_open_notice(HWND hwnd, uint64_t id, uint64_t cid, uint8_t scope);   /* fwd */
-static void summarize_start(HWND hwnd, uint64_t cid, uint8_t scope, uint64_t rs, uint64_t re);   /* fwd */
+static void summary_open_notice(oc_win *hwnd, uint64_t id, uint64_t cid, uint8_t scope);   /* fwd */
+static void summarize_start(oc_win *hwnd, uint64_t cid, uint8_t scope, uint64_t rs, uint64_t re);   /* fwd */
 /* The four kinds, by what the message is (feedback.h). */
 static uint32_t fb_confirm(const char *text) { return oc_fb_show(&g_fb, OC_FB_CONFIRM, text, NULL, 0, fb_now()); }
 static uint32_t fb_failed(const char *text)  { return oc_fb_show(&g_fb, OC_FB_FAILED, text, NULL, 0, fb_now()); }
@@ -2664,13 +2615,13 @@ static char g_test_dir[512];
  */
 #define OC_CRUMBS 64
 #define OC_CRUMB_MAGIC 0x4F43524Bu      /* "OCRK" */
-typedef struct { char text[96]; DWORD tick; } oc_crumb;
+typedef struct { char text[96]; uint32_t tick; } oc_crumb;
 typedef struct {
-    volatile LONG magic;
-    volatile LONG n;          /* monotonic; index = n % OC_CRUMBS */
-    volatile LONG clean;      /* 1 once the process has exited normally */
-    DWORD    pid;
-    DWORD    start_tick;
+    volatile int32_t magic;
+    volatile int32_t n;          /* monotonic; index = n % OC_CRUMBS */
+    volatile int32_t clean;      /* 1 once the process has exited normally */
+    uint32_t pid;
+    uint32_t start_tick;
     oc_crumb c[OC_CRUMBS];
 } oc_crumb_ring;
 
@@ -2678,61 +2629,75 @@ typedef struct {
  * always safe. It costs the post-mortem, not the live report. */
 static oc_crumb_ring  g_crumbs_local;
 static oc_crumb_ring *g_ring = &g_crumbs_local;
-static HANDLE g_ring_map, g_ring_file;
 static char   g_ring_path[700];
+
+/* A death that runs no handler, for the harness: the CRT's fast-fail where the
+ * platform has one, an immediate exit elsewhere. */
+static void crash_fastfail(void) {
+#if defined(_WIN32)
+    __fastfail(1);
+#else
+    _Exit(7);
+#endif
+}
 
 static void crumb(const char *fmt, ...) {
     oc_crumb_ring *r = g_ring;
-    LONG slot = InterlockedIncrement(&r->n) - 1;
+    int32_t slot = __atomic_add_fetch(&r->n, 1, __ATOMIC_SEQ_CST) - 1;
     oc_crumb *c = &r->c[slot % OC_CRUMBS];
     va_list ap; va_start(ap, fmt);
-    _vsnprintf(c->text, sizeof c->text - 1, fmt, ap);
+    vsnprintf(c->text, sizeof c->text - 1, fmt, ap);
     va_end(ap);
     c->text[sizeof c->text - 1] = 0;
-    c->tick = GetTickCount();
+    c->tick = (uint32_t)now_ms();
 }
 
 /* Write a ring's breadcrumbs into an open report. Shared by the live crash
- * filter and the post-mortem, so a report reads the same either way. */
-static void crumbs_dump(FILE *f, const oc_crumb_ring *r, DWORD now) {
-    LONG total = r->n;
-    LONG first = total > OC_CRUMBS ? total - OC_CRUMBS : 0;
-    fprintf(f, "-- last %ld of %ld breadcrumbs --\n", total - first, total);
-    for (LONG i = first; i < total; i++) {
+ * report and the post-mortem, so a report reads the same either way. */
+static void crumbs_dump(FILE *f, const oc_crumb_ring *r, uint32_t now) {
+    int32_t total = r->n;
+    int32_t first = total > OC_CRUMBS ? total - OC_CRUMBS : 0;
+    fprintf(f, "-- last %ld of %ld breadcrumbs --\n", (long)(total - first), (long)total);
+    for (int32_t i = first; i < total; i++) {
         const oc_crumb *c = &r->c[i % OC_CRUMBS];
         fprintf(f, "  -%5lums %s\n", (unsigned long)(now - c->tick), c->text);
     }
 }
 
 /* Where a crash report goes. The test dir when the harness is driving, because
- * then I can read it without going near the Windows file system by hand;
- * %LOCALAPPDATA% for a real user. */
+ * then I can read it without going near the file system by hand; the
+ * platform's per-user data directory for a real user. */
 static void crash_dir(char *out, size_t cap) {
     if (g_test_dir[0]) { snprintf(out, cap, "%s", g_test_dir); return; }
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("TEMP");
-    snprintf(out, cap, "%s\\OpenChime", base ? base : ".");
-    CreateDirectoryA(out, NULL);
+    oc_plat_data_dir(out, cap);
+}
+
+/* The application's half of a crash report (the platform writes the fault):
+ * what the app was doing, which a bare stack cannot answer. */
+static void crash_app_part(FILE *f, void *user) {
+    (void)user;
+    fprintf(f, "view=%d dpi=%u authed=%d\n", g_view, g_dpi,
+            g_client && oc_client_model(g_client) ? oc_client_model(g_client)->authed : 0);
+    crumbs_dump(f, g_ring, (uint32_t)now_ms());
 }
 
 /* Turn one ring left behind by a dead process into a report. Called for every
  * `live-*.crumbs` found at startup; the file goes either way, so a ring is
  * reported once and does not accumulate. */
 static void crumbs_postmortem(const char *dir, const char *name) {
-    char path[700]; snprintf(path, sizeof path, "%s\\%s", dir, name);
-    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (fh == INVALID_HANDLE_VALUE) return;
-    HANDLE mp = CreateFileMappingW(fh, NULL, PAGE_READONLY, 0, 0, NULL);
-    oc_crumb_ring *r = mp ? (oc_crumb_ring *)MapViewOfFile(mp, FILE_MAP_READ, 0, 0,
-                                                           sizeof(oc_crumb_ring)) : NULL;
-    if (r && r->magic == (LONG)OC_CRUMB_MAGIC && !r->clean) {
+    char path[700]; snprintf(path, sizeof path, "%s%c%s", dir, OC_PATH_SEP, name);
+    FILE *in = fopen(path, "rb");
+    if (!in) return;
+    oc_crumb_ring *r = calloc(1, sizeof *r);
+    size_t got = r ? fread(r, 1, sizeof *r, in) : 0;
+    fclose(in);
+    if (r && got == sizeof *r && r->magic == (int32_t)OC_CRUMB_MAGIC && !r->clean) {
         char out[700];
-        snprintf(out, sizeof out, "%s\\postmortem-%lu.txt", dir, (unsigned long)r->pid);
+        snprintf(out, sizeof out, "%s%cpostmortem-%lu.txt", dir, OC_PATH_SEP, (unsigned long)r->pid);
         FILE *f = fopen(out, "wb");
         if (f) {
             /* Say plainly what this is. A report with no exception record is
-             * evidence of a death that ran no handler — which is itself the
+             * evidence of a death that ran no handler -- which is itself the
              * finding, and is why it is not silently shaped like a crash log. */
             fprintf(f, "openchime post-mortem\n");
             fprintf(f, "pid=%lu ran_for=%lums\n", (unsigned long)r->pid,
@@ -2746,40 +2711,33 @@ static void crumbs_postmortem(const char *dir, const char *name) {
             fclose(f);
         }
     }
-    if (r) UnmapViewOfFile(r);
-    if (mp) CloseHandle(mp);
-    CloseHandle(fh);
-    DeleteFileA(path);
+    free(r);
+    remove(path);
 }
 
 /* Report anything the last run left, then map our own ring. */
 static void crumbs_start(void) {
     char dir[600]; crash_dir(dir, sizeof dir);
+    oc_plat_crash_reports(dir, crash_app_part, NULL);
 
-    WIN32_FIND_DATAA fd;
-    char pat[700]; snprintf(pat, sizeof pat, "%s\\live-*.crumbs", dir);
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do { crumbs_postmortem(dir, fd.cFileName); } while (FindNextFileA(h, &fd));
-        FindClose(h);
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            size_t l = strlen(de->d_name);
+            if (l > 12 && !strncmp(de->d_name, "live-", 5) && !strcmp(de->d_name + l - 7, ".crumbs"))
+                crumbs_postmortem(dir, de->d_name);
+        }
+        closedir(d);
     }
 
-    snprintf(g_ring_path, sizeof g_ring_path, "%s\\live-%lu.crumbs", dir,
-             (unsigned long)GetCurrentProcessId());
-    g_ring_file = CreateFileA(g_ring_path, GENERIC_READ | GENERIC_WRITE,
-                              FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    if (g_ring_file == INVALID_HANDLE_VALUE) { g_ring_file = NULL; return; }
-    g_ring_map = CreateFileMappingW(g_ring_file, NULL, PAGE_READWRITE, 0,
-                                    sizeof(oc_crumb_ring), NULL);
-    oc_crumb_ring *r = g_ring_map ? (oc_crumb_ring *)MapViewOfFile(
-                           g_ring_map, FILE_MAP_ALL_ACCESS, 0, 0,
-                           sizeof(oc_crumb_ring)) : NULL;
-    if (!r) return;                       /* keep the static fallback */
-    memset(r, 0, sizeof *r);
-    r->magic = (LONG)OC_CRUMB_MAGIC;
-    r->pid = GetCurrentProcessId();
-    r->start_tick = GetTickCount();
+    snprintf(g_ring_path, sizeof g_ring_path, "%s%clive-%lu.crumbs", dir, OC_PATH_SEP,
+             (unsigned long)oc_getpid());
+    oc_crumb_ring *r = oc_plat_ring_map(g_ring_path, sizeof(oc_crumb_ring));
+    if (!r) { g_ring_path[0] = 0; return; }     /* keep the static fallback */
+    r->magic = (int32_t)OC_CRUMB_MAGIC;
+    r->pid = (uint32_t)oc_getpid();
+    r->start_tick = (uint32_t)now_ms();
     g_ring = r;
 }
 
@@ -2789,102 +2747,10 @@ static void crumbs_start(void) {
 static void crumbs_clean_exit(void) {
     if (g_ring != &g_crumbs_local) {
         g_ring->clean = 1;
-        FlushViewOfFile(g_ring, sizeof(oc_crumb_ring));
-        UnmapViewOfFile(g_ring);
+        oc_plat_ring_unmap(g_ring, sizeof(oc_crumb_ring));
         g_ring = &g_crumbs_local;
     }
-    if (g_ring_map)  { CloseHandle(g_ring_map);  g_ring_map = NULL; }
-    if (g_ring_file) { CloseHandle(g_ring_file); g_ring_file = NULL; }
-    if (g_ring_path[0]) DeleteFileA(g_ring_path);
-}
-
-typedef BOOL (WINAPI *mdwd_fn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
-                               const MINIDUMP_EXCEPTION_INFORMATION *, void *, void *);
-
-/* The CRT's two ways out that never reach an exception filter. Both raise a
- * real exception so the ordinary path writes the ordinary report, with the
- * breadcrumbs that say what the app was doing — rather than the process simply
- * vanishing, which is what was reported. */
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep);   /* fwd */
-
-static void crt_raise(const char *what) {
-    crumb("FATAL %s", what);
-    /* RaiseException synthesises the EXCEPTION_POINTERS the filter wants; the
-     * code is ours, so a report from here is distinguishable from a real fault. */
-    RaiseException(0xE0C11A5Du, EXCEPTION_NONCONTINUABLE, 0, NULL);
-}
-
-static void crt_bad_param(const wchar_t *expr, const wchar_t *fn, const wchar_t *file,
-                          unsigned line, uintptr_t reserved) {
-    (void)expr; (void)fn; (void)file; (void)line; (void)reserved;
-    crt_raise("CRT invalid parameter");
-}
-
-static void crt_on_abort(int sig) { (void)sig; crt_raise("abort()"); }
-
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
-    char dir[600]; crash_dir(dir, sizeof dir);
-    DWORD pid = GetCurrentProcessId();
-
-    char txt[700]; snprintf(txt, sizeof txt, "%s\\crash-%lu.txt", dir, (unsigned long)pid);
-    FILE *f = fopen(txt, "wb");
-    if (f) {
-        EXCEPTION_RECORD *er = ep && ep->ExceptionRecord ? ep->ExceptionRecord : NULL;
-        void *base = (void *)GetModuleHandleW(NULL);
-        void *addr = er ? er->ExceptionAddress : NULL;
-        fprintf(f, "openchime crash\n");
-        fprintf(f, "code=0x%08lx addr=%p module=%p rva=0x%llx\n",
-                er ? (unsigned long)er->ExceptionCode : 0, addr, base,
-                (addr && base) ? (unsigned long long)((char *)addr - (char *)base) : 0ull);
-        /* An access violation says which address and whether it was a read or a
-         * write — often enough on its own to name the pointer. */
-        if (er && er->ExceptionCode == (DWORD)EXCEPTION_ACCESS_VIOLATION &&
-            er->NumberParameters >= 2)
-            fprintf(f, "access=%s at 0x%llx\n",
-                    er->ExceptionInformation[0] == 0 ? "read" :
-                    er->ExceptionInformation[0] == 1 ? "write" : "execute",
-                    (unsigned long long)er->ExceptionInformation[1]);
-        fprintf(f, "view=%d dpi=%u authed=%d\n", g_view, g_dpi,
-                g_client && oc_client_model(g_client) ? oc_client_model(g_client)->authed : 0);
-
-        /* The breadcrumbs, oldest first, with ms before the crash — the answer to
-         * "what was it doing", which is the question a bare stack cannot answer. */
-        crumbs_dump(f, g_ring, GetTickCount());
-        /* The dump is attempted here, while the report is still open, so the
-         * report can say whether one exists. A zero-length .dmp sitting beside a
-         * crash log is worse than no file: it looks like evidence. */
-        HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
-        int dumped = 0; DWORD dump_err = 0;
-        char dmp[700]; snprintf(dmp, sizeof dmp, "%s\\crash-%lu.dmp", dir, (unsigned long)pid);
-        if (dbg) {
-            mdwd_fn mdwd = (mdwd_fn)(void *)GetProcAddress(dbg, "MiniDumpWriteDump");
-            if (mdwd) {
-                HANDLE h = CreateFileA(dmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                                       FILE_ATTRIBUTE_NORMAL, NULL);
-                if (h != INVALID_HANDLE_VALUE) {
-                    MINIDUMP_EXCEPTION_INFORMATION mei;
-                    mei.ThreadId = GetCurrentThreadId();
-                    mei.ExceptionPointers = ep;
-                    mei.ClientPointers = FALSE;
-                    /* Stacks, threads and modules only: the data segments and
-                     * the memory the stacks point at hold session tokens,
-                     * message text and keys, and the file is asked to be sent. */
-                    dumped = mdwd(GetCurrentProcess(), pid, h,
-                                  MiniDumpNormal | MiniDumpWithHandleData,
-                                  &mei, NULL, NULL) ? 1 : 0;
-                    if (!dumped) dump_err = GetLastError();
-                    CloseHandle(h);
-                }
-            } else dump_err = GetLastError();
-        } else dump_err = GetLastError();
-        if (!dumped) { DeleteFileA(dmp); fprintf(f, "minidump: FAILED (err=%lu)\n", (unsigned long)dump_err); }
-        else         fprintf(f, "minidump: %s\n", dmp);
-        fclose(f);
-    }
-
-    /* Let the process die: swallowing the fault would leave a client running on
-     * corrupt state, which is worse than an exit the user can see. */
-    return EXCEPTION_EXECUTE_HANDLER;
+    if (g_ring_path[0]) remove(g_ring_path);
 }
 
 /* ---- small helpers ------------------------------------------------------- */
@@ -2893,7 +2759,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
  * paint; it used to live beside the click router, which is why the frame could not
  * see it. */
 static int in_rect(rectf r, int x, int y) {
-    /* AN EMPTY RECT CONTAINS NOTHING. The app disables a control by zeroing its
+    /* AN EMPTY irect CONTAINS NOTHING. The app disables a control by zeroing its
      * rect -- a row scrolled out of view, a button a view does not draw -- and an
      * inclusive test made every one of those match a click at exactly (0,0):
      * found live, where one click in the top-left corner added a recipient from a
@@ -2907,8 +2773,6 @@ static rectf rf(float l, float t, float r, float b) {
     rectf x = { l, t, r, b }; return x;
 }
 
-/* theme.h stores 0xRRGGBB; GDI/Win32 want a COLORREF (0x00BBGGRR). */
-#define OCRGB(x) RGB(((x) >> 16) & 0xff, ((x) >> 8) & 0xff, (x) & 0xff)
 
 /* Ask DWM for a caption that matches the shell. Attr 20 = DWMWA_USE_IMMERSIVE_DARK_MODE
  * on Win10 1903+, 19 on 1809.
@@ -2916,10 +2780,8 @@ static rectf rf(float l, float t, float r, float b) {
  * It follows the RESOLVED theme, not a constant: with SYSTEM as the default, a light
  * machine drew a light shell under a dark caption, which is the one part of the window
  * we do not paint and therefore the one part that gives the mismatch away. */
-static void apply_titlebar(HWND h) {
-    BOOL dark = oc_theme_is_light() ? FALSE : TRUE;
-    if (FAILED(DwmSetWindowAttribute(h, 20, &dark, sizeof dark)))
-        DwmSetWindowAttribute(h, 19, &dark, sizeof dark);
+static void apply_titlebar(oc_win *h) {
+    if (h && h->sdl) oc_plat_window_caption_dark(h->sdl, !oc_theme_is_light());
 }
 
 static void fill(gfx *rt, rectf r, uint32_t rgb) {
@@ -2942,13 +2804,6 @@ static void fill_rect_a(gfx *rt, rectf r, uint32_t rgb, float a) {
 static void stroke_round(gfx *rt, rectf r, float rad,
                          uint32_t rgb, float w) {
     gfx_stroke_round(rt, gr(r), rad, w, rgb, 1.0f);
-}
-
-/* UTF-8 -> UTF-16 into caller buffer; returns character count (no NUL). */
-static int to_w(const char *s, WCHAR *out, int cap) {
-    if (!s) { out[0] = 0; return 0; }
-    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, out, cap);
-    return n > 0 ? n - 1 : 0;
 }
 
 /* ---- the text engine ------------------------------------------------------
@@ -2987,6 +2842,16 @@ static uint64_t txt_hash(const char *s, const fmtw *fm, float w, uint32_t rgb) {
 
 static void txt_drop_all(void) {
     g_txt_gen++;
+}
+
+/* One target's rasters, destroyed: its renderer is about to go, and a texture
+ * of a dead renderer must not be drawn or destroyed later. */
+static void txt_drop_target(int target) {
+    for (int i = 0; i < TXT_CACHE; i++) {
+        txt_ent *e = &g_txt_c[target][i];
+        if (e->tex) gfx_tex_destroy(e->tex);
+        memset(e, 0, sizeof *e);
+    }
 }
 
 /* Rasterize (or fetch) `s` in `fm` at width `w`; returns the texture and its
@@ -3310,8 +3175,11 @@ static void draw_lucide(gfx *rt, int id, rectf box, uint32_t rgb) {
  * the text around it. The box follows the text scale; the EDIT is exactly the
  * font's line height and sits centred in it (search_edit_place()). */
 #define SEARCH_BOX_H UIS(30.0f)
-static void search_edit_place(HWND e, rectf box);   /* fwd -- beside layout_find */
-static void search_fonts_sync(void);                /* fwd */
+/* Where a search box's text goes, inside the chrome search_box_draw() drew:
+ * after the glyph, up to the right inset. */
+static rectf search_text_box(rectf box) {
+    return rf(box.left + UIS(32.0f), box.top, box.right - UIS(10.0f), box.bottom);
+}
 
 static void search_box_draw(gfx *rt, rectf box, uint32_t fill) {
     fill_round(rt, box, OC_R_CONTROL, fill);
@@ -3397,7 +3265,7 @@ static float textsize_mult(void) {
 static const char *ui_family(void) {
     static const char *cached;
     if (!cached)
-        cached = st_dwrite_family_present(g_st, "Segoe UI Variable Text")
+        cached = st_family_present(g_st, "Segoe UI Variable Text")
                      ? "Segoe UI Variable Text" : "Segoe UI";
     return cached;
 }
@@ -3484,7 +3352,7 @@ static int gfx_stack_init(void) {
      * uses. A shipped client never allocates it. */
     if (g_test_dir[0]) gfx_ledger_enable(g_gfx, 1);
     st_sink sink = { NULL, cap_blit };
-    g_st = st_dwrite_create(&sink);
+    g_st = oc_plat_text_create(&sink);
     if (!g_st) return 0;
     fonts_build();
     emoji_fonts_build();
@@ -3579,7 +3447,7 @@ static int any_overlay(const oc_model *m) {
 }
 
 static void ac_close(void);   /* fwd */
-static void picker_close(HWND hwnd);   /* fwd — accel_dispatch's Esc closes it */
+static void picker_close(oc_win *hwnd);   /* fwd — accel_dispatch's Esc closes it */
 static int  modal_open(void);          /* fwd — pointer_blocked() asks */
 /* Is a floating surface between the pointer and the shell? Hover must not track
  * the pointer under a menu, the emoji picker, the palette, a flyout, the time
@@ -3632,10 +3500,10 @@ static void draft_flush(uint64_t cid) {
      * call sites that must each remember. */
     if (g_ed_is_newmsg) { newmsg_flush(); return; }
     if (!cid || !g_client || g_edit_msg) return;   /* an edit-in-progress is not a draft */
-    WCHAR w[DRAFT_TEXT_MAX];
+    oc_wch w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n < 0) n = 0;
-    if (cid == g_draft_sent_cid && lstrcmpW(w, g_draft_sent) == 0) return;   /* unchanged */
+    if (cid == g_draft_sent_cid && wcmp(w, g_draft_sent) == 0) return;   /* unchanged */
     if (n == 0) {
         /* Nothing typed and nothing stored: there is no draft to write or to
          * clear, so no request. Leaving every conversation used to write an
@@ -3646,10 +3514,10 @@ static void draft_flush(uint64_t cid) {
             if (dm->drafts[i].channel_id == cid && dm->drafts[i].thread_root == 0) { stored = 1; break; }
         if (!stored) { g_draft_sent_cid = cid; g_draft_sent[0] = 0; g_draft_dirty = 0; return; }
     }
-    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    int blen = (wlen(w) * 3 + 1);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+    to_u8(w, b, blen);
     oc_client_set_draft(g_client, cid, 0, b);
     {   /* keep our own copy in step; see the note above */
         const oc_model *m = model();
@@ -3657,7 +3525,7 @@ static void draft_flush(uint64_t cid) {
     }
     free(b);
     g_draft_sent_cid = cid;
-    lstrcpynW(g_draft_sent, w, DRAFT_TEXT_MAX);
+    wcpyn(g_draft_sent, w, DRAFT_TEXT_MAX);
     g_draft_dirty = 0;
     /* The sidebar marker and the Drafts rail entry are drawn FROM the model this
      * just changed, and nothing else here would repaint: the write is on a
@@ -3665,28 +3533,28 @@ static void draft_flush(uint64_t cid) {
      * this the pencil appears whenever something unrelated redraws — which the
      * caret blink usually does within half a second, so it looked fine and was
      * simply late. */
-    { HWND hw = GetActiveWindow(); if (hw) InvalidateRect(hw, NULL, FALSE); }
+    { oc_win *hw = g_main; if (hw) invalidate(); }
 }
 
-static int composer_refit(HWND hwnd);   /* fwd */
+static int composer_refit(oc_win *hwnd);   /* fwd */
 
 /* Put `cid`'s stored draft in the composer, or clear it. */
 static void draft_restore(uint64_t cid) {
     const oc_model *m = model();
     const char *d = m ? oc_model_draft(m, cid, 0) : NULL;
     if (d && d[0]) {
-        WCHAR w[DRAFT_TEXT_MAX];
+        oc_wch w[DRAFT_TEXT_MAX];
         to_w(d, w, DRAFT_TEXT_MAX);
         ed_set(w);                                   /* caret lands at the end */
         g_draft_sent_cid = cid;
-        lstrcpynW(g_draft_sent, w, DRAFT_TEXT_MAX);
+        wcpyn(g_draft_sent, w, DRAFT_TEXT_MAX);
     } else {
         ed_clear();
         g_draft_sent_cid = cid;
         g_draft_sent[0] = 0;
     }
     g_draft_dirty = 0;
-    if (g_main_hwnd && composer_refit(g_main_hwnd)) InvalidateRect(g_main_hwnd, NULL, FALSE);
+    if (g_main && composer_refit(g_main)) invalidate();
 }
 
 /* Throw a draft away (REQ-223, REQ-228): the stored copy, everywhere it is synced
@@ -3732,9 +3600,9 @@ static void draft_delete(uint64_t cid, uint64_t root) {
 /* Deleted at once, with Undo on the toast it raises: a draft is writing, and
  * the safeguard against losing one is being able to take the delete back, not a
  * question asked before every delete (feedback.h). */
-static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
+static void confirm_open(oc_win *hwnd, int act, uint64_t id, const char *title,
                          const char *body, const char *ok_label);   /* fwd */
-static void draft_delete_ask(HWND hwnd, uint64_t cid, uint64_t root) {
+static void draft_delete_ask(oc_win *hwnd, uint64_t cid, uint64_t root) {
     (void)hwnd;
     draft_delete(cid, root);
 }
@@ -3771,7 +3639,7 @@ static uint64_t chanref_resolve(const char *name) {
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];
         if (c->kind == OC_CHANNEL_KIND_DM || !c->name[0]) continue;
-        if (!_stricmp(c->name, name)) return c->channel_id;
+        if (!SDL_strcasecmp(c->name, name)) return c->channel_id;
     }
     return 0;
 }
@@ -3950,7 +3818,7 @@ static void avatar_want(uint64_t aid) {
     if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
     if (thumb_get(NULL, aid, NULL, NULL) || thumb_failed(aid)) return;
     g_thumb_pending = aid;
-    g_thumb_deadline = GetTickCount64() + 8000;
+    g_thumb_deadline = now_ms() + 8000;
     oc_client_fetch_attachment(g_client, aid);
 }
 
@@ -4566,7 +4434,7 @@ static rectf           g_call_hdr_btn, g_calls_plus, g_cstrip, g_cstrip_mute, g_
 static struct { rectf r; uint64_t ch; } g_call_rows[8];
 static int             g_n_call_rows;
 static uint32_t        g_call_err_seq;      /* the refusal last seen arrive, and when */
-static ULONGLONG       g_call_err_at;
+static uint64_t       g_call_err_at;
 typedef struct { rectf r; int cmd; char aid[40]; char name[96]; } call_btn;
 static call_btn        g_call_btns[CC_MAX_PICK + 48];
 static int             g_n_call_btns;
@@ -4588,9 +4456,9 @@ static uint8_t *g_share_px;
 static size_t   g_share_pxcap;
 static uint64_t g_share_seen;            /* the sharer last told about */
 static rectf    g_share_stage;
-static HWND     g_sharebar, g_sharebar_text, g_shareborder;
+static oc_win   g_sharebar, g_shareborder;
 static int      g_sharebar_excluded;
-static ULONGLONG g_share_err_until;      /* say that sharing failed until then */
+static uint64_t g_share_err_until;      /* say that sharing failed until then */
 static int      g_share_pick_pending;    /* Ctrl+Shift+S away from the call: pick once it is drawn */
 
 /* A device remembered by a hash of its id (prefs o:/p:): short enough for the
@@ -4892,6 +4760,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
      * numbers (find_box()), because two hand-kept copies is how the white box
      * ended up floating half out of its own border at large text. */
     search_box_draw(rt, find_box(), OC_COL_INPUT);
+    if (g_find) field_draw(rt, g_find, search_text_box(find_box()), OC_COL_TEXT);
     /* Unreads only: one chip, lit while on. Beside the find box because both
      * answer the same question — which conversations should this list show. */
     g_sb_unread_chip = unread_chip_box();
@@ -5807,13 +5676,13 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                 bw = (float)at->width * sc; bh = (float)at->height * sc;
             }
             rectf area = rf(tx, by + 3, tx + bw, by + 3 + bh);
-            UINT iw = 0, ih = 0;
+            unsigned iw = 0, ih = 0;
             gfx_tex *pbmp = at->poster_id ? thumb_get(rt, at->poster_id, &iw, &ih) : NULL;
             fill_round(rt, area, OC_R_CONTROL, 0x101010);
             if (pbmp) gfx_tex_draw(rt, pbmp, gr(area), OC_R_CONTROL, 1.0f);
             else if (at->poster_id && !g_thumbs_off && !thumb_failed(at->poster_id) && !g_thumb_pending && g_client) {
                 g_thumb_pending = at->poster_id;
-                g_thumb_deadline = GetTickCount64() + 8000;
+                g_thumb_deadline = now_ms() + 8000;
                 oc_client_fetch_attachment(g_client, at->poster_id);
             }
             stroke_round(rt, area, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
@@ -5853,7 +5722,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             draw_text(rt, at->filename, g_meta,
                       rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_MUTED);
             by += LINE_H;
-            UINT iw = 0, ih = 0;
+            unsigned iw = 0, ih = 0;
             gfx_tex *bmp = thumb_get(rt, at->id, &iw, &ih);
             float bw = THUMB_W, bh = THUMB_H;
             if (bmp) {
@@ -5885,7 +5754,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                  * on every shot. */
                 if (!g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
                     g_thumb_pending = at->id;
-                    g_thumb_deadline = GetTickCount64() + 8000;
+                    g_thumb_deadline = now_ms() + 8000;
                     oc_client_fetch_attachment(g_client, at->id);
                 }
             }
@@ -6160,7 +6029,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     if (capture && jump_i >= 0) {
         *scroll = total - jump_off - visible * 0.66f;
         g_flash_mid = g_jump_mid;
-        g_flash_until = GetTickCount64() + 1600;
+        g_flash_until = now_ms() + 1600;
         g_jump_mid = 0;
     }
 
@@ -6331,7 +6200,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
             }
             /* Jump flash — fades out so it reads as "here it is", not as state. */
             if (capture && g_flash_mid == msgs[first + i].message_id) {
-                ULONGLONG now = GetTickCount64();
+                uint64_t now = now_ms();
                 if (now < g_flash_until) {
                     float a = (float)(g_flash_until - now) / 1600.0f;
                     rectf fr = rf(reg.left, y, reg.right, y + heights[i]);
@@ -6383,7 +6252,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
         for (int k = 0; k < g_n_hist_exhausted; k++) if (g_hist_exhausted[k] == g_sel) done = 1;
         if (!done) {
             g_hist_pending_chan = g_sel;
-            g_hist_deadline = GetTickCount64() + 5000;
+            g_hist_deadline = now_ms() + 5000;
             g_hist_before = msgs[0].message_id;
             oc_client_history(g_client, g_sel, msgs[0].message_id);
         }
@@ -6537,6 +6406,7 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
      * layout_search(). */
     g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 10 + SEARCH_BOX_H);
     search_box_draw(rt, g_srch_box, OC_COL_INPUT);
+    if (g_srch) field_draw(rt, g_srch, search_text_box(g_srch_box), OC_COL_TEXT);
     body.top = g_srch_box.bottom + 10;
 
     /* A count line, so "5 results" and "no matches" are told apart at a glance. */
@@ -7305,11 +7175,11 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         g_notify_hits[i].r = hit_visible(g_notify_hits[i].r, reg);
 }
 
-static void layout_composer(HWND hwnd);   /* fwd */
-static void layout_natives(HWND hwnd);    /* fwd — owns every native child */
-static void scale_apply(HWND hwnd);        /* fwd — text size / zoom (ARCH-97) */
-static void dpi_set(HWND hwnd, UINT dpi);  /* fwd */
-static void layout_search(HWND hwnd);     /* fwd */
+static void layout_composer(oc_win *hwnd);   /* fwd */
+static void layout_natives(oc_win *hwnd);    /* fwd — owns every native child */
+static void scale_apply(oc_win *hwnd);        /* fwd — text size / zoom (ARCH-97) */
+static void dpi_set(oc_win *hwnd, unsigned dpi);  /* fwd */
+static void layout_search(oc_win *hwnd);     /* fwd */
 static int  window_is_covered(void);      /* fwd */
 static int  g_a11y_n;    /* items published last frame — reported, so the tree is assertable */
 static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined beside the composer state it reads */
@@ -7339,24 +7209,34 @@ static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined 
  * where the show does not activate. A clean launch with nothing competing
  * activated every time, which is why the A/B against an older build looked like a
  * regression and then refused to reproduce. */
-static void show_and_focus(HWND hwnd) {
-    if (!hwnd) return;
+static void show_and_focus(oc_win *hwnd) {
+    if (!hwnd || !hwnd->sdl) return;
     /* Whatever brought the window back -- the tray icon, a permalink, the test
      * harness -- it is no longer hidden. Cleared HERE because this is the one
-     * function that shows it; clearing at each call site is how the flag and the
-     * window drifted apart the first time. */
+     * function that shows it. */
     g_hidden_to_tray = 0;
-    if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
-    /* A minimised window IS "visible" to IsWindowVisible, and SW_SHOW does not
-     * un-minimise — so without this, "show and focus" left an iconic window
-     * iconic: focused, painting nothing, every hit-box zero. */
-    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-    SetForegroundWindow(hwnd);
-    SetActiveWindow(hwnd);
-    SetFocus(hwnd);
+    SDL_ShowWindow(hwnd->sdl);
+    /* A minimised window is "shown" too, so without this "show and focus"
+     * left an iconic window iconic: focused, painting nothing. */
+    if (SDL_GetWindowFlags(hwnd->sdl) & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(hwnd->sdl);
+    SDL_RaiseWindow(hwnd->sdl);
+    oc_plat_window_front(hwnd->sdl);
+    focus_set(NULL);
 }
 
-static void nav_conversation(HWND hwnd, int delta, int unread_only) {
+/* "Can the user see this right now?": the window is in front, shown and not
+ * minimised. A hidden window can still hold the focus, which is why visible
+ * is asked separately. */
+static int win_visible(const oc_win *w) {
+    if (!w || !w->sdl) return 0;
+    SDL_WindowFlags fl = SDL_GetWindowFlags(w->sdl);
+    return !(fl & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+}
+static int win_front(const oc_win *w) {
+    return win_visible(w) && (SDL_GetWindowFlags(w->sdl) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+
+static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
     const oc_model *m = model();
     if (!m || !m->n_channels) return;
     oc_sidebar_opts o = g_sb;
@@ -7384,7 +7264,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
     if (ids[next] == g_sel && nids == 1) return;
     select_channel(ids[next]);
     layout_composer(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* ---- shortcuts: one table, dispatched from the message loop ----------------
@@ -7434,26 +7314,26 @@ static const struct {
     { 0,                  0,          ACC_NONE,  "Esc",                "Close the open pane, popover or picker" },
     { 0,                  0,          ACC_NONE,  "Tab",                "Insert the highlighted completion" },
     { 0,                  0,          ACC_NONE,  "Up / Down",          "Move through completions" },
-    { AM_ALT,             VK_UP,      ACC_NAV_PREV,        "Alt+Up / Alt+Down",   "Previous / next conversation" },
-    { AM_ALT,             VK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
-    { AM_ALT | AM_SHIFT,  VK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
-    { AM_ALT | AM_SHIFT,  VK_DOWN,    ACC_NAV_NEXT_UNREAD, NULL, NULL },
+    { AM_ALT,             OCK_UP,      ACC_NAV_PREV,        "Alt+Up / Alt+Down",   "Previous / next conversation" },
+    { AM_ALT,             OCK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
+    { AM_ALT | AM_SHIFT,  OCK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
+    { AM_ALT | AM_SHIFT,  OCK_DOWN,    ACC_NAV_NEXT_UNREAD, NULL, NULL },
     { AM_CTRL,            'K',        ACC_PALETTE, "Ctrl+K",           "Command palette" },
     { AM_CTRL,            'F',        ACC_SEARCH,  "Ctrl+F",           "Search messages" },
-    { AM_CTRL,            VK_OEM_2,   ACC_KEYS,    "Ctrl+/",           "This list" },
-    { AM_CTRL,            VK_OEM_COMMA, ACC_PREFS,  "Ctrl+,",           "Preferences" },
+    { AM_CTRL,            OCK_SLASH,   ACC_KEYS,    "Ctrl+/",           "This list" },
+    { AM_CTRL,            OCK_COMMA, ACC_PREFS,  "Ctrl+,",           "Preferences" },
     /* The numeric keypad's +/- are different virtual keys and a user with a full
      * keyboard will reach for them. */
-    { AM_CTRL | AM_SHIFT, 'L',        ACC_LISTEN,  "Ctrl+Shift+L",     "Read this conversation aloud, from now on" },
+    { AM_CTRL | AM_SHIFT, 'u',        ACC_LISTEN,  "Ctrl+Shift+u",     "Read this conversation aloud, from now on" },
     /* Voice input (REQ-296). The talk key is HELD: accel_dispatch also sees its
      * key-up, which is what lets go. */
-    { AM_CTRL | AM_SHIFT, VK_SPACE,   ACC_PTT,     "Ctrl+Shift+Space", "Hold to talk into the message box; in a call, hold to talk while muted" },
+    { AM_CTRL | AM_SHIFT, OCK_SPACE,   ACC_PTT,     "Ctrl+Shift+Space", "Hold to talk into the message box; in a call, hold to talk while muted" },
     { AM_CTRL | AM_SHIFT, 'M',        ACC_CALL_MUTE, "Ctrl+Shift+M",   "Mute or unmute yourself in a call" },
     { AM_CTRL | AM_SHIFT, 'S',        ACC_CALL_SHARE, "Ctrl+Shift+S",  "Share your screen in a call, or stop sharing" },
     { AM_CTRL | AM_SHIFT, 'T',        ACC_FREETALK, "Ctrl+Shift+T",    "Free talk: post what you say, piece by piece" },
     /* Shift+Esc, as the reference client binds it. Plain Esc closes whatever is
      * open, so the Esc handler below stands aside while Shift is held. */
-    { AM_SHIFT,           VK_ESCAPE,  ACC_MARK_ALL_READ, "Shift+Esc",  "Mark every conversation read" },
+    { AM_SHIFT,           OCK_ESCAPE,  ACC_MARK_ALL_READ, "Shift+Esc",  "Mark every conversation read" },
     /* The newest toast's action -- Undo, most often -- without reaching for the
      * pointer (REQ-290); plain Esc dismisses the newest toast. */
     { AM_CTRL | AM_SHIFT, 'Z',        ACC_TOAST_ACTION, "Ctrl+Shift+Z", "Do what the newest notice offers (Undo)" },
@@ -7462,7 +7342,7 @@ static const struct {
      * below rather than as nine rows, so this one is the documentation. */
     { 0,                  0,          ACC_NONE,    "Ctrl+1 \u2026 Ctrl+9", "Switch to that workspace" },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
-    { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
+    { 0,                  OCK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
     { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
     /* The same actions without a pointer. Display-only rows: the keys are
@@ -7473,28 +7353,29 @@ static const struct {
     { 0,                  0,          ACC_NONE,  "Up / Down, Enter",   "Move through an open menu and choose" },
 };
 
-static void search_open(HWND hwnd);            /* fwd */
-static void palette_open(HWND hwnd);           /* fwd */
-static void modal_enter(HWND hwnd, int *flag); /* fwd */
+static void search_open(oc_win *hwnd);            /* fwd */
+static void palette_open(oc_win *hwnd);           /* fwd */
+static void modal_enter(oc_win *hwnd, int *flag); /* fwd */
 static void modal_finish(int save);            /* fwd */
 static int  modal_open(void);                  /* fwd */
 
-static void app_quit(HWND hwnd);   /* fwd — the deliberate exit (REQ-138) */
-static void dict_ptt_down(HWND hwnd, int by);   /* fwd — voice input (REQ-296) */
-static void dict_ptt_up(HWND hwnd, int by);     /* fwd */
-static void dict_freetalk_toggle(HWND hwnd);    /* fwd */
+static void app_quit(oc_win *hwnd);   /* fwd — the deliberate exit (REQ-138) */
+static int  on_close_request(oc_win *hwnd);   /* fwd — the window's close, asked or pressed */
+static void dict_ptt_down(oc_win *hwnd, int by);   /* fwd — voice input (REQ-296) */
+static void dict_ptt_up(oc_win *hwnd, int by);     /* fwd */
+static void dict_freetalk_toggle(oc_win *hwnd);    /* fwd */
 static int  g_dict_hold;                        /* what holds push to talk down */
 #define DH_KEY 1                                /* ...the talk key */
 
-static int  call_ptt(HWND hwnd, int down);      /* fwd — calls (REQ-150) */
-static void call_open_view(HWND hwnd, uint64_t ch);   /* fwd */
-static int  ws_go(HWND hwnd, int slot);        /* fwd — Ctrl+<digit> and the switcher */
-static void menu_dispatch(HWND hwnd, int cmd);  /* fwd */
-static void menu_run_kind(HWND hwnd, int kind, int cmd);  /* fwd — a menu item chosen */
+static int  call_ptt(oc_win *hwnd, int down);      /* fwd — calls (REQ-150) */
+static void call_open_view(oc_win *hwnd, uint64_t ch);   /* fwd */
+static int  ws_go(oc_win *hwnd, int slot);        /* fwd — Ctrl+<digit> and the switcher */
+static void menu_dispatch(oc_win *hwnd, int cmd);  /* fwd */
+static void menu_run_kind(oc_win *hwnd, int kind, int cmd);  /* fwd — a menu item chosen */
 static int  transcript_shell(void);             /* fwd — is the chat shell on screen */
-static void kb_row_move(HWND hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
-static void kb_context_menu(HWND hwnd);         /* fwd — Shift+F10 / the Menu key */
-static void accel_run(HWND hwnd, int action) {
+static void kb_row_move(oc_win *hwnd, int d);      /* fwd — Ctrl+Up / Ctrl+Down */
+static void kb_context_menu(oc_win *hwnd);         /* fwd — Shift+F10 / the Menu key */
+static void accel_run(oc_win *hwnd, int action) {
     switch (action) {
     case ACC_QUIT:    app_quit(hwnd);     break;
     case ACC_PALETTE: palette_open(hwnd); break;
@@ -7540,10 +7421,8 @@ static void accel_run(HWND hwnd, int action) {
         /* One toggle rather than an F6 handler in each control, which is how the
          * two ends drifted: the composer sent focus to the filter box even in the
          * views that have no filter box. */
-        HWND f = GetFocus();
-        if (ed_focused() && g_find && IsWindowVisible(g_find)) { g_ed_focus = 0; SetFocus(g_find); }
+        if (ed_focused() && g_find && g_find->visible) focus_set(g_find);
         else ed_focus(hwnd);
-        (void)f;
         break; }
     default: break;
     }
@@ -7568,35 +7447,37 @@ static int g_synth_mods = -1;
 
 static int mod_down(int vk) {
     if (g_synth_mods >= 0)
-        return vk == VK_CONTROL ? !!(g_synth_mods & AM_CTRL)
-             : vk == VK_MENU    ? !!(g_synth_mods & AM_ALT)
-             : vk == VK_SHIFT   ? !!(g_synth_mods & AM_SHIFT) : 0;
-    return (GetKeyState(vk) & 0x8000) != 0;
+        return vk == OCK_CONTROL ? !!(g_synth_mods & AM_CTRL)
+             : vk == OCK_ALT     ? !!(g_synth_mods & AM_ALT)
+             : vk == OCK_SHIFT   ? !!(g_synth_mods & AM_SHIFT) : 0;
+    SDL_Keymod m = SDL_GetModState();
+    return vk == OCK_CONTROL ? (m & SDL_KMOD_CTRL) != 0
+         : vk == OCK_ALT     ? (m & SDL_KMOD_ALT) != 0
+         : vk == OCK_SHIFT   ? (m & SDL_KMOD_SHIFT) != 0 : 0;
 }
 
-static int vm_key(HWND hwnd, WPARAM wp);   /* fwd: the video overlay owns the keyboard while up */
-static int accel_dispatch(HWND hwnd, const MSG *m) {
+static int vm_key(oc_win *hwnd, int wp);   /* fwd: the video overlay owns the keyboard while up */
+/* `key` is an OCK_ name (or the letter); `up` a release; `alt` the Alt key
+ * held; `rep` the auto-repeat of a held key. */
+static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
+    (void)alt;
     /* The held talk key. Letting go of Space ends it whichever modifier went
      * first, and while it is held its auto-repeat is claimed rather than typed
      * as spaces into the words being dictated. */
     /* The same held key in a call: letting go stops talking. */
-    if (g_call_ptt && m->wParam == VK_SPACE &&
-        (m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN ||
-         m->message == WM_KEYUP || m->message == WM_SYSKEYUP)) {
-        if (m->message == WM_KEYUP || m->message == WM_SYSKEYUP) call_ptt(hwnd, 0);
+    if (g_call_ptt && key == OCK_SPACE) {
+        if (up) call_ptt(hwnd, 0);
         return 1;
     }
-    if (g_dict_hold == DH_KEY && m->wParam == VK_SPACE &&
-        (m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN ||
-         m->message == WM_KEYUP || m->message == WM_SYSKEYUP)) {
-        if (m->message == WM_KEYUP || m->message == WM_SYSKEYUP) {
+    if (g_dict_hold == DH_KEY && key == OCK_SPACE) {
+        if (up) {
             dict_ptt_up(hwnd, DH_KEY);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
         return 1;
     }
-    if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) return 0;
-    if (VM_UP() && m->message == WM_KEYDOWN && vm_key(hwnd, m->wParam)) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
+    if (up) return 0;
+    if (VM_UP() && !alt && vm_key(hwnd, key)) { invalidate(); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
      * modal_key in the window proc. */
@@ -7607,23 +7488,23 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * it still needing a pointer, which is the same gap one step later
      * (REQ-264). Ahead of everything below, including the Esc block, which keeps
      * closing it. */
-    if (m->message == WM_KEYDOWN && g_menu && !modal_open()) {
-        WPARAM k = m->wParam;
-        if (k == VK_DOWN || k == VK_UP) {
-            if (g_sub_open) sub_move(k == VK_DOWN ? 1 : -1);
-            else            menu_move(k == VK_DOWN ? 1 : -1);
-            InvalidateRect(hwnd, NULL, FALSE); return 1;
+    if (!alt && g_menu && !modal_open()) {
+        int k = key;
+        if (k == OCK_DOWN || k == OCK_UP) {
+            if (g_sub_open) sub_move(k == OCK_DOWN ? 1 : -1);
+            else            menu_move(k == OCK_DOWN ? 1 : -1);
+            invalidate(); return 1;
         }
-        if (k == VK_HOME || k == VK_END) {
-            if (!g_sub_open) { g_menu_hover = -1; menu_move(k == VK_HOME ? 1 : -1); }
-            InvalidateRect(hwnd, NULL, FALSE); return 1;
+        if (k == OCK_HOME || k == OCK_END) {
+            if (!g_sub_open) { g_menu_hover = -1; menu_move(k == OCK_HOME ? 1 : -1); }
+            invalidate(); return 1;
         }
-        if (k == VK_RIGHT && !g_sub_open && g_menu_hover >= 0 &&
+        if (k == OCK_RIGHT && !g_sub_open && g_menu_hover >= 0 &&
             g_mi[g_menu_hover].kind == MK_SUB) {
-            sub_open_from_keyboard(); InvalidateRect(hwnd, NULL, FALSE); return 1;
+            sub_open_from_keyboard(); invalidate(); return 1;
         }
-        if (k == VK_LEFT && g_sub_open) { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (k == VK_RETURN || k == VK_SPACE) {
+        if (k == OCK_LEFT && g_sub_open) { submenu_close(); invalidate(); return 1; }
+        if (k == OCK_RETURN || k == OCK_SPACE) {
             if (g_sub_open) {
                 if (g_sub_hover >= 0 && g_sub_hover < g_n_subrows) {
                     int cmd = g_subrows[g_sub_hover].cmd;
@@ -7640,23 +7521,23 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
                     menu_run_kind(hwnd, kind, cmd);
                 }
             }
-            InvalidateRect(hwnd, NULL, FALSE); return 1;
+            invalidate(); return 1;
         }
     }
     /* Ctrl+Up / Ctrl+Down walk the transcript, and Shift+F10 or the Menu key open
      * the actions for where they land -- the keyboard route to the context menu
      * (REQ-264). With no message focused the menu is the conversation's own, which
      * is the sidebar row's menu reached without the sidebar. */
-    if (m->message == WM_KEYDOWN && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) &&
-        (m->wParam == VK_UP || m->wParam == VK_DOWN) && transcript_shell() && !g_menu) {
-        kb_row_move(hwnd, m->wParam == VK_DOWN ? 1 : -1);
-        InvalidateRect(hwnd, NULL, FALSE);
+    if (!alt && mod_down(OCK_CONTROL) && !mod_down(OCK_SHIFT) &&
+        (key == OCK_UP || key == OCK_DOWN) && transcript_shell() && !g_menu) {
+        kb_row_move(hwnd, key == OCK_DOWN ? 1 : -1);
+        invalidate();
         return 1;
     }
-    if (m->message == WM_KEYDOWN && !g_menu && !modal_open() &&
-        (m->wParam == VK_APPS || (m->wParam == VK_F10 && mod_down(VK_SHIFT)))) {
+    if (!alt && !g_menu && !modal_open() &&
+        (key == OCK_APPS || (key == OCK_F10 && mod_down(OCK_SHIFT)))) {
         kb_context_menu(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     /* Esc dismisses a transient overlay FIRST, whatever has focus. The
@@ -7667,19 +7548,19 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * claims the key when one of these four is actually up. */
     /* Shift+Esc is a shortcut of its own (marking everything read) and must reach
      * the table below; bare Esc dismisses what is open. */
-    if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE && !mod_down(VK_SHIFT)) {
+    if (!alt && key == OCK_ESCAPE && !mod_down(OCK_SHIFT)) {
         /* Waiting on the browser: the fields are hidden, so nothing else hears Esc. */
         if (g_view == VIEW_SIGNIN && g_si_connecting && g_si_browser && g_si_client) {
             oc_client_cancel_signin(g_si_client);
             return 1;
         }
-        if (g_tp_open)   { g_tp_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (g_share_full && !g_menu) { g_share_full = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (g_sub_open)  { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (g_lightbox)  { g_lightbox = 0;     InvalidateRect(hwnd, NULL, FALSE); return 1; }
-        if (g_kb_mid)    { g_kb_mid = 0;       InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_tp_open)   { g_tp_open = 0; invalidate(); return 1; }
+        if (g_share_full && !g_menu) { g_share_full = 0; invalidate(); return 1; }
+        if (g_sub_open)  { submenu_close(); invalidate(); return 1; }
+        if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; invalidate(); return 1; }
+        if (g_more_open) { g_more_open = 0;    invalidate(); return 1; }
+        if (g_lightbox)  { g_lightbox = 0;     invalidate(); return 1; }
+        if (g_kb_mid)    { g_kb_mid = 0;       invalidate(); return 1; }
         /* Focus-specific Esc (drop the completion list, cancel an edit, clear a
          * selection) stays with the control that owns it — fall through. */
         if (g_n_ac > 0 || g_edit_msg || g_has_sel) return 0;
@@ -7693,39 +7574,39 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
             if (pm && (pm->thread_open || pm->search_open || pm->pinlist_open ||
                        pm->weblist_open || pm->storage_open || pm->audit_open)) {
                 close_overlays();
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
         }
         /* Then the newest notice: Esc dismisses it, as its close button does. */
         if (g_fb.n > 0 && !modal_open()) {
             oc_fb_dismiss(&g_fb, g_fb.t[g_fb.n - 1].id);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
         return 0;
     }
     unsigned mods = 0;
-    if (mod_down(VK_CONTROL)) mods |= AM_CTRL;
-    if (mod_down(VK_MENU))    mods |= AM_ALT;
-    if (mod_down(VK_SHIFT))   mods |= AM_SHIFT;
+    if (mod_down(OCK_CONTROL)) mods |= AM_CTRL;
+    if (mod_down(OCK_ALT))    mods |= AM_ALT;
+    if (mod_down(OCK_SHIFT))   mods |= AM_SHIFT;
     /* Ctrl+<digit>: the workspace at that place in the rail. Claimed whether or
      * not there is one, so Ctrl+4 with three signed in does not fall through to
      * whatever else a bare "4" would do. */
-    if (mods == AM_CTRL && m->wParam >= '1' && m->wParam <= '9') {
-        ws_go(hwnd, (int)m->wParam - '1');
+    if (mods == AM_CTRL && key >= '1' && key <= '9') {
+        ws_go(hwnd, key - '1');
         return 1;
     }
     for (size_t i = 0; i < sizeof SHORTCUTS / sizeof SHORTCUTS[0]; i++) {
         if (SHORTCUTS[i].action == ACC_NONE || !SHORTCUTS[i].vk) continue;
-        if (SHORTCUTS[i].vk != (uint16_t)m->wParam) continue;
+        if (SHORTCUTS[i].vk != (uint16_t)key) continue;
         if (SHORTCUTS[i].mods != mods) continue;
         /* A held key repeats (bit 30: it was already down). Holding the talk key
          * is one press, so a microphone that failed to open is not retried at
          * the keyboard's repeat rate. */
-        if (SHORTCUTS[i].action == ACC_PTT && (m->lParam & (1L << 30))) return 1;
+        if (SHORTCUTS[i].action == ACC_PTT && rep) return 1;
         accel_run(hwnd, SHORTCUTS[i].action);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     return 0;
@@ -7949,7 +7830,7 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
     g_about_max = over > 0 ? over : 0;
     if (g_about_scroll > g_about_max) {
         g_about_scroll = g_about_max;
-        InvalidateRect(g_main_hwnd, NULL, FALSE);
+        invalidate();
     }
     gfx_clip_pop(rt);
 }
@@ -8104,14 +7985,14 @@ static void file_badge_named(gfx *rt, const char *filename, const char *mime, ui
     if (media_kind == OC_MEDIA_VIDEO_MESSAGE ||
         strncmp(mime, "video/", 6) == 0)             { col = 0xE0701A; snprintf(tag, sizeof tag, "VID"); }
     else if (mime_is_image(mime))                   { col = 0x8B5CF6; snprintf(tag, sizeof tag, "IMG"); }
-    else if (ext && !_stricmp(ext, ".pdf"))       { col = 0xD64545; snprintf(tag, sizeof tag, "PDF"); }
-    else if (ext && (!_stricmp(ext, ".doc") || !_stricmp(ext, ".docx")))
+    else if (ext && !SDL_strcasecmp(ext, ".pdf"))       { col = 0xD64545; snprintf(tag, sizeof tag, "PDF"); }
+    else if (ext && (!SDL_strcasecmp(ext, ".doc") || !SDL_strcasecmp(ext, ".docx")))
                                                     { col = 0x2B5CE6; snprintf(tag, sizeof tag, "DOC"); }
-    else if (ext && (!_stricmp(ext, ".xls") || !_stricmp(ext, ".xlsx") || !_stricmp(ext, ".csv")))
+    else if (ext && (!SDL_strcasecmp(ext, ".xls") || !SDL_strcasecmp(ext, ".xlsx") || !SDL_strcasecmp(ext, ".csv")))
                                                     { col = 0x1E8E4E; snprintf(tag, sizeof tag, "XLS"); }
-    else if (ext && (!_stricmp(ext, ".zip") || !_stricmp(ext, ".gz") || !_stricmp(ext, ".7z")))
+    else if (ext && (!SDL_strcasecmp(ext, ".zip") || !SDL_strcasecmp(ext, ".gz") || !SDL_strcasecmp(ext, ".7z")))
                                                     { col = 0xB2802E; snprintf(tag, sizeof tag, "ZIP"); }
-    else if (ext && !_stricmp(ext, ".txt"))       { col = 0x4B7A9B; snprintf(tag, sizeof tag, "TXT"); }
+    else if (ext && !SDL_strcasecmp(ext, ".txt"))       { col = 0x4B7A9B; snprintf(tag, sizeof tag, "TXT"); }
     if (reclaimed) col = OC_COL_FAINT;
     fill_round(rt, r, OC_R_CONTROL, col);
     g_meta->align = ST_ALIGN_CENTER;
@@ -8156,7 +8037,7 @@ static const oc_model *g_fsortm;
 static int file_cmp(const void *pa, const void *pb) {
     const oc_file_view *a = &g_fsortm->files[*(const int *)pa];
     const oc_file_view *b = &g_fsortm->files[*(const int *)pb];
-    if (g_file_sort == FSORT_NAME)    return _stricmp(a->filename, b->filename);
+    if (g_file_sort == FSORT_NAME)    return SDL_strcasecmp(a->filename, b->filename);
     if (g_file_sort == FSORT_LARGEST) return a->size == b->size ? 0 : (a->size < b->size ? 1 : -1);
     return a->created_at == b->created_at ? 0 : (a->created_at < b->created_at ? 1 : -1);
 }
@@ -8250,6 +8131,7 @@ static float draw_file_filters(gfx *rt, rectf body, int full) {
          * placed over it by layout_files_find(). */
         g_file_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
         search_box_draw(rt, g_file_search_box, OC_COL_INPUT);
+        if (g_ffind) field_draw(rt, g_ffind, search_text_box(g_file_search_box), OC_COL_TEXT);
         y = g_file_search_box.bottom + 12;
     } else {
         g_file_search_box = rf(0, 0, 0, 0);
@@ -9634,8 +9516,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
 
     char q[64] = "";
     if (g_pal_edit) {
-        WCHAR wq[64]; GetWindowTextW(g_pal_edit, wq, 64);
-        WideCharToMultiByte(CP_UTF8, 0, wq, -1, q, sizeof q, NULL, NULL);
+        snprintf(q, sizeof q, "%s", g_pal_edit->buf);
     }
 
     /* Collect matches first so the panel can be sized to them. */
@@ -9699,6 +9580,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
 
     g_pal_box = rf(px + 12, py + 12, px + pw - 12, py + pb);
     search_box_draw(rt, g_pal_box, OC_COL_BASE);
+    if (g_pal_edit) field_draw(rt, g_pal_edit, search_text_box(g_pal_box), OC_COL_TEXT);
     /* Name the mode: the same panel means two things now, and a picker that does
      * not say which is a trap. */
     if (g_fwd_mid)
@@ -9745,41 +9627,6 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
  * the same session was always possible and never intended. */
 #define OC_URL_SCHEME "openchime"
 
-/* Register the scheme for THIS USER. Under HKCU rather than HKCR because it
- * needs no elevation and follows the person rather than the machine; the
- * installer writes the same keys so a fresh install works before first run. */
-static void url_scheme_register(void) {
-    WCHAR exe[MAX_PATH];
-    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
-    WCHAR cmd[MAX_PATH + 16];
-    _snwprintf(cmd, MAX_PATH + 16, L"\"%s\" \"%%1\"", exe);
-    HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Classes\\openchime", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL)
-        != ERROR_SUCCESS) return;
-    RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)L"URL:OpenChime", 28);
-    RegSetValueExW(k, L"URL Protocol", 0, REG_SZ, (const BYTE *)L"", 2);
-    RegCloseKey(k);
-    if (RegCreateKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Classes\\openchime\\shell\\open\\command",
-            0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
-        RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)cmd,
-                       (DWORD)((wcslen(cmd) + 1) * sizeof(WCHAR)));
-        RegCloseKey(k);
-    }
-}
-
-/* Hand `url` to an already-running client. Returns 1 when one took it. */
-static int url_handoff(const char *url) {
-    HWND other = FindWindowW(L"OpenChimeWin", NULL);
-    if (!other) return 0;
-    COPYDATASTRUCT cds;
-    cds.dwData = OC_COPYDATA_URL;
-    cds.cbData = (DWORD)(strlen(url) + 1);
-    cds.lpData = (void *)url;
-    SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cds);
-    return 1;
-}
 
 /* ---- the notification window (REQ-138) -----------------------------------
  *
@@ -9811,14 +9658,11 @@ static int url_handoff(const char *url) {
  * Not a layout constant -- the layout is measured -- just an upper bound. */
 #define NTOAST_HMAX  UIS(160.0f)
 
-static HWND          g_nt_hwnd;
-static SDL_Window   *g_nt_win;
-static SDL_Renderer *g_nt_ren;
-static gfx          *g_nt_gfx;
+static oc_win        g_nt_win;
 static struct {
     char      title[128], body[256];
     uint64_t  ws_slot, channel_id;
-    ULONGLONG born;
+    uint64_t born;
 } g_nt[NTOAST_MAX];
 static int  g_n_nt;
 static int  g_nt_hover = -1;         /* hovering holds it open */
@@ -9881,13 +9725,13 @@ static void nt_activate(int i) {
     if (i < 0 || i >= g_n_nt) return;
     uint64_t ws = g_nt[i].ws_slot, cid = g_nt[i].channel_id;
     g_n_nt = 0;
-    if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE);
+    if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl);
     g_nt_shown = 0;
-    if (g_main_hwnd) {
-        show_and_focus(g_main_hwnd);
+    if (g_main) {
+        show_and_focus(g_main);
         if ((int)ws != g_ws_active && (int)ws < g_n_wss) { ws_save_active(); ws_load((int)ws); }
         if (cid) { g_view = VIEW_HOME; close_overlays(); select_channel(cid); }
-        InvalidateRect(g_main_hwnd, NULL, FALSE);
+        invalidate();
     }
 }
 
@@ -9901,7 +9745,7 @@ static void nt_activate(int i) {
  * "verb|workspace|channel|extra\nreply" -- one line for what was pressed, one
  * for what was typed, because a reply may contain anything including the
  * separator the first line uses. */
-static void call_join_here(HWND hwnd, uint64_t ch);   /* fwd: an invitation's Join */
+static void call_join_here(oc_win *hwnd, uint64_t ch);   /* fwd: an invitation's Join */
 static void toast_action_perform(char *p2) {
     char *nl = strchr(p2, '\n');
     const char *reply = nl ? nl + 1 : "";
@@ -9921,9 +9765,9 @@ static void toast_action_perform(char *p2) {
         if ((int)ws != g_ws_active && (int)ws < g_n_wss) { ws_save_active(); ws_load((int)ws); }
         if (!strcmp(verb, "join") || !strcmp(verb, "decline")) {
             /* An invitation's buttons (REQ-302). */
-            HWND h = FindWindowW(L"OpenChimeWin", NULL);
+            oc_win *h = g_main;
             if (!strcmp(verb, "join")) {
-                if (h) { ShowWindow(h, SW_RESTORE); SetForegroundWindow(h); }
+                show_and_focus(h);
                 call_join_here(h, cid);
             } else {
                 oc_client_call_decline(g_client, cid);
@@ -9977,96 +9821,56 @@ static void nt_drop(int i) {
     for (int k = i; k < g_n_nt - 1; k++) g_nt[k] = g_nt[k + 1];
     g_n_nt--;
     g_nt_hover = g_nt_close_hover = -1;
-    if (!g_n_nt) { if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE); g_nt_shown = 0; }
+    if (!g_n_nt) { if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl); g_nt_shown = 0; }
     else { nt_layout(); nt_paint(); }
 }
 
-static LRESULT CALLBACK nt_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    switch (m) {
-    case WM_LBUTTONUP: {
-        { int ci = nt_close_at(GET_X_LPARAM(l), GET_Y_LPARAM(l));
-          if (ci >= 0) { nt_drop(ci); return 0; } }
-        nt_activate(nt_row_at(GET_Y_LPARAM(l)));
-        return 0;
-    }
-    case WM_MOUSEMOVE: {
-        g_nt_hover = nt_row_at(GET_Y_LPARAM(l));
-        g_nt_close_hover = nt_close_at(GET_X_LPARAM(l), GET_Y_LPARAM(l));
-        TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
-        TrackMouseEvent(&tme);
-        nt_paint();                      /* the cross lights under the pointer */
-        return 0;
-    }
-    case WM_MOUSELEAVE: g_nt_hover = g_nt_close_hover = -1; nt_paint(); return 0;
-    /* Repaint on demand. Painting only when a notification is pushed was not
-     * enough: the window is resized to fit the stack immediately afterwards, so
-     * the first render went to the old surface and what stayed on screen was an
-     * unpainted window. */
-    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); nt_paint(); EndPaint(h, &ps); return 0; }
-    case WM_ERASEBKGND: return 1;   /* we draw every pixel; erasing only flickers */
-    /* Never take the foreground: answering WM_MOUSEACTIVATE this way is what
-     * keeps a notification from stealing the caret out of another app. */
-    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    }
-    return DefWindowProcW(h, m, w, l);
+/* A click on a row opens what it was about; on its cross, dismisses it.
+ * (The coordinates arrive in DIPs; the hit-tests speak device pixels.) */
+static void nt_click(int mx, int my) {
+    int ci = nt_close_at(PX(mx), PX(my));
+    if (ci >= 0) { nt_drop(ci); return; }
+    nt_activate(nt_row_at(PX(my)));
+}
+static void nt_hover(int mx, int my) {
+    g_nt_hover = nt_row_at(PX(my));
+    g_nt_close_hover = nt_close_at(PX(mx), PX(my));
+    nt_paint();                      /* the cross lights under the pointer */
 }
 
 /* Whether DWM accepted the rounded-corner request. Reported rather than
  * assumed: the attribute is silently ignored on Windows 10, and the toast
  * cannot be photographed from outside -- a desktop capture over RDP comes back
  * black, for the same reason the rect above is reported from in here. */
-static HRESULT g_nt_round_hr = E_FAIL;
+static int g_nt_round_hr = -1;
 
 static int nt_create(void) {
-    if (g_nt_hwnd) return 1;
-    static int registered;
-    HINSTANCE inst = GetModuleHandleW(NULL);
-    if (!registered) {
-        WNDCLASSEXW wc; ZeroMemory(&wc, sizeof wc);
-        wc.cbSize = sizeof wc; wc.lpfnWndProc = nt_proc; wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-        wc.lpszClassName = L"OpenChimeNotify";
-        if (!RegisterClassExW(&wc)) return 0;
-        registered = 1;
-    }
-    /* Created at the size it will actually be, BEFORE SDL wraps it. SDL takes
-     * the backbuffer from the HWND at wrap time and resizing a foreign window
-     * afterwards does not grow it -- which showed as a correctly positioned
-     * window that painted its clear colour and a 10px corner of the first thing
-     * drawn into it. The stack only ever grows downward from one row, so the
-     * full height is knowable here. */
-    {
-        float sc0 = (float)g_dpi / 96.0f;
-        int w0 = (int)(NTOAST_W * sc0);
-        int h0 = (int)((NTOAST_HMAX + NTOAST_GAP) * sc0) * NTOAST_MAX;
-        g_nt_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-                                    L"OpenChimeNotify", L"", WS_POPUP,
-                                    0, 0, w0, h0, NULL, NULL, inst, NULL);
-    }
-    if (!g_nt_hwnd) return 0;
-    /* LET THE SHELL ROUND IT. The card cannot round its own fill: the corners
-     * would expose the window's clear colour, and there is no colour that is
-     * right against an arbitrary desktop. DWM clips the window instead --
-     * antialiased, at whatever radius the running Windows considers correct,
-     * which is the actual standard rather than our guess at it.
-     *
-     * Attr 33 = DWMWA_WINDOW_CORNER_PREFERENCE, value 2 = DWMWCP_ROUND, both
-     * written out because the mingw headers predate them. It fails harmlessly
-     * on Windows 10, where a square popup is the native look anyway. */
-    {
-        DWORD round = 2;
-        g_nt_round_hr = DwmSetWindowAttribute(g_nt_hwnd, 33, &round, sizeof round);
-    }
-    SDL_PropertiesID props = SDL_CreateProperties();
-    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_WIN32_HWND_POINTER, g_nt_hwnd);
-    g_nt_win = SDL_CreateWindowWithProperties(props);
-    SDL_DestroyProperties(props);
-    if (!g_nt_win) return 0;
-    g_nt_ren = SDL_CreateRenderer(g_nt_win, NULL);
-    if (!g_nt_ren) return 0;
-    g_nt_gfx = gfx_create(g_nt_ren);
-    if (!g_nt_gfx) return 0;
-    g_gfx_for[TXT_TARGET_TOAST] = g_nt_gfx;
+    if (g_nt_win.sdl) return 1;
+#ifdef __EMSCRIPTEN__
+    /* No second window on the web (WEB.md): a page has one canvas, and a
+     * notification there is the Notification API's. The in-app toasts carry
+     * the news meanwhile. */
+    return 0;
+#endif
+    /* Created at the size it will actually be: the stack only ever grows
+     * downward from one row, so the full height is knowable here. Borderless,
+     * topmost, never focusable -- it must never steal the caret from what you
+     * are typing into -- and a utility window, so it is out of the taskbar. */
+    float sc0 = (float)g_dpi / 96.0f;
+    int w0 = (int)(NTOAST_W * sc0);
+    int h0 = (int)((NTOAST_HMAX + NTOAST_GAP) * sc0) * NTOAST_MAX;
+    g_nt_win.sdl = SDL_CreateWindow("", w0, h0,
+                                    SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_UTILITY |
+                                    SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_HIDDEN);
+    if (!g_nt_win.sdl) return 0;
+    /* Let the platform round it: the card cannot round its own fill, since
+     * there is no colour that is right against an arbitrary desktop. */
+    g_nt_round_hr = oc_plat_window_round(g_nt_win.sdl);
+    g_nt_win.ren = SDL_CreateRenderer(g_nt_win.sdl, NULL);
+    if (!g_nt_win.ren) return 0;
+    g_nt_win.g = gfx_create(g_nt_win.ren);
+    if (!g_nt_win.g) return 0;
+    g_gfx_for[TXT_TARGET_TOAST] = g_nt_win.g;
     g_gfx_for[TXT_TARGET_MAIN]  = g_gfx;
     return 1;
 }
@@ -10083,47 +9887,24 @@ static float nt_stack_h(void) {
 /* Bottom-right of the WORK AREA, not the screen: over the taskbar is where a
  * notification is least readable and most in the way. */
 static void nt_layout(void) {
-    if (!g_nt_hwnd) return;
-    /* THE WORK AREA OF THE MONITOR THIS WINDOW IS ON, not SPI_GETWORKAREA.
-     *
-     * SPI_GETWORKAREA answers for the primary monitor and its answer depends on
-     * the calling thread's DPI context, so it returned 1896 here and 1920 to
-     * the test dump moments later -- which put the card 24px off the right edge
-     * while every measurement insisted it was flush. MonitorFromWindow is the
-     * per-monitor question and the only one worth asking of a window that is
-     * placed relative to a screen corner. */
-    RECT wa;
-    {
-        HMONITOR mon = MonitorFromWindow(g_nt_hwnd, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFO mi; mi.cbSize = sizeof mi;
-        if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
-        else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    }
+    if (!g_nt_win.sdl) return;
+    /* THE WORK AREA OF THE MONITOR THE MAIN WINDOW IS ON: a card placed
+     * relative to a screen corner has to ask the per-monitor question. */
+    SDL_Rect wa = { 0, 0, 1280, 720 };
+    SDL_DisplayID disp = g_main && g_main->sdl ? SDL_GetDisplayForWindow(g_main->sdl) : 0;
+    if (!disp) disp = SDL_GetPrimaryDisplay();
+    SDL_GetDisplayUsableBounds(disp, &wa);
     float sc = (float)g_dpi / 96.0f;
-    /* CEIL, not truncate. The card is drawn in DIPs and the window is sized in
-     * pixels, so 53 DIP at 1.5 is 79.5 -- and a window of 79 clips the half
-     * pixel the bottom border lives in. */
+    /* CEIL, not truncate: 53 DIP at 1.5 is 79.5, and a window of 79 clips the
+     * half pixel the bottom border lives in. */
     int w = (int)ceilf(NTOAST_W * sc);
     int h = (int)ceilf(nt_stack_h() * sc);
     if (h <= 0) h = (int)ceilf(NTOAST_HMAX * sc);
-    /* SIZED TO THE STACK, and this is what stops the window being a white slab
-     * reaching down to the taskbar.
-     *
-     * It is CREATED tall enough for the largest stack, because SDL takes its
-     * backbuffer when it wraps the HWND and never grows it -- but shrinking the
-     * WINDOW is fine: SDL keeps rendering into its full surface and the window
-     * simply reveals the top of it. Clipping with SetWindowRgn was the previous
-     * attempt and did not hold, which left the cleared background visible below
-     * the card for the whole height the window was created at. */
-    SetWindowPos(g_nt_hwnd, HWND_TOPMOST,
-                 /* THE CORNER OF THE WORK AREA, both axes, with nothing
-                  * subtracted. wa.right and wa.bottom already exclude the
-                  * taskbar; an inset on top of that is a second gap, and having
-                  * one on the right and not the bottom is why the card looked
-                  * wedged into one edge and floating off the other. */
-                 wa.right - w, wa.bottom - h,
-                 w, h, SWP_NOACTIVATE);
-    /* SDL took the window's size when it wrapped the HWND -- which was the 10x10
+    /* SIZED TO THE STACK; the corner of the work area, both axes, with nothing
+     * subtracted -- the bounds already exclude the taskbar. */
+    SDL_SetWindowSize(g_nt_win.sdl, w, h);
+    SDL_SetWindowPosition(g_nt_win.sdl, wa.x + wa.w - w, wa.y + wa.h - h);
+    /* SDL took the window's size when it wrapped the oc_win *-- which was the 10x10
      * the window was created at, because it cannot be positioned until we know
      * how many notifications it holds. Without this the renderer keeps clipping
      * to 10x10 and the window paints a corner of the accent bar and nothing
@@ -10131,11 +9912,11 @@ static void nt_layout(void) {
 }
 
 static void nt_paint(void) {
-    if (!g_nt_gfx || !g_n_nt) return;
+    if (!g_nt_win.g || !g_n_nt) return;
     int prev = g_txt_target;
     g_txt_target = TXT_TARGET_TOAST;
-    gfx_set_scale(g_nt_gfx, (float)g_dpi / 96.0f);
-    gfx_begin(g_nt_gfx, OC_COL_INPUT);
+    gfx_set_scale(g_nt_win.g, (float)g_dpi / 96.0f);
+    gfx_begin(g_nt_win.g, OC_COL_INPUT);
     float top = 0;
     for (int i = 0; i < g_n_nt; i++) {
         nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
@@ -10149,37 +9930,37 @@ static void nt_paint(void) {
          * A stroke is centred on its path, so it needs half its width inside
          * the surface and no more. Half of 1.0 is 0.5. */
         rectf r = rf(0, top, NTOAST_W, top + g.h);
-        fill(g_nt_gfx, r, g_nt_hover == i ? OC_COL_HOVER : OC_COL_INPUT);
-        stroke_round(g_nt_gfx, rf(r.left + 0.5f, r.top + 0.5f,
+        fill(g_nt_win.g, r, g_nt_hover == i ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(g_nt_win.g, rf(r.left + 0.5f, r.top + 0.5f,
                                   r.right - 0.5f, r.bottom - 0.5f), OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
-        fill(g_nt_gfx, rf(r.left, r.top, r.left + 4, r.bottom), OC_COL_ACCENT);
+        fill(g_nt_win.g, rf(r.left, r.top, r.left + 4, r.bottom), OC_COL_ACCENT);
         /* The APP'S MARK, not its name. Windows already labels its own toasts
          * with the application, and spending a line on "OpenChime" says the one
          * thing the icon already says. */
         float ix = r.left + g.icon_x, iy = r.top + g.icon_y;
         float pad = UIS(6.0f);
-        fill_round(g_nt_gfx, rf(ix, iy, ix + NTOAST_ICON, iy + NTOAST_ICON), OC_R_CONTROL, OC_COL_ACCENT);
-        draw_lucide(g_nt_gfx, OC_ICON_DMS,
+        fill_round(g_nt_win.g, rf(ix, iy, ix + NTOAST_ICON, iy + NTOAST_ICON), OC_R_CONTROL, OC_COL_ACCENT);
+        draw_lucide(g_nt_win.g, OC_ICON_DMS,
                     rf(ix + pad, iy + pad, ix + NTOAST_ICON - pad, iy + NTOAST_ICON - pad),
                     0xFFFFFF);
         float tx = r.left + g.text_x, tr = r.right - NTOAST_PAD;
-        draw_text(g_nt_gfx, g_nt[i].title, g_ui_b,
+        draw_text(g_nt_win.g, g_nt[i].title, g_ui_b,
                   rf(tx, r.top + g.title_y, tr, r.top + g.title_y + g.title_h), OC_COL_TEXT);
-        draw_text(g_nt_gfx, g_nt[i].body, g_meta_w,
+        draw_text(g_nt_win.g, g_nt[i].body, g_meta_w,
                   rf(tx, r.top + g.body_y, tr, r.top + g.body_y + g.body_h), OC_COL_MUTED);
         {
             rectf cb = rf(r.left + g.close_x, r.top + g.close_y,
                           r.left + g.close_x + g.close_sz, r.top + g.close_y + g.close_sz);
             int on = (g_nt_close_hover == i);
-            if (on) fill_round(g_nt_gfx, cb, OC_R_CONTROL, OC_COL_HOVER);
+            if (on) fill_round(g_nt_win.g, cb, OC_R_CONTROL, OC_COL_HOVER);
             float k = g.close_sz * 0.3f;
             uint32_t cc = on ? OC_COL_TEXT : OC_COL_MUTED;
-            gfx_line(g_nt_gfx, cb.left + k, cb.top + k, cb.right - k, cb.bottom - k, 1.4f, cc, 1.0f);
-            gfx_line(g_nt_gfx, cb.right - k, cb.top + k, cb.left + k, cb.bottom - k, 1.4f, cc, 1.0f);
+            gfx_line(g_nt_win.g, cb.left + k, cb.top + k, cb.right - k, cb.bottom - k, 1.4f, cc, 1.0f);
+            gfx_line(g_nt_win.g, cb.right - k, cb.top + k, cb.left + k, cb.bottom - k, 1.4f, cc, 1.0f);
         }
         top += g.h + NTOAST_GAP;
     }
-    gfx_end(g_nt_gfx);
+    gfx_end(g_nt_win.g);
     g_txt_target = prev;
 }
 
@@ -10193,7 +9974,7 @@ static void own_toast_show(const char *title, const char *body,
         if (g_nt[i].channel_id == channel_id && g_nt[i].ws_slot == ws_slot) {
             snprintf(g_nt[i].title, sizeof g_nt[i].title, "%s", title ? title : "");
             snprintf(g_nt[i].body,  sizeof g_nt[i].body,  "%s", body ? body : "");
-            g_nt[i].born = GetTickCount64();
+            g_nt[i].born = now_ms();
             nt_layout(); nt_paint();
             return;
         }
@@ -10205,10 +9986,10 @@ static void own_toast_show(const char *title, const char *body,
     snprintf(g_nt[g_n_nt].body,  sizeof g_nt[g_n_nt].body,  "%s", body ? body : "");
     g_nt[g_n_nt].ws_slot = ws_slot;
     g_nt[g_n_nt].channel_id = channel_id;
-    g_nt[g_n_nt].born = GetTickCount64();
+    g_nt[g_n_nt].born = now_ms();
     g_n_nt++;
     nt_layout();
-    ShowWindow(g_nt_hwnd, SW_SHOWNOACTIVATE);
+    SDL_ShowWindow(g_nt_win.sdl);
     g_nt_shown = 1;
     nt_paint();
 }
@@ -10218,7 +9999,7 @@ static void own_toast_show(const char *title, const char *body,
 static void nt_tick(void) {
     if (!g_n_nt) return;
     nt_paint();                    /* cheap: three rects and two strings */
-    ULONGLONG now = GetTickCount64();
+    uint64_t now = now_ms();
     int changed = 0;
     for (int i = g_n_nt - 1; i >= 0; i--) {
         if (i == g_nt_hover) continue;
@@ -10227,7 +10008,7 @@ static void nt_tick(void) {
         g_n_nt--; changed = 1;
     }
     if (!changed) return;
-    if (g_n_nt == 0) { if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE); g_nt_shown = 0; }
+    if (g_n_nt == 0) { if (g_nt_win.sdl) SDL_HideWindow(g_nt_win.sdl); g_nt_shown = 0; }
     else { nt_layout(); nt_paint(); }
 }
 
@@ -10345,10 +10126,10 @@ static void toast_action_run(int action) {
         const oc_summary_notice n = g_sum_toasts[action - FBA_SUMMARY];
         if (!n.id) return;
         g_sum_toasts[action - FBA_SUMMARY].id = 0;
-        if (n.status == OC_SUM_OK) summary_open_notice(g_main_hwnd, n.id, n.channel_id, n.scope);
+        if (n.status == OC_SUM_OK) summary_open_notice(g_main, n.id, n.channel_id, n.scope);
         else {
             oc_client_summary_dismiss(g_client, n.id);
-            summarize_start(g_main_hwnd, n.channel_id, n.scope, n.start_ms, n.end_ms);
+            summarize_start(g_main, n.channel_id, n.scope, n.start_ms, n.end_ms);
         }
     }
 }
@@ -10809,7 +10590,7 @@ static void draw_summary_float(gfx *rt, const oc_model *m, float W, float H) {
 
 /* What a click on the pane's hit `i` does, the same from the mouse and from an
  * automation invoke. */
-static void summary_hit_run(HWND hwnd, int i) {
+static void summary_hit_run(oc_win *hwnd, int i) {
     const oc_model *m = model();
     if (!m || i < 0 || i >= g_n_sumhits) return;
     if (g_sumhits[i].kind == SH_TOGGLE) sum_toggle(m, g_sumhits[i].topic);
@@ -10826,14 +10607,14 @@ static void summary_hit_run(HWND hwnd, int i) {
         fb_confirm(notify ? "We'll let you know when your summary is ready." : "Summary canceled.");
     } else {
         g_jump_mid = g_sumhits[i].mid;
-        g_jump_deadline = GetTickCount64() + 1500;
+        g_jump_deadline = now_ms() + 1500;
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Ask for a summary of `cid` over `scope` (REQ-310), and open the pane beside
  * the conversation so its citations can be gone to. */
-static void summarize_start(HWND hwnd, uint64_t cid, uint8_t scope, uint64_t rs, uint64_t re) {
+static void summarize_start(oc_win *hwnd, uint64_t cid, uint8_t scope, uint64_t rs, uint64_t re) {
     const oc_model *m = model();
     if (!g_client || !m || !cid || !oc_model_summarize_available(m)) return;
     if (cid != g_sel) select_channel(cid);
@@ -10847,7 +10628,7 @@ static void summarize_start(HWND hwnd, uint64_t cid, uint8_t scope, uint64_t rs,
 
 /* Open a summary notice (REQ-310): in its conversation, the summary as it was
  * made, in the pane beside it. */
-static void summary_open_notice(HWND hwnd, uint64_t id, uint64_t cid, uint8_t scope) {
+static void summary_open_notice(oc_win *hwnd, uint64_t id, uint64_t cid, uint8_t scope) {
     const oc_model *m = model();
     if (!g_client || !m || !id || !cid) return;
     if (cid != g_sel) select_channel(cid);
@@ -11266,7 +11047,13 @@ static void draw_signin(gfx *rt, float W, float H) {
         draw_text(rt, labels[i], g_meta, rf(fx, y, fx + fw, y + 18), OC_COL_MUTED);
         rectf box = rf(fx, y + 20, fx + fw, y + 52);
         fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
-        stroke_round(rt, box, OC_R_CONTROL, g_si_err[0] ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+        stroke_round(rt, box, OC_R_CONTROL, g_si_err[0] ? OC_COL_DANGER : g_focus == g_si_e_ws ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+        {
+            /* Room for the ".openchime.io" chip at the right edge, while it is
+             * drawn, so typed text can never run under it. */
+            float sw = (g_si_step == 1 && si_suffix_applies()) ? 8 + 7.0f * (float)(strlen(oc_default_suffix()) + 1) : 0;
+            if (g_si_e_ws) field_draw(rt, g_si_e_ws, rf(box.left + 12, box.top, box.right - 12 - sw, box.bottom), OC_COL_TEXT);
+        }
         /* Hosted mode: the service suffix is chrome, not something to type --
          * and only beside what it would be added to. An address, a port or a
          * dotted name is reached as typed, and the suffix after it read as part
@@ -11479,11 +11266,11 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
 
     g_pick_box = rf(px + 12, box_top, px + pw - 12, box_bot);
     search_box_draw(rt, g_pick_box, OC_COL_BASE);
+    if (g_pick_edit) field_draw(rt, g_pick_edit, search_text_box(g_pick_box), OC_COL_TEXT);
 
     char q[64] = "";
     if (g_pick_edit) {
-        WCHAR wq[64]; GetWindowTextW(g_pick_edit, wq, 64);
-        WideCharToMultiByte(CP_UTF8, 0, wq, -1, q, sizeof q, NULL, NULL);
+        snprintf(q, sizeof q, "%s", g_pick_edit->buf);
     }
 
     /* Skin-tone swatches, in the panel header beside the title. Drawn from a
@@ -11618,59 +11405,61 @@ static void ac_close(void);                                   /* fwd */
 static int  reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
 
 /* Open the picker for the composer (mid == 0) or for reacting to a message. */
-static void picker_open(HWND hwnd, uint64_t mid) {
+static void picker_open(oc_win *hwnd, uint64_t mid) {
+    (void)hwnd;
     g_pick_open = 1; g_pick_mid = mid; g_pick_scroll = 0;
     g_pick_target = mid ? PICK_REACT : PICK_COMPOSER;
     ac_close();
     if (g_pick_edit) {
-        SetWindowTextW(g_pick_edit, L"");
-        ShowWindow(g_pick_edit, SW_SHOW);
-        SetFocus(g_pick_edit);
+        field_set(g_pick_edit, "");
+        field_show(g_pick_edit, 1);
+        focus_set(g_pick_edit);
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* The status dialog's variant: same picker, anchored to the emoji button and
  * allowed to float over the card that opened it (the time-picker pattern). */
-static void picker_open_status(HWND hwnd, rectf anchor) {
+static void picker_open_status(oc_win *hwnd, rectf anchor) {
+    (void)hwnd;
     g_pick_open = 1; g_pick_mid = 0; g_pick_scroll = 0;
     g_pick_target = PICK_STATUS;
     g_pick_anchor = anchor;
     if (g_pick_edit) {
-        SetWindowTextW(g_pick_edit, L"");
-        ShowWindow(g_pick_edit, SW_SHOW);
-        SetFocus(g_pick_edit);
+        field_set(g_pick_edit, "");
+        field_show(g_pick_edit, 1);
+        focus_set(g_pick_edit);
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* A quick-reaction slot's variant: the same floating picker, over Preferences. */
-static void picker_open_quick(HWND hwnd, int slot, rectf anchor) {
+static void picker_open_quick(oc_win *hwnd, int slot, rectf anchor) {
     picker_open_status(hwnd, anchor);
     g_pick_target = PICK_QUICK;
     g_pick_quick_slot = slot;
 }
 
-static HWND g_status_edit;                /* fwd-declared here: picker_close
+static field *g_status_edit;              /* fwd-declared here: picker_close
                                            * hands focus back to it */
-static void picker_close(HWND hwnd) {
+static void picker_close(oc_win *hwnd) {
     int was = g_pick_target;
     g_pick_open = 0; g_pick_mid = 0;
     g_pick_target = PICK_COMPOSER;
     g_pick_quick_slot = -1;
-    if (g_pick_edit) ShowWindow(g_pick_edit, SW_HIDE);
+    if (g_pick_edit) field_show(g_pick_edit, 0);
     /* Focus goes back to whoever the picker was working for. Preferences has
      * no field of its own, so it gets the window: never the composer under
      * the card. */
-    if (was == PICK_STATUS) { if (g_status_edit) SetFocus(g_status_edit); }
-    else if (was == PICK_QUICK) { if (hwnd) SetFocus(hwnd); }
+    if (was == PICK_STATUS) { if (g_status_edit) focus_set(g_status_edit); }
+    else if (was == PICK_QUICK) { focus_set(NULL); }
     else ed_focus(hwnd);
-    if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
+    if (hwnd) invalidate();
 }
 
 /* Apply the chosen emoji to whichever caller opened the picker. */
 static char g_status_emoji[24];           /* fwd-declared: the picker fills it */
-static void picker_choose(HWND hwnd, const char *emoji) {
+static void picker_choose(oc_win *hwnd, const char *emoji) {
     if (!emoji || !g_client) { picker_close(hwnd); return; }
     if (g_pick_target == PICK_QUICK) {
         /* Only the catalogue can be a quick reaction (the set is stored as
@@ -11698,8 +11487,8 @@ static void picker_choose(HWND hwnd, const char *emoji) {
         oc_client_react(g_client, chan, g_pick_mid, emoji,
                         (msg && reaction_is_mine(msg, emoji)) ? 0 : 1);
     } else {
-        WCHAR w[16];
-        if (MultiByteToWideChar(CP_UTF8, 0, emoji, -1, w, 16) > 0) {
+        oc_wch w[16];
+        if (to_w(emoji, w, 16) > 0) {
             ed_insert(w);
         }
     }
@@ -11712,29 +11501,20 @@ static void picker_choose(HWND hwnd, const char *emoji) {
  * is typed or taken from a suggestion, and "Clear after" is prefilled from
  * the live expiry. The generic form stays for forms; this is not one. */
 
-static WNDPROC g_status_prev;
-static HFONT form_font(void);              /* fwd — the status field shares it */
-/* The status field's own proc. NOT form_edit_proc: that one forwards to the
- * FORM's saved wndproc (g_form_edit_prev), which is unset unless a generic
- * form ran first — subclassing this edit with it sent every message of a
- * visible control into a NULL proc, and the paint/caret traffic of a focused
- * EDIT became a spin that starved the timer. Same keys, own chain. */
+/* The status field's own keys: Enter commits the card, Esc closes the picker
+ * first and the card second (the dropdown rule). */
 static void modal_finish(int save);            /* fwd */
 static int  modal_open(void);                  /* fwd */
-static LRESULT CALLBACK status_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && modal_open()) {
-        if (wp == VK_RETURN) { modal_finish(1); return 0; }
-        if (wp == VK_ESCAPE) {
-            /* Picker first, card second — the dropdown rule. */
-            if (g_pick_open && g_pick_target == PICK_STATUS)
-                picker_close(GetParent(hwnd));
-            else
-                modal_finish(0);
-            return 0;
-        }
+static int status_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (!modal_open()) return 0;
+    if (key == OCK_RETURN) { modal_finish(1); return 1; }
+    if (key == OCK_ESCAPE) {
+        if (g_pick_open && g_pick_target == PICK_STATUS) picker_close(g_main);
+        else modal_finish(0);
+        return 1;
     }
-    if (msg == WM_CHAR && (wp == '\r' || wp == 27)) return 0;   /* no beep */
-    return CallWindowProcW(g_status_prev, hwnd, msg, wp, lp);
+    return 0;
 }
 
 #define STATUS_SETTING_KEY "status.recents"
@@ -11794,7 +11574,7 @@ static void status_recents_push(const char *emoji, const char *text, int clear) 
     /* MRU with case-insensitive dedupe on the text. */
     int found = -1;
     for (int i = 0; i < g_n_status_recents; i++)
-        if (!_stricmp(g_status_recents[i].text, text)) { found = i; break; }
+        if (!SDL_strcasecmp(g_status_recents[i].text, text)) { found = i; break; }
     if (found < 0) {
         if (g_n_status_recents < STATUS_RECENTS_MAX) g_n_status_recents++;
         found = g_n_status_recents - 1;
@@ -11827,7 +11607,7 @@ static void status_suggs_build(void) {
                     g_n_status_suggs < (int)(sizeof g_status_suggs / sizeof g_status_suggs[0]); i++) {
         int dup = 0;
         for (int k = 0; k < 5; k++)
-            if (!_stricmp(g_status_recents[i].text, g_status_suggs[k].text)) { dup = 1; break; }
+            if (!SDL_strcasecmp(g_status_recents[i].text, g_status_suggs[k].text)) { dup = 1; break; }
         if (dup) continue;
         snprintf(g_status_suggs[g_n_status_suggs].emoji, sizeof g_status_suggs[0].emoji, "%s", g_status_recents[i].emoji);
         snprintf(g_status_suggs[g_n_status_suggs].text,  sizeof g_status_suggs[0].text,  "%s", g_status_recents[i].text);
@@ -11854,16 +11634,13 @@ static uint64_t status_expiry_ms(int pick) {
 
 static void status_commit(void) {
     char txt[128] = "";
-    if (g_status_edit) {
-        WCHAR w[128]; GetWindowTextW(g_status_edit, w, 128);
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, txt, sizeof txt, NULL, NULL);
-    }
+    if (g_status_edit) snprintf(txt, sizeof txt, "%s", g_status_edit->buf);
     if (g_client)
         oc_client_set_status(g_client, g_status_emoji, txt, status_expiry_ms(g_status_clear));
     if (txt[0]) status_recents_push(g_status_emoji, txt, g_status_clear);
 }
 
-static void status_open(HWND hwnd) {
+static void status_open(oc_win *hwnd) {
     const oc_model *sm = model();
     g_status_emoji[0] = 0;
     g_status_clear = 0;
@@ -11887,31 +11664,14 @@ static void status_open(HWND hwnd) {
     status_recents_load(sm);
     status_suggs_build();
     if (!g_status_edit) {
-        g_status_edit = CreateWindowExW(0, L"EDIT", L"",
-            WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
-            (HMENU)(INT_PTR)0xF7, GetModuleHandleW(NULL), NULL);
-        if (g_status_edit) {
-            SendMessageW(g_status_edit, EM_SETCUEBANNER, TRUE,
-                         (LPARAM)L"What are you up to?");
-            g_status_prev = (WNDPROC)SetWindowLongPtrW(g_status_edit, GWLP_WNDPROC,
-                                                       (LONG_PTR)status_edit_proc);
-        }
+        static field fld;
+        field_init(&fld, "What are you up to?", 0, 0);
+        fld.key = status_key;
+        g_status_edit = &fld;
     }
-    /* The FORM's font, at the current text scale, re-applied on every open —
-     * the stock DEFAULT_GUI_FONT is the tiny legacy shell face and sat both
-     * small and high in the 30px box. */
-    if (g_status_edit) {
-        HFONT ff = form_font();
-        SendMessageW(g_status_edit, WM_SETFONT,
-                     ff ? (WPARAM)ff : (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    }
-    if (g_status_edit) {
-        WCHAR w[128];
-        MultiByteToWideChar(CP_UTF8, 0, cur, -1, w, 128);
-        SetWindowTextW(g_status_edit, w);
-    }
+    field_set(g_status_edit, cur);
     modal_enter(hwnd, &g_status_open);   /* paints once; rects exist after */
-    if (g_status_edit) { ShowWindow(g_status_edit, SW_SHOW); SetFocus(g_status_edit); }
+    field_show(g_status_edit, 1); focus_set(g_status_edit);
 }
 
 static void draw_status_body(gfx *rt, rectf body) {
@@ -11936,9 +11696,12 @@ static void draw_status_body(gfx *rt, rectf body) {
     g_status_erect = rf(body.left + 42, y + 2, body.right, y + 32);
     fill_round(rt, g_status_erect, OC_R_CONTROL, OC_COL_INPUT);
     {
-        int focused = (g_status_edit && GetFocus() == g_status_edit);
+        int focused = (g_status_edit && g_focus == g_status_edit);
         stroke_round(rt, g_status_erect, OC_R_CONTROL,
                      focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 1.5f : 1.0f);
+        if (g_status_edit)
+            field_draw(rt, g_status_edit, rf(g_status_erect.left + 9, g_status_erect.top,
+                                             g_status_erect.right - 9, g_status_erect.bottom), OC_COL_TEXT);
     }
     y += UIS(46.0f);
 
@@ -11983,7 +11746,7 @@ static void draw_status_body(gfx *rt, rectf body) {
  * over the status card). Returns 1 always — a click during an open picker is
  * the picker's to consume, wherever it lands. */
 static void prefs_save(void);   /* fwd */
-static int picker_click(HWND hwnd, int x, int y) {
+static int picker_click(oc_win *hwnd, int x, int y) {
     if (in_rect(g_pick_panel, (float)x, (float)y)) {
         /* A tone is a preference, so choosing one re-renders the picker
          * and stays open — it is a change to what you are looking at, not
@@ -11993,7 +11756,7 @@ static int picker_click(HWND hwnd, int x, int y) {
             if (in_rect(g_pick_tones[i].r, (float)x, (float)y)) {
                 g_skin_tone = g_pick_tones[i].tone;
                 prefs_save();
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
         for (int i = 0; i < g_n_pick_cells; i++)
@@ -12172,7 +11935,7 @@ static void draw_tip_below(gfx *rt, rectf b, const char *name, float lim0, float
 static void draw_act_tip(gfx *rt, int first, int last, float lim0, float lim1) {
     if (g_act_hover < first || g_act_hover > last) return;
     rectf b = act_rect(g_act_hover);
-    if (b.right <= b.left || GetTickCount64() - g_act_hover_since < FMT_TIP_MS) return;
+    if (b.right <= b.left || now_ms() - g_act_hover_since < FMT_TIP_MS) return;
     draw_tip(rt, b, ACT_NAME[g_act_hover], ACT_CHORD[g_act_hover], lim0, lim1);
 }
 
@@ -12201,7 +11964,7 @@ static void draw_fmt_toolbar(gfx *rt, float bx0, float by0, float bx1) {
     /* The tooltip, once the pointer has RESTED on a button (draw_tip). */
     if (g_fmt_hover >= 0 && g_fmt_hover < FMT_COUNT &&
         g_fmt_btn[g_fmt_hover].right > 0 &&
-        GetTickCount64() - g_fmt_hover_since >= FMT_TIP_MS)
+        now_ms() - g_fmt_hover_since >= FMT_TIP_MS)
         draw_tip(rt, g_fmt_btn[g_fmt_hover], FMT_NAME[g_fmt_hover], FMT_CHORD[g_fmt_hover], bx0, bx1);
 }
 
@@ -12282,7 +12045,7 @@ static void dict_draw_btn(gfx *rt, rectf r, int icon, int live, uint32_t live_co
 #define FTRAY_DONE_MS 700            /* a finished chip lingers this long, green */
 enum { FTRAY_MAX = OC_MAX_ATTACH };
 static void thumb_decode(uint64_t id, const uint8_t *data, size_t len);   /* fwd */
-static void ed_changed(HWND hwnd);                                         /* fwd */
+static void ed_changed(oc_win *hwnd);                                         /* fwd */
 typedef struct {
     char      path[1024];   /* a local file; empty when the bytes are in `mem` */
     char      name[128];
@@ -12295,7 +12058,7 @@ typedef struct {
     uint8_t   ix;           /* its place in that post */
     uint8_t   failed;       /* the last try stopped at this file */
     float     shown;        /* the bar as drawn, easing toward the real fraction */
-    ULONGLONG done_at;
+    uint64_t done_at;
     rectf     r, x;         /* the chip, and its remove / cancel button */
 } ftray_chip;
 static ftray_chip g_ftray[FTRAY_MAX];
@@ -12325,22 +12088,22 @@ static float composer_tray(void) {
 static const char *ftray_mime(const char *name) {
     const char *e = strrchr(name, '.');
     if (!e) return "";
-    if (!_stricmp(e, ".png")) return "image/png";
-    if (!_stricmp(e, ".jpg") || !_stricmp(e, ".jpeg")) return "image/jpeg";
-    if (!_stricmp(e, ".gif")) return "image/gif";
-    if (!_stricmp(e, ".bmp")) return "image/bmp";
-    if (!_stricmp(e, ".webp")) return "image/webp";
-    if (!_stricmp(e, ".mp4") || !_stricmp(e, ".webm") || !_stricmp(e, ".mov")) return "video/mp4";
+    if (!SDL_strcasecmp(e, ".png")) return "image/png";
+    if (!SDL_strcasecmp(e, ".jpg") || !SDL_strcasecmp(e, ".jpeg")) return "image/jpeg";
+    if (!SDL_strcasecmp(e, ".gif")) return "image/gif";
+    if (!SDL_strcasecmp(e, ".bmp")) return "image/bmp";
+    if (!SDL_strcasecmp(e, ".webp")) return "image/webp";
+    if (!SDL_strcasecmp(e, ".mp4") || !SDL_strcasecmp(e, ".webm") || !SDL_strcasecmp(e, ".mov")) return "video/mp4";
     return "";
 }
 
-static void ftray_changed(HWND hwnd) {
+static void ftray_changed(oc_win *hwnd) {
     if (composer_tray() != g_ftray_laid) { g_ftray_laid = composer_tray(); composer_refit(hwnd); layout_composer(hwnd); }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Add a local file (UTF-8 path) to the tray of the open conversation. */
-static void ftray_add(HWND hwnd, const char *path) {
+static void ftray_add(oc_win *hwnd, const char *path) {
     if (!g_client || !g_sel || !path || !path[0]) return;
     if (g_n_ftray == FTRAY_MAX) {
         char t[80];
@@ -12348,15 +12111,12 @@ static void ftray_add(HWND hwnd, const char *path) {
         composer_hint(t, 1);
         return;
     }
-    WCHAR wp[MAX_PATH];
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, MAX_PATH)) return;
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (!GetFileAttributesExW(wp, GetFileExInfoStandard, &fa) ||
-        (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+    struct stat fa;
+    if (stat(path, &fa) != 0 || (fa.st_mode & S_IFMT) == S_IFDIR) {
         composer_hint("That is not a file that can be attached.", 1);
         return;
     }
-    uint64_t size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    uint64_t size = (uint64_t)fa.st_size;
     const char *base = path;
     for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
     if (size > OC_MAX_ATTACHMENT_SIZE) {
@@ -12377,7 +12137,7 @@ static void ftray_add(HWND hwnd, const char *path) {
      * transcript's thumbnails use, under a key no attachment id can take. */
     if (mime_is_image(ftray_mime(base)) && size && size <= 8u * 1024u * 1024u) {
         static uint64_t seq;
-        FILE *f = _wfopen(wp, L"rb");
+        FILE *f = fopen(path, "rb");
         uint8_t *d = f ? malloc((size_t)size) : NULL;
         if (d && fread(d, 1, (size_t)size, f) == size) {
             c->thumb = (1ull << 62) | ++seq;
@@ -12392,7 +12152,7 @@ static void ftray_add(HWND hwnd, const char *path) {
 
 /* Add bytes held in memory -- an image pasted from the clipboard -- to the tray
  * of the open conversation, under `name`. Takes ownership of `data`. */
-static void ftray_add_mem(HWND hwnd, const char *name, uint8_t *data, size_t len) {
+static void ftray_add_mem(oc_win *hwnd, const char *name, uint8_t *data, size_t len) {
     if (!g_client || !g_sel || !data || !len) { free(data); return; }
     if (g_n_ftray == FTRAY_MAX) {
         char t[80];
@@ -12478,7 +12238,7 @@ static int ftray_post(const char *text) {
 /* A post that did not go: its files wait again, the one it stopped at marked,
  * and its text comes back — into the box if you are looking at an empty one,
  * otherwise as that conversation's draft, unless it already has one. */
-static void ftray_unpost(HWND hwnd, oc_client *cl, uint64_t tag, int failed_ix) {
+static void ftray_unpost(oc_win *hwnd, oc_client *cl, uint64_t tag, int failed_ix) {
     for (int i = 0; i < g_n_ftray; i++)
         if (g_ftray[i].cl == cl && g_ftray[i].tag == tag) {
             g_ftray[i].failed = failed_ix >= 0 && g_ftray[i].ix == failed_ix;
@@ -12490,10 +12250,10 @@ static void ftray_unpost(HWND hwnd, oc_client *cl, uint64_t tag, int failed_ix) 
     if (t && t[0]) {
         const oc_model *m = oc_client_model(cl);
         if (cl == g_client && g_ftray_posts[p].cid == g_sel && ed_len() == 0) {
-            WCHAR *w = NULL;
-            int wl = MultiByteToWideChar(CP_UTF8, 0, t, -1, NULL, 0);
-            if (wl > 0 && (w = malloc((size_t)wl * sizeof(WCHAR))) != NULL) {
-                MultiByteToWideChar(CP_UTF8, 0, t, -1, w, wl);
+            oc_wch *w = NULL;
+            int wl = ((int)strlen(t) + 1);
+            if (wl > 0 && (w = malloc((size_t)wl * sizeof(oc_wch))) != NULL) {
+                to_w(t, w, wl);
                 ed_set(w);
                 ed_changed(hwnd);
                 free(w);
@@ -12512,7 +12272,7 @@ static void ftray_unpost(HWND hwnd, oc_client *cl, uint64_t tag, int failed_ix) 
 /* The chip's × : a waiting file leaves the tray; a file on its way cancels its
  * whole post, since a message is posted whole or not at all, and the rest of
  * that post's files wait again. */
-static void ftray_remove(HWND hwnd, int i) {
+static void ftray_remove(oc_win *hwnd, int i) {
     if (i < 0 || i >= g_n_ftray) return;
     uint64_t tag = g_ftray[i].tag;
     oc_client *cl = g_ftray[i].cl;
@@ -12538,13 +12298,13 @@ static int ftray_state(const oc_model *m, const ftray_chip *c, float *frac) {
     return 1;
 }
 
-static void ftray_taskbar(HWND hwnd, uint64_t done, uint64_t total);   /* fwd */
+static void ftray_taskbar(oc_win *hwnd, uint64_t done, uint64_t total);   /* fwd */
 
 /* Once a frame: follow each post by its tag, ease the bars, retire what landed,
  * and give back what failed. */
-static void ftray_tick(HWND hwnd) {
+static void ftray_tick(oc_win *hwnd) {
     int moving = 0;
-    ULONGLONG now = GetTickCount64();
+    uint64_t now = now_ms();
     /* What failed first, since giving a post back changes the chips. */
     for (int i = 0; i < g_n_ftray; i++) {
         ftray_chip *c = &g_ftray[i];
@@ -12573,7 +12333,7 @@ static void ftray_tick(HWND hwnd) {
     }
     ftray_taskbar(hwnd, sum_done, sum_total);
     if (composer_tray() != g_ftray_laid) { g_ftray_laid = composer_tray(); composer_refit(hwnd); layout_composer(hwnd); moving = 1; }
-    if (moving) InvalidateRect(hwnd, NULL, FALSE);
+    if (moving) invalidate();
 }
 
 /* A workspace going away takes its chips and posts with it. */
@@ -12597,7 +12357,7 @@ static void ftray_fit(const char *s, fmtw *fmt, float w, char *out, size_t cap) 
 
 static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
     const oc_model *m = model();
-    ULONGLONG now = GetTickCount64();
+    uint64_t now = now_ms();
     float x = bx0 + COMPOSER_PAD, y = by0 + (FTRAY_H - FTRAY_CHIP_H) / 2 + UIS(2);
     float right = bx1 - COMPOSER_PAD, gap = UIS(8);
     int shown = 0, total = 0, here = ftray_count();
@@ -12627,7 +12387,7 @@ static void ftray_draw(gfx *rt, float bx0, float by0, float bx1) {
         /* The picture, or the type badge the Files view uses. */
         float pic = FTRAY_CHIP_H - UIS(12);
         rectf pr = rf(r.left + UIS(6), r.top + UIS(6), r.left + UIS(6) + pic, r.top + UIS(6) + pic);
-        UINT iw = 0, ih = 0;
+        unsigned iw = 0, ih = 0;
         gfx_tex *tex = c->thumb ? thumb_get(rt, c->thumb, &iw, &ih) : NULL;
         if (tex) {
             gfx_tex_draw(rt, tex, gr(pr), OC_R_CONTROL, 1.0f);
@@ -12729,7 +12489,7 @@ static void composer_hint_draw(gfx *rt) {
 }
 
 /* A press on a chip's × . Returns 1 if it took the click. */
-static int ftray_click(HWND hwnd, float x, float y) {
+static int ftray_click(oc_win *hwnd, float x, float y) {
     for (int i = 0; i < g_n_ftray; i++)
         if (ftray_here(&g_ftray[i]) && in_rect(g_ftray[i].x, x, y)) { ftray_remove(hwnd, i); return 1; }
     for (int i = 0; i < g_n_ftray; i++)
@@ -12966,7 +12726,7 @@ static uint64_t g_mention_cid;
 static uint32_t g_unresolved_seen;
 static uint32_t g_unresolved_total_seen;   /* REQ-308: the total that followed it */
 
-static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
+static void confirm_open(oc_win *hwnd, int act, uint64_t id, const char *title,
                          const char *body, const char *ok_label) {
     g_confirm_act = act; g_confirm_id = id;
     snprintf(g_confirm_title, sizeof g_confirm_title, "%s", title);
@@ -12976,16 +12736,16 @@ static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
 }
 
 static void link_open(const char *url);   /* fwd */
-static void cert_trust_run(HWND hwnd);    /* fwd */
+static void cert_trust_run(oc_win *hwnd);    /* fwd */
 
-static void confirm_run(HWND hwnd) {
+static void confirm_run(oc_win *hwnd) {
     (void)hwnd;
     switch (g_confirm_act) {
     case CONF_WEBHOOK_DELETE: oc_client_delete_webhook(g_client, g_confirm_id); break;
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
-    case CONF_CERT_TRUST: cert_trust_run(g_main_hwnd); break;
+    case CONF_CERT_TRUST: cert_trust_run(g_main); break;
     case CONF_LINK_OPEN: {
         char u[sizeof g_confirm_url];
         memcpy(u, g_confirm_url, sizeof u);
@@ -13049,7 +12809,7 @@ static void via_group_reason(char *buf, size_t cap, const char *name, const char
 
 /* Taking a group off a channel can take many people with it, so it is asked
  * first -- from the pane's row and the menu alike. */
-static void channel_group_remove_ask(HWND hwnd, const oc_model *m, uint64_t cid, uint64_t gid) {
+static void channel_group_remove_ask(oc_win *hwnd, const oc_model *m, uint64_t cid, uint64_t gid) {
     const oc_group_view *g = oc_model_group(m, gid);
     const oc_channel *c = oc_model_channel((oc_model *)m, cid);
     if (!g || !c) return;
@@ -13064,7 +12824,7 @@ static void channel_group_remove_ask(HWND hwnd, const oc_model *m, uint64_t cid,
 /* Add a group to a channel, or take one off: a choice of those it does not
  * have, or of those it does. The channel menu and the members pane both come
  * here. */
-static void channel_group_pick(HWND hwnd, const oc_model *m, uint64_t cid, int add) {
+static void channel_group_pick(oc_win *hwnd, const oc_model *m, uint64_t cid, int add) {
     const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
     if (!ch) return;
     uint64_t ids[64]; int n = 0;
@@ -13394,7 +13154,7 @@ static int g_form_lines[FORM_MAX_FIELDS];
 static float form_multi_h(const oc_field *f, float w) {
     /* The EDIT's own line pitch where its font exists; the five-line floor is
      * the box this field always had. */
-    float lh = g_form_font_lh > 0 ? DIPF(g_form_font_lh) : UIS(22.0f);
+    float lh = UIS(22.0f);
     float floor_h = UIS(22.0f) * (float)FORM_MULTI_MIN + UIS(8.0f);
     int lines = FORM_MULTI_MIN;
     if (f && f->value[0]) {
@@ -13555,7 +13315,7 @@ static void draw_form(gfx *rt, rectf body) {
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The focused field gets the accent ring, so tabbing is visible: the
              * EDIT itself draws no border of ours. */
-            int focused = (g_form_edit[i] && GetFocus() == g_form_edit[i]);
+            int focused = (g_form_edit[i] && g_focus == g_form_edit[i]);
             /* ONE weight for both states; only the COLOUR says which has focus.
              * A 1.0px stroke on a rounded rect antialiases to something so faint
              * at 100% that an unfocused field read as a half-drawn box beside
@@ -13566,6 +13326,8 @@ static void draw_form(gfx *rt, rectf body) {
             stroke_round(rt, box, OC_R_CONTROL,
                          i == g_form_err_field ? OC_COL_DANGER : focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
+            if (g_form_edit[i])
+                field_draw(rt, g_form_edit[i], rf(box.left + 9, box.top + 5, box.right - 9, box.bottom - 5), OC_COL_TEXT);
             if (f->hint && f->hint[0])
                 draw_text(rt, f->hint, g_meta_w,
                           rf(body.left, box.bottom + 3, body.right,
@@ -13668,16 +13430,7 @@ static void form_collect(int save) {
     if (save && g_form_f)
         for (int i = 0; i < g_form_n; i++) {
             if (!g_form_edit[i]) continue;       /* checks/choices are written on click */
-            WCHAR w[2 * sizeof g_form_f[i].value];
-            GetWindowTextW(g_form_edit[i], w, (int)(sizeof w / sizeof w[0]));
-            /* Back to plain LF: CRLF is how the EDIT keeps lines, not how anything
-             * else in the app stores text, and "\r\n" in a description is two
-             * bytes of a thousand spent on a line ending. */
-            WCHAR *d = w;
-            for (WCHAR *q = w; *q; q++) if (*q != L'\r') *d++ = *q;
-            *d = 0;
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, g_form_f[i].value,
-                                (int)sizeof g_form_f[i].value, NULL, NULL);
+            snprintf(g_form_f[i].value, sizeof g_form_f[i].value, "%s", g_form_edit[i]->buf);
         }
     g_form_result = save ? 1 : 0;
     g_form_done = 1;
@@ -13776,9 +13529,9 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
 }
 
 static void prefs_save(void);                    /* fwd */
-static void palette_close(HWND hwnd);            /* fwd */
-static void picker_close(HWND hwnd);             /* fwd */
-static void menu_dispatch(HWND hwnd, int cmd);   /* fwd */
+static void palette_close(oc_win *hwnd);            /* fwd */
+static void picker_close(oc_win *hwnd);             /* fwd */
+static void menu_dispatch(oc_win *hwnd, int cmd);   /* fwd */
 static void close_overlays(void);                /* fwd */
 
 /* ---- the four modals, described once --------------------------------------
@@ -13843,10 +13596,10 @@ static void prefs_restore(void) {
     quick_rebuild();
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
      * through the one path that knows that — and only when they actually moved. */
-    if (g_dpi != g_prefs_snap.dpi) dpi_set(GetActiveWindow(), g_prefs_snap.dpi);
+    if (g_dpi != g_prefs_snap.dpi) dpi_set(g_main, g_prefs_snap.dpi);
     if (g_pref_textsize != g_prefs_snap.textsize) {
         g_pref_textsize = g_prefs_snap.textsize;
-        scale_apply(GetActiveWindow());
+        scale_apply(g_main);
     }
 }
 
@@ -14004,7 +13757,7 @@ static int sch_first_future_slot(void) {
 
 /* Open on a sensible slot: the first half-hour at least thirty minutes away,
  * which rolls to tomorrow's midnight slot late at night. */
-static void sched_custom_open(HWND hwnd) {
+static void sched_custom_open(oc_win *hwnd) {
     time_t t = time(NULL) + 30 * 60; struct tm tv;
     if (!oc_localtime_r(&t, &tv)) return;
     int min = ((tv.tm_hour * 60 + tv.tm_min + 29) / 30) * 30;
@@ -14113,14 +13866,15 @@ static void draw_sched_custom(gfx *rt, rectf body) {
 }
 
 /* A click on the card. Returns 1 for any click inside it. */
-static int sched_custom_click(HWND hwnd, int x, int y) {
+static int sched_custom_click(oc_win *hwnd, int x, int y) {
+    (void)hwnd;
     if (in_rect(g_sch_prev, x, y)) {
         if (--g_sch_vm < 0) { g_sch_vm = 11; g_sch_vy--; }
-        InvalidateRect(hwnd, NULL, FALSE); return 1;
+        invalidate(); return 1;
     }
     if (in_rect(g_sch_next, x, y)) {
         if (++g_sch_vm > 11) { g_sch_vm = 0; g_sch_vy++; }
-        InvalidateRect(hwnd, NULL, FALSE); return 1;
+        invalidate(); return 1;
     }
     for (int i = 0; i < g_n_sch_days; i++)
         if (g_sch_days[i].on && in_rect(g_sch_days[i].r, x, y)) {
@@ -14133,12 +13887,12 @@ static int sched_custom_click(HWND hwnd, int x, int y) {
                 if (f >= 0) { g_sch_min = f; g_sch_tscroll = (float)(f / 30) * SCH_ROW_H - 3 * SCH_ROW_H; }
             }
             g_sch_err = 0;
-            InvalidateRect(hwnd, NULL, FALSE); return 1;
+            invalidate(); return 1;
         }
     for (int i = 0; i < g_n_sch_times; i++)
         if (g_sch_times[i].on && in_rect(g_sch_times[i].r, x, y)) {
             g_sch_min = g_sch_times[i].min; g_sch_err = 0;
-            InvalidateRect(hwnd, NULL, FALSE); return 1;
+            invalidate(); return 1;
         }
     return in_rect(g_modal_card, x, y);
 }
@@ -14151,8 +13905,7 @@ static int sched_custom_click(HWND hwnd, int x, int y) {
  * click; Summarize stays grey until both days are picked. */
 static oc_sumcal g_sr_cal;
 static uint64_t  g_sr_cid;
-static HWND      g_sr_edit[2];
-static WNDPROC   g_sr_prev_proc[2];
+static field    *g_sr_edit[2];
 static rectf     g_sr_erect[2], g_sr_prev, g_sr_next;
 static calday    g_sr_days[84];
 static int       g_n_sr_days;
@@ -14178,10 +13931,9 @@ static int sr_look(int y, int m, int d, int *on, void *ctx) {
 static void sr_fields_show(void) {
     for (int k = 0; k < 2; k++) {
         if (!g_sr_edit[k]) continue;
-        char t[16]; WCHAR w[16];
+        char t[16];
         oc_summary_day_text(k ? g_sr_cal.end : g_sr_cal.start, t, sizeof t);
-        MultiByteToWideChar(CP_UTF8, 0, t, -1, w, 16);
-        SetWindowTextW(g_sr_edit[k], w);
+        field_set(g_sr_edit[k], t);
     }
 }
 
@@ -14190,9 +13942,8 @@ static void sr_fields_read(void) {
     g_sr_err = NULL;
     for (int k = 0; k < 2; k++) {
         if (!g_sr_edit[k]) continue;
-        WCHAR w[32]; char t[64];
-        GetWindowTextW(g_sr_edit[k], w, 32);
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, t, sizeof t, NULL, NULL);
+        char t[64];
+        snprintf(t, sizeof t, "%s", g_sr_edit[k]->buf);
         if (!t[0]) { if (k) g_sr_cal.end = 0; else g_sr_cal.start = 0; continue; }
         uint64_t d;
         if (oc_summary_date_parse(t, &d) != 0) { if (strlen(t) >= 10) g_sr_err = "A date is written YYYY-MM-DD."; continue; }
@@ -14205,45 +13956,34 @@ static void sr_fields_read(void) {
     }
 }
 
-static LRESULT CALLBACK sr_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    int k = hwnd == g_sr_edit[1];
-    if (msg == WM_KEYDOWN && modal_open()) {
-        if (wp == VK_RETURN) { sr_fields_read(); menu_dispatch(GetParent(hwnd), 310); return 0; }
-        if (wp == VK_ESCAPE) { modal_finish(0); return 0; }
-        if (wp == VK_TAB) { SetFocus(g_sr_edit[!k]); return 0; }
-    }
-    if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == '\t')) return 0;   /* no beep */
-    LRESULT r = CallWindowProcW(g_sr_prev_proc[k], hwnd, msg, wp, lp);
-    if (msg == WM_CHAR || (msg == WM_KEYDOWN && (wp == VK_DELETE || wp == VK_BACK))) {
-        sr_fields_read();
-        InvalidateRect(GetParent(hwnd), NULL, FALSE);
-    }
-    return r;
+static int sr_key(field *f, int key, int ctrl, int shift) {
+    (void)ctrl; (void)shift;
+    int k = f == g_sr_edit[1];
+    if (!modal_open()) return 0;
+    if (key == OCK_RETURN) { sr_fields_read(); menu_dispatch(g_main, 310); return 1; }
+    if (key == OCK_ESCAPE) { modal_finish(0); return 1; }
+    if (key == OCK_TAB) { focus_set(g_sr_edit[!k]); return 1; }
+    return 0;
 }
+static void sr_changed(field *f) { (void)f; sr_fields_read(); }
 
-static void sumrange_open(HWND hwnd, uint64_t cid) {
+static void sumrange_open(oc_win *hwnd, uint64_t cid) {
     oc_sumcal_init(&g_sr_cal, (uint64_t)time(NULL) * 1000u);
     oc_sumcal_shift(&g_sr_cal, -1);          /* this month on the right, as Slack's */
     g_sr_cid = cid;
     g_sr_err = NULL;
-    static const WCHAR *const CUE[2] = { L"Start date (ex. 2026-10-05)", L"End date (ex. 2026-10-05)" };
+    static const char *const CUE[2] = { "Start date (ex. 2026-10-05)", "End date (ex. 2026-10-05)" };
+    static field flds[2];
     for (int k = 0; k < 2; k++) {
         if (!g_sr_edit[k]) {
-            g_sr_edit[k] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
-                                           (HMENU)(INT_PTR)(0xF8 + k), GetModuleHandleW(NULL), NULL);
-            if (g_sr_edit[k]) {
-                SendMessageW(g_sr_edit[k], EM_SETCUEBANNER, TRUE, (LPARAM)CUE[k]);
-                g_sr_prev_proc[k] = (WNDPROC)SetWindowLongPtrW(g_sr_edit[k], GWLP_WNDPROC, (LONG_PTR)sr_edit_proc);
-            }
+            field_init(&flds[k], CUE[k], 0, 0);
+            flds[k].key = sr_key; flds[k].changed = sr_changed;
+            g_sr_edit[k] = &flds[k];
         }
-        if (g_sr_edit[k]) {
-            HFONT ff = form_font();
-            SendMessageW(g_sr_edit[k], WM_SETFONT, ff ? (WPARAM)ff : (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-            SetWindowTextW(g_sr_edit[k], L"");
-        }
+        field_set(g_sr_edit[k], "");
     }
     modal_enter(hwnd, &g_sr_open);
-    if (g_sr_edit[0]) { ShowWindow(g_sr_edit[0], SW_SHOW); SetFocus(g_sr_edit[0]); }
+    if (g_sr_edit[0]) { field_show(g_sr_edit[0], 1); focus_set(g_sr_edit[0]); }
 }
 
 /* The card's rows, top to bottom: a label and a field over each month, the
@@ -14304,12 +14044,13 @@ static void draw_sumrange(gfx *rt, rectf body) {
         float fx = x0 + k * (mw + gap);
         draw_text(rt, LABEL[k], g_meta, rf(fx + UIS(2.0f), y, fx + mw, y + SR_LABEL_H), OC_COL_MUTED);
         rectf b = rf(fx, y + SR_LABEL_H, fx + mw, y + SR_LABEL_H + SR_FIELD_H);
-        int focused = g_sr_edit[k] && GetFocus() == g_sr_edit[k];
+        int focused = g_sr_edit[k] && g_focus == g_sr_edit[k];
         fill_round(rt, b, OC_R_CONTROL, OC_COL_INPUT);
         stroke_round(rt, b, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 2.0f : 1.0f);
         float ih = UIS(16.0f), iy = (b.top + b.bottom) / 2 - ih / 2;
         draw_lucide(rt, OC_ICON_CALENDAR, rf(b.left + UIS(11.0f), iy, b.left + UIS(11.0f) + ih, iy + ih), OC_COL_MUTED);
         g_sr_erect[k] = rf(b.left + UIS(34.0f), b.top, b.right, b.bottom);
+        if (g_sr_edit[k]) field_draw(rt, g_sr_edit[k], rf(g_sr_erect[k].left + 2, b.top, b.right - 10, b.bottom), OC_COL_TEXT);
     }
     y += SR_LABEL_H + SR_FIELD_H + SR_GAP_H;
     /* Month titles, centred over their grids; the arrows at the outer ends of
@@ -14359,20 +14100,21 @@ static void draw_sumrange(gfx *rt, rectf body) {
 }
 
 /* A click on the card. Returns 1 for any click inside it. */
-static int sumrange_click(HWND hwnd, int x, int y) {
+static int sumrange_click(oc_win *hwnd, int x, int y) {
+    (void)hwnd;
     if (in_rect(g_sr_prev, x, y) || in_rect(g_sr_next, x, y)) {
         oc_sumcal_shift(&g_sr_cal, in_rect(g_sr_prev, x, y) ? -1 : 1);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     for (int k = 0; k < 2; k++)
-        if (in_rect(g_sr_erect[k], x, y) && g_sr_edit[k]) { SetFocus(g_sr_edit[k]); return 1; }
+        if (in_rect(g_sr_erect[k], x, y) && g_sr_edit[k]) { focus_set(g_sr_edit[k]); return 1; }
     for (int i = 0; i < g_n_sr_days; i++)
         if (g_sr_days[i].on && in_rect(g_sr_days[i].r, x, y)) {
             oc_sumcal_pick(&g_sr_cal, sr_day(g_sr_days[i].y, g_sr_days[i].m, g_sr_days[i].d));
             g_sr_err = NULL;
             sr_fields_show();
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
     return in_rect(g_modal_card, x, y);
@@ -14536,7 +14278,7 @@ static const oc_modal_spec *modal_current(void) {
 
 /* Open a modal through here, so its snapshot is always taken. Forgetting that on
  * one path is how Cancel would silently become a second Save. */
-static void modal_enter(HWND hwnd, int *flag) {
+static void modal_enter(oc_win *hwnd, int *flag) {
     /* A CONFIRMATION must not move you: it is a question about what you are looking
      * at, and answering "Revoke" in Admin > Invites dumped you on Home, losing the
      * list you were working in. The your-account modals below do set VIEW_HOME,
@@ -14584,17 +14326,17 @@ static void modal_enter(HWND hwnd, int *flag) {
     g_view = keep_view ? prev_view : VIEW_HOME;
     /* The card's own field is native, so it is hidden under the dialog here, as
      * modal_finish puts it back. */
-    if (g_view == VIEW_SIGNIN) layout_signin(g_main_hwnd);
+    if (g_view == VIEW_SIGNIN) layout_signin(g_main);
     const oc_modal_spec *s = modal_current();
     if (s->snapshot) s->snapshot();
     /* Repaint NOW, so the frame's geometry exists before any click can arrive:
      * the card rect is measured during paint, and the guard in modal_frame_click
      * swallows clicks until it exists — correct, but it meant the first click after
-     * opening was silently lost. This was GetActiveWindow() at first, which is
+     * opening was silently lost. This was g_main at first, which is
      * NULL whenever our window is not in the foreground, so the invalidate did
      * nothing in exactly the case that needed it. Take the window as an argument
      * and there is nothing to be wrong about. */
-    if (hwnd) { InvalidateRect(hwnd, NULL, FALSE); UpdateWindow(hwnd); }
+    if (hwnd) { invalidate(); paint_now(); }
 }
 
 /* Close it. `commit` decides which way: Save runs commit, Cancel runs restore. */
@@ -14603,19 +14345,19 @@ static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 static void modal_finish(int save) {
     g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
     if (g_pick_open && picker_floats()) picker_close(NULL);
-    if (g_status_edit) ShowWindow(g_status_edit, SW_HIDE);
-    for (int k = 0; k < 2; k++) if (g_sr_edit[k]) ShowWindow(g_sr_edit[k], SW_HIDE);
+    if (g_status_edit) field_show(g_status_edit, 0);
+    for (int k = 0; k < 2; k++) if (g_sr_edit[k]) field_show(g_sr_edit[k], 0);
     const oc_modal_spec *s = modal_current();
     /* A confirmation's "commit" is its action. Handled here rather than through
      * spec->commit so the action can take the window handle. */
     if (g_form_open) { form_collect(save); g_form_open = 0; }
-    if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(GetActiveWindow()); }
+    if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(g_main); }
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
-    if (g_view == VIEW_SIGNIN) layout_signin(g_main_hwnd);   /* its fields, back */
+    if (g_view == VIEW_SIGNIN) layout_signin(g_main);   /* its fields, back */
     /* Back to the dialog this one was opened from (g_modal_stack). Its snapshot
      * is the one taken when IT opened and is left alone: the dialog on top was a
      * detour, not a second opening. The action above may have left instead --
@@ -14635,7 +14377,7 @@ static void modal_finish(int save) {
  * show that. */
 static char g_modal_lastclick[128] = "";
 
-static int modal_frame_click(HWND hwnd, int x, int y) {
+static int modal_frame_click(oc_win *hwnd, int x, int y) {
     (void)hwnd;
     if (!modal_open()) return 0;
     snprintf(g_modal_lastclick, sizeof g_modal_lastclick,
@@ -14678,41 +14420,43 @@ static int form_field_is_drawn(int i) {
 /* Tab and Shift+Tab across every stop in the form: each field, plus the action
  * button beside one of them. Native fields hand focus to their EDIT; drawn ones
  * hold it here, which is what makes them reachable at all. */
-static void form_focus_step(HWND owner, int dir) {
+static void form_focus_step(oc_win *owner, int dir) {
+    (void)owner;
     if (!g_form_open || g_form_n <= 0) return;
     /* Where we are now: a focused EDIT, or a drawn stop. */
     int at = g_form_focus;
     if (at < 0) {
-        HWND f = GetFocus();
-        for (int i = 0; i < g_form_n; i++) if (g_form_edit[i] == f) { at = i; break; }
+        field *f = g_focus;
+        for (int i = 0; i < g_form_n; i++) if (f && g_form_edit[i] == f) { at = i; break; }
         if (at < 0) at = dir > 0 ? -1 : g_form_n;
     }
     for (int step = 0; step <= g_form_n + 1; step++) {
         /* The action button is a stop of its own, immediately after its field. */
         if (dir > 0 && !g_form_focus_btn && at == g_form_action_field && g_form_on_action) {
-            g_form_focus = at; g_form_focus_btn = 1; SetFocus(owner); return;
+            g_form_focus = at; g_form_focus_btn = 1; focus_set(NULL); return;
         }
-        if (dir < 0 && g_form_focus_btn) { g_form_focus_btn = 0; g_form_focus = at; SetFocus(owner); return; }
+        if (dir < 0 && g_form_focus_btn) { g_form_focus_btn = 0; g_form_focus = at; focus_set(NULL); return; }
         g_form_focus_btn = 0;
         at += dir;
         if (at >= g_form_n) at = 0;
         if (at < 0) at = g_form_n - 1;
         if (dir < 0 && at == g_form_action_field && g_form_on_action) {
-            g_form_focus = at; g_form_focus_btn = 1; SetFocus(owner); return;
+            g_form_focus = at; g_form_focus_btn = 1; focus_set(NULL); return;
         }
         if (g_form_edit[at]) {
             g_form_focus = -1;
-            SetFocus(g_form_edit[at]);
-            SendMessageW(g_form_edit[at], EM_SETSEL, 0, -1);
+            focus_set(g_form_edit[at]);
+            field_select_all(g_form_edit[at]);
             return;
         }
-        if (form_field_is_drawn(at)) { g_form_focus = at; SetFocus(owner); return; }
+        if (form_field_is_drawn(at)) { g_form_focus = at; focus_set(NULL); return; }
     }
 }
 
 /* The keys a drawn field answers once it has focus: change the value, open the
  * list, press the button. Returns 1 when the key was the form's. */
-static int form_focus_key(HWND hwnd, WPARAM vk) {
+static int form_focus_key(oc_win *hwnd, int vk) {
+    (void)hwnd;
     if (!g_form_open || g_form_focus < 0 || g_form_focus >= g_form_n) return 0;
     oc_field *f = &g_form_f[g_form_focus];
     int nopt = 0;
@@ -14720,27 +14464,27 @@ static int form_focus_key(HWND hwnd, WPARAM vk) {
     if (f->hint && f->hint[0] && f->kind != FF_CHECK) nopt++;
     int val = atoi(f->value);
     if (g_form_focus_btn) {
-        if (vk == VK_SPACE || vk == VK_RETURN) {
+        if (vk == OCK_SPACE || vk == OCK_RETURN) {
             if (g_form_on_action && !g_form_action_busy) g_form_on_action(g_form_focus);
             return 1;
         }
         return 0;
     }
-    if (f->kind == FF_CHECK && (vk == VK_SPACE || vk == VK_RETURN)) {
+    if (f->kind == FF_CHECK && (vk == OCK_SPACE || vk == OCK_RETURN)) {
         snprintf(f->value, sizeof f->value, "%d", val ? 0 : 1);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
-    if (f->kind == FF_SELECT && (vk == VK_SPACE || vk == VK_RETURN)) {
+    if (f->kind == FF_SELECT && (vk == OCK_SPACE || vk == OCK_RETURN)) {
         g_form_sel_field = g_form_focus;
         g_form_sel_scroll = val - FORM_SEL_VISIBLE / 2;
         if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     if ((f->kind == FF_CHOICE || f->kind == FF_SELECT) &&
-        (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN)) {
-        int d = (vk == VK_RIGHT || vk == VK_DOWN) ? 1 : -1;
+        (vk == OCK_LEFT || vk == OCK_RIGHT || vk == OCK_UP || vk == OCK_DOWN)) {
+        int d = (vk == OCK_RIGHT || vk == OCK_DOWN) ? 1 : -1;
         int nv = val + d;
         if (nv < 0) nv = 0;
         if (nopt && nv >= nopt) nv = nopt - 1;
@@ -14748,31 +14492,31 @@ static int form_focus_key(HWND hwnd, WPARAM vk) {
             snprintf(f->value, sizeof f->value, "%d", nv);
             if (g_form_on_pick) g_form_on_pick(g_form_focus, nv);
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     return 0;
 }
 
-static int modal_key(HWND hwnd, WPARAM vk) {
+static int modal_key(oc_win *hwnd, int vk) {
     (void)hwnd;
     if (!modal_open()) return 0;
     /* A dropdown floating over the modal owns Escape first — closing the card
      * underneath it and leaving the list open is the wrong half, and the
      * pre-translate handler that would have caught this returns early while a
      * modal is up (deliberately: shortcuts must not open surfaces behind it). */
-    if (vk == VK_ESCAPE && g_tp_open) { g_tp_open = 0; return 1; }
+    if (vk == OCK_ESCAPE && g_tp_open) { g_tp_open = 0; return 1; }
     /* And for a form's open FF_SELECT list: Escape closes the list, not the card
      * it is standing on. */
-    if (vk == VK_ESCAPE && g_form_sel_field >= 0) { g_form_sel_field = -1; return 1; }
+    if (vk == OCK_ESCAPE && g_form_sel_field >= 0) { g_form_sel_field = -1; return 1; }
     if (g_form_sel_field < 0 && form_focus_key(hwnd, vk)) return 1;
     /* Same rule for an emoji picker floating over the card. */
-    if (vk == VK_ESCAPE && g_pick_open && picker_floats()) {
+    if (vk == OCK_ESCAPE && g_pick_open && picker_floats()) {
         picker_close(hwnd);
         return 1;
     }
-    if (vk == VK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
-    if (vk == VK_RETURN) {
+    if (vk == OCK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
+    if (vk == OCK_RETURN) {
         if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
         else if (g_modal_primary_cmd == MODAL_CANCEL) { modal_finish(0); g_modal_closed_by = "enter"; }
         else if (g_modal_primary_cmd != -1)  menu_dispatch(hwnd, g_modal_primary_cmd);
@@ -14807,87 +14551,42 @@ static int modal_key(HWND hwnd, WPARAM vk) {
  * and all but the last two also yield to `window_is_covered()`. A new view or a
  * new overlay has to be named in one of those predicates; it cannot silently
  * inherit somebody else's children. */
-static void layout_files_find(HWND hwnd);   /* fwd */
-static void layout_dir_find(HWND hwnd);     /* fwd */
+static void layout_files_find(oc_win *hwnd);   /* fwd */
+static void layout_dir_find(oc_win *hwnd);     /* fwd */
 
-static void layout_natives(HWND hwnd) {
-    {   /* The native children are placed against the same columns the scene
-         * draws, so they need the same scale — computed here too, because layout
-         * can run before a paint. */
-        RECT rc0; GetClientRect(hwnd, &rc0);
+static void layout_natives(oc_win *hwnd) {
+    {   /* The fields are placed against the same columns the scene draws, so
+         * they need the same scale -- computed here too, because layout can
+         * run before a paint. */
+        irect rc0; client_rect(hwnd, &rc0);
         shell_scale_update(DIPF(rc0.right), DIPF(rc0.bottom));
     }
-    search_fonts_sync();       /* before anything is placed by its line height */
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
     layout_files_find(hwnd);
     layout_dir_find(hwnd);
 
     int covered = window_is_covered();
-    if (g_pal_edit) {
-        /* The palette is itself the cover, so it does not consult `covered`. */
-        if (g_pal_open) {
-            ShowWindow(g_pal_edit, SW_SHOW);
-            search_edit_place(g_pal_edit, g_pal_box);
-        } else {
-            ShowWindow(g_pal_edit, SW_HIDE);
-        }
-    }
-    /* The form's fields are part of the modal, so they do not consult `covered` —
-     * the modal IS what covers the window. Positioned inside the rect the painter
-     * recorded, inset so the box reads as the control's border.
-     *
-     * ...but they DO consult the open FF_SELECT list, and that is the whole of
-     * why: a native child composites ABOVE the drawn scene, so a self-drawn
-     * dropdown is punched through by every EDIT it overlaps — three fields'
-     * worth of text floating on top of the list, which reads as corruption
-     * rather than as a z-order rule. There is no z-order to win here; the only
-     * answer is that the children are not shown. This is the predicate CLIENT.md
-     * requires every native child's visibility to be decided by, and a new one
-     * has to name itself here too. */
+    /* The palette is itself the cover, so it does not consult `covered`. */
+    if (g_pal_edit) field_show(g_pal_edit, g_pal_open);
+    /* The form's fields are part of the modal, so they do not consult `covered`
+     * either -- the modal IS what covers the window -- but they DO consult the
+     * open FF_SELECT list, which is drawn over them. This is the predicate
+     * CLIENT.md requires every field's visibility to be decided by, and a new
+     * one has to name itself here too. */
     int sel_list_open = g_form_open && g_form_sel_field >= 0;
     for (int i = 0; i < FORM_MAX_FIELDS; i++) {
         if (!g_form_edit[i]) continue;
-        if (sel_list_open) { ShowWindow(g_form_edit[i], SW_HIDE); continue; }
         rectf b = g_form_erect[i];
-        if (!g_form_open || b.right <= b.left) { ShowWindow(g_form_edit[i], SW_HIDE); continue; }
-        ShowWindow(g_form_edit[i], SW_SHOW);
-        MoveWindow(g_form_edit[i], PX(b.left + 9), PX(b.top + 5),
-                   PX(b.right - b.left - 18), PX(b.bottom - b.top - 10), TRUE);
+        field_show(g_form_edit[i], !sel_list_open && g_form_open && b.right > b.left);
     }
-    if (g_pick_edit) {
-        /* Over a modal only when a modal owns the picker — the one companion
-         * allowed to float above a card (the time-picker rule). */
-        if (g_pick_open && (!covered || picker_floats())) {
-            ShowWindow(g_pick_edit, SW_SHOW);
-            search_edit_place(g_pick_edit, g_pick_box);
-        } else {
-            ShowWindow(g_pick_edit, SW_HIDE);
-        }
-    }
-    for (int k = 0; k < 2; k++) {
-        /* The range card's fields, as the status field: the card owns them. */
-        if (!g_sr_edit[k]) continue;
-        rectf b = g_sr_erect[k];
-        if (g_sr_open && b.right > b.left) {
-            ShowWindow(g_sr_edit[k], SW_SHOW);
-            MoveWindow(g_sr_edit[k], PX(b.left + 2), PX(b.top + 9),
-                       PX(b.right - b.left - 12), PX(b.bottom - b.top - 18), TRUE);
-        } else {
-            ShowWindow(g_sr_edit[k], SW_HIDE);
-        }
-    }
-    if (g_status_edit) {
-        /* Like the form's fields: the status modal IS the cover and owns it. */
-        rectf b = g_status_erect;
-        if (g_status_open && b.right > b.left) {
-            ShowWindow(g_status_edit, SW_SHOW);
-            MoveWindow(g_status_edit, PX(b.left + 9), PX(b.top + 5),
-                       PX(b.right - b.left - 18), PX(b.bottom - b.top - 10), TRUE);
-        } else {
-            ShowWindow(g_status_edit, SW_HIDE);
-        }
-    }
+    /* Over a modal only when a modal owns the picker -- the one companion
+     * allowed to float above a card (the time-picker rule). */
+    if (g_pick_edit) field_show(g_pick_edit, g_pick_open && (!covered || picker_floats()));
+    /* The range card's fields, as the status field: the card owns them. */
+    for (int k = 0; k < 2; k++)
+        if (g_sr_edit[k]) field_show(g_sr_edit[k], g_sr_open && g_sr_erect[k].right > g_sr_erect[k].left);
+    if (g_status_edit) field_show(g_status_edit, g_status_open && g_status_erect.right > g_status_erect.left);
 }
 
 /* ---- paint --------------------------------------------------------------- */
@@ -14896,7 +14595,7 @@ static void layout_natives(HWND hwnd) {
  * shots). Caller wraps this in BeginDraw/EndDraw; brushes must belong to `rt`. */
 /* Views that show the channel sidebar + transcript + composer.
  *
- * Deliberately FALSE during sign-in even when the shell is drawn behind the
+ * Deliberately 0 during sign-in even when the shell is drawn behind the
  * card (g_si_overlay): this gates the native children — composer, find box —
  * and a native child composites above Direct2D, so leaving them shown would
  * punch them straight through the sign-in card. `shell_visible` is the drawing
@@ -15246,7 +14945,7 @@ static void draw_groups(gfx *rt, const oc_model *m, rectf body) {
 }
 
 /* The three texts of a group, asked for in one form. 1 if confirmed. */
-static int group_form(HWND hwnd, const char *title, char *handle, char *name, char *desc) {
+static int group_form(oc_win *hwnd, const char *title, char *handle, char *name, char *desc) {
     oc_field f[3] = {
         { FF_TEXT, "Handle", "What @ names: letters, digits, . _ -", "" },
         { FF_TEXT, "Name", "Shown beside the handle", "" },
@@ -15264,7 +14963,7 @@ static int group_form(HWND hwnd, const char *title, char *handle, char *name, ch
 }
 
 /* A click in Admin > Groups. 1 if it was one. */
-static int groups_click(HWND hwnd, const oc_model *m, int x, int y) {
+static int groups_click(oc_win *hwnd, const oc_model *m, int x, int y) {
     if (in_rect(g_grp_new_btn, x, y)) {
         char h[OC_GROUP_HANDLE_MAX + 1] = "", n[OC_GROUP_NAME_MAX + 1] = "", d[OC_GROUP_DESC_MAX + 1] = "";
         if (group_form(hwnd, "New group", h, n, d)) oc_client_create_group(g_client, h, n, d);
@@ -15993,7 +15692,7 @@ static void draw_browse(gfx *rt, const oc_model *m, rectf body) {
     ovl_end(rt, body);
 }
 
-static void copy_to_clipboard(HWND hwnd, const char *utf8);   /* fwd: tfield */
+static void copy_to_clipboard(oc_win *hwnd, const char *utf8);   /* fwd: tfield */
 static uint64_t g_tgt_blink;      /* the To: caret's phase, reset on every edit */
 
 /* ---- a one-line text field ---------------------------------------------
@@ -16010,7 +15709,7 @@ typedef struct {
     int  len;       /* bytes, never inside a character */
     int  caret;     /* byte index of the insertion point */
     int  anchor;    /* the other end of the selection; == caret when there is none */
-    WCHAR pending;  /* a high surrogate waiting for its pair */
+    oc_wch pending;  /* a high surrogate waiting for its pair */
 } tfield;
 
 static int tf_lead(const tfield *t, int i) {          /* is `i` a character start? */
@@ -16061,9 +15760,9 @@ static int tf_insert(tfield *t, const char *u8, int n) {
 
 /* One WM_CHAR. Surrogate pairs arrive as two messages and are joined here —
  * converting each half on its own dropped every astral character silently. */
-static int tf_char(tfield *t, WCHAR ch) {
+static int tf_char(tfield *t, oc_wch ch) {
     if (ch < 0x20 || ch == 0x7F) return 0;        /* control keys are not text */
-    WCHAR w[2];
+    oc_wch w[2];
     int wn = 0;
     if (ch >= 0xD800 && ch <= 0xDBFF) { t->pending = ch; return 1; }
     if (ch >= 0xDC00 && ch <= 0xDFFF) {
@@ -16071,11 +15770,11 @@ static int tf_char(tfield *t, WCHAR ch) {
         w[wn++] = t->pending; w[wn++] = ch; t->pending = 0;
     } else { t->pending = 0; w[wn++] = ch; }
     char u8[8];
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, wn, u8, (int)sizeof u8, NULL, NULL);
+    int n = to_u8n(w, wn, u8, sizeof u8);
     return tf_insert(t, u8, n) ? 1 : 1;           /* full is still the field's key */
 }
 
-static void tf_copy(const tfield *t, HWND hwnd) {
+static void tf_copy(const tfield *t, oc_win *hwnd) {
     if (!tf_has_sel(t)) return;
     int a = tf_lo(t), n = tf_hi(t) - a;
     char *s = (char *)malloc((size_t)n + 1);
@@ -16085,24 +15784,18 @@ static void tf_copy(const tfield *t, HWND hwnd) {
     free(s);
 }
 
-static int tf_paste(tfield *t, HWND hwnd) {
-    if (!OpenClipboard(hwnd)) return 0;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+static int tf_paste(tfield *t, oc_win *hwnd) {
+    (void)hwnd;
+    char *src = SDL_GetClipboardText();
     int did = 0;
-    if (h) {
-        const WCHAR *src = (const WCHAR *)GlobalLock(h);
-        if (src) {
-            /* One line: a pasted newline ends the paste rather than becoming a
-             * glyph nobody can see in a single-line field. */
-            char u8[128];
-            int wl = 0;
-            while (src[wl] && src[wl] != L'\r' && src[wl] != L'\n' && wl < 60) wl++;
-            int n = WideCharToMultiByte(CP_UTF8, 0, src, wl, u8, (int)sizeof u8, NULL, NULL);
-            did = tf_insert(t, u8, n);
-            GlobalUnlock(h);
-        }
+    if (src && src[0]) {
+        /* One line: a pasted newline ends the paste rather than becoming a
+         * glyph nobody can see in a single-line field. */
+        int n = 0;
+        while (src[n] && src[n] != '\r' && src[n] != '\n' && n < 120) n++;
+        did = tf_insert(t, src, n);
     }
-    CloseClipboard();
+    SDL_free(src);
     return did;
 }
 
@@ -16125,21 +15818,21 @@ static int tf_hit(const tfield *t, fmtw *fmt, float x0, float x) {
 
 /* The field's own keys. Returns 1 when it took the key — the caller must not let
  * anything it declines reach another field. */
-static int tf_key(tfield *t, HWND hwnd, WPARAM vk, int ctrl, int shift) {
+static int tf_key(tfield *t, oc_win *hwnd, int vk, int ctrl, int shift) {
     int before = t->caret;
     switch (vk) {
-    case VK_LEFT:  t->caret = ctrl ? tf_word_left(t, t->caret) : tf_left(t, t->caret); break;
-    case VK_RIGHT: t->caret = ctrl ? tf_word_right(t, t->caret) : tf_right(t, t->caret); break;
-    case VK_HOME:  t->caret = 0; break;
-    case VK_END:   t->caret = t->len; break;
-    case VK_BACK:
+    case OCK_LEFT:  t->caret = ctrl ? tf_word_left(t, t->caret) : tf_left(t, t->caret); break;
+    case OCK_RIGHT: t->caret = ctrl ? tf_word_right(t, t->caret) : tf_right(t, t->caret); break;
+    case OCK_HOME:  t->caret = 0; break;
+    case OCK_END:   t->caret = t->len; break;
+    case OCK_BACK:
         if (tf_has_sel(t)) { tf_del_range(t, tf_lo(t), tf_hi(t)); return 1; }
         if (t->caret > 0) {
             tf_del_range(t, ctrl ? tf_word_left(t, t->caret) : tf_left(t, t->caret), t->caret);
             return 1;
         }
         return 0;                                  /* empty: the caller may act */
-    case VK_DELETE:
+    case OCK_DELETE:
         if (tf_has_sel(t)) { tf_del_range(t, tf_lo(t), tf_hi(t)); return 1; }
         if (t->caret < t->len) { tf_del_range(t, t->caret, ctrl ? tf_word_right(t, t->caret) : tf_right(t, t->caret)); return 1; }
         return 1;
@@ -16166,12 +15859,415 @@ static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
         fill(rt, rf(x0 + wa, box.top + UIS(6), x0 + wb, box.bottom - UIS(6)), OC_COL_SELECT);
     }
     if (t->len) draw_text(rt, t->buf, fmt, rf(x0, box.top, box.right - UIS(12), box.bottom), ink);
-    if (focused && ((GetTickCount64() - g_tgt_blink) / 530) % 2 == 0) {
+    if (focused && ((now_ms() - g_tgt_blink) / 530) % 2 == 0) {
         memcpy(tmp, t->buf, (size_t)t->caret); tmp[t->caret] = 0;
         float wc = text_width(tmp, fmt);
         fill(rt, rf(x0 + wc, box.top + UIS(7), x0 + wc + 1.0f, box.bottom - UIS(7)), OC_COL_TEXT);
     }
 }
+
+/* ---- the drawn text fields: implementation ----------------------------------
+ * Declared with the window above (field, g_focus); defined here because they
+ * draw through the same helpers the rest of the scene uses. Byte indices into
+ * UTF-8, stepped on character boundaries, as tfield does. */
+
+static int fld_lead(const field *f, int i) {
+    return i <= 0 || i >= f->len || ((unsigned char)f->buf[i] & 0xC0) != 0x80;
+}
+static int fld_left(const field *f, int i)  { do { i--; } while (i > 0 && !fld_lead(f, i)); return i < 0 ? 0 : i; }
+static int fld_right(const field *f, int i) { do { i++; } while (i < f->len && !fld_lead(f, i)); return i > f->len ? f->len : i; }
+static int fld_has_sel(const field *f) { return f->caret != f->anchor; }
+static int fld_lo(const field *f) { return f->caret < f->anchor ? f->caret : f->anchor; }
+static int fld_hi(const field *f) { return f->caret > f->anchor ? f->caret : f->anchor; }
+static int fld_word_left(const field *f, int i) {
+    while (i > 0 && f->buf[fld_left(f, i)] == ' ') i = fld_left(f, i);
+    while (i > 0 && f->buf[fld_left(f, i)] != ' ') i = fld_left(f, i);
+    return i;
+}
+static int fld_word_right(const field *f, int i) {
+    while (i < f->len && f->buf[i] != ' ') i = fld_right(f, i);
+    while (i < f->len && f->buf[i] == ' ') i = fld_right(f, i);
+    return i;
+}
+static void fld_notify(field *f) { f->blink = now_ms(); if (f->changed) f->changed(f); invalidate(); }
+static void fld_del_range(field *f, int a, int b) {
+    if (a < 0) a = 0;
+    if (b > f->len) b = f->len;
+    if (a >= b) return;
+    memmove(f->buf + a, f->buf + b, (size_t)(f->len - b) + 1);
+    f->len -= b - a;
+    f->caret = f->anchor = a;
+}
+/* Returns 1 when anything was inserted. Refuses rather than truncates a
+ * character: half of one is not text. */
+static int fld_insert(field *f, const char *u8, int n) {
+    if (n <= 0) return 0;
+    if (fld_has_sel(f)) fld_del_range(f, fld_lo(f), fld_hi(f));
+    int cap = f->maxlen > 0 && f->maxlen < FIELD_BUF ? f->maxlen : FIELD_BUF - 1;
+    if (f->len + n > cap) return 0;
+    memmove(f->buf + f->caret + n, f->buf + f->caret, (size_t)(f->len - f->caret) + 1);
+    memcpy(f->buf + f->caret, u8, (size_t)n);
+    f->len += n;
+    f->caret = f->anchor = f->caret + n;
+    return 1;
+}
+
+static void field_init(field *f, const char *placeholder, int multi, int password) {
+    memset(f, 0, sizeof *f);
+    f->placeholder = placeholder;
+    f->multi = multi; f->password = password;
+    f->enabled = 1;
+}
+static void field_set(field *f, const char *utf8) {
+    size_t n = utf8 ? strlen(utf8) : 0;
+    int cap = f->maxlen > 0 && f->maxlen < FIELD_BUF ? f->maxlen : FIELD_BUF - 1;
+    if (n > (size_t)cap) n = (size_t)cap;
+    /* Never inside a character. */
+    while (n > 0 && ((unsigned char)utf8[n] & 0xC0) == 0x80) n--;
+    memcpy(f->buf, utf8 ? utf8 : "", n); f->buf[n] = 0;
+    f->len = (int)n; f->caret = f->anchor = (int)n;
+    f->scroll = 0; f->comp_len = 0; f->comp[0] = 0;
+    fld_notify(f);
+}
+static void field_select_all(field *f) { f->anchor = 0; f->caret = f->len; }
+static void field_show(field *f, int on) {
+    if (!f || f->visible == on) return;
+    f->visible = on;
+    if (!on && g_focus == f) g_focus = NULL;
+    invalidate();
+}
+
+/* What the field shows: its text, or a bullet for each character. */
+static const char *fld_shown(const field *f, char *tmp, size_t cap) {
+    if (!f->password) return f->buf;
+    size_t o = 0;
+    for (int i = 0; i < f->len; i = fld_right(f, i)) {
+        if (o + 4 > cap) break;
+        memcpy(tmp + o, "\xE2\x80\xA2", 3); o += 3;   /* U+2022 */
+    }
+    tmp[o] = 0;
+    return tmp;
+}
+/* The shown text's byte offset for a buffer offset (bullets are three bytes). */
+static int fld_shown_off(const field *f, int off) {
+    if (!f->password) return off;
+    int n = 0;
+    for (int i = 0; i < off && i < f->len; i = fld_right(f, i)) n += 3;
+    return n;
+}
+static int fld_buf_off(const field *f, int shown) {
+    if (!f->password) return shown;
+    int i = 0, n = 0;
+    while (i < f->len && n + 3 <= shown) { i = fld_right(f, i); n += 3; }
+    return i;
+}
+static fmtw *fld_fmt(const field *f) {
+    if (f->fmt) return f->fmt;
+    return f->multi ? g_meta_w : g_ui;
+}
+
+/* A layout of the shown text at the field's width, for hit-testing and the
+ * caret; a single-line field lays out unbounded and scrolls. */
+static st_layout *fld_layout(const field *f, char *tmp, size_t cap, const char **shown) {
+    fmtw *fm = fld_fmt(f);
+    if (!fm || !fm->f || !g_st) return NULL;
+    *shown = fld_shown(f, tmp, cap);
+    float w = f->multi ? (f->box.right - f->box.left) : 1.0e6f;
+    if (w < 1) w = 1;
+    return st_layout_create(g_st, fm->f, *shown, strlen(*shown), w, 1.0e6f, ST_ALIGN_LEFT);
+}
+
+static int field_line_count(field *f, float w) {
+    if (!f->multi) return 1;
+    rectf was = f->box;
+    f->box = rf(0, 0, w, 1.0e6f);
+    char tmp[FIELD_BUF * 3 + 1]; const char *shown;
+    st_layout *l = fld_layout(f, tmp, sizeof tmp, &shown);
+    f->box = was;
+    if (!l) return 1;
+    st_metrics m; st_layout_metrics(l, &m);
+    st_layout_destroy(l);
+    return m.lines < 1 ? 1 : m.lines;
+}
+
+/* The caret's rect in the layout's space, for the given buffer offset. */
+static st_rect fld_caret_rect(const field *f, st_layout *l, int off) {
+    st_rect r = st_hit_pos(l, (size_t)fld_shown_off(f, off), false);
+    if (r.h <= 0) {
+        fmtw *fm = fld_fmt(f);
+        r.h = fm ? st_line_height(g_st, fm->f) : 18.0f;
+    }
+    return r;
+}
+
+static int field_hit(const field *f, float x, float y) {
+    char tmp[FIELD_BUF * 3 + 1]; const char *shown;
+    st_layout *l = fld_layout(f, tmp, sizeof tmp, &shown);
+    if (!l) return 0;
+    float lx = x - f->box.left + (f->multi ? 0 : f->scroll);
+    float ly = y - f->box.top + (f->multi ? f->scroll : 0);
+    bool inside, trailing;
+    size_t off = st_hit_point(l, lx, ly, &inside, &trailing);
+    /* Past the end of the line it lands on: the layout's offset, not the end
+     * of the text. */
+    if (trailing) {
+        /* step to the next character boundary of the shown text */
+        size_t n = strlen(shown);
+        if (off < n) { off++; while (off < n && ((unsigned char)shown[off] & 0xC0) == 0x80) off++; }
+    }
+    st_layout_destroy(l);
+    int b = fld_buf_off(f, (int)off);
+    if (b > f->len) b = f->len;
+    while (b > 0 && b < f->len && !fld_lead(f, b)) b--;
+    return b;
+}
+
+static int field_mouse(field *f, int kind, float x, float y) {
+    if (!f->visible || !f->enabled) return 0;
+    if (kind == 0) {
+        if (!in_rect(f->box, (int)x, (int)y)) return 0;
+        focus_set(f);
+        int at = field_hit(f, x, y);
+        f->caret = at;
+        if (!mod_down(OCK_SHIFT)) f->anchor = at;
+        f->dragging = 1;
+        f->blink = now_ms();
+        invalidate();
+        return 1;
+    }
+    if (kind == 3) {
+        if (!in_rect(f->box, (int)x, (int)y)) return 0;
+        focus_set(f);
+        int at = field_hit(f, x, y);
+        f->anchor = fld_word_left(f, at);
+        f->caret = fld_word_right(f, at);
+        invalidate();
+        return 1;
+    }
+    if (kind == 1) {
+        if (!f->dragging) return 0;
+        f->caret = field_hit(f, x, y);
+        invalidate();
+        return 1;
+    }
+    if (kind == 2) {
+        if (!f->dragging) return 0;
+        f->dragging = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int field_key(field *f, int key, int ctrl, int shift) {
+    if (!f->enabled) return 0;
+    if (f->key && f->key(f, key, ctrl, shift)) { invalidate(); return 1; }
+    int before = f->caret;
+    switch (key) {
+    case OCK_LEFT:  f->caret = ctrl ? fld_word_left(f, f->caret) : fld_left(f, f->caret); break;
+    case OCK_RIGHT: f->caret = ctrl ? fld_word_right(f, f->caret) : fld_right(f, f->caret); break;
+    case OCK_HOME:
+        if (f->multi && !ctrl) { while (f->caret > 0 && f->buf[f->caret - 1] != '\n') f->caret--; }
+        else f->caret = 0;
+        break;
+    case OCK_END:
+        if (f->multi && !ctrl) { while (f->caret < f->len && f->buf[f->caret] != '\n') f->caret++; }
+        else f->caret = f->len;
+        break;
+    case OCK_UP: case OCK_DOWN: {
+        if (!f->multi) return 0;
+        char tmp[FIELD_BUF * 3 + 1]; const char *shown;
+        st_layout *l = fld_layout(f, tmp, sizeof tmp, &shown);
+        if (!l) return 1;
+        st_rect cr = fld_caret_rect(f, l, f->caret);
+        float ty = key == OCK_UP ? cr.y - cr.h / 2 : cr.y + cr.h * 1.5f;
+        bool inside, trailing;
+        size_t off = st_hit_point(l, cr.x, ty, &inside, &trailing);
+        st_layout_destroy(l);
+        if (ty < 0) off = 0;
+        f->caret = fld_buf_off(f, (int)off);
+        if (f->caret > f->len) f->caret = f->len;
+        break;
+    }
+    case OCK_BACK:
+        if (fld_has_sel(f)) { fld_del_range(f, fld_lo(f), fld_hi(f)); fld_notify(f); return 1; }
+        if (f->caret > 0) {
+            fld_del_range(f, ctrl ? fld_word_left(f, f->caret) : fld_left(f, f->caret), f->caret);
+            fld_notify(f);
+        }
+        return 1;
+    case OCK_DELETE:
+        if (fld_has_sel(f)) { fld_del_range(f, fld_lo(f), fld_hi(f)); fld_notify(f); return 1; }
+        if (f->caret < f->len) {
+            fld_del_range(f, f->caret, ctrl ? fld_word_right(f, f->caret) : fld_right(f, f->caret));
+            fld_notify(f);
+        }
+        return 1;
+    case OCK_RETURN:
+        if (!f->multi) return 0;
+        if (ctrl) return 0;
+        fld_insert(f, "\n", 1); fld_notify(f);
+        return 1;
+    case 'A': if (!ctrl) return 0; f->anchor = 0; f->caret = f->len; invalidate(); return 1;
+    case 'C': case 'X':
+        if (!ctrl) return 0;
+        if (fld_has_sel(f) && !f->password) {
+            int a = fld_lo(f), n = fld_hi(f) - a;
+            char *s = malloc((size_t)n + 1);
+            if (s) { memcpy(s, f->buf + a, (size_t)n); s[n] = 0; SDL_SetClipboardText(s); free(s); }
+        }
+        if (key == 'X' && fld_has_sel(f)) { fld_del_range(f, fld_lo(f), fld_hi(f)); fld_notify(f); }
+        return 1;
+    case 'V': {
+        if (!ctrl) return 0;
+        char *t = SDL_GetClipboardText();
+        if (t && t[0]) {
+            /* One line in a single-line field: a pasted newline ends the paste. */
+            int n = 0;
+            if (f->multi) {
+                char *d = t;
+                for (char *q = t; *q; q++) if (*q != '\r') *d++ = *q;
+                *d = 0; n = (int)(d - t);
+            } else {
+                while (t[n] && t[n] != '\r' && t[n] != '\n') n++;
+            }
+            if (fld_insert(f, t, n)) fld_notify(f);
+        }
+        SDL_free(t);
+        return 1;
+    }
+    case OCK_TAB: case OCK_ESCAPE:
+        return 0;                                   /* navigation: the owner's */
+    default:
+        return key >= 0x100 ? 0 : 0;                /* letters arrive as text */
+    }
+    if (!shift) f->anchor = f->caret;
+    f->blink = now_ms();
+    invalidate();
+    return f->caret != before || !shift;
+}
+
+static int field_text_input(field *f, const char *utf8) {
+    if (!f->enabled || !utf8) return 0;
+    f->comp_len = 0; f->comp[0] = 0;
+    int n = (int)strlen(utf8);
+    if (!f->multi) {
+        char one[256]; int o = 0;
+        for (int i = 0; utf8[i] && o < (int)sizeof one - 1; i++)
+            if (utf8[i] != '\n' && utf8[i] != '\r' && utf8[i] != '\t') one[o++] = utf8[i];
+        one[o] = 0;
+        if (fld_insert(f, one, o)) fld_notify(f);
+        return 1;
+    }
+    if (fld_insert(f, utf8, n)) fld_notify(f);
+    return 1;
+}
+
+static void field_editing(field *f, const char *utf8) {
+    snprintf(f->comp, sizeof f->comp, "%s", utf8 ? utf8 : "");
+    f->comp_len = (int)strlen(f->comp);
+    invalidate();
+}
+
+/* Text, selection, composition and caret inside `box`; the view drew the
+ * chrome. The field remembers `box` for hit-testing. */
+static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
+    f->box = box;
+    f->visible = 1;
+    fmtw *fm = fld_fmt(f);
+    if (!fm) return;
+    char tmp[FIELD_BUF * 3 + 1]; const char *shown;
+    st_layout *l = fld_layout(f, tmp, sizeof tmp, &shown);
+    int focused = (g_focus == f);
+    float lh = st_line_height(g_st, fm->f);
+    float text_y = f->multi ? box.top : box.top + ((box.bottom - box.top) - lh) / 2;
+    if (text_y < box.top) text_y = box.top;
+    /* The caret keeps itself in view: a single-line field scrolls left, a
+     * multi-line one up. */
+    if (l) {
+        st_rect cr = fld_caret_rect(f, l, f->caret);
+        if (!f->multi) {
+            float w = box.right - box.left;
+            if (cr.x - f->scroll > w - 2) f->scroll = cr.x - w + 2;
+            if (cr.x - f->scroll < 0) f->scroll = cr.x;
+            if (f->scroll < 0) f->scroll = 0;
+        } else {
+            float h = box.bottom - box.top;
+            if (cr.y + cr.h - f->scroll > h) f->scroll = cr.y + cr.h - h;
+            if (cr.y - f->scroll < 0) f->scroll = cr.y;
+            if (f->scroll < 0) f->scroll = 0;
+            st_metrics m; st_layout_metrics(l, &m);
+            f->lines = m.lines < 1 ? 1 : m.lines;
+        }
+    }
+    gfx_clip_push(rt, gr(box));
+    float ox = box.left - (f->multi ? 0 : f->scroll), oy = text_y - (f->multi ? f->scroll : 0);
+    if (!f->len && !f->comp_len) {
+        if (f->placeholder && f->placeholder[0])
+            draw_text(rt, f->placeholder, fm, rf(box.left, text_y, box.right + 4000, text_y + (f->multi ? lh : lh)), OC_COL_FAINT);
+    } else if (l) {
+        if (focused && fld_has_sel(f)) {
+            st_rect rr[64];
+            int a = fld_shown_off(f, fld_lo(f)), b = fld_shown_off(f, fld_hi(f));
+            int n = st_hit_range(l, (size_t)a, (size_t)(b - a), rr, 64);
+            for (int i = 0; i < n; i++)
+                fill(rt, rf(ox + rr[i].x, oy + rr[i].y, ox + rr[i].x + rr[i].w, oy + rr[i].y + rr[i].h), OC_COL_SELECT);
+        }
+        /* Drawn through the cached text path, at the layout's width, so what is
+         * drawn is what was measured. */
+        int wrap_was = fm->wrap;
+        rectf tr = f->multi ? rf(ox, oy, box.right, oy + 1.0e6f) : rf(ox, oy, ox + 1.0e6f, oy + lh);
+        draw_text(rt, shown, fm, tr, ink);
+        fm->wrap = wrap_was;
+        if (f->comp_len && focused) {
+            st_rect cr = fld_caret_rect(f, l, f->caret);
+            rectf cb = rf(ox + cr.x, oy + cr.y, ox + cr.x + 1.0e6f, oy + cr.y + cr.h);
+            draw_text(rt, f->comp, fm, cb, ink);
+            float cw = text_width(f->comp, fm);
+            fill(rt, rf(cb.left, cb.top + cr.h - 1, cb.left + cw, cb.top + cr.h), ink);
+        }
+    }
+    if (focused && l && ((now_ms() - f->blink) / 530) % 2 == 0) {
+        st_rect cr = fld_caret_rect(f, l, f->caret);
+        float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
+        fill(rt, rf(cx, oy + cr.y + 1, cx + 1.0f, oy + cr.y + cr.h - 1), OC_COL_TEXT);
+        /* Where an IME should put its candidates (and what a magnifier follows). */
+        SDL_Rect area = { PX(cx), PX(oy + cr.y), 1, PX(cr.h) };
+        SDL_SetTextInputArea(g_win, &area, 0);
+    }
+    gfx_clip_pop(rt);
+    if (l) st_layout_destroy(l);
+}
+
+/* The fields a pointer can reach this frame: the modal's own on top, then
+ * the palette, then the shell's boxes -- and none of the shell's while a
+ * modal covers the window. A press outside every field returns the keyboard
+ * to the window, as clicking a native window did. */
+static int fields_mouse(int kind, float x, float y) {
+    field *modal[8]; int nm = 0;
+    if (g_status_edit) modal[nm++] = g_status_edit;
+    for (int k = 0; k < 2; k++) if (g_sr_edit[k]) modal[nm++] = g_sr_edit[k];
+    for (int i = 0; i < FORM_MAX_FIELDS && nm < 8; i++) if (g_form_edit[i]) modal[nm++] = g_form_edit[i];
+    field *shell[8] = { g_pal_edit, g_pick_edit, g_srch, g_find, g_ffind, g_dir_edit, g_si_e_ws, g_si_e_user };
+    if (kind == 1 || kind == 2) {
+        /* A drag or a release belongs to the field that took the press. */
+        if (g_focus && g_focus->dragging) return field_mouse(g_focus, kind, x, y);
+        return 0;
+    }
+    for (int i = 0; i < nm; i++) if (modal[i]->visible && field_mouse(modal[i], kind, x, y)) return 1;
+    for (int i = 0; i < 8; i++) if (shell[i] && shell[i]->visible && field_mouse(shell[i], kind, x, y)) return 1;
+    if (g_si_e_pass && g_si_e_pass->visible && field_mouse(g_si_e_pass, kind, x, y)) return 1;
+    if (kind == 0 && g_focus) focus_set(NULL);
+    return 0;
+}
+
+static void focus_set(field *f) {
+    if (f && (!f->visible || !f->enabled)) f = NULL;
+    if (g_focus == f) { if (f) f->blink = now_ms(); return; }
+    g_focus = f;
+    if (f) { f->blink = now_ms(); g_ed_focus = 0; }
+    invalidate();
+}
+
 
 /* ---- the target picker (REQ-229) -------------------------------------------
  * A first-class control, not a dropdown welded to one pane: chips for what you
@@ -16207,7 +16303,7 @@ static void tgt_clear(void) {
  * saved nothing at all. */
 static void tgt_touch(void) {
     if (g_tgt_host != TGT_HOST_NEWMSG) return;     /* a group's picker has no draft */
-    g_draft_dirty = 1; g_draft_touch_ms = GetTickCount64();
+    g_draft_dirty = 1; g_draft_touch_ms = now_ms();
 }
 
 /* Whether `s` holds `needle`, ignoring case; an empty needle is in anything. */
@@ -16313,9 +16409,9 @@ static void tgt_accept(int i) {
  * selection, clipboard, and deleting in either direction. What the field declines
  * is the picker's — the list, the chips, and the two keys that leave. Nothing
  * falls past this function while the To: field has focus. */
-static int tgt_key(HWND hwnd, WPARAM vk, int ctrl, int shift) {
-    if (vk == VK_DOWN)  { if (g_n_tgt) { g_tgt_sel = g_tgt_sel + 1 >= g_n_tgt ? g_n_tgt - 1 : g_tgt_sel + 1; } return 1; }
-    if (vk == VK_UP)    { if (g_n_tgt) { g_tgt_sel = g_tgt_sel > 0 ? g_tgt_sel - 1 : 0; } return 1; }
+static int tgt_key(oc_win *hwnd, int vk, int ctrl, int shift) {
+    if (vk == OCK_DOWN)  { if (g_n_tgt) { g_tgt_sel = g_tgt_sel + 1 >= g_n_tgt ? g_n_tgt - 1 : g_tgt_sel + 1; } return 1; }
+    if (vk == OCK_UP)    { if (g_n_tgt) { g_tgt_sel = g_tgt_sel > 0 ? g_tgt_sel - 1 : 0; } return 1; }
     /* Enter takes the highlighted candidate — but only if there IS one. With
      * nothing to accept it is not the picker's key, and falls through to the
      * caller, which moves to the message. Tab is never the picker's: it is the
@@ -16324,21 +16420,21 @@ static int tgt_key(HWND hwnd, WPARAM vk, int ctrl, int shift) {
     /* ...and only while there is a QUERY. With an empty box the list is just the
      * roster, so an Enter that kept accepting from it would add whoever
      * happened to be first every time you pressed it — which is what it did. */
-    if (vk == VK_RETURN) {
+    if (vk == OCK_RETURN) {
         if (g_tgt_q.len && g_n_tgt) { tgt_accept(g_tgt_sel); return 1; }
         return 0;
     }
     /* Escape clears the query when there is one; with an empty box it is not the
      * picker's key, and the pane closes on it. */
-    if (vk == VK_ESCAPE) {
+    if (vk == OCK_ESCAPE) {
         if (!g_tgt_q.len) return 0;
         tf_clear(&g_tgt_q); tgt_rebuild(); return 1;
     }
-    if (vk == VK_TAB) return 0;                 /* the pane's key, not the field's */
+    if (vk == OCK_TAB) return 0;                 /* the pane's key, not the field's */
     {
         int had = g_tgt_q.len;
         if (tf_key(&g_tgt_q, hwnd, vk, ctrl, shift)) {
-            g_tgt_blink = GetTickCount64();
+            g_tgt_blink = now_ms();
             /* A changed query is a new list, so the highlight goes back to the
              * top: leaving it where it was let Enter accept a row that had
              * scrolled out from under it and was never on screen. */
@@ -16350,16 +16446,16 @@ static int tgt_key(HWND hwnd, WPARAM vk, int ctrl, int shift) {
      * address field does and what makes a mis-click cheap to undo. It repeats
      * only after the key is released: holding Backspace to clear a name used to
      * carry on and eat the recipients behind it. */
-    if (vk == VK_BACK) {
+    if (vk == OCK_BACK) {
         if (g_n_tgt_chip && !g_tgt_chip_armed) { g_n_tgt_chip--; g_tgt_chip_armed = 1; tgt_touch(); tgt_rebuild(); }
         return 1;
     }
     return 1;
 }
 
-static int tgt_char(WCHAR ch) {
+static int tgt_char(oc_wch ch) {
     if (!tf_char(&g_tgt_q, ch)) return 0;
-    g_tgt_blink = GetTickCount64();
+    g_tgt_blink = now_ms();
     g_tgt_sel = 0;
     tgt_rebuild();
     return 1;
@@ -16546,7 +16642,7 @@ static int grp_pick_click(int x, int y) {
     if (in_rect(g_tgt_box, x, y)) {
         g_grp_pick_focus = 1;
         g_tgt_q.caret = g_tgt_q.anchor = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)x);
-        g_tgt_blink = GetTickCount64();
+        g_tgt_blink = now_ms();
         tgt_rebuild();
         return 1;
     }
@@ -16610,7 +16706,7 @@ static int chan_pick_click(int x, int y) {
     if (in_rect(g_tgt_box, x, y)) {
         g_chan_pick_focus = 1;
         g_tgt_q.caret = g_tgt_q.anchor = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)x);
-        g_tgt_blink = GetTickCount64();
+        g_tgt_blink = now_ms();
         tgt_rebuild();
         return 1;
     }
@@ -16631,7 +16727,7 @@ static int chan_pick_click(int x, int y) {
  * `adding`: the header's Add people and the channel menu's Add someone and
  * Remove someone all come here, the last without the picker -- a person's
  * Remove is on their row. */
-static void members_open(HWND hwnd, uint64_t cid, int adding) {
+static void members_open(oc_win *hwnd, uint64_t cid, int adding) {
     if (cid != g_sel) select_channel(cid);
     if (!transcript_shell()) g_view = VIEW_HOME;
     rp_push(RP_MEMBERS);
@@ -16639,7 +16735,7 @@ static void members_open(HWND hwnd, uint64_t cid, int adding) {
     layout_composer(hwnd);
     /* The pane yields to the conversation in a narrow window; say so rather
      * than seem to do nothing. */
-    RECT rc; GetClientRect(hwnd, &rc);
+    irect rc; client_rect(hwnd, &rc);
     if (members_w(DIPF(rc.right)) <= 0)
         fb_confirm("Widen the window to show the channel's members.");
 }
@@ -16656,10 +16752,10 @@ static void members_open(HWND hwnd, uint64_t cid, int adding) {
  * is drawn into, so this pane borrows the same editor, undo stack, IME handling
  * and formatting toolbar rather than growing a second one that would drift. */
 static int         g_nm_to_focus = 1;      /* the To: field owns the keys first */
-static WCHAR       g_nm_saved[DRAFT_TEXT_MAX];  /* the text the draft holds */
+static oc_wch       g_nm_saved[DRAFT_TEXT_MAX];  /* the text the draft holds */
 static uint64_t    g_nm_wait_uid;          /* a DM we asked for, to send into */
 static char       *g_nm_pending;
-static ULONGLONG   g_nm_pending_at;   /* when it was handed over, for the deadline */
+static uint64_t   g_nm_pending_at;   /* when it was handed over, for the deadline */
 static uint64_t    g_nm_pending_when; /* 0 to send on arrival, else the scheduled time */
 
 static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
@@ -16671,11 +16767,11 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
      * appear while you typed past what had been written, and to report another
      * device's unaddressed draft as though it were this one. */
     {
-        WCHAR now[DRAFT_TEXT_MAX];
+        oc_wch now[DRAFT_TEXT_MAX];
         int n = ed_get(now, DRAFT_TEXT_MAX);
         if (n < 0) now[0] = 0;
         const char *stored = oc_model_draft(m, 0, 0);
-        if (stored && stored[0] && lstrcmpW(now, g_nm_saved) == 0)
+        if (stored && stored[0] && wcmp(now, g_nm_saved) == 0)
             snprintf(sub, sizeof sub, "Saved");
         else if (now[0])
             snprintf(sub, sizeof sub, "Saving\u2026");
@@ -16779,7 +16875,7 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
  * had decided who it was for. */
 static void newmsg_flush(void) {
     if (!g_client || !g_ed_is_newmsg) return;
-    WCHAR w[DRAFT_TEXT_MAX];
+    oc_wch w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n < 0) n = 0;
     char rcpt[160] = "";
@@ -16788,16 +16884,16 @@ static void newmsg_flush(void) {
         if (!g_tgt_chip[i].is_channel)
             used += (size_t)snprintf(rcpt + used, sizeof rcpt - used, "%s%llu",
                                      used ? "," : "", (unsigned long long)g_tgt_chip[i].id);
-    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    int blen = (wlen(w) * 3 + 1);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+    to_u8(w, b, blen);
     oc_client_set_draft_to(g_client, rcpt, b);
     {
         const oc_model *m = model();
         if (m) oc_model_draft_local_to((oc_model *)m, rcpt, b);
     }
-    lstrcpynW(g_nm_saved, w, DRAFT_TEXT_MAX);      /* what "Saved" is about */
+    wcpyn(g_nm_saved, w, DRAFT_TEXT_MAX);      /* what "Saved" is about */
     free(b);
 }
 
@@ -16828,10 +16924,10 @@ static void newmsg_restore(void) {
     g_tgt_host = TGT_HOST_NEWMSG;     /* every way into the pane comes through here */
     const char *d = m ? oc_model_draft(m, 0, 0) : NULL;
     if (d && d[0]) {
-        WCHAR w[DRAFT_TEXT_MAX];
+        oc_wch w[DRAFT_TEXT_MAX];
         to_w(d, w, DRAFT_TEXT_MAX);
         ed_set(w);
-        lstrcpynW(g_nm_saved, w, DRAFT_TEXT_MAX);
+        wcpyn(g_nm_saved, w, DRAFT_TEXT_MAX);
     } else { ed_clear(); g_nm_saved[0] = 0; }
 
     const char *rc = m ? oc_model_draft_recipients(m) : NULL;
@@ -16860,7 +16956,7 @@ static void newmsg_restore(void) {
  * One function for every door to it (the channel header's compose button, the DM
  * list's pencil, the Drafts pane's New) so they cannot come to mean different
  * things. */
-static void open_new_message(HWND hwnd) {
+static void open_new_message(oc_win *hwnd) {
     nm_editor_take();
     g_view = VIEW_NEWMSG; g_nm_to_focus = 1; tgt_clear();
     newmsg_restore(); layout_composer(hwnd);
@@ -16869,13 +16965,13 @@ static void open_new_message(HWND hwnd) {
 /* Leave the pane the way you came in. The draft is flushed first -- the pane's
  * own draft, through draft_flush's redirect -- so nothing typed is lost, and the
  * view returns to the conversation that was open. */
-static void newmsg_close(HWND hwnd) {
+static void newmsg_close(oc_win *hwnd) {
     if (g_view != VIEW_NEWMSG) return;
     nm_editor_release();
     g_view = VIEW_HOME;
     g_nm_to_focus = 1;
     layout_composer(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Resolve the chips into a conversation and post. A channel goes straight
@@ -16897,20 +16993,20 @@ static void newmsg_deliver(uint64_t cid, const char *body, uint64_t at) {
 /* Send the pane's message, or -- when `at` is non-zero -- schedule it for then.
  * Both need the same conversation, and when that conversation does not exist yet
  * both wait for the daemon to create it (REQ-224, REQ-229). */
-static void newmsg_send_at(HWND hwnd, uint64_t at) {
+static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
     if (!g_client) return;
     /* A refusal SAYS WHY. A send button that does nothing when pressed is
      * indistinguishable from one that is broken, and this one had three ways to
      * return in silence. */
     if (!g_n_tgt_chip) { composer_hint("Who is this for? Add a channel or a person above.", 0); return; }
     if (!ed_len())     { composer_hint("There is nothing to send yet.", 0); return; }
-    WCHAR w[DRAFT_TEXT_MAX];          /* ED_MAX + 1; asserted where ED_MAX lives */
+    oc_wch w[DRAFT_TEXT_MAX];          /* ED_MAX + 1; asserted where ED_MAX lives */
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n <= 0) return;
     {   /* Whitespace alone is nothing to say, exactly as the composer holds. */
         int only_ws = 1;
         for (int i = 0; i < n; i++)
-            if (w[i] != L' ' && w[i] != L'\t' && w[i] != L'\n' && w[i] != L'\r') { only_ws = 0; break; }
+            if (w[i] != u' ' && w[i] != u'\t' && w[i] != u'\n' && w[i] != u'\r') { only_ws = 0; break; }
         if (only_ws) { composer_hint("There is nothing to send yet.", 0); return; }
     }
     /* An archived channel is read-only (REQ-035). Refuse here, with the message
@@ -16927,10 +17023,10 @@ static void newmsg_send_at(HWND hwnd, uint64_t at) {
     /* One send at a time. A second press while the first is still waiting for its
      * conversation used to free the first message and replace it. */
     if (g_nm_pending) { composer_hint("Still sending the last one\u2026", 0); return; }
-    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    int blen = (wlen(w) * 3 + 1);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+    to_u8(w, b, blen);
 
     /* Empty the field FIRST. select_channel() flushes the outgoing conversation's
      * draft on its way out, and with the message still in the box it wrote the
@@ -16953,7 +17049,7 @@ static void newmsg_send_at(HWND hwnd, uint64_t at) {
         } else {   /* ask for the DM, deliver when it exists */
             free(g_nm_pending); g_nm_pending = strdup(b);
             g_nm_wait_uid = g_tgt_chip[0].id;
-            g_nm_pending_at = GetTickCount64();
+            g_nm_pending_at = now_ms();
             oc_client_open_dm(g_client, g_tgt_chip[0].id);
         }
     } else {
@@ -16962,7 +17058,7 @@ static void newmsg_send_at(HWND hwnd, uint64_t at) {
             if (!g_tgt_chip[i].is_channel) ids[k++] = g_tgt_chip[i].id;
         free(g_nm_pending); g_nm_pending = strdup(b);
         g_nm_wait_uid = 0;
-        g_nm_pending_at = GetTickCount64();
+        g_nm_pending_at = now_ms();
         g_n_group_pending = k;
         for (int i = 0; i < k; i++) g_group_pending[i] = ids[i];
         oc_client_open_group_dm(g_client, ids, k);
@@ -17071,7 +17167,7 @@ static rectf g_dnew_btn;
 /* A thread card's overflow (REQ-062). Its own numbers, like every other context
  * menu: the dropdown space is crowded and "700" here cannot be mistaken for a
  * notification level there. */
-static void thread_menu_run(HWND hwnd, int cmd) {
+static void thread_menu_run(oc_win *hwnd, int cmd) {
     (void)hwnd;
     uint64_t root = g_menu_target, cid = g_menu_target2;
     g_thread_menu_root = 0;
@@ -17120,6 +17216,7 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
      * invisible to a person, which is the worst of both. */
     g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 8 + SEARCH_BOX_H);
     search_box_draw(rt, g_dir_search_box, OC_COL_INPUT);
+    if (g_dir_edit) field_draw(rt, g_dir_edit, search_text_box(g_dir_search_box), OC_COL_TEXT);
     body.top = g_dir_search_box.bottom + 12;
 
     char filter[80];
@@ -17256,7 +17353,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     /* A refusal, said in words rather than as a code, for a few seconds from
      * when it ARRIVED -- not from when this view was next drawn, or an old one
      * greets you later as if it were news. */
-    if (m->call_error && m->call_error_seq && GetTickCount64() - g_call_err_at < 8000) {
+    if (m->call_error && m->call_error_seq && now_ms() - g_call_err_at < 8000) {
         const char *why = m->call_error == OC_ERR_CALL_FULL ? "The call is full."
                         : m->call_error == OC_ERR_NOT_CALL_STARTER ? "Only the person who started the call can end it for everyone."
                         : m->call_error == OC_ERR_CALL_UNAVAILABLE ? "Calls are unavailable on this server right now."
@@ -17513,7 +17610,7 @@ static void draw_call_view(gfx *rt, const oc_model *m, rectf reg) {
     call_btn_add(b, CC_LEAVE, "call.leave", "Leave");
     const char *hint = st.mic_error ? "The microphone could not be opened: you can listen, but not be heard."
                      : st.speaker_error ? "The speaker could not be opened."
-                     : GetTickCount64() < g_share_err_until ? "Sharing stopped: what was shared went away, or Windows refused it."
+                     : now_ms() < g_share_err_until ? "Sharing stopped: what was shared went away, or Windows refused it."
                      : st.transport ? "This network blocks the call's own route, so its audio is going through the server connection."
                      : muted ? "Muted. Hold Ctrl+Shift+Space to talk; Ctrl+Shift+M to unmute."
                      : "Ctrl+Shift+M mutes. Hold Ctrl+Shift+Space to talk while muted.";
@@ -18120,7 +18217,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             draw_tip(rt, rf(px, py, px, py), shown, NULL, 0, W);
         }
         /* The header's and the pane's icon-only buttons' names, over both. */
-        if (g_chtip && GetTickCount64() - g_chtip_since >= FMT_TIP_MS) {
+        if (g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS) {
             rectf tb = g_chtip == 1 ? g_addppl_btn : g_grp_plus;
             if (tb.right > tb.left)
                 draw_tip_below(rt, tb, g_chtip == 1 ? "Add people" : "Add a group", 0, W);
@@ -18202,13 +18299,13 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     draw_toasts(rt, W, H);  /* …and failure notices float above even those */
 }
 
-static void layout_search(HWND hwnd);
-static void layout_find(HWND hwnd);    /* fwd */
+static void layout_search(oc_win *hwnd);
+static void layout_find(oc_win *hwnd);    /* fwd */
 
-static void paint(HWND hwnd) {
+static void paint(oc_win *hwnd) {
     if (!g_gfx || !g_st) return;
     gfx *rt = g_gfx;
-    RECT rc; GetClientRect(hwnd, &rc);
+    irect rc; client_rect(hwnd, &rc);
     /* DIPs, not pixels — the scene is authored device-independent and the
      * gfx/sdltext scale (DPI x zoom) maps it at the seam. */
     scene_scale_apply();
@@ -18273,7 +18370,7 @@ static void paint(HWND hwnd) {
 typedef char draft_mirror_fits_the_field[(DRAFT_TEXT_MAX == ED_MAX + 1) ? 1 : -1];
 #define ED_UNDO  16
 
-static WCHAR g_ed[ED_MAX + 1];
+static oc_wch g_ed[ED_MAX + 1];
 static int   g_ed_len;
 static int   g_ed_caret, g_ed_anchor;      /* selection is [min, max) */
 static int   g_ed_dragging;
@@ -18308,7 +18405,7 @@ static int g_ed_tex_w, g_ed_tex_h;
  * g_ed_w2b[u16 index] = byte offset into the layout's text. */
 static int g_ed_w2b[ED_MAX + 131];
 static int g_ed_map_units;
-static ULONGLONG g_ed_blink;               /* caret phase reference */
+static uint64_t g_ed_blink;               /* caret phase reference */
 
 static size_t ed_b(int u16_off) {          /* u16 -> byte, clamped */
     if (u16_off < 0) return 0;
@@ -18325,13 +18422,13 @@ static int ed_u16(size_t byte_off) {       /* byte -> u16 (binary search) */
 }
 
 /* IME composition in progress: drawn inline at the caret, not yet in the text. */
-static WCHAR g_ed_comp[128];
+static oc_wch g_ed_comp[128];
 static int   g_ed_comp_len;
 
 /* Undo/redo: whole-text snapshots. A message is at most ED_MAX units, so a
  * snapshot is 8KB and sixteen of them is cheaper than the bookkeeping a
  * per-edit journal needs — and it cannot get out of step with the buffer. */
-typedef struct { WCHAR t[ED_MAX + 1]; int len, caret; } ed_snap;
+typedef struct { oc_wch t[ED_MAX + 1]; int len, caret; } ed_snap;
 static ed_snap g_ed_undo[ED_UNDO], g_ed_redo[ED_UNDO];
 static int g_ed_n_undo, g_ed_n_redo;
 
@@ -18398,7 +18495,7 @@ static void ed_hidden_build(void) {
      * safe to ship a switch between them. */
     if (!g_pref_richtext) return;
     if (g_ed_len <= 0) return;
-    bytes = WideCharToMultiByte(CP_UTF8, 0, g_ed, g_ed_len, u8, (int)sizeof u8 - 1, NULL, NULL);
+    bytes = to_u8n(g_ed, g_ed_len, u8, (int)sizeof u8 - 1);
     if (bytes <= 0) return;
     u8[bytes] = 0;
     n = oc_rt_scan(u8, (size_t)bytes, sp, OC_RT_MAX);
@@ -18420,8 +18517,8 @@ static void ed_hidden_build(void) {
         if (i + 1 < n && sp[i + 1].start == sp[i].start + sp[i].len &&
             (sp[i + 1].style | OC_RT_DELIM) == sp[i].style)
             kind = ED_H_OPEN;
-        at  = MultiByteToWideChar(CP_UTF8, 0, u8, (int)sp[i].start, NULL, 0);
-        len = MultiByteToWideChar(CP_UTF8, 0, u8 + sp[i].start, (int)sp[i].len, NULL, 0);
+        at  = to_w_count(u8, (int)sp[i].start);
+        len = to_w_count(u8 + sp[i].start, (int)sp[i].len);
         if (at < 0 || len <= 0) continue;
         for (k = at; k < at + len && k < g_ed_len; k++) g_ed_hidden[k] = kind;
     }
@@ -18449,14 +18546,14 @@ static void ed_delete_range(int a, int b);   /* fwd */
  * Any caret move, click, undo, mode switch or buffer replacement clears both:
  * they describe what the NEXT keystroke means, and after any of those it no
  * longer means it. */
-static WCHAR g_ed_pending[4];
+static oc_wch g_ed_pending[4];
 static int   g_ed_n_pending;
 static int   g_ed_cont;
 static void ed_intent_clear(void) { g_ed_n_pending = 0; g_ed_cont = 0; }
 
 /* The buffer as it was before the current edit, and what was invisible in it.
  * Kept for one reason: see ed_repair_orphans(). */
-static WCHAR         g_ed_prev[ED_MAX + 1];
+static oc_wch         g_ed_prev[ED_MAX + 1];
 static int           g_ed_prev_len;
 static unsigned char g_ed_prev_hidden[ED_MAX + 1];
 
@@ -18533,7 +18630,7 @@ static void ed_repair_orphans(void) {
 static void ed_remember(void) {
     if (!g_ed_hidden_valid) ed_hidden_build();
     g_ed_prev_len = g_ed_len;
-    memcpy(g_ed_prev, g_ed, (size_t)(g_ed_len + 1) * sizeof(WCHAR));
+    memcpy(g_ed_prev, g_ed, (size_t)(g_ed_len + 1) * sizeof(oc_wch));
     memcpy(g_ed_prev_hidden, g_ed_hidden, (size_t)g_ed_len);
 }
 
@@ -18592,13 +18689,13 @@ static void ed_snap_push(ed_snap *stack, int *n) {
         (*n)--;
     }
     ed_snap *s = &stack[(*n)++];
-    memcpy(s->t, g_ed, (size_t)(g_ed_len + 1) * sizeof(WCHAR));
+    memcpy(s->t, g_ed, (size_t)(g_ed_len + 1) * sizeof(oc_wch));
     s->len = g_ed_len;
     s->caret = g_ed_caret;
 }
 
 static void ed_snap_apply(const ed_snap *s) {
-    memcpy(g_ed, s->t, (size_t)(s->len + 1) * sizeof(WCHAR));
+    memcpy(g_ed, s->t, (size_t)(s->len + 1) * sizeof(oc_wch));
     g_ed_len = s->len;
     g_ed_caret = g_ed_anchor = s->caret > s->len ? s->len : s->caret;
     ed_invalidate_layout();
@@ -18629,20 +18726,20 @@ static void ed_delete_range(int a, int b) {
     if (a < 0) a = 0;
     if (b > g_ed_len) b = g_ed_len;
     if (a >= b) return;
-    memmove(g_ed + a, g_ed + b, (size_t)(g_ed_len - b + 1) * sizeof(WCHAR));
+    memmove(g_ed + a, g_ed + b, (size_t)(g_ed_len - b + 1) * sizeof(oc_wch));
     g_ed_len -= (b - a);
     g_ed_caret = g_ed_anchor = a;
     ed_invalidate_layout();
 }
 
-static void ed_insert_n(const WCHAR *s, int n) {
+static void ed_insert_n(const oc_wch *s, int n) {
     if (!s || n <= 0) return;
     if (ed_has_sel()) ed_delete_range(ed_sel_lo(), ed_sel_hi());
     if (g_ed_len + n > ED_MAX) n = ED_MAX - g_ed_len;   /* a cap, not a crash */
     if (n <= 0) return;
     memmove(g_ed + g_ed_caret + n, g_ed + g_ed_caret,
-            (size_t)(g_ed_len - g_ed_caret + 1) * sizeof(WCHAR));
-    memcpy(g_ed + g_ed_caret, s, (size_t)n * sizeof(WCHAR));
+            (size_t)(g_ed_len - g_ed_caret + 1) * sizeof(oc_wch));
+    memcpy(g_ed + g_ed_caret, s, (size_t)n * sizeof(oc_wch));
     g_ed_len += n;
     g_ed_caret += n;
     g_ed_anchor = g_ed_caret;
@@ -18660,36 +18757,36 @@ static int  ed_caret_pos(void) { return g_ed_caret; }
  * land in the address line is the field lying about where you are typing. */
 static int  ed_focused(void) { return g_ed_focus && !(g_view == VIEW_NEWMSG && g_nm_to_focus); }
 
-static int ed_get(WCHAR *out, int cap) {
+static int ed_get(oc_wch *out, int cap) {
     int n = g_ed_len < cap - 1 ? g_ed_len : cap - 1;
     if (n < 0) n = 0;
-    memcpy(out, g_ed, (size_t)n * sizeof(WCHAR));
+    memcpy(out, g_ed, (size_t)n * sizeof(oc_wch));
     out[n] = 0;
     return n;
 }
 
-static void ed_set(const WCHAR *s) {
+static void ed_set(const oc_wch *s) {
     ed_intent_clear();
     ed_begin_edit();
-    int n = s ? lstrlenW(s) : 0;
+    int n = s ? wlen(s) : 0;
     if (n > ED_MAX) n = ED_MAX;
-    if (n > 0) memcpy(g_ed, s, (size_t)n * sizeof(WCHAR));
+    if (n > 0) memcpy(g_ed, s, (size_t)n * sizeof(oc_wch));
     g_ed_len = n; g_ed[n] = 0;
     g_ed_caret = g_ed_anchor = n;               /* caret to end, as EM_SETSEL -2 did */
     g_ed_scroll = 0;
     ed_invalidate_layout();
 }
 
-static void ed_clear(void) { ed_set(L""); g_ed_n_undo = g_ed_n_redo = 0; }
+static void ed_clear(void) { ed_set(u""); g_ed_n_undo = g_ed_n_redo = 0; }
 
-static void ed_insert(const WCHAR *s) { ed_begin_edit(); ed_insert_n(s, s ? lstrlenW(s) : 0); }
+static void ed_insert(const oc_wch *s) { ed_begin_edit(); ed_insert_n(s, s ? wlen(s) : 0); }
 
-static void ed_replace_range(int a, int b, const WCHAR *s) {
+static void ed_replace_range(int a, int b, const oc_wch *s) {
     ed_intent_clear();
     ed_begin_edit();
     g_ed_caret = g_ed_anchor = a;
     ed_delete_range(a, b);
-    ed_insert_n(s, s ? lstrlenW(s) : 0);
+    ed_insert_n(s, s ? wlen(s) : 0);
 }
 
 static void ed_select_all(void) { g_ed_anchor = 0; g_ed_caret = g_ed_len; }
@@ -18713,7 +18810,7 @@ static void ed_select_all(void) { g_ed_anchor = 0; g_ed_caret = g_ed_len; }
  * wraps a multi-line range one line at a time, because a run cannot cross a
  * line break. */
 
-static int ed_is_space(WCHAR c) { return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r'; }
+static int ed_is_space(oc_wch c) { return c == u' ' || c == u'\t' || c == u'\n' || c == u'\r'; }
 
 /* The run of invisible CLOSERS starting at `pos`. Caret positions canonicalise
  * left, so a caret at the back edge of a formatted run sits with the closers
@@ -18728,11 +18825,11 @@ static int ed_closer_run_at(int pos) {
  * nearest invisible `d0` on each side, walking through content and other
  * styles' delimiters, stopping at a line break (a run cannot cross one).
  * Fills the innermost delimiter offsets when it does. */
-static int ed_enclosing_run(int a, int b, WCHAR d0, int *op, int *cl) {
+static int ed_enclosing_run(int a, int b, oc_wch d0, int *op, int *cl) {
     int k, found = 0;
     for (k = a; k > 0; k--) {
-        WCHAR c = g_ed[k - 1];
-        if (c == L'\n') return 0;
+        oc_wch c = g_ed[k - 1];
+        if (c == u'\n') return 0;
         if (ed_char_hidden(k - 1) && c == d0) {
             if (ed_char_hidden(k - 1) != ED_H_OPEN) return 0;   /* after a closed run */
             *op = k - 1;
@@ -18742,8 +18839,8 @@ static int ed_enclosing_run(int a, int b, WCHAR d0, int *op, int *cl) {
     }
     if (!found) return 0;
     for (k = b; k < g_ed_len; k++) {
-        WCHAR c = g_ed[k];
-        if (c == L'\n') return 0;
+        oc_wch c = g_ed[k];
+        if (c == u'\n') return 0;
         if (ed_char_hidden(k) && c == d0) {
             if (ed_char_hidden(k) != ED_H_CLOSE) return 0;
             *cl = k;
@@ -18755,14 +18852,14 @@ static int ed_enclosing_run(int a, int b, WCHAR d0, int *op, int *cl) {
 
 /* Wrap (or unwrap) the selection in `d` — see the module comment above for
  * the rules. */
-static void ed_fmt_inline(const WCHAR *d) {
-    int dl = lstrlenW(d);
+static void ed_fmt_inline(const oc_wch *d) {
+    int dl = wlen(d);
     int a = ed_sel_lo(), b = ed_sel_hi();
     /* A toggle FROM a selection leaves the text selected (the second press is
      * the undo); a toggle from a bare caret collapses back to one — leaving
      * the word selected meant the next keystroke silently replaced it. */
     int had_sel = a < b;
-    size_t db = (size_t)dl * sizeof(WCHAR);
+    size_t db = (size_t)dl * sizeof(oc_wch);
 
     /* Trim to the non-space core. A delimiter next to a space is not a
      * delimiter (MARKDOWN.md §2.1), so wrapping the trailing space a
@@ -18817,7 +18914,7 @@ static void ed_fmt_inline(const WCHAR *d) {
         }
     }
     if (a >= b) {
-        /* No selection: take the WORD the caret is in or against, the way every
+        /* No selection: take the uint16_t the caret is in or against, the way every
          * editor with a bold button does. The scan stops at INVISIBLE
          * characters as well as spaces — a word at the edge of a formatted run
          * must not swallow that run's delimiters into itself, which is how a
@@ -18837,7 +18934,7 @@ static void ed_fmt_inline(const WCHAR *d) {
              * press ends the continuation. */
             if (g_ed_cont && dl == 1) {
                 int w = g_ed_caret;
-                while (w > 0 && (g_ed[w - 1] == L' ' || g_ed[w - 1] == L'\t')) w--;
+                while (w > 0 && (g_ed[w - 1] == u' ' || g_ed[w - 1] == u'\t')) w--;
                 if (w > 0 && ed_char_hidden(w - 1) == ED_H_CLOSE && g_ed[w - 1] == d[0]) {
                     g_ed_cont = 0;
                     return;
@@ -18846,7 +18943,7 @@ static void ed_fmt_inline(const WCHAR *d) {
             for (int i = 0; i < g_ed_n_pending; i++)
                 if (g_ed_pending[i] == d[0]) {
                     memmove(&g_ed_pending[i], &g_ed_pending[i + 1],
-                            (size_t)(g_ed_n_pending - i - 1) * sizeof(WCHAR));
+                            (size_t)(g_ed_n_pending - i - 1) * sizeof(oc_wch));
                     g_ed_n_pending--;
                     return;
                 }
@@ -18938,7 +19035,7 @@ static void ed_fmt_inline(const WCHAR *d) {
         int segs[16][2], nseg = 0, i2 = a;
         while (i2 < b && nseg < 16) {
             int e3 = i2;
-            while (e3 < b && g_ed[e3] != L'\n') e3++;
+            while (e3 < b && g_ed[e3] != u'\n') e3++;
             int s3 = i2, t3 = e3;
             while (s3 < t3 && ed_is_space(g_ed[s3])) s3++;
             while (t3 > s3 && ed_is_space(g_ed[t3 - 1])) t3--;
@@ -18964,22 +19061,22 @@ static void ed_fmt_inline(const WCHAR *d) {
  * of the toolbar is to write what that function reads. */
 static int ed_block_marker(int p, int kind, int *at, int *len) {
     int i = p, q;
-    while (i < g_ed_len && (g_ed[i] == L' ' || g_ed[i] == L'\t')) i++;
+    while (i < g_ed_len && (g_ed[i] == u' ' || g_ed[i] == u'\t')) i++;
     if (at) *at = i;
     if (kind == FMT_QUOTE) {
-        if (i < g_ed_len && g_ed[i] == L'>') {
-            if (len) *len = (i + 1 < g_ed_len && g_ed[i + 1] == L' ') ? 2 : 1;
+        if (i < g_ed_len && g_ed[i] == u'>') {
+            if (len) *len = (i + 1 < g_ed_len && g_ed[i + 1] == u' ') ? 2 : 1;
             return 1;
         }
     } else if (kind == FMT_BULLET) {
-        if (i + 1 < g_ed_len && g_ed[i] == L'-' && g_ed[i + 1] == L' ') {
+        if (i + 1 < g_ed_len && g_ed[i] == u'-' && g_ed[i + 1] == u' ') {
             if (len) *len = 2;
             return 1;
         }
     } else {
         q = i;
-        while (q < g_ed_len && g_ed[q] >= L'0' && g_ed[q] <= L'9') q++;
-        if (q > i && q + 1 < g_ed_len && g_ed[q] == L'.' && g_ed[q + 1] == L' ') {
+        while (q < g_ed_len && g_ed[q] >= u'0' && g_ed[q] <= u'9') q++;
+        if (q > i && q + 1 < g_ed_len && g_ed[q] == u'.' && g_ed[q + 1] == u' ') {
             if (len) *len = q + 2 - i;
             return 1;
         }
@@ -18995,11 +19092,11 @@ static void ed_fmt_block(int kind) {
     int starts[256];                    /* a bound, not a guess: a 256-line block
                                          * toggle is past what ED_MAX can hold in
                                          * anything but empty lines */
-    while (ls > 0 && g_ed[ls - 1] != L'\n') ls--;
-    while (le < g_ed_len && g_ed[le] != L'\n') le++;
+    while (ls > 0 && g_ed[ls - 1] != u'\n') ls--;
+    while (le < g_ed_len && g_ed[le] != u'\n') le++;
     for (i = ls; i <= le && n < (int)(sizeof starts / sizeof starts[0]); ) {
         starts[n++] = i;
-        while (i < le && g_ed[i] != L'\n') i++;
+        while (i < le && g_ed[i] != u'\n') i++;
         if (i < le) i++; else break;
     }
     for (i = 0; i < n; i++)
@@ -19015,12 +19112,12 @@ static void ed_fmt_block(int kind) {
                 le -= len;
             }
         } else if (!ed_block_marker(starts[i], kind, &at, NULL)) {
-            WCHAR pre[12];
+            oc_wch pre[12];
             /* Numbered by POSITION in the block, not by iteration order, so a
              * list reads 1. 2. 3. however it was built. */
-            if (kind == FMT_ORDERED) wsprintfW(pre, L"%d. ", i + 1);
-            else lstrcpyW(pre, kind == FMT_QUOTE ? L"> " : L"- ");
-            len = lstrlenW(pre);
+            if (kind == FMT_ORDERED) { char tmp[16]; snprintf(tmp, sizeof tmp, "%d. ", i + 1); to_w(tmp, pre, 20); }
+            else wcpyn(pre, kind == FMT_QUOTE ? u"> " : u"- ", 20);
+            len = wlen(pre);
             g_ed_caret = g_ed_anchor = at;
             ed_insert_n(pre, len);
             le += len;
@@ -19061,15 +19158,15 @@ static void ed_newline(void) {
     }
     ed_intent_clear();
     int ls = g_ed_caret, le = g_ed_caret, at = 0, len = 0, kind = -1, i, empty = 1;
-    while (ls > 0 && g_ed[ls - 1] != L'\n') ls--;
-    while (le < g_ed_len && g_ed[le] != L'\n') le++;
+    while (ls > 0 && g_ed[ls - 1] != u'\n') ls--;
+    while (le < g_ed_len && g_ed[le] != u'\n') le++;
     if      (ed_block_marker(ls, FMT_BULLET,  &at, &len)) kind = FMT_BULLET;
     else if (ed_block_marker(ls, FMT_ORDERED, &at, &len)) kind = FMT_ORDERED;
     else if (ed_block_marker(ls, FMT_QUOTE,   &at, &len)) kind = FMT_QUOTE;
-    if (kind < 0) { ed_insert(L"\n"); return; }
+    if (kind < 0) { ed_insert(u"\n"); return; }
 
     for (i = at + len; i < le; i++)
-        if (g_ed[i] != L' ' && g_ed[i] != L'\t') { empty = 0; break; }
+        if (g_ed[i] != u' ' && g_ed[i] != u'\t') { empty = 0; break; }
     ed_begin_edit();
     if (empty) {                        /* the way out of the list */
         ed_delete_range(at, at + len);
@@ -19077,36 +19174,36 @@ static void ed_newline(void) {
         return;
     }
     {
-        WCHAR pre[20];
+        oc_wch pre[20];
         if (kind == FMT_ORDERED) {
             int num = 0;
-            for (i = at; i < g_ed_len && g_ed[i] >= L'0' && g_ed[i] <= L'9'; i++)
-                num = num * 10 + (g_ed[i] - L'0');
-            wsprintfW(pre, L"\n%d. ", num + 1);
-        } else lstrcpyW(pre, kind == FMT_QUOTE ? L"\n> " : L"\n- ");
+            for (i = at; i < g_ed_len && g_ed[i] >= u'0' && g_ed[i] <= u'9'; i++)
+                num = num * 10 + (g_ed[i] - u'0');
+            { char tmp[16]; snprintf(tmp, sizeof tmp, "\n%d. ", num + 1); to_w(tmp, pre, 20); }
+        } else wcpyn(pre, kind == FMT_QUOTE ? u"\n> " : u"\n- ", 20);
         /* From the END of the item, not from mid-word: Shift+Enter with the
          * caret in the middle of "one" would otherwise split the text across
          * the marker and leave half of it above. */
         g_ed_caret = g_ed_anchor = le;
-        ed_insert_n(pre, lstrlenW(pre));
+        ed_insert_n(pre, wlen(pre));
     }
 }
 
 /* One entry point for both the toolbar and the chords, so they cannot drift. */
 static void ed_format(int what) {
     switch (what) {
-    case FMT_BOLD:   ed_fmt_inline(L"*"); break;
-    case FMT_ITALIC: ed_fmt_inline(L"_"); break;
-    case FMT_STRIKE: ed_fmt_inline(L"~"); break;
-    case FMT_CODE:   ed_fmt_inline(L"`"); break;
+    case FMT_BOLD:   ed_fmt_inline(u"*"); break;
+    case FMT_ITALIC: ed_fmt_inline(u"_"); break;
+    case FMT_STRIKE: ed_fmt_inline(u"~"); break;
+    case FMT_CODE:   ed_fmt_inline(u"`"); break;
     default:         ed_fmt_block(what);  break;
     }
 }
 
-static void ed_focus(HWND hwnd) {
+static void ed_focus(oc_win *hwnd) {
     g_ed_focus = 1;
-    g_ed_blink = GetTickCount64();
-    if (hwnd) SetFocus(hwnd);                   /* the MAIN window owns the keys */
+    g_ed_blink = now_ms();
+    if (hwnd) focus_set(NULL);                   /* the MAIN window owns the keys */
 }
 
 /* The layout, rebuilt only when the text or the width changed. The composition
@@ -19115,11 +19212,11 @@ static void ed_focus(HWND hwnd) {
 static st_layout *ed_layout(float w) {
     if (g_ed_layout && g_ed_layout_w == w) return g_ed_layout;
     ed_invalidate_layout();
-    WCHAR tmp[ED_MAX + 130];
+    oc_wch tmp[ED_MAX + 130];
     int n = 0;
-    memcpy(tmp, g_ed, (size_t)g_ed_caret * sizeof(WCHAR)); n = g_ed_caret;
-    if (g_ed_comp_len) { memcpy(tmp + n, g_ed_comp, (size_t)g_ed_comp_len * sizeof(WCHAR)); n += g_ed_comp_len; }
-    memcpy(tmp + n, g_ed + g_ed_caret, (size_t)(g_ed_len - g_ed_caret) * sizeof(WCHAR));
+    memcpy(tmp, g_ed, (size_t)g_ed_caret * sizeof(oc_wch)); n = g_ed_caret;
+    if (g_ed_comp_len) { memcpy(tmp + n, g_ed_comp, (size_t)g_ed_comp_len * sizeof(oc_wch)); n += g_ed_comp_len; }
+    memcpy(tmp + n, g_ed + g_ed_caret, (size_t)(g_ed_len - g_ed_caret) * sizeof(oc_wch));
     n += g_ed_len - g_ed_caret;
     tmp[n] = 0;
 
@@ -19209,39 +19306,29 @@ static int ed_lines(float w) {
  * it does NOT go away by itself, because our CreateCaret adopts the thread's
  * caret, so if a native EDIT had shown one, ours blinks wherever it was last
  * put. That is the bar left sitting at the bottom of the Drafts pane. */
-static int   g_caret_owned;
-static POINT g_caret_at = { -32768, -32768 };
+static int    g_caret_owned;
+static ipoint g_caret_at = { -32768, -32768 };
 
 static void ed_caret_kill(void) {
     if (!g_caret_owned) return;
-    DestroyCaret();
     g_caret_owned = 0;
     g_caret_at.x = g_caret_at.y = -32768;
 }
 
-/* `cr` is the caret rect in DIPs, as the field draws it. */
+/* `cr` is the caret rect in DIPs, as the field draws it. Told to the platform
+ * as the text input area: what an IME puts its candidates by and what a
+ * magnifier follows. */
 static void ed_caret_sync(rectf cr) {
     if (!ed_focused()) { ed_caret_kill(); return; }
     g_caret_placed = 1;
     int h = PX(cr.bottom - cr.top);
     if (h < 1) h = 1;
-    if (!g_caret_owned) {
-        /* The caret belongs to the focused window by definition, and ed_focus()
-         * puts focus on the MAIN window (the composer is drawn, not a child), so
-         * GetFocus() is the right owner without threading an HWND through the
-         * paint pass. If focus has gone elsewhere there is no caret to own.
-         *
-         * One device pixel wide and never shown: this caret exists to be
-         * reported, not seen — see the call site in ed_draw. */
-        HWND owner = GetFocus();
-        if (!owner || !CreateCaret(owner, NULL, 1, h)) return;
-        g_caret_owned = 1;
-        g_caret_at.x = g_caret_at.y = -32768;
-    }
-    POINT p = { PX(cr.left), PX(cr.top) };
+    g_caret_owned = 1;
+    ipoint p = { PX(cr.left), PX(cr.top) };
     if (p.x == g_caret_at.x && p.y == g_caret_at.y) return;   /* no event churn */
     g_caret_at = p;
-    SetCaretPos(p.x, p.y);
+    SDL_Rect area = { p.x, p.y, 1, h };
+    SDL_SetTextInputArea(g_win, &area, 0);
 }
 
 static int ed_caret_rect(rectf box, rectf *out) {
@@ -19281,186 +19368,81 @@ static int ed_caret_rect(rectf box, rectf *out) {
  * expectation here is built on. */
 static int ed_word_left(int from) {
     int i = from;
-    while (i > 0 && g_ed[i - 1] == L' ') i--;
-    while (i > 0 && g_ed[i - 1] != L' ') i--;
+    while (i > 0 && g_ed[i - 1] == u' ') i--;
+    while (i > 0 && g_ed[i - 1] != u' ') i--;
     return i;
 }
 static int ed_word_right(int from) {
     int i = from;
-    while (i < g_ed_len && g_ed[i] != L' ') i++;
-    while (i < g_ed_len && g_ed[i] == L' ') i++;
+    while (i < g_ed_len && g_ed[i] != u' ') i++;
+    while (i < g_ed_len && g_ed[i] == u' ') i++;
     return i;
 }
 
-static void ed_clip_copy(HWND hwnd) {
+static void ed_clip_copy(oc_win *hwnd) {
+    (void)hwnd;
     if (!ed_has_sel()) return;
     int a = ed_sel_lo(), n = ed_sel_hi() - a;
-    if (!OpenClipboard(hwnd)) return;
-    EmptyClipboard();
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)(n + 1) * sizeof(WCHAR));
-    if (h) {
-        WCHAR *dst = (WCHAR *)GlobalLock(h);
-        if (dst) {
-            memcpy(dst, g_ed + a, (size_t)n * sizeof(WCHAR));
-            dst[n] = 0;
-            GlobalUnlock(h);
-            SetClipboardData(CF_UNICODETEXT, h);
-        } else GlobalFree(h);
-    }
-    CloseClipboard();
-}
-
-/* A clipboard DIB as a PNG file in memory, through WIC: the DIB becomes a BMP
- * file (a header in front of it), which WIC decodes and re-encodes. A pasted
- * screenshot then travels at PNG size rather than as raw pixels. NULL if it
- * cannot. */
-static uint8_t *dib_to_png(const uint8_t *dib, size_t dlen, size_t *out_len) {
-    *out_len = 0;
-    if (!dib || dlen < sizeof(BITMAPINFOHEADER)) return NULL;
-    const BITMAPINFOHEADER *bi = (const BITMAPINFOHEADER *)dib;
-    if (bi->biSize < sizeof(BITMAPINFOHEADER) || bi->biSize > dlen) return NULL;
-    size_t colors = bi->biClrUsed ? bi->biClrUsed : (bi->biBitCount <= 8 ? (1u << bi->biBitCount) : 0);
-    size_t masks = (bi->biSize == sizeof(BITMAPINFOHEADER) && bi->biCompression == BI_BITFIELDS) ? 12 : 0;
-    size_t off = sizeof(BITMAPFILEHEADER) + bi->biSize + masks + colors * sizeof(RGBQUAD);
-    size_t blen = sizeof(BITMAPFILEHEADER) + dlen;
-    if (off > blen) return NULL;
-    uint8_t *bmp = malloc(blen);
-    if (!bmp) return NULL;
-    BITMAPFILEHEADER fh = { 0x4D42, (DWORD)blen, 0, 0, (DWORD)off };
-    memcpy(bmp, &fh, sizeof fh);
-    memcpy(bmp + sizeof fh, dib, dlen);
-
-    uint8_t *png = NULL;
-    if (!g_wic &&
-        FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
-                                &IID_IWICImagingFactory, (void **)&g_wic))) { free(bmp); return NULL; }
-    IWICStream *in = NULL; IWICBitmapDecoder *dec = NULL; IWICBitmapFrameDecode *frame = NULL;
-    IStream *out = NULL; IWICBitmapEncoder *enc = NULL; IWICBitmapFrameEncode *fe = NULL;
-    if (SUCCEEDED(IWICImagingFactory_CreateStream(g_wic, &in)) &&
-        SUCCEEDED(IWICStream_InitializeFromMemory(in, bmp, (DWORD)blen)) &&
-        SUCCEEDED(IWICImagingFactory_CreateDecoderFromStream(g_wic, (IStream *)in, NULL,
-                                                             WICDecodeMetadataCacheOnLoad, &dec)) &&
-        SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame)) &&
-        SUCCEEDED(CreateStreamOnHGlobal(NULL, TRUE, &out)) &&
-        SUCCEEDED(IWICImagingFactory_CreateEncoder(g_wic, &GUID_ContainerFormatPng, NULL, &enc)) &&
-        SUCCEEDED(IWICBitmapEncoder_Initialize(enc, out, WICBitmapEncoderNoCache)) &&
-        SUCCEEDED(IWICBitmapEncoder_CreateNewFrame(enc, &fe, NULL)) &&
-        SUCCEEDED(IWICBitmapFrameEncode_Initialize(fe, NULL)) &&
-        SUCCEEDED(IWICBitmapFrameEncode_WriteSource(fe, (IWICBitmapSource *)frame, NULL)) &&
-        SUCCEEDED(IWICBitmapFrameEncode_Commit(fe)) &&
-        SUCCEEDED(IWICBitmapEncoder_Commit(enc))) {
-        STATSTG st;
-        HGLOBAL hg = NULL;
-        if (SUCCEEDED(IStream_Stat(out, &st, STATFLAG_NONAME)) && st.cbSize.QuadPart &&
-            st.cbSize.QuadPart <= OC_MAX_ATTACHMENT_SIZE &&
-            SUCCEEDED(GetHGlobalFromStream(out, &hg))) {
-            const void *src = GlobalLock(hg);
-            if (src && (png = malloc((size_t)st.cbSize.QuadPart)) != NULL) {
-                memcpy(png, src, (size_t)st.cbSize.QuadPart);
-                *out_len = (size_t)st.cbSize.QuadPart;
-            }
-            if (src) GlobalUnlock(hg);
-        }
-    }
-    if (fe)    IWICBitmapFrameEncode_Release(fe);
-    if (enc)   IWICBitmapEncoder_Release(enc);
-    if (out)   IStream_Release(out);
-    if (frame) IWICBitmapFrameDecode_Release(frame);
-    if (dec)   IWICBitmapDecoder_Release(dec);
-    if (in)    IWICStream_Release(in);
-    free(bmp);
-    return png;
-}
-
-/* A copy of clipboard format `fmt`'s bytes, or NULL. The clipboard is open. */
-static uint8_t *clip_bytes(UINT fmt, size_t *len) {
-    *len = 0;
-    HANDLE h = fmt ? GetClipboardData(fmt) : NULL;
-    if (!h) return NULL;
-    SIZE_T n = GlobalSize(h);
-    const void *src = n ? GlobalLock(h) : NULL;
-    uint8_t *d = (src && n <= OC_MAX_ATTACHMENT_SIZE) ? malloc(n) : NULL;
-    if (d) { memcpy(d, src, n); *len = n; }
-    if (src) GlobalUnlock(h);
-    return d;
+    char *u8 = malloc((size_t)n * 3 + 1);
+    if (!u8) return;
+    to_u8n(g_ed + a, n, u8, (size_t)n * 3 + 1);
+    SDL_SetClipboardText(u8);
+    free(u8);
 }
 
 /* Paste what is not text as attachments (REQ-140): copied files as themselves,
  * so a GIF keeps its animation; otherwise an image, as the source put it on the
- * clipboard -- a GIF's own bytes, else PNG, else the bitmap turned into a PNG.
- * Anything that also carries text pastes as text: a copy out of a document puts
- * a picture of it beside the words, and the words are what was meant. Returns 1
- * if it attached something. The tray lives in the conversation, so the New
- * message pane pastes text only. */
-static int clip_paste_attach(HWND hwnd) {
+ * clipboard (the platform answers for its clipboard). Anything that also
+ * carries text pastes as text. Returns 1 if it attached something. The tray
+ * lives in the conversation, so the New message pane pastes text only. */
+static int clip_paste_attach(oc_win *hwnd) {
     if (!g_client || !g_sel || g_view == VIEW_NEWMSG) return 0;
-    if (!OpenClipboard(hwnd)) return 0;
-    int did = 0;
-    if (IsClipboardFormatAvailable(CF_HDROP)) {
-        HDROP drop = (HDROP)GetClipboardData(CF_HDROP);
-        UINT nf = drop ? DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0) : 0;
-        char paths[FTRAY_MAX][1024];
-        UINT np = 0;
-        for (UINT i = 0; i < nf && np < FTRAY_MAX; i++) {
-            WCHAR wf[MAX_PATH];
-            if (DragQueryFileW(drop, i, wf, MAX_PATH) &&
-                WideCharToMultiByte(CP_UTF8, 0, wf, -1, paths[np], sizeof paths[np], NULL, NULL) > 0)
-                np++;
-        }
-        CloseClipboard();                        /* before adding: a toast may pump */
-        for (UINT i = 0; i < np; i++) ftray_add(hwnd, paths[i]);
+    char *files = oc_plat_clipboard_files();
+    if (files) {
+        int np = 0;
+        for (const char *p = files; *p && np < FTRAY_MAX; p += strlen(p) + 1, np++) ftray_add(hwnd, p);
+        free(files);
         return np > 0;
     }
-    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-        char name[64];
-        SYSTEMTIME t; GetLocalTime(&t);
-        uint8_t *d = NULL; size_t n = 0;
-        UINT gif = RegisterClipboardFormatW(L"GIF"), png = RegisterClipboardFormatW(L"PNG");
-        if (IsClipboardFormatAvailable(gif) && (d = clip_bytes(gif, &n)) != NULL) {
-            snprintf(name, sizeof name, "pasted-image-%04u%02u%02u-%02u%02u%02u.gif",
-                     t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-        } else if (IsClipboardFormatAvailable(png) && (d = clip_bytes(png, &n)) != NULL) {
-            snprintf(name, sizeof name, "pasted-image-%04u%02u%02u-%02u%02u%02u.png",
-                     t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-        } else if (IsClipboardFormatAvailable(CF_DIB)) {
-            size_t dl = 0;
-            uint8_t *dib = clip_bytes(CF_DIB, &dl);
-            d = dib_to_png(dib, dl, &n);
-            free(dib);
-            snprintf(name, sizeof name, "pasted-image-%04u%02u%02u-%02u%02u%02u.png",
-                     t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    if (!SDL_HasClipboardText()) {
+        size_t n = 0; char ext[8];
+        uint8_t *d = oc_plat_clipboard_image(&n, ext);
+        if (d && n) {
+            char name[64];
+            time_t now = time(NULL); struct tm t;
+            if (!oc_localtime_r(&now, &t)) memset(&t, 0, sizeof t);
+            snprintf(name, sizeof name, "pasted-image-%04d%02d%02d-%02d%02d%02d.%s",
+                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, ext);
+            ftray_add_mem(hwnd, name, d, n);
+            return 1;
         }
-        CloseClipboard();
-        if (d && n) { ftray_add_mem(hwnd, name, d, n); did = 1; }
-        else free(d);
-        return did;
+        free(d);
     }
-    CloseClipboard();
     return 0;
 }
 
-static void ed_clip_paste(HWND hwnd) {
+static void ed_clip_paste(oc_win *hwnd) {
     if (clip_paste_attach(hwnd)) return;
-    if (!OpenClipboard(hwnd)) return;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        const WCHAR *src = (const WCHAR *)GlobalLock(h);
-        if (src) {
-            /* Newlines survive — a pasted paragraph is a paragraph — but a lone
-             * CR from a Windows CRLF pair would draw as a stray glyph, so the pair
-             * collapses to one LF. */
-            WCHAR tmp[ED_MAX + 1];
+    char *src = SDL_GetClipboardText();
+    if (src && src[0]) {
+        /* Newlines survive -- a pasted paragraph is a paragraph -- but a lone
+         * CR from a CRLF pair would draw as a stray glyph, so the pair
+         * collapses to one LF. */
+        oc_wch *w = malloc(((size_t)strlen(src) + 1) * sizeof(oc_wch));
+        if (w) {
+            to_w(src, w, (int)strlen(src) + 1);
+            oc_wch tmp[ED_MAX + 1];
             int n = 0;
-            for (int i = 0; src[i] && n < ED_MAX; i++) {
-                if (src[i] == L'\r' && src[i + 1] == L'\n') continue;
-                tmp[n++] = src[i] == L'\r' ? L'\n' : src[i];
+            for (int i = 0; w[i] && n < ED_MAX; i++) {
+                if (w[i] == '\r' && w[i + 1] == '\n') continue;
+                tmp[n++] = w[i] == '\r' ? '\n' : w[i];
             }
             tmp[n] = 0;
             ed_insert(tmp);
-            GlobalUnlock(h);
+            free(w);
         }
     }
-    CloseClipboard();
+    SDL_free(src);
 }
 
 static void composer_send(void);            /* fwd */
@@ -19469,15 +19451,15 @@ static int  composer_remeasure(void);       /* fwd */
 static void ac_rebuild(void);               /* fwd */
 static void ac_close(void);                 /* fwd */
 static void ac_accept(void);                /* fwd */
-static void layout_composer(HWND hwnd);     /* fwd */
+static void layout_composer(oc_win *hwnd);     /* fwd */
 
 /* Anything that CHANGED the text: re-measure the box, refresh the completion
  * popover and repaint. One place, so no key handler can forget a step. */
-static void ed_changed(HWND hwnd) {
+static void ed_changed(oc_win *hwnd) {
     g_cmp_hint[0] = '\0';                 /* an edit answers the hint */
     /* The typing indicator used to ride EN_CHANGE from the RichEdit. This is that
      * notification's replacement, and the rate limit is the same 2s. */
-    DWORD now = GetTickCount();
+    uint32_t now = (uint32_t)now_ms();
     if (g_client && g_sel && now - g_last_typing > 2000) {
         /* Not from the New message pane: its text is for somebody who is not in
          * the channel g_sel names, and they would see you typing into theirs. */
@@ -19493,11 +19475,11 @@ static void ed_changed(HWND hwnd) {
      * this client sends, and a draft nobody is reading yet does not need to be
      * that fresh. Leaving, blurring and quitting all flush immediately. */
     g_draft_dirty = 1;
-    g_draft_touch_ms = GetTickCount64();
+    g_draft_touch_ms = now_ms();
     ac_rebuild();
     if (composer_remeasure()) layout_composer(hwnd);
-    g_ed_blink = GetTickCount64();       /* a caret that blinks while you type reads as lag */
-    InvalidateRect(hwnd, NULL, FALSE);
+    g_ed_blink = now_ms();       /* a caret that blinks while you type reads as lag */
+    invalidate();
 }
 
 /* Where typed text goes when the caret sits against an invisible marker.
@@ -19529,22 +19511,22 @@ static int grp_pick_has_keys(void) {
            g_tgt_host == TGT_HOST_GROUP && g_grp_pick_focus;
 }
 
-static int ed_char(HWND hwnd, WCHAR ch) {
+static int ed_char(oc_win *hwnd, oc_wch ch) {
     /* The group's Add people field keeps every character while it has the
      * keys: the composer is off screen, and must not collect them. */
     if (grp_pick_has_keys() || (chan_pick_live() && g_chan_pick_focus)) {
-        tgt_char(ch); InvalidateRect(hwnd, NULL, FALSE); return 1;
+        tgt_char(ch); invalidate(); return 1;
     }
     if (g_view == VIEW_NEWMSG && g_nm_to_focus && tgt_char(ch)) {
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     if (!g_ed_focus) return 0;
-    if (ch == L'\t') return 1;               /* Tab is navigation, never text */
-    if (ch < 0x20 && ch != L'\n') return 1;  /* control chars: eaten, not inserted */
-    WCHAR s[2] = { ch, 0 };
+    if (ch == u'\t') return 1;               /* Tab is navigation, never text */
+    if (ch < 0x20 && ch != u'\n') return 1;  /* control chars: eaten, not inserted */
+    oc_wch s[2] = { ch, 0 };
     if (!ed_has_sel() && g_pref_richtext) {
-        if (ch == L' ' || ch == L'\n') {
+        if (ch == u' ' || ch == u'\n') {
             /* Whitespace at the back edge of a formatted run: the dialect
              * cannot hold it against the closer (MARKDOWN.md §2), so it goes
              * OUTSIDE — and for a space, the CONTINUATION arms, so the next
@@ -19556,21 +19538,21 @@ static int ed_char(HWND hwnd, WCHAR ch) {
             if (cr > 0) {
                 g_ed_caret = g_ed_anchor = g_ed_caret + cr;
                 ed_insert(s);
-                g_ed_cont = (ch == L' ');
+                g_ed_cont = (ch == u' ');
                 ed_changed(hwnd);
                 return 1;
             }
-            if (ch == L'\n') g_ed_cont = 0;
+            if (ch == u'\n') g_ed_cont = 0;
         } else {
             if (g_ed_cont) {
                 /* The word after the gap: pull the closer run forward over the
                  * whitespace so this character lands back inside the run. */
                 int w = g_ed_caret;
-                while (w > 0 && (g_ed[w - 1] == L' ' || g_ed[w - 1] == L'\t')) w--;
+                while (w > 0 && (g_ed[w - 1] == u' ' || g_ed[w - 1] == u'\t')) w--;
                 int cr = 0;
                 while (w - cr > 0 && ed_char_hidden(w - cr - 1) == ED_H_CLOSE) cr++;
                 if (w < g_ed_caret && cr > 0 && cr <= 8) {
-                    WCHAR run[8];
+                    oc_wch run[8];
                     int tgt = g_ed_caret - cr;
                     for (int i = 0; i < cr; i++) run[i] = g_ed[w - cr + i];
                     ed_begin_edit();
@@ -19606,42 +19588,42 @@ static int ed_char(HWND hwnd, WCHAR ch) {
 }
 
 /* A virtual key. Returns 1 when consumed. */
-static int ed_key(HWND hwnd, WPARAM vk) {
+static int ed_key(oc_win *hwnd, int vk) {
     /* Admin > Groups' Add people: the field's keys are the picker's, as in New
      * message. What it declines -- Enter with nothing to pick, Escape on an
      * empty query, Tab -- adds the chosen people or lets go. */
     if (grp_pick_has_keys()) {
-        if (!tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) {
-            if (vk == VK_RETURN && !g_tgt_q.len) grp_pick_commit();   /* not on a query that matched nobody */
-            else if (vk == VK_ESCAPE || vk == VK_TAB) g_grp_pick_focus = 0;
+        if (!tgt_key(hwnd, vk, mod_down(OCK_CONTROL), mod_down(OCK_SHIFT))) {
+            if (vk == OCK_RETURN && !g_tgt_q.len) grp_pick_commit();   /* not on a query that matched nobody */
+            else if (vk == OCK_ESCAPE || vk == OCK_TAB) g_grp_pick_focus = 0;
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     /* The members pane's Add people, the same way: Enter on an empty query
      * invites the chosen, Escape on one closes the picker, Tab lets go. */
     if (chan_pick_live() && g_chan_pick_focus) {
-        if (!tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) {
-            if (vk == VK_RETURN && !g_tgt_q.len) chan_pick_commit();
-            else if (vk == VK_ESCAPE) mem_mode_set(MEM_NORMAL, 0);
-            else if (vk == VK_TAB) g_chan_pick_focus = 0;
+        if (!tgt_key(hwnd, vk, mod_down(OCK_CONTROL), mod_down(OCK_SHIFT))) {
+            if (vk == OCK_RETURN && !g_tgt_q.len) chan_pick_commit();
+            else if (vk == OCK_ESCAPE) mem_mode_set(MEM_NORMAL, 0);
+            else if (vk == OCK_TAB) g_chan_pick_focus = 0;
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     /* In the New Message pane the To: field owns the keys until you leave it
      * (REQ-229): Enter there accepts a name rather than sending half a message
      * to nobody. */
     if (g_view == VIEW_NEWMSG && g_nm_to_focus) {
-        if (tgt_key(hwnd, vk, mod_down(VK_CONTROL), mod_down(VK_SHIFT))) { InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (tgt_key(hwnd, vk, mod_down(OCK_CONTROL), mod_down(OCK_SHIFT))) { invalidate(); return 1; }
         /* Tab, or Enter with nothing left to pick: on to the message itself.
          * Shift+Tab is the other direction and there is nothing before this
          * field, so it stays -- taking it as "next" made Shift+Tab move forward,
          * which is the one thing it cannot mean. */
-        if (vk == VK_TAB && mod_down(VK_SHIFT)) return 1;
-        if (vk == VK_TAB || vk == VK_RETURN) {
+        if (vk == OCK_TAB && mod_down(OCK_SHIFT)) return 1;
+        if (vk == OCK_TAB || vk == OCK_RETURN) {
             g_nm_to_focus = 0; ed_focus(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
         /* EVERY OTHER KEY STOPS HERE. The field that has the keys is the field
@@ -19650,36 +19632,36 @@ static int ed_key(HWND hwnd, WPARAM vk) {
          * it, and the arrows walked a caret that was not drawn -- all while the
          * ring and the characters were on the To: field. Escape is the one key
          * the shell may still have (closing the pane, below). */
-        if (vk == VK_ESCAPE) { newmsg_close(hwnd); return 1; }
+        if (vk == OCK_ESCAPE) { newmsg_close(hwnd); return 1; }
         return 1;
     }
-    if (g_view == VIEW_NEWMSG && vk == VK_ESCAPE) { newmsg_close(hwnd); return 1; }
+    if (g_view == VIEW_NEWMSG && vk == OCK_ESCAPE) { newmsg_close(hwnd); return 1; }
     /* Shift+Tab from the message goes back to the recipients: a field you can
      * only leave is a keyboard trap. */
-    if (g_view == VIEW_NEWMSG && !g_nm_to_focus && vk == VK_TAB && mod_down(VK_SHIFT)) {
+    if (g_view == VIEW_NEWMSG && !g_nm_to_focus && vk == OCK_TAB && mod_down(OCK_SHIFT)) {
         g_nm_to_focus = 1; tgt_rebuild();
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     if (!g_ed_focus) return 0;
-    int ctrl = mod_down(VK_CONTROL);
-    int shift = mod_down(VK_SHIFT);
+    int ctrl = mod_down(OCK_CONTROL);
+    int shift = mod_down(OCK_SHIFT);
     int moved = 0, changed = 0;
 
     switch (vk) {
-    case VK_LEFT:
+    case OCK_LEFT:
         g_ed_caret = ctrl ? ed_canon(ed_word_left(g_ed_caret)) : ed_step(g_ed_caret, -1);
         moved = 1; break;
-    case VK_RIGHT:
+    case OCK_RIGHT:
         g_ed_caret = ctrl ? ed_canon(ed_word_right(g_ed_caret)) : ed_step(g_ed_caret, 1);
         moved = 1; break;
-    case VK_UP: case VK_DOWN: {
+    case OCK_UP: case OCK_DOWN: {
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
          * "the line above" is a question only DirectWrite can answer. */
         st_layout *tl = ed_layout(g_ed_box.right - g_ed_box.left);
         if (!tl) break;
         st_rect cr = st_hit_pos(tl, ed_b(g_ed_caret), false);
-        float wanty = cr.y + (vk == VK_UP ? -cr.h / 2 : cr.h * 1.5f);
+        float wanty = cr.y + (vk == OCK_UP ? -cr.h / 2 : cr.h * 1.5f);
         bool trail = false, inside = false;
         size_t hb = st_hit_point(tl, cr.x, wanty, &inside, &trail);
         g_ed_caret = ed_u16(hb) + (trail ? 1 : 0);
@@ -19687,12 +19669,12 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         g_ed_caret = ed_canon(g_ed_caret);
         moved = 1; break;
     }
-    case VK_HOME: g_ed_caret = 0; moved = 1; break;
+    case OCK_HOME: g_ed_caret = 0; moved = 1; break;
     /* End canonicalises INTO a trailing delimiter, which is the rule doing its
      * job: it puts the caret where typing continues the emphasis the message
      * ends in, as it would in any rich editor. */
-    case VK_END:  g_ed_caret = ed_canon(g_ed_len); moved = 1; break;
-    case VK_BACK:
+    case OCK_END:  g_ed_caret = ed_canon(g_ed_len); moved = 1; break;
+    case OCK_BACK:
         ed_intent_clear();
         if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
         else if (g_ed_caret > 0) {
@@ -19704,7 +19686,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
             else      ed_delete_char_at(g_ed_caret - 1);
         }
         changed = 1; break;
-    case VK_DELETE:
+    case OCK_DELETE:
         ed_intent_clear();
         if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
         else if (g_ed_caret < g_ed_len) {
@@ -19720,7 +19702,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
             }
         }
         changed = 1; break;
-    case VK_RETURN:
+    case OCK_RETURN:
         /* The completion popover claims Enter first — that is what makes Tab and
          * Enter interchangeable for accepting one. */
         if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
@@ -19731,14 +19713,14 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         if (g_view == VIEW_NEWMSG) { newmsg_send_at(hwnd, 0); return 1; }
         composer_send();
         return 1;
-    case VK_TAB:
+    case OCK_TAB:
         if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
         return 1;                            /* never a literal tab in a message */
-    case VK_ESCAPE:
-        if (g_n_ac > 0) { ac_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
+    case OCK_ESCAPE:
+        if (g_n_ac > 0) { ac_close(); invalidate(); return 1; }
         if (g_edit_msg) { composer_cancel_edit(); return 1; }
         return 0;                            /* let the shell close what is open */
-    case 'A': if (ctrl) { ed_select_all(); InvalidateRect(hwnd, NULL, FALSE); return 1; } return 0;
+    case 'A': if (ctrl) { ed_select_all(); invalidate(); return 1; } return 0;
     /* Formatting. Slack's bindings, because they are the ones in the
      * fingers of anyone arriving here — and the Ctrl+Shift pairs sit on top of
      * cut and copy exactly as they do there. */
@@ -19766,9 +19748,9 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         ed_intent_clear();               /* the intent described the OLD caret */
         if (!shift) g_ed_anchor = g_ed_caret;
         ed_invalidate_layout();          /* the composition splice moves with the caret */
-        g_ed_blink = GetTickCount64();
+        g_ed_blink = now_ms();
         ac_rebuild();
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
     }
     if (changed) ed_changed(hwnd);
     return 1;
@@ -19789,7 +19771,7 @@ static int ed_hit(float x, float y) {
     return pos < 0 ? 0 : (pos > g_ed_len ? g_ed_len : pos);
 }
 
-static int ed_mouse_down(HWND hwnd, float x, float y) {
+static int ed_mouse_down(oc_win *hwnd, float x, float y) {
     if (!in_rect(g_ed_box, x, y)) return 0;
     ed_focus(hwnd);
     /* A click in the body is the whole answer to which field has the keys. The
@@ -19800,21 +19782,22 @@ static int ed_mouse_down(HWND hwnd, float x, float y) {
     ed_intent_clear();
     g_ed_caret = g_ed_anchor = ed_canon(ed_hit(x, y));
     g_ed_dragging = 1;
-    SetCapture(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    SDL_CaptureMouse(true);
+    invalidate();
     return 1;
 }
 
-static void ed_mouse_move(HWND hwnd, float x, float y) {
+static void ed_mouse_move(oc_win *hwnd, float x, float y) {
+    (void)hwnd;
     if (!g_ed_dragging) return;
     g_ed_caret = ed_canon(ed_hit(x, y));
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 static void ed_mouse_up(void) {
     if (!g_ed_dragging) return;
     g_ed_dragging = 0;
-    ReleaseCapture();
+    SDL_CaptureMouse(false);
 }
 
 /* ---- double-click word selection --------------------------------
@@ -19831,7 +19814,7 @@ static void ed_mouse_up(void) {
 /* The run around `pos` — a word, or the whitespace between two. UTF-16 offsets,
  * which is what both callers already index in (the field's buffer, and the
  * transcript's body layout). */
-static void word_bounds(const WCHAR *s, int len, int pos, int *a, int *b) {
+static void word_bounds(const oc_wch *s, int len, int pos, int *a, int *b) {
     int i = pos < 0 ? 0 : (pos > len ? len : pos), sp;
     /* Clicking just PAST a word takes that word. It is where the caret lands
      * when you double-click the end of one, and taking the space instead is the
@@ -19843,7 +19826,7 @@ static void word_bounds(const WCHAR *s, int len, int pos, int *a, int *b) {
     while (*b < len && (ed_is_space(s[*b]) ? 1 : 0) == sp) (*b)++;
 }
 
-static int ed_select_word(HWND hwnd, float x, float y) {
+static int ed_select_word(oc_win *hwnd, float x, float y) {
     int a, b;
     if (!in_rect(g_ed_box, x, y)) return 0;
     ed_focus(hwnd);
@@ -19856,78 +19839,28 @@ static int ed_select_word(HWND hwnd, float x, float y) {
  * The composition string is drawn inline (underlined) and the candidate window is
  * pinned to the caret. Handled here rather than left to DefWindowProc because a
  * self-drawn field has no HIMC-owning control to place it for us. */
-static void ed_ime_place(HWND hwnd) {
-    HIMC imc = ImmGetContext(hwnd);
-    if (!imc) return;
+static void ed_ime_place(oc_win *hwnd) {
+    (void)hwnd;
     rectf cr;
     if (ed_caret_rect(g_ed_box, &cr)) {
-        COMPOSITIONFORM cf;
-        cf.dwStyle = CFS_POINT;
-        cf.ptCurrentPos.x = PX(cr.left);
-        cf.ptCurrentPos.y = PX(cr.top);
-        cf.rcArea.left = PX(g_ed_box.left);   cf.rcArea.top = PX(g_ed_box.top);
-        cf.rcArea.right = PX(g_ed_box.right); cf.rcArea.bottom = PX(g_ed_box.bottom);
-        ImmSetCompositionWindow(imc, &cf);
-        CANDIDATEFORM cdf;
-        cdf.dwIndex = 0;
-        cdf.dwStyle = CFS_CANDIDATEPOS;
-        cdf.ptCurrentPos = cf.ptCurrentPos;
-        memset(&cdf.rcArea, 0, sizeof cdf.rcArea);
-        ImmSetCandidateWindow(imc, &cdf);
+        SDL_Rect a = { PX(cr.left), PX(cr.top), 1, PX(cr.bottom - cr.top) };
+        SDL_SetTextInputArea(g_win, &a, 0);
     }
-    ImmReleaseContext(hwnd, imc);
 }
 
-static int ed_ime(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    (void)wp;
-    /* ed_focused(), not g_ed_focus: with the New message pane's To: field focused
-     * the composition belongs to that field, and splicing it into the body put
-     * the recipient's name inside the message with the candidate window over a
-     * field nobody was typing in. */
+/* An IME composition in progress (SDL_EVENT_TEXT_EDITING): `comp` is the text
+ * being composed, empty when it ended; the committed text arrives as ordinary
+ * text input. ed_focused(), not g_ed_focus: with the New message pane's To:
+ * field focused the composition belongs to that field. */
+static int ed_ime(oc_win *hwnd, const char *comp) {
     if (!ed_focused()) return 0;
-    if (msg == WM_IME_STARTCOMPOSITION) {
-        g_ed_comp_len = 0; g_ed_comp[0] = 0;
-        ed_invalidate_layout();
-        ed_ime_place(hwnd);
-        return 1;                            /* no default composition window */
-    }
-    if (msg == WM_IME_ENDCOMPOSITION) {
-        g_ed_comp_len = 0; g_ed_comp[0] = 0;
-        ed_invalidate_layout();
-        InvalidateRect(hwnd, NULL, FALSE);
-        return 1;
-    }
-    if (msg == WM_IME_COMPOSITION) {
-        HIMC imc = ImmGetContext(hwnd);
-        if (imc) {
-            if (lp & GCS_RESULTSTR) {
-                LONG bytes = ImmGetCompositionStringW(imc, GCS_RESULTSTR, NULL, 0);
-                if (bytes > 0 && bytes < (LONG)sizeof g_ed_comp) {
-                    WCHAR res[128];
-                    ImmGetCompositionStringW(imc, GCS_RESULTSTR, res, (DWORD)bytes);
-                    int n = bytes / (LONG)sizeof(WCHAR);
-                    res[n] = 0;
-                    g_ed_comp_len = 0;         /* the committed text replaces it */
-                    ed_insert(res);
-                }
-            }
-            if (lp & GCS_COMPSTR) {
-                LONG bytes = ImmGetCompositionStringW(imc, GCS_COMPSTR, NULL, 0);
-                g_ed_comp_len = 0;
-                if (bytes > 0 && bytes < (LONG)sizeof g_ed_comp) {
-                    ImmGetCompositionStringW(imc, GCS_COMPSTR, g_ed_comp, (DWORD)bytes);
-                    g_ed_comp_len = bytes / (LONG)sizeof(WCHAR);
-                }
-                g_ed_comp[g_ed_comp_len] = 0;
-            }
-            ImmReleaseContext(hwnd, imc);
-        }
-        ed_invalidate_layout();
-        ed_ime_place(hwnd);
-        ed_changed(hwnd);
-        return 1;
-    }
-    return 0;
+    g_ed_comp_len = comp ? to_w(comp, g_ed_comp, (int)(sizeof g_ed_comp / sizeof g_ed_comp[0])) : 0;
+    g_ed_comp[g_ed_comp_len] = 0;
+    ed_invalidate_layout();
+    ed_ime_place(hwnd);
+    ed_changed(hwnd);
+    invalidate();
+    return 1;
 }
 
 /* ---- draw ---------------------------------------------------------------- */
@@ -20006,7 +19939,7 @@ static void ed_draw(gfx *rt, rectf box) {
     if (ed_focused()) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
-            ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0) {
+            ((now_ms() - g_ed_blink) / 530) % 2 == 0) {
             /* Declared transient for the audit: this bar is present in half the
              * frames by design, so any check that asserts two frames are equal
              * has to know not to compare it. Without the tag the consistency
@@ -20076,7 +20009,7 @@ static void sum_menu_open(rectf a, uint64_t cid) {
 }
 
 /* A row of the Summarize menu: a span, or the custom range's card. */
-static void sum_menu_run(HWND hwnd, int cmd) {
+static void sum_menu_run(oc_win *hwnd, int cmd) {
     if (cmd < 1 || cmd > 5 || !g_menu_target) return;
     if (SUM_MENU_SCOPE[cmd] == OC_SUM_RANGE) sumrange_open(hwnd, g_menu_target);
     else summarize_start(hwnd, g_menu_target, SUM_MENU_SCOPE[cmd], 0, 0);
@@ -20245,7 +20178,7 @@ static oc_acc_item g_acc_items[OC_ACC_MAX];
 static void a11y_publish_scene(const oc_model *m) {
     oc_acc_item *items = g_acc_items;
     int n = 0;
-    const WCHAR *ctext = NULL;
+    const oc_wch *ctext = NULL;
     int caret = 0, anchor = 0;
     g_acc_layer = 0;
     g_acc_surface = rf(0, 0, 0, 0);
@@ -20850,7 +20783,7 @@ modal_items:
     if (modal_open()) {
         for (int i = 0; i < g_n_modal_btns && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX];
-            /* Named for the WORD, so `modal.button.save` survives the button
+            /* Named for the uint16_t, so `modal.button.save` survives the button
              * moving and `modal.button.1` would not. */
             char low[32]; snprintf(low, sizeof low, "%s", g_modal_btns[i].label);
             for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
@@ -20972,7 +20905,7 @@ modal_items:
  * encodings, which is where this kind of code usually goes wrong. */
 
 /* The caret, and the start of the token it sits in, as UTF-16 indices. */
-static int ac_token_range(WCHAR *buf, int cap, int *tok_start) {
+static int ac_token_range(oc_wch *buf, int cap, int *tok_start) {
     if (ed_has_sel()) return -1;                 /* a live selection: not completing */
     int len = ed_len();
     if (len <= 0 || len >= cap) return -1;
@@ -20981,7 +20914,7 @@ static int ac_token_range(WCHAR *buf, int cap, int *tok_start) {
     if (caret > len) caret = len;
     int ts = 0;
     for (int i = caret - 1; i >= 0; i--)
-        if (buf[i] == L' ' || buf[i] == L'\t' || buf[i] == L'\n' || buf[i] == L'\r') { ts = i + 1; break; }
+        if (buf[i] == u' ' || buf[i] == u'\t' || buf[i] == u'\n' || buf[i] == u'\r') { ts = i + 1; break; }
     *tok_start = ts;
     return caret;
 }
@@ -20990,7 +20923,7 @@ static void ac_close(void) { g_n_ac = 0; g_ac_sel = 0; }
 
 static void ac_rebuild(void) {
     const oc_model *m = model();
-    WCHAR buf[4096]; int ts = 0;
+    oc_wch buf[4096]; int ts = 0;
     int caret = m ? ac_token_range(buf, 4096, &ts) : -1;
     if (caret < 0 || caret == ts) { ac_close(); return; }
 
@@ -20998,7 +20931,7 @@ static void ac_rebuild(void) {
      * already-typed content the user moved back past. */
     buf[caret] = 0;
     char u8[4096];
-    if (WideCharToMultiByte(CP_UTF8, 0, buf, -1, u8, sizeof u8, NULL, NULL) <= 0) { ac_close(); return; }
+    if (to_u8(buf, u8, sizeof u8) <= 0) { ac_close(); return; }
 
     g_n_ac = (int)oc_complete(m, u8, g_ac, AC_MAX, NULL, &g_ac_kind);
     if (g_ac_sel >= g_n_ac) g_ac_sel = 0;
@@ -21009,14 +20942,14 @@ static void ac_rebuild(void) {
 static void ac_accept(void) {
     crumb("ac_accept sel=%d n=%d", g_ac_sel, g_n_ac);
     if (g_n_ac <= 0) return;
-    WCHAR buf[4096]; int ts = 0;
+    oc_wch buf[4096]; int ts = 0;
     int caret = ac_token_range(buf, 4096, &ts);
     if (caret < 0) { ac_close(); return; }
 
-    WCHAR repl[128];
-    int n = MultiByteToWideChar(CP_UTF8, 0, g_ac[g_ac_sel].repl, -1, repl, 126);
+    oc_wch repl[128];
+    int n = to_w(g_ac[g_ac_sel].repl, repl, 126);
     if (n <= 0) { ac_close(); return; }
-    repl[n - 1] = L' '; repl[n] = 0;             /* overwrite the NUL with a space */
+    repl[n - 1] = u' '; repl[n] = 0;             /* overwrite the NUL with a space */
 
     ed_replace_range(ts, caret, repl);
     ac_close();
@@ -21025,8 +20958,8 @@ static void ac_accept(void) {
 /* Hand the composer's text to the daemon's queue instead of sending it now
  * (REQ-224, ARCH-102). The body leaves the field exactly as a send would take
  * it, so what arrives later is what you wrote. */
-static void sched_at(HWND hwnd, uint64_t at);   /* fwd */
-static void sched_menu_run(HWND hwnd, int cmd) {
+static void sched_at(oc_win *hwnd, uint64_t at);   /* fwd */
+static void sched_menu_run(oc_win *hwnd, int cmd) {
     if (!g_client || !g_sel || ed_len() <= 0) return;
     if (cmd == 303) { sched_custom_open(hwnd); return; }
     uint64_t now = (uint64_t)time(NULL) * 1000ULL, at = now;
@@ -21046,7 +20979,7 @@ static void sched_menu_run(HWND hwnd, int cmd) {
 /* Hand the composer's text to the schedule at `at`. Shared by the presets and the
  * custom card, so a message scheduled either way leaves the composer, its draft
  * and the toast in the same state. */
-static void sched_at(HWND hwnd, uint64_t at) {
+static void sched_at(oc_win *hwnd, uint64_t at) {
     if (!g_client || ed_len() <= 0) return;
     /* From the New message pane the destination is the pane's, not g_sel -- and
      * it is the same journey as a send, with a time on it: the conversation is
@@ -21054,13 +20987,13 @@ static void sched_at(HWND hwnd, uint64_t at) {
      * Send later used to refuse anyone you had not already written to. */
     if (g_view == VIEW_NEWMSG) { newmsg_send_at(hwnd, at); return; }
     if (!g_sel) return;
-    WCHAR w[DRAFT_TEXT_MAX];
+    oc_wch w[DRAFT_TEXT_MAX];
     int n = ed_get(w, DRAFT_TEXT_MAX);
     if (n <= 0) return;
-    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    int blen = (wlen(w) * 3 + 1);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (!b) return;
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+    to_u8(w, b, blen);
     /* Into the thread when the composer is replying in one, exactly as a send
      * would be (composer_send): the root rides the schedule, and the daemon posts
      * it as a reply when it fires. */
@@ -21087,7 +21020,7 @@ static void composer_send(void) {
      * (newmsg_send); reaching this from there -- through a stale button rect, an
      * accessibility action or a key -- posted the message to whatever channel was
      * last open. One send per pane, and this is the conversation's. */
-    if (g_view == VIEW_NEWMSG) { newmsg_send_at(GetActiveWindow(), 0); return; }
+    if (g_view == VIEW_NEWMSG) { newmsg_send_at(g_main, 0); return; }
     if (!g_client || !g_sel) return;
     /* Offline: the message waits in the box, said there, rather than going into a
      * queue that a dropped connection could lose. */
@@ -21112,15 +21045,15 @@ static void composer_send(void) {
     /* Files waiting in the tray go with the text, as one message; the text may
      * then be empty. An edit changes text only, so the tray waits it out. */
     int files = !g_edit_msg && ftray_waiting();
-    int wlen = ed_len();
-    if (wlen <= 0 && !files) return;
-    WCHAR *w = (WCHAR *)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
+    int wn = ed_len();
+    if (wn <= 0 && !files) return;
+    oc_wch *w = (oc_wch *)malloc((size_t)(wn + 1) * sizeof(oc_wch));
     if (!w) return;
-    ed_get(w, wlen + 1);
-    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    ed_get(w, wn + 1);
+    int blen = (wlen(w) * 3 + 1);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (b) {
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+        to_u8(w, b, blen);
         /* Drop a trailing newline the RichEdit may append; skip empty/whitespace. */
         int nonspace = 0;
         for (char *p = b; *p; p++) if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') { nonspace = 1; break; }
@@ -21160,10 +21093,10 @@ static void composer_send(void) {
 static void composer_begin_edit(const oc_msg *msg) {
     if (!msg || msg->deleted) return;
     g_edit_msg = msg->message_id;
-    WCHAR w[2048];
+    oc_wch w[2048];
     to_w(msg->body ? msg->body : "", w, 2048);
     ed_set(w);                                          /* caret lands at the end */
-    ed_focus(GetActiveWindow());
+    ed_focus(g_main);
 }
 
 static void composer_cancel_edit(void) {
@@ -21204,7 +21137,7 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
  * autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
  * accepting a candidate rather than sending is what makes the popover feel like
  * part of the composer instead of a thing floating over it. */
-static void nav_conversation(HWND hwnd, int delta, int unread_only);   /* fwd */
+static void nav_conversation(oc_win *hwnd, int delta, int unread_only);   /* fwd */
 
 
 /* Recompute the composer's height from what is actually in it. EM_GETLINECOUNT
@@ -21239,14 +21172,14 @@ static int composer_remeasure(void) {
  * the width is a guess, so a measure can be right for the guess and wrong for the
  * field. Twice at most: measuring can move the field, and the second measure is at
  * the width the first laid out. Returns 1 if anything moved. */
-static int composer_refit(HWND hwnd) {
+static int composer_refit(oc_win *hwnd) {
     int moved = 0;
     for (int i = 0; i < 2 && composer_remeasure(); i++) { layout_composer(hwnd); moved = 1; }
     return moved;
 }
 
 /* Position the RichEdit over the composer region for the current window size. */
-static void layout_find(HWND hwnd);   /* fwd */
+static void layout_find(oc_win *hwnd);   /* fwd */
 
 /* Is the MIDDLE column currently a conversation you could type into?
  *
@@ -21302,9 +21235,9 @@ static void composer_btns_clear(void) {
     g_mic_btn = g_freetalk_btn = rf(0, 0, 0, 0);
 }
 
-static void layout_composer(HWND hwnd) {
+static void layout_composer(oc_win *hwnd) {
     layout_find(hwnd);
-    /* The composer is drawn, not moved: this computes the TEXT RECT that
+    /* The composer is drawn, not moved: this computes the TEXT irect that
      * ed_draw paints into and ed_hit tests against. There is no child window to
      * show or hide any more — which also means no bare control punched through an
      * overlay, the class of bug that produced three defects in a row. Focus
@@ -21323,8 +21256,8 @@ static void layout_composer(HWND hwnd) {
         g_ed_focus = 0;
         return;
     }
-    RECT rc; GetClientRect(hwnd, &rc);
-    rc.right = (LONG)DIPF(rc.right); rc.bottom = (LONG)DIPF(rc.bottom);
+    irect rc; client_rect(hwnd, &rc);
+    rc.right = (int32_t)DIPF(rc.right); rc.bottom = (int32_t)DIPF(rc.bottom);
     float members = members_w((float)rc.right);
     float main_x = RAIL_W + SIDEBAR_W;
     /* Inside the composer box, between the attach (+) and send buttons. */
@@ -21368,86 +21301,28 @@ static rectf unread_chip_box(void) {
               RAIL_W + SIDEBAR_W - UIS(10), HEADER_H + UIS(36));
 }
 
-/* Place a search box's EDIT in the chrome search_box_draw() drew: after the
- * glyph, the font's line height tall, centred top to bottom. */
-static void search_edit_place(HWND e, rectf box) {
-    form_font();                                   /* the line height is its */
-    int lh = g_form_font_lh > 0 ? g_form_font_lh : PX(UIS(18.0f));
-    int x = PX(box.left + UIS(32.0f)), r = PX(box.right - UIS(10.0f));
-    int top = PX(box.top) + (PX(box.bottom) - PX(box.top) - lh) / 2;
-    MoveWindow(e, x, top, r > x ? r - x : 1, lh, TRUE);
-}
-
-/* Every search box on the current font. Called from the paint path, so a text
- * size or DPI change reaches them on the next frame; only a changed font is
- * sent, as WM_SETFONT repaints the control. */
-static void search_fonts_sync(void) {
-    static HFONT applied;
-    HFONT f = form_font();
-    if (!f || f == applied) return;
-    HWND boxes[] = { g_find, g_srch, g_ffind, g_dir_edit, g_pal_edit, g_pick_edit };
-    for (size_t i = 0; i < sizeof boxes / sizeof boxes[0]; i++)
-        if (boxes[i]) SendMessageW(boxes[i], WM_SETFONT, (WPARAM)f, TRUE);
-    applied = f;
-}
-
-static void layout_find(HWND hwnd) {
+static void layout_find(oc_win *hwnd) {
     (void)hwnd;   /* the sidebar has a fixed width; geometry is constant */
     if (!g_find) return;
-
-    /* A native child window composites ABOVE the parent's Direct2D output, so
-     * this box punches a hole through anything the shell floats over the
-     * sidebar — it was cutting the workspace menu's header block in half, which
-     * read as a corrupt avatar and a missing workspace name. The D2D panels
-     * cannot draw over it, so it has to get out of the way.
-     *
-     * The search and emoji boxes never showed this because each is already
-     * gated on its own pane's open flag; the find box had no such guard. */
     /* Shown only when the column actually holds the channel list this box
-     * filters — see sidebar_kind(). Asking "does this view have a sidebar" is
+     * filters -- see sidebar_kind(). Asking "does this view have a sidebar" is
      * what let it leak into the DMs and Activity lists. */
-    int want = sidebar_kind() == SBK_CHANNELS && !window_is_covered();
-
-    /* Only act on a change: this runs every frame, and a redundant MoveWindow
-     * still churns WM_WINDOWPOSCHANGED and can flicker the control. The DPI is
-     * part of "changed" — the box is placed in device pixels, so a scale change
-     * has to re-place it even though its visibility did not move. */
-    static int shown = -1;
-    static UINT laid_at_dpi = 0;
-    static float laid_at_scale = -1.0f;
-    /* The SCALE is part of "changed" too, and it was not: text size or zoom moved
-     * the chrome this box sits in while the cache said nothing had happened, so
-     * the control stayed at its old place — a bare white rectangle floating over
-     * the sidebar. */
-    /* And the font's line height, which sizes the EDIT: the box is first placed
-     * before there is a font, and the font arriving changes nothing above. */
-    static int laid_at_lh = -1;
-    if (want == shown && laid_at_dpi == g_dpi && laid_at_scale == g_text_scale &&
-        laid_at_lh == g_form_font_lh) return;
-    shown = want;
-    laid_at_dpi = g_dpi;
-    laid_at_scale = g_text_scale;
-    laid_at_lh = g_form_font_lh;
-    if (!want) { ShowWindow(g_find, SW_HIDE); return; }
-    search_edit_place(g_find, find_box());
-    ShowWindow(g_find, SW_SHOW);
+    field_show(g_find, sidebar_kind() == SBK_CHANNELS && !window_is_covered());
 }
 
-static WNDPROC g_find_oldproc;
-static void nav_conversation(HWND hwnd, int delta, int unread_only);   /* fwd */
+static void nav_conversation(oc_win *hwnd, int delta, int unread_only);   /* fwd */
 
-/* F6 has to work in both directions, or moving focus to the filter box strands
- * the keyboard there. Esc returns as well, since that is the reflex. */
-static LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    /* Esc only. F6 and Alt+arrows are message-loop shortcuts now (SHORTCUTS) —
-     * this proc used to carry its own copies, which is how the two ends of F6
-     * drifted apart. */
-    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
-        ed_focus(GetParent(hwnd));
-        return 0;
-    }
-    if (msg == WM_CHAR && wp == VK_ESCAPE) return 0;    /* no MessageBeep */
-    return CallWindowProcW(g_find_oldproc, hwnd, msg, wp, lp);
+/* Esc returns the keyboard to the composer. F6 and Alt+arrows are message-loop
+ * shortcuts (SHORTCUTS), not the field's. */
+static int find_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (key == OCK_ESCAPE) { ed_focus(g_main); return 1; }
+    return 0;
+}
+static void find_changed(field *f) {
+    char b[128]; snprintf(b, sizeof b, "%s", f->buf);
+    for (char *p = b; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+    snprintf(g_find_filter, sizeof g_find_filter, "%s", b);
 }
 
 /* The Files view's "Search files" box. Native child number seven, and written
@@ -21457,66 +21332,37 @@ static LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  *
  * g_file_search_box is measured during paint, so this runs from the paint path
  * (layout_natives) as well as on resize. */
-static void layout_files_find(HWND hwnd) {
+static void layout_files_find(oc_win *hwnd) {
     (void)hwnd;
     if (!g_ffind) return;
     int want = (g_view == VIEW_FILES) && !window_is_covered() &&
                g_file_search_box.right > g_file_search_box.left;
-    if (!want) { ShowWindow(g_ffind, SW_HIDE); return; }
-    search_edit_place(g_ffind, g_file_search_box);
-    ShowWindow(g_ffind, SW_SHOW);
+    field_show(g_ffind, want);
 }
 
 /* The People pane's search box. Native child number EIGHT, and written to the
  * same rules as the seventh: gated on its own view, never on a predicate that
  * happens to be true there, and reported in the dump because `shot` renders
  * Direct2D only and cannot see a native child. */
-static void dir_find_create(HWND parent) {
-    g_dir_edit = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
-        (HMENU)(INT_PTR)0xF5, GetModuleHandleW(NULL), NULL);
-    if (!g_dir_edit) return;
-    SendMessageW(g_dir_edit, WM_SETFONT, (WPARAM)form_font(), TRUE);
-    SendMessageW(g_dir_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search people");
+static void dir_changed(field *f) {
+    snprintf(g_dir_filter, sizeof g_dir_filter, "%s", f->buf);
+    g_ovl_scroll = 0;          /* a new query starts at the top */
 }
 
-static void layout_dir_find(HWND hwnd) {
+static void layout_dir_find(oc_win *hwnd) {
     (void)hwnd;
     if (!g_dir_edit) return;
-    int want = (g_view == VIEW_DIRECTORY) && !window_is_covered();
-    if (!want) { ShowWindow(g_dir_edit, SW_HIDE); return; }
-    /* Inside the box the painter measured, inset so the container reads as the
-     * control's border — g_dir_search_box is only valid after a paint, which is
-     * why this runs from the paint path too. */
-    if (g_dir_search_box.right <= g_dir_search_box.left) { ShowWindow(g_dir_edit, SW_HIDE); return; }
-    search_edit_place(g_dir_edit, g_dir_search_box);
-    ShowWindow(g_dir_edit, SW_SHOW);
+    int want = (g_view == VIEW_DIRECTORY) && !window_is_covered() &&
+               g_dir_search_box.right > g_dir_search_box.left;
+    field_show(g_dir_edit, want);
 }
 
-static void files_find_create(HWND parent) {
-    g_ffind = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
-        (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
-    if (!g_ffind) return;
-    SendMessageW(g_ffind, WM_SETFONT, (WPARAM)form_font(), TRUE);
-    SendMessageW(g_ffind, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search files");
-}
-
-static void find_create(HWND parent) {
-    g_find = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
-        (HMENU)(INT_PTR)0xF1, GetModuleHandleW(NULL), NULL);
-    if (!g_find) return;
-    SendMessageW(g_find, WM_SETFONT, (WPARAM)form_font(), TRUE);
-    SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation");
-    g_find_oldproc = (WNDPROC)SetWindowLongPtrW(g_find, GWLP_WNDPROC, (LONG_PTR)find_proc);
-    layout_find(parent);
-}
+static void ffind_changed(field *f) { snprintf(g_file_q, sizeof g_file_q, "%s", f->buf); }
 
 /* Place the search-overlay query EDIT over the chrome draw_search() painted.
  * g_srch_box is only valid after a paint, so this runs from the paint path as
  * well as from WM_SIZE. */
-static void layout_search(HWND hwnd) {
+static void layout_search(oc_win *hwnd) {
     const oc_model *m = model();
     if (!g_srch) return;
     /* `covered` matters here too: the search box is a middle-column overlay, and
@@ -21535,56 +21381,43 @@ static void layout_search(HWND hwnd) {
      * not. Reported from a screenshot of the running client. */
     if (!m || !m->search_open || !transcript_shell() || dm_index_view() ||
         window_is_covered()) {
-        ShowWindow(g_srch, SW_HIDE); return;
+        field_show(g_srch, 0); return;
     }
     (void)hwnd;
-    ShowWindow(g_srch, SW_SHOW);
-    search_edit_place(g_srch, g_srch_box);
+    field_show(g_srch, 1);
 }
 
-/* Enter submits the query; Escape closes the overlay. An EDIT swallows both, so
- * they are intercepted by a subclass rather than in the main key handler. */
-static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-static WNDPROC g_srch_prev;
 
-static void search_create(HWND parent) {
-    g_srch = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
-        (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
-    if (!g_srch) return;
-    SendMessageW(g_srch, WM_SETFONT, (WPARAM)form_font(), TRUE);
-    SendMessageW(g_srch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search messages");
-    g_srch_prev = (WNDPROC)SetWindowLongPtrW(g_srch, GWLP_WNDPROC, (LONG_PTR)srch_proc);
-}
+static void menu_dispatch(oc_win *hwnd, int cmd);   /* fwd */
 
-static void menu_dispatch(HWND hwnd, int cmd);   /* fwd */
-
-static void palette_close(HWND hwnd) {
+static void palette_close(oc_win *hwnd) {
+    (void)hwnd;
     /* Dismissing the picker cancels the forward. Leaving g_fwd_mid set would turn
      * the NEXT palette open — a plain jump-to — into a silent forward. */
     if (g_fwd_mid && !g_pal_accepting) { g_fwd_mid = g_fwd_cid = 0; }
     g_pal_open = 0; g_pal_sel = 0;
-    if (g_pal_edit) ShowWindow(g_pal_edit, SW_HIDE);
-    ed_focus(GetActiveWindow());
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_pal_edit) field_show(g_pal_edit, 0);
+    ed_focus(g_main);
+    invalidate();
 }
 
-static void palette_open(HWND hwnd) {
+static void palette_open(oc_win *hwnd) {
+    (void)hwnd;
     g_pal_open = 1; g_pal_sel = 0;
     if (g_pal_edit) {
-        SetWindowTextW(g_pal_edit, L"");
-        ShowWindow(g_pal_edit, SW_SHOW);
-        SetFocus(g_pal_edit);
+        field_set(g_pal_edit, "");
+        field_show(g_pal_edit, 1);
+        focus_set(g_pal_edit);
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Run the highlighted row. Closing FIRST matters: several commands open a modal
  * form, and the palette must not still be on screen behind it. */
-static int  permalink_follow(HWND hwnd, const char *text);   /* fwd */
-static void forward_send(HWND hwnd, uint64_t to_cid);        /* fwd */
+static int  permalink_follow(oc_win *hwnd, const char *text);   /* fwd */
+static void forward_send(oc_win *hwnd, uint64_t to_cid);        /* fwd */
 
-static void palette_accept(HWND hwnd) {
+static void palette_accept(oc_win *hwnd) {
     g_pal_accepting = 1;
     /* A pasted permalink is accepted here rather than in the composer, and that is
      * the deliberate half of the paste rule: pasting a link into the message box must keep
@@ -21592,8 +21425,7 @@ static void palette_accept(HWND hwnd) {
      * "jump to" surface, so following one there surprises nobody. */
     {
         char q[512] = "";
-        if (g_pal_edit) { WCHAR w[512]; GetWindowTextW(g_pal_edit, w, 512);
-                          WideCharToMultiByte(CP_UTF8, 0, w, -1, q, sizeof q, NULL, NULL); }
+        if (g_pal_edit) snprintf(q, sizeof q, "%s", g_pal_edit->buf);
         if (q[0] && !strncmp(q, "openchime://", 12)) {
             g_pal_accepting = 0;
             palette_close(hwnd);
@@ -21619,10 +21451,8 @@ static void palette_accept(HWND hwnd) {
     g_pal_accepting = 0;
 }
 
-static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-static WNDPROC g_pal_prev;
 
-static void download_attachment(HWND hwnd, const oc_attachment *a);   /* fwd */
+static void download_attachment(oc_win *hwnd, const oc_attachment *a);   /* fwd */
 
 /* ---- video messages (REQ-162–166, ARCH-110, docs/VIDEO-MESSAGES.md §9) -------
  *
@@ -21645,7 +21475,7 @@ enum { REC_PREVIEW, REC_COUNTDOWN, REC_RECORDING, REC_FINISHING, REC_REVIEW, REC
 static oc_recorder *g_rec;
 static int          g_rec_phase, g_rec_err;
 static char         g_rec_detail[200];
-static ULONGLONG    g_rec_count_at;           /* when the countdown started */
+static uint64_t    g_rec_count_at;           /* when the countdown started */
 static oc_rec_result g_rec_res;               /* the take under review */
 static oc_player   *g_vplayer;
 static uint64_t     g_vplay_aid;              /* the video message being played (0 = a review) */
@@ -21666,7 +21496,7 @@ static char         g_vm_src[256];
 static int          g_vm_corner = OC_CORNER_BR;
 static int          g_vm_nocam, g_vm_sound;
 static int          g_vm_gone;          /* the recorded window closed; the take stops there */
-static HWND         g_recbar;           /* the recording bar, while a screen records */
+static oc_win       g_recbar;           /* the recording bar, while a screen records */
 static int          g_recbar_excluded;  /* ... and kept out of the capture */
 static float        g_vm_volume = 1.0f;      /* 0..1, Up and Down in the player */
 static uint64_t     g_vm_post_tag;            /* the last send, for its outcome toast */
@@ -21676,12 +21506,12 @@ static int          g_vm_tw, g_vm_th;
 static uint8_t     *g_vm_px;
 static size_t       g_vm_pxcap;
 static uint64_t     g_vm_seq;
-static struct { uint64_t id; uint8_t *d; size_t n; ULONGLONG used; } g_vcache[VM_CACHE_N];
+static struct { uint64_t id; uint8_t *d; size_t n; uint64_t used; } g_vcache[VM_CACHE_N];
 
 static const uint8_t *vcache_get(uint64_t id, size_t *n) {
     for (int i = 0; i < VM_CACHE_N; i++)
         if (g_vcache[i].id == id && g_vcache[i].d) {
-            g_vcache[i].used = GetTickCount64();
+            g_vcache[i].used = now_ms();
             *n = g_vcache[i].n;
             return g_vcache[i].d;
         }
@@ -21701,7 +21531,7 @@ static void vcache_put(uint64_t id, uint8_t *d, size_t n) {
         }
         if (slot >= 0 && total <= VM_CACHE_BYTES) {
             g_vcache[slot].id = id; g_vcache[slot].d = d; g_vcache[slot].n = n;
-            g_vcache[slot].used = GetTickCount64();
+            g_vcache[slot].used = now_ms();
             return;
         }
         if (oldest < 0) { free(d); return; }
@@ -21735,8 +21565,8 @@ static void vm_frame_update(void) {
     g_vm_tw = w; g_vm_th = h;
 }
 
-static void vm_set_title(HWND hwnd, int recording) {
-    SetWindowTextW(hwnd, recording ? L"● Recording - OpenChime" : L"OpenChime");
+static void vm_set_title(oc_win *hwnd, int recording) {
+    (void)hwnd;
     if (g_win) SDL_SetWindowTitle(g_win, recording ? "\xE2\x97\x8F Recording - OpenChime" : "OpenChime");
 }
 
@@ -21758,20 +21588,21 @@ static void listen_drop_player(void) {
 /* Turn talking mode on for the conversation on screen, or off. */
 static int g_listen_heard;   /* a message finished playing since the channel was last marked read */
 
-static void listen_set(HWND hwnd, int on) {
+static void listen_set(oc_win *hwnd, int on) {
+    (void)hwnd;
     if (!g_client) return;
     listen_drop_player();
     g_listen_heard = 0;
     oc_client_listen(g_client, on ? g_sel : 0, on);
     if (on) fb_confirm("Reading new messages aloud");
     oc_a11y_announce(on ? "Reading new messages aloud" : "Stopped reading aloud");
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Once a frame: start what is ready, retire what has finished, and stop
  * altogether if the user has gone somewhere else -- nothing plays from a
  * conversation that is not on screen. */
-static void listen_tick(HWND hwnd, const oc_model *m) {
+static void listen_tick(oc_win *hwnd, const oc_model *m) {
     if (!g_client || !m) return;
     uint64_t ch = oc_model_listening_channel(m);
     if (ch && ch != g_sel) { listen_set(hwnd, 0); return; }
@@ -21783,7 +21614,7 @@ static void listen_tick(HWND hwnd, const oc_model *m) {
             listen_drop_player();
             oc_client_listen_done(g_client);      /* on to the next message */
             g_listen_heard = 1;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
         return;
     }
@@ -21798,7 +21629,7 @@ static void listen_tick(HWND hwnd, const oc_model *m) {
         const oc_channel *lc = oc_model_channel((oc_model *)m, ch);
         if (lc && lc->unread) {
             oc_client_mark_read(g_client, ch);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
     }
 
@@ -21817,7 +21648,7 @@ static void listen_tick(HWND hwnd, const oc_model *m) {
         return;
     }
     oc_player_play(g_listen_player);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* ---- voice input (REQ-296-300, ARCH-112) ------------------------------------
@@ -21857,14 +21688,14 @@ static int dict_free_offered(void) {
 
 /* Close the microphone. `send_rest` 1 sends what was being said (let go, turned
  * off); 0 drops it (left the conversation). */
-static void dict_stop(HWND hwnd, int send_rest) {
+static void dict_stop(oc_win *hwnd, int send_rest) {
     g_dict_hold = DH_NONE;
     if (!g_dict) return;
     crumb("dict_stop rest=%d", send_rest);
     oc_dictate_stop(g_dict, send_rest);
     g_dict = NULL;
     g_dict_client = NULL;
-    if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
+    if (hwnd) invalidate();
 }
 
 /* A client is about to be stopped: a session sending through it goes first. */
@@ -21897,7 +21728,7 @@ static const char *dict_refusal_text(uint16_t code) {
     }
 }
 
-static int dict_start(HWND hwnd, uint8_t mode) {
+static int dict_start(oc_win *hwnd, uint8_t mode) {
     dict_stop(hwnd, 1);
     if (mode == OC_STT_MODE_FREE ? !dict_free_offered() : !dict_offered()) return 0;
     uint64_t ch, root;
@@ -21912,23 +21743,23 @@ static int dict_start(HWND hwnd, uint8_t mode) {
     if (!g_dict) { fb_failed(dict_error_text(err)); return 0; }
     g_dict_client = g_client;
     oc_a11y_announce(mode == OC_STT_MODE_FREE ? "Free talk on" : "Listening");
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
     return 1;
 }
 
-static void dict_ptt_down(HWND hwnd, int by) {
+static void dict_ptt_down(oc_win *hwnd, int by) {
     if (g_dict_hold) return;
     if (dict_start(hwnd, OC_STT_MODE_PTT)) g_dict_hold = by;
 }
 
 /* Let go: only what pressed it may release it, so a mouse-up does not end a
  * hold the keyboard started. */
-static void dict_ptt_up(HWND hwnd, int by) {
+static void dict_ptt_up(oc_win *hwnd, int by) {
     if (!g_dict_hold || g_dict_hold != by) return;
     dict_stop(hwnd, 1);
 }
 
-static void dict_freetalk_toggle(HWND hwnd) {
+static void dict_freetalk_toggle(oc_win *hwnd) {
     if (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE) {
         dict_stop(hwnd, 1);
         oc_a11y_announce("Free talk off");
@@ -21940,7 +21771,7 @@ static void dict_freetalk_toggle(HWND hwnd) {
 /* Once a frame: end the session when its conversation is no longer on screen,
  * say what the daemon refused, and put push-to-talk words into the composer they
  * were spoken into -- each piece one undo step. */
-static void dict_tick(HWND hwnd, const oc_model *m) {
+static void dict_tick(oc_win *hwnd, const oc_model *m) {
     if (g_dict) {
         uint64_t ch, root;
         dict_target(&ch, &root);
@@ -21959,20 +21790,20 @@ static void dict_tick(HWND hwnd, const oc_model *m) {
     dict_target(&ch, &root);
     char *text = NULL;
     while (ch && oc_model_stt_take_words((oc_model *)m, ch, root, &text)) {
-        int n = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-        WCHAR *w = n > 0 ? (WCHAR *)malloc(((size_t)n + 1) * sizeof(WCHAR)) : NULL;
+        int n = ((int)strlen(text) + 1);
+        oc_wch *w = n > 0 ? (oc_wch *)malloc(((size_t)n + 1) * sizeof(oc_wch)) : NULL;
         if (w) {
             /* A space between these words and any before them on the line. */
             int at = ed_caret_pos(), o = 0;
-            if (at > 0 && g_ed[at - 1] != L' ' && g_ed[at - 1] != L'\n') w[o++] = L' ';
-            MultiByteToWideChar(CP_UTF8, 0, text, -1, w + o, n);
+            if (at > 0 && g_ed[at - 1] != u' ' && g_ed[at - 1] != u'\n') w[o++] = u' ';
+            to_w(text, w + o, n);
             ed_insert(w);
             ed_changed(hwnd);
             free(w);
         }
         free(text);
         text = NULL;
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
     }
 }
 
@@ -22001,7 +21832,7 @@ static void preview_tick(const oc_model *m) {
      * voice) or the connection may have gone; either way the button must not
      * stay disabled forever waiting for a sample that is not coming. */
     if (g_form_action_busy && !g_preview_player && g_preview_asked_ms &&
-        GetTickCount64() - g_preview_asked_ms > 12000) {
+        now_ms() - g_preview_asked_ms > 12000) {
         g_form_action_busy = 0;
         g_preview_asked_ms = 0;
         fb_failed("That voice could not be played just now.");
@@ -22018,8 +21849,8 @@ static void preview_tick(const oc_model *m) {
      * from the press to the first sound. */
     if (g_preview_asked_ms) {
         crumb("preview ready in %llu ms",
-              (unsigned long long)(GetTickCount64() - g_preview_asked_ms));
-        g_preview_wait_ms = (uint32_t)(GetTickCount64() - g_preview_asked_ms);
+              (unsigned long long)(now_ms() - g_preview_asked_ms));
+        g_preview_wait_ms = (uint32_t)(now_ms() - g_preview_asked_ms);
         g_preview_asked_ms = 0;
     }
 }
@@ -22050,7 +21881,7 @@ static void profile_voice_play(int field) {
     preview_drop();
     oc_client_voice_preview(g_client, id);
     g_form_action_busy = 1;
-    g_preview_asked_ms = GetTickCount64();
+    g_preview_asked_ms = now_ms();
 }
 
 static void vm_player_close(void) {
@@ -22069,82 +21900,135 @@ static void vm_player_close(void) {
  * without help. Windows that can keep a window out of a capture keep this one
  * out (WDA_EXCLUDEFROMCAPTURE, Windows 10 2004 and later); elsewhere it appears
  * in the recording, which the docs say (REQ-166). */
-enum { RECBAR_TEXT = 1, RECBAR_STOP, RECBAR_DISCARD };
-static HWND g_recbar_text, g_recbar_stop;
 static char g_recbar_line[96];
+static int  g_recbar_stop_on = 1;
 
-static void vm_command(HWND hwnd, int cmd);   /* fwd */
+static void vm_command(oc_win *hwnd, int cmd);   /* fwd */
 
-static LRESULT CALLBACK recbar_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_COMMAND:
-        if (LOWORD(wp) == RECBAR_STOP)    { vm_command(g_main_hwnd, VMC_STOP); return 0; }
-        if (LOWORD(wp) == RECBAR_DISCARD) { vm_command(g_main_hwnd, VMC_DISCARD); return 0; }
-        break;
-    case WM_CLOSE:                                  /* the caption's close is Stop, never a silent loss */
-        vm_command(g_main_hwnd, VMC_STOP);
-        return 0;
+/* The two bars share one shape: a line of text and one or two buttons, drawn
+ * with the app's own primitives in a small always-on-top window. */
+#define BAR_H 60.0f
+typedef struct { const char *label; int enabled; } bar_btn;
+static rectf g_bar_btn_r[2][2];      /* [bar][button]: 0 the recording bar, 1 the share bar */
+static int   g_bar_hover[2] = { -1, -1 };
+
+static int bar_ix(const oc_win *w) { return w == &g_sharebar ? 1 : 0; }
+
+static void bar_paint(oc_win *w, const char *line, const bar_btn *btns, int n) {
+    if (!w->g) return;
+    int ix = bar_ix(w);
+    int prev = g_txt_target;
+    g_txt_target = ix ? TXT_TARGET_SHAREBAR : TXT_TARGET_RECBAR;
+    g_gfx_for[g_txt_target] = w->g;
+    int pw, ph; SDL_GetWindowSizeInPixels(w->sdl, &pw, &ph);
+    float W = DIPF(pw), H = DIPF(ph);
+    gfx_set_scale(w->g, (float)g_dpi / 96.0f);
+    gfx_begin(w->g, OC_COL_SIDEBAR);
+    float bw = ix ? 110.0f : 80.0f, bh = 28.0f, pad = 10.0f;
+    float x = W - pad;
+    for (int i = n - 1; i >= 0; i--) {
+        rectf r = rf(x - bw, (H - bh) / 2, x, (H + bh) / 2);
+        g_bar_btn_r[ix][i] = r;
+        int hot = g_bar_hover[ix] == i && btns[i].enabled;
+        fill_round(w->g, r, OC_R_CONTROL, i == 0 ? (hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT) : (hot ? OC_COL_HOVER : OC_COL_INPUT));
+        g_ui->align = ST_ALIGN_CENTER;
+        draw_text(w->g, btns[i].label, g_ui, rf(r.left, r.top + 5, r.right, r.bottom),
+                  !btns[i].enabled ? OC_COL_FAINT : i == 0 ? 0xFFFFFF : OC_COL_TEXT);
+        g_ui->align = ST_ALIGN_LEFT;
+        x -= bw + pad;
     }
-    return DefWindowProcW(h, msg, wp, lp);
+    for (int i = n; i < 2; i++) g_bar_btn_r[ix][i] = rf(0, 0, 0, 0);
+    draw_text(w->g, line, g_ui, rf(pad, (H - 20) / 2, x, (H + 20) / 2), OC_COL_TEXT);
+    gfx_end(w->g);
+    g_txt_target = prev;
 }
 
-static void recbar_open(HWND owner) {
-    static int registered;
-    HINSTANCE inst = GetModuleHandleW(NULL);
-    if (!registered) {
-        WNDCLASSEXW wc;
-        memset(&wc, 0, sizeof wc);
-        wc.cbSize = sizeof wc;
-        wc.lpfnWndProc = recbar_proc;
-        wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"OpenChimeRecordingBar";
-        if (!RegisterClassExW(&wc)) return;
-        registered = 1;
-    }
-    int w = PX(380), h = PX(96);
-    RECT wa = { 0, 0, 1280, 720 };
-    MONITORINFO mi; mi.cbSize = sizeof mi;
-    if (GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mi)) wa = mi.rcWork;
-    g_recbar = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"OpenChimeRecordingBar",
-                               L"OpenChime \u2014 recording", WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                               wa.left + (wa.right - wa.left - w) / 2, wa.top + PX(12), w, h,
-                               NULL, NULL, inst, NULL);
-    if (!g_recbar) return;
-    RECT cr; GetClientRect(g_recbar, &cr);
-    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    int bw = PX(80), bh = PX(28), pad = PX(10);
-    g_recbar_text = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                                    pad, (cr.bottom - bh) / 2, cr.right - 2 * bw - 4 * pad, bh,
-                                    g_recbar, (HMENU)(INT_PTR)RECBAR_TEXT, inst, NULL);
-    g_recbar_stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                    cr.right - 2 * bw - 2 * pad, (cr.bottom - bh) / 2, bw, bh,
-                                    g_recbar, (HMENU)(INT_PTR)RECBAR_STOP, inst, NULL);
-    HWND discard = CreateWindowExW(0, L"BUTTON", L"Discard", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                   cr.right - bw - pad, (cr.bottom - bh) / 2, bw, bh,
-                                   g_recbar, (HMENU)(INT_PTR)RECBAR_DISCARD, inst, NULL);
-    SendMessageW(g_recbar_text, WM_SETFONT, (WPARAM)font, TRUE);
-    SendMessageW(g_recbar_stop, WM_SETFONT, (WPARAM)font, TRUE);
-    SendMessageW(discard, WM_SETFONT, (WPARAM)font, TRUE);
-    g_recbar_excluded = SetWindowDisplayAffinity(g_recbar, 0x11 /* WDA_EXCLUDEFROMCAPTURE */) ? 1 : 0;
+static void recbar_paint(void) {
+    if (!g_recbar.sdl) return;
+    bar_btn b[2] = { { g_rec_phase == REC_COUNTDOWN ? "Cancel" : "Stop", g_recbar_stop_on }, { "Discard", 1 } };
+    bar_paint(&g_recbar, g_recbar_line, b, 2);
+}
+static void sharebar_paint(void) {
+    if (!g_sharebar.sdl) return;
+    char line[200];
+    snprintf(line, sizeof line, "You're sharing %s", g_share_name[0] ? g_share_name : "your screen");
+    bar_btn b[1] = { { "Stop sharing", 1 } };
+    bar_paint(&g_sharebar, line, b, 1);
+}
+
+static void bar_hover(oc_win *w, int mx, int my) {
+    int ix = bar_ix(w), h = -1;
+    for (int i = 0; i < 2; i++) if (in_rect(g_bar_btn_r[ix][i], mx, my)) h = i;
+    if (h == g_bar_hover[ix]) return;
+    g_bar_hover[ix] = h;
+    if (ix) sharebar_paint(); else recbar_paint();
+}
+
+static void menu_dispatch(oc_win *hwnd, int cmd);   /* fwd */
+static void bar_click(oc_win *w, int mx, int my) {
+    int ix = bar_ix(w);
+    for (int i = 0; i < 2; i++)
+        if (in_rect(g_bar_btn_r[ix][i], mx, my)) {
+            if (ix)          menu_dispatch(g_main, CC_SHARE_STOP);
+            else if (i == 0) { if (g_recbar_stop_on) vm_command(g_main, VMC_STOP); }
+            else             vm_command(g_main, VMC_DISCARD);
+            return;
+        }
+}
+
+/* Open a bar at the top centre of the work area of `disp` (0: the main
+ * window's display). */
+static int bar_open(oc_win *w, const char *title, float wdip, SDL_DisplayID disp) {
+    if (w->sdl) return 1;
+    if (!disp) disp = g_main && g_main->sdl ? SDL_GetDisplayForWindow(g_main->sdl) : 0;
+    if (!disp) disp = SDL_GetPrimaryDisplay();
+    SDL_Rect wa = { 0, 0, 1280, 720 };
+    SDL_GetDisplayUsableBounds(disp, &wa);
+    int pw = PX(wdip), ph = PX(BAR_H);
+    w->sdl = SDL_CreateWindow(title, pw, ph, SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_UTILITY | SDL_WINDOW_HIDDEN);
+    if (!w->sdl) return 0;
+    SDL_SetWindowPosition(w->sdl, wa.x + (wa.w - pw) / 2, wa.y + PX(12));
+    w->ren = SDL_CreateRenderer(w->sdl, NULL);
+    w->g = w->ren ? gfx_create(w->ren) : NULL;
+    if (!w->g) { if (w->ren) SDL_DestroyRenderer(w->ren); SDL_DestroyWindow(w->sdl); memset(w, 0, sizeof *w); return 0; }
+    SDL_ShowWindow(w->sdl);
+    return 1;
+}
+
+static void bar_close(oc_win *w) {
+    if (!w->sdl) return;
+    int ix = bar_ix(w);
+    g_gfx_for[ix ? TXT_TARGET_SHAREBAR : TXT_TARGET_RECBAR] = NULL;
+    txt_drop_target(ix ? TXT_TARGET_SHAREBAR : TXT_TARGET_RECBAR);
+    if (w->g) gfx_destroy(w->g);
+    if (w->ren) SDL_DestroyRenderer(w->ren);
+    SDL_DestroyWindow(w->sdl);
+    memset(w, 0, sizeof *w);
+    g_bar_hover[ix] = -1;
+}
+
+static void recbar_open(oc_win *owner) {
+    (void)owner;
+    if (!bar_open(&g_recbar, "OpenChime \xE2\x80\x94 recording", 380.0f, 0)) return;
+    /* Windows that can keep a window out of a capture keep this one out;
+     * elsewhere it appears in the recording, which the docs say (REQ-166). */
+    g_recbar_excluded = oc_plat_window_capture_exclude(g_recbar.sdl, 1);
     g_recbar_line[0] = '\0';
-    ShowWindow(g_recbar, SW_SHOWNOACTIVATE);
+    recbar_paint();
     crumb("recbar open excluded=%d", g_recbar_excluded);
 }
 
 static void recbar_close(void) {
-    if (g_recbar) DestroyWindow(g_recbar);
-    g_recbar = g_recbar_text = g_recbar_stop = NULL;
+    bar_close(&g_recbar);
     g_recbar_line[0] = '\0';
 }
 
 /* What the bar says: the countdown, the time, or that it is finishing. */
 static void recbar_update(void) {
-    if (!g_recbar) return;
+    if (!g_recbar.sdl) return;
     char line[96] = "";
     if (g_rec_phase == REC_COUNTDOWN) {
-        int left = 3 - (int)((GetTickCount64() - g_rec_count_at) / 1000);
+        int left = 3 - (int)((now_ms() - g_rec_count_at) / 1000);
         snprintf(line, sizeof line, "Recording in %d\xE2\x80\xA6", left < 1 ? 1 : left);
     } else if (g_rec_phase == REC_RECORDING && g_rec) {
         oc_rec_status st; oc_recorder_status(g_rec, &st);
@@ -22155,31 +22039,29 @@ static void recbar_update(void) {
     } else if (g_rec_phase == REC_FINISHING) {
         snprintf(line, sizeof line, "Finishing\xE2\x80\xA6");
     }
-    if (strcmp(line, g_recbar_line) == 0) return;
+    int on = g_rec_phase != REC_FINISHING;
+    if (strcmp(line, g_recbar_line) == 0 && on == g_recbar_stop_on) return;
     snprintf(g_recbar_line, sizeof g_recbar_line, "%s", line);
-    WCHAR w[96]; to_w(line, w, 96);
-    SetWindowTextW(g_recbar_text, w);
-    SetWindowTextW(g_recbar_stop, g_rec_phase == REC_COUNTDOWN ? L"Cancel" : L"Stop");
-    EnableWindow(g_recbar_stop, g_rec_phase != REC_FINISHING);
+    g_recbar_stop_on = on;
+    recbar_paint();
 }
 
 /* Step the card aside for a screen recording, or bring it back. Called after
  * anything that can change the phase. */
-static void vm_update_away(HWND hwnd) {
+static void vm_update_away(oc_win *hwnd) {
     int away = g_vm == VM_REC && g_vm_src[0] &&
                (g_rec_phase == REC_COUNTDOWN || g_rec_phase == REC_RECORDING || g_rec_phase == REC_FINISHING);
-    if (away && !g_recbar) recbar_open(hwnd);
-    if (!away && g_recbar) {
+    if (away && !g_recbar.sdl) recbar_open(hwnd);
+    if (!away && g_recbar.sdl) {
         recbar_close();
         /* The card is back: so is the window it lives in. */
-        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+        show_and_focus(hwnd);
     }
     g_vm_away = away;
     recbar_update();
 }
 
-static void vm_close(HWND hwnd) {
+static void vm_close(oc_win *hwnd) {
     vm_player_close();
     if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
     oc_rec_result_free(&g_rec_res);
@@ -22187,7 +22069,7 @@ static void vm_close(HWND hwnd) {
     g_vplay_aid = 0; g_vplay_loading = 0;
     vm_update_away(hwnd);
     vm_set_title(hwnd, 0);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* The chosen screen or window, or NULL for the camera (or when it has gone). */
@@ -22198,7 +22080,7 @@ static const oc_capture_device *vm_source(void) {
     return NULL;
 }
 
-static void rec_open_devices(HWND hwnd) {
+static void rec_open_devices(oc_win *hwnd) {
     oc_recorder_opts o = {0};
     g_vm_ncams = oc_capture_list(g_vm_cams, 8);
     if (g_vm_ncams < 0) g_vm_ncams = 0;
@@ -22231,22 +22113,23 @@ static void rec_open_devices(HWND hwnd) {
     (void)hwnd;
 }
 
-static void vm_open_recorder(HWND hwnd) {
+static void vm_open_recorder(oc_win *hwnd) {
     if (!g_client || !g_sel || g_vm) return;
     /* The microphone has one owner (ARCH-112): recording ends voice input. */
     dict_stop(hwnd, 1);
     g_vm = VM_REC;
-    SetFocus(hwnd);
+    focus_set(NULL);
     rec_open_devices(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
-static void vm_open_player(HWND hwnd, const oc_attachment *at) {
+static void vm_open_player(oc_win *hwnd, const oc_attachment *at) {
+    (void)hwnd;
     if (!g_client || !at || at->reclaimed || g_vm) return;
     g_vm = VM_PLAY;
     g_vplay_aid = at->id;
     snprintf(g_vplay_name, sizeof g_vplay_name, "%s", at->filename);
-    SetFocus(hwnd);
+    focus_set(NULL);
     size_t n = 0;
     const uint8_t *d = vcache_get(at->id, &n);
     if (d) {
@@ -22258,7 +22141,7 @@ static void vm_open_player(HWND hwnd, const oc_attachment *at) {
         g_vplay_loading = 1;
         oc_client_fetch_media(g_client, at->id);
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* A fetched attachment arrived. Returns 1 if it was the video being opened. */
@@ -22274,11 +22157,11 @@ static int vm_take_bytes(uint64_t id, uint8_t *d, size_t n) {
     return 1;
 }
 
-static void vm_send(HWND hwnd) {
+static void vm_send(oc_win *hwnd) {
     if (!g_rec_res.video || !g_client || !g_sel) return;
     vm_player_close();                                /* it borrows the bytes being handed over */
-    WCHAR wcap[4096]; char cap[8192] = "";
-    if (ed_get(wcap, 4096) > 0) WideCharToMultiByte(CP_UTF8, 0, wcap, -1, cap, sizeof cap, NULL, NULL);
+    oc_wch wcap[4096]; char cap[8192] = "";
+    if (ed_get(wcap, 4096) > 0) to_u8(wcap, cap, sizeof cap);
     /* Into the open thread when the composer is replying there, as a typed
      * message would go (composer_send). */
     const oc_model *pm = model();
@@ -22297,15 +22180,15 @@ static void vm_send(HWND hwnd) {
 
 /* A device chosen from a dropdown: reopen the recorder on it. */
 /* Reopen the recorder after a choice on the card changed what it records. */
-static void vm_reopen(HWND hwnd) {
+static void vm_reopen(oc_win *hwnd) {
     if (g_vm != VM_REC || (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR)) return;
     if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
     vm_tex_drop();
     rec_open_devices(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
-static void vm_pick_device(HWND hwnd, int camera, int ix) {
+static void vm_pick_device(oc_win *hwnd, int camera, int ix) {
     if (g_vm != VM_REC || (g_rec_phase != REC_PREVIEW && g_rec_phase != REC_ERROR)) return;
     if (camera && g_vm_nocam && ix < g_vm_ncams) { g_vm_nocam = 0; g_vm_cam = ix; vm_reopen(hwnd); return; }
     if (camera) { if (ix >= g_vm_ncams || ix == g_vm_cam) return; g_vm_cam = ix; }
@@ -22313,16 +22196,16 @@ static void vm_pick_device(HWND hwnd, int camera, int ix) {
     if (g_rec) { oc_recorder_close(g_rec); g_rec = NULL; }
     vm_tex_drop();
     rec_open_devices(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
-static void vm_command(HWND hwnd, int cmd) {
+static void vm_command(oc_win *hwnd, int cmd) {
     crumb("vm_command %d", cmd);
     switch (cmd) {
     case VMC_OPEN:     vm_open_recorder(hwnd); break;
     case VMC_RECORD:
         if (g_vm == VM_REC && g_rec && g_rec_phase == REC_PREVIEW) {
-            g_rec_phase = REC_COUNTDOWN; g_rec_count_at = GetTickCount64();
+            g_rec_phase = REC_COUNTDOWN; g_rec_count_at = now_ms();
         }
         break;
     case VMC_STOP:
@@ -22355,7 +22238,7 @@ static void vm_command(HWND hwnd, int cmd) {
         g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
         g_menu_w = UIS(220);
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         g_menu_x = field.left;
         g_menu_y = field.bottom + 4;
         if (g_menu_y + h > DIPF(rc.bottom) - 8) g_menu_y = field.top - 4 - h;
@@ -22388,7 +22271,7 @@ static void vm_command(HWND hwnd, int cmd) {
         g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
         g_menu_w = field.right - field.left > UIS(240) ? field.right - field.left : UIS(240);
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         float WH = DIPF(rc.bottom);
         g_menu_x = field.left;
         g_menu_y = field.bottom + 4;
@@ -22428,7 +22311,7 @@ static void vm_command(HWND hwnd, int cmd) {
         g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
         g_menu_w = field.right - field.left > UIS(260) ? field.right - field.left : UIS(260);
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         g_menu_x = field.left;
         g_menu_y = field.bottom + 4;
         if (g_menu_y + h > DIPF(rc.bottom) - 8) g_menu_y = field.top - 4 - h;
@@ -22441,9 +22324,8 @@ static void vm_command(HWND hwnd, int cmd) {
         vm_reopen(hwnd);
         break;
     case VMC_PRIVACY: {
-        const WCHAR *uri = (g_rec_err == OC_REC_MIC_DENIED) ? L"ms-settings:privacy-microphone"
-                                                           : L"ms-settings:privacy-webcam";
-        ShellExecuteW(NULL, L"open", uri, NULL, NULL, SW_SHOWNORMAL);
+        SDL_OpenURL(g_rec_err == OC_REC_MIC_DENIED ? "ms-settings:privacy-microphone"
+                                                   : "ms-settings:privacy-webcam");
         break;
     }
     case VMC_PLAYPAUSE:
@@ -22466,11 +22348,11 @@ static void vm_command(HWND hwnd, int cmd) {
         break;
     }
     vm_update_away(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Per tick: advance the recording card, and report how a send went. */
-static void vm_tick(HWND hwnd, const oc_model *m) {
+static void vm_tick(oc_win *hwnd, const oc_model *m) {
     if (m && g_vm_post_tag) {
         if (m->media_posted_tag == g_vm_post_tag) {
             if (g_vm_fb) oc_fb_update(&g_fb, g_vm_fb, OC_FB_CONFIRM, "Video message sent.", fb_now());
@@ -22487,7 +22369,7 @@ static void vm_tick(HWND hwnd, const oc_model *m) {
         }
     }
     if (g_vm != VM_REC) return;
-    if (g_rec_phase == REC_COUNTDOWN && GetTickCount64() - g_rec_count_at >= 3000) {
+    if (g_rec_phase == REC_COUNTDOWN && now_ms() - g_rec_count_at >= 3000) {
         if (g_rec && oc_recorder_start(g_rec) == 0) { g_rec_phase = REC_RECORDING; vm_set_title(hwnd, 1); }
         else g_rec_phase = REC_PREVIEW;
     }
@@ -22606,7 +22488,7 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
         oc_rec_status st; memset(&st, 0, sizeof st);
         if (g_rec) oc_recorder_status(g_rec, &st);
         if (g_rec_phase == REC_COUNTDOWN) {
-            int left = 3 - (int)((GetTickCount64() - g_rec_count_at) / 1000);
+            int left = 3 - (int)((now_ms() - g_rec_count_at) / 1000);
             snprintf(line, sizeof line, "Recording in %d\xE2\x80\xA6", left < 1 ? 1 : left);
             char big[4]; snprintf(big, sizeof big, "%d", left < 1 ? 1 : left);
             g_display->align = ST_ALIGN_CENTER;
@@ -22844,7 +22726,7 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
 }
 
 /* Clicks while the overlay is up: always consumed. */
-static int vm_click(HWND hwnd, int x, int y) {
+static int vm_click(oc_win *hwnd, int x, int y) {
     if (!VM_UP()) return 0;
     if (g_menu) {                       /* a device dropdown is open over the card */
         for (int i = 0; i < g_n_mirows; i++)
@@ -22865,24 +22747,24 @@ static int vm_click(HWND hwnd, int x, int y) {
         oc_player_status ps; oc_player_status_get(g_vplayer, &ps);
         float frac = ((float)x - g_vm_seek.left) / (g_vm_seek.right - g_vm_seek.left);
         oc_player_seek(g_vplayer, (uint32_t)(frac * (float)ps.duration_ms));
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     return 1;
 }
 
-static int vm_key(HWND hwnd, WPARAM wp) {
+static int vm_key(oc_win *hwnd, int wp) {
     if (!VM_UP()) return 0;
-    if (g_menu) { if (wp == VK_ESCAPE) { g_menu = MENU_NONE; g_menu_hover = -1; } return 1; }
-    if (wp == VK_ESCAPE) { vm_command(hwnd, g_rec_phase == REC_RECORDING ? VMC_STOP : VMC_CLOSE); return 1; }
+    if (g_menu) { if (wp == OCK_ESCAPE) { g_menu = MENU_NONE; g_menu_hover = -1; } return 1; }
+    if (wp == OCK_ESCAPE) { vm_command(hwnd, g_rec_phase == REC_RECORDING ? VMC_STOP : VMC_CLOSE); return 1; }
     if (g_vplayer) {
         oc_player_status ps; oc_player_status_get(g_vplayer, &ps);
-        if (wp == VK_SPACE) { vm_command(hwnd, VMC_PLAYPAUSE); return 1; }
+        if (wp == OCK_SPACE) { vm_command(hwnd, VMC_PLAYPAUSE); return 1; }
         if (wp == 'M')      { vm_command(hwnd, VMC_MUTE); return 1; }
-        if (wp == VK_LEFT)  { oc_player_seek(g_vplayer, ps.position_ms > 5000 ? ps.position_ms - 5000 : 0); return 1; }
-        if (wp == VK_RIGHT) { oc_player_seek(g_vplayer, ps.position_ms + 5000); return 1; }
-        if (wp == VK_UP || wp == VK_DOWN) {
-            g_vm_volume += wp == VK_UP ? 0.1f : -0.1f;
+        if (wp == OCK_LEFT)  { oc_player_seek(g_vplayer, ps.position_ms > 5000 ? ps.position_ms - 5000 : 0); return 1; }
+        if (wp == OCK_RIGHT) { oc_player_seek(g_vplayer, ps.position_ms + 5000); return 1; }
+        if (wp == OCK_UP || wp == OCK_DOWN) {
+            g_vm_volume += wp == OCK_UP ? 0.1f : -0.1f;
             if (g_vm_volume < 0) g_vm_volume = 0;
             if (g_vm_volume > 1) g_vm_volume = 1;
             g_vm_muted = 0;
@@ -22890,7 +22772,7 @@ static int vm_key(HWND hwnd, WPARAM wp) {
             return 1;
         }
     }
-    if (g_vm == VM_REC && wp == VK_RETURN) {
+    if (g_vm == VM_REC && wp == OCK_RETURN) {
         if (g_rec_phase == REC_PREVIEW)   { vm_command(hwnd, VMC_RECORD); return 1; }
         if (g_rec_phase == REC_RECORDING) { vm_command(hwnd, VMC_STOP); return 1; }
         if (g_rec_phase == REC_REVIEW)    { vm_command(hwnd, VMC_SEND); return 1; }
@@ -22900,11 +22782,11 @@ static int vm_key(HWND hwnd, WPARAM wp) {
 
 /* The expanded image: the full bitmap fitted to the window over a dimmed
  * backdrop. Drawn last so nothing overlaps it. */
-static gfx_tex *thumb_get(gfx *rt, uint64_t id, UINT *w, UINT *h);  /* fwd */
+static gfx_tex *thumb_get(gfx *rt, uint64_t id, unsigned *w, unsigned *h);  /* fwd */
 
 static void draw_lightbox(gfx *rt, float W, float H) {
     if (!g_lightbox) return;
-    UINT iw = 0, ih = 0;
+    unsigned iw = 0, ih = 0;
     gfx_tex *bmp = thumb_get(rt, g_lightbox, &iw, &ih);
     if (!bmp || !iw || !ih) { return; }
 
@@ -22930,49 +22812,9 @@ static void draw_lightbox(gfx *rt, float W, float H) {
  * works from an IStream, so the buffer is wrapped rather than copied to disk. */
 static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
     if (!g_gfx || !data || !len) return;
-    if (!g_wic &&
-        FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
-                                &IID_IWICImagingFactory, (void **)&g_wic)))
-        return;
-
-    UINT iw = 0, ih = 0;
-    uint8_t *thumb_px = NULL; UINT thumb_stride = 0;
-    IWICStream *stream = NULL;
-    IWICBitmapDecoder *dec = NULL;
-    IWICBitmapFrameDecode *frame = NULL;
-    IWICFormatConverter *conv = NULL;
-
-    if (SUCCEEDED(IWICImagingFactory_CreateStream(g_wic, &stream)) &&
-        SUCCEEDED(IWICStream_InitializeFromMemory(stream, (BYTE *)data, (DWORD)len)) &&
-        SUCCEEDED(IWICImagingFactory_CreateDecoderFromStream(
-            g_wic, (IStream *)stream, NULL, WICDecodeMetadataCacheOnLoad, &dec)) &&
-        SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame)) &&
-        SUCCEEDED(IWICImagingFactory_CreateFormatConverter(g_wic, &conv)) &&
-        /* D2D wants premultiplied BGRA whatever the source format was. */
-        SUCCEEDED(IWICFormatConverter_Initialize(conv, (IWICBitmapSource *)frame,
-                                                 &GUID_WICPixelFormat32bppPBGRA,
-                                                 WICBitmapDitherTypeNone, NULL, 0.0,
-                                                 WICBitmapPaletteTypeMedianCut))) {
-        IWICBitmapSource_GetSize((IWICBitmapSource *)conv, &iw, &ih);
-        /* The premultiplied-BGRA pixels are what the cache keeps: the texture
-         * is made from them (and remade from them after a device reset), and
-         * they belong to nobody's render target. */
-        if (iw && ih && (uint64_t)iw * ih <= 4096ull * 4096ull) {
-            UINT stride = iw * 4;
-            uint8_t *px = malloc((size_t)stride * ih);
-            if (px) {
-                WICRect all = { 0, 0, (INT)iw, (INT)ih };
-                if (SUCCEEDED(IWICBitmapSource_CopyPixels((IWICBitmapSource *)conv, &all,
-                                                          stride, stride * ih, px))) {
-                    thumb_px = px; thumb_stride = stride;
-                } else free(px);
-            }
-        }
-    }
-    if (conv)   IWICFormatConverter_Release(conv);
-    if (frame)  IWICBitmapFrameDecode_Release(frame);
-    if (dec)    IWICBitmapDecoder_Release(dec);
-    if (stream) IWICStream_Release(stream);
+    int iw = 0, ih = 0;
+    uint8_t *thumb_px = oc_plat_image_decode(data, len, &iw, &ih);
+    unsigned thumb_stride = (unsigned)iw * 4;
 
     if (!thumb_px) {  /* not decodable: remember, so we do not re-fetch every frame */
         if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = id;
@@ -22990,71 +22832,66 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
     g_thumbs[g_n_thumbs].tex = gfx_tex_create_text(g_gfx, thumb_px,
                                                    (int)thumb_stride,
                                                    (int)iw, (int)ih);
-    g_thumbs[g_n_thumbs].w = iw;
-    g_thumbs[g_n_thumbs].h = ih;
+    g_thumbs[g_n_thumbs].w = (unsigned)iw;
+    g_thumbs[g_n_thumbs].h = (unsigned)ih;
     g_n_thumbs++;
 }
 
 /* Run whatever is currently in the query box. */
 static void search_submit(void) {
     if (!g_srch || !g_client) return;
-    WCHAR w[256]; GetWindowTextW(g_srch, w, 256);
     char q[256];
-    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, q, sizeof q, NULL, NULL) <= 0) return;
+    snprintf(q, sizeof q, "%s", g_srch->buf);
     if (!q[0]) return;
     g_srch_scroll = 0;
     oc_client_search(g_client, q);
 }
 
 /* Open the overlay with the box focused and empty — no modal prompt. */
-static void search_open(HWND hwnd) {
+static void search_open(oc_win *hwnd) {
     if (!g_client) return;
     g_view = VIEW_HOME;
     g_srch_scroll = 0;
     oc_client_open_search(g_client);
-    SetWindowTextW(g_srch, L"");
+    field_set(g_srch, "");
     layout_search(hwnd);
-    SetFocus(g_srch);
-    InvalidateRect(hwnd, NULL, FALSE);
+    focus_set(g_srch);
+    invalidate();
 }
 
-static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    HWND parent = GetParent(hwnd);
-    if (msg == WM_KEYDOWN) {
-        switch (wp) {
-        case VK_ESCAPE: palette_close(parent); return 0;
-        case VK_RETURN: palette_accept(parent); return 0;
-        case VK_UP:     g_pal_sel--; InvalidateRect(parent, NULL, FALSE); return 0;
-        case VK_DOWN:   g_pal_sel++; InvalidateRect(parent, NULL, FALSE); return 0;
-        default: break;
-        }
+/* The palette's keys: Esc closes, Enter runs the row, the arrows move. */
+static int pal_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    switch (key) {
+    case OCK_ESCAPE: palette_close(g_main); return 1;
+    case OCK_RETURN: palette_accept(g_main); return 1;
+    case OCK_UP:     g_pal_sel--; invalidate(); return 1;
+    case OCK_DOWN:   g_pal_sel++; invalidate(); return 1;
+    default: return 0;
     }
-    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;   /* no bell */
-    return CallWindowProcW(g_pal_prev, hwnd, msg, wp, lp);
 }
+static void pal_changed(field *f) { (void)f; g_pal_sel = 0; }
 
 /* The emoji picker's search box: Esc closes the picker, exactly as the
- * shortcuts sheet says it does. Unsubclassed, the default EDIT proc swallowed
- * the key, so the picker was undismissable from its own search field. */
-static WNDPROC g_pick_prev;
-static LRESULT CALLBACK pick_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { picker_close(GetParent(hwnd)); return 0; }
-    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;   /* no bell */
-    return CallWindowProcW(g_pick_prev, hwnd, msg, wp, lp);
+ * shortcuts sheet says it does. */
+static int pick_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (key == OCK_ESCAPE) { picker_close(g_main); return 1; }
+    return 0;
 }
+static void pick_changed(field *f) { (void)f; g_pick_scroll = 0; }
 
-static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && wp == VK_RETURN) { search_submit(); return 0; }
-    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;  /* no MessageBeep */
-    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
-        HWND parent = GetParent(hwnd);
+/* Enter submits the query; Escape closes the overlay. */
+static int srch_key(field *f, int key, int ctrl, int shift) {
+    (void)ctrl; (void)shift;
+    if (key == OCK_RETURN) { search_submit(); return 1; }
+    if (key == OCK_ESCAPE) {
         if (g_client) oc_client_close_search(g_client);
-        ShowWindow(hwnd, SW_HIDE);
-        ed_focus(parent);
-        InvalidateRect(parent, NULL, FALSE);
-        return 0;
+        field_show(f, 0);
+        ed_focus(g_main);
+        return 1;
     }
-    return CallWindowProcW(g_srch_prev, hwnd, msg, wp, lp);
+    return 0;
 }
 
 /* Place the sign-in EDITs over the field chrome draw_signin() paints. The two
@@ -23062,7 +22899,7 @@ static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * pad/step offsets here in step with that function. */
 /* The hosted suffix beside the workspace field: not in advanced mode, and only
  * beside what it would be added to (oc_workspace_takes_suffix). */
-static void si_get(HWND e, char *out, size_t cap);   /* fwd */
+static void si_get(field *e, char *out, size_t cap);   /* fwd */
 static int si_suffix_applies(void) {
     if (g_si_advanced || !g_si_e_ws) return 0;
     char typed[320];
@@ -23070,101 +22907,54 @@ static int si_suffix_applies(void) {
     return oc_workspace_takes_suffix(typed, oc_default_suffix());
 }
 
-static void layout_signin(HWND hwnd) {
+static void layout_signin(oc_win *hwnd) {
+    (void)hwnd;
     if (!g_si_e_ws) return;
     int on = (g_view == VIEW_SIGNIN && !g_si_connecting && !modal_open());
-    ShowWindow(g_si_e_ws,   (on && g_si_step == 1) ? SW_SHOW : SW_HIDE);
+    field_show(g_si_e_ws, on && g_si_step == 1);
     /* No credentials are typed here any more (AUTH.md §8.10): the fields stay
      * hidden, and the page in the browser asks. */
-    ShowWindow(g_si_e_user, SW_HIDE);
-    ShowWindow(g_si_e_pass, SW_HIDE);
-    if (!on) return;
-
-    RECT rc; GetClientRect(hwnd, &rc);
-    si_geom g = si_layout(DIPF(rc.right), DIPF(rc.bottom));
-    float y = g.fields_y;
-
-    /* Inset inside the drawn 32px-tall rounded box. */
-    int ex = (int)(g.fx + 12), ew = (int)(g.fw - 24), eh = 20;
-    if (g_si_step == 1) {
-        /* Leave room for the ".openchime.io" chip the painter draws at the right
-         * edge of the box, so typed text can never run under it -- while it is
-         * drawn, which depends on what has been typed (si_suffix_applies). */
-        int sw = !si_suffix_applies() ? 0 : (int)(8 + 7.0 * (double)(strlen(oc_default_suffix()) + 1));
-        MoveWindow(g_si_e_ws, PX(ex), PX(y + 20 + 6), PX(ew - sw), PX(eh), TRUE);
-    } else {
-        MoveWindow(g_si_e_user, PX(ex), PX(y + 20 + 6), PX(ew), PX(eh), TRUE);
-        MoveWindow(g_si_e_pass, PX(ex), PX(y + 62 + 20 + 6), PX(ew), PX(eh), TRUE);
-    }
+    field_show(g_si_e_user, 0);
+    field_show(g_si_e_pass, 0);
 }
 
-/* Enter submits from any sign-in field. Subclassed rather than left to
- * IsDialogMessage's default-button handling, which we have no default button
- * for (the buttons are D2D-drawn) — and eating WM_CHAR too silences the EDIT's
- * beep on Enter, exactly as re_proc does for the composer. */
-static WNDPROC g_si_oldproc;
-static LRESULT CALLBACK si_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN) {
-        if (msg == WM_KEYDOWN) signin_submit(GetParent(hwnd));
-        return 0;
-    }
-    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
-        if (msg == WM_KEYDOWN) signin_cancel(GetParent(hwnd));
-        return 0;
-    }
-    return CallWindowProcW(g_si_oldproc, hwnd, msg, wp, lp);
+/* Enter submits from any sign-in field; Esc goes back. */
+static int si_key(field *f, int key, int ctrl, int shift) {
+    (void)f; (void)ctrl; (void)shift;
+    if (key == OCK_RETURN) { signin_submit(g_main); return 1; }
+    if (key == OCK_ESCAPE) { signin_cancel(g_main); return 1; }
+    return 0;
 }
+/* The suffix comes and goes with what is typed, and the field's width with it. */
+static void si_ws_changed(field *f) { (void)f; layout_signin(g_main); }
 
-static void signin_create(HWND parent) {
-    HINSTANCE inst = GetModuleHandleW(NULL);
-    DWORD base = WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL;
-    g_si_e_ws   = CreateWindowExW(0, L"EDIT", L"", base, 0, 0, 10, 10, parent,
-                                  (HMENU)(INT_PTR)0xF2, inst, NULL);
-    g_si_e_user = CreateWindowExW(0, L"EDIT", L"", base, 0, 0, 10, 10, parent,
-                                  (HMENU)(INT_PTR)0xF3, inst, NULL);
-    g_si_e_pass = CreateWindowExW(0, L"EDIT", L"", base | ES_PASSWORD, 0, 0, 10, 10, parent,
-                                  (HMENU)(INT_PTR)0xF4, inst, NULL);
-    HWND all[3] = { g_si_e_ws, g_si_e_user, g_si_e_pass };
-    for (int i = 0; i < 3; i++)
-        if (all[i]) SendMessageW(all[i], WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    if (g_si_e_ws)
-        SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE, (LPARAM)L"your-workspace");
-    for (int i = 0; i < 3; i++) {
-        if (!all[i]) continue;
-        g_si_oldproc = (WNDPROC)SetWindowLongPtrW(all[i], GWLP_WNDPROC, (LONG_PTR)si_edit_proc);
-    }
-    layout_signin(parent);
-}
 
 /* Re-skin the native children after a theme change. The D2D chrome repaints itself
  * from oc_theme[] every frame; an EDIT caches its background brush. The composer
  * used to be here too, when it was a RichEdit with its own background and character
  * format — it is drawn from oc_theme[] like everything else now. */
-static void theme_restyle_children(void) {
-    if (g_find_brush) { DeleteObject(g_find_brush); g_find_brush = NULL; }
-}
+static void theme_restyle_children(void) { }
 
 /* Force a scale factor. Shared by WM_DPICHANGED's path, the `dpi` test verb and
  * the Advanced pane's override, because the render target, the brushes and every
  * cached thumbnail all carry the old DPI and forgetting one of them leaves the
  * window drawing at two scales at once. */
-static void dpi_set(HWND hwnd, UINT dpi) {
+static void dpi_set(oc_win *hwnd, unsigned dpi) {
     if (dpi < 48 || dpi > 480) return;
     g_dpi = dpi;
     /* Rasters carry the old scale; the next paint's scene_scale_apply() bumps
      * the text generation and the caches rebuild lazily. Thumbnails are
      * content images drawn in DIPs — they survive as they are. */
-    g_form_font_scale = -1;   /* rebuilt at the new DPI by the next form_font() */
     layout_natives(hwnd);
     layout_signin(hwnd);
-    InvalidateRect(hwnd, NULL, TRUE);
+    invalidate();
 }
 
 /* Every text-size or zoom change goes through here. A DirectWrite format's size is
  * immutable, so a scale change means rebuilding the whole table, restyling the
  * native children that carry their own font, and relaying out — three steps that
  * were each forgettable at each call site. */
-static void scale_apply(HWND hwnd) {
+static void scale_apply(oc_win *hwnd) {
     g_text_scale = textsize_mult();
     fonts_build();      /* g_body's uniform line spacing scales inside it */
     mlay_drop_all();
@@ -23179,7 +22969,7 @@ static void scale_apply(HWND hwnd) {
      * every glyph stayed its original size while the words around it grew. */
     emoji_fonts_build();
     layout_natives(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* EVERYTHING A PALETTE CHANGE HAS TO DO. Both switches below funnel through it,
@@ -23209,9 +22999,8 @@ static void palette_changed(void) {
     txt_drop_all();
     theme_restyle_children();
     /* The caption is not ours to paint, so it has to be told. */
-    HWND top = GetActiveWindow();
-    if (top) apply_titlebar(top);
-    if (g_main_hwnd) InvalidateRect(g_main_hwnd, NULL, FALSE);
+    apply_titlebar(g_main);
+    invalidate();
 }
 
 /* Every theme switch goes through here so no caller can forget the children. */
@@ -23233,7 +23022,7 @@ static void scheme_set(int scheme) {
 /* Where the RichEdit used to be created. Nothing to create: the composer is part of
  * the scene. It still needs the focus at startup, because typing into the
  * conversation without clicking first is the whole point of a chat client. */
-static void composer_create(HWND parent) {
+static void composer_create(oc_win *parent) {
     layout_composer(parent);
     ed_focus(parent);
 }
@@ -23254,65 +23043,47 @@ static int reaction_is_mine(const oc_msg *msg, const char *emoji) {
     return 0;
 }
 
-static void copy_to_clipboard(HWND hwnd, const char *utf8) {
-    if (!utf8 || !OpenClipboard(hwnd)) return;
-    EmptyClipboard();
-    int wl = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (size_t)wl * sizeof(WCHAR));
-    if (h) {
-        WCHAR *p = (WCHAR *)GlobalLock(h);
-        MultiByteToWideChar(CP_UTF8, 0, utf8, -1, p, wl);
-        GlobalUnlock(h);
-        SetClipboardData(CF_UNICODETEXT, h);
-    }
-    CloseClipboard();
+static void copy_to_clipboard(oc_win *hwnd, const char *utf8) {
+    (void)hwnd;
+    if (utf8) SDL_SetClipboardText(utf8);
 }
 
-static void download_attachment(HWND hwnd, const oc_attachment *a) {
-    WCHAR file[MAX_PATH]; file[0] = 0;
-    MultiByteToWideChar(CP_UTF8, 0, a->filename, -1, file, MAX_PATH);
-    OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
-    ofn.lStructSize = sizeof ofn;
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
-    if (GetSaveFileNameW(&ofn)) {
-        char path[1024];
-        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
-        oc_client_download(g_client, a->id, path);
+/* Downloads in flight, by the attachment id their transfer carries: when the
+ * core reports one done, the platform is told the file is there (a browser
+ * downloads it only then). */
+static struct { uint64_t tag; char path[1024]; } g_dl[8];
+
+static void download_attachment(oc_win *hwnd, const oc_attachment *a) {
+    char path[1024];
+    if (!oc_plat_pick_save(hwnd->sdl, a->filename, path, sizeof path)) return;
+    oc_client_download(g_client, a->id, path);
+    for (int i = 0; i < 8; i++)
+        if (!g_dl[i].tag) { g_dl[i].tag = a->id; snprintf(g_dl[i].path, sizeof g_dl[i].path, "%s", path); break; }
+}
+
+static void downloads_tick(const oc_model *m) {
+    if (!m) return;
+    for (int i = 0; i < 8; i++) {
+        if (!g_dl[i].tag) continue;
+        for (int k = 0; k < OC_MODEL_XFERS; k++)
+            if (m->xfers[k].tag == g_dl[i].tag && m->xfers[k].phase) {
+                if (m->xfers[k].phase == 1) oc_plat_file_saved(g_dl[i].path);
+                g_dl[i].tag = 0;
+                break;
+            }
     }
 }
 
 
 /* Pick local files for the selected conversation's upload tray. Several at once:
  * the dialog then answers with the folder, then each name, each NUL-ended. */
-static void upload_file(HWND hwnd) {
+static void upload_file(oc_win *hwnd) {
     crumb("upload_file");
     if (!g_client || !g_sel) return;
-    static WCHAR file[32 * MAX_PATH];
-    file[0] = 0;
-    OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
-    ofn.lStructSize = sizeof ofn;
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = sizeof file / sizeof file[0];
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | OFN_ALLOWMULTISELECT;
-    if (!GetOpenFileNameW(&ofn)) return;
-    const WCHAR *first = file, *next = file + wcslen(file) + 1;
-    WCHAR full[MAX_PATH];
-    char path[1024];
-    if (!*next) {                                  /* one file: the whole path */
-        WideCharToMultiByte(CP_UTF8, 0, first, -1, path, sizeof path, NULL, NULL);
-        ftray_add(hwnd, path);
-        return;
-    }
-    for (; *next; next += wcslen(next) + 1) {
-        if (_snwprintf(full, MAX_PATH, L"%ls\\%ls", first, next) < 0) continue;
-        full[MAX_PATH - 1] = 0;
-        WideCharToMultiByte(CP_UTF8, 0, full, -1, path, sizeof path, NULL, NULL);
-        ftray_add(hwnd, path);
-    }
+    static char files[32 * 1024];
+    int n = oc_plat_pick_files(hwnd->sdl, NULL, 1, files, sizeof files);
+    const char *p = files;
+    for (int i = 0; i < n; i++, p += strlen(p) + 1) ftray_add(hwnd, p);
 }
 
 /* The message context menu. Built into the app's own floating menu — see
@@ -23321,7 +23092,7 @@ static void upload_file(HWND hwnd) {
  * `cx`/`cy` are CLIENT DIPs, not screen pixels: the custom menu is drawn by us, in
  * our own coordinate space. The native version needed ClientToScreen; passing those
  * screen coordinates here would put the menu wherever the window happens to sit. */
-static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, float cy) {
+static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float cx, float cy) {
     (void)hwnd;
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     const oc_msg *msg = find_msg(c, mid);
@@ -23376,7 +23147,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, 
     /* Keep it on screen: a menu opened near the bottom used to run off it. */
     {
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         float H = DIPF(rc.bottom), W = DIPF(rc.right);
         if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
         if (g_menu_y < 8) g_menu_y = 8;
@@ -23389,7 +23160,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, 
 /* The thumbnail kebab's actions. `g_menu_target` is the attachment id; the entry
  * is found again by id rather than held as a pointer, because the model can be
  * rebuilt between opening the menu and clicking it. */
-static void thumb_menu_run(HWND hwnd, int cmd) {
+static void thumb_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (!m || !g_menu_target) return;
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
@@ -23403,10 +23174,10 @@ static void thumb_menu_run(HWND hwnd, int cmd) {
     else if (cmd == 3) copy_to_clipboard(hwnd, at->filename);
 }
 
-static void member_menu_run(HWND hwnd, int cmd);    /* fwd */
-static void channel_menu_run(HWND hwnd, int cmd);   /* fwd */
+static void member_menu_run(oc_win *hwnd, int cmd);    /* fwd */
+static void channel_menu_run(oc_win *hwnd, int cmd);   /* fwd */
 
-static void msg_menu_run(HWND hwnd, int cmd) {
+static void msg_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (!m || !cmd) return;
     uint64_t mid = g_menu_target, chan = g_menu_target2;
@@ -23506,7 +23277,7 @@ static void msg_menu_react(int idx) {
                     reaction_is_mine(msg, e) ? 0 : 1);
 }
 
-static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float cx, float cy) {
+static void show_member_menu(oc_win *hwnd, const oc_model *m, uint64_t uid, float cx, float cy) {
     int self = (uid == m->user_id);
     uint8_t me = self_role(m);
     g_n_mi = 0;
@@ -23567,7 +23338,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
     g_menu_x = cx; g_menu_y = cy;
     {
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         float H = DIPF(rc.bottom), W = DIPF(rc.right);
         menu_fit(W - 16);
         if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
@@ -23576,7 +23347,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
     }
 }
 
-static void member_menu_run(HWND hwnd, int cmd) {
+static void member_menu_run(oc_win *hwnd, int cmd) {
     (void)hwnd;
     uint64_t uid = g_menu_target;
     switch (cmd) {
@@ -23601,13 +23372,13 @@ static void member_menu_run(HWND hwnd, int cmd) {
 
 /* ---- input --------------------------------------------------------------- */
 
-static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float cx, float cy);
-static void open_ws_menu(HWND hwnd);
-static void open_profile_menu(HWND hwnd);
-static void open_new_menu(HWND hwnd);
-static void open_new_message(HWND hwnd);   /* fwd */
-static void open_switcher(HWND hwnd);
-static void menu_dispatch(HWND hwnd, int cmd);
+static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, float cx, float cy);
+static void open_ws_menu(oc_win *hwnd);
+static void open_profile_menu(oc_win *hwnd);
+static void open_new_menu(oc_win *hwnd);
+static void open_new_message(oc_win *hwnd);   /* fwd */
+static void open_switcher(oc_win *hwnd);
+static void menu_dispatch(oc_win *hwnd, int cmd);
 
 
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
@@ -23629,7 +23400,7 @@ static void files_view_sync(void) {
     if (m && m->filelist_open && g_client) oc_client_close_files(g_client);
 }
 
-static int files_click(HWND hwnd, int x, int y) {
+static int files_click(oc_win *hwnd, int x, int y) {
     /* "Load more" first: it sits under the rows and nothing else claims it. */
     if (in_rect(g_file_more_btn, (float)x, (float)y)) {
         if (g_client) oc_client_list_files_more(g_client);
@@ -23683,7 +23454,7 @@ static int files_click(HWND hwnd, int x, int y) {
                 if (f->channel_id && f->channel_id != g_sel) select_channel(f->channel_id);
                 if (from_view) { g_view = VIEW_HOME; layout_composer(hwnd); }
                 g_jump_mid = f->message_id;
-            g_jump_deadline = GetTickCount64() + 1500;
+            g_jump_deadline = now_ms() + 1500;
                 select_tab(TAB_MESSAGES);
             }
             return 1;
@@ -23730,7 +23501,8 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
 
 /* Send `mid` on to another conversation as a structured reference (REQ-057,
  * ARCH-108) — the ids only; see the note in the body below. */
-static void forward_send(HWND hwnd, uint64_t to_cid) {
+static void forward_send(oc_win *hwnd, uint64_t to_cid) {
+    (void)hwnd;
     const oc_model *m = model();
     if (!m || !g_client || !g_fwd_mid || !to_cid) return;
     const oc_channel *src = oc_model_channel((oc_model *)m, g_fwd_cid);
@@ -23759,12 +23531,12 @@ static void forward_send(HWND hwnd, uint64_t to_cid) {
     }
     fb_confirm(note);
     g_fwd_mid = g_fwd_cid = 0;
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
  * a link that does nothing is indistinguishable from a broken app. */
-static int permalink_follow(HWND hwnd, const char *text) {
+static int permalink_follow(oc_win *hwnd, const char *text) {
     char host[256]; uint64_t chan = 0, mid = 0;
     if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
     if (!g_client) { fb_failed("Sign in to open a link."); return 1; }
@@ -23776,7 +23548,7 @@ static int permalink_follow(HWND hwnd, const char *text) {
     /* Compared against the same string the copy path builds, so the two halves
      * cannot disagree about whether a port is part of the identity. A bare host is
      * accepted too: a link written before the port was included is still ours. */
-    if (host[0] && self[0] && _stricmp(host, self) != 0 && _stricmp(host, g_host) != 0) {
+    if (host[0] && self[0] && SDL_strcasecmp(host, self) != 0 && SDL_strcasecmp(host, g_host) != 0) {
         char msg[256];
         snprintf(msg, sizeof msg, "That link is for %s \u2014 switch workspace first.", host);
         fb_failed(msg);
@@ -23797,11 +23569,11 @@ static int permalink_follow(HWND hwnd, const char *text) {
      * is nothing to arm and nothing to flash. */
     if (mid) {
         g_jump_mid = mid;
-        g_jump_deadline = GetTickCount64() + 4000;
+        g_jump_deadline = now_ms() + 4000;
     }
     select_tab(TAB_MESSAGES);
     layout_composer(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
     return 1;
 }
 
@@ -23809,7 +23581,7 @@ static int permalink_follow(HWND hwnd, const char *text) {
  * its own, so 21 means Edit on a message and a notification level in a dropdown;
  * the click and the automation invoke both come through here so they cannot mean
  * different things. */
-static void menu_run_kind(HWND hwnd, int kind, int cmd) {
+static void menu_run_kind(oc_win *hwnd, int kind, int cmd) {
     if (kind == MENU_THREAD)       thread_menu_run(hwnd, cmd);
     else if (kind == MENU_SCHED)   sched_menu_run(hwnd, cmd);
     else if (kind == MENU_SUMMARIZE) sum_menu_run(hwnd, cmd);
@@ -23820,10 +23592,10 @@ static void menu_run_kind(HWND hwnd, int kind, int cmd) {
     else                           menu_dispatch(hwnd, cmd);
 }
 
-static int call_click(HWND hwnd, int x, int y);   /* fwd: the call's controls */
+static int call_click(oc_win *hwnd, int x, int y);   /* fwd: the call's controls */
 /* Ask before removing row `row` of the Workspaces dialog. One place, because the
  * button and the Delete key both end here. */
-static void wsmgr_ask_forget(HWND hwnd, int row) {
+static void wsmgr_ask_forget(oc_win *hwnd, int row) {
     if (row < 0 || row >= g_n_sw) return;
     int slot = ws_find(g_sw[row].ws);
     int live = (slot >= 0 && g_wss[slot].client);
@@ -23842,7 +23614,7 @@ static void wsmgr_ask_forget(HWND hwnd, int row) {
 }
 
 /* One row's button, pressed -- by a click or by an invoke through the tree. */
-static void wsmgr_act(HWND hwnd, int row, int act) {
+static void wsmgr_act(oc_win *hwnd, int row, int act) {
     if (row < 0 || row >= g_n_sw) return;
     g_wsmgr_focus = row;
     char ws[256], user[80];
@@ -23869,20 +23641,20 @@ static void wsmgr_act(HWND hwnd, int row, int act) {
 /* The Workspaces dialog's keys: the arrows, Page Up/Down, Home and End move a row
  * focus that the paint keeps in view, and Delete asks to remove that row. Enter
  * and Esc stay the frame's. Returns 1 when the key was the list's. */
-static int wsmgr_key(HWND hwnd, WPARAM vk) {
+static int wsmgr_key(oc_win *hwnd, int vk) {
     if (!g_wsmgr_open || g_n_sw <= 0) return 0;
     float rowh = UIS(54), visible = g_wsmgr_list.bottom - g_wsmgr_list.top;
     int page = rowh > 0 ? (int)(visible / rowh) : 1;
     if (page < 1) page = 1;
     int at = g_wsmgr_focus;
     switch (vk) {
-    case VK_DOWN:  at = at < 0 ? 0 : at + 1; break;
-    case VK_UP:    at = at < 0 ? 0 : at - 1; break;
-    case VK_NEXT:  at = at < 0 ? 0 : at + page; break;
-    case VK_PRIOR: at = at < 0 ? 0 : at - page; break;
-    case VK_HOME:  at = 0; break;
-    case VK_END:   at = g_n_sw - 1; break;
-    case VK_DELETE:
+    case OCK_DOWN:  at = at < 0 ? 0 : at + 1; break;
+    case OCK_UP:    at = at < 0 ? 0 : at - 1; break;
+    case OCK_NEXT:  at = at < 0 ? 0 : at + page; break;
+    case OCK_PRIOR: at = at < 0 ? 0 : at - page; break;
+    case OCK_HOME:  at = 0; break;
+    case OCK_END:   at = g_n_sw - 1; break;
+    case OCK_DELETE:
         if (at < 0) return 0;
         wsmgr_ask_forget(hwnd, at);
         return 1;
@@ -23895,7 +23667,7 @@ static int wsmgr_key(HWND hwnd, WPARAM vk) {
     return 1;
 }
 
-static int on_click(HWND hwnd, int x, int y) {
+static int on_click(oc_win *hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* Toasts are painted above everything, a dialog included, so they are
      * hit-tested above everything too -- a toast over the composer or a
@@ -23928,7 +23700,7 @@ static int on_click(HWND hwnd, int x, int y) {
             if (g_dm_compose) { g_dm_compose = 0; pick_clear(); }
             else              close_overlays();
             layout_composer(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
     }
@@ -23956,7 +23728,7 @@ static int on_click(HWND hwnd, int x, int y) {
         if (in_rect(g_tgt_box, x, y)) {
             g_nm_to_focus = 1;
             g_tgt_q.caret = g_tgt_q.anchor = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)x);
-            g_tgt_blink = GetTickCount64();
+            g_tgt_blink = now_ms();
             tgt_rebuild();
             return 1;
         }
@@ -23967,7 +23739,7 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
         if (in_rect(g_nm_emoji, x, y)) { g_nm_to_focus = 0; ed_focus(hwnd); picker_open(hwnd, 0); return 1; }
-        if (in_rect(g_nm_at, x, y))    { g_nm_to_focus = 0; ed_focus(hwnd); ed_insert(L"@"); ac_rebuild(); return 1; }
+        if (in_rect(g_nm_at, x, y))    { g_nm_to_focus = 0; ed_focus(hwnd); ed_insert(u"@"); ac_rebuild(); return 1; }
         if (in_rect(g_nm_attach, x, y)) {
             /* An attachment needs a conversation to hang on, and this pane does
              * not have one until the send resolves it. Say so, rather than
@@ -24050,11 +23822,11 @@ static int on_click(HWND hwnd, int x, int y) {
         if (g_status_open) {
             if (in_rect(g_status_emoji_btn, x, y)) {
                 picker_open_status(hwnd, g_status_emoji_btn);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
             if (in_rect(g_status_erect, x, y)) {
-                if (g_status_edit) SetFocus(g_status_edit);
+                if (g_status_edit) focus_set(g_status_edit);
                 return 1;
             }
             for (int i = 0; i < g_n_status_suggs; i++)
@@ -24063,19 +23835,15 @@ static int on_click(HWND hwnd, int x, int y) {
                      * default clear time — one click, whole status. */
                     snprintf(g_status_emoji, sizeof g_status_emoji, "%s",
                              g_status_suggs[i].emoji);
-                    if (g_status_edit) {
-                        WCHAR w[96];
-                        MultiByteToWideChar(CP_UTF8, 0, g_status_suggs[i].text, -1, w, 96);
-                        SetWindowTextW(g_status_edit, w);
-                    }
+                    if (g_status_edit) field_set(g_status_edit, g_status_suggs[i].text);
                     g_status_clear = g_status_suggs[i].clear;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                     return 1;
                 }
             for (int k = 0; k < 5; k++)
                 if (in_rect(g_status_chip_hits[k], x, y)) {
                     g_status_clear = k;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                     return 1;
                 }
             return 1;   /* the card swallows what nothing above claimed */
@@ -24331,11 +24099,11 @@ static int on_click(HWND hwnd, int x, int y) {
                              g_form_sel_rows[i].val);
                     if (g_form_on_pick) g_form_on_pick(g_form_sel_field, g_form_sel_rows[i].val);
                     g_form_sel_field = -1;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                     return 1;
                 }
             g_form_sel_field = -1;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
         for (int i = 0; i < g_form_n; i++)
@@ -24347,7 +24115,7 @@ static int on_click(HWND hwnd, int x, int y) {
                  * already have the hardest one to see. */
                 g_form_sel_scroll = atoi(g_form_f[i].value) - FORM_SEL_VISIBLE / 2;
                 if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
         /* The action beside a field, before the field itself: it is drawn inside
@@ -24355,7 +24123,7 @@ static int on_click(HWND hwnd, int x, int y) {
         if (g_form_on_action && g_form_action_field >= 0 && !g_form_action_busy &&
             in_rect(g_form_action_btn, x, y)) {
             g_form_on_action(g_form_action_field);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
         for (int i = 0; i < g_n_form_hits; i++)
@@ -24363,14 +24131,14 @@ static int on_click(HWND hwnd, int x, int y) {
                 snprintf(g_form_f[g_form_hits[i].field].value,
                          sizeof g_form_f[g_form_hits[i].field].value, "%d", g_form_hits[i].val);
                 if (g_form_on_pick) g_form_on_pick(g_form_hits[i].field, g_form_hits[i].val);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
         /* Clicking a field's box focuses it — the EDIT itself is only as tall as
          * its text, and the visible target is the rounded box behind it. */
         for (int i = 0; i < g_form_n; i++)
             if (g_form_edit[i] && in_rect(g_form_erect[i], x, y)) {
-                SetFocus(g_form_edit[i]);
+                focus_set(g_form_edit[i]);
                 return 1;
             }
         if (g_form_side.on) {
@@ -24385,7 +24153,7 @@ static int on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < QUICK_SLOTS; i++) {
             if (in_rect(g_quick_clear[i], x, y)) {
                 if (quick_slots_filled() > 1) quick_slot_set(i, "");
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
             if (in_rect(g_quick_tile[i], x, y)) {
@@ -24394,7 +24162,7 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         }
         for (int i = 0; i < PC_COUNT; i++)
-            if (in_rect(g_pref_cats[i], x, y)) { g_pref_cat = i; InvalidateRect(hwnd, NULL, FALSE); return 1; }
+            if (in_rect(g_pref_cats[i], x, y)) { g_pref_cat = i; invalidate(); return 1; }
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
             int v = g_pref_hits[i].val;
@@ -24510,7 +24278,7 @@ static int on_click(HWND hwnd, int x, int y) {
             for (size_t i = 0; hex && i < n; i++) hex = isxdigit((unsigned char)code[i]) != 0;
             if (!hex) {
                 snprintf(g_si_err, sizeof g_si_err, "that isn't a reset code \u2014 it is 64 letters and digits");
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 1;
             }
             signin_start_reset(hwnd, code);
@@ -24520,7 +24288,7 @@ static int on_click(HWND hwnd, int x, int y) {
             (g_si_step == 2 && y >= (int)g_si_remember_box.top &&
              y <= (int)g_si_remember_box.bottom &&
              x >= (int)g_si_remember_box.left && x < (int)g_si_remember_box.left + 140)) {
-            g_si_remember = !g_si_remember; InvalidateRect(hwnd, NULL, FALSE); return 1;
+            g_si_remember = !g_si_remember; invalidate(); return 1;
         }
         return 1;
     }
@@ -24556,7 +24324,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 if (g_mirows[i].kind == MK_SUB) {
                     if (g_sub_open) submenu_close();
                     else { g_sub_open = g_mirows[i].cmd; g_sub_anchor_top = g_mirows[i].top; }
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                     return 1;
                 }
                 int cmd = g_mirows[i].cmd, kind = g_menu;
@@ -24723,7 +24491,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
-                g_jump_deadline = GetTickCount64() + 1500;
+                g_jump_deadline = now_ms() + 1500;
                 return 1;
             }
     }
@@ -24749,7 +24517,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 g_view = VIEW_HOME;
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
-            g_jump_deadline = GetTickCount64() + 1500;
+            g_jump_deadline = now_ms() + 1500;
                 select_tab(TAB_MESSAGES);
                 layout_composer(hwnd);
                 return 1;
@@ -24837,7 +24605,7 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The header's Summarize: its spans, in a menu under it (REQ-310). */
     if (in_rect(g_sum_hdr_btn, x, y) && g_sel) {
         sum_menu_open(g_sum_hdr_btn, g_sel);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 1;
     }
     /* Talking mode on or off for the conversation on screen (REQ-291). */
@@ -24917,7 +24685,7 @@ static int on_click(HWND hwnd, int x, int y) {
             } else {
                 /* Reversible, but it changes the channel for everyone — worth a
                  * confirm, unlike the topic. */
-                WCHAR q[320]; char t[240];
+                oc_wch q[320]; char t[240];
                 snprintf(t, sizeof t,
                          "Archive #%s?\n\nIt becomes read-only and disappears from the sidebar of "
                          "anyone who is not a member. History stays searchable, and you can "
@@ -24974,7 +24742,7 @@ static int on_click(HWND hwnd, int x, int y) {
             /* Jump to it in the transcript — a pin is a pointer into the
              * conversation, so landing on it in context is the point. */
             g_jump_mid = g_pinrows[i].mid;
-            g_jump_deadline = GetTickCount64() + 1500;
+            g_jump_deadline = now_ms() + 1500;
             oc_client_close_pins(g_client);
             return 1;
         }
@@ -25004,8 +24772,6 @@ static int on_click(HWND hwnd, int x, int y) {
          * Those map to REQ-232, REQ-231 and REQ-057, none of which exist yet —
          * offering them greyed out would be four dead entries, so the menu is
          * only what actually works. */
-        POINT pt = { PX(x), PX(y) };
-        ClientToScreen(hwnd, &pt);
         /* The image kebab, on the app's own menu now. */
         g_n_mi = 0;
         mi_item(1, "View full size");
@@ -25017,7 +24783,7 @@ static int on_click(HWND hwnd, int x, int y) {
         g_menu_x = (float)x; g_menu_y = (float)y;
         {
             float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-            RECT rc; GetClientRect(hwnd, &rc);
+            irect rc; client_rect(hwnd, &rc);
             float H = DIPF(rc.bottom), W = DIPF(rc.right);
             if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
             if (g_menu_y < 8) g_menu_y = 8;
@@ -25052,10 +24818,10 @@ static int on_click(HWND hwnd, int x, int y) {
             close_overlays();
             select_channel(g_fwd_hits[i].chan);
             g_jump_mid = g_fwd_hits[i].mid;
-            g_jump_deadline = GetTickCount64() + 4000;
+            g_jump_deadline = now_ms() + 4000;
             select_tab(TAB_MESSAGES);
             layout_composer(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 1;
         }
     if (in_rect(g_unread_jump, x, y)) {
@@ -25066,7 +24832,7 @@ static int on_click(HWND hwnd, int x, int y) {
         if (jc) for (size_t i = 0; i < jc->n_msgs; i++)
             if (jc->msgs[i].message_id > g_unread_from) {
                 g_jump_mid = jc->msgs[i].message_id;
-                g_jump_deadline = GetTickCount64() + 2000;
+                g_jump_deadline = now_ms() + 2000;
                 break;
             }
         return 1;
@@ -25119,9 +24885,9 @@ static int on_click(HWND hwnd, int x, int y) {
          * take over, so the button and typing "@" behave identically. */
         {
             ed_focus(hwnd);
-            ed_insert(L"@");
+            ed_insert(u"@");
             ac_rebuild();
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
         return 1;
     }
@@ -25149,7 +24915,7 @@ static int on_click(HWND hwnd, int x, int y) {
                         /* Arm the jump BEFORE selecting: select_channel closes the
                          * overlay and may fire the backfill this jump waits on. */
                         g_jump_mid = g_searchrows[i].mid;
-                        g_jump_deadline = GetTickCount64() + 4000;
+                        g_jump_deadline = now_ms() + 4000;
                         select_channel(g_searchrows[i].cid);   /* also closes the overlay */
                         return 1;
                     }
@@ -25280,7 +25046,7 @@ static int msgrow_clamp(int y) {
     return (float)y < g_msgrows[0].top ? 0 : g_n_msgrows - 1;
 }
 
-/* Map a client point over row `ri` to a BYTE offset in that message's body —
+/* Map a client point over row `ri` to a uint8_t offset in that message's body —
  * bytes end to end since ARCH-106, which is also what selection slices and the
  * clipboard copies. */
 static uint32_t hit_pos(int ri, int x, int y) {
@@ -25449,21 +25215,19 @@ static int link_under(int x, int y, char *out, size_t cap) {
  * the call that does the damage, and a one-line guard at the dangerous end is
  * worth more than the assumption that every future caller kept the invariant. */
 static void link_open(const char *url) {
-    WCHAR w[1024];
     if (!url || !url[0]) return;
     g_confirm_url[0] = 0;
-    if (_strnicmp(url, "http://", 7) && _strnicmp(url, "https://", 8)) return;
-    if (to_w(url, w, 1024) < 1) return;
-    ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+    if (SDL_strncasecmp(url, "http://", 7) && SDL_strncasecmp(url, "https://", 8)) return;
+    SDL_OpenURL(url);
 }
 
 /* A labelled link's text can say anything while it points elsewhere, which is
  * the shape a phishing message takes (MARKDOWN.md §4). So one is opened only
  * after saying where it goes: its host, then the full address, and a choice. A
  * bare address needs none of this -- it is its own label. */
-static void link_open_labelled(HWND hwnd, const char *url) {
+static void link_open_labelled(oc_win *hwnd, const char *url) {
     if (!url || !url[0]) return;
-    if (_strnicmp(url, "http://", 7) && _strnicmp(url, "https://", 8)) return;
+    if (SDL_strncasecmp(url, "http://", 7) && SDL_strncasecmp(url, "https://", 8)) return;
     snprintf(g_confirm_url, sizeof g_confirm_url, "%s", url);
     const char *h = strstr(url, "://");
     h = h ? h + 3 : url;
@@ -25474,25 +25238,27 @@ static void link_open_labelled(HWND hwnd, const char *url) {
     confirm_open(hwnd, CONF_LINK_OPEN, 0, "Open this link?", body, "Open link");
 }
 
-static int selection_start(HWND hwnd, int x, int y) {
+static int selection_start(oc_win *hwnd, int x, int y) {
+    (void)hwnd;
     int r = msgrow_at(x, y);
     if (r < 0) { g_has_sel = 0; return 0; }
     uint32_t pos = hit_pos(r, x, y);
     g_sel_a_mid = g_sel_f_mid = g_msgrows[r].mid;
     g_sel_a_pos = g_sel_f_pos = pos;
     g_has_sel = 1; g_selecting = 1; g_hover_mid = 0;
-    SetCapture(hwnd); SetFocus(hwnd);      /* take focus so Ctrl+C reaches us */
+    SDL_CaptureMouse(true); focus_set(NULL);      /* take focus so Ctrl+C reaches us */
     return 1;
 }
 
 /* The transcript's half of word selection: double-click selects the word under the
  * pointer, triple-click the whole message. Same positions selection_start uses,
  * so copy_selection needs to know nothing about how the range was made. */
-static int selection_word(HWND hwnd, int x, int y, int whole_message) {
+static int selection_word(oc_win *hwnd, int x, int y, int whole_message) {
+    (void)hwnd;
     const oc_model *m = model();
     const oc_channel *c;
     const oc_msg *msg;
-    WCHAR w[2048];
+    oc_wch w[2048];
     int n, a, b, r = msgrow_at(x, y);
     if (r < 0 || !m || !g_sel) return 0;
     c = oc_model_channel((oc_model *)m, g_sel);
@@ -25506,7 +25272,7 @@ static int selection_word(HWND hwnd, int x, int y, int whole_message) {
     g_sel_a_mid = g_sel_f_mid = g_msgrows[r].mid;
     g_sel_a_pos = (uint32_t)a; g_sel_f_pos = (uint32_t)b;
     g_has_sel = 1; g_selecting = 0; g_hover_mid = 0;
-    SetFocus(hwnd);                        /* so Ctrl+C reaches us */
+    focus_set(NULL);                        /* so Ctrl+C reaches us */
     return 1;
 }
 
@@ -25521,12 +25287,12 @@ static void selection_update(int x, int y) {
 static void selection_end(void) {
     if (!g_selecting) return;
     g_selecting = 0;
-    ReleaseCapture();
+    SDL_CaptureMouse(false);
     if (g_sel_a_mid == g_sel_f_mid && g_sel_a_pos == g_sel_f_pos) g_has_sel = 0;
 }
 
 /* Copy the current transcript selection to the clipboard as Unicode text. */
-static void copy_selection(HWND hwnd) {
+static void copy_selection(oc_win *hwnd) {
     const oc_model *m = model();
     if (!m || !g_has_sel || !g_sel) return;
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
@@ -25541,40 +25307,33 @@ static void copy_selection(HWND hwnd) {
     if (ai < fi || (ai == fi && g_sel_a_pos <= g_sel_f_pos)) { lo = ai; lop = g_sel_a_pos; hi = fi; hip = g_sel_f_pos; }
     else                                                     { lo = fi; lop = g_sel_f_pos; hi = ai; hip = g_sel_a_pos; }
 
-    static WCHAR buf[16384]; size_t bl = 0;
+    static oc_wch buf[16384]; size_t bl = 0;
     for (long gi = lo; gi <= hi && bl < 16350; gi++) {
-        WCHAR w[2048];
+        oc_wch w[2048];
         int wn = to_w(body_text(&c->msgs[gi]), w, 2048);
         if (wn < 0) wn = 0;
         uint32_t s = (gi == lo) ? lop : 0;
         uint32_t e = (gi == hi) ? hip : (uint32_t)wn;
         if (e > (uint32_t)wn) e = (uint32_t)wn;
         if (s > e) s = e;
-        if (gi > lo && bl + 2 < 16350) { buf[bl++] = L'\r'; buf[bl++] = L'\n'; }
+        if (gi > lo && bl + 2 < 16350) { buf[bl++] = u'\r'; buf[bl++] = u'\n'; }
         for (uint32_t k = s; k < e && bl < 16350; k++) buf[bl++] = w[k];
     }
     buf[bl] = 0;
-    if (bl == 0 || !OpenClipboard(hwnd)) return;
-    EmptyClipboard();
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (bl + 1) * sizeof(WCHAR));
-    if (h) {
-        WCHAR *p = (WCHAR *)GlobalLock(h);
-        memcpy(p, buf, (bl + 1) * sizeof(WCHAR));
-        GlobalUnlock(h);
-        SetClipboardData(CF_UNICODETEXT, h);
+    if (bl == 0) return;
+    {
+        char *u8 = malloc((size_t)bl * 3 + 1);
+        if (u8) { to_u8(buf, u8, (size_t)bl * 3 + 1); copy_to_clipboard(hwnd, u8); free(u8); }
     }
-    CloseClipboard();
 }
 
 /* The Drafts row's context menu (on_rclick) and what it acts on. */
 enum { DRAFT_CMD_OPEN = 2600, DRAFT_CMD_DELETE = 2601 };
 static uint64_t g_dmenu_cid, g_dmenu_root;
 
-static void on_rclick(HWND hwnd, int x, int y) {
+static void on_rclick(oc_win *hwnd, int x, int y) {
     const oc_model *m = model();
     if (!m) return;
-    POINT pt = { PX(x), PX(y) };   /* back to device pixels for the popup */
-    ClientToScreen(hwnd, &pt);
     /* Sidebar channel rows -> channel menu. */
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_rows; i++)
@@ -25602,12 +25361,12 @@ static void on_rclick(HWND hwnd, int x, int y) {
                 g_menu_x = (float)x; g_menu_y = (float)y;
                 {   /* On screen, as the message menu keeps itself. */
                     float mh = 12; for (int k = 0; k < g_n_mi; k++) mh += menu_item_h(g_mi[k].kind);
-                    RECT rc; GetClientRect(hwnd, &rc);
+                    irect rc; client_rect(hwnd, &rc);
                     float H = DIPF(rc.bottom), W = DIPF(rc.right);
                     if (g_menu_y + mh > H - 8) g_menu_y = H - 8 - mh;
                     if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
                 }
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return;
             }
         return;
@@ -25646,11 +25405,18 @@ static void on_rclick(HWND hwnd, int x, int y) {
 /* ---- core wiring ---------------------------------------------------------- */
 
 static const char *store_path(void) {
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("APPDATA");
-    if (!base || !base[0]) return NULL;
     static char path[1024];
     char dir[900];
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("APPDATA");
+    if (!base || !base[0]) {
+        /* Not Windows: the platform's data directory stands in. The path is a
+         * flag (persistence on) more than a place, as the comment below says;
+         * on the web the credential store itself is what persists. */
+        if (!oc_plat_data_dir(dir, sizeof dir)) return NULL;
+        snprintf(path, sizeof path, "%s%cstate", dir, OC_PATH_SEP);
+        return path;
+    }
     snprintf(dir, sizeof dir, "%s\\openchime", base);
     /* The client writes NOTHING to disk (ARCH-88), so this directory is never
      * created — the path exists only so a caller can distinguish "persistence
@@ -25660,7 +25426,7 @@ static const char *store_path(void) {
     snprintf(old, sizeof old, "%s\\state.db", dir);     remove(old);
     snprintf(old, sizeof old, "%s\\state.db-wal", dir); remove(old);
     snprintf(old, sizeof old, "%s\\state.db-shm", dir); remove(old);
-    _rmdir(dir);                                  /* only succeeds if now empty */
+    SDL_RemovePath(dir);                          /* only succeeds if now empty */
     snprintf(path, sizeof path, "%s\\state", dir);
     return path;
 }
@@ -25700,7 +25466,7 @@ static void ws_key(const char *ws, char *out, size_t cap) {
 
 /* --- a certificate the person must judge (ARCH-10) -------------------------- */
 
-static void signin_submit(HWND hwnd);   /* fwd */
+static void signin_submit(oc_win *hwnd);   /* fwd */
 
 /* Ask whether to trust a server certificate no trusted authority vouches for,
  * in the shape security prompts share (the Remote Desktop and browser warnings,
@@ -25710,7 +25476,7 @@ static void signin_submit(HWND hwnd);   /* fwd */
  * fingerprint is shown as an administrator's tools print it, with Copy and
  * Windows' own certificate viewer beside it. The answer comes back through
  * confirm_run -> cert_trust_run; declining is the confirmation's cancel. */
-static void ask_trust_cert(HWND hwnd, const char *ws, const char *fp_hex,
+static void ask_trust_cert(oc_win *hwnd, const char *ws, const char *fp_hex,
                            const uint8_t *der, size_t der_len, int changed) {
     g_trust.der_len = der && der_len <= sizeof g_trust.der ? der_len : 0;
     if (g_trust.der_len) memcpy(g_trust.der, der, der_len);
@@ -25723,7 +25489,7 @@ static void ask_trust_cert(HWND hwnd, const char *ws, const char *fp_hex,
     /* The sign-in's fields are native windows over the card; they give way to
      * the question, and Enter and Esc go to it rather than to them. */
     layout_signin(hwnd);
-    SetFocus(hwnd);
+    focus_set(NULL);
 }
 
 /* The question's body: its paragraphs, in order, for drawing and measuring. */
@@ -25764,7 +25530,7 @@ static float cert_q_body(gfx *rt, rectf body) {
     return y + h + UIS(8) - body.top;
 }
 
-static void cert_q_copy(HWND hwnd) {
+static void cert_q_copy(oc_win *hwnd) {
     char fp[128];
     if (oc_fingerprint_format(g_trust.fp, 0, fp, sizeof fp) != 0) return;
     copy_to_clipboard(hwnd, fp);
@@ -25774,29 +25540,9 @@ static void cert_q_copy(HWND hwnd) {
 /* Windows' own certificate viewer -- the one its administrators know -- over the
  * certificate that was shown. cryptui is loaded when asked for, as dbghelp is:
  * a dialog few will open is no reason for every start to import it. */
-static void cert_q_view(HWND hwnd) {
+static void cert_q_view(oc_win *hwnd) {
     if (!g_trust.der_len) return;
-    typedef BOOL (WINAPI *view_fn)(PCCRYPTUI_VIEWCERTIFICATE_STRUCTW, BOOL *);
-    HMODULE ui = LoadLibraryW(L"cryptui.dll");
-    view_fn view = ui ? (view_fn)(void *)GetProcAddress(ui, "CryptUIDlgViewCertificateW") : NULL;
-    PCCERT_CONTEXT cc = view ? CertCreateCertificateContext(X509_ASN_ENCODING, g_trust.der,
-                                                            (DWORD)g_trust.der_len) : NULL;
-    if (cc) {
-        CRYPTUI_VIEWCERTIFICATE_STRUCTW v;
-        memset(&v, 0, sizeof v);
-        v.dwSize = sizeof v;
-        v.hwndParent = hwnd;
-        v.szTitle = L"Server certificate";
-        v.pCertContext = cc;
-        /* Without "Install Certificate": that would make a server's own
-         * certificate a root this computer trusts for anything, which is far
-         * more than trusting this server. */
-        v.dwFlags = CRYPTUI_DISABLE_ADDTOSTORE;
-        BOOL changed = FALSE;
-        view(&v, &changed);
-        CertFreeCertificateContext(cc);
-    }
-    if (ui) FreeLibrary(ui);
+    oc_plat_view_certificate(hwnd->sdl, g_trust.der, g_trust.der_len);
 }
 
 /* What the person trusted for workspace `key`, kept with its credential. */
@@ -25821,7 +25567,7 @@ static void trust_save(const char *key, const unsigned char fp[32]) {
  * certificate first -- before anything is typed. One nobody vouches for is put
  * to the person and OC_PROBE_UNTRUSTED returned; trusting it files the trust and
  * runs the sign-in step `resume` again, which probes with it. */
-static int probe_workspace(HWND hwnd, const char *ws, const char *domain, const char *host, int port,
+static int probe_workspace(oc_win *hwnd, const char *ws, const char *domain, const char *host, int port,
                            oc_signin_source *src, int max, int resume, const char *user) {
     char key[256]; ws_key(ws, key, sizeof key);
     unsigned char fp[32];
@@ -25845,7 +25591,7 @@ static int probe_workspace(HWND hwnd, const char *ws, const char *domain, const 
  * A connection that is up has had its answer. `seen` is the last seq handled
  * for `c`, 0 for one not looked at yet: the question may have come before the
  * first look, as it does for a workspace connected at start-up. */
-static void cert_tick(HWND hwnd, oc_client *c, const char *ws, uint32_t *seen) {
+static void cert_tick(oc_win *hwnd, oc_client *c, const char *ws, uint32_t *seen) {
     const oc_model *m = c ? oc_client_model(c) : NULL;
     if (m && m->connected) *seen = m->cert_seq;
     if (!m || m->cert_seq == *seen || modal_open()) return;
@@ -25860,23 +25606,24 @@ static void cert_tick(HWND hwnd, oc_client *c, const char *ws, uint32_t *seen) {
 /* Trust was pressed. A connection is told, and reconnects -- if it is still one
  * of ours: the sign-in may have been abandoned while the question was up. A probe's
  * trust is filed under the workspace and its step run again. */
-static void cert_trust_run(HWND hwnd) {
+static void cert_trust_run(oc_win *hwnd) {
     unsigned char fp[32];
     if (oc_fingerprint_from_hex(g_trust.fp, fp) != 0) return;
     g_trust.answered = 1;
     if (g_trust.client) {
         if (g_trust.client != g_si_client && g_trust.client != g_client) return;
-        if (g_trust.client == g_si_client) g_si_started = GetTickCount64();   /* a fresh wait */
+        if (g_trust.client == g_si_client) g_si_started = now_ms();   /* a fresh wait */
         oc_client_trust_cert(g_trust.client, g_trust.fp);
         return;
     }
     trust_save(g_trust.key, fp);
     /* Not from here: this runs inside the question's closing, which would then
      * close any question the step asks in turn. */
-    PostMessageW(hwnd, WM_APP_TRUST_RESUME, 0, 0);
+    (void)hwnd;
+    { SDL_Event e; memset(&e, 0, sizeof e); e.type = g_app_evtype; e.user.code = APP_EV_TRUST_RESUME; SDL_PushEvent(&e); }
 }
 
-static void cert_trust_resume(HWND hwnd) {
+static void cert_trust_resume(oc_win *hwnd) {
     int r = g_trust.resume;
     g_trust.resume = TRUST_NONE;
     if (g_view != VIEW_SIGNIN) return;
@@ -26116,7 +25863,7 @@ static void ws_save_active(void) {
  * Announced, because a switch with no visible cursor movement is silent to a
  * screen reader (REQ-269). */
 static void ws_load(int i);   /* fwd */
-static int ws_go(HWND hwnd, int i) {
+static int ws_go(oc_win *hwnd, int i) {
     if (i < 0 || i >= g_n_wss || i == g_ws_active) return i >= 0 && i < g_n_wss;
     ws_save_active();
     close_overlays();
@@ -26130,7 +25877,7 @@ static int ws_go(HWND hwnd, int i) {
         snprintf(said, sizeof said, "%s", name[0] ? name : g_wss[i].ws);
         oc_a11y_announce(said);
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
     return 1;
 }
 
@@ -26241,11 +25988,8 @@ static void boot_other_workspaces(const char *skip) {
 /* ---- sign-in flow -------------------------------------------------- */
 
 /* Read a native EDIT's text as UTF-8. */
-static void si_get(HWND e, char *out, size_t cap) {
-    WCHAR w[320]; out[0] = '\0';
-    if (!e) return;
-    GetWindowTextW(e, w, (int)(sizeof w / sizeof w[0]));
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
+static void si_get(field *e, char *out, size_t cap) {
+    snprintf(out, cap, "%s", e ? e->buf : "");
 }
 
 /* Tear a session down to the state a fresh sign-in expects. Shared by the
@@ -26277,7 +26021,7 @@ static void reset_session(void) {
  * account that used it, so the address step is answered already. Land straight
  * on the password — which is the whole point of keeping the entry after a
  * sign-out rather than forgetting it. */
-static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
+static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user) {
     oc_endpoint ep;
     if (!ws || !ws[0] || oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
         signin_begin(hwnd, ws, user);       /* unresolvable: let step 1 say so */
@@ -26301,7 +26045,7 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
          * it comes back here (cert_trust_run). */
         g_si_nsrc = 0;
         snprintf(g_si_err, sizeof g_si_err, "the server's certificate was not trusted");
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return;
     }
     if (g_si_nsrc < 0) g_si_nsrc = 0;
@@ -26310,17 +26054,14 @@ static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
     layout_signin(hwnd);
     /* Set the account AFTER the step-2 layout has shown the field. signin_begin
      * fills it while step 1 still has it hidden, which did not stick. */
-    if (g_si_e_user && user && user[0]) {
-        WCHAR wu[320]; to_w(user, wu, 320);
-        SetWindowTextW(g_si_e_user, wu);
-    }
-    if (g_si_e_pass) SetFocus(g_si_e_pass);
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_si_e_user && user && user[0]) field_set(g_si_e_user, user);
+    if (g_si_e_pass) focus_set(g_si_e_pass);
+    invalidate();
 }
 
 /* Abandon an overlay sign-in and go back to the workspace behind it. Only
  * possible when there IS one — at cold start there is nowhere to return to. */
-static void signin_cancel(HWND hwnd) {
+static void signin_cancel(oc_win *hwnd) {
     if (!g_si_overlay || !g_client) return;
     if (g_si_client) { dict_forget(g_si_client); oc_client_stop(g_si_client); g_si_client = NULL; }
     g_si_connecting = 0; g_si_err[0] = '\0'; g_si_invite[0] = '\0';
@@ -26328,13 +26069,13 @@ static void signin_cancel(HWND hwnd) {
     g_view = VIEW_HOME;
     layout_signin(hwnd);
     layout_composer(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Sign in to an ADDITIONAL workspace, leaving the current one connected. The
  * card renders over the live shell (see g_si_overlay) so the app never blanks
  * while you have somewhere to be. */
-static void signin_begin_add(HWND hwnd) {
+static void signin_begin_add(oc_win *hwnd) {
     close_overlays();
     /* The current workspace is left completely alone — still connected, still
      * rendered behind the card. It is parked only if the new sign-in succeeds. */
@@ -26342,7 +26083,7 @@ static void signin_begin_add(HWND hwnd) {
 }
 
 /* Enter the sign-in view at step 1, pre-filled with `ws`/`user` when known. */
-static void signin_begin(HWND hwnd, const char *ws, const char *user) {
+static void signin_begin(oc_win *hwnd, const char *ws, const char *user) {
     /* Overlay exactly when there is something worth keeping on screen. Covers
      * every caller: cold start and a last-workspace sign-out have no client and
      * get the full-window card; adding or re-entering a workspace has one and
@@ -26356,43 +26097,39 @@ static void signin_begin(HWND hwnd, const char *ws, const char *user) {
     g_si_advanced = (g_si_ws[0] && (strchr(g_si_ws, '.') || strchr(g_si_ws, ':') ||
                                     strchr(g_si_ws, '['))) ? 1 : 0;
     if (g_si_e_ws)
-        SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE,
-                     (LPARAM)(g_si_advanced ? L"chat.example.com or host:port" : L"your-workspace"));
-    WCHAR w[320];
-    if (g_si_e_ws)   { to_w(g_si_ws, w, 320);              SetWindowTextW(g_si_e_ws, w); }
-    if (g_si_e_user) { to_w(user ? user : "", w, 320);     SetWindowTextW(g_si_e_user, w); }
-    if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
+        g_si_e_ws->placeholder = g_si_advanced ? "chat.example.com or host:port" : "your-workspace";
+    if (g_si_e_ws)   field_set(g_si_e_ws, g_si_ws);
+    if (g_si_e_user) field_set(g_si_e_user, user ? user : "");
+    if (g_si_e_pass) field_set(g_si_e_pass, "");
     layout_signin(hwnd);
     layout_composer(hwnd);        /* hides the composer + find box for this view */
-    if (g_si_e_ws) SetFocus(g_si_e_ws);
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_si_e_ws) focus_set(g_si_e_ws);
+    invalidate();
 }
 
 /* Back to step 1 from step 2 (or from a failure), keeping what was typed. */
-static void signin_back(HWND hwnd) {
+static void signin_back(oc_win *hwnd) {
     g_si_step = 1; g_si_connecting = 0; g_si_err[0] = '\0';
     layout_signin(hwnd);
-    if (g_si_e_ws) SetFocus(g_si_e_ws);
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_si_e_ws) focus_set(g_si_e_ws);
+    invalidate();
 }
 
 /* Switch step 1 between the hosted short-name field and the full-address field.
  * The cue banner and the field width change with it; what was typed is kept, so
  * flipping modes to correct a mistake never costs the user their input. */
-static void signin_set_advanced(HWND hwnd, int on) {
+static void signin_set_advanced(oc_win *hwnd, int on) {
     g_si_advanced = on;
     g_si_err[0] = '\0';
-    if (g_si_e_ws)
-        SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE,
-                     (LPARAM)(on ? L"chat.example.com or host:port" : L"your-workspace"));
+    if (g_si_e_ws) g_si_e_ws->placeholder = on ? "chat.example.com or host:port" : "your-workspace";
     layout_signin(hwnd);
-    if (g_si_e_ws) SetFocus(g_si_e_ws);
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_si_e_ws) focus_set(g_si_e_ws);
+    invalidate();
 }
 
 /* Fail the in-flight attempt: drop the client, return to the credential step
  * with `why`, and clear the password — the field that needs re-entering. */
-static void signin_fail(HWND hwnd, const char *why) {
+static void signin_fail(oc_win *hwnd, const char *why) {
     /* Copy the reason BEFORE stopping the client: callers pass m->last_error,
      * which lives in the model that oc_client_stop() frees (oc_model_free +
      * free(c)). Reading it afterwards is a use-after-free — it silently produced
@@ -26411,16 +26148,16 @@ static void signin_fail(HWND hwnd, const char *why) {
      * the step that has something on it. */
     g_si_step = (g_si_nsrc > 0 && !si_has_local()) ? 1 : 2;
     snprintf(g_si_err, sizeof g_si_err, "%s", tmp);
-    if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
+    if (g_si_e_pass) field_set(g_si_e_pass, "");
     layout_signin(hwnd);
-    if (g_si_e_pass) SetFocus(g_si_e_pass);
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (g_si_e_pass) focus_set(g_si_e_pass);
+    invalidate();
 }
 
 /* The primary button / Enter. Step 1 resolves the workspace (REQ-010/011) and
  * advances; step 2 starts the client and hands off to the tick, which watches
  * the model for the outcome (signin_poll). */
-static void signin_submit(HWND hwnd) {
+static void signin_submit(oc_win *hwnd) {
     g_si_err[0] = '\0';
     if (g_si_step == 1) {
         si_get(g_si_e_ws, g_si_ws, sizeof g_si_ws);
@@ -26463,7 +26200,7 @@ static void signin_submit(HWND hwnd) {
         if (!si_has_local() && si_browser_count() == 1) { signin_start_browser(hwnd, NULL, NULL); return; }
         g_si_step = 2;
         layout_signin(hwnd);
-        if (g_si_e_user) SetFocus(g_si_e_user);
+        if (g_si_e_user) focus_set(g_si_e_user);
         goto redraw;
     }
 
@@ -26472,24 +26209,24 @@ static void signin_submit(HWND hwnd) {
     signin_start_browser(hwnd, OC_SOURCE_ID_LOCAL, NULL);
     return;
 redraw:
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Sign in through the browser: the core asks the daemon for the URL and waits on
  * its loopback listener; the poll opens the URL when the model carries it. */
-static void signin_start(HWND hwnd, const char *source_id, const char *invite, const char *reset);
+static void signin_start(oc_win *hwnd, const char *source_id, const char *invite, const char *reset);
 
-static void signin_start_browser(HWND hwnd, const char *source_id, const char *invite) {
+static void signin_start_browser(oc_win *hwnd, const char *source_id, const char *invite) {
     signin_start(hwnd, source_id, invite, NULL);
 }
 
 /* A local account an administrator reset: the browser opens first on the page
  * that sets the new password, which goes on to this sign-in. */
-static void signin_start_reset(HWND hwnd, const char *reset) {
+static void signin_start_reset(oc_win *hwnd, const char *reset) {
     signin_start(hwnd, OC_SOURCE_ID_LOCAL, NULL, reset);
 }
 
-static void signin_start(HWND hwnd, const char *source_id, const char *invite, const char *reset) {
+static void signin_start(oc_win *hwnd, const char *source_id, const char *invite, const char *reset) {
     g_si_err[0] = '\0';
     snprintf(g_host, sizeof g_host, "%s", g_si_host);
     g_port = g_si_port;
@@ -26501,15 +26238,62 @@ static void signin_start(HWND hwnd, const char *source_id, const char *invite, c
                                                  store_path(), g_secret, g_si_remember, g_si_fp);
     if (!g_si_client) {
         snprintf(g_si_err, sizeof g_si_err, "could not start the client");
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return;
     }
     g_si_browser = 1;
     g_si_opened_seq = 0;
     g_si_connecting = 1;
-    g_si_started = GetTickCount64();
+    g_si_started = now_ms();
     layout_signin(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
+}
+
+/* The web client's two entries into the browser sign-in (WEB.md). Served by
+ * the daemon for the workspace `ws` (its own address), with nothing
+ * remembered: begin the sign-in at once, no probe -- the daemon the page
+ * came from names the way in (AUTH_BEGIN) and the page goes to it. */
+static void signin_served(oc_win *hwnd, const char *ws) {
+    oc_endpoint ep;
+    if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) return;
+    snprintf(g_si_ws, sizeof g_si_ws, "%s", ws);
+    snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
+    g_si_port = ep.port;
+    g_si_fp[0] = '\0';
+    signin_start_browser(hwnd, NULL, NULL);
+}
+
+/* ...and back with the token: the sign-in resumes from what was stashed on
+ * the way out, and the first connection presents it (AUTH, §8.2). */
+static void signin_resume(oc_win *hwnd, const char *ws, const char *token) {
+    char source[64] = "", verifier[OC_SIGNIN_VERIFIER_LEN + 1] = "";
+    oc_endpoint ep;
+    if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) return;
+    if (!oc_signin_unstash(source, sizeof source, verifier, sizeof verifier)) {
+        snprintf(g_si_err, sizeof g_si_err, "the sign-in did not start in this tab");
+        invalidate();
+        return;
+    }
+    snprintf(g_si_ws, sizeof g_si_ws, "%s", ws);
+    snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
+    g_si_port = ep.port;
+    g_si_fp[0] = '\0';
+    g_si_err[0] = '\0';
+    snprintf(g_host, sizeof g_host, "%s", g_si_host);
+    g_port = g_si_port;
+    ws_key(g_si_ws, g_cur_ws, sizeof g_cur_ws);
+    g_cred[0] = '\0';
+    oc_signin_result res = { source, verifier, token, NULL };
+    g_si_client = oc_client_start_signin_result(g_cur_ws, g_host, g_port, &res, store_path(), g_secret,
+                                                g_si_remember, g_si_fp);
+    oc_signin_wipe(verifier, sizeof verifier);
+    if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); invalidate(); return; }
+    g_si_browser = 0;
+    g_si_opened_seq = 0;
+    g_si_connecting = 1;
+    g_si_started = now_ms();
+    layout_signin(hwnd);
+    invalidate();
 }
 
 /* The daemon's authorize URL, to the default browser. The core has already
@@ -26517,24 +26301,24 @@ static void signin_start(HWND hwnd, const char *source_id, const char *invite, c
  * the call that does the opening. Its own buffer: a sign-in URL is longer than a
  * link in a message. */
 static void signin_open_url(const char *url) {
-    WCHAR w[2300];
-    if (!url || (_strnicmp(url, "https://", 8) && _strnicmp(url, "http://", 7))) return;
+    if (!url || (SDL_strncasecmp(url, "https://", 8) && SDL_strncasecmp(url, "http://", 7))) return;
     /* Under the automation hook the URL goes to a file instead: a harness plays
      * the browser, and a test run never opens tabs on somebody's desktop. */
     if (g_test_dir[0]) {
         char path[600]; snprintf(path, sizeof path, "%s\\signin_url.txt", g_test_dir);
         FILE *f = fopen(path, "wb");
         if (f) { fputs(url, f); fclose(f); }
-        return;
+        /* ...except where this application IS the browser: the page goes
+         * there, and the harness drives it in the sign-in page (WEB.md). */
+        if (strcmp(oc_plat_name(), "web") != 0) return;
     }
-    if (to_w(url, w, 2300) < 1) return;
-    ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+    oc_plat_open_signin(url);
 }
 
 /* Called each tick while an attempt is in flight. Mirrors the TUI's await_auth:
  * authed wins; a sticky last_error with no connection is the failure; and a
  * deadline stops us waiting forever on a black-hole endpoint. */
-static void signin_poll(HWND hwnd) {
+static void signin_poll(oc_win *hwnd) {
     const oc_model *m = g_si_client ? oc_client_model(g_si_client) : NULL;
     if (!m) return;
     /* A certificate to judge first. While it is being read the attempt waits,
@@ -26546,7 +26330,7 @@ static void signin_poll(HWND hwnd) {
     cert_tick(hwnd, g_si_client, g_si_ws, &cert_seen);
     int judged = g_trust.client && g_trust.client == g_si_client;
     if (judged && g_confirm_open && g_confirm_act == CONF_CERT_TRUST) {
-        g_si_started = GetTickCount64();
+        g_si_started = now_ms();
         return;
     }
     if (judged && !g_trust.answered) {
@@ -26574,10 +26358,10 @@ static void signin_poll(HWND hwnd) {
             remember_workspace(g_si_ws, NULL);
             snprintf(g_remember_ws, sizeof g_remember_ws, "%s", g_si_ws);
         }
-        if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");   /* don't keep it in a control */
+        if (g_si_e_pass) field_set(g_si_e_pass, "");   /* don't keep it in a control */
         layout_signin(hwnd);
         layout_composer(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return;
     }
     if (m->last_error[0] && !m->connected && !(judged && m->error_seq == g_trust.err_seq)) {
@@ -26587,15 +26371,15 @@ static void signin_poll(HWND hwnd) {
     if (g_si_browser && m->signin_url[0]) {
         /* The person is in their browser; the core gives them five minutes, so the
          * connect deadline does not apply. Each URL is opened once. */
-        g_si_started = GetTickCount64();
+        g_si_started = now_ms();
         if (g_si_opened_seq != m->signin_seq) {
             g_si_opened_seq = m->signin_seq;
             signin_open_url(m->signin_url);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
         return;
     }
-    if (GetTickCount64() - g_si_started > SI_TIMEOUT) {
+    if (now_ms() - g_si_started > SI_TIMEOUT) {
         char why[224]; snprintf(why, sizeof why, "timed out reaching %s", g_si_host);
         signin_fail(hwnd, why);
     }
@@ -26603,39 +26387,6 @@ static void signin_poll(HWND hwnd) {
 
 /* ---- generic single-field modal prompt ----------------------------------- */
 
-static void lg_set_font(HWND w) {
-    SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-}
-
-static HFONT form_font(void) {
-    if (g_form_font && g_form_font_scale == g_text_scale) return g_form_font;
-    /* The family is chosen by asking the text engine what is installed, and the
-     * native boxes are made before it is: until then there is no font, and the
-     * first paint hands them one (search_fonts_sync()). */
-    if (!g_st) return NULL;
-    if (g_form_font_prev) DeleteObject(g_form_font_prev);
-    g_form_font_prev = g_form_font;
-    g_form_font_scale = g_text_scale;
-    g_form_font = CreateFontW(-PX(FONT_UI * g_text_scale), 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS,
-                              /* GDI wants the family wide; the sdltext side
-                               * of the same decision is ui_family(). */
-                              st_dwrite_family_present(g_st, "Segoe UI Variable Text")
-                                  ? L"Segoe UI Variable Text" : L"Segoe UI");
-    /* Its line height, which a single-line EDIT needs to be exactly: shorter and
-     * the descenders are cut, taller and the text rides high in its box. */
-    g_form_font_lh = PX(FONT_UI * g_text_scale * 1.35f);
-    HDC dc = GetDC(NULL);
-    if (dc && g_form_font) {
-        HGDIOBJ was = SelectObject(dc, g_form_font);
-        TEXTMETRICW tm;
-        if (GetTextMetricsW(dc, &tm)) g_form_font_lh = (int)tm.tmHeight;
-        SelectObject(dc, was);
-    }
-    if (dc) ReleaseDC(NULL, dc);
-    return g_form_font;
-}
 
 /* ---- generic multi-field modal form ------------------------------
  * Six flows used to collapse into one single-line prompt, which is why the
@@ -26673,25 +26424,15 @@ static HFONT form_font(void) {
  * what the harness's `key` verb does deliberately. So the field itself answers
  * them, the same way the composer's proc does. This was found by the smoke: Esc
  * and Enter were dead in the one modal where you are always typing. */
-static WNDPROC g_form_edit_prev;
-
-static LRESULT CALLBACK form_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    /* In a multi-line field Enter is a NEW LINE -- the thing prose needs -- so
-     * submitting moves to Ctrl+Enter there, as it does in every editor that has
-     * both. Esc still cancels from anywhere. */
-    int multi = (GetWindowLongPtrW(hwnd, GWL_STYLE) & ES_MULTILINE) != 0;
-    if (msg == WM_KEYDOWN && g_form_open) {
-        if (wp == VK_RETURN && (!multi || (GetKeyState(VK_CONTROL) & 0x8000))) {
-            modal_finish(1); return 0;
-        }
-        if (wp == VK_ESCAPE) { modal_finish(0); return 0; }
-    }
-    /* A lone Enter in a single-line EDIT otherwise beeps through WM_CHAR; in a
-     * multi-line one it is the newline, except the Ctrl+Enter that submitted. */
-    if (msg == WM_CHAR && wp == 27) return 0;
-    if (msg == WM_CHAR && wp == '\r' && (!multi || (GetKeyState(VK_CONTROL) & 0x8000))) return 0;
-    if (msg == WM_CHAR && wp == 0x0A && multi) return 0;   /* Ctrl+Enter's LF, already handled */
-    return CallWindowProcW(g_form_edit_prev, hwnd, msg, wp, lp);
+/* In a multi-line field Enter is a NEW LINE -- the thing prose needs -- so
+ * submitting moves to Ctrl+Enter there, as it does in every editor that has
+ * both. Esc still cancels from anywhere. */
+static int form_key(field *f, int key, int ctrl, int shift) {
+    (void)shift;
+    if (!g_form_open) return 0;
+    if (key == OCK_RETURN && (!f->multi || ctrl)) { modal_finish(1); return 1; }
+    if (key == OCK_ESCAPE) { modal_finish(0); return 1; }
+    return 0;
 }
 
 /* Seeded by the harness's `formnext` verb: the NEXT form dialog answers with
@@ -26707,7 +26448,7 @@ static char g_form_seed[FORM_MAX_FIELDS][256];
 static int  g_form_seeded;      /* how many fields were seeded; 0 = not armed */
 static int  g_form_seed_cancel; /* seeded, but answer "cancel" */
 
-static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
+static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n) {
     if (!owner || !f || n <= 0) return 0;
     if (n > FORM_MAX_FIELDS) n = FORM_MAX_FIELDS;
     if (g_form_seeded) {
@@ -26722,49 +26463,22 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
     }
     if (g_form_open) return 0;              /* one at a time; see the header */
 
-    HINSTANCE inst = GetModuleHandleW(NULL);
     g_form_f = f; g_form_n = n;
     snprintf(g_form_title, sizeof g_form_title, "%s", title ? title : "");
     memset(g_form_edit, 0, sizeof g_form_edit);
     for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
 
-    /* Create the EDITs hidden and unpositioned: the painter has not run yet, so
-     * nobody knows where they go. layout_natives moves and shows them from the
-     * rects the first paint records — the same order the composer follows. */
+    /* The fields exist hidden and unplaced: the painter has not run yet, so
+     * nobody knows where they go. layout_natives shows them from the rects the
+     * first paint records -- the same order the composer follows. */
+    static field flds[FORM_MAX_FIELDS];
     for (int i = 0; i < n; i++) {
         if (f[i].kind != FF_TEXT && f[i].kind != FF_PASSWORD && f[i].kind != FF_MULTILINE) continue;
-        int multi = (f[i].kind == FF_MULTILINE);
-        /* Twice the value: a multi-line EDIT stores its lines as CRLF, and every
-         * "\n" in the value becomes two characters on the way in. */
-        WCHAR wv[2 * sizeof f[i].value];
-        if (multi) {
-            char crlf[2 * sizeof f[i].value]; size_t o = 0;
-            for (const char *q = f[i].value; *q && o + 2 < sizeof crlf; q++) {
-                if (*q == '\n') crlf[o++] = '\r';
-                crlf[o++] = *q;
-            }
-            crlf[o] = '\0';
-            to_w(crlf, wv, (int)(sizeof wv / sizeof wv[0]));
-        } else {
-            to_w(f[i].value, wv, (int)(sizeof wv / sizeof wv[0]));
-        }
-        g_form_edit[i] = CreateWindowExW(0, L"EDIT", wv,
-            WS_CHILD | WS_TABSTOP |
-            /* No WS_VSCROLL: a native scrollbar is non-client paint the drawn
-             * scene cannot supply, and it came out as a solid black bar down the
-             * field. ES_AUTOVSCROLL still follows the caret, and the wheel and
-             * the arrows reach every line. */
-            (multi ? (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) : ES_AUTOHSCROLL) |
-            (f[i].kind == FF_PASSWORD ? ES_PASSWORD : 0),
-            0, 0, 10, 10, owner, NULL, inst, NULL);
-        if (g_form_edit[i]) {
-            SendMessageW(g_form_edit[i], EM_SETLIMITTEXT, sizeof f[i].value - 1, 0);
-            HFONT ff = form_font();
-            if (ff) SendMessageW(g_form_edit[i], WM_SETFONT, (WPARAM)ff, TRUE);
-            else    lg_set_font(g_form_edit[i]);
-            g_form_edit_prev = (WNDPROC)SetWindowLongPtrW(g_form_edit[i], GWLP_WNDPROC,
-                                                          (LONG_PTR)form_edit_proc);
-        }
+        field_init(&flds[i], NULL, f[i].kind == FF_MULTILINE, f[i].kind == FF_PASSWORD);
+        flds[i].maxlen = (int)sizeof f[i].value - 1;
+        flds[i].key = form_key;
+        g_form_edit[i] = &flds[i];
+        field_set(g_form_edit[i], f[i].value);
     }
 
     g_form_done = 0; g_form_result = 0;
@@ -26783,66 +26497,45 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
         int counted = 0;
         for (int i = 0; i < n; i++)
             if (f[i].kind == FF_MULTILINE && g_form_edit[i] && f[i].value[0]) {
-                g_form_lines[i] = (int)SendMessageW(g_form_edit[i], EM_GETLINECOUNT, 0, 0);
+                g_form_lines[i] = field_line_count(g_form_edit[i], g_form_erect[i].right - g_form_erect[i].left - 18);
                 counted = 1;
             }
         if (counted) {
-            InvalidateRect(owner, NULL, FALSE);
-            UpdateWindow(owner);
+            invalidate();
+            paint_now();
             layout_natives(owner);
         }
     }
     g_form_focus = -1; g_form_focus_btn = 0;
     for (int i = 0; i < n; i++)
-        if (g_form_edit[i]) { SetFocus(g_form_edit[i]); SendMessageW(g_form_edit[i], EM_SETSEL, 0, -1); break; }
+        if (g_form_edit[i]) { field_show(g_form_edit[i], 1); focus_set(g_form_edit[i]); field_select_all(g_form_edit[i]); break; }
 
-    MSG m;
-    while (!g_form_done && GetMessageW(&m, NULL, 0, 0) > 0) {
-        /* Enter and Esc are handled by the fields themselves (form_edit_proc) and by
-         * modal_key when focus is elsewhere, so the loop does not second-guess them.
-         * Tab between the fields: the dialog manager skips hidden and disabled
-         * children, and everything else of ours is hidden while a modal is up. */
-        /* TAB IS OURS, not the dialog manager's. IsDialogMessage only walks
-         * child windows, and this form's checks, chips and selects are drawn --
-         * so the time zone and the read-aloud voice were unreachable from the
-         * keyboard entirely. */
-        if (m.message == WM_KEYDOWN && m.wParam == VK_TAB) {
-            form_focus_step(owner, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
-            InvalidateRect(owner, NULL, FALSE);
-            continue;
-        }
-        /* A drawn field with the keyboard answers its own keys before the dialog
-         * manager turns them into something else (Space on a button, say). */
-        if (m.message == WM_KEYDOWN && g_form_focus >= 0 && form_focus_key(owner, m.wParam)) {
-            InvalidateRect(owner, NULL, FALSE);
-            continue;
-        }
-        if (IsDialogMessageW(owner, &m)) continue;
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
-    }
+    /* Synchronous, by a nested turn of the one loop: Tab, Esc and Enter are
+     * answered where every key is (on_event), so the loop does not second-guess
+     * them. */
+    while (!g_form_done && !g_quit) pump();
 
     for (int i = 0; i < n; i++)
-        if (g_form_edit[i]) { DestroyWindow(g_form_edit[i]); g_form_edit[i] = NULL; }
+        if (g_form_edit[i]) { field_show(g_form_edit[i], 0); g_form_edit[i] = NULL; }
     g_form_sel_field = -1;
     g_form_err_field = -1;                 /* the next form starts with nothing wrong */
     g_form_f = NULL; g_form_n = 0;
     g_form_side.on = 0;
     g_form_side.up_btn = g_form_side.rm_btn = rf(0, 0, 0, 0);
-    SetFocus(owner);
+    focus_set(NULL);
     layout_natives(owner);
-    InvalidateRect(owner, NULL, FALSE);
+    invalidate();
     return g_form_result;
 }
 
-static void copy_to_clipboard(HWND hwnd, const char *utf8);   /* fwd */
+static void copy_to_clipboard(oc_win *hwnd, const char *utf8);   /* fwd */
 
 /* A one-time secret (invite / webhook token). A MessageBox cannot be selected
  * from, so the token was easy to lose the moment it was dismissed — the one
  * thing that must not happen to a value shown exactly once. This gives
  * it a read-only-ish field, puts it on the clipboard immediately, and says
  * plainly that it will not be shown again. */
-static void show_secret(HWND owner, const char *title, const char *what,
+static void show_secret(oc_win *owner, const char *title, const char *what,
                         const char *token, const char *note) {
     static char label[192];
     oc_field f[1] = { { FF_TEXT, "", "", "" } };
@@ -26858,7 +26551,7 @@ static void show_secret(HWND owner, const char *title, const char *what,
  * person -- workspace, how to sign in, expiry -- in a field that can be selected
  * from, and already on the clipboard, as show_secret does for a bare token. The
  * clipboard gets CRLF line ends, which is what a Windows paste target expects. */
-static void show_invitation(HWND owner, const oc_model *m) {
+static void show_invitation(oc_win *owner, const oc_model *m) {
     oc_field f[1] = { { FF_MULTILINE, "Invitation \u2014 copied to your clipboard", "", "" } };
     if (!oc_model_invitation_text(m, g_cur_ws, f[0].value, sizeof f[0].value)) return;
     char crlf[2 * sizeof f[0].value]; size_t o = 0;
@@ -26880,7 +26573,7 @@ static void show_invitation(HWND owner, const oc_model *m) {
  * own app, which opens the page through its own connection -- and the page's
  * link too where a browser anywhere can reach it. A link through this client's
  * tunnel would work only here, so it is never the one sent. */
-static void show_reset(HWND owner, const oc_model *m) {
+static void show_reset(oc_win *owner, const oc_model *m) {
     char link[1200] = "";
     if (oc_client_pages_direct(g_client)) {
         char q[96];
@@ -26912,7 +26605,7 @@ static int g_await_invite;      /* show the minted invite token once it arrives 
 /* "Invite people": by address where the workspace signs people in through a
  * provider, by one-time token where it has password accounts, and either where
  * it has both -- a workspace refuses the kind it cannot redeem. */
-static void invite_people(HWND hwnd, uint8_t role) {
+static void invite_people(oc_win *hwnd, uint8_t role) {
     const oc_model *m = model();
     if (!g_client || !m) return;
     int by_addr = oc_model_offers_browser(m), by_token = oc_model_offers_local(m);
@@ -26967,7 +26660,7 @@ static float menu_total_height(void) {
 /* Switch to `ws`. Already connected -> instant, and the one we leave keeps
  * running. Otherwise connect it as an additional client; only when
  * there is no credential to connect with do we fall back to sign-in. */
-static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
+static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred) {
     if (!ws || !ws[0]) return;
     int existing = ws_find(ws);
     if (existing >= 0 && g_wss[existing].client) {
@@ -26977,7 +26670,7 @@ static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
         g_view = VIEW_HOME;
         layout_signin(hwnd);
         layout_composer(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return;
     }
     ws_save_active();          /* keep the current one running */
@@ -26995,7 +26688,7 @@ static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
     }
     layout_signin(hwnd);
     layout_composer(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 static void sw_book_cb(void *ctx, const char *workspace, const char *label,
@@ -27022,7 +26715,7 @@ static void sw_book_load(void) {
     oc_store_close(st);
 }
 
-static void open_ws_menu(HWND hwnd) {
+static void open_ws_menu(oc_win *hwnd) {
     (void)hwnd;
     const oc_model *m = model();
     int admin = m && self_role(m) >= OC_ROLE_ADMIN;
@@ -27093,7 +26786,7 @@ static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
     return (uint32_t)delta;
 }
 
-static void open_profile_menu(HWND hwnd) {
+static void open_profile_menu(oc_win *hwnd) {
     /* The reference's profile popover, item for item (its shape, not a copy):
      * identity header, an input-look status row, ONE away/active toggle worded
      * from live presence, "Pause notifications \xE2\x80\xBA" whose durations
@@ -27123,7 +26816,7 @@ static void open_profile_menu(HWND hwnd) {
     mi_item_d(3, "Sign out");
     g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     submenu_close();
-    RECT rc; GetClientRect(hwnd, &rc);
+    irect rc; client_rect(hwnd, &rc);
     /* DIPF, as every other anchor does — raw pixels put the menu low at >100%.
      * The You slot grows when a status emoji is stacked above the avatar, and
      * the menu anchors to the slot's true top. */
@@ -27133,7 +26826,7 @@ static void open_profile_menu(HWND hwnd) {
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
-static void open_new_menu(HWND hwnd) {
+static void open_new_menu(oc_win *hwnd) {
     g_n_mi = 0;
     mi_item(1, "New channel");
     mi_item(6, "New direct message");
@@ -27157,7 +26850,7 @@ static void open_new_menu(HWND hwnd) {
     if (rail_rect_of(NAV_NEW, &btop, &bbot)) {
         g_menu_y = bbot - menu_total_height();
     } else {
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         g_menu_y = DIPF(rc.bottom) - 8 - menu_total_height();
     }
     if (g_menu_y < 8) g_menu_y = 8;
@@ -27276,7 +26969,7 @@ static void sidebar_opts_load(const oc_model *m) {
  * shows the active choice — the very thing a submenu would hide a level down.
  * Commands encode as 200 + section*16 + slot so one dispatcher serves both. */
 #define SEC_CMD(sec, slot) (200 + (sec) * 16 + (slot))
-static void open_section_menu(HWND hwnd, int sec) {
+static void open_section_menu(oc_win *hwnd, int sec) {
     (void)hwnd;
     int cust = oc_sb_custom_index(sec);
     if (cust >= g_sb.n_custom) cust = -1;
@@ -27366,7 +27059,7 @@ static void open_files_menu(int which) {
     if (g_menu_x + g_menu_w > rightof) g_menu_x = rightof - g_menu_w;
 }
 
-static void open_switcher(HWND hwnd) {
+static void open_switcher(oc_win *hwnd) {
     (void)hwnd;
     sw_book_load();
     g_n_mi = 0;
@@ -27410,12 +27103,12 @@ static void open_switcher(HWND hwnd) {
 /* The deliberate exit. Everything that ends the process comes through here, so
  * the unsent-outbox question is asked once and in one place — it used to live in
  * WM_CLOSE, which no longer means "quit". */
-static void app_quit(HWND hwnd) {
+static void app_quit(oc_win *hwnd) {
     g_quitting = 1;
     if (hwnd) {
         if (g_sel) draft_flush(g_sel);
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();
-        SendMessageW(hwnd, WM_CLOSE, 0, 0);
+        on_close_request(hwnd);
     }
 }
 
@@ -27448,9 +27141,9 @@ static void call_engine_ensure(void) {
 /* A client is about to be stopped: if its call is the engine's, the engine lets
  * go of it first, and nothing will call into the engine for it again. */
 static void share_end(int tell);                                      /* fwd: sharing, below */
-static void share_tick(HWND hwnd);                                    /* fwd */
-static void share_open_picker(HWND hwnd);                             /* fwd */
-static int  share_begin(HWND hwnd, const char *id, const char *name); /* fwd */
+static void share_tick(oc_win *hwnd);                                    /* fwd */
+static void share_open_picker(oc_win *hwnd);                             /* fwd */
+static int  share_begin(oc_win *hwnd, const char *id, const char *name); /* fwd */
 static void call_forget(oc_client *c) {
     if (!c || !g_call_engine) return;
     if (g_call_client == c && g_share_on) share_end(0);
@@ -27472,22 +27165,22 @@ static void call_claim(void) {
     g_call_client = g_client;
 }
 
-static void call_open_view(HWND hwnd, uint64_t ch) {
+static void call_open_view(oc_win *hwnd, uint64_t ch) {
     close_overlays();
     g_call_view_ch = ch;
     g_view = VIEW_CALL;
     layout_composer(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* The microphone has one owner (ARCH-112): a call takes it from voice input and
  * from a recording, as they take it from each other. */
-static void call_take_microphone(HWND hwnd) {
+static void call_take_microphone(oc_win *hwnd) {
     dict_stop(hwnd, 0);
     if (g_vm) vm_close(hwnd);
 }
 
-static void call_join_here(HWND hwnd, uint64_t ch) {
+static void call_join_here(oc_win *hwnd, uint64_t ch) {
     if (!g_client || !ch) return;
     call_take_microphone(hwnd);
     call_claim();
@@ -27515,7 +27208,7 @@ static int call_candidates(const oc_model *m, const oc_channel *c, uint64_t *out
     return n;
 }
 
-static void call_pick_open(HWND hwnd, uint64_t ch, int invite, const uint64_t *cand, int n, int room) {
+static void call_pick_open(oc_win *hwnd, uint64_t ch, int invite, const uint64_t *cand, int n, int room) {
     g_cpick_ch = ch;
     g_cpick_invite = invite;
     g_cpick_n = n < CC_MAX_PICK ? n : CC_MAX_PICK;
@@ -27526,7 +27219,7 @@ static void call_pick_open(HWND hwnd, uint64_t ch, int invite, const uint64_t *c
 /* Start a call in `ch` (REQ-301): everyone, up to the cap; the starter picks
  * when there are more. A channel's members are asked for first if this client
  * does not hold them. */
-static void call_start_here(HWND hwnd, uint64_t ch) {
+static void call_start_here(oc_win *hwnd, uint64_t ch) {
     const oc_model *m = model();
     if (!m || !ch) return;
     if (oc_model_call_in(m, ch)) { call_join_here(hwnd, ch); return; }
@@ -27550,7 +27243,7 @@ static void call_start_here(HWND hwnd, uint64_t ch) {
 }
 
 /* Once a tick: a start waiting on a member list goes when the list is in. */
-static void call_tick(HWND hwnd) {
+static void call_tick(oc_win *hwnd) {
     const oc_model *m = model();
     if (g_call_start_pending && m && m->chanmem_channel == g_call_start_pending && !m->chanmem_loading)
         call_start_here(hwnd, g_call_start_pending);
@@ -27558,7 +27251,7 @@ static void call_tick(HWND hwnd) {
     if (g_call_ptt && !call_here(m)) g_call_ptt = 0;
     if (m && m->call_error_seq != g_call_err_seq) {
         g_call_err_seq = m->call_error_seq;
-        g_call_err_at = GetTickCount64();
+        g_call_err_at = now_ms();
         if (m->call_error == OC_ERR_CALL_FULL) oc_a11y_announce("The call is full");
     }
     /* Getting back into a call (PROTOCOL.md §5.17): said as it starts, and how
@@ -27579,7 +27272,8 @@ static void call_tick(HWND hwnd) {
     if (m) share_tick(hwnd);
 }
 
-static void call_open_device_menu(HWND hwnd, int speakers) {
+static void call_open_device_menu(oc_win *hwnd, int speakers) {
+    (void)hwnd;
     call_devices_refresh();
     g_n_mi = 0;
     mi_section(speakers ? "SPEAKER" : "MICROPHONE");
@@ -27603,11 +27297,12 @@ static void call_open_device_menu(HWND hwnd, int speakers) {
     g_menu_x = field.left;
     g_menu_y = field.top - 4 - h;             /* the controls sit at the bottom: open upward */
     if (g_menu_y < 8) g_menu_y = 8;
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* The "+" on Calls: which conversation to call, the most recently active first. */
-static void call_open_conv_menu(HWND hwnd) {
+static void call_open_conv_menu(oc_win *hwnd) {
+    (void)hwnd;
     const oc_model *m = model();
     if (!m) return;
     g_n_mi = 0;
@@ -27633,13 +27328,13 @@ static void call_open_conv_menu(HWND hwnd) {
     g_menu_w = UIS(280);
     g_menu_x = g_calls_plus.left;
     g_menu_y = g_calls_plus.bottom + 4;
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 static void call_prefs_changed(void) { prefs_save(); }
 
 /* Every call control, whichever way it was reached. */
-static void call_cmd(HWND hwnd, int cmd) {
+static void call_cmd(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (!m) return;
     int in = call_here(m);
@@ -27768,11 +27463,11 @@ static void call_cmd(HWND hwnd, int cmd) {
         call_prefs_changed();
         break;
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* A click in the call's parts of the window; 1 if it was one. */
-static int call_click(HWND hwnd, int x, int y) {
+static int call_click(oc_win *hwnd, int x, int y) {
     for (int i = 0; i < g_n_call_btns; i++)
         if (in_rect(g_call_btns[i].r, x, y)) { call_cmd(hwnd, g_call_btns[i].cmd); return 1; }
     if (in_rect(g_cstrip_mute, x, y))  { call_cmd(hwnd, CC_MUTE); return 1; }
@@ -27786,13 +27481,14 @@ static int call_click(HWND hwnd, int x, int y) {
 }
 
 /* Push to talk in a call: the chord that dictates outside one (CALLS.md §2). */
-static int call_ptt(HWND hwnd, int down) {
+static int call_ptt(oc_win *hwnd, int down) {
+    (void)hwnd;
     const oc_model *m = model();
     if (!call_here(m) || !g_call_engine) return 0;
     if (down == g_call_ptt) return 1;
     g_call_ptt = down;
     oc_call_engine_set_ptt(g_call_engine, down);
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
     return 1;
 }
 
@@ -27805,141 +27501,71 @@ static int call_ptt(HWND hwnd, int down) {
  * green frame marks what is shared, both kept out of the capture where Windows
  * allows it (WDA_EXCLUDEFROMCAPTURE), as the recording bar is. */
 
-enum { SHAREBAR_TEXT = 1, SHAREBAR_STOP };
-
-static LRESULT CALLBACK sharebar_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_COMMAND:
-        if (LOWORD(wp) == SHAREBAR_STOP) { menu_dispatch(g_main_hwnd, CC_SHARE_STOP); return 0; }
-        break;
-    case WM_CLOSE:                                  /* the caption's close stops sharing */
-        menu_dispatch(g_main_hwnd, CC_SHARE_STOP);
-        return 0;
-    }
-    return DefWindowProcW(h, msg, wp, lp);
+/* The screen rectangle of what is shared: the platform knows its monitors by
+ * the place the capture backend lists them, and its windows by handle. */
+static int share_target_rect(SDL_Rect *out) {
+    return oc_plat_share_rect(g_share_id, &out->x, &out->y, &out->w, &out->h);
 }
 
-/* The screen rectangle of what is shared: a monitor by its place in the list the
- * capture backend made, or a window by its handle. 0 if it cannot be found. */
-typedef struct { int want, at; RECT r; int found; } mon_find;
-static BOOL CALLBACK share_mon_cb(HMONITOR hm, HDC dc, LPRECT rc, LPARAM lp) {
-    (void)hm; (void)dc;
-    mon_find *f = (mon_find *)lp;
-    if (f->at++ == f->want) { f->r = *rc; f->found = 1; return FALSE; }
-    return TRUE;
-}
-
-static int share_target_rect(RECT *out) {
-    if (!strncmp(g_share_id, "screen:", 7) && g_share_id[7] >= '0' && g_share_id[7] <= '9') {
-        mon_find f = { atoi(g_share_id + 7), 0, { 0, 0, 0, 0 }, 0 };
-        EnumDisplayMonitors(NULL, NULL, share_mon_cb, (LPARAM)&f);
-        if (f.found) *out = f.r;
-        return f.found;
-    }
-    if (!strncmp(g_share_id, "window:", 7)) {
-        HWND w = (HWND)(uintptr_t)strtoull(g_share_id + 7, NULL, 16);
-        if (!w || !IsWindow(w) || IsIconic(w)) return 0;
-        if (DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS, out, sizeof *out) != S_OK && !GetWindowRect(w, out))
-            return 0;
-        return 1;
-    }
-    return 0;
-}
-
-/* The green frame: a click-through window the size of what is shared, drawn as
- * a border with the inside keyed out. */
-static LRESULT CALLBACK shareborder_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
-        HBRUSH key = CreateSolidBrush(RGB(255, 0, 255)), green = CreateSolidBrush(RGB(0x2B, 0xAC, 0x76));
-        FillRect(dc, &rc, green);
-        int t = PX(4);
-        RECT in = { rc.left + t, rc.top + t, rc.right - t, rc.bottom - t };
-        FillRect(dc, &in, key);
-        DeleteObject(key); DeleteObject(green);
-        EndPaint(h, &ps);
-        return 0;
-    }
-    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
-    return DefWindowProcW(h, msg, wp, lp);
+/* The green frame: a click-through window the size of what is shared, drawn
+ * as a border with the inside clear. */
+static void shareborder_paint(void) {
+    if (!g_shareborder.g) return;
+    int pw, ph; SDL_GetWindowSizeInPixels(g_shareborder.sdl, &pw, &ph);
+    SDL_SetRenderDrawBlendMode(g_shareborder.ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(g_shareborder.ren, 0, 0, 0, 0);
+    SDL_RenderClear(g_shareborder.ren);
+    SDL_SetRenderDrawColor(g_shareborder.ren, 0x2B, 0xAC, 0x76, 0xFF);
+    int t = PX(4);
+    SDL_FRect r[4] = { { 0, 0, (float)pw, (float)t }, { 0, (float)(ph - t), (float)pw, (float)t },
+                       { 0, 0, (float)t, (float)ph }, { (float)(pw - t), 0, (float)t, (float)ph } };
+    SDL_RenderFillRects(g_shareborder.ren, r, 4);
+    SDL_RenderPresent(g_shareborder.ren);
 }
 
 static void shareborder_place(void) {
-    if (!g_shareborder) return;
-    RECT r;
-    if (!share_target_rect(&r)) { ShowWindow(g_shareborder, SW_HIDE); return; }
-    SetWindowPos(g_shareborder, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!g_shareborder.sdl) return;
+    SDL_Rect r;
+    if (!share_target_rect(&r)) { SDL_HideWindow(g_shareborder.sdl); return; }
+    SDL_SetWindowPosition(g_shareborder.sdl, r.x, r.y);
+    SDL_SetWindowSize(g_shareborder.sdl, r.w, r.h);
+    SDL_ShowWindow(g_shareborder.sdl);
+    shareborder_paint();
 }
 
-static void sharebar_open(HWND owner) {
-    static int registered;
-    HINSTANCE inst = GetModuleHandleW(NULL);
-    if (!registered) {
-        WNDCLASSEXW wc;
-        memset(&wc, 0, sizeof wc);
-        wc.cbSize = sizeof wc;
-        wc.lpfnWndProc = sharebar_proc;
-        wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"OpenChimeShareBar";
-        if (!RegisterClassExW(&wc)) return;
-        wc.lpfnWndProc = shareborder_proc;
-        wc.hbrBackground = NULL;
-        wc.lpszClassName = L"OpenChimeShareBorder";
-        if (!RegisterClassExW(&wc)) return;
-        registered = 1;
-    }
-    int w = PX(360), h = PX(80);
-    RECT wa = { 0, 0, 1280, 720 }, tr;
-    MONITORINFO mi; mi.cbSize = sizeof mi;
-    HMONITOR hm = share_target_rect(&tr) ? MonitorFromRect(&tr, MONITOR_DEFAULTTONEAREST)
-                                         : MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
-    if (GetMonitorInfoW(hm, &mi)) wa = mi.rcWork;
-    g_sharebar = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"OpenChimeShareBar",
-                                 L"OpenChime \u2014 sharing", WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                                 wa.left + (wa.right - wa.left - w) / 2, wa.top + PX(12), w, h,
-                                 NULL, NULL, inst, NULL);
-    if (!g_sharebar) return;
-    RECT cr; GetClientRect(g_sharebar, &cr);
-    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    int bw = PX(110), bh = PX(28), pad = PX(10);
-    g_sharebar_text = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                                      pad, (cr.bottom - bh) / 2, cr.right - bw - 3 * pad, bh,
-                                      g_sharebar, (HMENU)(INT_PTR)SHAREBAR_TEXT, inst, NULL);
-    HWND stop = CreateWindowExW(0, L"BUTTON", L"Stop sharing", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                cr.right - bw - pad, (cr.bottom - bh) / 2, bw, bh,
-                                g_sharebar, (HMENU)(INT_PTR)SHAREBAR_STOP, inst, NULL);
-    SendMessageW(g_sharebar_text, WM_SETFONT, (WPARAM)font, TRUE);
-    SendMessageW(stop, WM_SETFONT, (WPARAM)font, TRUE);
-    WCHAR wl[200]; char line[200];
-    snprintf(line, sizeof line, "You're sharing %s", g_share_name[0] ? g_share_name : "your screen");
-    to_w(line, wl, 200);
-    SetWindowTextW(g_sharebar_text, wl);
-    g_sharebar_excluded = SetWindowDisplayAffinity(g_sharebar, 0x11 /* WDA_EXCLUDEFROMCAPTURE */) ? 1 : 0;
-    ShowWindow(g_sharebar, SW_SHOWNOACTIVATE);
-    g_shareborder = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT |
-                                    WS_EX_NOACTIVATE, L"OpenChimeShareBorder", L"", WS_POPUP,
-                                    0, 0, 1, 1, NULL, NULL, inst, NULL);
-    if (g_shareborder) {
-        SetLayeredWindowAttributes(g_shareborder, RGB(255, 0, 255), 0, LWA_COLORKEY);
-        SetWindowDisplayAffinity(g_shareborder, 0x11);
+static void sharebar_open(oc_win *owner) {
+    (void)owner;
+    SDL_Rect tr; SDL_DisplayID disp = 0;
+    if (share_target_rect(&tr)) disp = SDL_GetDisplayForRect(&tr);
+    if (!bar_open(&g_sharebar, "OpenChime \xE2\x80\x94 sharing", 360.0f, disp)) return;
+    g_sharebar_excluded = oc_plat_window_capture_exclude(g_sharebar.sdl, 1);
+    sharebar_paint();
+    g_shareborder.sdl = SDL_CreateWindow("", 1, 1, SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP |
+                                         SDL_WINDOW_TRANSPARENT | SDL_WINDOW_NOT_FOCUSABLE |
+                                         SDL_WINDOW_UTILITY | SDL_WINDOW_HIDDEN);
+    if (g_shareborder.sdl) {
+        g_shareborder.ren = SDL_CreateRenderer(g_shareborder.sdl, NULL);
+        g_shareborder.g = NULL;
+        oc_plat_window_click_through(g_shareborder.sdl, 1);
+        oc_plat_window_capture_exclude(g_shareborder.sdl, 1);
+        if (g_shareborder.ren) g_shareborder.g = (gfx *)1;   /* a marker: it draws with the renderer directly */
         shareborder_place();
     }
     crumb("sharebar open excluded=%d", g_sharebar_excluded);
 }
 
 static void sharebar_close(void) {
-    if (g_sharebar) DestroyWindow(g_sharebar);
-    if (g_shareborder) DestroyWindow(g_shareborder);
-    g_sharebar = g_sharebar_text = g_shareborder = NULL;
+    bar_close(&g_sharebar);
+    if (g_shareborder.sdl) {
+        if (g_shareborder.ren) SDL_DestroyRenderer(g_shareborder.ren);
+        SDL_DestroyWindow(g_shareborder.sdl);
+        memset(&g_shareborder, 0, sizeof g_shareborder);
+    }
 }
 
 /* The screens and windows there are to share, as the recorder lists them. */
-static void share_open_picker(HWND hwnd) {
+static void share_open_picker(oc_win *hwnd) {
+    (void)hwnd;
     g_share_nsrcs = oc_capture_list_screens(g_share_srcs, CC_MAX_SRC);
     if (g_share_nsrcs < 0) g_share_nsrcs = 0;
     g_n_mi = 0;
@@ -27959,11 +27585,11 @@ static void share_open_picker(HWND hwnd) {
     g_menu_x = field.right > field.left ? field.left : UIS(300);
     g_menu_y = (field.bottom > field.top ? field.top : UIS(400)) - 4 - h;
     if (g_menu_y < 8) g_menu_y = 8;
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* Share `id` (a device id from oc_capture_list_screens) under the name `name`. */
-static int share_begin(HWND hwnd, const char *id, const char *name) {
+static int share_begin(oc_win *hwnd, const char *id, const char *name) {
     const oc_model *m = model();
     if (!call_here(m) || !g_call_engine) return 0;
     if (oc_call_engine_share_start(g_call_engine, id, 1920, 1080) != 0) {
@@ -27993,7 +27619,7 @@ static void share_end(int tell) {
 }
 
 /* Once a tick, from call_tick: what the engine and the daemon say about sharing. */
-static void share_tick(HWND hwnd) {
+static void share_tick(oc_win *hwnd) {
     const oc_model *m = model();
     int in = call_here(m);
     if (g_share_pick_pending) {
@@ -28017,7 +27643,7 @@ static void share_tick(HWND hwnd) {
             fb_confirm(t);
         } else if (st.share_state == 0) {
             share_end(1);                              /* the source went away, or never opened */
-            g_share_err_until = GetTickCount64() + 8000;
+            g_share_err_until = now_ms() + 8000;
             fb_failed("Screen sharing stopped.");
         } else {
             shareborder_place();                       /* a shared window moves */
@@ -28037,7 +27663,7 @@ static void share_tick(HWND hwnd) {
         g_share_actual = 0;
         g_share_sx = g_share_sy = 0;
         g_share_seen = sharer;
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
     }
 }
 
@@ -28089,14 +27715,14 @@ static void notify_call(const char *title, const char *body, const char *source,
     notify_deliver(title, body, source, ws_slot, channel_id, snd);
 }
 
-static void menu_dispatch(HWND hwnd, int cmd) {
+static void menu_dispatch(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     if (cmd >= CC_MUTE && cmd <= CC_LAST) { call_cmd(hwnd, cmd); return; }
     switch (cmd) {
     case 88:     /* REQ-310: the header's Summarize menu, from the palette too */
         if (g_sel) {
             rectf a = g_sum_hdr_btn;
-            if (a.right <= a.left) { RECT cr; GetClientRect(hwnd, &cr); a = rf(0, 40, DIPF(cr.right) - 16, 40); }
+            if (a.right <= a.left) { irect cr; client_rect(hwnd, &cr); a = rf(0, 40, DIPF(cr.right) - 16, 40); }
             sum_menu_open(a, g_sel);
         }
         break;
@@ -28240,7 +27866,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!g_sr_open) break;
         {
             uint64_t rs, re;
-            if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) { InvalidateRect(hwnd, NULL, FALSE); break; }
+            if (oc_sumcal_range(&g_sr_cal, &rs, &re) != 0) { invalidate(); break; }
             modal_finish(0);
             g_modal_closed_by = "save";
             summarize_start(hwnd, g_sr_cid, OC_SUM_RANGE, rs, re);
@@ -28250,7 +27876,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!g_sch_open) break;
         {
             uint64_t at = sch_ms(g_sch_y, g_sch_m, g_sch_d, g_sch_min);
-            if (!sch_future(at)) { g_sch_err = 1; InvalidateRect(hwnd, NULL, FALSE); break; }
+            if (!sch_future(at)) { g_sch_err = 1; invalidate(); break; }
             modal_finish(0);
             g_modal_closed_by = "save";
             sched_at(hwnd, at);
@@ -28345,17 +27971,8 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         break; }
     case 55: {   /* choose an image, upload it, claim it as the avatar */
         if (!g_client) break;
-        WCHAR file[MAX_PATH]; file[0] = 0;
-        OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
-        ofn.lStructSize = sizeof ofn;
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFile = file;
-        ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp\0";
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!GetOpenFileNameW(&ofn)) break;
         char path[1024];
-        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
+        if (!oc_plat_pick_files(hwnd->sdl, "Images|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp", 0, path, sizeof path)) break;
         /* The bytes need A channel to be uploaded into (the wire requires one) and
          * nothing is posted there. The SELF-DM is the honest choice: it is the one
          * conversation that is unambiguously the user's own space. Falling back to
@@ -28445,7 +28062,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         g_sb.unreads_only = !g_sb.unreads_only;
         g_sb_scroll = 0;              /* the list just changed length under the scroll */
         sidebar_opts_save();
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         break;
     case 86: {   /* talking mode, from its header button or a screen reader */
         const oc_model *lm = model();
@@ -28460,17 +28077,8 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         char name[48];
         snprintf(name, sizeof name, "%s", f[0].value);
         for (char *q2 = name; *q2; q2++) if (*q2 >= 'A' && *q2 <= 'Z') *q2 += 32;
-        WCHAR file[MAX_PATH]; file[0] = 0;
-        OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
-        ofn.lStructSize = sizeof ofn;
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFile = file;
-        ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = L"Images\0*.png;*.gif;*.jpg;*.jpeg;*.webp\0";
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!GetOpenFileNameW(&ofn)) break;
         char path[1024];
-        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
+        if (!oc_plat_pick_files(hwnd->sdl, "Images|*.png;*.gif;*.jpg;*.jpeg;*.webp", 0, path, sizeof path)) break;
         /* Uploaded into the self-DM for the same reason an avatar is: the bytes need
          * a channel and that is the user's own space. Nothing is posted there. */
         uint64_t up = 0;
@@ -28552,10 +28160,10 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         }
         break;
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
-static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float cx, float cy) {
+static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, float cx, float cy) {
     const oc_channel *c = oc_model_channel((oc_model *)m, cid);
     if (!c) return;
     g_n_mi = 0;
@@ -28612,7 +28220,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
     g_menu_x = cx; g_menu_y = cy;
     {
         float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
-        RECT rc; GetClientRect(hwnd, &rc);
+        irect rc; client_rect(hwnd, &rc);
         float H = DIPF(rc.bottom), W = DIPF(rc.right);
         if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
         if (g_menu_y < 8) g_menu_y = 8;
@@ -28632,7 +28240,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
  *
  * The rows come from the last paint, which is what the pointer hit-tests against
  * too, so the keyboard and the mouse cannot disagree about where a message is. */
-static void kb_row_move(HWND hwnd, int d) {
+static void kb_row_move(oc_win *hwnd, int d) {
     (void)hwnd;
     if (g_n_msgrows <= 0) { g_kb_mid = 0; return; }
     int cur = -1;
@@ -28652,7 +28260,7 @@ static void kb_row_move(HWND hwnd, int d) {
     if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
 }
 
-static void kb_context_menu(HWND hwnd) {
+static void kb_context_menu(oc_win *hwnd) {
     const oc_model *m = model();
     if (!m) return;
     if (g_kb_mid) {
@@ -28676,7 +28284,7 @@ static void kb_context_menu(HWND hwnd) {
     menu_move(1);
 }
 
-static void channel_menu_run(HWND hwnd, int cmd) {
+static void channel_menu_run(oc_win *hwnd, int cmd) {
     const oc_model *m = model();
     uint64_t cid = g_menu_target;
     if (!m || !cid) return;
@@ -28752,107 +28360,31 @@ static int write_bmp(const char *path, int w, int h, const void *bgra) {
  * here would fail the whole frame. */
 /* ---- composited snapshots ------------------------------------------------ */
 
-/* Blit every visible native child onto `mem`, over the Direct2D scene already
- * rendered there, at the position it really occupies.
- *
- * This exists because NEITHER capture route is complete on its own, which cost
- * real time to discover:
- *
- *   - Re-rendering the scene into a DC target (test_shot) draws only what WE
- *     draw. The composer's RichEdit, the find/search/files boxes, the emoji
- *     picker and the sign-in fields are child windows, so they are invisible to
- *     it — and that is exactly the class of bug that kept reaching the user
- *    , plus anything the RichEdit paints itself, like the composer cue.
- *   - PrintWindow(PW_RENDERFULLCONTENT) captures the children and the window
- *     chrome but returns a BLANK client area, because our WM_PAINT renders
- *     through a D2D HWND target straight to the screen and never touches the HDC
- *     Windows hands it. Measured, not assumed: the capture showed white with the
- *     RichEdit's placeholder floating in it.
- *
- * So we composite exactly as the window does: our scene underneath, children on
- * top. EnumChildWindows rather than a list of the six handles, because a list is
- * one more thing a seventh child has to be added to — and forgetting is the
- * failure mode this whole area keeps repeating. */
-static BOOL CALLBACK snap_child(HWND ch, LPARAM lp) {
-    HDC mem = (HDC)lp;
-    if (!IsWindowVisible(ch)) return TRUE;
-    HWND parent = GetParent(ch);
-    RECT wr; GetWindowRect(ch, &wr);
-    POINT tl = { wr.left, wr.top };
-    ScreenToClient(parent, &tl);
-    int cw = wr.right - wr.left, chh = wr.bottom - wr.top;
-    if (cw <= 0 || chh <= 0) return TRUE;
-
-    HDC tmp = CreateCompatibleDC(mem);
-    HBITMAP bm = CreateCompatibleBitmap(mem, cw, chh);
-    if (tmp && bm) {
-        HGDIOBJ o = SelectObject(tmp, bm);
-        /* Both, in this order, because neither is reliable alone and this was
-         * established by measurement rather than documentation: PrintWindow on a
-         * CHILD returned an empty box for the RichEdit (the send arrow went
-         * primary, proving text was there, while the capture stayed blank), and
-         * WM_PRINTCLIENT is what a control implements for exactly this purpose.
-         * Whichever fills the bitmap wins; running both costs nothing at
-         * screenshot rate. */
-        SendMessageW(ch, WM_ERASEBKGND, (WPARAM)tmp, 0);
-        if (!PrintWindow(ch, tmp, 0))
-            SendMessageW(ch, WM_PRINTCLIENT, (WPARAM)tmp,
-                         PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
-        else
-            SendMessageW(ch, WM_PRINTCLIENT, (WPARAM)tmp, PRF_CLIENT | PRF_CHILDREN);
-        BitBlt(mem, tl.x, tl.y, cw, chh, tmp, 0, 0, SRCCOPY);
-        SelectObject(tmp, o);
-    }
-    if (bm) DeleteObject(bm);
-    if (tmp) DeleteDC(tmp);
-    return TRUE;
-}
-
-static int test_shot(HWND hwnd, const char *path) {
-    RECT rc; GetClientRect(hwnd, &rc);
+/* One image of the whole window: the scene rendered and read back. Every
+ * field is drawn now, so what the renderer holds is the whole application. */
+static int test_shot(oc_win *hwnd, const char *path) {
+    irect rc; client_rect(hwnd, &rc);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0 || !g_gfx) return 0;
-    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
-    BITMAPINFO bi; ZeroMemory(&bi, sizeof bi);
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;   /* top-down */
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void *bits = NULL;
-    HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    gfx_begin(g_gfx, OC_COL_BASE);
+    scene_scale_apply();
+    g_thumbs_off = 1;      /* do not FETCH during a capture */
+    render_scene(g_gfx, model(), DIPF(w), DIPF(h));
+    g_thumbs_off = 0;
+    unsigned char *rgba = malloc((size_t)w * h * 4), *bgra = malloc((size_t)w * h * 4);
     int ok = 0;
-    if (dib && bits) {
-        HGDIOBJ old = SelectObject(mem, dib);
-        /* The same renderer draws the same scene — brushes are data now, so
-         * there is nothing to swap and nothing target-owned to fail on.
-         * gfx_readback returns straight RGBA; the DIB wants BGRX. */
-        gfx_begin(g_gfx, OC_COL_BASE);
-        scene_scale_apply();
-        g_thumbs_off = 1;      /* do not FETCH during a capture */
-        render_scene(g_gfx, model(), DIPF(w), DIPF(h));
-        g_thumbs_off = 0;
-        unsigned char *rgba = malloc((size_t)w * h * 4);
-        if (rgba && gfx_readback(g_gfx, rgba, w, h)) {
-            unsigned char *d = bits;
-            for (size_t i = 0; i < (size_t)w * h; i++) {
-                d[i * 4 + 0] = rgba[i * 4 + 2];
-                d[i * 4 + 1] = rgba[i * 4 + 1];
-                d[i * 4 + 2] = rgba[i * 4 + 0];
-                d[i * 4 + 3] = 0xFF;
-            }
-            ok = 1;
+    /* gfx_readback returns straight RGBA; the BMP wants BGRX. */
+    if (rgba && bgra && gfx_readback(g_gfx, rgba, w, h)) {
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            bgra[i * 4 + 0] = rgba[i * 4 + 2];
+            bgra[i * 4 + 1] = rgba[i * 4 + 1];
+            bgra[i * 4 + 2] = rgba[i * 4 + 0];
+            bgra[i * 4 + 3] = 0xFF;
         }
-        free(rgba);
-        gfx_end(g_gfx);
-        GdiFlush();
-        /* Children last, over the scene — one snapshot that shows the whole
-         * application, so there is no second command to remember and no
-         * blind spot to forget about. */
-        if (ok) { EnumChildWindows(hwnd, snap_child, (LPARAM)mem); GdiFlush(); }
-        if (ok) ok = write_bmp(path, w, h, bits);
-        SelectObject(mem, old);
+        ok = write_bmp(path, w, h, bgra);
     }
-    if (dib) DeleteObject(dib);
-    DeleteDC(mem); ReleaseDC(NULL, screen);
+    free(rgba); free(bgra);
+    gfx_end(g_gfx);
     return ok;
 }
 
@@ -28861,14 +28393,20 @@ static void test_ack(const char *msg) {
     FILE *f = fopen(p, "wb"); if (f) { fputs(msg ? msg : "ok", f); fclose(f); }
 }
 
-/* The main window, for the dump's own use: the harness needs to ask about THIS
- * window rather than about whatever happens to be active. */
-static HWND test_main_window(void) { return g_main_hwnd; }
 
 static void test_dump(const char *path) {
     const oc_model *m = model();
     FILE *f = fopen(path, "wb"); if (!f) return;
-    if (!m) { fprintf(f, "no model\n"); fclose(f); return; }
+    if (!m) {
+        /* Not signed in: the sign-in card's state is what there is to see. */
+        fprintf(f, "no model\nsignin step=%d browser=%d connecting=%d err=%s\n",
+                g_si_step, g_si_browser, g_si_connecting, g_si_err);
+        if (g_si_client) {
+            const oc_model *sm = oc_client_model(g_si_client);
+            if (sm) fprintf(f, "signin last_error=%s signin_url=%.120s\n", sm->last_error, sm->signin_url);
+        }
+        fclose(f); return;
+    }
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
@@ -28891,9 +28429,7 @@ static void test_dump(const char *path) {
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
     {
-        POINT cp = { -1, -1 };
-        GetCaretPos(&cp);
-        fprintf(f, "caret owned=%d x=%ld y=%ld\n", g_caret_owned, (long)cp.x, (long)cp.y);
+        fprintf(f, "caret owned=%d x=%ld y=%ld\n", g_caret_owned, (long)g_caret_at.x, (long)g_caret_at.y);
     }
     /* The last error the core reported, and its monotonic sequence. Without this
      * a failed intent is indistinguishable from an intent that was never sent —
@@ -28966,7 +28502,7 @@ static void test_dump(const char *path) {
             g_addppl_btn.left, g_addppl_btn.top, g_addppl_btn.right, g_addppl_btn.bottom,
             g_mem_pick_add.left, g_mem_pick_add.top, g_mem_pick_add.right, g_mem_pick_add.bottom,
             g_mem_pick_cancel.left, g_mem_pick_cancel.top, g_mem_pick_cancel.right, g_mem_pick_cancel.bottom,
-            g_chtip && GetTickCount64() - g_chtip_since >= FMT_TIP_MS ? g_chtip : 0);
+            g_chtip && now_ms() - g_chtip_since >= FMT_TIP_MS ? g_chtip : 0);
     {
         const oc_channel *gc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         const oc_group_view *vg = gc ? oc_model_group(m, oc_model_via_group(m, g_sel, m->user_id)) : NULL;
@@ -29070,7 +28606,7 @@ static void test_dump(const char *path) {
                     cs.view_frames, cs.view_frame_no, cs.view_nacks, cs.view_plis, cs.view_skipped,
                     (int)cs.view_errors, g_share_tw, g_share_th, fpx, centre, g_share_full, g_share_actual,
                     g_share_stage.left, g_share_stage.top, g_share_stage.right, g_share_stage.bottom,
-                    g_sharebar != NULL, g_sharebar_excluded, g_shareborder != NULL && IsWindowVisible(g_shareborder));
+                    g_sharebar.sdl != NULL, g_sharebar_excluded, g_shareborder.sdl != NULL && win_visible(&g_shareborder));
         }
         /* Missed calls, as the transcripts hold them (REQ-304). */
         {
@@ -29162,7 +28698,7 @@ static void test_dump(const char *path) {
                 g_tgt_sel, g_n_tgt, ed_len(), g_nm_pending ? 1 : 0);
     }
     fprintf(f, "startup visible=%d started=%d si_ws=\"%s\" si_err=\"%s\"\n",
-            g_main_hwnd ? IsWindowVisible(g_main_hwnd) : 0, g_clients_started, g_si_ws, g_si_err);
+            win_visible(g_main), g_clients_started, g_si_ws, g_si_err);
     /* Modal + the settings a form modal can change, so snapshot/commit/restore is
      * assertable rather than eyeballed — Cancel silently behaving like Save is
      * exactly the bug this design exists to prevent. */
@@ -29281,9 +28817,9 @@ static void test_dump(const char *path) {
             g_prof_dm_btn.left, g_prof_dm_btn.top, g_prof_dm_btn.right, g_prof_dm_btn.bottom);
     {
         char ed8[1024] = "";
-        WCHAR edw[512];
+        oc_wch edw[512];
         int n = ed_get(edw, 512);
-        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, edw, -1, ed8, sizeof ed8, NULL, NULL);
+        if (n > 0) to_u8(edw, ed8, sizeof ed8);
         {   /* The caret's own rect, so "is the caret on the text line" is a
              * question the harness can ask. It could not, which is how a caret
              * drawn below the line by a zero-height formatting run got out. */
@@ -29360,10 +28896,7 @@ static void test_dump(const char *path) {
     }
     for (int i = 0; i < g_form_n && g_form_f; i++) {
         char cur[256]; snprintf(cur, sizeof cur, "%s", g_form_f[i].value);
-        if (g_form_edit[i]) {
-            WCHAR w[256]; GetWindowTextW(g_form_edit[i], w, 256);
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, cur, (int)sizeof cur, NULL, NULL);
-        }
+        if (g_form_edit[i]) snprintf(cur, sizeof cur, "%s", g_form_edit[i]->buf);
         /* A SELECT has no native EDIT, so `cur` is empty for one and the rect
          * that matters is its own box: report both, or the harness cannot tell a
          * select that is not drawn from one whose value it cannot read. */
@@ -29376,12 +28909,11 @@ static void test_dump(const char *path) {
         /* A multi-line field's lines, as the EDIT itself wraps them, against how
          * many its box shows: "all of it is visible" is lines <= shown. */
         if (g_form_f[i].kind == FF_MULTILINE && g_form_edit[i]) {
-            RECT er; SendMessageW(g_form_edit[i], EM_GETRECT, 0, (LPARAM)&er);
-            int lhp = g_form_font_lh > 0 ? g_form_font_lh : 1;
+            float lh = g_meta_w && g_meta_w->f ? st_line_height(g_st, g_meta_w->f) : UIS(18.0f);
             fprintf(f, "  formlines %d lines=%d shown=%d first=%d\n", i,
-                    (int)SendMessageW(g_form_edit[i], EM_GETLINECOUNT, 0, 0),
-                    (int)((er.bottom - er.top) / lhp),
-                    (int)SendMessageW(g_form_edit[i], EM_GETFIRSTVISIBLELINE, 0, 0));
+                    g_form_edit[i]->lines,
+                    (int)((g_form_erect[i].bottom - g_form_erect[i].top - 10) / (lh > 0 ? lh : 1)),
+                    (int)(g_form_edit[i]->scroll / (lh > 0 ? lh : 1)));
         }
     }
     fprintf(f, "formsel open=%d field=%d scroll=%d rows=%d panel=%.0f,%.0f,%.0f,%.0f\n",
@@ -29394,10 +28926,7 @@ static void test_dump(const char *path) {
                 g_form_sel_rows[i].r.right, g_form_sel_rows[i].r.bottom);
     {
         char stxt[128] = "";
-        if (g_status_edit) {
-            WCHAR w[128]; GetWindowTextW(g_status_edit, w, 128);
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, stxt, (int)sizeof stxt, NULL, NULL);
-        }
+        if (g_status_edit) snprintf(stxt, sizeof stxt, "%s", g_status_edit->buf);
         fprintf(f, "statusmodal open=%d emoji=\"%s\" text=\"%s\" clear=%d nsugg=%d "
                    "btn=%.0f,%.0f,%.0f,%.0f erect=%.0f,%.0f,%.0f,%.0f\n",
                 g_status_open, g_status_emoji, stxt, g_status_clear, g_n_status_suggs,
@@ -29507,18 +29036,16 @@ static void test_dump(const char *path) {
      * harness cannot see is the one that reaches the user. */
     fprintf(f, "sisuffix shown=%d\n", g_si_suffix_shown);
     fprintf(f, "natives re=%d find=%d ffind=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
-            (g_ed_box.right > g_ed_box.left), g_find && IsWindowVisible(g_find),
-            g_ffind && IsWindowVisible(g_ffind),
-            g_srch && IsWindowVisible(g_srch), g_pick_edit && IsWindowVisible(g_pick_edit),
-            g_pal_edit && IsWindowVisible(g_pal_edit),
-            g_si_e_ws && IsWindowVisible(g_si_e_ws),
+            (g_ed_box.right > g_ed_box.left), g_find && g_find->visible,
+            g_ffind && g_ffind->visible,
+            g_srch && g_srch->visible, g_pick_edit && g_pick_edit->visible,
+            g_pal_edit && g_pal_edit->visible,
+            g_si_e_ws && g_si_e_ws->visible,
             sidebar_kind(), main_is_conversation(), window_is_covered());
-    /* The search boxes: whether each wears the UI font (form_font()), that
-     * font's height and face, and where its EDIT sits against the chrome drawn
-     * for it -- all in device pixels -- so "one control, the app's text, centred"
-     * is a check rather than a look at a picture. */
+    /* The search boxes: whether each is shown, where its text sits against the
+     * chrome drawn for it (device pixels), and what it holds. */
     {
-        struct { const char *name; HWND w; rectf box; } sb[] = {
+        struct { const char *name; field *w; rectf box; } sb[] = {
             { "find",  g_find,      find_box() },
             { "srch",  g_srch,      g_srch_box },
             { "files", g_ffind,     g_file_search_box },
@@ -29526,20 +29053,15 @@ static void test_dump(const char *path) {
             { "pal",   g_pal_edit,  g_pal_box },
             { "pick",  g_pick_edit, g_pick_box },
         };
-        HFONT uf = form_font();
         for (size_t i = 0; i < sizeof sb / sizeof sb[0]; i++) {
             if (!sb[i].w) { fprintf(f, "searchbox %s made=0\n", sb[i].name); continue; }
-            HFONT hf = (HFONT)SendMessageW(sb[i].w, WM_GETFONT, 0, 0);
-            LOGFONTW lf; memset(&lf, 0, sizeof lf);
-            if (hf) GetObjectW(hf, sizeof lf, &lf);
-            char face[64]; WideCharToMultiByte(CP_UTF8, 0, lf.lfFaceName, -1, face, sizeof face, NULL, NULL);
-            RECT er; GetWindowRect(sb[i].w, &er);
-            MapWindowPoints(NULL, g_main_hwnd, (POINT *)&er, 2);
-            fprintf(f, "searchbox %s made=1 vis=%d uifont=%d lf=%ld face=\"%s\" lh=%d "
-                       "edit=%ld,%ld,%ld,%ld box=%d,%d,%d,%d\n",
-                    sb[i].name, IsWindowVisible(sb[i].w) ? 1 : 0, hf == uf, (long)lf.lfHeight, face,
-                    g_form_font_lh, (long)er.left, (long)er.top, (long)er.right, (long)er.bottom,
-                    PX(sb[i].box.left), PX(sb[i].box.top), PX(sb[i].box.right), PX(sb[i].box.bottom));
+            rectf er = sb[i].w->box;
+            fprintf(f, "searchbox %s made=1 vis=%d uifont=1 lf=0 face=\"\" lh=%d "
+                       "edit=%d,%d,%d,%d box=%d,%d,%d,%d text=\"%s\"\n",
+                    sb[i].name, sb[i].w->visible ? 1 : 0, PX(UIS(18.0f)),
+                    PX(er.left), PX(er.top), PX(er.right), PX(er.bottom),
+                    PX(sb[i].box.left), PX(sb[i].box.top), PX(sb[i].box.right), PX(sb[i].box.bottom),
+                    sb[i].w->buf);
         }
     }
     /* Hit-box geometry, because a hit test that silently matches nothing looks
@@ -29646,7 +29168,7 @@ static void test_dump(const char *path) {
         #define contains(o, i) ((o)->l <= (i)->l && (o)->t <= (i)->t && \
                                 (o)->r >= (i)->r && (o)->b >= (i)->b)
         char first_ov[96] = "", first_out[96] = "";
-        RECT rcw; GetClientRect(g_main_hwnd ? g_main_hwnd : GetActiveWindow(), &rcw);
+        irect rcw; client_rect(g_main ? g_main : g_main, &rcw);
         int md = modal_open();
         int ml = PX(g_modal_card.left), mt = PX(g_modal_card.top);
         int mr = PX(g_modal_card.right), mb = PX(g_modal_card.bottom);
@@ -29774,15 +29296,19 @@ static void test_dump(const char *path) {
     /* Whether this window actually HAS the keyboard, which is the condition the
      * composer's auto-focus turns on — "focus=0" alone cannot tell you whether
      * the field declined it or the window never had it to give. */
-    /* Against the MAIN window, not GetActiveWindow(): when the app is not active
-     * both GetActiveWindow() and GetFocus() return NULL for this thread, so
+    /* Against the MAIN window, not g_main: when the app is not active
+     * both g_main and GetFocus() return NULL for this thread, so
      * comparing them to each other reported "focused" in precisely the case that
      * is broken — and the wait built on it waited for a condition that was
      * already true. An instrument that reads 1 when the thing it measures is
      * absent is worse than no instrument. */
-    {   HWND mw = test_main_window();
-        fprintf(f, "wnd_active=%d wnd_focus=%d\n",
-                GetForegroundWindow() == mw, GetFocus() == mw); }
+    /* Asked of the platform, not of our record of events: whether the window is
+     * the foreground one, and whether it holds the keyboard -- which a process
+     * can give its own window without owning the foreground (a client launched
+     * by the harness into a session nobody is looking at), so the two are
+     * different facts. */
+    fprintf(f, "wnd_active=%d wnd_focus=%d\n", oc_plat_window_is_front(g_main->sdl),
+            oc_plat_window_has_keyboard(g_main->sdl) && !g_focus);
     /* Keywords and priority people (REQ-135), and the schedule (REQ-136): what
      * the client believes, which is the half a server-side test cannot see. */
     {
@@ -29848,7 +29374,7 @@ static void test_dump(const char *path) {
         if (m) for (size_t i = 0; i < m->n_users; i++)
             if (dir_matches(&m->users[i], low, 0)) nvis++;
         fprintf(f, "people n=%d q=\"%s\" box=%d\n", nvis, g_dir_filter,
-                g_dir_edit && IsWindowVisible(g_dir_edit));
+                g_dir_edit && g_dir_edit->visible);
     }
     /* Threads (REQ-062): what the list holds and what the pane offers. */
     {
@@ -29891,7 +29417,7 @@ static void test_dump(const char *path) {
      * a tooltip is showing, or none: the two rows' buttons can be compared, and
      * "does this button say what it is" asked, without a screenshot. */
     {
-        ULONGLONG now = GetTickCount64();
+        uint64_t now = now_ms();
         const char *tip = "";
         if (g_fmt_hover >= 0 && g_fmt_hover < FMT_COUNT && now - g_fmt_hover_since >= FMT_TIP_MS)
             tip = FMT_NAME[g_fmt_hover];
@@ -29957,28 +29483,25 @@ static void test_dump(const char *path) {
      * than probed from outside: two attempts to read it with a P/Invoke came
      * back all zeroes, and a screenshot of a window that lives eight seconds
      * catches an empty screen as often as not. */
-    if (g_nt_hwnd) {
-        RECT nr; GetWindowRect(g_nt_hwnd, &nr);
-        RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-        fprintf(f, "ntrect l=%ld t=%ld r=%ld b=%ld  work r=%ld b=%ld  "
-                   "right_gap=%ld bottom_gap=%ld dpi=%d vis=%d\n",
-                nr.left, nr.top, nr.right, nr.bottom, wa.right, wa.bottom,
-                wa.right - nr.right, wa.bottom - nr.bottom,
-                g_dpi, IsWindowVisible(g_nt_hwnd) ? 1 : 0);
-        {
-            DWORD rp = 0;
-            HRESULT gr2 = DwmGetWindowAttribute(g_nt_hwnd, 33, &rp, sizeof rp);
-            fprintf(f, "ntround set_hr=0x%08lX get_hr=0x%08lX pref=%lu\n",
-                    (unsigned long)g_nt_round_hr, (unsigned long)gr2,
-                    (unsigned long)rp);
-        }
+    if (g_nt_win.sdl) {
+        int nx, ny, nw, nh; SDL_GetWindowPosition(g_nt_win.sdl, &nx, &ny); SDL_GetWindowSize(g_nt_win.sdl, &nw, &nh);
+        SDL_Rect wa = { 0, 0, 0, 0 };
+        SDL_DisplayID disp = SDL_GetDisplayForWindow(g_nt_win.sdl);
+        if (disp) SDL_GetDisplayUsableBounds(disp, &wa);
+        fprintf(f, "ntrect l=%d t=%d r=%d b=%d  work r=%d b=%d  "
+                   "right_gap=%d bottom_gap=%d dpi=%d vis=%d\n",
+                nx, ny, nx + nw, ny + nh, wa.x + wa.w, wa.y + wa.h,
+                wa.x + wa.w - (nx + nw), wa.y + wa.h - (ny + nh),
+                g_dpi, win_visible(&g_nt_win));
+        fprintf(f, "ntround set_hr=0x%08lX get_hr=0x%08lX pref=%lu\n",
+                (unsigned long)g_nt_round_hr, 0ul, (unsigned long)(g_nt_round_hr == 0 ? 2 : 0));
     }
     fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d withdrawn=%d\n",
             g_pref_deliver, g_delivered_by, g_wintoast_ok, g_aumid,
             g_nt_shown, g_n_nt, g_snd_muted, g_osn_withdrawn);
     fprintf(f, "hidden=%d visible=%d told=%d connected=%d\n",
             g_hidden_to_tray,
-            g_main_hwnd ? (IsWindowVisible(g_main_hwnd) ? 1 : 0) : 0,
+            win_visible(g_main),
             g_close_to_tray_told,
             (m && m->connected) ? 1 : 0);
     /* `taskbar`: -1 the ITaskbarList3 could not be created, 0 not yet asked
@@ -29986,7 +29509,7 @@ static void test_dump(const char *path) {
      * from "the overlay never applied", and that ambiguity cost a smoke run. */
     fprintf(f, "badge=%d flash_pref=%d flashes=%d taskbar=%d hr=0x%08lx\n",
             g_badge_shown < 0 ? 0 : g_badge_shown, g_pref_flash, g_flashes_raised,
-            g_taskbar_dead ? -1 : (g_taskbar ? 1 : 0), (unsigned long)g_taskbar_hr);
+            oc_plat_badge_status() ? -1 : (g_badge_shown >= 0 ? 1 : 0), (unsigned long)(unsigned)oc_plat_badge_status());
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
     /* The video overlay (REQ-162/165): which card, its phase, and its buttons. */
     {
@@ -30011,7 +29534,7 @@ static void test_dump(const char *path) {
          * the capture. */
         fprintf(f, "vmsrc src=\"%s\" corner=%d sound=%d nocam=%d nscreens=%d away=%d bar=%d excluded=%d gone=%d "
                    "rec_w=%d rec_h=%d frame_w=%d frame_h=%d vbox=%.0f,%.0f,%.0f,%.0f\n",
-                g_vm_src, g_vm_corner, g_vm_sound, g_vm_nocam, g_vm_nscreens, g_vm_away, g_recbar != NULL,
+                g_vm_src, g_vm_corner, g_vm_sound, g_vm_nocam, g_vm_nscreens, g_vm_away, g_recbar.sdl != NULL,
                 g_recbar_excluded, g_vm_gone, g_rec_res.width, g_rec_res.height, g_vm_tw, g_vm_th,
                 g_vm_vbox.left, g_vm_vbox.top, g_vm_vbox.right, g_vm_vbox.bottom);
         for (int i = 0; i < g_vm_nscreens; i++)
@@ -30068,7 +29591,7 @@ static void test_dump(const char *path) {
 }
 
 /* Poll <OPENCHIME_TEST_DIR>/cmd for one command per tick; write <dir>/ack. */
-static void test_poll(HWND hwnd) {
+static void test_poll(oc_win *hwnd) {
     if (!g_test_dir[0]) return;
     char cmdpath[600]; snprintf(cmdpath, sizeof cmdpath, "%s\\cmd", g_test_dir);
     FILE *f = fopen(cmdpath, "rb"); if (!f) return;
@@ -30101,10 +29624,10 @@ static void test_poll(HWND hwnd) {
          * The ledger belongs to the WINDOW's target. test_shot renders into its
          * own, which is the right thing for a picture and the wrong thing here:
          * a capture's ledger would describe the capture. */
-        UpdateWindow(hwnd);
+        paint_now();
         test_ack(gfx_ledger_dump(g_gfx, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "send")) {
-        { WCHAR w[1024]; to_w(arg, w, 1024); ed_set(w); composer_send(); }
+        { oc_wch w[1024]; to_w(arg, w, 1024); ed_set(w); composer_send(); }
         test_ack("ok");
     } else if (!strcmp(verb, "channel")) {
         /* By NAME, or by id when the argument is a number — a DM has no name at all
@@ -30121,9 +29644,7 @@ static void test_poll(HWND hwnd) {
         /* The two halves of a click, apart: a HELD button (the microphone's hold
          * to talk) is only testable with time between them. */
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
-        LPARAM pos = MAKELPARAM(PX(x), PX(y));
-        if (!strcmp(verb, "mousedown")) SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
-        else                            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+        synth_mouse(hwnd, !strcmp(verb, "mousedown") ? 0 : 2, x, y);
         test_ack("ok");
     } else if (!strcmp(verb, "click")) {
         /* A REAL WM_LBUTTONDOWN/UP pair, not a direct on_click: the composer is a
@@ -30131,27 +29652,20 @@ static void test_poll(HWND hwnd) {
          * handler, so a verb that jumped straight to on_click could not click into
          * the one control users click into most. */
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
-        LPARAM pos = MAKELPARAM(PX(x), PX(y));
-        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
-        SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+        synth_mouse(hwnd, 0, x, y);
+        synth_mouse(hwnd, 2, x, y);
         test_ack("ok");
     } else if (!strcmp(verb, "dblclick") || !strcmp(verb, "tripleclick")) {
         /* A real WM_LBUTTONDBLCLK, which is what the system sends only because
          * the class asks for it (CS_DBLCLKS) — driving two `click`s instead
          * would test the thing that was already happening and passing. The
          * triple sends the following down/up too, in one go, so the assertion
-         * does not depend on the harness beating GetDoubleClickTime(). */
+         * does not depend on the harness beating 500u. */
         int x = 0, y = 0;
         if (sscanf(arg, "%d %d", &x, &y) == 2) {
-            LPARAM pos = MAKELPARAM(PX(x), PX(y));
-            SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
-            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
-            SendMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, pos);
-            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
-            if (verb[0] == 't') {
-                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
-                SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
-            }
+            synth_mouse(hwnd, 0, x, y); synth_mouse(hwnd, 2, x, y);
+            synth_mouse(hwnd, 3, x, y); synth_mouse(hwnd, 2, x, y);
+            if (verb[0] == 't') { synth_mouse(hwnd, 0, x, y); synth_mouse(hwnd, 2, x, y); }
             test_ack("ok");
         } else test_ack("err");
     } else if (!strcmp(verb, "drag")) {
@@ -30163,12 +29677,10 @@ static void test_poll(HWND hwnd) {
          * move is exactly the kind that passes a teleport and fails a drag. */
         int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         if (sscanf(arg, "%d %d %d %d", &x0, &y0, &x1, &y1) == 4) {
-            SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(PX(x0), PX(y0)));
+            synth_mouse(hwnd, 0, x0, y0);
             for (int s = 1; s <= 4; s++)
-                SendMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON,
-                             MAKELPARAM(PX(x0 + (x1 - x0) * s / 4),
-                                        PX(y0 + (y1 - y0) * s / 4)));
-            SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(PX(x1), PX(y1)));
+                synth_mouse(hwnd, 1, x0 + (x1 - x0) * s / 4, y0 + (y1 - y0) * s / 4);
+            synth_mouse(hwnd, 2, x1, y1);
             test_ack("ok");
         } else test_ack("err");
     } else if (!strcmp(verb, "rclick")) {
@@ -30182,24 +29694,24 @@ static void test_poll(HWND hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "size")) {
         int w = 0, h = 0; sscanf(arg, "%d %d", &w, &h);
-        if (w > 0 && h > 0) SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        if (w > 0 && h > 0) SDL_SetWindowSize(hwnd->sdl, w, h);
         test_ack("ok");
     } else if (!strcmp(verb, "min")) {
         /* Really minimise: the taskbar flash is gated on not being the
          * foreground window, and only losing it for real exercises that. */
-        ShowWindow(hwnd, SW_MINIMIZE);
+        SDL_MinimizeWindow(hwnd->sdl);
         test_ack("ok");
     } else if (!strcmp(verb, "close")) {
         /* WM_CLOSE through the real path, so what the harness drives is what a
          * click on the title bar's X does. `close quit` is the deliberate exit. */
         if (!strcmp(arg, "quit")) app_quit(hwnd);
-        else SendMessageW(hwnd, WM_CLOSE, 0, 0);
+        else on_close_request(hwnd);
         test_ack("ok");
     } else if (!strcmp(verb, "traymenu")) {
         /* The right-click path without a right click: the tray icon is outside
          * the window, so no click verb can reach it. */
         show_and_focus(hwnd); tray_menu_open();
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack("ok");
     } else if (!strcmp(verb, "restore")) {
         show_and_focus(hwnd);
@@ -30212,7 +29724,7 @@ static void test_poll(HWND hwnd) {
         /* Put text in the composer WITHOUT sending, caret at the end, so the
          * autocomplete popover sees the same state as live typing. */
         {
-            WCHAR w[1024]; to_w(arg, w, 1024);
+            oc_wch w[1024]; to_w(arg, w, 1024);
             ed_set(w);
             ac_rebuild();
             test_ack("ok");
@@ -30224,24 +29736,16 @@ static void test_poll(HWND hwnd) {
          * stepping outside a closer) live in ed_char, so only this verb can
          * exercise them; `type` bypasses everything they exist to do. */
         {
-            WCHAR w[1024]; to_w(arg, w, 1024);
-            for (int i = 0; w[i]; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
+            oc_wch w[1024]; to_w(arg, w, 1024);
+            for (int i = 0; w[i]; i++) synth_char(hwnd, w[i]);
             test_ack("ok");
         }
     } else if (!strcmp(verb, "dirfind")) {
         /* Drive the People pane's search box (REQ-289). Through the control, so
          * the EN_CHANGE path the user's typing takes is the one under test — the
          * palette verb sets its box the same way. */
-        if (g_dir_edit) {
-            WCHAR w[80]; to_w(arg, w, 80);
-            SetWindowTextW(g_dir_edit, w);
-            /* SetWindowText does not reliably raise EN_CHANGE for a control the
-             * app owns, so the notification is posted explicitly rather than
-             * assumed — the alternative is a verb that sets a box nothing reads. */
-            SendMessageW(hwnd, WM_COMMAND,
-                         MAKEWPARAM(0xF5, EN_CHANGE), (LPARAM)g_dir_edit);
-            test_ack("ok");
-        } else test_ack("err");
+        if (g_dir_edit) { field_set(g_dir_edit, arg); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "attach")) {
         /* Into the upload tray, as picking the file would: the dialog cannot be
          * driven, the tray can. */
@@ -30254,7 +29758,7 @@ static void test_poll(HWND hwnd) {
         else test_ack("err");
     } else if (!strcmp(verb, "palette")) {
         palette_open(hwnd);
-        if (arg[0]) { WCHAR w[64]; to_w(arg, w, 64); SetWindowTextW(g_pal_edit, w); }
+        if (arg[0] && g_pal_edit) field_set(g_pal_edit, arg);
         test_ack("ok");
     } else if (!strcmp(verb, "wsadd")) {
         /* "<workspace> <user:pass>" — connect an ADDITIONAL workspace. */
@@ -30272,16 +29776,14 @@ static void test_poll(HWND hwnd) {
          * Files and Later — had no way to be tested at all. */
         int x = 0, y = 0, d = 0;
         sscanf(arg, "%d %d %d", &x, &y, &d);
-        POINT sp = { PX(x), PX(y) };
-        ClientToScreen(hwnd, &sp);
-        SendMessageW(hwnd, WM_MOUSEWHEEL, (WPARAM)(d << 16), MAKELPARAM(sp.x, sp.y));
+        synth_wheel(hwnd, x, y, d);
         test_ack("ok");
     } else if (!strcmp(verb, "chars")) {
         /* Real WM_CHARs, one per character. `type` SETS the text; this
          * TYPES it, which is the path that exercises insertion, the caret, the
          * typing indicator and the autocomplete — the code a user actually runs. */
-        WCHAR w[512]; int n = to_w(arg, w, 512);
-        for (int i = 0; i < n; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
+        oc_wch w[512]; int n = to_w(arg, w, 512);
+        for (int i = 0; i < n; i++) synth_char(hwnd, w[i]);
         test_ack("ok");
     } else if (!strcmp(verb, "call")) {
         /* Calls through the calls the controls make (REQ-150, REQ-301-305):
@@ -30338,7 +29840,7 @@ static void test_poll(HWND hwnd) {
             if (ok) oc_call_engine_set_volume(g_call_engine, uid, (float)pct / 100.0f);
         }
         else ok = 0;
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack(ok ? "ok" : "err");
     } else if (!strcmp(verb, "dictate")) {
         /* Voice input through the same calls the controls make: the microphone
@@ -30350,7 +29852,7 @@ static void test_poll(HWND hwnd) {
             if (on != (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE)) dict_freetalk_toggle(hwnd);
             test_ack(on == (g_dict && oc_dictate_mode(g_dict) == OC_STT_MODE_FREE) ? "ok" : "err");
         } else test_ack("err");
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
     } else if (!strcmp(verb, "key") || !strcmp(verb, "keyup")) {
         /* A raw virtual key through the real WM_KEYDOWN path, so Esc/Enter/Tab
          * behaviour is drivable at all — without this, every keyboard rule in the
@@ -30368,73 +29870,21 @@ static void test_poll(HWND hwnd) {
             if (!strncmp(k, "shift+", 6)) { want |= AM_SHIFT; k += 6; continue; }
             break;
         }
-        int vk = !strcmp(k, "esc")   ? VK_ESCAPE :
-                 !strcmp(k, "enter") ? VK_RETURN :
-                 !strcmp(k, "tab")   ? VK_TAB    :
-                 !strcmp(k, "up")    ? VK_UP     :
-                 !strcmp(k, "down")  ? VK_DOWN   :
-                 /* The function keys by name, and the Menu key that a keyboard
-                  * with one sends: without these `key f10` reached atoi(), which
-                  * answers 0 -- a key the harness "pressed" and nothing received,
-                  * acked "ok" either way. */
-                 (k[0] == 'f' && k[1] >= '1' && k[1] <= '9' && atoi(k + 1) >= 1 && atoi(k + 1) <= 12)
-                     ? (VK_F1 + atoi(k + 1) - 1) :
-                 (!strcmp(k, "menu") || !strcmp(k, "apps")) ? VK_APPS :
-                 !strcmp(k, "f6")    ? VK_F6     :
-                 !strcmp(k, "space") ? VK_SPACE  :
-                 !strcmp(k, "slash") ? VK_OEM_2  :
-                 /* Named, because a single digit is the DIGIT key (Ctrl+0 is zoom
-                  * reset) — `key 8` for VK_BACK would be read as typing "8". */
-                 (!strcmp(k, "back") || !strcmp(k, "backspace")) ? VK_BACK :
-                 (!strcmp(k, "del") || !strcmp(k, "delete")) ? VK_DELETE :
-                 !strcmp(k, "home") ? VK_HOME :
-                 !strcmp(k, "end")  ? VK_END  :
-                 !strcmp(k, "left") ? VK_LEFT :
-                 !strcmp(k, "right") ? VK_RIGHT :
-                 /* The OEM keys, by name: "=" and "-" are not letters and atoi()
-                  * quietly turned both into VK 0, so `key ctrl+=` was a no-op that
-                  * still acked "ok" — a harness lying in the one direction that
-                  * matters. */
-                 (!strcmp(k, "=") || !strcmp(k, "plus") || !strcmp(k, "equals")) ? VK_OEM_PLUS :
-                 (!strcmp(k, "-") || !strcmp(k, "minus")) ? VK_OEM_MINUS :
-                 (!strcmp(k, ",") || !strcmp(k, "comma")) ? VK_OEM_COMMA :
-                 (k[0] >= '0' && k[0] <= '9' && !k[1]) ? k[0] :   /* VK_0..VK_9 are ASCII */
-                 (k[0] >= 'a' && k[0] <= 'z' && !k[1]) ? (k[0] - 32) : atoi(k);
+        int vk = oc_key_from_name(k);
         /* Modifiers are read with GetKeyState, so they have to be really held:
          * SetKeyboardState makes them so for this thread without moving the user's
          * physical keyboard. */
-        BYTE ks[256]; GetKeyboardState(ks);
-        BYTE saved_c = ks[VK_CONTROL], saved_a = ks[VK_MENU], saved_s = ks[VK_SHIFT];
-        if (want & AM_CTRL)  ks[VK_CONTROL] = 0x80;
-        if (want & AM_ALT)   ks[VK_MENU]    = 0x80;
-        if (want & AM_SHIFT) ks[VK_SHIFT]   = 0x80;
-        SetKeyboardState(ks);
-        /* And say it directly, which is what the handlers actually read. */
         g_synth_mods = (int)want;
-        MSG km; memset(&km, 0, sizeof km);
         /* `keyup` lets the key go: the release a held key (the talk key) waits for. */
         int up = !strcmp(verb, "keyup");
-        km.hwnd = hwnd;
-        km.message = (want & AM_ALT) ? (up ? WM_SYSKEYUP : WM_SYSKEYDOWN) : (up ? WM_KEYUP : WM_KEYDOWN);
-        km.wParam = (WPARAM)vk;
-        km.lParam = up ? (LPARAM)0xC0000001 : 0;   /* bits 30-31: was down, going up */
-        /* Unclaimed keys go to the FOCUSED window, which is where a real keystroke
-         * goes. Sending them to the main window instead made Esc look broken: the
-         * palette's Esc lives in the palette box's proc, and the main proc has no
-         * reason to know about it. */
-        if (!accel_dispatch(hwnd, &km)) {
-            HWND target = GetFocus();
-            SendMessageW(target ? target : hwnd, km.message, (WPARAM)vk, km.lParam);
-        }
+        synth_key(hwnd, vk, up, (want & AM_ALT) != 0);
         g_synth_mods = -1;
-        ks[VK_CONTROL] = saved_c; ks[VK_MENU] = saved_a; ks[VK_SHIFT] = saved_s;
-        SetKeyboardState(ks);
         test_ack("ok");
     } else if (!strcmp(verb, "move")) {
         /* A real WM_MOUSEMOVE, so hover goes through the same path the mouse
          * does rather than a test-only shortcut that could drift from it. */
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
-        SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(PX(x), PX(y)));
+        synth_mouse(hwnd, 1, x, y);
         test_ack("ok");
     } else if (!strcmp(verb, "nav")) {
         int d = 0, u = 0; sscanf(arg, "%d %d", &d, &u);
@@ -30443,7 +29893,7 @@ static void test_poll(HWND hwnd) {
         /* Force a scale factor so the layout can be checked without a scaled
          * display attached. Same path WM_DPICHANGED takes. */
         int d = atoi(arg);
-        if (d >= 48 && d <= 480) { dpi_set(hwnd, (UINT)d); test_ack("ok"); }
+        if (d >= 48 && d <= 480) { dpi_set(hwnd, (unsigned)d); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "wsforget")) {
         /* The removal itself, minus the confirmation dialog a harness cannot
@@ -30564,9 +30014,8 @@ static void test_poll(HWND hwnd) {
         if (sscanf(arg, "%d %d", &x, &y) != 2) { test_ack("err"); }
         else {
             test_ack("ok");
-            LPARAM pos = MAKELPARAM(PX(x), PX(y));
-            SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
-            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+            synth_mouse(hwnd, 0, x, y);
+            synth_mouse(hwnd, 2, x, y);
         }
     } else if (!strcmp(verb, "formtype")) {
         /* `formtype <field> <text>` -- into the open form's field, through the
@@ -30575,8 +30024,7 @@ static void test_poll(HWND hwnd) {
         if (sscanf(arg, "%d %n", &fi, &used) < 1 || !g_form_open || fi < 0 ||
             fi >= FORM_MAX_FIELDS || !g_form_edit[fi]) { test_ack("err"); }
         else {
-            WCHAR w[512]; to_w(arg + used, w, 512);
-            SetWindowTextW(g_form_edit[fi], w);
+            field_set(g_form_edit[fi], arg + used);
             test_ack("ok");
         }
     } else if (!strcmp(verb, "form")) {
@@ -30642,11 +30090,11 @@ static void test_poll(HWND hwnd) {
             if (grp) g_grp_pick_focus = 1; else g_chan_pick_focus = 1;
             tgt_rebuild();
             if (strcmp(q, "-")) {
-                WCHAR w[128]; to_w(q, w, 128);
-                for (int i = 0; w[i]; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
+                oc_wch w[128]; to_w(q, w, 128);
+                for (int i = 0; w[i]; i++) synth_char(hwnd, w[i]);
             }
-            for (int i = 0; i < row; i++) SendMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
-            SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+            for (int i = 0; i < row; i++) synth_key(hwnd, OCK_DOWN, 0, 0);
+            synth_key(hwnd, OCK_RETURN, 0, 0);
             test_ack("ok");
         }
     } else if (!strcmp(verb, "chmenu")) {
@@ -30712,7 +30160,7 @@ static void test_poll(HWND hwnd) {
         else if (!strcmp(what, "collapse")) { oc_sb_set_collapsed(&g_sb, atoi(rest), 1); test_ack("ok"); }
         else                             { test_ack("err"); }
         sidebar_opts_save();
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
     } else if (!strcmp(verb, "textsize")) {
         /* 0 Small .. 3 Largest (ARCH-97). Drivable because the scaling paths are
          * where fixed-height chrome fails, and a review that cannot set the size
@@ -30730,7 +30178,7 @@ static void test_poll(HWND hwnd) {
             int cat = atoi(arg);
             if (cat >= 0 && cat < PC_COUNT) g_pref_cat = cat;
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
         theme_set(atoi(arg)); prefs_save(); test_ack("ok");
@@ -30741,7 +30189,7 @@ static void test_poll(HWND hwnd) {
         ac_accept(); test_ack("ok");
     } else if (!strcmp(verb, "search")) {
         search_open(hwnd);
-        if (arg[0]) { WCHAR w[256]; to_w(arg, w, 256); SetWindowTextW(g_srch, w); search_submit(); }
+        if (arg[0]) { field_set(g_srch, arg); search_submit(); }
         test_ack("ok");
     } else if (!strcmp(verb, "pin")) {
         /* Kept once the kebab became drivable: this exercises the client call
@@ -30796,8 +30244,8 @@ static void test_poll(HWND hwnd) {
          * -- a diagnostic that is correct about the code and wrong about the
          * intent. A pragma cannot go here: it would split the else-if chain. */
         else if (!strcmp(arg, "badparam")) { const char *volatile nofmt = NULL; printf(nofmt); }
-        else if (!strcmp(arg, "fastfail")) { __fastfail(1); }
-        else if (!strcmp(arg, "kill"))     { TerminateProcess(GetCurrentProcess(), 3); }
+        else if (!strcmp(arg, "fastfail")) { crash_fastfail(); }
+        else if (!strcmp(arg, "kill"))     { _Exit(3); }
     } else if (!strcmp(verb, "mute")) {
         /* `mute <channel_id> <0|1>` — bypasses the channel context menu, which
          * needs a right-click on a specific row and a menu target the harness
@@ -30940,7 +30388,7 @@ static void test_poll(HWND hwnd) {
         g_pref_richtext = !strcmp(arg, "rich") ? 1 : 0;
         ed_mode_changed();
         if (composer_remeasure()) layout_composer(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack("ok");
     } else if (!strcmp(verb, "voicepreview")) {
         /* Ask for a voice's audition and time it. The answer is `preview
@@ -30948,7 +30396,7 @@ static void test_poll(HWND hwnd) {
          * is the number the warm cache exists to change. */
         if (g_client && arg[0]) {
             preview_drop();
-            g_preview_asked_ms = GetTickCount64();
+            g_preview_asked_ms = now_ms();
             g_preview_wait_ms = 0;
             oc_client_voice_preview(g_client, arg);
             test_ack("ok");
@@ -30958,7 +30406,7 @@ static void test_poll(HWND hwnd) {
          * a verb rather than a click at a measured coordinate, because the
          * pencil moves with the sidebar. */
         open_new_message(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack("ok");
     } else if (!strcmp(verb, "dmcompose")) {
         /* Toggle the "New direct message" picker, as its sidebar button does.
@@ -30967,13 +30415,13 @@ static void test_poll(HWND hwnd) {
          * about the view it failed to leave. */
         g_dm_compose = !g_dm_compose;
         layout_composer(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack("ok");
     } else if (!strcmp(verb, "summenu")) {
         /* The header's Summarize menu, open (REQ-310). */
         if (g_sel && g_sum_hdr_btn.right > g_sum_hdr_btn.left) {
             sum_menu_open(g_sum_hdr_btn, g_sel);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             test_ack("ok");
         } else test_ack("err");
     } else if (!strcmp(verb, "sumrange")) {
@@ -30988,19 +30436,19 @@ static void test_poll(HWND hwnd) {
             oc_sumcal_pick(&g_sr_cal, d2);
             sr_fields_show();
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack(g_sr_open ? "ok" : "err");
     } else if (!strcmp(verb, "sumtoggle")) {
         /* "sumtoggle <topic>" shows or hides a topic's details. */
         const oc_model *tm2 = model();
-        if (tm2 && tm2->summary_open) { sum_toggle(tm2, atoi(arg)); InvalidateRect(hwnd, NULL, FALSE); test_ack("ok"); }
+        if (tm2 && tm2->summary_open) { sum_toggle(tm2, atoi(arg)); invalidate(); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "sumnotify") || !strcmp(verb, "sumcancel")) {
         /* The waiting pane's Notify me when ready / Cancel, as clicked. */
         int want = !strcmp(verb, "sumnotify") ? SH_NOTIFY : SH_CANCEL, done = 0;
         for (int i = 0; i < g_n_sumhits && !done; i++)
             if (g_sumhits[i].kind == want) { summary_hit_run(hwnd, i); done = 1; }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack(done ? "ok" : "err");
     } else if (!strcmp(verb, "sumopen")) {
         /* "sumopen <notice>" opens a summary notice, as its toast's View does;
@@ -31020,7 +30468,7 @@ static void test_poll(HWND hwnd) {
         if (!strstr(arg, "hover"))
             for (int i = 0; i < g_n_sumhits; i++)
                 if (g_sumhits[i].kind == SH_CITE && g_sumhits[i].num == num) { summary_hit_run(hwnd, i); break; }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         test_ack("ok");
     } else if (!strcmp(verb, "summary")) {
         /* "summary <scope>" asks for this conversation's summary over that span
@@ -31081,9 +30529,9 @@ static void test_poll(HWND hwnd) {
      * synthesised keystrokes depend on the window being foreground — which it
      * is not when the harness drives it from WSL. */
     } else if (!strcmp(verb, "siws") || !strcmp(verb, "siuser") || !strcmp(verb, "sipass")) {
-        HWND e = !strcmp(verb, "siws")  ? g_si_e_ws
-               : !strcmp(verb, "siuser") ? g_si_e_user : g_si_e_pass;
-        if (e) { WCHAR w[320]; to_w(arg, w, 320); SetWindowTextW(e, w); test_ack("ok"); }
+        field *e = !strcmp(verb, "siws")  ? g_si_e_ws
+                 : !strcmp(verb, "siuser") ? g_si_e_user : g_si_e_pass;
+        if (e) { field_set(e, arg); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "siadv")) {
         signin_set_advanced(hwnd, !g_si_advanced); test_ack("ok");
@@ -31094,7 +30542,7 @@ static void test_poll(HWND hwnd) {
     } else {
         test_ack("unknown");
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    invalidate();
 }
 
 /* The pointer, spoken through SDL (its subclass owns WM_SETCURSOR for the
@@ -31121,7 +30569,7 @@ static void cursor_want(int kind) {
  * with "and N more" when a group named more than the notice lists (REQ-308).
  * `update`: the total arrived after the notice opened, so an open notice's text
  * is brought up to it rather than a second one opened. */
-static void unresolved_notice(HWND hwnd, const oc_model *m, int update) {
+static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
     char names[256];
     int listed = m->unresolved.n_peers;
     if (m->unresolved.total > listed)
@@ -31181,91 +30629,44 @@ static void unresolved_notice(HWND hwnd, const oc_model *m, int update) {
     }
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    /* Explorer restarted: its new taskbar has no overlay and the old COM proxy
-     * points at the dead shell. Drop both; the next tick re-applies the badge. */
-    if (g_taskbar_created_msg && msg == g_taskbar_created_msg) {
-        if (g_taskbar) { ITaskbarList3_Release(g_taskbar); g_taskbar = NULL; }
-        g_taskbar_dead = 0;
-        g_badge_shown = -1;
-        return 0;
-    }
-    switch (msg) {
-    case WM_CREATE:
-        oc_fb_init(&g_fb, fb_say);
-        /* Before any child: the provider must exist by the time the first
-         * WM_GETOBJECT arrives, and a screen reader may ask immediately. */
-        oc_a11y_init(hwnd);
-        composer_create(hwnd);
-        find_create(hwnd);
-        files_find_create(hwnd);
-        dir_find_create(hwnd);
-        search_create(hwnd);
-        g_pal_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
-            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF4, GetModuleHandleW(NULL), NULL);
-        if (g_pal_edit) {
-            SendMessageW(g_pal_edit, WM_SETFONT, (WPARAM)form_font(), TRUE);
-            SendMessageW(g_pal_edit, EM_SETCUEBANNER, TRUE,
-                         (LPARAM)L"Run an action or jump to a conversation");
-            g_pal_prev = (WNDPROC)SetWindowLongPtrW(g_pal_edit, GWLP_WNDPROC, (LONG_PTR)pal_proc);
-        }
-        g_pick_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
-            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF3, GetModuleHandleW(NULL), NULL);
-        if (g_pick_edit) {
-            SendMessageW(g_pick_edit, WM_SETFONT, (WPARAM)form_font(), TRUE);
-            SendMessageW(g_pick_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search emoji");
-            g_pick_prev = (WNDPROC)SetWindowLongPtrW(g_pick_edit, GWLP_WNDPROC, (LONG_PTR)pick_proc);
-        }
-        signin_create(hwnd);
-        DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
-        g_dpi = dpi_for_window(hwnd);
-        SetTimer(hwnd, TIMER_TICK, 30, NULL);
-        tray_init(hwnd);   /* the fallback notification surface */
-        /* Identity for the real Windows notification (REQ-138). The same string
-         * the installer puts on the Start-menu shortcut: Windows resolves a
-         * toast's identity through that shortcut, and a mismatch is the failure
-         * that looks like nothing happening. Tried ONCE, here, so the delivery
-         * chain knows for the whole session which backend it has rather than
-         * discovering it per notification. */
-        snprintf(g_aumid, sizeof g_aumid, "%s", OC_AUMID);
+/* Every drawn field, made once with the window. Their placeholders are what
+ * the native boxes' cue banners said; their keys and change hooks are what
+ * the subclass procedures did. */
+static void fields_create(void) {
+    static field find, ffind, dir, srch, pal, pick, si[3];
+    field_init(&find, "Find a conversation", 0, 0);
+    find.key = find_key; find.changed = find_changed; find.maxlen = 63; g_find = &find;
+    field_init(&ffind, "Search files", 0, 0);
+    ffind.changed = ffind_changed; ffind.maxlen = 63; g_ffind = &ffind;
+    field_init(&dir, "Search people", 0, 0);
+    dir.changed = dir_changed; dir.maxlen = 79; g_dir_edit = &dir;
+    field_init(&srch, "Search messages", 0, 0);
+    srch.key = srch_key; srch.maxlen = 255; g_srch = &srch;
+    field_init(&pal, "Run an action or jump to a conversation", 0, 0);
+    pal.key = pal_key; pal.changed = pal_changed; pal.maxlen = 511; g_pal_edit = &pal;
+    field_init(&pick, "Search emoji", 0, 0);
+    pick.key = pick_key; pick.changed = pick_changed; pick.maxlen = 63; g_pick_edit = &pick;
+    field_init(&si[0], "your-workspace", 0, 0);
+    si[0].key = si_key; si[0].changed = si_ws_changed; si[0].maxlen = 319; g_si_e_ws = &si[0];
+    field_init(&si[1], NULL, 0, 0); si[1].key = si_key; si[1].maxlen = 319; g_si_e_user = &si[1];
+    field_init(&si[2], NULL, 0, 1); si[2].key = si_key; si[2].maxlen = 319; g_si_e_pass = &si[2];
+    layout_find(g_main);
+    layout_signin(g_main);
+}
+
+/* ==== the window's events (what the window procedure was) ====================
+ *
+ * One dispatcher over SDL's queue. Each handler below is the body the Win32
+ * message had, with the message's arguments already turned into DIPs and
+ * key names; the harness drives the same handlers with synthetic events, so
+ * what it tests is what a user runs. A handler's `return 0` means "handled",
+ * as the window procedure's did. */
+
+/* The tick (every TICK_MS): every client is ticked, the model is read, and
+ * whatever changed is asked to paint. */
+static int on_tick(oc_win *hwnd) {
+    if (hwnd && hwnd->sdl) g_win_focused = (SDL_GetWindowFlags(hwnd->sdl) & SDL_WINDOW_INPUT_FOCUS) != 0;
         {
-            HRESULT (WINAPI *setid)(PCWSTR) = NULL;
-            HMODULE sh = LoadLibraryW(L"shell32.dll");
-            if (sh) setid = (HRESULT (WINAPI *)(PCWSTR))(void *)
-                            GetProcAddress(sh, "SetCurrentProcessExplicitAppUserModelID");
-            if (setid) { WCHAR w[128]; to_w(g_aumid, w, 128); setid(w); }
-        }
-        /* The OS notifications: the identity this process is known by, the
-         * tray icon the balloon fallback rides on, and where a button's or the
-         * reply box's use is handed. The activator and the Start-menu
-         * shortcut Windows resolves it through are the backend's to set up --
-         * Windows reads the activator CLSID off that shortcut for an
-         * unpackaged app, and Inno cannot write the property. */
-        oc_osn_init(g_aumid, "OpenChime", g_tray_live ? hwnd : NULL, TRAY_UID, toast_action_cb);
-        g_wintoast_ok = (oc_osn_caps() & OC_OSN_CAP_ACTIONS) != 0;
-        /* So a toast's click has somewhere to land. Written on every start
-         * rather than at install time only: a developer build, a portable copy
-         * and an upgraded path all need it to point at THIS exe. */
-        url_scheme_register();
-        return 0;
-    case WM_DROPFILES: {
-        HDROP drop = (HDROP)wp;
-        UINT nf = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
-        /* Into the conversation's tray, which has to be on screen to be seen. */
-        if (nf && g_client && g_sel && g_view != VIEW_HOME) { g_view = VIEW_HOME; layout_composer(hwnd); }
-        for (UINT i = 0; i < nf && g_client && g_sel; i++) {
-            WCHAR wf[MAX_PATH];
-            if (DragQueryFileW(drop, i, wf, MAX_PATH)) {
-                char path[1024];
-                WideCharToMultiByte(CP_UTF8, 0, wf, -1, path, sizeof path, NULL, NULL);
-                ftray_add(hwnd, path);
-            }
-        }
-        DragFinish(drop);
-        return 0;
-    }
-    case WM_TIMER:
-        if (wp == TIMER_TICK) {
             /* Every workspace is ticked, not just the one on screen — that is
              * the whole point of multi-workspace. A background workspace drains its
              * events, accrues unread, and can raise a notification. */
@@ -31277,18 +30678,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* The toolbar tooltip's dwell: nothing repaints while the pointer
              * rests, so the tick fires the one paint that reveals it. */
             if (g_fmt_hover >= 0 && !g_fmt_tip_shown &&
-                GetTickCount64() - g_fmt_hover_since >= FMT_TIP_MS) {
+                now_ms() - g_fmt_hover_since >= FMT_TIP_MS) {
                 g_fmt_tip_shown = 1;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             if (g_act_hover >= 0 && !g_act_tip_shown &&
-                GetTickCount64() - g_act_hover_since >= FMT_TIP_MS) {
+                now_ms() - g_act_hover_since >= FMT_TIP_MS) {
                 g_act_tip_shown = 1;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
-            if (g_chtip && !g_chtip_shown && GetTickCount64() - g_chtip_since >= FMT_TIP_MS) {
+            if (g_chtip && !g_chtip_shown && now_ms() - g_chtip_since >= FMT_TIP_MS) {
                 g_chtip_shown = 1;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             /* Poll the attempt's outcome HERE, not only in the g_client-gated
              * block below: signing in from the signed-out state has no g_client,
@@ -31300,7 +30701,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * OUTSIDE the g_client gate below, because the case that needs it
              * most is the one where there is no client: a workspace that did not
              * resolve left the window hidden for ever. */
-            if (!g_geom_applied && g_geom_deadline && GetTickCount64() > g_geom_deadline) {
+            if (!g_geom_applied && g_geom_deadline && now_ms() > g_geom_deadline) {
                 g_geom_applied = 1;
                 show_and_focus(hwnd);
             }
@@ -31310,8 +30711,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * sit over the sign-in view for good. Cleared from here instead. */
             if (!g_client && g_badge_shown != 0) taskbar_badge_apply(hwnd, 0);
         }
-        if (wp == TIMER_TICK && g_client) {
+        if (g_client) {
             oc_client_tick(g_client);
+            downloads_tick(model());
             /* The conversation on screen, scrolled to its end, in the window
              * the user is looking at, is read: what the badge counted has been
              * seen. Opening a channel marks it read before its history has
@@ -31319,7 +30721,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * counted itself unread under the reader's eyes, and the row went
              * bold with a number while they were in it. */
             if (g_sel && transcript_shell() && g_scroll == 0 && !g_edit_msg &&
-                GetForegroundWindow() == hwnd) {
+                win_front(hwnd)) {
                 const oc_model *vm = model();
                 const oc_channel *vc = vm && vm->authed ? oc_model_channel((oc_model *)vm, g_sel) : NULL;
                 if (vc && vc->unread > 0 && vc->high_water > vc->read_marker)
@@ -31330,7 +30732,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             call_tick(hwnd);         /* a start waiting on a member list */
             /* The call view's duration, levels and speaking rings move without
              * any event to repaint on. */
-            if (g_view == VIEW_CALL || call_here(model())) InvalidateRect(hwnd, NULL, FALSE);
+            if (g_view == VIEW_CALL || call_here(model())) invalidate();
             /* A URL this process was launched for, followed once there is
              * something to follow it into: selecting a channel before the model
              * knows any is a no-op that looks like the link failing. */
@@ -31348,7 +30750,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_ed_is_newmsg && g_view != VIEW_NEWMSG) {
                 nm_editor_release();
                 layout_composer(hwnd);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             } else if (!g_ed_is_newmsg && g_view == VIEW_NEWMSG) {
                 /* And the way IN: arriving by a route that only sets the view
                  * left the pane holding the previous conversation's draft, with
@@ -31359,22 +30761,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 tgt_clear();
                 newmsg_restore();
                 layout_composer(hwnd);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             /* The debounced draft write. On this tick rather than a
              * timer of its own: there is already one heartbeat driving the
              * client, and a second would be a second thing to start, stop and
              * forget on every path that opens or closes a window. */
             if (g_draft_dirty && g_view == VIEW_NEWMSG &&
-                GetTickCount64() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
+                now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
                 newmsg_flush();
                 g_draft_dirty = 0;
-                InvalidateRect(hwnd, NULL, FALSE);   /* the header says "Saved" */
+                invalidate();   /* the header says "Saved" */
             }
             if (g_draft_dirty && g_sel && !g_edit_msg && g_view != VIEW_NEWMSG &&
-                GetTickCount64() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
+                now_ms() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
                 draft_flush(g_sel);
-                InvalidateRect(hwnd, NULL, FALSE);   /* the marker is model-drawn */
+                invalidate();   /* the marker is model-drawn */
             }
             /* A draft written on ANOTHER device lands in the model; show it here
              * only if this field is empty and has not been touched since it was
@@ -31415,7 +30817,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * list again when the counts move while it is on screen. */
             {
                 static uint32_t seen_seq, seen_u = UINT32_MAX, seen_c = UINT32_MAX;
-                if (m && m->srvalerts_seq != seen_seq) { seen_seq = m->srvalerts_seq; InvalidateRect(hwnd, NULL, FALSE); }
+                if (m && m->srvalerts_seq != seen_seq) { seen_seq = m->srvalerts_seq; invalidate(); }
                 if (m && (m->srvalerts_unacked != seen_u || m->srvalerts_current != seen_c)) {
                     seen_u = m->srvalerts_unacked; seen_c = m->srvalerts_current;
                     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_ALERTS && g_client) oc_client_srvalerts_list(g_client);
@@ -31452,7 +30854,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_dm_pending) {
                 const oc_channel *nd = dm_with(m, g_dm_pending);
                 if (nd) { g_dm_pending = 0; g_dm_compose = 0; pick_clear(); select_channel(nd->channel_id);
-                          InvalidateRect(hwnd, NULL, FALSE); }
+                          invalidate(); }
             }
             /* A New Message addressed to people had to wait for the DM to be
              * created (REQ-229). It exists now, so the message goes. */
@@ -31462,8 +30864,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * composer already emptied, which looks exactly like a message that
              * was sent. The text comes back into the pane instead, with the
              * reason, so it can be sent again. */
-            if (g_nm_pending && GetTickCount64() - g_nm_pending_at > 15000) {
-                WCHAR back[DRAFT_TEXT_MAX];
+            if (g_nm_pending && now_ms() - g_nm_pending_at > 15000) {
+                oc_wch back[DRAFT_TEXT_MAX];
                 to_w(g_nm_pending, back, DRAFT_TEXT_MAX);
                 free(g_nm_pending); g_nm_pending = NULL;
                 g_nm_wait_uid = 0; g_n_group_pending = 0;
@@ -31471,7 +30873,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ed_set(back);
                 ed_changed(hwnd);
                 fb_failed("That conversation could not be opened \u2014 your message is back here.");
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             if (g_nm_pending) {
                 const oc_channel *nc = NULL;
@@ -31492,14 +30894,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         select_channel(nc->channel_id);
                         layout_composer(hwnd);
                     }
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                 }
             }
             /* Persist a settled move. WM_EXITSIZEMOVE covers a drag, but not a
              * programmatic move, and nothing covers being killed — a debounce
              * means the placement survives without waiting for a clean exit. */
             if (g_geom_dirty_at && g_geom_applied &&
-                GetTickCount64() - g_geom_dirty_at > 1200) {
+                now_ms() - g_geom_dirty_at > 1200) {
                 g_geom_dirty_at = 0;
                 prefs_save();
             }
@@ -31530,8 +30932,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                  * reading it" while the window was not even on screen. Minimising
                  * activates another window, which is why that path looked fine
                  * and this one did not. */
-                int fg = (GetForegroundWindow() == hwnd) &&
-                         IsWindowVisible(hwnd) && !IsIconic(hwnd);
+                int fg = win_front(hwnd);
                 /* Every workspace, not just the visible one — a background
                  * workspace's mail is exactly what you cannot otherwise see. */
                 for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
@@ -31799,17 +31200,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * the OS suppresses the balloons. Recomputed every tick, applied
              * only on change. */
             {
-                /* The shell broadcasts this when it (re)creates our taskbar
-                 * button; an Explorer restart wipes the overlay, and this is
-                 * the signal to put it back. The filter, because an elevated
-                 * process is deaf to a medium-integrity Explorer's broadcast
-                 * without it (UIPI). */
-                if (!g_taskbar_created_msg) {
-                    g_taskbar_created_msg = RegisterWindowMessageW(L"TaskbarButtonCreated");
-                    if (g_taskbar_created_msg)
-                        ChangeWindowMessageFilterEx(hwnd, g_taskbar_created_msg,
-                                                    MSGFLT_ALLOW, NULL);
-                }
                 int total = 0, any_unread = 0;
                 for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
                     const oc_model *wm = (g_n_wss > 0)
@@ -31830,12 +31220,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 uint64_t fid = 0; size_t flen = 0;
                 uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
                 if (fd && vm_take_bytes(fid, fd, flen)) {
-                    InvalidateRect(hwnd, NULL, FALSE);   /* a video, now owned by the cache */
+                    invalidate();   /* a video, now owned by the cache */
                 } else if (fd) {
                     thumb_decode(fid, fd, flen);
                     free(fd);
                     if (g_thumb_pending == fid) g_thumb_pending = 0;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                 }
             }
             /* A fetch that never came back — a reclaimed or oversized image.
@@ -31849,8 +31239,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * else is moving. */
             if (g_thumb_pending && m->xfer_phase == 0 && m->xfer_tag && m->xfer_tag != g_thumb_pending &&
                 m->xfer_done < m->xfer_total)
-                g_thumb_deadline = GetTickCount64() + 8000;
-            if (g_thumb_pending && GetTickCount64() > g_thumb_deadline) {
+                g_thumb_deadline = now_ms() + 8000;
+            if (g_thumb_pending && now_ms() > g_thumb_deadline) {
                 if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = g_thumb_pending;
                 g_thumb_pending = 0;
             }
@@ -31864,7 +31254,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const oc_channel *hc = oc_model_channel((oc_model *)m, g_hist_pending_chan);
                 if (hc && hc->n_msgs && hc->msgs[0].message_id < g_hist_before) {
                     g_hist_pending_chan = 0;
-                } else if (GetTickCount64() > g_hist_deadline) {
+                } else if (now_ms() > g_hist_deadline) {
                     if (g_n_hist_exhausted < 32) g_hist_exhausted[g_n_hist_exhausted++] = g_hist_pending_chan;
                     g_hist_pending_chan = 0;
                 }
@@ -31874,11 +31264,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * (REQ-232/ARCH-96) and give it another window to land — every
              * surface that points at a message (pins, files, activity, saved,
              * search) used to dead-end here with an apology. */
-            if (g_jump_mid && GetTickCount64() > g_jump_deadline) {
+            if (g_jump_mid && now_ms() > g_jump_deadline) {
                 if (!g_jump_fetched && g_sel) {
                     g_jump_fetched = g_jump_mid;
                     oc_client_history_around(g_client, g_sel, g_jump_mid, 40);
-                    g_jump_deadline = GetTickCount64() + 4000;
+                    g_jump_deadline = now_ms() + 4000;
                 } else {
                     /* Asked and it still did not arrive: it is not in a channel
                      * we can read, or it is gone. */
@@ -31891,7 +31281,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
                 sidebar_opts_load(m);
                 g_sb_settings_pending = 0;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             /* The oldest entry paged in is the cursor for loading older ones. */
             if (m->n_audit) {
@@ -31908,26 +31298,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                  * a visible window would flash it at the default size first. */
                 if (!g_geom_applied) {
                     g_geom_applied = 1;
-                    RECT saved = { g_win_x, g_win_y, g_win_x + g_win_w, g_win_y + g_win_h };
                     /* A saved place no monitor shows any more is not restored: the
                      * default placement is visible, and an invisible window reads
                      * as an app that did not start. */
-                    if (g_win_x != -1 && MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
-                        WINDOWPLACEMENT wp2; wp2.length = sizeof wp2;
-                        wp2.flags = 0;
-                        wp2.showCmd = g_win_max ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
-                        wp2.ptMinPosition.x = wp2.ptMinPosition.y = 0;
-                        wp2.ptMaxPosition.x = wp2.ptMaxPosition.y = 0;
-                        wp2.rcNormalPosition.left = g_win_x;
-                        wp2.rcNormalPosition.top = g_win_y;
-                        wp2.rcNormalPosition.right = g_win_x + g_win_w;
-                        wp2.rcNormalPosition.bottom = g_win_y + g_win_h;
-                        SetWindowPlacement(hwnd, &wp2);
+                    SDL_Rect saved = { g_win_x, g_win_y, g_win_w, g_win_h };
+                    if (g_win_x != -1 && SDL_GetDisplayForRect(&saved)) {
+                        SDL_SetWindowPosition(hwnd->sdl, g_win_x, g_win_y);
+                        SDL_SetWindowSize(hwnd->sdl, g_win_w, g_win_h);
+                        if (g_win_max) SDL_MaximizeWindow(hwnd->sdl);
                     }
                     show_and_focus(hwnd);   /* see show_and_focus: shown late = not activated */
                 }
                 layout_composer(hwnd);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             /* The field takes the keyboard as soon as there is a conversation to type
              * into. Not at creation: SetFocus on a window that is not shown yet does
@@ -31943,8 +31326,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * owned the foreground dropping every keystroke until it was clicked.
              * A window shown late is exactly that case, and this client shows
              * late by design when it auto-connects (it waits for its geometry). */
-            HWND tf = GetFocus();
-            if (!g_ed_focus && (tf == hwnd || tf == NULL) &&
+            if (!g_ed_focus && !g_focus &&
                 main_is_conversation() && !window_is_covered())
                 ed_focus(hwnd);
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
@@ -31992,7 +31374,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else {
                     signin_begin(hwnd, ws, NULL);
                 }
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 0;
             }
             /* The session was refused and the connection has given up — expired,
@@ -32019,7 +31401,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 signin_begin(hwnd, ws, NULL);
                 snprintf(g_si_err, sizeof g_si_err, "You were signed out of %.150s. Sign in again.",
                          label[0] ? label : ws);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 0;
             }
             if (g_await_invite && m->invite_token[0]) {   /* show the invitation once */
@@ -32035,146 +31417,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 show_secret(hwnd, "Webhook created", "Webhook token", m->webhook_token,
                             "POST to /webhook/<token>. Shown once; delete and recreate if you lose it.");
             }
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
-        if (wp == TIMER_TICK) test_poll(hwnd);   /* automation channel (no-op unless enabled) */
+        test_poll(hwnd);   /* automation channel (no-op unless enabled) */
         return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT ps; BeginPaint(hwnd, &ps);
-        paint(hwnd);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_DPICHANGED: {
-        /* Dragged to a differently-scaled monitor, or the display setting
-         * changed. Windows hands us the rect the window should occupy there;
-         * honouring it is what stops the window jumping size. The render target
-         * is rebuilt because its DPI is fixed at creation. */
-        g_dpi = HIWORD(wp);
-        RECT *sug = (RECT *)lp;
-        if (sug)
-            SetWindowPos(hwnd, NULL, sug->left, sug->top,
-                         sug->right - sug->left, sug->bottom - sug->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        /* Rasters carry the old scale; the next paint's scene_scale_apply()
-         * rebuilds the caches. */
-        layout_composer(hwnd);
-        layout_signin(hwnd);
-        InvalidateRect(hwnd, NULL, TRUE);
-        return 0;
-    }
-    case WM_MOVE:
-        if (geom_capture(hwnd)) g_geom_dirty_at = GetTickCount64();
-        return 0;
-    case WM_EXITSIZEMOVE:
-        /* Persist when a drag ENDS, not on every WM_SIZE: the bucket is a
-         * network round trip and a resize emits dozens of those. */
-        if (geom_capture(hwnd) && g_geom_applied) prefs_save();
-        return 0;
-    case WM_SETTINGCHANGE:
-        /* The desktop's light/dark setting changed. With SYSTEM as the default this
-         * is the common case, not an exotic one — and an app that only notices at the
-         * next launch is the thing "match system" was supposed to avoid. Windows
-         * signals it as a WM_SETTINGCHANGE naming "ImmersiveColorSet". */
-        if (lp && oc_theme_mode() == OC_THEME_SYSTEM &&
-            lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
-            theme_set(OC_THEME_SYSTEM);          /* re-resolve; also fixes the caption */
-            thumbs_drop();                       /* nothing cached is wrong, but the RT is */
-            InvalidateRect(hwnd, NULL, TRUE);
-        }
-        return 0;
-    case WM_SIZE:
-        if (geom_capture(hwnd)) g_geom_dirty_at = GetTickCount64();
-        if (g_win) {
-            RECT rcs; GetClientRect(hwnd, &rcs);
-            /* Keep SDL's notion of the (foreign) window's size current so the
-             * renderer's swapchain follows a resize. */
-            SDL_SetWindowSize(g_win, rcs.right - rcs.left, rcs.bottom - rcs.top);
-        }
-        layout_composer(hwnd);
-        layout_signin(hwnd);      /* the card is centred, so it moves with the window */
-        return 0;
-    case WM_COMMAND:
-        /* The suffix comes and goes with what is typed, and the field's width
-         * with it. */
-        if (g_si_e_ws && (HWND)lp == g_si_e_ws && HIWORD(wp) == EN_CHANGE) {
-            layout_signin(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
-        if (g_pal_edit && (HWND)lp == g_pal_edit && HIWORD(wp) == EN_CHANGE) {
-            g_pal_sel = 0;
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
-        if (g_pick_edit && (HWND)lp == g_pick_edit && HIWORD(wp) == EN_CHANGE) {
-            g_pick_scroll = 0;
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
-        if (g_ffind && (HWND)lp == g_ffind && HIWORD(wp) == EN_CHANGE) {
-            WCHAR w[64]; GetWindowTextW(g_ffind, w, 64);
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, g_file_q, sizeof g_file_q, NULL, NULL);
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
-        if (g_dir_edit && (HWND)lp == g_dir_edit && HIWORD(wp) == EN_CHANGE) {
-            WCHAR w[80]; GetWindowTextW(g_dir_edit, w, 80);
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, g_dir_filter, sizeof g_dir_filter, NULL, NULL);
-            g_ovl_scroll = 0;          /* a new query starts at the top */
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
-        if (g_find && (HWND)lp == g_find && HIWORD(wp) == EN_CHANGE) {
-            WCHAR w[64]; GetWindowTextW(g_find, w, 64);
-            char b[128]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, NULL, NULL);
-            for (char *p = b; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
-            snprintf(g_find_filter, sizeof g_find_filter, "%s", b);
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
-        return 0;
-    case WM_CTLCOLOREDIT:
-        /* The find box and the sign-in fields both sit on the OC_COL_INPUT
-         * surface the D2D chrome paints under them, so they share a brush. */
-        if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_pick_edit ||
-            (HWND)lp == g_ffind || (HWND)lp == g_dir_edit ||
-            (HWND)lp == g_pal_edit ||
-            (HWND)lp == g_si_e_ws ||
-            (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
-            SetBkColor((HDC)wp, OCRGB(OC_COL_INPUT));
-            SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
-            if (!g_find_brush) g_find_brush = CreateSolidBrush(OCRGB(OC_COL_INPUT));
-            return (LRESULT)g_find_brush;
-        }
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    case WM_MOUSEWHEEL: {
-        /* WM_MOUSEWHEEL carries SCREEN coordinates; map them to decide whether
-         * the sidebar or the transcript scrolls. */
-        POINT wpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ScreenToClient(hwnd, &wpt);
-        wpt.x = (LONG)DIPF(wpt.x); wpt.y = (LONG)DIPF(wpt.y);
-        float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
+}
+
+static int on_wheel(oc_win *hwnd, int px_x, int px_y, float units, int notches) {
+    ipoint wpt = { px_x, px_y };
+    wpt.x = (int32_t)DIPF(wpt.x); wpt.y = (int32_t)DIPF(wpt.y);
+    float dy = units * 48.0f;
+    (void)notches;
         const oc_model *wm = model();
         if (g_view == VIEW_NEWMSG && g_n_tgt &&
             in_rect(g_tgt_list, (float)wpt.x, (float)wpt.y)) {
             /* A list with more matches than rows needs a mouse way through it;
              * the arrow keys were the only one. */
             g_tgt_top -= (int)(dy / 48.0f);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         if (g_sch_open && in_rect(g_sch_tlist, (float)wpt.x, (float)wpt.y)) {
             g_sch_tscroll -= dy;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         /* A shared screen at actual size scrolls under the wheel; Shift, across. */
         if (g_share_actual && g_share_tex && in_rect(g_share_stage, (float)wpt.x, (float)wpt.y)) {
-            if (GetKeyState(VK_SHIFT) & 0x8000) g_share_sx -= dy; else g_share_sy -= dy;
-            InvalidateRect(hwnd, NULL, FALSE);
+            if (mod_down(OCK_SHIFT)) g_share_sx -= dy; else g_share_sy -= dy;
+            invalidate();
             return 0;
         }
         if (g_tp_open) {   /* the open dropdown owns the wheel, as a dropdown does */
             g_tp_scroll -= dy;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         /* Same rule for a form's open list — and it is what makes a
@@ -32182,9 +31458,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * screen. In ROWS, not pixels: the panel's row height is decided during
          * paint, and a pixel offset would have to guess it. */
         if (g_form_sel_field >= 0) {
-            g_form_sel_scroll -= (GET_WHEEL_DELTA_WPARAM(wp) > 0) ? 3 : -3;
+            g_form_sel_scroll -= (units > 0) ? 3 : -3;
             if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         if (g_pick_open && in_rect(g_pick_panel, (float)wpt.x, (float)wpt.y)) {
@@ -32192,7 +31468,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * by search. Same dropdown rule as the time list above. */
             g_pick_scroll -= dy;
             if (g_pick_scroll < 0) g_pick_scroll = 0;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         /* A MODAL OWNS THE WHEEL, ahead of every shell surface below.
@@ -32214,14 +31490,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_ovl_scroll -= dy;
             if (g_ovl_scroll < 0) g_ovl_scroll = 0;
             if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         /* The members pane owns the wheel over itself. Ahead of the sidebar and
          * the transcript below, which would otherwise scroll while the pointer
          * sits on the roster -- the pane's own rows being what the wheel is for. */
         {
-            RECT wrc; GetClientRect(hwnd, &wrc);
+            irect wrc; client_rect(hwnd, &wrc);
             float cw = DIPF(wrc.right);
             float mw = members_w(cw);
             if (mw > 0 && g_show_members && g_rp_mode == RP_MEMBERS &&
@@ -32229,7 +31505,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mem_scroll -= dy;
                 if (g_mem_scroll < 0) g_mem_scroll = 0;
                 if (g_mem_scroll > g_mem_max) g_mem_scroll = g_mem_max;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 0;
             }
             if (mw > 0 && g_show_members && g_rp_mode == RP_SUMMARY &&
@@ -32237,7 +31513,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_sum_scroll -= dy;
                 if (g_sum_scroll < 0) g_sum_scroll = 0;
                 if (g_sum_scroll > g_sum_max) g_sum_scroll = g_sum_max;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 0;
             }
         }
@@ -32289,15 +31565,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_scroll < 0) g_scroll = 0;
             if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 0;
-    }
     /* Double-click selects a word, in the field or in a message. The
      * same order as the button-down below — composer first, then the
      * transcript — so what you double-click is what answers. */
-    case WM_LBUTTONDBLCLK: {
-        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
-        g_dbl_ms = GetTickCount64(); g_dbl_x = mx; g_dbl_y = my;
+}
+
+static int on_dblclk(oc_win *hwnd, int mx, int my) {
+    if (fields_mouse(3, (float)mx, (float)my)) { invalidate(); return 0; }
+        g_dbl_ms = now_ms(); g_dbl_x = mx; g_dbl_y = my;
         /* A double-click on a message that has replies opens its thread, as the
          * replies row under it does; one without replies falls through to the
          * word selection. */
@@ -32309,16 +31586,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (dmsg && dmsg->reply_count && !dmsg->deleted) {
                 g_dbl_ms = 0;
                 g_scroll = 0; oc_client_open_thread(g_client, g_sel, dmsg->message_id);
-                InvalidateRect(hwnd, NULL, FALSE); return 0;
+                invalidate(); return 0;
             }
         }
         if (!window_is_covered() &&
             !(g_view == VIEW_NEWMSG && in_rect(g_tgt_list, (float)mx, (float)my)) &&
             ed_select_word(hwnd, (float)mx, (float)my)) {
-            InvalidateRect(hwnd, NULL, FALSE); return 0;
+            invalidate(); return 0;
         }
         if (!any_overlay(model()) && selection_word(hwnd, mx, my, 0)) {
-            InvalidateRect(hwnd, NULL, FALSE); return 0;
+            invalidate(); return 0;
         }
         /* A double-click in the To: field takes the word under it, as in any text
          * field; anywhere else in the pane it is an ordinary click. Both used to
@@ -32329,17 +31606,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int at = tf_hit(&g_tgt_q, g_ui, g_tgt_qx, (float)mx);
                 g_tgt_q.anchor = tf_word_left(&g_tgt_q, at);
                 g_tgt_q.caret  = tf_word_right(&g_tgt_q, at);
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
                 return 0;
             }
             on_click(hwnd, mx, my);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
             return 0;
         }
         return 0;
-    }
-    case WM_LBUTTONDOWN: {
-        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+}
+
+static int on_lbutton_down(oc_win *hwnd, int mx, int my) {
+    if (fields_mouse(0, (float)mx, (float)my)) { invalidate(); return 0; }
         /* The members pane's picker keeps the keys only while the pointer stays
          * with it: a click anywhere else lets them go -- here, ahead of the
          * composer, which takes its clicks before on_click ever sees them, so
@@ -32351,15 +31629,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * or the whole message. Windows has no triple-click message; every app
          * that offers one counts it, and this is that count: the click after a
          * double-click, inside the system's own double-click time. */
-        if ((GetTickCount64() - g_dbl_ms) < GetDoubleClickTime() &&
+        if ((now_ms() - g_dbl_ms) < 500u &&
             mx >= g_dbl_x - 4 && mx <= g_dbl_x + 4 && my >= g_dbl_y - 4 && my <= g_dbl_y + 4) {
             g_dbl_ms = 0;
             if (!window_is_covered() && in_rect(g_ed_box, (float)mx, (float)my)) {
                 ed_focus(hwnd); ed_select_all();
-                InvalidateRect(hwnd, NULL, FALSE); return 0;
+                invalidate(); return 0;
             }
             if (!any_overlay(model()) && selection_word(hwnd, mx, my, 1)) {
-                InvalidateRect(hwnd, NULL, FALSE); return 0;
+                invalidate(); return 0;
             }
         }
         /* The composer first: it is a self-drawn field now, so a click in it
@@ -32374,7 +31652,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ed_mouse_down(hwnd, (float)mx, (float)my)) return 0;
         if (!any_overlay(model()) && pt_in(g_sbar_thumb, mx, my)) {
             g_sbar_drag = 1; g_sbar_grab = (float)my - g_sbar_thumb.top;
-            SetCapture(hwnd);
+            SDL_CaptureMouse(true);
         } else if (!on_click(hwnd, mx, my) && !any_overlay(model())) {
             /* Recorded HERE rather than at the top of the handler, so it is tied
              * to the one case where the transcript actually took the click: if
@@ -32384,11 +31662,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_chan_down = g_link_down[0] ? 0 : chanref_under(mx, my);
             selection_start(hwnd, mx, my);
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 0;
-    }
-    case WM_MOUSEMOVE: {
-        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+}
+
+static int on_mouse_move(oc_win *hwnd, int mx, int my) {
+    if (fields_mouse(1, (float)mx, (float)my)) { invalidate(); return 0; }
         /* Hand over a link, I-BEAM over the composer's text: the field is a
          * custom control, so nothing else will ever ask for the text cursor —
          * the I-beam SDL cursor existed from day one and had no caller. */
@@ -32404,7 +31683,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * where the pointer is without every widget tracking its own hover. */
         if (mx != g_mouse_x || g_mouse_y != my) {
             g_mouse_x = mx; g_mouse_y = my;
-            if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
+            if (modal_open()) invalidate();   /* frame hovers */
         }
         {   /* The header's Summarize and the summary pane (REQ-310): what the
              * pointer is on decides a fill, a name or a citation's card. */
@@ -32417,7 +31696,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (in_rect(g_sum_people_r, fx, fy)) sh = 1002;
                 else for (int i = 0; i < g_n_sumhits; i++) if (in_rect(g_sumhits[i].r, fx, fy)) { sh = i; break; }
             }
-            if (sh != sum_last) { sum_last = sh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (sh != sum_last) { sum_last = sh; invalidate(); }
         }
         {   /* Shelf hover (REQ-228) — gated exactly as the CLICK is, or
              * the two disagree: a row that glows but refuses the click is the
@@ -32427,7 +31706,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 (float)mx >= RAIL_W && (float)mx < RAIL_W + SIDEBAR_W)
                 for (int i = 0; i < g_n_shelf; i++)
                     if ((float)my >= g_shelf_rows[i].top && (float)my < g_shelf_rows[i].bot) sh = i;
-            if (sh != g_shelf_hover) { g_shelf_hover = sh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (sh != g_shelf_hover) { g_shelf_hover = sh; invalidate(); }
         }
         {   /* Formatting-toolbar hover. Cheap enough to ask every move,
              * and it keeps the seven buttons out of the hover state machine
@@ -32438,9 +31717,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (in_rect(g_fmt_btn[i], (float)mx, (float)my)) { fh = i; break; }
             if (fh != g_fmt_hover) {
                 g_fmt_hover = fh;
-                g_fmt_hover_since = GetTickCount64();   /* tooltip dwell restarts */
+                g_fmt_hover_since = now_ms();   /* tooltip dwell restarts */
                 g_fmt_tip_shown = 0;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
         }
         {   /* Add people and Add a group: which one the pointer rests on, for
@@ -32452,9 +31731,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (ch != g_chtip) {
                 g_chtip = ch;
-                g_chtip_since = GetTickCount64();
+                g_chtip_since = now_ms();
                 g_chtip_shown = 0;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
         }
         {   /* The action rows' tooltips: which button the pointer rests on, on
@@ -32468,9 +31747,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             if (ah != g_act_hover) {
                 g_act_hover = ah;
-                g_act_hover_since = GetTickCount64();
+                g_act_hover_since = now_ms();
                 g_act_tip_shown = 0;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
         }
         {   /* Send split-button hover, same reasoning as above: two
@@ -32478,7 +31757,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int sh2 = (pointer_blocked() || !composer_ready()) ? 0
                     : in_rect(g_send_btn,  (float)mx, (float)my) ? 1
                     : in_rect(g_sched_btn, (float)mx, (float)my) ? 2 : 0;
-            if (sh2 != g_send_hover) { g_send_hover = sh2; InvalidateRect(hwnd, NULL, FALSE); }
+            if (sh2 != g_send_hover) { g_send_hover = sh2; invalidate(); }
         }
         {   /* Small chrome buttons (sidebar compose, workspace header, the
              * context pane's back/close, the DM-list compose): one tracked id so
@@ -32493,20 +31772,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (in_rect(g_rp_back, fx2, fy2))        ch = 5;
                 else if (in_rect(g_dm_compose_btn, fx2, fy2)) ch = 6;
             }
-            if (ch != g_chrome_hover) { g_chrome_hover = ch; InvalidateRect(hwnd, NULL, FALSE); }
+            if (ch != g_chrome_hover) { g_chrome_hover = ch; invalidate(); }
             /* Member rows are click targets (they open the profile) — track them. */
             uint64_t mh = 0;
             if (!pointer_blocked())
                 for (int i = 0; i < g_n_memrows; i++)
                     if (in_rect(g_memrows[i].r, (float)mx, (float)my)) { mh = g_memrows[i].uid; break; }
-            if (mh != g_mem_hover) { g_mem_hover = mh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (mh != g_mem_hover) { g_mem_hover = mh; invalidate(); }
             /* Emoji-picker cells: the picker floats, so this is tracked while it
              * is open — its own surface, exempt from pointer_blocked. */
             int pkh = -1;
             if (g_pick_open)
                 for (int i = 0; i < g_n_pick_cells; i++)
                     if (in_rect(g_pick_cells[i].r, (float)mx, (float)my)) { pkh = i; break; }
-            if (pkh != g_pick_hover) { g_pick_hover = pkh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (pkh != g_pick_hover) { g_pick_hover = pkh; invalidate(); }
         }
         if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
         /* Link hover. UNCONDITIONAL, before the rail/sidebar/transcript
@@ -32530,7 +31809,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * follows it, so where it goes is never a secret (MARKDOWN.md §4). */
             if ((kind == 2) != g_link_hover_lab ||
                 (kind == 2 && (mx != g_link_hover_x || my != g_link_hover_y)))
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             g_link_hover_lab = kind == 2;
             g_link_hover_x = mx; g_link_hover_y = my;
             /* One or the other, never both: a reference cannot sit inside a URL,
@@ -32540,8 +31819,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (strcmp(u, g_link_hover) || ch != g_chan_hover) {
                 memcpy(g_link_hover, u, strlen(u) + 1);
                 g_chan_hover = ch;
-                if (u[0] || ch) SetCursor(LoadCursorW(NULL, IDC_HAND));
-                else if (had)   SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                if (u[0] || ch) cursor_want(2);
+                else if (had)   cursor_want(0);
             }
         }
         if (g_sbar_drag) {
@@ -32551,16 +31830,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (off > g_sbar_travel) off = g_sbar_travel;
                 g_scroll = (1.0f - off / g_sbar_travel) * g_scroll_max;
             }
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         } else if (g_selecting) {
             selection_update(mx, my);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         } else if (g_menu) {
             /* Pointer inside the flyout: keep it and the parent pill lit — the
              * recompute below would close it the instant the pointer crossed
              * onto the second panel. Repaint for the flyout's own row hover. */
             if (g_sub_open && in_rect(g_sub_panel, mx, my)) {
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             } else {
             /* Dropdown-menu hover. */
             int h = -1;
@@ -32587,14 +31866,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_sub_open != g_mirows[h].cmd) {
                         g_sub_open = g_mirows[h].cmd;
                         g_sub_anchor_top = g_mirows[h].top;
-                        InvalidateRect(hwnd, NULL, FALSE);
+                        invalidate();
                     }
                 } else if (g_sub_open) {
                     submenu_close();
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    invalidate();
                 }
             }
-            if (hi != g_menu_hover) { g_menu_hover = hi; InvalidateRect(hwnd, NULL, FALSE); }
+            if (hi != g_menu_hover) { g_menu_hover = hi; invalidate(); }
             }
         } else if (transcript_shell() && (float)mx >= RAIL_W &&
                    (float)mx < RAIL_W + SIDEBAR_W) {
@@ -32608,8 +31887,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         else scid = g_rows[i].cid;
                         break;
                     }
-            if (sec != g_sb_hover_sec) { g_sb_hover_sec = sec; InvalidateRect(hwnd, NULL, FALSE); }
-            if (scid != g_sb_hover_cid) { g_sb_hover_cid = scid; InvalidateRect(hwnd, NULL, FALSE); }
+            if (sec != g_sb_hover_sec) { g_sb_hover_sec = sec; invalidate(); }
+            if (scid != g_sb_hover_cid) { g_sb_hover_cid = scid; invalidate(); }
         } else {
             uint64_t th = 0;
             if (!pointer_blocked())
@@ -32620,7 +31899,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * not flickering at the edges. */
             if (!th) for (int i = 0; i < g_n_thumb_dl; i++)
                 if (in_rect(g_thumb_dl[i].r, mx, my)) { th = g_thumb_hover; break; }
-            if (th != g_thumb_hover) { g_thumb_hover = th; InvalidateRect(hwnd, NULL, FALSE); }
+            if (th != g_thumb_hover) { g_thumb_hover = th; invalidate(); }
         }
         if ((float)mx < RAIL_W) {
             /* Rail hover. */
@@ -32628,9 +31907,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!pointer_blocked())
                 for (int i = 0; i < g_n_navrows; i++)
                     if ((float)my >= g_navrows[i].top && (float)my < g_navrows[i].bot) { a = g_navrows[i].act; break; }
-            if (a != g_nav_hover) { g_nav_hover = a; InvalidateRect(hwnd, NULL, FALSE); }
+            if (a != g_nav_hover) { g_nav_hover = a; invalidate(); }
         } else {
-            if (g_nav_hover != -100) { g_nav_hover = -100; InvalidateRect(hwnd, NULL, FALSE); }
+            if (g_nav_hover != -100) { g_nav_hover = -100; invalidate(); }
             /* Clear the section/row hover only when the pointer has LEFT the
              * sidebar — this reset used to run for every mx >= RAIL_W, which
              * includes the sidebar itself, so the branch above set the hover and
@@ -32638,19 +31917,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * appear and its click path was dead. */
             if (!(transcript_shell() && (float)mx >= RAIL_W &&
                   (float)mx < RAIL_W + SIDEBAR_W)) {
-                if (g_sb_hover_sec != -1) { g_sb_hover_sec = -1; InvalidateRect(hwnd, NULL, FALSE); }
-                if (g_sb_hover_cid)       { g_sb_hover_cid = 0;  InvalidateRect(hwnd, NULL, FALSE); }
+                if (g_sb_hover_sec != -1) { g_sb_hover_sec = -1; invalidate(); }
+                if (g_sb_hover_cid)       { g_sb_hover_cid = 0;  invalidate(); }
             }
             int r = (any_overlay(model()) || pointer_blocked() || !transcript_shell())
                         ? -1 : msgrow_at(mx, my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
-            if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
+            if (h != g_hover_mid) { g_hover_mid = h; invalidate(); }
             /* Activity / Later row hover. */
             uint64_t lh = 0;
             if (!pointer_blocked())
                 for (int i = 0; i < g_n_listrows; i++)
                     if (in_rect(g_listrows[i].row, (float)mx, (float)my)) { lh = g_listrows[i].mid; break; }
-            if (lh != g_listrow_hover) { g_listrow_hover = lh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (lh != g_listrow_hover) { g_listrow_hover = lh; invalidate(); }
             /* DMs-index row hover. */
             uint64_t dh = 0;
             if (!pointer_blocked()) {
@@ -32659,13 +31938,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 for (int i = 0; i < g_n_pickrows && !dh; i++)
                     if (in_rect(g_pickrows[i].r, (float)mx, (float)my)) { dh = g_pickrows[i].uid; break; }
             }
-            if (dh != g_dm_hover) { g_dm_hover = dh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (dh != g_dm_hover) { g_dm_hover = dh; invalidate(); }
             /* Tab strip hover. */
             int th2 = -1;
             if (!pointer_blocked())
                 for (int i = 0; i < TAB_COUNT; i++)
                     if (in_rect(g_tab_r[i], (float)mx, (float)my)) { th2 = i; break; }
-            if (th2 != g_tab_hover) { g_tab_hover = th2; InvalidateRect(hwnd, NULL, FALSE); }
+            if (th2 != g_tab_hover) { g_tab_hover = th2; invalidate(); }
             /* Files-list row hover. */
             uint64_t fh = 0;
             if (!pointer_blocked()) {
@@ -32676,21 +31955,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         fh = fm->files[g_filerows[i].ix].id; break;
                     }
             }
-            if (fh != g_hover_filerow) { g_hover_filerow = fh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (fh != g_hover_filerow) { g_hover_filerow = fh; invalidate(); }
             /* Pins-overlay row hover, so a row reads as the clickable thing it is. */
             uint64_t ph = 0;
             if (!pointer_blocked())
                 for (int i = 0; i < g_n_pinrows; i++)
                     if (in_rect(g_pinrows[i].row, (float)mx, (float)my)) { ph = g_pinrows[i].mid; break; }
-            if (ph != g_hover_pinrow) { g_hover_pinrow = ph; InvalidateRect(hwnd, NULL, FALSE); }
+            if (ph != g_hover_pinrow) { g_hover_pinrow = ph; invalidate(); }
         }
         return 0;
-    }
-    case WM_LBUTTONUP: {
-        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+}
+
+static int on_lbutton_up(oc_win *hwnd, int mx, int my) {
+    if (fields_mouse(2, (float)mx, (float)my)) { invalidate(); return 0; }
         if (g_dict_hold == DH_MOUSE) { dict_ptt_up(hwnd, DH_MOUSE); return 0; }
-        if (g_ed_dragging) { ed_mouse_up(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (g_sbar_drag) { g_sbar_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); }
+        if (g_ed_dragging) { ed_mouse_up(); invalidate(); return 0; }
+        if (g_sbar_drag) { g_sbar_drag = 0; SDL_CaptureMouse(false); invalidate(); }
         else if (g_selecting) {
             selection_end();
             /* Open only if this was a CLICK and not a drag — selection_end()
@@ -32709,22 +31989,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (!g_has_sel && g_chan_down) {
                 if (chanref_under(mx, my) == g_chan_down) select_channel(g_chan_down);
             }
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
         g_link_down[0] = 0; g_chan_down = 0;
         return 0;
-    }
     /* No WM_SETCURSOR arm: SDL's window proc answers it for the client area
      * with the SDL cursor (and does not chain), so the app's cursor choice is
      * pushed through SDL_SetCursor from the hover machine instead —
      * cursor_apply(), called from WM_MOUSEMOVE. */
-    case WM_KEYUP:
-        /* Backspace deletes ONE chip per press. The repeat that follows a held
-         * key used to walk backwards through the recipients, so clearing a
-         * mistyped name took the people behind it with it. */
-        if (wp == VK_BACK) g_tgt_chip_armed = 0;
-        break;
-    case WM_KEYDOWN:
+}
+
+static int on_key_down(oc_win *hwnd, int wp) {
         /* Ctrl+C copies the TRANSCRIPT selection — but only when there is one,
          * and only unshifted. It used to claim the key outright, which meant
          * copy_selection() returned having done nothing and the composer's own
@@ -32734,26 +32009,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * reading it, and it is the same claim that swallowed the formatting toolbar's
          * Ctrl+Shift+C. Falling through is what makes the field's copy reachable
          * at all. */
-        if (wp == 'C' && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) && g_has_sel) {
+        if (wp == 'C' && mod_down(OCK_CONTROL) && !mod_down(OCK_SHIFT) && g_has_sel) {
             copy_selection(hwnd); return 0;
         }
-        if (VM_UP() && vm_key(hwnd, wp)) { InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (VM_UP() && vm_key(hwnd, wp)) { invalidate(); return 0; }
+        if (wp == OCK_ESCAPE && g_lightbox) { g_lightbox = 0; invalidate(); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
-        if (wp == VK_ESCAPE && g_rp_mode != RP_MEMBERS) {
-            rp_pop(); InvalidateRect(hwnd, NULL, FALSE); return 0;
+        if (wp == OCK_ESCAPE && g_rp_mode != RP_MEMBERS) {
+            rp_pop(); invalidate(); return 0;
         }
-        if (wp == VK_ESCAPE && g_sub_open) { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (wp == OCK_ESCAPE && g_sub_open) { submenu_close(); invalidate(); return 0; }
+        if (wp == OCK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; invalidate(); return 0; }
         /* Esc and Enter both go to modal_key, so cancel-vs-commit is decided in
          * one place rather than by whichever handler saw the key first. */
-        if (wsmgr_key(hwnd, wp)) { InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (modal_open() && (wp == VK_ESCAPE || wp == VK_RETURN) && modal_key(hwnd, wp)) {
-            InvalidateRect(hwnd, NULL, FALSE); return 0;
+        if (wsmgr_key(hwnd, wp)) { invalidate(); return 0; }
+        if (modal_open() && (wp == OCK_ESCAPE || wp == OCK_RETURN) && modal_key(hwnd, wp)) {
+            invalidate(); return 0;
         }
-        if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (wp == OCK_ESCAPE && g_more_open) { g_more_open = 0; invalidate(); return 0; }
+        if (wp == OCK_ESCAPE && g_has_sel) { g_has_sel = 0; invalidate(); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
          * field owns every other key while it has focus. The main window
@@ -32764,33 +32039,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * loop (SHORTCUTS / accel_dispatch), not here: a shortcut in this proc only
          * fires when the main window has focus, which is now always. */
         return 0;
-    case WM_CHAR:
-        if (ed_char(hwnd, (WCHAR)wp)) return 0;
-        return 0;
-    case WM_IME_STARTCOMPOSITION:
-    case WM_IME_COMPOSITION:
-    case WM_IME_ENDCOMPOSITION:
-        if (ed_ime(hwnd, msg, wp, lp)) return 0;
-        break;
-    case WM_GETOBJECT: {
-        /* The whole accessibility surface hangs off this one message (ARCH-99).
-         * Answering only UiaRootObjectId and falling through otherwise leaves
-         * MSAA/OBJID_CLIENT to DefWindowProc, which is what the nine native EDIT
-         * children still rely on. */
-        int handled = 0;
-        LRESULT r = oc_a11y_get_object(hwnd, wp, lp, &handled);
-        if (handled) return r;
-        break;
-    }
-    case OC_WM_A11Y_INVOKE: {
-        /* A UIA client pressed something (REQ-290). It arrived on an RPC thread
-         * and was posted here, so every rect, menu and model pointer this touches
-         * belongs to the thread now running it.
-         *
-         * Each case ends in the SAME call the mouse path makes. That is the whole
-         * discipline: an automation route that reimplements the action tests a
-         * second implementation of it and proves nothing about the first. */
-        uint64_t tok = ((uint64_t)wp << 32) | (uint32_t)lp;
+}
+
+/* A UIA client pressed something (REQ-290). It arrived on an RPC thread and
+ * was posted here, so every rect, menu and model pointer this touches belongs
+ * to the thread now running it. Each case ends in the SAME call the mouse
+ * path makes. */
+static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
         int kind = (int)(tok >> 56);
         uint64_t arg = tok & 0x00FFFFFFFFFFFFFFull;
         switch (kind) {
@@ -32948,19 +32203,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_status_open && (int)arg < g_n_status_suggs) {
                 snprintf(g_status_emoji, sizeof g_status_emoji, "%s",
                          g_status_suggs[arg].emoji);
-                if (g_status_edit) {
-                    WCHAR w[96];
-                    MultiByteToWideChar(CP_UTF8, 0, g_status_suggs[arg].text, -1, w, 96);
-                    SetWindowTextW(g_status_edit, w);
-                }
+                if (g_status_edit) field_set(g_status_edit, g_status_suggs[arg].text);
                 g_status_clear = g_status_suggs[arg].clear;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             break;
         case AT_STATUSCHIP:
             if (g_status_open && (int)arg < 5) {
                 g_status_clear = (int)arg;
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             break;
         case AT_SUMCAL:
@@ -32998,14 +32249,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else if (arg < QUICK_SLOTS) {
                     picker_open_quick(hwnd, (int)arg, g_quick_tile[arg]);
                 }
-                InvalidateRect(hwnd, NULL, FALSE);
+                invalidate();
             }
             break;
         case AT_FORMSIDE:
             if (g_form_open && g_form_side.on)
                 menu_dispatch(hwnd, arg ? g_form_side.remove_cmd : g_form_side.upload_cmd);
             break;
-        case AT_MENTION:   ed_focus(hwnd); ed_insert(L"@"); ac_rebuild(); break;
+        case AT_MENTION:   ed_focus(hwnd); ed_insert(u"@"); ac_rebuild(); break;
         case AT_SCHEDMENU:
             /* The same menu the chevron opens, built where it is built — a second
              * copy of its items here would be a second thing to keep in step. */
@@ -33024,22 +32275,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         default: break;
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 0;
-    }
-    case WM_SETFOCUS:
+}
+
+static int on_focus_gained(oc_win *hwnd) {
         /* Coming back from a native child (the find box, the palette, a form
          * field) means the field is typeable again. */
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 0;
-    case WM_CAPTURECHANGED:
-        /* The press on the microphone lost the mouse -- to another window, or
-         * released with no holder (another app activated): the release will never
-         * arrive here, so this is the release. */
-        if (g_dict_hold == DH_MOUSE && (HWND)lp != hwnd) dict_ptt_up(hwnd, DH_MOUSE);
-        break;
-    case WM_KILLFOCUS:
+}
+
+static int on_focus_lost(oc_win *hwnd) {
         /* The talk key's release goes wherever focus went, so the hold ends
          * here -- a microphone left open behind another app is the one failure
          * push to talk must not have. */
@@ -33056,29 +32304,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * and magnifier watching it. */
         ed_caret_kill();
         ed_mouse_up();
-        InvalidateRect(hwnd, NULL, FALSE);
+        invalidate();
         return 0;
-    case WM_GETMINMAXINFO: {
-        /* Item 4: never shrink below fitting the workspace icon + Home + More +
-         * New + Alerts + Profile (the overflow floor). */
-        MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        RECT wr, cr; GetWindowRect(hwnd, &wr); GetClientRect(hwnd, &cr);
-        int frameH = (int)((wr.bottom - wr.top) - (cr.bottom - cr.top));
-        int frameW = (int)((wr.right - wr.left) - (cr.right - cr.left));
-        if (frameH < 0 || frameH > 200) frameH = 40;
-        if (frameW < 0 || frameW > 200) frameW = 16;
-        int minClientH = PX(64 + 2 * RAIL_IH + 3 * RAIL_IH + 12);  /* start+Home+More+cluster */
-        mmi->ptMinTrackSize.y = minClientH + frameH;
-        mmi->ptMinTrackSize.x = PX(640) + frameW;
-        return 0;
-    }
-    case WM_RBUTTONDOWN:
-        on_rclick(hwnd, (int)DIPF(GET_X_LPARAM(lp)), (int)DIPF(GET_Y_LPARAM(lp)));
-        InvalidateRect(hwnd, NULL, FALSE);
-        return 0;
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_CLOSE:
+}
+
+/* The window's close box, or Ctrl+Q. CLOSING HIDES when there is a tray to
+ * come back from; quitting asks about unsent messages first. */
+static int on_close_request(oc_win *hwnd) {
         /* The draft goes with the window. Before anything below, because a
          * decision you reverse still leaves the draft correct. */
         if (g_sel) draft_flush(g_sel);
@@ -33093,7 +32325,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * process the user cannot reach OR close — so the old quit path stays as
          * the fallback rather than being deleted. */
         if (g_tray_live && !g_quitting && g_pref_close == CLOSE_HIDES) {
-            ShowWindow(hwnd, SW_HIDE);
+            SDL_HideWindow(hwnd->sdl);
             g_hidden_to_tray = 1;
             if (!g_close_to_tray_told) {
                 g_close_to_tray_told = 1;
@@ -33118,179 +32350,423 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * discarded on quit without a word. */
             if (g_nm_pending) pending++;
             if (pending > 0) {
-                WCHAR w[320]; char line[320];
+                char line[320];
                 snprintf(line, sizeof line,
                          "%d message%s composed while offline %s not been sent yet.\n\n"
                          "Quitting now will discard %s.",
                          pending, pending == 1 ? "" : "s", pending == 1 ? "has" : "have",
                          pending == 1 ? "it" : "them");
-                to_w(line, w, 320);
-                /* The ONE MessageBoxW that stays: WM_CLOSE has to answer
+                /* The ONE blocking dialog that stays: the close has to answer
                  * "may I close?" before it returns, and the app's own modal is
-                 * non-blocking by design — it answers on a later click. A blocking
-                 * question needs a blocking dialog. */
-                if (MessageBoxW(hwnd, w, L"Unsent messages",
-                                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
+                 * non-blocking by design -- it answers on a later click. */
+                const SDL_MessageBoxButtonData btns[2] = {
+                    { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel" },
+                    { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Quit" },
+                };
+                SDL_MessageBoxData mb = { SDL_MESSAGEBOX_WARNING, hwnd->sdl, "Unsent messages", line, 2, btns, NULL };
+                int pressed = 0;
+                if (!SDL_ShowMessageBox(&mb, &pressed) || pressed != 1)
                     return 0;
             }
         }
-        return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
-    case WM_COPYDATA: {
-        /* Another launch of this app handing us a URL it was asked to open --
-         * a toast click, or a permalink from a browser. Following it here is
-         * what makes the second process unnecessary. */
-        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
-        if (cds && cds->dwData == OC_COPYDATA_ACTION && cds->lpData) {
-            char pay[1200];
-            snprintf(pay, sizeof pay, "%.*s", (int)cds->cbData, (const char *)cds->lpData);
-            toast_action_perform(pay);
-            return 1;
-        }
-        if (cds && cds->dwData == OC_COPYDATA_URL && cds->lpData) {
-            char url[512];
-            snprintf(url, sizeof url, "%.*s", (int)cds->cbData, (const char *)cds->lpData);
-            show_and_focus(hwnd);
-            permalink_follow(hwnd, url);
-        }
+        g_quit = 1;
         return 1;
-    }
-    case WM_SYSCOMMAND:
-        /* MINIMISE CAN HIDE TOO, when asked. Separate from the close setting
-         * because they are separate wishes: some people want the window gone
-         * from the taskbar while working, and still want close to mean close. */
-        if ((wp & 0xFFF0) == SC_MINIMIZE && g_pref_min_tray && g_tray_live) {
-            ShowWindow(hwnd, SW_HIDE);
-            g_hidden_to_tray = 1;
-            return 0;
-        }
-        break;
-    case WM_APP_TRUST_RESUME:
-        cert_trust_resume(hwnd);
-        return 0;
-    case WM_APP_TRAY:
-        /* The tray icon is a control now. Left click shows the window; right
-         * click shows it AND opens the app's own menu inside it.
-         *
-         * Restoring first is deliberate rather than a compromise. ARCH-98 bans
-         * TrackPopupMenu — it runs its own modal loop, which the harness cannot
-         * drive and which this app has no other instance of — and a tray menu
-         * has no window of its own to draw into. Showing the window gives the
-         * self-drawn menu somewhere to live, keeps every tray action drivable,
-         * and reuses the menu that already exists instead of adding a second
-         * kind. */
-        if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
-            show_and_focus(hwnd);
-        } else if (LOWORD(lp) == NIN_BALLOONUSERCLICK) {
-            /* Clicking the BALLOON opens what it was about. The tray icon has
-             * had a callback since the close-to-tray work; this is the record of
-             * which conversation raised the last one, without which there is
-             * nothing to select. */
-            show_and_focus(hwnd);
-            if (g_last_notify_cid) {
-                if ((int)g_last_notify_ws != g_ws_active && (int)g_last_notify_ws < g_n_wss)
-                    { ws_save_active(); ws_load((int)g_last_notify_ws); }
-                g_view = VIEW_HOME; close_overlays(); select_channel(g_last_notify_cid);
-                InvalidateRect(hwnd, NULL, FALSE);
-            }
-        } else if (LOWORD(lp) == WM_RBUTTONUP) {
-            show_and_focus(hwnd);
-            tray_menu_open();
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
-        return 0;
-    case WM_DESTROY:
-        KillTimer(hwnd, TIMER_TICK);
-        oc_a11y_shutdown();   /* tell UIA the provider is going, before the window does */
-        tray_done();       /* or the icon lingers in the notification area */
-        for (int i = 0; i < g_n_wss; i++)
-            if (g_wss[i].client && g_wss[i].client != g_client) { dict_forget(g_wss[i].client); oc_client_stop(g_wss[i].client); }
-        g_n_wss = 0;
-        if (g_client) { dict_forget(g_client); listen_drop_player(); preview_drop(); oc_client_stop(g_client); g_client = NULL; }
-        /* The ring is marked and removed HERE rather than after the message
-         * loop, because reaching WM_DESTROY is what "exited normally" means —
-         * and anything that does not reach it leaves the file, which is exactly
-         * the signal the next start reports on. */
-        crumb("clean exit");
-        crumbs_clean_exit();
-        PostQuitMessage(0);
-        return 0;
-    default:
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    /* A `break` inside the switch (the IME arms) means "not handled": fall through
-     * to the default handling rather than returning 0, which would swallow it. */
-    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
-    (void)prev; (void)cmdline;
+/* Another launch of this app handing us what it was asked to open -- a toast
+ * click, or a permalink from a browser -- or a toast button's press. Following
+ * it here is what makes the second process unnecessary. */
+static void on_handoff(oc_win *hwnd, char *s) {
+    char *nl = strchr(s, '\n');
+    if (!nl) { free(s); return; }
+    *nl = 0;
+    const char *kind = s, *payload = nl + 1;
+    if (!strcmp(kind, "action")) {
+        char pay[1200];
+        snprintf(pay, sizeof pay, "%s", payload);
+        toast_action_perform(pay);
+    } else if (!strcmp(kind, "url")) {
+        char url[512];
+        snprintf(url, sizeof url, "%s", payload);
+        show_and_focus(hwnd);
+        permalink_follow(hwnd, url);
+    }
+    free(s);
+}
 
+/* The tray icon is a control. Left click shows the window; right click shows
+ * it AND opens the app's own menu inside it (ARCH-98 bans the platform's
+ * popup menu: it runs its own modal loop, which the harness cannot drive). */
+static void on_tray(oc_win *hwnd, int what) {
+    if (what == OC_TRAY_CLICK) {
+        show_and_focus(hwnd);
+    } else if (what == OC_TRAY_BALLOON_CLICK) {
+        show_and_focus(hwnd);
+        if (g_last_notify_cid) {
+            if ((int)g_last_notify_ws != g_ws_active && (int)g_last_notify_ws < g_n_wss)
+                { ws_save_active(); ws_load((int)g_last_notify_ws); }
+            g_view = VIEW_HOME; close_overlays(); select_channel(g_last_notify_cid);
+            invalidate();
+        }
+    } else if (what == OC_TRAY_RCLICK) {
+        show_and_focus(hwnd);
+        tray_menu_open();
+        invalidate();
+    }
+}
+
+/* The main window changed size: the scene is laid out again at the new one. */
+static void on_size(oc_win *hwnd) {
+    if (geom_capture(hwnd)) g_geom_dirty_at = now_ms();
+    layout_composer(hwnd);
+    layout_signin(hwnd);
+    invalidate();
+}
+
+/* The teardown WM_DESTROY did: every client stopped, the ring marked clean. */
+static void on_destroy(oc_win *hwnd) {
+    (void)hwnd;
+    oc_a11y_shutdown();
+    oc_plat_tray_done();
+    for (int i = 0; i < g_n_wss; i++)
+        if (g_wss[i].client && g_wss[i].client != g_client) { dict_forget(g_wss[i].client); oc_client_stop(g_wss[i].client); }
+    g_n_wss = 0;
+    if (g_client) { dict_forget(g_client); listen_drop_player(); preview_drop(); oc_client_stop(g_client); g_client = NULL; }
+    crumb("clean exit");
+    crumbs_clean_exit();
+}
+
+/* ---- the one inbox ------------------------------------------------------- */
+
+/* Which of our windows an event names. */
+static oc_win *win_of_event(const SDL_Event *e) {
+    SDL_Window *w = SDL_GetWindowFromEvent(e);
+    if (!w) return NULL;
+    if (g_main && w == g_main->sdl) return g_main;
+    if (g_nt_win.sdl && w == g_nt_win.sdl) return &g_nt_win;
+    if (g_recbar.sdl && w == g_recbar.sdl) return &g_recbar;
+    if (g_sharebar.sdl && w == g_sharebar.sdl) return &g_sharebar;
+    if (g_shareborder.sdl && w == g_shareborder.sdl) return &g_shareborder;
+    return NULL;
+}
+
+/* Window coordinates to device pixels (one on Windows; two on a Retina Mac). */
+static int wc_px(oc_win *w, float v) {
+    float d = w && w->sdl ? SDL_GetWindowPixelDensity(w->sdl) : 1.0f;
+    return (int)(v * d + 0.5f);
+}
+
+/* A key the handlers claimed, so the text SDL sends for the same press is
+ * not typed as well: Space held to talk, a shortcut on a letter. */
+static int g_claimed_text;
+
+static void on_event(const SDL_Event *e) {
+    oc_win *win = win_of_event(e);
+    oc_win *hwnd = g_main;
+    switch (e->type) {
+    case SDL_EVENT_QUIT:
+        if (!g_quitting) { g_quitting = 1; if (!on_close_request(hwnd)) g_quitting = 0; }
+        return;
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        if (win == &g_recbar)   { vm_command(hwnd, VMC_STOP); return; }
+        if (win == &g_sharebar) { menu_dispatch(hwnd, CC_SHARE_STOP); return; }
+        if (win == hwnd) on_close_request(hwnd);
+        return;
+    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        if (win == hwnd) on_size(hwnd);
+        return;
+    case SDL_EVENT_WINDOW_MOVED:
+        if (win == hwnd && geom_capture(hwnd)) g_geom_dirty_at = now_ms();
+        return;
+    case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+        /* Dragged to a differently-scaled monitor, or the display setting
+         * changed. Rasters carry the old scale; the next paint's
+         * scene_scale_apply() rebuilds the caches. */
+        if (win == hwnd) dpi_set(hwnd, (unsigned)(96.0f * SDL_GetWindowDisplayScale(hwnd->sdl) + 0.5f));
+        return;
+    case SDL_EVENT_SYSTEM_THEME_CHANGED:
+        /* The desktop's light/dark setting changed. With SYSTEM as the default
+         * this is the common case, not an exotic one. */
+        if (oc_theme_mode() == OC_THEME_SYSTEM) {
+            theme_set(OC_THEME_SYSTEM);
+            thumbs_drop();
+            invalidate();
+        }
+        return;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        if (win == hwnd) { g_win_focused = 1; on_focus_gained(hwnd); }
+        return;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        if (win == hwnd) { g_win_focused = 0; on_focus_lost(hwnd); }
+        return;
+    case SDL_EVENT_WINDOW_MINIMIZED:
+        /* MINIMISE CAN HIDE TOO, when asked. Separate from the close setting
+         * because they are separate wishes. */
+        if (win == hwnd && g_pref_min_tray && g_tray_live) {
+            SDL_HideWindow(hwnd->sdl);
+            g_hidden_to_tray = 1;
+        }
+        return;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+        if (win == &g_nt_win) { g_nt_hover = g_nt_close_hover = -1; nt_paint(); }
+        return;
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (win == hwnd)
+            on_wheel(hwnd, wc_px(win, e->wheel.mouse_x), wc_px(win, e->wheel.mouse_y),
+                     e->wheel.y, e->wheel.integer_y);
+        return;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+        int mx = (int)DIPF(wc_px(win, e->button.x)), my = (int)DIPF(wc_px(win, e->button.y));
+        if (win == &g_recbar || win == &g_sharebar) { bar_click(win, mx, my); return; }
+        if (win != hwnd) return;
+        if (e->button.button == SDL_BUTTON_RIGHT) {
+            on_rclick(hwnd, mx, my);
+            invalidate();
+            return;
+        }
+        if (e->button.button != SDL_BUTTON_LEFT) return;
+        /* The platform counts the clicks; the second of a pair is the double. */
+        if (e->button.clicks == 2) on_dblclk(hwnd, mx, my);
+        else                       on_lbutton_down(hwnd, mx, my);
+        return;
+    }
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        int mx = (int)DIPF(wc_px(win, e->button.x)), my = (int)DIPF(wc_px(win, e->button.y));
+        if (win == &g_nt_win) { nt_click(mx, my); return; }
+        if (win != hwnd || e->button.button != SDL_BUTTON_LEFT) return;
+        on_lbutton_up(hwnd, mx, my);
+        return;
+    }
+    case SDL_EVENT_MOUSE_MOTION: {
+        int mx = (int)DIPF(wc_px(win, e->motion.x)), my = (int)DIPF(wc_px(win, e->motion.y));
+        if (win == &g_nt_win) { nt_hover(mx, my); return; }
+        if (win == &g_recbar || win == &g_sharebar) { bar_hover(win, mx, my); return; }
+        if (win != hwnd) return;
+        on_mouse_move(hwnd, mx, my);
+        return;
+    }
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP: {
+        int key = oc_key_from_sdl(e->key.key);
+        int up = e->type == SDL_EVENT_KEY_UP;
+        int alt = (e->key.mod & SDL_KMOD_ALT) != 0;
+        if (!up) g_claimed_text = 0;
+        /* App shortcuts BEFORE anything sees the key, so they work regardless
+         * of which control has focus -- and the composer has it almost always. */
+        if (accel_dispatch(hwnd, key, up, alt, e->key.repeat ? 1 : 0)) { if (!up) g_claimed_text = 1; return; }
+        if (up) {
+            /* Backspace deletes ONE chip per press. */
+            if (key == OCK_BACK) g_tgt_chip_armed = 0;
+            return;
+        }
+        /* A form's Tab order and its drawn controls' keys, ahead of the field
+         * with the keyboard. */
+        if (g_form_open && key == OCK_TAB) {
+            form_focus_step(hwnd, mod_down(OCK_SHIFT) ? -1 : 1);
+            invalidate(); g_claimed_text = 1; return;
+        }
+        if (g_form_open && g_form_focus >= 0 && form_focus_key(hwnd, key)) { invalidate(); g_claimed_text = 1; return; }
+        if (g_focus) {
+            /* Tab between the sign-in fields: the dialog manager's job, once. */
+            if (key == OCK_TAB && g_view == VIEW_SIGNIN) {
+                field *order[3] = { g_si_e_ws, g_si_e_user, g_si_e_pass };
+                int at = -1, n = 0; field *vis[3];
+                for (int i = 0; i < 3; i++) if (order[i] && order[i]->visible) { if (order[i] == g_focus) at = n; vis[n++] = order[i]; }
+                if (n > 1 && at >= 0) {
+                    field *nf = vis[(at + (mod_down(OCK_SHIFT) ? n - 1 : 1)) % n];
+                    focus_set(nf); field_select_all(nf);
+                }
+                g_claimed_text = 1; return;
+            }
+            if (field_key(g_focus, key, mod_down(OCK_CONTROL), mod_down(OCK_SHIFT))) {
+                if (key < 0x100) g_claimed_text = 1;
+                return;
+            }
+            /* Esc and Enter still belong to the frame when the field declined
+             * them: cancel-vs-commit is decided in one place. */
+            if (key == OCK_ESCAPE || key == OCK_RETURN) {
+                if (modal_open() && modal_key(hwnd, key)) { invalidate(); return; }
+            }
+            return;
+        }
+        if (on_key_down(hwnd, key) == 0 && key < 0x100 && key != OCK_SPACE) {
+            /* The handlers answered 0 for every key; a printable one they did
+             * not type arrives as text next. Nothing to claim. */
+        }
+        return;
+    }
+    case SDL_EVENT_TEXT_INPUT: {
+        if (g_claimed_text) { g_claimed_text = 0; return; }
+        if (g_focus) { field_text_input(g_focus, e->text.text); return; }
+        oc_wch w[64];
+        int n = to_w(e->text.text, w, 64);
+        for (int i = 0; i < n; i++) ed_char(hwnd, w[i]);
+        return;
+    }
+    case SDL_EVENT_TEXT_EDITING:
+        if (g_focus) { field_editing(g_focus, e->edit.text); return; }
+        ed_ime(hwnd, e->edit.text);
+        return;
+    case SDL_EVENT_DROP_FILE:
+        if (!g_client || !g_sel || !e->drop.data) return;
+        /* Into the conversation's tray, which has to be on screen to be seen. */
+        if (g_view != VIEW_HOME) { g_view = VIEW_HOME; layout_composer(hwnd); }
+        ftray_add(hwnd, e->drop.data);
+        return;
+    default:
+        break;
+    }
+    if (e->type == oc_plat_event_type()) {
+        switch (e->user.code) {
+        case OC_PLAT_EV_HANDOFF:      on_handoff(hwnd, (char *)e->user.data1); break;
+        case OC_PLAT_EV_A11Y_INVOKE:
+            on_a11y_invoke(hwnd, ((uint64_t)(uintptr_t)e->user.data1 << 32) | (uint32_t)(uintptr_t)e->user.data2);
+            break;
+        case OC_PLAT_EV_TASKBAR_RESET: g_badge_shown = -1; break;
+        case OC_PLAT_EV_TRAY:         on_tray(hwnd, (int)(intptr_t)e->user.data1); break;
+        default: break;
+        }
+        return;
+    }
+    if (e->type == g_app_evtype) {
+        if (e->user.code == APP_EV_TRUST_RESUME) cert_trust_resume(hwnd);
+        return;
+    }
+}
+
+/* ---- the loop -------------------------------------------------------------- */
+
+static uint64_t g_next_tick;
+
+/* One turn of the loop: wait for an event or the tick, whichever is first,
+ * handle everything queued, tick if due, paint if asked. The nested loop a
+ * form runs is this same turn, so re-entrancy is what it always was. */
+static void pump(void) {
+    SDL_Event e;
+    uint64_t now = now_ms();
+    int wait = g_next_tick > now ? (int)(g_next_tick - now) : 0;
+    if (g_dirty) wait = 0;
+#ifdef __EMSCRIPTEN__
+    /* The page's thread cannot block: yield to the browser for the wait. */
+    if (wait > 0) emscripten_sleep((unsigned)(wait > 8 ? 8 : wait));
+    int got = SDL_PollEvent(&e);
+#else
+    int got = SDL_WaitEventTimeout(&e, wait);
+#endif
+    if (got) {
+        on_event(&e);
+        while (SDL_PollEvent(&e)) on_event(&e);
+    }
+    if (now_ms() >= g_next_tick) {
+        g_next_tick = now_ms() + TICK_MS;
+        on_tick(g_main);
+    }
+    if (g_dirty) { g_dirty = 0; paint(g_main); }
+}
+
+/* Paint now, for the few places that need the frame before they go on. */
+static void paint_now(void) { g_dirty = 0; paint(g_main); }
+
+/* Synthetic input, for the harness: the same handlers the pointer reaches. */
+static void synth_mouse(oc_win *hwnd, int kind, int x_dip, int y_dip) {
+    SDL_Event e; memset(&e, 0, sizeof e);
+    float d = SDL_GetWindowPixelDensity(hwnd->sdl);
+    float x = (float)PX(x_dip) / d, y = (float)PX(y_dip) / d;
+    e.common.timestamp = SDL_GetTicksNS();
+    if (kind == 1) {
+        e.type = SDL_EVENT_MOUSE_MOTION; e.motion.windowID = SDL_GetWindowID(hwnd->sdl);
+        e.motion.x = x; e.motion.y = y;
+    } else {
+        e.type = kind == 2 ? SDL_EVENT_MOUSE_BUTTON_UP : SDL_EVENT_MOUSE_BUTTON_DOWN;
+        e.button.windowID = SDL_GetWindowID(hwnd->sdl);
+        e.button.button = SDL_BUTTON_LEFT; e.button.down = kind != 2;
+        e.button.clicks = (Uint8)(kind == 3 ? 2 : 1);
+        e.button.x = x; e.button.y = y;
+    }
+    on_event(&e);
+}
+static void synth_key(oc_win *hwnd, int key, int up, int alt) {
+    (void)hwnd;
+    g_claimed_text = 0;
+    if (accel_dispatch(hwnd, key, up, alt, 0)) return;
+    if (up) { if (key == OCK_BACK) g_tgt_chip_armed = 0; return; }
+    if (g_form_open && key == OCK_TAB) { form_focus_step(hwnd, mod_down(OCK_SHIFT) ? -1 : 1); invalidate(); return; }
+    if (g_form_open && g_form_focus >= 0 && form_focus_key(hwnd, key)) { invalidate(); return; }
+    if (g_focus) {
+        if (field_key(g_focus, key, mod_down(OCK_CONTROL), mod_down(OCK_SHIFT))) return;
+        if ((key == OCK_ESCAPE || key == OCK_RETURN) && modal_open() && modal_key(hwnd, key)) { invalidate(); return; }
+        return;
+    }
+    on_key_down(hwnd, key);
+}
+static void synth_wheel(oc_win *hwnd, int x_dip, int y_dip, int delta) {
+    on_wheel(hwnd, PX(x_dip), PX(y_dip), (float)delta / 120.0f, delta / 120);
+}
+static void synth_char(oc_win *hwnd, oc_wch ch) {
+    if (g_focus) {
+        char u8[8]; oc_wch w[2] = { ch, 0 };
+        to_u8(w, u8, sizeof u8);
+        field_text_input(g_focus, u8);
+        return;
+    }
+    ed_char(hwnd, ch);
+}
+
+/* ==== main ================================================================== */
+
+int main(int argc, char *argv[]) {
     /* Before anything else, so a crash during startup is reported too. */
-    SetUnhandledExceptionFilter(crash_filter);
-
-    /* A stack overflow is one of the deaths that runs no handler, because there
-     * is no stack left to run one on. Reserving a slice up front is what lets
-     * the filter execute at all in that case. */
-    { ULONG guard = 64 * 1024; SetThreadStackGuarantee(&guard); }
-
-    /* The CRT does not fault on its own errors — it calls abort(), which never
-     * reaches an exception filter. Both are routed to the same report. The
-     * SIGABRT handler runs BEFORE the CRT's default behaviour, so it also means
-     * no abort dialog: a message box on a driven client is a hang, not a
-     * diagnostic. (`_set_abort_behavior` would say so explicitly but is absent
-     * from mingw's import library, and the handler makes it redundant.) */
-    _set_invalid_parameter_handler(crt_bad_param);
-    signal(SIGABRT, crt_on_abort);
-
-    /* COM, single-threaded apartment, for the UI thread's registered classes —
-     * ITaskbarList3 (the overlay badge) and WIC (inline images). Nothing had
-     * ever initialised it: D2D and DWrite do not need it, so every
-     * CoCreateInstance in this file was quietly living on borrowed luck. */
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    oc_plat_boot();
 
     /* Automation hook: OPENCHIME_TEST_DIR enables the file command channel. */
     { const char *td = getenv("OPENCHIME_TEST_DIR");
       if (td && td[0]) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
 
     /* AFTER the test dir is known, because that is where a report belongs when
-     * the harness is driving — and reporting the last run has to happen before
+     * the harness is driving -- and reporting the last run has to happen before
      * this one starts overwriting anything. */
     crumbs_start();
     crumb("start");
 
-    /* Open the OS credential store first: the "do we have a session?" probe
-     * below reads through it. */
     g_secret = oc_secret_open_os("openchime");
     oc_sidebar_opts_defaults(&g_sb);
 
     /* Credential resolution, uniform with the TUI:
-     *   1. Dev quick-launch `openchime.exe <workspace> <user:pass>` — connect directly.
-     *   2. A remembered workspace with a still-valid session token — reconnect
+     *   1. Dev quick-launch `openchime <workspace> <user:pass>` -- connect directly.
+     *   2. A remembered workspace with a still-valid session token -- reconnect
      *      silently; the net thread reuses the stored token.
-     *   3. Otherwise the in-window sign-in view, pre-filled from the book.
-     * Only case 3 needs the window up first, but the window is now created
-     * before any of them so the sign-in view has somewhere to live. */
+     *   3. Otherwise the in-window sign-in view, pre-filled from the book. */
     static char aws[256], acred[264];
     static char pre_ws[256], pre_user[128];
     int direct = 0;
-    int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     /* A URL on the command line -- a toast click, or a permalink from a browser
-     * -- belongs to the client that is ALREADY RUNNING. Hand it over and stop;
-     * a second client would fight the first over the same session, and the
-     * notification would open a conversation in a window nobody was looking at. */
-    if (argv && argc >= 2) {
-        char maybe_url[512];
-        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, maybe_url, sizeof maybe_url, NULL, NULL);
-        if (strncmp(maybe_url, OC_URL_SCHEME "://", sizeof OC_URL_SCHEME + 1) == 0) {
-            if (url_handoff(maybe_url)) { LocalFree(argv); return 0; }
-            /* Nobody running: fall through and start normally, then follow it
-             * once there is a session to follow it into. */
-            snprintf(g_pending_url, sizeof g_pending_url, "%s", maybe_url);
-        }
+     * -- belongs to the client that is ALREADY RUNNING. Hand it over and stop. */
+    if (argc >= 2 && !strncmp(argv[1], OC_URL_SCHEME "://", sizeof OC_URL_SCHEME + 1)) {
+        if (oc_plat_handoff("url", argv[1])) return 0;
+        snprintf(g_pending_url, sizeof g_pending_url, "%s", argv[1]);
     }
-    if (argv && argc >= 3) {
-        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, aws, sizeof aws, NULL, NULL);
-        WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, acred, sizeof acred, NULL, NULL);
+    /* A browser sign-in's result (oc_plat_signin_result): the web client,
+     * served again after the daemon's sign-in page sent the person back with
+     * the token. The workspace is the one the page was served for (argv[1])
+     * and the sign-in resumes from what was stashed on the way out. */
+    static char rtoken[8192];
+    /* `openchime --signin <workspace>`: sign in to that workspace through the
+     * browser now, nothing typed here -- how the daemon's page starts the web
+     * client (WEB.md). With a result on the platform the sign-in resumes. */
+    int served = argc >= 3 && strcmp(argv[1], "--signin") == 0;
+    int resume = served && oc_plat_signin_result(rtoken, sizeof rtoken);
+    if (served) {
+        snprintf(aws, sizeof aws, "%s", argv[2]);
+        if (!resume) {
+            /* Remembered already: the stored session reconnects as it would
+             * anywhere, and the sign-in page is not visited. */
+            char key[288]; ws_key(aws, key, sizeof key);
+            if (have_stored_token(key)) direct = 1;
+        }
+    } else if (argc >= 3) {
+        snprintf(aws, sizeof aws, "%s", argv[1]);
+        snprintf(acred, sizeof acred, "%s", argv[2]);
         direct = 1;
     } else {
         int have_last = pick_last_workspace(pre_ws, sizeof pre_ws, pre_user, sizeof pre_user);
@@ -33299,141 +32775,89 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             direct = 1;
         }
     }
-    if (argv) LocalFree(argv);
 
-    /* Before the window exists: awareness is a process-wide, one-shot decision. */
-    dpi_declare_awareness();
-    /* Before anything paints: the palette is runtime state now, and every
-     * OC_COL_* reads through it. */
     /* SYSTEM by default: match the desktop unless the user says otherwise. */
     oc_theme_apply(OC_THEME_SYSTEM);
-    /* ONE attempt, whatever the outcome. Starting the client twice here put two
-     * net threads on one workspace, each authenticating and each writing the same
-     * credential, with the first orphaned where nothing ticks it. */
     char startup_err[sizeof g_si_err] = "";
     if (direct && !connect_start(aws, acred)) {
-        /* Said, not swallowed: the sign-in view carries the reason, and is shown
-         * like any other first run rather than held back for settings that are
-         * never coming. The reason is worded as signin_submit words it, so a
-         * workspace that fails on the command line and one that fails when typed
-         * read the same. It is kept aside here and set after signin_begin,
-         * which starts every sign-in from a clean slate and would erase it. */
         direct = 0;
         snprintf(pre_ws, sizeof pre_ws, "%s", aws);
         oc_endpoint sep;
         if (oc_resolve(aws, oc_default_suffix(), &sep) == OC_RESOLVE_BAD_WORKSPACE)
             snprintf(startup_err, sizeof startup_err, "invalid workspace '%s'", aws);
         else
-            snprintf(startup_err, sizeof startup_err, "'%s' not found — does not resolve in DNS", aws);
+            snprintf(startup_err, sizeof startup_err, "'%s' not found \xE2\x80\x94 does not resolve in DNS", aws);
         g_view = VIEW_SIGNIN;
     }
     if (direct) {
-        /* bring up EVERY other remembered workspace that has a stored
-         * token, not just the one you used last. This was blocked purely on
-         * with one client there was nowhere to put them, so unread
-         * elsewhere was invisible until you went looking. The most-recently-used
-         * one stays active; the rest connect behind it. */
         if (!acred[0]) boot_other_workspaces(aws);
     } else {
-        /* The most-recently-used workspace has no usable token — but another one
-         * may still have. Signing out of the last workspace you used must not
-         * strand the ones you are still signed in to. */
         boot_other_workspaces(NULL);
         int first = ws_first_live(-1);
         if (first >= 0) { ws_load(first); g_view = VIEW_HOME; }
         else            { g_view = VIEW_SIGNIN; }
     }
 
-    WNDCLASSEXW wc;
-    memset(&wc, 0, sizeof wc);
-    wc.cbSize        = sizeof wc;
-    /* CS_DBLCLKS or Windows never sends WM_LBUTTONDBLCLK at all — a double-click
-     * arrives as two ordinary downs, which is why double-clicking a word in the
-     * self-drawn field just moved the caret twice. */
-    wc.style         = CS_DBLCLKS;
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = inst;
-    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    /* Taskbar, Alt-Tab and the window corner all read these; without them the
-     * app showed the generic Windows default everywhere. */
-    wc.hIcon   = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APPICON));
-    wc.hIconSm = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APPICON));
-    wc.lpszClassName = L"OpenChimeWin";
-    if (!RegisterClassExW(&wc)) return 1;
-
-    HWND hwnd = CreateWindowExW(0, L"OpenChimeWin", L"OpenChime",
-                    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                    1120, 820, NULL, NULL, inst, NULL);
-    if (!hwnd) return 1;
-    g_main_hwnd = hwnd;
-    /* SDL wraps OUR window (ARCH-80): the class, the WndProc, the message
-     * loop, the tray, IME and the UIA provider all keep their Win32 handling
-     * untouched; SDL supplies the renderer the gfx layer draws through. */
+    /* A window shown by a process that does not own the foreground is not
+     * activated, and SDL_RaiseWindow declines to force it unless asked: this
+     * client shows late by design when it auto-connects (it waits for its
+     * geometry), and the harness launches it from another process. */
+    SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
-    /* SDL installs its own unhandled-exception filter, and the last installer
-     * wins — so ours is re-asserted after it. A filter that is silently replaced
-     * looks exactly like a crash that produced no report, which is one of the
-     * things being investigated here. */
-    SetUnhandledExceptionFilter(crash_filter);
+    oc_plat_after_sdl_init();
+    g_app_evtype = SDL_RegisterEvents(1);
+    /* Created hidden: when auto-connecting it is held back until the settings
+     * bucket arrives so it opens where it was left rather than snapping there a
+     * second later; shown immediately when there is nothing to wait for. */
+    g_main->sdl = SDL_CreateWindow("OpenChime", 1120, 820,
+                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!g_main->sdl) return 1;
+    g_win = g_main->sdl;
+    if (!gfx_stack_init()) return 1;
+    g_main->ren = g_ren; g_main->g = g_gfx;
+    oc_plat_window_attach(g_win);
+    g_dpi = (unsigned)(96.0f * SDL_GetWindowDisplayScale(g_win) + 0.5f);
+    if (g_dpi < 48 || g_dpi > 480) g_dpi = 96;
+    SDL_SetWindowMinimumSize(g_win, 640, 64 + 2 * (int)RAIL_IH + 3 * (int)RAIL_IH + 12);
+    oc_plat_window_caption_dark(g_win, !oc_theme_is_light());
+    SDL_StartTextInput(g_win);
+
+    /* What WM_CREATE did. The provider before anything else: a screen reader
+     * may ask the moment the window exists. */
+    oc_fb_init(&g_fb, fb_say);
+    oc_a11y_init(g_win);
+    fields_create();
+    composer_create(g_main);
+    g_tray_live = oc_plat_tray_init(g_win, "OpenChime");
+    snprintf(g_aumid, sizeof g_aumid, "%s", OC_AUMID);
     {
-        SDL_PropertiesID props = SDL_CreateProperties();
-        SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_WIN32_HWND_POINTER, hwnd);
-        g_win = SDL_CreateWindowWithProperties(props);
-        SDL_DestroyProperties(props);
+        unsigned tray_id = 0;
+        void *th = oc_plat_tray_notify_handle(&tray_id);
+        oc_osn_init(g_aumid, "OpenChime", th, tray_id, toast_action_cb);
+        g_wintoast_ok = (oc_osn_caps() & OC_OSN_CAP_ACTIONS) != 0;
     }
-    if (!g_win || !gfx_stack_init()) return 1;
-    /* THE WINDOW'S OWN ICON, set after SDL has wrapped the HWND.
-     *
-     * The window CLASS carries one, which is normally enough -- but SDL sets a
-     * window icon of its own when it adopts a foreign HWND, and a window icon
-     * beats the class icon everywhere the shell looks. That is why the taskbar
-     * button and the window thumbnail could disagree about what this
-     * application looks like.
-     *
-     * LoadImage at the shell's own metrics rather than LoadIcon: LoadIcon hands
-     * back a single system-sized icon and lets the shell stretch it, which is
-     * how a crisp 32px mark turns into a blurred one in the taskbar. */
-    {
-        HICON big = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
-                                      GetSystemMetrics(SM_CXICON),
-                                      GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
-        HICON sml = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
-                                      GetSystemMetrics(SM_CXSMICON),
-                                      GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-        if (big) SendMessageW(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)big);
-        if (sml) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)sml);
-    }
-    apply_titlebar(hwnd);
-    /* When we are auto-connecting, hold the window back until the settings
-     * bucket arrives so it can open where it was left rather than snapping
-     * there a second later. Shown regardless after a short grace period, and
-     * immediately when there is nothing to wait for (the sign-in view). */
-    if (direct) g_geom_deadline = GetTickCount64() + 1500;
-    else { g_geom_applied = 1; ShowWindow(hwnd, show); SetForegroundWindow(hwnd); }
-    UpdateWindow(hwnd);
-    /* After ShowWindow: SetFocus on a child of a not-yet-shown window does not
-     * stick, which left the workspace field unfocused and swallowed typing. */
+    /* So a toast's click has somewhere to land. Written on every start rather
+     * than at install time only: a developer build, a portable copy and an
+     * upgraded path all need it to point at THIS executable. */
+    oc_plat_url_scheme_register(OC_URL_SCHEME);
+
+    if (direct) g_geom_deadline = now_ms() + 1500;
+    else { g_geom_applied = 1; show_and_focus(g_main); }
     if (!direct) {
-        signin_begin(hwnd, pre_ws[0] ? pre_ws : NULL, pre_user[0] ? pre_user : NULL);
+        signin_begin(g_main, pre_ws[0] ? pre_ws : NULL, pre_user[0] ? pre_user : NULL);
         if (startup_err[0]) {
             snprintf(g_si_err, sizeof g_si_err, "%s", startup_err);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate();
         }
     }
+    if (resume) signin_resume(g_main, aws, rtoken);
+    else if (served && !direct) signin_served(g_main, aws);
+    oc_signin_wipe(rtoken, sizeof rtoken);
+    invalidate();
+    g_next_tick = now_ms() + TICK_MS;
+    while (!g_quit) pump();
 
-    MSG m;
-    while (GetMessageW(&m, NULL, 0, 0) > 0) {
-        /* Give the sign-in view a dialog manager so Tab moves between its fields
-         * and Enter submits. Gated to that view so the RichEdit composer keeps
-         * its own Tab/Enter handling (re_proc) everywhere else. */
-        if (g_view == VIEW_SIGNIN && IsDialogMessageW(hwnd, &m)) continue;
-        /* App shortcuts BEFORE anything sees the key, so they work regardless of
-         * which control has focus — and the composer has it almost always. */
-        if (accel_dispatch(hwnd, &m)) continue;
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
-    }
-
+    on_destroy(g_main);
     /* Teardown mirrors gfx_stack_init: caches, formats, contexts, SDL. */
     mlay_drop_all();
     thumbs_drop();
@@ -33448,7 +32872,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_gfx) gfx_destroy(g_gfx);
     if (g_ren) SDL_DestroyRenderer(g_ren);
     if (g_win) SDL_DestroyWindow(g_win);
+    oc_plat_quit();
     SDL_Quit();
     oc_secret_free(g_secret);
     return 0;
 }
+

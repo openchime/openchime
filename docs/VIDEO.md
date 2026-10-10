@@ -224,7 +224,7 @@ PROTOCOL.md §5.17 has the frames:
 
 ## 8. Client surfaces
 
-**Windows** (`client/gui/win32/winmain.c`), after Slack's huddles:
+**Windows** (`client/gui/app/app.c`), after Slack's huddles:
 
 - **Share screen** beside Invite in the call view, and **Ctrl+Shift+S**, open the
   list of screens and windows — the video recorder's (`oc_capture_list_screens`).

@@ -37,6 +37,8 @@ void oc_i420_from_nv12(oc_frame *dst, const uint8_t *y, int y_stride,
 void oc_i420_from_yuy2(oc_frame *dst, const uint8_t *src, int stride);
 /* BGRA (as Windows and Direct2D order it), 8 bits per channel. */
 void oc_i420_from_bgra(oc_frame *dst, const uint8_t *src, int stride);
+/* RGBA (as a browser's canvas and most cameras elsewhere order it). */
+void oc_i420_from_rgba(oc_frame *dst, const uint8_t *src, int stride);
 
 /* I420 to BGRA with alpha 255, for the preview and the player. `dst` holds
  * width*height*4 bytes. */

@@ -29,6 +29,8 @@
 #include "totp.h"
 #ifdef OC_TTS
 #include "tts.h"
+#include "tts_data.h"
+#include "webapp.h"
 #include "tts_render.h"
 #endif
 #ifdef OC_STT
@@ -856,6 +858,13 @@ int main(int argc, char **argv) {
     }
 
     /* Serve the binary protocol until a shutdown signal. */
+    {   /* The web client this daemon serves (webapp.h): beside the binary, as
+         * the voice data is. Its absence is a note, not a fault. */
+        char exe[1024] = "", werr[256] = "";
+        oc_tts_exe_dir(exe, sizeof exe);
+        if (oc_webapp_load(exe, werr, sizeof werr)) fprintf(stderr, "web client: serving /app/\n");
+        else fprintf(stderr, "web client: not served (%s)\n", werr);
+    }
     int served = oc_netloop_run(proto_port, &tls, db, &g_stop);
     if (audio_udp >= 0) close(audio_udp);
 

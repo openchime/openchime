@@ -373,8 +373,10 @@ static void *denied_open(const char *id, int w, int h, int fps, int *err) {
 
 const oc_capture_backend oc_capture_denied = { syn_list, denied_open, syn_start, syn_next, syn_stop, syn_close };
 
-#ifndef _WIN32
-/* Built with each platform's client (docs/VIDEO-MESSAGES.md §3.2). */
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+/* Built with each platform's client (docs/VIDEO-MESSAGES.md §3.2): Windows in
+ * cap_mf.c and cap_wgc.c, the browser in client/gui/platform/web/cap_web.c;
+ * none yet elsewhere. */
 const oc_capture_backend *oc_capture_platform(void) { return NULL; }
 const oc_capture_backend *oc_capture_screen_platform(void) { return NULL; }
 #endif

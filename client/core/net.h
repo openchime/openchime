@@ -113,6 +113,24 @@ oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int por
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui);
+/* A browser sign-in's result, for a client that could not wait for it: the
+ * token the daemon's page sent back (AUTH.md §8.2), with the source and the
+ * PKCE verifier the sign-in began with, and the state for a provider's code
+ * (NULL otherwise). The web client (WEB.md) resumes its sign-in this way after
+ * the browser comes back to it. */
+#ifndef OC_SIGNIN_RESULT_DEFINED
+#define OC_SIGNIN_RESULT_DEFINED
+typedef struct {
+    const char *source_id, *verifier, *token, *state;
+} oc_signin_result;
+#endif
+/* As oc_net_start_signin, presenting `result` as the first thing: AUTH with
+ * it, no AUTH_BEGIN. */
+oc_net *oc_net_start_signin_result(const char *workspace_key, const char *host, int port,
+                                   const oc_signin_result *result,
+                                   const char *store_path, oc_secret *secret,
+                                   int pin_only, const unsigned char *published_pin,
+                                   oc_queue *to_ui, oc_queue *from_ui);
 /* As oc_net_start_signin to a local account, opening first the page that sets
  * a new password with the reset's token `reset` (hex), which goes on to the
  * sign-in (AUTH.md §2). */

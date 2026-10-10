@@ -160,14 +160,14 @@ static const char *http_alpn[] = { OC_ALPN_HTTP11, NULL };
  * with a small body limit so 413 is cheap to reach; in plaintext a health route
  * and a fallback for everything else. */
 static const oc_http_route T_ROUTES[] = {
-    { "POST", "/webhook/", 1, OC_HTTP_LOOP, 64, NULL, NULL, 0 },
-    { "GET",  "/static",   0, OC_HTTP_STATIC, 0, "text/plain", "hello", 5 },
+    { "POST", "/webhook/", 1, OC_HTTP_LOOP, 64, NULL, NULL, 0, NULL },
+    { "GET",  "/static",   0, OC_HTTP_STATIC, 0, "text/plain", "hello", 5, NULL },
 };
 static const oc_http_site T_SITE = { T_ROUTES, 2, NULL };
 static const oc_http_route P_ROUTES[] = {
-    { NULL, "/healthz", 0, OC_HTTP_STATIC, 16, "text/plain", "OK", 2 },
+    { NULL, "/healthz", 0, OC_HTTP_STATIC, 16, "text/plain", "OK", 2, NULL },
 };
-static const oc_http_route P_FALLBACK = { NULL, "/", 1, OC_HTTP_STATIC, 16, "text/html", "<p>here</p>", 11 };
+static const oc_http_route P_FALLBACK = { NULL, "/", 1, OC_HTTP_STATIC, 16, "text/html", "<p>here</p>", 11, NULL };
 static const oc_http_site P_SITE = { P_ROUTES, 1, &P_FALLBACK };
 
 /* Everything the peer sends until it closes, as a string -- or what came within

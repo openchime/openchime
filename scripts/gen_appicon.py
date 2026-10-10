@@ -123,4 +123,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--msix":
         main_msix(sys.argv[2] if len(sys.argv) > 2 else "packaging/windows/msix/assets")
     else:
-        main(sys.argv[1] if len(sys.argv) > 1 else "client/gui/win32/res/openchime.ico")
+        main(sys.argv[1] if len(sys.argv) > 1 else "client/gui/platform/win32/res/openchime.ico")
