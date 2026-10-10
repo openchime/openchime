@@ -85,13 +85,15 @@ void oc_i420_from_yuy2(oc_frame *dst, const uint8_t *src, int stride) {
     }
 }
 
-void oc_i420_from_bgra(oc_frame *dst, const uint8_t *src, int stride) {
+/* Four bytes a pixel with red, green and blue at `ri`, `gi`, `bi`: BGRA as
+ * Windows orders it, RGBA as a browser's canvas does. */
+static void from_rgb4(oc_frame *dst, const uint8_t *src, int stride, int ri, int gi, int bi) {
     int w = dst->width, h = dst->height;
     for (int r = 0; r < h; r++) {
         const uint8_t *s = src + r * stride;
         uint8_t *yy = dst->plane[0] + r * dst->stride[0];
         for (int c = 0; c < w; c++) {
-            int b = s[4 * c], g = s[4 * c + 1], rr = s[4 * c + 2];
+            int b = s[4 * c + bi], g = s[4 * c + gi], rr = s[4 * c + ri];
             yy[c] = clamp8(((47 * rr + 157 * g + 16 * b + 128) >> 8) + 16);
         }
     }
@@ -102,7 +104,7 @@ void oc_i420_from_bgra(oc_frame *dst, const uint8_t *src, int stride) {
             for (int dy = 0; dy < 2; dy++)
                 for (int dx = 0; dx < 2; dx++) {
                     const uint8_t *p = src + (2 * r + dy) * stride + 4 * (2 * c + dx);
-                    sb += p[0]; sg += p[1]; sr += p[2];
+                    sb += p[bi]; sg += p[gi]; sr += p[ri];
                 }
             sb = (sb + 2) >> 2; sg = (sg + 2) >> 2; sr = (sr + 2) >> 2;
             u[c] = clamp8(((-26 * sr - 87 * sg + 112 * sb + 128) >> 8) + 128);
@@ -110,6 +112,9 @@ void oc_i420_from_bgra(oc_frame *dst, const uint8_t *src, int stride) {
         }
     }
 }
+
+void oc_i420_from_bgra(oc_frame *dst, const uint8_t *src, int stride) { from_rgb4(dst, src, stride, 2, 1, 0); }
+void oc_i420_from_rgba(oc_frame *dst, const uint8_t *src, int stride) { from_rgb4(dst, src, stride, 0, 1, 2); }
 
 void oc_i420_to_bgra(const oc_frame *src, uint8_t *dst, int dst_stride) {
     int w = src->width, h = src->height;

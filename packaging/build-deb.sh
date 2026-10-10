@@ -51,6 +51,14 @@ if [ -f "$STT/manifest" ]; then
   find "$stage/usr/share/openchime/stt" -type d -exec chmod 0755 {} +
   find "$stage/usr/share/openchime/stt" -type f -exec chmod 0644 {} +
 fi
+# The web client the daemon serves (docs/WEB.md), the same way.
+WEB="$(dirname "$BINARY")/web"
+if [ -f "$WEB/openchime.wasm" ]; then
+  mkdir -p "$stage/usr/share/openchime"
+  cp -r "$WEB" "$stage/usr/share/openchime/web"
+  find "$stage/usr/share/openchime/web" -type d -exec chmod 0755 {} +
+  find "$stage/usr/share/openchime/web" -type f -exec chmod 0644 {} +
+fi
 install -D -m 0644 "$root/packaging/debian/openchimed.service" "$stage/lib/systemd/system/openchimed.service"
 # 0600: it holds secrets, and systemd (root) is what reads it, not the daemon.
 install -D -m 0600 "$root/packaging/openchimed.env"            "$stage/etc/openchime/openchimed.env"

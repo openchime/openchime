@@ -37,6 +37,10 @@ TTS="$(dirname "$BINARY")/tts"
 # And voice input's recognizer data in stt/, for the same reason.
 STT="$(dirname "$BINARY")/stt"
 [ -f "$STT/manifest" ] && cp -r "$STT" "$dir/stt"
+# And the web client the daemon serves (docs/WEB.md), the same way: a daemon
+# always serves the client built with it.
+WEB="$(dirname "$BINARY")/web"
+[ -f "$WEB/openchime.wasm" ] && cp -r "$WEB" "$dir/web"
 install -m 0644 "$root/packaging/debian/openchimed.service" "$dir/openchimed.service"
 install -m 0600 "$root/packaging/openchimed.env"            "$dir/openchimed.env"
 "$root/packaging/licenses.sh" "$MBEDTLS_DIR"              > "$dir/COPYRIGHT"
@@ -64,6 +68,11 @@ if [ -d stt ]; then
     mkdir -p /usr/share/openchime
     rm -rf /usr/share/openchime/stt
     cp -r stt /usr/share/openchime/stt
+fi
+if [ -d web ]; then
+    mkdir -p /usr/share/openchime
+    rm -rf /usr/share/openchime/web
+    cp -r web /usr/share/openchime/web
 fi
 install -D -m 0644 openchimed.service /lib/systemd/system/openchimed.service
 install -D -m 0644 COPYRIGHT          /usr/share/doc/openchimed/copyright

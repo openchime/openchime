@@ -24,7 +24,8 @@
 #include "storage.h"
 #include "framebuf.h"
 #include "http.h"
-#include "webpages.h"   /* the sign-in pages (AUTH.md §8.10) */
+#include "webpages.h"
+#include "webapp.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
 #include "jwt.h"         /* oc_base64url_encode: a passkey's challenge; oc_jwt_nonce_matches */
 #include "oidcrp.h"      /* direct connections (AUTH.md §8.5) */
@@ -209,6 +210,7 @@ typedef struct conn_s {
     uint64_t     seen_ms;      /* when its session's last_seen_ms was last written */
     int          used;         /* a frame since then: the session is in use */
     char         source[46]; /* peer IP string, for per-source rate limiting */
+    char         ws_host[260]; /* a WebSocket peer: the Host its page was served from (webapp.h) */
     uint8_t     *out;       /* growable pending-output buffer (capped, see out_append) */
     size_t       out_cap, out_len, out_sent;
     uint32_t     events;    /* current epoll interest */
@@ -1813,8 +1815,11 @@ static void handle_auth_begin(conn *c, const oc_auth_begin *b, oc_dbwriter *dbw)
         send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "no such sign-in source");
         return;
     }
-    if (!is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+    if (!(is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+          oc_webapp_is_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len, c->ws_host)) ||
         !is_challenge((const char *)b->challenge.ptr, b->challenge.len)) {
+        fprintf(stderr, "sign-in: refused AUTH_BEGIN: redirect_uri %.*s is not loopback nor this daemon's app (page host '%s')\n",
+                (int)(b->redirect_uri.len < 200 ? b->redirect_uri.len : 200), (const char *)b->redirect_uri.ptr, c->ws_host);
         send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri must be loopback");
         return;
     }
@@ -1892,8 +1897,11 @@ static void handle_auth_begin_direct(conn *c, const oc_auth_begin *b, int idx) {
         send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "the sign-in provider cannot be reached");
         return;
     }
-    if (!is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+    if (!(is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+          oc_webapp_is_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len, c->ws_host)) ||
         !is_challenge((const char *)b->challenge.ptr, b->challenge.len) || b->redirect_uri.len >= 560) {
+        fprintf(stderr, "sign-in: refused AUTH_BEGIN: redirect_uri %.*s is not loopback nor this daemon's app (page host '%s')\n",
+                (int)(b->redirect_uri.len < 200 ? b->redirect_uri.len : 200), (const char *)b->redirect_uri.ptr, c->ws_host);
         send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri must be loopback");
         return;
     }
@@ -1998,8 +2006,11 @@ static void handle_auth_begin_local(conn *c, const oc_auth_begin *b, oc_dbwriter
         send_auth_error(c, OC_ERR_AUTH_SOURCE_UNAVAILABLE, "no such sign-in source");
         return;
     }
-    if (!is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+    if (!(is_loopback_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len) ||
+          oc_webapp_is_redirect((const char *)b->redirect_uri.ptr, b->redirect_uri.len, c->ws_host)) ||
         !is_challenge((const char *)b->challenge.ptr, b->challenge.len)) {
+        fprintf(stderr, "sign-in: refused AUTH_BEGIN: redirect_uri %.*s is not loopback nor this daemon's app (page host '%s')\n",
+                (int)(b->redirect_uri.len < 200 ? b->redirect_uri.len : 200), (const char *)b->redirect_uri.ptr, c->ws_host);
         send_auth_error(c, OC_ERR_AUTH_INVALID_TOKEN, "redirect_uri must be loopback");
         return;
     }
@@ -4120,25 +4131,29 @@ static void http_reply(conn *c, int status, const char *ctype, const char *body,
 #define WEBHOOK_PREFIX "/webhook/"
 /* The sign-in pages (AUTH.md §8.10): a GET shows one, a POST is its form. */
 #define WEB_MAX_BODY 8192u
+/* The browser client's way onto the wire (CLIENT.md §4, ARCH-74): a WebSocket
+ * upgrade, after which the connection carries the binary protocol in frames,
+ * handled on the I/O thread (ioloop.c). */
+#define WS_PATH "/ws"
 static const oc_http_route TLS_ROUTES[] = {
-    { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0 },
-    { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
-    { "POST", "/signin/verify", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
-    { "GET",  "/signup", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
-    { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
-    { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
-    { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "GET",  "/codes.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
-    { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0 },
-    { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0 },
+    { "GET",  WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL },
+    { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0, NULL },
+    { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "POST", "/signin/verify", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "GET",  "/signup", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "GET",  "/codes.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
 };
-static const oc_http_site TLS_SITE = { TLS_ROUTES, sizeof TLS_ROUTES / sizeof TLS_ROUTES[0], NULL };
 
 /* A workspace address is a perfectly natural thing to paste into a browser, so
  * every non-/healthz path on the health port answers with this instead of a
@@ -4178,15 +4193,32 @@ static const char LANDING_BODY[] =
  * ignored, up to a small limit. */
 #define HEALTH_MAX_BODY 4096u
 static const oc_http_route HEALTH_ROUTES[] = {
-    { NULL, "/healthz", 0, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/plain", "OK", 2 },
+    { NULL, "/healthz", 0, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/plain", "OK", 2, NULL },
+    /* The protocol in WebSocket frames, in the clear, for a browser page served
+     * from the same box in development; a deployment fronts both with TLS. */
+    { "GET", WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL },
 };
 static const oc_http_route HEALTH_LANDING = {
     NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8",
-    LANDING_BODY, sizeof LANDING_BODY - 1
+    LANDING_BODY, sizeof LANDING_BODY - 1, NULL
 };
-static const oc_http_site HEALTH_SITE = {
-    HEALTH_ROUTES, sizeof HEALTH_ROUTES / sizeof HEALTH_ROUTES[0], &HEALTH_LANDING
-};
+
+/* The sites as served: the fixed routes above, then the web client's when its
+ * wasm is beside the binary (webapp.h) -- on the TLS port only, where the
+ * sign-in pages it chains to live; the health port stays health and the
+ * harness's WebSocket, nothing a person signs in through in the clear. */
+static oc_http_route g_tls_routes[sizeof TLS_ROUTES / sizeof TLS_ROUTES[0] + 8];
+static oc_http_site  g_tls_site, g_health_site;
+static void sites_init(void) {
+    size_t na = 0;
+    const oc_http_route *app = oc_webapp_routes(&na);
+    size_t nt = sizeof TLS_ROUTES / sizeof TLS_ROUTES[0];
+    memcpy(g_tls_routes, TLS_ROUTES, sizeof TLS_ROUTES);
+    for (size_t i = 0; i < na && i < 8; i++) g_tls_routes[nt + i] = app[i];
+    g_tls_site.routes = g_tls_routes; g_tls_site.n = nt + (na < 8 ? na : 8); g_tls_site.fallback = NULL;
+    g_health_site.routes = HEALTH_ROUTES; g_health_site.n = sizeof HEALTH_ROUTES / sizeof HEALTH_ROUTES[0];
+    g_health_site.fallback = &HEALTH_LANDING;
+}
 
 /* Dispatch one webhook post, routed here by the I/O thread (POST under
  * WEBHOOK_PREFIX). Returns 0 to keep the connection (the post is awaiting its
@@ -4291,7 +4323,7 @@ static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);              
 /* The names a passkey may be made for, and the one this request came to: set
  * per request by on_web_page, read by the page handlers it calls. */
 static char g_pk_names[1024];
-static __thread char g_req_rp[256], g_req_origin[300];
+static __thread char g_req_rp[256], g_req_origin[300], g_req_host[260];
 void oc_netloop_set_passkey_names(const char *names) {
     snprintf(g_pk_names, sizeof g_pk_names, "%s", names ? names : "");
 }
@@ -4358,6 +4390,11 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     }
     int post = req->method_len == 4 && memcmp(req->method, "POST", 4) == 0;
     passkey_rp(req, g_req_rp, g_req_origin);
+    /* The request's Host, for the reset page's redirect check (webapp.h). */
+    g_req_host[0] = '\0';
+    if (req->host && req->host_len && req->host_len < sizeof g_req_host) {
+        memcpy(g_req_host, req->host, req->host_len); g_req_host[req->host_len] = '\0';
+    }
 
     /* The fields: the query's for a GET, the form's for a POST. */
     char q[WEB_MAX_BODY + 1];
@@ -4404,8 +4441,13 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
         w->done = 1;   /* just back from setting a new password */
     /* A sign-in or sign-up sends its token to the client that asked, over
      * loopback, bound to its challenge -- anything else is not our link. */
+    char page_host[260] = "";
+    if (req->host && req->host_len && req->host_len < sizeof page_host) {
+        memcpy(page_host, req->host, req->host_len); page_host[req->host_len] = '\0';
+    }
     if (!bad && kind != OC_PAGE_PASSWORD &&
-        (!is_loopback_redirect(w->redirect_uri, strlen(w->redirect_uri)) ||
+        (!(is_loopback_redirect(w->redirect_uri, strlen(w->redirect_uri)) ||
+           oc_webapp_is_redirect(w->redirect_uri, strlen(w->redirect_uri), page_host)) ||
          !is_challenge(w->nonce, strlen(w->nonce)))) bad = 1;
     if (bad) {
         const char *b = oc_page_invalid(&len);
@@ -4717,7 +4759,8 @@ static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     if (field_get(q, "t", t, sizeof t) || field_get(q, "password", pass, sizeof pass) ||
         field_get(q, "confirm", confirm, sizeof confirm) || strlen(t) != 64 ||
         field_get(q, "redirect_uri", redirect, sizeof redirect) || field_get(q, "nonce", nonce, sizeof nonce) ||
-        ((redirect[0] || nonce[0]) && (!is_loopback_redirect(redirect, strlen(redirect)) ||
+        ((redirect[0] || nonce[0]) && (!(is_loopback_redirect(redirect, strlen(redirect)) ||
+                                         oc_webapp_is_redirect(redirect, strlen(redirect), g_req_host)) ||
                                        !is_challenge(nonce, strlen(nonce))))) {
         const char *b = oc_page_invalid(&len);
         web_reply(c, 400, b, len, NULL, NULL);
@@ -5080,6 +5123,9 @@ static void on_io_event(int ep, conn **conns, oc_dbwriter *dbw, oc_io_event *e, 
     case OC_IO_OPENED:
         c->state = CONN_ESTABLISHED;
         c->http = e->http;
+        if (!e->http && e->len && e->len < sizeof c->ws_host) {
+            memcpy(c->ws_host, e->data, e->len); c->ws_host[e->len] = '\0';
+        }
         oc_io_event_free(e);
         return;
     case OC_IO_FRAME:
@@ -8268,7 +8314,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                   oc_idmap_init(&g_by_user, 2 * OC_NETLOOP_MAX_FD) == 0 && oc_srccount_init(&g_by_src, 2 * OC_NETLOOP_MAX_FD) == 0;
     if (!indexed) NETLOOP_FAIL("allocating the connection indexes");
     /* The I/O threads (ARCH-22): every accepted socket is theirs from here. */
-    g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted, &TLS_SITE, &HEALTH_SITE) : NULL;
+    sites_init();
+    g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted, &g_tls_site, &g_health_site) : NULL;
     int iofd = -1;
     if (indexed && !g_io) { NETLOOP_FAIL("starting the I/O threads"); indexed = 0; }
     if (g_io) {

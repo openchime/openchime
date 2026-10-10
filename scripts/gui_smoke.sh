@@ -174,7 +174,7 @@ case "$fixture" in
 esac
 
 # --- 2. it paints a shell you can use --------------------------------------
-# The three predicates in winmain.c, in the one view that has to work: a channel
+# The three predicates in app.c, in the one view that has to work: a channel
 # list on the left, a conversation in the middle, nothing covering the window.
 # The full seven-view matrix is the regression suite's; this asks only whether
 # the shell came up at all.

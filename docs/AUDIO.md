@@ -190,6 +190,21 @@ PulseAudio, PipeWire, CoreAudio, and WASAPI behind one API, and — critically �
 supports the duplex mode §2 requires, with resampling so the engine can request
 16 kHz regardless of what the hardware prefers.
 
+**The device layer is one file over a backend seam.** What is the same
+everywhere -- the rings, the timestamps, the far-end reference, the
+microphone's one owner, the synthetic test devices -- is
+`client/core/media/audio_dev.c`; a backend (`audio_backend.h`) lists and opens
+the devices and runs their callbacks, which hand samples to the device layer and
+do nothing else. miniaudio is the backend on the desktops (`audio_ma.c`, and the
+phones' when they come); the browser's is Web Audio
+(`client/gui/platform/web/audio_web.c`, WEB.md): an AudioContext per sample
+rate, a microphone as a `getUserMedia` stream into a processing node, a speaker
+as such a node into the destination, the page's thread moving samples between
+the browser's float buffers and the rings in wasm memory. The computer's own
+sound (loopback) is the audio track the browser gives with a screen capture --
+a tab's sound anywhere, the system's on Chromium for Windows -- and absent
+where it gives none.
+
 **The device layer** is shared with video messages (ARCH-110):
 `client/core/media/audio_dev.{c,h}` enumerates capture and playback devices,
 opens either at a requested rate and channel count, and joins each device
@@ -483,7 +498,7 @@ switch.
 | HPKE and SFrame | `shared/e2e_hpke.c`, `shared/e2e_sframe.c` |
 | Call state, invitations, keys forwarded, missed calls | `daemon/netloop.c`, `daemon/dbwriter.c` |
 | Relay | `daemon/relay.c`, driven by `daemon/netloop.c` |
-| Calls section, call view, strip, toasts, keys | `client/gui/win32/winmain.c` |
+| Calls section, call view, strip, toasts, keys | `client/gui/app/app.c` |
 
 ## 8. TUI surface
 

@@ -1,6 +1,8 @@
 openchimed
 # Read-aloud's data directory, assembled by `make` beside the binary.
 /tts/
+# The web client the daemon serves, placed beside the binary by `make web`.
+/web/
 build/
 # Release artefacts (.deb/.rpm/.tar.gz and the stripped binary they share),
 # produced by packaging/build-*.sh and by the release workflow. Built, never

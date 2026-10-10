@@ -70,6 +70,9 @@ if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
   echo "build_mbedtls: building ${SRC} static libraries"
   # `make lib` builds only the libraries (skips programs/tests). The release
   # tarball ships pre-generated sources, so no Python is required.
+  # `fetch`: the configured sources alone, for another toolchain's build
+  # (scripts/build_mbedtls_wasm.sh); the native libraries are not needed there.
+  if [ "${1:-}" = fetch ]; then echo "build_mbedtls: sources in third_party/${SRC}"; exit 0; fi
   make -C "${SRC}" -j"$(nproc)" lib
 fi
 

@@ -85,8 +85,12 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c
-SRC        := $(SHARED_SRC) $(DAEMON_SRC)
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c
+# The web client's page and loader, compiled into the daemon as resources
+# (daemon/webapp.h): generated from the web build, so the daemon is never
+# built without the client that matches it. Needs emcc (docs/WEB.md).
+WEBAPP_RES := build/gen/webapp_res.c
+SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
 # Vendored, pinned mbedTLS (scripts/build_mbedtls.sh) — one version across local
@@ -103,7 +107,7 @@ INC := -Ishared -Idaemon -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird
 
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
-APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
+APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES)
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
 TEST_SRC  := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c,$(wildcard tests/*.c))
@@ -114,7 +118,9 @@ TEST_BIN  := build/tests
 # the view-model/reducers + the oc_client facade. It has no main of its own — the
 # headless test (make test) links and drives it against an in-process daemon, and
 # frontends (a TUI first, then native GUIs) link it too. See docs/CLIENT.md.
-CORE_SRC := $(wildcard client/core/*.c)
+# signin_web.c is the browser's signin.c (WEB.md): the web core takes it in
+# place of signin.c, the native build leaves it out.
+CORE_SRC := $(filter-out client/core/signin_web.c,$(wildcard client/core/*.c))
 CORE_INC := -Iclient/core
 
 # --- Video message media (ARCH-110) -------------------------------------------
@@ -168,6 +174,9 @@ TTSKIT_INC := -Ittskit
 # byte-offset range styling. The portable core (the byte<->UTF-16 offset map)
 # compiles everywhere and is covered by `make test`; the DirectWrite backend
 # compiles only into Windows builds. See sdltext/sdltext.h.
+# The portable application layer of the GUI (ARCH-80): every graphical client
+# compiles it over its platform directory (client/gui/platform/<os>/).
+APP_GUI_SRC    := $(wildcard client/gui/app/*.c)
 SDLTEXT_COMMON := sdltext/st_common.c
 SDLTEXT_WIN    := sdltext/st_common.c sdltext/st_dwrite.c
 SDLTEXT_INC    := -Isdltext
@@ -204,7 +213,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test test-ci check-opcodes check-refs check-release-cc core tui bench bench-loop clean distclean FORCE s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
+.PHONY: all run test test-ci check-opcodes check-refs check-release-cc core tui bench bench-loop clean distclean FORCE s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client web-core web-test web web-gfx-demo web-gfx-test web-gui
 
 all: $(BIN)
 
@@ -382,7 +391,7 @@ check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $
 	done
 	@for f in $(RELEASE_CC_TEST_SRC); do \
 	  $(RELEASE_CC) $(CFLAGS) $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) \
-	    -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen -c -o /dev/null $$f || exit 1; \
+	    -DOC_TTS -DOC_STT -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen -c -o /dev/null $$f || exit 1; \
 	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
@@ -410,10 +419,10 @@ TSAN_SUITES := $(subst $(eval) ,$(comma),$(strip $(TSAN_LIST)))
 # one Windows call behind an #ifdef, and the contrast guarantee it carries has to
 # be asserted somewhere that RUNS. The audit that would otherwise check it needs
 # a Windows host and a developer who remembers; this needs neither.
-THEME_SRC := client/gui/win32/theme.c
+THEME_SRC := client/gui/app/theme.c
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen \
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/app/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen \
 	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # The same test binary under ThreadSanitizer, for the code that shares memory
@@ -439,8 +448,8 @@ test-ci-plain: ci-only check-opcodes check-refs $(TEST_BIN)
 test-ci-threads: ci-only $(TSAN_BIN)
 	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
-$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/win32 -Iclient/shared -Ituikit -Ithird_party/qrcodegen \
+$(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/app/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen \
 	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
@@ -494,6 +503,108 @@ core: $(CORE_SRC) $(SHARED_SRC) $(wildcard client/core/*.h shared/*.h) $(MBEDTLS
 	    $(CC) $(CFLAGS) $(INC) $(CORE_INC) -c $$f -o build/core/$$(basename $$f .c).o || exit 1; \
 	done
 
+# The web client, step one (docs/WEB.md): the app-core and the shared wire
+# compiled to WebAssembly with Emscripten, with the page that starts it and a
+# dev server. Needs emcc on PATH (source ~/emsdk/emsdk_env.sh); the mbedTLS
+# build for wasm is made once beside the native one (scripts/build_mbedtls_wasm.sh).
+# `make web-test` runs it against a daemon in a headless Chromium (scripts/webtest.sh).
+WEB_DIR      := build/web
+WEB_SRC      := client/gui/platform/web/core_main.c client/gui/platform/web/secret_mem.c
+WEB_MBEDTLS  := build/wasm/mbedtls/library
+WEB_CFLAGS   := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread
+WEB_LDFLAGS  := -pthread -sPTHREAD_POOL_SIZE=4 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB \
+                -sENVIRONMENT=web,worker -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+                -sEXPORTED_FUNCTIONS=_main,_oc_web_start,_oc_web_stop,_oc_web_phase,_oc_web_channels \
+                -sWEBSOCKET_SUBPROTOCOL=binary -sEXIT_RUNTIME=0 -Wno-pthreads-mem-growth
+web-core: $(WEB_DIR)/openchime-core.js
+$(WEB_MBEDTLS)/libmbedtls.a:
+	scripts/build_mbedtls_wasm.sh
+$(WEB_DIR)/openchime-core.js: $(CORE_SRC) $(SHARED_SRC) $(WEB_SRC) $(wildcard client/core/*.h shared/*.h) $(WEB_MBEDTLS)/libmbedtls.a
+	mkdir -p $(WEB_DIR)
+	emcc $(WEB_CFLAGS) -Ishared $(CORE_INC) -Iclient/shared -Ithird_party/jsmn -Ibuild/wasm/mbedtls/include \
+	    $(CORE_SRC) $(SHARED_SRC) $(WEB_SRC) \
+	    $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MBEDTLS)/libmbedx509.a $(WEB_MBEDTLS)/libmbedcrypto.a \
+	    $(WEB_LDFLAGS) -o $@
+	cp client/gui/platform/web/index.html $(WEB_DIR)/index.html
+# The drawing layer on the web (step two): oc_gfx over SDL3 built for wasm
+# (scripts/build_sdl3_wasm.sh). `web-gfx-test` runs the backend's own pixel
+# test under Node; `web-gfx-demo` is the page that draws a conversation's chrome.
+WEB_SDL3     := build/wasm/sdl3
+# By absolute path: emsdk puts its own directory on the PATH, which holds a
+# directory named `node`, and make's direct exec stops at it where a shell walks on.
+NODE         ?= $(shell command -v node)
+WEB_GFX_SRC  := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c client/shared/icons.c
+WEB_GFX_FLAGS := -std=c99 -O2 $(WARN_CFLAGS) -Wno-typedef-redefinition -pthread \
+                 -Iclient/gui/gfx -Iclient/shared -I$(WEB_SDL3)/include
+WEB_GFX_LD   := $(WEB_SDL3)/lib/libSDL3.a -pthread -sALLOW_MEMORY_GROWTH=1 -Wno-pthreads-mem-growth
+$(WEB_SDL3)/lib/libSDL3.a:
+	scripts/build_sdl3_wasm.sh
+$(WEB_DIR)/gfx-test.js: $(WEB_GFX_SRC) client/gui/gfx/gfx_test_win.c client/gui/gfx/gfx.h $(WEB_SDL3)/lib/libSDL3.a
+	mkdir -p $(WEB_DIR)
+	emcc $(WEB_GFX_FLAGS) $(WEB_GFX_SRC) client/gui/gfx/gfx_test_win.c $(WEB_GFX_LD) -sENVIRONMENT=node,worker -o $@
+$(WEB_DIR)/gfx-demo.js: $(WEB_GFX_SRC) client/gui/platform/web/gfx_demo.c client/gui/platform/web/gfx-demo.html client/gui/gfx/gfx.h $(WEB_SDL3)/lib/libSDL3.a
+	mkdir -p $(WEB_DIR)
+	emcc $(WEB_GFX_FLAGS) $(WEB_GFX_SRC) client/gui/platform/web/gfx_demo.c $(WEB_GFX_LD) -sENVIRONMENT=web,worker -o $@
+	cp client/gui/platform/web/gfx-demo.html $(WEB_DIR)/gfx-demo.html
+web-gfx-demo: $(WEB_DIR)/gfx-demo.js
+web-gfx-test: $(WEB_DIR)/gfx-test.js
+	$(NODE) $(WEB_DIR)/gfx-test.js
+# The client itself on the web: the same application layer as Windows
+# (client/gui/app) over the browser platform (client/gui/platform/web), the
+# canvas text backend, the core, and stand-ins for what a browser lacks.
+# Asyncify lets the client's own loop yield to the page.
+# Media in the browser (WEB.md): the portable media, voice and call code as the
+# desktop links it, over the browser's capture and audio backends in place of
+# Media Foundation, Graphics Capture and miniaudio; the codecs built for wasm
+# by scripts/build_media_wasm.sh.
+WEB_MEDIA_SRC := $(filter-out client/core/media/audio_ma.c client/core/media/cap_mf.c client/core/media/cap_wgc.c,$(MEDIA_SRC)) \
+                 $(VOICE_SRC) $(CALL_SRC) client/gui/platform/web/cap_web.c client/gui/platform/web/audio_web.c
+WEB_MEDIA_LIBS := build/wasm/libvpx/lib/libvpx.a build/wasm/opus/lib/libopus.a build/wasm/speexdsp/lib/libspeexdsp.a
+WEB_GUI_SRC  := $(APP_GUI_SRC) client/gui/platform/web/plat_web.c client/gui/platform/web/a11y_web.c \
+                client/gui/platform/web/secret_mem.c client/shared/icons.c client/shared/feedback.c \
+                client/shared/osnotify_web.c sdltext/st_canvas.c sdltext/st_common.c client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c \
+                $(WEB_MEDIA_SRC)
+WEB_GUI_INC  := -Ishared -Iclient/core -Iclient/core/media -Iclient/core/voice -Iclient/core/call \
+                -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Isdltext -Iclient/gui/gfx -Ithird_party/jsmn \
+                -I$(WEB_SDL3)/include -Ibuild/wasm/mbedtls/include \
+                -Ibuild/wasm/libvpx/include -Ibuild/wasm/opus/include -Ibuild/wasm/speexdsp/include -Ithird_party/libfvad/include
+WEB_GUI_CFLAGS := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread -Wno-typedef-redefinition \
+                  -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-but-set-global -Wno-format-security
+WEB_GUI_OBJS := $(patsubst %.c,build/wasm/gui/%.o,$(WEB_GUI_SRC))
+# The browser has no loopback listener for a sign-in's return: the core's
+# signin.c is replaced by signin_web.c, the same API over the page (WEB.md).
+WEB_CORE_SRC  := $(filter-out client/core/signin.c,$(CORE_SRC)) client/core/signin_web.c
+WEB_CORE_OBJS := $(patsubst %.c,build/wasm/core/%.o,$(WEB_CORE_SRC) $(SHARED_SRC))
+build/wasm/gui/%.o: %.c client/gui/platform/platform.h client/gui/app/keys.h $(WEB_SDL3)/lib/libSDL3.a $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MEDIA_LIBS)
+	@mkdir -p $(dir $@)
+	emcc $(WEB_GUI_CFLAGS) $(WEB_GUI_INC) -c $< -o $@
+$(WEB_MEDIA_LIBS) &:
+	scripts/build_media_wasm.sh
+build/wasm/core/%.o: %.c $(WEB_MBEDTLS)/libmbedtls.a
+	@mkdir -p $(dir $@)
+	emcc $(WEB_CFLAGS) -Ishared $(CORE_INC) -Iclient/shared -Ithird_party/jsmn -Ibuild/wasm/mbedtls/include -c $< -o $@
+$(WEB_DIR)/openchime.js: $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) client/gui/platform/web/openchime.html
+	mkdir -p $(WEB_DIR)
+	emcc $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MBEDTLS)/libmbedx509.a $(WEB_MBEDTLS)/libmbedcrypto.a $(WEB_SDL3)/lib/libSDL3.a \
+	    $(WEB_MEDIA_LIBS) \
+	    -pthread -sPTHREAD_POOL_SIZE=16 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=128MB -sSTACK_SIZE=1MB -sASYNCIFY -sASYNCIFY_STACK_SIZE=65536 \
+	    -sENVIRONMENT=web,worker -sWEBSOCKET_SUBPROTOCOL=binary -sEXIT_RUNTIME=0 -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,UTF16ToString,stringToNewUTF8,stringToUTF8,FS,ENV \
+	    -sFORCE_FILESYSTEM -Wno-pthreads-mem-growth -Wno-limited-postlink-optimizations -o $@
+	cp client/gui/platform/web/openchime.html $(WEB_DIR)/openchime.html
+	# The daemon serves the wasm from web/ beside its binary (daemon/webapp.h),
+	# as it finds its voice data: placed there for a developer's daemon, and
+	# copied into the packages the same way by the release.
+	mkdir -p web
+	cp $(WEB_DIR)/openchime.wasm web/
+web-gui: $(WEB_DIR)/openchime.js
+$(WEBAPP_RES): $(WEB_DIR)/openchime.js scripts/embed_res.py
+	mkdir -p build/gen
+	python3 scripts/embed_res.py $@ oc_webapp_html=$(WEB_DIR)/openchime.html oc_webapp_js=$(WEB_DIR)/openchime.js
+web: web-core web-gfx-demo web-gui
+web-test: $(WEB_DIR)/openchime-core.js $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js $(BIN)
+	$(NODE) $(WEB_DIR)/gfx-test.js
+	scripts/webtest.sh
+
 # The TUI: app-core + shared wire + termbox2/utf8proc. -Wno-unused-result relaxes
 # one warning from the vendored termbox2 header (its read/write/strerror_r calls).
 tui: $(TUI_BIN)
@@ -530,11 +641,11 @@ WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
 WIN_TUI_BIN := build/openchime-tui.exe
 # -g: debug info, so a crash RVA from the report (see crash_filter) resolves to a
 # file and line via addr2line. Without it the report can only say "somewhere in
-# winmain.c", which is not a lead. No runtime cost; strip on release if size matters.
+# app.c", which is not a lead. No runtime cost; strip on release if size matters.
 # The Windows flags are their own variable rather than an addition to CFLAGS, so
 # they carry WARN_CFLAGS explicitly. They must: the cross build is where the two
 # implicit float declarations hid, because nothing on the native side compiles
-# winmain.c at all.
+# app.c at all.
 WIN_CFLAGS := -std=c99 $(WARN_CFLAGS) -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
            $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/qrcodegen -Ithird_party/termbox2 -Ithird_party/utf8proc
@@ -553,11 +664,11 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static -o $@
 
 
-# The native Windows GUI (Win32 + Direct2D/DirectWrite/WIC, pure C — ARCH-80/82)
-# over the same shared app-core. Mirrors windows-tui (core+shared+mbedtls-win)
-# but compiles the client/gui/win32 sources instead of the
-# TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
-# Unicode entry point; -mwindows selects the GUI subsystem (no console).
+# The Windows GUI (ARCH-80): the portable application layer (client/gui/app,
+# SDL3 + oc_gfx + sdltext) over the Windows platform (client/gui/platform/win32)
+# and the same shared app-core. Mirrors windows-tui (core+shared+mbedtls-win)
+# but compiles the GUI sources instead of the TUI/tuikit stack. SDL supplies the
+# entry point (SDL_main.h); -mwindows selects the GUI subsystem (no console).
 SDL3_VERSION := 3.4.14
 SDL3_WIN     := third_party/sdl3-$(SDL3_VERSION)-win
 SDL3_WIN_LIB := $(SDL3_WIN)/lib/libSDL3.a
@@ -590,30 +701,32 @@ $(WIN_SPEEXDSP_A):
 	scripts/build_speexdsp.sh windows
 # Debug symbols, split out of the shipped binary (see the strip step below).
 WIN_GUI_SYMS := build/openchime.debug
-GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
+# The application layer (client/gui/app, portable: SDL3 + oc_gfx + sdltext) over
+# the Windows platform (client/gui/platform/win32); see client/gui/platform/platform.h.
+GUI_SRC := $(APP_GUI_SRC) $(wildcard client/gui/platform/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
            client/shared/osnotify_win.c client/shared/feedback.c \
            $(SDLTEXT_WIN) $(GFX_SRC)
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-               $(CORE_INC) $(CALL_INC) -Iclient/gui/win32 -Iclient/shared \
+               $(CORE_INC) $(CALL_INC) -Iclient/gui/app -Iclient/gui/platform -Iclient/gui/platform/win32 -Iclient/shared \
                $(SDLTEXT_INC) -Iclient/gui/gfx -I$(SDL3_WIN)/include
 
 # Resources (app icon + VERSIONINFO). Regenerate the .ico with
 # scripts/gen_appicon.py.
 WIN_GUI_RES := build/openchime_res.o
-$(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime.ico \
-                client/gui/win32/res/openchime_res.h $(WIN_RES_SRC) | build
-	$(WINDRES) -I client/gui/win32/res $(WINDRES_ARGS) $< -O coff -o $@
+$(WIN_GUI_RES): client/gui/platform/win32/res/openchime.rc client/gui/platform/win32/res/openchime.ico \
+                client/gui/platform/win32/res/openchime_res.h $(WIN_RES_SRC) | build
+	$(WINDRES) -I client/gui/platform/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 
 windows-gui: $(WIN_GUI_BIN)
 $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) $(CALL_HDRS) \
+                $(wildcard client/gui/app/*.h client/gui/platform/*.h client/gui/platform/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) $(CALL_HDRS) \
                 $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
-	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/win32/res \
+	$(WINCC) $(WIN_CFLAGS) -std=c11 -Wno-unused-result -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res \
 	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lcomdlg32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_MEDIA_SYSLIBS) $(WIN_SDL_SYSLIBS) -static -o $@
 # Split the debug info out rather than discarding it. The client writes real
-# minidumps on a crash (crash_filter, winmain.c), and symbolicating a mingw
+# minidumps on a crash (crash_filter, client/gui/platform/win32/plat_win32.c), and symbolicating a mingw
 # build needs its DWARF -- a plain strip would shrink the download by trading
 # away every future crash report. So: keep the symbols beside the binary, strip
 # the shipped one, and record a debuglink so a debugger loads them back.
