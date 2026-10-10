@@ -276,7 +276,11 @@ enum {
     OC_EV_SUMMARY,
     /* SUMMARY_QUEUED: where the SUMMARIZE named by `req_id` stands; `count` is
      * how many requests are ahead of it, 0 once it is being made. */
-    OC_EV_SUMMARY_QUEUED
+    OC_EV_SUMMARY_QUEUED,
+    /* SUMMARY_READY: a summary made while its asker was not watching.
+     * `summary_id` is the notice, `channel_id`, `sum_scope`, `span_start`/
+     * `span_end` what was asked, `status` whether it was made, `made_at` when. */
+    OC_EV_SUMMARY_READY
 };
 
 typedef struct {
@@ -380,6 +384,8 @@ typedef struct {
     size_t    der_len;
     uint32_t req_id;      /* SUMMARY: the request it answers */
     uint64_t summary_id, span_start, span_end;   /* SUMMARY */
+    uint8_t  sum_scope;   /* SUMMARY_READY */
+    uint64_t made_at;     /* SUMMARY_READY */
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -532,6 +538,10 @@ enum {
     OC_CMD_CHANNEL_ADD_GROUP,
     OC_CMD_CHANNEL_REMOVE_GROUP,
     OC_CMD_SUMMARIZE,      /* summarize `channel_id` over `scope` (REQ-310), as `req_id` */
+    OC_CMD_SUMMARY_DETACH, /* stop watching request `req_id`: be told when it is made */
+    OC_CMD_SUMMARY_CANCEL, /* cancel request `req_id` */
+    OC_CMD_SUMMARY_OPEN,   /* open notice `message_id`, answered as SUMMARY to `req_id` */
+    OC_CMD_SUMMARY_DISMISS, /* notice `message_id` seen, unopened */
     OC_CMD_QUIT
 };
 

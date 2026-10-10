@@ -30,7 +30,10 @@
 
 #include <stdint.h>
 
-enum { OC_FB_CONFIRM = 0, OC_FB_UNDO, OC_FB_PROGRESS, OC_FB_FAILED };
+/* NOTICE: something good that is ready for the person to act on (a summary
+ * made while they were away): shown as a confirmation, but it stays until it
+ * is acted on or dismissed. */
+enum { OC_FB_CONFIRM = 0, OC_FB_UNDO, OC_FB_PROGRESS, OC_FB_FAILED, OC_FB_NOTICE };
 enum { OC_FB_INFO = 0, OC_FB_WARN, OC_FB_ERROR };      /* a banner's severity */
 
 #define OC_FB_TOASTS   3        /* on screen at once */
@@ -94,8 +97,8 @@ int  oc_fb_tick(oc_fb *f, uint64_t now_ms);
 const oc_fb_toast *oc_fb_find(const oc_fb *f, uint32_t id);
 
 /* How long a toast of `kind` saying `text` stays: a confirmation long enough to
- * read (4 s, plus some for a longer sentence, up to 10 s), Undo 10 s, progress
- * and failures until they end or are dismissed (0). */
+ * read (4 s, plus some for a longer sentence, up to 10 s), Undo 10 s, progress,
+ * failures and notices until they end, are acted on, or are dismissed (0). */
 uint64_t oc_fb_duration_ms(int kind, const char *text);
 
 /* Banners: set (or change) state `id`, or clear it. The one showing is the

@@ -127,6 +127,11 @@ void oc_netloop_set_stt(const struct oc_stt_engine *engine);
  * advertises no "summarize" and answers SUMMARIZE with OC_SUM_UNAVAILABLE. */
 struct oc_sum_worker;
 void oc_netloop_set_summary(struct oc_sum_worker *w);
+/* Summaries are configured and coming up: offered, and requests queued, until
+ * set_summary (they are on) or summary_failed (every waiting request is told
+ * they are unavailable, and they are no longer offered). */
+void oc_netloop_summary_starting(void);
+void oc_netloop_summary_failed(void);
 
 /* What the loop's turns cost, for the load harness and the tests that hold the
  * loop to a bound. A turn is the work between one epoll_wait returning and the

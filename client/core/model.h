@@ -158,6 +158,13 @@ typedef struct {
     uint64_t starter;
 } oc_call_notice;
 
+/* A summary made while its asker was not watching (REQ-310, SUMMARY_READY):
+ * made (`status` OC_SUM_OK) or not, over the span asked for. */
+typedef struct {
+    uint64_t id, channel_id, start_ms, end_ms, made_at_ms;
+    uint8_t  scope, status, toasted;
+} oc_summary_notice;
+
 typedef struct {
     uint64_t channel_id;
     char    *name;         /* heap; NULL until a CHANNEL_LIST entry names it */
@@ -476,10 +483,17 @@ typedef struct {
     uint8_t   summary_status;
     uint32_t  summary_req;
     int32_t   summary_position;  /* requests ahead of it while loading; -1 until told */
+    uint8_t   summary_resend;    /* the connection dropped while loading: ask again once signed in */
+    uint64_t  summary_notice;    /* opened from this notice (SUMMARY_OPEN), 0 when asked */
     uint64_t  summary_channel;
     uint64_t  summary_start, summary_end;   /* the span: asked for, then as covered */
     char     *summary_error;
     oc_summary_view summary;
+    /* Summaries made while their asker was not watching, not yet opened or
+     * dismissed (SUMMARY_READY), oldest first. `toasted`: given to the
+     * frontend once (oc_model_summary_notice_take). */
+    oc_summary_notice *sum_notices;
+    size_t    n_sum_notices, cap_sum_notices;
     /* The selected channel's own member roster (REQ-031) and shared files
      * (REQ-143). Both are per-channel views, refreshed on open rather than
      * cached: a client stores nothing (ARCH-88) and a stale roster is worse
@@ -1093,6 +1107,13 @@ int oc_model_call_invited(const oc_call_view *v, uint64_t user_id);
  * and the level cannot (ARCH-103). Considered once, whatever the verdict. */
 size_t oc_model_call_notify_take(oc_model *m, int quiet, int paused,
                                  oc_call_notice *out, size_t max);
+/* The next summary notice not yet given to the frontend (for a toast): 1 and
+ * *out, or 0. Each is given once, however often the daemon tells it. */
+int oc_model_summary_notice_take(oc_model *m, oc_summary_notice *out);
+/* A notice by id, or NULL. */
+const oc_summary_notice *oc_model_summary_notice(const oc_model *m, uint64_t id);
+/* Forget notice `id` (opened or dismissed). */
+void oc_model_summary_notice_drop(oc_model *m, uint64_t id);
 /* Record a presence value (used for our own presence, which the server does not
  * echo back to us). */
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);

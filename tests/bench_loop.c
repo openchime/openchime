@@ -572,6 +572,7 @@ int main(int argc, char **argv) {
     const char *db = "build/bench_loop.db";
     unlink(db); unlink("build/bench_loop.db-wal"); unlink("build/bench_loop.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start(db);
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     if (!dbw) { fprintf(stderr, "db start failed\n"); return 1; }
     for (int i = 0; i < N_USERS; i++) {
         char user[16]; snprintf(user, sizeof user, "u%d", i);

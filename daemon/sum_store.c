@@ -22,9 +22,26 @@ static int cmp_msg(const void *a, const void *b) {
     return x->id < y->id ? -1 : x->id > y->id;
 }
 
-/* People's messages only: not a deleted one, not a call event, not an
- * integration's post (a webhook signs with its own name). */
-#define PEOPLE " deleted_at_ms IS NULL AND kind=0 AND author_name IS NULL "
+/* The messages summarized: people's and integrations' posts, not a deleted
+ * one or a call event. */
+#define SUMMARIZED " deleted_at_ms IS NULL AND kind=0 "
+/* Who wrote a message (m, joined to its author u): an integration's post signs
+ * with its own name, anyone else's with theirs. */
+#define AUTHOR_NAME " COALESCE(NULLIF(m.author_name,''), u.display_name, '') "
+
+/* A message's plain text, whole, on the heap ("(an attachment)" when it has
+ * none); NULL when out of memory. */
+static char *plain_text(sqlite3_stmt *st, int col) {
+    const char *body = (const char *)sqlite3_column_blob(st, col);
+    size_t blen = (size_t)sqlite3_column_bytes(st, col);
+    char *speak = malloc(2 * blen + 64);
+    if (!speak) return NULL;
+    size_t sl = body ? oc_speakable_full(body, blen, NULL, NULL, speak, 2 * blen + 64) : 0;
+    speak[sl] = '\0';
+    if (sl) return speak;
+    free(speak);
+    return strdup("(an attachment)");
+}
 
 static void (*g_changed)(int64_t channel, int64_t at_ms);
 
@@ -45,7 +62,7 @@ int oc_sum_load_window(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t e
     int nr = 0, cr = 0, rc = -1;
     if (sqlite3_prepare_v2(db,
             "SELECT DISTINCT COALESCE(parent_id, id) FROM messages "
-            "WHERE channel_id=?1 AND created_at_ms>=?2 AND created_at_ms<?3 AND" PEOPLE ";",
+            "WHERE channel_id=?1 AND created_at_ms>=?2 AND created_at_ms<?3 AND" SUMMARIZED ";",
             -1, &st, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_int64(st, 1, channel);
@@ -65,12 +82,12 @@ int oc_sum_load_window(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t e
 
     sqlite3_stmt *last = NULL, *rows = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT MAX(created_at_ms) FROM messages WHERE (id=?1 OR parent_id=?1) AND" PEOPLE ";",
+            "SELECT MAX(created_at_ms) FROM messages WHERE (id=?1 OR parent_id=?1) AND" SUMMARIZED ";",
             -1, &last, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
             "SELECT m.id, COALESCE(m.parent_id,0), m.author_id, m.created_at_ms, COALESCE(m.edited_at_ms,0), "
-            "m.body, COALESCE(u.display_name,'') FROM messages m LEFT JOIN users u ON u.id=m.author_id "
-            "WHERE (m.id=?1 OR m.parent_id=?1) AND m.deleted_at_ms IS NULL AND m.kind=0 AND m.author_name IS NULL "
+            "m.body," AUTHOR_NAME "FROM messages m LEFT JOIN users u ON u.id=m.author_id "
+            "WHERE (m.id=?1 OR m.parent_id=?1) AND m.deleted_at_ms IS NULL AND m.kind=0 "
             "ORDER BY m.id;", -1, &rows, NULL) != SQLITE_OK)
         goto done;
     int cm = 0;
@@ -95,16 +112,8 @@ int oc_sum_load_window(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t e
             m->author_id = sqlite3_column_int64(rows, 2);
             m->created_ms = sqlite3_column_int64(rows, 3);
             m->edited_ms = sqlite3_column_int64(rows, 4);
-            const char *body = (const char *)sqlite3_column_blob(rows, 5);
-            size_t blen = (size_t)sqlite3_column_bytes(rows, 5);
             /* The whole message: a summary must not lose any of it. */
-            size_t scap = 2 * blen + 64;
-            char *speak = malloc(scap);
-            if (!speak) goto done;
-            size_t sl = body ? oc_speakable_full(body, blen, NULL, NULL, speak, scap) : 0;
-            speak[sl] = '\0';
-            m->text = sl ? speak : strdup("(an attachment)");
-            if (!sl) free(speak);
+            m->text = plain_text(rows, 5);
             m->author = strdup((const char *)sqlite3_column_text(rows, 6));
             if (!m->text || !m->author) { free((char *)m->text); free((char *)m->author); goto done; }
             w->n++;
@@ -128,6 +137,60 @@ void oc_sum_user_name(sqlite3 *db, int64_t user_id, char *out, size_t cap) {
     sqlite3_bind_int64(st, 1, user_id);
     if (sqlite3_step(st) == SQLITE_ROW) snprintf(out, cap, "%s", (const char *)sqlite3_column_text(st, 0));
     sqlite3_finalize(st);
+}
+
+int oc_sum_span_people(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t end_ms, oc_sum_buf *out) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT CASE WHEN COALESCE(m.author_name,'')<>'' THEN 0 ELSE m.author_id END AS uid,"
+            AUTHOR_NAME "AS nm, COUNT(*) AS c FROM messages m LEFT JOIN users u ON u.id=m.author_id "
+            "WHERE m.channel_id=?1 AND m.created_at_ms>=?2 AND m.created_at_ms<?3 AND m.deleted_at_ms IS NULL "
+            "AND m.kind=0 GROUP BY uid, nm ORDER BY c DESC, nm;", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int64(st, 1, channel);
+    sqlite3_bind_int64(st, 2, start_ms);
+    sqlite3_bind_int64(st, 3, end_ms);
+    int64_t count = 0;
+    int n = 0;
+    oc_sum_buf_puts(out, "\"posters\":[");
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        oc_sum_buf_printf(out, "%s{\"id\":%lld,\"name\":", n++ ? "," : "", (long long)sqlite3_column_int64(st, 0));
+        oc_sum_buf_json(out, (const char *)sqlite3_column_text(st, 1));
+        oc_sum_buf_puts(out, "}");
+        count += sqlite3_column_int64(st, 2);
+    }
+    sqlite3_finalize(st);
+    oc_sum_buf_printf(out, "],\"count\":%lld", (long long)count);
+    return out->oom ? -1 : 0;
+}
+
+int oc_sum_sources(sqlite3 *db, const int64_t *ids, int n, oc_sum_buf *out) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT" AUTHOR_NAME ", CASE WHEN COALESCE(m.author_name,'')<>'' THEN 0 ELSE m.author_id END,"
+            " m.created_at_ms, COALESCE(m.parent_id,0), m.body FROM messages m LEFT JOIN users u ON u.id=m.author_id "
+            "WHERE m.id=?1 AND m.deleted_at_ms IS NULL;", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    int k = 0, rc = 0;
+    oc_sum_buf_puts(out, "\"sources\":{");
+    for (int i = 0; i < n && rc == 0; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, ids[i]);
+        if (sqlite3_step(st) != SQLITE_ROW) continue;
+        char *text = plain_text(st, 4);
+        if (!text) { rc = -1; break; }
+        oc_sum_buf_printf(out, "%s\"%lld\":{\"author\":", k++ ? "," : "", (long long)ids[i]);
+        oc_sum_buf_json(out, (const char *)sqlite3_column_text(st, 0));
+        oc_sum_buf_printf(out, ",\"author_id\":%lld,\"at\":%lld,\"parent\":%lld,\"text\":",
+                          (long long)sqlite3_column_int64(st, 1), (long long)sqlite3_column_int64(st, 2),
+                          (long long)sqlite3_column_int64(st, 3));
+        oc_sum_buf_json(out, text);
+        oc_sum_buf_puts(out, "}");
+        free(text);
+    }
+    sqlite3_finalize(st);
+    oc_sum_buf_puts(out, "}");
+    return rc == 0 && !out->oom ? 0 : -1;
 }
 
 static char *col_dup(sqlite3_stmt *st, int i) {
@@ -297,7 +360,7 @@ int64_t oc_sum_anchor(sqlite3 *db, int64_t channel, int64_t start_ms, uint64_t g
     sqlite3_stmt *st = NULL;
     int64_t at = start_ms;
     if (sqlite3_prepare_v2(db,
-            "SELECT created_at_ms FROM messages WHERE channel_id=?1 AND created_at_ms<?2 AND" PEOPLE
+            "SELECT created_at_ms FROM messages WHERE channel_id=?1 AND created_at_ms<?2 AND" SUMMARIZED
             "ORDER BY created_at_ms DESC;", -1, &st, NULL) != SQLITE_OK)
         return start_ms;
     sqlite3_bind_int64(st, 1, channel);

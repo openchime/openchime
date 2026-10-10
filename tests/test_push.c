@@ -202,6 +202,7 @@ static void test_collect(void) {
     const char *path = "build/test_push_collect.db";
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return;
 
@@ -615,6 +616,7 @@ static void test_default_and_mute(void) {
     const char *path = "build/test_push_default.db";
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return;
 
@@ -752,6 +754,7 @@ static void test_notify_roundtrip(int v6) {
     }
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) { return; }
 
@@ -832,6 +835,7 @@ static void test_keyword_is_not_a_broadcast(void) {
     const char *path = "build/test_push_keyword.db";
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return;
 
@@ -976,6 +980,7 @@ static void test_collect_matches_evaluator(void) {
     const char *path = "build/test_push_parity.db";
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return;
 
@@ -1134,6 +1139,7 @@ static void test_call_invite(void) {
     const char *path = "build/test_push_call.db";
     cleanup_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
     CHECK(w != NULL);
     if (!w) return;
     uint64_t alice = oc_dbwriter_register_local(w, "c-alice", "pw", OC_ROLE_OWNER, 2048);

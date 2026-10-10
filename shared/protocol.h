@@ -513,6 +513,16 @@ typedef enum {
     OC_MSG_SUMMARIZE            = 0x00FD, /* C->S */
     OC_MSG_SUMMARY              = 0x00FE, /* S->C, the answer to one SUMMARIZE */
     OC_MSG_SUMMARY_QUEUED       = 0x0100, /* S->C, where one SUMMARIZE is in the queue */
+    /* A summary is the asker's, not the connection's: they may stop watching
+     * it (DETACH: "notify me", or the pane closed) and be told when it is
+     * ready (READY, on every connection they have, and again at sign-in until
+     * seen), or cancel it. A notice is opened (OPEN, answered by SUMMARY with
+     * the summary as it was made) or dismissed. */
+    OC_MSG_SUMMARY_DETACH       = 0x0101, /* C->S { req_id } */
+    OC_MSG_SUMMARY_CANCEL       = 0x0102, /* C->S { req_id } */
+    OC_MSG_SUMMARY_READY        = 0x0103, /* S->C, a notice */
+    OC_MSG_SUMMARY_OPEN         = 0x0104, /* C->S { req_id, notice_id } */
+    OC_MSG_SUMMARY_DISMISS      = 0x0105, /* C->S { notice_id } */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -791,6 +801,10 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_ACT_MENTION  0u   /* someone named me */
 #define OC_ACT_REACTION 1u   /* someone reacted to something I wrote */
 #define OC_ACT_REPLY    2u   /* someone replied in a thread I started */
+/* A summary I asked for, made while I was not watching (REQ-310): message_id
+ * is the notice (SUMMARY_OPEN), text its scope (OC_SUM_*) in digits, action
+ * its status. */
+#define OC_ACT_SUMMARY  4u
 #define OC_MAX_SAVED    200u
 #define OC_MAX_ACTIVITY 200u
 
@@ -1007,21 +1021,35 @@ typedef struct { uint64_t message_id; uint64_t channel_id;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t actor_id;
                  oc_slice actor_name; uint32_t text_start; uint32_t text_len; } oc_action;
 /* SUMMARIZE (REQ-310): which span of a channel or DM to summarize. scope
- * OC_SUM_UNREAD (from the reader's place to now), OC_SUM_WEEK (the last seven
- * days, today included), OC_SUM_RANGE ([start_ms, end_ms)), OC_SUM_DAILY (the
- * day before today, or every day since the reader was last about). Days are the
- * reader's, by their time zone. req_id is echoed on the answer. */
-enum { OC_SUM_UNREAD = 0, OC_SUM_WEEK = 1, OC_SUM_RANGE = 2, OC_SUM_DAILY = 3 };
+ * OC_SUM_UNREAD (from the reader's place to now), OC_SUM_TODAY (today so far),
+ * OC_SUM_DAILY (since yesterday: yesterday and today so far), OC_SUM_WEEK (the
+ * last seven days, today included), OC_SUM_RANGE ([start_ms, end_ms)). Days are
+ * the reader's, by their time zone. req_id is echoed on the answer. */
+enum { OC_SUM_UNREAD = 0, OC_SUM_WEEK = 1, OC_SUM_RANGE = 2, OC_SUM_DAILY = 3, OC_SUM_TODAY = 4 };
 typedef struct { uint32_t req_id; uint64_t channel_id; uint8_t scope; uint64_t start_ms; uint64_t end_ms; } oc_summarize;
 /* SUMMARY: status OC_SUM_OK with the span summarized and the summary as JSON
  * (SUMMARIES.md §3) in body; otherwise body is a sentence saying why. */
-enum { OC_SUM_OK = 0, OC_SUM_UNAVAILABLE = 1, OC_SUM_FORBIDDEN = 2, OC_SUM_FAILED = 3 };
+enum { OC_SUM_OK = 0, OC_SUM_UNAVAILABLE = 1, OC_SUM_FORBIDDEN = 2, OC_SUM_FAILED = 3, OC_SUM_CANCELLED = 4 };
 typedef struct { uint32_t req_id; uint8_t status; uint64_t summary_id; uint64_t channel_id;
                  uint64_t start_ms; uint64_t end_ms; oc_slice version; oc_slice body; } oc_summary;
 /* SUMMARY_QUEUED: a SUMMARIZE the daemon is making, and how many requests are
  * ahead of it (0: it is being made now). Sent when it is queued and whenever
  * the queue moves; its SUMMARY ends it. */
 typedef struct { uint32_t req_id; uint16_t position; } oc_summary_queued;
+/* SUMMARY_QUEUED's position while summaries are still coming up (the model
+ * being fetched or loaded): it waits for them, not behind other requests. */
+#define OC_SUM_POS_STARTING 0xFFFFu
+/* SUMMARY_DETACH and SUMMARY_CANCEL: the asker's SUMMARIZE by its req_id. A
+ * cancel is answered SUMMARY OC_SUM_CANCELLED. */
+typedef struct { uint32_t req_id; } oc_summary_req;
+/* SUMMARY_READY: a summary made while its asker was not watching -- made
+ * (status OC_SUM_OK) or not (another status) -- over the span asked for. */
+typedef struct { uint64_t notice_id; uint64_t channel_id; uint8_t scope; uint8_t status;
+                 uint64_t start_ms; uint64_t end_ms; uint64_t made_at_ms; } oc_summary_ready;
+/* SUMMARY_OPEN: the notice's summary, answered as SUMMARY with req_id;
+ * SUMMARY_DISMISS: seen, without opening. */
+typedef struct { uint32_t req_id; uint64_t notice_id; } oc_summary_open;
+typedef struct { uint64_t notice_id; } oc_summary_dismiss;
 
 /* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
  * follow the LIST_PINS shape — stream the entries, then a terminator — because
@@ -1639,6 +1667,10 @@ oc_result oc_encode_action(oc_wbuf *w, uint16_t version, const oc_action *m);
 oc_result oc_encode_summarize(oc_wbuf *w, uint16_t version, const oc_summarize *m);
 oc_result oc_encode_summary(oc_wbuf *w, uint16_t version, const oc_summary *m);
 oc_result oc_encode_summary_queued(oc_wbuf *w, uint16_t version, const oc_summary_queued *m);
+oc_result oc_encode_summary_req(oc_wbuf *w, uint16_t version, uint16_t type, const oc_summary_req *m);
+oc_result oc_encode_summary_ready(oc_wbuf *w, uint16_t version, const oc_summary_ready *m);
+oc_result oc_encode_summary_open(oc_wbuf *w, uint16_t version, const oc_summary_open *m);
+oc_result oc_encode_summary_dismiss(oc_wbuf *w, uint16_t version, const oc_summary_dismiss *m);
 oc_result oc_encode_attach_media_set(oc_wbuf *w, uint16_t version, const oc_attach_media_set *m);
 oc_result oc_encode_attach_media_ok(oc_wbuf *w, uint16_t version, const oc_attach_media_ok *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
@@ -1920,6 +1952,10 @@ oc_result oc_decode_action(oc_rbuf *p, oc_action *m);
 oc_result oc_decode_summarize(oc_rbuf *p, oc_summarize *m);
 oc_result oc_decode_summary(oc_rbuf *p, oc_summary *m);
 oc_result oc_decode_summary_queued(oc_rbuf *p, oc_summary_queued *m);
+oc_result oc_decode_summary_req(oc_rbuf *p, oc_summary_req *m);
+oc_result oc_decode_summary_ready(oc_rbuf *p, oc_summary_ready *m);
+oc_result oc_decode_summary_open(oc_rbuf *p, oc_summary_open *m);
+oc_result oc_decode_summary_dismiss(oc_rbuf *p, oc_summary_dismiss *m);
 oc_result oc_decode_attach_media_set(oc_rbuf *p, oc_attach_media_set *m);
 oc_result oc_decode_attach_media_ok(oc_rbuf *p, oc_attach_media_ok *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);

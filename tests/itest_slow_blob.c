@@ -298,13 +298,14 @@ int run_slow_blob_tests(void) {
     unlink("build/itest_slowblob.db-wal");
     unlink("build/itest_slowblob.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_slowblob.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     if (!dbw) { slow_s3_stop(&g_s3); return failures; }
     CHECK(oc_dbwriter_register_local(dbw, "sb-alice", "pw", OC_ROLE_OWNER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "sb-bob",   "pw", OC_ROLE_MEMBER, 2048) != 0);
 
     struct sb_loop_arg arg;
-    arg.port = 18600 + (int)(getpid() % 900);
+    arg.port = 18100 + (int)(getpid() % 800);    /* between netloop's ports and client_core's */
     arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
     pthread_t th;
     CHECK(pthread_create(&th, NULL, sb_loop_thread, &arg) == 0);

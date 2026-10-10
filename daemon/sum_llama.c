@@ -50,7 +50,6 @@ typedef struct {
     const char           *tmpl;
     int                   n_ctx;
     int                   used;        /* tokens in the context now */
-    int                   can_follow;  /* the last answer ended: a follow-up may go on from it */
 } llama_handle;
 
 static void quiet_log(enum ggml_log_level level, const char *text, void *ud) {
@@ -61,6 +60,12 @@ static void quiet_log(enum ggml_log_level level, const char *text, void *ud) {
 static uint32_t thread_cpu_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+static uint32_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
@@ -88,6 +93,12 @@ static void *l_open(void *vctx, char *err, size_t errcap) {
     cp.n_threads = 1;
     cp.n_threads_batch = 1;
     cp.no_perf = 1;
+    /* The context cache at 8 bits: about half the memory of 16, which is what
+     * keeps a model and its context inside the budget (SUMMARIES.md §6). A
+     * quantized V cache needs flash attention. */
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
     h->ctx = llama_init_from_model(h->model, cp);
     if (!h->ctx) {
         snprintf(err, errcap, "cannot make a context of %d tokens", e->n_ctx);
@@ -140,7 +151,6 @@ static int tokenize(llama_handle *h, const char *text, int start, llama_token **
  * the model ends it or the context is full. */
 static int generate(llama_handle *h, const char *grammar, int max_out, oc_sum_gate_fn gate, void *gate_ctx,
                     char **out, oc_sum_run_stats *st, char *err, size_t errcap) {
-    h->can_follow = 0;
     /* The answer may use whatever the context has left. */
     if (max_out <= 0 || max_out > h->n_ctx - h->used) max_out = h->n_ctx - h->used;
     if (max_out <= 0) {
@@ -172,7 +182,7 @@ static int generate(llama_handle *h, const char *grammar, int max_out, oc_sum_ga
     o[0] = '\0';
     for (;;) {
         if (produced >= max_out) {
-            snprintf(err, errcap, "the answer filled the model's context (%d tokens) without ending", h->n_ctx);
+            snprintf(err, errcap, "the answer reached its %d tokens without ending", max_out);
             *out = o;           /* as far as it got, for the log */
             o = NULL;
             goto done;
@@ -202,12 +212,11 @@ static int generate(llama_handle *h, const char *grammar, int max_out, oc_sum_ga
         }
         h->used++;
     }
-    if (st) st->output_tokens += (uint32_t)produced;
     *out = o;
     o = NULL;
-    h->can_follow = 1;
     rc = 0;
 done:
+    if (st) st->output_tokens += (uint32_t)produced;
     free(o);
     llama_sampler_free(smpl);
     return rc;
@@ -220,14 +229,13 @@ static const char *no_think(const llama_handle *h) {
     return h->tmpl && strstr(h->tmpl, "<think>") ? "<think>\n\n</think>\n\n" : "";
 }
 
-static int l_run(void *vh, const char *system, const char *user, int max_out,
+static int l_run(void *vh, const char *system, const char *user, const char *grammar, int max_out,
                  oc_sum_gate_fn gate, void *gate_ctx, char **out, oc_sum_run_stats *st, char *err,
                  size_t errcap) {
     llama_handle *h = vh;
-    uint32_t cpu0 = thread_cpu_ms();
+    uint32_t cpu0 = thread_cpu_ms(), t0 = mono_ms();
     *out = NULL;
     if (st) memset(st, 0, sizeof *st);
-    h->can_follow = 0;
 
     /* The model's own chat format. */
     llama_chat_message msgs[2] = { { "system", system }, { "user", user } };
@@ -261,67 +269,20 @@ static int l_run(void *vh, const char *system, const char *user, int max_out,
     llama_memory_clear(llama_get_memory(h->ctx), true);
     h->used = 0;
     int rc = -1;
+    uint32_t t1 = mono_ms(), t2 = t1;
     if (feed(h, tok, nt, gate, gate_ctx, err, errcap) != 0) goto done;
+    t2 = mono_ms();
     if (st) st->prompt_tokens = (uint32_t)h->used;
-    rc = generate(h, NULL, max_out, gate, gate_ctx, out, st, err, errcap);
+    rc = generate(h, grammar, max_out, gate, gate_ctx, out, st, err, errcap);
 done:
     free(tok);
-    if (st) st->cpu_ms = thread_cpu_ms() - cpu0;
-    return rc;
-}
-
-/* What the chat format writes between the end of an answer and the start of the
- * next one, around `user`: rendered with a marker for the answer, and taken
- * from just after it. Heap, or NULL. */
-static char *turn_after_answer(const llama_handle *h, const char *user) {
-    static const char MARK[] = "\x01\x02\x03";
-    llama_chat_message msgs[4] = { { "system", "s" }, { "user", "u" }, { "assistant", MARK }, { "user", user } };
-    size_t cap = strlen(user) + 1024;
-    char *buf = malloc(cap);
-    if (!buf) return NULL;
-    int n = llama_chat_apply_template(h->tmpl, msgs, 4, true, buf, (int32_t)cap);
-    if (n >= 0 && (size_t)n >= cap) {
-        cap = (size_t)n + 1;
-        char *nb = realloc(buf, cap);
-        if (!nb) { free(buf); return NULL; }
-        buf = nb;
-        n = llama_chat_apply_template(h->tmpl, msgs, 4, true, buf, (int32_t)cap);
+    if (st) {
+        uint32_t t3 = mono_ms();
+        st->cpu_ms = thread_cpu_ms() - cpu0;
+        st->read_ms = t2 - t1;
+        st->write_ms = t3 - t2;
+        st->wall_ms = t3 - t0;
     }
-    char *m = n < 0 ? NULL : strstr(buf, MARK);
-    if (!m) { free(buf); return NULL; }
-    const char *nt = no_think(h);
-    char *rest = m + sizeof MARK - 1;
-    char *t = malloc(strlen(rest) + strlen(nt) + 1);
-    if (t) { strcpy(t, rest); strcat(t, nt); }
-    free(buf);
-    return t;
-}
-
-static int l_more(void *vh, const char *user, const char *grammar, oc_sum_gate_fn gate, void *gate_ctx,
-                  char **out, oc_sum_run_stats *st, char *err, size_t errcap) {
-    llama_handle *h = vh;
-    uint32_t cpu0 = thread_cpu_ms();
-    *out = NULL;
-    if (st) memset(st, 0, sizeof *st);
-    if (!h->can_follow || !h->tmpl) { snprintf(err, errcap, "no answer to follow"); return -1; }
-    h->can_follow = 0;
-    char *turn = turn_after_answer(h, user);
-    if (!turn) { snprintf(err, errcap, "the chat format has no follow-up turn"); return -1; }
-    llama_token *tok = NULL;
-    int nt = tokenize(h, turn, 0, &tok);
-    free(turn);
-    if (nt < 0) { snprintf(err, errcap, "the follow-up does not tokenize"); return -1; }
-    int rc = -1;
-    if (h->used + nt >= h->n_ctx) {
-        snprintf(err, errcap, "the follow-up does not fit the model's context (%d tokens)", h->n_ctx);
-        goto done;
-    }
-    if (feed(h, tok, nt, gate, gate_ctx, err, errcap) != 0) goto done;
-    if (st) st->prompt_tokens = (uint32_t)nt;
-    rc = generate(h, grammar, 0, gate, gate_ctx, out, st, err, errcap);
-done:
-    free(tok);
-    if (st) st->cpu_ms = thread_cpu_ms() - cpu0;
     return rc;
 }
 
@@ -334,6 +295,5 @@ const oc_sum_engine *oc_sum_llama_engine(const char *path, const char *version, 
     e.eng.open = l_open;
     e.eng.close = l_close;
     e.eng.run = l_run;
-    e.eng.more = l_more;
     return &e.eng;
 }

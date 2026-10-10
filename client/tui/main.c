@@ -686,7 +686,8 @@ static void draw_help(int W, int H) {
         { NULL, NULL },
         { NULL, "Everything else" },
         { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
-        { "Summaries",  "Ctrl+K · Summarize, or Enter on a channel: ↑/↓ item · Enter goes to it" },
+        { "Summaries",  "Summarize ▾ in the title, Ctrl+K, or Enter on a channel" },
+        { "",           "↑/↓ select · Space details · Enter goes to the message" },
     };
     int n = (int)(sizeof R / sizeof R[0]);
     const tk_theme *th = tk_theme_active();
@@ -785,7 +786,9 @@ enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLO
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
        ACT_STORAGE, ACT_AUDIT, ACT_ALERTS, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT, ACT_SECURITY,
        /* summaries (REQ-310): ask, pick the span, or go back to the open one */
-       ACT_SUMMARIZE, ACT_SUM_UNREAD, ACT_SUM_WEEK, ACT_SUM_DAILY, ACT_SUM_RANGE, ACT_SUM_BACK };
+       ACT_SUMMARIZE, ACT_SUM_UNREAD, ACT_SUM_TODAY, ACT_SUM_WEEK, ACT_SUM_DAILY, ACT_SUM_RANGE, ACT_SUM_BACK,
+       /* summaries made while you were away: the list, then one of them */
+       ACT_SUM_NOTICES, ACT_SUM_NOTICE0 };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
 static int      g_nmenu;
@@ -854,7 +857,8 @@ static const tk_pal_item g_launcher_items[] = {
 };
 /* The launcher as it is now: summaries only where the daemon makes them
  * (REQ-313), and a way back to the open one for this conversation. */
-static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 1];
+static tk_pal_item g_launcher_now[sizeof g_launcher_items / sizeof *g_launcher_items + 2];
+static char g_sum_ready_label[48];
 static int launcher_build(const oc_model *m, uint64_t cid) {
     int n = 0;
     for (size_t i = 0; i < sizeof g_launcher_items / sizeof *g_launcher_items; i++) {
@@ -863,15 +867,37 @@ static int launcher_build(const oc_model *m, uint64_t cid) {
     }
     if (m->summary_open && cid && m->summary_channel == cid)
         g_launcher_now[n++] = (tk_pal_item){ "Channel", "Back to the summary", NULL, NULL, ACT_SUM_BACK };
+    if (m->n_sum_notices) {
+        snprintf(g_sum_ready_label, sizeof g_sum_ready_label, "Summaries ready (%zu)", m->n_sum_notices);
+        g_launcher_now[n++] = (tk_pal_item){ "You", g_sum_ready_label, NULL, NULL, ACT_SUM_NOTICES };
+    }
     return n;
+}
+/* The summaries made while you were away, newest first, as many as the menu
+ * holds: Enter opens one, d dismisses it. Each item's id is ACT_SUM_NOTICE0
+ * plus its place in the model's list. */
+static void conv_where(const oc_model *m, uint64_t cid, char *out, size_t cap);
+static char g_notice_labels[sizeof g_menu / sizeof *g_menu][160];
+static void menu_build_sum_notices(const oc_model *m) {
+    g_nmenu = 0;
+    for (size_t k = m->n_sum_notices; k > 0 && g_nmenu < (int)(sizeof g_menu / sizeof *g_menu); k--) {
+        const oc_summary_notice *sn = &m->sum_notices[k - 1];
+        char where[96];
+        conv_where(m, sn->channel_id, where, sizeof where);
+        oc_summary_notice_title(sn->status, sn->scope, sn->start_ms, sn->end_ms, where, g_notice_labels[g_nmenu],
+                                sizeof g_notice_labels[g_nmenu]);
+        g_menu[g_nmenu] = (menuitem){ g_notice_labels[g_nmenu], ACT_SUM_NOTICE0 + (int)(k - 1) };
+        g_nmenu++;
+    }
 }
 /* The spans a summary can cover (PROTOCOL.md SUMMARIZE). */
 static void menu_build_summary_span(void) {
     g_nmenu = 0;
-    g_menu[g_nmenu++] = (menuitem){ "Unread",           ACT_SUM_UNREAD };
-    g_menu[g_nmenu++] = (menuitem){ "Last 7 days",      ACT_SUM_WEEK };
-    g_menu[g_nmenu++] = (menuitem){ "Since yesterday",  ACT_SUM_DAILY };
-    g_menu[g_nmenu++] = (menuitem){ "Dates",            ACT_SUM_RANGE };
+    g_menu[g_nmenu++] = (menuitem){ "Unread",            ACT_SUM_UNREAD };
+    g_menu[g_nmenu++] = (menuitem){ "Today",             ACT_SUM_TODAY };
+    g_menu[g_nmenu++] = (menuitem){ "Since yesterday",   ACT_SUM_DAILY };
+    g_menu[g_nmenu++] = (menuitem){ "Last 7 days",       ACT_SUM_WEEK };
+    g_menu[g_nmenu++] = (menuitem){ "Custom date range", ACT_SUM_RANGE };
 }
 
 /* ---- sidebar (shared with the GUI via the core) ----------------------------
@@ -963,6 +989,9 @@ static void sidebar_select(const sb_row *rows, int i, size_t *focus) {
     else { g_sb_hdr = -1; *focus = rows[i].idx; }
 }
 
+/* Where the title's Summarize was drawn (x1 0: not drawn). */
+static int g_sumbtn_x0, g_sumbtn_x1, g_sumbtn_y;
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll, int help_open, int ac_idx,
                    int panel, int msg_sel, int mem_sel, uint64_t editing) {
@@ -1000,14 +1029,23 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* The daemon's critical failures, to an owner or admin only (REQ-263): a
      * warning sign and how many nobody has acknowledged -- red -- or, all
      * acknowledged, how many still hold -- yellow. Left of the unread count. */
+    int right = W - (u[0] ? (int)strlen(u) + 1 : 0);
     if (m->srvalerts_have && (m->srvalerts_unacked || m->srvalerts_current)) {
         char a[48];
         if (m->srvalerts_unacked) snprintf(a, sizeof a, "\xe2\x9a\xa0 %u alert%s ", m->srvalerts_unacked,
                                            m->srvalerts_unacked == 1 ? "" : "s");
         else snprintf(a, sizeof a, "\xe2\x9a\xa0 %u ongoing ", m->srvalerts_current);
         int aw = tk_str_width(a);
-        int at = W - (u[0] ? (int)strlen(u) + 1 : 0) - aw - 1;
+        int at = right - aw - 1;
         if (at > 0) tk_text(at, 0, W, a, (m->srvalerts_unacked ? TB_RED : TB_YELLOW) | TB_BOLD, th->header_bg);
+        right = at;
+    }
+    /* Summaries made while you were away (REQ-310), left of those. */
+    if (m->n_sum_notices) {
+        char sb[48];
+        snprintf(sb, sizeof sb, "\xe2\x9c\xa6 %zu ready ", m->n_sum_notices);
+        int at = right - tk_str_width(sb) - 1;
+        if (at > 0) tk_text(at, 0, W, sb, th->accent | TB_BOLD, th->header_bg);
     }
 
     /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
@@ -1082,6 +1120,19 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
     else                         snprintf(mt, sizeof mt, "no channel");
     tk_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
+    /* Summarize, at the right of the conversation's title (REQ-310): a click
+     * offers the spans, as the launcher's "Summarize" does. */
+    g_sumbtn_x0 = g_sumbtn_x1 = 0;
+    if (fc && oc_model_summarize_available(m) &&
+        !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open)) {
+        static const char LABEL[] = " Summarize \xe2\x96\xbe ";
+        int lw = tk_str_width(LABEL), lx = msg_x + msg_w - 2 - lw;
+        if (lx > msg_x + tk_str_width(mt) + 6) {
+            const tk_theme *bth = tk_theme_active();
+            tk_text(lx, panels_top, lx + lw, LABEL, bth->accent, bth->bg);
+            g_sumbtn_x0 = lx; g_sumbtn_x1 = lx + lw; g_sumbtn_y = panels_top;
+        }
+    }
     {
         int ix = msg_x + 1, iy = panels_top + 1, iw = msg_w - 2, ih = panels_h - 2;
         int normal = !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open);
@@ -1166,6 +1217,15 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         snprintf(st, sizeof st, " %s%s%s", m->status[0] ? m->status : "", retry,
                  scroll > 0 ? "   [scrolled]" : "");
         int sx = tk_text(0, H - 3, W, st, th->muted, TB_DEFAULT);
+        if (m->n_sum_notices) {
+            /* The newest summary made while you were away, until it is opened. */
+            const oc_summary_notice *sn = &m->sum_notices[m->n_sum_notices - 1];
+            char where[96], t[200], line[260];
+            conv_where(m, sn->channel_id, where, sizeof where);
+            oc_summary_notice_title(sn->status, sn->scope, sn->start_ms, sn->end_ms, where, t, sizeof t);
+            snprintf(line, sizeof line, "   \xe2\x9c\xa6 %s \xc2\xb7 Ctrl+K to open", t);
+            sx = tk_text(sx, H - 3, W, line, th->accent, TB_DEFAULT);
+        }
         if (fc) {
             uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
             if (nt) {
@@ -1358,68 +1418,414 @@ static void draw_alerts(const oc_model *m, int W, int H, int sel) {
     }
 }
 
-/* The open summary (REQ-310): the overview, then decisions, actions, problems
- * and facts, each item with how many messages it came from. Up/down selects
- * an item; Enter goes to its first message; Esc closes and forgets it. While
- * the daemon makes it, says so: on a small server that can take minutes. */
-static void draw_summary(const oc_model *m, int W, int H, int sel) {
-    const tk_theme *th = tk_theme_active();
-    char span[48], title[320], name[96];
-    oc_summary_span_label(m->summary_scope, m->summary_start, m->summary_end, span, sizeof span);
-    const oc_channel *ch = oc_model_channel((oc_model *)m, m->summary_channel);
+/* Which topics of the open summary have their details closed. Kept for the
+ * request it was shown for; a new summary starts with every topic open. */
+static unsigned char *g_sum_closed;
+static size_t        g_sum_closed_n;
+static uint32_t      g_sum_closed_req;
+
+static int sum_closed(const oc_model *m, size_t t) {
+    if (g_sum_closed_req != m->summary_req || g_sum_closed_n != m->summary.n_topics) {
+        free(g_sum_closed);
+        g_sum_closed = calloc(m->summary.n_topics ? m->summary.n_topics : 1, 1);
+        g_sum_closed_n = g_sum_closed ? m->summary.n_topics : 0;
+        g_sum_closed_req = m->summary_req;
+    }
+    return t < g_sum_closed_n && g_sum_closed[t];
+}
+
+/* What can be selected in the summary, in order: each topic's heading, the
+ * details of an open topic, then each item that needs attention. Entry `e` as
+ * its topic and detail (-1 for the heading), or topic -1 and the item: 1, or 0
+ * past the end. */
+static int sum_entry(const oc_model *m, int e, int *topic, int *detail) {
+    if (!m->summary_open || m->summary_loading || m->summary_status != OC_SUM_OK || e < 0) return 0;
+    for (size_t t = 0; t < m->summary.n_topics; t++) {
+        if (e-- == 0) { *topic = (int)t; *detail = -1; return 1; }
+        if (sum_closed(m, t)) continue;
+        size_t nd = m->summary.topics[t].n_details;
+        if ((size_t)e < nd) { *topic = (int)t; *detail = e; return 1; }
+        e -= (int)nd;
+    }
+    if ((size_t)e < m->summary.n_attention) { *topic = -1; *detail = e; return 1; }
+    return 0;
+}
+
+/* The messages entry (`t`, `d`) cites, and how many. */
+static const uint64_t *sum_entry_refs(const oc_model *m, int t, int d, size_t *n) {
+    *n = 0;
+    if (t < 0) { if (d >= 0 && (size_t)d < m->summary.n_attention) { *n = m->summary.attention[d].n_refs; return m->summary.attention[d].refs; } return NULL; }
+    if (d < 0) { *n = m->summary.topics[t].n_refs; return m->summary.topics[t].refs; }
+    *n = m->summary.topics[t].details[d].n_refs;
+    return m->summary.topics[t].details[d].refs;
+}
+
+/* A topic's people and size: "Ann, Bob, Cara +2 · 14 messages". */
+static void topic_meta(const oc_summary_topic *tp, char *out, size_t cap) {
+    size_t w = 0;
+    out[0] = '\0';
+    for (size_t k = 0; k < tp->n_people && k < 3 && w < cap; k++)
+        w += (size_t)snprintf(out + w, cap - w, "%s%s", k ? ", " : "", tp->people[k]);
+    if (tp->n_people > 3 && w < cap) w += (size_t)snprintf(out + w, cap - w, " +%zu", tp->n_people - 3);
+    if (tp->count && w < cap)
+        snprintf(out + w, cap - w, "%s%llu message%s", w ? " \xc2\xb7 " : "", (unsigned long long)tp->count,
+                 tp->count == 1 ? "" : "s");
+}
+
+/* The conversation a summary is of: "#name" or "@name". */
+static void conv_where(const oc_model *m, uint64_t cid, char *out, size_t cap) {
+    const oc_channel *ch = oc_model_channel((oc_model *)m, cid);
     if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
         const char *pn = oc_model_user_name(m, ch->peer_id);
-        snprintf(name, sizeof name, "@%s", pn[0] ? pn : "dm");
-    } else snprintf(name, sizeof name, "#%s", ch && ch->name ? ch->name : "…");
-    snprintf(title, sizeof title, "Summary of %s · %s  ·  ↑↓ select · Enter go to message · Esc closes", name, span);
+        snprintf(out, cap, "@%s", pn[0] ? pn : "dm");
+    } else snprintf(out, cap, "#%s", ch && ch->name ? ch->name : "…");
+}
+
+static void sum_where(const oc_model *m, char *out, size_t cap) { conv_where(m, m->summary_channel, out, cap); }
+
+/* `s` centred in `width` columns, on the heap. */
+static char *centred(const char *s, int width) {
+    int w = tk_str_width(s), pad = w < width ? (width - w) / 2 : 0;
+    char *o = malloc((size_t)pad + strlen(s) + 1);
+    if (!o) return NULL;
+    memset(o, ' ', (size_t)pad);
+    strcpy(o + pad, s);
+    return o;
+}
+
+/* The open summary (REQ-310), as Slack lays one out: what it covers (the dates,
+ * how many messages, who posted), then each topic -- its title, what happened,
+ * and its details, each citing its messages as [n]. Up/down selects a topic or
+ * a detail; the selected detail shows the message it cites under it; Space (or
+ * Enter on a topic) opens and closes a topic's details; Enter on a detail goes
+ * to its message; Esc closes and forgets it. While the daemon makes it, says
+ * what it is summarizing and where the request stands; one not made says why,
+ * and r asks again. */
+static void draw_summary(const oc_model *m, int W, int H, int sel) {
+    const tk_theme *th = tk_theme_active();
+    char where[96], title[200];
+    sum_where(m, where, sizeof where);
+    if (m->summary_loading)
+        snprintf(title, sizeof title, "Summarizing %s  ·  n notify me when ready · c cancel · Esc closes", where);
+    else
+        snprintf(title, sizeof title, "Summary of %s  ·  ↑↓ select · Space details · Enter go to message · Esc closes", where);
     int cw = W - 10 > 96 ? 96 : W - 10;
     if (cw < 20) cw = 20;
     rows_t r = {0};
     if (m->summary_loading) {
-        char wait[96];
-        oc_summary_wait_text(m->summary_position, wait, sizeof wait);
-        wrap_words_push(&r, wait, th->muted, cw, 0);
+        char t1[200], t2[96];
+        oc_summary_wait_title(m->summary_scope, m->summary_start, m->summary_end, where, t1, sizeof t1);
+        oc_summary_wait_text(m->summary_position, t2, sizeof t2);
+        rows_push(&r, strdup(""), th->fg);
+        rows_push(&r, centred(t1, cw), th->fg | TB_BOLD);
+        rows_push(&r, centred(t2, cw), th->muted);
+        rows_push(&r, strdup(""), th->fg);
     } else if (m->summary_status != OC_SUM_OK) {
-        wrap_words_push(&r, m->summary_error ? m->summary_error : "No summary.", TB_RED | TB_BOLD, cw, 0);
-    } else if (!m->summary.overview[0] && !m->summary.n_items) {
-        wrap_words_push(&r, "Nothing to summarize in this span.", th->muted, cw, 0);
+        /* What went wrong, the daemon's reason, and, unless it was refused,
+         * how to ask again. */
+        wrap_words_push(&r, oc_summary_fail_title(m->summary_status), TB_RED | TB_BOLD, cw, 0);
+        if (m->summary_error && *m->summary_error) wrap_words_push(&r, m->summary_error, th->muted, cw, 0);
+        if (m->summary_status != OC_SUM_FORBIDDEN) {
+            rows_push(&r, strdup(""), th->fg);
+            rows_push(&r, strdup("Press r to try again."), th->fg);
+        }
+    } else if (!m->summary.n_topics && !m->summary.overview[0]) {
+        wrap_words_push(&r, m->summary.count ? "Nothing to summarize in this span: its threads go on past it."
+                                             : "No messages in this span.", th->muted, cw, 0);
     } else {
-        if (m->summary.overview[0]) wrap_words_push(&r, m->summary.overview, th->fg, cw, 0);
-        for (uint8_t k = 0; k < 4; k++) {
-            int any = 0;
-            for (size_t i = 0; i < m->summary.n_items; i++) {
-                const oc_summary_item *it = &m->summary.items[i];
-                if (it->kind != k) continue;
-                if (!any) {
-                    rows_push(&r, strdup(""), th->fg);
-                    rows_push(&r, strdup(oc_summary_kind_heading(k)), th->accent2 | TB_BOLD);
-                    any = 1;
-                }
-                size_t cap = strlen(it->text) + (it->who ? strlen(it->who) : 0) + 64;
-                char *line = malloc(cap);
-                if (!line) continue;
-                snprintf(line, cap, "%s %s%s%s%s%s%s · %zu message%s", (int)i == sel ? "\xe2\x96\xb8" : "\xe2\x80\xa2",
-                         it->who ? it->who : "", it->who ? ": " : "", it->text,
-                         it->status[0] ? " (" : "", it->status, it->status[0] ? ")" : "",
-                         it->n_refs, it->n_refs == 1 ? "" : "s");
-                size_t first = r.n;
-                wrap_words_push(&r, line, (int)i == sel ? (th->accent | TB_BOLD) : th->fg, cw, 2);
-                free(line);
-                for (size_t j = first; j < r.n; j++) r.v[j].mi = (int)i;
+        const oc_summary_view *v = &m->summary;
+        char dates[48], who[512], line[700];
+        oc_summary_dates(m->summary_start, m->summary_end, dates, sizeof dates);
+        oc_summary_posters_text(v, who, sizeof who);
+        snprintf(line, sizeof line, "%s · %llu message%s%s%s", dates, (unsigned long long)v->count,
+                 v->count == 1 ? "" : "s", who[0] ? " · " : "", who);
+        wrap_words_push(&r, line, th->muted, cw, 2);
+        int e = 0;
+        unsigned num = 0;
+        if (v->overview[0]) {
+            /* Numbered with everything else, as the GUI numbers it. */
+            size_t cap = strlen(v->overview) + 16 + v->n_refs * 8;
+            char *ol = malloc(cap);
+            if (ol) {
+                size_t w = (size_t)snprintf(ol, cap, "%s", v->overview);
+                for (size_t k = 0; k < v->n_refs && w < cap; k++) w += (size_t)snprintf(ol + w, cap - w, " [%u]", ++num);
+                rows_push(&r, strdup(""), th->fg);
+                wrap_words_push(&r, ol, th->fg | TB_BOLD, cw, 0);
+                free(ol);
             }
         }
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+        for (size_t t = 0; t < v->n_topics; t++) {
+            const oc_summary_topic *tp = &v->topics[t];
+            int closed = sum_closed(m, t);
+            rows_push(&r, strdup(""), th->fg);
+            snprintf(line, sizeof line, "%s %s", closed ? "\xe2\x96\xb8" : "\xe2\x96\xbe", tp->title[0] ? tp->title : where);
+            size_t first = r.n;
+            wrap_words_push(&r, line, e == sel ? (th->accent | TB_BOLD) : (th->fg | TB_BOLD), cw, 2);
+            for (size_t j = first; j < r.n; j++) r.v[j].mi = e;
+            e++;
+            char meta[160];
+            topic_meta(tp, meta, sizeof meta);
+            if (meta[0]) { snprintf(line, sizeof line, "  %s", meta); wrap_words_push(&r, line, th->faint, cw, 2); }
+            if (tp->text[0]) {
+                snprintf(line, sizeof line, "  %s", tp->text);
+                wrap_words_push(&r, line, th->fg, cw, 2);
+            }
+            if (closed) {
+                for (size_t d = 0; d < tp->n_details; d++) num += (unsigned)tp->details[d].n_refs;
+                continue;
+            }
+            if (tp->n_details) rows_push(&r, strdup("  More details"), th->muted);
+            for (size_t d = 0; d < tp->n_details; d++) {
+                const oc_summary_detail *dt = &tp->details[d];
+                size_t cap = strlen(dt->text) + 16 + dt->n_refs * 8;
+                char *dl = malloc(cap);
+                if (!dl) continue;
+                size_t w = (size_t)snprintf(dl, cap, "  \xe2\x80\xa2 %s", dt->text);
+                for (size_t k = 0; k < dt->n_refs && w < cap; k++)
+                    w += (size_t)snprintf(dl + w, cap - w, " [%u]", ++num);
+                first = r.n;
+                wrap_words_push(&r, dl, e == sel ? (th->accent | TB_BOLD) : th->fg, cw, 4);
+                free(dl);
+                for (size_t j = first; j < r.n; j++) r.v[j].mi = e;
+                /* The selected detail: every message it cites, in order, each
+                 * as a citation's preview shows it, under its [n]. */
+                for (size_t k = 0; e == sel && k < dt->n_refs; k++) {
+                    const oc_summary_source *src = oc_summary_source_of(v, dt->refs[k]);
+                    if (!src) continue;
+                    size_t pfirst = r.n;
+                    char when[48];
+                    oc_summary_when(src->at, now_ms, g_cfg && g_cfg->time_24h, when, sizeof when);
+                    snprintf(line, sizeof line, "      [%u] %s · %s%s · %s", num - (unsigned)dt->n_refs + 1 + (unsigned)k,
+                             src->author, src->parent ? "Thread in " : "", where, when);
+                    wrap_words_push(&r, line, th->muted, cw, 6);
+                    rows_t body = {0};
+                    wrap_words_push(&body, src->text, th->muted, cw - 6, 0);
+                    for (size_t j = 0; j < body.n && j < 4; j++) {
+                        int more = j == 3 && body.n > 4;
+                        snprintf(line, sizeof line, "      %s%s", body.v[j].s, more ? "\xe2\x80\xa6" : "");
+                        rows_push(&r, strdup(line), th->muted);
+                    }
+                    rows_free(&body);
+                    for (size_t j = pfirst; j < r.n; j++) r.v[j].mi = e;
+                }
+                e++;
+            }
+        }
+        if (v->n_attention) {
+            rows_push(&r, strdup(""), th->fg);
+            rows_push(&r, strdup("Needs attention"), th->fg | TB_BOLD);
+            for (size_t a = 0; a < v->n_attention; a++) {
+                const oc_summary_attention *at = &v->attention[a];
+                size_t cap = strlen(at->text) + 40 + at->n_refs * 8;
+                char *al = malloc(cap);
+                if (!al) continue;
+                size_t w = (size_t)snprintf(al, cap, "  \xe2\x80\xa2 %s: %s", at->question ? "Question" : "Action", at->text);
+                for (size_t k = 0; k < at->n_refs && w < cap; k++) w += (size_t)snprintf(al + w, cap - w, " [%u]", ++num);
+                size_t first = r.n;
+                wrap_words_push(&r, al, e == sel ? (th->accent | TB_BOLD) : th->fg, cw, 4);
+                free(al);
+                for (size_t j = first; j < r.n; j++) r.v[j].mi = e;
+                e++;
+            }
+        }
+        if (v->n_more) {
+            size_t w = 0;
+            char more[700];
+            w = (size_t)snprintf(more, sizeof more, "More topics: ");
+            for (size_t k = 0; k < v->n_more && w < sizeof more; k++)
+                w += (size_t)snprintf(more + w, sizeof more - w, "%s%s", k ? ", " : "", v->more[k]);
+            rows_push(&r, strdup(""), th->fg);
+            wrap_words_push(&r, more, th->muted, cw, 2);
+        }
+        rows_push(&r, strdup(""), th->fg);
+        rows_push(&r, strdup("AI-generated summarization may be inaccurate."), th->faint);
     }
     int rows = (int)r.n;
     if (rows > H - 8) rows = H - 8;
     if (rows < 1) rows = 1;
     tk_rect box = modal_frame(W, H, cw, rows, title);
-    /* Keep the selected item in view. */
+    /* Keep the selected entry, and what shows under it, in view. */
     int start = 0, last = -1;
     for (int i = 0; i < (int)r.n; i++) if (r.v[i].mi == sel && sel >= 0) last = i;
     if (last >= box.h) start = last - box.h + 1;
-    for (int i = 0; i < box.h && start + i < (int)r.n; i++)
-        tk_text(box.x, box.y + i, box.x + box.w, r.v[start + i].s, r.v[start + i].fg, th->bg);
+    for (int i = 0; i < box.h && start + i < (int)r.n; i++) {
+        const row_t *rw = &r.v[start + i];
+        tk_text(box.x, box.y + i, box.x + box.w, rw->s, rw->fg, th->bg);
+        /* People named in it, in the mention colour. */
+        if (m->summary_loading || m->summary_status != OC_SUM_OK) continue;
+        oc_summary_mention mn[16];
+        size_t nm = oc_summary_mentions(&m->summary, rw->s, mn, 16);
+        for (size_t k = 0; k < nm; k++) {
+            char pre[700], name[256];
+            snprintf(pre, sizeof pre, "%.*s", (int)mn[k].start, rw->s);
+            snprintf(name, sizeof name, "%.*s", (int)mn[k].len, rw->s + mn[k].start);
+            int x = box.x + tk_str_width(pre);
+            if (x < box.x + box.w) tk_text(x, box.y + i, box.x + box.w, name, th->accent2 | (rw->fg & TB_BOLD), th->bg);
+        }
+    }
     rows_free(&r);
+}
+
+/* ---- the custom range picker (REQ-310) ---------------------------------------
+ * "Summarize custom date range": the first and last day typed into two fields
+ * or picked on two months side by side. Arrows move the day, Enter picks it
+ * (first day, then last), PgUp/PgDn change month, Tab goes round the fields and
+ * buttons; Summarize does nothing until both days are picked. */
+enum { CAL_GRID, CAL_START, CAL_END, CAL_GO, CAL_CANCEL, CAL_N };
+static int        g_cal_open, g_cal_focus;
+static oc_sumcal  g_cal;
+static uint64_t   g_cal_cur, g_cal_cid;
+static tk_input   g_cal_in[2];
+static const char *g_cal_err;
+
+/* `day` moved `n` days, by the calendar. */
+static uint64_t day_add(uint64_t day, int n) {
+    time_t t = (time_t)(day / 1000);
+    struct tm tm;
+    if (!oc_localtime_r(&t, &tm)) return day;
+    tm.tm_mday += n;
+    tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    time_t r = mktime(&tm);
+    return r == (time_t)-1 ? day : (uint64_t)r * 1000u;
+}
+
+static void cal_fields(void) {
+    char a[16], b[16];
+    oc_summary_day_text(g_cal.start, a, sizeof a);
+    oc_summary_day_text(g_cal.end, b, sizeof b);
+    tk_input_set(&g_cal_in[0], a);
+    tk_input_set(&g_cal_in[1], b);
+}
+
+static void cal_open(uint64_t cid) {
+    oc_sumcal_init(&g_cal, (uint64_t)time(NULL) * 1000u);
+    g_cal_cur = g_cal.today;
+    oc_sumcal_shift(&g_cal, -1);              /* this month on the right, as Slack's */
+    tk_input_init(&g_cal_in[0], 0, "Start YYYY-MM-DD");
+    tk_input_init(&g_cal_in[1], 0, "End YYYY-MM-DD");
+    g_cal_focus = CAL_GRID;
+    g_cal_err = NULL;
+    g_cal_cid = cid;
+    g_cal_open = 1;
+}
+
+/* Keep the day the cursor is on in one of the two months shown. */
+static void cal_follow(void) {
+    int y, m;
+    uint64_t cells[42];
+    for (int guard = 0; guard < 240; guard++) {
+        oc_sumcal_month(&g_cal, 0, &y, &m, cells);
+        uint64_t first = 0, last = 0;
+        for (int i = 0; i < 42; i++) if (cells[i]) { if (!first) first = cells[i]; }
+        oc_sumcal_month(&g_cal, 1, &y, &m, cells);
+        for (int i = 0; i < 42; i++) if (cells[i]) last = cells[i];
+        if (g_cal_cur < first) oc_sumcal_shift(&g_cal, -1);
+        else if (g_cal_cur > last) oc_sumcal_shift(&g_cal, 1);
+        else break;
+    }
+}
+
+/* A field typed in: the day it names, when it is one that can be picked. */
+static int cal_take(int which) {
+    uint64_t d;
+    if (oc_summary_date_parse(tk_input_value(&g_cal_in[which]), &d) != 0) { g_cal_err = "A date is YYYY-MM-DD."; return -1; }
+    if (d > g_cal.today) { g_cal_err = "That day has not happened yet."; return -1; }
+    if (which == 0) { g_cal.start = d; if (g_cal.end && g_cal.end < d) g_cal.end = 0; }
+    else if (!g_cal.start || d < g_cal.start) { g_cal_err = "The end date is before the start date."; return -1; }
+    else g_cal.end = d;
+    g_cal_cur = d;
+    cal_follow();
+    g_cal_err = NULL;
+    return 0;
+}
+
+static void draw_sumcal(int W, int H) {
+    const tk_theme *th = tk_theme_active();
+    tk_rect b = modal_frame(W, H, 46, 13, "Summarize custom date range");
+    tk_input_draw(&g_cal_in[0], (tk_rect){ b.x, b.y, 21, 1 }, g_cal_focus == CAL_START);
+    tk_input_draw(&g_cal_in[1], (tk_rect){ b.x + 24, b.y, 21, 1 }, g_cal_focus == CAL_END);
+    static const char *const MONTHS[12] = { "January", "February", "March", "April", "May", "June", "July",
+                                            "August", "September", "October", "November", "December" };
+    for (int which = 0; which < 2; which++) {
+        int y, mo, gx = b.x + which * 24;
+        uint64_t cells[42];
+        oc_sumcal_month(&g_cal, which, &y, &mo, cells);
+        char head[32];
+        snprintf(head, sizeof head, "%s %d", MONTHS[mo - 1], y);
+        int hw = tk_str_width(head);
+        tk_text(gx + (20 - hw) / 2, b.y + 2, gx + 20, head, th->fg | TB_BOLD, th->bg);
+        tk_text(gx, b.y + 3, gx + 20, "Su Mo Tu We Th Fr Sa", th->muted, th->bg);
+        for (int i = 0; i < 42; i++) {
+            if (!cells[i]) continue;
+            uint64_t d = cells[i];
+            time_t t = (time_t)(d / 1000);
+            struct tm tm;
+            if (!oc_localtime_r(&t, &tm)) continue;
+            char num[4];
+            snprintf(num, sizeof num, "%2d", tm.tm_mday);
+            uintattr_t fg = d > g_cal.today ? th->faint : th->fg;
+            if (g_cal.start && d >= g_cal.start && d <= (g_cal.end ? g_cal.end : g_cal.start)) fg = th->accent | TB_BOLD;
+            if (d == g_cal.today) fg |= TB_BOLD;
+            if (d == g_cal_cur && g_cal_focus == CAL_GRID) fg |= TB_REVERSE;
+            tk_text(gx + (i % 7) * 3, b.y + 4 + i / 7, gx + 20, num, fg, th->bg);
+        }
+    }
+    tk_text(b.x, b.y + 2, b.x + 2, "\xe2\x80\xb9", th->muted, th->bg);
+    tk_text(b.x + 44, b.y + 2, b.x + 46, "\xe2\x80\xba", th->muted, th->bg);
+    if (g_cal_err) tk_text(b.x, b.y + 11, b.x + b.w, g_cal_err, TB_RED | TB_BOLD, th->bg);
+    else tk_text(b.x, b.y + 11, b.x + b.w, "Arrows · Enter picks · PgUp/PgDn · Tab next", th->faint, th->bg);
+    uint64_t rs, re;
+    int ready = oc_sumcal_range(&g_cal, &rs, &re) == 0;
+    tk_text(b.x + b.w - 26, b.y + 12, b.x + b.w, "[ Cancel ]", g_cal_focus == CAL_CANCEL ? (th->fg | TB_REVERSE) : th->fg, th->bg);
+    tk_text(b.x + b.w - 13, b.y + 12, b.x + b.w, "[ Summarize ]",
+            !ready ? th->faint : g_cal_focus == CAL_GO ? (th->accent | TB_BOLD | TB_REVERSE) : (th->accent | TB_BOLD), th->bg);
+}
+
+/* A key in the range picker. 1 when it asked for the summary. */
+static int sumcal_key(oc_client *cl, const struct tb_event *ev) {
+    if (ev->key == TB_KEY_ESC) { g_cal_open = 0; return 0; }
+    if (ev->key == TB_KEY_TAB) {
+        if (g_cal_focus == CAL_START || g_cal_focus == CAL_END) {
+            if (tk_input_value(&g_cal_in[g_cal_focus - CAL_START])[0]) cal_take(g_cal_focus - CAL_START);
+        }
+        g_cal_focus = (g_cal_focus + 1) % CAL_N;
+        if (g_cal_focus == CAL_START || g_cal_focus == CAL_END) cal_fields();
+        return 0;
+    }
+    if (g_cal_focus == CAL_START || g_cal_focus == CAL_END) {
+        tk_result r = tk_input_handle(&g_cal_in[g_cal_focus - CAL_START], ev);
+        if (r == TK_CANCEL) g_cal_open = 0;
+        else if (r == TK_SELECT && cal_take(g_cal_focus - CAL_START) == 0) g_cal_focus++;
+        return 0;
+    }
+    if (g_cal_focus == CAL_GRID) {
+        int step = ev->key == TB_KEY_ARROW_LEFT ? -1 : ev->key == TB_KEY_ARROW_RIGHT ? 1
+                 : ev->key == TB_KEY_ARROW_UP ? -7 : ev->key == TB_KEY_ARROW_DOWN ? 7 : 0;
+        if (step) {
+            uint64_t d = day_add(g_cal_cur, step);
+            if (d <= g_cal.today) { g_cal_cur = d; cal_follow(); }
+        } else if (ev->key == TB_KEY_PGUP || ev->key == TB_KEY_PGDN) {
+            oc_sumcal_shift(&g_cal, ev->key == TB_KEY_PGUP ? -1 : 1);
+            int y, m;
+            uint64_t cells[42];
+            oc_sumcal_month(&g_cal, 0, &y, &m, cells);
+            for (int i = 0; i < 42; i++) if (cells[i]) { if (cells[i] <= g_cal.today) g_cal_cur = cells[i]; break; }
+        } else if (ev->key == TB_KEY_ENTER) {
+            oc_sumcal_pick(&g_cal, g_cal_cur);
+            cal_fields();
+            g_cal_err = NULL;
+            if (g_cal.end) g_cal_focus = CAL_GO;
+        }
+        return 0;
+    }
+    if (ev->key != TB_KEY_ENTER) return 0;
+    if (g_cal_focus == CAL_CANCEL) { g_cal_open = 0; return 0; }
+    uint64_t rs, re;
+    if (oc_sumcal_range(&g_cal, &rs, &re) != 0) { g_cal_err = "Pick the first and last day."; return 0; }
+    g_cal_open = 0;
+    return oc_client_summarize(cl, g_cal_cid, OC_SUM_RANGE, rs, re) != 0;
 }
 
 /* ---- workspace switcher (REQ-013) -------------------------------------------
@@ -2296,7 +2702,7 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW, PROMPT_INVITE, PROMPT_SUMRANGE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW, PROMPT_INVITE };
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
@@ -2434,7 +2840,15 @@ int main(int argc, char **argv) {
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
         if (action_open) {
             int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
-            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 34, mh, act_title);
+            /* As wide as its longest item (a summary's line is long), within
+             * the screen; never narrower than the usual 34. */
+            int mw = 34;
+            for (int k = 0; k < g_nmenu; k++) {
+                int lw = tk_str_width(g_menu[k].label) + 4;
+                if (lw > mw) mw = lw;
+            }
+            if (mw > tb_width() - 4) mw = tb_width() - 4;
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), mw, mh, act_title);
             tk_list_draw(&action_menu, in);
         }
         if (prompt_kind == PROMPT_INVITE) {
@@ -2458,6 +2872,7 @@ int main(int argc, char **argv) {
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
         if (alerts_open) draw_alerts(oc_client_model(cl), tb_width(), tb_height(), asel);
         if (summary_ui && oc_client_model(cl)->summary_open) draw_summary(oc_client_model(cl), tb_width(), tb_height(), ssel);
+        if (g_cal_open) draw_sumcal(tb_width(), tb_height());
         tb_present();
 
         struct tb_event ev;
@@ -2468,12 +2883,19 @@ int main(int argc, char **argv) {
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
             else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open &&
-                     !alerts_open && !summary_ui) {
+                     !alerts_open && !summary_ui && !g_cal_open) {
                 int Wm = tb_width(); int chw, memw, msgx, msgw;
                 layout(Wm, &chw, &memw, &msgx, &msgw);
                 int prow = ev.y - 2;           /* first panel content row */
                 const oc_model *mm = oc_client_model(cl);
-                if (prow >= 0 && ev.x < chw) {                      /* Channels */
+                if (g_sumbtn_x1 && ev.y == g_sumbtn_y && ev.x >= g_sumbtn_x0 && ev.x < g_sumbtn_x1 &&
+                    focus < mm->n_channels) {                       /* the title's Summarize */
+                    act_cid = mm->channels[focus].channel_id;
+                    menu_build_summary_span();
+                    action_menu.sel = action_menu.top = 0;   /* the spans start at the first */
+                    act_title = "Summarize";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                } else if (prow >= 0 && ev.x < chw) {                      /* Channels */
                     sb_row rows[256];
                     int nrows = sidebar_build(mm, rows, 256);
                     if (prow < nrows) {
@@ -2562,16 +2984,41 @@ int main(int argc, char **argv) {
             }
             continue;
         }
-        if (summary_ui) {                      /* the summary: select an item, go to it, close */
+        if (g_cal_open) {                      /* the custom range picker */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else if (sumcal_key(cl, &ev)) { summary_ui = 1; ssel = 0; }
+            continue;
+        }
+        if (summary_ui) {                      /* the summary: select, open a topic, go to a message, close */
             const oc_model *sm = oc_client_model(cl);
-            int n = sm->summary_open && !sm->summary_loading ? (int)sm->summary.n_items : 0;
+            int t = -1, d = -1;
+            int have = sum_entry(sm, ssel, &t, &d);
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else if (ev.key == TB_KEY_ESC || !sm->summary_open) { summary_ui = 0; oc_client_close_summary(cl); }
-            else if (ev.key == TB_KEY_ARROW_DOWN) { if (ssel + 1 < n) ssel++; }
+            else if ((ev.ch == 'n' || ev.ch == 'c') && sm->summary_loading) {
+                /* Told when it is ready instead (n), or not made at all (c). */
+                if (ev.ch == 'n') oc_client_summary_detach(cl);
+                else oc_client_summary_cancel(cl);
+                summary_ui = 0;
+            }
+            else if (ev.ch == 'r' && !sm->summary_loading && sm->summary_status != OC_SUM_OK) {
+                if (oc_client_summary_retry(cl)) ssel = 0;
+            }
+            else if (ev.key == TB_KEY_ARROW_DOWN) { int a, b; if (sum_entry(sm, ssel + 1, &a, &b)) ssel++; }
             else if (ev.key == TB_KEY_ARROW_UP)   { if (ssel > 0) ssel--; }
-            else if (ev.key == TB_KEY_ENTER && ssel < n && sm->summary.items[ssel].n_refs) {
+            else if (have && t >= 0 && (ev.ch == ' ' || ev.key == TB_KEY_SPACE || (ev.key == TB_KEY_ENTER && d < 0))) {
+                /* Open or close the topic's details, keeping its heading selected. */
+                sum_closed(sm, (size_t)t);
+                if ((size_t)t < g_sum_closed_n) g_sum_closed[t] ^= 1;
+                for (int e = 0, a, b; sum_entry(sm, e, &a, &b); e++) if (a == t && b < 0) { ssel = e; break; }
+            }
+            else if (have && ev.key == TB_KEY_ENTER) {
+                /* A detail, or what needs attention: its first message. */
+                size_t nr = 0;
+                const uint64_t *rr = sum_entry_refs(sm, t, d, &nr);
+                if (!nr) continue;
                 /* Kept while you stay in the conversation: Ctrl+K goes back to it. */
-                jump_mid = sm->summary.items[ssel].refs[0];
+                jump_mid = rr[0];
                 jump_since = time(NULL);
                 jump_asked = 0;
                 summary_ui = 0;
@@ -2621,13 +3068,6 @@ int main(int argc, char **argv) {
                 else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
                 else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
                 else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
-                else if (k == PROMPT_SUMRANGE && *v) {
-                    uint64_t rs, re;
-                    if (oc_summary_range_parse(v, &rs, &re) != 0) {
-                        prompt_kind = PROMPT_SUMRANGE;     /* stay open, and say what it takes */
-                        prompt_title = "Two dates, the first not after the second: YYYY-MM-DD YYYY-MM-DD";
-                    } else if (oc_client_summarize(cl, act_cid, OC_SUM_RANGE, rs, re)) { summary_ui = 1; ssel = 0; }
-                }
                 else if (k == PROMPT_INVITE) {
                     /* An address where the workspace signs people in through a
                      * provider; blank for a token, where it has password accounts.
@@ -2721,11 +3161,31 @@ int main(int argc, char **argv) {
                 else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (id == ACT_SUMMARIZE && act_cid) {
                     menu_build_summary_span();
+                    action_menu.sel = action_menu.top = 0;   /* the spans start at the first */
                     act_title = "Summarize";
                     action_open = 1; tk_list_reset_filter(&action_menu);
                 }
                 else if (id == ACT_SUM_BACK) { summary_ui = 1; ssel = 0; }
+                else if (id == ACT_SUM_NOTICES) {
+                    menu_build_sum_notices(oc_client_model(cl));
+                    action_menu.sel = action_menu.top = 0;
+                    act_title = "Summaries ready";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
             }
+            continue;
+        }
+        if (action_open && act_title && !strcmp(act_title, "Summaries ready") && ev.ch == 'd') {
+            /* Dismiss the selected summary without opening it. */
+            const oc_model *nm = oc_client_model(cl);
+            int k = action_menu.sel;
+            if (k >= 0 && k < g_nmenu) {
+                size_t at = (size_t)(g_menu[k].id - ACT_SUM_NOTICE0);
+                if (at < nm->n_sum_notices) oc_client_summary_dismiss(cl, nm->sum_notices[at].id);
+            }
+            menu_build_sum_notices(oc_client_model(cl));
+            if (!g_nmenu) action_open = 0;
+            else if (action_menu.sel >= g_nmenu) action_menu.sel = g_nmenu - 1;
             continue;
         }
         if (action_open) {                     /* message action menu (tuikit) */
@@ -2812,17 +3272,36 @@ int main(int argc, char **argv) {
                     /* summaries: the span, then the summary */
                     else if (id == ACT_SUMMARIZE) {
                         menu_build_summary_span();
+                        action_menu.sel = action_menu.top = 0;   /* the spans start at the first */
                         act_title = "Summarize";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
-                    else if (id == ACT_SUM_UNREAD || id == ACT_SUM_WEEK || id == ACT_SUM_DAILY) {
-                        uint8_t sc = id == ACT_SUM_UNREAD ? OC_SUM_UNREAD : id == ACT_SUM_WEEK ? OC_SUM_WEEK : OC_SUM_DAILY;
+                    else if (id == ACT_SUM_UNREAD || id == ACT_SUM_TODAY || id == ACT_SUM_WEEK || id == ACT_SUM_DAILY) {
+                        uint8_t sc = id == ACT_SUM_UNREAD ? OC_SUM_UNREAD : id == ACT_SUM_TODAY ? OC_SUM_TODAY
+                                   : id == ACT_SUM_WEEK ? OC_SUM_WEEK : OC_SUM_DAILY;
                         if (oc_client_summarize(cl, act_cid, sc, 0, 0)) { summary_ui = 1; ssel = 0; }
                     }
-                    else if (id == ACT_SUM_RANGE) {
-                        prompt_kind = PROMPT_SUMRANGE;
-                        prompt_title = "Summarize: the first and last day (YYYY-MM-DD YYYY-MM-DD)";
-                        tk_input_init(&prompt_input, 0, "2026-09-04 2026-09-14");
+                    else if (id == ACT_SUM_RANGE) cal_open(act_cid);
+                    else if (id >= ACT_SUM_NOTICE0) {
+                        /* A summary made while you were away: opened in its own
+                         * conversation, which is selected first. */
+                        const oc_model *nm = oc_client_model(cl);
+                        size_t at = (size_t)(id - ACT_SUM_NOTICE0);
+                        if (at < nm->n_sum_notices) {
+                            oc_summary_notice sn = nm->sum_notices[at];
+                            for (size_t k = 0; k < nm->n_channels; k++)
+                                if (nm->channels[k].channel_id == sn.channel_id) {
+                                    focus = k;
+                                    if (last_focus_cid != sn.channel_id) {
+                                        scroll = 0; msg_sel = -1; last_focus_cid = sn.channel_id; g_hold_unread = 0;
+                                        jump_mid = 0;
+                                    }
+                                    break;
+                                }
+                            if (oc_client_summary_open_notice(cl, sn.id, sn.channel_id, sn.scope)) {
+                                summary_ui = 1; ssel = 0;
+                            }
+                        }
                     }
                 }
             }

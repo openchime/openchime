@@ -65,6 +65,30 @@ static long hread(hconn *c, void *buf, size_t cap) {
     return n < 0 ? -1 : (long)n;
 }
 
+/* Whether the `len` bytes read so far (NUL-terminated) are a whole response:
+ * its headers, then as many bytes as Content-Length says, or a chunked body up
+ * to its last chunk. A server is asked to close after answering, but one
+ * behind a proxy may keep the connection open, and waiting for the close
+ * would then wait for the proxy's idle timeout. Without either, the close
+ * ends it. */
+static int resp_complete(const char *buf, size_t len) {
+    const char *end = strstr(buf, "\r\n\r\n");
+    if (!end) return 0;
+    size_t hlen = (size_t)(end - buf) + 4, body = len - hlen;
+    for (const char *p = strstr(buf, "\r\n"); p && p < end; p = strstr(p + 2, "\r\n")) {
+        const char *h = p + 2;
+        if (!strncasecmp(h, "Content-Length:", 15)) return body >= strtoull(h + 15, NULL, 10);
+        if (!strncasecmp(h, "Transfer-Encoding:", 18)) {
+            const char *eol = strstr(h, "\r\n");
+            char v[64];
+            snprintf(v, sizeof v, "%.*s", (int)(eol - h - 18), h + 18);
+            if (strcasestr(v, "chunked"))
+                return body >= 5 && (!strncmp(buf + hlen, "0\r\n\r\n", 5) || strstr(buf + hlen, "\r\n0\r\n\r\n"));
+        }
+    }
+    return 0;
+}
+
 /* Undo chunked transfer coding in place; the decoded length. */
 static size_t dechunk(char *b, size_t len) {
     size_t in = 0, out = 0;
@@ -166,6 +190,8 @@ int oc_https_request(const char *method, const char *url, const char *ctype,
         if (got < 0) { fail(err, errcap, "read from %s failed", host); goto out; }
         if (got == 0) break;
         len += (size_t)got;
+        buf[len] = '\0';
+        if (resp_complete(buf, len)) break;
     }
     buf[len] = '\0';
     char *end = strstr(buf, "\r\n\r\n");

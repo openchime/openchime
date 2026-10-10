@@ -348,12 +348,32 @@ Unit tests must be reproducible and independent of wall-clock or environment:
 
 ### 2.4 Which suites run where
 
-`make test` runs every suite, in one process, one after another, in about a
-minute and a half; the longest are `client_core` (about 25 s), `netloop` (about
-20 s) and `media` (about 15 s), and most take under a second. CI runs each
-suite **once**, split by whether its code runs threads:
+`make test` runs every suite, side by side: as many at once as there are CPUs,
+each in a process of its own (`OC_TEST_JOBS`, `tests/main.c`), its output printed
+whole when it ends. It ends by printing each suite's time, slowest first. The
+suites are nearly all waiting -- on timers, sockets, real-time audio and video
+-- so the run takes about as long as the slowest suite: about 50 s on a quiet
+machine, with `client_core` about 49 s, `netloop` 37 s, `media` 16 s, `summary`
+12 s and most under a second. The budget is two minutes. `OC_TEST_JOBS=1` runs
+them one after another in one process, as before.
 
-- `make test-tsan` runs the suites whose code runs threads — the loop and its I/O
+Side by side, suites must not share anything outside their process: each
+suite's databases under `build/` have their own names, and the suites that
+listen use port ranges no other suite uses (`itest_netloop` from 15000,
+`itest_slow_blob` from 18100, `test_client_core` from 19000). A new suite that
+listens takes a port from the kernel (bind port 0) or a range of its own.
+
+Password hashing in the tests is at test strength: every test writer is given
+2,048 PBKDF2 rounds (`oc_dbwriter_set_pw_iterations`), including the check an
+unknown name gets and a new password's key, where production uses 600,000.
+
+There are two test commands: `make test`, every suite plainly, the one to run
+locally; and `make test-ci`, CI's, which refuses unless `CI` is set (as GitHub
+Actions sets it). `make test-ci` runs each suite once, split by whether its code
+runs threads (CI runs the halves in parallel jobs, `PART=threads` and
+`PART=plain`):
+
+- the suites whose code runs threads — the loop and its I/O
   threads, the writer and readers, the worker pools, the client, the recorder and
   player — under ThreadSanitizer (address randomization off, `tests/tsan.supp`
   for the one test-only reconfiguration). The list is the Makefile's
@@ -366,12 +386,11 @@ suite **once**, split by whether its code runs threads:
   order the code does not promise — a count, a status or a flag taken to mean
   something happened before or after another thread's step — since the
   sanitizer's slowing is exactly what brings the other order out.
-- `make test-rest` runs every other suite, plainly (`OC_TEST_EXCEPT` names the
+- every other suite, plainly (`OC_TEST_EXCEPT` names the
   suites to leave out). A suite with no thread cannot race, so instrumenting it
   would only make it slower.
 
-Locally, `make test` is the one to run before a pull request; `make test-tsan` is
-for chasing a race CI reported, narrowed to the suite that raced.
+Locally, `make test` is the one to run before a pull request.
 
 ---
 
@@ -676,9 +695,9 @@ Jobs, on three machines at once:
   `main()`; the published image is tested by nothing); every Linux translation
   unit through the release's own compiler under `-Werror`
   (`make check-release-cc`: zig's clang against the release's glibc — the
-  daemon's, the client's and the tests' sources); and `make test-rest`, whose
-  prerequisites are `check-opcodes` and `check-refs`.
-- **`thread-sanitizer`** — `make test-tsan` (§2.4).
+  daemon's, the client's and the tests' sources); and `make test-ci PART=plain`,
+  whose prerequisites are `check-opcodes` and `check-refs`.
+- **`thread-sanitizer`** — `make test-ci PART=threads` (§2.4).
 - **`windows`** — the Windows cross-compile of the TUI and GUI, so the ported
   client stays building, and the Linux TUI built with that runner's gcc, newer
   than the `build` job's, which raises warnings at `-O2` that gcc 11 and clang

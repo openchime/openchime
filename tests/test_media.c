@@ -438,11 +438,14 @@ static void test_recorder(void) {
         uint64_t ams = info.audio.present ? (info.audio.duration - info.opus_preskip) * 1000 / 48000 : 0;
         printf("  video track %llu ms, audio track %llu ms\n", (unsigned long long)vms, (unsigned long long)ams);
         CHECK(info.audio.present);
-        CHECK(llabs((long long)vms - (long long)ams) < 40 + 20);   /* within a frame and an Opus block */
-        CHECK(info.video.n_samples >= 66 && info.video.n_samples <= 77);
+        /* How many frames a 2.5 s recording holds, and how close its tracks end,
+         * are the host keeping up in real time: speed limits (check.h). */
+        CHECK_SPEED(llabs((long long)vms - (long long)ams) < 40 + 20);   /* within a frame and an Opus block */
+        CHECK_SPEED(info.video.n_samples >= 66 && info.video.n_samples <= 77);
         CHECK(info.video.samples[0].sync);
         int k = oc_recorder_poster_index(&info);
-        CHECK(k > 0 && info.video.samples[k].sync && info.video.samples[k].dts >= info.video.timescale);
+        CHECK(k >= 0 && info.video.samples[k].sync);
+        CHECK_SPEED(k > 0 && info.video.samples[k].dts >= info.video.timescale);
         oc_mp4_info_free(&info);
     }
     CHECK(ffprobe_ok(g_rec.video, g_rec.video_len, g_rec.duration_ms));
@@ -525,7 +528,9 @@ static void test_player(void) {
     printf("  played: presented %llu, dropped %llu of %u\n", (unsigned long long)st.presented,
            (unsigned long long)st.dropped, n_frames);
     CHECK(st.presented + st.dropped == n_frames);
-    CHECK(st.dropped <= n_frames / 10);
+    /* A decoder slower than real time drops frames to keep the clock: how many
+     * is the host's speed (check.h). */
+    CHECK_SPEED(st.dropped <= n_frames / 10);
     CHECK(st.position_ms == st.duration_ms);
 
     /* A seek lands on the keyframe at or before the target. */
@@ -552,7 +557,7 @@ static void test_player(void) {
            st.frame_ms, k2_ms, (unsigned long long)(st.dropped - before_d));
     CHECK(st.dropped > before_d);
     CHECK(st.presented > before_p);
-    CHECK(k2_ms > 0);
+    CHECK_SPEED(k2_ms > 0);                                 /* a second keyframe: as many frames as real time made */
     CHECK_SPEED(st.position_ms >= 2100);                    /* the clock follows the audio */
     CHECK_SPEED(st.frame_ms >= k2_ms);                      /* and the picture caught up */
     oc_player_close(p);
@@ -636,8 +641,8 @@ static void check_frame_rate(const char *what, const int64_t *pts_us, int n,
            what, n, span_ms, n * 1000.0 / (span_ms ? span_ms : 1), fps);
     CHECK(n <= ceil_n);
     CHECK(n >= 1);
-    if (n >= 2)                            /* from the start of the span to its end */
-        CHECK(pts_us[n - 1] - pts_us[0] > (int64_t)span_ms * 1000 - 1000000);
+    if (n >= 2)                            /* from the start of the span to its end: the host's speed */
+        CHECK_SPEED(pts_us[n - 1] - pts_us[0] > (int64_t)span_ms * 1000 - 1000000);
     if (n < 3) return;
     double gaps[4096];
     int ng = 0, backwards = 0;

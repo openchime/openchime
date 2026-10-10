@@ -53,4 +53,10 @@ static int failures OC_UNUSED = 0;
         if (!OC_UNDER_TSAN) CHECK(cond);                                     \
     } while (0)
 
+/* How long to wait for work to be done -- frames encoded and decoded, say --
+ * before calling it not done. Not a speed limit: what is checked is that it is
+ * done. But the sanitizer slows the work as much as fifteen times, so under it
+ * the wait is that much longer. */
+#define WAIT_MS(ms) ((ms) * (OC_UNDER_TSAN ? 15 : 1))
+
 #endif /* OC_TEST_CHECK_H */

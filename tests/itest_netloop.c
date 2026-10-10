@@ -1257,6 +1257,7 @@ static void test_upload_restarted(int port, const uint8_t *pin, oc_dbwriter *dbw
  * second ask is served from the cache without rendering again; a message with
  * nothing to say and one in a channel the asker cannot read are refused. */
 static int g_stub_says;                       /* renders the stub actually did */
+static volatile int g_stub_hold;              /* set: a render waits, as a slow model's does */
 
 static void *stub_open(void *ctx, char *err, size_t cap) { (void)ctx; (void)err; (void)cap; static int t; return &t; }
 static void stub_close(void *e) { (void)e; }
@@ -1266,6 +1267,7 @@ static const char *stub_voice_label(int v) { return v % 2 == 0 ? "Test Low" : "T
 static int stub_say(void *e, const char *segment, int voice, float **pcm, size_t *n,
                     char *err, size_t cap) {
     (void)e; (void)voice; (void)err; (void)cap;
+    while (__atomic_load_n(&g_stub_hold, __ATOMIC_ACQUIRE)) usleep(1000);
     __sync_fetch_and_add(&g_stub_says, 1);
     size_t samples = strlen(segment) * 240;   /* 10 ms a character at 24 kHz */
     *pcm = malloc(samples * sizeof **pcm);
@@ -1534,18 +1536,24 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
     CHECK(fetch_preview(&a, "no-such-voice", NULL, &code) == 0 && code == OC_ERR_TTS_UNAVAILABLE);
     /* A preview asked for while a message's speech is on its way is refused, and
      * the speech still arrives whole: auditioning a voice must not abort a listen.
-     * Both requests go in one write so the preview meets the transfer in flight. */
+     * The speech is of a message not yet rendered, and its render is held, so it
+     * is on its way -- whatever order the daemon reads the two requests in --
+     * until the refusal has come back. */
     {
+        uint64_t mid2 = say_something(&a, OC_DEFAULT_CHANNEL, "Rollback finished. All green.", 0xB4);
+        CHECK(mid2 != 0);
+        __atomic_store_n(&g_stub_hold, 1, __ATOMIC_RELEASE);
         uint8_t two[256];
         oc_wbuf w2;
         oc_wbuf_init(&w2, two, sizeof two);
-        oc_audio_get ag = { mid };
+        oc_audio_get ag = { mid2 };
         oc_voice_preview_get vp = { oc_slice_str("test-voice-f") };
         CHECK(oc_encode_audio_get(&w2, OC_PROTOCOL_VERSION, &ag) == OC_OK);
         CHECK(oc_encode_voice_preview_get(&w2, OC_PROTOCOL_VERSION, &vp) == OC_OK);
         CHECK(write_all(&b.conn, two, w2.len) == 0);
         CHECK(read_audio(&b, 0, NULL, &code) == 0 && code == OC_ERR_TRANSFER_PROTOCOL);
-        CHECK(read_audio(&b, mid, NULL, &code) == bytes && code == 0);
+        __atomic_store_n(&g_stub_hold, 0, __ATOMIC_RELEASE);
+        CHECK(read_audio(&b, mid2, NULL, &code) > 0 && code == 0);
     }
 
     /* An unknown message is unknown, not a render. */
@@ -1897,9 +1905,8 @@ static int token_of(const char *resp, char *tok, size_t cap) {
 /* Whether the daemon closed `c`: 1 when the stream ends within `secs`, 0 when
  * it is still open (the read only timed out). Frames on the way are skipped.
  * A close the test expects gets PEER_CLOSES, long enough for a loaded machine
- * and over as soon as it happens; a connection that must stay open is watched
- * for PEER_STAYS. */
-enum { PEER_CLOSES = 30, PEER_STAYS = 5 };
+ * and over as soon as it happens; that a connection stays open is peer_open's. */
+enum { PEER_CLOSES = 30 };
 static int peer_closed(client *c, int secs) {
     struct timeval tv = { secs, 0 };
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1936,6 +1943,11 @@ static int session_count_of(client *c, int *current) {
     }
     return -1;
 }
+
+/* Whether the daemon kept the signed-in `c`: it answers a request on it. The
+ * daemon handles a connection's frames in order, after whatever closed or kept
+ * it, so the answer is proof without waiting out a timeout. */
+static int peer_open(client *c) { return session_count_of(c, NULL) >= 0; }
 
 static int signed_in(client *c, int port, const uint8_t *pin, const char *user, const char *pw) {
     uint64_t uid = 0;
@@ -2035,8 +2047,8 @@ static void test_revoke_one_session(int port, const uint8_t *pin) {
     oc_revoke_session rs = { alids[almine] };   /* alice's, not sid's */
     CHECK(oc_encode_revoke_session(&w, OC_PROTOCOL_VERSION, &rs) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
     CHECK(session_list_read(&a, ids, 8, &mine) == 2);     /* the answer: the list, both still there */
-    CHECK(peer_closed(&b, PEER_STAYS) == 0);
-    CHECK(peer_closed(&al, PEER_STAYS) == 0);
+    CHECK(peer_open(&b));
+    CHECK(peer_open(&al));
     int almine2 = -1;
     CHECK(session_ids(&al, alids, 8, &almine2) >= 1 && almine2 >= 0);   /* her row is still there */
     client_close(&al);
@@ -2112,14 +2124,14 @@ static void test_unauthed_closed(int port, const uint8_t *pin) {
     CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     client_close(&a);
 
-    oc_netloop_set_unauthed_ms(1500);
+    oc_netloop_set_unauthed_ms(1000);
     client idle, quiet, in;
     CHECK(client_open(&idle, port, pin) == 0 && do_handshake(&idle) == 0);
     CHECK(client_open(&quiet, port, pin) == 0);                 /* TLS, then nothing */
     CHECK(signed_in(&in, port, pin, "carol", "pw") == 0);
     CHECK(peer_closed(&idle, PEER_CLOSES) == 1);
     CHECK(peer_closed(&quiet, PEER_CLOSES) == 1);
-    CHECK(peer_closed(&in, PEER_STAYS) == 0);
+    CHECK(peer_open(&in));
     oc_netloop_set_unauthed_ms(0);
     client_close(&idle); client_close(&quiet); client_close(&in);
 }
@@ -2153,7 +2165,7 @@ static void test_revoke_other_devices(int port, const uint8_t *pin) {
     oc_logout lo = { OC_LOGOUT_THIS, { none, sizeof none } };
     CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK && write_all(&e.conn, buf, w.len) == 0);
     CHECK(peer_closed(&e, PEER_CLOSES) == 1);
-    CHECK(peer_closed(&d, PEER_STAYS) == 0 && peer_closed(&a, PEER_STAYS) == 0);
+    CHECK(peer_open(&d) && peer_open(&a));
     client_close(&e);
 
     /* Signing out everywhere closes every connection the user has. */
@@ -2423,6 +2435,7 @@ static void test_direct_signin(int port) {
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
     unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_direct.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     char why[128];
     CHECK(oc_dbwriter_configure_join_rules(dbw, "domain:acme.example", why, sizeof why) == 0);
@@ -2571,6 +2584,7 @@ static void test_web_signin(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin) == 0);
     unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_web.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
     if (!dbw2) { oc_tls_server_free(&srv2); goto restore; }
     CHECK(!oc_dbwriter_password_frames(dbw2) && oc_dbwriter_local_browser(dbw2));
@@ -2704,7 +2718,7 @@ static void test_web_signin(int port) {
         CHECK(oc_encode_auth(&aw, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&held.conn, ab, aw.len) == 0);
         CHECK(read_frame_raw(&held, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);
     }
-    CHECK(peer_closed(&held, PEER_STAYS) == 0);
+    CHECK(peer_open(&held));
     CHECK(web_call(port, pin, "GET", "/account/password", NULL, NULL, NULL, resp, sizeof resp) == 200);
     CHECK(strstr(resp, "autocomplete=\"new-password\"") != NULL);
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
@@ -3276,6 +3290,7 @@ static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
     if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
     unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
     d->dbw = oc_dbwriter_start("build/itest_dev.db");
+    if (d->dbw) oc_dbwriter_set_pw_iterations(d->dbw, 2048);   /* fast PBKDF2 for tests */
     if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
     if (!d->dbw) return -1;
     d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
@@ -3440,6 +3455,7 @@ static void test_voice_input_absent(int port, int by_env) {
     unlink("build/itest_stt_off.db-wal");
     unlink("build/itest_stt_off.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_stt_off.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
     struct loop_arg arg2;
@@ -3496,7 +3512,7 @@ static void test_voice_input_absent(int port, int by_env) {
 typedef struct { int calls; volatile int hold; } sum_stub;
 static void *sstub_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void sstub_close(void *h) { (void)h; }
-static int sstub_run(void *h, const char *system, const char *user, int max_out,
+static int sstub_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
                      oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
     (void)system; (void)user; (void)max_out; (void)err; (void)cap;
     __atomic_add_fetch(&((sum_stub *)h)->calls, 1, __ATOMIC_RELAXED);
@@ -3507,7 +3523,9 @@ static int sstub_run(void *h, const char *system, const char *user, int max_out,
         nanosleep(&ts, NULL);
     }
     if (st) memset(st, 0, sizeof *st);
-    *out = strdup("Overview: The ship date was set.\nDecisions:\n- Ship on Friday [1]\nActions:\nProblems:\nFacts:\n");
+    *out = strdup(grammar && strstr(grammar, "note ::=")
+                  ? "- [1] decision | Shipping | The ship date was set.\n"
+                  : "Overview: [1] The ship date was set.\n## Shipping\n[1] The ship date was set.\n- [1] Ship on Friday\n");
     return 0;
 }
 static int sq_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
@@ -3522,6 +3540,27 @@ static int sq_store(void *ctx, const oc_sum_answer *a, oc_sum_new *nodes, int n)
 static int sq_take(void *ctx, int64_t row) {
     (void)ctx;
     return oc_dbwriter_sum_take(g_sum_dbw, row);
+}
+
+/* Wait until no request in the summary queue is watched by a connection: the
+ * writer has taken a DETACH, or a closed connection's drop. 1, or 0 on timeout. */
+static int sum_none_watched(void) {
+    for (int i = 0; i < 500; i++) {
+        sqlite3 *db = NULL;
+        int watched = -1;
+        if (sqlite3_open_v2("build/itest_sum.db", &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM summary_requests WHERE conn_id<>0;", -1, &st, NULL) ==
+                    SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+                watched = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(db);
+        if (watched == 0) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
 }
 
 static int summarize_await(client *c, uint32_t req, uint8_t scope, oc_summary *out, char *body, size_t cap) {
@@ -3551,6 +3590,7 @@ static void test_summaries(int port) {
     unlink("build/itest_sum.db-wal");
     unlink("build/itest_sum.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_sum.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
     g_sum_dbw = dbw2;
@@ -3604,7 +3644,9 @@ static void test_summaries(int port) {
     char body[4096];
     CHECK(summarize_await(&a, 7, OC_SUM_WEEK, &sm, body, sizeof body) == 0);
     CHECK(sm.status == OC_SUM_OK && sm.summary_id != 0 && sm.end_ms > sm.start_ms);
-    CHECK(strstr(body, "Ship on Friday") != NULL && strstr(body, "\"people\"") != NULL);
+    /* One five-word message: the summary is its overview, never longer than it. */
+    CHECK(strstr(body, "\"overview\":{\"text\":\"The ship date was set.\"") != NULL && strstr(body, "\"posters\":[{\"id\":") != NULL &&
+          strstr(body, "\"count\":1,") != NULL && strstr(body, "\"sources\":{\"") != NULL);
     int calls = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
     CHECK(calls >= 1);
     uint64_t first = sm.summary_id;
@@ -3714,6 +3756,219 @@ static void test_summaries(int port) {
         sqlite3_close(qdb);
     }
 
+    /* Today and since yesterday are the reader's days, up to now. */
+    {
+        uint64_t day = 86400000ull, now_ms = (uint64_t)time(NULL) * 1000u, today = now_ms / day * day;
+        CHECK(summarize_await(&a, 40, OC_SUM_TODAY, &sm, body, sizeof body) == 0);
+        CHECK(sm.status == OC_SUM_OK && sm.start_ms == today && sm.end_ms > now_ms - 60000 && sm.end_ms <= now_ms + 60000);
+        CHECK(summarize_await(&a, 41, OC_SUM_DAILY, &sm, body, sizeof body) == 0);
+        CHECK(sm.status == OC_SUM_OK && sm.start_ms == today - day && sm.end_ms > now_ms - 60000);
+    }
+
+    /* A summary is its asker's (SUMMARIES.md §5). One they stop watching goes
+     * on, and when made is told to every connection they have as a notice; it
+     * opens as it was made, is in Activity, and is told again at sign-in until
+     * seen. One cancelled -- waiting, or being made -- is answered CANCELLED,
+     * and leaves nothing behind. */
+    {
+        client a2;
+        CHECK(client_open(&a2, port, pin2) == 0);
+        CHECK(do_handshake(&a2) == 0);
+        CHECK(do_auth(&a2, "alice", "pw-alice", &ua) == 0);
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000u, day = 86400000ull;
+        __atomic_store_n(&stub.hold, 1, __ATOMIC_RELEASE);
+        int c0 = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
+        oc_summarize q = { 50, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 3 * day, now_ms + day + 7 };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
+            struct timespec ts = { 0, 10 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        CHECK(__atomic_load_n(&stub.calls, __ATOMIC_RELAXED) > c0);   /* being made */
+        oc_summary_req dr = { 50 };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summary_req(&w, OC_PROTOCOL_VERSION, OC_MSG_SUMMARY_DETACH, &dr) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+        /* The detach is the writer's before the model is let go. */
+        CHECK(sum_none_watched());
+        __atomic_store_n(&stub.hold, 0, __ATOMIC_RELEASE);
+        uint64_t notice = 0;
+        for (int i = 0; i < 200 && !notice; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a2, &hdr, &p) != 0) break;
+            oc_summary_ready rd;
+            if (hdr.msg_type == OC_MSG_SUMMARY_READY && oc_decode_summary_ready(&p, &rd) == OC_OK) {
+                CHECK(rd.status == OC_SUM_OK && rd.channel_id == OC_DEFAULT_CHANNEL && rd.scope == OC_SUM_RANGE &&
+                      rd.start_ms == q.start_ms && rd.end_ms == q.end_ms && rd.made_at_ms > 0);
+                notice = rd.notice_id;
+            }
+        }
+        CHECK(notice != 0);
+        /* The asker's own connection is told too, and is not sent the summary. */
+        int told = 0, answered = 0;
+        for (int i = 0; i < 200 && !told; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a, &hdr, &p) != 0) break;
+            oc_summary_ready rd;
+            oc_summary sa;
+            if (hdr.msg_type == OC_MSG_SUMMARY_READY && oc_decode_summary_ready(&p, &rd) == OC_OK)
+                told = rd.notice_id == notice;
+            if (hdr.msg_type == OC_MSG_SUMMARY && oc_decode_summary(&p, &sa) == OC_OK && sa.req_id == 50) answered = 1;
+        }
+        CHECK(told && !answered);
+        /* Opened: the summary as it was made, and the notice seen. */
+        oc_summary_open so = { 51, notice };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summary_open(&w, OC_PROTOCOL_VERSION, &so) == OC_OK);
+        CHECK(send_frame(&a2, buf, w.len) == 0);
+        int opened = 0;
+        for (int i = 0; i < 100 && !opened; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a2, &hdr, &p) != 0) break;
+            if (hdr.msg_type == OC_MSG_SUMMARY && oc_decode_summary(&p, &sm) == OC_OK && sm.req_id == 51) {
+                opened = sm.status == OC_SUM_OK && sm.start_ms == q.start_ms &&
+                         memmem(sm.body.ptr, sm.body.len, "\"overview\"", 10) != NULL ? 1 : -1;
+            }
+        }
+        CHECK(opened == 1);
+        /* In Activity, as the notice. */
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_list_activity(&w, OC_PROTOCOL_VERSION, OC_ACTF_INVOLVED) == OC_OK);
+        CHECK(send_frame(&a2, buf, w.len) == 0);
+        int listed = 0, ended = 0;
+        for (int i = 0; i < 300 && !ended; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a2, &hdr, &p) != 0) break;
+            oc_activity_entry ae;
+            if (hdr.msg_type == OC_MSG_ACTIVITY_ENTRY && oc_decode_activity_entry(&p, &ae) == OC_OK &&
+                ae.kind == OC_ACT_SUMMARY && ae.message_id == notice && ae.channel_id == OC_DEFAULT_CHANNEL &&
+                ae.action == OC_SUM_OK)
+                listed = 1;
+            ended = hdr.msg_type == OC_MSG_ACTIVITY;
+        }
+        CHECK(listed && ended);
+        /* Another made unwatched, its connection then gone: told at the next
+         * sign-in, until dismissed. */
+        __atomic_store_n(&stub.hold, 1, __ATOMIC_RELEASE);
+        c0 = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
+        oc_summarize q2 = { 52, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 4 * day, now_ms + day + 7 };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q2) == OC_OK);
+        CHECK(send_frame(&a2, buf, w.len) == 0);
+        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
+            struct timespec ts = { 0, 10 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        client_close(&a2);
+        CHECK(sum_none_watched());
+        __atomic_store_n(&stub.hold, 0, __ATOMIC_RELEASE);
+        uint64_t notice2 = 0;
+        for (int i = 0; i < 200 && !notice2; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a, &hdr, &p) != 0) break;
+            oc_summary_ready rd;
+            if (hdr.msg_type == OC_MSG_SUMMARY_READY && oc_decode_summary_ready(&p, &rd) == OC_OK &&
+                rd.start_ms == q2.start_ms)
+                notice2 = rd.notice_id;
+        }
+        CHECK(notice2 != 0);
+        CHECK(client_open(&a2, port, pin2) == 0);
+        CHECK(do_handshake(&a2) == 0);
+        CHECK(do_auth(&a2, "alice", "pw-alice", &ua) == 0);
+        int again = 0, again_first = 0;
+        for (int i = 0; i < 100 && !again; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a2, &hdr, &p) != 0) break;
+            oc_summary_ready rd;
+            if (hdr.msg_type == OC_MSG_SUMMARY_READY && oc_decode_summary_ready(&p, &rd) == OC_OK) {
+                if (rd.notice_id == notice) again_first = 1;   /* opened: not told again */
+                again = rd.notice_id == notice2;
+            }
+        }
+        CHECK(again && !again_first);
+        oc_summary_dismiss sd = { notice2 };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summary_dismiss(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK);
+        CHECK(send_frame(&a2, buf, w.len) == 0);
+        /* Cancelled while being made, and while waiting behind it. */
+        __atomic_store_n(&stub.hold, 1, __ATOMIC_RELEASE);
+        c0 = __atomic_load_n(&stub.calls, __ATOMIC_RELAXED);
+        oc_summarize q3 = { 60, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 5 * day, now_ms + day + 7 };
+        oc_summarize q4 = { 61, OC_DEFAULT_CHANNEL, OC_SUM_RANGE, now_ms - 6 * day, now_ms + day + 7 };
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q3) == OC_OK);
+        CHECK(send_frame(&a2, buf, w.len) == 0);
+        for (int i = 0; i < 500 && __atomic_load_n(&stub.calls, __ATOMIC_RELAXED) == c0; i++) {
+            struct timespec ts = { 0, 10 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &q4) == OC_OK);
+        CHECK(send_frame(&a2, buf, w.len) == 0);
+        int waiting = 0;
+        for (int i = 0; i < 100 && !waiting; i++) {
+            oc_header hdr;
+            oc_rbuf p;
+            if (read_frame(&a2, &hdr, &p) != 0) break;
+            oc_summary_queued qq;
+            if (hdr.msg_type == OC_MSG_SUMMARY_QUEUED && oc_decode_summary_queued(&p, &qq) == OC_OK && qq.req_id == 61)
+                waiting = qq.position == 1;
+        }
+        CHECK(waiting);
+        for (uint32_t k = 61; k >= 60; k--) {
+            oc_summary_req cr = { k };
+            oc_wbuf_init(&w, buf, sizeof buf);
+            CHECK(oc_encode_summary_req(&w, OC_PROTOCOL_VERSION, OC_MSG_SUMMARY_CANCEL, &cr) == OC_OK);
+            CHECK(send_frame(&a2, buf, w.len) == 0);
+            int cancelled = 0;
+            for (int i = 0; i < 100 && !cancelled; i++) {
+                oc_header hdr;
+                oc_rbuf p;
+                if (read_frame(&a2, &hdr, &p) != 0) break;
+                if (hdr.msg_type == OC_MSG_SUMMARY && oc_decode_summary(&p, &sm) == OC_OK && sm.req_id == k)
+                    cancelled = sm.status == OC_SUM_CANCELLED ? 1 : -1;
+            }
+            CHECK(cancelled == 1);
+        }
+        /* The running one stops at its next pause, though the model still
+         * holds; let go, the worker moves on, as a fresh request answered shows,
+         * and what was cancelled left no notice (below). */
+        __atomic_store_n(&stub.hold, 0, __ATOMIC_RELEASE);
+        CHECK(summarize_await(&a2, 62, OC_SUM_TODAY, &sm, body, sizeof body) == 0 && sm.status == OC_SUM_OK);
+        /* A summary given live is marked seen by a write of its own, after the
+         * SUMMARY is sent: waited for, not raced. */
+        int left = -1, notices = -1, unseen = -1;
+        for (int t = 0; t < 500; t++) {
+            sqlite3 *ndb = NULL;
+            CHECK(sqlite3_open_v2("build/itest_sum.db", &ndb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+            sqlite3_stmt *ns = NULL;
+            if (sqlite3_prepare_v2(ndb, "SELECT (SELECT COUNT(*) FROM summary_requests), (SELECT COUNT(*) FROM "
+                                        "summary_notices), (SELECT COUNT(*) FROM summary_notices WHERE seen_at_ms IS "
+                                        "NULL);", -1, &ns, NULL) == SQLITE_OK && sqlite3_step(ns) == SQLITE_ROW) {
+                left = sqlite3_column_int(ns, 0);
+                notices = sqlite3_column_int(ns, 1);
+                unseen = sqlite3_column_int(ns, 2);
+            }
+            sqlite3_finalize(ns);
+            sqlite3_close(ndb);
+            if (unseen == 0) break;
+            struct timespec ts = { 0, 10 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        CHECK(left == 0);          /* cancelled: out of the queue */
+        CHECK(unseen == 0);        /* opened, dismissed, or given to whoever watched */
+        CHECK(notices >= 2);       /* and nothing for what was cancelled */
+        client_close(&a2);
+    }
+
     /* A channel the reader cannot read is refused. */
     oc_wbuf_init(&w, buf, sizeof buf);
     oc_summarize no = { 10, 999999, OC_SUM_WEEK, 0, 0 };
@@ -3740,8 +3995,54 @@ static void test_summaries(int port) {
     CHECK(g_auth_summarize == 0);
     client_close(&a);
 
-    stop_loop(&arg2, th2);
+    /* While summaries come up: offered, and a request waits in the queue for
+     * the worker, which makes it once they are on. */
+    oc_netloop_summary_starting();
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_summarize == 1);
+    oc_netloop_set_summary(wk);
+    CHECK(summarize_await(&a, 12, OC_SUM_DAILY, &sm, body, sizeof body) == 0);
+    CHECK(sm.status == OC_SUM_OK);
+    /* If they fail to come up, what waited is told so, and they are no longer
+     * offered. */
     oc_sum_worker_stop(wk);
+    wk = NULL;
+    oc_netloop_set_summary(NULL);
+    oc_netloop_summary_starting();
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_summarize wait = { 13, OC_DEFAULT_CHANNEL, OC_SUM_UNREAD, 0, 0 };
+    CHECK(oc_encode_summarize(&w, OC_PROTOCOL_VERSION, &wait) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    int queued = 0;
+    for (int i = 0; i < 50 && !queued; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        oc_summary_queued qq;
+        if (read_frame(&a, &hdr, &p) != 0) break;
+        queued = hdr.msg_type == OC_MSG_SUMMARY_QUEUED && oc_decode_summary_queued(&p, &qq) == OC_OK && qq.req_id == 13;
+    }
+    CHECK(queued);
+    oc_netloop_summary_failed();
+    int told = 0;
+    for (int i = 0; i < 50 && !told; i++) {
+        oc_header hdr;
+        oc_rbuf p;
+        if (read_frame(&a, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_SUMMARY && oc_decode_summary(&p, &sm) == OC_OK && sm.req_id == 13)
+            told = sm.status == OC_SUM_UNAVAILABLE ? 1 : -1;
+    }
+    CHECK(told == 1);
+    client_close(&a);
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(g_auth_summarize == 0);
+    client_close(&a);
+
+    stop_loop(&arg2, th2);
+    if (wk) oc_sum_worker_stop(wk);
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unlink("build/itest_sum.db");
@@ -4832,6 +5133,7 @@ static void test_call_routed(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_routed.db"); unlink("build/itest_routed.db-wal"); unlink("build/itest_routed.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_routed.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER,  2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw2, "bob",   "pw-bob",   OC_ROLE_MEMBER, 2048) != 0);
@@ -6084,6 +6386,7 @@ static void test_http_stack(int port, int hport) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_http.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
 
     oc_netloop_set_health_port(hport);
@@ -6193,6 +6496,7 @@ static void test_auth_begin(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_begin.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
     /* Any P-256 public key will do: nothing here presents a token. */
     static const char PEM[] =
@@ -6285,6 +6589,7 @@ static void test_proxy_header(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_proxy.db");
+    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
     struct loop_arg arg2;
     arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
@@ -6357,6 +6662,7 @@ int run_netloop_tests(void) {
     unlink("build/itest_netloop.db-wal");
     unlink("build/itest_netloop.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_netloop.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
 
     /* Provision the accounts the clients log in as, before the loop serves
@@ -6379,7 +6685,7 @@ int run_netloop_tests(void) {
     CHECK(flooder != 0);
 
     struct loop_arg arg;
-    arg.port = 18000 + (int)(getpid() % 2000);
+    arg.port = 15000 + (int)(getpid() % 2000);   /* to 17131, below every other suite's ports */
     arg.srv = &srv;
     arg.dbw = dbw;
     arg.stop = 0;

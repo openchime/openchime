@@ -48,6 +48,9 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
  * own database keeps what it wrote. */
 static const char *TEMPLATE_DB = "build/test_dbwriter_template.db";
 
+/* Low PBKDF2 rounds keep the tests fast; the production default is 600k. */
+#define TEST_PW_ITERS 2048
+
 static int make_template(void) {
     static int made;
     if (made) return made > 0;
@@ -69,7 +72,9 @@ static oc_dbwriter *start_db(const char *path) {
         if (in) fclose(in);
         if (out) fclose(out);
     }
-    return oc_dbwriter_start(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    if (w) oc_dbwriter_set_pw_iterations(w, TEST_PW_ITERS);   /* fast PBKDF2 for tests */
+    return w;
 }
 
 static int stored_member(const char *path, uint64_t ch, uint64_t uid);
@@ -82,9 +87,6 @@ static void cleanup_db(const char *path) {
     snprintf(shm, sizeof shm, "%s-shm", path);
     unlink(wal); unlink(shm);
 }
-
-/* Low PBKDF2 rounds keep the tests fast; the production default is 600k. */
-#define TEST_PW_ITERS 2048
 
 static uint64_t reg(oc_dbwriter *w, const char *user, const char *pass, uint8_t role) {
     return oc_dbwriter_register_local(w, user, pass, role, TEST_PW_ITERS);
@@ -1849,6 +1851,25 @@ static void test_channel_details(void) {
     CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
     oc_dbres_free(r);
 
+    /* A PUBLIC channel carol has not joined is one she can read: she may see
+     * who is in it, its files and its pins, as she may its messages. */
+    r = create_channel(w, alice, "lobby", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t lobby = r ? r->channel_id : 0;
+    oc_dbres_free(r);
+    r = list_members(w, carol, lobby);
+    CHECK(r && r->type == OC_RES_MEMBER_LIST);
+    oc_dbres_free(r);
+    r = list_files(w, carol, lobby);
+    CHECK(r && r->type == OC_RES_FILE_LIST);
+    oc_dbres_free(r);
+    r = list_pins(w, carol, lobby);
+    CHECK(r && r->type == OC_RES_PINS);
+    oc_dbres_free(r);
+    r = list_pins(w, carol, secret);
+    CHECK(r && r->type == OC_RES_PIN_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
     /* Files. Rows are written directly here because the upload path is a
      * multi-frame protocol exercised in its own suite; what is under test is
      * the LISTING — its scope, its ordering, and what it leaves out. */
@@ -2254,6 +2275,58 @@ static oc_dbres *list_drafts(oc_dbwriter *w, uint64_t uid) {
     return wait_result(w);
 }
 
+/* A database loaded from an export holds messages but no `mentions` rows
+ * (scripts/slack_to_db.py writes none), so the server's unread count read 0
+ * where the client, reading the text, counted the @channel lines. Crossing
+ * schema step 60 the writer scans every message without rows once, with the
+ * scanner a send uses. Made here by sending, wiping the rows and the step, and
+ * starting again. */
+static void test_index_mentions(void) {
+    const char *path = "build/test_dbwriter_index_mentions.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+    uint8_t idem[OC_IDEM_LEN] = { 0x60, 1 };
+    uint64_t m1 = send_msg(w, alice, idem, "@channel the office is closed Friday");
+    idem[1] = 2;
+    uint64_t m2 = send_msg(w, alice, idem, "@bob can you take the 3 o'clock");
+    idem[1] = 3;
+    uint64_t m3 = send_msg(w, alice, idem, "nothing for anyone here");
+    CHECK(m1 && m2 && m3);
+    oc_dbwriter_stop(w);
+
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    w = start_db(path);
+    CHECK(w != NULL);
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    int rows = 0, chan = 0, named = 0, none = 0;
+    sqlite3_prepare_v2(db, "SELECT message_id, user_id, kind FROM mentions;", -1, &st, NULL);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t mid = (uint64_t)sqlite3_column_int64(st, 0);
+        rows++;
+        if (mid == m1 && sqlite3_column_int(st, 2) == OC_MENTION_CHANNEL) chan++;
+        if (mid == m2 && (uint64_t)sqlite3_column_int64(st, 1) == bob) named++;
+        if (mid == m3) none++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    CHECK(chan >= 1);       /* the @channel line is a row for the channel */
+    CHECK(named == 1);      /* the @bob line is a row for bob */
+    CHECK(none == 0);       /* the plain line has none */
+    CHECK(rows >= 2);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_drafts(void) {
     const char *path = "build/test_dbwriter_drafts.db";
     cleanup_db(path);
@@ -2300,12 +2373,31 @@ static void test_drafts(void) {
     oc_dbres_free(r);
     r = list_drafts(w, alice); CHECK(r && r->n_drafts == 0); oc_dbres_free(r);
 
-    /* A non-member is refused: a draft is user content ABOUT a conversation,
-     * and storing one for a channel you cannot see would report its existence
-     * back to you on every other device. */
-    r = set_draft(w, alice, 999999, 0, "for a channel that is not mine");
+    /* A channel you cannot READ is refused: a draft is user content ABOUT a
+     * conversation, and storing one for a channel you cannot see would report
+     * its existence back to you on every other device. A public channel you
+     * have not joined is one you can read and type in, so its draft is kept;
+     * a private one you are not in is refused, as is one that does not exist. */
+    r = set_draft(w, alice, 999999, 0, "for a channel that is not there");
     CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
     oc_dbres_free(r);
+    {
+        r = create_channel(w, bob, "town-square", 1);
+        uint64_t square = r ? r->channel_id : 0;
+        oc_dbres_free(r);
+        r = create_channel(w, bob, "bobs-room", 0);
+        uint64_t room = r ? r->channel_id : 0;
+        oc_dbres_free(r);
+        CHECK(square && room);
+        r = set_draft(w, alice, square, 0, "typed before joining");
+        CHECK(r && r->type == OC_RES_DRAFT);
+        oc_dbres_free(r);
+        r = list_drafts(w, alice); CHECK(r && r->n_drafts == 1); oc_dbres_free(r);
+        r = set_draft(w, alice, square, 0, ""); oc_dbres_free(r);
+        r = set_draft(w, alice, room, 0, "not for me");
+        CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+        oc_dbres_free(r);
+    }
 
     /* SENDING clears the draft, server-side, in the send's own transaction. */
     r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "about to send this"); oc_dbres_free(r);
@@ -7816,6 +7908,7 @@ int run_dbwriter_tests(void) {
     test_pins();
     test_channel_details();
     test_drafts();
+    test_index_mentions();
     test_scheduled();
     test_activity_unreads();
     test_channel_mutability();

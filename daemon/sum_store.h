@@ -22,8 +22,9 @@
 #define OC_SUM_KIND_PERIOD  3
 
 /* A channel's messages for a period: every top-level message and every thread
- * whose last activity is in [start, end), people only (no integration posts,
- * call events or deleted messages), as plain text, sorted by id. */
+ * whose last activity is in [start, end), people's and integrations' posts (no
+ * call events or deleted messages), as plain text, sorted by id; an
+ * integration's post is by the name it signs with. */
 typedef struct {
     oc_sum_msg *msgs;
     int         n;
@@ -34,6 +35,18 @@ void oc_sum_window_free(oc_sum_window *w);
 
 /* A display name for `user_id`, into `out` ("" when unknown). */
 void oc_sum_user_name(sqlite3 *db, int64_t user_id, char *out, size_t cap);
+
+/* Who posted in [start, end) of `channel` and how much, as JSON members
+ * appended to `out`: "posters":[{"id":<user id, 0 an integration>,"name":"..."}]
+ * (most messages first), "count":<messages>. 0 or -1. */
+int oc_sum_span_people(sqlite3 *db, int64_t channel, int64_t start_ms, int64_t end_ms, oc_sum_buf *out);
+
+/* The messages `ids` as a summary's sources, a JSON member appended to `out`:
+ * "sources":{"<id>":{"author","author_id" (0 an integration),"at","parent"
+ * (the thread root, 0 none),"text" (plain, whole)}}; a deleted one is left
+ * out. 0 or -1. */
+int oc_sum_sources(sqlite3 *db, const int64_t *ids, int n, oc_sum_buf *out);
+
 
 /* A node with these inputs (ikey) built with `version`: 1 and its id and body
  * (heap) if there is one, else 0. */

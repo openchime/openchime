@@ -102,6 +102,7 @@ struct oc_dbwriter {
     int             have_factor_key;         /* without it no step can be passed */
     int             local_mfa;               /* OC_MFA_*: when the second step is asked */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
+    uint32_t        pw_iters;                /* PBKDF2 rounds for new keys and the unknown-name check */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed sign-ins per source IP, every source */
 
@@ -535,7 +536,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone); free(r->pf_voice_id);
     free(r->tts_text); free(r->tts_blob_key);
-    free(r->sum_body); free(r->sum_version); free(r->sum_places);
+    free(r->sum_body); free(r->sum_version); free(r->sum_places); free(r->sum_notices);
     for (size_t i = 0; i < r->n_stt_names; i++) free(r->stt_names[i]);
     free(r->stt_names);
     free(r->call_uids);
@@ -1044,6 +1045,35 @@ static void alerts_counts(sqlite3 *db, uint32_t *unacked, uint32_t *current) {
 
 /* An owner's or admin's sign-in carries the counts, so the client can show them
  * at once; nobody else's does. */
+/* A person's summary notices not yet seen, oldest first: told again at sign-in
+ * (REQ-310, SUMMARIES.md §5). */
+static void notices_on_auth(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    size_t cap = 0;
+    if (sqlite3_prepare_v2(db, "SELECT id, channel_id, scope, status, start_ms, end_ms, made_at_ms "
+                               "FROM summary_notices WHERE user_id=?1 AND seen_at_ms IS NULL ORDER BY id;",
+                           -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return; }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (r->n_sum_notices == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            struct oc_sum_notice_row *nv = realloc(r->sum_notices, nc * sizeof *nv);
+            if (!nv) break;
+            r->sum_notices = nv;
+            cap = nc;
+        }
+        struct oc_sum_notice_row *n = &r->sum_notices[r->n_sum_notices++];
+        n->id = (uint64_t)sqlite3_column_int64(st, 0);
+        n->channel_id = (uint64_t)sqlite3_column_int64(st, 1);
+        n->scope = (uint8_t)sqlite3_column_int(st, 2);
+        n->status = (uint8_t)sqlite3_column_int(st, 3);
+        n->start_ms = (uint64_t)sqlite3_column_int64(st, 4);
+        n->end_ms = (uint64_t)sqlite3_column_int64(st, 5);
+        n->made_at_ms = (uint64_t)sqlite3_column_int64(st, 6);
+    }
+    sqlite3_finalize(st);
+}
+
 static void alerts_on_auth(sqlite3 *db, oc_dbres *r) {
     if (!oc_role_can_manage_members(r->role)) return;
     r->alerts_admin = 1;
@@ -1363,7 +1393,7 @@ static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
     uint64_t uid = register_local(db,
         j->username ? j->username : "", j->username ? strlen(j->username) : 0,
         j->password ? j->password : "", j->password ? strlen(j->password) : 0,
-        j->role, j->iterations);
+        j->role, j->iterations ? j->iterations : w->pw_iters);
     if (uid == 0) { r->type = OC_RES_REGISTER_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
     r->type = OC_RES_REGISTER_OK;
     r->user_id = uid;
@@ -1735,6 +1765,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
     r->role = role;
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
     alerts_on_auth(db, r);
+    notices_on_auth(db, uid, r);
     /* Do-not-disturb rides along, BOTH halves: the net thread keeps the FACT in
      * memory so presence fan-out can carry it, and it has no database of its
      * own. The pause is an instant (REQ-278); the schedule is a rule the net
@@ -2383,7 +2414,7 @@ static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
         if (chk && oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0) {
             chk->new_password = j->pf_new_pw;
             chk->new_pwlen = strlen(j->pf_new_pw);
-            chk->new_iters = OC_PW_ITERATIONS;
+            chk->new_iters = w->pw_iters;
             chk->owner = (oc_job *)j;
             ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
             oc_authpool_submit(w->auth, chk);
@@ -2825,7 +2856,7 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
     }
 
-    uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->iterations);
+    uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->iterations ? j->iterations : w->pw_iters);
     if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
 
     /* Consume the invite (single-use); the single writer thread makes this atomic
@@ -2860,6 +2891,7 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     alerts_on_auth(db, r);
+    notices_on_auth(db, uid, r);
     r->snooze_until_ms = snooze_until(db, uid);
     fill_schedule(db, uid, r);              /* REQ-136, as above */
     memcpy(r->session_token, token, sizeof token);
@@ -3838,6 +3870,40 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
  *
  * Thread messages included, deliberately diverging from Slack: a thread is where
  * the substantive discussion usually is, and the worst place to go deaf. */
+/* Index the mentions of every message that has none: the one-time pass a
+ * database loaded from an export needs (migrate.c, 0060), with the same scanner
+ * a send uses, so the server's unread count and the client's reading of the
+ * text agree. A message whose mentions are already rows is left alone, so the
+ * pass is safe to repeat. */
+static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
+                           const void *body, size_t body_len, uint64_t ts,
+                           oc_mention_unresolved *unres, uint16_t *unres_total);   /* below */
+static void index_mentions(sqlite3 *db) {
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.id, m.channel_id, m.body, m.created_at_ms FROM messages m "
+            " WHERE m.body IS NOT NULL AND m.deleted_at_ms IS NULL "
+            "   AND NOT EXISTS(SELECT 1 FROM mentions x WHERE x.message_id = m.id) "
+            " ORDER BY m.id;", -1, &q, NULL) != SQLITE_OK) return;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    size_t n = 0;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        uint64_t mid = (uint64_t)sqlite3_column_int64(q, 0);
+        uint64_t cid = (uint64_t)sqlite3_column_int64(q, 1);
+        const void *body = sqlite3_column_blob(q, 2);
+        size_t blen = (size_t)sqlite3_column_bytes(q, 2);
+        uint64_t ts = (uint64_t)sqlite3_column_int64(q, 3);
+        if (!body || !blen || !memchr(body, '@', blen)) continue;
+        oc_mention_unresolved unres; memset(&unres, 0, sizeof unres);
+        uint16_t unres_total = 0;
+        store_mentions(db, mid, cid, body, blen, ts, &unres, &unres_total);
+        n++;
+    }
+    sqlite3_finalize(q);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (n) fprintf(stderr, "dbwriter: scanned %zu messages for mentions they had no rows for\n", n);
+}
+
 static void store_keyword_hits(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                                uint64_t author_id, const void *body, size_t body_len,
                                uint64_t ts) {
@@ -5495,9 +5561,10 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->channel_id = j->channel_id;
 
-    /* You may only enumerate a channel you can read, or this becomes a way to
-     * discover who is in a private channel you were never invited to. */
-    if (!is_member(db, j->channel_id, j->user_id)) {
+    /* You may only enumerate a channel you can read -- a public one, or one
+     * you are in -- or this becomes a way to discover who is in a private
+     * channel you were never invited to. */
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     r->type = OC_RES_MEMBER_LIST;
@@ -5611,7 +5678,8 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->channel_id = j->channel_id;
 
-    if (j->channel_id && !is_member(db, j->channel_id, j->user_id)) {
+    /* A channel's files, to anyone who can read it (its messages carry them). */
+    if (j->channel_id && !channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     r->type = OC_RES_FILE_LIST;
@@ -5916,6 +5984,11 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "   WHERE p.author_id = ?1 AND c.author_id <> ?1 AND c.deleted_at_ms IS NULL "
         "     AND EXISTS(SELECT 1 FROM channel_members cm "
         "                 WHERE cm.channel_id = c.channel_id AND cm.user_id = ?1) "
+        "  UNION ALL "
+        /* --- summaries I asked for, made while I was not watching (REQ-310):
+         * the notice in message_id, its scope as text, its status as action --- */
+        "  SELECT 4, sn.id, sn.channel_id, 0, sn.made_at_ms, CAST(sn.scope AS TEXT), sn.status "
+        "    FROM summary_notices sn WHERE sn.user_id = ?1 "
         ") ORDER BY at DESC LIMIT ?3;";
 
     sqlite3_prepare_v2(db, SQL, -1, &st, NULL);
@@ -5933,7 +6006,9 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         arr[n].at         = (uint64_t)sqlite3_column_int64(st, 4);
         const unsigned char *t = sqlite3_column_text(st, 5);
         arr[n].text = t ? strdup((const char *)t) : NULL;
-        arr[n].action = (uint8_t)(sqlite3_column_int(st, 6) != 0);   /* REQ-058 */
+        /* REQ-058's flag; a summary's status (OC_ACT_SUMMARY). */
+        arr[n].action = arr[n].kind == OC_ACT_SUMMARY ? (uint8_t)sqlite3_column_int(st, 6)
+                                                      : (uint8_t)(sqlite3_column_int(st, 6) != 0);
         n++;
     }
     sqlite3_finalize(st);
@@ -6043,7 +6118,8 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->channel_id = j->channel_id;
 
-    if (!is_member(db, j->channel_id, j->user_id)) {
+    /* A channel's pins, to anyone who can read it. */
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     r->type = OC_RES_PINS;
@@ -8502,13 +8578,17 @@ static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->user_id = j->user_id;
-    /* Membership first, as every channel-scoped handler does. A draft is user
-     * content about a conversation, and storing one for a channel you cannot
-     * see would leak its existence back to you on any other device.
+    /* Read access, as every other read of a conversation has it: a public
+     * channel you have not joined is one you can type in (sending joins you),
+     * so a draft there is yours to keep. A private channel you are not in would
+     * leak its existence back to you on any other device, so that is refused.
+     * Membership alone was too strict: the client writes a conversation's draft
+     * on the way out, and every public channel you had only read answered
+     * "you are not in that channel" as you left it.
      *
-     * channel_id 0 is the UNADDRESSED case (REQ-229) and has no membership to
+     * channel_id 0 is the UNADDRESSED case (REQ-229) and has no channel to
      * check: it belongs to nobody's conversation yet, which is the point. */
-    if (j->channel_id && !is_member(db, j->channel_id, j->user_id)) {
+    if (j->channel_id && !channel_read_access(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     size_t blen = j->body_len > OC_DRAFT_BODY_MAX ? OC_DRAFT_BODY_MAX : j->body_len;
@@ -8594,19 +8674,21 @@ static oc_dbres *process_list_drafts(sqlite3 *db, const oc_job *j) {
     r->drafts = malloc(cap * sizeof *r->drafts);
     if (!r->drafts) return r;
     sqlite3_stmt *st = NULL;
-    /* Joined to channel_members so a draft for a conversation the user has
-     * since left stays stored (ARCH-101: leaving is reversible) but is not
-     * listed — "a draft for a channel you are not in is simply invisible until
-     * you return". */
+    /* Listed for the conversations the user can READ, the rule the write
+     * follows (process_set_draft): a public channel whether or not they have
+     * joined it, a private one only while they are in it. A draft for a private
+     * channel the user has since left stays stored (ARCH-101: leaving is
+     * reversible) but is not listed — "a draft for a channel you are not in is
+     * simply invisible until you return". */
     sqlite3_prepare_v2(db,
-        /* LEFT JOIN, and the membership test allows a NULL channel: an
-         * UNADDRESSED draft (REQ-229) belongs to no conversation yet, so an
-         * inner join would hide exactly the drafts the New Message pane
-         * depends on. */
+        /* LEFT JOINs, and the test allows a NULL channel: an UNADDRESSED draft
+         * (REQ-229) belongs to no conversation yet, so an inner join would hide
+         * exactly the drafts the New Message pane depends on. */
         "SELECT d.channel_id, d.thread_root, d.body, d.updated_ms, d.id, d.recipients "
         "FROM drafts d "
         "LEFT JOIN channel_members m ON m.channel_id = d.channel_id AND m.user_id = d.user_id "
-        "WHERE d.user_id=? AND (d.channel_id IS NULL OR m.user_id IS NOT NULL) "
+        "LEFT JOIN channels c ON c.id = d.channel_id "
+        "WHERE d.user_id=? AND (d.channel_id IS NULL OR m.user_id IS NOT NULL OR c.is_public = 1) "
         "ORDER BY d.updated_ms DESC LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     sqlite3_bind_int  (st, 2, (int)OC_MAX_DRAFTS);
@@ -9550,17 +9632,40 @@ static oc_dbres *process_summary_queue(sqlite3 *db, const oc_job *j) {
         }
         return r;
     }
+    /* The same span asked for again by the same person -- after a reconnect, or
+     * from another device -- is the request already waiting: the asker watches
+     * it now. A range is the same when its days are; the other spans when they
+     * start the same day. */
+    int joined = 0;
     if (sqlite3_prepare_v2(db,
-            "INSERT INTO summary_requests (conn_id, req_id, user_id, channel_id, start_ms, end_ms, tz_offset_min, "
-            "created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8);", -1, &st, NULL) == SQLITE_OK) {
+            "UPDATE summary_requests SET conn_id=?1, req_id=?2 WHERE id=(SELECT id FROM summary_requests "
+            "WHERE user_id=?3 AND channel_id=?4 AND scope=?5 AND tz_offset_min=?6 AND start_ms=?7 "
+            "AND (scope<>?9 OR end_ms=?8) ORDER BY id LIMIT 1);", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)j->conn_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->sum_req);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
         sqlite3_bind_int64(st, 4, (sqlite3_int64)j->channel_id);
-        sqlite3_bind_int64(st, 5, (sqlite3_int64)j->sum_start);
-        sqlite3_bind_int64(st, 6, (sqlite3_int64)j->sum_end);
-        sqlite3_bind_int(st, 7, j->sum_tz);
-        sqlite3_bind_int64(st, 8, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_int(st, 5, j->sum_scope);
+        sqlite3_bind_int(st, 6, j->sum_tz);
+        sqlite3_bind_int64(st, 7, (sqlite3_int64)j->sum_start);
+        sqlite3_bind_int64(st, 8, (sqlite3_int64)j->sum_end);
+        sqlite3_bind_int(st, 9, OC_SUM_RANGE);
+        if (sqlite3_step(st) == SQLITE_DONE) joined = sqlite3_changes(db) == 1;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!joined && sqlite3_prepare_v2(db,
+            "INSERT INTO summary_requests (conn_id, req_id, user_id, channel_id, scope, start_ms, end_ms, "
+            "tz_offset_min, created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9);", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->conn_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->sum_req);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int(st, 5, j->sum_scope);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)j->sum_start);
+        sqlite3_bind_int64(st, 7, (sqlite3_int64)j->sum_end);
+        sqlite3_bind_int(st, 8, j->sum_tz);
+        sqlite3_bind_int64(st, 9, (sqlite3_int64)dbw_now_ms());
         sqlite3_step(st);
     }
     sqlite3_finalize(st);
@@ -9589,21 +9694,125 @@ static oc_dbres *process_summary_take(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* A connection closed (DROP: all it watched) or its person stopped watching
+ * one request (DETACH): the requests go on, watched by nobody, and are told as
+ * notices when made. */
 static oc_dbres *process_summary_drop(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
-    int gone = 0;
-    if (sqlite3_prepare_v2(db, "DELETE FROM summary_requests WHERE conn_id=?1 AND state='queued';", -1, &st,
-                           NULL) == SQLITE_OK) {
+    const char *sql = j->type == OC_JOB_SUMMARY_DETACH
+        ? "UPDATE summary_requests SET conn_id=0, req_id=0 WHERE conn_id=?1 AND req_id=?2;"
+        : "UPDATE summary_requests SET conn_id=0, req_id=0 WHERE conn_id=?1;";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)j->conn_id);
-        if (sqlite3_step(st) == SQLITE_DONE) gone = sqlite3_changes(db);
+        if (j->type == OC_JOB_SUMMARY_DETACH) sqlite3_bind_int64(st, 2, (sqlite3_int64)j->sum_req);
+        sqlite3_step(st);
     }
     sqlite3_finalize(st);
-    if (!gone) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (r) r->type = OC_RES_OK;
+    return r;
+}
+
+/* Its asker cancelled a request: out of the queue, and answered CANCELLED;
+ * one being made is named (`sum_row`) for the worker to stop. A request
+ * already answered is left as it was. */
+static oc_dbres *process_summary_cancel(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    int64_t row = 0;
+    int running = 0;
+    if (sqlite3_prepare_v2(db, "SELECT id, state='running', channel_id FROM summary_requests "
+                               "WHERE conn_id=?1 AND req_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->conn_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->sum_req);
+        if (sqlite3_step(st) == SQLITE_ROW) { row = sqlite3_column_int64(st, 0); running = sqlite3_column_int(st, 1); }
+    }
+    sqlite3_finalize(st);
+    if (!row) {
         oc_dbres *r = calloc(1, sizeof *r);
         if (r) r->type = OC_RES_OK;
         return r;
     }
-    return places_result(db);
+    if (sqlite3_prepare_v2(db, "DELETE FROM summary_requests WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, row);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = sum_answer(j->conn_id, j->sum_req, OC_SUM_CANCELLED, j->channel_id);
+    if (r) {
+        r->sum_body = strdup("Summary canceled.");
+        r->sum_version = strdup("");
+        r->sum_row = running ? row : 0;
+        sum_places(db, r);
+    }
+    return r;
+}
+
+/* A notice opened: its summary as it was made (or why it was not), answered as
+ * SUMMARY to the asking request, and the notice seen. Only its own person's. */
+static oc_dbres *process_summary_open(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    oc_dbres *r = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT channel_id, start_ms, end_ms, tz_offset_min, status, body, reason "
+                               "FROM summary_notices WHERE id=?1 AND user_id=?2;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->sum_notice);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            int status = sqlite3_column_int(st, 4);
+            r = sum_answer(j->conn_id, j->sum_req, (uint8_t)status, (uint64_t)sqlite3_column_int64(st, 0));
+            if (r) {
+                r->sum_start = sqlite3_column_int64(st, 1);
+                r->sum_end = sqlite3_column_int64(st, 2);
+                r->sum_tz = sqlite3_column_int(st, 3);
+                const char *t = (const char *)sqlite3_column_text(st, status == OC_SUM_OK ? 5 : 6);
+                r->sum_body = strdup(t ? t : "");
+                r->sum_version = strdup("");
+                r->sum_id = j->sum_notice;
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    if (!r) {
+        r = sum_answer(j->conn_id, j->sum_req, OC_SUM_UNAVAILABLE, 0);
+        if (r) { r->sum_body = strdup("This summary is no longer kept."); r->sum_version = strdup(""); }
+        return r;
+    }
+    if (sqlite3_prepare_v2(db, "UPDATE summary_notices SET seen_at_ms=?3 WHERE id=?1 AND user_id=?2 "
+                               "AND seen_at_ms IS NULL;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->sum_notice);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* A notice seen without being opened: dismissed, or its summary delivered to
+ * the person watching it. */
+static oc_dbres *process_summary_seen(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE summary_notices SET seen_at_ms=?3 WHERE id=?1 AND user_id=?2 "
+                               "AND seen_at_ms IS NULL;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->sum_notice);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (r) r->type = OC_RES_OK;
+    return r;
+}
+
+/* Summaries did not come up: what someone is watching is answered and leaves
+ * the queue; what nobody watches waits for a start that brings them up. */
+static oc_dbres *process_summary_fail(sqlite3 *db) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_SUMMARY_FAILALL;
+    sum_places(db, r);
+    sqlite3_exec(db, "DELETE FROM summary_requests WHERE conn_id<>0;", NULL, NULL, NULL);
+    return r;
 }
 
 static oc_dbres *sum_answer(uint64_t conn_id, uint32_t req, uint8_t status, uint64_t channel) {
@@ -9622,25 +9831,68 @@ static oc_dbres *process_summary_store(sqlite3 *db, const oc_job *j) {
     const oc_sum_answer *a = b->a;
     oc_dbres *r = NULL;
     int rc = b->n ? oc_sum_store(db, a->channel, a->version, b->nodes, b->n) : 0;
-    if (a->conn_id && rc != 1) {
-        /* Answered: out of the queue. */
-        if (a->request_id) {
-            sqlite3_stmt *st = NULL;
-            if (sqlite3_prepare_v2(db, "DELETE FROM summary_requests WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
-                sqlite3_bind_int64(st, 1, (sqlite3_int64)a->request_id);
-                sqlite3_step(st);
-            }
-            sqlite3_finalize(st);
+    /* A request's answer -- unless it was cancelled meanwhile (its row gone):
+     * who watches it now, and whose it is. */
+    sqlite3_stmt *st = NULL;
+    uint64_t conn = 0, user = 0;
+    uint32_t req = 0;
+    int scope = 0, found = 0;
+    /* A build that failed is answered whatever became of its pieces. */
+    if (a->request_id && (rc != 1 || !a->ok) &&
+        sqlite3_prepare_v2(db, "SELECT conn_id, req_id, user_id, scope FROM summary_requests WHERE id=?1;", -1, &st,
+                           NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)a->request_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            conn = (uint64_t)sqlite3_column_int64(st, 0);
+            req = (uint32_t)sqlite3_column_int64(st, 1);
+            user = (uint64_t)sqlite3_column_int64(st, 2);
+            scope = sqlite3_column_int(st, 3);
+            found = 1;
         }
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (found) {
+        /* Answered: out of the queue, and kept as a notice -- seen at once if
+         * its watcher is given it, told to its person otherwise. */
+        if (sqlite3_prepare_v2(db, "DELETE FROM summary_requests WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)a->request_id);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+        st = NULL;
         int ok = a->ok && rc == 0;
-        r = sum_answer(a->conn_id, a->req_id, ok ? OC_SUM_OK : OC_SUM_FAILED, (uint64_t)a->channel);
+        uint8_t status = ok ? OC_SUM_OK : OC_SUM_FAILED;
+        const char *why = a->err ? a->err : "The summary could not be made.";
+        uint64_t now = dbw_now_ms(), notice = 0;
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO summary_notices (user_id, channel_id, scope, start_ms, end_ms, tz_offset_min, status, "
+                "body, reason, made_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)user);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)a->channel);
+            sqlite3_bind_int(st, 3, scope);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)a->start_ms);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)a->end_ms);
+            sqlite3_bind_int(st, 6, a->tz_offset_min);
+            sqlite3_bind_int(st, 7, status);
+            if (ok) sqlite3_bind_text(st, 8, a->body, -1, SQLITE_TRANSIENT);
+            else sqlite3_bind_text(st, 9, why, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 10, (sqlite3_int64)now);
+            if (sqlite3_step(st) == SQLITE_DONE) notice = (uint64_t)sqlite3_last_insert_rowid(db);
+        }
+        sqlite3_finalize(st);
+        r = sum_answer(conn, req, status, (uint64_t)a->channel);
         if (r) {
             r->sum_start = a->start_ms;
             r->sum_end = a->end_ms;
             r->sum_tz = a->tz_offset_min;
             r->sum_id = ok ? (uint64_t)(b->n ? b->nodes[b->n - 1].id : a->summary_id) : 0;
-            r->sum_body = strdup(ok ? a->body : (a->err ? a->err : "The summary could not be made."));
+            r->sum_body = strdup(ok ? a->body : why);
             r->sum_version = strdup(a->version ? a->version : "");
+            r->sum_notice = notice;
+            r->sum_user = user;
+            r->sum_scope = (uint8_t)scope;
+            r->sum_made_at = now;
             sum_places(db, r);
         }
     }
@@ -9701,12 +9953,11 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
     if (!channel_read_access(rdb, j->channel_id, j->user_id))
         return sum_answer(j->conn_id, j->sum_req, OC_SUM_FORBIDDEN, j->channel_id);
     int tz = 0;
-    int64_t seen = 0, now = (int64_t)dbw_now_ms();
+    int64_t now = (int64_t)dbw_now_ms();
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(rdb, "SELECT COALESCE(tz_offset_min,0), COALESCE(activity_seen_ms,0) FROM users WHERE id=?1;",
-                           -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(rdb, "SELECT COALESCE(tz_offset_min,0) FROM users WHERE id=?1;", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
-        if (sqlite3_step(st) == SQLITE_ROW) { tz = sqlite3_column_int(st, 0); seen = sqlite3_column_int64(st, 1); }
+        if (sqlite3_step(st) == SQLITE_ROW) tz = sqlite3_column_int(st, 0);
     }
     sqlite3_finalize(st);
     const int64_t day = 86400000;
@@ -9715,11 +9966,11 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
     case OC_SUM_WEEK:
         start = today - 6 * day; end = today + day;
         break;
-    case OC_SUM_DAILY:
-        end = today;
-        start = today - day;
-        /* Every day since the reader was last about. */
-        if (seen && seen < start) start = oc_sum_day_start(seen, tz);
+    case OC_SUM_TODAY:
+        start = today; end = now + 1;
+        break;
+    case OC_SUM_DAILY:   /* since yesterday: yesterday, and today so far */
+        start = today - day; end = now + 1;
         break;
     case OC_SUM_RANGE:
         start = (int64_t)j->sum_start; end = (int64_t)j->sum_end;
@@ -9745,13 +9996,17 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
     }
     int64_t id = 0;
     char *body = NULL, version[160] = "";
-    if (oc_sum_find_period(rdb, (int64_t)j->channel_id, start, end, tz, j->sum_version ? j->sum_version : "", 1,
-                           &id, &body, version, sizeof version)) {
+    /* One made by an earlier version is answered while its rebuild waits, when
+     * it has the shape clients read. */
+    int found = oc_sum_find_period(rdb, (int64_t)j->channel_id, start, end, tz, j->sum_version ? j->sum_version : "",
+                                   1, &id, &body, version, sizeof version);
+    if (found && !oc_sum_body_readable(body)) { free(body); body = NULL; found = 0; }
+    if (found) {
         oc_dbres *r = sum_answer(j->conn_id, j->sum_req, OC_SUM_OK, j->channel_id);
         if (r) {
             r->sum_id = (uint64_t)id;
             r->sum_start = start; r->sum_end = end; r->sum_tz = tz;
-            r->sum_body = oc_sum_client_body(rdb, body);
+            r->sum_body = oc_sum_client_body(rdb, body, (int64_t)j->channel_id, start, end);
             r->sum_version = strdup(version);
             if (!r->sum_body) r->sum_status = OC_SUM_FAILED;
         }
@@ -9759,7 +10014,10 @@ static oc_dbres *process_summary_lookup(sqlite3 *rdb, const oc_job *j) {
         return r;
     }
     oc_dbres *r = sum_answer(j->conn_id, j->sum_req, OC_SUM_OK, j->channel_id);
-    if (r) { r->type = OC_RES_SUMMARY_NEED; r->sum_start = start; r->sum_end = end; r->sum_tz = tz; }
+    if (r) {
+        r->type = OC_RES_SUMMARY_NEED; r->sum_start = start; r->sum_end = end; r->sum_tz = tz;
+        r->sum_scope = j->sum_scope;
+    }
     return r;
 }
 
@@ -9785,6 +10043,11 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SUMMARY_QUEUE) return process_summary_queue(w->db, j);
     if (j->type == OC_JOB_SUMMARY_TAKE)  return process_summary_take(w->db, j);
     if (j->type == OC_JOB_SUMMARY_DROP)  return process_summary_drop(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_FAIL)  return process_summary_fail(w->db);
+    if (j->type == OC_JOB_SUMMARY_DETACH) return process_summary_drop(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_CANCEL) return process_summary_cancel(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_OPEN)  return process_summary_open(w->db, j);
+    if (j->type == OC_JOB_SUMMARY_SEEN)  return process_summary_seen(w->db, j);
     if (j->type == OC_JOB_TTS_STORE)     return process_tts_store(w->db, j);
     if (j->type == OC_JOB_TTS_TOUCH)     return process_tts_touch(w->db, j);
     if (j->type == OC_JOB_TTS_VOICE_SET) return process_tts_voice_set(w->db, j);
@@ -10065,6 +10328,14 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
 
     /* Age out the audit log alongside the blobs (REQ-251a), per family. */
     prune_audit(db, j->audit_max_age_ms);
+    /* Summary notices a day after they were seen; unseen ones stay. */
+    if (sqlite3_prepare_v2(db, "DELETE FROM summary_notices WHERE seen_at_ms IS NOT NULL AND seen_at_ms < ?1;", -1,
+                           &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(now > SUM_NOTICE_KEEP_MS ? now - SUM_NOTICE_KEEP_MS : 0));
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
 
     /* Tier 0 (ARCH-111): read-aloud renderings, before anything a user uploaded.
      * A rendering is the daemon's own work and can be made again from the message
@@ -10325,7 +10596,7 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
             chk->pwlen = strlen(j->pf_old_pw);
             chk->new_password = j->pf_new_pw;
             chk->new_pwlen = strlen(j->pf_new_pw);
-            chk->new_iters = OC_PW_ITERATIONS;
+            chk->new_iters = w->pw_iters;
         }
     } else if (chk) {
         oc_slice cred = { (const uint8_t *)j->token, j->token_len }, user, pass;
@@ -10343,7 +10614,7 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
             if (found) {
                 chk->new_password = j->pf_new_pw;
                 chk->new_pwlen = strlen(j->pf_new_pw);
-                chk->new_iters = OC_PW_ITERATIONS;
+                chk->new_iters = w->pw_iters;
             }
         }
     }
@@ -10353,7 +10624,7 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
     if (!found && chk && j->type != OC_JOB_CHANGE_PASSWORD && chk->password &&
         oc_rand_bytes(chk->salt, OC_PW_SALT_LEN) == 0 && oc_rand_bytes(chk->stored, sizeof chk->stored) == 0) {
         chk->slen = OC_PW_SALT_LEN;
-        chk->iters = OC_PW_ITERATIONS;
+        chk->iters = w->pw_iters;
         chk->new_password = NULL;
         uid = 0;
         found = 1;
@@ -10485,6 +10756,12 @@ const char *oc_dbwriter_oidc_audience(oc_dbwriter *w) {
  * serving; read only on the writer thread. */
 void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users) {
     w->max_users = max_users > 0 ? max_users : 0;
+}
+
+/* PBKDF2 rounds for keys the writer makes and the unknown-name check; tests
+ * only, which hash at their own low count. Set before serving. */
+void oc_dbwriter_set_pw_iterations(oc_dbwriter *w, uint32_t iterations) {
+    w->pw_iters = iterations ? iterations : OC_PW_ITERATIONS;
 }
 
 uint8_t oc_dbwriter_auth_methods(oc_dbwriter *w) { return w->auth_methods; }
@@ -10853,6 +11130,7 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
     w->idem_retention_ms = OC_IDEM_RETENTION_MS;
     w->restore_window_ms = OC_RESTORE_WINDOW_MS;
+    w->pw_iters = OC_PW_ITERATIONS;
     w->prune_interval_ms = OC_PRUNE_INTERVAL_MS;
     w->auth_rl   = oc_ratelimit_new(OC_AUTH_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->source_rl = oc_ratelimit_new(OC_AUTH_SOURCE_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
@@ -10874,12 +11152,16 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
         fprintf(stderr, "dbwriter: pragma failed: %s\n", err ? err : "?");
         sqlite3_free(err); goto fail;
     }
+    int schema_before = oc_schema_version(w->db);
     if (oc_migrate_default(w->db, &err) != SQLITE_OK) {
         fprintf(stderr, "dbwriter: migration failed: %s\n", err ? err : "?");
         sqlite3_free(err); goto fail;
     }
-    /* The summary queue's connections died with the last run (migration 0058). */
-    sqlite3_exec(w->db, "DELETE FROM summary_requests;", NULL, NULL, NULL);
+    if (schema_before < 60) index_mentions(w->db);
+    /* The summary queue outlives the daemon, its connections do not: every
+     * request waits again, watched by nobody, and is made and told as a notice
+     * (migration 0059). */
+    sqlite3_exec(w->db, "UPDATE summary_requests SET state='queued', conn_id=0, req_id=0;", NULL, NULL, NULL);
     if (local_issuer_load(w) != 0) {
         fprintf(stderr, "dbwriter: the local issuer could not be made\n");
         goto fail;

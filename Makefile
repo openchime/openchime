@@ -85,7 +85,7 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
@@ -204,7 +204,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test test-rest test-tsan check-opcodes check-refs check-release-cc core tui bench bench-loop clean distclean FORCE s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
+.PHONY: all run test test-ci check-opcodes check-refs check-release-cc core tui bench bench-loop clean distclean FORCE s3-smoke windows-tui windows-gui tuikit-demo tts_pack demo-client
 
 all: $(BIN)
 
@@ -329,11 +329,12 @@ $(LLAMA_A): scripts/build_llamacpp.sh
 # The summary evaluation tool (docs/SUMMARIES.md §7): the daemon's summary code
 # outside the daemon. Development only; not built by `all`, never installed.
 SUMEVAL_SRC := scripts/sumeval.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c \
-               daemon/sum_llama.c daemon/json.c daemon/migrate.c shared/speakable.c shared/richtext.c \
-               shared/mention.c shared/url.c
-build/sumeval: $(SUMEVAL_SRC) $(LLAMA_A) $(SQLITE_O) $(HDRS) | build
+               daemon/sum_llama.c daemon/sum_cloud.c daemon/https_client.c daemon/json.c daemon/migrate.c \
+               shared/speakable.c shared/richtext.c shared/mention.c shared/url.c shared/tls.c \
+               third_party/ca-roots/ca_roots.c
+build/sumeval: $(SUMEVAL_SRC) $(LLAMA_A) $(MBEDTLS_A) $(SQLITE_O) $(HDRS) | build
 	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) -I$(LLAMA_DIR)/include -o $@ $(SUMEVAL_SRC) $(SQLITE_O) $(LLAMA_A) \
-	    -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl -lpthread -lm
+	    $(MBEDTLS_LIBS) -static-libstdc++ -static-libgcc -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -ldl -lpthread -lm
 $(KITTEN) build/kitten/voices.npz: scripts/build_kitten.sh scripts/tts_convert.c
 	scripts/build_kitten.sh
 build/moonshine/.done: scripts/build_moonshine.sh
@@ -385,15 +386,18 @@ check-release-cc: $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $
 	done; echo "check-release-cc: $(words $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(RELEASE_CC_TEST_SRC)) sources clean"
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
-# -O0 -g; a non-zero exit fails the build and CI.
+# -O0 -g; a non-zero exit fails the build and CI. The suites run side by side,
+# as many at once as there are CPUs (OC_TEST_JOBS, tests/main.c): they are nearly
+# all waiting, so the run takes about as long as its slowest suite.
+TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 test: check-opcodes check-refs $(TEST_BIN)
-	./$(TEST_BIN)
+	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
 
 # The suites whose code runs threads -- the loop and its I/O threads, the
 # writer and readers, the worker pools, the client, the recorder and player.
-# CI runs these under ThreadSanitizer (`make test-tsan`) and the rest plainly
-# (`make test-rest`), so every suite runs once there, never twice. A suite with
-# no thread cannot race, and instrumenting it only makes it slower.
+# `make test-ci` runs these under ThreadSanitizer and the rest plainly, so every
+# suite runs once there, never twice. A suite with no thread cannot race, and
+# instrumenting it only makes it slower.
 comma := ,
 TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_ioloop_tests \
              run_authpool_tests run_xferpool_tests run_slow_blob_tests run_storage_tests \
@@ -401,8 +405,6 @@ TSAN_LIST := run_netloop_tests run_client_core_tests run_dbwriter_tests run_iolo
              run_stt_tests run_push_tests run_invite_mail_tests run_enroll_tests \
              run_tls_tests run_signin_tests run_acme_tests
 TSAN_SUITES := $(subst $(eval) ,$(comma),$(strip $(TSAN_LIST)))
-test-rest: check-opcodes check-refs $(TEST_BIN)
-	OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
 
 # theme.c is GUI source and is compiled in anyway: it is colour arithmetic with
 # one Windows call behind an #ifdef, and the contrast guarantee it carries has to
@@ -423,7 +425,18 @@ TSAN_BIN := build/tests-tsan
 # Run with address randomization off (setarch -R): ThreadSanitizer maps its
 # shadow memory at fixed addresses, and the randomization of recent kernels
 # places the binary where that shadow has to go ("unexpected memory mapping").
-test-tsan: $(TSAN_BIN)
+# The two test commands are `make test` (everything, plainly: the local run)
+# and `make test-ci` (CI's: the suites without threads plainly, the others under
+# ThreadSanitizer). test-ci refuses outside CI, before its long build. CI runs
+# its halves in parallel jobs: PART=plain or PART=threads; unset, both.
+.PHONY: ci-only test-ci-plain test-ci-threads
+ci-only:
+	@if [ -z "$$CI" ]; then echo "make test-ci runs in CI only; locally, run make test"; exit 1; fi
+test-ci: ci-only
+	@$(MAKE) --no-print-directory $(if $(filter plain,$(PART)),test-ci-plain,$(if $(filter threads,$(PART)),test-ci-threads,test-ci-plain test-ci-threads))
+test-ci-plain: ci-only check-opcodes check-refs $(TEST_BIN)
+	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" OC_TEST_EXCEPT="$(TSAN_SUITES)" ./$(TEST_BIN)
+test-ci-threads: ci-only $(TSAN_BIN)
 	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
 $(TSAN_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(VOICE_HDRS) $(CALL_SRC) $(CALL_HDRS) $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC) $(HDRS) $(MEDIA_HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/win32/theme.h) $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP) | build

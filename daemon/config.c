@@ -385,8 +385,9 @@ int oc_config_load(char *err, size_t errcap) {
     c->tts.lang      = env_or2("OPENCHIME_TTS_LANG", NULL, "en-US");
 
     /* Summaries (REQ-310, ARCH-116): off unless the operator asks. "local" runs
-     * the model inside the daemon, fetched on first start; "cloud" names a model
-     * and a key for a hosted one. Anything else is a mistake worth stopping on.
+     * the model inside the daemon, fetched on first start; "cloud" names an API,
+     * a model and a key for a hosted one, and is a mistake without the first
+     * two. Anything else is a mistake worth stopping on.
      * Whether it actually comes on is decided at startup (main.c): a model that
      * will not load or answer leaves summaries off. */
     {
@@ -398,8 +399,13 @@ int oc_config_load(char *err, size_t errcap) {
             snprintf(err, errcap, "OPENCHIME_SUMMARY must be off, local or cloud, not '%s'", m);
             return -1;
         }
+        c->summary.url     = env_or2("OPENCHIME_SUMMARY_URL", NULL, "");
         c->summary.model   = env_or2("OPENCHIME_SUMMARY_MODEL", NULL, "");
         c->summary.api_key = env_or2("OPENCHIME_SUMMARY_API_KEY", NULL, "");
+        if (c->summary.mode == OC_SUMMARY_CLOUD && (!*c->summary.url || !*c->summary.model)) {
+            snprintf(err, errcap, "OPENCHIME_SUMMARY=cloud needs OPENCHIME_SUMMARY_URL and OPENCHIME_SUMMARY_MODEL");
+            return -1;
+        }
     }
 
     /* Voice input (ARCH-112). Its language is the recognizer's own; there is no

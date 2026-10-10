@@ -194,15 +194,33 @@ void oc_client_pin(oc_client *c, uint64_t channel_id, uint64_t message_id, uint8
 void oc_client_list_pins(oc_client *c, uint64_t channel_id);
 void oc_client_close_pins(oc_client *c);
 
-/* Summarize a channel or DM (REQ-310) over `scope`: OC_SUM_UNREAD, OC_SUM_WEEK,
- * OC_SUM_DAILY, or OC_SUM_RANGE over [start_ms, end_ms). The model's summary
- * view opens, loading, and the answer fills it; on a small server a summary
- * not yet made may take minutes. Shown only to the asker and kept nowhere.
+/* Summarize a channel or DM (REQ-310) over `scope`: OC_SUM_UNREAD, OC_SUM_TODAY,
+ * OC_SUM_DAILY, OC_SUM_WEEK, or OC_SUM_RANGE over [start_ms, end_ms). The
+ * model's summary view opens, loading, and the answer fills it; on a small
+ * server a summary not yet made may take minutes. A connection lost while it
+ * waits asks again once signed in. Shown only to the asker and kept nowhere.
  * Returns the request's id, or 0 when nothing was asked. Close forgets it; an
- * answer arriving after that is dropped. Offer it only where
+ * answer arriving after that is dropped, and the daemon, still making it,
+ * tells this person when it is made. Offer it only where
  * oc_model_summarize_available. */
 uint32_t oc_client_summarize(oc_client *c, uint64_t channel_id, uint8_t scope, uint64_t start_ms, uint64_t end_ms);
 void     oc_client_close_summary(oc_client *c);
+/* Ask again for the open summary that was not made, over the same span: the new
+ * request id, or 0 when there is nothing to retry (none open, still waiting,
+ * made, or refused for want of access). */
+uint32_t oc_client_summary_retry(oc_client *c);
+/* While the open summary is being made: stop watching it (it goes on, and the
+ * daemon tells this person when it is made: a notice), or cancel it. Either
+ * closes it here. Closing it while it is made (oc_client_close_summary) is the
+ * same as detaching. */
+void     oc_client_summary_detach(oc_client *c);
+void     oc_client_summary_cancel(oc_client *c);
+/* Open a notice (the model's, or one Activity lists, with its channel and
+ * scope): the summary as it was made fills the open summary, as asked by the
+ * returned request id (0: nothing asked). The notice is seen. */
+uint32_t oc_client_summary_open_notice(oc_client *c, uint64_t notice_id, uint64_t channel_id, uint8_t scope);
+/* A notice seen without opening it. */
+void     oc_client_summary_dismiss(oc_client *c, uint64_t notice_id);
 
 /* A channel's OWN member roster (REQ-031) — not the tenant roster, which is
  * oc_client_list_users. Showing the latter beside a channel name was wrong the

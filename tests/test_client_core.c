@@ -533,51 +533,129 @@ static void summary_answer(oc_model *m, uint32_t req, uint8_t status, const char
 
 static void test_summary_model(void) {
     static const char BODY[] =
-        "{\"summary\":{\"overview\":\"Ann asked Bob about \\\"6701\\\".\",\"refs\":[100,101],"
-        "\"decisions\":[{\"text\":\"Ship Friday\",\"by\":[],\"refs\":[101]}],"
-        "\"actions\":[{\"who\":11,\"what\":\"look at 6701\",\"refs\":[100,101],\"status\":\"open\"},"
-        "{\"who\":0,\"what\":\"test it\",\"refs\":[101]},{\"what\":\"QA team: check stores\",\"refs\":[100]}],"
-        "\"problems\":[{\"text\":\"slow uploads\",\"refs\":[100],\"status\":\"resolved\"}],"
-        "\"facts\":[{\"text\":\"Caf\\u00e9 \\ud83d\\ude00\",\"refs\":[]}]},"
-        "\"people\":{\"11\":\"Bob\"}}";
+        "{\"summary\":{\"overview\":{\"text\":\"Bob Stone took ticket 6701.\",\"refs\":[101]},\"topics\":["
+        "{\"title\":\"Ticket \\\"6701\\\"\",\"text\":\"Ann asked Bob Stone about it.\",\"refs\":[100,101],"
+        "\"count\":2,\"people\":[\"Ann\",\"Bob Stone\"],"
+        "\"details\":[{\"text\":\"Ann asked Bob Stone to look\",\"refs\":[100]},{\"text\":\"Bob took it\",\"refs\":[101]}]},"
+        "{\"title\":\"\",\"text\":\"Caf\\u00e9 \\ud83d\\ude00\",\"refs\":[102],\"count\":1,\"people\":[],\"details\":[]}],"
+        "\"attention\":[{\"kind\":\"question\",\"text\":\"Is 6701 fixed?\",\"refs\":[101]},"
+        "{\"kind\":\"action\",\"text\":\"Bob Stone to close 6701\",\"refs\":[101]}],"
+        "\"more\":[\"Lunch\",\"Parking\"]},"
+        "\"posters\":[{\"id\":0,\"name\":\"PartsFisher\"},{\"id\":10,\"name\":\"Ann\"},{\"id\":11,\"name\":\"Bob Stone\"}],"
+        "\"count\":525,"
+        "\"sources\":{\"100\":{\"author\":\"Ann\",\"author_id\":10,\"at\":1000,\"parent\":0,\"text\":\"Bob, look at 6701?\"},"
+        "\"101\":{\"author\":\"Bob Stone\",\"author_id\":11,\"at\":2000,\"parent\":100,\"text\":\"On it.\"}}}";
     oc_summary_view v;
     CHECK(oc_summary_view_parse(BODY, strlen(BODY), &v) == 0);
-    CHECK(!strcmp(v.overview, "Ann asked Bob about \"6701\".") && v.n_refs == 2 && v.refs[1] == 101);
-    CHECK(v.n_items == 6);
-    if (v.n_items == 6) {
-        CHECK(v.items[0].kind == OC_SUMI_DECISION && !strcmp(v.items[0].text, "Ship Friday") && !v.items[0].who);
-        CHECK(v.items[1].kind == OC_SUMI_ACTION && !strcmp(v.items[1].who, "Bob") &&
-              !strcmp(v.items[1].status, "open") && v.items[1].n_refs == 2);
-        CHECK(!strcmp(v.items[2].who, "Team") && v.items[2].status[0] == '\0');      /* no status given */
-        CHECK(v.items[3].who == NULL && !strcmp(v.items[3].text, "QA team: check stores"));
-        CHECK(v.items[4].kind == OC_SUMI_PROBLEM && !strcmp(v.items[4].status, "resolved"));
-        CHECK(v.items[5].kind == OC_SUMI_FACT && !strcmp(v.items[5].text, "Caf\xc3\xa9 \xf0\x9f\x98\x80") &&
-              v.items[5].n_refs == 0);
+    CHECK(!strcmp(v.overview, "Bob Stone took ticket 6701.") && v.n_refs == 1 && v.refs[0] == 101);
+    CHECK(v.n_topics == 2 && v.count == 525);
+    CHECK(v.n_attention == 2 && v.attention[0].question && !v.attention[1].question &&
+          !strcmp(v.attention[1].text, "Bob Stone to close 6701") && v.attention[1].refs[0] == 101);
+    CHECK(v.n_more == 2 && !strcmp(v.more[1], "Parking"));
+    if (v.n_topics == 2) {
+        CHECK(!strcmp(v.topics[0].title, "Ticket \"6701\"") && !strcmp(v.topics[0].text, "Ann asked Bob Stone about it."));
+        CHECK(v.topics[0].n_refs == 2 && v.topics[0].n_details == 2 && v.topics[0].count == 2 &&
+              v.topics[0].n_people == 2 && !strcmp(v.topics[0].people[1], "Bob Stone"));
+        if (v.topics[0].n_details == 2)
+            CHECK(!strcmp(v.topics[0].details[1].text, "Bob took it") && v.topics[0].details[1].n_refs == 1 &&
+                  v.topics[0].details[1].refs[0] == 101);
+        CHECK(!strcmp(v.topics[1].title, "") && !strcmp(v.topics[1].text, "Caf\xc3\xa9 \xf0\x9f\x98\x80") &&
+              v.topics[1].n_details == 0);
     }
+    CHECK(v.n_posters == 3 && v.posters[0].id == 0 && !strcmp(v.posters[0].name, "PartsFisher") && v.posters[2].id == 11);
+    const oc_summary_source *src = oc_summary_source_of(&v, 101);
+    CHECK(src && !strcmp(src->author, "Bob Stone") && src->author_id == 11 && src->at == 2000 && src->parent == 100 &&
+          !strcmp(src->text, "On it."));
+    CHECK(oc_summary_source_of(&v, 102) == NULL);
+    char ptext[96];
+    oc_summary_posters_text(&v, ptext, sizeof ptext);
+    CHECK(!strcmp(ptext, "PartsFisher, Ann, and Bob Stone"));
+    /* Names in the text are found whole, the longer first, not inside a word. */
+    oc_summary_mention mn[4];
+    size_t nmn = oc_summary_mentions(&v, "Ann asked Bob Stone; Annie and Bob did not.", mn, 4);
+    CHECK(nmn == 2 && mn[0].start == 0 && mn[0].len == 3 && mn[0].poster == 1 && mn[1].start == 10 &&
+          mn[1].len == 9 && mn[1].poster == 2);
     oc_summary_view_free(&v);
-    CHECK(oc_summary_view_parse("not json", 8, &v) == -1 && v.n_items == 0);
-    CHECK(oc_summary_view_parse("{\"people\":{}}", 13, &v) == -1);
+    CHECK(oc_summary_view_parse("not json", 8, &v) == -1 && v.n_topics == 0);
+    CHECK(oc_summary_view_parse("{\"posters\":[]}", 14, &v) == -1);
+    /* A body from before topics is not a summary this client reads. */
+    CHECK(oc_summary_view_parse("{\"summary\":{\"overview\":\"x\",\"decisions\":[]}}", 44, &v) == -1);
+    CHECK(oc_summary_view_parse("{\"summary\":{\"refs\":[],\"topics\":[]}}", 37, &v) == -1);   /* topics, no overview */
 
     /* A typed range is two local dates, the second day whole. */
-    uint64_t rs = 0, re = 0;
+    uint64_t rs = 0, re = 0, d0 = 0;
     CHECK(oc_summary_range_parse("2026-09-04 2026-09-14", &rs, &re) == 0 && re > rs);
     CHECK(re - rs >= 11ull * 86400000 - 3600000 && re - rs <= 11ull * 86400000 + 3600000);
-    char lab[48];
-    oc_summary_span_label(OC_SUM_RANGE, rs, re, lab, sizeof lab);
-    CHECK(!strcmp(lab, "2026-09-04 to 2026-09-14"));
+    CHECK(oc_summary_date_parse("2026-09-04", &d0) == 0 && d0 == rs);
+    CHECK(oc_summary_date_parse("2026-09-04x", &d0) == -1);
+    char lab[64];
+    oc_summary_dates(rs, re, lab, sizeof lab);
+    CHECK(!strcmp(lab, "Sep 4 - Sep 14"));
     CHECK(oc_summary_range_parse("2026-09-04 to 2026-09-04", &rs, &re) == 0);
-    oc_summary_span_label(OC_SUM_RANGE, rs, re, lab, sizeof lab);
-    CHECK(!strcmp(lab, "2026-09-04"));
+    oc_summary_dates(rs, re, lab, sizeof lab);
+    CHECK(!strcmp(lab, "Sep 4"));
     CHECK(oc_summary_range_parse("2026-09-14 2026-09-04", &rs, &re) == -1);   /* backwards */
     CHECK(oc_summary_range_parse("2026-02-30 2026-03-01", &rs, &re) == -1);   /* no such day */
     CHECK(oc_summary_range_parse("last week", &rs, &re) == -1);
-    oc_summary_span_label(OC_SUM_WEEK, 0, 0, lab, sizeof lab);
-    CHECK(!strcmp(lab, "Last 7 days"));
+    CHECK(!strcmp(oc_summary_scope_name(OC_SUM_TODAY), "Today") &&
+          !strcmp(oc_summary_scope_name(OC_SUM_DAILY), "Since yesterday") &&
+          !strcmp(oc_summary_scope_name(OC_SUM_RANGE), "Custom date range"));
+    oc_summary_wait_title(OC_SUM_UNREAD, 0, 0, "#pf-alerts", lab, sizeof lab);
+    CHECK(!strcmp(lab, "Summarizing unreads in #pf-alerts"));
+    oc_summary_wait_title(OC_SUM_RANGE, rs, re, "@Ann", lab, sizeof lab);
+    CHECK(!strcmp(lab, "Summarizing Sep 4 in @Ann"));
+    /* The range picker: the first click the first day, the second the last;
+     * one before the first starts over, a day after today is not taken. */
+    {
+        oc_sumcal cal;
+        uint64_t today = 0, a = 0, b = 0;
+        CHECK(oc_summary_date_parse("2026-10-05", &today) == 0);
+        oc_sumcal_init(&cal, today + 15ull * 3600000);
+        CHECK(cal.today == today && cal.year == 2026 && cal.month == 10);
+        uint64_t s28 = 0, o2 = 0, o7 = 0;
+        oc_summary_date_parse("2026-09-28", &s28);
+        oc_summary_date_parse("2026-10-02", &o2);
+        oc_summary_date_parse("2026-10-07", &o7);
+        CHECK(oc_sumcal_range(&cal, &a, &b) == -1);
+        oc_sumcal_pick(&cal, o2);
+        CHECK(cal.start == o2 && !cal.end && oc_sumcal_range(&cal, &a, &b) == -1);
+        oc_sumcal_pick(&cal, s28);                 /* before the first: starts over */
+        CHECK(cal.start == s28 && !cal.end);
+        oc_sumcal_pick(&cal, o7);                  /* not yet happened: not taken */
+        CHECK(!cal.end);
+        oc_sumcal_pick(&cal, o2);
+        CHECK(cal.end == o2 && oc_sumcal_range(&cal, &a, &b) == 0 && a == s28);
+        oc_summary_dates(a, b, lab, sizeof lab);
+        CHECK(!strcmp(lab, "Sep 28 - Oct 2"));
+        /* October 2026 starts on a Thursday: its 1st is the fifth cell; its
+         * 31st the 35th. Shown one month earlier, it is the right one. */
+        int yy, mm;
+        uint64_t cells[42];
+        oc_sumcal_month(&cal, 0, &yy, &mm, cells);
+        CHECK(yy == 2026 && mm == 10 && cells[3] == 0 && cells[35] == 0);
+        oc_summary_day_text(cells[4], lab, sizeof lab);
+        CHECK(!strcmp(lab, "2026-10-01"));
+        oc_summary_day_text(cells[34], lab, sizeof lab);
+        CHECK(!strcmp(lab, "2026-10-31"));
+        oc_sumcal_shift(&cal, -1);
+        oc_sumcal_month(&cal, 1, &yy, &mm, cells);
+        CHECK(yy == 2026 && mm == 10 && cells[4] != 0);
+        oc_sumcal_month(&cal, 0, &yy, &mm, cells);
+        CHECK(yy == 2026 && mm == 9);
+    }
+    /* When a source was posted, by the calendar. */
+    uint64_t noon = d0 + 12ull * 3600000;
+    oc_summary_when(noon + 22 * 60000 - 3600000, noon, 0, lab, sizeof lab);
+    CHECK(!strcmp(lab, "Today at 11:22 AM"));
+    oc_summary_when(noon - 86400000ull + 9 * 3600000, noon, 1, lab, sizeof lab);
+    CHECK(!strcmp(lab, "Yesterday at 21:00"));
+    oc_summary_when(noon - 3 * 86400000ull, noon, 0, lab, sizeof lab);
+    CHECK(!strcmp(lab, "Sep 1 at 12:00 PM"));
 
     oc_model m; oc_model_init(&m);
     /* Nothing open: an answer is dropped. */
     summary_answer(&m, 1, OC_SUM_OK, BODY);
-    CHECK(!m.summary_open && m.summary.n_items == 0);
+    CHECK(!m.summary_open && m.summary.n_topics == 0);
     oc_model_summary_begin(&m, 10, OC_SUM_WEEK, 0, 0, 2);
     CHECK(m.summary_open && m.summary_loading && m.summary_req == 2 && m.summary_position == -1);
     /* Its place in the daemon's queue follows SUMMARY_QUEUED; another request's
@@ -602,16 +680,18 @@ static void test_summary_model(void) {
         CHECK(m.summary_position == 0);
         oc_summary_wait_text(1, wt, sizeof wt);
         CHECK(!strcmp(wt, "Waiting: 1 request ahead of yours."));
+        oc_summary_wait_text((int32_t)OC_SUM_POS_STARTING, wt, sizeof wt);
+        CHECK(!strncmp(wt, "Getting ready to summarize", 26));
     }
     /* An answer to an earlier request is not this one. */
     summary_answer(&m, 1, OC_SUM_OK, BODY);
-    CHECK(m.summary_loading && m.summary.n_items == 0);
+    CHECK(m.summary_loading && m.summary.n_topics == 0);
     summary_answer(&m, 2, OC_SUM_OK, BODY);
-    CHECK(!m.summary_loading && m.summary_status == OC_SUM_OK && m.summary.n_items == 6 &&
+    CHECK(!m.summary_loading && m.summary_status == OC_SUM_OK && m.summary.n_topics == 2 &&
           m.summary_start == 1000 && m.summary_end == 2000);
     /* A refusal keeps the daemon's sentence. */
     oc_model_summary_begin(&m, 10, OC_SUM_UNREAD, 0, 0, 3);
-    CHECK(m.summary.n_items == 0);
+    CHECK(m.summary.n_topics == 0);
     summary_answer(&m, 3, OC_SUM_FORBIDDEN, "You cannot read this conversation.");
     CHECK(m.summary_status == OC_SUM_FORBIDDEN && m.summary_error &&
           !strcmp(m.summary_error, "You cannot read this conversation."));
@@ -619,6 +699,62 @@ static void test_summary_model(void) {
     oc_model_summary_begin(&m, 10, OC_SUM_UNREAD, 0, 0, 4);
     summary_answer(&m, 4, OC_SUM_OK, "garbage");
     CHECK(m.summary_status == OC_SUM_FAILED && m.summary_error);
+    /* Notices (SUMMARY_READY): each kept once however often told, given to a
+     * toast once, and forgotten when opened or dismissed. */
+    {
+        oc_ev r;
+        memset(&r, 0, sizeof r);
+        r.type = OC_EV_SUMMARY_READY;
+        r.summary_id = 70; r.channel_id = 10; r.sum_scope = OC_SUM_TODAY; r.status = OC_SUM_OK;
+        r.span_start = 1000; r.span_end = 2000; r.made_at = 3000;
+        oc_model_apply(&m, &r);
+        oc_model_apply(&m, &r);
+        r.summary_id = 71; r.status = OC_SUM_FAILED;
+        oc_model_apply(&m, &r);
+        CHECK(m.n_sum_notices == 2);
+        oc_summary_notice n;
+        CHECK(oc_model_summary_notice_take(&m, &n) == 1 && n.id == 70 && n.channel_id == 10 &&
+              n.scope == OC_SUM_TODAY && n.status == OC_SUM_OK && n.made_at_ms == 3000);
+        CHECK(oc_model_summary_notice_take(&m, &n) == 1 && n.id == 71 && n.status == OC_SUM_FAILED);
+        CHECK(oc_model_summary_notice_take(&m, &n) == 0);
+        r.summary_id = 70; r.status = OC_SUM_OK;
+        oc_model_apply(&m, &r);                 /* told again at sign-in: no second toast */
+        CHECK(oc_model_summary_notice_take(&m, &n) == 0);
+        oc_model_summary_notice_drop(&m, 70);
+        CHECK(m.n_sum_notices == 1 && oc_model_summary_notice(&m, 70) == NULL && oc_model_summary_notice(&m, 71));
+        char t[160];
+        oc_summary_notice_title(OC_SUM_OK, OC_SUM_TODAY, 0, 0, "#kudos", t, sizeof t);
+        CHECK(!strcmp(t, "Your summary of #kudos (Today) is ready"));
+        oc_summary_notice_title(OC_SUM_FAILED, OC_SUM_WEEK, 0, 0, "#kudos", t, sizeof t);
+        CHECK(!strcmp(t, "Couldn't summarize #kudos (Last 7 days)"));
+        oc_model_summary_notice_drop(&m, 71);
+    }
+    /* Each way of not being made has its headline. */
+    CHECK(!strcmp(oc_summary_fail_title(OC_SUM_UNAVAILABLE), "Summaries aren't available right now"));
+    CHECK(!strcmp(oc_summary_fail_title(OC_SUM_FORBIDDEN), "You can't summarize this conversation"));
+    CHECK(!strcmp(oc_summary_fail_title(OC_SUM_FAILED), "This summary couldn't be made"));
+    /* A connection lost while it waits: it is asked again, from the start of
+     * the queue; one already answered is not. */
+    oc_model_summary_begin(&m, 10, OC_SUM_TODAY, 0, 0, 5);
+    {
+        oc_ev q;
+        memset(&q, 0, sizeof q);
+        q.type = OC_EV_SUMMARY_QUEUED;
+        q.req_id = 5;
+        q.count = 3;
+        oc_model_apply(&m, &q);
+        memset(&q, 0, sizeof q);
+        q.type = OC_EV_DISCONNECTED;
+        oc_model_apply(&m, &q);
+        CHECK(m.summary_resend && m.summary_loading && m.summary_position == -1);
+        summary_answer(&m, 5, OC_SUM_OK, BODY);
+        oc_model_close_summary(&m);
+        CHECK(!m.summary_resend);
+        oc_model_summary_begin(&m, 10, OC_SUM_TODAY, 0, 0, 6);
+        summary_answer(&m, 6, OC_SUM_OK, BODY);
+        oc_model_apply(&m, &q);
+        CHECK(!m.summary_resend);
+    }
     oc_model_close_summary(&m);
     CHECK(!m.summary_open && !m.summary_error);
     /* Offered only where the daemon says so. */
@@ -635,12 +771,21 @@ static void test_summary_model(void) {
 static int core_sum_calls;
 static void *csum_open(void *ctx, char *err, size_t cap) { (void)err; (void)cap; return ctx; }
 static void csum_close(void *h) { (void)h; }
-static int csum_run(void *h, const char *system, const char *user, int max_out, oc_sum_gate_fn gate, void *gctx,
-                    char **out, oc_sum_run_stats *st, char *err, size_t cap) {
-    (void)h; (void)system; (void)user; (void)max_out; (void)gate; (void)gctx; (void)err; (void)cap;
+/* Held: the model is busy, as a real one is for minutes. */
+static volatile int core_sum_hold;
+static int csum_run(void *h, const char *system, const char *user, const char *grammar, int max_out,
+                    oc_sum_gate_fn gate, void *gctx, char **out, oc_sum_run_stats *st, char *err, size_t cap) {
+    (void)h; (void)system; (void)user; (void)max_out; (void)err; (void)cap;
     __atomic_add_fetch(&core_sum_calls, 1, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&core_sum_hold, __ATOMIC_ACQUIRE)) {
+        if (gate && gate(gctx)) return -1;
+        struct timespec ts = { 0, 5 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
     if (st) memset(st, 0, sizeof *st);
-    *out = strdup("Overview: The ship date was set.\nDecisions:\n- [1] Ship on Friday\nActions:\nProblems:\nFacts:\n");
+    *out = strdup(grammar && strstr(grammar, "note ::=")
+                  ? "- [1] decision | Shipping | The ship date was set.\n"
+                  : "Overview: [1] The ship date was set.\n## Shipping\n[1] The ship date was set.\n- [1] Ship on Friday\n");
     return 0;
 }
 static int csum_cpu(void *c, uint64_t *b, uint64_t *t) { (void)c; static uint64_t n; n += 100; *b = 0; *t = n; return 0; }
@@ -975,6 +1120,15 @@ static void test_feedback(void) {
     CHECK(oc_fb_duration_ms(OC_FB_CONFIRM, "a sentence that runs well past forty characters, as some do") > 4000);
     CHECK(oc_fb_duration_ms(OC_FB_CONFIRM, "x") == 4000 && oc_fb_duration_ms(OC_FB_UNDO, "x") == 10000);
     CHECK(oc_fb_duration_ms(OC_FB_FAILED, "x") == 0 && oc_fb_duration_ms(OC_FB_PROGRESS, "x") == 0);
+    CHECK(oc_fb_duration_ms(OC_FB_NOTICE, "x") == 0);   /* a notice stays until acted on */
+    {
+        oc_fb g; oc_fb_init(&g, NULL);
+        uint32_t nt = oc_fb_show(&g, OC_FB_NOTICE, "Your summary of #kudos (Today) is ready", "View", 1000, t);
+        oc_fb_tick(&g, t + 3600000);
+        CHECK(oc_fb_find(&g, nt) != NULL);                   /* an hour on, still there */
+        oc_fb_dismiss(&g, nt);
+        CHECK(oc_fb_find(&g, nt) == NULL);
+    }
     uint32_t fail = oc_fb_show(&f, OC_FB_FAILED, "Screen sharing could not start.", NULL, 0, t);
     CHECK(g_fb_loud[2] == 1);                                                     /* a failure, said assertively */
     uint32_t prog = oc_fb_show(&f, OC_FB_PROGRESS, "Sending video message…", NULL, 0, t);
@@ -2823,7 +2977,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(a, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ua && mb->call.sharer == ua));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 2; })));
-    CHECK(CALL_WAIT(6000, ({ watch(eb, &wb); wb.frames >= 10; })));
+    CHECK(CALL_WAIT(WAIT_MS(6000), ({ watch(eb, &wb); wb.frames >= 10; })));
     CHECK(wb.f.width == 1280 && wb.f.height == 800 && wb.rising && wb.bad == 0);
     oc_call_engine_stats(ea, &st);
     printf("  dana shares: erik has %d frames at %dx%d; dana sends %dx%d at %d fps, %d kbps, %u keyframes\n",
@@ -2860,7 +3014,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     uint64_t joined = mono_ms();
     oc_client_call_join(c, 1);
     CHECK(CALL_WAIT(3000, mc->in_call && mc->call.sharer == ua));
-    CHECK(CALL_WAIT(6000, ({ watch(ec, &wc); wc.frames >= 1; })));
+    CHECK(CALL_WAIT(WAIT_MS(6000), ({ watch(ec, &wc); wc.frames >= 1; })));
     printf("  faye joined late: her first frame after %d ms, %dx%d, frame number %d\n", (int)(mono_ms() - joined),
            wc.f.width, wc.f.height, wc.last);
     /* The loss above halved the rate, which may have stepped the size down to
@@ -2873,7 +3027,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_share(b, 1, 1);
     CHECK(CALL_WAIT(3000, ma->call.sharer == ub && mb->call.sharer == ub && mc->call.sharer == ub));
     CHECK(CALL_WAIT(3000, ({ oc_call_engine_stats(ea, &st); st.share_state == 0 && st.share_taken; })));
-    CHECK(CALL_WAIT(6000, ({ watch(ea, &wa); wa.frames >= 5; })));
+    CHECK(CALL_WAIT(WAIT_MS(6000), ({ watch(ea, &wa); wa.frames >= 5; })));
     CHECK(wa.f.width * 800 == wa.f.height * 1280 && wa.rising && wa.bad == 0);
 
     /* erik stops: nobody shares, and the picture goes. */
@@ -3257,8 +3411,8 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
     tone_io tc = { 880, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0 };
     oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
     oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
-    /* A lost path is reported after 1.5 s of quiet rather than twelve. */
-    setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:1500,tcp_probe:800", 1);
+    /* A lost path is reported after 0.8 s of quiet rather than twelve. */
+    setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:800,tcp_probe:800", 1);
     oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
     unsetenv("OPENCHIME_TEST_CALL_TIMERS");
     oc_client *c = oc_client_start("127.0.0.1", pport, "faye:pw-faye");
@@ -3277,7 +3431,7 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
      * keep-alives -- for twice the lost-path time: her path is not lost, and
      * she stays put, on UDP. */
     { uint32_t b0 = ma->call_back_seq;
-      CALL_WAIT(3200, 0);
+      CALL_WAIT(1700, 0);
       oc_call_engine_stats(ea, &sa);
       CHECK(ma->in_call && ma->call_back_seq == b0 && !ma->call_rejoining && sa.transport == 0); }
     oc_client_call_join(c, 1);
@@ -3471,6 +3625,7 @@ static void test_big_channel_list(int port) {
     unlink("build/test_core_biglist.db"); unlink("build/test_core_biglist.db-wal");
     unlink("build/test_core_biglist.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_biglist.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return; }
     uint64_t uid = oc_dbwriter_register_local(dbw, "hana", "pw-hana", OC_ROLE_OWNER, 2048);
@@ -3592,6 +3747,7 @@ static void test_cert_trust(int port) {
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
     unlink("build/test_core_trust.db"); unlink("build/test_core_trust.db-wal"); unlink("build/test_core_trust.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_trust.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return; }
     CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
@@ -3732,6 +3888,7 @@ static void test_published_fingerprint(int port) {
     unlink("build/test_core_fp.db"); unlink("build/test_core_fp.db-wal");
     unlink("build/test_core_fp.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_fp.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return; }
     CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
@@ -3919,6 +4076,7 @@ static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN
     snprintf(f, sizeof f, "%s-wal", db); unlink(f);
     snprintf(f, sizeof f, "%s-shm", db); unlink(f);
     oc_dbwriter *dbw = oc_dbwriter_start(db);
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
     if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
     if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
@@ -4122,7 +4280,7 @@ static void test_device_client(int port) {
         CHECK(dbw != NULL);
         if (!dbw) { oc_tls_server_free(&srv); return; }
         oc_netloop_set_device_interval_s(1);
-        oc_netloop_set_device_ttl_ms(4000);
+        oc_netloop_set_device_ttl_ms(1500);
         struct core_loop_arg arg;
         arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
         pthread_t th;
@@ -4199,18 +4357,18 @@ static void test_device_client(int port) {
         oc_client_stop(c);
 
         /* An approval slower than a connection is given to sign in (REQ-191:
-         * three seconds here, with the code good for its full ten minutes): the
+         * a second and a half here, with the code good for its full ten minutes): the
          * poll keeps the connection, so the approval signs in on it and nothing
          * is said meanwhile. The daemon used to close it, and the client called
          * that "could not reach the server", which ended a terminal's wait
          * though the code was still good. */
-        oc_netloop_set_unauthed_ms(3000);
+        oc_netloop_set_unauthed_ms(1500);
         c = oc_client_start_device("web.openchime.test", "127.0.0.1", arg.port, NULL, NULL, 1, NULL);
         CHECK(c != NULL && WAIT_FOR(c, m->device_code[0] != '\0'));
         snprintf(url, sizeof url, "%s", oc_client_model(c)->device_url);
         snprintf(code, sizeof code, "%s", oc_client_model(c)->device_code);
-        for (int k = 0; k < 2; k++) {                   /* six seconds: twice the limit */
-            uint64_t past = oc_model_now_ms() + 3000;
+        for (int k = 0; k < 2; k++) {                   /* three seconds: twice the limit */
+            uint64_t past = oc_model_now_ms() + 1500;
             CHECK(WAIT_FOR(c, oc_model_now_ms() >= past));
         }
         CHECK(oc_client_model(c)->error_seq == 0 && oc_client_model(c)->device_code[0] != '\0');
@@ -4240,6 +4398,7 @@ static void test_browser_signin(int port) {
     unlink("build/test_core_browser.db"); unlink("build/test_core_browser.db-wal");
     unlink("build/test_core_browser.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_browser.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     oc_issuer is;
     CHECK(oc_issuer_init(&is, "oc-core-browser") == 0);
@@ -4629,6 +4788,7 @@ int run_client_core_tests(void) {
     unlink("build/itest_core.db-wal");
     unlink("build/itest_core.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_core.db");
+    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return failures; }
 
@@ -4653,7 +4813,7 @@ int run_client_core_tests(void) {
     oc_netloop_set_stt(&CORE_STT);
 
     /* ...and summarizes with a stub model (REQ-310). */
-    static oc_sum_engine csum_eng = { &core_sum_calls, "stub", csum_open, csum_close, csum_run, NULL };
+    static oc_sum_engine csum_eng = { &core_sum_calls, "stub", csum_open, csum_close, csum_run, 0 };
     static oc_sum_probe csum_quiet = { csum_cpu, csum_mem, csum_net, csum_now, NULL };
     oc_sum_worker *csum = NULL;
     {
@@ -4916,17 +5076,87 @@ int run_client_core_tests(void) {
             const oc_model *am = oc_client_model(a);
             CHECK(am->summary_open && am->summary_channel == 1);
             CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading));
-            CHECK(am->summary_status == OC_SUM_OK && am->summary.n_items == 1 &&
-                  am->summary.items[0].kind == OC_SUMI_DECISION &&
-                  !strcmp(am->summary.items[0].text, "Ship on Friday") && am->summary.items[0].n_refs >= 1 &&
+            /* A span of one short message: its overview, citing it. */
+            CHECK(am->summary_status == OC_SUM_OK && !strcmp(am->summary.overview, "The ship date was set.") &&
+                  am->summary.n_refs >= 1 && am->summary.n_posters >= 1 &&
+                  am->summary.count >= 1 && am->summary.n_sources >= 1 &&
                   am->summary_end > am->summary_start);
             int calls = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
             uint32_t again = oc_client_summarize(a, 1, OC_SUM_WEEK, 0, 0);
             CHECK(again != req);
             CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
             CHECK(__atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) == calls);
+            /* Nothing to retry in a summary that was made. */
+            CHECK(oc_client_summary_retry(a) == 0);
             oc_client_close_summary(a);
-            CHECK(!am->summary_open && am->summary.n_items == 0);
+            CHECK(!am->summary_open && am->summary.n_topics == 0);
+            /* Today, the newest span, is asked for and made. */
+            CHECK(oc_client_summarize(a, 1, OC_SUM_TODAY, 0, 0) != 0);
+            CHECK(am->summary_open && am->summary_scope == OC_SUM_TODAY);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
+            oc_client_close_summary(a);
+            /* A span past the newest is not one. */
+            CHECK(oc_client_summarize(a, 1, OC_SUM_TODAY + 1, 0, 0) == 0 && !am->summary_open);
+            /* Closed while it is made, it goes on: its person is told when it
+             * is, and opening the notice shows it as it was made. */
+            uint64_t now_ms = (uint64_t)time(NULL) * 1000u;
+            __atomic_store_n(&core_sum_hold, 1, __ATOMIC_RELEASE);
+            int c0 = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            CHECK(oc_client_summarize(a, 1, OC_SUM_RANGE, now_ms - 3 * 86400000ull, now_ms + 86400000ull) != 0);
+            for (int i = 0; i < 500 && __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) == c0; i++) {
+                oc_client_tick(a);
+                struct timespec ts = { 0, 10 * 1000000L };
+                nanosleep(&ts, NULL);
+            }
+            oc_client_close_summary(a);         /* still being made: detached */
+            CHECK(!am->summary_open);
+            /* The detach is the daemon's before the model is let go. */
+            for (int i = 0; i < 500; i++) {
+                oc_client_tick(a);
+                sqlite3 *qdb = NULL;
+                int watched = -1;
+                if (sqlite3_open_v2("build/itest_core.db", &qdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                    sqlite3_stmt *qs = NULL;
+                    if (sqlite3_prepare_v2(qdb, "SELECT COUNT(*) FROM summary_requests WHERE conn_id<>0;", -1, &qs,
+                                           NULL) == SQLITE_OK && sqlite3_step(qs) == SQLITE_ROW)
+                        watched = sqlite3_column_int(qs, 0);
+                    sqlite3_finalize(qs);
+                }
+                sqlite3_close(qdb);
+                if (watched == 0) break;
+                struct timespec ts = { 0, 10 * 1000000L };
+                nanosleep(&ts, NULL);
+            }
+            __atomic_store_n(&core_sum_hold, 0, __ATOMIC_RELEASE);
+            CHECK(WAIT_FOR(a, m->n_sum_notices == 1));
+            oc_summary_notice n;
+            CHECK(oc_model_summary_notice_take((oc_model *)am, &n) == 1 && n.status == OC_SUM_OK && n.channel_id == 1 &&
+                  n.scope == OC_SUM_RANGE);
+            CHECK(oc_client_summary_open_notice(a, n.id, 0, 0) != 0);
+            CHECK(am->summary_open && am->summary_loading && am->n_sum_notices == 0);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading));
+            CHECK(am->summary_status == OC_SUM_OK && !strcmp(am->summary.overview, "The ship date was set."));
+            oc_client_close_summary(a);
+            /* Cancelled while it is made: closed here, and nothing told after. */
+            __atomic_store_n(&core_sum_hold, 1, __ATOMIC_RELEASE);
+            c0 = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            CHECK(oc_client_summarize(a, 1, OC_SUM_RANGE, now_ms - 4 * 86400000ull, now_ms + 86400000ull) != 0);
+            for (int i = 0; i < 500 && __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) == c0; i++) {
+                oc_client_tick(a);
+                struct timespec ts = { 0, 10 * 1000000L };
+                nanosleep(&ts, NULL);
+            }
+            oc_client_summary_cancel(a);
+            CHECK(!am->summary_open);
+            /* The cancel stops the held model at its next pause; a summary
+             * asked after it is made, and no notice came for the cancelled. */
+            __atomic_store_n(&core_sum_hold, 0, __ATOMIC_RELEASE);
+            c0 = __atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED);
+            CHECK(oc_client_summarize(a, 1, OC_SUM_RANGE, now_ms - 5 * 86400000ull, now_ms + 86400000ull) != 0);
+            CHECK(WAIT_FOR(a, m->summary_open && !m->summary_loading && m->summary_status == OC_SUM_OK));
+            CHECK(__atomic_load_n(&core_sum_calls, __ATOMIC_RELAXED) > c0);   /* the worker made it */
+            CHECK(am->n_sum_notices == 0);
+            oc_client_close_summary(a);
         }
 
         /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana

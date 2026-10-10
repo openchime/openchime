@@ -1399,27 +1399,40 @@ where one exists.
 *Design: [SUMMARIES.md](./SUMMARIES.md).*
 
 - **REQ-310.** A user has been able to **summarize a channel or DM** they can
-  read, over one of four spans: what they have not read, the last seven days, a range
-  they choose, and a daily recap of the day before (or of every day since they were
-  last about). Days have been the reader's own, by their time zone. A summary has
-  been structured fields and text — an overview, decisions, actions with who has
-  them, open or done, problems, open or resolved, and key facts — each item citing
-  the messages it came from. Messages from bots and integrations, call events and
-  deleted messages have not been summarized.
-- **REQ-311.** A summary has been **made recursively, from small pieces**: a channel
-  cut into chunks of whole messages (a whole thread where it fits) under one size
-  limit, a constant in the code; a thread or a message too big for a chunk cut into
-  pieces, each summarized, and the summaries summarized again until one remains; a
-  span made by feeding the summaries of its chunks back into the same summarizing,
-  cut into sections and summarized again for as long as they do not fit. A thread
-  has belonged to the period of its last activity. Every summary has been kept in
-  the database and reused by every later summary built on the same pieces. The work
-  has run single-threaded, in idle time, and has paused while the machine's CPU was
-  busy or its memory low; a summary someone asked for has been made while they
-  waited, ahead of and interrupting any work no one was waiting on, in the order
-  asked, with the asker told how many requests were ahead of theirs. Work no one
-  asked for has gone back no further than the last seven days. The queue of
-  requests has been kept in the database, where it can be seen.
+  read, from a Summarize button in its header, over one of five spans: what they
+  have not read, today, since yesterday, the last seven days, and a range of days
+  they pick on a calendar. Days have been the reader's own, by their time zone.
+  Any span with a message in it has been summarized, however short. A summary
+  has kept to one standard whatever it covers, sized to the span: about a word
+  to every ten of the span's, between 100 and 600, and never longer than the
+  span itself; the most important outcome first; two to six topics, each with
+  who was in it, how many messages it rests on, what happened and where it
+  stands, and up to three details; what needs attention — actions and unanswered questions — labelled;
+  the titles of further topics. Every line has cited the messages it came from;
+  a citation has shown the message it cites and gone to it. Integrations' posts
+  have been summarized under the names they sign with; call events and deleted
+  messages have not. Nobody has had to wait for one: a summary being made has
+  gone on when its asker closed it, asked to be told when it is ready, left the
+  app, or the daemon restarted, and they have been told in the app — a toast,
+  and an entry in Activity — when it was ready, opening it as it was made; or
+  they have cancelled it.
+- **REQ-311.** A summary has been **made recursively, from small pieces**: a
+  span whose messages fit one prompt summarized from them directly; a larger one
+  cut into chunks of whole messages (a whole thread where it fits) under one
+  size limit, a constant in the code, with notes taken on each chunk, and the
+  notes merged — at least two sets into one, fewer notes out than lines in — level
+  after level until they fit one prompt, then summarized with the messages they
+  cite. How much is written and that the recursion ends have been held by the
+  code, never left to the model. A thread or a message too big for a chunk has
+  been merged to one piece the same way. A thread has belonged to the period of
+  its last activity. Every piece has been kept in the database and reused by
+  everything later built on the same messages. The work has run single-threaded,
+  in idle time, and has paused while the machine's CPU was busy or its memory
+  low; a summary someone asked for has been made while they waited, ahead of and
+  interrupting any work no one was waiting on, in the order asked, with the
+  asker told how many requests were ahead of theirs. Work no one asked for has
+  gone back no further than the last seven days. The queue of requests has been
+  kept in the database, where it can be seen.
 - **REQ-312.** A summary has been **kept current**: a message sent, edited,
   deleted or restored has removed every summary built on it, recursively, and they
   have been made again from what is there now. A summary made by an older model or

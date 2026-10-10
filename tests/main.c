@@ -5,6 +5,7 @@
  * integration suites (TLS, event loop) live here too; the black-box,
  * container-level end-to-end tests are separate (Scripts/test-integration.sh). */
 
+#include <stddef.h>
 #include <stdio.h>
 
 int run_protocol_tests(void);
@@ -165,8 +166,8 @@ static void crash_report_install(void) {
 /* Run one suite, or not: OC_TEST_ONLY is a comma-separated list of names to run
  * ("media,audio" runs run_media_tests and run_audio_tests), empty for all. With
  * OC_TEST_REPEAT the whole selection runs that many times. Both exist for
- * hunting a crash that appears once in fifty runs: the alternative is four
- * minutes of unrelated suites per attempt. Unset, nothing changes. */
+ * hunting a crash that appears once in fifty runs: the alternative is a
+ * minute of unrelated suites per attempt. Unset, nothing changes. */
 static const char *g_only;
 
 /* OC_TEST_EXCEPT is the opposite list: the suites NOT to run. CI's build job
@@ -192,8 +193,191 @@ static int suite_wanted(const char *name) {
  * passing empty. */
 static int g_ran;
 
-/* One suite, named first, so the output says what was running when it died. */
-#define SUITE(fn) (suite_wanted(#fn) ? (g_ran++, g_suite = #fn, fn()) : 0)
+/* How long each suite took, printed slowest first at the end: the budget is
+ * two minutes for everything, and this says where it goes. */
+static struct { const char *name; double s; } g_times[128];
+static int g_ntimes;
+
+static void record_time(const char *name, double s) {
+    if (g_ntimes < (int)(sizeof g_times / sizeof g_times[0])) {
+        g_times[g_ntimes].name = name;
+        g_times[g_ntimes].s = s;
+        g_ntimes++;
+    }
+}
+
+static int by_time(const void *a, const void *b) {
+    double x = *(const double *)((const char *)a + offsetof(__typeof__(g_times[0]), s));
+    double y = *(const double *)((const char *)b + offsetof(__typeof__(g_times[0]), s));
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void print_times(void) {
+    qsort(g_times, (size_t)g_ntimes, sizeof g_times[0], by_time);
+    printf("\nsuite times (%.1fs in all):\n", elapsed_s());
+    for (int i = 0; i < g_ntimes; i++) printf("  %7.1fs  %s\n", g_times[i].s, g_times[i].name);
+}
+
+#define S(fn) { #fn, fn }
+static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
+    S(run_protocol_tests),
+    S(run_fuzz_tests),
+    S(run_framebuf_tests),
+    S(run_migrate_tests),
+    S(run_auth_tests),
+    S(run_jwt_tests),
+    S(run_joinrules_tests),
+    S(run_idtoken_tests),
+    S(run_relaykeys_tests),
+    S(run_totp_tests),
+    S(run_webauthn_tests),
+    S(run_proxyproto_tests),
+    S(run_signin_tests),
+    S(run_tkqr_tests),
+    S(run_devicecodes_tests),
+    S(run_ratelimit_tests),
+    S(run_idmap_tests),
+    S(run_srccount_tests),
+    S(run_authpool_tests),
+    S(run_ioloop_tests),
+    S(run_roles_tests),
+    S(run_dbwriter_tests),
+    S(run_http_tests),
+    S(run_sigv4_tests),
+    S(run_blob_s3_tests),
+    S(run_xferpool_tests),
+    S(run_storage_tests),
+    S(run_slow_blob_tests),
+    S(run_audio_tests),
+    S(run_media_tests),
+    S(run_video_media_tests),
+    S(run_emoji_tests),
+    S(run_tls_tests),
+    S(run_acme_tests),
+    S(run_netloop_tests),
+    S(run_client_core_tests),
+    S(run_callsig_tests),
+    S(run_enroll_tests),
+    S(run_push_tests),
+    S(run_invite_mail_tests),
+    S(run_mention_tests),
+    S(run_searchq_tests),
+    S(run_richtext_tests),
+    S(run_url_tests),
+    S(run_sock_tests),
+    S(run_speakable_tests),
+    S(run_action_tests),
+    S(run_ttskit_tests),
+    S(run_tts_worker_tests),
+    S(run_summary_tests),
+    S(run_voice_pick_tests),
+    S(run_tts_data_tests),
+    S(run_stt_tests),
+    S(run_voice_tests),
+    S(run_unfurl_tests),
+    S(run_sdltext_map_tests),
+    S(run_theme_tests),
+    S(run_e2e_tests),
+    S(run_call_media_tests),
+    S(run_share_media_tests),
+};
+#undef S
+enum { N_SUITES = sizeof SUITES / sizeof SUITES[0] };
+
+/* One suite in this process, named first, so the output says what was running
+ * when it died. */
+static int run_here(const struct suite *su) {
+    g_suite = su->name;
+    double t0 = elapsed_s();
+    int failed = su->fn();
+    record_time(su->name, elapsed_s() - t0);
+    return failed;
+}
+
+/* ---- suites side by side ------------------------------------------------------
+ *
+ * Nearly all of a run is waiting -- on timers, sockets, real-time audio and
+ * video -- so OC_TEST_JOBS=N runs up to N suites at once, each in a process of
+ * its own: what one suite does to its process (environment, test knobs, signal
+ * handlers) stays there. A suite's output goes to a file and is printed whole
+ * when it ends, so suites do not interleave. Each suite's databases are its
+ * own, and the suites that listen do so on port ranges no other suite uses.
+ * Unset or 1, the suites run one after another in this process. */
+
+typedef struct { pid_t pid; const struct suite *su; FILE *out; int rd; double t0; } job;
+
+/* Fork one suite. Its failure count and time come back on a pipe; a suite that
+ * dies sends nothing, and its exit status says how it ended. */
+static int job_start(job *j, const struct suite *su) {
+    int fds[2];
+    j->su = su; j->t0 = elapsed_s();
+    j->out = tmpfile();
+    if (!j->out || pipe(fds) != 0) { if (j->out) fclose(j->out); return -1; }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) { fclose(j->out); close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fileno(j->out), STDOUT_FILENO);
+        dup2(fileno(j->out), STDERR_FILENO);
+        g_ntimes = 0;
+        printf("--- %s\n", su->name);
+        int failed = run_here(su);
+        double t = g_ntimes ? g_times[0].s : 0;
+        fflush(NULL);
+        if (write(fds[1], &failed, sizeof failed) != (ssize_t)sizeof failed ||
+            write(fds[1], &t, sizeof t) != (ssize_t)sizeof t) _exit(3);
+        exit(0);
+    }
+    close(fds[1]);
+    j->pid = pid; j->rd = fds[0];
+    return 0;
+}
+
+/* Wait for one of the running suites to end; print its output and return its
+ * failures (1 for one that died without saying). */
+static int job_reap(job *jobs, int *n) {
+    int status;
+    pid_t pid = waitpid(-1, &status, 0);
+    if (pid < 0) return 1;
+    int k = 0;
+    while (k < *n && jobs[k].pid != pid) k++;
+    if (k == *n) return 0;
+    job *j = &jobs[k];
+    int failed = -1; double t = elapsed_s() - j->t0;
+    if (read(j->rd, &failed, sizeof failed) != (ssize_t)sizeof failed || read(j->rd, &t, sizeof t) != (ssize_t)sizeof t)
+        failed = -1;
+    close(j->rd);
+    fflush(stdout);
+    rewind(j->out);
+    char buf[8192]; size_t got;
+    while ((got = fread(buf, 1, sizeof buf, j->out)) > 0) fwrite(buf, 1, got, stdout);
+    fclose(j->out);
+    if (failed < 0) {
+        if (WIFSIGNALED(status)) printf("  FAIL %s died: %s\n", j->su->name, strsignal(WTERMSIG(status)));
+        else printf("  FAIL %s exited %d without its result\n", j->su->name, WEXITSTATUS(status));
+        failed = 1;
+    }
+    fflush(stdout);
+    record_time(j->su->name, t);
+    jobs[k] = jobs[--*n];
+    return failed;
+}
+
+static int run_parallel(int max_jobs) {
+    job jobs[64];
+    if (max_jobs > (int)(sizeof jobs / sizeof jobs[0])) max_jobs = (int)(sizeof jobs / sizeof jobs[0]);
+    int n = 0, total = 0;
+    for (int i = 0; i < N_SUITES; i++) {
+        if (!suite_wanted(SUITES[i].name)) continue;
+        g_ran++;
+        if (n == max_jobs) total += job_reap(jobs, &n);
+        if (job_start(&jobs[n], &SUITES[i]) == 0) n++;
+        else { printf("  FAIL %s: could not start\n", SUITES[i].name); total++; }
+    }
+    while (n > 0) total += job_reap(jobs, &n);
+    return total;
+}
 
 int main(void) {
     crash_report_install();
@@ -206,72 +390,17 @@ int main(void) {
     const char *rep = getenv("OC_TEST_REPEAT");
     int rounds = rep && *rep ? atoi(rep) : 1;
     if (rounds < 1) rounds = 1;
+    const char *jv = getenv("OC_TEST_JOBS");
+    int max_jobs = jv && *jv ? atoi(jv) : 1;
     int total = 0;
     for (int round = 0; round < rounds; round++) {
-    if (rounds > 1) printf("=== round %d of %d\n", round + 1, rounds);
-    total += SUITE(run_protocol_tests);
-    total += SUITE(run_fuzz_tests);
-    total += SUITE(run_framebuf_tests);
-    total += SUITE(run_migrate_tests);
-    total += SUITE(run_auth_tests);
-    total += SUITE(run_jwt_tests);
-    total += SUITE(run_joinrules_tests);
-    total += SUITE(run_idtoken_tests);
-    total += SUITE(run_relaykeys_tests);
-    total += SUITE(run_totp_tests);
-    total += SUITE(run_webauthn_tests);
-    total += SUITE(run_proxyproto_tests);
-    total += SUITE(run_signin_tests);
-    total += SUITE(run_tkqr_tests);
-    total += SUITE(run_devicecodes_tests);
-    total += SUITE(run_ratelimit_tests);
-    total += SUITE(run_idmap_tests);
-    total += SUITE(run_srccount_tests);
-    total += SUITE(run_authpool_tests);
-    total += SUITE(run_ioloop_tests);
-    total += SUITE(run_roles_tests);
-    total += SUITE(run_dbwriter_tests);
-    total += SUITE(run_http_tests);
-    total += SUITE(run_sigv4_tests);
-    total += SUITE(run_blob_s3_tests);
-    total += SUITE(run_xferpool_tests);
-    total += SUITE(run_storage_tests);
-    total += SUITE(run_slow_blob_tests);
-    total += SUITE(run_audio_tests);
-    total += SUITE(run_media_tests);
-    total += SUITE(run_video_media_tests);
-    total += SUITE(run_emoji_tests);
-    total += SUITE(run_tls_tests);
-    total += SUITE(run_acme_tests);
-    total += SUITE(run_netloop_tests);
-    total += SUITE(run_client_core_tests);
-    total += SUITE(run_callsig_tests);
-    total += SUITE(run_enroll_tests);
-    total += SUITE(run_push_tests);
-    total += SUITE(run_invite_mail_tests);
-    total += SUITE(run_mention_tests);
-    total += SUITE(run_searchq_tests);
-    total += SUITE(run_richtext_tests);
-    total += SUITE(run_url_tests);
-    total += SUITE(run_sock_tests);
-    total += SUITE(run_speakable_tests);
-    total += SUITE(run_action_tests);
-    total += SUITE(run_ttskit_tests);
-    total += SUITE(run_tts_worker_tests);
-    total += SUITE(run_summary_tests);
-    total += SUITE(run_voice_pick_tests);
-    total += SUITE(run_tts_data_tests);
-    total += SUITE(run_stt_tests);
-    total += SUITE(run_voice_tests);
-    total += SUITE(run_unfurl_tests);
-    total += SUITE(run_sdltext_map_tests);
-    total += SUITE(run_theme_tests);
-    total += SUITE(run_e2e_tests);
-    total += SUITE(run_call_media_tests);
-    total += SUITE(run_share_media_tests);
-
+        if (rounds > 1) printf("=== round %d of %d\n", round + 1, rounds);
+        if (max_jobs > 1) { total += run_parallel(max_jobs); continue; }
+        for (int i = 0; i < N_SUITES; i++)
+            if (suite_wanted(SUITES[i].name)) { g_ran++; total += run_here(&SUITES[i]); }
     }
     if (g_ran == 0) { printf("\nFAILED: the selection names no suite\n"); return 1; }
+    print_times();
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);
     return 1;

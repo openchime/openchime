@@ -176,13 +176,13 @@ jobs:
       # The suites that run no threads; the others run under the sanitizer in
       # its own job. check-opcodes and check-refs are its prerequisites.
       - name: Run the suites the sanitizer does not
-        run: make test-rest
+        run: make test-ci PART=plain
 
   thread-sanitizer:
     name: thread sanitizer
     # The daemon is threads -- the event loop, its I/O threads, the writer, the
     # readers and the auth pool, the worker pools -- and so are the client, its
-    # call engine and its recorder. `make test-tsan` runs the suites whose code
+    # call engine and its recorder. `make test-ci PART=threads` runs the suites whose code
     # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
     # race between our threads fails it (tests/tsan.supp). This is those
     # suites' only run in CI.
@@ -216,7 +216,7 @@ jobs:
             third_party/speexdsp-1.2.1
           key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
       - name: Test under ThreadSanitizer
-        run: make test-tsan
+        run: make test-ci PART=threads
 
   windows:
     name: windows cross-compile (TUI + GUI)

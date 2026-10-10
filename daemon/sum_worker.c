@@ -4,6 +4,7 @@
 #endif
 #include "sum_worker.h"
 
+#include <ctype.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@ typedef struct req {
     int64_t     channel, start_ms, end_ms;
     int         tz;
     int64_t     row;              /* summary_requests.id, 0 for idle work */
+    volatile int64_t *cancel;     /* the row its asker cancelled (oc_sum_worker_cancel) */
 } req;
 
 /* One build: the connection, the engine, the gate and the nodes made so far. */
@@ -43,6 +45,12 @@ typedef struct {
     int           tz;
     char          err[600];
     int           calls;
+    oc_sum_run_stats spent;       /* every call's, added up (the request's log line) */
+    int      dropped;             /* notes and sentences the checks took out, in all */
+    int      rewrites;            /* calls that wrote a summary or a part of one again, shorter */
+    int      reasks;              /* answers that ran away (hit their rail) and were asked once more */
+    int64_t       row;            /* the request's row, 0 for idle work */
+    volatile int64_t *cancel;     /* stops it when it holds `row` */
 } build;
 
 /* A summary: a stored node, or one made in this build. */
@@ -66,6 +74,7 @@ struct oc_sum_worker {
     pthread_mutex_t   mu;
     pthread_cond_t    cv;
     volatile int      pending;        /* a request was queued: stop idle work */
+    volatile int64_t  cancel_row;     /* a running request its asker cancelled */
     change           *changes;        /* under mu */
     int               n_changes, cap_changes;
     volatile int      stopping;
@@ -110,6 +119,8 @@ int64_t oc_sum_day_start(int64_t t, int tz) {
 static int gate_fn(void *vctx) {
     build *b = vctx;
     if (*b->stopping) return 1;
+    /* Its asker cancelled it. */
+    if (b->row && b->cancel && __atomic_load_n(b->cancel, __ATOMIC_ACQUIRE) == b->row) return 1;
     /* Idle work gives way to a request someone is waiting on. */
     if (b->yield && __atomic_load_n(b->yield, __ATOMIC_ACQUIRE)) return 1;
     if (!b->gate) return 0;
@@ -220,7 +231,7 @@ static oc_sum_input *inputs_of(const ref *kids, int n) {
     return in;
 }
 
-/* --- the one summarize step ------------------------------------------------------- */
+/* --- one call to the model -------------------------------------------------------- */
 
 static int ensure_engine(build *b) {
     if (*b->engine) return 0;
@@ -231,88 +242,222 @@ static int ensure_engine(build *b) {
     return 0;
 }
 
-/* Summarize `l`: the prompt, the model's answer, and the answer read back. Items
- * the model gave no line numbers are asked about once, in the same
- * conversation; those still without stand for every line. The stored summary
+/* `prompt`, its answer held to `grammar` and to `max_out` tokens. The answer
  * (heap), or NULL with b->err set. */
-static char *summarize(build *b, const char *intro, const oc_sum_lines *l, const oc_sum_people *pp,
-                       uint32_t *tokens, uint32_t *cpu) {
-    if (ensure_engine(b) != 0) return NULL;
+/* One call to the engine, counted and logged. */
+static int call_once(build *b, const char *prompt, const char *grammar, int max_out, char **raw,
+                     oc_sum_run_stats *st, char *err, size_t errcap) {
     const oc_sum_engine *e = b->cfg->engine;
-    oc_sum_buf prompt = {0};
-    if (oc_sum_prompt(intro, l, &prompt) != 0) {
-        oc_sum_buf_free(&prompt);
-        snprintf(b->err, sizeof b->err, "out of memory");
-        return NULL;
-    }
-    char *raw = NULL, *more = NULL, err[256] = "", *body = NULL;
-    oc_sum_run_stats st, st2;
-    memset(&st, 0, sizeof st);
-    memset(&st2, 0, sizeof st2);
-    oc_sum_buf out = {0}, ask = {0}, q = {0}, g = {0};
-    int rc = e->run(*b->engine, OC_SUM_SYSTEM, prompt.p, 0, gate_fn, b, &raw, &st, err, sizeof err);
+    memset(st, 0, sizeof *st);
+    int rc = e->run(*b->engine, OC_SUM_SYSTEM, prompt, grammar, max_out, gate_fn, b, raw, st, err, errcap);
     b->calls++;
+    return rc;
+}
+
+static char *ask(build *b, const char *stage, const char *prompt, const char *grammar, int max_out,
+                 uint32_t *tokens, uint32_t *cpu) {
+    if (ensure_engine(b) != 0) return NULL;
+    char *raw = NULL, err[256] = "";
+    oc_sum_run_stats st;
+    int rc = call_once(b, prompt, grammar, max_out, &raw, &st, err, sizeof err);
+    /* An answer that ran away -- reached its rail without ending, which a
+     * well-formed answer never does -- is asked for once more, the same
+     * request: a provider's or a sampler's bad moment, not the prompt's. */
+    if (rc != 0 && strstr(err, "without ending") && !*b->stopping) {
+        fprintf(stderr, "summary: the %s answer ran away (%s); asking once more\n", stage, err);
+        if (raw && *raw) fprintf(stderr, "summary: the answer as far as it got:\n%s\n", raw);
+        b->reasks++;
+        b->spent.prompt_tokens += st.prompt_tokens;
+        b->spent.output_tokens += st.output_tokens;
+        b->spent.wall_ms += st.wall_ms;
+        free(raw);
+        raw = NULL;
+        rc = call_once(b, prompt, grammar, max_out, &raw, &st, err, sizeof err);
+    }
+    /* Where the time goes, call by call (SUMMARIES.md §6). */
+    fprintf(stderr, "summary: call %s in %s: %u tokens in, %u out; reading %.1fs, writing %.1fs, %.1fs in all\n",
+            stage, b->where, st.prompt_tokens, st.output_tokens, st.read_ms / 1000.0, st.write_ms / 1000.0,
+            st.wall_ms / 1000.0);
+    b->spent.prompt_tokens += st.prompt_tokens;
+    b->spent.output_tokens += st.output_tokens;
+    b->spent.read_ms += st.read_ms;
+    b->spent.write_ms += st.write_ms;
+    b->spent.wall_ms += st.wall_ms;
+    b->spent.retries += st.retries;
+    b->spent.wait_ms += st.wait_ms;
+    if (tokens) *tokens += st.prompt_tokens;
+    if (cpu) *cpu += st.cpu_ms;
     if (rc != 0) {
         snprintf(b->err, sizeof b->err, "the model gave no answer: %s", err);
         if (raw && *raw && !*b->stopping && strcmp(err, "stopped") != 0)
             fprintf(stderr, "summary: the answer as far as it got:\n%s\n", raw);
-        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw ? raw : "", NULL);
-        goto done;
+        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt, raw ? raw : "", NULL);
+        free(raw);
+        return NULL;
     }
+    return raw;
+}
+
+/* Notes on `l`: the stored body (heap), or NULL with b->err set. */
+static char *take_notes(build *b, const char *stage, const char *intro, const oc_sum_lines *l, uint32_t *tokens,
+                        uint32_t *cpu) {
+    oc_sum_buf prompt = {0}, g = {0}, out = {0};
+    char *body = NULL;
+    int notes_max = oc_sum_notes_for(oc_sum_lines_tokens(l), l->n);
+    if (oc_sum_notes_prompt(intro, l, notes_max, &prompt, &g) != 0) { snprintf(b->err, sizeof b->err, "out of memory"); goto done; }
+    /* Room for notes past what was asked: a model that writes more loses
+     * them in the parser, not the call. */
+    char *raw = ask(b, stage, prompt.p, g.p, (notes_max + SUM_NOTES_SLACK) * SUM_NOTE_TOKENS, tokens, cpu);
+    if (!raw) goto done;
     int dropped = 0;
-    if (oc_sum_parse(raw, NULL, l, pp, &out, &ask, &dropped) < 0) {
+    if (oc_sum_parse_notes(raw, l, &out, &dropped, notes_max) < 0) {
+        snprintf(b->err, sizeof b->err, "the model's answer was not notes");
+        fprintf(stderr, "summary: the answer that was not notes:\n%s\n", raw);
+    } else {
+        body = out.p;
+        out.p = NULL;
+    }
+    b->dropped += dropped;
+    if (dropped) fprintf(stderr, "summary: %d of the notes dropped by the checks\n", dropped);
+    if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw, body);
+    free(raw);
+done:
+    oc_sum_buf_free(&prompt);
+    oc_sum_buf_free(&g);
+    oc_sum_buf_free(&out);
+    return body;
+}
+
+/* A part over `cap` words: rewritten by the model, at most SUM_REWRITES times,
+ * each rewrite checked as the first was; then cut at a sentence. -1 only when
+ * the model failed outright (stopped, or out of memory). */
+static int hold_part(build *b, oc_sum_part *p, int cap, const oc_sum_lines *l, uint32_t *tokens, uint32_t *cpu) {
+    for (int k = 0; p->text && k < SUM_REWRITES && (int)oc_sum_words(p->text) > cap; k++) {
+        oc_sum_buf prompt = {0}, g = {0};
+        if (oc_sum_rewrite_prompt(p->text, cap, &prompt, &g) != 0) { oc_sum_buf_free(&prompt); oc_sum_buf_free(&g); return -1; }
+        char *raw = ask(b, "rewrite", prompt.p, g.p, cap * 4 + 16, tokens, cpu);
+        b->rewrites++;
+        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw ? raw : "", NULL);
+        oc_sum_buf_free(&prompt);
+        oc_sum_buf_free(&g);
+        if (!raw) { if (*b->stopping) return -1; break; }
+        /* Citations a rewrite writes are not its own: the part keeps its lines. */
+        char *w = raw;
+        for (char *r = raw; *r; ) {
+            if (*r == '[') { char *e = r + 1; while (isdigit((unsigned char)*e)) e++; if (*e == ']' && e > r + 1) { r = e + 1; continue; } }
+            *w++ = *r++;
+        }
+        *w = '\0';
+        char *t = raw;
+        while (*t == ' ') t++;
+        size_t n = strlen(t);
+        while (n && (t[n - 1] == '\n' || t[n - 1] == ' ')) t[--n] = '\0';
+        if (*t) {
+            char *keep = strdup(t);
+            if (keep) {
+                char *old = p->text;
+                p->text = keep;
+                oc_sum_part_check(p, l);
+                if (!*p->text) { free(p->text); p->text = old; } else free(old);
+            }
+        }
+        free(raw);
+    }
+    if (p->text) oc_sum_cut_words(p->text, cap);
+    return 0;
+}
+
+/* The summary a reader is shown, of `l` (messages, or notes and the messages
+ * they cite) over a span of `input_words` words: the stored body (heap), or
+ * NULL with b->err set. */
+static char *write_summary(build *b, const char *intro, const oc_sum_lines *l, size_t input_words,
+                           uint32_t *tokens, uint32_t *cpu) {
+    oc_sum_caps c;
+    oc_sum_caps_for(input_words, &c);
+    oc_sum_buf prompt = {0}, g = {0}, out = {0};
+    oc_sum_final f;
+    memset(&f, 0, sizeof f);
+    char *body = NULL, *raw = NULL;
+    if (oc_sum_final_prompt(intro, l, &c, &prompt, &g) != 0) { snprintf(b->err, sizeof b->err, "out of memory"); goto done; }
+    /* The answer's rail: room for the whole shape, so an answer that keeps
+     * the form always ends, and never more than the context has left after
+     * the prompt (SUMMARIES.md §2). The length is asked for in the prompt and
+     * held by the shorten pass and the trim below, not here. */
+    int rail = c.room * SUM_TOKENS_PER_WORD + SUM_FINAL_SPARE_TOKENS;
+    int left = SUM_CTX_TOKENS - (int)(prompt.n / SUM_BYTES_PER_TOKEN) - SUM_FINAL_SPARE_TOKENS;
+    if (rail > left) rail = left;
+    if (rail < c.total * 2) rail = c.total * 2;
+    raw = ask(b, "final", prompt.p, g.p, rail, tokens, cpu);
+    if (!raw) goto done;
+    int dropped = 0;
+    if (oc_sum_parse_final(raw, l, &c, &f, &dropped) != 0) {
         snprintf(b->err, sizeof b->err, "the model's answer was not a summary");
-        fprintf(stderr, "summary: the answer that was not a summary:\n%s\n", raw ? raw : "");
+        fprintf(stderr, "summary: the answer that was not a summary:\n%s\n", raw);
         if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw, NULL);
         goto done;
     }
-    if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw, out.p);
-    if (ask.n && e->more) {
-        int n_items = 0;
-        for (size_t i = 0; i < ask.n; i++) n_items += ask.p[i] == '\n';
-        if (oc_sum_followup(ask.p, n_items, l->n, &q, &g) != 0) { snprintf(b->err, sizeof b->err, "out of memory"); goto done; }
-        rc = e->more(*b->engine, q.p, g.p, gate_fn, b, &more, &st2, err, sizeof err);
-        if (rc != 0 && (*b->stopping || !strcmp(err, "stopped"))) {
-            snprintf(b->err, sizeof b->err, "the model gave no answer: %s", err);
-            goto done;
-        }
-        if (rc != 0) fprintf(stderr, "summary: the follow-up gave no line numbers: %s\n", err);
-        else {
-            oc_sum_buf again = {0};
-            if (oc_sum_parse(raw, more, l, pp, &again, NULL, &dropped) < 0) {
-                oc_sum_buf_free(&again);
-                snprintf(b->err, sizeof b->err, "out of memory");
-                goto done;
+    b->dropped += dropped;
+    if (dropped) fprintf(stderr, "summary: %d sentences of the summary dropped by the checks\n", dropped);
+    oc_sum_final_rank(&f);
+    /* Well over its total: handed back once to be written shorter, in the same
+     * form and under the same grammar; the shorter answer stands when it is
+     * one, else the first does. One call, never two. */
+    int words = oc_sum_final_words(&f);
+    if (words > c.total + c.total * SUM_SHORTEN_OVER_PCT / 100) {
+        oc_sum_buf sp = {0};
+        if (oc_sum_shorten_prompt(&f, &c, &sp) != 0) { oc_sum_buf_free(&sp); snprintf(b->err, sizeof b->err, "out of memory"); goto done; }
+        char *again = ask(b, "shorten", sp.p, g.p, rail, tokens, cpu);
+        b->rewrites++;
+        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, sp.p, again ? again : "", NULL);
+        oc_sum_buf_free(&sp);
+        if (!again && *b->stopping) goto done;
+        if (again) {
+            oc_sum_final f2;
+            memset(&f2, 0, sizeof f2);
+            int d2 = 0;
+            if (oc_sum_parse_final(again, l, &c, &f2, &d2) == 0 && oc_sum_final_words(&f2) < words) {
+                oc_sum_final_free(&f);
+                f = f2;
+                b->dropped += d2;
+                oc_sum_final_rank(&f);
+                fprintf(stderr, "summary: written again: %d words, from %d, for a total of %d\n",
+                        oc_sum_final_words(&f), words, c.total);
+            } else {
+                oc_sum_final_free(&f2);
+                fprintf(stderr, "summary: written again no shorter (%d words for a total of %d); the first answer stands\n",
+                        words, c.total);
             }
-            oc_sum_buf_free(&out);
-            out = again;
+            free(again);
         }
-        if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, q.p, more ? more : "", out.p);
+        b->err[0] = '\0';
     }
+    /* Each part to its cap, then the whole to its. */
+    if (hold_part(b, &f.ov, c.overview, l, tokens, cpu) != 0) goto done;
+    for (int t = 0; t < f.nt; t++) {
+        if (f.top[t].para.text && hold_part(b, &f.top[t].para, c.para, l, tokens, cpu) != 0) goto done;
+        for (int d = 0; d < f.top[t].nd; d++)
+            if (hold_part(b, &f.top[t].det[d], c.detail, l, tokens, cpu) != 0) goto done;
+    }
+    for (int a = 0; a < f.na; a++)
+        if (hold_part(b, &f.att[a], c.detail, l, tokens, cpu) != 0) goto done;
+    oc_sum_final_fit(&f, &c);
+    f.words = input_words;
+    if (oc_sum_final_json(&f, &out) != 0) { snprintf(b->err, sizeof b->err, "out of memory"); goto done; }
+    if (b->cfg->trace) b->cfg->trace(b->cfg->trace_ctx, prompt.p, raw, out.p);
     body = out.p;
     out.p = NULL;
 done:
     free(raw);
-    free(more);
-    oc_sum_buf_free(&out);
-    oc_sum_buf_free(&ask);
-    oc_sum_buf_free(&q);
-    oc_sum_buf_free(&g);
+    oc_sum_final_free(&f);
     oc_sum_buf_free(&prompt);
-    if (tokens) *tokens = st.prompt_tokens + st2.prompt_tokens;
-    if (cpu) *cpu = st.cpu_ms + st2.cpu_ms;
+    oc_sum_buf_free(&g);
+    oc_sum_buf_free(&out);
     return body;
 }
 
 /* --- the recursion --------------------------------------------------------------- */
 
-static const char *name_of(void *ctx, int64_t uid) {
-    static __thread char nm[128];
-    oc_sum_user_name(((build *)ctx)->db, uid, nm, sizeof nm);
-    return nm;
-}
-
-/* "On Tue 08 Sep:" or "From Tue 08 Sep to Thu 10 Sep:", in the reader's zone. */
+/* "Tue 08 Sep" or "Tue 08 Sep to Thu 10 Sep", in the reader's zone. */
 static void date_label(const build *b, int64_t start, int64_t end, char *out, size_t cap) {
     char a[32], z[32];
     time_t ts = (time_t)((start + (int64_t)b->tz * 60000) / 1000);
@@ -326,13 +471,14 @@ static void date_label(const build *b, int64_t start, int64_t end, char *out, si
     else snprintf(out, cap, "From %s to %s:", a, z);
 }
 
-/* The lines of child summaries (dated when the build is), appended. */
-static int kid_lines(build *b, const ref *kids, int n, oc_sum_lines *l, oc_sum_people *pp) {
+/* The lines of child notes, appended: each child headed with its dates when
+ * the build is dated. */
+static int kid_lines(build *b, const ref *kids, int n, oc_sum_lines *l) {
     for (int i = 0; i < n; i++) {
         char label[96];
         if (b->dated) date_label(b, kids[i].start_ms, kids[i].end_ms, label, sizeof label);
-        if (oc_sum_body_lines(kids[i].body, name_of, b, b->dated ? label : NULL, l, pp) != 0) {
-            snprintf(b->err, sizeof b->err, "a stored summary could not be read");
+        if (oc_sum_notes_lines(kids[i].body, b->dated ? label : NULL, l) != 0) {
+            snprintf(b->err, sizeof b->err, "stored notes could not be read");
             return -1;
         }
     }
@@ -341,37 +487,33 @@ static int kid_lines(build *b, const ref *kids, int n, oc_sum_lines *l, oc_sum_p
 
 static size_t kids_tokens(build *b, const ref *kids, int n) {
     oc_sum_lines l = {0};
-    oc_sum_people pp = {0};
-    size_t t = kid_lines(b, kids, n, &l, &pp) == 0 ? oc_sum_lines_tokens(&l) : (size_t)-1;
+    size_t t = kid_lines(b, kids, n, &l) == 0 ? oc_sum_lines_tokens(&l) : (size_t)-1;
     oc_sum_lines_free(&l);
-    oc_sum_people_free(&pp);
     return t;
 }
 
-/* Summarize these children, together, into one node of `kind`: found if made
- * before, else one model call. */
-static int summarize_group(build *b, const ref *kids, int n, int kind, const oc_sum_new *proto, ref *out) {
+/* These children's notes merged into one node of `kind`: found if made before,
+ * else one model call, which keeps fewer notes than the lines it read. */
+static int merge(build *b, const ref *kids, int n, int kind, const oc_sum_new *proto, ref *out) {
     memset(out, 0, sizeof *out);
     char ikey[72];
     if (proto->ikey[0]) snprintf(ikey, sizeof ikey, "%s", proto->ikey);
     else key_of(kind_tag(kind), kids, n, b->dated, b->tz, ikey, sizeof ikey);
-    /* A period spans what was asked; anything else, what it holds. */
-    int64_t start = kind == OC_SUM_KIND_PERIOD || proto->start_ms ? proto->start_ms : kids[0].start_ms;
-    int64_t end = kind == OC_SUM_KIND_PERIOD || proto->end_ms ? proto->end_ms : kids[n - 1].end_ms;
-    if (kind != OC_SUM_KIND_PERIOD && find(b, ikey, out)) {
+    int64_t start = proto->start_ms ? proto->start_ms : kids[0].start_ms;
+    int64_t end = proto->end_ms ? proto->end_ms : kids[n - 1].end_ms;
+    if (find(b, ikey, out)) {
         out->start_ms = start;
         out->end_ms = end;
         return 0;
     }
     oc_sum_lines l = {0};
-    oc_sum_people pp = {0};
-    if (kid_lines(b, kids, n, &l, &pp) != 0) { oc_sum_lines_free(&l); oc_sum_people_free(&pp); return -1; }
-    char intro[256];
-    snprintf(intro, sizeof intro, "Summaries of consecutive parts of %s, oldest first.", b->where);
+    if (kid_lines(b, kids, n, &l) != 0) { oc_sum_lines_free(&l); return -1; }
+    char intro[384];
+    snprintf(intro, sizeof intro, "Notes on consecutive parts of %s, oldest first. Each is: (kind) topic: what "
+             "happened.", b->where);
     uint32_t tok = 0, cpu = 0;
-    char *body = summarize(b, intro, &l, &pp, &tok, &cpu);
+    char *body = take_notes(b, "merge", intro, &l, &tok, &cpu);
     oc_sum_lines_free(&l);
-    oc_sum_people_free(&pp);
     if (!body) return -1;
     oc_sum_input *in = inputs_of(kids, n);
     if (!in) { free(body); return -1; }
@@ -386,62 +528,69 @@ static int summarize_group(build *b, const ref *kids, int n, int kind, const oc_
     return keep(b, &x, body, in, n, out);
 }
 
-/* The recursion: what fits is summarized once; what does not is cut, in order,
- * into sections that fit, each summarized, and the sections go through this
- * again. A thing of one part is that part. */
-static int reduce(build *b, const ref *kids, int n, int kind, const oc_sum_new *proto, ref *out) {
+/* Bring `kids` under `budget` tokens, in place: while they do not fit, cut them,
+ * in order, into sections of as many as fit together and merge each section of
+ * two or more. Every round merges at least two into one, so it ends; a child
+ * alone at the end of a round goes up as it is. */
+static int fit(build *b, ref **kidsp, int *np, size_t budget) {
+    for (;;) {
+        ref *kids = *kidsp;
+        int n = *np;
+        size_t total = kids_tokens(b, kids, n);
+        if (total == (size_t)-1) return -1;
+        if (total <= budget || n < 2) return 0;
+        ref *sec = calloc((size_t)n, sizeof *sec);
+        if (!sec) return -1;
+        int ns = 0;
+        for (int s = 0; s < n; ) {
+            int e = s + 1;
+            while (e < n && kids_tokens(b, kids + s, e - s + 1) <= budget) e++;
+            if (e - s == 1 && e < n) e++;              /* two always fit: notes are small */
+            if (e - s == 1) {
+                sec[ns] = kids[s];
+                sec[ns].body = strdup(kids[s].body);
+                if (!sec[ns].body) { ref_free(sec, ns); free(sec); return -1; }
+            } else {
+                oc_sum_new sp;
+                memset(&sp, 0, sizeof sp);
+                if (merge(b, kids + s, e - s, OC_SUM_KIND_SECTION, &sp, &sec[ns]) != 0) {
+                    ref_free(sec, ns);
+                    free(sec);
+                    return -1;
+                }
+            }
+            ns++;
+            s = e;
+        }
+        ref_free(kids, n);
+        free(kids);
+        *kidsp = sec;
+        *np = ns;
+    }
+}
+
+/* One node of `kind` for these children (a big thread, a big message): fitted,
+ * then merged into one. A thing of one part is that part. */
+static int reduce_one(build *b, const ref *kids0, int n0, int kind, const oc_sum_new *proto, ref *out) {
     memset(out, 0, sizeof *out);
+    ref *kids = calloc((size_t)(n0 ? n0 : 1), sizeof *kids);
+    if (!kids) return -1;
+    int n = 0, rc = -1;
+    for (; n < n0; n++) {
+        kids[n] = kids0[n];
+        if (!(kids[n].body = strdup(kids0[n].body))) goto out;
+    }
     if (n == 1) {
         *out = kids[0];
-        out->body = strdup(kids[0].body);
-        return out->body ? 0 : -1;
-    }
-    size_t total = kids_tokens(b, kids, n);
-    if (total == (size_t)-1) return -1;
-    if (total <= b->cfg->threshold) return summarize_group(b, kids, n, kind, proto, out);
-
-    /* Sections, in order: as many children as fit together. */
-    int *ends = malloc((size_t)n * sizeof *ends);
-    ref *sec = calloc((size_t)n, sizeof *sec);
-    int ns = 0, ng = 0, singles = 0, rc = -1;
-    if (!ends || !sec) { free(ends); free(sec); return -1; }
-    for (int s = 0; s < n; ) {
-        int e = s + 1;
-        while (e < n && kids_tokens(b, kids + s, e - s + 1) <= b->cfg->threshold) e++;
-        ends[ng++] = e;
-        singles += e - s == 1;
-        s = e;
-    }
-    for (int g = 0, s = 0; g < ng; s = ends[g++]) {
-        int e = ends[g];
-        /* A child that fits, alone in its section, goes up as it is -- unless
-         * every section is one child, when only summarizing them gets shorter. */
-        if (e - s == 1 && singles < ng && kids_tokens(b, kids + s, 1) <= b->cfg->threshold) {
-            sec[ns] = kids[s];
-            sec[ns].body = strdup(kids[s].body);
-            if (!sec[ns].body) goto out;
-            ns++;
-            continue;
-        }
-        oc_sum_new sp;
-        memset(&sp, 0, sizeof sp);
-        sp.root_id = proto->root_id;
-        if (summarize_group(b, kids + s, e - s, OC_SUM_KIND_SECTION, &sp, &sec[ns]) != 0) goto out;
-        ns++;
-    }
-    /* Each level must come out smaller than what went in, or it never ends. */
-    size_t after = kids_tokens(b, sec, ns);
-    if (after >= total) {
-        snprintf(b->err, sizeof b->err,
-                 "the summaries of %d parts came to %zu tokens from %zu: they did not get shorter", n, after, total);
-        fprintf(stderr, "summary: %s\n", b->err);
+        kids[0].body = NULL;
+        rc = 0;
         goto out;
     }
-    rc = reduce(b, sec, ns, kind, proto, out);
+    if (fit(b, &kids, &n, SUM_INPUT_TOKENS) != 0) goto out;
+    rc = n == 1 ? (*out = kids[0], kids[0].body = NULL, 0) : merge(b, kids, n, kind, proto, out);
 out:
-    ref_free(sec, ns);
-    free(sec);
-    free(ends);
+    ref_free(kids, n);
+    free(kids);
     return rc;
 }
 
@@ -453,8 +602,8 @@ static int64_t chunk_start(const oc_sum_msg *m, const oc_sum_chunk *c) {
     return s == INT64_MAX ? 0 : s;
 }
 
-/* A message too big for a chunk: its parts, each summarized, then summarized
- * together through the recursion. The result is the chunk's (key `ikey`). */
+/* A message too big for a chunk: notes on each of its parts, then those merged
+ * into one. The result is the chunk's (key `ikey`). */
 static int big_message(build *b, const oc_sum_msg *m, const oc_sum_chunk *c, const char *ikey, ref *out) {
     const char *who = m->author && *m->author ? m->author : "someone";
     size_t label = (strlen(who) + 40) / SUM_BYTES_PER_TOKEN + 1;
@@ -474,18 +623,16 @@ static int big_message(build *b, const oc_sum_msg *m, const oc_sum_chunk *c, con
             continue;
         }
         oc_sum_lines l = {0};
-        oc_sum_people pp = {0};
         oc_sum_buf t = {0};
         oc_sum_buf_printf(&t, "%s (part %d of %d): %s", who, k + 1, np, parts[k]);
         char intro[256];
         snprintf(intro, sizeof intro, "One long message in %s, part %d of %d.", b->where, k + 1, np);
         uint32_t tok = 0, cpu = 0;
         char *body = NULL;
-        if (!t.oom && oc_sum_lines_add(&l, t.p, 0, NULL, &m->id, 1) == 0 && oc_sum_people_add(&pp, m->author_id, who) == 0)
-            body = summarize(b, intro, &l, &pp, &tok, &cpu);
+        if (!t.oom && oc_sum_lines_add_full(&l, t.p, 0, NULL, &m->id, 1, &m->id, 1, who, 0) == 0)
+            body = take_notes(b, "long message", intro, &l, &tok, &cpu);
         oc_sum_buf_free(&t);
         oc_sum_lines_free(&l);
-        oc_sum_people_free(&pp);
         if (!body) goto out;
         oc_sum_input *in = malloc(sizeof *in);
         if (!in) { free(body); goto out; }
@@ -509,7 +656,7 @@ static int big_message(build *b, const oc_sum_msg *m, const oc_sum_chunk *c, con
     proto.first_msg_id = proto.last_msg_id = m->id;
     proto.start_ms = m->created_ms;
     proto.end_ms = c->end_ms;
-    rc = reduce(b, kids, nk, OC_SUM_KIND_CHUNK, &proto, out);
+    rc = reduce_one(b, kids, nk, OC_SUM_KIND_CHUNK, &proto, out);
 out:
     if (kids) ref_free(kids, nk);
     free(kids);
@@ -517,7 +664,7 @@ out:
     return rc;
 }
 
-/* A chunk's summary: found, or made. */
+/* A chunk's notes: found, or made. */
 static int build_chunk(build *b, const oc_sum_window *w, const oc_sum_chunk *c, ref *out) {
     memset(out, 0, sizeof *out);
     oc_sum_input *in = malloc((size_t)(c->n ? c->n : 1) * sizeof *in);
@@ -542,15 +689,13 @@ static int build_chunk(build *b, const oc_sum_window *w, const oc_sum_chunk *c, 
         return big_message(b, m0, c, ikey, out);
     }
     oc_sum_lines l = {0};
-    oc_sum_people pp = {0};
     char intro[256];
     snprintf(intro, sizeof intro, "Messages from %s, oldest first. Indented lines are replies in a thread.", b->where);
     uint32_t tok = 0, cpu = 0;
     char *body = NULL;
-    if (oc_sum_chunk_lines(w->msgs, c, &l, &pp) == 0) body = summarize(b, intro, &l, &pp, &tok, &cpu);
+    if (oc_sum_chunk_lines(w->msgs, c, &l) == 0) body = take_notes(b, "chunk", intro, &l, &tok, &cpu);
     else snprintf(b->err, sizeof b->err, "out of memory");
     oc_sum_lines_free(&l);
-    oc_sum_people_free(&pp);
     if (!body) { free(in); return -1; }
     oc_sum_new x;
     memset(&x, 0, sizeof x);
@@ -566,41 +711,46 @@ static int build_chunk(build *b, const oc_sum_window *w, const oc_sum_chunk *c, 
     return keep(b, &x, body, in, c->n, out);
 }
 
-/* Every chunk and thread summary of the channel whose last activity is in
- * [start, end), in order: found, or made. The cut starts at the quiet gap
- * before `start`, so it makes the same chunks every cut there makes. */
-static int build_pieces(build *b, int64_t start, int64_t end, ref **kids_out, int *n_out) {
-    *kids_out = NULL;
-    *n_out = 0;
+/* The channel's messages around [start, end), and the cut of them: the cut
+ * starts at the quiet gap before `start`, so it makes the same chunks every cut
+ * there makes. */
+static int load_cut(build *b, int64_t start, int64_t end, oc_sum_window *w, oc_sum_cut *cut) {
     int64_t from = oc_sum_anchor(b->db, b->channel, start, b->cfg->gap_ms);
-    oc_sum_window w;
-    if (oc_sum_load_window(b->db, b->channel, from, end, &w) != 0) {
+    if (oc_sum_load_window(b->db, b->channel, from, end, w) != 0) {
         snprintf(b->err, sizeof b->err, "reading the channel failed");
         return -1;
     }
-    if (!strcmp(w.channel, "direct message")) snprintf(b->where, sizeof b->where, "a direct message");
-    else snprintf(b->where, sizeof b->where, "#%s", w.channel);
-    oc_sum_cut cut;
-    if (oc_sum_cut_build(w.msgs, w.n, b->cfg->threshold, b->cfg->gap_ms, &cut) != 0) {
-        oc_sum_window_free(&w);
+    if (!strcmp(w->channel, "direct message")) snprintf(b->where, sizeof b->where, "a direct message");
+    else snprintf(b->where, sizeof b->where, "#%s", w->channel);
+    if (oc_sum_cut_build(w->msgs, w->n, b->cfg->threshold, b->cfg->gap_ms, cut) != 0) {
+        oc_sum_window_free(w);
         snprintf(b->err, sizeof b->err, "out of memory");
         return -1;
     }
-    ref *kids = calloc((size_t)(cut.n ? cut.n : 1), sizeof *kids);
+    return 0;
+}
+
+/* Every chunk's and big thread's notes of the cut whose last activity is from
+ * `start` on, in order: found, or made. */
+static int build_pieces(build *b, const oc_sum_window *w, const oc_sum_cut *cut, int64_t start,
+                        ref **kids_out, int *n_out) {
+    *kids_out = NULL;
+    *n_out = 0;
+    ref *kids = calloc((size_t)(cut->n ? cut->n : 1), sizeof *kids);
     int nk = 0, rc = -1;
-    if (!kids) goto out;
-    for (int p = 0; p < cut.n; p++) {
-        const oc_sum_piece *pc = &cut.pieces[p];
+    if (!kids) return -1;
+    for (int p = 0; p < cut->n; p++) {
+        const oc_sum_piece *pc = &cut->pieces[p];
         if (pc->end_ms < start) continue;
         if (!pc->is_big_thread) {
-            if (build_chunk(b, &w, &pc->chunks[0], &kids[nk]) != 0) goto out;
+            if (build_chunk(b, w, &pc->chunks[0], &kids[nk]) != 0) goto out;
             nk++;
             continue;
         }
         ref *tc = calloc((size_t)pc->n_chunks, sizeof *tc);
         int nt = 0, ok = tc != NULL;
         for (int k = 0; ok && k < pc->n_chunks; k++) {
-            if (build_chunk(b, &w, &pc->chunks[k], &tc[nt]) != 0) ok = 0; else nt++;
+            if (build_chunk(b, w, &pc->chunks[k], &tc[nt]) != 0) ok = 0; else nt++;
         }
         if (ok) {
             oc_sum_new tp;
@@ -608,7 +758,7 @@ static int build_pieces(build *b, int64_t start, int64_t end, ref **kids_out, in
             tp.root_id = pc->root_id;
             tp.start_ms = tc[0].start_ms;
             tp.end_ms = pc->end_ms;
-            ok = reduce(b, tc, nt, OC_SUM_KIND_THREAD, &tp, &kids[nk]) == 0;
+            ok = reduce_one(b, tc, nt, OC_SUM_KIND_THREAD, &tp, &kids[nk]) == 0;
             if (ok) nk++;
         }
         if (tc) ref_free(tc, nt);
@@ -617,19 +767,18 @@ static int build_pieces(build *b, int64_t start, int64_t end, ref **kids_out, in
     }
     rc = 0;
 out:
-    oc_sum_cut_free(&cut);
-    oc_sum_window_free(&w);
-    if (rc != 0 && kids) { ref_free(kids, nk); free(kids); kids = NULL; nk = 0; }
+    if (rc != 0) { ref_free(kids, nk); free(kids); kids = NULL; nk = 0; }
     *kids_out = kids;
     *n_out = nk;
     return rc;
 }
 
 static const char *const EMPTY_BODY =
-    "{\"overview\":\"\",\"decisions\":[],\"actions\":[],\"problems\":[],\"facts\":[]}";
+    "{\"overview\":{\"text\":\"\",\"refs\":[]},\"topics\":[],\"attention\":[],\"more\":[]}";
 
-/* The period [start, end) in zone `tz`: found, or made from the chunk and
- * thread summaries in it. */
+/* The period [start, end) in zone `tz`: found, or made. A span whose messages
+ * fit one prompt is summarized from them directly; anything larger from its
+ * pieces' notes, fitted (SUMMARIES.md §2). */
 static int build_period(build *b, int64_t start, int64_t end, int tz, ref *out) {
     memset(out, 0, sizeof *out);
     char *body = NULL;
@@ -638,21 +787,10 @@ static int build_period(build *b, int64_t start, int64_t end, int tz, ref *out) 
         out->id = id; out->body = body; out->start_ms = start; out->end_ms = end;
         return 0;
     }
+    oc_sum_window w;
+    oc_sum_cut cut;
+    if (load_cut(b, start, end, &w, &cut) != 0) return -1;
     b->dated = 0;
-    ref *kids = NULL;
-    int nk = 0;
-    if (build_pieces(b, start, end, &kids, &nk) != 0) return -1;
-    /* Pieces with nothing to say add nothing. */
-    for (int i = 0; i < nk; ) {
-        if (oc_sum_body_empty(kids[i].body)) {
-            free(kids[i].body);
-            memmove(&kids[i], &kids[i + 1], (size_t)(nk - i - 1) * sizeof *kids);
-            nk--;
-        } else {
-            i++;
-        }
-    }
-    b->dated = 1;
     b->tz = tz;
     oc_sum_new pp;
     memset(&pp, 0, sizeof pp);
@@ -661,71 +799,132 @@ static int build_period(build *b, int64_t start, int64_t end, int tz, ref *out) 
     pp.end_ms = end;
     pp.tz_offset_min = tz;
     int rc = -1;
-    if (nk >= 2) {
-        rc = reduce(b, kids, nk, OC_SUM_KIND_PERIOD, &pp, out);
-    } else {
-        if (nk) *out = kids[0];
-        out->body = strdup(nk ? kids[0].body : EMPTY_BODY);
-        rc = out->body ? 0 : -1;
+    ref *kids = NULL;
+    int nk = 0;
+    oc_sum_lines all = {0}, l = {0};
+    oc_sum_input *in = NULL;
+    int n_in = 0;
+    uint32_t tok = 0, cpu = 0;
+    /* The span's messages as lines, and every message in them. */
+    for (int p = 0; p < cut.n; p++) {
+        if (cut.pieces[p].end_ms < start) continue;
+        for (int k = 0; k < cut.pieces[p].n_chunks; k++)
+            if (oc_sum_chunk_lines(w.msgs, &cut.pieces[p].chunks[k], &all) != 0) goto done;
     }
-    /* A period is always its own row, even over one child (or none), so the
-     * next request for it finds it. */
-    if (rc == 0 && !(out->is_new && b->nodes[out->id].kind == OC_SUM_KIND_PERIOD &&
-                     b->nodes[out->id].start_ms == start && b->nodes[out->id].end_ms == end)) {
-        ref one = *out;
-        int n_in = nk || out->ikey[0] ? 1 : 0;
-        oc_sum_input *in = n_in ? inputs_of(&one, 1) : malloc(sizeof *in);
-        char *bd = strdup(out->body);
-        if (!in || !bd) { free(in); free(bd); rc = -1; goto done; }
-        key_of('p', &one, n_in, 1, tz, pp.ikey, sizeof pp.ikey);
-        free(out->body);
-        memset(out, 0, sizeof *out);
-        rc = keep(b, &pp, bd, in, n_in, out);
+    size_t words = oc_sum_lines_words(&all);
+    if (!all.n) {
+        body = strdup(EMPTY_BODY);
+        in = malloc(sizeof *in);
+        if (!body || !in) goto done;
+    } else if (oc_sum_lines_tokens(&all) <= SUM_INPUT_TOKENS) {
+        char intro[256];
+        snprintf(intro, sizeof intro, "Messages from %s, oldest first. Indented lines are replies in a thread.", b->where);
+        if (!(body = write_summary(b, intro, &all, words, &tok, &cpu))) goto done;
+        for (int i = 0; i < all.n; i++) n_in += all.v[i].n_all;
+        if (!(in = malloc((size_t)(n_in ? n_in : 1) * sizeof *in))) goto done;
+        n_in = 0;
+        for (int i = 0; i < all.n; i++)
+            for (int k = 0; k < all.v[i].n_all; k++) {
+                int64_t mid = all.v[i].all[k], stamp = 0;
+                for (int q = 0; q < w.n; q++) if (w.msgs[q].id == mid) { stamp = w.msgs[q].edited_ms; break; }
+                in[n_in].kind = OC_SUM_IN_MSG; in[n_in].id = mid; in[n_in].stamp = stamp;
+                n_in++;
+            }
+    } else {
+        if (build_pieces(b, &w, &cut, start, &kids, &nk) != 0) goto done;
+        for (int i = 0; i < nk; ) {
+            if (oc_sum_body_empty(kids[i].body)) {
+                free(kids[i].body);
+                memmove(&kids[i], &kids[i + 1], (size_t)(nk - i - 1) * sizeof *kids);
+                nk--;
+            } else i++;
+        }
+        b->dated = 1;
+        if (fit(b, &kids, &nk, SUM_INPUT_TOKENS) != 0) goto done;
+        if (kid_lines(b, kids, nk, &l) != 0) goto done;
+        char intro[256];
+        snprintf(intro, sizeof intro, "Notes on %s, oldest first, each \"(kind) topic: what happened\".", b->where);
+        if (!(body = write_summary(b, intro, &l, words, &tok, &cpu))) goto done;
+        if (!(in = inputs_of(kids, nk))) goto done;
+        n_in = nk;
+    }
+    {
+        /* The period's key from what it was made of; a period is always its own
+         * row, so the next request for it finds it. */
+        oc_sum_ikey('p', in, n_in, pp.ikey, sizeof pp.ikey);
+        /* Its span and zone too: two spans over the same messages are two
+         * periods. */
+        uint64_t h = fnv(FNV_START, pp.ikey, strlen(pp.ikey));
+        int64_t span[3] = { start, end, tz };
+        h = fnv(h, span, sizeof span);
+        snprintf(pp.ikey, sizeof pp.ikey, "p:%016llx:%d", (unsigned long long)h, n_in);
+        pp.tokens_in = tok;
+        pp.cpu_ms = cpu;
+        rc = keep(b, &pp, body, in, n_in, out);
+        body = NULL;
+        in = NULL;
     }
 done:
+    free(body);
+    free(in);
     b->dated = 0;
-    ref_free(kids, nk);
-    free(kids);
+    if (kids) { ref_free(kids, nk); free(kids); }
+    oc_sum_lines_free(&all);
+    oc_sum_lines_free(&l);
+    oc_sum_cut_free(&cut);
+    oc_sum_window_free(&w);
     return rc;
 }
 
-char *oc_sum_client_body(sqlite3 *db, const char *body) {
+char *oc_sum_client_body(sqlite3 *db, const char *body, int64_t channel, int64_t start_ms, int64_t end_ms) {
     oc_json d;
     if (!body || oc_json_parse(&d, body, strlen(body)) != 0) return NULL;
-    int64_t *seen = NULL;
-    int ns = 0;
+    /* Every message it cites, anywhere in it -- the overview, the topics and
+     * their details, what needs attention -- once each, in order. */
+    int64_t *ids = NULL;
+    int n = 0, cap = 0, ok = 1;
+    for (int i = 0; ok && i + 1 < d.n; i++) {
+        if (d.t[i].type != JSMN_STRING || d.t[i].end - d.t[i].start != 4 || strncmp(d.js + d.t[i].start, "refs", 4) ||
+            d.t[i + 1].type != JSMN_ARRAY)
+            continue;
+        int x = i + 2;
+        for (int q = 0; ok && q < d.t[i + 1].size; q++, x = oc_json_skip(&d, x)) {
+            uint64_t v;
+            if (oc_json_u64(&d, x, &v) != 0) continue;
+            int dup = 0;
+            for (int y = 0; y < n && !dup; y++) dup = ids[y] == (int64_t)v;
+            if (dup) continue;
+            if (n == cap) {
+                int nc = cap ? cap * 2 : 32;
+                int64_t *nv = realloc(ids, (size_t)nc * sizeof *nv);
+                if (!nv) { ok = 0; break; }
+                ids = nv;
+                cap = nc;
+            }
+            ids[n++] = (int64_t)v;
+        }
+    }
+    oc_json_free(&d);
     oc_sum_buf out = {0};
     oc_sum_buf_puts(&out, "{\"summary\":");
     oc_sum_buf_puts(&out, body);
-    oc_sum_buf_puts(&out, ",\"people\":{");
-    int arr = oc_json_get(&d, 0, "actions");
-    if (arr >= 0 && d.t[arr].type == JSMN_ARRAY) {
-        seen = malloc((size_t)(d.t[arr].size ? d.t[arr].size : 1) * sizeof *seen);
-        int i = arr + 1;
-        for (int k = 0; seen && k < d.t[arr].size; k++, i = oc_json_skip(&d, i)) {
-            uint64_t v;
-            if (oc_json_u64(&d, oc_json_get(&d, i, "who"), &v) != 0 || !v) continue;
-            int dup = 0;
-            for (int y = 0; y < ns; y++) if (seen[y] == (int64_t)v) dup = 1;
-            if (dup) continue;
-            seen[ns++] = (int64_t)v;
-            char nm[128];
-            oc_sum_user_name(db, (int64_t)v, nm, sizeof nm);
-            oc_sum_buf_printf(&out, "%s\"%llu\":", ns > 1 ? "," : "", (unsigned long long)v);
-            oc_sum_buf_json(&out, nm);
-        }
-    }
-    oc_sum_buf_puts(&out, "}}");
-    free(seen);
-    oc_json_free(&d);
-    if (out.oom) { oc_sum_buf_free(&out); return NULL; }
+    oc_sum_buf_puts(&out, ",");
+    if (!ok || oc_sum_span_people(db, channel, start_ms, end_ms, &out) != 0) ok = 0;
+    oc_sum_buf_puts(&out, ",");
+    if (!ok || oc_sum_sources(db, ids, n, &out) != 0) ok = 0;
+    oc_sum_buf_puts(&out, "}");
+    free(ids);
+    if (!ok || out.oom) { oc_sum_buf_free(&out); return NULL; }
     return out.p;
 }
 
 static void build_init(build *b, const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *version, void **engine,
                        oc_sum_load *gate, volatile int *stopping, volatile int *yield, int64_t channel) {
     memset(b, 0, sizeof *b);
-    b->cfg = cfg; b->db = db; b->version = version; b->engine = engine; b->gate = gate; b->stopping = stopping;
+    b->cfg = cfg; b->db = db; b->version = version; b->engine = engine; b->stopping = stopping;
+    /* The load gate keeps the model off a machine that is busy; a hosted model
+     * does not run here, so only stopping and yielding hold it. */
+    b->gate = cfg->engine->remote ? NULL : gate;
     b->yield = yield;
     b->channel = channel;
     snprintf(b->where, sizeof b->where, "the channel");
@@ -747,19 +946,39 @@ static int run_build(const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *vers
     for (int attempt = 0; attempt < 2; attempt++) {
         build b;
         build_init(&b, cfg, db, version, engine, gate, stopping, yield, r->channel);
+        b.row = r->row;
+        b.cancel = r->cancel;
         ref top;
         oc_sum_answer a;
         memset(&a, 0, sizeof a);
         a.conn_id = r->conn_id; a.req_id = r->req_id; a.channel = r->channel; a.request_id = r->row;
         a.start_ms = r->start_ms; a.end_ms = r->end_ms; a.tz_offset_min = r->tz; a.version = version;
-        if (build_period(&b, r->start_ms, r->end_ms, r->tz, &top) != 0) {
+        int built = build_period(&b, r->start_ms, r->end_ms, r->tz, &top);
+        if (r->row)
+            fprintf(stderr, "summary: request %lld spent %d calls: %u tokens in, %u out; reading %.1fs, writing "
+                    "%.1fs, %.1fs in all; %d dropped by the checks; %d written again; %d asked again after running "
+                    "away; %u retries waiting %.1fs\n",
+                    (long long)r->row, b.calls, b.spent.prompt_tokens, b.spent.output_tokens, b.spent.read_ms / 1000.0,
+                    b.spent.write_ms / 1000.0, b.spent.wall_ms / 1000.0, b.dropped, b.rewrites, b.reasks, b.spent.retries,
+                    b.spent.wait_ms / 1000.0);
+        a.dropped = b.dropped;
+        a.rewrites = b.rewrites;
+        a.reasks = b.reasks;
+        a.retries = (int)b.spent.retries;
+        a.wait_ms = b.spent.wait_ms;
+        if (built != 0) {
             snprintf(err, errcap, "%s", b.err[0] ? b.err : "the summary could not be made");
             a.ok = 0; a.err = err;
-            cfg->sink.store(cfg->sink.ctx, &a, NULL, 0);
+            /* What was finished before it failed is kept: the next build of
+             * anything over the same messages starts from it (§4). */
+            if (b.n_nodes)
+                fprintf(stderr, "summary: keeping the %d pieces a failed build made; the next try starts from them\n",
+                        b.n_nodes);
+            cfg->sink.store(cfg->sink.ctx, &a, b.nodes, b.n_nodes);
             build_done(&b);
             return -1;
         }
-        char *client = oc_sum_client_body(db, top.body);
+        char *client = oc_sum_client_body(db, top.body, r->channel, r->start_ms, r->end_ms);
         a.ok = client != NULL;
         a.body = client;
         a.err = client ? NULL : "out of memory";
@@ -784,15 +1003,26 @@ static int run_chunks(const oc_sum_worker_cfg *cfg, sqlite3 *db, const char *ver
     build_init(&b, cfg, db, version, engine, gate, stopping, yield, channel);
     ref *kids = NULL;
     int nk = 0;
-    int rc = build_pieces(&b, start, end, &kids, &nk);
-    if (rc != 0) {
-        snprintf(err, errcap, "%s", b.err[0] ? b.err : "the chunks could not be made");
-    } else if (b.n_nodes) {
+    oc_sum_window w;
+    oc_sum_cut cut;
+    int rc = load_cut(&b, start, end, &w, &cut);
+    if (rc == 0) {
+        rc = build_pieces(&b, &w, &cut, start, &kids, &nk);
+        oc_sum_cut_free(&cut);
+        oc_sum_window_free(&w);
+    }
+    if (rc != 0) snprintf(err, errcap, "%s", b.err[0] ? b.err : "the chunks could not be made");
+    if (b.n_nodes) {
+        /* Stored whether or not every chunk was made: what was is kept. */
         oc_sum_answer a;
         memset(&a, 0, sizeof a);
-        a.channel = channel; a.start_ms = start; a.end_ms = end; a.version = version; a.ok = 1;
-        rc = cfg->sink.store(cfg->sink.ctx, &a, b.nodes, b.n_nodes);
-        if (rc < 0) snprintf(err, errcap, "storing the summaries failed");
+        a.channel = channel; a.start_ms = start; a.end_ms = end; a.version = version; a.ok = rc == 0;
+        a.err = rc == 0 ? NULL : err;
+        if (rc != 0)
+            fprintf(stderr, "summary: keeping the %d pieces a failed build made; the next try starts from them\n",
+                    b.n_nodes);
+        int st = cfg->sink.store(cfg->sink.ctx, &a, b.nodes, b.n_nodes);
+        if (rc == 0) { rc = st; if (rc < 0) snprintf(err, errcap, "storing the summaries failed"); }
     }
     ref_free(kids, nk);
     free(kids);
@@ -812,18 +1042,24 @@ static int open_db(const char *path, sqlite3 **db, char *err, size_t errcap) {
     return 0;
 }
 
-int oc_sum_build_now(const oc_sum_worker_cfg *cfg, int64_t channel, int64_t start_ms, int64_t end_ms,
-                     int tz_offset_min, char *err, size_t errcap) {
+int oc_sum_build_keep(const oc_sum_worker_cfg *cfg, void **engine, int64_t channel, int64_t start_ms,
+                      int64_t end_ms, int tz_offset_min, char *err, size_t errcap) {
     sqlite3 *db = NULL;
     if (open_db(cfg->db_path, &db, err, errcap) != 0) return -1;
     char version[160];
     oc_sum_version(cfg->engine, cfg->threshold, cfg->gap_ms, version, sizeof version);
-    void *engine = NULL;
     volatile int stopping = 0;
-    req r = { 0, 0, channel, start_ms, end_ms, tz_offset_min, 0 };
-    int rc = run_build(cfg, db, version, &engine, NULL, &stopping, NULL, &r, err, errcap);
-    if (engine) cfg->engine->close(engine);
+    req r = { 0, 0, channel, start_ms, end_ms, tz_offset_min, 0, NULL };
+    int rc = run_build(cfg, db, version, engine, NULL, &stopping, NULL, &r, err, errcap);
     sqlite3_close(db);
+    return rc;
+}
+
+int oc_sum_build_now(const oc_sum_worker_cfg *cfg, int64_t channel, int64_t start_ms, int64_t end_ms,
+                     int tz_offset_min, char *err, size_t errcap) {
+    void *engine = NULL;
+    int rc = oc_sum_build_keep(cfg, &engine, channel, start_ms, end_ms, tz_offset_min, err, errcap);
+    if (engine) cfg->engine->close(engine);
     return rc;
 }
 
@@ -904,7 +1140,7 @@ static void remember_period(oc_sum_worker *w, const req *r) {
     w->asked[w->n_asked++] = k;
 }
 
-/* Every channel with people's messages in the last SUM_BACKGROUND_DAYS, newest
+/* Every channel with messages in the last SUM_BACKGROUND_DAYS, newest
  * activity first, each to be summarized from now back to the window's start.
  * Older spans are made when someone asks for them. */
 static void fill_load(oc_sum_worker *w) {
@@ -912,7 +1148,7 @@ static void fill_load(oc_sum_worker *w) {
     w->filled = 1;
     if (sqlite3_prepare_v2(w->db,
             "SELECT channel_id, MIN(created_at_ms), MAX(created_at_ms) FROM messages "
-            "WHERE deleted_at_ms IS NULL AND kind=0 AND author_name IS NULL AND created_at_ms>=?1 "
+            "WHERE deleted_at_ms IS NULL AND kind=0 AND created_at_ms>=?1 "
             "GROUP BY channel_id ORDER BY 3 DESC;", -1, &st, NULL) != SQLITE_OK)
         return;
     sqlite3_bind_int64(st, 1, wall_ms() - (int64_t)SUM_BACKGROUND_DAYS * DAY_MS);
@@ -996,7 +1232,7 @@ static int idle_step(oc_sum_worker *w, void **engine) {
             free(body);
             continue;
         }
-        req r = { 0, 0, k->channel, k->start, k->end, k->tz, 0 };
+        req r = { 0, 0, k->channel, k->start, k->end, k->tz, 0, NULL };
         int rc = run_build(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &w->pending, &r, err, sizeof err);
         if (rc != 0 && !yielded(w, rc)) {
             if (!w->stopping) fprintf(stderr, "summary: channel %lld, background: %s\n", (long long)k->channel, err);
@@ -1016,7 +1252,7 @@ static int idle_step(oc_sum_worker *w, void **engine) {
         sqlite3_bind_text(st, 1, v, -1, SQLITE_STATIC);
         if (sqlite3_step(st) == SQLITE_ROW) {
             req r = { 0, 0, sqlite3_column_int64(st, 0), sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2),
-                      sqlite3_column_int(st, 3), 0 };
+                      sqlite3_column_int(st, 3), 0, NULL };
             sqlite3_finalize(st);
             st = NULL;
             int rc = run_build(&w->cfg, w->db, v, engine, &w->gate, &w->stopping, &w->pending, &r, err, sizeof err);
@@ -1077,10 +1313,19 @@ static void *run(void *arg) {
         if (r) {
             /* Someone is waiting: build now (the gate still pauses it). */
             remember_period(w, r);
+            r->cancel = &w->cancel_row;
             uint64_t t0 = mono_ms();
             fprintf(stderr, "summary: request %lld started: channel %lld, %lld..%lld\n", (long long)r->row,
                     (long long)r->channel, (long long)r->start_ms, (long long)r->end_ms);
-            if (run_build(&w->cfg, w->db, w->version, &engine, &w->gate, &w->stopping, NULL, r, err, sizeof err) != 0)
+            int built = run_build(&w->cfg, w->db, w->version, &engine, &w->gate, &w->stopping, NULL, r, err,
+                                  sizeof err);
+            /* Cancelled: stopped at a pause, or, when the call it was in ran to
+             * its end (a hosted model is asked once per call), made and not
+             * kept. */
+            if (__atomic_load_n(&w->cancel_row, __ATOMIC_ACQUIRE) == r->row)
+                fprintf(stderr, "summary: request %lld cancelled after %llus\n", (long long)r->row,
+                        (unsigned long long)((mono_ms() - t0) / 1000));
+            else if (built != 0)
                 fprintf(stderr, "summary: request %lld failed after %llus: %s\n", (long long)r->row,
                         (unsigned long long)((mono_ms() - t0) / 1000), err);
             else
@@ -1144,6 +1389,10 @@ void oc_sum_worker_stop(oc_sum_worker *w) {
     free(w->asked);
     free(w->fill);
     free(w);
+}
+
+void oc_sum_worker_cancel(oc_sum_worker *w, int64_t row) {
+    if (w && row) __atomic_store_n(&w->cancel_row, row, __ATOMIC_RELEASE);
 }
 
 void oc_sum_worker_wake(oc_sum_worker *w) {
