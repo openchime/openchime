@@ -53,7 +53,10 @@ order" belongs in integration.
 ### 2.1 Convention
 
 - All unit and in-process integration suites compile into **one** binary,
-  `build/tests`, run by `make test`. There is deliberately no per-test binary:
+  `build/tests`, run by `make test`, and that binary is a **demo build**
+  (`-DOC_DEMO`, like `make DEMO=1`): the suites sign in by password in frames
+  and set the test switches (CONFIG.md "Demo builds only"), which a production
+  build has no code for. There is deliberately no per-test binary:
   the tests exercise public APIs, so each `tests/*.c` links the real module
   objects rather than `#include`-ing the `.c` under test.
 - The one exception is platform-backend code that cannot execute on the build
@@ -425,7 +428,7 @@ under the same name, on a box restarted with it: a full handshake, no session
 resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, with
-the test knob `OPENCHIME_TEST_PASSWORD_AUTH` off — the product as shipped; the
+the demo build's switch `OPENCHIME_TEST_PASSWORD_AUTH` off — the product as shipped; the
 other suites sign in by password with it on (`tests/main.c` sets it).
 `test_jwt`: a token the daemon's issuer mints verifies against its key, name and
 audience, and not with a byte changed, for another audience, from another key or
@@ -671,7 +674,8 @@ works. Nothing proves the shipped *image* works (§3.2).
 
 The browser build (WEB.md) is checked where a Chromium is present (a
 developer's box today; a CI job once the runner has one; make fetches
-Emscripten itself).
+Emscripten itself). The daemon it starts must be a demo build (`make DEMO=1`):
+the check signs in by password and bootstraps its user.
 `make web-test` runs the first two:
 
 - **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
@@ -1156,18 +1160,18 @@ subcommands (`launch`, `devaddr`, `<verb...>`, `shot`, `dump`, `kill`), the
 same verbs, the same ack contract (exit status 1 when the client did not
 answer), and `scripts/web/pair.sh` is `scripts/gui/pair.sh` (`up`, `a`, `b`, `down`).
 A feature script therefore runs against either client: every script sources
-`scripts/gui/lib.sh`, which picks the drivers from `OC_GUI_PLATFORM=win32|web`
+`scripts/gui/lib.sh`, which picks the drivers from `OC_TEST_PLATFORM=win32|web`
 (win32 unless said) and sets `PLAT` for the checks that are the Windows
 platform's alone. `scripts/gui/run.sh [--win32|--web] <name>... | all` runs
 them by name and tallies the results, skipping on the web the scripts whose
 checks are Windows-only.
 
 **How it drives.** `launch` builds and starts the fixture daemon as
-`scripts/gui/drive.sh` does (`OC_DEV_PORT`, `OC_DEV_DIR`, `OC_DEV_WS`,
-`OC_DEV_USERS`; the health port off), then starts `scripts/web/drive.mjs`: a
+`scripts/gui/drive.sh` does (`OC_TEST_PORT`, `OC_TEST_DIR`, `OC_TEST_WS`,
+`OC_TEST_USERS`; the health port off), then starts `scripts/web/drive.mjs`: a
 Node process holding a headless Chromium on the daemon's own `/app/` page,
 signed in with the password quick-launch and the test hook on. The shell side
-writes the verb to `$OC_DEV_DIR/web-<a|b>/cmd` and waits for `ack`, as it
+writes the verb to `$OC_TEST_DIR/web-<a|b>/cmd` and waits for `ack`, as it
 does with the Windows client's scratch directory; the Node side relays the
 verb to the page's hook, takes a `dump` or `shot` back out of the page's
 filesystem into that directory, and copies an `attach`ed file onto the page
@@ -1195,21 +1199,47 @@ from source N against a daemon still running N-1 decodes garbage and reports onl
 "connection lost — reconnecting", which points nowhere near the cause. It cost
 real time three times in a single day before the guard existed.
 
-`make` is incremental, so it is free when nothing changed. `OC_DRIVE_NO_BUILD=1`
-skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
+`make` is incremental, so it is free when nothing changed. `OC_TEST_NO_BUILD=1`
+skips the build and `OC_TEST_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
+
+**The harness's variables** all begin `OC_TEST_`, and are read and defaulted in
+`scripts/gui/lib.sh` (the feature scripts), `scripts/gui/drive.sh` and
+`scripts/web/drive.sh` (one client) and the two `pair.sh` (two clients); an older
+prefix in the environment (`OC_DEV_`, `OC_PAIR_`, `OC_GUI_`, `OC_DRIVE_`,
+`OC_WEB_`) is refused by name. The daemon they start must be a demo build
+(`make DEMO=1`, CONFIG.md "Demo builds only"); the scripts check `--version`
+first and say so otherwise.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OC_TEST_PLATFORM` | `win32` | `win32` or `web`: which client the feature scripts drive (`scripts/gui/run.sh --web` sets it). |
+| `OC_TEST_PORT` | 8443 (one client), 9600 (a pair) | The fixture daemon's protocol port; every feature script sets its own. |
+| `OC_TEST_DIR` | `/tmp/openchime-dev`, `/tmp/openchime-pair` | The fixture daemon's state directory, wiped per run. |
+| `OC_TEST_WS` | `Acme HQ` | The fixture's workspace name. |
+| `OC_TEST_USERS` | `alice,bob,carol` / `alice,bob` | The fixture's bootstrapped users (`name:pw:role`). |
+| `OC_TEST_HOST` | the WSL machine's address / `127.0.0.1` | Where the clients reach the daemon. |
+| `OC_TEST_CALL_MAX`, `OC_TEST_ADVERTISE_PORT` | 10, unset | The fixture's call size and advertised UDP port. |
+| `OC_TEST_TONE_A`, `OC_TEST_TONE_B` | unset | Each paired client's synthetic microphone tone, in Hz. |
+| `OC_TEST_NO_BUILD`, `OC_TEST_NO_DAEMON`, `OC_TEST_LOCAL` | 0 | Skip the build; leave the daemon alone; run the Windows client from a local copy. |
+| `OC_TEST_DRIVE`, `OC_TEST_PAIR` | by platform | A driver of one's own, for a one-off. |
+| `OC_TEST_WHO`, `OC_TEST_DEBUG_PORT` | `a`, unset | The web driver's client letter; Chromium's remote-debugging port. |
+| `OC_TEST_KEEP_DB`, `OC_TEST_WAIT_MS` | 0, the script's | The smoke keeps the database; a longer wait for a slow machine. |
+
+The suite's own (`tests/main.c`) share the prefix: `OC_TEST_ONLY`, `OC_TEST_EXCEPT`,
+`OC_TEST_REPEAT`, `OC_TEST_JOBS`, `OC_TEST_FULL`.
 
 **The client is pointed at the address Windows reaches the daemon at.** Under
 WSL2 that is the WSL machine's own address (eth0's), not 127.0.0.1, which reaches
 a WSL listener only where localhost forwarding is on; elsewhere it is 127.0.0.1,
-and `OC_DEV_HOST` overrides either. `scripts/gui/drive.sh devaddr` prints the workspace
+and `OC_TEST_HOST` overrides either. `scripts/gui/drive.sh devaddr` prints the workspace
 `launch` defaults to, for a script that names it. At an address that is not
 loopback the dev daemon's self-signed certificate is asked about (ARCH-10), and
 `launch` answers Trust and connect for it — the daemon is the one the harness
 started — before it returns. It starts the client only once the daemon listens,
 waiting up to ninety seconds: the bootstrap accounts are hashed first, which for
 `scripts/gui/members.sh`'s sixty people is half a minute, and a client whose first attempt
-finds nothing there does not try again. Only the daemon on `OC_DEV_PORT` — found
+finds nothing there does not try again. Only the daemon on `OC_TEST_PORT` — found
 by its environment — is restarted.
 
 **Video messages drive on a synthetic camera.** Launch with
@@ -1227,7 +1257,7 @@ activation to an executable started from the WSL share (`\\wsl.localhost\…`):
 the recording could not start, with that step in brackets. `scripts/gui/drive.sh launch`
 runs `build/openchime.exe` from the share, which is fine for everything else;
 for a camera test, copy it to a Windows directory and start it from there —
-`OC_DRIVE_LOCAL=1` makes `launch` do exactly that.
+`OC_TEST_LOCAL=1` makes `launch` do exactly that.
 
 **Two verbs put text in the composer, and they are not interchangeable.**
 `type` sets the buffer directly (`ed_set`), bypassing the editor's own rules;
@@ -1330,7 +1360,7 @@ feature suite and does not aspire to be one.
 and `settle` poll for the state being asserted, so a true assertion returns on
 the first poll and only a real failure pays the timeout; the palette is asserted
 as a whole closed→open→closed **round trip**, refusing to credit a close whose
-open never happened. Tune the patience with `OC_SMOKE_WAIT_MS` (default 6000).
+open never happened. Tune the patience with `OC_TEST_WAIT_MS` (default 6000).
 
 **Its failures can be believed on sight, which is a property that was built in
 rather than hoped for.** It checks the **exit status of every verb**: gui_drive
@@ -1376,7 +1406,7 @@ directory — being VP9 and Opus at that size with both tones in it (`ffprobe`,
 
 **Keep the Remote Desktop window open while it runs.** A session that is not drawn
 captures its screens as black; a window is captured either way. `scripts/gui/drive.sh
-launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
+launch` with `OC_TEST_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
 
 ## Reading the links harness
@@ -1492,7 +1522,7 @@ a failure — is proven in `test_client_core.c`, and cancelling in
 ## Reading the members harness
 
 `scripts/gui/members.sh` scrolls the members pane (REQ-031) against its own
-fixture daemon (port 9600) bootstrapped with sixty people — `OC_DEV_USERS`, all of
+fixture daemon (port 9600) bootstrapped with sixty people — `OC_TEST_USERS`, all of
 whom land in `#general` on registration — so the roster is three times what the
 pane holds. It asserts that only what fits is drawn and the pane says the rest is
 below it; that the wheel reaches **every** member, counted as the distinct people
@@ -1568,7 +1598,7 @@ Not in CI, for the smoke's reason.
 
 `scripts/gui/calls_tcp.sh` is the same pair (port 9630) with UDP that goes
 nowhere: the daemon advertises the relay at a port nothing answers on
-(`OC_PAIR_ADVERTISE_PORT`, which `scripts/gui/pair.sh` passes as
+(`OC_TEST_ADVERTISE_PORT`, which `scripts/gui/pair.sh` passes as
 `OPENCHIME_AUDIO_ADVERTISE_PORT`). It asserts that each client finds within
 seconds that the relay does not answer, moves to the connection transport — the
 dump's `call` line says `transport=tcp` — and hears the other's tone

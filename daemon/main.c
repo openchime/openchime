@@ -8,7 +8,7 @@
  * the handshake (PROTOCOL.md §3), runs the two-mode auth handshake — local
  * passwords + session reconnect today, OIDC to follow (AUTH.md) — and serves
  * the messaging vertical. Local accounts can be provisioned at boot via
- * OC_BOOTSTRAP_USERS.
+ * OPENCHIME_BOOTSTRAP_USERS.
  */
 
 #include "audio.h"
@@ -193,7 +193,7 @@ static void start_certs(fed_services *f) {
 
 static void start_federated(fed_services *f) {
     const oc_config *cfg = f->cfg;
-    /* Push (ARCH-85): only with OC_PUSH_URL pointing at the control-plane push
+    /* Push (ARCH-85): only with OPENCHIME_PUSH_URL pointing at the control-plane push
      * gateway. It signs with the enrollment key and delivers offline mobile
      * notifications; absent in self-hosted stand-alone. */
     if (cfg->push.url && *cfg->push.url) {
@@ -393,14 +393,36 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--stt-manifest") == 0)
         return oc_stt_manifest(argv[2]);
 #endif
+    /* The registry's views (config.h): the reference CONFIG.md carries, the
+     * packaged environment file, and a check of this environment -- or of a
+     * file, applied over it -- through the same loader the daemon starts with. */
+    if (argc == 2 && strcmp(argv[1], "--config-reference") == 0) { oc_config_print_reference(stdout); return 0; }
+    if (argc == 2 && strcmp(argv[1], "--config-env") == 0) { oc_config_print_env_template(stdout); return 0; }
+    if (argc >= 2 && strcmp(argv[1], "--check-config") == 0) {
+        char cfgerr[512];
+        if (argc == 4 && strcmp(argv[2], "--env-file") == 0) {
+            if (oc_config_apply_env_file(argv[3], cfgerr, sizeof cfgerr) != 0) {
+                fprintf(stderr, "openchimed: %s\n", cfgerr);
+                return 1;
+            }
+        } else if (argc != 2) {
+            fprintf(stderr, "usage: openchimed --check-config [--env-file PATH]\n");
+            return 2;
+        }
+        if (oc_config_load(cfgerr, sizeof cfgerr) != 0) { fprintf(stderr, "openchimed: config error: %s\n", cfgerr); return 1; }
+        oc_config_report(stdout);
+        printf("openchimed: the configuration is complete; the daemon would start%s\n",
+               oc_config_is_demo() ? " (demo build)" : "");
+        return 0;
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
-            printf("openchimed %s (protocol %u)\n", OC_VERSION,
-                   (unsigned)OC_PROTOCOL_VERSION);
+            printf("openchimed %s (protocol %u)%s\n", OC_VERSION,
+                   (unsigned)OC_PROTOCOL_VERSION, oc_config_is_demo() ? " (demo build)" : "");
             return 0;
         }
         fprintf(stderr, "openchimed: unknown argument '%s'\n", argv[i]);
-        fprintf(stderr, "usage: openchimed [--version]\n");
+        fprintf(stderr, "usage: openchimed [--version | --check-config [--env-file PATH] | --config-reference | --config-env]\n");
         fprintf(stderr, "configuration is read from the environment; see CONFIG.md\n");
         return 2;
     }
@@ -409,8 +431,10 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
 
-    fprintf(stderr, "openchimed: version %s (protocol %u)\n", OC_VERSION,
-            (unsigned)OC_PROTOCOL_VERSION);
+    fprintf(stderr, "openchimed: version %s (protocol %u)%s\n", OC_VERSION,
+            (unsigned)OC_PROTOCOL_VERSION, oc_config_is_demo() ? " (demo build)" : "");
+    if (oc_config_is_demo())
+        fprintf(stderr, "openchimed: DEMO BUILD: the test switches are compiled in; this binary is for a box of your own, never a deployment\n");
 
     /* All daemon config is read once, here, into the process-global oc_config
      * (config.c). Subsystems read it via oc_config_get(); nothing else touches
@@ -472,8 +496,7 @@ int main(int argc, char **argv) {
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
     if (oc_dbwriter_password_frames(db))
-        fprintf(stderr, "openchimed: WARNING: OPENCHIME_TEST_PASSWORD_AUTH is set -- passwords are "
-                        "accepted outside the sign-in pages. A test setting; never set it in production.\n");
+        fprintf(stderr, "openchimed: OPENCHIME_TEST_PASSWORD_AUTH is on: passwords are accepted in frames (demo build)\n");
 
     /* Registered-user cap (CP-7, hosted plan CP-4): 0/unset = unlimited
      * (self-hosted). Injected into managed-box config at provision time. */
@@ -488,7 +511,7 @@ int main(int argc, char **argv) {
     /* Optionally provision local accounts before serving (AUTH.md §2). */
     bootstrap_users(db, cfg->bootstrap_users);
 
-    /* Federated enrollment (CP-8, AUTH.md §3.6). Gated on OC_ENROLL_URL — the
+    /* Federated enrollment (CP-8, AUTH.md §3.6). Gated on OPENCHIME_ENROLL_URL — the
      * operator opting this box into the control plane. On first boot: generate a
      * keypair + opaque audience, persist them, and print an enrollment code to
      * courier into the console. Then (if pending) call out to central to prove
@@ -546,7 +569,7 @@ int main(int argc, char **argv) {
             }
         }
         /* Try to activate. If the operator hasn't reserved the code yet (PENDING),
-         * retry every 3s for up to OC_ENROLL_WAIT_SECS before serving — so a box
+         * retry every 3s for up to OPENCHIME_ENROLL_WAIT_SECS before serving — so a box
          * can come up already-Active (and with push enabled) once the reserve
          * lands, no restart needed. Default 0 = one attempt (retry next boot). */
         int wait_secs = cfg->enroll.wait_secs;
@@ -740,7 +763,7 @@ int main(int argc, char **argv) {
     else fprintf(stderr, "openchimed: unfurl worker failed to start\n");
 
     /* First-run bootstrap (REQ-024, local mode only): if there is no owner yet
-     * and none was provisioned via OC_BOOTSTRAP_USERS, mint a one-time owner
+     * and none was provisioned via OPENCHIME_BOOTSTRAP_USERS, mint a one-time owner
      * setup token and print it once — the operator redeems it (REDEEM_INVITE)
      * to create the first owner, no pre-existing admin needed. */
     if (oc_dbwriter_auth_methods(db) & OC_AUTH_LOCAL) {

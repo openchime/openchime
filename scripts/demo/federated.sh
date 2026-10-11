@@ -27,7 +27,7 @@ trap 'kill "${DPID:-0}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "Building daemon + demo client"
-( cd "$ROOT" && make openchimed >/dev/null && make build/demo_client >/dev/null )
+( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make build/demo_client >/dev/null )
 
 daemon_env=(
   OPENCHIME_DB_PATH="$WORK/demo.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem"

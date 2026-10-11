@@ -7654,15 +7654,7 @@ static void backfill_accept(int ep, conn **conns, oc_dbres *r) {
 /* Overridable for tests, exactly as OPENCHIME_MAINT_INTERVAL_MS is: a suite
  * that has to wait fifteen real seconds to see a scheduled message fire is one
  * nobody runs. Floored so a bad value cannot busy-loop the writer. */
-static __thread uint64_t g_sched_tick_ms;   /* read once, when the loop starts */
-static uint64_t sched_tick_ms_env(void) {
-    const char *e = getenv("OPENCHIME_SCHED_TICK_MS");
-    if (e && *e) {
-        unsigned long long v = strtoull(e, NULL, 10);
-        if (v >= 50) return (uint64_t)v;
-    }
-    return 15000u;
-}
+static __thread uint64_t g_sched_tick_ms;   /* from the configuration, when the loop starts */
 static uint64_t sched_tick_ms(void) { return g_sched_tick_ms; }
 
 static void maybe_fire_scheduled(oc_dbwriter *dbw) {
@@ -7748,7 +7740,11 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     if (g_last_maint_ms && now - g_last_maint_ms < g_spol.interval_ms) return;
     g_last_maint_ms = now;
 
-    oc_storage_sample(g_blob_dir, now, &g_sstat);
+    /* Free space is measured on local disk only: an S3 store's is not ours to
+     * sample, and a low local filesystem must not evict from S3 or refuse
+     * uploads that would never have used it. Unmeasured, nothing is under
+     * pressure and nothing is refused (storage.c); the sweeps below still run. */
+    if (oc_blobstore_is_local(g_blobs)) oc_storage_sample(g_blob_dir, now, &g_sstat);
 
     /* Eviction is the destructive tier, so it is requested only when free space
      * is genuinely below the watermark AND the operator left it enabled. The
@@ -8067,7 +8063,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     g_enc = malloc(OC_MAX_FRAME_SIZE);
     g_enc_participant = malloc(OC_MAX_FRAME_SIZE);
     g_calls = calloc(OC_MAX_CALLS, sizeof *g_calls);
-    g_sched_tick_ms = sched_tick_ms_env();
+    g_sched_tick_ms = oc_config_get()->sched_tick_ms;
     g_last_sched_ms = 0; g_sched_more = 0; g_next_conn_id = 1; g_next_call_id = 0;
     g_last_maint_ms = 0; g_dnd_dirty = 0;
 #ifdef OC_TTS
@@ -8115,7 +8111,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     {
         const oc_config *cfg = oc_config_get();
         const char *bd = cfg->blob_dir;
-        g_blobs = oc_blobstore_open(bd);
+        g_blobs = oc_blobstore_open(bd, cfg->s3.endpoint ? &cfg->s3 : NULL);
         if (!g_blobs) {
             /* The path is in the message because this is the failure that
              * actually happens: every path default points into `/data`, which
@@ -8135,13 +8131,21 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         int nw = cfg->xfer_workers;
         snprintf(g_blob_dir, sizeof g_blob_dir, "%s", bd);
         g_spol = cfg->storage;
-        oc_storage_sample(g_blob_dir, now_ms(), &g_sstat);
-        fprintf(stderr, "openchimed: storage maintenance every %llus, "
-                        "max attachment age %llud, eviction %s, %llu MB free\n",
-                (unsigned long long)(g_spol.interval_ms / 1000),
-                (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)),
-                g_spol.evict_enabled ? "on" : "off",
-                (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
+        memset(&g_sstat, 0, sizeof g_sstat);
+        if (oc_blobstore_is_local(g_blobs)) {
+            oc_storage_sample(g_blob_dir, now_ms(), &g_sstat);
+            fprintf(stderr, "openchimed: storage maintenance every %llus, "
+                            "max attachment age %llud, eviction %s, %llu MB free\n",
+                    (unsigned long long)(g_spol.interval_ms / 1000),
+                    (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)),
+                    g_spol.evict_enabled ? "on" : "off",
+                    (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
+        } else {
+            fprintf(stderr, "openchimed: storage maintenance every %llus, "
+                            "max attachment age %llud; storage pressure: not measured (attachments in S3)\n",
+                    (unsigned long long)(g_spol.interval_ms / 1000),
+                    (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)));
+        }
 
         g_xfers = oc_xferpool_start(g_blobs, nw);
         if (!g_xfers) {

@@ -4070,7 +4070,7 @@ static int web_person(const char *url, const char *page, const char *fields) {
 static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN]) {
     const char *k = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
     int had = k != NULL;
-    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH"); oc_config_load(NULL, 0);
     char f[128];
     unlink(db);
     snprintf(f, sizeof f, "%s-wal", db); unlink(f);
@@ -4078,6 +4078,7 @@ static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN
     oc_dbwriter *dbw = oc_dbwriter_start(db);
     if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
     if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    oc_config_load(NULL, 0);
     if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
     if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
         oc_dbwriter_stop(dbw); return NULL;

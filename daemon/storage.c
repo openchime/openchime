@@ -2,45 +2,8 @@
 
 #include "storage.h"
 
-#include <stdlib.h>
 #include <string.h>
 #include <sys/statvfs.h>
-
-static uint64_t env_u64(const char *name, uint64_t dflt) {
-    const char *v = getenv(name);
-    if (!v || !*v) return dflt;
-    char *end = NULL;
-    unsigned long long n = strtoull(v, &end, 10);
-    if (end == v) return dflt;              /* unparseable: keep the default */
-    return (uint64_t)n;
-}
-
-#define MB (1024ull * 1024)
-
-void oc_storage_policy_load(oc_storage_policy *p) {
-    memset(p, 0, sizeof *p);
-    p->interval_ms    = env_u64("OPENCHIME_MAINT_INTERVAL_MS", 5 * 60 * 1000);
-    p->max_age_ms     = env_u64("OPENCHIME_ATTACH_MAX_AGE_DAYS", 0) * 24ull * 60 * 60 * 1000;
-    p->grace_ms       = env_u64("OPENCHIME_EVICT_GRACE_HOURS", 24) * 60ull * 60 * 1000;
-    p->reserve_bytes  = env_u64("OPENCHIME_DB_RESERVE_MB", 256) * MB;
-    p->pressure_bytes = env_u64("OPENCHIME_PRESSURE_MB", 512) * MB;
-    p->recover_bytes  = env_u64("OPENCHIME_RECOVER_MB", 1024) * MB;
-    p->batch          = (uint32_t)env_u64("OPENCHIME_MAINT_BATCH", 64);
-    /* Audit retention (REQ-251a). Applied PER FAMILY by the writer, so a flood
-     * of security events cannot age out administrative history (REQ-251b). */
-    p->audit_max_age_ms = env_u64("OPENCHIME_AUDIT_MAX_DAYS", 365) * 24ull * 60 * 60 * 1000;
-
-    const char *ev = getenv("OPENCHIME_EVICT");
-    p->evict_enabled = !(ev && (strcmp(ev, "off") == 0 || strcmp(ev, "0") == 0));
-
-    /* Keep the watermarks coherent however they were configured: the recovery
-     * target must sit above the pressure threshold, and both above the reserve,
-     * or the pass would either never stop or never protect the database. */
-    if (p->pressure_bytes < p->reserve_bytes) p->pressure_bytes = p->reserve_bytes;
-    if (p->recover_bytes  < p->pressure_bytes) p->recover_bytes = p->pressure_bytes;
-    if (p->interval_ms < 1000) p->interval_ms = 1000;   /* never busy-loop */
-    if (p->batch == 0) p->batch = 1;
-}
 
 void oc_storage_sample(const char *path, uint64_t now_ms, oc_storage_stats *out) {
     memset(out, 0, sizeof *out);

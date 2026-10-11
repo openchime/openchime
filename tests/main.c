@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include "config.h"
 
 int run_protocol_tests(void);
 int run_callsig_tests(void);
@@ -36,6 +37,7 @@ int run_sigv4_tests(void);
 int run_blob_s3_tests(void);
 int run_xferpool_tests(void);
 int run_storage_tests(void);
+int run_config_tests(void);
 int run_slow_blob_tests(void);
 int run_audio_tests(void);
 int run_media_tests(void);
@@ -247,6 +249,7 @@ static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
     S(run_sigv4_tests),
     S(run_blob_s3_tests),
     S(run_xferpool_tests),
+    S(run_config_tests),
     S(run_storage_tests),
     S(run_slow_blob_tests),
     S(run_audio_tests),
@@ -387,6 +390,7 @@ int main(void) {
      * (AUTH.md §8.10); the checks that the product refuses them turn it off
      * around themselves. */
     setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    oc_config_load(NULL, 0);   /* the writer reads it from the configuration */
     g_only = getenv("OC_TEST_ONLY");
     g_except = getenv("OC_TEST_EXCEPT");
     const char *rep = getenv("OC_TEST_REPEAT");

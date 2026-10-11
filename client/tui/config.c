@@ -10,7 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-void oc_config_defaults(oc_config *c) {
+void oc_tui_prefs_defaults(oc_tui_prefs *c) {
     c->mouse = 1;
     c->members_panel = 2;      /* auto */
     c->channels_width = 22;
@@ -68,7 +68,7 @@ static char *trim(char *s) {
     return s;
 }
 
-static void write_defaults(const char *path, const oc_config *c) {
+static void write_defaults(const char *path, const oc_tui_prefs *c) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f,
@@ -101,8 +101,8 @@ static int truthy(const char *v) {
     return strcmp(v, "on") == 0 || strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "yes") == 0;
 }
 
-void oc_config_load(oc_config *c) {
-    oc_config_defaults(c);
+void oc_tui_prefs_load(oc_tui_prefs *c) {
+    oc_tui_prefs_defaults(c);
     char path[1024];
     if (config_path(path, sizeof path) != 0) return;
 

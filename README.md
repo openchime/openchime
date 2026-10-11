@@ -151,7 +151,10 @@ on (`TTS`, `STT`, `SUM`, `WEB`) are remembered in `build/.features`, so a later
 arm64 into `build/aarch64/` (build only), and `make RELEASE=1` builds the host's
 as the release does, with zig against glibc 2.34.
 `make OC_VERSION=<n>` stamps a release number into `openchimed --version`;
-an unstamped build reports `dev`.
+an unstamped build reports `dev`. `make DEMO=1` builds the test switches in,
+which the GUI and web harness and the demo scripts need; a release never
+carries them, and `--version` says `(demo build)` when they are there
+(CONFIG.md, "Demo builds only").
 
 To build the distributable packages from an already-built binary:
 

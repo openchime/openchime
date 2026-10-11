@@ -115,7 +115,7 @@ and nothing to fetch.
   handle's 64 hex digits and 16 of a hash of the model version (`daemon/tts_worker.c`), so
   a render is written once per version and a retry rewrites the same object.
 - **Memory only while in use.** The ONNX Runtime session is created on the first render and
-  released after `OPENCHIME_TTS_IDLE_S` (default 300) with no work, so a daemon whose users
+  released after `OPENCHIME_TTS_IDLE_SECS` (default 300) with no work, so a daemon whose users
   are not listening holds none of the model's working memory. Measured peak while rendering:
   about 210 MB for a typical sentence, up to 315 MB for a long one; loading takes about a
   quarter of a second.
@@ -162,8 +162,6 @@ casts them to float, so a config taken from one conversion leaves the other unab
   with no tombstone. A reclaimed render is synthesized again when next asked for.
 - **Limits.** `AUDIO_GET` is rate-limited per connection (`OPENCHIME_TTS_RATE`), since a
   client asking for a whole history at once is a cheap way to occupy the render worker.
-- **Pre-render** (`OPENCHIME_TTS_PRERENDER`, off by default) queues new messages in
-  channels marked listenable at low priority, so a backlog is ready when someone opens it.
 
 **Storage arithmetic.** At 24 kbps a second of speech is 3 KB; a typical 100-character
 message is about 5 seconds, 15 KB. A thousand rendered messages is about 15 MB.

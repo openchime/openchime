@@ -39,9 +39,9 @@ WIN = "C:\\Windows\\Temp\\octest"
 LIN = "/mnt/c/Windows/Temp/octest"
 
 ENV = dict(os.environ)
-ENV.setdefault("OC_DEV_PORT", "9550")
-ENV.setdefault("OC_DEV_DIR", "/tmp/oc-audit-dev")
-ENV.setdefault("OC_DEV_WS", "Audit Fixture")
+ENV.setdefault("OC_TEST_PORT", "9550")
+ENV.setdefault("OC_TEST_DIR", "/tmp/oc-audit-dev")
+ENV.setdefault("OC_TEST_WS", "Audit Fixture")
 
 
 def drive(*args):

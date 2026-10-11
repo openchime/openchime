@@ -8,6 +8,7 @@
  * dropped frames and queue depth, never as unbounded memory. */
 #define _POSIX_C_SOURCE 200809L
 #include "oc_recorder.h"
+#include "env.h"
 #include "oc_capture.h"
 #include "oc_codec.h"
 #include "oc_mp4.h"
@@ -118,8 +119,8 @@ struct oc_recorder {
 };
 
 static uint32_t cap_from_env(uint32_t cap) {
-    const char *t = getenv("OPENCHIME_TEST_VIDEO_CAP_MS");
-    if (t && *t) {
+    const char *t = oc_env_demo("OPENCHIME_TEST_VIDEO_CAP_MS");
+    if (t) {
         long v = strtol(t, NULL, 10);
         if (v > 0 && v <= (long)OC_RECORDER_CAP_MS) return (uint32_t)v;
     }

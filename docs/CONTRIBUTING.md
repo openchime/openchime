@@ -86,6 +86,18 @@ time the gate exists to save. `make test-ci` refuses to run outside CI.
   `main` through a promotion, and promotion refuses a commit the guard did not
   pass).
 
+## Adding a setting
+
+A daemon setting is one row in `daemon/config_table.c`: its name, kind, range
+or values, default, class (operator, tuning, or demo-only) and one line of
+meaning. Nothing else: the loader reads it from the row, CONFIG.md's reference
+and `packaging/openchimed.env` are regenerated from it
+(`scripts/check/config.sh --write`), `openchimed --check-config` reports it, and
+`make test` fails if a `getenv` appears outside the loader or a name appears
+anywhere the registry does not know. A client setting goes through
+`client/core/env.c` and a `CLIENT` row, so the name is known. A test switch is a
+`CFG_DEMO` row and `#ifdef OC_DEMO` code: it does not exist in a shipped build.
+
 ## CI
 
 `ci.yml` runs on every pull request into `staging` and every push to `staging`,

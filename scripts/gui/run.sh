@@ -29,7 +29,7 @@ for n in $names; do
     echo "$n: skipped (its checks are the Windows platform's)"; skipped=$((skipped + 1)); continue
   fi
   echo "== $n ($plat)"
-  if OC_GUI_PLATFORM=$plat OC_DRIVE_NO_BUILD="${OC_DRIVE_NO_BUILD:-1}" "$s"; then passed=$((passed + 1)); else failed=$((failed + 1)); bad="$bad $n"; fi
+  if OC_TEST_PLATFORM=$plat OC_TEST_NO_BUILD="${OC_TEST_NO_BUILD:-1}" "$s"; then passed=$((passed + 1)); else failed=$((failed + 1)); bad="$bad $n"; fi
 done
 echo "run.sh ($plat): $passed passed, $failed failed, $skipped skipped${bad:+ --$bad}"
 [ $failed = 0 ]

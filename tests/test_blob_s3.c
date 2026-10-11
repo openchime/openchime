@@ -208,26 +208,19 @@ static void fake_stop(fake_s3 *f) {
 
 /* --- the test -------------------------------------------------------------- */
 
-static void set_env_for(const fake_s3 *f) {
-    char ep[64];
+/* The store's configuration as the loader would hand it (config.h). */
+static char g_ep[64];
+static oc_s3_config g_s3cfg;
+static const oc_s3_config *set_env_for(const fake_s3 *f) {
     /* Explicit http:// keeps this plaintext: a bare host would now default to
      * HTTPS, which is the right production default but untestable hermetically. */
-    snprintf(ep, sizeof ep, f->v6 ? "http://[::1]:%d" : "http://127.0.0.1:%d", f->port);
-    setenv("OPENCHIME_S3_ENDPOINT", ep, 1);
-    setenv("OPENCHIME_S3_BUCKET", "testbucket", 1);
-    setenv("OPENCHIME_S3_ACCESS_KEY", "AKIDEXAMPLE", 1);
-    setenv("OPENCHIME_S3_SECRET_KEY", "SECRETEXAMPLEKEY", 1);
-    setenv("OPENCHIME_S3_REGION", "us-east-1", 1);
+    snprintf(g_ep, sizeof g_ep, f->v6 ? "http://[::1]:%d" : "http://127.0.0.1:%d", f->port);
+    g_s3cfg.endpoint = g_ep; g_s3cfg.bucket = "testbucket";
+    g_s3cfg.access_key = "AKIDEXAMPLE"; g_s3cfg.secret_key = "SECRETEXAMPLEKEY"; g_s3cfg.region = "us-east-1";
+    return &g_s3cfg;
 }
 
-static void clear_env(void) {
-    unsetenv("OPENCHIME_S3_ENDPOINT");
-    unsetenv("OPENCHIME_S3_BUCKET");
-    unsetenv("OPENCHIME_S3_ACCESS_KEY");
-    unsetenv("OPENCHIME_S3_SECRET_KEY");
-    unsetenv("OPENCHIME_S3_REGION");
-    unsetenv("OPENCHIME_BLOB_BACKEND");
-}
+static void clear_env(void) { memset(&g_s3cfg, 0, sizeof g_s3cfg); }
 
 static void fill_pattern(uint8_t *b, size_t n, uint32_t seed) {
     uint32_t x = seed;
@@ -281,8 +274,9 @@ int run_blob_s3_tests(void) {
     if (f->port == 0) return failures;
     set_env_for(f);
 
-    oc_blobstore *bs = oc_blobstore_open("/tmp/oc-blob-s3-unused");
+    oc_blobstore *bs = oc_blobstore_open("/tmp/oc-blob-s3-unused", &g_s3cfg);
     CHECK(bs != NULL);
+    CHECK(!oc_blobstore_is_local(bs));
     if (!bs) { fake_stop(f); clear_env(); return failures; }
 
     /* Single-chunk, multi-chunk, and a chunk size that leaves a partial final
@@ -317,7 +311,8 @@ int run_blob_s3_tests(void) {
     clear_env();
     /* No S3 credentials -> the local-filesystem backend, which works against a
      * real directory rather than the fake endpoint. */
-    oc_blobstore *local = oc_blobstore_open("build/oc-blob-fs-test");
+    oc_blobstore *local = oc_blobstore_open("build/oc-blob-fs-test", NULL);
+    CHECK(oc_blobstore_is_local(local));
     CHECK(local != NULL);
     if (local) {
         oc_blob_writer *w = oc_blob_put_begin(local, "bbbb0001", 4);
@@ -338,13 +333,11 @@ int run_blob_s3_tests(void) {
         oc_blobstore_close(local);
     }
 
-    /* A partial S3 configuration is refused outright rather than silently
-     * falling back to local disk, which would put attachments somewhere the
-     * operator did not intend. */
-    setenv("OPENCHIME_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-    setenv("OPENCHIME_S3_BUCKET", "testbucket", 1);
-    /* access key + secret deliberately absent */
-    CHECK(oc_blobstore_open("build/oc-blob-fs-test") == NULL);
+    /* A partial S3 configuration is refused by the loader (test_config.c),
+     * never reaching the store; a backend configuration with no keys does not
+     * open either, rather than falling back to local disk. */
+    { oc_s3_config part = { "http://127.0.0.1:1", "testbucket", NULL, NULL, NULL };
+      CHECK(oc_blobstore_open("build/oc-blob-fs-test", &part) == NULL); }
     clear_env();
 
     fake_stop(f);
@@ -356,7 +349,7 @@ int run_blob_s3_tests(void) {
         return failures;
     }
     set_env_for(f);
-    oc_blobstore *bs6 = oc_blobstore_open("/tmp/oc-blob-s3-unused");
+    oc_blobstore *bs6 = oc_blobstore_open("/tmp/oc-blob-s3-unused", &g_s3cfg);
     CHECK(bs6 != NULL);
     if (bs6) {
         round_trip(bs6, f, "cccc0001", 5000, 4096);

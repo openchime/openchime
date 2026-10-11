@@ -22,13 +22,13 @@ WIN_DIR='C:\Windows\Temp\octest'
 # A file's path as the client under test names it (see scripts/gui/uploads.sh).
 cpath() { if [ "$PLAT" = web ]; then printf '%s/%s' "$LIN_DIR" "$1"; else printf '%s\\%s' "$WIN_DIR" "$1"; fi; }
 
-export OC_DEV_PORT="${OC_DEV_PORT:-9590}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-files}"
-export OC_DEV_WS="${OC_DEV_WS:-Files Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9590}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-files}"
+export OC_TEST_WS="${OC_TEST_WS:-Files Fixture}"
 export OPENCHIME_FILE_PAGE=2          # gui_drive passes the daemon its environment
 
-kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run"; exit 1; }
-rm -rf "$OC_DEV_DIR"
+kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
+rm -rf "$OC_TEST_DIR"
 
 D="/tmp/oc-files-dump.txt"
 snap() { "$DRIVE" dump files 2>/dev/null | tail -n +2 > "$D"; }

@@ -31,7 +31,7 @@ EXE="$HERE/build/openchime.exe"
 WIN_DIR='C:\Windows\Temp\octest'
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 OUT="${GUI_DRIVE_OUT:-/tmp/ocshot-web}"
-PORT="${OC_WEB_PORT:-8551}"
+PORT="${OC_TEST_WEB_PORT:-8551}"
 D=/tmp/oc-web-signin
 ADDR="$(ip -4 addr show eth0 | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
 [ -n "$ADDR" ] || { echo "FAIL: no WSL address" >&2; exit 1; }

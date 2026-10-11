@@ -21,7 +21,7 @@ trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true; kill "$D_PID" 2>/dev/
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "Build daemon + TUI + demo_client"
-( cd "$ROOT" && make openchimed >/dev/null && make linux >/dev/null && make build/demo_client >/dev/null )
+( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make linux >/dev/null && make build/demo_client >/dev/null )
 
 say "Start a local daemon (bootstrap users alice/bob)"
 mkdir -p "$WORK/blobs"

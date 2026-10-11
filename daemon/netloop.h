@@ -104,7 +104,7 @@ void oc_netloop_set_ready(void (*ready)(void *ctx), void *ctx);
 /* Wire the link-unfurl worker (REQ-222, ARCH-105). When set, a committed SEND
  * or EDIT has its URLs extracted and queued for fetching, and a stored unfurl
  * fans an UNFURL frame to the channel. Call before oc_netloop_run; NULL (the
- * default, and the OPENCHIME_UNFURL=off state) disables unfurls. */
+ * default) disables unfurls; there is no switch. */
 struct oc_unfurler;
 void oc_netloop_set_unfurler(struct oc_unfurler *u);
 

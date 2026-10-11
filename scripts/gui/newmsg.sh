@@ -21,9 +21,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 
 # Its own daemon, port and directory, wiped each run.
-export OC_DEV_PORT="${OC_DEV_PORT:-9520}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-newmsg}"
-export OC_DEV_WS="${OC_DEV_WS:-Newmsg Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9520}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-newmsg}"
+export OC_TEST_WS="${OC_TEST_WS:-Newmsg Fixture}"
 
 fails=0
 checks=0
@@ -31,10 +31,10 @@ fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); checks=$((checks + 1))
 ok()   { printf '  ok   %s\n' "$*"; checks=$((checks + 1)); }
 
 if ! kill_dev_daemon; then
-  say "a daemon is still listening on :$OC_DEV_PORT — refusing to wipe underneath it."
+  say "a daemon is still listening on :$OC_TEST_PORT — refusing to wipe underneath it."
   exit 1
 fi
-rm -rf "$OC_DEV_DIR"
+rm -rf "$OC_TEST_DIR"
 
 drive() { "$DRIVE" "$@" >/dev/null 2>&1; }
 # A press: down AND up, as a keyboard does. The `key` verb sends the down only,
@@ -68,7 +68,7 @@ say "build"
 make -C "$HERE" >/dev/null 2>&1 || { say "  FAIL daemon build"; exit 1; }
 make -C "$HERE" windows >/dev/null 2>&1 || { say "  FAIL gui build"; exit 1; }
 
-OC_DRIVE_NO_BUILD=1 "$DRIVE" launch "$("$DRIVE" devaddr)" "alice:pw" >/dev/null 2>&1
+OC_TEST_NO_BUILD=1 "$DRIVE" launch "$("$DRIVE" devaddr)" "alice:pw" >/dev/null 2>&1
 signed_in() { [ "$(key_of "$d" authed)" = "1" ]; }
 wait_for signed_in || { say "  FAIL never signed in"; exit 1; }
 

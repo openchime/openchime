@@ -38,9 +38,9 @@ WIN_DIR='C:\Windows\Temp\octest'
 # offers the one its picker chooses.
 SCREEN_ID=screen:0; [ "$PLAT" = web ] && SCREEN_ID=display
 
-export OC_DEV_PORT="${OC_DEV_PORT:-9530}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-screenrec}"
-export OC_DEV_WS="${OC_DEV_WS:-Screen Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9530}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-screenrec}"
+export OC_TEST_WS="${OC_TEST_WS:-Screen Fixture}"
 
 drive() {
   if ! "$DRIVE" "$@" >/dev/null 2>&1; then
@@ -67,14 +67,14 @@ wait_key() {                          # wait_key <line-prefix> <key> <want> [ms]
 uia_bar() { powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$HERE/scripts/gui/uia_recbar.ps1")" "$@" 2>&1 | tr -d '\r'; }
 
 # --- launch -------------------------------------------------------------------
-kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run"; exit 1; }
-rm -rf "$OC_DEV_DIR"
+kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
+rm -rf "$OC_TEST_DIR"
 export OPENCHIME_TEST_CAPTURE=synthetic-camera
 export OPENCHIME_TEST_AUDIO=synthetic
 export OPENCHIME_TEST_VIDEO_CAP_MS=15000
 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
-  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_DEV_PORT"; exit 1; }
+  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }
   sleep 0.1; t=$((t + 1))
 done
 drive channel general
@@ -156,13 +156,13 @@ ms=$(key_of "$v" take_ms)
 check "Stop ended it, well before the cap (${ms} ms of 15 s)" test "${ms:-0}" -ge 1500 -a "${ms:-0}" -le 9000
 
 say "== sending it"
-before=$(ls "$OC_DEV_DIR/blobs" 2>/dev/null | wc -l)
+before=$(ls "$OC_TEST_DIR/blobs" 2>/dev/null | wc -l)
 drive vm send
 t=0; mp4=""
 while [ "$t" -lt 300 ] && [ -z "$mp4" ]; do
-  for f in $(ls -t "$OC_DEV_DIR/blobs" 2>/dev/null); do
-    if ffprobe -v error -show_entries stream=codec_name "$OC_DEV_DIR/blobs/$f" 2>/dev/null | grep -q vp9; then
-      mp4="$OC_DEV_DIR/blobs/$f"; break
+  for f in $(ls -t "$OC_TEST_DIR/blobs" 2>/dev/null); do
+    if ffprobe -v error -show_entries stream=codec_name "$OC_TEST_DIR/blobs/$f" 2>/dev/null | grep -q vp9; then
+      mp4="$OC_TEST_DIR/blobs/$f"; break
     fi
   done
   sleep 0.1; t=$((t + 1))

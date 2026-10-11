@@ -52,7 +52,7 @@ CP_PID=$!
 for _ in $(seq 1 60); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$CP/healthz" 2>/dev/null)" = "200" ] && break; sleep 1; done
 
 say "Start a daemon in OIDC mode, pinned to the central public key"
-( cd "$ROOT" && make openchimed >/dev/null && make build/demo_client >/dev/null )
+( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make build/demo_client >/dev/null )
 OPENCHIME_DB_PATH="$WORK/oidc.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem" \
 OPENCHIME_BLOB_DIR="$WORK/blobs" OPENCHIME_PROTO_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" \
 OPENCHIME_AUTH_MODE=oidc OPENCHIME_OIDC_ISSUER="$ISS" OPENCHIME_OIDC_AUDIENCE="$AUD" OPENCHIME_OIDC_PUBKEY_FILE="$WORK/pub.pem" \

@@ -24,6 +24,7 @@
  * transfer. */
 
 #include "blob_backend.h"
+#include "config.h"   /* oc_s3_config */
 #include "sigv4.h"
 #include "tls.h"
 #include "sock.h"   /* oc_connect_any */
@@ -73,17 +74,11 @@ typedef struct {
     size_t   buf_off, buf_len;
 } s3_reader;
 
-static const char *env_or(const char *k, const char *d) {
-    const char *v = getenv(k);
-    return (v && *v) ? v : d;
-}
-
-static void *s3_open(const char *cfg) {
-    (void)cfg;
-    const char *ep = getenv("OPENCHIME_S3_ENDPOINT");
-    const char *bucket = getenv("OPENCHIME_S3_BUCKET");
-    const char *ak = getenv("OPENCHIME_S3_ACCESS_KEY");
-    const char *sk = getenv("OPENCHIME_S3_SECRET_KEY");
+static void *s3_open(const char *base_dir, const void *backend_cfg) {
+    (void)base_dir;
+    const oc_s3_config *c3 = backend_cfg;
+    if (!c3) return NULL;
+    const char *ep = c3->endpoint, *bucket = c3->bucket, *ak = c3->access_key, *sk = c3->secret_key;
     if (!ep || !*ep || !bucket || !*bucket || !ak || !*ak || !sk || !*sk) return NULL;
 
     s3_store *s = calloc(1, sizeof *s);
@@ -119,7 +114,7 @@ static void *s3_open(const char *cfg) {
         return NULL;
     }
     snprintf(s->bucket, sizeof s->bucket, "%s", bucket);
-    snprintf(s->region, sizeof s->region, "%s", env_or("OPENCHIME_S3_REGION", "us-east-1"));
+    snprintf(s->region, sizeof s->region, "%s", c3->region && *c3->region ? c3->region : "us-east-1");
     snprintf(s->ak, sizeof s->ak, "%s", ak);
     snprintf(s->sk, sizeof s->sk, "%s", sk);
     return s;

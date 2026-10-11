@@ -41,21 +41,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # daemon if one holds the port — a run once bound to a nine-hour-old daemon
 # holding real workspace data and reported confident nonsense. A test that can be
 # wrong about which machine it is testing is not a test.
-export OC_DEV_PORT="${OC_DEV_PORT:-9500}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-smoke}"
-export OC_DEV_WS="${OC_DEV_WS:-Smoke Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9500}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-smoke}"
+export OC_TEST_WS="${OC_TEST_WS:-Smoke Fixture}"
 
-if [ "${OC_SMOKE_KEEP_DB:-0}" != "1" ]; then
+if [ "${OC_TEST_KEEP_DB:-0}" != "1" ]; then
   if ! kill_dev_daemon; then
-    say "a daemon is still listening on :$OC_DEV_PORT and would keep running on a"
+    say "a daemon is still listening on :$OC_TEST_PORT and would keep running on a"
     say "deleted directory — refusing to wipe underneath it. Stop it and re-run."
     exit 1
   fi
-  rm -rf "$OC_DEV_DIR"
+  rm -rf "$OC_TEST_DIR"
 fi
 
 # How long a wait tolerates before calling it a failure. Only failing runs pay it.
-WAIT_MS="${OC_SMOKE_WAIT_MS:-6000}"
+WAIT_MS="${OC_TEST_WAIT_MS:-6000}"
 
 # --- driving -------------------------------------------------------
 # EVERY VERB'S EXIT STATUS IS CHECKED, which the regression suite does not do and
@@ -128,7 +128,7 @@ expect_grep() {                    # expect_grep <regex> <label>
 say "== it starts"
 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed — see scripts/gui/drive.sh launch"; exit 1; }
 if ! wait_grep 'authed=1 connected=1' 20000; then
-  say "   NOT AUTHED — the client started and never reached :$OC_DEV_PORT"
+  say "   NOT AUTHED — the client started and never reached :$OC_TEST_PORT"
   exit 1
 fi
 ok "the client launches, connects and authenticates"
@@ -139,8 +139,8 @@ checks=$((checks + 1))
 fixture=$(snap | grep -o 'workspace name="[^"]*"' | cut -d'"' -f2)
 checks=$((checks + 1))
 case "$fixture" in
-  "$OC_DEV_WS") ok "and it is the smoke fixture on :$OC_DEV_PORT, not somebody's workspace" ;;
-  *) fail "WRONG DAEMON — reached \"${fixture:-<none>}\", expected \"$OC_DEV_WS\""
+  "$OC_TEST_WS") ok "and it is the smoke fixture on :$OC_TEST_PORT, not somebody's workspace" ;;
+  *) fail "WRONG DAEMON — reached \"${fixture:-<none>}\", expected \"$OC_TEST_WS\""
      say "   Refusing to go on: every assertion below would be about the wrong data."
      exit 1 ;;
 esac
@@ -185,7 +185,7 @@ else fail "the composer never took the keyboard: $(snap | grep -E '^wnd_|^ed ' |
 #
 # The text is UNIQUE PER RUN, so the assertions below cannot be satisfied by a
 # message an earlier run left behind. The default wipe would give that too, but
-# only as a side effect — and OC_SMOKE_KEEP_DB=1 removes it, at which point a
+# only as a side effect — and OC_TEST_KEEP_DB=1 removes it, at which point a
 # fixed string would make this check pass without anything being sent. A test
 # that can pass for the wrong reason is worse than one that is absent.
 say "== it sends"

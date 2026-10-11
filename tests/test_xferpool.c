@@ -123,7 +123,7 @@ int run_xferpool_tests(void) {
     mkdir("build", 0755);
     mkdir(TMPDIR, 0700);
 
-    oc_blobstore *bs = oc_blobstore_open(TMPDIR);
+    oc_blobstore *bs = oc_blobstore_open(TMPDIR, NULL);
     CHECK(bs != NULL);
     if (!bs) return failures;
 

@@ -28,9 +28,9 @@ OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 WIN_DIR='C:\Windows\Temp\octest'
 
-export OC_DEV_PORT="${OC_DEV_PORT:-9510}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-voice}"
-export OC_DEV_WS="${OC_DEV_WS:-Voice Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9510}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-voice}"
+export OC_TEST_WS="${OC_TEST_WS:-Voice Fixture}"
 
 SENTENCE="Please send the quarterly report to Dana before the meeting on Thursday."
 HEARD_RE='quarterly report'          # what must come back, case-insensitively
@@ -40,19 +40,19 @@ kill_dev_daemon() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
-      grep -qx "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" && kill "$p" 2>/dev/null
+      grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && kill "$p" 2>/dev/null
   done
   # A daemon with the speech models loaded takes a few seconds to go.
   for _ in $(seq 1 60); do
-    (exec 3<>/dev/tcp/127.0.0.1/"$OC_DEV_PORT") 2>/dev/null || return 0
+    (exec 3<>/dev/tcp/127.0.0.1/"$OC_TEST_PORT") 2>/dev/null || return 0
     exec 3<&- 3>&-; sleep 0.3
   done
   return 1
 }
 
 fresh_fixture() {
-  kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run"; exit 1; }
-  rm -rf "$OC_DEV_DIR"
+  kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
+  rm -rf "$OC_TEST_DIR"
 }
 
 drive() {
@@ -132,7 +132,7 @@ if [ "$PLAT" = web ]; then export OPENCHIME_TEST_MIC="$LIN_DIR/voice-mic.wav"
 else export OPENCHIME_TEST_MIC="$WIN_DIR\\voice-mic.wav"; fi
 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
-  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_DEV_PORT"; exit 1; }
+  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }
   sleep 0.1; t=$((t + 1))
 done
 drive channel general
@@ -216,7 +216,7 @@ say "== the microphone blocked"
 fresh_fixture
 OPENCHIME_TEST_AUDIO=mic-denied "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
-  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_DEV_PORT"; exit 1; }
+  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }
   sleep 0.1; t=$((t + 1))
 done
 drive channel general
@@ -231,7 +231,7 @@ say "== voice input off"
 fresh_fixture
 OPENCHIME_STT=0 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
-  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_DEV_PORT"; exit 1; }
+  [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }
   sleep 0.1; t=$((t + 1))
 done
 drive channel general

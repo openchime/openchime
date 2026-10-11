@@ -29,12 +29,12 @@ WIN_DIR='C:\Windows\Temp\octest'
 # it onto the page).
 cpath() { if [ "$PLAT" = web ]; then printf '%s/%s' "$LIN_DIR" "$1"; else printf '%s\\%s' "$WIN_DIR" "$1"; fi; }
 
-export OC_DEV_PORT="${OC_DEV_PORT:-9630}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-uploads}"
-export OC_DEV_WS="${OC_DEV_WS:-Uploads Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9630}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-uploads}"
+export OC_TEST_WS="${OC_TEST_WS:-Uploads Fixture}"
 
-kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run"; exit 1; }
-rm -rf "$OC_DEV_DIR"
+kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
+rm -rf "$OC_TEST_DIR"
 
 D="/tmp/oc-uploads-dump.txt"
 snap() { "$DRIVE" dump uploads 2>/dev/null | tail -n +2 > "$D"; }

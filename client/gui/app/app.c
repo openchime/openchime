@@ -73,6 +73,7 @@
 
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
+#include "env.h"            /* the demo build's test switches */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
@@ -6545,11 +6546,17 @@ static void draw_storage(gfx *rt, const oc_model *m, rectf reg, int embedded) {
 
     draw_text(rt, "DISK", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
     y += 22;
+    if (s->total_bytes == 0) {
+        /* Attachments in S3: the daemon measures no filesystem (CONFIG.md). */
+        draw_kv(rt, body, &y, "Free", "not measured (attachments in S3)", OC_COL_TEXT);
+    } else {
     human_bytes(s->avail_bytes, v, sizeof v);
-    char both[96]; char tot[64];
+    char tot[64], free_[96];
     human_bytes(s->total_bytes, tot, sizeof tot);
-    snprintf(both, sizeof both, "%s free of %s", v, tot);
-    draw_kv(rt, body, &y, "Free", both, s->under_pressure ? OC_COL_DANGER : OC_COL_TEXT);
+    snprintf(free_, sizeof free_, "%s free of %s", v, tot);
+    draw_kv(rt, body, &y, "Free", free_, s->under_pressure ? OC_COL_DANGER : OC_COL_TEXT);
+    }
+    char both[96];
     human_bytes(s->attach_bytes, v, sizeof v);
     snprintf(both, sizeof both, "%llu file(s), %s", (unsigned long long)s->attach_count, v);
     draw_kv(rt, body, &y, "Attachments", both, OC_COL_TEXT);
@@ -28414,6 +28421,7 @@ static void test_dump(const char *path) {
         }
         fclose(f); return;
     }
+    fprintf(f, "build=%s\n", oc_env_is_demo() ? "demo" : "production");
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
@@ -32802,9 +32810,10 @@ int main(int argc, char *argv[]) {
     /* Before anything else, so a crash during startup is reported too. */
     oc_plat_boot();
 
-    /* Automation hook: OPENCHIME_TEST_DIR enables the file command channel. */
-    { const char *td = getenv("OPENCHIME_TEST_DIR");
-      if (td && td[0]) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
+    /* Automation hook (demo builds only): OPENCHIME_TEST_DIR enables the file
+     * command channel. A production client has no hook to enable. */
+    { const char *td = oc_env_demo("OPENCHIME_TEST_DIR");
+      if (td) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
 
     /* AFTER the test dir is known, because that is where a report belongs when
      * the harness is driving -- and reporting the last run has to happen before

@@ -105,6 +105,13 @@ cp -r %{_bindir_src}/web %{buildroot}%{_datadir}/openchime/web
 %post
 # An install from before the file was made private keeps its own mode: tighten it.
 [ -f %{_sysconfdir}/openchime/openchimed.env ] && chmod 0600 %{_sysconfdir}/openchime/openchimed.env || :
+# The settings as the new daemon reads them, before the restart below (the
+# install does not fail on them).
+if [ -f %{_sysconfdir}/openchime/openchimed.env ] && [ -x %{_bindir}/openchimed ]; then
+    %{_bindir}/openchimed --check-config --env-file %{_sysconfdir}/openchime/openchimed.env >/dev/null 2>/tmp/openchimed-check.$$ \
+      || { echo "openchimed: the settings in %{_sysconfdir}/openchime/openchimed.env would stop the daemon:"; cat /tmp/openchimed-check.$$; echo "  fix them, then: systemctl restart openchimed"; }
+    rm -f /tmp/openchimed-check.$$
+fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || :
     if [ "$1" -eq 1 ]; then

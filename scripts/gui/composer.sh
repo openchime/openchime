@@ -26,14 +26,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 
-export OC_DEV_PORT="${OC_DEV_PORT:-9540}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-composer}"
-export OC_DEV_WS="${OC_DEV_WS:-Composer Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9540}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-composer}"
+export OC_TEST_WS="${OC_TEST_WS:-Composer Fixture}"
 
 # Stop this port's daemon before wiping its directory: SQLite would keep writing
 # to the unlinked files. Found by its environment, which is where the port is.
-kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run"; exit 1; }
-rm -rf "$OC_DEV_DIR"
+kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
+rm -rf "$OC_TEST_DIR"
 
 snap() { "$DRIVE" dump composer >/dev/null 2>&1; cat "$LIN_DIR/composer.txt" 2>/dev/null; }
 ed_key() { snap | grep -m1 '^ed ' | grep -o "\b$1=[^ ]*" | head -1 | cut -d= -f2; }
@@ -66,7 +66,7 @@ check "in a conversation with no draft, the box is one line" fits 1
 [ "$(ed_key lines)" = 1 ] || fail "...but it is $(ed_key lines) lines"
 
 say "== the client starts again"
-OC_DRIVE_NO_BUILD=1 OC_DRIVE_NO_DAEMON=1 "$DRIVE" launch >/dev/null 2>&1
+OC_TEST_NO_BUILD=1 OC_TEST_NO_DAEMON=1 "$DRIVE" launch >/dev/null 2>&1
 for _ in $(seq 1 80); do snap | grep 'authed=1' >/dev/null && break; sleep 0.25; done
 "$DRIVE" size 1100 800 >/dev/null
 "$DRIVE" channel 1 >/dev/null

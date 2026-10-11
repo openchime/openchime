@@ -23,8 +23,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 
-export OC_PAIR_PORT="${OC_PAIR_PORT:-9580}"
-export OC_PAIR_DIR="${OC_PAIR_DIR:-/tmp/oc-reactions}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9580}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-reactions}"
 CH=1
 
 D="/tmp/oc-reactions-dump.txt"
@@ -48,7 +48,7 @@ click_chip() {
 
 say "== fixture: alice and bob, one message, bob reacts"
 "$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_PAIR_DIR"
+rm -rf "$OC_TEST_DIR"
 "$PAIR" up || { say "pair did not come up"; exit 1; }
 # Wide enough for the context pane the who-reacted list lives in.
 "$PAIR" a size 1200 820 >/dev/null

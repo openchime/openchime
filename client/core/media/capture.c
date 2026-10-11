@@ -1,6 +1,7 @@
 /* The capture front end and the synthetic source (oc_capture.h). */
 #define _POSIX_C_SOURCE 200809L
 #include "oc_capture.h"
+#include "env.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -31,14 +32,14 @@ struct oc_capture {
 };
 
 static const oc_capture_backend *pick(void) {
-    const char *t = getenv("OPENCHIME_TEST_CAPTURE");
+    const char *t = oc_env_demo("OPENCHIME_TEST_CAPTURE");
     if (t && (strcmp(t, "synthetic") == 0 || strcmp(t, "synthetic-camera") == 0)) return &oc_capture_synthetic;
     if (t && strcmp(t, "denied") == 0) return &oc_capture_denied;
     return oc_capture_platform();
 }
 
 static const oc_capture_backend *pick_screen(void) {
-    const char *t = getenv("OPENCHIME_TEST_CAPTURE");
+    const char *t = oc_env_demo("OPENCHIME_TEST_CAPTURE");
     if (t && strcmp(t, "synthetic") == 0) return &oc_capture_synthetic_screen;
     if (t && strcmp(t, "denied") == 0) return &oc_capture_denied;
     return oc_capture_screen_platform();
@@ -306,8 +307,8 @@ static int scr_start(void *impl) {
     scr *s = impl;
     s->running = 1; s->n = 0;
     s->next_us = oc_media_clock_us();
-    const char *g = getenv("OPENCHIME_TEST_SCREEN_GONE_MS");
-    s->gone_at_us = g && *g ? s->next_us + strtol(g, NULL, 10) * 1000 : 0;
+    const char *g = oc_env_demo("OPENCHIME_TEST_SCREEN_GONE_MS");
+    s->gone_at_us = g ? s->next_us + strtol(g, NULL, 10) * 1000 : 0;
     return OC_CAP_OK;
 }
 

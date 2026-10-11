@@ -320,6 +320,17 @@ int run_slow_blob_tests(void) {
     CHECK(SB_WAIT(alice, m->n_channels > 0, 5000));
     CHECK(SB_WAIT(bob,   m->n_channels > 0, 5000));
 
+    /* --- storage pressure is not measured on S3 ------------------------------
+     * The attachments are in S3, so the daemon samples no filesystem: the
+     * owner's storage report carries no disk size and no pressure, whatever
+     * the local disk under OPENCHIME_BLOB_DIR holds -- which is what keeps a
+     * low local disk from evicting out of S3 or refusing uploads (netloop.c). */
+    oc_client_storage_status(alice);
+    CHECK(SB_WAIT(alice, m->storage_have, 5000));
+    CHECK(oc_client_model(alice)->storage.total_bytes == 0);
+    CHECK(oc_client_model(alice)->storage.avail_bytes == 0);
+    CHECK(oc_client_model(alice)->storage.under_pressure == 0);
+
     /* --- baseline: bob's round-trip with nothing else happening ------------ */
     uint64_t base[5];
     for (int i = 0; i < 5; i++) {

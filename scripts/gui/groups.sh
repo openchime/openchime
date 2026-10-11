@@ -18,12 +18,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 fails=0
 
-export OC_PAIR_PORT="${OC_PAIR_PORT:-9640}"
-export OC_PAIR_DIR="${OC_PAIR_DIR:-/tmp/oc-groups}"
-export OC_PAIR_USERS="alice:pw:owner,bob:pw:member,carol:pw:member$(for i in 1 2 3 4 5 6 7 8 9; do printf ',u%d:pw:member' "$i"; done)"
+export OC_TEST_PORT="${OC_TEST_PORT:-9640}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-groups}"
+export OC_TEST_USERS="alice:pw:owner,bob:pw:member,carol:pw:member$(for i in 1 2 3 4 5 6 7 8 9; do printf ',u%d:pw:member' "$i"; done)"
 # The WSL machine's own address, as scripts/gui/calls_tcp.sh uses: Windows' forwarding of
 # 127.0.0.1 into WSL does not reliably reach a port it has not seen before.
-export OC_PAIR_HOST="${OC_PAIR_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
+export OC_TEST_HOST="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 
 check() { local what="$1"; shift; if "$@"; then say "  ok   $what"; else say "  FAIL $what"; fails=$((fails + 1)); fi; }
 dump() { "$PAIR" "$1" dump "groups_$1" > "/tmp/oc-groups-dump-$1.txt" 2>&1; }
@@ -46,7 +46,7 @@ press() { "$PAIR" "$1" key "$2" >/dev/null; "$PAIR" "$1" keyup "$2" >/dev/null; 
 
 say "== fixture: a fresh daemon, alice (owner) and bob"
 "$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_PAIR_DIR"
+rm -rf "$OC_TEST_DIR"
 "$PAIR" up || { say "pair did not come up"; exit 1; }
 
 say "== alice makes @crew in Admin > Groups, and puts carol and bob in it"

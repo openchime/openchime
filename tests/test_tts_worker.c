@@ -140,7 +140,7 @@ static int wait_result(oc_tts_worker *w, oc_tts_result *r, int timeout_ms) {
 static void test_worker(void) {
     mkdir("build", 0755);
     mkdir(TMPDIR, 0700);
-    oc_blobstore *bs = oc_blobstore_open(TMPDIR);
+    oc_blobstore *bs = oc_blobstore_open(TMPDIR, NULL);
     CHECK(bs != NULL);
     if (!bs) return;
     stub_opens = stub_closes = 0;

@@ -61,7 +61,7 @@ authority.
   It is typed only into the daemon's own sign-in page, in the system browser, and
   reaches the daemon only inside TLS — directly, or through the client's loopback
   tunnel (§8.10). It is never stored. A password in a frame is refused, but for a
-  test knob.
+  demo build's switch (a production build has no such path).
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
   created at first run from a one-time **setup token**. There is no config file
   and no configuration variable for it (ARCH-26): the daemon **mints** the token
@@ -423,7 +423,7 @@ After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
 - `local` — username + password in the frame. Refused (`AUTH_SOURCE_UNAVAILABLE`)
-  unless the daemon runs with the test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`;
+  unless the daemon runs with the demo build's switch `OPENCHIME_TEST_PASSWORD_AUTH=1` (CONFIG.md, "Demo builds only");
   local accounts sign in in the browser (§8.10).
 - `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
   `AUTH` then carries an ES256 JWT and the verifier (§8.2): the central-issued one

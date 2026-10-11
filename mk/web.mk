@@ -10,7 +10,7 @@
 WEB_DIR     := build/web
 WEB_MBEDTLS := build/wasm/mbedtls/library
 WEB_SDL3    := build/wasm/sdl3
-WEB_CFLAGS  := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread
+WEB_CFLAGS  := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread $(DEMO_DEF)
 
 $(WEB_MBEDTLS)/libmbedtls.a: $(EMCC)
 	@echo "openchime: building mbedTLS for wasm (about a minute, once)"
@@ -54,16 +54,16 @@ WEB_GUI_INC := -Ishared -Iclient/core -Iclient/core/media -Iclient/core/voice -I
                -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Isdltext -Iclient/gui/gfx -Ithird_party/jsmn \
                -I$(WEB_SDL3)/include -Ibuild/wasm/mbedtls/include \
                -Ibuild/wasm/libvpx/include -Ibuild/wasm/opus/include -Ibuild/wasm/speexdsp/include -Ithird_party/libfvad/include
-WEB_GUI_CFLAGS := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread -Wno-typedef-redefinition
+WEB_GUI_CFLAGS := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread -Wno-typedef-redefinition $(DEMO_DEF)
 WEB_GUI_OBJS := $(patsubst %.c,build/wasm/gui/%.o,$(WEB_GUI_SRC))
 # The browser has no loopback listener for a sign-in's return: the core's
 # signin.c is replaced by signin_web.c, the same API over the page (WEB.md).
 WEB_CORE_SRC  := $(filter-out client/core/signin.c,$(CORE_SRC)) client/core/signin_web.c
 WEB_CORE_OBJS := $(patsubst %.c,build/wasm/core/%.o,$(WEB_CORE_SRC) $(SHARED_SRC))
-build/wasm/gui/%.o: %.c client/gui/platform/platform.h client/gui/app/keys.h $(WEB_SDL3)/lib/libSDL3.a $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MEDIA_LIBS) $(EMCC)
+build/wasm/gui/%.o: %.c client/gui/platform/platform.h client/gui/app/keys.h $(WEB_SDL3)/lib/libSDL3.a $(WEB_MBEDTLS)/libmbedtls.a $(WEB_MEDIA_LIBS) $(EMCC) $(DEMO_STAMP)
 	@mkdir -p $(dir $@)
 	$(EMCC) $(WEB_GUI_CFLAGS) $(WEB_GUI_INC) -c $< -o $@
-build/wasm/core/%.o: %.c $(WEB_MBEDTLS)/libmbedtls.a $(EMCC)
+build/wasm/core/%.o: %.c $(WEB_MBEDTLS)/libmbedtls.a $(EMCC) $(DEMO_STAMP)
 	@mkdir -p $(dir $@)
 	$(EMCC) $(WEB_CFLAGS) -Ishared $(CORE_INC) -Iclient/shared -Ithird_party/jsmn -Ibuild/wasm/mbedtls/include -c $< -o $@
 $(WEB_DIR)/openchime.js: $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) client/gui/platform/web/openchime.html $(EMCC)

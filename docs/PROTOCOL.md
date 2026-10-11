@@ -1898,7 +1898,7 @@ audited as `password.change.failed` and counted by the account's sign-in limiter
 past which the change is `AUTH_RATE_LIMITED` unchecked;
 success answers with `PROFILE_UPDATED` (the name unchanged) as the ack, deletes the
 user's other sessions and closes their connections. `FORBIDDEN`
-too unless the daemon runs with the test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a
+too unless the daemon runs with the demo build's switch `OPENCHIME_TEST_PASSWORD_AUTH=1` (CONFIG.md, "Demo builds only"): a
 password is changed on the password page (AUTH.md §8.10).
 
 **`PROFILE_UPDATED` (S → C), `0x004A`** `{ user_id: u64, display_name: str }` — a

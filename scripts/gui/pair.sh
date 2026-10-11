@@ -18,12 +18,12 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EXE="$HERE/build/openchime.exe"
-PORT="${OC_PAIR_PORT:-9600}"
+PORT="${OC_TEST_PORT:-9600}"
 # Where the clients reach the daemon. 127.0.0.1 by default, which WSL forwards to
 # the daemon for TCP only: a call's audio is UDP, so a pair that calls names the
 # WSL machine's own address instead (scripts/gui/calls.sh does).
-HOST="${OC_PAIR_HOST:-127.0.0.1}"
-DEV="${OC_PAIR_DIR:-/tmp/openchime-pair}"
+HOST="${OC_TEST_HOST:-127.0.0.1}"
+DEV="${OC_TEST_DIR:-/tmp/openchime-pair}"
 PIDS="$DEV/pids"
 
 # One command channel per client, or they read each other's commands and answer
@@ -67,9 +67,9 @@ up)
         OPENCHIME_PROTO_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
         OPENCHIME_TEST_PASSWORD_AUTH=1 \
         OPENCHIME_WORKSPACE_NAME="Acme HQ" \
-        OPENCHIME_BOOTSTRAP_USERS="${OC_PAIR_USERS:-alice:pw:owner,bob:pw:member}" \
-        OPENCHIME_CALL_MAX="${OC_PAIR_CALL_MAX:-10}" \
-        ${OC_PAIR_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_PAIR_ADVERTISE_PORT"} \
+        OPENCHIME_BOOTSTRAP_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member}" \
+        OPENCHIME_CALL_MAX="${OC_TEST_CALL_MAX:-10}" \
+        ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
         OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
         setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &
     disown
@@ -113,11 +113,11 @@ up)
     # The test audio switches go through to the client as they do in
     # scripts/gui/drive.sh -- synthetic devices (and screens, OPENCHIME_TEST_CAPTURE), a
     # spoken file, and each client's own
-    # microphone tone (OC_PAIR_TONE_A / _B), so a pair in a call can tell whom
+    # microphone tone (OC_TEST_TONE_A / _B), so a pair in a call can tell whom
     # it is hearing. Unset, they are forwarded as nothing and change nothing.
     tone=""
-    [ "$who" = a ] && tone="${OC_PAIR_TONE_A:-}"
-    [ "$who" = b ] && tone="${OC_PAIR_TONE_B:-}"
+    [ "$who" = a ] && tone="${OC_TEST_TONE_A:-}"
+    [ "$who" = b ] && tone="${OC_TEST_TONE_B:-}"
     WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_TONE:OPENCHIME_TEST_CAPTURE" \
       OPENCHIME_TEST_DIR="$wdir" OPENCHIME_TEST_TONE="$tone" \
       OPENCHIME_TEST_AUDIO="${OPENCHIME_TEST_AUDIO:-}" OPENCHIME_TEST_MIC="${OPENCHIME_TEST_MIC:-}" \
