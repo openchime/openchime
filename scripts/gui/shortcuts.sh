@@ -19,11 +19,11 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 
-export OC_PAIR_PORT="${OC_PAIR_PORT:-9570}"
-export OC_PAIR_DIR="${OC_PAIR_DIR:-/tmp/oc-shortcuts}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9570}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-shortcuts}"
 # The clients reach the daemon at the WSL machine's own address, as the pair does.
-OC_PAIR_HOST_ADDR="${OC_PAIR_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
-export OC_PAIR_HOST="$OC_PAIR_HOST_ADDR"
+HOST_ADDR="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
+export OC_TEST_HOST="$HOST_ADDR"
 
 D="/tmp/oc-shortcuts-dump.txt"
 snap() { "$PAIR" a dump shortcuts > "$D" 2>&1; }
@@ -37,7 +37,7 @@ waitfor() {  # waitfor <secs> <command...>
 
 say "== fixture: alice and bob"
 "$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_PAIR_DIR"
+rm -rf "$OC_TEST_DIR"
 "$PAIR" up || { say "pair did not come up"; exit 1; }
 "$PAIR" a channel 1 >/dev/null
 "$PAIR" a mkchan quiet >/dev/null
@@ -70,8 +70,8 @@ rm -f "$D"
 say "== Ctrl+<digit> switches workspace"
 # A SECOND daemon, so there is a second workspace to switch to: a client keys a
 # workspace by its address, so signing in twice to one address is one workspace.
-SECOND_PORT=$((OC_PAIR_PORT + 1))
-SECOND_DIR="$OC_PAIR_DIR-2"
+SECOND_PORT=$((OC_TEST_PORT + 1))
+SECOND_DIR="$OC_TEST_DIR-2"
 rm -rf "$SECOND_DIR"; mkdir -p "$SECOND_DIR"
 env OPENCHIME_DB_PATH="$SECOND_DIR/db" \
     OPENCHIME_TLS_CERT="$SECOND_DIR/cert.pem" OPENCHIME_TLS_KEY="$SECOND_DIR/key.pem" \
@@ -89,7 +89,7 @@ for _ in $(seq 1 40); do
 done
 ws_n()     { snap; grep -m1 '^workspaces=' "$D" | grep -o 'workspaces=[0-9]*' | cut -d= -f2; }
 ws_active(){ snap; grep -m1 '^workspaces=' "$D" | grep -o 'active=[0-9-]*' | cut -d= -f2; }
-"$PAIR" a wsadd "$OC_PAIR_HOST_ADDR:$SECOND_PORT" "alice:pw" >/dev/null
+"$PAIR" a wsadd "$HOST_ADDR:$SECOND_PORT" "alice:pw" >/dev/null
 two_ws() { [ "$(ws_n)" = 2 ]; }
 check "alice's client holds two workspaces" waitfor 20 two_ws
 on_second() { [ "$(ws_active)" = 1 ]; }

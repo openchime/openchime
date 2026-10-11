@@ -476,11 +476,13 @@ static int add_os_roots(mbedtls_x509_crt *chain) {
 }
 #else
 /* The distribution's bundle (Debian/Ubuntu, then Fedora/RHEL), where an
- * organisation installs its internal CA; OC_TLS_OS_ROOTS overrides, for tests. */
+ * organisation installs its internal CA; oc_tls_set_os_roots overrides, for tests. */
+static const char *g_os_roots;
+void oc_tls_set_os_roots(const char *path) { g_os_roots = path && *path ? path : NULL; }
 static int add_os_roots(mbedtls_x509_crt *chain) {
-    const char *env = getenv("OC_TLS_OS_ROOTS");
-    const char *files[] = { env && *env ? env : "/etc/ssl/certs/ca-certificates.crt",
-                            env && *env ? NULL : "/etc/pki/tls/certs/ca-bundle.crt", NULL };
+    const char *env = g_os_roots;
+    const char *files[] = { env ? env : "/etc/ssl/certs/ca-certificates.crt",
+                            env ? NULL : "/etc/pki/tls/certs/ca-bundle.crt", NULL };
     for (int i = 0; files[i]; i++) {
         FILE *f = fopen(files[i], "rb");
         if (!f) continue;
@@ -490,6 +492,9 @@ static int add_os_roots(mbedtls_x509_crt *chain) {
     }
     return 0;
 }
+#endif
+#if defined(_WIN32)
+void oc_tls_set_os_roots(const char *path) { (void)path; }   /* the system store is the roots there */
 #endif
 
 /* The roots a set of clients was given: built from the extra roots as they

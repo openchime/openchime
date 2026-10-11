@@ -11166,10 +11166,9 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
         fprintf(stderr, "dbwriter: the local issuer could not be made\n");
         goto fail;
     }
-    {   /* The test knob (CONFIG.md): a password in a frame. */
-        const char *k = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
-        w->password_frames = k && strcmp(k, "1") == 0;
-    }
+    /* The demo build's switch (config.h): a password in a frame. Zero in a
+     * production build, whose configuration cannot set it. */
+    w->password_frames = oc_config_get()->demo.password_frames;
 
     w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (w->evfd < 0) { fprintf(stderr, "dbwriter: eventfd failed\n"); goto fail; }

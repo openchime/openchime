@@ -3,7 +3,7 @@
  * `<base>/<key>.tmp` and atomically rename into place on commit, so a reader
  * never sees a partial blob and an aborted upload leaves nothing behind. The
  * S3/MinIO backend (blob_s3.c) implements the same vtable and is selected with
- * OPENCHIME_BLOB_BACKEND=s3. */
+ * the four OPENCHIME_S3_* settings (config.h). */
 
 #include "blobstore.h"
 #include "blob_backend.h"
@@ -47,7 +47,8 @@ static int key_ok(const char *key) {
     return 1;
 }
 
-static void *fs_open(const char *base_dir) {
+static void *fs_open(const char *base_dir, const void *unused) {
+    (void)unused;
     if (!base_dir || !*base_dir) return NULL;
     if (mkdir(base_dir, 0700) != 0 && errno != EEXIST) return NULL;
     fs_store *s = calloc(1, sizeof *s);
@@ -164,44 +165,15 @@ const oc_blob_backend oc_blob_backend_fs = {
 
 /* --- Public dispatch ------------------------------------------------------- */
 
-/* Is a usable S3 configuration present? Selection is by *configuration*, not a
- * mode flag (ARCH-70): an operator who supplies S3 credentials gets the S3
- * backend, and one who doesn't gets local disk. All four values are required —
- * a partial configuration is an operator error, and silently falling back to
- * local disk would put attachments somewhere they didn't intend, so we say so
- * and let the caller fail rather than guess. */
-static int s3_configured(void) {
-    static const char *const REQUIRED[] = {
-        "OPENCHIME_S3_ENDPOINT", "OPENCHIME_S3_BUCKET",
-        "OPENCHIME_S3_ACCESS_KEY", "OPENCHIME_S3_SECRET_KEY",
-    };
-    int set = 0;
-    for (size_t i = 0; i < sizeof REQUIRED / sizeof REQUIRED[0]; i++) {
-        const char *v = getenv(REQUIRED[i]);
-        if (v && *v) set++;
-    }
-    if (set == 0) return 0;                     /* none: local disk */
-    if (set == (int)(sizeof REQUIRED / sizeof REQUIRED[0])) return 1;   /* all: S3 */
-    fprintf(stderr, "openchimed: incomplete S3 configuration (%d of 4 of "
-                    "OPENCHIME_S3_ENDPOINT/_BUCKET/_ACCESS_KEY/_SECRET_KEY set); "
-                    "set all four for S3 or none for local disk\n", set);
-    return -1;
-}
-
-oc_blobstore *oc_blobstore_open(const char *base_dir) {
-    int s3 = s3_configured();
-    if (s3 < 0) return NULL;                    /* misconfigured: refuse to guess */
-    /* OPENCHIME_BLOB_BACKEND is the legacy explicit selector, still honored so
-     * an existing deployment keeps working; the credential check above is the
-     * documented path. */
-    const char *sel = getenv("OPENCHIME_BLOB_BACKEND");
-    if (sel && strcmp(sel, "s3") == 0) s3 = 1;
-    else if (sel && strcmp(sel, "fs") == 0) s3 = 0;
-
-    const oc_blob_backend *be = s3 ? &oc_blob_backend_s3 : &oc_blob_backend_fs;
+/* Selection is by configuration, not a mode flag (ARCH-70): an operator who
+ * supplies the four S3 values gets the S3 backend, one who supplies none gets
+ * local disk; a partial set never reaches here (config.c refuses it). */
+oc_blobstore *oc_blobstore_open(const char *base_dir, const oc_s3_config *s3) {
+    int use_s3 = s3 && s3->endpoint && *s3->endpoint;
+    const oc_blob_backend *be = use_s3 ? &oc_blob_backend_s3 : &oc_blob_backend_fs;
     fprintf(stderr, "openchimed: blob storage = %s\n",
-            s3 ? "s3 (operator-supplied endpoint)" : "local disk");
-    void *store = be->open(base_dir);
+            use_s3 ? "s3 (operator-supplied endpoint)" : "local disk");
+    void *store = be->open(base_dir, s3);
     if (!store) return NULL;
     oc_blobstore *bs = calloc(1, sizeof *bs);
     if (!bs) { be->close(store); return NULL; }
@@ -209,6 +181,8 @@ oc_blobstore *oc_blobstore_open(const char *base_dir) {
     bs->store = store;
     return bs;
 }
+
+int oc_blobstore_is_local(const oc_blobstore *bs) { return bs && bs->be == &oc_blob_backend_fs; }
 
 void oc_blobstore_close(oc_blobstore *bs) {
     if (!bs) return;

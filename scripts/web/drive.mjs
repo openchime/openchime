@@ -37,9 +37,9 @@ const mic = process.env.OPENCHIME_TEST_MIC;
 if (mic) { url.searchParams.append('env', 'OPENCHIME_TEST_MIC=/mic.wav'); url.searchParams.set('mic', 'mic.wav'); }
 url.searchParams.set('hook', '1');
 
-// OC_WEB_DEBUG_PORT=<n>: Chromium's remote debugging on that port (a `b`
+// OC_TEST_DEBUG_PORT=<n>: Chromium's remote debugging on that port (a `b`
 // client takes the next), for a debugger to attach to a stuck page.
-const dbg = process.env.OC_WEB_DEBUG_PORT ? [`--remote-debugging-port=${parseInt(process.env.OC_WEB_DEBUG_PORT, 10) + (dir.endsWith('-b') ? 1 : 0)}`] : [];
+const dbg = process.env.OC_TEST_DEBUG_PORT ? [`--remote-debugging-port=${parseInt(process.env.OC_TEST_DEBUG_PORT, 10) + (dir.endsWith('-b') ? 1 : 0)}`] : [];
 // A profile kept per client name under the cache directory: the compiled
 // wasm stays cached across runs, which is most of a fresh page's sign-in time.
 const profile = path.join(process.env.XDG_CACHE_HOME || path.join(process.env.HOME || '/tmp', '.cache'), 'openchime-webdrive',

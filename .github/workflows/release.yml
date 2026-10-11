@@ -414,6 +414,14 @@ jobs:
           # inside the binary; this is the one file it serves from beside itself.
           cp -r web "$DIST/web"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
+      # No shipped daemon is a demo build: the marker a DEMO=1 build carries is
+      # absent, for either architecture (nothing need run).
+      - name: The daemon is not a demo build
+        run: |
+          set -euo pipefail
+          if grep -q OPENCHIME-DEMO-BUILD "$DIST/openchimed"; then
+            echo "::error::$DIST/openchimed is a demo build"; exit 1; fi
+          echo "not a demo build"
       # The host's binary runs here; the arm64 one is build-only.
       - name: Speak and hear with the release binary
         if: matrix.arch == 'amd64'
@@ -741,6 +749,8 @@ jobs:
           # it is asserted here rather than discovered there.
           for f in build/openchime.exe build/openchime-tui.exe; do
             file "$f" | grep -q 'PE32+' || { echo "::error::$f is not a PE32+ binary"; exit 1; }
+            # No shipped client is a demo build (the marker a DEMO=1 build carries).
+            if grep -q OPENCHIME-DEMO-BUILD "$f"; then echo "::error::$f is a demo build"; exit 1; fi
           done
 
       # Named for the toolchain, not the platform: these are the unpackaged

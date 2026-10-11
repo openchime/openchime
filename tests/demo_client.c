@@ -9,7 +9,7 @@
  *   demo_client <host> <port> <user> <pass> summarize <channel_id> <start_ms> <end_ms>
  *
  * `token` registers a push device token (so a later SEND has someone to notify);
- * `send` posts a message (which, if the daemon is enrolled + OC_PUSH_URL is set,
+ * `send` posts a message (which, if the daemon is enrolled + OPENCHIME_PUSH_URL is set,
  * drives the push emitter); `summarize` asks for a summary of a custom range and
  * waits for it however long it takes, as a client does: the body (JSON) on
  * stdout, and on stderr each queue position and then one line of status and

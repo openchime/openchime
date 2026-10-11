@@ -28,8 +28,8 @@ EXE="$HERE/build/openchime.exe"
 WIN_DIR='C:\Windows\Temp\octest'
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
-OC_DEV_DIR="${OC_DEV_DIR:-/tmp/openchime-dev}"
-OC_DEV_PORT="${OC_DEV_PORT:-8443}"
+OC_TEST_DIR="${OC_TEST_DIR:-/tmp/openchime-dev}"
+OC_TEST_PORT="${OC_TEST_PORT:-8443}"
 
 mkdir -p "$LIN_DIR" "$OUT"
 
@@ -38,9 +38,9 @@ mkdir -p "$LIN_DIR" "$OUT"
 # 127.0.0.1 only where localhost forwarding is on, and without it the client sat
 # on "could not reach the server" and every script built on `launch` failed its
 # first check. Anywhere else -- the daemon on the Windows host itself, say --
-# 127.0.0.1. OC_DEV_HOST overrides both.
+# 127.0.0.1. OC_TEST_HOST overrides both.
 dev_host() {
-  if [ -n "${OC_DEV_HOST:-}" ]; then printf '%s\n' "$OC_DEV_HOST"; return; fi
+  if [ -n "${OC_TEST_HOST:-}" ]; then printf '%s\n' "$OC_TEST_HOST"; return; fi
   local a=""
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     a="$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
@@ -75,12 +75,17 @@ trust_dev_cert() {
 case "${1:-}" in
   devaddr)
     # The default workspace `launch` uses, for a script that names it itself.
-    printf '%s:%s\n' "$(dev_host)" "$OC_DEV_PORT"; exit 0 ;;
+    printf '%s:%s\n' "$(dev_host)" "$OC_TEST_PORT"; exit 0 ;;
   launch)
-    # The default follows OC_DEV_PORT, so pointing a run at a second dev daemon
+  # A demo build (make DEMO=1): the fixture signs in by password in frames and
+  # bootstraps its users, which a production build refuses.
+  if ! "$HERE/openchimed" --version | grep -q 'demo build'; then
+    echo "$(basename "$0"): $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2
+  fi
+    # The default follows OC_TEST_PORT, so pointing a run at a second dev daemon
     # (a smoke run that must not touch the workspace you are using) does not also
     # require repeating the address on the command line.
-    ws="${2:-$(dev_host):$OC_DEV_PORT}"; cred="${3:-alice:pw}"
+    ws="${2:-$(dev_host):$OC_TEST_PORT}"; cred="${3:-alice:pw}"
 
     # --- Build BOTH sides, then restart the daemon on the new binary. ---------
     #
@@ -91,9 +96,9 @@ case "${1:-}" in
     # That cost real time three times in one day before this guard existed.
     #
     # `make` is incremental, so this is free when nothing changed. Skip with
-    # OC_DRIVE_NO_BUILD=1 when you deliberately want a mismatched pair (testing
+    # OC_TEST_NO_BUILD=1 when you deliberately want a mismatched pair (testing
     # the version-reject path, say).
-    if [ "${OC_DRIVE_NO_BUILD:-0}" != "1" ]; then
+    if [ "${OC_TEST_NO_BUILD:-0}" != "1" ]; then
       make -C "$HERE" >/dev/null || { echo "daemon build FAILED" >&2; exit 1; }
       make -C "$HERE" windows >/dev/null || { echo "gui build FAILED" >&2; exit 1; }
     fi
@@ -101,17 +106,17 @@ case "${1:-}" in
     # Restart the daemon unless it is already running the binary we just built.
     # Comparing start time to the binary's mtime is enough and avoids bouncing a
     # daemon (and its in-memory presence) on every launch.
-    if [ "${OC_DRIVE_NO_DAEMON:-0}" != "1" ]; then
+    if [ "${OC_TEST_NO_DAEMON:-0}" != "1" ]; then
       # The PORT is the question, not whether any openchimed exists: a daemon
       # started for something else (the e2e run uses 9443) satisfied a pgrep and
       # left the client with nothing to connect to — "launched" with authed=0 and
       # no explanation. Ask what the client will ask.
       listening=0
-      (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; listening=1; }
+      (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null && { exec 3<&- 3>&-; listening=1; }
       # Named in its environment: the port is not on its command line.
       dpid=""
       for p in $(pgrep -x openchimed || true); do
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" && { dpid=$p; break; }
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && { dpid=$p; break; }
       done
       # Only the daemon on THIS port is ours to restart: falling back to any
       # openchimed stopped whichever daemon another run happened to have up.
@@ -127,20 +132,20 @@ case "${1:-}" in
           # Gone from the port before the next binds it, or the new one fails to
           # bind and the wait below finds the old one on its way out.
           for _ in $(seq 1 40); do
-            (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null || break
+            (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null || break
             exec 3<&- 3>&-; sleep 0.25
           done
         fi
-        mkdir -p "$OC_DEV_DIR"
-        env OPENCHIME_DB_PATH="$OC_DEV_DIR/db" \
-            OPENCHIME_TLS_CERT="$OC_DEV_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_DEV_DIR/key.pem" \
-            OPENCHIME_BLOB_DIR="$OC_DEV_DIR/blobs" \
-            OPENCHIME_PROTO_PORT="${OC_DEV_PORT}" OPENCHIME_HEALTH_PORT=8080 \
+        mkdir -p "$OC_TEST_DIR"
+        env OPENCHIME_DB_PATH="$OC_TEST_DIR/db" \
+            OPENCHIME_TLS_CERT="$OC_TEST_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_TEST_DIR/key.pem" \
+            OPENCHIME_BLOB_DIR="$OC_TEST_DIR/blobs" \
+            OPENCHIME_PROTO_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT=8080 \
             OPENCHIME_TEST_PASSWORD_AUTH=1 \
-            OPENCHIME_WORKSPACE_NAME="${OC_DEV_WS:-Acme HQ}" \
-            OPENCHIME_BOOTSTRAP_USERS="${OC_DEV_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
+            OPENCHIME_BOOTSTRAP_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
             OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
-            setsid "$HERE/openchimed" > "$OC_DEV_DIR/daemon.log" 2>&1 < /dev/null &
+            setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
         # Wait for the listener rather than sleeping a guess -- and long enough:
         # the bootstrap accounts are hashed before it listens, so a fixture of
@@ -148,10 +153,10 @@ case "${1:-}" in
         # before then fails its one attempt and never tries again.
         up=0
         for _ in $(seq 1 360); do
-          (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; up=1; break; }
+          (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null && { exec 3<&- 3>&-; up=1; break; }
           sleep 0.25
         done
-        [ "$up" = 1 ] || { echo "the daemon is not listening on :$OC_DEV_PORT" >&2; exit 1; }
+        [ "$up" = 1 ] || { echo "the daemon is not listening on :$OC_TEST_PORT" >&2; exit 1; }
         echo "daemon restarted (was stale or absent)" >&2
       fi
     fi
@@ -168,9 +173,9 @@ case "${1:-}" in
     powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
     sleep 1
     rm -f "$LIN_DIR"/cmd "$LIN_DIR"/ack
-    # OC_DRIVE_LOCAL=1 runs a copy from a local Windows directory: Windows refuses
+    # OC_TEST_LOCAL=1 runs a copy from a local Windows directory: Windows refuses
     # a real camera to an executable started from the WSL share (TESTING.md).
-    if [ "${OC_DRIVE_LOCAL:-0}" = "1" ]; then
+    if [ "${OC_TEST_LOCAL:-0}" = "1" ]; then
       mkdir -p /mnt/c/Temp/octest-bin
       cp "$EXE" /mnt/c/Temp/octest-bin/openchime.exe
       EXE=/mnt/c/Temp/octest-bin/openchime.exe

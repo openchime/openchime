@@ -4,6 +4,7 @@
 
 #include "speakable.h"
 #include "tts_data.h"
+#include "config.h"
 #include "tts_kitten.h"
 #include "tts_render.h"
 #include "ttskit.h"
@@ -34,7 +35,7 @@ int oc_tts_data_ready(char *err, size_t errcap) {
     char exe[512] = "";
     oc_tts_exe_dir(exe, sizeof exe);
     char dir[512];
-    if (!oc_tts_data_dir(getenv("OPENCHIME_TTS_DATA_DIR"), OC_TTS_DATA_SYSTEM_DIR, exe,
+    if (!oc_tts_data_dir(oc_config_get()->tts.data_dir, OC_TTS_DATA_SYSTEM_DIR, exe,
                          dir, sizeof dir, err, errcap))
         return 0;
     if (oc_tts_data_verify(dir, OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES, err, errcap) != 0) return 0;

@@ -352,6 +352,22 @@ list of roots added and removed.
 `GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image. It is passed
 to `buildah login` and `skopeo --creds`.
 
+## Upgrading changes what the environment may say
+
+The daemon is strict about its settings (CONFIG.md): an unknown `OPENCHIME_*`
+name, a removed one (the `OC_*` aliases among them), a value that does not
+parse or is out of its range stops it. A box upgraded with an old environment
+file can therefore fail to come up, by design, rather than run with a setting
+it misread. The packages run `openchimed --check-config --env-file
+/etc/openchime/openchimed.env` on install and print what the new daemon would
+refuse; an operator runs the same before restarting. The release notes of the
+first release carrying this say so.
+
+No shipped binary is a demo build: the release asserts the marker a `DEMO=1`
+build carries is absent from the daemon of each architecture and from the
+Windows clients, and `make test`'s `scripts/check/release_lint.sh` keeps
+`DEMO=1` out of the release workflow, the Dockerfile and `packaging/`.
+
 ## Dry runs
 
 `dry_run: true` builds and verifies everything and publishes nothing. It skips

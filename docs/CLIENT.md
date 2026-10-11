@@ -774,7 +774,7 @@ the process exits is lost**, which is why a frontend warns on quit while the
 outbox is non-empty.
 
 The store is owned by the net thread. An unusable store just disables persistence
-and the client runs in memory. The TUI resolves `$OPENCHIME_STATE`, else
+and the client runs in memory. The TUI resolves
 `$HOME/.local/state/openchime/state`, purely as an on/off flag — nothing is
 written at that path, and resolving it deletes a pre-ARCH-88 `state.db` if one is
 there.
@@ -852,7 +852,7 @@ on black so any terminal's colours read the same) where the terminal has room,
 the daemon's fingerprint where the browser will warn about its certificate, and
 the time left; it also opens the page where there is a desktop to open it on,
 and Esc cancels. A `host port user:pw` command line still signs in by password,
-against a daemon with the test knob. The dialog resolves the workspace on submit
+against a daemon with the demo build's switch. The dialog resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
 reason and refocuses the password to retry. *Remember me* gates whether the
 session token persists (the store) or stays session-only. A returning user with a

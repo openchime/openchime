@@ -2,6 +2,7 @@
 #include "sock.h"       /* first: winsock2 before anything pulls in windows.h */
 
 #include "oc_call_engine.h"
+#include "env.h"
 
 #include "audio_dev.h"
 #include "oc_capture.h"
@@ -1079,7 +1080,7 @@ static void m_stop(void *ctx) {
 static void call_timers(oc_call_engine *e) {
     e->probe_ms = PROBE_MS; e->udp_wait_ms = UDP_WAIT_MS; e->udp_lost_ms = UDP_LOST_MS;
     e->tcp_probe_ms = TCP_PROBE_MS;
-    const char *v = getenv("OPENCHIME_TEST_CALL_TIMERS");
+    const char *v = oc_env_demo("OPENCHIME_TEST_CALL_TIMERS");
     for (const char *p = v; p && *p; ) {
         int *dst = !strncmp(p, "probe:", 6) ? &e->probe_ms :
                    !strncmp(p, "udp_wait:", 9) ? &e->udp_wait_ms :

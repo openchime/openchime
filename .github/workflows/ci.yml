@@ -140,7 +140,9 @@ jobs:
       # The daemon as the release builds it (every feature, the web client in),
       # the e2e client the step below drives, and the Linux terminal client.
       - name: Build the daemon, the e2e client and the terminal client
-        run: make TTS=1 STT=1 SUM=1 WEB=1 && make build/e2e_client linux
+        # DEMO=1: the end-to-end step below signs in by password in a frame and
+        # bootstraps its users, which only a demo build accepts (CONFIG.md).
+        run: make DEMO=1 TTS=1 STT=1 SUM=1 WEB=1 && make build/e2e_client linux
       # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
       # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
       # appearing here is a dependency that crept back in.

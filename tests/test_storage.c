@@ -26,65 +26,8 @@
 
 #define DBPATH "build/oc-storage-test.db"
 
-/* --- policy ---------------------------------------------------------------- */
-
-static void test_policy_defaults(void) {
-    unsetenv("OPENCHIME_MAINT_INTERVAL_MS");
-    unsetenv("OPENCHIME_ATTACH_MAX_AGE_DAYS");
-    unsetenv("OPENCHIME_EVICT_GRACE_HOURS");
-    unsetenv("OPENCHIME_DB_RESERVE_MB");
-    unsetenv("OPENCHIME_PRESSURE_MB");
-    unsetenv("OPENCHIME_RECOVER_MB");
-    unsetenv("OPENCHIME_MAINT_BATCH");
-    unsetenv("OPENCHIME_EVICT");
-
-    oc_storage_policy p;
-    oc_storage_policy_load(&p);
-    CHECK(p.interval_ms == 5 * 60 * 1000);
-    CHECK(p.max_age_ms == 0);                 /* keep attachments forever by default */
-    CHECK(p.evict_enabled == 1);              /* default-on, by decision */
-    CHECK(p.reserve_bytes > 0);
-    /* The watermarks must be ordered or the pass would oscillate or never
-     * protect the database. */
-    CHECK(p.recover_bytes >= p.pressure_bytes);
-    CHECK(p.pressure_bytes >= p.reserve_bytes);
-}
-
-static void test_policy_env(void) {
-    setenv("OPENCHIME_ATTACH_MAX_AGE_DAYS", "30", 1);
-    setenv("OPENCHIME_EVICT", "off", 1);
-    setenv("OPENCHIME_MAINT_INTERVAL_MS", "1000", 1);
-    setenv("OPENCHIME_DB_RESERVE_MB", "10", 1);
-    setenv("OPENCHIME_PRESSURE_MB", "20", 1);
-    setenv("OPENCHIME_RECOVER_MB", "40", 1);
-
-    oc_storage_policy p;
-    oc_storage_policy_load(&p);
-    CHECK(p.max_age_ms == 30ull * 24 * 60 * 60 * 1000);
-    CHECK(p.evict_enabled == 0);
-    CHECK(p.interval_ms == 1000);
-    CHECK(p.reserve_bytes == 10ull * 1024 * 1024);
-
-    /* A nonsensical ordering is repaired rather than obeyed. */
-    setenv("OPENCHIME_DB_RESERVE_MB", "100", 1);
-    setenv("OPENCHIME_PRESSURE_MB", "10", 1);
-    setenv("OPENCHIME_RECOVER_MB", "5", 1);
-    oc_storage_policy_load(&p);
-    CHECK(p.pressure_bytes >= p.reserve_bytes);
-    CHECK(p.recover_bytes >= p.pressure_bytes);
-
-    /* An interval of zero would busy-loop the maintenance tick. */
-    setenv("OPENCHIME_MAINT_INTERVAL_MS", "0", 1);
-    oc_storage_policy_load(&p);
-    CHECK(p.interval_ms >= 1000);
-
-    unsetenv("OPENCHIME_ATTACH_MAX_AGE_DAYS");
-    unsetenv("OPENCHIME_EVICT");
-    unsetenv("OPENCHIME_MAINT_INTERVAL_MS");
-    unsetenv("OPENCHIME_DB_RESERVE_MB");
-    unsetenv("OPENCHIME_PRESSURE_MB");
-    unsetenv("OPENCHIME_RECOVER_MB");
-}
+/* The policy itself (its defaults, ranges and the watermark order) is read
+ * by the configuration loader and tested in test_config.c. */
 
 static void test_thresholds(void) {
     oc_storage_policy p;
@@ -285,14 +228,11 @@ static void test_audit_query(oc_dbwriter *w, sqlite3 *db, uint64_t now, uint64_t
 }
 
 int run_storage_tests(void) {
-    printf("test_storage: policy defaults + env override, watermark ordering, "
-           "unmeasurable-fs safety, statvfs, and the maintenance pass "
+    printf("test_storage: watermark thresholds, unmeasurable-fs safety, statvfs, and the maintenance pass "
            "(orphans, age expiry, pressure eviction, grace window, tombstones), "
            "plus the usage report and its owner/admin gate, and the audit log "
            "(per-family cap defeating the flood attack, paging, admin gate)\n");
 
-    test_policy_defaults();
-    test_policy_env();
     test_thresholds();
     test_sample();
 

@@ -10,6 +10,9 @@
 #   make web-test     the browser client's checks, in a headless Chromium
 #   make clean        everything built, except the downloaded speech models
 #   make distclean    everything built, and the remembered configuration
+# With DEMO=1, a build with the test switches in it (the tests, the harness
+# and the demo scripts need one; a release never is one), remembered like the
+# features.
 # With ARCH=aarch64, the daemon cross-built for arm64 into build/aarch64/; with
 # RELEASE=1, the host's as the release builds it (zig, glibc 2.34). Neither is
 # remembered.
@@ -92,7 +95,21 @@ WEB ?= 0
 HOST_ARCH := $(shell uname -m)
 ARCH    ?= $(HOST_ARCH)
 RELEASE ?= 0
-FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB)
+# DEMO=1 builds the daemon and the clients with the test switches in them
+# (-DOC_DEMO: OPENCHIME_TEST_*, the password-in-frame path, the fixture's
+# bootstrap users; CONFIG.md "Demo builds only"). The tests, the harness and
+# the demo scripts need it; a release never carries it, and `make` refuses the
+# pair. Remembered like the features.
+DEMO ?= 0
+ifeq ($(DEMO),1)
+ifneq ($(RELEASE)$(OC_VERSION),0)
+$(error DEMO=1 is for a box of your own: a release (RELEASE=1, OC_VERSION) is never a demo build)
+endif
+DEMO_DEF := -DOC_DEMO
+else
+DEMO_DEF :=
+endif
+FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB) DEMO=$(DEMO)
 $(FEATURES): FORCE | build
 	@printf '%s\n' $(FEATURES_NOW) | cmp -s - $@ || printf '%s\n' $(FEATURES_NOW) > $@
 
@@ -123,6 +140,11 @@ CC_STAMP := build$(BUILD_SUFFIX)/.cc
 $(CC_STAMP): FORCE | build
 	@mkdir -p $(dir $@)
 	@echo '$(CC)' | cmp -s - $@ || echo '$(CC)' > $@
+# The demo switch's stamp, a prerequisite of every compile: flipping DEMO
+# rebuilds the daemon, the clients and the wasm objects, and nothing else.
+DEMO_STAMP := build/.demo
+$(DEMO_STAMP): FORCE | build
+	@echo '$(DEMO)' | cmp -s - $@ || echo '$(DEMO)' > $@
 include mk/sources.mk
 include mk/vendor.mk
 include mk/daemon.mk

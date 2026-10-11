@@ -2,13 +2,14 @@
 #define OC_BLOBSTORE_H
 
 #include <stddef.h>
+#include "config.h"   /* oc_s3_config */
 #include <stdint.h>
 
 /* Attachment blob storage (ARCH-70). Attachment *bytes* live here, never in
  * SQLite — the daemon streams them to/from this store in bounded chunks as it
  * proxies a transfer (ARCH-69). The interface is a narrow streaming seam so the
  * backend is swappable: this build ships a local-filesystem implementation; an
- * S3/MinIO (SigV4) implementation is selected with OPENCHIME_BLOB_BACKEND=s3.
+ * S3/MinIO (SigV4) implementation is selected by the four OPENCHIME_S3_* settings.
  *
  * `key` is an opaque storage key the daemon assigns (never exposed on the wire).
  * All calls are thread-safe with respect to *distinct* keys (each transfer owns
@@ -20,11 +21,16 @@ typedef struct oc_blob_writer oc_blob_writer;
 typedef struct oc_blob_reader oc_blob_reader;
 
 /* Open the store. `base_dir` is the local-filesystem root (created if absent);
- * with OPENCHIME_BLOB_BACKEND=s3 the S3/MinIO backend is used instead and
+ * with the OPENCHIME_S3_* settings the S3/MinIO backend is used instead and
  * `base_dir` is ignored (it reads OPENCHIME_S3_* from the environment). Returns
  * NULL on failure. */
-oc_blobstore *oc_blobstore_open(const char *base_dir);
+/* Open the store: S3 when `s3` names an endpoint (config.h: all four values,
+ * which the loader has checked), local disk under `base_dir` otherwise. */
+oc_blobstore *oc_blobstore_open(const char *base_dir, const oc_s3_config *s3);
 void oc_blobstore_close(oc_blobstore *bs);
+/* Whether the store is local disk: what the storage-pressure policy measures
+ * (netloop.c); an S3 store's free space is not ours to sample. */
+int oc_blobstore_is_local(const oc_blobstore *bs);
 
 /* Streaming write: begin -> chunk* -> commit | abort. The bytes are staged and
  * only become visible under `key` on commit, so an aborted or crashed upload

@@ -43,12 +43,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # a browser.
 SHARE_WH=1728x1080; [ "$PLAT" = web ] && SHARE_WH=864x540
 
-export OC_PAIR_PORT="${OC_PAIR_PORT:-9620}"
-export OC_PAIR_DIR="${OC_PAIR_DIR:-/tmp/oc-calls}"
-export OC_PAIR_HOST="${OC_PAIR_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9620}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-calls}"
+export OC_TEST_HOST="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 export OPENCHIME_TEST_AUDIO=synthetic
 export OPENCHIME_TEST_CAPTURE=synthetic   # the synthetic screen, for sharing
-export OC_PAIR_TONE_A=440 OC_PAIR_TONE_B=660
+export OC_TEST_TONE_A=440 OC_TEST_TONE_B=660
 CH=1                                   # #general: both are members
 
 # A dump of one client, into a file this script reads.
@@ -89,9 +89,9 @@ peer() {  # peer <who> <key>: that client's one other participant's value
   grep -m1 "^call.peer" "/tmp/oc-calls-dump-$1.txt" | tr ' ' '\n' | grep -m1 "^$2=" | cut -d= -f2
 }
 
-say "== fixture: a fresh daemon, alice (440 Hz) and bob (660 Hz) at $OC_PAIR_HOST:$OC_PAIR_PORT"
+say "== fixture: a fresh daemon, alice (440 Hz) and bob (660 Hz) at $OC_TEST_HOST:$OC_TEST_PORT"
 "$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_PAIR_DIR"
+rm -rf "$OC_TEST_DIR"
 "$PAIR" up || { say "pair did not come up"; exit 1; }
 offered() { ge "$(field a 'call ' cap)" 2 && ge "$(field b 'call ' cap)" 2; }
 dump a; dump b
@@ -262,8 +262,8 @@ waitfor b 8 b_out >/dev/null
 
 say "== more members than the call holds"
 "$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_PAIR_DIR"
-OC_PAIR_USERS="alice:pw:owner,bob:pw:member,carol:pw:member" OC_PAIR_CALL_MAX=2 "$PAIR" up >/dev/null 2>&1
+rm -rf "$OC_TEST_DIR"
+OC_TEST_USERS="alice:pw:owner,bob:pw:member,carol:pw:member" OC_TEST_CALL_MAX=2 "$PAIR" up >/dev/null 2>&1
 "$PAIR" a call start $CH >/dev/null
 picker() { grep -q '^callpick .* n=2 ' /tmp/oc-calls-dump-a.txt && [ "$(grep -o '^callpick .*on=.*' /tmp/oc-calls-dump-a.txt | grep -o ':1' | wc -l)" = 1 ]; }
 check "alice picks: two members offered, one ticked, as a call of two holds" waitfor a 10 picker

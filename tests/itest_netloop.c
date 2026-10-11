@@ -2581,7 +2581,7 @@ static void test_web_signin(int port) {
     const char *knob = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
     char saved[8] = "";
     if (knob) snprintf(saved, sizeof saved, "%s", knob);
-    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH"); oc_config_load(NULL, 0);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
@@ -3235,6 +3235,7 @@ static void test_web_signin(int port) {
     unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
 restore:
     if (saved[0]) setenv("OPENCHIME_TEST_PASSWORD_AUTH", saved, 1);
+    oc_config_load(NULL, 0);
 }
 
 /* --- device codes (AUTH.md §8.11) -------------------------------------------- */
@@ -3290,12 +3291,13 @@ static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
     memset(d, 0, sizeof *d);
     const char *knob = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
     int had = knob != NULL;
-    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH");
+    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH"); oc_config_load(NULL, 0);
     if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
     unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
     d->dbw = oc_dbwriter_start("build/itest_dev.db");
     if (d->dbw) oc_dbwriter_set_pw_iterations(d->dbw, 2048);   /* fast PBKDF2 for tests */
     if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    oc_config_load(NULL, 0);
     if (!d->dbw) return -1;
     d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
     oc_netloop_set_device_ttl_ms(ttl);

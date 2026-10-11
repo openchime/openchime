@@ -33,9 +33,9 @@ OUT="${OC_AUDIT_OUT:-/tmp/oc-audit}"
 # Its OWN daemon on its OWN port, for the reason the smoke gives at length:
 # a run that adopts whatever is listening can be wrong about which machine it is
 # testing, and then everything it reports is confident nonsense.
-export OC_DEV_PORT="${OC_DEV_PORT:-9550}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-audit-dev}"
-export OC_DEV_WS="${OC_DEV_WS:-Audit Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9550}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-audit-dev}"
+export OC_TEST_WS="${OC_TEST_WS:-Audit Fixture}"
 
 quick=0 keep=0 only=""
 while [ $# -gt 0 ]; do
@@ -94,7 +94,7 @@ seed() {
   [ -x "$HERE/build/demo_client" ] || make -C "$HERE" build/demo_client >/dev/null 2>&1
   for c in engineering design releases; do drive mkchan "$c 1"; done
   sleep 1
-  send() { "$HERE/build/demo_client" 127.0.0.1 "$OC_DEV_PORT" "$1" pw send "$2" "$3" >/dev/null 2>&1; }
+  send() { "$HERE/build/demo_client" 127.0.0.1 "$OC_TEST_PORT" "$1" pw send "$2" "$3" >/dev/null 2>&1; }
   send alice 1 "Welcome to the audit fixture."
   send bob   1 "A reply, so a row has a neighbour."
   send carol 1 "And a third, so grouping has something to group."
@@ -108,7 +108,7 @@ seed() {
   sleep 1
 }
 
-echo "audit: launching on :$OC_DEV_PORT"
+echo "audit: launching on :$OC_TEST_PORT"
 "$DRIVE" launch >/dev/null 2>&1 || { echo "audit: the client did not start" >&2; exit 1; }
 seed
 # 1024x768 of CLIENT area. The window is larger by its frame; the audit measures

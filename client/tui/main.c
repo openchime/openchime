@@ -51,6 +51,7 @@
 #include "store.h"      /* peek a stored session token (skip the login box) */
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
+#include "env.h"        /* the demo build's switches, and whether this is one */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 #include "net.h"        /* oc_net_probe: how a workspace signs people in */
 
@@ -74,7 +75,7 @@
 #define COMPOSER_CAP 1024
 
 /* Machine-local prefs, loaded once in main() (see config.h). */
-static const oc_config *g_cfg = NULL;
+static const oc_tui_prefs *g_cfg = NULL;
 
 /* Keys of the portable prefs mirrored into the daemon's synced settings bucket
  * (the daemon-side config layer). Machine-local-only fields (e.g. workspace) are
@@ -95,7 +96,7 @@ static int synced_int(const oc_model *m, const char *key, int fallback) {
 /* Layer the daemon's synced bucket over the machine-local file defaults (`base`):
  * a key present in the bucket wins, else the file/default value stands. Returns 1
  * if the effective mouse setting changed, so the caller re-arms termbox input. */
-static int apply_synced_settings(oc_config *cfg, const oc_config *base, const oc_model *m) {
+static int apply_synced_settings(oc_tui_prefs *cfg, const oc_tui_prefs *base, const oc_model *m) {
     int old_mouse = cfg->mouse;
     cfg->mouse          = synced_int(m, OC_SYNC_KEY_MOUSE,    base->mouse) ? 1 : 0;
     cfg->members_panel  = synced_int(m, OC_SYNC_KEY_MEMBERS,  base->members_panel);
@@ -1306,6 +1307,9 @@ static void draw_storage(const oc_model *m, int W, int H) {
     struct { char t[128]; uintattr_t c; } L[16];
     int n = 0;
 #define SROW(col, ...) do { snprintf(L[n].t, sizeof L[n].t, __VA_ARGS__); L[n].c = (col); n++; } while (0)
+    if (s->total_bytes == 0)   /* attachments in S3: no filesystem measured (CONFIG.md) */
+        SROW(th->fg, "Disk         not measured (attachments in S3)");
+    else
     SROW(s->under_pressure ? (TB_RED | TB_BOLD) : th->fg, "Disk         %llu MB free of %llu MB",
          (unsigned long long)(s->avail_bytes / MBv), (unsigned long long)(s->total_bytes / MBv));
     SROW(th->fg, "Attachments  %llu file(s), %llu MB",
@@ -2008,13 +2012,11 @@ static int parse_hhmm(const char *s) {
  *   /delete         tombstone your last message
  */
 /* Resolve the local store path (session token + trusted fingerprint persistence): the
- * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state
+ * $HOME/.local/state/openchime/state
  * (creating the dirs). This is a DIRECTORY now, not a database file (ARCH-88).
  * Returns NULL when there is nowhere to put it (persistence then disabled — the
  * client still runs, just in-memory). */
 static const char *resolve_store_path(void) {
-    const char *explicit = getenv("OPENCHIME_STATE");
-    if (explicit && explicit[0]) return explicit;
     const char *home = getenv("HOME");
     if (!home || !home[0]) return NULL;
     static char path[1200];
@@ -2558,7 +2560,16 @@ static int have_stored_token(const char *store_path, const char *key, const char
     return has;
 }
 
+#ifndef OC_VERSION
+#define OC_VERSION "dev"
+#endif
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        printf("openchime-tui %s (protocol %u)%s\n", OC_VERSION, (unsigned)OC_PROTOCOL_VERSION,
+               oc_env_is_demo() ? " (demo build)" : "");
+        return 0;
+    }
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         fprintf(stderr, "usage: %s [<workspace>] [user:pass]\n"
                         "       %s <host> <port> [user:pass]\n"
@@ -2571,8 +2582,8 @@ int main(int argc, char **argv) {
      * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
     setlocale(LC_ALL, "");
 
-    static oc_config cfg, file_cfg;
-    oc_config_load(&cfg);
+    static oc_tui_prefs cfg, file_cfg;
+    oc_tui_prefs_load(&cfg);
     file_cfg = cfg;          /* the machine-local base; synced settings layer over it */
     g_cfg = &cfg;
 

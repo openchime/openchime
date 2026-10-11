@@ -26,9 +26,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 
-export OC_DEV_PORT="${OC_DEV_PORT:-9610}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-keymenu}"
-export OC_DEV_WS="${OC_DEV_WS:-Keymenu Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9610}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-keymenu}"
+export OC_TEST_WS="${OC_TEST_WS:-Keymenu Fixture}"
 
 MENU_MSG=6            # the enum's value, as the dump prints it
 MENU_CHANNEL=8
@@ -46,8 +46,8 @@ k() {
   fi
 }
 
-kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run"; exit 1; }
-rm -rf "$OC_DEV_DIR"
+kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
+rm -rf "$OC_TEST_DIR"
 
 D="/tmp/oc-keymenu-dump.txt"
 # The same rule for the dump: an unanswered `dump` leaves the PREVIOUS file on

@@ -26,9 +26,9 @@ LIN_DIR='/mnt/c/Windows/Temp/octest'
 
 # Its own daemon, port and directory, wiped each run -- the isolation scripts/gui/smoke.sh
 # explains, so a run can never be testing somebody's real workspace.
-export OC_DEV_PORT="${OC_DEV_PORT:-9510}"
-export OC_DEV_DIR="${OC_DEV_DIR:-/tmp/oc-startup}"
-export OC_DEV_WS="${OC_DEV_WS:-Startup Fixture}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9510}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-startup}"
+export OC_TEST_WS="${OC_TEST_WS:-Startup Fixture}"
 
 VIEW_SIGNIN=100
 fails=0
@@ -37,10 +37,10 @@ fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); checks=$((checks + 1))
 ok()   { printf '  ok   %s\n' "$*"; checks=$((checks + 1)); }
 
 if ! kill_dev_daemon; then
-  say "a daemon is still listening on :$OC_DEV_PORT — refusing to wipe underneath it."
+  say "a daemon is still listening on :$OC_TEST_PORT — refusing to wipe underneath it."
   exit 1
 fi
-rm -rf "$OC_DEV_DIR"
+rm -rf "$OC_TEST_DIR"
 
 snap() { "$DRIVE" dump startup >/dev/null 2>&1; cat "$LIN_DIR/startup.txt" 2>/dev/null; }
 key_of() { printf '%s' "$1" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2; }
@@ -58,7 +58,7 @@ wait_for() {
 }
 
 launch() {   # launch <workspace> <credential>
-  OC_DRIVE_NO_BUILD=1 "$DRIVE" launch "$1" "$2" >/dev/null 2>&1
+  OC_TEST_NO_BUILD=1 "$DRIVE" launch "$1" "$2" >/dev/null 2>&1
 }
 
 say "build"
@@ -96,7 +96,7 @@ esac
 
 # --- 3. a workspace that is not a workspace ------------------------------------
 say "3. a malformed workspace"
-launch ":$OC_DEV_PORT" "alice:pw"
+launch ":$OC_TEST_PORT" "alice:pw"
 if wait_for on_signin; then ok "lands on the sign-in view"; else fail "never reached the sign-in view"; fi
 [ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" || fail "window is not visible"
 case "$(quoted_of "$d" si_err)" in

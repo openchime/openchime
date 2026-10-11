@@ -10,6 +10,7 @@ cd "$(dirname "$0")/../.."
 CHROME="${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)}"
 [ -x "${CHROME:-/nonexistent}" ] || { echo "webtest: no Chromium (set CHROME)" >&2; exit 2; }
 [ -f build/web/openchime.js ] || { echo "webtest: build/web is not built (make web)" >&2; exit 2; }
+./openchimed --version | grep -q 'demo build' || { echo "webtest: ./openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
 W=build/webtest; rm -rf "$W"; mkdir -p "$W/db" "$W/blobs"
 # The browser profiles are kept across runs: the compiled wasm is cached in them.
 mkdir -p build/webtest-profile

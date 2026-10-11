@@ -16,14 +16,14 @@ typedef struct {
     int  members_width;      /* Members panel width, columns */
     int  time_24h;           /* 1 = 24-hour timestamps, 0 = 12-hour */
     char workspace[192];      /* default workspace to connect to (optional) */
-} oc_config;
+} oc_tui_prefs;
 
 /* Built-in defaults. */
-void oc_config_defaults(oc_config *c);
+void oc_tui_prefs_defaults(oc_tui_prefs *c);
 
 /* Load the config into *c (defaults applied first). Creates the file with
  * commented defaults if it doesn't exist. Best-effort: any parse/IO error leaves
  * the defaults in place. */
-void oc_config_load(oc_config *c);
+void oc_tui_prefs_load(oc_tui_prefs *c);
 
 #endif /* OC_TUI_CONFIG_H */

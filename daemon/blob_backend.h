@@ -5,11 +5,11 @@
 #include <stdint.h>
 
 /* Private backend interface behind the oc_blobstore seam (ARCH-70). Each backend
- * (local filesystem, S3/MinIO) provides these; oc_blobstore_open picks one by env
+ * (local filesystem, S3/MinIO) provides these; oc_blobstore_open picks one by configuration
  * and every public oc_blob_* call delegates through the selected vtable. `store`,
  * `w`, `r` are backend-private handles. */
 typedef struct {
-    void *(*open)(const char *cfg);        /* cfg = base dir (fs); env (s3). NULL on fail */
+    void *(*open)(const char *base_dir, const void *backend_cfg);   /* fs: base_dir; s3: the oc_s3_config. NULL on fail */
     void  (*close)(void *store);
     void *(*put_begin)(void *store, const char *key, uint64_t size_hint);
     int   (*put_chunk)(void *w, const void *data, size_t len);

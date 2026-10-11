@@ -2,7 +2,7 @@
 # Drive the web client as scripts/gui/drive.sh drives the Windows one (docs/
 # TESTING.md, "Driving the web client"): the same subcommands, the same verbs,
 # the same ack contract, so a feature script runs against either by setting
-# OC_GUI_DRIVE. The client is the daemon's own /app/ page in a headless
+# OC_TEST_DRIVE. The client is the daemon's own /app/ page in a headless
 # Chromium held by scripts/web/drive.mjs; the command channel is a directory
 # of files, as the Windows client's is.
 #
@@ -12,18 +12,18 @@
 #   scripts/web/drive.sh shot <name> | dump <name> # into $GUI_DRIVE_OUT / to stdout
 #   scripts/web/drive.sh kill
 #
-# OC_WEB_WHO=a|b names the client for a pair (its own page and channel);
-# OC_DEV_PORT, OC_DEV_DIR, OC_DEV_WS, OC_DEV_USERS as scripts/gui/drive.sh; the
+# OC_TEST_WHO=a|b names the client for a pair (its own page and channel);
+# OC_TEST_PORT, OC_TEST_DIR, OC_TEST_WS, OC_TEST_USERS as scripts/gui/drive.sh; the
 # OPENCHIME_TEST_* switches reach the page (scripts/web/drive.mjs). Needs node, the
 # playwright-core package (npm install, from package.json) and a Chromium:
 # CHROME names it, else Playwright's download is looked for.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
-OC_DEV_DIR="${OC_DEV_DIR:-/tmp/openchime-dev}"
-OC_DEV_PORT="${OC_DEV_PORT:-8443}"
-WHO="${OC_WEB_WHO:-a}"
-DIR="$OC_DEV_DIR/web-$WHO"
+OC_TEST_DIR="${OC_TEST_DIR:-/tmp/openchime-dev}"
+OC_TEST_PORT="${OC_TEST_PORT:-8443}"
+WHO="${OC_TEST_WHO:-a}"
+DIR="$OC_TEST_DIR/web-$WHO"
 mkdir -p "$DIR" "$OUT"
 
 chromium() {
@@ -34,23 +34,28 @@ chromium() {
 daemon_pid() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
-    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" && { echo "$p"; return; }
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && { echo "$p"; return; }
   done
 }
 
 case "${1:-}" in
-  devaddr) printf '127.0.0.1:%s\n' "$OC_DEV_PORT"; exit 0 ;;
+  devaddr) printf '127.0.0.1:%s\n' "$OC_TEST_PORT"; exit 0 ;;
   launch)
-    ws="${2:-127.0.0.1:$OC_DEV_PORT}"; cred="${3:-alice:pw}"
+  # A demo build (make DEMO=1): the fixture signs in by password in frames and
+  # bootstraps its users, which a production build refuses.
+  if ! "$HERE/openchimed" --version | grep -q 'demo build'; then
+    echo "$(basename "$0"): $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2
+  fi
+    ws="${2:-127.0.0.1:$OC_TEST_PORT}"; cred="${3:-alice:pw}"
     # Both halves built, as scripts/gui/drive.sh builds both: the daemon carries the client.
-    if [ "${OC_DRIVE_NO_BUILD:-0}" != "1" ]; then
+    if [ "${OC_TEST_NO_BUILD:-0}" != "1" ]; then
       make -C "$HERE" >/dev/null || { echo "daemon build FAILED" >&2; exit 1; }
     fi
     [ -d "$HERE/node_modules/playwright-core" ] || (cd "$HERE" && npm install --no-audit --no-fund --silent)
     # The daemon on this port, restarted when stale or absent (scripts/gui/drive.sh's rule).
-    if [ "${OC_DRIVE_NO_DAEMON:-0}" != "1" ]; then
+    if [ "${OC_TEST_NO_DAEMON:-0}" != "1" ]; then
       dpid="$(daemon_pid || true)"; stale=1
-      if [ -n "$dpid" ] && (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null; then
+      if [ -n "$dpid" ] && (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null; then
         started=$(stat -c %Y "/proc/$dpid" 2>/dev/null || echo 0)
         built=$(stat -c %Y "$HERE/openchimed" 2>/dev/null || echo 0)
         [ "$started" -ge "$built" ] && stale=0
@@ -63,26 +68,26 @@ case "${1:-}" in
           for _ in $(seq 1 120); do kill -0 "$dpid" 2>/dev/null || break; sleep 0.25; done
         fi
         # And the port free, whoever held it.
-        for _ in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null || break; exec 3<&- 3>&-; sleep 0.25; done
-        mkdir -p "$OC_DEV_DIR"
-        env OPENCHIME_DB_PATH="$OC_DEV_DIR/db" \
-            OPENCHIME_TLS_CERT="$OC_DEV_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_DEV_DIR/key.pem" \
-            OPENCHIME_BLOB_DIR="$OC_DEV_DIR/blobs" \
-            OPENCHIME_PROTO_PORT="$OC_DEV_PORT" OPENCHIME_HEALTH_PORT=0 \
+        for _ in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null || break; exec 3<&- 3>&-; sleep 0.25; done
+        mkdir -p "$OC_TEST_DIR"
+        env OPENCHIME_DB_PATH="$OC_TEST_DIR/db" \
+            OPENCHIME_TLS_CERT="$OC_TEST_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_TEST_DIR/key.pem" \
+            OPENCHIME_BLOB_DIR="$OC_TEST_DIR/blobs" \
+            OPENCHIME_PROTO_PORT="$OC_TEST_PORT" OPENCHIME_HEALTH_PORT=0 \
             OPENCHIME_TEST_PASSWORD_AUTH=1 \
-            OPENCHIME_WORKSPACE_NAME="${OC_DEV_WS:-Acme HQ}" \
-            OPENCHIME_BOOTSTRAP_USERS="${OC_DEV_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
-            OPENCHIME_CALL_MAX="${OC_DEV_CALL_MAX:-10}" OPENCHIME_SUMMARY=off \
-            ${OC_PAIR_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_PAIR_ADVERTISE_PORT"} \
+            OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
+            OPENCHIME_BOOTSTRAP_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_CALL_MAX="${OC_TEST_CALL_MAX:-10}" OPENCHIME_SUMMARY=off \
+            ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
             OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
-            setsid "$HERE/openchimed" > "$OC_DEV_DIR/daemon.log" 2>&1 < /dev/null &
+            setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
         up=0
         for _ in $(seq 1 360); do
-          (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; up=1; break; }
+          (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null && { exec 3<&- 3>&-; up=1; break; }
           sleep 0.25
         done
-        [ "$up" = 1 ] || { echo "the daemon is not listening on :$OC_DEV_PORT" >&2; exit 1; }
+        [ "$up" = 1 ] || { echo "the daemon is not listening on :$OC_TEST_PORT" >&2; exit 1; }
         echo "daemon restarted (was stale or absent)" >&2
       fi
     fi

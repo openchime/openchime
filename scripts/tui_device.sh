@@ -35,6 +35,7 @@ await() {   # a regex the screen must come to show
 env -u OPENCHIME_TEST_PASSWORD_AUTH OPENCHIME_DB_PATH="$D/db" OPENCHIME_TLS_CERT="$D/cert.pem" \
     OPENCHIME_TLS_KEY="$D/key.pem" OPENCHIME_BLOB_DIR="$D/blobs" OPENCHIME_PROTO_PORT="$PORT" \
     OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Device Code" OPENCHIME_BOOTSTRAP_USERS="dee:pw-dee:owner" \
+    "$HERE/openchimed" --version | grep -q 'demo build' || { echo "tui_device: $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &
 disown
 for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && { exec 3<&- 3>&-; break; }; sleep 0.2; done

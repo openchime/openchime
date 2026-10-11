@@ -17,9 +17,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 fails=0
 
-export OC_PAIR_PORT="${OC_PAIR_PORT:-9660}"
-export OC_PAIR_DIR="${OC_PAIR_DIR:-/tmp/oc-sbox}"
-export OC_PAIR_HOST="${OC_PAIR_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9660}"
+export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-sbox}"
+export OC_TEST_HOST="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 
 say()   { printf '%s\n' "$*"; }
 check() { local what="$1"; shift; if "$@"; then say "  ok   $what"; else say "  FAIL $what"; fails=$((fails + 1)); fi; }
@@ -78,7 +78,7 @@ uniform() { [ "$(printf '%s\n' $SIZES | sort -u | wc -l)" -eq 1 ]; }
 
 say "== fixture: a fresh daemon, alice"
 "$PAIR" down >/dev/null 2>&1
-rm -rf "$OC_PAIR_DIR"
+rm -rf "$OC_TEST_DIR"
 "$PAIR" up || { say "pair did not come up"; exit 1; }
 "$PAIR" a size 1600 1000 >/dev/null
 a dpi 96; a textsize 1

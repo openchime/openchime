@@ -2,6 +2,7 @@
  * over the backend that owns the devices (audio_backend.h). */
 #define _POSIX_C_SOURCE 200809L
 #include "audio_dev.h"
+#include "env.h"
 #include "oc_media.h"
 
 #include <stdatomic.h>
@@ -188,14 +189,14 @@ static void take_flush(oc_audio_dev *d) {
 }
 
 static int use_synthetic(void) {
-    const char *t = getenv("OPENCHIME_TEST_AUDIO");
+    const char *t = oc_env_demo("OPENCHIME_TEST_AUDIO");
     return t && (strcmp(t, "synthetic") == 0 || strcmp(t, "mic-denied") == 0);
 }
 
 /* `OPENCHIME_TEST_AUDIO=mic-denied`: the synthetic devices, with the microphone
  * refused as the operating system refuses one it blocks. */
 static int mic_denied(void) {
-    const char *t = getenv("OPENCHIME_TEST_AUDIO");
+    const char *t = oc_env_demo("OPENCHIME_TEST_AUDIO");
     return t && strcmp(t, "mic-denied") == 0;
 }
 
@@ -203,8 +204,8 @@ static int mic_denied(void) {
  * synthetic microphone to speak -- so voice input is testable end to end on a
  * machine with no microphone. NULL (and the tone) when unset or unusable. */
 static int16_t *load_test_clip(int rate, int channels, size_t *n_out) {
-    const char *path = getenv("OPENCHIME_TEST_MIC");
-    if (!path || !*path) return NULL;
+    const char *path = oc_env_demo("OPENCHIME_TEST_MIC");
+    if (!path) return NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     unsigned char h[12];
@@ -332,8 +333,8 @@ static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rat
         d->synthetic = 1;
         if (capture && !loopback) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
         if (capture && !loopback) {
-            const char *lead = getenv("OPENCHIME_TEST_MIC_LEAD_MS");
-            int ms = lead && *lead ? atoi(lead) : 0;
+            const char *lead = oc_env_demo("OPENCHIME_TEST_MIC_LEAD_MS");
+            int ms = lead ? atoi(lead) : 0;
             if (ms > 0) d->syn_lead = (uint64_t)ms * (uint64_t)rate / 1000;
         }
         d->syn_start_us = oc_media_clock_us();
@@ -376,15 +377,15 @@ static double syn_loop_value(double t_s) {
  * on one machine in a call each speak their own, so either can tell which of
  * them it is hearing. */
 static double mic_tone_hz(void) {
-    const char *t = getenv("OPENCHIME_TEST_TONE");
-    double hz = t && *t ? atof(t) : 0.0;
+    const char *t = oc_env_demo("OPENCHIME_TEST_TONE");
+    double hz = t ? atof(t) : 0.0;
     return hz > 20.0 && hz < 7000.0 ? hz : 440.0;
 }
 
 /* 0 none; 1 the echo over the microphone's own tone; 2 the echo alone. */
 static int mic_echo(void) {
-    const char *t = getenv("OPENCHIME_TEST_MIC_ECHO");
-    if (!t || !*t || strcmp(t, "0") == 0) return 0;
+    const char *t = oc_env_demo("OPENCHIME_TEST_MIC_ECHO");
+    if (!t || strcmp(t, "0") == 0) return 0;
     return strcmp(t, "only") == 0 ? 2 : 1;
 }
 

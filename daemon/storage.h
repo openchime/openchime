@@ -43,21 +43,10 @@ typedef struct {
     uint64_t audit_max_age_ms;/* audit entries older than this age out, per family */
 } oc_storage_policy;
 
-/* Load the policy from the environment, applying documented defaults for
- * anything unset:
- *   OPENCHIME_MAINT_INTERVAL_MS   (default 300000 — five minutes)
- *   OPENCHIME_ATTACH_MAX_AGE_DAYS (default 0 — keep forever)
- *   OPENCHIME_EVICT_GRACE_HOURS   (default 24)
- *   OPENCHIME_DB_RESERVE_MB       (default 256)
- *   OPENCHIME_PRESSURE_MB         (default 512)
- *   OPENCHIME_RECOVER_MB          (default 1024)
- *   OPENCHIME_MAINT_BATCH         (default 64)
- *   OPENCHIME_EVICT               (default on; "off"/"0" disables)
- *   OPENCHIME_AUDIT_MAX_DAYS      (default 365; 0 = never prune the audit log)
- * The two watermarks are deliberately distinct: reclaiming down to the same
- * threshold that triggered it would leave the daemon oscillating at the
- * boundary, running a pass on nearly every tick. */
-void oc_storage_policy_load(oc_storage_policy *p);
+/* The policy comes from the configuration (config.h: the OPENCHIME_*_MB,
+ * _DAYS and _HOURS rows, in these units). The two watermarks are distinct:
+ * reclaiming down to the same threshold that triggered it would leave the
+ * daemon oscillating at the boundary, running a pass on nearly every tick. */
 
 /* Sample free space on the filesystem holding `path`. Never fails loudly: an
  * unmeasurable path yields `valid = 0`, and the caller then treats storage as
