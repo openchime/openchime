@@ -55,7 +55,7 @@ static inline int oc_key_from_sdl(SDL_Keycode k) {
     }
 }
 
-/* The harness names keys; the same names here and in scripts/gui_drive.sh. */
+/* The harness names keys; the same names here and in scripts/gui/drive.sh. */
 static inline int oc_key_from_name(const char *k) {
     if (!k || !k[0]) return OCK_NONE;
     if (!k[1]) {

@@ -4,7 +4,7 @@ One licence, for everything this repository's contributors wrote:
 
 | Path | Licence | SPDX |
 |---|---|---|
-| the whole repository — `daemon/`, `client/`, `shared/`, `tuikit/`, `scripts/`, `packaging/`, `docs/`, `tests/`, `Scripts/` | GNU Affero General Public License v3.0 or later | `AGPL-3.0-or-later` |
+| the whole repository — `daemon/`, `client/`, `shared/`, `tuikit/`, `scripts/`, `packaging/`, `docs/`, `tests/` | GNU Affero General Public License v3.0 or later | `AGPL-3.0-or-later` |
 | `third_party/` | other people's work under their own terms — see below | — |
 
 `LICENSE` is the AGPL text and covers the repository. There are no

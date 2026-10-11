@@ -44,7 +44,7 @@ Locally, and in about 2 minutes, a pull request needs exactly this, which
 `/oc-feature-finish` runs:
 
 1. `make && make test` — zero warnings, every suite passing.
-2. `scripts/check_pr.sh "<title>"` — the title's format and length.
+2. `scripts/check/pr.sh "<title>"` — the title's format and length.
 3. One commit, signed off, no body; pushed; the pull request raised into
    `staging` with an empty body.
 
@@ -73,9 +73,9 @@ time the gate exists to save. `make test-ci` refuses to run outside CI.
   Instead of pointing at an issue, say the thing: "the daemon exits 0 when it
   cannot start, which systemd reads as success". The prose survives the tracker.
 
-  **This is enforced.** `make check-refs` (`scripts/check_refs.sh`) fails on a
-  hash followed by digits and on a tracker URL ending in a number.
-  It is a prerequisite of `make test` and its own step in CI's build job.
+  **This is enforced.** `scripts/check/refs.sh` fails on a hash followed by
+  digits and on a tracker URL ending in a number. `make test` and CI's build
+  job run it before the suite.
   A bare link to the tracker carrying no number is fine — and note the rule
   applies to this file too, which is why the patterns above are described rather
   than written out.
@@ -100,11 +100,11 @@ machines at once:
   it and drives it over TLS with the e2e client; compiles every Linux
   translation unit with the release's clang under `-Werror`
   (`check-release-cc`); runs the suites that start no threads
-  (`make test-ci PART=plain`, with `check-opcodes` and `check-refs`).
+  (`make test-ci PART=plain`, which runs the opcode and issue-reference checks first).
 - **`thread-sanitizer`** — the suites that start threads, under
   ThreadSanitizer (`make test-ci PART=threads`); their only run in CI.
-- **`windows`** — cross-compiles the Windows TUI + GUI, and builds the Linux
-  TUI with that runner's newer gcc, which warns where gcc 11 and clang do not.
+- **`windows`** — cross-compiles the Windows TUI + GUI with the pinned
+  llvm-mingw (make fetches it).
 - **`pr policy`** and **`guard`** — the pull request's title and body, and the
   attribution guard ([`attribution-guard`](../.github/workflows/attribution-guard.yml)).
   The guard has **no `paths-ignore`**, so it runs on every push including

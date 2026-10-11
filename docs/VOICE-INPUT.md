@@ -104,7 +104,7 @@ Compute follows the length of the audio, where Whisper always encodes 30 seconds
 published files are int8-quantized `.ort` — `frontend.model.ort`,
 `frontend.weights.ort`, `encoder.ort`, `adapter.ort`, `cross_kv.ort`,
 `decoder_kv.ort`, `tokenizer.bin`, `streaming_config.json`, about 45 MB — fetched at
-pinned SHA-256s by `scripts/build_moonshine.sh` from Moonshine's dated CDN directory
+pinned SHA-256s by `scripts/build/moonshine.sh` from Moonshine's dated CDN directory
 (`quantized_26_08_21`). They load as published in the daemon's ONNX Runtime 1.30.0.
 
 **Measured on the daemon** (x86-64, one core): the model loads in 0.08 s on the first
@@ -123,7 +123,8 @@ daemon holds 0.1 MB more with voice input built in than without it.
   the little-endian samples in host order before hearing them.
 - **Its own data directory and manifest** — `OPENCHIME_STT_DATA_DIR`, else
   `/usr/share/openchime/stt`, else `stt/` beside the executable — so missing data
-  turns voice input off without touching read-aloud. `make STT=0` builds without it.
+  turns voice input off without touching read-aloud. `make full` (or `make STT=1`) builds
+  it in; a plain `make` leaves it out.
 - **Spoken mentions:** before posting or returning, "at" followed by a name becomes
   `@name` when it names exactly one member of the channel; the daemon holds the
   roster (ARCH-89).
@@ -170,4 +171,4 @@ stays for clients that cannot carry a model.
 | `make test` — daemon | the `STT_*` frames; the capability and cap; order, cap, rate, a chunk out of order, a failed recognition; off, and no engine as with missing data; free talk posts through the send path, idempotently, refused for an archived channel or a non-member, and never after its speaker has left; mention normalisation |
 | `make test` — client core | free talk arrives as `BROADCAST`s in order with no client `SEND`; push to talk's words wait for the composer they were spoken into, and nothing is sent; one microphone owner |
 | Build job and release | read-aloud renders a sentence and `openchimed --stt-hear` must hear its words — built, stripped, and installed from the `.deb` |
-| Win32 harness | `scripts/gui_voice.sh`: a synthetic microphone speaking a recorded sentence (`OPENCHIME_TEST_MIC`) — push to talk by key, mouse and UI Automation puts the words in the composer unsent; free talk posts them; leaving the conversation and opening the recorder end the session; absent with voice input off |
+| Win32 harness | `scripts/gui/voice.sh`: a synthetic microphone speaking a recorded sentence (`OPENCHIME_TEST_MIC`) — push to talk by key, mouse and UI Automation puts the words in the composer unsent; free talk posts them; leaving the conversation and opening the recorder end the session; absent with voice input off |

@@ -4,7 +4,9 @@ Which models the summarizer (docs/SUMMARIES.md) has been run with, how each
 did, and what to know before choosing one. The prompt is the same for every
 model; nothing in it is written for one (§6 there). A model is **verified** when
 it completed every span of the evaluation set with the current prompt version and
-its summaries read as the standard asks (§1 there), graded by hand.
+its summaries read as the standard asks (§1 there), graded by hand. The
+scripts named below were development tools, removed from the tree once the
+model was chosen; this page is the record of the runs.
 
 **How a run is made.** The evaluation set is 30 spans of one real workspace
 (10 small, 10 medium, 10 large; `scripts/sumeval_set.py`), run cold through the

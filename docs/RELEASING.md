@@ -32,9 +32,8 @@ its first job, `branch`, refuses anything else.
 ## Shape
 
     branch ─▶ guard ─────┐
-          ├─▶ test ──────┼─▶ version ─┬─▶ packages (amd64, arm64) ──────────────┐
-          └─▶ preflight ─┘            ├─▶ image ─▶ image-manifest ───────────────┤
-                                      └─▶ windows-build ─▶ windows-package ──────┴─▶ publish ─┬─▶ smoke
+          ├─▶ test ──────┼─▶ version ─┬─▶ packages (amd64, arm64) ─▶ image ─▶ image-manifest ─┐
+          └─▶ preflight ─┘            └─▶ windows-build ─▶ windows-package ─────────────────────┴─▶ publish ─┬─▶ smoke
                                                                                               ├─▶ close-issues
                                                                                               └─▶ unreserve (on failure)
 
@@ -43,7 +42,7 @@ than CI would be worse than no gate, because it would look like one. `guard` is
 the attribution guard, gated via `workflow_call`.
 
 `close-issues` closes the issues the release shipped: every commit on `main`
-names its issue in the subject, and `scripts/close_shipped_issues.sh` reads the
+names its issue in the subject, and `scripts/release/close_shipped_issues.sh` reads the
 commits between the previous `release-N` and this one. An issue closes when it
 ships, not when it merges. The job only ever warns — the release is already live.
 
@@ -142,12 +141,21 @@ reservation mid-job.
 
 ## `:latest` moves last
 
-`image` needs only `version`, so it runs beside `windows-package`. It builds one
-image per architecture with **buildah** on a native runner of that architecture;
-a separate `image-manifest` job then publishes the `:VERSION` manifest list that
+`image` follows `packages`: it lays each architecture's release tarball onto a
+glibc base with **buildah** (`Dockerfile`, `packaging/image-context.sh`; no
+compile, no `RUN`, so the arm64 image is built on the x86 runner with
+`--arch arm64` and no emulation) and pushes a per-architecture image; a
+separate `image-manifest` job then publishes the `:VERSION` manifest list that
 indexes them. The per-architecture tags (`:VERSION-amd64`, `:VERSION-arm64`) are
 an implementation detail — nothing is documented as pullable until the manifest
 exists.
+
+Everything Linux-hosted runs on one image, `ubuntu-24.04`, with every compiler
+fetched pinned by make (VENDORS.md §2, "Toolchains"). The arm64 daemon is
+**cross-built** there with zig (`make RELEASE=1 ARCH=aarch64`) and is build-only:
+the render, the hearing check and the package install run for amd64; arm64 ships
+the same sources through the same compiler, asserted for its glibc floor and
+packaged, but not run.
 
 `:VERSION` **only**. If `:latest` moved there and a later job failed, `publish`
 would be skipped and `:latest` would point at a version with no packages, no tag
@@ -317,7 +325,7 @@ with no edit.
 
 A tool the release downloads is pinned to a versioned asset with a known SHA-256,
 never fetched from a mutable "latest" redirect — the same rule as
-`build_mbedtls.sh`, which refuses to fetch without one.
+`scripts/build/mbedtls.sh`, which refuses to fetch without one.
 
 ## The CA roots are a snapshot
 
@@ -325,7 +333,7 @@ The roots every outbound HTTPS connection trusts are compiled in
 (`third_party/ca-roots/ca_roots.c`, [TLS.md](./TLS.md)), so a root Mozilla
 removes stays trusted until a release carries the change. Before promoting, take
 the newest dated extract and its sum from https://curl.se/docs/caextract.html,
-set `CA_ROOTS_DATE` and `CA_ROOTS_SHA256` in `scripts/update_ca_roots.sh`, run it,
+set `CA_ROOTS_DATE` and `CA_ROOTS_SHA256` in `scripts/gen/ca_roots.sh`, run it,
 and land the regenerated file on `staging` like any other change. Its diff is the
 list of roots added and removed.
 

@@ -311,7 +311,7 @@ typedef enum {
      * property the next inbound branch silently removes. Typing moves rather
      * than the other two because it is the only contiguous pair among them, so
      * two values buy back both collisions. Every opcode now carries exactly one
-     * message type, which is what scripts/check_opcodes.sh enforces with no
+     * message type, which is what scripts/check/opcodes.sh enforces with no
      * exceptions. */
     OC_MSG_TYPING           = 0x007E, /* C->S, "I am typing" in a channel (REQ-121) */
     OC_MSG_TYPING_UPDATE    = 0x007F, /* S->C, relay of a typing signal */

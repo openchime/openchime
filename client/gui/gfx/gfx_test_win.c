@@ -4,7 +4,7 @@
  * Runs against SDL's SOFTWARE renderer on a plain surface: no window, no GPU,
  * so it is deterministic, headless, and asserts real pixels — fills, rounded
  * corners, the clip stack, lines, icon tessellation, both texture paths and
- * the DIP scale. Built by `make windows-gfx-test`; exit code is the failure
+ * the DIP scale. Built by `make build/gfx_test.exe`; exit code is the failure
  * count (docs/TESTING.md, the platform-backend exception).
  */
 

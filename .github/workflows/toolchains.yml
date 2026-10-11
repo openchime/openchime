@@ -1,0 +1,40 @@
+# Once a month: are the pinned toolchains (zig, Emscripten, llvm-mingw;
+# mk/toolchains.mk) behind upstream? scripts/check/toolchains.sh asks, and when
+# one is, this files or refreshes one issue with the table and the new
+# checksum. Nothing is bumped by itself: a bump is a pull request CI builds
+# with, which is what pinning is for.
+name: toolchains
+
+on:
+  schedule:
+    - cron: '17 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    name: pinned toolchains against upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare the pins with upstream
+        id: cmp
+        run: |
+          set +e
+          scripts/check/toolchains.sh > table.md
+          echo "behind=$?" >> "$GITHUB_OUTPUT"
+          cat table.md
+      - name: File or refresh the issue
+        if: steps.cmp.outputs.behind == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Pinned toolchains are behind upstream"
+          body="$(printf 'The build pins its toolchains in scripts/build/{zig,emsdk,llvm_mingw}.sh (mk/toolchains.mk). Upstream has moved:\n\n%s\n\nTo take one: change the version and the SHA-256 in its script, open a pull request, and let CI build with it. Refreshed by .github/workflows/toolchains.yml.' "$(cat table.md)")"
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then gh issue edit "$n" --body "$body"; else gh issue create --title "$title" --body "$body"; fi

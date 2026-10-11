@@ -6405,11 +6405,19 @@ static void test_http_stack(int port, int hport) {
         oc_mkdir("build/itest_webapp/web");
         FILE *f;
         f = fopen("build/itest_webapp/web/openchime.wasm", "wb"); CHECK(f); if (f) { fwrite("\0asm", 1, 4, f); fclose(f); }
-        CHECK(oc_webapp_load("build/itest_webapp", werr, sizeof werr));
-        CHECK(oc_webapp_loaded());
+        /* A daemon built without the client (WEB=0) refuses to serve it and
+         * says why; one built with it loads. The route assertions below
+         * follow the same split. */
+        if (oc_webapp_built()) {
+            CHECK(oc_webapp_load("build/itest_webapp", werr, sizeof werr));
+            CHECK(oc_webapp_loaded());
+        } else {
+            CHECK(!oc_webapp_load("build/itest_webapp", werr, sizeof werr));
+            CHECK(!oc_webapp_loaded() && strstr(werr, "not built"));
+        }
         /* The redirect a browser sign-in may name: the page's own origin at
          * /app/ exactly, for the Host its connection was upgraded with. */
-        CHECK(oc_webapp_is_redirect("https://chat.example:8443/app/", 30, "chat.example:8443"));
+        CHECK(oc_webapp_is_redirect("https://chat.example:8443/app/", 30, "chat.example:8443") == oc_webapp_built());
         CHECK(!oc_webapp_is_redirect("http://127.0.0.1:8080/app/", 26, "127.0.0.1:8080"));   /* https only */
         CHECK(!oc_webapp_is_redirect("https://chat.example:8443/app/x", 31, "chat.example:8443"));
         CHECK(!oc_webapp_is_redirect("https://chat.example:8443/app/", 30, "other.example"));
@@ -6451,22 +6459,28 @@ static void test_http_stack(int port, int hport) {
     const char *r0 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     CHECK(write_all(&h.conn, (const uint8_t *)r0, strlen(r0)) == 0);
     http_read_response(&h, resp, sizeof resp);
-    CHECK(strncmp(resp, "HTTP/1.1 302 ", 13) == 0 && strstr(resp, "Location: /app/\r\n"));
-    client_close(&h);
-    CHECK(http_client_open(&h, port, pin2) == 0);
-    const char *ra = "GET /app/ HTTP/1.1\r\nHost: x\r\n\r\n";
-    CHECK(write_all(&h.conn, (const uint8_t *)ra, strlen(ra)) == 0);
-    http_read_response(&h, resp, sizeof resp);
-    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "text/html") &&
-          strstr(resp, "Cross-Origin-Opener-Policy: same-origin\r\n") &&
-          strstr(resp, "Cross-Origin-Embedder-Policy: require-corp\r\n") &&
-          strstr(resp, "<canvas id=\"canvas\""));
-    client_close(&h);
-    CHECK(http_client_open(&h, port, pin2) == 0);
-    const char *rw = "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\n\r\n";
-    CHECK(write_all(&h.conn, (const uint8_t *)rw, strlen(rw)) == 0);
-    http_read_response(&h, resp, sizeof resp);
-    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n"));
+    if (oc_webapp_built()) {
+        CHECK(strncmp(resp, "HTTP/1.1 302 ", 13) == 0 && strstr(resp, "Location: /app/\r\n"));
+        client_close(&h);
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        const char *ra = "GET /app/ HTTP/1.1\r\nHost: x\r\n\r\n";
+        CHECK(write_all(&h.conn, (const uint8_t *)ra, strlen(ra)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "text/html") &&
+              strstr(resp, "Cross-Origin-Opener-Policy: same-origin\r\n") &&
+              strstr(resp, "Cross-Origin-Embedder-Policy: require-corp\r\n") &&
+              strstr(resp, "<canvas id=\"canvas\""));
+        client_close(&h);
+        CHECK(http_client_open(&h, port, pin2) == 0);
+        const char *rw = "GET /app/openchime.wasm HTTP/1.1\r\nHost: x\r\n\r\n";
+        CHECK(write_all(&h.conn, (const uint8_t *)rw, strlen(rw)) == 0);
+        http_read_response(&h, resp, sizeof resp);
+        CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "Content-Type: application/wasm\r\n"));
+    } else {
+        /* No client in this daemon: the TLS port has no front door, and
+         * refuses "/" as it does anything else it does not serve. */
+        CHECK(strncmp(resp, "HTTP/1.1 404 ", 13) == 0);
+    }
     client_close(&h);
     CHECK(http_client_open(&h, port, pin2) == 0);
     const char *r1 = "GET /nothing-here HTTP/1.1\r\nHost: x\r\n\r\n";

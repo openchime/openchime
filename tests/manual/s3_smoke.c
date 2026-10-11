@@ -16,7 +16,7 @@
  *     export OPENCHIME_S3_ACCESS_KEY=<key>
  *     export OPENCHIME_S3_SECRET_KEY=<secret>
  *     export OPENCHIME_S3_REGION=auto
- *     make s3-smoke && ./build/s3_smoke
+ *     make build/s3_smoke && ./build/s3_smoke
  *     fly storage destroy <bucket> -y                 # clean up
  *
  * Keep credentials out of the repo and out of shell history. Last verified

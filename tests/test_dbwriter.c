@@ -2276,7 +2276,7 @@ static oc_dbres *list_drafts(oc_dbwriter *w, uint64_t uid) {
 }
 
 /* A database loaded from an export holds messages but no `mentions` rows
- * (scripts/slack_to_db.py writes none), so the server's unread count read 0
+ * (a loaded export writes none), so the server's unread count read 0
  * where the client, reading the text, counted the @channel lines. Crossing
  * schema step 60 the writer scans every message without rows once, with the
  * scanner a send uses. Made here by sending, wiping the rows and the step, and

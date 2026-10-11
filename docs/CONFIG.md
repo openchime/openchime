@@ -175,8 +175,9 @@ fail, bounded and silent.
 
 Speech is built into the daemon (ARCH-111), and its voice model and pronunciation
 data are files shipped beside it in the same package, so the feature is on unless it
-is turned off or its data is missing. A daemon built with `make TTS=0` has no read-aloud
-whatever these say, and tells its clients so.
+is turned off or its data is missing. A daemon built without it (`make` builds none of the
+speech features in; `make full` or `make TTS=1` does) has no read-aloud whatever these say,
+and tells its clients so.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -198,8 +199,9 @@ about 3 KB a second of speech, stored until the disk needs the room.
 
 Speech recognition is built into the daemon (ARCH-112) on the same engine as
 read-aloud, and its recognizer's files ship beside it in the same package, so the
-feature is on unless it is turned off or its data is missing. A daemon built with
-`make STT=0` has no voice input whatever these say, and tells its clients so.
+feature is on unless it is turned off or its data is missing. A daemon built without it
+(`make full` or `make STT=1` builds it in) has no voice input whatever these say, and tells
+its clients so.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -230,8 +232,8 @@ the model is ready. Any failure leaves summaries off with the reason logged,
 what waited is told so, and the rest of the daemon runs on: on a CPU without those instructions, `local` is
 always off. With `cloud`, the API must answer a one-line prompt at startup; a
 model that reasons before answering is told not to through whichever field its
-API honours, or summaries are off (SUMMARIES.md §6). A daemon built with `make
-SUM=0` has no local model; `cloud` still works.
+API honours, or summaries are off (SUMMARIES.md §6). A daemon built without llama.cpp
+(`make full` or `make SUM=1` builds it in) has no local model; `cloud` still works.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -324,7 +326,7 @@ rather than client state (ARCH-88/REQ-201).
 |---|---|---|
 | `OPENCHIME_STATE` | TUI | A vestigial path (default `$HOME/.local/state/openchime/state`), read only as a **persistence on/off flag**: the client writes no file there (ARCH-88), and the store keeps everything in the OS credential store. An unset `HOME` with no override resolves to nothing, which disables persistence for that run. Resolving the path also **deletes** any `state.db`/`-wal`/`-shm` a pre-ARCH-88 build left behind. |
 | `OPENCHIME_SUFFIX` | `resolve.c` | Overrides the DNS suffix appended to a bare workspace name (`acme` → `acme.<suffix>`), ARCH-14. **Defaults to `workspace.openchime.io`** (`OC_SERVICE_SUFFIX` in `client/core/resolve.h`, returned by `oc_default_suffix()`) — the hosted case is the common one, so a bare name resolves under the service domain unless this says otherwise. A dotted domain or an explicit `:port` bypasses suffixing entirely. |
-| `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook — a file command channel plus the screenshot / state-dump drop directory — set by `scripts/gui_drive.sh` (which exports it across the WSL boundary via `WSLENV`) and used through it by `scripts/gui_smoke.sh` (the boot check). `scripts/gui_snap.sh` neither sets nor reads it: that script captures the window from outside with `PrintWindow`. Dev only. |
+| `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook — a file command channel plus the screenshot / state-dump drop directory — set by `scripts/gui/drive.sh` (which exports it across the WSL boundary via `WSLENV`) and used through it by `scripts/gui/smoke.sh` (the boot check). `scripts/gui/snap.sh` neither sets nor reads it: that script captures the window from outside with `PrintWindow`. Dev only. |
 
 ## Test-only knobs
 
@@ -348,7 +350,7 @@ connection and back takes a second rather than fifteen), `OC_TEST_FULL` (the
 full pronunciation-guesser reference in `make test`, not a tenth of it),
 and, in the clients, `OPENCHIME_TEST_AUDIO`, `OPENCHIME_TEST_MIC` and
 `OPENCHIME_TEST_TONE` — the synthetic audio devices, what the synthetic
-microphone speaks, and its tone (440 Hz unless set), which `scripts/gui_calls.sh`
+microphone speaks, and its tone (440 Hz unless set), which `scripts/gui/calls.sh`
 gives each of its two clients so either can tell whom it hears — and
 `OPENCHIME_TEST_MIC_LEAD_MS`, how long from opening the synthetic microphone
 stays silent before its tone starts, so that the screen-recording test's echo

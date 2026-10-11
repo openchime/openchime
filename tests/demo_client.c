@@ -1,4 +1,4 @@
-/* Flexible black-box client for the local federated demo (scripts/demo-federated.sh).
+/* Flexible black-box client for the local federated demo (scripts/demo/federated.sh).
  * Connects to a *running* daemon over TLS (trusting any certificate, like e2e_client), logs in
  * with local credentials, and runs ONE command — enough to drive the cross-repo
  * flows by hand/script:
@@ -13,7 +13,7 @@
  * drives the push emitter); `summarize` asks for a summary of a custom range and
  * waits for it however long it takes, as a client does: the body (JSON) on
  * stdout, and on stderr each queue position and then one line of status and
- * seconds (the summary trials, scripts/sumpod.sh). Exits 0 on success. Not part of `make test`.
+ * seconds (the summary model trials, docs/MODELS.md). Exits 0 on success. Not part of `make test`.
  */
 
 #include "protocol.h"

@@ -13,7 +13,7 @@
  * installer wrapping them carried one (packaging/windows/openchime.iss).
  *
  * The Makefile passes OC_VERSION_NUM to windres as bare digits, from the same
- * OC_VERSION that scripts/version.sh allocates and the daemon reports. A
+ * OC_VERSION that scripts/release/version.sh allocates and the daemon reports. A
  * source build leaves it unset and gets 0, matching the daemon's "dev".
  *
  * Only the number crosses the command line, and the display string is built
@@ -21,7 +21,7 @@
  * through a second shell, so a --define carrying quotes loses them on the way
  * and the string literal arrives as bare tokens. Digits have no such problem.
  *
- * Why 1.0.<release>.0: version.sh hands out a bare integer, and Windows wants
+ * Why 1.0.<release>.0: scripts/release/version.sh hands out a bare integer, and Windows wants
  * four fields. Third field, so the number increases monotonically -- the only
  * property Windows actually enforces. Same placement as the MSIX manifest and
  * the Inno script, so all three agree.

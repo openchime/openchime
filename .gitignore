@@ -8,7 +8,7 @@ build/
 # produced by packaging/build-*.sh and by the release workflow. Built, never
 # committed — the published copies live in the repository on R2 (ARCH-20).
 dist/
-# Ignore vendored third_party contents (mbedTLS is fetched by scripts/build_*.sh)
+# Ignore vendored third_party contents (mbedTLS is fetched by scripts/build/*.sh)
 # — but keep the single-file libraries that have no fetch script and so must live
 # in the repo: jsmn (JSON), termbox2 + utf8proc (the TUI cell grid + Unicode
 # width, ARCH-75). (Ignore the *contents* with /* rather than the directory, so
@@ -33,6 +33,9 @@ dist/
 .playwright-mcp/
 __pycache__/
 /stt/
-# The web harness's Playwright library (package.json), installed by scripts/web_drive.sh.
+# The web harness's Playwright library (package.json), installed by scripts/web/drive.sh.
 node_modules/
 package-lock.json
+
+# The container image's build context (packaging/image-context.sh).
+image/

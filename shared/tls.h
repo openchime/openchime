@@ -7,7 +7,7 @@
  * non-blocking epoll loop: handshake/read/write return WANT_READ / WANT_WRITE
  * when the socket would block, which the caller maps to epoll interest.
  *
- * mbedTLS is pinned and vendored (scripts/build_mbedtls.sh) so local, CI, and
+ * mbedTLS is pinned and vendored (scripts/build/mbedtls.sh) so local, CI, and
  * the Docker image share one version; see docs/TLS.md.
  */
 

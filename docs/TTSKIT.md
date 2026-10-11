@@ -249,7 +249,7 @@ tts_free(t);
 
 A `tts` is read-only after loading and can be shared by threads.
 
-**From the command line,** `make tts_pack` builds a small tool that uses the same code:
+**From the command line,** `make build/tts_pack` builds a small tool that uses the same code:
 
 ```
 $ build/tts_pack word ttskit/data/en-US migration Kubernetes API readme
@@ -268,8 +268,8 @@ The committed files are the output of one script. Rerun it when CMUdict's pin, t
 (§3), the packer or the training settings change; nobody needs to run it to build OpenChime.
 
 ```
-scripts/build_ttskit_data.sh            # rebuild in build/ttskit-data and compare with the committed files
-scripts/build_ttskit_data.sh install    # rebuild and replace them
+scripts/build/ttskit_data.sh            # rebuild in build/ttskit-data and compare with the committed files
+scripts/build/ttskit_data.sh install    # rebuild and replace them
 ```
 
 **Prerequisites:** x86-64 Linux, a C compiler, `curl`, `python3` (only to unpack a wheel) and
