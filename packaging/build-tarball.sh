@@ -5,7 +5,7 @@
 # variants), NixOS, SUSE, and -- the case that actually motivated it -- an
 # air-gapped operator. ARCH-20 tells a stand-alone operator wanting zero
 # dependency on the project to "build from source", but the source build runs
-# scripts/build_mbedtls.sh, which downloads mbedTLS from GitHub. So the
+# scripts/build/mbedtls.sh, which downloads mbedTLS from GitHub. So the
 # advertised offline path was not offline. This tarball is.
 #
 #   build-tarball.sh <version> <arch> <binary> [outdir]

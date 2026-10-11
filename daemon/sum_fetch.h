@@ -18,7 +18,7 @@
 /* The model this daemon summarizes with: open-licensed (Apache-2.0), a 4-bit
  * GGUF file. A development build may pin another, all five together, by a
  * header given to the compiler with -include (the summary trials,
- * scripts/sumpod.sh). */
+ * docs/MODELS.md). */
 #ifndef OC_SUM_MODEL_NAME
 #define OC_SUM_MODEL_NAME   "qwen3.5-2b-q4_k_m"
 #define OC_SUM_MODEL_FILE   "Qwen3.5-2B-Q4_K_M.gguf"
@@ -36,7 +36,7 @@ int oc_sum_model_ensure(const char *dir, const char *file, const char *url, cons
                         size_t errcap);
 
 /* Whether this CPU can run the local model. On x86-64 it is built for
- * x86-64-v3 (scripts/build_llamacpp.sh), and a CPU without AVX2, FMA, F16C or
+ * x86-64-v3 (scripts/build/llamacpp.sh), and a CPU without AVX2, FMA, F16C or
  * BMI2 would stop the whole daemon at the first such instruction; elsewhere
  * every CPU can. `supports` answers for a feature name ("avx2", ...); NULL asks
  * the CPU itself (a test passes its own). 1, or 0 with a reason. */

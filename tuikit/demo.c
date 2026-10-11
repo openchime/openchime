@@ -1,6 +1,6 @@
 /*
  * tuikit demo — a standalone harness that exercises every widget with no daemon
- * and no app-core, so the toolbox is testable on its own (`make tuikit-demo`).
+ * and no app-core, so the toolbox is testable on its own (`make build/tuikit-demo`).
  * Tab cycles focus across a filterable list, two inputs (one masked), a textarea,
  * and a scrolling viewport; Ctrl-O opens a modal menu; Ctrl-Q quits. The footer
  * is generated from a tk_binding table.

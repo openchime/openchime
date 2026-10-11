@@ -9,7 +9,7 @@ are four ways a dependency enters the build; each row below says which:
 | Class | How it's managed | Reproducible? |
 |-------|------------------|---------------|
 | **Vendored (committed)** | Single-file source committed under `third_party/` | Yes — frozen in git |
-| **Fetched at build** | Downloaded + built by a `scripts/build_*.sh` (gitignored output) | Version-pinned in the script |
+| **Fetched at build** | Downloaded + built by a `scripts/build/*.sh` (gitignored output) | Version-pinned in the script |
 | **System / OS package** | Provided by the host or base image, linked at build | Pinned by the OS, not by us |
 | **Container image** | Base of the published deployment image; not used for dev or test | Per the image tag |
 
@@ -38,7 +38,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a standalone C library) | Voice input in the Win32 client (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
-| **Mozilla CA roots** | curl's extract, dated (see `scripts/update_ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, the control plane, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
+| **Mozilla CA roots** | curl's extract, dated (see `scripts/gen/ca_roots.sh`) | The roots every outbound HTTPS client verifies against (ARCH-10): S3, the control plane, unfurls, the client's `.well-known` fetch | Daemon + every client (`third_party/ca-roots/ca_roots.c`, generated) | https://curl.se/docs/caextract.html | MPL-2.0 (the certificate data) |
 | **SQLite** (amalgamation) | 3.53.4 | The daemon's database (ARCH-2), compiled in with `SQLITE_ENABLE_FTS5`. **Not linked by any client** (ARCH-88) | Daemon + tests (`third_party/sqlite-3.53.4/sqlite3.c`) | https://sqlite.org | Public Domain |
 
 **Why the daemon compiles SQLite in rather than linking the host's (ARCH-20; no
@@ -102,7 +102,22 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 (see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
-## 2. Fetched at build time — `scripts/build_*.sh` (gitignored output)
+## 2. Fetched at build time — `scripts/build/*.sh` (gitignored output)
+
+**Toolchains** come this way too (`mk/toolchains.mk`): make fetches each on
+first use, pinned by version and SHA-256 in its script, into `third_party/`,
+and puts it first on `PATH` for every recipe and vendor script, so nothing
+depends on what a machine or a runner image happens to have installed.
+`make full` needs only cc, make, cmake, python3, git, curl and xz beyond them.
+A bump is the version and the sum in one script and a pull request CI builds
+with; `.github/workflows/toolchains.yml` files an issue monthly when upstream
+has moved (`scripts/check/toolchains.sh`).
+
+| Toolchain | Version | Script | Builds | License |
+|-----------|---------|--------|--------|---------|
+| **zig** (its bundled clang and lld) | 0.13.0 | `scripts/build/zig.sh` | the release's Linux daemon against glibc 2.34 (`make RELEASE=1`), the arm64 daemon cross-built from x86 (`make ARCH=aarch64`), and CI's second-compiler pass (`make check-release-cc`) | MIT |
+| **Emscripten** (emsdk) | 6.0.8 | `scripts/build/emsdk.sh` | the web client (`make web`) and the loader compiled into a `WEB=1` daemon; brings its own Node for `make web-test` | MIT / NCSA |
+| **llvm-mingw** (clang, lld, LLVM binutils, mingw-w64 headers and CRT) | 20261006 | `scripts/build/llvm_mingw.sh` | the Windows GUI and TUI and their libraries (`make windows`), through the `x86_64-w64-mingw32-*` names | Apache-2.0 with LLVM exception; mingw-w64 under its own permissive terms |
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
@@ -115,10 +130,10 @@ unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
 | **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: eight files — the frontend, encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
-| **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build_ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
+| **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
 
-Fetched + built by `scripts/build_mbedtls.sh` from the official GitHub release
+Fetched + built by `scripts/build/mbedtls.sh` from the official GitHub release
 tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
 `MBEDTLS_VERSION` (default `3.6.2`). Built as **static** libs
 (`libmbedtls/libmbedx509/libmbedcrypto.a`) with **`MBEDTLS_THREADING`** enabled —
@@ -133,10 +148,10 @@ unverified: the script prints the `curl` that retrieves the upstream sum and
 exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 
 **SDL3** follows the identical arrangement one script over:
-`scripts/build_sdl3_windows.sh` fetches the pinned release tarball
+`scripts/build/sdl3_windows.sh` fetches the pinned release tarball
 (SHA-256-verified, refuses an unpinned bump), cross-builds a **static-only**
-`libSDL3.a` with mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
-`make windows-gfx-test` links it. SDL's own build is CMake; the script invoking
+`libSDL3.a` with llvm-mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
+`make build/gfx_test.exe` links it. SDL's own build is CMake; the script invoking
 it is the same arrangement as invoking mbedTLS's make — the dependency's build
 system stays its own business, and this tree's stays make. It is the first
 genuinely large dependency in the tree, which is exactly why it sits in this
@@ -145,8 +160,9 @@ libvpx). zlib-licensed: no notice needs to travel with a shipped
 binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
 **libvpx and libopus** are the codecs (ARCH-110), fetched the same way:
-`scripts/build_libvpx.sh` and `scripts/build_opus.sh`, each taking `native` (the
-Linux build `make test` links) or `windows` (cross-built with mingw for the Win32
+`scripts/build/libvpx.sh` and `scripts/build/opus.sh`, each taking `native` (the
+Linux build `make test` links; with `OC_ARCH`, another architecture's, as `make
+ARCH=aarch64` asks) or `windows` (cross-built with llvm-mingw for the Win32
 client), each refusing an unverified tarball and an unpinned bump exactly as above.
 Both build **static-only**. libvpx is configured VP9-only and real-time-only, with
 no examples, tools, docs or unit tests, and needs **nasm** for its assembly; its
@@ -160,7 +176,7 @@ the notice carried with a shipped client.
 **Read-aloud's engine and model** (ARCH-111) come the same way, with more to
 say because ONNX Runtime is the one C++ dependency and the model is large:
 
-- `scripts/build_onnxruntime.sh` fetches the v1.30.0 **source** tarball
+- `scripts/build/onnxruntime.sh` fetches the v1.30.0 **source** tarball
   (SHA-256-verified) and builds it with its own `tools/ci_build/build.py` as a
   minimal static library: `--minimal_build`, `--include_ops_by_config
   daemon/ort.ops.config` with type reduction, `--disable_ml_ops`,
@@ -172,13 +188,13 @@ say because ONNX Runtime is the one C++ dependency and the model is large:
   `third_party/onnxruntime-1.30.0/lib/libonnxruntime.a`. It needs CMake 3.28+, a
   C++17 compiler and Python 3, and takes about 20 minutes. The daemon links it with
   `-static-libstdc++ -static-libgcc`, so no C++ runtime is required of the host.
-- `scripts/build_kitten.sh` fetches the model at pinned Hugging Face and GitHub
-  revisions (SHA-256-verified) and converts it to `.ort` with `scripts/tts_convert.c`
+- `scripts/build/kitten.sh` fetches the model at pinned Hugging Face and GitHub
+  revisions (SHA-256-verified) and converts it to `.ort` with `scripts/build/tts_convert.c`
   linked against ONNX Runtime's **prebuilt** full release (also pinned; a build tool
-  on the build machine only, `build_onnxruntime.sh converter`). The converted file is
+  on the build machine only, `scripts/build/onnxruntime.sh converter`). The converted file is
   not byte-reproducible, so its input and the converter are what is pinned.
-- `make` assembles the converted model, the voices and ttskit's data into `tts/` beside
-  `openchimed`. `make TTS=0` builds a daemon without any of it.
+- `make full` (or `make TTS=1`) assembles the converted model, the voices and ttskit's
+  data into `tts/` beside `openchimed`. A plain `make` builds a daemon without any of it.
 
 ONNX Runtime (MIT, with its ThirdPartyNotices), Kitten (Apache-2.0) and CMUdict
 notices travel with every package through `packaging/licenses.sh`.
@@ -186,33 +202,33 @@ notices travel with every package through `packaging/licenses.sh`.
 **Voice input's recognizer** (ARCH-112) runs on that same ONNX Runtime, whose
 operator config (`daemon/ort.ops.config`) is the union of both models':
 
-- `scripts/build_moonshine.sh` fetches Moonshine's eight published files from its
+- `scripts/build/moonshine.sh` fetches Moonshine's eight published files from its
   dated CDN directory at pinned SHA-256s, refusing a mismatch. They load in ONNX
   Runtime 1.30.0 as published, so nothing is converted.
-- `make` assembles them into `stt/` beside `openchimed` with a manifest the daemon
-  checks at startup. `make STT=0` builds a daemon without voice input.
+- `make full` (or `make STT=1`) assembles them into `stt/` beside `openchimed` with a
+  manifest the daemon checks at startup. A plain `make` builds a daemon without voice input.
 
 Moonshine's MIT notice travels with every package through `packaging/licenses.sh`.
 
 **The summary model's engine** (ARCH-116) is llama.cpp, the second C++
 dependency, built the same way:
 
-- `scripts/build_llamacpp.sh` fetches the v0.5.0 **source** tarball
+- `scripts/build/llamacpp.sh` fetches the v0.5.0 **source** tarball
   (SHA-256-verified) and builds `libllama` and ggml with CMake: CPU only, static,
   no OpenMP (it would add libgomp to the daemon's runtime), no tools, examples,
   server or network code; x86-64 compiled for x86-64-v3 (AVX2), arm64 for its
   baseline. The archives are merged into one
   `third_party/llamacpp-0.5.0/lib/libllamacpp.a` beside `llama.h` and the ggml
   headers. It needs CMake 3.14+ and a C++17 compiler, and takes a few minutes. The
-  daemon links it with the same static C++ runtime as ONNX Runtime. `make SUM=0`
-  builds without it.
+  daemon links it with the same static C++ runtime as ONNX Runtime. `make full` (or
+  `make SUM=1`) builds it in; a plain `make` leaves it out.
 - **The model is never shipped**: the daemon fetches it on first use from a pinned
   address and checks a pinned SHA-256 (SUMMARIES.md §6). It is Qwen3.5 2B
   (Apache-2.0), 4-bit GGUF.
 
 llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.
 
-**speexdsp** is fetched by `scripts/build_speexdsp.sh` — `native` for `make test`,
+**speexdsp** is fetched by `scripts/build/speexdsp.sh` — `native` for `make test`,
 `windows` for the Win32 client — SHA-256-verified and refusing an unpinned bump,
 built static and floating point into `third_party/speexdsp-1.2.1[-win]/`
 (gitignored). The daemon links none of it.
@@ -229,46 +245,48 @@ published container image; their versions track the OS, not this repo.
 | **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
 | **GLib** *(optional)* | Pulled in transitively by libsecret | TUI (only when libsecret present) | via libsecret | https://gitlab.gnome.org/GNOME/glib | LGPL-2.1 |
 
-`libsecret`/`glib` are **optional and dynamically linked**: `make tui` detects
+`libsecret`/`glib` are **optional and dynamically linked**: `make linux` detects
 libsecret via `pkg-config` and compiles the keyring backend, else compiles a stub
 and that machine then persists no credential at all (headless / no D-Bus). They are
-*not* linked into the daemon, the test binary, or `make core`.
+*not* linked into the daemon or the test binary.
 
 - **Local build headers:** `libsecret-1-dev` for the keyring backend. SQLite needs
   none — it is compiled from the committed amalgamation.
-- **CI installs:** `bzip2` (for the mbedTLS tarball). CI builds
-  the **Windows** TUI and GUI (`make windows-tui windows-gui`) but not the Linux
-  `make tui` target, so it needs neither libsecret nor libresolv: the mingw build
-  reaches DNS through `DnsQuery` and the credential store through Credential
-  Manager.
+- **CI installs:** `bzip2`, `nasm` and `xz-utils`; every compiler is fetched by
+  make (the toolchains above). The Windows TUI and GUI (`make windows`) need
+  neither libsecret nor libresolv: the mingw build reaches DNS through
+  `DnsQuery` and the credential store through Credential Manager.
 
 ## 4. Container images — deployment only
 
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
-| **Alpine Linux** | `3.20` | Build + runtime base of the published image | mixed (base OS) | https://alpinelinux.org |
+| **Debian** | `bookworm-slim` | Runtime base of the published image (glibc 2.36, above the binary's 2.34 floor) | mixed (base OS) | https://www.debian.org |
 
 One image, and it is an **output** rather than a tool: the OCI image published to
-GHCR for the hosted model (ARCH-20/76). It adds no Alpine packages: the daemon
-links everything it needs, CA roots included.
+GHCR for the hosted model (ARCH-20/76). Nothing is compiled in it: the Dockerfile
+lays the release tarball's daemon, speech data and web client onto the base
+(`packaging/image-context.sh`), so the image carries the same binary as the
+packages, and the arm64 image is built on the x86 runner with no emulation. It
+adds no packages: the daemon links everything it needs, CA roots included.
 
 The project runs no containers for development or testing (ARCH-36), so this
 table holds exactly one row. The sole image reference in the repo is the
-`FROM alpine:3.20` in `Dockerfile` — a tag rather than a digest, which is the
-upstream's own stability contract for a base OS.
+`FROM debian:bookworm-slim` in `Dockerfile` — a tag rather than a digest, which
+is the upstream's own stability contract for a base OS.
 
 ## 5. Build & dev tooling (not linked into the product)
 
 - **C99 toolchain** — gcc or clang (+ `ar`); the whole tree builds with
   `-std=c99 -Wall -Wextra`.
 - **make** — the only build system (no CMake/autotools for OpenChime itself).
-- **bash, curl, tar, bzip2** — used by `scripts/build_mbedtls.sh` and the image
-  build.
+- **bash, curl, tar, bzip2, xz, git, python3, cmake** — used by the
+  `scripts/build/*.sh` fetch scripts; cmake and python3 by ONNX Runtime's,
+  llama.cpp's and SDL3's own builds.
 - **pkg-config** — detects libsecret for the TUI.
-- **zig** (`0.13.0`, MIT) — **release only**, not needed for a local build.
-  `zig cc` builds the shipped Linux daemon against glibc 2.34, the oldest
-  supported target (ARCH-20). Pinned by SHA-256 per architecture in
-  `.github/workflows/release.yml`.
+- **zig, Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
+  zig is the release's compiler and CI's second compiler; a plain `make` of the
+  host's daemon uses the system cc.
 - **buildah / skopeo** — **release only**. Build and push the OCI image and move
   the `:latest` tag, daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
@@ -282,11 +300,12 @@ The Windows GUI is the portable application (`client/gui/app/`, ARCH-80) over
 
 | Item | Version | Note | License |
 |------|---------|------|---------|
-| `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile (mingw); used by `make windows-tui` and `make windows-gui` | Apache-2.0 |
-| `scripts/build_sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (mingw, static, CMake invoked by the script); used by `make windows-gfx-test` | zlib |
-| `scripts/build_libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (mingw, static, nasm); used by `make windows-gui` | BSD-3-Clause |
-| `scripts/build_opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (mingw, static); used by `make windows-gui` | BSD-3-Clause |
-| `scripts/build_speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (mingw, static); used by `make windows-gui` | BSD-3-Clause |
+| `scripts/build/llvm_mingw.sh`, `third_party/llvm-mingw-20261006` | 20261006 | The toolchain itself (clang, lld, LLVM binutils, mingw-w64 headers and CRT, UCRT), fetched by make | Apache-2.0 with LLVM exception |
+| `scripts/build/mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile; used by `make windows` | Apache-2.0 |
+| `scripts/build/sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (static, CMake invoked by the script); used by `make windows` and `make build/gfx_test.exe` | zlib |
+| `scripts/build/libvpx.sh windows`, `third_party/libvpx-1.17.0-win` | 1.17.0 | Windows cross-compile (static, nasm); used by `make windows` | BSD-3-Clause |
+| `scripts/build/opus.sh windows`, `third_party/opus-1.6.1-win` | 1.6.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |
+| `scripts/build/speexdsp.sh windows`, `third_party/speexdsp-1.2.1-win` | 1.2.1 | Windows cross-compile (static); used by `make windows` | BSD-3-Clause |
 | Media Foundation (`mfplat`, `mfreadwrite`, `mf`, `mfuuid`) | OS | Camera capture for video messages (`client/core/media/cap_mf.c`) | Windows system libraries |
 
 ## 7. Why libvpx
@@ -314,7 +333,7 @@ that reason: `send`, `smile`, `at-sign` and `download`, hand-authored in Lucide'
 conventions (24×24, 2px round-capped strokes) under `client/shared/icons_src/`.
 Keeping them out of the vendored tree is what keeps the ISC attribution truthful —
 it covers Lucide's work and nothing else.
-A dev-time script (`scripts/gen_icons.py`, uses `svgelements`) flattens those SVGs
+A dev-time script (`scripts/gen/icons.py`, uses `svgelements`) flattens those SVGs
 into platform-agnostic cubic-bezier path data baked into `client/shared/icons.{h,c}`
 — so there is **no icon-font dependency** and each native client strokes the same
 geometry with its own 2D API (Win32 uses Direct2D `ID2D1PathGeometry`). The

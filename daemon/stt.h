@@ -17,7 +17,7 @@
 #define OC_STT_LANG "en-US"
 
 /* The model and the published files together, as the manifest and STT_INFO
- * name them. The files are pinned by SHA-256 in scripts/build_moonshine.sh;
+ * name them. The files are pinned by SHA-256 in scripts/build/moonshine.sh;
  * change them and change this. */
 #define OC_STT_MODEL_VERSION OC_STT_LANG "/moonshine-tiny-streaming/quantized_26_08_21"
 

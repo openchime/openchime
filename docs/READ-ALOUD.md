@@ -122,12 +122,13 @@ and nothing to fetch.
 - **Checking a build by ear:** `openchimed --tts-say VOICE TEXT OUT.wav` renders with the
   model in that binary and reports the real-time factor.
 
-**Building it.** `make` builds ONNX Runtime once (`scripts/build_onnxruntime.sh`, about 20
+**Building it.** `make` builds ONNX Runtime once (`scripts/build/onnxruntime.sh`, about 20
 minutes; CMake, a C++17 compiler and Python are build-time needs) and fetches and converts the
-model once (`scripts/build_kitten.sh`, pinned by SHA-256; the conversion uses the prebuilt
+model once (`scripts/build/kitten.sh`, pinned by SHA-256; the conversion uses the prebuilt
 full ONNX Runtime, a build tool only). The converted model is not byte-reproducible — the
 converter orders part of its header differently between runs — so the input model and the
-converter are what is pinned. `make TTS=0` builds a daemon without read-aloud. The operator
+converter are what is pinned. `make full` (or `make TTS=1`) builds read-aloud in; a plain
+`make` leaves it out. The operator
 config is regenerated with ONNX Runtime's `create_reduced_build_config.py --format ORT
 --enable_type_reduction` when the model changes, from the model as converted on **both**
 architectures: on arm64 ONNX Runtime keeps `MatMul` and `Add` in half precision, where amd64

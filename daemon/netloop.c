@@ -318,14 +318,14 @@ static __thread uint64_t g_next_conn_id = 1;
  * with g_enc/g_next_conn_id. */
 static __thread oc_blobstore *g_blobs;
 static __thread oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
+/* The summary worker (ARCH-116): NULL when summaries are off. */
+static oc_sum_worker *g_sum;
 #ifdef OC_TTS
 /* Read-aloud (ARCH-111): the render worker and the engine it runs. The engine is
  * injected before the loop starts (a daemon built with read-aloud passes the
  * voice model; a test passes a stub), and the worker exists only when the
  * operator left the feature on. */
 static const oc_tts_engine *g_tts_engine;
-/* The summary worker (ARCH-116): NULL when summaries are off. */
-static oc_sum_worker *g_sum;
 static __thread oc_tts_worker       *g_tts;
 /* Renders in flight, so two listeners asking for the same message at the same
  * moment cost one render: the first submits, the rest wait on the same handle. */

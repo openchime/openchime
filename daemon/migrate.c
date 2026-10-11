@@ -1296,7 +1296,7 @@ static const char MIGRATION_0058[] =
 
 /* 0060: nothing to the schema. The step marks the point from which the writer
  * indexes mentions for messages that have none (dbwriter's index_mentions at
- * start): a workspace loaded from an export (scripts/slack_to_db.py) holds its
+ * start): a workspace loaded from a Slack export (as the summary evaluation did, docs/SUMMARIES.md) holds its
  * messages but no `mentions` rows, so the server's unread count, which reads
  * that table, said 0 where the client, which reads the text, counted the
  * @channel and @name lines. A database that is already past this step has had

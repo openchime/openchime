@@ -269,6 +269,6 @@ cross into `client/core` and are encoded there, so the wire is the same everywhe
   costs NACKs and resends, not the picture; faye joins late and has a picture
   within seconds; erik takes over, which stops dana's; erik stops and the picture
   goes.
-- `scripts/gui_calls.sh`: two Win32 clients — alice shares, bob's view shows her
+- `scripts/gui/calls.sh`: two Win32 clients — alice shares, bob's view shows her
   screen with readable, rising frame numbers; full screen, Esc, actual size; the
   accessibility names; bob takes over; bob stops.

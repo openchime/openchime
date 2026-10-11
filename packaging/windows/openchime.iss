@@ -19,7 +19,7 @@
   #define Version "0"
 #endif
 
-; The four-part form Windows expects in file version metadata. version.sh
+; The four-part form Windows expects in file version metadata. scripts/release/version.sh
 ; hands out a bare integer, so it lands in the third field: 1.0.<release>.0
 ; increases monotonically, which is the only property Windows requires.
 #define FileVersion "1.0." + Version + ".0"

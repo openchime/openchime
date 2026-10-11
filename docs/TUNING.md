@@ -4,8 +4,11 @@ How to teach a model too small to infer the summarizer's form from its
 prompt (docs/SUMMARIES.md §2) to write it anyway, so that it can run in the
 daemon on a small box (§6 there). Nothing in the daemon changes: the result is
 one GGUF, pinned in `daemon/sum_fetch.h` like today's model, and the prompts,
-the grammar and the checks stay as they are. The scripts are development
-tools under `scripts/sumtune_*`; none run in the build or in CI.
+the grammar and the checks stay as they are. The scripts this page names
+(`sumtune_*`, `sumeval_*`, `sumpod*`, `slack_to_db.py`) were development tools
+that never ran in the build or CI; they were removed from the tree once the
+model was chosen and tuned, and are in the history at the commit before that
+removal. This page stays as the record of the method.
 
 **Why.** On the 30-span set (docs/MODELS.md), models of 1B or so hold the
 form only because the grammar makes them, and what they write inside it is

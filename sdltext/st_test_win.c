@@ -5,7 +5,7 @@
  * against the real DirectWrite on real Windows: formats, layouts, byte-offset
  * styling over multibyte text, the three hit-test shapes, inline boxes, line
  * metrics, and the raster path down to actual pixels through a memory sink.
- * Built by `make windows-sdltext-test`, run on a Windows host (or WSL
+ * Built by `make build/sdltext_test.exe`, run on a Windows host (or WSL
  * interop); the exit code is the failure count, same contract as tests/.
  */
 

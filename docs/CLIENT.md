@@ -138,7 +138,7 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   frames. Lifted from `tests/e2e_client.c`. A process normally has one oc_client
   (one net thread), but a multi-client harness (the headless test) spins several
   concurrently; that is safe because the vendored mbedTLS is built with
-  **`MBEDTLS_THREADING`** (`scripts/build_mbedtls.sh`), so its internal shared
+  **`MBEDTLS_THREADING`** (`scripts/build/mbedtls.sh`), so its internal shared
   state is mutex-protected.
 - **`queue.c` — two thread-safe queues** (mutex+condvar FIFO, the daemon's
   net↔dbwriter shape): **intents in** (send, backfill, react, edit, delete,
@@ -280,7 +280,7 @@ model; translate input to intents }, stop.
   **notcurses is rejected on licensing** — it hard-depends on libunistring
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
-  like the daemon (`make tui`), zero transitive dependencies. The widget/
+  like the daemon (`make linux`), zero transitive dependencies. The widget/
   formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
   [TUIKIT.md](./TUIKIT.md)): panels, modal lists, a command palette, text
   prompts, and a 256-color theme.
@@ -867,19 +867,19 @@ central relay is out of repo.
 
 ## 7. Build
 
-The core + TUI build on the host (a `make tui` target linking `client/core/*.c` +
+The core + TUI build on the host (a `make linux` target linking `client/core/*.c` +
 `client/tui/*.c` + `shared/*` + `third_party/utf8proc/utf8proc.c`, with
 `termbox2.h` compiled `TB_IMPL` in one TU), like the daemon — no cross-compile,
 no container, no external build system. termbox2 and utf8proc are **vendored as
 committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
 v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources with
 zero transitive dependencies (ARCH-75). The GUI is one application
-(`client/gui/app/`) compiled over a platform directory: `make windows-gui`
-cross-compiles it with mingw over `client/gui/platform/win32/` and the SDL3
-and mbedTLS built for Windows; a Linux or macOS build is the same sources over
-their own platform directory once it exists. Release artifacts come from
-CI/CD, never a dev machine.
-The web build (`make web`, [WEB.md](./WEB.md)) needs Emscripten on the PATH and
+(`client/gui/app/`) compiled over a platform directory: `make windows`
+cross-compiles it with the pinned llvm-mingw over `client/gui/platform/win32/`
+and the SDL3 and mbedTLS built for Windows; a Linux or macOS build is the same
+sources over their own platform directory once it exists. Release artifacts
+come from CI/CD, never a dev machine.
+The web build (`make web`, [WEB.md](./WEB.md)) fetches its pinned Emscripten and
 builds mbedTLS and SDL3 for wasm once into `build/wasm/`, beside the native trees.
 
 ## The text fields are drawn (every platform)
@@ -989,7 +989,7 @@ focus.
 - **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
   opening a second surface behind it would leave two things claiming the screen.
   Esc and Enter reach it through `modal_key`.
-- Test with `gui_drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
+- Test with `scripts/gui/drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
   The verb really holds the modifiers via `SetKeyboardState`, because
   `accel_dispatch` reads `GetKeyState`; posting a bare key proves nothing.
 
@@ -1410,7 +1410,7 @@ frame drew, in order, with its rect, its clip, its colour and a tag
 (`gfx_ledger_dump`). It exists because a screenshot answers "what does this look
 like" and nothing else: a label clipped to nothing, ink the colour of the
 surface behind it, and two strings drawn over each other all produce a picture
-that looks right to a comparison and wrong to a person. `scripts/gui_audit.sh`
+that looks right to a comparison and wrong to a person. `scripts/gui/audit.sh`
 reads it; [TESTING.md](./TESTING.md) explains what it can and cannot be asked.
 
 Two rules for anything drawing text through it. A text raster carries its colour
@@ -1427,7 +1427,7 @@ unverifiable.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asks one question — **does the client boot and run?** —
+`scripts/gui/smoke.sh` asks one question — **does the client boot and run?** —
 and answers it in about ten seconds across fourteen checks: it launches,
 connects and authenticates against its own fixture daemon; paints the Home shell
 (the `sidebar_kind` / `main_is_conversation` / `window_is_covered` predicates);
@@ -1450,7 +1450,7 @@ something an earlier run left in the database.
 assertions covering the composer's editing rules, the modal frame, the schedule
 card and a DPI × zoom × text-size matrix lived here once; it took seven minutes,
 which meant it was skipped, which meant it caught nothing. Verifying a feature
-is done by driving it — by hand through `scripts/gui_drive.sh`, or with a
+is done by driving it — by hand through `scripts/gui/drive.sh`, or with a
 harness scoped to that feature — not by making the boot check longer. A new view
 or overlay is added to the predicates in `app.c`; it does not get a line
 here.
@@ -1462,7 +1462,7 @@ same discipline as reading CI.
 
 ## Seeing the whole window (the harness)
 
-`scripts/gui_drive.sh shot <name>` produces one image of the entire
+`scripts/gui/drive.sh shot <name>` produces one image of the entire
 application: the scene is rendered and read back from the renderer
 (`gfx_readback`), on every platform the same way. Every field is drawn now,
 so what the renderer holds is the whole application; there is no second
@@ -1509,7 +1509,7 @@ to change a format's size, so any preference that moves the scale must call
   provider over the self-drawn UI, a real system caret and UIA events
   (**ARCH-99**), with an `AutomationId` and an `InvokePattern` on every
   actionable element (**REQ-290**), verified from outside the process by
-  `scripts/uia_probe.ps1`. Rich text and its toolbar (**REQ-220**, ARCH-100) are
+  `scripts/gui/uia_probe.ps1`. Rich text and its toolbar (**REQ-220**, ARCH-100) are
   a shared parser in `client/core/` plus sdltext byte ranges.
 - **The TUI** sits on the same core and is text-only (§3).
 - **Further desktops are ports of the portable layer** (ARCH-80): the portable

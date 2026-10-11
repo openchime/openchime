@@ -2,7 +2,7 @@
  * by `make web` for the browser, served under /app/ with the cross-origin
  * isolation headers wasm threads need. A daemon always serves the client that
  * matches it: the page and the loader (openchime.html, openchime.js) are
- * compiled into the binary as resources (scripts/embed_res.py), and the one
+ * compiled into the binary as resources (scripts/build/embed_res.py), and the one
  * thing outside it is the wasm binary, shipped beside the executable as the
  * voice data is (`web/openchime.wasm` beside the executable, or
  * /usr/share/openchime/web when installed), read once at startup. The two
@@ -18,9 +18,13 @@
 #define OC_WEBAPP_SYSTEM_DIR "/usr/share/openchime/web"
 #define OC_WEBAPP_PATH       "/app/"
 
+/* Whether this daemon carries the client at all: the loader is compiled in
+ * when the daemon is built with WEB=1 (`make full`), and is empty otherwise. */
+int oc_webapp_built(void);
+
 /* Find and read the wasm beside the binary. 1 when it is there; 0 with `err`
  * filled when not (which is not an error for the daemon: it runs without a
- * web client). */
+ * web client), as it is when the client was not built in at all. */
 int oc_webapp_load(const char *exe_dir, char *err, size_t errcap);
 int oc_webapp_loaded(void);
 

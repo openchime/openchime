@@ -6,7 +6,7 @@
  * scenario resets the loop's turn statistics (netloop.h), runs, and prints the
  * turn p50/p99/max beside the latency the clients measured. It is a measuring
  * instrument, not a test: nothing here passes or fails, and it is not part of
- * `make test`. `make bench-loop` builds it; the numbers it prints before and
+ * `make test`. `make build/bench_loop` builds it; the numbers it prints before and
  * after a change to the loop are recorded in docs/TESTING.md §5.
  *
  * Usage: bench_loop [scenario ...]   scenarios: chat fanout storm backfill call call-tcp

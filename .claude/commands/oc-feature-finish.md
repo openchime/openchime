@@ -32,7 +32,7 @@ failing output, stop.
 ## 3. The title
 
 ```
-scripts/check_pr.sh "OC-<number>: <Capitalised imperative summary>"
+scripts/check/pr.sh "OC-<number>: <Capitalised imperative summary>"
 ```
 
 It must pass: the house format, and at most 72 characters once GitHub appends

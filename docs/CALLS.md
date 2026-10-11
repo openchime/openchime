@@ -277,5 +277,5 @@ cover: tampering, a wrong key or another sender, another info or aad, low-order 
 replay window. The client end-to-end test, which runs the switches between epochs, (`test_client_core.c`) taps the relay and checks it sees only
 ciphertext, and that after a participant leaves every packet is under an epoch it was
 never given a key for; and a shared screen crosses it as SFrame too (VIDEO.md §9).
-`scripts/gui_calls.sh` runs two Win32 clients in a call and checks each receives the other's
+`scripts/gui/calls.sh` runs two Win32 clients in a call and checks each receives the other's
 packets, every one decrypting once the keys are in.

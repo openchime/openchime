@@ -2282,9 +2282,9 @@ choose — which makes each one a per-frontend *obligation*.*
   conversation, message, composer control, formatting button, filter chip, tab,
   pane row and modal button carries an id and — where it is a control rather than
   content — an `InvokePattern`, so a client can press it rather than click at a
-  measured point. Verified from OUTSIDE the process: `scripts/uia_probe.ps1`
+  measured point. Verified from OUTSIDE the process: `scripts/gui/uia_probe.ps1`
   asserts that no actionable element lacks an id, that no id is claimed twice and
-  that each is invokable, and `scripts/uia_invoke.ps1` presses one by id in the
+  that each is invokable, and `scripts/gui/uia_invoke.ps1` presses one by id in the
   suite.
 
   **Invokes are marshalled, not executed where they arrive.** UIA calls come in on

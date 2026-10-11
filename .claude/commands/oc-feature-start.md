@@ -49,7 +49,7 @@ name below.
   `defect`, `verification-gap`).
 
 The issue number may appear in the **branch name** and in **commit messages**
-— never in a file (`make check-refs` enforces it; say the thing or cite
+— never in a file (`make test` enforces it through scripts/check/refs.sh; say the thing or cite
 `REQ-N` / `ARCH-N` instead).
 
 ## 3. The branch

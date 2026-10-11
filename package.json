@@ -1,7 +1,7 @@
 {
   "name": "openchime-web-harness",
   "private": true,
-  "description": "The web client's test driver (scripts/web_drive.sh) needs the Playwright library; nothing else here is JavaScript.",
+  "description": "The web client's test driver (scripts/web/drive.sh) needs the Playwright library; nothing else here is JavaScript.",
   "devDependencies": {
     "playwright-core": "1.63.0"
   }

@@ -241,7 +241,6 @@ static field *g_focus;
 static void   focus_set(field *f);
 
 /* The main window and the keyboard's view of it. */
-static int g_win_focused;        /* the OS gave this window the keyboard */
 static int g_quit;               /* the loop ends */
 
 /* Modifier state, as the handlers read it. The harness may hold a synthetic
@@ -739,7 +738,7 @@ static void      (*g_form_on_action)(int field);
  * outside the clip — and what survives is asymmetric: the LEFT edge disappears
  * entirely while the right keeps a sliver, so every field rendered as a
  * rounded rectangle missing one side. One DIP clears the 0.75 half-width of the
- * 1.5 stroke. `make windows-gfx-test` measures both the trap and this rule. */
+ * 1.5 stroke. `make build/gfx_test.exe` measures both the trap and this rule. */
 #define FORM_BOX_INSET 1.0f
 static rectf g_form_sel_box[FORM_MAX_FIELDS];
 static int   g_form_sel_field = -1;      /* which field's list is open, -1 none */
@@ -1684,7 +1683,7 @@ static oc_client  *g_dict_client;         /* the client the session sends throug
 static void dict_forget(oc_client *c);    /* fwd: before a client is stopped */
 static void ftray_forget(oc_client *cl);   /* fwd: ...and its upload tray */
 #define VM_MAX_BTNS    12
-static rectf        g_vm_card, g_vm_seek, g_vm_close, g_vm_vbox;
+static rectf        g_vm_seek, g_vm_close, g_vm_vbox;
 static struct { rectf r; int cmd; char label[48]; } g_vm_btns[VM_MAX_BTNS];
 static int          g_n_vm_btns;
 static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H);   /* fwd */
@@ -2016,7 +2015,6 @@ static rectf g_sched_mode_hit[4];
 static rectf g_sched_base_hit[2];
 static rectf g_sched_day_chk[7];
 static rectf g_sched_day_hit[7][2];
-static int         g_sched_rows_drawn;
 /* The time dropdown. Slack's is a scrolling list of half-hours, which the action
  * menus cannot be: they are a fixed panel capped at 28 items and 48 would neither
  * fit the array nor the screen. So this is its own small control — the same
@@ -2164,7 +2162,6 @@ static float    g_srch_scroll;          /* search-results scroll offset, px */
 static float    g_srch_max;             /* its maximum, computed at paint */
 static rectf g_srch_box;          /* the query field's chrome, for layout_search */
 static char     g_find_filter[64];      /* current filter text (lowercased) */
-static rectf g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
 /* The pointer, in DIPs, updated from WM_MOUSEMOVE. The file tracked a dozen
  * derived hover states (g_nav_hover, g_hover_mid, …) but never the position
@@ -3906,7 +3903,6 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
      * workspace's initial (its display name, not the host). */
     float cx = RAIL_W / 2;
     rectf av = rf(cx - 18, 14, cx + 18, 50);
-    g_rail_btn = av;
     fill_round(rt, av, OC_R_AVATAR_LG, OC_COL_ACCENT);
     /* The same hover cue every other rail item gives — the switcher was the one
      * clickable thing on the rail with no feedback at all. */
@@ -7055,7 +7051,6 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
             mx = b.right + 8;
         }
         float ny = my + 34;
-        g_sched_rows_drawn = 0;
         for (int i = 0; i < 7; i++) {
             g_sched_day_chk[i] = rf(0, 0, 0, 0);
             g_sched_day_hit[i][0] = g_sched_day_hit[i][1] = rf(0, 0, 0, 0);
@@ -7111,7 +7106,6 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
                 }
                 ny += 30;
             }
-            g_sched_rows_drawn = 7;
         }
         fill(rt, rf(body.left + 20, ny + 6, body.right - 20, ny + 7), OC_COL_BORDER);
         body.top = ny + 16;
@@ -8228,7 +8222,6 @@ static void draw_file_rows(gfx *rt, const oc_model *m, rectf body,
                            float y, int show_channel) {
     files_build_order(m);
     g_n_filerows = 0;
-    int shown = 0;
     /* Scrolling, through the offset five other panes already share. The
      * list used to stop at the pane edge and merely COUNT what it could not show,
      * which told you the rows existed and still refused to reach them. */
@@ -8241,7 +8234,6 @@ static void draw_file_rows(gfx *rt, const oc_model *m, rectf body,
         const oc_file_view *f = &m->files[i];
         if (y + rowh < list.top) { y += rowh; continue; }   /* scrolled above */
         if (y > list.bottom) break;
-        shown++;
         rectf row = rf(body.left + 12, y, body.right - 12, y + 46);
         if (g_hover_filerow == f->id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
 
@@ -9374,10 +9366,8 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
      * that was actually broken. */
     float avail = w - 32;
     float need_full = 0, need_icons = 0;
-    int n_tabs = 0;
     for (int i = 0; i < TAB_COUNT; i++) {
         if (!tab_applies(tc, i)) continue;
-        n_tabs++;
         need_full  += 26 + text_width(TABS[i].label, g_ui) + 16 + 4;
         need_icons += 34 + 4;
         if (g_tab == i) need_icons += text_width(TABS[i].label, g_ui) + 8;
@@ -15062,7 +15052,6 @@ static uint64_t g_dm_hover;
  * this, picking someone created the conversation and left you looking at the
  * list, with the new row somewhere in the sidebar. */
 static uint64_t g_dm_pending;
-static int g_dm_index_now;            /* this frame's middle column is the DM index */
 static rectf g_dm_compose_btn;
 
 /* The DM channel with `uid`, or NULL. */
@@ -18192,10 +18181,6 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
             } else {
                 draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
             }
-            /* The composer is chrome for a conversation. Hiding only the native
-             * RichEdit left its box, buttons and send arrow painted over the DM
-             * index — an input you cannot type into is worse than none. */
-            g_dm_index_now = dm_index;
         }
         /* main_is_conversation(), not just the DM index: the RichEdit already
          * hid itself under the Files/Pins/About tabs and search, but the box,
@@ -22476,7 +22461,6 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
         float ch = UIS(56) + vh + UIS(52) + UIS(60) + orow;
         if (ch > H - 40) { vh -= ch - (H - 40); ch = H - 40; }
         rectf card = rf((W - cw) / 2, (H - ch) / 2, (W + cw) / 2, (H + ch) / 2);
-        g_vm_card = card;
         fill_round(rt, card, OC_R_OVERLAY, OC_COL_BASE);
         stroke_round(rt, card, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
         draw_text(rt, g_rec_phase == REC_REVIEW ? "Review your video message" : "Record a video message",
@@ -22678,7 +22662,6 @@ static void draw_video_overlay(gfx *rt, const oc_model *m, float W, float H) {
     }
 
     /* The player. */
-    g_vm_card = rf(0, 0, W, H);
     float bar = UIS(52);
     rectf vbox = rf(UIS(40), UIS(48), W - UIS(40), H - bar - UIS(16));
     g_vm_close = rf(W - UIS(48), UIS(10), W - UIS(16), UIS(40));
@@ -25939,7 +25922,7 @@ static void boot_book_cb(void *ctx, const char *workspace, const char *label,
  * process, no window, no error, indistinguishable from a client that failed to
  * start at all. */
 /* How many clients connect_start has started this process. Observable by the
- * harness (scripts/gui_startup.sh, via test_dump): a startup given a workspace
+ * harness (scripts/gui/startup.sh, via test_dump): a startup given a workspace
  * starts exactly one, and a second is the defect where two net threads shared a
  * workspace, each authenticating, with the first orphaned. */
 static int g_clients_started;
@@ -28442,7 +28425,7 @@ static void test_dump(const char *path) {
      * a person, and 500 names is not read by anyone. */
     /* The accessibility surface (ARCH-99). `avail` is whether the UIA entry
      * points resolved at all; `items` is what the last paint described. Neither
-     * proves a client can SEE the tree — scripts/uia_probe.ps1 does that, from
+     * proves a client can SEE the tree — scripts/gui/uia_probe.ps1 does that, from
      * outside the process — but a zero here localises the failure to this side. */
     fprintf(f, "unres seq=%u n=%u can_add=%u priv=%u names=\"%s\"\n",
             m->unresolved.seq, (unsigned)m->unresolved.n_peers,
@@ -28700,7 +28683,7 @@ static void test_dump(const char *path) {
                 g_preview_wait_ms, g_form_action_busy);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
-    /* How the client started (scripts/gui_startup.sh). `visible` is whether the
+    /* How the client started (scripts/gui/startup.sh). `visible` is whether the
      * window is on screen at all -- a client that started and showed nothing
      * looked, from here, exactly like one that never started. `started` counts
      * clients connect_start began, and `si_err` is the reason the sign-in view
@@ -29081,7 +29064,7 @@ static void test_dump(const char *path) {
             if (!sb[i].w) { fprintf(f, "searchbox %s made=0\n", sb[i].name); continue; }
             rectf er = sb[i].w->box;
             /* The fields are drawn with the UI format: its face and size are
-             * what the harness compares across the boxes (gui_search_boxes.sh). */
+             * what the harness compares across the boxes (scripts/gui/search_boxes.sh). */
             fprintf(f, "searchbox %s made=1 vis=%d uifont=1 lf=%d face=\"%s\" lh=%d "
                        "edit=%d,%d,%d,%d box=%d,%d,%d,%d text=\"%s\"\n",
                     sb[i].name, sb[i].w->visible ? 1 : 0, PX(UIS(FONT_UI * g_text_scale)), ui_family(), PX(UIS(18.0f)),
@@ -30266,10 +30249,12 @@ static void test_poll(oc_win *hwnd) {
         /* Passing NULL IS the test: this hook exists to prove the crash
          * handler catches an invalid-parameter fault. The null goes through a
          * volatile pointer so the call is still the one being tested but the
-         * compiler can no longer prove the argument is null and warn about it
-         * -- a diagnostic that is correct about the code and wrong about the
-         * intent. A pragma cannot go here: it would split the else-if chain. */
-        else if (!strcmp(arg, "badparam")) { const char *volatile nofmt = NULL; printf(nofmt); }
+         * compiler can no longer prove the argument is null, and the call goes
+         * through a plain function pointer, which carries no format attribute
+         * for clang's -Wformat-security to check -- diagnostics that are
+         * correct about the code and wrong about the intent. A pragma cannot
+         * go here: it would split the else-if chain. */
+        else if (!strcmp(arg, "badparam")) { const char *volatile nofmt = NULL; int (*volatile pf)(const char *, ...) = printf; pf(nofmt); }
         else if (!strcmp(arg, "fastfail")) { crash_fastfail(); }
         else if (!strcmp(arg, "kill"))     { _Exit(3); }
     } else if (!strcmp(verb, "mute")) {
@@ -30764,7 +30749,6 @@ static void fields_create(void) {
 /* The tick (every TICK_MS): every client is ticked, the model is read, and
  * whatever changed is asked to paint. */
 static int on_tick(oc_win *hwnd) {
-    if (hwnd && hwnd->sdl) g_win_focused = (SDL_GetWindowFlags(hwnd->sdl) & SDL_WINDOW_INPUT_FOCUS) != 0;
         {
             /* Every workspace is ticked, not just the one on screen — that is
              * the whole point of multi-workspace. A background workspace drains its
@@ -32594,10 +32578,10 @@ static void on_event(const SDL_Event *e) {
         }
         return;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
-        if (win == hwnd) { g_win_focused = 1; on_focus_gained(hwnd); }
+        if (win == hwnd) on_focus_gained(hwnd);
         return;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
-        if (win == hwnd) { g_win_focused = 0; on_focus_lost(hwnd); }
+        if (win == hwnd) on_focus_lost(hwnd);
         return;
     case SDL_EVENT_WINDOW_MINIMIZED:
         /* MINIMISE CAN HIDE TOO, when asked. Separate from the close setting

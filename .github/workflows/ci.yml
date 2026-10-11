@@ -10,15 +10,19 @@ name: ci
 #                  compiler), and the suites that run no threads.
 #   - thread-sanitizer: the suites whose code runs threads, under
 #                  ThreadSanitizer -- their one run in CI.
-#   - windows:     mingw cross-compile of the Windows front-ends (TUI + the
-#                  SDL3/sdltext GUI, ARCH-80/106/107). Build breaks only.
+#   - windows:     the Windows front-ends (TUI + the SDL3/sdltext GUI,
+#                  ARCH-80/106/107) cross-compiled with the pinned llvm-mingw.
+#                  Build breaks only.
 #
 # Each suite runs once: the threaded ones under the sanitizer, the rest plainly
-# (the Makefile's TSAN_SUITES). Every vendored library is cached by the script
-# that builds it. What the release checks itself -- read-aloud and voice input
-# on the stripped binary and the installed package -- is not repeated here.
+# (the Makefile's TSAN_SUITES). Every vendored library and toolchain is fetched
+# pinned by the script that builds it (mk/toolchains.mk) and cached by that
+# script's hash; nothing is installed from a package the day decides. One
+# runner image everywhere, ubuntu-24.04, the same one the release builds on.
+# What the release checks itself -- read-aloud and voice input on the stripped
+# binary and the installed package -- is not repeated here.
 #
-# There is deliberately no GUI job. scripts/gui_smoke.sh needs a Windows host for
+# There is deliberately no GUI job. scripts/gui/smoke.sh needs a Windows host for
 # the client and a Linux one for the epoll-based daemon at the same time, which no
 # hosted runner provides; a job was carried here for a self-hosted box gated on
 # vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
@@ -56,7 +60,7 @@ concurrency:
 jobs:
   build:
     name: build + unit tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -78,11 +82,22 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
-          # bzip2 for the vendored mbedTLS
-          # tarball that `make test` builds via scripts/build_mbedtls.sh; nasm
-          # for libvpx's assembly (scripts/build_libvpx.sh). gdb so that a test
-          # binary that crashes prints every thread's stack (tests/main.c).
-          sudo apt-get install -y --no-install-recommends bzip2 nasm gdb
+          # bzip2 for the vendored mbedTLS tarball that `make` builds via
+          # scripts/build/mbedtls.sh; nasm for libvpx's assembly
+          # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
+          # so that a test binary that crashes prints every thread's stack
+          # (tests/main.c). cmake, curl, git and python3 are on the image.
+          sudo apt-get install -y --no-install-recommends bzip2 nasm gdb xz-utils
+      # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
+      # release-compiler pass, Emscripten for the web client the daemon embeds.
+      # Keyed by the scripts, which pin the versions and the checksums.
+      - name: Restore the toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/zig-0.13.0
+            third_party/emsdk-6.0.8
+          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
       # Read-aloud's engine and model (ARCH-111): ONNX Runtime built minimal and
       # static from source (about 20 minutes), the converted voice model, and
       # voice input's recognizer files (ARCH-112). All are pure functions of the
@@ -95,7 +110,7 @@ jobs:
             third_party/onnxruntime-1.30.0
             build/kitten
             build/moonshine
-          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build_kitten.sh', 'scripts/tts_convert.c', 'scripts/build_moonshine.sh') }}
+          key: tts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build/onnxruntime.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
       # The vendored native libraries: each script builds only what is missing,
       # so a hit skips the download and the build. Keyed by the scripts, which pin
       # the versions and checksums, and by the compiler that builds them.
@@ -108,16 +123,10 @@ jobs:
             third_party/opus-1.6.1
             third_party/speexdsp-1.2.1
             third_party/llamacpp-0.5.0
-          key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_llamacpp.sh') }}
-      # The web client's toolchain (docs/WEB.md): the daemon is never built
-      # without the client it serves -- the page and loader are compiled into it
-      # (daemon/webapp.h), so `make` needs emcc. The two wasm libraries are built
-      # once by their scripts and cached, keyed by the scripts and the emsdk.
-      - name: Install Emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: 6.0.8
-          actions-cache-folder: emsdk-cache
+          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/llamacpp.sh') }}
+      # The web client's libraries (docs/WEB.md): the release daemon carries the
+      # client (WEB=1), so this job builds it too. Built once by their scripts
+      # and cached, keyed by the scripts and the pinned Emscripten.
       - name: Restore the wasm libraries
         uses: actions/cache@v6
         with:
@@ -127,9 +136,11 @@ jobs:
             build/wasm/libvpx
             build/wasm/opus
             build/wasm/speexdsp
-          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build_mbedtls_wasm.sh', 'scripts/build_sdl3_wasm.sh', 'scripts/build_media_wasm.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
-      - name: Build the daemon and the e2e client
-        run: make && make build/e2e_client
+          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # The daemon as the release builds it (every feature, the web client in),
+      # the e2e client the step below drives, and the Linux terminal client.
+      - name: Build the daemon, the e2e client and the terminal client
+        run: make TTS=1 STT=1 SUM=1 WEB=1 && make build/e2e_client linux
       # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
       # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
       # appearing here is a dependency that crept back in.
@@ -174,26 +185,11 @@ jobs:
       # declaration after a label each passed gcc and broke a release. Every
       # Linux translation unit -- the daemon's, the client's and the tests' --
       # goes through that exact compiler under -Werror, which is the tree's
-      # second-compiler check too. Zig is cached under the home directory.
-      - name: Restore the release's compiler
-        uses: actions/cache@v6
-        with:
-          path: ~/zig
-          key: zig-0.13.0-linux-x86_64
+      # second-compiler check too. make fetches the pinned zig.
       - name: Everything compiles with the release's compiler
-        env:
-          ZIG_VERSION: '0.13.0'
-          ZIG_SHA: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
-        run: |
-          set -euo pipefail
-          if [ ! -x "$HOME/zig/zig" ]; then
-            curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
-            echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c -
-            mkdir -p "$HOME/zig" && tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
-          fi
-          make check-release-cc RELEASE_CC="$HOME/zig/zig cc -target x86_64-linux-gnu.2.34"
+        run: make check-release-cc
       # The suites that run no threads; the others run under the sanitizer in
-      # its own job. check-opcodes and check-refs are its prerequisites.
+      # its own job. its recipe runs the opcode and issue-reference checks first.
       - name: Run the suites the sanitizer does not
         run: make test-ci PART=plain
 
@@ -205,7 +201,7 @@ jobs:
     # runs threads (the Makefile's TSAN_SUITES) under ThreadSanitizer, and a data
     # race between our threads fails it (tests/tsan.supp). This is those
     # suites' only run in CI.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -233,42 +229,19 @@ jobs:
             third_party/libvpx-1.17.0
             third_party/opus-1.6.1
             third_party/speexdsp-1.2.1
-          key: vendor-ubuntu-22.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
-      # The web client's toolchain (docs/WEB.md): the daemon is never built
-      # without the client it serves -- the page and loader are compiled into it
-      # (daemon/webapp.h), so `make` needs emcc. The two wasm libraries are built
-      # once by their scripts and cached, keyed by the scripts and the emsdk.
-      - name: Install Emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: 6.0.8
-          actions-cache-folder: emsdk-cache
-      - name: Restore the wasm libraries
-        uses: actions/cache@v6
-        with:
-          path: |
-            build/wasm/mbedtls
-            build/wasm/sdl3
-            build/wasm/libvpx
-            build/wasm/opus
-            build/wasm/speexdsp
-          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build_mbedtls_wasm.sh', 'scripts/build_sdl3_wasm.sh', 'scripts/build_media_wasm.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh') }}
+          key: vendor-${{ runner.os }}-24.04-${{ runner.arch }}-gcc-${{ hashFiles('scripts/build/mbedtls.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
+      # The test binary needs no Emscripten: the web client's page is embedded
+      # from source and its loader only into a daemon built with WEB=1.
       - name: Test under ThreadSanitizer
         run: make test-ci PART=threads
 
   windows:
     name: windows cross-compile (TUI + GUI)
-    # 24.04, not 22.04: the older runner's mingw-w64 headers declare
-    # IRawElementProviderSimple but not the fragment/text interfaces, so the UIA
-    # provider (ARCH-99) compiled to its stub and CI proved nothing about the
-    # code that actually ships.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      # mingw-w64 for the cross-compile; bzip2 + curl for the vendored mbedTLS
-      # tarball that build_mbedtls_windows.sh fetches and cross-builds.
-      - name: Install cross toolchain
+      - name: Install build deps
         run: |
           # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
@@ -286,13 +259,17 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
-          # g++-mingw-w64-x86-64 solely for the SDL3 cross-build: SDL's
-          # Windows branch enables CXX unconditionally (see
-          # scripts/build_sdl3_windows.sh). Nothing of ours compiles as C++.
-          sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 bzip2 curl nasm
+          # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
+          # for the toolchain tarball. The compiler is not a package: make
+          # fetches the pinned llvm-mingw (scripts/build/llvm_mingw.sh).
+          sudo apt-get install -y --no-install-recommends bzip2 nasm xz-utils
+      - name: Restore the toolchain
+        uses: actions/cache@v6
+        with:
+          path: third_party/llvm-mingw-20261006
+          key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
       # The cross-built libraries and SDL3, cached like the native ones: each
-      # script builds only what is missing.
+      # script builds only what is missing, and make runs each from its rule.
       - name: Restore the vendored Windows libraries
         uses: actions/cache@v6
         with:
@@ -303,24 +280,10 @@ jobs:
             third_party/speexdsp-1.2.1-win
             third_party/sdl3-3.4.14-win
             third_party/mbedtls-3.6.2
-          key: vendor-win-ubuntu-24.04-${{ hashFiles('scripts/build_mbedtls.sh', 'scripts/build_mbedtls_windows.sh', 'scripts/build_libvpx.sh', 'scripts/build_opus.sh', 'scripts/build_speexdsp.sh', 'scripts/build_sdl3_windows.sh') }}
-      - name: Cross-build the vendored Windows mbedTLS
-        run: scripts/build_mbedtls_windows.sh
-      # libvpx and libopus for the Win32 client's video messages (ARCH-110).
-      # speexdsp for voice input's echo canceller (ARCH-112).
-      - name: Cross-build the vendored Windows libvpx, libopus and speexdsp
-        run: scripts/build_libvpx.sh windows && scripts/build_opus.sh windows && scripts/build_speexdsp.sh windows
-      # cmake is preinstalled on the hosted runners; SDL's own build is CMake,
-      # invoked by the fetch script (VENDORS.md §2).
-      - name: Cross-build the vendored Windows SDL3
-        run: scripts/build_sdl3_windows.sh
+          key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
       # Both Windows front-ends share the app-core + shared wire code; a clean
       # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
-      # builds under mingw.
-      - name: Compile the Windows front-ends
-        run: make windows-tui windows-gui
-      # This runner's gcc is newer than the build job's, and at -O2 it raises
-      # warnings (format-truncation among them) that gcc 11 and clang do not,
-      # so the Linux terminal client is built here too.
-      - name: The terminal client builds with this runner's gcc
-        run: gcc --version | head -1 && make tui
+      # builds under clang's mingw. The two Windows test programs are built
+      # too (a Windows host runs them, docs/TESTING.md).
+      - name: Compile the Windows front-ends and test programs
+        run: make windows build/sdltext_test.exe build/gfx_test.exe

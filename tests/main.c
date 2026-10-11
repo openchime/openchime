@@ -3,7 +3,7 @@
  * and exposes a run_<suite>_tests() returning its failure count. Built by
  * `make test`; a non-zero total exits non-zero and fails CI. In-process
  * integration suites (TLS, event loop) live here too; the black-box,
- * container-level end-to-end tests are separate (Scripts/test-integration.sh). */
+ * the end-to-end run against a real daemon is the build job of ci.yml. */
 
 #include <stddef.h>
 #include <stdio.h>

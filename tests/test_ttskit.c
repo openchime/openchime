@@ -18,7 +18,7 @@
 #define DATA "ttskit/data/en-US"
 #define LANG "en-US"
 
-/* The committed data files. Regenerating them (scripts/build_ttskit_data.sh)
+/* The committed data files. Regenerating them (scripts/build/ttskit_data.sh)
  * changes these, the reference output below and TTSKIT.md §8 together. */
 static const char *LEXICON_SHA256 = "b1338cd8ae4d22c8b8a808e4c1fa1879579acbd3157556488d9f43ba5b559bf7";
 static const char *GUESSES_SHA256 = "51cf60b34b3f23a12a33bb5d5c4a239f92966e5a92e38ee0a649b2df43e0794e";
