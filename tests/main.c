@@ -64,6 +64,7 @@ int run_stt_tests(void);
 int run_voice_tests(void);
 int run_unfurl_tests(void);
 int run_sdltext_map_tests(void);
+int run_sdltext_unicode_tests(void);
 int run_theme_tests(void);
 int run_e2e_tests(void);
 int run_call_media_tests(void);
@@ -276,6 +277,7 @@ static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
     S(run_voice_tests),
     S(run_unfurl_tests),
     S(run_sdltext_map_tests),
+    S(run_sdltext_unicode_tests),
     S(run_theme_tests),
     S(run_e2e_tests),
     S(run_call_media_tests),

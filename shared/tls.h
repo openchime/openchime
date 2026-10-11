@@ -123,6 +123,10 @@ typedef struct {
     /* client: verification is the caller's to judge after the handshake
      * (oc_tls_conn_defer_verify); `ip_ok` is the address check's answer. */
     int                 defer, ip_ok;
+    /* No TLS at all (oc_tls_conn_init_plain): the bytes go to the socket as
+     * they are. For a transport that is secured underneath -- the browser's
+     * WebSocket over HTTPS -- where a second TLS would only cost. */
+    int                 plain;
 } oc_tls_conn;
 
 /* Load the cert+key from the given PEM paths, generating a self-signed pair
@@ -193,6 +197,11 @@ void oc_tls_client_free(oc_tls_client *c);
 /* Set up a connection object. `endpoint` is MBEDTLS_SSL_IS_SERVER or
  * MBEDTLS_SSL_IS_CLIENT and must match `conf`. Returns 0 on success. */
 int  oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd);
+/* A connection with no TLS: the handshake is nothing, reads and writes are the
+ * socket's, there is no peer certificate and the ALPN reads as oc/1. Every other
+ * call on it is a no-op. For a wire that is already secured (the browser
+ * client's WebSocket, CLIENT.md §4). Returns 0. */
+int  oc_tls_conn_init_plain(oc_tls_conn *c, int fd);
 /* Set the expected peer hostname: sends SNI and, under CA verification, makes
  * the certificate's name actually get checked. Call before the handshake. An IP
  * address (IPv4, or IPv6 with or without brackets) is not a hostname: it is sent

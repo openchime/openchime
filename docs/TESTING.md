@@ -667,6 +667,47 @@ works. Nothing proves the shipped *image* works (§3.2).
   the loop stops nothing answers the health port. The webhook post itself is
   `test_webhook_vertical`, unchanged.
 
+### 3.4 The web client (`make web-test`, local)
+
+The browser build (WEB.md) has two checks, run where Emscripten and a Chromium
+are present (a developer's box today; a CI job once the runner has them):
+
+- **`make web-gfx-test`** — the gfx backend's own pixel test
+  (`client/gui/gfx/gfx_test_win.c`) compiled to wasm over the SDL3 built for
+  it, run under Node with SDL's dummy video driver: the same assertions as the
+  Windows run, exit code the failure count.
+- **`scripts/webtest.sh`** — a daemon on a fresh database with one bootstrapped
+  owner, the built page served with the two cross-origin-isolation headers
+  wasm threads need (`scripts/webdev.py`), and a headless Chromium loading it.
+  The page's core connects through the WebSocket transport, signs in with the
+  password and receives the channel list; the test reads `oc-web: signed in`
+  and the channel count from the browser's console log and fails on anything
+  else within thirty seconds. Then the client itself (`openchime.html`, the
+  Windows application compiled for the browser) is loaded the same way; the
+  page polls its test hook until the model reads `authed=1 connected=1` and
+  takes the client's own screenshot (`shot`, through `gfx_readback` as on
+  Windows), which is left in `build/webtest/gui.bmp` beside the daemon log and
+  the browser logs.
+
+  Then a video message is recorded through the client's own `vm` verbs with
+  the synthetic camera and the browser's fake microphone: the dump must show
+  the file taken (`take_bytes`) and the console that the audio ran on the
+  worklet (`oc-web: audio worklet`, not the fallback), and the client's
+  `sttest` verb must pass: the text layer's right-to-left order, cluster
+  hit-testing and line breaking through the API the views use. Last, a Japanese
+  composition is played into the page's hidden input for the input method
+  (`?ime=1`) and the composer must hold its result.
+- **`make web-harness`** — the Windows feature scripts against the browser
+  ("Driving the web client" below): the smoke, voice input, screen recording,
+  uploads, files, the two call scripts and the search boxes, each on its own
+  fixture daemon, each printing its `OK — N checks` line. The checks are the
+  Windows scripts' own; what is the Windows platform's alone (UI Automation,
+  its windows, the clipboard set from PowerShell) is skipped there.
+
+The WebSocket transport itself is covered natively, in `itest_netloop`'s HTTP
+stack scenario: the upgrade's accept value and echoed subprotocol, HELLO's
+answer in frames, a ping's pong, and an unmasked frame ending the connection.
+
 ---
 
 ## 4. Continuous integration
@@ -1103,6 +1144,41 @@ x86_64-w64-mingw32-addr2line -e build/openchime.debug -f -C -i "$va"
 
 Keep the `.debug` file for any binary handed to somebody else; without it a
 minidump from that build resolves to nothing.
+
+## Driving the web client
+
+`scripts/web_drive.sh` is `gui_drive.sh` for the browser: the same
+subcommands (`launch`, `devaddr`, `<verb...>`, `shot`, `dump`, `kill`), the
+same verbs, the same ack contract (exit status 1 when the client did not
+answer), and `scripts/web_pair.sh` is `gui_pair.sh` (`up`, `a`, `b`, `down`).
+A feature script therefore runs against either client by setting
+`OC_GUI_DRIVE=scripts/web_drive.sh` (or `OC_GUI_PAIR=scripts/web_pair.sh`);
+the ported scripts carry a `PLAT` switch for the checks that are the Windows
+platform's alone. `make web-harness` runs them all.
+
+**How it drives.** `launch` builds and starts the fixture daemon as
+`gui_drive.sh` does (`OC_DEV_PORT`, `OC_DEV_DIR`, `OC_DEV_WS`,
+`OC_DEV_USERS`; the health port off), then starts `scripts/web_drive.mjs`: a
+Node process holding a headless Chromium on the daemon's own `/app/` page,
+signed in with the password quick-launch and the test hook on. The shell side
+writes the verb to `$OC_DEV_DIR/web-<a|b>/cmd` and waits for `ack`, as it
+does with the Windows client's scratch directory; the Node side relays the
+verb to the page's hook, takes a `dump` or `shot` back out of the page's
+filesystem into that directory, and copies an `attach`ed file onto the page
+first so the verb names a path the client can read. The browser runs with
+Chromium's fake camera and microphone, its own permission prompts answered,
+its screen picker choosing the screen; `OPENCHIME_TEST_AUDIO`, `_MIC`,
+`_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a
+`_MIC` WAV is served to it. Needs `node`, the `playwright-core` package
+(`package.json`; `launch` installs it) and a Chromium (`CHROME`, else
+Playwright's download).
+
+**What the ports skip in a browser**, by `PLAT`: UI Automation (`uia_*.ps1`),
+the recording bar's own window and its capture exclusion, a window as a
+recording source (the browser's picker is its own), the clipboard set from
+PowerShell, and the tray's notification counters. Everything else -- the
+dumps, the verbs, the media checks down to the tones in the recorded file --
+is the same code.
 
 ## Driving the Win32 GUI
 

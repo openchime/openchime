@@ -728,6 +728,8 @@ void st_draw(st_ctx *c, st_layout *l, float x, float y, uint32_t rgb,
     }
 }
 
+int st_family_present(st_ctx *c, const char *family) { return st_dwrite_family_present(c, family); }
+
 int st_dwrite_family_present(st_ctx *c, const char *family)
 {
     WCHAR *fam = st__wide(family, strlen(family));

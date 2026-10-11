@@ -2585,6 +2585,15 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
  * passkeys key on; otherwise `lb`'s tunnel, carrying the pages to the very
  * certificate this client accepted. -1 before any connection got that far. */
 static int page_url(oc_net *n, oc_loopback *lb, const char *path, char *out, size_t cap) {
+#ifdef __EMSCRIPTEN__
+    /* The web client is served by the daemon whose pages these are (WEB.md):
+     * the page's own origin, which the browser judged. */
+    (void)n;
+    char base[300];
+    if (!lb || oc_loopback_tunnel_base(lb, base, sizeof base) != 0) return -1;
+    int wb = snprintf(out, cap, "%s%s", base, path);
+    return wb < 0 || (size_t)wb >= cap ? -1 : 0;
+#endif
     oc_mutex_lock(&n->accept_mu);
     int have = n->accepted, ca = n->accepted_ca;
     oc_tunnel_target t;
@@ -2801,11 +2810,21 @@ static int run_connection(oc_net *n, int reconnecting,
      * is applied. Multiple oc_clients in one process (the headless test) set up
      * TLS concurrently; safe because the vendored mbedTLS is built with
      * MBEDTLS_THREADING. */
+#ifdef __EMSCRIPTEN__
+    /* The browser client (CLIENT.md §4): the socket is a WebSocket the page
+     * opened over HTTPS, so the wire is secured and judged by the browser, and
+     * the connection carries the protocol in the clear inside it. There is no
+     * certificate here to pin. */
+    memset(&cli, 0, sizeof cli);
+    (void)cert_judge;
+    if (oc_tls_conn_init_plain(&conn, fd) != 0) { oc_closesock(fd); return RC_LOST; }
+#else
     if (oc_tls_client_init_verify(&cli, NULL) != 0 ||
         oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
     }
     oc_tls_conn_defer_verify(&conn);
+#endif
     /* Resume the last session if the daemon still takes its ticket: a reconnect
      * then skips the certificate and signature of a full handshake. The ticket
      * came from a connection that passed the same pin check. */
@@ -2826,10 +2845,12 @@ static int run_connection(oc_net *n, int reconnecting,
         oc_tls_session_free(&n->resume);   /* the next attempt starts from nothing */
         goto drop;
     }
+#ifndef __EMSCRIPTEN__
     {
         int judged = cert_judge(n, cs, &conn);
         if (judged != 0) { rc = judged; oc_tls_session_free(&n->resume); goto drop; }
     }
+#endif
 
     /* HELLO -> WELCOME */
     {
@@ -2940,6 +2961,11 @@ static int run_connection(oc_net *n, int reconnecting,
                 push_err(n->to_ui, "could not start a browser sign-in on this computer");
                 rc = RC_FATAL; goto drop;
             }
+#ifdef __EMSCRIPTEN__
+            /* The browser leaves this page for the sign-in and comes back to
+             * a new one, which resumes with these (signin_web.c). */
+            oc_signin_stash(n->source_id, n->verifier);
+#endif
             uint8_t bb[512]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
             oc_auth_begin ab = { oc_slice_str(n->source_id), oc_slice_str(redirect),
                                  oc_slice_str(challenge) };
@@ -4183,7 +4209,8 @@ oc_net *oc_net_start_verified(const char *workspace_key, const char *host, int p
 
 static oc_net *net_start(const char *workspace_key, const char *host, int port,
                          const char *token, const char *source_id, const char *invite, int device,
-                         int reset, const char *store_path, oc_secret *secret,
+                         int reset, const oc_signin_result *result,
+                         const char *store_path, oc_secret *secret,
                          int pin_only, const unsigned char *published_pin,
                          oc_queue *to_ui, oc_queue *from_ui);
 
@@ -4192,15 +4219,25 @@ oc_net *oc_net_start_signin(const char *workspace_key, const char *host, int por
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui) {
-    return net_start(workspace_key, host, port, token, source_id, invite, 0, 0, store_path, secret, pin_only,
+    return net_start(workspace_key, host, port, token, source_id, invite, 0, 0, NULL, store_path, secret, pin_only,
                      published_pin, to_ui, from_ui);
+}
+
+oc_net *oc_net_start_signin_result(const char *workspace_key, const char *host, int port,
+                                   const oc_signin_result *result,
+                                   const char *store_path, oc_secret *secret,
+                                   int pin_only, const unsigned char *published_pin,
+                                   oc_queue *to_ui, oc_queue *from_ui) {
+    if (!result || !result->token || !result->token[0] || !result->verifier || !result->source_id) return NULL;
+    return net_start(workspace_key, host, port, "", result->source_id, NULL, 0, 0, result, store_path, secret,
+                     pin_only, published_pin, to_ui, from_ui);
 }
 
 oc_net *oc_net_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
                            const char *store_path, oc_secret *secret,
                            int pin_only, const unsigned char *published_pin,
                            oc_queue *to_ui, oc_queue *from_ui) {
-    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, store_path, secret,
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, NULL, store_path, secret,
                      pin_only, published_pin, to_ui, from_ui);
 }
 
@@ -4208,13 +4245,14 @@ oc_net *oc_net_start_device(const char *workspace_key, const char *host, int por
                             const char *store_path, oc_secret *secret,
                             int pin_only, const unsigned char *published_pin,
                             oc_queue *to_ui, oc_queue *from_ui) {
-    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, store_path, secret, pin_only,
+    return net_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, NULL, store_path, secret, pin_only,
                      published_pin, to_ui, from_ui);
 }
 
 static oc_net *net_start(const char *workspace_key, const char *host, int port,
                          const char *token, const char *source_id, const char *invite, int device,
-                         int reset, const char *store_path, oc_secret *secret,
+                         int reset, const oc_signin_result *result,
+                         const char *store_path, oc_secret *secret,
                          int pin_only, const unsigned char *published_pin,
                          oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
@@ -4230,6 +4268,14 @@ static oc_net *net_start(const char *workspace_key, const char *host, int port,
     snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
     n->port = port;
     n->token = token ? strdup(token) : NULL;
+    if (result) {
+        /* Resuming a browser sign-in: the token is presented on the first
+         * connection, with what the sign-in began with. */
+        snprintf(n->source_id, sizeof n->source_id, "%s", result->source_id);
+        snprintf(n->verifier, sizeof n->verifier, "%s", result->verifier);
+        if (result->state) snprintf(n->oidc_state, sizeof n->oidc_state, "%s", result->state);
+        n->oidc_token = strdup(result->token);
+    }
     n->store_path = (store_path && store_path[0]) ? strdup(store_path) : NULL;
     n->secret = secret;
     snprintf(n->client_type, sizeof n->client_type, "%s", "tui");

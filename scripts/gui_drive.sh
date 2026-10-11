@@ -198,9 +198,8 @@ esac
 if [ "$1" = "shot" ] && [ $# -eq 2 ]; then
   name="$2"; cmd="shot ${WIN_DIR}\\${name}.bmp"
 elif [ "$1" = "shotfull" ] && [ $# -eq 2 ]; then
-  # The whole window, native children included (PrintWindow/DWM). Use this by
-  # default: `shot` re-renders the D2D scene only and cannot see the composer,
-  # the find/search boxes, the sign-in fields or the emoji picker.
+  # Kept as an alias of `shot`: every field is drawn now, so the scene the
+  # renderer holds is the whole application.
   name="$2"; cmd="shotfull ${WIN_DIR}\\${name}.bmp"
 elif [ "$1" = "dump" ] && [ $# -eq 2 ]; then
   # Same convenience as `shot`. Without it a bare name is written relative to the

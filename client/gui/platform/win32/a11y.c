@@ -42,6 +42,8 @@
 #include <wctype.h>   /* towlower — FindText's ignore-case */
 
 #include "a11y.h"
+#include "a11y_win32.h"
+#include "platform.h"
 
 /* An older mingw-w64 (the ubuntu-22.04 runner shipped one) declares
  * IRawElementProviderSimple but not the fragment/text interfaces. Rather than
@@ -50,7 +52,7 @@
  * the real path is the one actually compiled (see .github/workflows/ci.yml). */
 #ifndef __IRawElementProviderFragment_INTERFACE_DEFINED__
 #warning "UIA provider interfaces missing from this toolchain - accessibility disabled"
-void oc_a11y_init(HWND hwnd) { (void)hwnd; }
+void oc_a11y_init(SDL_Window *w) { (void)w; }
 void oc_a11y_shutdown(void) { }
 int  oc_a11y_available(void) { return 0; }
 LRESULT oc_a11y_get_object(HWND h, WPARAM w, LPARAM l, int *handled) {
@@ -508,8 +510,8 @@ static acc_el *el_new(int idx) {
 
 /* ---- public surface -------------------------------------------------------- */
 
-void oc_a11y_init(HWND hwnd) {
-    g_hwnd = hwnd;
+void oc_a11y_init(SDL_Window *w) {
+    g_hwnd = w ? (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(w), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL) : NULL;
     if (!g_lock_ready) { InitializeCriticalSection(&g_lock); g_lock_ready = 1; }
     HMODULE m = LoadLibraryW(L"UIAutomationCore.dll");
     if (!m) return;
@@ -545,7 +547,7 @@ LRESULT oc_a11y_get_object(HWND hwnd, WPARAM wp, LPARAM lp, int *handled) {
 }
 
 void oc_a11y_publish(const oc_acc_item *items, int n,
-                     const WCHAR *composer, int caret, int anchor) {
+                     const uint16_t *composer, int caret, int anchor) {
     if (!g_lock_ready) return;
     if (n < 0) n = 0;
     if (n > OC_ACC_MAX) n = OC_ACC_MAX;
@@ -554,7 +556,7 @@ void oc_a11y_publish(const oc_acc_item *items, int n,
     g_n_items = n;
     g_comp_len = 0; g_comp[0] = 0;
     if (composer) {
-        int L = (int)wcsnlen(composer, (sizeof g_comp / sizeof g_comp[0]) - 1);
+        int L = 0; while (composer[L] && L < (int)(sizeof g_comp / sizeof g_comp[0]) - 1) L++;
         memcpy(g_comp, composer, (size_t)L * sizeof(WCHAR));
         g_comp[L] = 0; g_comp_len = L;
     }
@@ -1101,7 +1103,10 @@ static HRESULT STDMETHODCALLTYPE ivp_Invoke(IInvokeProvider *t) {
     if (e->idx >= 0 && e->idx < g_n_items) tok = g_items[e->idx].invoke;
     LeaveCriticalSection(&g_lock);
     if (!tok || !g_hwnd) return UIA_E_INVALIDOPERATION;
-    PostMessageW(g_hwnd, OC_WM_A11Y_INVOKE, (WPARAM)(tok >> 32), (LPARAM)(tok & 0xFFFFFFFFu));
+    {   SDL_Event e; memset(&e, 0, sizeof e);
+        e.type = oc_plat_event_type(); e.user.code = OC_PLAT_EV_A11Y_INVOKE;
+        e.user.data1 = (void *)(uintptr_t)(tok >> 32); e.user.data2 = (void *)(uintptr_t)(tok & 0xFFFFFFFFu);
+        SDL_PushEvent(&e); }
     return S_OK;
 }
 static IInvokeProviderVtbl g_ivvt = {

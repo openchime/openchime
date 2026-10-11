@@ -144,11 +144,11 @@ static void test_head_fields(void) {
 
 static void test_router(void) {
     static const oc_http_route R[] = {
-        { "POST", "/webhook/", 1, OC_HTTP_LOOP,   64, NULL, NULL, 0 },
-        { "GET",  "/page",     0, OC_HTTP_STATIC, 0, "text/plain", "p", 1 },
-        { NULL,   "/any",      0, OC_HTTP_STATIC, 0, "text/plain", "a", 1 },
+        { "POST", "/webhook/", 1, OC_HTTP_LOOP,   64, NULL, NULL, 0, NULL },
+        { "GET",  "/page",     0, OC_HTTP_STATIC, 0, "text/plain", "p", 1, NULL },
+        { NULL,   "/any",      0, OC_HTTP_STATIC, 0, "text/plain", "a", 1, NULL },
     };
-    static const oc_http_route FB = { NULL, "/", 1, OC_HTTP_STATIC, 0, "text/html", "f", 1 };
+    static const oc_http_route FB = { NULL, "/", 1, OC_HTTP_STATIC, 0, "text/html", "f", 1, NULL };
     oc_http_site site = { R, 3, NULL }, site_fb = { R, 3, &FB };
     oc_http_req req;
     int st = 0;

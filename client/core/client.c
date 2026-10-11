@@ -71,13 +71,14 @@ oc_client *oc_client_start_verified(const char *workspace_key, const char *host,
 
 static oc_client *client_start(const char *workspace_key, const char *host, int port,
                                const char *cred, const char *source_id, const char *invite, int device,
-                               int reset, const char *store_path, oc_secret *secret,
+                               int reset, const oc_signin_result *result,
+                               const char *store_path, oc_secret *secret,
                                int remember, const char *published_fingerprint);
 
 oc_client *oc_client_start_device(const char *workspace_key, const char *host, int port,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint) {
-    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, store_path, secret,
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, NULL, 1, 0, NULL, store_path, secret,
                         remember, published_fingerprint);
 }
 
@@ -85,20 +86,29 @@ oc_client *oc_client_start_signin(const char *workspace_key, const char *host, i
                                   const char *cred, const char *source_id, const char *invite,
                                   const char *store_path, oc_secret *secret,
                                   int remember, const char *published_fingerprint) {
-    return client_start(workspace_key, host, port, cred, source_id, invite, 0, 0, store_path, secret,
+    return client_start(workspace_key, host, port, cred, source_id, invite, 0, 0, NULL, store_path, secret,
                         remember, published_fingerprint);
+}
+
+oc_client *oc_client_start_signin_result(const char *workspace_key, const char *host, int port,
+                                         const oc_signin_result *result,
+                                         const char *store_path, oc_secret *secret,
+                                         int remember, const char *published_fingerprint) {
+    return client_start(workspace_key, host, port, "", result ? result->source_id : NULL, NULL, 0, 0, result,
+                        store_path, secret, remember, published_fingerprint);
 }
 
 oc_client *oc_client_start_reset(const char *workspace_key, const char *host, int port, const char *reset,
                                  const char *store_path, oc_secret *secret,
                                  int remember, const char *published_fingerprint) {
-    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, store_path, secret,
+    return client_start(workspace_key, host, port, "", OC_SOURCE_ID_LOCAL, reset, 0, 1, NULL, store_path, secret,
                         remember, published_fingerprint);
 }
 
 static oc_client *client_start(const char *workspace_key, const char *host, int port,
                                const char *cred, const char *source_id, const char *invite, int device,
-                               int reset, const char *store_path, oc_secret *secret,
+                               int reset, const oc_signin_result *result,
+                               const char *store_path, oc_secret *secret,
                                int remember, const char *published_fingerprint) {
     oc_client *c = calloc(1, sizeof *c);
     if (!c) return NULL;
@@ -114,6 +124,8 @@ static oc_client *client_start(const char *workspace_key, const char *host, int 
                                           have ? pin : NULL, &c->events, &c->cmds)
            : reset  ? oc_net_start_reset(workspace_key, host, port, invite, store_path, secret, !remember,
                                          have ? pin : NULL, &c->events, &c->cmds)
+           : result  ? oc_net_start_signin_result(workspace_key, host, port, result, store_path, secret,
+                                                 !remember, have ? pin : NULL, &c->events, &c->cmds)
                     : oc_net_start_signin(workspace_key, host, port, cred, source_id, invite, store_path, secret,
                                           !remember, have ? pin : NULL, &c->events, &c->cmds);
     if (!c->net) {

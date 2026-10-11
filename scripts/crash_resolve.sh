@@ -5,7 +5,7 @@
 #   scripts/crash_resolve.sh 0x283a9                    # just an RVA
 #
 # The client writes crash-<pid>.txt on an unhandled exception (see crash_filter in
-# winmain.c): the exception code, the faulting address, the module's load base, the
+# client/gui/platform/win32/plat_win32.c): the exception code, the faulting address, the module's load base, the
 # RVA between them, and the last 64 breadcrumbs. The RVA is the part that needs a
 # build to interpret, and it only resolves against the SAME binary that crashed —
 # rebuild in between and the answer is fiction.

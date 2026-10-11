@@ -32,8 +32,10 @@
 # reading CI.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRIVE="$HERE/scripts/gui_drive.sh"
-LIN_DIR='/mnt/c/Windows/Temp/octest'
+# The driver: the Windows client's, or the web client's with
+# OC_GUI_DRIVE=scripts/web_drive.sh (docs/TESTING.md); the verbs, the dump and
+# the checks are the same on both.
+DRIVE="${OC_GUI_DRIVE:-$HERE/scripts/gui_drive.sh}"
 START=$SECONDS
 fails=0
 checks=0
@@ -104,7 +106,7 @@ drive() {
 # One fresh dump. `ack` means the handler ran, not that its effect is painted —
 # most of the interesting fields are recorded during WM_PAINT — so nothing here
 # reads a dump once and hopes; it waits for the state it is about to assert.
-snap() { "$DRIVE" dump smoke >/dev/null 2>&1; cat "$LIN_DIR/smoke.txt" 2>/dev/null; }
+snap() { "$DRIVE" dump smoke 2>/dev/null | tail -n +2; }   # the ack line, then the dump
 
 key_of() { printf '%s' "$1" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2; }
 
@@ -174,7 +176,7 @@ case "$fixture" in
 esac
 
 # --- 2. it paints a shell you can use --------------------------------------
-# The three predicates in winmain.c, in the one view that has to work: a channel
+# The three predicates in app.c, in the one view that has to work: a channel
 # list on the left, a conversation in the middle, nothing covering the window.
 # The full seven-view matrix is the regression suite's; this asks only whether
 # the shell came up at all.

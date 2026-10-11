@@ -119,6 +119,31 @@ seconds is answered `408`; a chunked body (`Transfer-Encoding`) is refused `400`
 The `oc` version suffix (`/1`) tracks the transport-framing generation, distinct from the
 per-frame `version` field in §2.
 
+### 1.2 WebSocket transport (the browser client)
+
+A browser opens no socket of its own, so the web client (ARCH-74,
+[WEB.md](./WEB.md)) reaches the daemon through a **WebSocket** (RFC 6455)
+carrying the same frames:
+
+- **`GET /ws`** with `Upgrade: websocket`, on the TLS port (a connection that
+  negotiated `http/1.1` or no ALPN, §1.1) and on the plaintext health port
+  (ARCH-25) for a page served from the same box in development. The daemon
+  answers `101` with `Sec-WebSocket-Accept` and echoes the first subprotocol
+  offered (a browser drops a connection whose offer went unanswered; the
+  client offers `binary`).
+- From then on the connection is a protocol peer as if it had negotiated
+  `oc/1`: the handshake (§3), auth (§4) and every frame are unchanged. A
+  client's frames are **binary** and masked, as the standard requires; the
+  daemon's are binary and unmasked. The payloads of successive binary (and
+  continuation) frames form **one byte stream** of §2 frames: one WebSocket
+  message may hold several protocol frames, or part of one, and the receiver
+  reassembles as it does over TCP. A ping is answered with a pong; a close, a
+  text frame or a reserved bit ends the connection.
+- **There is no TLS inside the WebSocket.** The page's HTTPS (`wss://`) is
+  the wire's TLS, judged by the browser; the daemon's certificate pin (§1,
+  ARCH-10) does not apply to this transport, and a deployment serves `/ws`
+  only on 443 or behind the same front door.
+
 ---
 
 ## 2. Frame format

@@ -37,7 +37,14 @@
 # call's audio is UDP.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PAIR="$HERE/scripts/gui_pair.sh"
+# The pair driver: the Windows clients', or the web clients' with
+# OC_GUI_PAIR=scripts/web_pair.sh (docs/TESTING.md).
+PAIR="${OC_GUI_PAIR:-$HERE/scripts/gui_pair.sh}"
+PLAT=win32; [ -n "${OC_GUI_PAIR:-}" ] && PLAT=web
+# The shared screen's size: the synthetic 2560x1600 screen fitted into the
+# platform's limit (oc_plat_share_limits): 1920x1080 on a desktop, 960x540 in
+# a browser.
+SHARE_WH=1728x1080; [ "$PLAT" = web ] && SHARE_WH=864x540
 START=$SECONDS
 fails=0
 checks=0
@@ -199,10 +206,10 @@ check "alice's call view offers Share screen (call.share)" has_aid a call.share
 sfield() { field "$1" 'share ' "$2"; }
 a_sharing()   { [ "$(sfield a state)" = 2 ] && [ "$(sfield a bar)" = 1 ]; }
 b_sees_a()    { [ "$(sfield b sharer)" = "$(field a 'call ' self)" ] && ge "$(sfield b view_frames)" 10; }
-b_picture()   { [ "$(sfield b tex)" = 1728x1080 ] && ge "$(sfield b px_fno)" 1; }
+b_picture()   { [ "$(sfield b tex)" = "$SHARE_WH" ] && ge "$(sfield b px_fno)" 1; }
 check "alice's share is confirmed, and her bar is up" waitfor a 10 a_sharing
 check "bob receives it" waitfor b 15 b_sees_a
-check "bob's call view shows it at 1728x1080 (2560x1600 fitted into 1920x1080), with a readable frame number" waitfor b 10 b_picture
+check "bob's call view shows it at $SHARE_WH (2560x1600 fitted into the platform's limit), with a readable frame number" waitfor b 10 b_picture
 f1="$(sfield b px_fno)"; sleep 2; dump b
 rising() { gt "$(sfield b px_fno)" "${f1:-0}"; }
 check "...which keeps moving on (frame ${f1:-?} two seconds ago)" rising
@@ -226,7 +233,7 @@ check "actual size" waitfor b 4 actual
 say "== bob takes over, then stops"
 "$PAIR" b call share "window:synthetic" >/dev/null
 a_taken() { [ "$(sfield a on)" = 0 ] && [ "$(sfield a bar)" = 0 ] && [ "$(sfield a sharer)" = "$(field b 'call ' self)" ]; }
-a_sees_b() { ge "$(sfield a view_frames)" 5 && [ "$(sfield a tex)" = 1728x1080 ]; }
+a_sees_b() { ge "$(sfield a view_frames)" 5 && [ "$(sfield a tex)" = "$SHARE_WH" ]; }
 check "alice's share stops, and bob is the sharer" waitfor a 10 a_taken
 check "alice sees bob's" waitfor a 15 a_sees_b
 "$PAIR" b call share stop >/dev/null

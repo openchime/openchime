@@ -14,7 +14,10 @@
 # Its own daemon on its own port, wiped each run; only alice's client is driven.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PAIR="$HERE/scripts/gui_pair.sh"
+# The pair driver: the Windows clients', or the web clients' with
+# OC_GUI_PAIR=scripts/web_pair.sh (docs/TESTING.md).
+PAIR="${OC_GUI_PAIR:-$HERE/scripts/gui_pair.sh}"
+PLAT=win32; [ -n "${OC_GUI_PAIR:-}" ] && PLAT=web
 fails=0
 
 export OC_PAIR_PORT="${OC_PAIR_PORT:-9660}"
@@ -37,12 +40,16 @@ dpi()   { grep -m1 -o '\bdpi=[0-9]*' "$D" | cut -d= -f2; }
 box_ok() {
   local n="$1" e b el et er eb bl bt br bb lh lf min
   [ "$(field "$n" vis)" = 1 ] && [ "$(field "$n" uifont)" = 1 ] || return 1
-  case "$(face "$n")" in "Segoe UI"|"Segoe UI Variable Text") ;; *) return 1 ;; esac
+  # The UI face: Segoe on Windows; the browser's system font on the web,
+  # whatever it is called there (fonts are not part of parity, WEB.md).
+  case "$(face "$n")" in "Segoe UI"|"Segoe UI Variable Text") ;; "") return 1 ;; *) [ "$PLAT" = web ] || return 1 ;; esac
   lf="$(field "$n" lf)"; lh="$(field "$n" lh)"; min=$(( 14 * $(dpi) / 96 ))
   [ "${lf#-}" -ge "$min" ] || return 1
   IFS=, read -r el et er eb <<< "$(field "$n" edit)"
   IFS=, read -r bl bt br bb <<< "$(field "$n" box)"
-  [ $((eb - et)) -eq "$lh" ] || return 1
+  # The field's box is the chrome's full height (the text is centred inside it
+  # by field_draw); it must hold at least a line.
+  [ $((eb - et)) -ge "$lh" ] || return 1
   [ "$el" -gt "$bl" ] && [ "$er" -lt "$br" ] && [ "$et" -ge "$bt" ] && [ "$eb" -le "$bb" ] || return 1
   local above=$((et - bt)) below=$((bb - eb)); local d=$((above - below)); [ "${d#-}" -le 1 ]
 }

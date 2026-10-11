@@ -9,7 +9,12 @@
 #include <vpx/vpx_decoder.h>
 #include <vpx/vpx_encoder.h>
 
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+/* A page's threads are Web Workers from a pool of fixed size (WEB.md): an
+ * encoder that took one per core would drain it, and a thread the pool
+ * cannot give never starts while the page's thread is busy. Three in all. */
+static int cores(void) { return 3; }
+#elif defined(_WIN32)
 #include <windows.h>
 static int cores(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
 #else

@@ -21,9 +21,17 @@
 # nothing -- when a local upload finishes is not something to test against.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRIVE="$HERE/scripts/gui_drive.sh"
+# The driver: the Windows client's, or the web client's with
+# OC_GUI_DRIVE=scripts/web_drive.sh (docs/TESTING.md); the Windows-only checks
+# (the clipboard set from PowerShell) run there alone.
+DRIVE="${OC_GUI_DRIVE:-$HERE/scripts/gui_drive.sh}"
+PLAT=win32; [ -n "${OC_GUI_DRIVE:-}" ] && PLAT=web
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 WIN_DIR='C:\Windows\Temp\octest'
+# A file's path as the client under test names it: the Windows share for the
+# Windows client, this machine's path for the web client (the driver carries
+# it onto the page).
+cpath() { if [ "$PLAT" = web ]; then printf '%s/%s' "$LIN_DIR" "$1"; else printf '%s\\%s' "$WIN_DIR" "$1"; fi; }
 START=$SECONDS
 fails=0
 checks=0
@@ -53,7 +61,7 @@ kill_dev_daemon || { say "a daemon still holds :$OC_DEV_PORT; stop it and re-run
 rm -rf "$OC_DEV_DIR"
 
 D="/tmp/oc-uploads-dump.txt"
-snap() { "$DRIVE" dump uploads >/dev/null 2>&1; cp "$LIN_DIR/uploads.txt" "$D" 2>/dev/null; }
+snap() { "$DRIVE" dump uploads 2>/dev/null | tail -n +2 > "$D"; }
 tray() { snap; grep -m1 '^ftray ' "$D" | grep -o "\b$1=[^ ]*" | head -1 | cut -d= -f2; }
 chip() { grep "^  fchip $1 " "$D" | grep -o "\b$2=[^ ]*" | head -1 | cut -d= -f2 | tr -d '"'; }
 waitfor() {  # waitfor <secs> <command...>
@@ -86,7 +94,7 @@ for _ in $(seq 1 80); do snap; grep -q 'authed=1' "$D" && break; sleep 0.25; don
 make_png "$LIN_DIR/up-picture.png"
 printf 'the notes\n' > "$LIN_DIR/up-notes.txt"
 head -c 300000 /dev/urandom > "$LIN_DIR/up-data.bin"
-for f in up-picture.png up-notes.txt up-data.bin; do "$DRIVE" attach "$WIN_DIR\\$f" >/dev/null; done
+for f in up-picture.png up-notes.txt up-data.bin; do "$DRIVE" attach "$(cpath $f)" >/dev/null; done
 three() { [ "$(tray here)" = 3 ] && [ "$(tray height)" != 0 ]; }
 check "three chips, and the box grew to hold them" waitfor 5 three
 check "the picture shows itself" bash -c "grep -q '^  fchip 0 name=\"up-picture.png\" here=1 pic=1 ' $D"
@@ -117,9 +125,10 @@ one_msg() {
 check "both files are on one message, and the removed one on none" waitfor 10 one_msg
 check "...which carries the text" bash -c "grep -q '^  ch 1 .*prev=\"two files\"' $D"
 
+if [ "$PLAT" = win32 ]; then   # a browser copies the file when it is attached: it cannot go away under the post
 say "== a file that cannot be read stops the post"
 printf 'soon gone\n' > "$LIN_DIR/up-gone.txt"
-"$DRIVE" attach "$WIN_DIR\\up-gone.txt" >/dev/null
+"$DRIVE" attach "$(cpath up-gone.txt)" >/dev/null
 rm -f "$LIN_DIR/up-gone.txt"
 "$DRIVE" send "comes back" >/dev/null
 returned() { [ "$(tray here)" = 1 ] && [ "$(chip 0 failed)" = 1 ] && [ "$(chip 0 state)" = -1 ] && [ "$(tray posts)" = 0 ]; }
@@ -132,7 +141,9 @@ click_x 0
 anchored() { snap; grep -q '^  ch 1 .*prev="after the failure"' "$D"; }
 check "nothing was posted for it (the next message is the last)" waitfor 10 anchored
 check "...and no such file was shared" bash -c "! grep -q 'name=\"up-gone.txt\"' $D"
+fi
 
+if [ "$PLAT" = win32 ]; then   # the clipboard is set from PowerShell: Windows alone
 say "== pasting attaches what is not text"
 # The Windows clipboard, set the way other programs set it: Explorer's copy puts a
 # file list on it (CF_HDROP); an image copied out of a program puts a bitmap.
@@ -155,11 +166,12 @@ as_text() { [ "$(tray here)" = 0 ] && grep -Eq '^ed len=11 ' "$D"; }
 check "text still pastes as text, and adds no chip" waitfor 5 as_text
 "$DRIVE" key ctrl+a >/dev/null; "$DRIVE" key delete >/dev/null
 clip "[Windows.Forms.Clipboard]::Clear()"
+fi
 
 say "== a large one, to watch (not asserted)"
 head -c $((120 * 1024 * 1024)) /dev/urandom > "$LIN_DIR/up-large.bin"
-"$DRIVE" attach "$WIN_DIR\\up-picture.png" >/dev/null
-"$DRIVE" attach "$WIN_DIR\\up-large.bin" >/dev/null
+"$DRIVE" attach "$(cpath up-picture.png)" >/dev/null
+"$DRIVE" attach "$(cpath up-large.bin)" >/dev/null
 "$DRIVE" send "a large one" >/dev/null
 sleep 0.6; "$DRIVE" shot uploads_moving >/dev/null
 check "the large one lands" waitfor 120 landed
