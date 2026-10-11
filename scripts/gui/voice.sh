@@ -40,7 +40,7 @@ kill_dev_daemon() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
-      grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && kill "$p" 2>/dev/null
+      grep -qx "OPENCHIME_PORT=$OC_TEST_PORT" && kill "$p" 2>/dev/null
   done
   # A daemon with the speech models loaded takes a few seconds to go.
   for _ in $(seq 1 60); do

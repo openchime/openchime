@@ -49,7 +49,7 @@ plays media (ARCH-75).
 | Audio | Opus (libopus), 48 kHz mono, 20 ms frames, 48 kbps, VOIP application; on a screen recording with computer sound, the microphone and the computer's sound mixed (§4.2) |
 | Poster | JPEG, the first keyframe at or after 1 s, at the video's own dimensions |
 | Length cap | 5 minutes, stopped by the recorder |
-| Size cap | `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`, 160 MiB by default, enforced by the daemon; the recorder stops at 155 MiB so a take always fits the default |
+| Size cap | 160 MiB (`OC_MAX_VIDEO_SIZE`), enforced by the daemon; the recorder stops at 155 MiB so a take always fits |
 | File name | `<display name>-video-<YYYYMMDDHHMMSS>.mp4`, and the poster the same with `.jpg` |
 
 Five minutes is about 30 MB at 360p, 95 MB at 720p and 150 MB at 1080p. The daemon
@@ -298,8 +298,8 @@ not refuse the post, and a failure at any step cancels the rest and reports why.
 uploaded by the caller, is finalized and not yet posted, has `mime = video/mp4`,
 a `duration_ms` no longer than five minutes, and even dimensions no larger than
 1920×1080 — and unless the poster is the same caller's finalized `image/jpeg` in the
-same channel, no larger than 1 MiB. A video larger than
-`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` is refused with `MEDIA_TOO_LARGE`.
+same channel, no larger than 1 MiB. A video larger than 160 MiB
+(`OC_MAX_VIDEO_SIZE`) is refused with `MEDIA_TOO_LARGE`.
 
 **The duration is advisory.** The daemon links no codec (ARCH-110), so it cannot
 measure one; a modified client could report thirty seconds for a longer file. The

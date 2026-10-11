@@ -48,7 +48,7 @@ endif
 # llama.cpp runs the summary model inside openchimed on one thread. Everything
 # else of summaries -- the pieces, prompts, checks, storage and worker -- is
 # plain C in DAEMON_SRC, so `make test` drives it with a stub model. Without
-# SUM, summaries are never available locally (OPENCHIME_SUMMARY=cloud still is).
+# SUM, summaries are never available locally (OPENCHIME_SUMMARY=cloud:… still is).
 ifeq ($(SUM),1)
 SUM_SRC   := daemon/sum_llama.c
 SUM_DEPS  := $(LLAMA_A)

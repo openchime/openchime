@@ -24,7 +24,7 @@ sender, and the mixer. The Win32 client carries it; the TUI has no calls (§8).
 ## 1. The model: one call per conversation
 
 A conversation has at most **one call** at a time, with an ephemeral roster of
-up to `OPENCHIME_CALL_MAX` participants (ARCH-73). Anyone who can read the
+up to ten participants (`OC_CALL_MAX`, ARCH-73). Anyone who can read the
 conversation may join it; starting one invites its members; it lasts while one
 participant remains, or until its starter ends it; a dropped participant rejoins
 with a fresh `CALL_JOIN` (CALLS.md §1).
@@ -317,17 +317,19 @@ all carries the call's audio over its TCP connection instead of leaving.
 
 Behind a front door that forwards UDP for many workspaces from one address, the
 relay is reached at the door's port rather than its own, and the door has to
-tell workspaces apart by the packet alone. `OPENCHIME_AUDIO_ADVERTISE_PORT`
-names the port `CALL_JOINED` gives out, and `OPENCHIME_AUDIO_TOKEN_PREFIX` puts
-up to 16 fixed bytes in front of every token's 16 random ones, for the door to
-route by (CONFIG.md). Both are off by default, and a daemon reached directly
-behaves as it always has. The token is opaque to the client, which holds up to
-32 bytes, so neither needs a client that knows about it.
+tell workspaces apart by the packet alone. That is the hosted platform's
+topology, so both are the control plane's to set (MANAGED.md):
+`OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` names the port `CALL_JOINED` gives out,
+and `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX` puts up to 16 fixed bytes in front of
+every token's 16 random ones, for the door to route by. Both are off by
+default, and a daemon reached directly behaves as it always has. The token is
+opaque to the client, which holds up to 32 bytes, so neither needs a client
+that knows about it.
 
 The daemon advertises `calls` when its relay is running, not when clients can
 reach it: nothing on the host can tell whether a firewall or platform in front
-of it passes the relay's port. A deployment should expose that port, pinned with
-`OPENCHIME_AUDIO_PORT`, as it exposes the protocol port.
+of it passes the relay's port. The relay's UDP port is the protocol's
+(`OPENCHIME_PORT`), so a deployment exposes one number twice: TCP and UDP.
 
 **When UDP does not get through.** The daemon also advertises `calls-tcp`, and a
 client whose network passes no UDP to the relay sends and receives its media over

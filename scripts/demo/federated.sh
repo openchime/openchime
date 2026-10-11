@@ -30,12 +30,11 @@ say "Building daemon + demo client"
 ( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make build/demo_client >/dev/null )
 
 daemon_env=(
-  OPENCHIME_DB_PATH="$WORK/demo.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem"
-  OPENCHIME_BLOB_DIR="$WORK/blobs" OPENCHIME_PROTO_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" OPENCHIME_TEST_PASSWORD_AUTH=1
-  OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member"
+  OPENCHIME_DATA_DIR="$WORK/data" OPENCHIME_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH"
+  OPENCHIME_DEMO_USERS="alice:pw:owner,bob:pw:member"
   OPENCHIME_ENROLL_URL="$CP" OPENCHIME_PUSH_URL="$CP"
 )
-mkdir -p "$WORK/blobs"
+mkdir -p "$WORK/data"
 
 boot() { env "${daemon_env[@]}" "$ROOT/openchimed" >>"$WORK/daemon.log" 2>&1 & DPID=$!; }
 wait_health() { for _ in $(seq 1 40); do curl -sf "http://localhost:$HEALTH/healthz" >/dev/null 2>&1 && return 0; sleep 0.25; done; return 1; }

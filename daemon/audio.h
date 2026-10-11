@@ -10,7 +10,7 @@
  * devices hold (ARCH-113). Clients speak to it directly over UDP. */
 
 /* Per-join bearer token that identifies (call, participant) to the relay:
- * OPENCHIME_AUDIO_TOKEN_PREFIX, the same for every token this daemon issues and
+ * OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX, the same for every token this daemon issues and
  * there for a front door to route by, then OC_AUDIO_TOKEN_RAND random bytes.
  * Every token one daemon issues has the one length; the relay takes it from
  * its first participant. A client holds up to OC_AUDIO_TOKEN_MAX. */

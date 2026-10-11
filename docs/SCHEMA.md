@@ -930,7 +930,7 @@ search, backfill, unread and mention query responsible for excluding it, and the
 first one that forgot would leak unsent text into somebody else's transcript.
 
 The partial `idx_sched_due` is what the ~15 s firing sweep reads
-(`OPENCHIME_SCHED_TICK_MS`); `state` carries the outcome, and `fail_reason` is
+(`OPENCHIME_DEMO_SCHED_MS` shortens it in a demo build); `state` carries the outcome, and `fail_reason` is
 shown to the author, because a message promised and not sent is the one case
 where silence is indefensible.
 
@@ -1053,7 +1053,7 @@ the video is sent, and fixed once it is.
 
 *`duration_ms`, `width` and `height` are the client's measurements.* The daemon
 links no codec and cannot check them; they are display facts, and the byte cap
-(`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`) is what bounds a video message.
+(`OC_MAX_VIDEO_SIZE`) is what bounds a video message.
 
 *`poster_id` is an attachment of its own* — the same uploader's JPEG in the same
 channel — that no message references, so the storage sweep (§3g) would take it for
@@ -1348,7 +1348,7 @@ CREATE INDEX local_recovery_user ON local_recovery(user_id);
 
 ### `local_totp`
 An account's TOTP secret, **sealed**: AES-256-GCM under the factor key
-(`OPENCHIME_FACTOR_KEY_FILE`, CONFIG.md), which is kept outside the database,
+(`factor.key` in the data directory, CONFIG.md), which is kept outside the database,
 with the account's id as associated data — a 12-byte nonce, the ciphertext and a
 16-byte tag. The database alone therefore gives away no second step, and a
 secret moved to another account does not open. **A backup needs the key file as

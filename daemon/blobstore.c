@@ -3,7 +3,7 @@
  * `<base>/<key>.tmp` and atomically rename into place on commit, so a reader
  * never sees a partial blob and an aborted upload leaves nothing behind. The
  * S3/MinIO backend (blob_s3.c) implements the same vtable and is selected with
- * the four OPENCHIME_S3_* settings (config.h). */
+ * OPENCHIME_S3 (config.h). */
 
 #include "blobstore.h"
 #include "blob_backend.h"

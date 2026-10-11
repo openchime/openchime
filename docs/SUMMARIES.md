@@ -394,7 +394,7 @@ nothing stored found yet — for the worker to take once they are on. If they do
 not come up, every request that waited is answered UNAVAILABLE ("Summaries
 could not be started on this server.") and they are offered no more.
 
-**A hosted model** (`OPENCHIME_SUMMARY=cloud`, `daemon/sum_cloud.c`). The same
+**A hosted model** (`OPENCHIME_SUMMARY=cloud:<url>,<model>`, `daemon/sum_cloud.c`). The same
 pipeline, with each call sent to an OpenAI-style chat-completions API instead of
 the model in the daemon: the same system and user prompt, `temperature` 0 and
 the call's answer cap (`max_tokens`), and nothing else, so any such API answers
@@ -453,8 +453,8 @@ build/sumeval run dev.db <model> <channel> <start_ms> <end_ms> [threshold] [gap_
 ```
 
 `<model>` is a GGUF file, run by the local engine, or the URL of a
-chat-completions API, asked by the hosted engine (§6) for the model in
-`OPENCHIME_SUMMARY_MODEL` and the key in `OPENCHIME_SUMMARY_API_KEY`; nothing
+chat-completions API, asked by the hosted engine (§6) for the model named
+beside it in `OPENCHIME_SUMMARY` with the key in `OPENCHIME_SUMMARY_API_KEY`; nothing
 runs on the machine for a URL.
 
 `run` prints the summary as a client receives it, then one line of measurements:
@@ -496,9 +496,7 @@ docs/TUNING.md.
 
 | Variable | Values |
 |---|---|
-| `OPENCHIME_SUMMARY` | `off` (default), `local` or `cloud` (§6). |
-| `OPENCHIME_SUMMARY_URL` | For `cloud`, required: the API's base, e.g. `https://models.example.com/v1`; requests go to `<base>/chat/completions`. https, or http to a loopback address. |
-| `OPENCHIME_SUMMARY_MODEL` | For `cloud`, required: the model's name there. It names the summaries' version, so changing it remakes them. |
+| `OPENCHIME_SUMMARY` | `off` (default), `local`, or `cloud:<url>,<model>` (§6): the API's base, e.g. `https://models.example.com/v1` (requests go to `<base>/chat/completions`; https, or http to a loopback address), and the model's name there, which names the summaries' version, so changing it remakes them. |
 | `OPENCHIME_SUMMARY_API_KEY` | For `cloud`: its key, sent as a bearer token; none when empty. |
 
 Everything else — the chunk size, the gap, the standard's caps, the gate's

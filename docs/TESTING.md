@@ -303,8 +303,8 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   source**: `dbw_now_ms` calls `clock_gettime` directly with no override seam, so
   determinism here comes from asserting relative facts rather than from
   scripting time. What *is* injectable is the interval a periodic job runs at
-  (`oc_dbwriter_set_idem_retention`, `OPENCHIME_MAINT_INTERVAL_MS`,
-  `OPENCHIME_SCHED_TICK_MS`, `oc_netloop_set_relay_silence_ms`,
+  (`oc_dbwriter_set_idem_retention`, `OPENCHIME_DEMO_MAINT_MS`,
+  `OPENCHIME_DEMO_SCHED_MS`, `oc_netloop_set_relay_silence_ms`,
   `oc_netloop_set_presence_rate_ms`, `OPENCHIME_TEST_CALL_TIMERS`,
   `OPENCHIME_TEST_VIDEO_CAP_MS`), which is what lets a suite compress a clock it
   cannot fake.
@@ -428,8 +428,8 @@ under the same name, on a box restarted with it: a full handshake, no session
 resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, with
-the demo build's switch `OPENCHIME_TEST_PASSWORD_AUTH` off — the product as shipped; the
-other suites sign in by password with it on (`tests/main.c` sets it).
+the demo build's switch `OPENCHIME_DEMO_PASSWORD_FRAMES` off — the product as shipped; the
+other suites sign in by password with it on, a demo build's default.
 `test_jwt`: a token the daemon's issuer mints verifies against its key, name and
 audience, and not with a byte changed, for another audience, from another key or
 past its time; a `sub` names a user only as `local|<id>`. `itest_netloop`
@@ -583,7 +583,7 @@ works. Nothing proves the shipped *image* works (§3.2).
 - **Never downward (`test_dbwriter` `test_oidc_no_downgrade`):** an emailed
   code for a Google user's address is refused with `AUTH_USE_PROVIDER` and makes
   no identity; Microsoft for a person known by emailed code links; with
-  `OPENCHIME_OIDC_EMAIL_LINK=any` the emailed code links too.
+  the writer's email-link switch on (which the daemon never sets) the emailed code links too.
 - **The relay's published keys (`test_relaykeys`; `test_dbwriter`
   `test_relay_published_keys`):** a JWKS yields its P-256 signing keys as PEM and
   passes over another curve or type, a key for encryption or another algorithm,
@@ -970,9 +970,8 @@ it was from the separate process: p99 0.9–1.4 ms, against 1.3–2.0 ms before,
 video's 0.5–0.9 ms. With five of ten on the connection transport it is 1.2 ms.
 
 **Memory** (`scripts/bench.sh 50 100 200`, read-aloud and voice input off —
-`OPENCHIME_TTS_DATA_DIR` and `OPENCHIME_STT_DATA_DIR` pointed at nothing — since
-rendering the voice auditions at start loads a model of about 190 MB, which
-drowns every other figure):
+`OPENCHIME_TTS=off OPENCHIME_STT=off` — since rendering the voice auditions at
+start loads a model of about 190 MB, which drowns every other figure):
 
 | | before | after |
 |---|---|---|
@@ -1091,10 +1090,9 @@ build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direc
 
 ### Notes / gotchas
 
-- **`OPENCHIME_BLOB_DIR`** must point at a writable directory. Outside the container the
-  default `/data/blobs` doesn't exist, and `oc_netloop_run` refuses to start without a
-  usable blob store — the daemon logs `blob storage = local disk` then exits before
-  `netloop: listening`. The script sets it to a temp dir.
+- **`OPENCHIME_DATA_DIR`** must be writable, or creatable. Outside the container the
+  default `/data` is neither, and the daemon exits before `netloop: listening`. The
+  script sets it to a temp dir.
 - The demo uses **local auth** for the client (bootstrap users), independent of push.
   Push only needs the box **enrolled** (active audience + key) and `OPENCHIME_PUSH_URL` set.
 - **OIDC-relay login** against a live daemon is *not* covered here — it needs real Google
@@ -1285,8 +1283,8 @@ under test.
 > reporting confident nonsense, which is exactly what the fixture check refuses.
 >
 > **Kill a dev daemon by its environment, not its command line.** It is started
-> as `env OPENCHIME_PROTO_PORT=… openchimed`, so the port never appears in the
-> process's *cmdline* and `pkill -f OPENCHIME_PROTO_PORT=9500` matches nothing —
+> as `env OPENCHIME_PORT=… openchimed`, so the port never appears in the
+> process's *cmdline* and `pkill -f OPENCHIME_PORT=9500` matches nothing —
 > exiting 1, looking exactly like "nothing to kill". The daemon then keeps
 > running on a directory that has been deleted underneath it (SQLite happily
 > writes to the unlinked inode), and every upload fails with an opaque
@@ -1485,7 +1483,7 @@ Not in CI, for the smoke's reason.
 ## Reading the files harness
 
 `scripts/gui/files.sh` pages the Win32 files view (REQ-143) against its own
-fixture daemon (port 9590) with `OPENCHIME_FILE_PAGE=2`, so three uploads are
+fixture daemon (port 9590) with `OPENCHIME_DEMO_FILE_PAGE=2`, so three uploads are
 enough to see paging a real daemon would only show past two hundred files. It
 asserts that the first page holds its two rows and says more remain; that "Load
 more" is published to assistive technology; that pressing it APPENDS the next
@@ -1599,7 +1597,7 @@ Not in CI, for the smoke's reason.
 `scripts/gui/calls_tcp.sh` is the same pair (port 9630) with UDP that goes
 nowhere: the daemon advertises the relay at a port nothing answers on
 (`OC_TEST_ADVERTISE_PORT`, which `scripts/gui/pair.sh` passes as
-`OPENCHIME_AUDIO_ADVERTISE_PORT`). It asserts that each client finds within
+`OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT`). It asserts that each client finds within
 seconds that the relay does not answer, moves to the connection transport — the
 dump's `call` line says `transport=tcp` — and hears the other's tone
 (PROTOCOL.md §5.17, AUDIO.md §4).

@@ -19,7 +19,10 @@
 extern char **environ;
 
 static oc_config g_cfg;
-static char     *g_pubkey_buf;        /* OPENCHIME_OIDC_PUBKEY_FILE's bytes, freed on reload */
+/* The structured rows' pieces, pointed at from g_cfg; one load at a time. */
+static char g_tls_names[512], g_tls_dir[256], g_tls_email[128];
+static char g_s3_buf[1024];
+static char g_sum_url[512], g_sum_model[128];
 
 /* Where each row's value came from, for --check-config: one slot per row, or
  * per instance of a pattern row. */
@@ -190,6 +193,174 @@ int cfg_parse_connect(oc_config *c, const cfg_row *r, const char *name, const ch
     return 0;
 }
 
+
+/* OPENCHIME_AUTH: `local`, `relay`, or both, comma-separated. A name it does
+ * not know stops the boot: a typo must not quietly leave a workspace with no
+ * way in, or with one its operator did not mean. */
+int cfg_parse_auth(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)r;
+    c->auth_local = c->auth_relay = 0;
+    const char *p = v;
+    while (*p) {
+        const char *e = strchr(p, ',');
+        if (!e) e = p + strlen(p);
+        const char *s = p, *t = e;
+        while (s < e && (*s == ' ' || *s == '\t')) s++;
+        while (t > s && (t[-1] == ' ' || t[-1] == '\t')) t--;
+        size_t n = (size_t)(t - s);
+        if (n == 5 && !strncmp(s, "local", 5)) c->auth_local = 1;
+        else if (n == 5 && !strncmp(s, "relay", 5)) c->auth_relay = 1;
+        else if (n) { snprintf(err, errcap, "%s=%s: unknown source \"%.*s\" (local, relay)", name, v, (int)n, s); return -1; }
+        p = *e ? e + 1 : e;
+    }
+    if (!c->auth_local && !c->auth_relay) return fail(err, errcap, name, v, "names no source (local, relay)");
+    return 0;
+}
+
+/* OPENCHIME_TLS: self | file | central | acme:<names>[;email=…][;directory=…]. */
+int cfg_parse_tls(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)r;
+    c->tls_src.names = c->tls_src.email = NULL;
+    c->tls_src.directory = "https://acme-v02.api.letsencrypt.org/directory";
+    if (!strcmp(v, "self"))    { c->tls_src.source = OC_TLS_SRC_SELF; return 0; }
+    if (!strcmp(v, "file"))    { c->tls_src.source = OC_TLS_SRC_FILE; return 0; }
+    if (!strcmp(v, "central")) { c->tls_src.source = OC_TLS_SRC_CENTRAL; return 0; }
+    if (strncmp(v, "acme:", 5) != 0)
+        return fail(err, errcap, name, v, "must be self, file, central or acme:<names>[;email=…][;directory=…]");
+    c->tls_src.source = OC_TLS_SRC_ACME;
+    const char *p = v + 5;
+    const char *e = strchr(p, ';');
+    size_t nl = e ? (size_t)(e - p) : strlen(p);
+    if (!nl) return fail(err, errcap, name, v, "acme: needs the names to certify, comma-separated");
+    if (nl >= sizeof g_tls_names) return fail(err, errcap, name, v, "the names are too long");
+    for (size_t i = 0; i < nl; i++)
+        if (!(isalnum((unsigned char)p[i]) || p[i] == '.' || p[i] == '-' || p[i] == ','))
+            return fail(err, errcap, name, v, "the names are DNS names, comma-separated");
+    memcpy(g_tls_names, p, nl); g_tls_names[nl] = '\0';
+    c->tls_src.names = g_tls_names;
+    p = e ? e + 1 : p + nl;
+    while (*p) {
+        e = strchr(p, ';');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        const char *eq = memchr(p, '=', len);
+        if (len) {
+            if (!eq) { snprintf(err, errcap, "%s: \"%.*s\" is not key=value", name, (int)len, p); return -1; }
+            size_t kl = (size_t)(eq - p), vl = len - kl - 1;
+            char *dst; size_t cap;
+            if (kl == 5 && !strncmp(p, "email", 5)) { dst = g_tls_email; cap = sizeof g_tls_email; }
+            else if (kl == 9 && !strncmp(p, "directory", 9)) { dst = g_tls_dir; cap = sizeof g_tls_dir; }
+            else { snprintf(err, errcap, "%s: unknown key \"%.*s\" (email, directory)", name, (int)kl, p); return -1; }
+            if (!vl || vl >= cap) { snprintf(err, errcap, "%s: %.*s is empty or too long", name, (int)kl, p); return -1; }
+            memcpy(dst, eq + 1, vl); dst[vl] = '\0';
+            if (dst == g_tls_email) c->tls_src.email = g_tls_email;
+            else {
+                if (strncmp(g_tls_dir, "https://", 8) != 0) { snprintf(err, errcap, "%s: directory must be an https URL", name); return -1; }
+                c->tls_src.directory = g_tls_dir;
+            }
+        }
+        p = e ? e + 1 : p + len;
+    }
+    return 0;
+}
+
+static int hexval(int ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* Percent-decode `n` bytes of `src` into `dst` (cap `cap`); the decoded length, or -1. */
+static int pct_decode(const char *src, size_t n, char *dst, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        int ch = (unsigned char)src[i];
+        if (ch == '%') {
+            if (i + 2 >= n) return -1;
+            int h = hexval((unsigned char)src[i + 1]), l = hexval((unsigned char)src[i + 2]);
+            if (h < 0 || l < 0) return -1;
+            ch = h * 16 + l; i += 2;
+        }
+        if (o + 1 >= cap) return -1;
+        dst[o++] = (char)ch;
+    }
+    dst[o] = '\0';
+    return (int)o;
+}
+
+/* OPENCHIME_S3: s3://KEY:SECRET@host[:port]/bucket[?region=…], or http+s3://
+ * for a plaintext endpoint (a fake in a test). Everything the backend needs is
+ * in the one value, so there is no partial set to mistake for local disk. */
+int cfg_parse_s3(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)r;
+    static const char want[] = "must be s3://KEY:SECRET@host[:port]/bucket[?region=…] (http+s3:// for plaintext)";
+    const char *shown = "(set)";
+    const char *p, *scheme;
+    if (!strncmp(v, "s3://", 5)) { p = v + 5; scheme = "https://"; }
+    else if (!strncmp(v, "http+s3://", 10)) { p = v + 10; scheme = "http://"; }
+    else return fail(err, errcap, name, shown, want);
+    const char *slash = strchr(p, '/');
+    if (!slash) return fail(err, errcap, name, shown, want);
+    const char *at = NULL;
+    for (const char *q = p; q < slash; q++) if (*q == '@') at = q;
+    if (!at) return fail(err, errcap, name, shown, "needs KEY:SECRET@ before the host");
+    const char *colon = memchr(p, ':', (size_t)(at - p));
+    if (!colon || colon == p || colon + 1 == at) return fail(err, errcap, name, shown, "needs KEY:SECRET@ before the host, neither empty");
+    size_t hl = (size_t)(slash - (at + 1));
+    if (!hl) return fail(err, errcap, name, shown, "needs a host");
+    const char *bucket = slash + 1;
+    const char *qm = strchr(bucket, '?');
+    size_t bl = qm ? (size_t)(qm - bucket) : strlen(bucket);
+    if (!bl || memchr(bucket, '/', bl)) return fail(err, errcap, name, shown, "needs /bucket, one path segment");
+    const char *region = "us-east-1"; size_t rl = strlen(region);
+    if (qm) {
+        if (strncmp(qm + 1, "region=", 7) != 0 || !qm[8] || strchr(qm + 8, '&'))
+            return fail(err, errcap, name, shown, "the only query is ?region=…");
+        region = qm + 8; rl = strlen(region);
+    }
+    char *b = g_s3_buf; size_t cap = sizeof g_s3_buf;
+    int n;
+    c->s3.access_key = b;
+    if ((n = pct_decode(p, (size_t)(colon - p), b, cap)) < 0) return fail(err, errcap, name, shown, "the key does not percent-decode");
+    b += n + 1; cap -= (size_t)n + 1;
+    c->s3.secret_key = b;
+    if ((n = pct_decode(colon + 1, (size_t)(at - colon - 1), b, cap)) < 0) return fail(err, errcap, name, shown, "the secret does not percent-decode");
+    b += n + 1; cap -= (size_t)n + 1;
+    c->s3.endpoint = b;
+    if (strlen(scheme) + hl + 1 > cap) return fail(err, errcap, name, shown, "too long");
+    n = snprintf(b, cap, "%s%.*s", scheme, (int)hl, at + 1);
+    b += n + 1; cap -= (size_t)n + 1;
+    c->s3.bucket = b;
+    if (bl + 1 > cap) return fail(err, errcap, name, shown, "too long");
+    memcpy(b, bucket, bl); b[bl] = '\0';
+    b += bl + 1; cap -= bl + 1;
+    c->s3.region = b;
+    if (rl + 1 > cap) return fail(err, errcap, name, shown, "too long");
+    memcpy(b, region, rl + 1);
+    return 0;
+}
+
+/* OPENCHIME_SUMMARY: off | local | cloud:<url>,<model>. */
+int cfg_parse_summary(oc_config *c, const cfg_row *r, const char *name, const char *v, char *err, size_t errcap) {
+    (void)r;
+    c->summary.url = c->summary.model = "";
+    if (!strcmp(v, "off"))   { c->summary.mode = OC_SUMMARY_OFF; return 0; }
+    if (!strcmp(v, "local")) { c->summary.mode = OC_SUMMARY_LOCAL; return 0; }
+    if (strncmp(v, "cloud:", 6) != 0) return fail(err, errcap, name, v, "must be off, local or cloud:<url>,<model>");
+    const char *u = v + 6, *comma = strchr(u, ',');
+    if (!comma) return fail(err, errcap, name, v, "cloud: needs <url>,<model>");
+    size_t ul = (size_t)(comma - u), ml = strlen(comma + 1);
+    if (strncmp(u, "https://", 8) != 0 && strncmp(u, "http://", 7) != 0)
+        return fail(err, errcap, name, v, "the URL must be http(s)://");
+    if (!ml) return fail(err, errcap, name, v, "cloud: needs <url>,<model>");
+    if (ul >= sizeof g_sum_url || ml >= sizeof g_sum_model) return fail(err, errcap, name, v, "too long");
+    memcpy(g_sum_url, u, ul); g_sum_url[ul] = '\0';
+    memcpy(g_sum_model, comma + 1, ml + 1);
+    c->summary.mode = OC_SUMMARY_CLOUD;
+    c->summary.url = g_sum_url; c->summary.model = g_sum_model;
+    return 0;
+}
+
 /* --- the table walk ------------------------------------------------------------ */
 
 static int file_set(const char *name) {
@@ -316,70 +487,50 @@ static int scan_unknown(char *err, size_t errcap) {
 
 /* The rules that span rows, and the values derived from them. */
 static int validate(oc_config *c, char *err, size_t errcap) {
-    /* The factor key: beside the database unless named. */
-    if (c->factor_key_file_env && c->factor_key_file_env[0])
-        snprintf(c->factor_key_file, sizeof c->factor_key_file, "%s", c->factor_key_file_env);
-    else {
-        const char *slash = strrchr(c->db_path, '/');
-        int dl = slash ? (int)(slash - c->db_path) : 1;
-        snprintf(c->factor_key_file, sizeof c->factor_key_file, "%.*s/factor.key", dl, slash ? c->db_path : ".");
+    /* The deployment model (ARCH-76): what the box was started with says it. */
+    int ticket = c->enroll.ticket && *c->enroll.ticket;
+    c->deployment_mode = ticket ? OC_DEPLOY_MANAGED : c->enroll.url ? OC_DEPLOY_FEDERATED : OC_DEPLOY_STANDALONE;
+    if (ticket && !c->enroll.url) {
+        snprintf(err, errcap, "OPENCHIME_MANAGED_TICKET: a managed box is started with OPENCHIME_ENROLL_URL as well");
+        return -1;
+    }
+    if (ticket && !c->oidc.audience) {
+        snprintf(err, errcap, "OPENCHIME_MANAGED_TICKET: a managed box is started with OPENCHIME_MANAGED_AUDIENCE as well");
+        return -1;
     }
 
-    /* A video message is an attachment first, so it can never be allowed more:
-     * a value set above the attachment cap is refused; the default follows a
-     * smaller cap down, since nobody asked for the larger number. */
-    if (c->max_video_size > c->max_attach_size) {
-        const char *given = getenv("OPENCHIME_MAX_VIDEO_MESSAGE_SIZE");
-        if (given && *given) {
-            snprintf(err, errcap, "OPENCHIME_MAX_VIDEO_MESSAGE_SIZE=%llu: must not exceed OPENCHIME_MAX_ATTACHMENT_SIZE (%llu)",
-                     (unsigned long long)c->max_video_size, (unsigned long long)c->max_attach_size);
-            return -1;
-        }
-        c->max_video_size = c->max_attach_size;
-    }
+    /* The data directory's layout. */
+    size_t dl = strlen(c->data_dir);
+    while (dl > 1 && c->data_dir[dl - 1] == '/') dl--;
+    if (dl + 16 >= sizeof c->db_path) { snprintf(err, errcap, "OPENCHIME_DATA_DIR: too long"); return -1; }
+    snprintf(c->db_path, sizeof c->db_path, "%.*s/openchime.db", (int)dl, c->data_dir);
+    snprintf(c->blob_dir, sizeof c->blob_dir, "%.*s/blobs", (int)dl, c->data_dir);
+    snprintf(c->tls_cert, sizeof c->tls_cert, "%.*s/cert.pem", (int)dl, c->data_dir);
+    snprintf(c->tls_key, sizeof c->tls_key, "%.*s/key.pem", (int)dl, c->data_dir);
+    snprintf(c->factor_key_file, sizeof c->factor_key_file, "%.*s/factor.key", (int)dl, c->data_dir);
 
-    /* The blob backend is chosen by configuration: all four S3 values, or none.
-     * A partial set is an operator error, not a fallback to local disk. */
-    {
-        const char *const names[4] = { "OPENCHIME_S3_ENDPOINT", "OPENCHIME_S3_BUCKET", "OPENCHIME_S3_ACCESS_KEY", "OPENCHIME_S3_SECRET_KEY" };
-        const char *const vals[4]  = { c->s3.endpoint, c->s3.bucket, c->s3.access_key, c->s3.secret_key };
-        int set = !!vals[0] + !!vals[1] + !!vals[2] + !!vals[3];
-        if (set && set != 4) {
-            char on[128] = "", off[128] = "";
-            for (int i = 0; i < 4; i++) {
-                char *dst = vals[i] ? on : off; size_t cap = vals[i] ? sizeof on : sizeof off;
-                snprintf(dst + strlen(dst), cap - strlen(dst), "%s%s", *dst ? ", " : "", names[i]);
-            }
-            snprintf(err, errcap, "%s set without %s: set all four for S3 or none for local disk", on, off);
-            return -1;
-        }
-    }
-
-    /* The storage policy in the maintenance pass's units; the watermarks must
-     * be ordered or the pass would either never stop or never protect the
-     * database, and that is the operator's to fix, not ours to reorder. */
+    /* The storage policy: the design's numbers (storage.h), in the pass's
+     * units. A demo build may shorten the interval (the row writes it). */
     {
         const uint64_t MB = 1024ull * 1024;
         oc_storage_policy *p = &c->storage;
-        memset(p, 0, sizeof *p);
-        p->interval_ms      = c->storage_raw.maint_interval_ms;
-        p->max_age_ms       = c->storage_raw.attach_max_age_days * 24ull * 60 * 60 * 1000;
-        p->grace_ms         = c->storage_raw.evict_grace_hours * 60ull * 60 * 1000;
-        p->reserve_bytes    = c->storage_raw.db_reserve_mb * MB;
-        p->pressure_bytes   = c->storage_raw.pressure_mb * MB;
-        p->batch            = (uint32_t)c->storage_raw.maint_batch;
-        p->evict_enabled    = c->storage_raw.evict;
-        p->audit_max_age_ms = c->storage_raw.audit_max_days * 24ull * 60 * 60 * 1000;
-        if (p->pressure_bytes < p->reserve_bytes) {
-            snprintf(err, errcap, "OPENCHIME_PRESSURE_MB=%llu: must be at least OPENCHIME_DB_RESERVE_MB (%llu)",
-                     (unsigned long long)c->storage_raw.pressure_mb, (unsigned long long)c->storage_raw.db_reserve_mb);
-            return -1;
-        }
+        if (!p->interval_ms) p->interval_ms = 5 * 60 * 1000;
+        p->max_age_ms       = 0;                        /* attachments are kept */
+        p->grace_ms         = 24ull * 60 * 60 * 1000;   /* nothing younger than a day is evicted */
+        p->reserve_bytes    = 256 * MB;                 /* the database's (REQ-216) */
+        p->pressure_bytes   = 512 * MB;                 /* eviction starts below this (REQ-215) */
+        p->batch            = 64;
+        p->evict_enabled    = 1;
+        p->audit_max_age_ms = 365ull * 24 * 60 * 60 * 1000;   /* REQ-251 */
     }
 #ifndef OC_DEMO
+    /* A production build: the constants, whatever the zeroed demo rows hold. */
     c->storage.interval_ms = 5 * 60 * 1000;
-    c->sched_tick_ms = 15000;
-    c->file_page = (int)OC_MAX_FILE_LIST;
+    c->sched_tick_ms       = 15000;
+    c->file_page           = (int)OC_MAX_FILE_LIST;
+    c->call_max            = OC_CALL_MAX;
+    c->max_conns_per_ip    = OC_MAX_CONNS_PER_IP;
+    memset(&c->demo, 0, sizeof c->demo);
 #endif
 
     /* Roots trusted beside the built-in ones: read and checked now, so a file
@@ -390,13 +541,13 @@ static int validate(oc_config *c, char *err, size_t errcap) {
     }
     oc_tls_set_os_roots(c->demo.os_roots);
 
-    /* The relay's key: the file, read once, over the inline form. */
-    free(g_pubkey_buf); g_pubkey_buf = NULL;
-    if (c->oidc.pubkey_file) {
-        g_pubkey_buf = read_file(c->oidc.pubkey_file);
-        if (!g_pubkey_buf) { snprintf(err, errcap, "OPENCHIME_OIDC_PUBKEY_FILE=%s: cannot read", c->oidc.pubkey_file); return -1; }
-        c->oidc.pubkey = g_pubkey_buf;
+    /* The relay is the control plane this box is enrolled with (AUTH.md §3):
+     * its issuer is that origin and its keys are the ones it publishes. */
+    if (c->auth_relay && !c->enroll.url) {
+        snprintf(err, errcap, "OPENCHIME_AUTH=relay: the relay is the control plane; needs OPENCHIME_ENROLL_URL");
+        return -1;
     }
+    if (!c->oidc.pubkey) c->oidc.pubkey = "";
 
     /* Both carry signed requests: https, or plain http to loopback for a test. */
     if (c->enroll.url && !oc_url_transport_ok(c->enroll.url)) {
@@ -408,26 +559,17 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         return -1;
     }
 
-    /* The certificate's source: central on an enrolled managed box, else self,
-     * unless told; what each source needs is checked here, so a box that cannot
-     * get the certificate it was told to get does not start instead of serving
+    /* The certificate's source: central on a managed box, else self, unless
+     * told; what each source needs is checked here, so a box that cannot get
+     * the certificate it was told to get does not start instead of serving
      * the wrong one. */
-    if ((int)c->tls_src.source < 0) {
-        int managed_bound = c->deployment_mode == OC_DEPLOY_MANAGED && c->enroll.url;
-        c->tls_src.source = managed_bound ? OC_TLS_SRC_CENTRAL : OC_TLS_SRC_SELF;
-    }
-    if (c->tls_src.source == OC_TLS_SRC_ACME && !c->tls_src.names) {
-        snprintf(err, errcap, "OPENCHIME_TLS_SOURCE=acme: needs OPENCHIME_TLS_NAME, the names to certify");
+    if (!c->tls_src.given && c->deployment_mode == OC_DEPLOY_MANAGED) c->tls_src.source = OC_TLS_SRC_CENTRAL;
+    if (c->tls_src.source == OC_TLS_SRC_CENTRAL && !c->enroll.url) {
+        snprintf(err, errcap, "OPENCHIME_TLS=central: a certificate through central needs an enrollment (OPENCHIME_ENROLL_URL)");
         return -1;
     }
     if (c->tls_src.source == OC_TLS_SRC_FILE && (access(c->tls_cert, R_OK) != 0 || access(c->tls_key, R_OK) != 0)) {
-        snprintf(err, errcap, "OPENCHIME_TLS_SOURCE=file: needs OPENCHIME_TLS_CERT and OPENCHIME_TLS_KEY to be readable (%s, %s)",
-                 c->tls_cert, c->tls_key);
-        return -1;
-    }
-
-    if (c->summary.mode == OC_SUMMARY_CLOUD && (!*c->summary.url || !*c->summary.model)) {
-        snprintf(err, errcap, "OPENCHIME_SUMMARY=cloud: needs OPENCHIME_SUMMARY_URL and OPENCHIME_SUMMARY_MODEL");
+        snprintf(err, errcap, "OPENCHIME_TLS=file: needs %s and %s to be readable", c->tls_cert, c->tls_key);
         return -1;
     }
 
@@ -466,6 +608,17 @@ int oc_config_load(char *err, size_t errcap) {
                     snprintf(err, errcap, "%s is a demo build's setting and this is not a demo build (make DEMO=1)", name);
                     return -1;
                 }
+                /* The control plane's rows come with its ticket; a self-hoster
+                 * setting one by hand is told so. A demo build, which stands
+                 * in for a managed box in the fixtures, takes them as given. */
+                if (r->cls == CFG_MANAGED && strcmp(name, "OPENCHIME_MANAGED_TICKET") != 0 && !oc_config_is_demo()) {
+                    const char *t = getenv("OPENCHIME_MANAGED_TICKET");
+                    if (!t || !*t) {
+                        snprintf(err, errcap, "%s is the control plane's, set at provision time with OPENCHIME_MANAGED_TICKET (MANAGED.md)", name);
+                        return -1;
+                    }
+                }
+                if (!strcmp(name, "OPENCHIME_TLS")) c->tls_src.given = 1;
                 if (slot < MAX_SLOTS) g_src[slot] = file_set(name) ? SRC_FILE : SRC_ENV;
             } else {
                 v = r->dflt; is_default = 1;
@@ -527,7 +680,7 @@ void oc_config_report(void *out_) {
             if ((r->flags & CFG_CLIENT) || r->kind == CFG_CUSTOM) {
                 if (env && *env) snprintf(val, sizeof val, "%s", (r->flags & CFG_SECRET) ? "(set)" : env);
                 else if (r->flags & CFG_CLIENT) continue;
-                else snprintf(val, sizeof val, "(unset)");
+                else snprintf(val, sizeof val, "%s", r->dflt ? r->dflt : "(unset)");
             } else {
                 const void *p = (const char *)c + r->off;
                 switch (r->kind) {
@@ -548,9 +701,9 @@ void oc_config_report(void *out_) {
                 default: break;
                 }
             }
-            fprintf(out, "%-36s = %-40s (%s%s)\n", name, val,
+            fprintf(out, "%-38s = %-40s (%s%s)\n", name, val,
                     src == SRC_FILE ? "file" : src == SRC_ENV ? "environment" : "default",
-                    r->cls == CFG_DEMO ? ", demo" : "");
+                    r->cls == CFG_DEMO ? ", demo" : r->cls == CFG_MANAGED ? ", managed" : "");
         }
     }
 }
@@ -587,7 +740,7 @@ static void print_group(FILE *out, const char *group, cfg_class cls) {
 void oc_config_print_reference(void *out_) {
     FILE *out = out_;
     fprintf(out, "<!-- Generated by `openchimed --config-reference` from daemon/config_table.c; do not edit by hand (scripts/check/config.sh). -->\n");
-    fprintf(out, "\n## Settings\n\nEvery variable the daemon reads. A value that does not parse, is out of its range, or names a setting that does not exist stops the daemon before it opens anything; an empty value is unset. `openchimed --check-config` tests a file before a restart.\n");
+    fprintf(out, "\n## Settings and features\n\nEverything an operator may set. A value that does not parse, is out of its range, or names a setting that does not exist stops the daemon before it opens anything; an empty value is unset. `openchimed --check-config` tests a file before a restart.\n");
     /* Operator rows, by group in table order. */
     const char *seen[32]; int n_seen = 0;
     for (const cfg_row *r = OC_CFG; r->name; r++) {
@@ -597,11 +750,11 @@ void oc_config_print_reference(void *out_) {
         seen[n_seen++] = r->group;
     }
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_OPERATOR);
-    fprintf(out, "\n## Tuning\n\nDefaults that are right for almost everyone; listed so they are known, not because a deployment sets them.\n");
-    for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_TUNING);
+    fprintf(out, "\n## Managed\n\nWritten by the control plane when it provisions a managed box (MANAGED.md), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.\n");
+    for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_MANAGED);
     fprintf(out, "\n## Demo builds only\n\nRead by a daemon or client built with `make DEMO=1` (TESTING.md). A production build refuses to start with any of them set; the code behind them is not in it.\n");
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_DEMO);
-    fprintf(out, "\n## No longer read\n\n| Name | Instead |\n|---|---|\n");
+    fprintf(out, "\n## No longer read\n\nA name that was a setting once. Set, it stops the daemon with the line below; the constants it names are in `daemon/config.h`.\n\n| Name | Instead |\n|---|---|\n");
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) fprintf(out, "| `%s` | %s |\n", x->name, x->instead);
 }
 
@@ -611,8 +764,8 @@ void oc_config_print_env_template(void *out_) {
         "# OpenChime daemon configuration.\n"
         "#\n"
         "# The daemon is configured entirely from its environment (ARCH-26); this is\n"
-        "# the EnvironmentFile systemd hands it. Every setting the daemon reads is\n"
-        "# here, at its default, commented; uncomment to change one. A value that\n"
+        "# the EnvironmentFile systemd hands it. Every setting an operator may make\n"
+        "# is here, at its default, commented; uncomment to change one. A value that\n"
         "# does not parse or is out of range stops the daemon: test an edit with\n"
         "#   openchimed --check-config --env-file /etc/openchime/openchimed.env\n"
         "# docs/CONFIG.md explains each. Generated by `openchimed --config-env`.\n"
@@ -632,10 +785,7 @@ void oc_config_print_env_template(void *out_) {
             fprintf(out, "# %s\n", r->doc);
             /* The paths the packages repoint into the unit's StateDirectory, set. */
             const char *packaged = NULL;
-            if (!strcmp(r->name, "OPENCHIME_DB_PATH"))  packaged = "/var/lib/openchime/openchime.db";
-            if (!strcmp(r->name, "OPENCHIME_BLOB_DIR")) packaged = "/var/lib/openchime/blobs";
-            if (!strcmp(r->name, "OPENCHIME_TLS_CERT")) packaged = "/var/lib/openchime/cert.pem";
-            if (!strcmp(r->name, "OPENCHIME_TLS_KEY"))  packaged = "/var/lib/openchime/key.pem";
+            if (!strcmp(r->name, "OPENCHIME_DATA_DIR")) packaged = "/var/lib/openchime";
             if (r->flags & CFG_PATTERN) {
                 char name[80]; const char *pct = strstr(r->name, "%d");
                 snprintf(name, sizeof name, "%.*s1", (int)(pct - r->name), r->name);

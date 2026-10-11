@@ -66,7 +66,7 @@ the form is docs/TUNING.md.
 
 - Any OpenAI-style chat-completions API works; the request is `model`,
   `messages`, `temperature` 0 and `max_tokens`, nothing else.
-- The model is named by its provider's name, exactly (`OPENCHIME_SUMMARY_MODEL`).
+- The model is named by its provider's name, exactly (the `<model>` in `OPENCHIME_SUMMARY=cloud:<url>,<model>`).
   Changing it remakes every summary.
 - A model that reasons before answering is told not to at startup, through
   whichever of the known fields its API honours (SUMMARIES.md §6, one log line

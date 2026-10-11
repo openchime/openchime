@@ -41,7 +41,7 @@ down)
   OC_TEST_WHO=a "$DRIVE" kill >/dev/null 2>&1 || true
   OC_TEST_WHO=b "$DRIVE" kill >/dev/null 2>&1 || true
   for p in $(pgrep -x openchimed 2>/dev/null); do
-    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$PORT" || continue
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$PORT" || continue
     kill "$p" 2>/dev/null || true
     for _ in $(seq 1 120); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
   done

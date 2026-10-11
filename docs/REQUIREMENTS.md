@@ -1190,7 +1190,7 @@ where one exists.
   caller can read; migration 0023 adds the one index that access pattern needed.
   Pending uploads are excluded, reclaimed rows are listed and flagged. Filtering
   by type is client-side over the returned `mime`. The answer comes a page at a
-  time (200 rows, `OPENCHIME_FILE_PAGE`) and says whether more remain; the client
+  time (200 rows) and says whether more remain; the client
   asks for the next page with the keyset cursor the last row it holds gives it,
   and the Win32 files view offers "Load more" while there are more, so a channel
   with thousands of files can be browsed past the first page.
@@ -1237,8 +1237,8 @@ where one exists.
   left a **"Missed call"** line in the conversation's history, a call event
   rather than a message (ARCH-90), not searched, not read aloud and not
   notifying.
-- **REQ-305.** A call has held at most **`OPENCHIME_CALL_MAX`** people (default
-  10, from 2 to 32); a join or invitation past it has been refused as full.
+- **REQ-305.** A call has held at most **ten** people (`OC_CALL_MAX`); a join
+  or invitation past it has been refused as full.
 - **REQ-306.** A call has been **end-to-end encrypted**: the daemon, the relay
   and the network have carried audio only the participants' devices could
   decrypt, with keys that change on every join and leave (ARCH-113).
@@ -1302,7 +1302,7 @@ where one exists.
   codec and treats the file as an ordinary attachment (REQ-140) with media
   metadata beside it — duration, dimensions and a poster image. Because the daemon
   cannot measure a duration, the reported one is advisory and the enforced bound
-  is a **byte cap** for video messages (`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`).
+  is a **byte cap** for video messages (`OC_MAX_VIDEO_SIZE`, 160 MiB).
 - **REQ-165.** A video message has **played back in the client**: a
   card in the conversation with its poster, a play mark and its duration, opening
   a player with play and pause, seeking, volume and download. Previews name it
@@ -1438,7 +1438,7 @@ where one exists.
   have been made again from what is there now. A summary made by an older model or
   prompt has been kept and served until the new one was made.
 - **REQ-313.** Summaries have been **absent unless the operator turns them on**:
-  `OPENCHIME_SUMMARY` off (the default), local or cloud. *Local* runs one known,
+  `OPENCHIME_SUMMARY` off (the default), `local` or `cloud:<url>,<model>`. *Local* runs one known,
   open-licensed model inside the daemon, fetched on first setup. A model that cannot
   be fetched or loaded, or a CPU that cannot run it, has left summaries off, said why
   in the log, and left the rest of the server running. Where summaries are off, no

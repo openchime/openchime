@@ -9,7 +9,7 @@
  * SQLite — the daemon streams them to/from this store in bounded chunks as it
  * proxies a transfer (ARCH-69). The interface is a narrow streaming seam so the
  * backend is swappable: this build ships a local-filesystem implementation; an
- * S3/MinIO (SigV4) implementation is selected by the four OPENCHIME_S3_* settings.
+ * S3/MinIO (SigV4) implementation is selected by OPENCHIME_S3.
  *
  * `key` is an opaque storage key the daemon assigns (never exposed on the wire).
  * All calls are thread-safe with respect to *distinct* keys (each transfer owns
@@ -20,10 +20,6 @@ typedef struct oc_blobstore oc_blobstore;
 typedef struct oc_blob_writer oc_blob_writer;
 typedef struct oc_blob_reader oc_blob_reader;
 
-/* Open the store. `base_dir` is the local-filesystem root (created if absent);
- * with the OPENCHIME_S3_* settings the S3/MinIO backend is used instead and
- * `base_dir` is ignored (it reads OPENCHIME_S3_* from the environment). Returns
- * NULL on failure. */
 /* Open the store: S3 when `s3` names an endpoint (config.h: all four values,
  * which the loader has checked), local disk under `base_dir` otherwise. */
 oc_blobstore *oc_blobstore_open(const char *base_dir, const oc_s3_config *s3);

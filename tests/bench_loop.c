@@ -29,6 +29,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -552,9 +553,9 @@ static void *loop_thread(void *p) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    setenv("OPENCHIME_BLOB_DIR", "build/bench_blobs", 1);
-    setenv("OPENCHIME_CALL_MAX", "10", 1);
-    setenv("OPENCHIME_MAX_CONNS_PER_IP", "0", 1);
+    mkdir("build/bench_data", 0700);
+    setenv("OPENCHIME_DATA_DIR", "build/bench_data", 1);
+    setenv("OPENCHIME_DEMO_CONNS_PER_IP", "0", 1);
     char cfgerr[128];
     if (oc_config_load(cfgerr, sizeof cfgerr) != 0) { fprintf(stderr, "config: %s\n", cfgerr); return 1; }
 

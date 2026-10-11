@@ -49,14 +49,14 @@ check() { local what="$1"; shift; checks=$((checks + 1)); if "$@"; then ok "$wha
 # running daemon does not reset it: SQLite keeps writing to the unlinked inode,
 # so the workspace stays live while its files are gone. And killing it needs the
 # ENVIRONMENT, not the command line -- the daemon is started as
-# `env OPENCHIME_PROTO_PORT=... openchimed`, so its own cmdline carries no port
-# and `pkill -f OPENCHIME_PROTO_PORT=9500` matches nothing while looking exactly
+# `env OPENCHIME_PORT=... openchimed`, so its own cmdline carries no port
+# and `pkill -f OPENCHIME_PORT=9500` matches nothing while looking exactly
 # like "nothing to kill". Waits for the port to free; 1 if it does not.
 kill_dev_daemon() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
-      grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && kill "$p" 2>/dev/null
+      grep -qx "OPENCHIME_PORT=$OC_TEST_PORT" && kill "$p" 2>/dev/null
   done
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     (exec 3<>/dev/tcp/127.0.0.1/"$OC_TEST_PORT") 2>/dev/null || return 0

@@ -7,15 +7,30 @@ configuration file** (ARCH-26): the daemon is configured entirely from its
 process environment, read once at startup into a single `oc_config` singleton
 (`daemon/config.c`) from one registry (`daemon/config_table.c`), which is also
 where the reference below, the packaged environment file and
-`openchimed --check-config` come from. The files the loader opens are PEM files
-the environment names: the OIDC public keys (`OPENCHIME_OIDC_PUBKEY_FILE`),
-any extra CA roots (`OPENCHIME_EXTRA_CA`) and a direct connection's secret.
+`openchimed --check-config` come from. The files the loader opens are the ones
+the data directory holds and the PEM files the environment names (any extra CA
+roots, a direct connection's secret).
+
+**The surface is small, on purpose.** An operator sees two kinds of row:
+**features**, each a flag that turns a capability on or off with its one value
+where there is anything to configure (`OPENCHIME_TLS=acme:chat.example.com`,
+`OPENCHIME_S3=s3://…`, `OPENCHIME_SUMMARY=cloud:<url>,<model>`), and
+**settings**, values with no feature behind them (the name, the data
+directory, the ports, who may join). Nineteen in all. Every path is under one
+`OPENCHIME_DATA_DIR` at a fixed name, the deployment model is derived from
+what the box was started with rather than declared, and everything nobody
+varies — session life, worker counts, queue depths, storage watermarks, rate
+limits, the call cap — is a constant in `daemon/config.h`, not a row. Seven
+more rows are the control plane's, written when it provisions a managed box
+([MANAGED.md](./MANAGED.md)); set without its ticket they refuse the start.
+Nine are a demo build's test switches, which a production build refuses.
 
 **The daemon is strict about its environment.** A value that does not parse,
 a value outside its range, a name it does not know (a typo, or a name it no
-longer reads) and, in a production build, a demo build's switch each stop the
-daemon before it opens anything, with one line naming the variable, the value
-and what is accepted. An empty value is unset. There is no lenient mode:
+longer reads), a managed row without the ticket and, in a production build, a
+demo build's switch each stop the daemon before it opens anything, with one
+line naming the variable, the value and what is accepted. An empty value is
+unset. There is no lenient mode:
 `openchimed --check-config --env-file /etc/openchime/openchimed.env` runs the
 same loader over a file and prints every effective value with its source, so
 an edit is tested before a restart (the packages run it on install).
@@ -26,218 +41,102 @@ ever fetched from a control plane at runtime, in any deployment model — a
 federated deployment contacts its opted-in services for their own function, never
 to learn how to run (ARCH-26/76).
 
-**The packages ship an `EnvironmentFile`, and it is not decoration.** The `.deb`,
-`.rpm` and tarball install `/etc/openchime/openchimed.env` and the unit reads it.
-It is marked as configuration (`conffiles` / `%config(noreplace)`), so an
-upgrade preserves your edits. It is mode `0600`, owned by root — it can hold an
-enrollment ticket and storage keys, and it is systemd that reads it, not the
-daemon's own user — and an install tightens a file an older one left wider. It **must** override the path defaults below: those
-point at `/data`, which suits the container image, whereas the systemd unit runs
-with `ProtectSystem=strict` and a `StateDirectory`, making `/var/lib/openchime`
-the only writable path. The shipped file repoints the database, blobs and TLS
-identity there. The table's defaults are therefore what the *binary* does, not
-what a packaged install does.
+**The packages ship an `EnvironmentFile`.** The `.deb`, `.rpm` and tarball
+install `/etc/openchime/openchimed.env` and the unit reads it. It is marked as
+configuration (`conffiles` / `%config(noreplace)`), so an upgrade preserves
+your edits. It is mode `0600`, owned by root — it can hold an S3 key and a
+summary API key, and it is systemd that reads it, not the daemon's own user —
+and an install tightens a file an older one left wider. It sets the one thing
+a packaged install must: `OPENCHIME_DATA_DIR=/var/lib/openchime`, the unit's
+`StateDirectory`, since the binary's own default is `/data`, which suits the
+container image and exists nowhere else.
 
-**No aliases.** The older `OC_`-prefixed spellings are no longer read; a daemon
-started with one says which `OPENCHIME_` name replaced it and stops (the table
-at the end lists them).
+**The data directory's layout** is fixed: `openchime.db` (the database, which
+the daemon creates and migrates), `blobs/` (attachments on local disk, unless
+`OPENCHIME_S3`), `cert.pem` and `key.pem` (the certificate presented, written
+by the daemon or, with `OPENCHIME_TLS=file`, yours), `factor.key` (the key
+local accounts' second-step secrets are sealed under: back it up with the
+database) and `summary/` (the local summary model, fetched on first use). The
+daemon makes the directory if it is absent (not its parents), and everything
+inside it. The speech features'
+data and the web client are not configuration: they are found at
+`/usr/share/openchime/{tts,stt,web}`, else beside the executable.
 
----
+**No aliases.** A name that was a setting once is not read; a daemon started
+with one says what replaced it, or the constant it became, and stops (the
+table at the end lists them).
 
 ---
 
 <!-- config-reference -->
 <!-- Generated by `openchimed --config-reference` from daemon/config_table.c; do not edit by hand (scripts/check/config.sh). -->
 
-## Settings
+## Settings and features
 
-Every variable the daemon reads. A value that does not parse, is out of its range, or names a setting that does not exist stops the daemon before it opens anything; an empty value is unset. `openchimed --check-config` tests a file before a restart.
+Everything an operator may set. A value that does not parse, is out of its range, or names a setting that does not exist stops the daemon before it opens anything; an empty value is unset. `openchimed --check-config` tests a file before a restart.
 
-### Core
+### Settings
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_DEPLOYMENT_MODE` | `standalone` | The deployment model (ARCH-76). `federated` enables nothing by itself: each service is gated on its own URL. One of `standalone`, `federated`, `managed`. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. |
-| `OPENCHIME_WORKSPACE_ADDRESS` | *(empty)* | The workspace's canonical address, when it moved and still answers at the old one; clients re-file it under this. |
-| `OPENCHIME_DB_PATH` | `/data/openchime.db` | The SQLite database; created and migrated by the daemon. The packages set `/var/lib/openchime/openchime.db`. |
-| `OPENCHIME_TLS_CERT` | `/data/cert.pem` | The certificate the daemon presents (PEM); with `OPENCHIME_TLS_SOURCE=self`, where it writes its own. |
-| `OPENCHIME_TLS_KEY` | `/data/key.pem` | Its private key (PEM). |
-| `OPENCHIME_PROTO_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on (443 for a real deployment, ARCH-54). Integer 1..65535. |
-| `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 turns it off. Integer 0..65535. |
-| `OPENCHIME_MAX_USERS` | `0` | The most registered users; 0 is unlimited. A managed box has it set by the control plane (CP-7). Integer 0..1000000. |
+| `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`. |
+| `OPENCHIME_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54). Integer 1..65535. |
+| `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
+| `OPENCHIME_JOIN` | *(unset)* | Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §3). Unset: only by invitation. |
+| `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
+| `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots trusted beside the built-in ones for every outbound connection (push, enrollment, unfurls, S3): a service behind a private CA. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
 
-### Sessions and local sign-in
+### Features
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_SESSION_DAYS` | `30` | How many days a session lives (REQ-181). Integer 1..3650. |
-| `OPENCHIME_SESSION_IDLE_DAYS` | `0` | How many days a session may go unused; 0 is no idle limit. Integer 0..3650. |
-| `OPENCHIME_LOCAL_MFA` | `optional` | Whether local accounts are asked for a second step (AUTH.md §8.6). One of `off`, `optional`, `required`. |
-| `OPENCHIME_FACTOR_KEY_FILE` | *(unset)* | The key local accounts' second-step secrets are sealed under; unset, `factor.key` beside the database. Back it up with the database. |
-
-### Authentication
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_AUTH_MODE` | `local` | Where accounts come from, comma-separated: `local` (passwords held here), `relay` or `oidc` (the central relay, ARCH-56); checked at startup. |
-| `OPENCHIME_OIDC_ISSUER` | *(unset)* | The relay's issuer URL, for `relay`. |
-| `OPENCHIME_OIDC_AUDIENCE` | *(unset)* | The audience the relay's tokens carry for this workspace; an enrolled box derives it. |
-| `OPENCHIME_OIDC_PUBKEY` | *(unset)* | The relay's public key, PEM, inline. The control plane writes this form. |
-| `OPENCHIME_OIDC_PUBKEY_FILE` | *(unset)* | The relay's public key, PEM, as a file; read at startup and preferred over the inline form. |
-| `OPENCHIME_OIDC_ALLOW` | *(unset)* | Who may join by signing in: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §3). Empty: only by invitation. |
-| `OPENCHIME_OIDC_EMAIL_LINK` | `provider-only` | Whether an emailed code may sign into a person a provider knows (AUTH.md §8.4). One of `provider-only`, `any`. |
-| `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (AUTH.md §8.5): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
-
-### Outbound TLS
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots trusted beside the built-in ones for every outbound connection (push, enrollment, unfurls, S3): a self-hosted service behind a private CA. |
-
-### Certificates
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_TLS_SOURCE` | *(unset)* | Where the daemon's certificate comes from (TLS.md): its own self-signed one, your files, ACME for OPENCHIME_TLS_NAME, or central. Unset: `central` on an enrolled managed box, else `self`. One of `self`, `file`, `acme`, `central`. |
-| `OPENCHIME_TLS_NAME` | *(unset)* | The DNS names to certify, comma-separated; required by `acme`. |
-| `OPENCHIME_ACME_DIRECTORY` | `https://acme-v02.api.letsencrypt.org/directory` | The ACME directory URL. |
-| `OPENCHIME_ACME_EMAIL` | *(unset)* | The ACME account's contact address. |
-
-### Attachments and blob storage
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_BLOB_DIR` | `/data/blobs` | Where attachments are kept on local disk, and the filesystem whose free space the pressure policy measures. The packages set `/var/lib/openchime/blobs`. |
-| `OPENCHIME_MAX_ATTACHMENT_SIZE` | `209715200` | The largest attachment, in bytes; the wire's cap (200 MiB) is the most it can be. Integer 1..209715200. |
-| `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` | `167772160` | The largest video message, in bytes; at most the attachment size. Integer 1..209715200. |
-| `OPENCHIME_S3_ENDPOINT` | *(unset)* | S3 instead of local disk (ARCH-70): the endpoint (`host`, `host:port`, or a URL whose scheme picks the transport). All four S3 values, or none. |
-| `OPENCHIME_S3_BUCKET` | *(unset)* | The bucket. |
-| `OPENCHIME_S3_ACCESS_KEY` | *(unset)* | The access key. |
-| `OPENCHIME_S3_SECRET_KEY` | *(unset)* | The secret key. |
-| `OPENCHIME_S3_REGION` | `us-east-1` | The region SigV4 signs for. |
-
-### Storage pressure and maintenance
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_ATTACH_MAX_AGE_DAYS` | `0` | Attachments older than this expire; 0 keeps them forever. Integer 0..36500. |
-| `OPENCHIME_EVICT` | `on` | Whether the oldest attachments are evicted when free space falls below OPENCHIME_PRESSURE_MB (REQ-215). Local disk only. `on` or `off`. |
-| `OPENCHIME_AUDIT_MAX_DAYS` | `365` | Audit entries older than this age out, per family (REQ-251); 0 keeps them forever. Integer 0..36500. |
-
-### Federated services
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_ENROLL_URL` | *(unset)* | The control plane to enrol with (ARCH-84): https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
-| `OPENCHIME_ENROLL_CODE_FILE` | *(unset)* | Where the enrollment code is also written, for an installer to read. |
-| `OPENCHIME_ENROLL_WAIT_SECS` | `0` | How long the first start waits for the enrollment to be claimed before serving anyway. Integer 0..86400. |
-| `OPENCHIME_ENROLL_TICKET` | *(unset)* | A managed box's claim ticket, written by the control plane at provision time. |
-| `OPENCHIME_PUSH_URL` | *(unset)* | The mobile push relay (ARCH-16/85), contentless: https, or http to loopback for a test. |
+| `OPENCHIME_TLS` | `self` | The certificate the daemon presents (TLS.md): `self` (its own, made at first run), `file` (`cert.pem` and `key.pem` in the data directory), `acme:<names>[;email=…][;directory=…]` (RFC 8555 for the comma-separated names), or `central` (through the control plane; the default on a managed box). |
+| `OPENCHIME_AUTH` | `local` | Where accounts come from: `local` (passwords held here), `relay` (sign-in through the control plane this box is enrolled with, ARCH-56), or `local,relay`. |
+| `OPENCHIME_MFA` | `optional` | Whether local accounts are asked for a second step (AUTH.md §8.6). One of `off`, `optional`, `required`. |
+| `OPENCHIME_S3` | *(unset)* | Attachments in S3 instead of under the data directory (ARCH-70): `s3://KEY:SECRET@host[:port]/bucket[?region=…]`, or `http+s3://` for a plaintext endpoint; percent-encode `/`, `+` and `@` in the key and secret. Unset: local disk. |
+| `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it; off saves the voice model's memory. `on` or `off`. |
+| `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. `on` or `off`. |
+| `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `off`, `local` (the model runs inside the daemon, fetched on first start), or `cloud:<url>,<model>` (a hosted API's base URL and the model there). |
+| `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | The hosted API's key, for `cloud`. |
+| `OPENCHIME_ENROLL_URL` | *(unset)* | The control plane to enrol with (ARCH-84), which makes the box federated: https, or http to loopback for a test. Prints an `oce1.` code to the log on first run. |
+| `OPENCHIME_PUSH_URL` | *(unset)* | The mobile push relay (ARCH-16/85), contentless; needs an enrollment. https, or http to loopback for a test. |
 | `OPENCHIME_INVITE_MAIL` | `off` | Whether invitations bound to an address are reported to central for it to mail (REQ-280); needs an active enrollment. One of `off`, `on`. |
 
-### Audio
+## Managed
+
+Written by the control plane when it provisions a managed box (MANAGED.md), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.
+
+### Managed
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_AUDIO_PORT` | `0` | The call relay's UDP port; 0 is ephemeral (AUDIO.md §4). Integer 0..65535. |
-| `OPENCHIME_AUDIO_ADVERTISE_PORT` | `0` | The UDP port clients are told, where a front door maps it; 0 is the bound one. Integer 0..65535. |
-| `OPENCHIME_AUDIO_TOKEN_PREFIX` | *(unset)* | Hex bytes (at most 16) that lead every relay token, so a front door can route by them. |
-
-### Calls and files
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_CALL_MAX` | `10` | The most people in one call (REQ-305); every participant mixes every other's stream. Integer 2..32. |
-
-### Read-aloud
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_TTS` | `on` | Read-aloud (ARCH-111), in a build that carries it. `on` or `off`. |
-| `OPENCHIME_TTS_LANG` | `en-US` | The language read in; the binary carries one and refuses another. |
-| `OPENCHIME_TTS_DATA_DIR` | *(unset)* | Where the voice data is; unset, `/usr/share/openchime/tts`, else `tts/` beside the executable. |
-
-### Voice input
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_STT` | `on` | Voice input (ARCH-112), in a build that carries it. `on` or `off`. |
-| `OPENCHIME_STT_DATA_DIR` | *(unset)* | Where the recognizer's data is; unset, `/usr/share/openchime/stt`, else `stt/` beside the executable. |
-
-### Summaries
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_SUMMARY` | `off` | Summaries (REQ-310): `local` runs the model inside the daemon (fetched on first start), `cloud` names a hosted API. One of `off`, `local`, `cloud`. |
-| `OPENCHIME_SUMMARY_URL` | *(empty)* | The hosted API's base URL, for `cloud`. |
-| `OPENCHIME_SUMMARY_MODEL` | *(empty)* | The model there, for `cloud`. |
-| `OPENCHIME_SUMMARY_API_KEY` | *(empty)* | Its key. |
-
-### Client-side
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name (ARCH-14); `workspace.openchime.io` unset. |
-
-## Tuning
-
-Defaults that are right for almost everyone; listed so they are known, not because a deployment sets them.
-
-### Core
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_MAX_CONNS_PER_IP` | `256` | Connections one address may hold at once; 0 disables the cap. Behind a proxy, see OPENCHIME_TRUSTED_PROXIES. Integer 0..1000000. |
-| `OPENCHIME_XFER_WORKERS` | `2` | Threads that move attachment bytes to and from the blob store (ARCH-69); each holds a TLS session and a chunk buffer. Integer 1..16. |
-
-### Storage pressure and maintenance
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_EVICT_GRACE_HOURS` | `24` | Never evict anything younger than this. Integer 0..8760. |
-| `OPENCHIME_DB_RESERVE_MB` | `256` | Free space that belongs to the database: below it, uploads are refused (REQ-216). Measured on the attachment filesystem, so it protects the database only when the two share a disk. Integer 1..1048576. |
-| `OPENCHIME_PRESSURE_MB` | `512` | Free space below which eviction starts; at least the reserve. Integer 1..1048576. |
-| `OPENCHIME_MAINT_BATCH` | `64` | The most attachments one maintenance pass reclaims. Integer 1..100000. |
-
-### Read-aloud
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_TTS_QUEUE` | `256` | How many renders may wait. Integer 1..4096. |
-| `OPENCHIME_TTS_IDLE_SECS` | `300` | How long the model stays loaded with nothing to do. Integer 5..86400. |
-| `OPENCHIME_TTS_RATE` | `60` | AUDIO_GETs one connection may make a minute. Integer 1..6000. |
-
-### Voice input
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_STT_QUEUE` | `64` | Segments that may wait for the recognizer. Integer 1..1024. |
-| `OPENCHIME_STT_IDLE_SECS` | `300` | How long the model stays loaded with nothing to hear. Integer 5..86400. |
-| `OPENCHIME_STT_RATE` | `60` | Segments one connection may send a minute. Integer 1..6000. |
-| `OPENCHIME_STT_MAX_SECS` | `30` | The longest segment. Integer 5..60. |
+| `OPENCHIME_MANAGED_TICKET` | *(unset)* | The one-time claim ticket; with it the box is managed and the other rows here may be set. |
+| `OPENCHIME_MANAGED_AUDIENCE` | *(unset)* | The audience central minted for this workspace; the relay's tokens carry it. |
+| `OPENCHIME_MANAGED_RELAY_KEY` | *(unset)* | A relay public key, PEM, pinned beneath the keys the relay publishes (AUTH.md §3.3). |
+| `OPENCHIME_MANAGED_MAX_USERS` | `0` | The most registered users (CP-7); 0 is unlimited. Integer 0..1000000. |
+| `OPENCHIME_MANAGED_ADDRESS` | *(empty)* | The workspace's canonical address, when it moved and still answers at the old one; clients re-file it under this. |
+| `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` | `0` | The UDP port clients are told, where a front door maps it (AUDIO.md §4); 0 is the bound one. Integer 0..65535. |
+| `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX` | *(unset)* | Hex bytes (at most 16) that lead every relay token, so a front door can route by them. |
 
 ## Demo builds only
 
 Read by a daemon or client built with `make DEMO=1` (TESTING.md). A production build refuses to start with any of them set; the code behind them is not in it.
 
-### Storage pressure and maintenance
+### Demo
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_MAINT_INTERVAL_MS` | `300000` | How often the maintenance pass runs; five minutes in a production build. Integer 1000..86400000. |
-| `OPENCHIME_SCHED_TICK_MS` | `15000` | How often scheduled messages are swept; fifteen seconds in a production build. Integer 50..3600000. |
-
-### Test switches
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_TEST_PASSWORD_AUTH` | `off` | The daemon takes a local password in a frame, as the test suites and the harness sign in (AUTH.md §8.10). `on` or `off`. |
-| `OPENCHIME_UNFURL_ALLOW_PRIVATE` | `off` | Turns the unfurl fetcher's SSRF gate off, so a test can fetch a loopback fixture. `on` or `off`. |
-| `OPENCHIME_BOOTSTRAP_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
-| `OPENCHIME_FILE_PAGE` | `200` | How many files one LIST_FILES page carries; the wire's maximum in a production build. Integer 1..200. |
-| `OPENCHIME_TEST_OS_ROOTS` | *(unset)* | The CA bundle read instead of the operating system's, for a test with its own CA. |
+| `OPENCHIME_DEMO_PASSWORD_FRAMES` | `on` | The daemon takes a local password in a frame, as the test suites and the harness sign in (AUTH.md §8.10); `off` is the product as shipped. `on` or `off`. |
+| `OPENCHIME_DEMO_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
+| `OPENCHIME_DEMO_FILE_PAGE` | `200` | How many files one LIST_FILES page carries, so a test sees a second page. Integer 1..200. |
+| `OPENCHIME_DEMO_CALL_MAX` | `10` | The most people in one call, so a test can fill one. Integer 2..32. |
+| `OPENCHIME_DEMO_CONNS_PER_IP` | `1024` | Connections one address may hold; 0 is no cap, for a load test from one host. Integer 0..1000000. |
+| `OPENCHIME_DEMO_MAINT_MS` | `300000` | How often the maintenance pass runs. Integer 1000..86400000. |
+| `OPENCHIME_DEMO_SCHED_MS` | `15000` | How often scheduled messages are swept. Integer 50..3600000. |
+| `OPENCHIME_DEMO_PRIVATE_UNFURL` | `off` | Turns the unfurl fetcher's SSRF gate off, so a test can fetch a loopback fixture. `on` or `off`. |
+| `OPENCHIME_DEMO_OS_ROOTS` | *(unset)* | The CA bundle read instead of the operating system's, for a test with its own CA. |
 | `OPENCHIME_TEST_DIR` | *(unset)* | GUI: the directory of the automation hook's command channel and dumps (TESTING.md). |
 | `OPENCHIME_TEST_AUDIO` | *(unset)* | Clients: `synthetic` audio devices, or `mic-denied`. |
 | `OPENCHIME_TEST_MIC` | *(unset)* | Clients: a WAV the synthetic microphone speaks. |
@@ -248,25 +147,83 @@ Read by a daemon or client built with `make DEMO=1` (TESTING.md). A production b
 | `OPENCHIME_TEST_SCREEN_GONE_MS` | *(unset)* | Clients: the synthetic screen ends after this many ms. |
 | `OPENCHIME_TEST_VIDEO_CAP_MS` | *(unset)* | Clients: a shorter video message cap, in ms. |
 | `OPENCHIME_TEST_CALL_TIMERS` | *(unset)* | Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset. |
+| `OPENCHIME_TEST_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14). |
 
 ## No longer read
 
+A name that was a setting once. Set, it stops the daemon with the line below; the constants it names are in `daemon/config.h`.
+
 | Name | Instead |
 |---|---|
-| `OC_AUTH_MODE` | renamed OPENCHIME_AUTH_MODE |
-| `OC_OIDC_ISSUER` | renamed OPENCHIME_OIDC_ISSUER |
-| `OC_OIDC_AUDIENCE` | renamed OPENCHIME_OIDC_AUDIENCE |
-| `OC_OIDC_PUBKEY` | renamed OPENCHIME_OIDC_PUBKEY |
-| `OC_OIDC_PUBKEY_FILE` | renamed OPENCHIME_OIDC_PUBKEY_FILE |
-| `OC_BOOTSTRAP_USERS` | renamed OPENCHIME_BOOTSTRAP_USERS (demo builds only) |
-| `OC_ENROLL_URL` | renamed OPENCHIME_ENROLL_URL |
-| `OC_ENROLL_CODE_FILE` | renamed OPENCHIME_ENROLL_CODE_FILE |
-| `OC_ENROLL_WAIT_SECS` | renamed OPENCHIME_ENROLL_WAIT_SECS |
-| `OC_PUSH_URL` | renamed OPENCHIME_PUSH_URL |
-| `OC_TLS_OS_ROOTS` | renamed OPENCHIME_TEST_OS_ROOTS (demo builds only) |
-| `OPENCHIME_RECOVER_MB` | removed: nothing read it; eviction runs to OPENCHIME_PRESSURE_MB |
-| `OPENCHIME_BLOB_BACKEND` | removed: the backend is S3 when the four OPENCHIME_S3_* values are set, local disk when none is |
-| `OPENCHIME_STATE` | removed: the TUI keeps its state in the credential store (ARCH-88) |
+| `OPENCHIME_DEPLOYMENT_MODE` | derived: managed with OPENCHIME_MANAGED_TICKET, federated with OPENCHIME_ENROLL_URL, else standalone |
+| `OPENCHIME_DB_PATH` | the database is openchime.db under OPENCHIME_DATA_DIR |
+| `OPENCHIME_BLOB_DIR` | attachments are blobs/ under OPENCHIME_DATA_DIR |
+| `OPENCHIME_TLS_CERT` | cert.pem under OPENCHIME_DATA_DIR |
+| `OPENCHIME_TLS_KEY` | key.pem under OPENCHIME_DATA_DIR |
+| `OPENCHIME_FACTOR_KEY_FILE` | factor.key under OPENCHIME_DATA_DIR |
+| `OPENCHIME_TTS_DATA_DIR` | the voice data is found at /usr/share/openchime/tts, else tts/ beside the executable |
+| `OPENCHIME_STT_DATA_DIR` | the recognizer's data is found at /usr/share/openchime/stt, else stt/ beside the executable |
+| `OPENCHIME_PROTO_PORT` | renamed OPENCHIME_PORT |
+| `OPENCHIME_AUDIO_PORT` | the call relay's UDP port is OPENCHIME_PORT |
+| `OPENCHIME_WORKSPACE_ADDRESS` | renamed OPENCHIME_MANAGED_ADDRESS (the control plane's) |
+| `OPENCHIME_MAX_USERS` | renamed OPENCHIME_MANAGED_MAX_USERS (the control plane's) |
+| `OPENCHIME_MAX_CONNS_PER_IP` | a constant, 1024; a demo build reads OPENCHIME_DEMO_CONNS_PER_IP |
+| `OPENCHIME_XFER_WORKERS` | a constant, 2 |
+| `OPENCHIME_SESSION_DAYS` | a constant, 30 |
+| `OPENCHIME_SESSION_IDLE_DAYS` | a constant: no idle limit |
+| `OPENCHIME_LOCAL_MFA` | renamed OPENCHIME_MFA |
+| `OPENCHIME_AUTH_MODE` | renamed OPENCHIME_AUTH |
+| `OPENCHIME_OIDC_ISSUER` | the relay is the control plane: its issuer is OPENCHIME_ENROLL_URL's origin |
+| `OPENCHIME_OIDC_AUDIENCE` | an enrolled box's audience is its enrollment's; a managed box is started with OPENCHIME_MANAGED_AUDIENCE |
+| `OPENCHIME_OIDC_PUBKEY` | the relay's keys are the ones it publishes; a managed box may pin one with OPENCHIME_MANAGED_RELAY_KEY |
+| `OPENCHIME_OIDC_PUBKEY_FILE` | the relay's keys are the ones it publishes |
+| `OPENCHIME_OIDC_ALLOW` | renamed OPENCHIME_JOIN |
+| `OPENCHIME_OIDC_EMAIL_LINK` | a constant: an emailed code signs into a person a provider knows only through that provider |
+| `OPENCHIME_TLS_SOURCE` | OPENCHIME_TLS=self|file|acme:<names>|central |
+| `OPENCHIME_TLS_NAME` | OPENCHIME_TLS=acme:<names> |
+| `OPENCHIME_ACME_DIRECTORY` | OPENCHIME_TLS=acme:<names>;directory=<url> |
+| `OPENCHIME_ACME_EMAIL` | OPENCHIME_TLS=acme:<names>;email=<address> |
+| `OPENCHIME_MAX_ATTACHMENT_SIZE` | a constant: the wire's cap, 200 MiB |
+| `OPENCHIME_MAX_VIDEO_MESSAGE_SIZE` | a constant, 160 MiB |
+| `OPENCHIME_S3_ENDPOINT` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |
+| `OPENCHIME_S3_BUCKET` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |
+| `OPENCHIME_S3_ACCESS_KEY` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |
+| `OPENCHIME_S3_SECRET_KEY` | OPENCHIME_S3=s3://KEY:SECRET@host[:port]/bucket[?region=…] |
+| `OPENCHIME_S3_REGION` | OPENCHIME_S3=s3://…/bucket?region=<region> |
+| `OPENCHIME_ATTACH_MAX_AGE_DAYS` | a constant: attachments are kept |
+| `OPENCHIME_EVICT` | a constant: on, on local disk |
+| `OPENCHIME_EVICT_GRACE_HOURS` | a constant, 24 |
+| `OPENCHIME_DB_RESERVE_MB` | a constant, 256 |
+| `OPENCHIME_PRESSURE_MB` | a constant, 512 |
+| `OPENCHIME_MAINT_BATCH` | a constant, 64 |
+| `OPENCHIME_AUDIT_MAX_DAYS` | a constant, 365 |
+| `OPENCHIME_MAINT_INTERVAL_MS` | a constant, five minutes; a demo build reads OPENCHIME_DEMO_MAINT_MS |
+| `OPENCHIME_SCHED_TICK_MS` | a constant, fifteen seconds; a demo build reads OPENCHIME_DEMO_SCHED_MS |
+| `OPENCHIME_ENROLL_CODE_FILE` | the enrollment code is in the log |
+| `OPENCHIME_ENROLL_WAIT_SECS` | a constant: one attempt at first start, then each boot; a managed box waits two minutes for its claim |
+| `OPENCHIME_ENROLL_TICKET` | renamed OPENCHIME_MANAGED_TICKET |
+| `OPENCHIME_AUDIO_ADVERTISE_PORT` | renamed OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT (the control plane's) |
+| `OPENCHIME_AUDIO_TOKEN_PREFIX` | renamed OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX (the control plane's) |
+| `OPENCHIME_CALL_MAX` | a constant, 10; a demo build reads OPENCHIME_DEMO_CALL_MAX |
+| `OPENCHIME_TTS_LANG` | the binary carries one language |
+| `OPENCHIME_TTS_QUEUE` | a constant, 256 |
+| `OPENCHIME_TTS_IDLE_SECS` | a constant, 300 |
+| `OPENCHIME_TTS_RATE` | a constant, 60 a minute |
+| `OPENCHIME_STT_QUEUE` | a constant, 64 |
+| `OPENCHIME_STT_IDLE_SECS` | a constant, 300 |
+| `OPENCHIME_STT_RATE` | a constant, 60 a minute |
+| `OPENCHIME_STT_MAX_SECS` | a constant, 30: the model's limit |
+| `OPENCHIME_SUMMARY_URL` | OPENCHIME_SUMMARY=cloud:<url>,<model> |
+| `OPENCHIME_SUMMARY_MODEL` | OPENCHIME_SUMMARY=cloud:<url>,<model> |
+| `OPENCHIME_TEST_PASSWORD_AUTH` | renamed OPENCHIME_DEMO_PASSWORD_FRAMES, on by default in a demo build |
+| `OPENCHIME_BOOTSTRAP_USERS` | renamed OPENCHIME_DEMO_USERS |
+| `OPENCHIME_FILE_PAGE` | renamed OPENCHIME_DEMO_FILE_PAGE |
+| `OPENCHIME_UNFURL_ALLOW_PRIVATE` | renamed OPENCHIME_DEMO_PRIVATE_UNFURL |
+| `OPENCHIME_TEST_OS_ROOTS` | renamed OPENCHIME_DEMO_OS_ROOTS |
+| `OPENCHIME_SUFFIX` | the service suffix is built in; a demo client reads OPENCHIME_TEST_SUFFIX |
+| `OPENCHIME_RECOVER_MB` | nothing read it |
+| `OPENCHIME_BLOB_BACKEND` | OPENCHIME_S3 set is S3; unset is local disk |
+| `OPENCHIME_STATE` | the TUI keeps its state in the credential store (ARCH-88) |
 <!-- /config-reference -->
 
 ## Link unfurls (REQ-222, ARCH-105)
@@ -288,13 +245,13 @@ column detail is in [SCHEMA.md](./SCHEMA.md).
 | Where | Written | What it controls |
 |---|---|---|
 | `schema_version` | By the migrator, one row per applied migration | Which migrations have run. At each boot every migration above the highest row is applied in its own transaction; a failure rolls that one back and stops the boot (ARCH-27). |
-| `server_identity` (one row) | On the first run that generates a TLS identity | The daemon's certificate and private key. When present it is written over `OPENCHIME_TLS_CERT` / `OPENCHIME_TLS_KEY` at startup, so a restored database keeps the fingerprint clients pinned (ARCH-10/66b). |
+| `server_identity` (one row) | On the first run that generates a TLS identity | The daemon's certificate and private key. When present it is written over `cert.pem` / `key.pem` in the data directory at startup, so a restored database keeps the fingerprint clients pinned (ARCH-10/66b). |
 | `local_issuer` (one row) | At first start | The key and issuer name that sign the ID token a browser sign-in on the daemon's own pages ends with (AUTH.md §8.10, migration 0050): a restored database still verifies what it signed. A private key. |
 | `acme_account`, `tls_certificate` (one row each) | When a CA-issued certificate is first obtained | The ACME account (with its CA's directory) and the certificate presented, with its source, names and expiry; presented at once on a restart that still has that source and those names (migration 0049). |
-| `enrollment` (one row) | When `OPENCHIME_ENROLL_URL` first takes effect | The enrollment key, the audience and `pending` / `active`. The stored audience outranks `OPENCHIME_OIDC_AUDIENCE`, and push and invitation mail need `active` (ARCH-84/85). |
+| `enrollment` (one row) | When `OPENCHIME_ENROLL_URL` first takes effect | The enrollment key, the audience and `pending` / `active`. The stored audience is the relay's; a managed box's must match `OPENCHIME_MANAGED_AUDIENCE`, and push and invitation mail need `active` (ARCH-84/85). |
 | `invites` with no `created_by` | At boot, in `local` auth mode, while no owner who can sign in exists | The first-run setup token, printed once to stderr; redeeming it creates the owner (REQ-024, ARCH-59). A newer token spends the older ones, and none is redeemed once an owner can sign in. |
 | `users.role` | By owners and admins | `owner` / `admin` / `member` — who may administer the workspace (ARCH-60). |
-| `users.disabled` | By member removal | A removed member cannot sign in and does not count against `OPENCHIME_MAX_USERS` (CP-7). |
+| `users.disabled` | By member removal | A removed member cannot sign in and does not count against `OPENCHIME_MANAGED_MAX_USERS` (CP-7). |
 | `webhooks` | By owners and admins | Incoming webhooks and the channel each posts to (REQ-170). |
 | `custom_emoji` | By members | The workspace's own emoji (REQ-072). |
 
@@ -340,9 +297,9 @@ feature switches are remembered in `build/.features`).
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `TTS` | `0` | `1` builds read-aloud in; without it `OPENCHIME_TTS*` are accepted and have no effect. `make full` sets it. |
-| `STT` | `0` | `1` builds voice input in; likewise `OPENCHIME_STT*`. |
-| `SUM` | `0` | `1` builds llama.cpp in for `OPENCHIME_SUMMARY=local`; `cloud` works without it. |
+| `TTS` | `0` | `1` builds read-aloud in; without it `OPENCHIME_TTS` is accepted and has no effect. `make full` sets it. |
+| `STT` | `0` | `1` builds voice input in; likewise `OPENCHIME_STT`. |
+| `SUM` | `0` | `1` builds llama.cpp in for `OPENCHIME_SUMMARY=local`; `cloud:…` works without it. |
 | `WEB` | `0` | `1` compiles the web client's loader into the daemon, which then serves it at `/app/`. |
 | `DEMO` | `0` | `1` builds the test switches in (the "Demo builds only" section): the tests, the GUI and web harness and the demo scripts need one; a release is never one, and `make` refuses `DEMO=1` with `RELEASE=1` or `OC_VERSION`. `--version` says `(demo build)`. |
 | `OC_VERSION` | *(unset: `dev`)* | The release number `--version` prints; the release workflow sets it (ARCH-20). |

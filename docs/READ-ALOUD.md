@@ -60,9 +60,8 @@ the same three in turn at 253 MB).
 ## 3. Voices
 
 **One language per deployment.** The daemon speaks the language its engine was
-built for — `en-US` — set by `OPENCHIME_TTS_LANG` and refused at startup if
-this binary has no engine for it, because reading every message in a language
-nobody asked for is worse than not starting. The tag is stamped into the
+built for — `en-US` (`OC_TTS_LANG`), and there is no setting to ask for another:
+a binary speaks the one it carries. The tag is stamped into the
 pronunciation data (a lexicon of one language with a guesser of another
 pronounces fluent nonsense, so the pair is checked), it is part of the model
 version that keys the cache, and it is announced with every voice on `TTS_INFO`.
@@ -91,7 +90,7 @@ and nothing to fetch.
   (`daemon/ort.ops.config`). The daemon is under 9 MB.
 - **What is beside it.** The Kitten mini model converted to ONNX Runtime's `.ort` format, its
   voices, and ttskit's `en-US` lexicon and guesser — about 108 MB — in a data directory: the
-  first of `OPENCHIME_TTS_DATA_DIR`, `/usr/share/openchime/tts` (where the packages put it)
+  first of `/usr/share/openchime/tts` (where the packages put it)
   and `tts/` beside the executable (where the tarball and a source build put it). They are
   mapped and used in place: ONNX Runtime reads the weights straight from the file's pages and
   ttskit binary-searches its tables there, so they cost disk, and memory only for the pages a
@@ -103,7 +102,7 @@ and nothing to fetch.
   checks it; data that is absent, belongs to another build, or has been altered or partly
   copied turns read-aloud off with the reason in the log, and the daemon runs on without it.
 - **One render worker thread.** The net loop puts a request (message handle, voice, speakable
-  text) on a bounded queue (`OPENCHIME_TTS_QUEUE`, default 256; full answers
+  text) on a bounded queue (`OC_TTS_QUEUE`, 256; full answers
   `TTS_UNAVAILABLE`) and the worker wakes it through an eventfd when a render is stored, the
   pattern of the transfer pool.
 - **Inside a render.** ttskit turns each sentence into phonemes; the phonemes become Kitten's
@@ -115,7 +114,7 @@ and nothing to fetch.
   handle's 64 hex digits and 16 of a hash of the model version (`daemon/tts_worker.c`), so
   a render is written once per version and a retry rewrites the same object.
 - **Memory only while in use.** The ONNX Runtime session is created on the first render and
-  released after `OPENCHIME_TTS_IDLE_SECS` (default 300) with no work, so a daemon whose users
+  released after `OC_TTS_IDLE_SECS` (300) with no work, so a daemon whose users
   are not listening holds none of the model's working memory. Measured peak while rendering:
   about 210 MB for a typical sentence, up to 315 MB for a long one; loading takes about a
   quarter of a second.
@@ -160,7 +159,7 @@ casts them to float, so a config taken from one conversion leaves the other unab
 - **Storage.** `rendered_audio` rows point at blobs. The maintenance pass reclaims renders
   before any attachment tier, least recently used first, deleting the row and the blob
   with no tombstone. A reclaimed render is synthesized again when next asked for.
-- **Limits.** `AUDIO_GET` is rate-limited per connection (`OPENCHIME_TTS_RATE`), since a
+- **Limits.** `AUDIO_GET` is rate-limited per connection (`OC_TTS_GETS_PER_MIN`, 60), since a
   client asking for a whole history at once is a cheap way to occupy the render worker.
 
 **Storage arithmetic.** At 24 kbps a second of speech is 3 KB; a typical 100-character

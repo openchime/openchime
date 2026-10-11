@@ -27,12 +27,8 @@ static int is_dir(const char *path) {
     return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-int oc_data_dir_find(const char *var, const char *env, const char *system_dir, const char *exe_dir,
+int oc_data_dir_find(const char *system_dir, const char *exe_dir,
                      const char *beside, char *out, size_t cap, char *err, size_t errcap) {
-    if (env && *env) {
-        if (!is_dir(env)) { seterr(err, errcap, "%s=%s is not a directory", var, env); return 0; }
-        return snprintf(out, cap, "%s", env) < (int)cap;
-    }
     if (is_dir(system_dir)) return snprintf(out, cap, "%s", system_dir) < (int)cap;
     if (exe_dir && *exe_dir) {
         char path[1024];
@@ -44,9 +40,9 @@ int oc_data_dir_find(const char *var, const char *env, const char *system_dir, c
     return 0;
 }
 
-int oc_tts_data_dir(const char *env, const char *system_dir, const char *exe_dir,
+int oc_tts_data_dir(const char *system_dir, const char *exe_dir,
                     char *out, size_t cap, char *err, size_t errcap) {
-    return oc_data_dir_find("OPENCHIME_TTS_DATA_DIR", env, system_dir, exe_dir, "tts",
+    return oc_data_dir_find(system_dir, exe_dir, "tts",
                             out, cap, err, errcap);
 }
 

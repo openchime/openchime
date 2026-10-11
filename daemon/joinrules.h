@@ -1,5 +1,5 @@
 /*
- * Who may join through an OIDC source (AUTH.md §8.4): OPENCHIME_OIDC_ALLOW, a
+ * Who may join through an OIDC source (AUTH.md §8.4): OPENCHIME_JOIN, a
  * comma-separated list of rules, default deny, consulted only for an identity
  * the workspace has not seen.
  *

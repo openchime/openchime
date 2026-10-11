@@ -8,9 +8,9 @@ set -eu
 # image carried a SQLite command-line tool at all.
 #
 # Creating the directory IS still ours: the daemon creates the database, not the
-# path leading to it, and on a fresh volume that path does not exist.
-: "${OPENCHIME_DB_PATH:=/data/openchime.db}"
-mkdir -p "$(dirname "$OPENCHIME_DB_PATH")"
+# directory holding it, and on a fresh volume that path does not exist.
+: "${OPENCHIME_DATA_DIR:=/data}"
+mkdir -p "$OPENCHIME_DATA_DIR"
 
 # Arguments are forwarded, so `podman run <image> --version` reports the release
 # instead of silently starting a daemon. Without "$@" the entrypoint swallows

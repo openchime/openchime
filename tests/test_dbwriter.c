@@ -6251,7 +6251,7 @@ static void test_dm(void) {
     cleanup_db(path);
 }
 
-/* CP-7: the registered-user cap (OPENCHIME_MAX_USERS). */
+/* CP-7: the registered-user cap (OPENCHIME_MANAGED_MAX_USERS). */
 /* Link unfurls (REQ-222, ARCH-105): the store job re-validates the message,
  * refuses a URL the body no longer carries, and the stored row rides the
  * backfill replay; an edit drops the old body's rows. */

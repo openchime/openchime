@@ -73,14 +73,11 @@ say "== Ctrl+<digit> switches workspace"
 SECOND_PORT=$((OC_TEST_PORT + 1))
 SECOND_DIR="$OC_TEST_DIR-2"
 rm -rf "$SECOND_DIR"; mkdir -p "$SECOND_DIR"
-env OPENCHIME_DB_PATH="$SECOND_DIR/db" \
-    OPENCHIME_TLS_CERT="$SECOND_DIR/cert.pem" OPENCHIME_TLS_KEY="$SECOND_DIR/key.pem" \
-    OPENCHIME_BLOB_DIR="$SECOND_DIR/blobs" \
-    OPENCHIME_PROTO_PORT="$SECOND_PORT" OPENCHIME_HEALTH_PORT=0 \
-    OPENCHIME_TEST_PASSWORD_AUTH=1 \
+env OPENCHIME_DATA_DIR="$SECOND_DIR/data" \
+    OPENCHIME_PORT="$SECOND_PORT" OPENCHIME_HEALTH_PORT=0 \
     OPENCHIME_WORKSPACE_NAME="Second Fixture" \
-    OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner" \
-    OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
+    OPENCHIME_DEMO_USERS="alice:pw:owner" \
+    OPENCHIME_MANAGED_MAX_USERS=100 \
     setsid "$HERE/openchimed" > "$SECOND_DIR/daemon.log" 2>&1 < /dev/null &
 disown
 for _ in $(seq 1 40); do
@@ -116,7 +113,7 @@ kill_second() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
-      grep -qx "OPENCHIME_PROTO_PORT=$SECOND_PORT" && kill "$p" 2>/dev/null
+      grep -qx "OPENCHIME_PORT=$SECOND_PORT" && kill "$p" 2>/dev/null
   done
 }
 kill_second

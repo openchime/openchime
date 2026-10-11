@@ -11,23 +11,20 @@
  * Run it after touching blob_s3.c, sigv4.c, or the TLS client:
  *
  *     fly storage create -n <bucket> -o <org> -y      # or any S3 provider
- *     export OPENCHIME_S3_ENDPOINT=fly.storage.tigris.dev
- *     export OPENCHIME_S3_BUCKET=<bucket>
- *     export OPENCHIME_S3_ACCESS_KEY=<key>
- *     export OPENCHIME_S3_SECRET_KEY=<secret>
- *     export OPENCHIME_S3_REGION=auto
+ *     export OPENCHIME_S3='s3://<key>:<secret>@fly.storage.tigris.dev/<bucket>?region=auto'
  *     make build/s3_smoke && ./build/s3_smoke
  *     fly storage destroy <bucket> -y                 # clean up
  *
  * Keep credentials out of the repo and out of shell history. Last verified
  * against Tigris: streaming round-trips, sizes, delete semantics, and (by
- * pointing OPENCHIME_S3_ENDPOINT at badssl.com hosts) that expired,
+ * pointing OPENCHIME_S3 at badssl.com hosts) that expired,
  * self-signed, untrusted-root, and wrong-hostname certificates are rejected.
  *
  * Exercises exactly what the daemon does: streaming put in many chunks,
  * streaming get, size reporting, byte-for-byte round-trip, and delete. */
 
 #include "blobstore.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,14 +88,17 @@ static int round_trip(oc_blobstore *bs, const char *key, size_t size, size_t chu
 }
 
 int main(void) {
+    char cfgerr[256];
+    if (oc_config_load(cfgerr, sizeof cfgerr) != 0 || !oc_config_get()->s3.endpoint) {
+        fprintf(stderr, "s3_smoke: %s\n", cfgerr[0] ? cfgerr : "set OPENCHIME_S3 (see the header)");
+        return 2;
+    }
     printf("S3 smoke test against a real provider\n");
     printf("endpoint: %s  bucket: %s  region: %s\n",
-           getenv("OPENCHIME_S3_ENDPOINT"), getenv("OPENCHIME_S3_BUCKET"),
-           getenv("OPENCHIME_S3_REGION"));
+           oc_config_get()->s3.endpoint, oc_config_get()->s3.bucket, oc_config_get()->s3.region);
 
-    /* base_dir is ignored by the S3 backend; credentials in the environment
-     * select it (blobstore.c). */
-    oc_blobstore *bs = oc_blobstore_open("/tmp/unused-s3-smoke");
+    /* base_dir is ignored by the S3 backend; OPENCHIME_S3 selects it (blobstore.c). */
+    oc_blobstore *bs = oc_blobstore_open("/tmp/unused-s3-smoke", &oc_config_get()->s3);
     CHECK(bs != NULL, "oc_blobstore_open selected + connected the S3 backend");
     if (!bs) { printf("\nFAILED: could not open the store\n"); return 1; }
 

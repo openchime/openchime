@@ -56,7 +56,7 @@ int oc_webapp_load(const char *exe_dir, char *err, size_t errcap) {
         if (err && errcap) snprintf(err, errcap, "the web client was not built into this daemon (make WEB=1, or make full)");
         return 0;
     }
-    if (!oc_data_dir_find("web", NULL, OC_WEBAPP_SYSTEM_DIR, exe_dir, "web", dir, sizeof dir, err, errcap))
+    if (!oc_data_dir_find(OC_WEBAPP_SYSTEM_DIR, exe_dir, "web", dir, sizeof dir, err, errcap))
         return 0;
     snprintf(path, sizeof path, "%s/openchime.wasm", dir);
     g_wasm = read_file(path, &g_wasm_len);

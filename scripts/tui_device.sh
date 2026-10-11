@@ -20,7 +20,7 @@ fail() { echo "FAIL: $*" >&2; cleanup; exit 1; }
 cleanup() {
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     for p in $(pgrep -x openchimed || true); do
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$PORT" && kill "$p" 2>/dev/null
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$PORT" && kill "$p" 2>/dev/null
     done
     [ -z "${KEEP:-}" ] && rm -rf "$D/db"* "$D/home" "$D/blobs" "$D/"*.pem
     return 0
@@ -32,14 +32,13 @@ await() {   # a regex the screen must come to show
 }
 
 # --- the daemon, as shipped ---------------------------------------------------
-env -u OPENCHIME_TEST_PASSWORD_AUTH OPENCHIME_DB_PATH="$D/db" OPENCHIME_TLS_CERT="$D/cert.pem" \
-    OPENCHIME_TLS_KEY="$D/key.pem" OPENCHIME_BLOB_DIR="$D/blobs" OPENCHIME_PROTO_PORT="$PORT" \
-    OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Device Code" OPENCHIME_BOOTSTRAP_USERS="dee:pw-dee:owner" \
+env OPENCHIME_DEMO_PASSWORD_FRAMES=off OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
+    OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Device Code" OPENCHIME_DEMO_USERS="dee:pw-dee:owner" \
     "$HERE/openchimed" --version | grep -q 'demo build' || { echo "tui_device: $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &
 disown
 for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && { exec 3<&- 3>&-; break; }; sleep 0.2; done
-grep -q 'OPENCHIME_TEST_PASSWORD_AUTH' "$D/daemon.log" && fail "the daemon has the test knob on"
+grep -q 'password frames are on' "$D/daemon.log" && fail "the daemon has the test knob on"
 
 # --- the TUI -------------------------------------------------------------------
 tmux new-session -d -s "$SESSION" -x 110 -y 50 "env HOME=$D/home $HERE/build/openchime-tui 127.0.0.1:$PORT"

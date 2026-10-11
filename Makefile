@@ -162,13 +162,11 @@ full:
 # 127.0.0.1:8443 with sane paths + bootstrap users (alice/pw, bob/pw). Connect
 # from another terminal: build/openchime-tui 127.0.0.1 8443 alice:pw
 run: $(BIN) $(TUI_BIN)
-	@mkdir -p /tmp/openchime-dev/blobs
+	@mkdir -p /tmp/openchime-dev
 	@echo "openchime dev daemon -> 127.0.0.1:8443  (users: alice/pw, bob/pw)"
 	@echo "connect: build/openchime-tui 127.0.0.1 8443 alice:pw"
-	@OPENCHIME_DB_PATH=/tmp/openchime-dev/db OPENCHIME_BLOB_DIR=/tmp/openchime-dev/blobs \
-	 OPENCHIME_TLS_CERT=/tmp/openchime-dev/cert.pem OPENCHIME_TLS_KEY=/tmp/openchime-dev/key.pem \
-	 OPENCHIME_PROTO_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
-	 OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
+	@OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
+	 OPENCHIME_DEMO_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
 
 # Every client the tree builds, one per platform: macOS, iOS and Android join
 # this list when they exist.

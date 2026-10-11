@@ -291,7 +291,7 @@ static int addressing_tests(void) {
     CHECK(r != NULL);
     if (!r) { close(udp); return failures; }
 
-    /* Tokens as a daemon with OPENCHIME_AUDIO_TOKEN_PREFIX set issues them: the
+    /* Tokens as a daemon with OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX set issues them: the
      * longest there is, sixteen bytes of prefix and sixteen random. */
     uint8_t tA[OC_AUDIO_TOKEN_MAX], tB[OC_AUDIO_TOKEN_MAX], tC[OC_AUDIO_TOKEN_MAX];
     memset(tA, 0x7E, OC_AUDIO_PREFIX_MAX); memset(tB, 0x7E, OC_AUDIO_PREFIX_MAX);

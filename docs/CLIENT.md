@@ -819,8 +819,8 @@ none, which is exactly the case the prompt exists for.
 
 **Workspace resolution (REQ-010/011,** `client/core/resolve.c`**).** A
 user-typed workspace — a full domain (`chat.acme.com`) or a bare
-name (`acme`, which gets the configured `$OPENCHIME_SUFFIX`
-appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
+name (`acme`, which gets the service suffix — or a demo build's
+`$OPENCHIME_TEST_SUFFIX` — appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
 the domain's A record at 443. A resolution failure is a distinct status, so the
 TUI tells "workspace not found" apart from "could not reach the server" (connect)
 and "auth failed" (login). The TUI accepts `<workspace>` (resolved) or a raw

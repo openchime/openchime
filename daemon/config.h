@@ -11,16 +11,23 @@
  * the effective value and source of every row. A variable that is not a row
  * does not exist.
  *
+ * SMALL. An operator sees settings and feature flags: what to decide, with a
+ * value where there is anything to configure. The control plane's rows
+ * (CFG_MANAGED) are refused unless the box is started with its ticket, and a
+ * demo build's switches (CFG_DEMO) are refused by a production build. What
+ * nobody varies is a constant below, in code, not a row.
+ *
  * STRICT. A value that does not parse, a value outside its range, a name the
- * registry does not know (a typo, a removed alias) or, in a production build,
- * a demo-only variable: each stops the daemon before it opens anything, with
- * one line naming the variable, the value and what is accepted. There is no
- * soft mode; `openchimed --check-config` is how an operator tests a file
- * before a restart. An EMPTY value is unset (the default applies), which is
- * the one leniency, and systemd's own convention.
+ * registry does not know (a typo, a removed name) or a row that is not this
+ * box's to set: each stops the daemon before it opens anything, with one line
+ * naming the variable, the value and what is accepted. There is no soft mode;
+ * `openchimed --check-config` is how an operator tests a file before a
+ * restart. An EMPTY value is unset (the default applies), which is the one
+ * leniency, and systemd's own convention.
  *
  * String fields point into the process environment, which the daemon never
- * mutates after loading, so they are valid for the process lifetime.
+ * mutates after loading, or into the loader's own buffers; either is valid for
+ * the process lifetime.
  */
 
 #ifndef OC_CONFIG_H
@@ -31,12 +38,31 @@
 
 #include "storage.h"    /* oc_storage_policy */
 
-/* Deployment model (ARCH-76). Set explicitly via OPENCHIME_DEPLOYMENT_MODE. */
+/* Deployment model (ARCH-76), derived: managed when started with the control
+ * plane's ticket, federated when enrolled, else standalone. */
 typedef enum {
     OC_DEPLOY_STANDALONE = 0,
     OC_DEPLOY_FEDERATED  = 1,
     OC_DEPLOY_MANAGED    = 2,
 } oc_deploy_mode;
+
+/* --- The constants that were once settings -----------------------------------
+ * Each is here because nothing in any deployment varies it: the number is the
+ * design, and a row would only be a way to get it wrong. */
+#define OC_SESSION_TTL_MS      (30ull * 24 * 60 * 60 * 1000)   /* a session lives 30 days (REQ-181) */
+#define OC_SESSION_IDLE_MS     0ull                            /* and may go unused as long as it lives */
+#define OC_XFER_WORKERS        2       /* threads moving attachment bytes (ARCH-69); each holds a TLS session */
+#define OC_MAX_CONNS_PER_IP    1024    /* connections one address may hold: a large office behind one NAT */
+#define OC_CALL_MAX            10      /* the most people in one call (REQ-305, CALLS.md) */
+#define OC_MAX_VIDEO_SIZE      (160ull * 1024 * 1024)   /* a video message, under the attachment cap (REQ-164) */
+#define OC_TTS_QUEUE           256     /* renders that may wait */
+#define OC_TTS_IDLE_SECS       300     /* the voice model stays loaded this long with nothing to do */
+#define OC_TTS_GETS_PER_MIN    60      /* AUDIO_GETs one connection may make a minute */
+#define OC_STT_QUEUE           64      /* segments that may wait for the recognizer */
+#define OC_STT_IDLE_SECS       300
+#define OC_STT_SEGS_PER_MIN    60      /* segments one connection may send a minute */
+#define OC_STT_MAX_SECS        30      /* the longest segment: the model's own limit */
+#define OC_CLAIM_WAIT_SECS     120     /* how long a managed box's first start waits for central */
 
 /* A direct connection (AUTH.md §8.5), from OPENCHIME_OIDC_CONNECT_<n>:
  * `label=…;issuer=…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. */
@@ -55,123 +81,88 @@ enum { OC_SUMMARY_OFF = 0, OC_SUMMARY_LOCAL = 1, OC_SUMMARY_CLOUD = 2 };
 /* Where the certificate the daemon presents comes from (TLS.md, "Certificates"). */
 typedef enum {
     OC_TLS_SRC_SELF    = 0,   /* its own self-signed certificate, made at first run */
-    OC_TLS_SRC_FILE    = 1,   /* the operator's, OPENCHIME_TLS_CERT / _KEY */
-    OC_TLS_SRC_ACME    = 2,   /* ACME (RFC 8555, TLS-ALPN-01) for OPENCHIME_TLS_NAME */
+    OC_TLS_SRC_FILE    = 1,   /* the operator's cert.pem and key.pem in the data directory */
+    OC_TLS_SRC_ACME    = 2,   /* ACME (RFC 8555, TLS-ALPN-01) for the names given */
     OC_TLS_SRC_CENTRAL = 3,   /* through central, for a name under the service suffix */
 } oc_tls_source;
 
-/* The blob store's backend configuration (ARCH-70): the four S3 values, all
- * set or none, chosen by configuration rather than a mode flag. */
+/* The blob store's S3 backend (ARCH-70), from OPENCHIME_S3; endpoint NULL is
+ * local disk. */
 typedef struct {
     const char *endpoint, *bucket, *access_key, *secret_key, *region;
 } oc_s3_config;
 
 typedef struct {
-    /* Workspace identity (infra). */
-    oc_deploy_mode deployment_mode;
-    const char *workspace_name;     /* "" ⇒ client derives from the host subdomain */
-    const char *workspace_address;  /* canonical address, "" ⇒ none: clients keep what they dialled */
+    /* Identity. */
+    oc_deploy_mode deployment_mode;     /* derived (above) */
+    const char *workspace_name;         /* "" ⇒ a client derives one from the host */
+    const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
 
-    /* Paths + ports. */
-    const char *db_path, *tls_cert, *tls_key;
-    /* The key local accounts' second-step secrets are sealed under (AUTH.md
-     * §8.6): OPENCHIME_FACTOR_KEY_FILE, else factor.key beside the database. */
-    const char *factor_key_file_env;
-    char        factor_key_file[1024];
-    int         local_mfa;   /* OPENCHIME_LOCAL_MFA: 0 off, 1 optional, 2 required */
-    /* How long a session lives, and may go unused (0: no limit), in days (REQ-181). */
-    int         session_days, session_idle_days;
-    int health_port, proto_port, audio_port;
-    /* The audio relay as clients reach it, where that differs from the socket
-     * (AUDIO.md §4): the UDP port CALL_JOINED names (0: the bound one), and the
-     * bytes that lead every relay token so a front door can route by them. */
-    int audio_advertise_port;
+    /* OPENCHIME_DATA_DIR and its layout: everything the daemon keeps, under one
+     * directory, at fixed names. */
+    const char *data_dir;
+    char db_path[1024], blob_dir[1024], tls_cert[1024], tls_key[1024], factor_key_file[1024];
+
+    /* Ports. The call relay's UDP socket is on proto_port too (AUDIO.md §4). */
+    int proto_port;
+    int health_port;                    /* 0: no plaintext listener */
+
+    /* The audio relay as clients reach it, where a front door maps it
+     * (AUDIO.md §4; managed rows). */
+    int     audio_advertise_port;       /* 0: the bound one */
     uint8_t audio_token_prefix[16];
     size_t  audio_token_prefix_len;
 
-    /* Limits / tuning. */
-    int      max_users;             /* 0 = unlimited */
-    int      xfer_workers;          /* 1..16 */
-    int      max_conns_per_ip;      /* 0 disables */
-    const char *trusted_proxies;    /* peers whose PROXY v2 header is believed; NULL = none */
-    const char *extra_ca;           /* PEM roots added to the built-in ones; NULL = none */
-    uint64_t max_attach_size;
-    uint64_t max_video_size;        /* video message byte cap (REQ-164); <= max_attach_size */
-    const char *blob_dir;
-    oc_s3_config s3;                /* the S3 backend, when all four are set */
+    int         max_users;              /* OPENCHIME_MANAGED_MAX_USERS; 0 = unlimited */
+    const char *trusted_proxies;        /* peers whose PROXY v2 header is believed; NULL = none */
+    const char *extra_ca;               /* PEM roots added to the built-in ones; NULL = none */
 
-    /* Storage-pressure policy: the numbers as set (the table's rows) and the
-     * policy derived from them in the units the maintenance pass uses. */
+    oc_s3_config      s3;               /* endpoint NULL: local disk under data_dir/blobs */
+    oc_storage_policy storage;          /* the maintenance pass's constants (demo rows may shorten the interval) */
+    uint64_t          sched_tick_ms;    /* the scheduled-send sweep; 15 s unless a demo build is told otherwise */
+
+    /* Auth (OPENCHIME_AUTH): which sources are on. */
+    int auth_local, auth_relay;
+    int local_mfa;                      /* OPENCHIME_MFA: 0 off, 1 optional, 2 required */
     struct {
-        uint64_t maint_interval_ms, attach_max_age_days, evict_grace_hours,
-                 db_reserve_mb, pressure_mb, maint_batch, audit_max_days;
-        int      evict;
-    } storage_raw;
-    oc_storage_policy storage;
-    /* The scheduled-send sweep (netloop.c), in ms; 15 s unless a demo build is
-     * told otherwise. */
-    uint64_t sched_tick_ms;
-
-    /* Auth. */
-    const char *auth_mode;          /* "local" | "oidc" | "relay", comma-separated */
-    struct { const char *issuer, *audience, *pubkey, *pubkey_file, *allow;
-             int email_link_any; } oidc;  /* OPENCHIME_OIDC_EMAIL_LINK=any */
+        const char *audience;           /* OPENCHIME_MANAGED_AUDIENCE: central minted it */
+        const char *pubkey;             /* OPENCHIME_MANAGED_RELAY_KEY: a pinned floor under the published keys; "" none */
+        const char *allow;              /* OPENCHIME_JOIN */
+    } oidc;
     oc_oidc_connect connect[OC_OIDC_MAX_CONNECT];   /* direct connections, in order */
     int             n_connect;
-    const char *bootstrap_users;    /* demo builds only */
 
-    /* Federated enrollment (CP-8). */
-    struct { const char *url, *code_file, *ticket; int wait_secs; } enroll;
-
-    /* Outbound push emitter (ARCH-85). */
+    /* Federated services (ARCH-84/85). */
+    struct { const char *url, *ticket; } enroll;
     struct { const char *url; } push;
+    int invite_mail;                    /* REQ-280; needs an active enrollment */
 
-    /* Invitation mail through central (REQ-280, ARCH-85): OPENCHIME_INVITE_MAIL,
-     * off unless "on". Needs an active enrollment as well. */
-    int invite_mail;
-
-    /* The certificate's source, and for ACME its names, CA and contact. */
+    /* The certificate's source (OPENCHIME_TLS), and for ACME its names, CA and contact. */
     struct {
         oc_tls_source source;
-        const char   *source_env;   /* as given; NULL when the default applied */
-        const char   *names;        /* comma-separated DNS names */
-        const char   *directory;    /* the ACME directory URL */
-        const char   *email;        /* ACME contact, or NULL */
+        int           given;            /* set by the operator, not defaulted */
+        const char   *names;            /* comma-separated DNS names, or NULL */
+        const char   *directory;        /* the ACME directory URL */
+        const char   *email;            /* ACME contact, or NULL */
     } tls_src;
 
-    /* Link unfurls (REQ-222, ARCH-105). Always on -- there is no switch.
-     * `allow_private` disables the SSRF gate; demo builds only. */
-    struct { int allow_private; } unfurl;
-
-    /* Read-aloud (REQ-291-295, ARCH-111). Built into the daemon and on by
-     * default: there is nothing to install. `enabled` 0 turns it off, and a
-     * daemon built without it has it off whatever this says. `queue` is how
-     * many renders may wait, `idle_secs` how long the model stays loaded with
-     * nothing to do, `rate` how many AUDIO_GETs a connection may make a minute. */
-    struct { int enabled, queue, idle_secs, rate; const char *lang, *data_dir; } tts;
-    /* Voice input (REQ-296-300, ARCH-112). Built in and on by default, with its
-     * own data directory, so either speech feature can be missing without the
-     * other. `queue` bounds segments waiting for the recognizer, `idle_secs` how
-     * long the model stays loaded with nothing to hear, `rate` how many segments
-     * a connection may send a minute, and `max_secs` the longest segment. */
-    struct { int enabled, queue, idle_secs, rate, max_secs; const char *data_dir; } stt;
-    /* Summaries of channels and DMs (REQ-310, ARCH-116): OPENCHIME_SUMMARY is
-     * off, local or cloud; for cloud, OPENCHIME_SUMMARY_URL is the hosted API's
-     * base, OPENCHIME_SUMMARY_MODEL names the model there and
-     * OPENCHIME_SUMMARY_API_KEY is its key. */
+    /* The speech features: built in and on by default (ARCH-111/112); their
+     * data is found as every build's is (tts_data.h). */
+    struct { int enabled; } tts, stt;
+    /* Summaries (REQ-310, ARCH-116): OPENCHIME_SUMMARY is off, local or
+     * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;
-    /* Calls (REQ-305): the most people in one call, 2 to OC_MAX_CALL_PARTICIPANTS. */
-    int call_max;
-    /* How many files one LIST_FILES page carries (REQ-143). The wire's maximum
-     * unless a demo build is told otherwise, so a test can see a second page
-     * without uploading two hundred and one files. */
-    int file_page;
 
     /* Demo builds only (OC_DEMO): the test switches. In a production build
-     * these fields are always zero and the variables refuse the start. */
+     * these are the production values and the variables refuse the start. */
+    int call_max;                       /* OC_CALL_MAX unless OPENCHIME_DEMO_CALL_MAX */
+    int file_page;                      /* the wire's maximum unless OPENCHIME_DEMO_FILE_PAGE */
+    int max_conns_per_ip;               /* OC_MAX_CONNS_PER_IP unless OPENCHIME_DEMO_CONNS_PER_IP */
     struct {
-        int password_frames;        /* OPENCHIME_TEST_PASSWORD_AUTH: a password in a frame */
-        const char *os_roots;       /* OPENCHIME_TEST_OS_ROOTS: the OS CA bundle to read instead */
+        int         password_frames;    /* OPENCHIME_DEMO_PASSWORD_FRAMES: a password in a frame; on in a demo build */
+        int         private_unfurl;     /* OPENCHIME_DEMO_PRIVATE_UNFURL: the unfurl SSRF gate off */
+        const char *users;              /* OPENCHIME_DEMO_USERS: accounts made at first start */
+        const char *os_roots;           /* OPENCHIME_DEMO_OS_ROOTS: the CA bundle read instead of the OS's */
     } demo;
 } oc_config;
 

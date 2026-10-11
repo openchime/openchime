@@ -61,16 +61,13 @@ up)
   : > "$PIDS"
 
   if ! (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
-    env OPENCHIME_DB_PATH="$DEV/db" \
-        OPENCHIME_TLS_CERT="$DEV/cert.pem" OPENCHIME_TLS_KEY="$DEV/key.pem" \
-        OPENCHIME_BLOB_DIR="$DEV/blobs" \
-        OPENCHIME_PROTO_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
-        OPENCHIME_TEST_PASSWORD_AUTH=1 \
+    env OPENCHIME_DATA_DIR="$DEV/data" \
+        OPENCHIME_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
         OPENCHIME_WORKSPACE_NAME="Acme HQ" \
-        OPENCHIME_BOOTSTRAP_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member}" \
-        OPENCHIME_CALL_MAX="${OC_TEST_CALL_MAX:-10}" \
-        ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
-        OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
+        OPENCHIME_DEMO_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member}" \
+        OPENCHIME_DEMO_CALL_MAX="${OC_TEST_CALL_MAX:-10}" \
+        ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
+        OPENCHIME_MANAGED_MAX_USERS=100 \
         setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &
     disown
     for _ in $(seq 1 40); do
@@ -178,7 +175,7 @@ down)
   # first found the old daemon, with the old database, still listening.
   for p in $(pgrep -x openchimed 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
-      grep -qx "OPENCHIME_PROTO_PORT=$PORT" && kill "$p" 2>/dev/null
+      grep -qx "OPENCHIME_PORT=$PORT" && kill "$p" 2>/dev/null
   done
   echo "pair down"
   ;;
