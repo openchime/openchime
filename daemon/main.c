@@ -27,10 +27,10 @@
 #include "unfurl.h"
 #include "tls.h"
 #include "totp.h"
+#include "tts_data.h"   /* the beside-the-binary data lookup: speech data and the web client's wasm */
+#include "webapp.h"
 #ifdef OC_TTS
 #include "tts.h"
-#include "tts_data.h"
-#include "webapp.h"
 #include "tts_render.h"
 #endif
 #ifdef OC_STT

@@ -33,7 +33,7 @@ jobs:
   # "fast-forward main to what I was run on" would release a feature branch.
   branch:
     name: dispatched on staging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Refuse any other ref
@@ -59,7 +59,7 @@ jobs:
   fast-forward:
     name: fast-forward main
     needs: [branch, test]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
     permissions:

@@ -7,7 +7,7 @@
 
 #include "tts_data.h"   /* oc_data_dir_find: the same beside-the-binary lookup */
 
-/* The page and the loader, compiled in (scripts/embed_res.py, the Makefile's
+/* The page and the loader, compiled in (scripts/build/embed_res.py, the Makefile's
  * WEBAPP_RES). */
 extern const unsigned char oc_webapp_html[];
 extern const size_t        oc_webapp_html_len;
@@ -48,8 +48,14 @@ static void route(const char *path, const char *ctype, const void *body, size_t 
     r->extra = ISOLATION NO_CACHE;
 }
 
+int oc_webapp_built(void) { return oc_webapp_js_len > 0; }
+
 int oc_webapp_load(const char *exe_dir, char *err, size_t errcap) {
     char dir[1024], path[1200];
+    if (!oc_webapp_built()) {
+        if (err && errcap) snprintf(err, errcap, "the web client was not built into this daemon (make WEB=1, or make full)");
+        return 0;
+    }
     if (!oc_data_dir_find("web", NULL, OC_WEBAPP_SYSTEM_DIR, exe_dir, "web", dir, sizeof dir, err, errcap))
         return 0;
     snprintf(path, sizeof path, "%s/openchime.wasm", dir);

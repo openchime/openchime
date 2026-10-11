@@ -94,10 +94,10 @@ supplies a function that formats item *i* into a styled string. This is the rule
 
 Compiled into the TUI targets (repo style — one gcc invocation, no separate archive step):
 `TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c))` + `-Ituikit`, added to both
-`tui` and `windows-tui` (`demo.c` is filtered out — it carries its own `main()`).
+`linux` and `windows` (`demo.c` is filtered out — it carries its own `main()`).
 `tk_term` owns the Windows console backend. `termbox2.h`/`utf8proc` stay
 vendored in `third_party/`. `libtuikit.a` (an `ar` archive of `tuikit/*.o`) is a documented
 option for reuse elsewhere, not required.
 
-`tuikit/demo.c` (`make tuikit-demo`) exercises each widget standalone — the library's own
+`tuikit/demo.c` (`make build/tuikit-demo`) exercises each widget standalone — the library's own
 smoke, no daemon needed.

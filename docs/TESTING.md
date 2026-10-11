@@ -24,7 +24,7 @@ The black-box integration tier drives a natively-run daemon over a real socket
 (the `build` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (7k iterations by default —
 5k random + 2k framed, raised with `-D` for a deep run; clean under
 ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
-`Scripts/bench.sh`) round it out.
+`scripts/bench.sh`) round it out.
 
 ---
 
@@ -58,7 +58,7 @@ order" belongs in integration.
   objects rather than `#include`-ing the `.c` under test.
 - The one exception is platform-backend code that cannot execute on the build
   host: sdltext's DirectWrite backend (ARCH-106) has its own console program,
-  `make windows-sdltext-test` → `build/sdltext_test.exe`, same
+  `make build/sdltext_test.exe` → `build/sdltext_test.exe`, same
   failure-count-as-exit-code contract. CI cross-compiles it (the compile is
   the header/vtable check mingw keeps honest); a Windows host runs it. The
   portable half of sdltext (the byte↔UTF-16 offset map) stays in `make test`
@@ -236,7 +236,7 @@ framework, and OpenChime follows suit.
   spellings, and `oc_hostport`, `oc_addr_is_loopback` and
   `oc_workspace_takes_suffix` — the hosted suffix beside a bare name or nothing
   typed, never beside an address, a port, a dotted name or `localhost` — hold to
-  their tables (`scripts/gui_web_signin.sh` checks the Win32 field shows it for
+  their tables (`scripts/gui/web_signin.sh` checks the Win32 field shows it for
   `acme` and not for the daemon's address); a
   client resolves `[::1]:<port>`, signs in and sends over IPv6 with nothing else
   looked up; the call engine picks the relay's family IPv4 first and IPv6 when
@@ -446,7 +446,7 @@ page, a wrong password leaving it waiting, cancel, a password typed into the
 client refused with where it goes, and a session kept by Remember me. Mutation
 proofs cover the knob, the verifier, `Origin`, direct-versus-tunnel both ways,
 the tunnel's certificate and `Host` checks, the page's limiter and the subject.
-`scripts/gui_web_signin.sh` drives it on Windows: the Win32 client, with no
+`scripts/gui/web_signin.sh` drives it on Windows: the Win32 client, with no
 credentials, against a knob-free self-signed daemon at the WSL address —
 certificate trusted, sign-up through the tunnel with the setup token, password
 changed on its page, and, the workspace forgotten, the old password refused and
@@ -669,22 +669,20 @@ works. Nothing proves the shipped *image* works (§3.2).
 
 ### 3.4 The web client (`make web-test`, local)
 
-The browser build (WEB.md) has two checks, run where Emscripten and a Chromium
-are present (a developer's box today; a CI job once the runner has them):
+The browser build (WEB.md) is checked where a Chromium is present (a
+developer's box today; a CI job once the runner has one; make fetches
+Emscripten itself).
+`make web-test` runs the first two:
 
-- **`make web-gfx-test`** — the gfx backend's own pixel test
-  (`client/gui/gfx/gfx_test_win.c`) compiled to wasm over the SDL3 built for
-  it, run under Node with SDL's dummy video driver: the same assertions as the
-  Windows run, exit code the failure count.
-- **`scripts/webtest.sh`** — a daemon on a fresh database with one bootstrapped
+- **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
+  over the SDL3 built for it (`build/web/gfx-test.js`), run under Node with
+  SDL's dummy video driver: the same assertions as the Windows run, exit code
+  the failure count.
+- **`scripts/web/test.sh`** — a daemon on a fresh database with one bootstrapped
   owner, the built page served with the two cross-origin-isolation headers
-  wasm threads need (`scripts/webdev.py`), and a headless Chromium loading it.
-  The page's core connects through the WebSocket transport, signs in with the
-  password and receives the channel list; the test reads `oc-web: signed in`
-  and the channel count from the browser's console log and fails on anything
-  else within thirty seconds. Then the client itself (`openchime.html`, the
-  Windows application compiled for the browser) is loaded the same way; the
-  page polls its test hook until the model reads `authed=1 connected=1` and
+  wasm threads need (`scripts/web/serve.py`), and a headless Chromium loading the
+  client (`openchime.html`, the Windows application compiled for the browser);
+  the page polls its test hook until the model reads `authed=1 connected=1` and
   takes the client's own screenshot (`shot`, through `gfx_readback` as on
   Windows), which is left in `build/webtest/gui.bmp` beside the daemon log and
   the browser logs.
@@ -697,7 +695,7 @@ are present (a developer's box today; a CI job once the runner has them):
   hit-testing and line breaking through the API the views use. Last, a Japanese
   composition is played into the page's hidden input for the input method
   (`?ime=1`) and the composer must hold its result.
-- **`make web-harness`** — the Windows feature scripts against the browser
+- **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, voice input, screen recording,
   uploads, files, the two call scripts and the search boxes, each on its own
   fixture daemon, each printing its `OK — N checks` line. The checks are the
@@ -729,7 +727,8 @@ branch's runs saved, which is why the push to `staging` runs too.
 
 Jobs, on three machines at once:
 
-- **`build`** — `make` and the e2e client; `ldd` (only libc and libm are
+- **`build`** — `make` with every feature, the e2e client and the Linux
+  terminal client; `ldd` (only libc and libm are
   dynamic); the built daemon started from its environment, `/healthz`, then the
   protocol vertical over TLS with the e2e client (§3.2 — the one thing the
   in-process suites cannot show, since they link the daemon's code without its
@@ -737,12 +736,15 @@ Jobs, on three machines at once:
   unit through the release's own compiler under `-Werror`
   (`make check-release-cc`: zig's clang against the release's glibc — the
   daemon's, the client's and the tests' sources); and `make test-ci PART=plain`,
-  whose prerequisites are `check-opcodes` and `check-refs`.
+  which runs the opcode and issue-reference source checks first.
 - **`thread-sanitizer`** — `make test-ci PART=threads` (§2.4).
-- **`windows`** — the Windows cross-compile of the TUI and GUI, so the ported
-  client stays building, and the Linux TUI built with that runner's gcc, newer
-  than the `build` job's, which raises warnings at `-O2` that gcc 11 and clang
-  do not.
+- **`windows`** — the Windows cross-compile of the TUI, the GUI and the two
+  Windows test programs with the pinned llvm-mingw, so the ported client stays
+  building.
+
+All three run on `ubuntu-24.04`, the image the release builds on too; every
+compiler is fetched pinned by make (VENDORS.md §2, "Toolchains"), never
+installed from the runner's packages.
 
 The three, with the pull request's policy check and the attribution guard, are
 required checks on `staging`. Everything runs non-interactively and
@@ -771,7 +773,7 @@ A new suite is one `SUITE(run_<name>_tests)` line in `tests/main.c`; if its code
 
 Measured answers to "how much memory does the daemon use, and how many
 concurrent connections does it hold" — measured, not assumed. Reproduced by
-`Scripts/bench.sh`, which drives the
+`scripts/bench.sh`, which drives the
 running daemon with the `tests/bench_load.c` load client and samples the
 daemon's resident memory (`/proc/<pid>/status` `VmRSS`) while the load runs.
 
@@ -785,8 +787,8 @@ scheduling costs measured here.
 ### How to run
 
 ```
-Scripts/bench.sh                 # default: idle memory at 50, 100, 200 conns + latency
-Scripts/bench.sh 50 100 200 400  # custom connection counts
+scripts/bench.sh                 # default: idle memory at 50, 100, 200 conns + latency
+scripts/bench.sh 50 100 200 400  # custom connection counts
 ```
 
 It bootstraps a set of local accounts (auth is a 600k-iteration PBKDF2, so it
@@ -931,7 +933,7 @@ Running the storage maintenance pass every 200 ms — 25× more often than the
 | KB per connection | 55–57 | 52–65 |
 | Round-trip latency | unchanged | unchanged |
 
-### The event loop's turns (`make bench-loop`, ARCH-22)
+### The event loop's turns (`make build/bench_loop`, ARCH-22)
 
 `tests/bench_loop.c` runs the daemon in-process — writer, readers, auth pool, the
 event loop with its I/O threads and call relay — and drives it with real TLS
@@ -963,7 +965,7 @@ slice at a time; the storm's worst turn was a hundred handshakes on the loop.
 it was from the separate process: p99 0.9–1.4 ms, against 1.3–2.0 ms before, and
 video's 0.5–0.9 ms. With five of ten on the connection transport it is 1.2 ms.
 
-**Memory** (`Scripts/bench.sh 50 100 200`, read-aloud and voice input off —
+**Memory** (`scripts/bench.sh 50 100 200`, read-aloud and voice input off —
 `OPENCHIME_TTS_DATA_DIR` and `OPENCHIME_STT_DATA_DIR` pointed at nothing — since
 rendering the voice auditions at start loads a model of about 190 MB, which
 drowns every other figure):
@@ -989,7 +991,7 @@ The loop's own turn is the figure to compare.
   (a few logins/sec, ≈500 ms each) is never the limit — a burst of N clients takes
   N/2 seconds to drain, and a short timeout would count slow-but-fine clients
   as connection failures.
-- `Scripts/bench.sh` prints the whole result line, `connections_ok=` included —
+- `scripts/bench.sh` prints the whole result line, `connections_ok=` included —
   a failed connection reports `rtt 0.00`, so hiding the count makes a degenerate
   run read like an outstanding result.
 - The memory table reports **requested vs connected** and divides by the
@@ -1032,14 +1034,14 @@ Start the control plane directly (e.g. `dotnet run` with `Push:Log:Enabled=true`
 against a Postgres you started), then:
 
 ```sh
-scripts/demo-federated.sh http://localhost:5176
+scripts/demo/federated.sh http://localhost:5176
 ```
 
 It scripts the real console reserve — no dev endpoint needed — and drives the
 same flow. Then drive a client against the daemon it left running:
 
 ```sh
-make demo-client
+make build/demo_client
 build/demo_client 127.0.0.1 8443 bob   pw token apns tok-bob-demo
 build/demo_client 127.0.0.1 8443 alice pw send  1 "hello from the federated stack"
 ```
@@ -1054,7 +1056,7 @@ That is the daemon→central push wire firing end to end (signed, contentless).
 
 ### OIDC-relay login (the identity wire)
 
-`scripts/demo-oidc.sh` proves the other daemon↔central wire (ARCH-56/57): the control
+`scripts/demo/oidc.sh` proves the other daemon↔central wire (ARCH-56/57): the control
 plane **mints** an ES256 identity token and a daemon in **OIDC mode verifies** it against
 the central key it pins. It generates an ES256 keypair (private → the control plane's
 signing key, public → the daemon), starts both — **it needs a Postgres already
@@ -1072,14 +1074,14 @@ credentials to the relay instead of the dev mint endpoint.
 
 ### TUI runtime smoke (the interactive client)
 
-`scripts/demo-tui.sh` runtime-verifies the **TUI** (ARCH-75) against a live daemon — the
+`scripts/demo/tui.sh` runtime-verifies the **TUI** (ARCH-75) against a live daemon — the
 headless check the project lacked (it was only ever build-verified). It drives the real
 interactive client in a **tmux** pane: connect + auto-login as alice, send a message from
 the composer, receive a broadcast from bob (via `demo_client`), and assert both render in
 the transcript. Requires `tmux`. To connect the TUI by hand instead:
 
 ```sh
-make tui
+make linux
 build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direct connect
 ```
 
@@ -1093,7 +1095,7 @@ build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direc
   Push only needs the box **enrolled** (active audience + key) and `OPENCHIME_PUSH_URL` set.
 - **OIDC-relay login** against a live daemon is *not* covered here — it needs real Google
   credentials on the control plane. The mint↔verify contract is unit-tested on both sides.
-- `demo_client` (`make demo-client`) is the flexible black-box tool: `token <apns|fcm>
+- `demo_client` (`make build/demo_client`) is the flexible black-box tool: `token <apns|fcm>
   <tok>` or `send <channel> <text>` against a running daemon.
 
 ## A death always leaves evidence
@@ -1118,7 +1120,7 @@ The CRT's two exits are routed in as well: `abort()` and an invalid-parameter
 call both raise a real exception, so they produce the ordinary report
 instead of vanishing.
 
-**Prove it rather than wait for it.** `gui_drive.sh die <av|abort|badparam|fastfail|kill>`
+**Prove it rather than wait for it.** `scripts/gui/drive.sh die <av|abort|badparam|fastfail|kill>`
 forces one class each. `av`, `abort` and `badparam` produce a crash report;
 `fastfail` and `kill` produce none, by construction, and are caught by the ring.
 
@@ -1130,35 +1132,39 @@ post-mortems the harness caused on purpose and bury the one that matters.
 
 ## Symbolicating a Win32 crash
 
-`make windows-gui` ships a **stripped** `build/openchime.exe` and keeps the
+`make windows` ships a **stripped** `build/openchime.exe` and keeps the
 symbols beside it in `build/openchime.debug`, linked by a `.gnu_debuglink`. The
 crash report the client writes carries a module-relative `rva=`, which stripping
 does not move, so a crash is resolved without the shipped binary having symbols
 in it:
 
 ```
-base=$(x86_64-w64-mingw32-objdump -p build/openchime.debug | awk '/ImageBase/{print $2}')
-va=$(python3 -c "print(hex(0x$base + 0xRVA))")
-x86_64-w64-mingw32-addr2line -e build/openchime.debug -f -C -i "$va"
+scripts/release/crash_resolve.sh 0xRVA        # or the crash-<pid>.txt itself
 ```
+
+which reads the ImageBase with the toolchain's `objdump -p` and resolves the
+address with its `addr2line` (llvm-symbolizer, which reads PE + DWARF; both in
+`third_party/llvm-mingw-*/bin`).
 
 Keep the `.debug` file for any binary handed to somebody else; without it a
 minidump from that build resolves to nothing.
 
 ## Driving the web client
 
-`scripts/web_drive.sh` is `gui_drive.sh` for the browser: the same
+`scripts/web/drive.sh` is `scripts/gui/drive.sh` for the browser: the same
 subcommands (`launch`, `devaddr`, `<verb...>`, `shot`, `dump`, `kill`), the
 same verbs, the same ack contract (exit status 1 when the client did not
-answer), and `scripts/web_pair.sh` is `gui_pair.sh` (`up`, `a`, `b`, `down`).
-A feature script therefore runs against either client by setting
-`OC_GUI_DRIVE=scripts/web_drive.sh` (or `OC_GUI_PAIR=scripts/web_pair.sh`);
-the ported scripts carry a `PLAT` switch for the checks that are the Windows
-platform's alone. `make web-harness` runs them all.
+answer), and `scripts/web/pair.sh` is `scripts/gui/pair.sh` (`up`, `a`, `b`, `down`).
+A feature script therefore runs against either client: every script sources
+`scripts/gui/lib.sh`, which picks the drivers from `OC_GUI_PLATFORM=win32|web`
+(win32 unless said) and sets `PLAT` for the checks that are the Windows
+platform's alone. `scripts/gui/run.sh [--win32|--web] <name>... | all` runs
+them by name and tallies the results, skipping on the web the scripts whose
+checks are Windows-only.
 
 **How it drives.** `launch` builds and starts the fixture daemon as
-`gui_drive.sh` does (`OC_DEV_PORT`, `OC_DEV_DIR`, `OC_DEV_WS`,
-`OC_DEV_USERS`; the health port off), then starts `scripts/web_drive.mjs`: a
+`scripts/gui/drive.sh` does (`OC_DEV_PORT`, `OC_DEV_DIR`, `OC_DEV_WS`,
+`OC_DEV_USERS`; the health port off), then starts `scripts/web/drive.mjs`: a
 Node process holding a headless Chromium on the daemon's own `/app/` page,
 signed in with the password quick-launch and the test hook on. The shell side
 writes the verb to `$OC_DEV_DIR/web-<a|b>/cmd` and waits for `ack`, as it
@@ -1182,7 +1188,7 @@ is the same code.
 
 ## Driving the Win32 GUI
 
-`scripts/gui_drive.sh launch` **builds both sides and restarts the daemon if the
+`scripts/gui/drive.sh launch` **builds both sides and restarts the daemon if the
 running one predates the binary it just built.** That is not convenience: the
 client and daemon share a wire and ship together (ARCH-61), so a client built
 from source N against a daemon still running N-1 decodes garbage and reports only
@@ -1196,19 +1202,19 @@ mismatched pair is the thing under test, such as the version-reject path.
 **The client is pointed at the address Windows reaches the daemon at.** Under
 WSL2 that is the WSL machine's own address (eth0's), not 127.0.0.1, which reaches
 a WSL listener only where localhost forwarding is on; elsewhere it is 127.0.0.1,
-and `OC_DEV_HOST` overrides either. `gui_drive.sh devaddr` prints the workspace
+and `OC_DEV_HOST` overrides either. `scripts/gui/drive.sh devaddr` prints the workspace
 `launch` defaults to, for a script that names it. At an address that is not
 loopback the dev daemon's self-signed certificate is asked about (ARCH-10), and
 `launch` answers Trust and connect for it — the daemon is the one the harness
 started — before it returns. It starts the client only once the daemon listens,
 waiting up to ninety seconds: the bootstrap accounts are hashed first, which for
-`gui_members.sh`'s sixty people is half a minute, and a client whose first attempt
+`scripts/gui/members.sh`'s sixty people is half a minute, and a client whose first attempt
 finds nothing there does not try again. Only the daemon on `OC_DEV_PORT` — found
 by its environment — is restarted.
 
 **Video messages drive on a synthetic camera.** Launch with
 `WSLENV=OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_AUDIO OPENCHIME_TEST_CAPTURE=synthetic
-OPENCHIME_TEST_AUDIO=synthetic scripts/gui_drive.sh launch` (add
+OPENCHIME_TEST_AUDIO=synthetic scripts/gui/drive.sh launch` (add
 `OPENCHIME_TEST_VIDEO_CAP_MS` to shorten the five-minute cap, or
 `OPENCHIME_TEST_CAPTURE=denied` for the blocked-camera path). The `vm` verb opens,
 records, stops, sends, plays and closes by name, and `dump` reports the overlay on
@@ -1218,7 +1224,7 @@ turn on the camera of the machine it happens to be on.
 **A real camera needs the client on a local disk.** Windows refuses camera
 activation to an executable started from the WSL share (`\\wsl.localhost\…`):
 `ActivateObject` fails with `0x80070490`, element not found, and the card says
-the recording could not start, with that step in brackets. `gui_drive.sh launch`
+the recording could not start, with that step in brackets. `scripts/gui/drive.sh launch`
 runs `build/openchime.exe` from the share, which is fine for everything else;
 for a camera test, copy it to a Windows directory and start it from there —
 `OC_DRIVE_LOCAL=1` makes `launch` do exactly that.
@@ -1237,7 +1243,7 @@ nothing: Backspace in the To: field takes one recipient per press and clears its
 latch in `WM_KEYUP`, so a script that never released it deleted one chip and
 silently did nothing on every Backspace after, while the checks that followed
 asserted against a state the run never reached. **Anything pressed more than once
-in a run must be released**, which is what `gui_newmsg.sh`'s `press` helper does:
+in a run must be released**, which is what `scripts/gui/newmsg.sh`'s `press` helper does:
 `drive key <k>; drive keyup <k>`. Hold a key only where the hold is the thing
 under test.
 
@@ -1258,7 +1264,7 @@ under test.
 
 ## Reading the startup harness
 
-`scripts/gui_startup.sh` answers the question the smoke suite deliberately
+`scripts/gui/startup.sh` answers the question the smoke suite deliberately
 stops short of: **what does the client do between launch and its first frame.**
 It launches the client four ways — a workspace that signs in, one that does not
 resolve (`nosuch.invalid`, reserved never to), one that is malformed, and one
@@ -1280,7 +1286,7 @@ pre-push gate — run it when a change touches how the client starts.
 
 ## Reading the New message harness
 
-`scripts/gui_newmsg.sh` asks the questions the New message pane (REQ-229)
+`scripts/gui/newmsg.sh` asks the questions the New message pane (REQ-229)
 answered wrongly for its whole life, in 32 checks on its own fixture daemon and
 port (9520):
 
@@ -1314,7 +1320,7 @@ the target picker, or the composer's key routing.
 
 ## Reading the GUI smoke
 
-`scripts/gui_smoke.sh` answers one question —
+`scripts/gui/smoke.sh` answers one question —
 **does the client boot and run** — in about ten seconds across fourteen checks.
 It drives the client through the test hook (`OPENCHIME_TEST_DIR`) and stands up
 its own fixture daemon on its own port. It is the pre-push gate; it is not a
@@ -1343,7 +1349,7 @@ the client is alive or died on the last keystroke.
 assertions that runs for minutes is skipped, and so
 catches nothing — the failure mode of a slow gate is not that it is slow, it is
 that it stops being run. Verify a feature by driving it, through
-`scripts/gui_drive.sh` or a harness scoped to that feature. Do not add it here.
+`scripts/gui/drive.sh` or a harness scoped to that feature. Do not add it here.
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no
@@ -1356,26 +1362,26 @@ check can erase the evidence a wait is polling for.
 
 ## Reading the screen-recording harness
 
-`scripts/gui_screenrec.sh` records with real Windows.Graphics.Capture against its
+`scripts/gui/screenrec.sh` records with real Windows.Graphics.Capture against its
 own fixture daemon (port 9530), with a known picture in the camera box
 (`OPENCHIME_TEST_CAPTURE=synthetic-camera`) and known sound
 (`OPENCHIME_TEST_AUDIO=synthetic`: the microphone 440 Hz, the computer 660 Hz). It
 asserts the screens and windows listed, the box in the chosen corner of the preview
 (colour bars at the rectangle the dump's `vmsrc` line and `oc_inset_rect` put it),
 the card stepping aside for the recording bar, the bar kept out of the capture and
-read and pressed through UI Automation (`scripts/uia_recbar.ps1`), Stop ending the
+read and pressed through UI Automation (`scripts/gui/uia_recbar.ps1`), Stop ending the
 take at the fitted size, the file the daemon stores — found in the fixture's blob
 directory — being VP9 and Opus at that size with both tones in it (`ffprobe`,
 `ffmpeg`), and a window closed mid-take keeping what came before.
 
 **Keep the Remote Desktop window open while it runs.** A session that is not drawn
-captures its screens as black; a window is captured either way. `gui_drive.sh
+captures its screens as black; a window is captured either way. `scripts/gui/drive.sh
 launch` with `OC_DRIVE_LOCAL=1` runs the client from a local copy, which a real
 camera needs.
 
 ## Reading the links harness
 
-`scripts/gui_links.sh` drives links in the transcript (REQ-220, MARKDOWN.md §4)
+`scripts/gui/links.sh` drives links in the transcript (REQ-220, MARKDOWN.md §4)
 against its own fixture daemon (port 9650). It sends a labelled link and a bare
 address, then asserts that hovering the label reports the real address, marked
 labelled, in the dump's `link hover= labelled=` line; that clicking it opens the
@@ -1386,8 +1392,8 @@ confirmation is always dismissed.
 
 ## Reading the reactions harness
 
-`scripts/gui_reactions.sh` drives the who-reacted pane (REQ-070/071) over
-`gui_pair.sh` (port 9580): bob reacts, so alice's pane has somebody else's
+`scripts/gui/reactions.sh` drives the who-reacted pane (REQ-070/071) over
+`scripts/gui/pair.sh` (port 9580): bob reacts, so alice's pane has somebody else's
 reaction to join. It asserts a chip per distinct emoji with its count, marked
 when it is yours; that pressing one adds your reaction and pressing it again
 takes it back, with the message agreeing; and that each chip is published to
@@ -1402,8 +1408,8 @@ smoke's reason.
 
 ## Reading the shortcuts harness
 
-`scripts/gui_shortcuts.sh` drives the Win32 client's keyboard shortcuts over
-`gui_pair.sh` (port 9570) and asserts the EFFECT of each key, not that it
+`scripts/gui/shortcuts.sh` drives the Win32 client's keyboard shortcuts over
+`scripts/gui/pair.sh` (port 9570) and asserts the EFFECT of each key, not that it
 dispatched: two clients, so bob can leave something unread for alice. It
 covers Shift+Esc — every conversation read, as the reference client binds it —
 and that bare Esc still closes what is open and marks nothing; and Ctrl+<digit>,
@@ -1417,7 +1423,7 @@ end. It reads the dump's `marks ch … unread=`, `toast[n]` and
 
 ## Reading the composer harness
 
-`scripts/gui_composer.sh` drives the Win32 message box against its own fixture
+`scripts/gui/composer.sh` drives the Win32 message box against its own fixture
 daemon (port 9540) and asserts that the box is always tall enough for its text,
 however the text got there: a draft long enough to wrap, restored when the client
 starts again; leaving for a conversation with no draft and coming back; a
@@ -1433,7 +1439,7 @@ the smoke's reason.
 
 ## Reading the drafts harness
 
-`scripts/gui_drafts.sh` deletes drafts in the Win32 client against its own fixture
+`scripts/gui/drafts.sh` deletes drafts in the Win32 client against its own fixture
 daemon (port 9560): each Drafts row's Delete, published to assistive technology;
 the confirmation, where Cancel keeps the draft; a confirmed delete gone from the
 list, the count and the sidebar, and not written back by the composer, which still
@@ -1448,7 +1454,7 @@ Not in CI, for the smoke's reason.
 
 ## Reading the files harness
 
-`scripts/gui_files.sh` pages the Win32 files view (REQ-143) against its own
+`scripts/gui/files.sh` pages the Win32 files view (REQ-143) against its own
 fixture daemon (port 9590) with `OPENCHIME_FILE_PAGE=2`, so three uploads are
 enough to see paging a real daemon would only show past two hundred files. It
 asserts that the first page holds its two rows and says more remain; that "Load
@@ -1463,7 +1469,7 @@ rather than repeating it. Not in CI, for the smoke's reason.
 
 ## Reading the uploads harness
 
-`scripts/gui_uploads.sh` drives the Win32 message box's upload tray (REQ-140)
+`scripts/gui/uploads.sh` drives the Win32 message box's upload tray (REQ-140)
 against its own fixture daemon (port 9630). It attaches files through the
 `attach` verb — the file dialog cannot be driven, the tray can — and asserts
 that they wait as chips, an image with its picture, each chip's button published
@@ -1485,7 +1491,7 @@ a failure — is proven in `test_client_core.c`, and cancelling in
 
 ## Reading the members harness
 
-`scripts/gui_members.sh` scrolls the members pane (REQ-031) against its own
+`scripts/gui/members.sh` scrolls the members pane (REQ-031) against its own
 fixture daemon (port 9600) bootstrapped with sixty people — `OC_DEV_USERS`, all of
 whom land in `#general` on registration — so the roster is three times what the
 pane holds. It asserts that only what fits is drawn and the pane says the rest is
@@ -1512,7 +1518,7 @@ distinguishes the two is whether anybody past the first screen is ever drawn.
 
 ## Reading the keyboard-menu harness
 
-`scripts/gui_keymenu.sh` drives the keyboard's route to the context menu
+`scripts/gui/keymenu.sh` drives the keyboard's route to the context menu
 (REQ-269) against its own fixture daemon (port 9610), with the pointer parked off
 every row so nothing it asserts can be the mouse's doing. It covers Ctrl+Down and
 Ctrl+Up putting the keyboard on a message and moving between them; Shift+F10
@@ -1539,7 +1545,7 @@ file on disk for everything after it to read.
 
 ## Reading the calls harness
 
-`scripts/gui_calls.sh` runs two Win32 clients in a call over `gui_pair.sh`
+`scripts/gui/calls.sh` runs two Win32 clients in a call over `scripts/gui/pair.sh`
 against its own fixture daemon (port 9620): alice's synthetic microphone at
 440 Hz, bob's at 660 Hz (`OPENCHIME_TEST_TONE`). The clients reach the daemon at
 the WSL machine's own address rather than 127.0.0.1, because WSL forwards only TCP
@@ -1560,15 +1566,15 @@ and `callevents`. The `call` verb drives it: `call start|join|open|leave|end|dec
 `call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
 Not in CI, for the smoke's reason.
 
-`scripts/gui_calls_tcp.sh` is the same pair (port 9630) with UDP that goes
+`scripts/gui/calls_tcp.sh` is the same pair (port 9630) with UDP that goes
 nowhere: the daemon advertises the relay at a port nothing answers on
-(`OC_PAIR_ADVERTISE_PORT`, which `gui_pair.sh` passes as
+(`OC_PAIR_ADVERTISE_PORT`, which `scripts/gui/pair.sh` passes as
 `OPENCHIME_AUDIO_ADVERTISE_PORT`). It asserts that each client finds within
 seconds that the relay does not answer, moves to the connection transport — the
 dump's `call` line says `transport=tcp` — and hears the other's tone
 (PROTOCOL.md §5.17, AUDIO.md §4).
 
-`scripts/gui_groups.sh` drives user groups (REQ-307–309) on a pair of its own
+`scripts/gui/groups.sh` drives user groups (REQ-307–309) on a pair of its own
 (port 9640, clients reaching the daemon at the WSL address; carol and u1–u9 exist without clients).
 - Alice makes `@crew` in Admin → Groups through the tab's own buttons (the `grpbtn` verb presses them, `formnext` fills their forms).
 - She adds carol and bob with the people picker (`grppick <query>` types into it through the real key path and presses Enter): `car` finds carol, `#gen` offers nothing and adds nobody, and one Add puts both in.
@@ -1586,7 +1592,7 @@ dump's `call` line says `transport=tcp` — and hears the other's tone
 
 The dump's `groups` and `chgroups` lines carry the groups, the open channel's, whether this user is in it through one, and whether its newest message names them. `grppick` carries the picker's owner (`host` 1 a group's, 2 the members pane's), focus, whether the pane is adding (`memmode` 1), chips and matches, and the verb drives whichever of the two is open; `memgrp` the GROUPS subheading's + (`plus`), group-row Removes and the hovered row's Remove; `memppl` the header's Add people, the picker's Add and Cancel, and which icon's tooltip is up (`tip`); `memrow` names each row's person, with its Remove when shown and whether that is dimmed (`via`).
 
-`gui_pair.sh`'s command directories are per port (`ocpair-<port>-a`, `-b`), so two pairs up at once never read each other's commands.
+`scripts/gui/pair.sh`'s command directories are per port (`ocpair-<port>-a`, `-b`), so two pairs up at once never read each other's commands.
 
 The daemon side is in `make test`:
 - `test_dbwriter` covers the rules, membership by reference, `@group`, and the invariant. The invariant is a random sequence of every membership operation checked against a reference model after each step.
@@ -1598,7 +1604,7 @@ Each guard was shown to fail with the change it guards reverted.
 
 ## Reading the search-box harness
 
-`scripts/gui_search_boxes.sh` checks the six search boxes (CLIENT.md, "The six
+`scripts/gui/search_boxes.sh` checks the six search boxes (CLIENT.md, "The six
 search boxes are one control") on a pair of its own (port 9660; only alice is
 driven). At the default text size, the largest, and 200% DPI it opens each box in
 turn — the sidebar's find box, search messages, Files, People, Jump to and the
@@ -1616,7 +1622,7 @@ the EDIT given a fixed height again.
 
 ## Reading the voice harness
 
-`scripts/gui_voice.sh` drives voice input in the Win32 client end to end against
+`scripts/gui/voice.sh` drives voice input in the Win32 client end to end against
 its own fixture daemon (port 9510), with real recognition: read-aloud renders a
 sentence, and `OPENCHIME_TEST_AUDIO=synthetic` with `OPENCHIME_TEST_MIC=<wav>`
 makes the client's microphone speak it. It asserts push to talk by the held key,
@@ -1631,7 +1637,7 @@ touches voice input, the composer's controls or the device layer.
 
 ## The visual audit — checking a render with no render to compare it to
 
-`scripts/gui_audit.sh` walks every surface of the Win32 client across themes,
+`scripts/gui/audit.sh` walks every surface of the Win32 client across themes,
 DPI settings and text sizes, and checks each captured scene against properties
 it must hold **on its own**. It is not the smoke and must not become one: the
 smoke asks "does the client boot" in ten seconds and runs before every push;
@@ -1654,7 +1660,7 @@ it drew.
 **The paint ledger** (`gfx_ledger_dump`, verb `ledger <path>`) is one row per
 primitive, in draw order, with the rect, the clip in force, the colour and a
 tag — see the note in `client/gui/gfx/gfx.h`. It is allocated only when
-`OPENCHIME_TEST_DIR` is set. From it, `scripts/audit/oracles.py` asks questions
+`OPENCHIME_TEST_DIR` is set. From it, `scripts/gui/audit/oracles.py` asks questions
 a single frame can answer:
 
 - a string whose raster runs past its clip is **truncated**, and nothing on
@@ -1695,7 +1701,7 @@ check that fires on correct code is one people learn to skip, which is how the
 client's own fit check came to report phantom overlaps for months without
 anybody reading it.
 
-**`scripts/audit/pair.py`** compares two captures of one surface in two states
+**`scripts/gui/audit/pair.py`** compares two captures of one surface in two states
 and reports what MOVED. Some defects are invisible in one frame: a label that
 shifts a pixel when its row goes semibold looks correct in both screenshots and
 reads as a twitch in use. The property is that changing a state must not change
@@ -1710,7 +1716,7 @@ see. Nothing internal to the tree can catch that, because the tree is
 consistent with itself; only the other account knows. This is what found the
 Admin view still offering conversation rows for a sidebar it does not draw.
 
-**The checks that need pixels** (`scripts/audit/pixels.py`) close the gap
+**The checks that need pixels** (`scripts/gui/audit/pixels.py`) close the gap
 between what the app asked for and what the renderer produced. A stroke
 tessellator that blows its vertex budget discards icons whole: the draw
 call happens, the ledger records it, and nothing appears. So a
@@ -1719,7 +1725,7 @@ box must not come back one flat colour, and a disc's rim must be a ramp rather
 than a step. Each is asked only of shapes nothing was drawn over afterwards —
 without that filter every button in the app is a finding.
 
-**The states that must agree** (`scripts/audit/consistency.py`) compare the
+**The states that must agree** (`scripts/gui/audit/consistency.py`) compare the
 client against itself. A theme reached by a live switch must render as a cold
 start in that theme does; 96 → 192 → 96 must equal a cold 96; a conversation
 reached twice must look the same both times. The theme case is one switch, from
@@ -1728,7 +1734,7 @@ back to X — which passes with the defect present, because a cache whose key fo
 theme is stale in both directions and lands on the right colours by being wrong
 twice.
 
-**Contact sheets** (`scripts/audit/sheets.py`) are for the findings no check
+**Contact sheets** (`scripts/gui/audit/sheets.py`) are for the findings no check
 will ever make. "A 13px marker on an 18px tile looks bad" is a judgement, not a
 property. The sheets do not replace the eye; they change what it is asked to
 do — every icon at every size on one page, every avatar composite on another,
@@ -1736,7 +1742,7 @@ the corner arc of every rounded rect on a third. A thing that is wrong is then
 sitting beside eleven things that are right, which is a glance rather than a
 hunt through 224 screenshots.
 
-**`scripts/audit/selftest.py` proves every check can fail**, with a synthetic
+**`scripts/gui/audit/selftest.py` proves every check can fail**, with a synthetic
 scene per check and, for the pixel ones, a real capture handed a ledger that
 lies about it. Run it after touching anything in that directory; it needs no
 client. A check that has never failed has not been shown to check anything, and
@@ -1754,7 +1760,7 @@ may ask rather than excusing a result:
   caret blinks on a 530ms phase), so frame-equality checks skip it.
 
 **Reading a run.** Scenes and how to reach them live in
-`scripts/audit/scenes.tsv`, one row per surface with the verbs and — not
+`scripts/gui/audit/scenes.tsv`, one row per surface with the verbs and — not
 optional — a dump key to wait for. A verb acks when its handler *ran*, not when
 the frame showing its effect has been painted, and several of these views paint
 "Loading…" until the daemon answers; sleeping a fixed time instead
@@ -1791,7 +1797,7 @@ Both read `overlaps=0 outside=0`.
 
 ## Observing the tray balloon
 
-`scripts/gui_balloon.sh` answers whether the tray balloon is **drawn**, which
+`scripts/gui/balloon.sh` answers whether the tray balloon is **drawn**, which
 nothing else can: the balloon is the middle of the notification chain — WinRT
 toast, else balloon, else the client's own window — and wherever toasts work it
 is never reached. The run turns the toast off for its own duration (`wintoast 0`

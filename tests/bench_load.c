@@ -4,7 +4,7 @@
  * broadcast fan-out so the number is per-connection latency) — and holds the
  * connections open. Reports connection success, round-trip latency percentiles,
  * and aggregate throughput. The daemon's resident memory is sampled externally
- * (Scripts/bench.sh) while this runs, so the two together answer "how many
+ * (scripts/bench.sh) while this runs, so the two together answer "how many
  * concurrent connections fit in the lean memory profile, at what latency".
  *
  * Not part of `make test` (it drives a live daemon). Links only the shared wire

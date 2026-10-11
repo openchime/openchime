@@ -22,15 +22,14 @@ loop hears `OPENED` a second time, as a protocol peer, and nothing else in it
 changed. Tested in `tests/itest_netloop.c` (the upgrade, the HELLO's answer,
 ping, an unmasked frame).
 
-**The core in a browser.** `make web-core` compiles `client/core/*.c` and the
-shared wire to `build/web/openchime-core.{js,wasm}` with Emscripten, with
-pthreads: the network thread is a Web Worker and its socket is Emscripten's
-WebSocket, which the page points at `/ws` (`client/gui/platform/web/index.html`).
+**The core in a browser.** `client/core/*.c` and the shared wire compile
+with Emscripten, with pthreads: the network thread is a Web Worker and its
+socket is Emscripten's WebSocket, which the page points at `/ws`.
 Inside the WebSocket the protocol goes in the clear: the page's HTTPS is the
 wire's TLS, so the core opens a **plain connection** (`oc_tls_conn_init_plain`)
 and judges no certificate -- the browser judged the origin's. mbedTLS still
 links, for the sign-in hashing and the call keys, built for wasm once beside
-the native build (`scripts/build_mbedtls_wasm.sh`). Three places in the core
+the native build (`scripts/build/mbedtls_wasm.sh`). Three places in the core
 have an Emscripten branch and no more: the connection's setup (`net.c`), SRV
 lookup (`resolve.c`, a browser has no resolver), and `poll` (`sock.h`,
 Emscripten's reports and never waits, so a timeout is a loop of short sleeps
@@ -38,15 +37,12 @@ on the network thread). The credential store is in memory for now
 (`client/gui/platform/web/secret_mem.c`).
 
 **The drawing layer in a browser.** SDL3 builds for wasm from the same release
-the Windows client uses (`scripts/build_sdl3_wasm.sh`), and `oc_gfx` compiles
-over it unchanged. `make web-gfx-test` runs the backend's own pixel test
-(`client/gui/gfx/gfx_test_win.c`, the same assertions) under Node and passes.
-`make web-gfx-demo` is a page that draws a conversation's chrome with the
-renderer's primitives into the page's canvas through WebGL
-(`client/gui/platform/web/gfx_demo.c`).
+the Windows client uses (`scripts/build/sdl3_wasm.sh`), and `oc_gfx` compiles
+over it unchanged. `make web-test` runs the backend's own pixel test
+(`client/gui/gfx/gfx_test_win.c`, the same assertions) under Node first.
 
-**The application in a browser.** `make web-gui` compiles the application
-layer -- `client/gui/app/`, the same sources `make windows-gui` compiles --
+**The application in a browser.** `make web` compiles the application
+layer -- `client/gui/app/`, the same sources `make windows` compiles --
 over the browser's platform directory (`client/gui/platform/web/`). The
 window, its events, timers, cursors and clipboard text are SDL3 on both; what
 only a platform can do is the contract in `client/gui/platform/platform.h`,
@@ -92,8 +88,8 @@ invoke token the UIA route delivers; announcements go to a live region.
 **Served by the daemon** (`daemon/webapp.h`). The daemon is the client's web
 server, and a daemon always serves the client that matches it: the page and the
 loader (`openchime.html`, `openchime.js`) are compiled into the binary as
-resources (`scripts/embed_res.py`, the Makefile's `WEBAPP_RES`), so `make`
-builds the web client before the daemon and needs emcc; the one thing outside
+resources (`scripts/build/embed_res.py`, the Makefile's `WEBAPP_RES`), so a
+`WEB=1` daemon (`make full`) builds the web client first; the one thing outside
 the binary is the wasm, shipped beside the executable as the voice data is
 (`web/openchime.wasm` beside it, `/usr/share/openchime/web` when installed by a
 package, which the .deb, .rpm, tarball and image all carry). On the TLS port
@@ -122,7 +118,7 @@ The password quick-launch (`?user=&pass=`) is the test harness's only, under
 links (`client/core/media`, `voice`, `call`: VP9 through libvpx, Opus,
 speexdsp's canceller and preprocessor, the MP4 muxer, the recorder, the player,
 the segmenter, the call engine with SFrame and its jitter buffers) is compiled
-to wasm (`scripts/build_media_wasm.sh` builds the three libraries), over the
+to wasm (`scripts/build/media_wasm.sh` builds the three libraries), over the
 browser's two backends in place of Media Foundation, Graphics Capture and
 miniaudio: the camera and a screen through `getUserMedia` and
 `getDisplayMedia` (`cap_web.c`, VIDEO-MESSAGES.md §3.2) and the microphone
@@ -185,7 +181,7 @@ Emscripten port passes through; a crash leaves nothing but the console.
 
 ## What is left, in order
 
-1. **`make web-test` and `make web-harness` in CI.** CI builds the client (the
+1. **`make web-test` and `scripts/gui/run.sh --web all` in CI.** CI builds the client (the
    daemon needs it) but runs the browser tests locally only; a runner with a
    Chromium joins them.
 
@@ -217,11 +213,10 @@ the system's notification sounds, a crash dump, UDP for a call.
 ## Building it
 
 ```
-source ~/emsdk/emsdk_env.sh          # Emscripten 6.0.8, the version CI and the release pin
-make web                             # the client, the core page and the drawing demo in build/web (the codecs for wasm are built once)
-make                                 # the daemon, with the client compiled in and web/openchime.wasm beside it
-make web-test                        # gfx under Node, the core, then the client in a headless Chromium
-python3 scripts/webdev.py build/web  # the dev server: http://127.0.0.1:8765/openchime.html?host=…&port=…&user=…&pass=…
+make web                             # the client in build/web; the first run fetches Emscripten 6.0.8 (mk/toolchains.mk) and builds SDL3, mbedTLS and the codecs for wasm once
+make WEB=1                           # the daemon with the client compiled in and web/openchime.wasm beside it (remembered; `make full` does the same)
+make web-test                        # gfx under Node, then the client in a headless Chromium
+python3 scripts/web/serve.py build/web  # the dev server: http://127.0.0.1:8765/openchime.html?host=…&port=…&user=…&pass=…
 ```
 
 A daemon started from this directory serves the client at `https://<its

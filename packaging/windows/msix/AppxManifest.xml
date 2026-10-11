@@ -18,7 +18,7 @@
 
   Version is rewritten by .github/workflows/release.yml. It must be a.b.c.d
   with the fourth field 0 (the Store reserves the revision), so the bare
-  release number from version.sh lands in the third field.
+  release number from scripts/release/version.sh lands in the third field.
 -->
 <Package
     xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"

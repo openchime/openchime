@@ -137,12 +137,21 @@ is statically linked. Debian bullseye (glibc 2.31) is too old.
 ## Local build (daemon)
 
 ```
-make
+make          # the daemon alone, in a minute or two: no speech, no summaries, no web client
+make full     # everything: read-aloud, voice input, summaries, the web client, and every client
 ```
 
-Requires a C toolchain and SQLite development headers (`sqlite3.h`,
-`libsqlite3`) on the host. `make OC_VERSION=<n>` stamps a release number into
-`openchimed --version`; an unstamped build reports `dev`.
+Requires a C toolchain; SQLite and mbedTLS are vendored and built once.
+`make full` also needs CMake, a C++17 compiler, Python 3, git, curl and xz; it
+fetches its own pinned Emscripten, llvm-mingw and zig (`mk/toolchains.mk`), and
+its first run compiles ONNX Runtime (about 20 minutes). The switches it turns
+on (`TTS`, `STT`, `SUM`, `WEB`) are remembered in `build/.features`, so a later
+`make` rebuilds the same daemon; one at a time works too (`make SUM=1`), and
+`make distclean` forgets them. `make ARCH=aarch64` cross-builds the daemon for
+arm64 into `build/aarch64/` (build only), and `make RELEASE=1` builds the host's
+as the release does, with zig against glibc 2.34.
+`make OC_VERSION=<n>` stamps a release number into `openchimed --version`;
+an unstamped build reports `dev`.
 
 To build the distributable packages from an already-built binary:
 
@@ -157,9 +166,11 @@ Note the release does **not** build with the host toolchain. It builds with
 target, because a binary linked against a newer glibc will not start on an older
 one — and every hosted runner carries a newer one. Zig ships glibc stub
 libraries for each version and links against whichever it is told to, so the
-floor holds without a container. The release asserts the result rather than
-trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the build
-fails. Nothing in the pipeline uses Docker.
+floor holds without a container, and the arm64 daemon comes off the same x86
+runner (`make RELEASE=1 ARCH=aarch64`). The release asserts the result rather
+than trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the
+build fails. One Linux host builds everything but the Windows installers'
+signing; nothing in the pipeline uses Docker.
 
 ## Client (app-core + native frontends)
 
@@ -167,11 +178,7 @@ The client ([docs/CLIENT.md](docs/CLIENT.md)) is **one shared C app-core with a
 native UI per platform** (the tdlib model, ARCH-74). The app-core
 (`client/core/`) is frontend-agnostic — it links the daemon's exact `shared/`
 wire code, owns the network thread and the view-model, and is driven headlessly
-by `make test` (`tests/test_client_core.c`). A standalone compile check:
-
-```
-make core
-```
+by `make test` (`tests/test_client_core.c`).
 
 The **web client** (`docs/WEB.md`) is the same graphical client -- one
 portable application over a per-platform directory (`client/gui/app/`,
@@ -182,7 +189,7 @@ own page, and the client is there -- the page and loader are compiled into the
 daemon and the wasm ships beside it, so a daemon always serves the client that
 matches it. Building the daemon therefore needs Emscripten (`make`).
 
-One frontend is a **TUI** (`make tui`, built on the in-tree `tuikit`
+One frontend is a **TUI** (`make linux`, built on the in-tree `tuikit`
 toolbox over termbox2 + utf8proc, ARCH-83), built on the host like the daemon and
 also shipping on Windows (ARCH-81). It is menu- and screen-driven — panels, context
 menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
@@ -211,10 +218,10 @@ toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards all run end to end with their daemon halves.
 
-**Two harnesses, and they answer different questions.** `scripts/gui_smoke.sh`
+**Two harnesses, and they answer different questions.** `scripts/gui/smoke.sh`
 asks whether the client boots and runs — fourteen assertions in about ten
 seconds, run before every push, and deliberately kept that size: a suite that
-takes minutes is a suite that gets skipped. `scripts/gui_audit.sh` is the long one, walking every surface across
+takes minutes is a suite that gets skipped. `scripts/gui/audit.sh` is the long one, walking every surface across
 themes, DPI settings and text sizes and checking each captured scene against
 properties it must hold on its own — a string that fits its box, ink that can be
 read against what is behind it, one label not drawn over another, nothing drawn

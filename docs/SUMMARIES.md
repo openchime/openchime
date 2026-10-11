@@ -348,7 +348,7 @@ machine, so only stopping and a waiting request hold its calls.
 Which models have been run, and how each did, is in docs/MODELS.md.
 
 **Engine.** llama.cpp, from pinned source, CPU only, one static archive
-(`scripts/build_llamacpp.sh`; VENDORS.md). On x86-64 it targets x86-64-v3
+(`scripts/build/llamacpp.sh`; VENDORS.md). On x86-64 it targets x86-64-v3
 (AVX2, FMA, F16C, BMI2); before anything from llama.cpp runs, the daemon checks
 the CPU has them (`oc_sum_cpu_ok`), and on one that does not, local summaries
 are off with the reason logged. The model file is memory-mapped.
@@ -439,10 +439,11 @@ the seconds waited.
 
 ## 7. Evaluating
 
-`scripts/sumeval.c` runs the same code outside the daemon, and
-`scripts/slack_to_db.py` loads a Slack export into a database at the daemon's
-schema. They and the scripts below are development tools and never installed;
-exported data never enters the repository.
+The evaluation was made with development tools that have since been removed
+from the tree (they are in the history at the commit before their removal);
+this section stays as the record of the method. `sumeval.c` ran the same code
+outside the daemon, and `slack_to_db.py` loaded a Slack export into a database
+at the daemon's schema. Exported data never enters the repository.
 
 ```
 make build/sumeval
