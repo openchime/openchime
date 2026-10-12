@@ -29,7 +29,7 @@ typedef struct oc_unfurler oc_unfurler;
 
 /* Start the worker. `dbw` receives the completed fetches; `allow_private`
  * disables the SSRF gate and exists ONLY so a test can fetch from a loopback
- * fixture (OPENCHIME_UNFURL_ALLOW_PRIVATE) — never set it in a deployment.
+ * fixture (OPENCHIME_DEMO_PRIVATE_UNFURL) — never set it in a deployment.
  * Returns NULL on failure. */
 oc_unfurler *oc_unfurler_start(oc_dbwriter *dbw, int allow_private);
 

@@ -6,7 +6,7 @@
 #   scripts/gui/calls_tcp.sh --down     # ... and take it down afterwards
 #
 # The daemon tells the clients the relay is at a UDP port nothing listens on
-# (OPENCHIME_AUDIO_ADVERTISE_PORT), so every datagram they send is lost and none
+# (OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT), so every datagram they send is lost and none
 # comes back -- a network that blocks UDP, as far as either can tell. It asserts
 # that each client finds that within seconds and moves to the connection, that
 # each then hears the other's tone, and that the call view says where the audio

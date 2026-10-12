@@ -129,14 +129,14 @@ cleanup() {
     drive wsforget "$WS" 2>/dev/null || true
     "$HERE/scripts/gui/drive.sh" kill >/dev/null 2>&1 || true
     for p in $(pgrep -x openchimed || true); do
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$PORT" && kill "$p" 2>/dev/null
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$PORT" && kill "$p" 2>/dev/null
     done
     rm -f "$LIN_DIR/web.ps1" "$LIN_DIR/signin_url.txt"
 }
 
 # --- the daemon, as shipped (no knob), with no owner yet ---------------------
 for p in $(pgrep -x openchimed || true); do
-    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$PORT" && kill "$p" 2>/dev/null
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$PORT" && kill "$p" 2>/dev/null
 done
 # A daemon told to stop takes a moment to let go of the port; one started into
 # it fails to bind, and the client then reaches the old one on its way out.
@@ -145,9 +145,8 @@ for _ in $(seq 1 50); do
     exec 3<&- 3>&-; sleep 0.2
 done
 rm -rf "$D"; mkdir -p "$D/blobs"
-env -u OPENCHIME_TEST_PASSWORD_AUTH OPENCHIME_DB_PATH="$D/db" OPENCHIME_TLS_CERT="$D/cert.pem" \
-    OPENCHIME_TLS_KEY="$D/key.pem" OPENCHIME_BLOB_DIR="$D/blobs" OPENCHIME_PROTO_PORT="$PORT" \
-    OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Web Sign-in" OPENCHIME_DEPLOYMENT_MODE=standalone \
+env OPENCHIME_DEMO_PASSWORD_FRAMES=off OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
+    OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Web Sign-in" \
     OPENCHIME_TTS=0 OPENCHIME_STT=0 \
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &
 disown
@@ -157,7 +156,7 @@ for _ in $(seq 1 150); do     # the speech models load first: seconds on a busy 
     [ -n "$TOKEN" ] && break; sleep 0.2
 done
 [ -n "$TOKEN" ] || fail "the daemon printed no setup token"
-grep -q 'OPENCHIME_TEST_PASSWORD_AUTH' "$D/daemon.log" && fail "the daemon has the test knob on"
+grep -q 'password frames are on' "$D/daemon.log" && fail "the daemon has the test knob on"
 # The token is printed before the listener is up (the speech models load in
 # between), so wait for the port the client will ask, not for the log.
 for _ in $(seq 1 150); do

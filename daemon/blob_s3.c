@@ -3,7 +3,7 @@
  * (daemon/sigv4.c) and streaming the body with
  * `x-amz-content-sha256: UNSIGNED-PAYLOAD` so an upload/download need not be
  * buffered whole. Selected by the presence of S3 credentials (blobstore.c);
- * configured via OPENCHIME_S3_ENDPOINT, _BUCKET, _ACCESS_KEY, _SECRET_KEY,
+ * configured via OPENCHIME_S3 (config.h: endpoint, bucket, access key, secret key,
  * _REGION.
  *
  * **Transport.** HTTPS by default, with real CA-chain + hostname verification

@@ -1341,7 +1341,7 @@ int  oc_dbwriter_eventfd(oc_dbwriter *w);
  * args; call once before serving traffic. `pubkey_pem` is one or more PEM
  * SubjectPublicKeyInfo blocks; `relay_origin` is where AUTH_BEGIN sends a browser
  * ("" when the box is not enrolled anywhere). Returns 0 / -1. */
-/* Set the registered-user cap (CP-7, OPENCHIME_MAX_USERS); <=0 = unlimited. Call
+/* Set the registered-user cap (CP-7, OPENCHIME_MANAGED_MAX_USERS); <=0 = unlimited. Call
  * once before serving. */
 void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
 
@@ -1361,19 +1361,19 @@ void oc_dbwriter_set_relay_keys(oc_dbwriter *w, const char *fetched_pem);
  * are refused. */
 void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on);
 
-/* Who may join through an OIDC source (OPENCHIME_OIDC_ALLOW, AUTH.md §8.4).
+/* Who may join through an OIDC source (OPENCHIME_JOIN, AUTH.md §8.4).
  * NULL or "" admits nobody new. Returns -1 with a reason in `err` on a rule it
  * does not understand; call before the writer serves traffic. */
 int oc_dbwriter_configure_join_rules(oc_dbwriter *w, const char *spec,
                                      char *err, size_t errcap);
 /* Whether an emailed code may sign into a person who signs in here with a
- * provider (OPENCHIME_OIDC_EMAIL_LINK=any); off, it is refused. Before serving. */
+ * provider (a constant: never); off, it is refused. Before serving. */
 void oc_dbwriter_set_email_link(oc_dbwriter *w, int any);
 /* The key a local account's TOTP secret is sealed under (AUTH.md §8.6), or NULL
  * when none could be had: an account with a second step then cannot pass it,
  * rather than passing without it. Before serving. */
 void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32);
-/* Whether local accounts are asked for a second step (OPENCHIME_LOCAL_MFA):
+/* Whether local accounts are asked for a second step (OPENCHIME_MFA):
  * OC_MFA_OFF never, and its page is closed; OC_MFA_OPTIONAL when one is set
  * up; OC_MFA_REQUIRED always -- an account with none signs in only once it has
  * set one up. Before serving. */
@@ -1381,8 +1381,8 @@ void oc_dbwriter_set_factor_key(oc_dbwriter *w, const uint8_t *key32);
 #define OC_MFA_OPTIONAL 1
 #define OC_MFA_REQUIRED 2
 void oc_dbwriter_set_local_mfa(oc_dbwriter *w, int policy);
-/* How long a session lives (OPENCHIME_SESSION_DAYS), and how long one may go
- * unused before it is refused (OPENCHIME_SESSION_IDLE_DAYS; 0, never), in ms.
+/* How long a session lives (OC_SESSION_TTL_MS), and how long one may go
+ * unused before it is refused (OC_SESSION_IDLE_MS; 0, never), in ms.
  * Before serving. */
 void oc_dbwriter_set_session_policy(oc_dbwriter *w, uint64_t ttl_ms, uint64_t idle_ms);
 int  oc_dbwriter_local_mfa(oc_dbwriter *w);
@@ -1396,7 +1396,7 @@ uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
 /* Local accounts sign in in the browser, on the daemon's pages (AUTH.md §8.10):
  * its issuer is ready. */
 int         oc_dbwriter_local_browser(oc_dbwriter *w);
-/* The test knob OPENCHIME_TEST_PASSWORD_AUTH=1, read when the writer starts: a
+/* The demo switch OPENCHIME_DEMO_PASSWORD_FRAMES, read when the writer starts: a
  * password may still come in a frame -- AUTH local, REDEEM_INVITE,
  * CHANGE_PASSWORD. Off, only the pages take one. */
 int         oc_dbwriter_password_frames(oc_dbwriter *w);

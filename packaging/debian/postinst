@@ -48,7 +48,7 @@ it before anyone else can:
   journalctl -u openchimed | grep -i 'setup token'
 
 The daemon listens on 8443 by default so installing could not collide with a web
-server on 443. For a real deployment set OPENCHIME_PROTO_PORT=443 in the config
+server on 443. For a real deployment set OPENCHIME_PORT=443 in the config
 file above -- the service already holds CAP_NET_BIND_SERVICE, so no root needed.
 
 EOF

@@ -52,6 +52,7 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -2345,14 +2346,14 @@ static void test_sni_name(void) {
         CHECK(sent == (T[i].want != NULL));
         CHECK(T[i].want ? strcmp(out, T[i].want) == 0 : out[0] == '\0');
     }
-    /* A bare name resolves under the hosted suffix, and OPENCHIME_SUFFIX still wins. */
+    /* A bare name resolves under the hosted suffix; a demo build's OPENCHIME_TEST_SUFFIX wins. */
     char d[256];
-    unsetenv("OPENCHIME_SUFFIX");
+    unsetenv("OPENCHIME_TEST_SUFFIX");
     CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0);
     CHECK(strcmp(d, "acme.workspace.openchime.io") == 0);
-    setenv("OPENCHIME_SUFFIX", "chat.example", 1);
+    setenv("OPENCHIME_TEST_SUFFIX", "chat.example", 1);
     CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0 && strcmp(d, "acme.chat.example") == 0);
-    unsetenv("OPENCHIME_SUFFIX");
+    unsetenv("OPENCHIME_TEST_SUFFIX");
 }
 
 struct moved_label { const char *workspace; char label[256]; };
@@ -2368,7 +2369,7 @@ static void moved_label_cb(void *ctx, const char *workspace, const char *label,
  * same address, or none, changes nothing. */
 static void test_workspace_move(void) {
     mock_reset();
-    unsetenv("OPENCHIME_SUFFIX");
+    unsetenv("OPENCHIME_TEST_SUFFIX");
     oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
     oc_store *s = oc_store_open("ignored");
     CHECK(s != NULL);
@@ -4068,16 +4069,14 @@ static int web_person(const char *url, const char *page, const char *fields) {
 
 /* A daemon for local sign-in in the browser, as shipped (the test knob off). */
 static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN]) {
-    const char *k = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
-    int had = k != NULL;
-    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH"); oc_config_load(NULL, 0);
+    setenv("OPENCHIME_DEMO_PASSWORD_FRAMES", "off", 1); oc_config_load(NULL, 0);
     char f[128];
     unlink(db);
     snprintf(f, sizeof f, "%s-wal", db); unlink(f);
     snprintf(f, sizeof f, "%s-shm", db); unlink(f);
     oc_dbwriter *dbw = oc_dbwriter_start(db);
     if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
-    if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    unsetenv("OPENCHIME_DEMO_PASSWORD_FRAMES");
     oc_config_load(NULL, 0);
     if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
     if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
@@ -4776,11 +4775,12 @@ int run_client_core_tests(void) {
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
      * how itest_netloop provisions it. */
-    setenv("OPENCHIME_BLOB_DIR", "build/itest_core_blobs", 1);
+    mkdir("build/itest_core_data", 0700);
+    setenv("OPENCHIME_DATA_DIR", "build/itest_core_data", 1);
     /* Two files to a page, so the paging below is exercised with three uploads
      * rather than two hundred and one. Read once, by the config the loop thread
      * loads before the netloop runs. */
-    setenv("OPENCHIME_FILE_PAGE", "2", 1);
+    setenv("OPENCHIME_DEMO_FILE_PAGE", "2", 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);

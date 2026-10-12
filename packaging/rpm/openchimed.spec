@@ -134,7 +134,7 @@ The first-run owner setup token is printed to the log once, at first start:
   journalctl -u openchimed | grep -i 'setup token'
 
 The daemon listens on 8443 by default. For a real deployment set
-OPENCHIME_PROTO_PORT=443 -- the unit already holds CAP_NET_BIND_SERVICE.
+OPENCHIME_PORT=443 -- the unit already holds CAP_NET_BIND_SERVICE.
 
 EOF
 fi

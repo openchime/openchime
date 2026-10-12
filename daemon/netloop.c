@@ -2139,13 +2139,12 @@ static int stt_refuse(conn *c, uint32_t segment_id, uint16_t code, const char *w
 }
 
 #ifdef OC_STT
-/* Segments per connection per minute (OPENCHIME_STT_RATE): free talk sends one
+/* Segments per connection per minute (OC_STT_SEGS_PER_MIN): free talk sends one
  * every few seconds; this bounds a client sending far faster than anyone talks. */
 static int stt_rate_ok(conn *c) {
-    const oc_config *cfg = oc_config_get();
     uint64_t now = now_ms();
     if (now - c->stt_win_start >= 60000u) { c->stt_win_start = now; c->stt_count = 0; }
-    if (c->stt_count >= (unsigned)cfg->stt.rate) return 0;
+    if (c->stt_count >= (unsigned)OC_STT_SEGS_PER_MIN) return 0;
     c->stt_count++;
     return 1;
 }
@@ -2222,10 +2221,9 @@ static int audio_open_blob(int ep, conn **conns, conn *c, const char *key, uint6
 /* Read-aloud's per-connection limit, the shape of send_rate_ok: a fixed window,
  * counted on the connection, so one client cannot occupy the render worker. */
 static int audio_rate_ok(conn *c) {
-    const oc_config *cfg = oc_config_get();
     uint64_t now = now_ms();
     if (now - c->audio_win_start >= 60000u) { c->audio_win_start = now; c->audio_count = 0; }
-    if (c->audio_count >= (unsigned)cfg->tts.rate) return 0;
+    if (c->audio_count >= (unsigned)OC_TTS_GETS_PER_MIN) return 0;
     c->audio_count++;
     return 1;
 }
@@ -3862,7 +3860,6 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_stt_begin sb;
             if (oc_decode_stt_begin(&p, &sb) != OC_OK) return -1;
 #ifdef OC_STT
-            const oc_config *scfg = oc_config_get();
             uint16_t refuse = 0;
             const char *why = "";
             if (!g_stt) { refuse = OC_ERR_STT_UNAVAILABLE; why = "voice input is off"; }
@@ -3871,7 +3868,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                      (sb.mode == OC_STT_MODE_FREE && sb.channel_id == 0)) {
                 refuse = OC_ERR_TRANSFER_PROTOCOL; why = "bad segment";
             }
-            else if (sb.sample_count > (uint32_t)scfg->stt.max_secs * OC_STT_RATE) {
+            else if (sb.sample_count > (uint32_t)OC_STT_MAX_SECS * OC_STT_RATE) {
                 refuse = OC_ERR_SEGMENT_TOO_LONG; why = "segment too long";
             }
             else if (stt_waiting(c->conn_id) >= OC_STT_WAIT_MAX || !stt_rate_ok(c)) {
@@ -5484,7 +5481,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             if (g_stt && g_stt_engine) {
                 si.model_version = oc_slice_str(g_stt_engine->version);
                 si.lang = oc_slice_str(g_stt_engine->lang ? g_stt_engine->lang : "");
-                si.max_segment_ms = (uint32_t)oc_config_get()->stt.max_secs * 1000u;
+                si.max_segment_ms = (uint32_t)OC_STT_MAX_SECS * 1000u;
             }
 #endif
             oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
@@ -7651,7 +7648,7 @@ static void backfill_accept(int ep, conn **conns, oc_dbres *r) {
  *
  * Raised again immediately whenever one fires, so a backlog drains at queue
  * speed rather than one per tick — the flag is set by the result path below. */
-/* Overridable for tests, exactly as OPENCHIME_MAINT_INTERVAL_MS is: a suite
+/* Overridable for tests, exactly as OPENCHIME_DEMO_MAINT_MS is: a suite
  * that has to wait fifteen real seconds to see a scheduled message fire is one
  * nobody runs. Floored so a bad value cannot busy-loop the writer. */
 static __thread uint64_t g_sched_tick_ms;   /* from the configuration, when the loop starts */
@@ -8121,14 +8118,13 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                             "at \"%s\": %s\n", bd ? bd : "(unset)", strerror(errno));
             close(ep); close(lfd); loop_state_free(conns); return -1;
         }
-        g_max_attach = cfg->max_attach_size;
-        g_max_video  = cfg->max_video_size;
+        g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+        g_max_video  = OC_MAX_VIDEO_SIZE;
 
-        /* Blob I/O runs here, off the net thread (ARCH-69). Worker count from
-         * config (default 2, clamped 1..16): each in-flight transfer holds a TLS
-         * session plus a chunk buffer, which has to stay modest against the 256MB
-         * lean profile (REQ-210). */
-        int nw = cfg->xfer_workers;
+        /* Blob I/O runs here, off the net thread (ARCH-69): each in-flight
+         * transfer holds a TLS session plus a chunk buffer, which has to stay
+         * modest against the 256MB lean profile (REQ-210). */
+        int nw = OC_XFER_WORKERS;
         snprintf(g_blob_dir, sizeof g_blob_dir, "%s", bd);
         g_spol = cfg->storage;
         memset(&g_sstat, 0, sizeof g_sstat);
@@ -8165,8 +8161,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     {
         const oc_config *cfg = oc_config_get();
         if (g_stt_engine && cfg->stt.enabled) {
-            g_stt = oc_stt_worker_start(g_stt_engine, (size_t)cfg->stt.queue,
-                                        (unsigned)cfg->stt.idle_secs * 1000u);
+            g_stt = oc_stt_worker_start(g_stt_engine, (size_t)OC_STT_QUEUE,
+                                        (unsigned)OC_STT_IDLE_SECS * 1000u);
             if (!g_stt) {
                 fprintf(stderr, "stt: cannot start the recognition worker; voice input is off\n");
             } else {
@@ -8175,7 +8171,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 sev.events = EPOLLIN; sev.data.fd = stt_eventfd;
                 epoll_ctl(ep, EPOLL_CTL_ADD, stt_eventfd, &sev);
                 fprintf(stderr, "stt: voice input on, %s, queue %d, segments up to %ds, model idle %ds\n",
-                        g_stt_engine->version, cfg->stt.queue, cfg->stt.max_secs, cfg->stt.idle_secs);
+                        g_stt_engine->version, OC_STT_QUEUE, OC_STT_MAX_SECS, OC_STT_IDLE_SECS);
             }
         }
     }
@@ -8191,8 +8187,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     {
         const oc_config *cfg = oc_config_get();
         if (g_tts_engine && cfg->tts.enabled) {
-            g_tts = oc_tts_worker_start(g_tts_engine, g_blobs, (size_t)cfg->tts.queue,
-                                        (unsigned)cfg->tts.idle_secs * 1000u);
+            g_tts = oc_tts_worker_start(g_tts_engine, g_blobs, (size_t)OC_TTS_QUEUE,
+                                        (unsigned)OC_TTS_IDLE_SECS * 1000u);
             if (!g_tts) {
                 fprintf(stderr, "tts: cannot start the render worker; read-aloud is off\n");
             } else {
@@ -8201,7 +8197,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 tev.events = EPOLLIN; tev.data.fd = tts_eventfd;
                 epoll_ctl(ep, EPOLL_CTL_ADD, tts_eventfd, &tev);
                 fprintf(stderr, "tts: read-aloud on, %d voices, queue %d, model idle %ds\n",
-                        g_tts_engine->voices, cfg->tts.queue, cfg->tts.idle_secs);
+                        g_tts_engine->voices, OC_TTS_QUEUE, OC_TTS_IDLE_SECS);
                 /* WARM THE AUDITIONS. Every voice auditions with the same
                  * sentence, so there are exactly `voices` renderings to have, and
                  * having them is the difference between Play answering in a
@@ -8243,10 +8239,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     }
     g_device_rl = oc_ratelimit_new(OC_DEVICE_LOOKUPS_MAX, OC_DEVICE_LOOKUPS_WINDOW, 1024);
 
-    /* Per-source-IP concurrent-connection cap (0 disables). Blunts a
-     * connection-exhaustion flood from one host while staying generous enough
-     * for a large office behind one NAT; operators tune it. The global cap is
-     * OC_NETLOOP_MAX_FD. */
+    /* Per-source-IP concurrent-connection cap (config.h; a demo build may
+     * change it, 0 disabling it). Blunts a connection-exhaustion flood from one
+     * host while staying generous enough for a large office behind one NAT.
+     * The global cap is OC_NETLOOP_MAX_FD. */
     int max_per_ip = oc_config_get()->max_conns_per_ip;
     /* Parsed once; main refuses to start on a list it cannot read, so NULL here is
      * the empty list and nobody is trusted. */

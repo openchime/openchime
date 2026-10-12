@@ -1848,7 +1848,7 @@ static void test_voice_input_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
-/* OPENCHIME_STT_RATE: segments one connection may send a minute. The window
+/* OC_STT_SEGS_PER_MIN: segments one connection may send a minute. The window
  * opens at a connection's first segment, so a fresh one sending one more than
  * the limit meets it within the minute whatever the clock says. */
 static void test_voice_input_rate(int port, const uint8_t *pin) {
@@ -2578,10 +2578,7 @@ static void test_direct_signin(int port) {
  * product as shipped: a password is taken only by a page, which ends with an ID
  * token the client presents on AUTH. */
 static void test_web_signin(int port) {
-    const char *knob = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
-    char saved[8] = "";
-    if (knob) snprintf(saved, sizeof saved, "%s", knob);
-    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH"); oc_config_load(NULL, 0);
+    setenv("OPENCHIME_DEMO_PASSWORD_FRAMES", "off", 1); oc_config_load(NULL, 0);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
@@ -3234,7 +3231,7 @@ static void test_web_signin(int port) {
     oc_tls_server_free(&srv2);
     unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
 restore:
-    if (saved[0]) setenv("OPENCHIME_TEST_PASSWORD_AUTH", saved, 1);
+    unsetenv("OPENCHIME_DEMO_PASSWORD_FRAMES");
     oc_config_load(NULL, 0);
 }
 
@@ -3289,14 +3286,12 @@ struct dev_daemon { oc_tls_server srv; uint8_t pin[OC_TLS_FINGERPRINT_LEN]; oc_d
                     struct loop_arg arg; pthread_t th; uint64_t dee; };
 static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
     memset(d, 0, sizeof *d);
-    const char *knob = getenv("OPENCHIME_TEST_PASSWORD_AUTH");
-    int had = knob != NULL;
-    unsetenv("OPENCHIME_TEST_PASSWORD_AUTH"); oc_config_load(NULL, 0);
+    setenv("OPENCHIME_DEMO_PASSWORD_FRAMES", "off", 1); oc_config_load(NULL, 0);
     if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
     unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
     d->dbw = oc_dbwriter_start("build/itest_dev.db");
     if (d->dbw) oc_dbwriter_set_pw_iterations(d->dbw, 2048);   /* fast PBKDF2 for tests */
-    if (had) setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    unsetenv("OPENCHIME_DEMO_PASSWORD_FRAMES");
     oc_config_load(NULL, 0);
     if (!d->dbw) return -1;
     d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
@@ -5131,8 +5126,8 @@ static void test_call_routed(int port) {
     socklen_t u2l = sizeof u2; getsockname(udp2, (struct sockaddr *)&u2, &u2l);
     uint16_t audio_port = ntohs(u2.sin_port);
     oc_netloop_set_audio(udp2, audio_port);
-    setenv("OPENCHIME_AUDIO_TOKEN_PREFIX", "0a0b0c", 1);
-    setenv("OPENCHIME_AUDIO_ADVERTISE_PORT", "40001", 1);
+    setenv("OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX", "0a0b0c", 1);
+    setenv("OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT", "40001", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
@@ -5216,8 +5211,8 @@ static void test_call_routed(int port) {
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     /* Put the shared configuration back: the main loop reads it too. */
-    unsetenv("OPENCHIME_AUDIO_TOKEN_PREFIX");
-    unsetenv("OPENCHIME_AUDIO_ADVERTISE_PORT");
+    unsetenv("OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX");
+    unsetenv("OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT");
     oc_netloop_set_audio(-1, 0);   /* its loop gave the socket back */
     close(udp2);
     char cfgerr[128];
@@ -6272,7 +6267,7 @@ static void test_concurrent_load(int port, const uint8_t *pin) {
     for (int i = 0; i < N; i++) CHECK(args[i].ok == 1);
 }
 
-/* The per-address cap (OPENCHIME_MAX_CONNS_PER_IP, 2 here) on the TLS port, run
+/* The per-address cap (OPENCHIME_DEMO_CONNS_PER_IP, 2 here) on the TLS port, run
  * in test_http_stack's loop: two in and the third refused at accept, a close
  * giving its place back, and IPv6 counted by its /64 apart from 127.0.0.1. */
 static void throttle_checks(int port, const uint8_t *pin2) {
@@ -6385,7 +6380,7 @@ static size_t plain_exchange(int port, const char *req, char *buf, size_t cap) {
  *   - the health port counts against the same per-address cap as the TLS port;
  *   - and it is the loop's: once the loop stops, nothing answers it. */
 static void test_http_stack(int port, int hport) {
-    setenv("OPENCHIME_MAX_CONNS_PER_IP", "2", 1);
+    setenv("OPENCHIME_DEMO_CONNS_PER_IP", "2", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
@@ -6627,7 +6622,7 @@ static void test_http_stack(int port, int hport) {
     }
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
-    unsetenv("OPENCHIME_MAX_CONNS_PER_IP");
+    unsetenv("OPENCHIME_DEMO_CONNS_PER_IP");
     unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
 }
 
@@ -6748,7 +6743,7 @@ static void test_auth_begin(int port) {
  * own loop, with loopback as the trusted forwarder and a per-address cap of two. */
 static void test_proxy_header(int port) {
     setenv("OPENCHIME_TRUSTED_PROXIES", "127.0.0.0/8", 1);
-    setenv("OPENCHIME_MAX_CONNS_PER_IP", "2", 1);
+    setenv("OPENCHIME_DEMO_CONNS_PER_IP", "2", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
@@ -6792,7 +6787,7 @@ static void test_proxy_header(int port) {
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unsetenv("OPENCHIME_TRUSTED_PROXIES");
-    unsetenv("OPENCHIME_MAX_CONNS_PER_IP");
+    unsetenv("OPENCHIME_DEMO_CONNS_PER_IP");
     unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
 }
 
@@ -6800,10 +6795,11 @@ int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
     /* Attachment blobs go to a build-local dir (REQ-140); the daemon defaults to
-     * /data/blobs, which isn't writable in the test sandbox. */
-    setenv("OPENCHIME_BLOB_DIR", "build/itest_blobs", 1);
+     * /data, which isn't writable in the test sandbox. */
+    mkdir("build/itest_data", 0700);
+    setenv("OPENCHIME_DATA_DIR", "build/itest_data", 1);
     /* A small call cap, so the call test can fill one (REQ-305). */
-    setenv("OPENCHIME_CALL_MAX", "3", 1);
+    setenv("OPENCHIME_DEMO_CALL_MAX", "3", 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -6916,7 +6912,7 @@ int run_netloop_tests(void) {
     }
 
     stop_loop(&arg, th);
-    unsetenv("OPENCHIME_CALL_MAX");
+    unsetenv("OPENCHIME_DEMO_CALL_MAX");
 
     if (failures == 0) {
         test_voice_input_absent(arg.port + 124, 1);

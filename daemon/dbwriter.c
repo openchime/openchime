@@ -83,7 +83,7 @@ struct oc_dbwriter {
     int             oidc_enabled;
     char           *oidc_issuer;
     char           *oidc_audience;
-    char           *oidc_pubkey_pem;         /* pinned: OPENCHIME_OIDC_PUBKEY */
+    char           *oidc_pubkey_pem;         /* pinned beneath the published keys ("" none) */
     /* What relay tokens are verified against: the pinned keys and the ones the
      * relay last published (relaykeys.h), swapped whole under keys_mu, which is
      * all another thread touches. */
@@ -92,7 +92,7 @@ struct oc_dbwriter {
     char           *relay_origin;            /* where the relay is ("" if nowhere) */
     struct oc_seen_jti *seen_jti;            /* relay and local tokens already used (AUTH.md §8.2) */
     oc_local_issuer *local_iss;              /* this daemon's issuer for local accounts (§8.10) */
-    int             password_frames;         /* OPENCHIME_TEST_PASSWORD_AUTH: frames may carry one */
+    int             password_frames;         /* OPENCHIME_DEMO_PASSWORD_FRAMES: frames may carry one */
     oc_join_rules  *join_rules;              /* who may join by OIDC (AUTH.md §8.4) */
     int             email_link_any;          /* an emailed code may stand in for a provider */
     oc_ratelimit   *step_rl;                 /* wrong second-step codes, per account */
@@ -745,7 +745,7 @@ static oc_dbres *process_welcome_general(sqlite3 *db, const oc_job *j) {
 }
 
 /* True when adding a NEW user `subject` would exceed the cap (CP-7,
- * OPENCHIME_MAX_USERS). max_users <= 0 is unlimited; an already-existing subject is
+ * OPENCHIME_MANAGED_MAX_USERS). max_users <= 0 is unlimited; an already-existing subject is
  * never capped (idempotent bootstrap / re-login). Counts active users only — a
  * removed member (disabled=1) frees a seat. */
 static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int max_users) {
@@ -1995,7 +1995,7 @@ static int check_totp(oc_dbwriter *w, uint64_t uid, const char *code) {
     if (!have) return 0;
     uint8_t secret[OC_TOTP_SECRET_LEN];
     if (!w->have_factor_key || oc_factor_open(w->factor_key, uid, sealed, sizeof sealed, secret) != 0) {
-        fprintf(stderr, "openchimed: a second step was refused: the factor key %s (OPENCHIME_FACTOR_KEY_FILE)\n",
+        fprintf(stderr, "openchimed: a second step was refused: the factor key %s (factor.key in the data directory)\n",
                 w->have_factor_key ? "does not open its secret" : "is missing");
         return -1;
     }
@@ -2069,7 +2069,7 @@ static oc_dbres *security_begin(oc_dbwriter *w, const oc_job *j, oc_dbres *r, ui
         oc_e2e_wipe(secret, sizeof secret);
         if (!w->have_factor_key)
             fprintf(stderr, "openchimed: a second step cannot be set up: the factor key is missing "
-                            "(OPENCHIME_FACTOR_KEY_FILE)\n");
+                            "(factor.key in the data directory)\n");
         r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     oc_e2e_wipe(secret, sizeof secret);
@@ -10734,8 +10734,8 @@ void oc_dbwriter_set_relay_keys(oc_dbwriter *w, const char *fetched_pem) {
     char *set = malloc(a + 1 + b + 1);
     if (!set) return;
     memcpy(set, w->oidc_pubkey_pem, a);
-    set[a] = '\n';
-    memcpy(set + a + 1, fetched_pem, b + 1);
+    if (a) set[a++] = '\n';
+    memcpy(set + a, fetched_pem, b + 1);
     pthread_mutex_lock(&w->keys_mu);
     char *old = w->oidc_keyset_pem;
     w->oidc_keyset_pem = set;
@@ -10752,7 +10752,7 @@ const char *oc_dbwriter_oidc_audience(oc_dbwriter *w) {
     return w->oidc_audience ? w->oidc_audience : "";
 }
 
-/* Registered-user cap (CP-7, OPENCHIME_MAX_USERS). <=0 means unlimited. Set before
+/* Registered-user cap (CP-7, OPENCHIME_MANAGED_MAX_USERS). <=0 means unlimited. Set before
  * serving; read only on the writer thread. */
 void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users) {
     w->max_users = max_users > 0 ? max_users : 0;

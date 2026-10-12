@@ -128,7 +128,7 @@ Configuration is entirely environment variables in
 `/etc/openchime/openchimed.env` (every one of them:
 [docs/CONFIG.md](docs/CONFIG.md)). It listens on **8443** out of the box so
 installing cannot collide with a web server on 443; switch
-`OPENCHIME_PROTO_PORT=443` for a real deployment, which needs no root because
+`OPENCHIME_PORT=443` for a real deployment, which needs no root because
 the unit already carries `CAP_NET_BIND_SERVICE`.
 
 **Requirements:** glibc **2.34+** and libsqlite3. Everything else, TLS included,

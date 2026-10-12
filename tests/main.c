@@ -386,10 +386,9 @@ static int run_parallel(int max_jobs) {
 
 int main(void) {
     crash_report_install();
-    /* The suites sign in by password, in frames, as the test knob allows
-     * (AUTH.md §8.10); the checks that the product refuses them turn it off
-     * around themselves. */
-    setenv("OPENCHIME_TEST_PASSWORD_AUTH", "1", 1);
+    /* The suites sign in by password, in frames, as a demo build allows by
+     * default (AUTH.md §8.10); the checks that the product refuses them set
+     * OPENCHIME_DEMO_PASSWORD_FRAMES=off around themselves. */
     oc_config_load(NULL, 0);   /* the writer reads it from the configuration */
     g_only = getenv("OC_TEST_ONLY");
     g_except = getenv("OC_TEST_EXCEPT");

@@ -24,10 +24,10 @@ COPY stt /usr/share/openchime/stt
 COPY web /usr/share/openchime/web
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
-ENV OPENCHIME_DB_PATH=/data/openchime.db
+ENV OPENCHIME_DATA_DIR=/data
 ENV OPENCHIME_HEALTH_PORT=8080
-ENV OPENCHIME_PROTO_PORT=8443
+ENV OPENCHIME_PORT=8443
 
-EXPOSE 8080 8443
+EXPOSE 8080 8443/tcp 8443/udp
 
 ENTRYPOINT ["/entrypoint.sh"]

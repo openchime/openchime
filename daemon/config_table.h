@@ -20,8 +20,8 @@ typedef enum {
 } cfg_kind;
 
 typedef enum {
-    CFG_OPERATOR, /* a setting an operator may need: the reference's first part */
-    CFG_TUNING,   /* a knob whose default is right for almost everyone */
+    CFG_OPERATOR, /* a setting or feature flag an operator decides: the reference's first part */
+    CFG_MANAGED,  /* the control plane's, written at provision time; refused without its ticket */
     CFG_DEMO,     /* a demo build's test switch; refused by a production build */
 } cfg_class;
 

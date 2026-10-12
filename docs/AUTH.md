@@ -87,7 +87,7 @@ authority.
   person who lost their phone and their recovery codes. The new password is
   derived on the auth pool, with no old one to check. Issuing and using a link
   are both audited.
-- **Registered-user cap:** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
+- **Registered-user cap:** the daemon honors `OPENCHIME_MANAGED_MAX_USERS` (0/unset
   = unlimited). Creating a *new* user past the cap — via invite redeem, direct
   register, bootstrap, or a first-time OIDC login — is refused with
   `ERROR USER_LIMIT`; an existing user still logs in, and a removed member
@@ -355,14 +355,11 @@ a random `audience` (`ws_…`), persists them (so they survive restarts), and pr
 an `oce1.` **enrollment code** the operator couriers into the control-plane
 console. The daemon then calls out (CA-verified HTTPS — it dials central, never the
 reverse, ARCH-56) to prove possession of the private key and activate the binding.
-The enrolled audience then feeds the OIDC configuration above (§3.4) automatically,
-so an enrolled box need not be given `OPENCHIME_OIDC_AUDIENCE` by hand. The enrollment
-*flow/registry* remains a control-plane concern; only the client half is here.
-Two optional knobs support unattended bring-up (see [TESTING.md §6](./TESTING.md)):
-`OPENCHIME_ENROLL_CODE_FILE` also writes the `oce1.` code to a file (so orchestration can
-reserve it without scraping the log), and `OPENCHIME_ENROLL_WAIT_SECS` retries activation for
-that many seconds before serving (default 0 = one attempt, retry next boot), so a box
-can come up already-Active once the operator reserves the code.
+The enrolled audience is the relay's audience (§3.4): an enrolled box is given none
+by hand. The enrollment *flow/registry* remains a control-plane concern; only the
+client half is here. Activation is tried once at each start: the first prints the
+code and serves pending, and the boot after the operator reserves it comes up
+active.
 
 **The daemon's push emitter (ARCH-85).** An enrolled box additionally set with
 `OPENCHIME_PUSH_URL` (the control-plane push gateway) delivers
@@ -399,9 +396,10 @@ token on reconnect), the daemon then does the same thing:
   (`AUTH{method=session}`); the daemon hashes and looks it up, and resumes
   without a full re-auth. The session lifetime is the daemon's to set (REQ-181) —
   it is not tied to a provider token's expiry.
-- **Lifetime (REQ-181):** a session lives `OPENCHIME_SESSION_DAYS` (30) from
-  its sign-in, and with `OPENCHIME_SESSION_IDLE_DAYS` set, one unused that long
-  is refused — and deleted — at its next use. "Unused" is measured: a session's
+- **Lifetime (REQ-181):** a session lives 30 days from its sign-in
+  (`OC_SESSION_TTL_MS`, a constant: nothing varies it); the writer can also
+  refuse — and delete — one unused for a given time at its next use, which the
+  daemon sets to no limit. "Unused" is measured: a session's
   `last_seen_ms` is written at its sign-in and then, while its connection sends
   anything, at most hourly, in one batched writer job, so it costs nothing per
   message.
@@ -419,11 +417,11 @@ token on reconnect), the daemon then does the same thing:
 
 After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 (PROTOCOL.md §4) listing the sources this deployment signs people in with
-(`OPENCHIME_AUTH_MODE`: `local`, `relay`, or both). The client draws one control
+(`OPENCHIME_AUTH`: `local`, `relay`, or both). The client draws one control
 per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
 - `local` — username + password in the frame. Refused (`AUTH_SOURCE_UNAVAILABLE`)
-  unless the daemon runs with the demo build's switch `OPENCHIME_TEST_PASSWORD_AUTH=1` (CONFIG.md, "Demo builds only");
+  unless the daemon is a demo build with `OPENCHIME_DEMO_PASSWORD_FRAMES` on, its default (CONFIG.md, "Demo builds only");
   local accounts sign in in the browser (§8.10).
 - `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
   `AUTH` then carries an ES256 JWT and the verifier (§8.2): the central-issued one
@@ -569,11 +567,13 @@ whichever way they arrive.** A Microsoft identity is `<issuer>|<oid>` — the
 tenant's own stable id for the person — so it would be the same identity from any
 other relying party of that tenant.
 
-**Keys.** `OPENCHIME_OIDC_PUBKEY[_FILE]` may hold several PEM keys. A token's
-`kid` is the signing key's RFC 7638 thumbprint; the daemon computes the same
-thumbprint for each key it pins and verifies with the one that matches, refusing
-an unknown `kid`. Rotation is an overlap — ship the new key beside the old,
-switch the signer, retire the old — with still no online key fetch (ARCH-26).
+**Keys.** The relay's keys are the ones it publishes at `<origin>/oidc/jwks`,
+read at boot and daily (§3.3, `daemon/relaykeys.c`); a managed box may hold one
+more, pinned beneath them, in `OPENCHIME_MANAGED_RELAY_KEY`. A token's `kid` is
+the signing key's RFC 7638 thumbprint; the daemon computes the same thumbprint
+for each key it holds and verifies with the one that matches, refusing an unknown
+`kid`. Rotation is an overlap — publish the new key beside the old, switch the
+signer, retire the old — and reaches every enrolled daemon by itself.
 
 **Which provider.** `/oidc/authorize` takes `workspace`, `redirect_uri` and
 `nonce`. Central sends the person straight to the workspace's provider when it has
@@ -581,15 +581,17 @@ one, and asks when it has several; which providers a workspace offers is a fact 
 central's registry, because it configures central's page and not the box. A new
 provider at central therefore needs no daemon or client release.
 
-**Where the relay is.** At the origin of `OPENCHIME_ENROLL_URL` — a workspace must
-be enrolled for central to mint for it, so the relay needs no address of its own.
+**Where the relay is.** At the origin of `OPENCHIME_ENROLL_URL`, which is also
+its issuer — a workspace must be enrolled for central to mint for it, so the
+relay needs no address of its own, and `OPENCHIME_AUTH=relay` without an
+enrollment refuses the start.
 
 ### 8.4 Identity, and who may join
 
 **A person is `(upstream issuer, subject)`**, held in a `user_identities` table,
 whichever source delivered them.
 
-**Who may join is one setting, `OPENCHIME_OIDC_ALLOW`** — a comma-separated list
+**Who may join is one setting, `OPENCHIME_JOIN`** — a comma-separated list
 of rules, default deny, evaluated only for an identity the workspace has not seen:
 
 | Rule | Admits |
@@ -651,8 +653,8 @@ and that provider's second factor: it is refused with `AUTH_USE_PROVIDER`
 emailed code for an address is always the same identity, so only a person who
 came by emailed code signs in by one. The other way links: a person known by
 emailed code who later signs in with Google or Microsoft is the same person, by
-the stronger proof. A workspace may allow the downward link with
-`OPENCHIME_OIDC_EMAIL_LINK=any`.
+the stronger proof. The downward link is never allowed (the writer has the
+switch; the daemon sets it off).
 
 A first sign-in sets the display name and address from the token; later ones
 update the identity row only, and never overwrite a name the person chose.
@@ -767,7 +769,7 @@ bound to its name, so one made before a rename does not answer after it; the
 page says to add it again. Turning the step off, or a reset that clears it,
 removes them. Passkey-only accounts, with no password, are not offered.
 
-**Policy** is `OPENCHIME_LOCAL_MFA`: `optional` (the default) asks for the step
+**Policy** is `OPENCHIME_MFA`: `optional` (the default) asks for the step
 where one is set up; `required` also refuses the sign-in of an account with none
 until it sets one up — the page says where; `off` asks for none and closes the
 setup page.
@@ -779,7 +781,8 @@ step.
 
 Exactly one party mints a workspace's audience. **Self-hosted:** the daemon, as
 §3.6 — an operator couriers the code. **Managed:** central, which starts the box
-with `OPENCHIME_OIDC_AUDIENCE` and a one-time `OPENCHIME_ENROLL_TICKET`. The daemon
+with `OPENCHIME_MANAGED_AUDIENCE` and a one-time `OPENCHIME_MANAGED_TICKET`
+([MANAGED.md](./MANAGED.md)). The daemon
 adopts that audience, generates its own key as it always does, and claims the
 binding: the ticket, its public key, and a signature over
 `openchime-claim-v1|<aud>|<base64url(SHA-256(ticket))>|<base64url(SHA-256(public key))>`,
@@ -813,15 +816,15 @@ freshness window is what bounds a replay.
 
 | Setting | Meaning |
 |---|---|
-| `OPENCHIME_AUTH_MODE` | A list of the sources — `local`, `relay`, or `local,relay` — with `oidc` read as `relay`. |
-| `OPENCHIME_OIDC_PUBKEY[_FILE]` | May hold several keys (§8.3). |
-| `OPENCHIME_OIDC_ALLOW` | Who may join (§8.4). |
+| `OPENCHIME_AUTH` | The sources — `local` (the default), `relay`, or `local,relay`. `relay` needs `OPENCHIME_ENROLL_URL`: the relay is the control plane the box is enrolled with, its issuer that origin, its keys the published ones (§8.3). |
+| `OPENCHIME_MFA` | Local accounts' second step: `optional`, `required`, `off` (§8.6). |
+| `OPENCHIME_JOIN` | Who may join (§8.4). |
 | `OPENCHIME_OIDC_CONNECT_<n>` | A direct connection, `n` 1 to 4 (§8.5): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub\|oid;redirect=127.0.0.1\|localhost`. Any error in one stops the boot. |
-| `OPENCHIME_ENROLL_TICKET` | Managed workspaces only (§8.7). |
+| `OPENCHIME_MANAGED_TICKET`, `_AUDIENCE`, `_RELAY_KEY` | Managed workspaces only (§8.7, MANAGED.md). |
 
 ### 8.9 Certificates through central
 
-A daemon bound to central (§8.7) with `OPENCHIME_TLS_SOURCE=central` gets its
+A daemon bound to central (§8.7) with `OPENCHIME_TLS=central` (the managed default) gets its
 TLS certificate for its name under the service suffix through central, which
 holds that DNS zone and so completes an ACME DNS-01 challenge on the daemon's
 behalf; the daemon needs no inbound access and no DNS of its own (ARCH-10). Both
@@ -835,7 +838,7 @@ requests are machine requests, signed as §8.7 says, to the enrollment origin:
   `202` with `Retry-After` (seconds) while central is still completing the
   challenge; or a `4xx`, which is final until the next boot.
 
-A box whose `OPENCHIME_WORKSPACE_ADDRESS` its kept certificate does not name — it
+A box whose `OPENCHIME_MANAGED_ADDRESS` its kept certificate does not name — it
 moved to a new address, and central restarted it — asks for a new one at boot
 rather than presenting the old one until renewal.
 
@@ -927,9 +930,10 @@ loopback and its `nonce` a challenge. A refusal shows the form again and never
 says which half of a credential was wrong.
 
 **Passwords in frames.** `AUTH{local}`, `REDEEM_INVITE` and `CHANGE_PASSWORD` are
-refused unless the daemon runs with `OPENCHIME_TEST_PASSWORD_AUTH=1`, a test
-knob (CONFIG.md) that it warns about at start; the test suites and the GUI
-scripts sign in with it.
+refused unless the daemon is a demo build with `OPENCHIME_DEMO_PASSWORD_FRAMES`
+on (its default; CONFIG.md), which it warns about at start; the test suites and
+the GUI scripts sign in that way, and the checks that prove the refusal set it
+`off`.
 
 **The terminal client** signs in to a local account with a device code (§8.11),
 which works where it has no browser of its own.

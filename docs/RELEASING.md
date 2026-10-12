@@ -355,7 +355,7 @@ to `buildah login` and `skopeo --creds`.
 ## Upgrading changes what the environment may say
 
 The daemon is strict about its settings (CONFIG.md): an unknown `OPENCHIME_*`
-name, a removed one (the `OC_*` aliases among them), a value that does not
+name, one that was a setting once (the table at the end of CONFIG.md), a value that does not
 parse or is out of its range stops it. A box upgraded with an old environment
 file can therefore fail to come up, by design, rather than run with a setting
 it misread. The packages run `openchimed --check-config --env-file

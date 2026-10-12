@@ -29,7 +29,7 @@ Then, in the daemon's environment (CONFIG.md):
 
 ```
 OPENCHIME_OIDC_CONNECT_1=label=Acme SSO;issuer=https://…;client_id=…;secret_file=/etc/openchime/sso.secret
-OPENCHIME_OIDC_ALLOW=owner:dana@acme.example,domain:acme.example
+OPENCHIME_JOIN=owner:dana@acme.example,domain:acme.example
 ```
 
 The secret file holds the client secret and nothing else; leave `secret_file` out

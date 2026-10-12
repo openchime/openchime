@@ -16,19 +16,14 @@
 #define OC_TTS_DATA_SYSTEM_DIR "/usr/share/openchime/tts"
 #define OC_TTS_DATA_MANIFEST   "manifest"
 
-/* Choose the data directory. `env` (OPENCHIME_TTS_DATA_DIR), when set, is used
- * if it is a directory and is otherwise a failure -- an operator who names a
- * directory means that one, and quietly using another would be a surprise.
- * Unset, the first of `system_dir` and `exe_dir/tts` that is a directory is
- * chosen; either may be NULL. Writes the path to `out` and returns 1, or returns
- * 0 with a reason in `err`. */
-int oc_tts_data_dir(const char *env, const char *system_dir, const char *exe_dir,
+/* Choose the data directory: `system_dir` when it exists, else `tts/` beside
+ * the executable. 1 with `out` set, or 0 with `err` saying why not. */
+int oc_tts_data_dir(const char *system_dir, const char *exe_dir,
                     char *out, size_t cap, char *err, size_t errcap);
 
-/* The same choice for any speech feature's data: `var` names the environment
- * variable in messages, and `beside` is the directory name looked for next to the
- * executable ("tts" for read-aloud, "stt" for voice input). */
-int oc_data_dir_find(const char *var, const char *env, const char *system_dir, const char *exe_dir,
+/* The same choice for any speech feature's data: `beside` is the directory name
+ * looked for next to the executable ("tts" for read-aloud, "stt" for voice input). */
+int oc_data_dir_find(const char *system_dir, const char *exe_dir,
                      const char *beside, char *out, size_t cap, char *err, size_t errcap);
 
 /* The directory holding the running executable, from /proc/self/exe. 1 or 0. */

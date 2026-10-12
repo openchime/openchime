@@ -112,7 +112,7 @@ core with the result (`oc_client_start_signin_result`), whose first connection
 presents `AUTH{oidc}` as a desktop's does after its listener hears the
 redirect. A stored session reconnects on a reload without visiting the page.
 The password quick-launch (`?user=&pass=`) is the test harness's only, under
-`OPENCHIME_TEST_PASSWORD_AUTH`.
+`OPENCHIME_DEMO_PASSWORD_FRAMES`.
 
 **Media in the browser.** The same media, voice and call code the desktop
 links (`client/core/media`, `voice`, `call`: VP9 through libvpx, Opus,

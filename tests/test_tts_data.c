@@ -25,28 +25,20 @@ int run_tts_data_tests(void) {
 
     char root[] = "/tmp/oc-ttsdata-XXXXXX";
     CHECK(mkdtemp(root) != NULL);
-    char sys[256], exe[256], exev[256], env[256], out[512], err[256];
+    char sys[256], exe[256], exev[256], out[512], err[256];
     snprintf(sys, sizeof sys, "%s/system", root);
     snprintf(exe, sizeof exe, "%s/bin", root);
     snprintf(exev, sizeof exev, "%s/bin/tts", root);
-    snprintf(env, sizeof env, "%s/configured", root);
-    mkdir(sys, 0700); mkdir(exe, 0700); mkdir(exev, 0700); mkdir(env, 0700);
+    mkdir(sys, 0700); mkdir(exe, 0700); mkdir(exev, 0700);
 
-    /* Configured and present: used. */
-    CHECK(oc_tts_data_dir(env, sys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, env) == 0);
-    /* Configured and absent: refused, even though a system directory exists. */
-    char gone[256]; snprintf(gone, sizeof gone, "%s/nope", root);
-    err[0] = '\0';
-    CHECK(oc_tts_data_dir(gone, sys, exe, out, sizeof out, err, sizeof err) == 0 && contains(err, "not a directory"));
-    /* Unset: the system directory first... */
-    CHECK(oc_tts_data_dir(NULL, sys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, sys) == 0);
-    CHECK(oc_tts_data_dir("", sys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, sys) == 0);
+    /* The system directory first... */
+    CHECK(oc_tts_data_dir(sys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, sys) == 0);
     /* ...then beside the executable. */
     char nosys[256]; snprintf(nosys, sizeof nosys, "%s/nosys", root);
-    CHECK(oc_tts_data_dir(NULL, nosys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, exev) == 0);
+    CHECK(oc_tts_data_dir(nosys, exe, out, sizeof out, err, sizeof err) == 1 && strcmp(out, exev) == 0);
     /* Neither: disabled, with a reason. */
     err[0] = '\0';
-    CHECK(oc_tts_data_dir(NULL, nosys, nosys, out, sizeof out, err, sizeof err) == 0 && contains(err, "no data"));
+    CHECK(oc_tts_data_dir(nosys, nosys, out, sizeof out, err, sizeof err) == 0 && contains(err, "no data"));
 
     /* The running test binary has a directory. */
     CHECK(oc_tts_exe_dir(out, sizeof out) == 1 && out[0] == '/');
@@ -107,6 +99,7 @@ int run_tts_data_tests(void) {
     oc_tts_map m;
     CHECK(oc_tts_map_open(a, &m) == 0 && m.n == strlen("model bytes") && memcmp(m.p, "model bytes", m.n) == 0);
     oc_tts_map_close(&m);
+    char gone[256]; snprintf(gone, sizeof gone, "%s/nope", root);
     CHECK(oc_tts_map_open(gone, &m) == -1);
 
     char cmd[512];

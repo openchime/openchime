@@ -71,7 +71,7 @@ likewise vendored — as committed single-file source, both MIT (ARCH-75).
   forgotten, and from then on only a root vouches.
 - **The daemon** presents one certificate to every connection — the binary
   protocol and HTTP alike (ARCH-34) — from the source it was told
-  (`OPENCHIME_TLS_SOURCE`, "Certificates" below): its own self-signed identity,
+  (`OPENCHIME_TLS`, "Certificates" below): its own self-signed identity,
   the operator's files, or a CA-issued certificate it obtains and renews.
 - **Fingerprint** = SHA-256 of the certificate DER.
 
@@ -140,17 +140,20 @@ which would otherwise spin its input loop forever.
 
 ## Certificates
 
-`OPENCHIME_TLS_SOURCE` (CONFIG.md) says where the daemon's certificate comes
-from:
+`OPENCHIME_TLS` (CONFIG.md), one value, says where the daemon's certificate
+comes from:
 
 - **`self`** (the default): a P-256 self-signed certificate made on first run,
-  kept in the database (ARCH-66b) and in `OPENCHIME_TLS_CERT` / `_KEY`.
-- **`file`**: the operator's certificate and key, those files, as given.
-- **`acme`**: ACME (RFC 8555) for the names in `OPENCHIME_TLS_NAME`, from the CA
-  at `OPENCHIME_ACME_DIRECTORY` — Let's Encrypt by default, or an internal CA's
-  ACME directory for a network with no internet.
+  kept in the database (ARCH-66b) and as `cert.pem` / `key.pem` in the data
+  directory.
+- **`file`**: the operator's own `cert.pem` and `key.pem` in the data directory
+  (`OPENCHIME_DATA_DIR`), as given; refused at start if either is unreadable.
+- **`acme:<names>[;email=<address>][;directory=<url>]`**: ACME (RFC 8555) for
+  the comma-separated DNS names, from the CA at `directory` — Let's Encrypt
+  unless given, or an internal CA's ACME directory for a network with no
+  internet — with `email` as the account's contact.
 - **`central`**: through central, for a name under the service suffix (AUTH.md
-  §8.9) — the default on a managed box bound to central.
+  §8.9) — the default on a managed box, and refused without an enrollment.
 
 Until a CA-issued certificate is obtained the daemon presents its self-signed
 one; once one is, it is kept (migration 0049) and presented at once on every

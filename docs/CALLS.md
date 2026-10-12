@@ -31,8 +31,8 @@ conversation may join its call. There is no ringing and no answering: a call is
   everyone.
 - **Missed calls.** A call that ends with nobody but its starter ever having joined leaves
   a **"Missed call"** line in the conversation's history, authored by the starter (§4).
-- **The cap.** At most `OPENCHIME_CALL_MAX` people in a call (default 10, from 2 to 32;
-  CONFIG.md). A join or an invitation past it is refused with `CALL_FULL`.
+- **The cap.** At most ten people in a call (`OC_CALL_MAX`; a demo build may set
+  `OPENCHIME_DEMO_CALL_MAX`, 2 to 32). A join or an invitation past it is refused with `CALL_FULL`.
 - **One call at a time.** A connection is in at most one call; joining another leaves the
   first. A user is in a call from one device: joining from a second moves them.
 - **Losing the connection is not leaving.** The daemon holds a disconnected participant's

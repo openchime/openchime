@@ -34,7 +34,7 @@ chromium() {
 daemon_pid() {
   local p
   for p in $(pgrep -x openchimed 2>/dev/null); do
-    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && { echo "$p"; return; }
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$OC_TEST_PORT" && { echo "$p"; return; }
   done
 }
 
@@ -70,16 +70,13 @@ case "${1:-}" in
         # And the port free, whoever held it.
         for _ in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null || break; exec 3<&- 3>&-; sleep 0.25; done
         mkdir -p "$OC_TEST_DIR"
-        env OPENCHIME_DB_PATH="$OC_TEST_DIR/db" \
-            OPENCHIME_TLS_CERT="$OC_TEST_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_TEST_DIR/key.pem" \
-            OPENCHIME_BLOB_DIR="$OC_TEST_DIR/blobs" \
-            OPENCHIME_PROTO_PORT="$OC_TEST_PORT" OPENCHIME_HEALTH_PORT=0 \
-            OPENCHIME_TEST_PASSWORD_AUTH=1 \
+        env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
+            OPENCHIME_PORT="$OC_TEST_PORT" OPENCHIME_HEALTH_PORT=0 \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
-            OPENCHIME_BOOTSTRAP_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
-            OPENCHIME_CALL_MAX="${OC_TEST_CALL_MAX:-10}" OPENCHIME_SUMMARY=off \
-            ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
-            OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
+            OPENCHIME_DEMO_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_DEMO_CALL_MAX="${OC_TEST_CALL_MAX:-10}" OPENCHIME_SUMMARY=off \
+            ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
+            OPENCHIME_MANAGED_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
         up=0

@@ -109,10 +109,11 @@ build/bench_loop: tests/bench_loop.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O)
 	    tests/bench_loop.c $(APP_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
 # Manual S3 smoke test (tests/manual/s3_smoke.c) -- NOT part of `make test`.
 # Needs live S3 credentials in the environment; see the header of that file.
-build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c \
-	    daemon/blob_s3.c daemon/sigv4.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o $@
-	@echo "built $@ -- needs OPENCHIME_S3_* credentials to run"
+build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c \
+	    daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c \
+	    third_party/ca-roots/ca_roots.c $(MBEDTLS_LIBS) -lpthread -o $@
+	@echo "built $@ -- needs OPENCHIME_S3 to run"
 # Standalone harness exercising every tuikit widget (ARCH-83) -- no core, no
 # daemon, no TLS. The toolbox's own smoke test.
 build/tuikit-demo: $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) $(wildcard tuikit/*.h) | build

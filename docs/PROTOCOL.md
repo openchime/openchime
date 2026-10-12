@@ -74,7 +74,7 @@ nothing else. The address is kept in one spelling (`inet_ntop`'s), so
 ever appended to it. A name is dialled on every address it has, IPv6 and IPv4,
 in the system's order, each given at most 3 s before the next is tried.
 
-The daemon *binds* a configurable port (`OPENCHIME_PROTO_PORT`). In production it
+The daemon *binds* a configurable port (`OPENCHIME_PORT`; the call relay's UDP socket is on the same number). In production it
 binds 443 (self-hosted: the systemd unit grants `CAP_NET_BIND_SERVICE`, per
 ARCH-20; hosted: Fly maps external 443 → the container). Local/dev binds a
 high port (8443) to avoid needing privilege — a deploy-time override, never a
@@ -221,8 +221,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 - `MAX_BODY_SIZE` = **65,536 bytes** (64 KiB) for a message body (REQ-054).
   The 1 KiB gap between body and frame limits is framing/field-header
   headroom, reconciling REQ-054's "~64KB body" with ARCH-30's "~64KB frame."
-- `MAX_ATTACHMENT_SIZE` = **200 MiB** (default; `OPENCHIME_MAX_ATTACHMENT_SIZE`
-  overridable, REQ-140). A file's *bytes* are never in SQLite (they go to object
+- `MAX_ATTACHMENT_SIZE` = **200 MiB** (the cap, REQ-140; nothing varies it). A file's *bytes* are never in SQLite (they go to object
   storage, ARCH-17/70), but they **do** transport over this protocol — proxied
   through the daemon, split into chunks (§5.14). Each chunk is an ordinary frame:
   its `data` payload is capped so the whole frame stays `<= MAX_FRAME_SIZE`, so
@@ -364,7 +363,7 @@ sign-in, or a verifier that is not its challenge's, is `AUTH_INVALID_TOKEN` and 
 code goes nowhere; a provider that cannot be reached is
 `AUTH_SOURCE_UNAVAILABLE`. A **local** credential, a password in the
 frame, is refused with `AUTH_SOURCE_UNAVAILABLE` unless the daemon runs with the
-test knob `OPENCHIME_TEST_PASSWORD_AUTH=1`: a local account signs in in the
+demo build's switch `OPENCHIME_DEMO_PASSWORD_FRAMES` on: a local account signs in in the
 browser.
 
 ### 4.2a `AUTH_BEGIN` (client → server), msg_type `0x0015`, and `AUTH_REDIRECT` (server → client), msg_type `0x0016`
@@ -445,12 +444,12 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `deployment_mode` | u8   | `0` standalone, `1` federated, `2` managed (ARCH-76).       |
 | `max_users`       | u32  | Registered-user cap; `0` = unlimited.                       |
 | `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
-| `call_max`        | u8   | The most people in one call, `OPENCHIME_CALL_MAX` (REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
+| `call_max`        | u8   | The most people in one call, ten (`OC_CALL_MAX`, REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
 
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 
 Pushed right after `WORKSPACE_INFO`, and only where the deployment names the
-workspace's canonical address (`OPENCHIME_WORKSPACE_ADDRESS`). A hosted workspace
+workspace's canonical address (`OPENCHIME_MANAGED_ADDRESS`). A hosted workspace
 that moved to a new address still answers at its former one for a while; a client
 that connected by it files the workspace under the new one (CLIENT.md, "The
 workspace key") and dials that next time. A new frame, so no version bump.
@@ -796,7 +795,7 @@ client learns of the new channel immediately.
 
 Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
 every user joins at authentication, so the messaging path always has a channel
-to deliver to. On a managed deployment (`OPENCHIME_DEPLOYMENT_MODE=managed`) the
+to deliver to. On a managed deployment (started with `OPENCHIME_MANAGED_TICKET`) the
 daemon creates it at its first boot with a welcome in its topic and description —
 the ordinary columns, nothing authored, no system user; a `general` that already
 exists is never rewritten, and a self-hosted daemon creates it bare.
@@ -930,8 +929,8 @@ Either way the reply is
 
 **`REDEEM_INVITE` (client → server), msg_type `0x0047`** — sent **before** `AUTH`
 (the invitee has no account yet), it creates the account and authenticates in one
-step. Refused (`AUTH_SOURCE_UNAVAILABLE`) unless the daemon runs with the test knob
-`OPENCHIME_TEST_PASSWORD_AUTH=1`: an invitation is redeemed on the sign-up page
+step. Refused (`AUTH_SOURCE_UNAVAILABLE`) unless the daemon is a demo build with
+`OPENCHIME_DEMO_PASSWORD_FRAMES` on: an invitation is redeemed on the sign-up page
 (AUTH.md §8.10).
 
 | Field      | Type  | Notes                                                        |
@@ -1107,8 +1106,8 @@ discover who is in a private channel you were never invited to
 **`FILE_ENTRY` (`0x003E`)** newest-first, then **`FILES` (`0x003F`)**
 `{ channel_id, count: u32, more: u8 }`.
 
-A page holds at most `OPENCHIME_FILE_PAGE` rows (default 200, the most the frame
-budget allows). `before_ms`/`before_id` are the **keyset cursor**: the
+A page holds at most 200 rows (the most the frame budget allows; a demo build's
+`OPENCHIME_DEMO_FILE_PAGE` may shorten it). `before_ms`/`before_id` are the **keyset cursor**: the
 `created_at` and `attachment_id` of the last row the client already has, and
 `0`/`0` for the first page. The daemon returns the rows strictly older than that
 pair — `(created_at_ms, id) < (before_ms, before_id)`, the row-value comparison
@@ -1578,8 +1577,8 @@ poster. Posting it is four steps, all on frames that already exist but one:
 
 The daemon refuses with `UNKNOWN_ATTACHMENT` 3011 when the video is not the
 caller's finalized, unreclaimed upload, `MEDIA_TOO_LARGE` 3022 when it exceeds
-`MAX_VIDEO_MESSAGE_SIZE` (`OPENCHIME_MAX_VIDEO_MESSAGE_SIZE`, default 160 MiB and
-never above `MAX_ATTACHMENT_SIZE`), and `MEDIA_INVALID` 3021 when: the kind is not
+`MAX_VIDEO_MESSAGE_SIZE` (`OC_MAX_VIDEO_SIZE`, 160 MiB, under
+`MAX_ATTACHMENT_SIZE`), and `MEDIA_INVALID` 3021 when: the kind is not
 `1`; the duration is `0` or over 300 000 ms; either dimension is odd, under 2, or
 over 1920×1080; the video is not `video/mp4` or has already been sent; or the
 poster is not a finalized, unsent `image/jpeg` of at most 1 MiB uploaded by the
@@ -1898,7 +1897,7 @@ audited as `password.change.failed` and counted by the account's sign-in limiter
 past which the change is `AUTH_RATE_LIMITED` unchecked;
 success answers with `PROFILE_UPDATED` (the name unchanged) as the ack, deletes the
 user's other sessions and closes their connections. `FORBIDDEN`
-too unless the daemon runs with the demo build's switch `OPENCHIME_TEST_PASSWORD_AUTH=1` (CONFIG.md, "Demo builds only"): a
+too unless the daemon is a demo build with `OPENCHIME_DEMO_PASSWORD_FRAMES` on (CONFIG.md, "Demo builds only"): a
 password is changed on the password page (AUTH.md §8.10).
 
 **`PROFILE_UPDATED` (S → C), `0x004A`** `{ user_id: u64, display_name: str }` — a
@@ -2123,7 +2122,7 @@ written in one client invisible in another.
 A draft may be **unaddressed** — `channel_id` absent with a `recipients` list
 beside it — because the New Message pane autosaves before a recipient is chosen
 (REQ-229). A scheduled message is held in its own table and fired by a daemon
-sweep on its own ~15 s timer (`OPENCHIME_SCHED_TICK_MS`), delivered through the
+sweep on its own 15 s timer (a demo build's `OPENCHIME_DEMO_SCHED_MS` shortens it), delivered through the
 ordinary send path so mentions and notifications cannot diverge, with the
 **daemon minting the idempotency token at fire time** — the client's token
 belongs to the scheduling request.
@@ -2519,8 +2518,8 @@ A **participant** is a user on one connection, with a **slot** (0-255, the low
 byte of every SFrame KID it sends under) and its **device key** (an X25519
 public key). A connection is in at most one call, and a user in a call from one
 device: joining from a second moves them. The **epoch** starts at 1 and goes up
-by one on every join and every leave. The cap is `OPENCHIME_CALL_MAX` (default
-10), announced on `WORKSPACE_INFO` as `call_max`.
+by one on every join and every leave. The cap is ten (`OC_CALL_MAX`; a demo
+build's `OPENCHIME_DEMO_CALL_MAX` may lower it), announced on `WORKSPACE_INFO` as `call_max`.
 
 **`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64, device_key: 32 bytes,
 codecs: u8, n: u16, n × { user_id: u64 } }` — start the conversation's call, or
@@ -2543,8 +2542,8 @@ u64, slot: u8, device_key: 32 bytes, codecs: u8, flags: u8 }` — `flags` bit 0
 (below) — the joiner's private media endpoint
 (the relay's `udp_port` and a bearer `token`), its slot, and the call as
 it stands. The token is opaque to the client and 16 to 32 bytes long: 16 random
-bytes behind the daemon's `OPENCHIME_AUDIO_TOKEN_PREFIX`, if one is set, and
-`udp_port` is `OPENCHIME_AUDIO_ADVERTISE_PORT` where that is set (AUDIO.md §4).
+bytes behind the daemon's `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX`, if one is set, and
+`udp_port` is `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` where that is set (AUDIO.md §4).
 The client then speaks UDP directly to the relay, over IPv4, at the host it
 connected to: `token ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
 payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
@@ -2855,7 +2854,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
 | `2002` | `AUTH_INVALID_TOKEN`  | auth       | yes   | JWT failed signature/audience/expiry validation (REQ-023).     |
 | `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
-| `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
+| `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MANAGED_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
 | `2005` | `AUTH_NOT_ALLOWED`    | auth       | yes   | A valid identity that no join rule or invite admits (AUTH.md §8.4). An identity the workspace already knows still signs in. |
 | `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | no    | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach; or a password came in a frame, where the daemon takes one only on its pages (AUTH.md §8.10). |
 | `2007` | `AUTH_PENDING` | auth   | no    | A device code not approved yet (§4.2c). |
@@ -2863,7 +2862,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2009` | `AUTH_EXPIRED` | auth   | no    | A device code that ran out, was collected, or never was. |
 | `2010` | `AUTH_DENIED` | auth   | no    | A device code refused on the page. |
 | `2011` | `AUTH_USE_PROVIDER` | auth | yes | A sign-in by emailed code for a person who signs in here with a provider; they sign in with that provider instead (AUTH.md §8.4). |
-| `2012` | `AUTH_SETUP_REQUIRED` | auth | — | Pages only: a local account with no second step where `OPENCHIME_LOCAL_MFA=required` (AUTH.md §8.6). |
+| `2012` | `AUTH_SETUP_REQUIRED` | auth | — | Pages only: a local account with no second step where `OPENCHIME_MFA=required` (AUTH.md §8.6). |
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
@@ -2891,7 +2890,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3025` | `CALL_UNAVAILABLE`    | calls      | no    | The audio relay exited and could not be restarted, so a `CALL_JOIN` is refused rather than answered with a media port nothing listens on (§5.17). |
 | `3026` | `SEGMENT_TOO_LONG`    | voice input | no   | A segment's `sample_count` exceeds the cap `STT_INFO` announced (§5.14c, REQ-298). |
 | `3027` | `STT_UNAVAILABLE`     | voice input | no   | Voice input is off, too many segments are waiting, the queue is full, or recognition failed (§5.14c, REQ-300). |
-| `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past `OPENCHIME_CALL_MAX` (§5.17, REQ-305). |
+| `3028` | `CALL_FULL`           | calls      | no    | A join, a start's invitations or a `CALL_INVITE` would put the call past the cap (§5.17, REQ-305). |
 | `3029` | `NOT_CALL_STARTER`    | calls      | no    | `CALL_END` from someone other than the call's starter (§5.17). |
 | `3030` | `NOT_IN_CALL`         | calls      | no    | No call in that conversation, or the sender is not in it (`CALL_INVITE`, `CALL_END`, `CALL_KEY`). |
 | `3031` | `INVITE_UNREDEEMABLE` | admin      | no    | `INVITE_USER` carried an email where no sign-in source could ever spend an invite bound to one: the deployment offers no provider sign-in (§5.8). |

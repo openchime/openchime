@@ -121,8 +121,8 @@ daemon holds 0.1 MB more with voice input built in than without it.
   to the net loop, one intra-op thread, the session opened on first use and released
   when idle. The loop only copies a segment's bytes as they arrive; the worker puts
   the little-endian samples in host order before hearing them.
-- **Its own data directory and manifest** — `OPENCHIME_STT_DATA_DIR`, else
-  `/usr/share/openchime/stt`, else `stt/` beside the executable — so missing data
+- **Its own data directory and manifest** — `/usr/share/openchime/stt`, else
+  `stt/` beside the executable — so missing data
   turns voice input off without touching read-aloud. `make full` (or `make STT=1`) builds
   it in; a plain `make` leaves it out.
 - **Spoken mentions:** before posting or returning, "at" followed by a name becomes
@@ -131,9 +131,10 @@ daemon holds 0.1 MB more with voice input built in than without it.
 - **Audio is never kept:** a segment's samples are freed once answered, never written
   or logged.
 
-**Limits** (CONFIG.md): `OPENCHIME_STT` (on), `OPENCHIME_STT_QUEUE` (64),
-`OPENCHIME_STT_IDLE_SECS` (300), `OPENCHIME_STT_RATE` (60 segments per connection per
-minute), `OPENCHIME_STT_MAX_SECS` (30), `OPENCHIME_STT_DATA_DIR`.
+**Limits.** The one setting is `OPENCHIME_STT` (on; CONFIG.md). The rest are
+constants (`daemon/config.h`): `OC_STT_QUEUE` 64, `OC_STT_IDLE_SECS` 300,
+`OC_STT_SEGS_PER_MIN` 60 per connection, `OC_STT_MAX_SECS` 30 — the model's
+own limit.
 
 ## 7. The Win32 client
 

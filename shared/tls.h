@@ -193,7 +193,7 @@ int  oc_tls_conn_ca_trusted(const oc_tls_conn *c);
  * any client is set up. Returns 0, or -1 with the previous extra roots cleared. */
 int  oc_tls_set_extra_ca(const char *path);
 /* Read the CA bundle at `path` instead of the operating system's (a test with
- * its own CA; the daemon's OPENCHIME_TEST_OS_ROOTS, demo builds only). NULL or
+ * its own CA; the daemon's OPENCHIME_DEMO_OS_ROOTS, demo builds only). NULL or
  * "" restores the system's. Not thread-safe: call before any client is set up. */
 void oc_tls_set_os_roots(const char *path);
 void oc_tls_client_free(oc_tls_client *c);

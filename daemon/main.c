@@ -8,7 +8,7 @@
  * the handshake (PROTOCOL.md §3), runs the two-mode auth handshake — local
  * passwords + session reconnect today, OIDC to follow (AUTH.md) — and serves
  * the messaging vertical. Local accounts can be provisioned at boot via
- * OPENCHIME_BOOTSTRAP_USERS.
+ * OPENCHIME_DEMO_USERS.
  */
 
 #include "audio.h"
@@ -80,7 +80,7 @@ static int write_file(const char *path, const char *data) {
     return 0;
 }
 
-/* Provision local accounts from OPENCHIME_BOOTSTRAP_USERS="user:pass[:role],..."
+/* Provision local accounts from OPENCHIME_DEMO_USERS="user:pass[:role],..."
  * (AUTH.md §2 — the owner bootstrap / air-gapped account setup). Idempotent:
  * re-running never clobbers an existing password. role ∈ owner|admin|member
  * (default member). Runs before the loop serves traffic, so registering through
@@ -231,8 +231,7 @@ static int nap(unsigned secs) {
 static void *claim_thread(void *arg) {
     fed_services *f = arg;
     const oc_config *cfg = f->cfg;
-    int wait_secs = cfg->enroll.wait_secs > 0 ? cfg->enroll.wait_secs : 120;
-    time_t deadline = time(NULL) + wait_secs;
+    time_t deadline = time(NULL) + OC_CLAIM_WAIT_SECS;
     unsigned pause = 2;
     while (!g_stop) {
         oc_enroll_result er = oc_enroll_claim(cfg->enroll.url, f->audience, f->privkey,
@@ -447,16 +446,13 @@ int main(int argc, char **argv) {
     const oc_config *cfg = oc_config_get();
 
 #ifdef OC_TTS
-    /* Read-aloud's engine: the voice model built into this binary, chosen by the
-     * language asked for (ARCH-111). Whether it is used at all is the operator's,
-     * through OPENCHIME_TTS. A language this binary cannot speak is refused here
-     * rather than fallen back from: starting anyway would read every message in a
-     * language nobody asked for. Necessarily after the config is loaded. */
+    /* Read-aloud's engine: the voice model built into this binary (ARCH-111).
+     * Whether it is used at all is the operator's, through OPENCHIME_TTS.
+     * Necessarily after the config is loaded. */
     {
-        const oc_tts_engine *tts_engine = oc_tts_engine_for(cfg->tts.lang);
+        const oc_tts_engine *tts_engine = oc_tts_engine_for(OC_TTS_LANG);
         if (!tts_engine && cfg->tts.enabled) {
-            fprintf(stderr, "openchimed: no read-aloud voice for OPENCHIME_TTS_LANG=%s "
-                            "(this binary speaks %s)\n", cfg->tts.lang, OC_TTS_LANG);
+            fprintf(stderr, "openchimed: no read-aloud voice for %s in this binary\n", OC_TTS_LANG);
             return 2;
         }
         /* The voice data is files beside the daemon, not bytes inside it, so it
@@ -486,17 +482,24 @@ int main(int argc, char **argv) {
     }
 #endif
     const char *db_path = cfg->db_path, *cert_path = cfg->tls_cert, *key_path = cfg->tls_key;
-    int health_port = cfg->health_port, proto_port = cfg->proto_port;
+    int health_port = cfg->health_port > 0 ? cfg->health_port : -1, proto_port = cfg->proto_port;
     fprintf(stderr, "openchimed: deployment=%s workspace=\"%s\"\n",
             oc_deploy_mode_name(cfg->deployment_mode),
             cfg->workspace_name && cfg->workspace_name[0] ? cfg->workspace_name : "(unset)");
+
+    /* The data directory (CONFIG.md): made if absent, one level, as its
+     * contents are; its parent is the deployment's. */
+    if (mkdir(cfg->data_dir, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "openchimed: OPENCHIME_DATA_DIR=%s: cannot create: %s\n", cfg->data_dir, strerror(errno));
+        return 1;
+    }
 
     /* DB-writer thread: opens the connection and applies migrations before we
      * serve any traffic (ARCH-27). Fatal if it can't. */
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
     if (oc_dbwriter_password_frames(db))
-        fprintf(stderr, "openchimed: OPENCHIME_TEST_PASSWORD_AUTH is on: passwords are accepted in frames (demo build)\n");
+        fprintf(stderr, "openchimed: password frames are on: passwords are accepted in frames (demo build)\n");
 
     /* Registered-user cap (CP-7, hosted plan CP-4): 0/unset = unlimited
      * (self-hosted). Injected into managed-box config at provision time. */
@@ -509,7 +512,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "openchimed: #general created with its welcome\n");
 
     /* Optionally provision local accounts before serving (AUTH.md §2). */
-    bootstrap_users(db, cfg->bootstrap_users);
+    bootstrap_users(db, cfg->demo.users);
 
     /* Federated enrollment (CP-8, AUTH.md §3.6). Gated on OPENCHIME_ENROLL_URL — the
      * operator opting this box into the control plane. On first boot: generate a
@@ -555,78 +558,31 @@ int main(int argc, char **argv) {
                 if (oc_enroll_build_code(pk, aud, code, sizeof code) == 0) {
                     fprintf(stderr, "openchimed: enrollment code (courier into your "
                                     "control-plane console): %s\n", code);
-                    /* Also write it to the enrollment code file (if set) so
-                     * orchestration — e.g. the local federated demo's enroll-init —
-                     * can reserve it without scraping the log. */
-                    const char *cf = cfg->enroll.code_file;
-                    if (cf && *cf) {
-                        FILE *f = fopen(cf, "w");
-                        if (f) { fprintf(f, "%s\n", code); fclose(f); }
-                    }
                 }
             } else {
                 fprintf(stderr, "openchimed: enrollment key generation failed\n");
             }
         }
-        /* Try to activate. If the operator hasn't reserved the code yet (PENDING),
-         * retry every 3s for up to OPENCHIME_ENROLL_WAIT_SECS before serving — so a box
-         * can come up already-Active (and with push enabled) once the reserve
-         * lands, no restart needed. Default 0 = one attempt (retry next boot). */
-        int wait_secs = cfg->enroll.wait_secs;
+        /* Try to activate, once: the operator reserves the code in the console
+         * and the next boot finds it claimed. */
         if (enroll_audience && enroll_privkey && !enroll_active) {
-            time_t deadline = time(NULL) + wait_secs;
-            for (;;) {
-                oc_enroll_result er = oc_enroll_activate(enroll_url, enroll_audience,
-                                                         enroll_privkey);
-                if (er == OC_ENROLL_ACTIVE) {
-                    oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
-                    enroll_active = 1;
-                    fprintf(stderr, "openchimed: enrollment activated (audience=%s)\n", enroll_audience);
-                    break;
-                }
-                if (time(NULL) >= deadline) {
-                    if (er == OC_ENROLL_PENDING)
-                        fprintf(stderr, "openchimed: enrollment pending — reserve the code in the "
-                                        "console; activation retries on next boot\n");
-                    else
-                        fprintf(stderr, "openchimed: enrollment activation failed (central unreachable?)\n");
-                    break;
-                }
-                sleep(3);   /* waiting for the operator to reserve the code */
+            oc_enroll_result er = oc_enroll_activate(enroll_url, enroll_audience, enroll_privkey);
+            if (er == OC_ENROLL_ACTIVE) {
+                oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
+                enroll_active = 1;
+                fprintf(stderr, "openchimed: enrollment activated (audience=%s)\n", enroll_audience);
+            } else if (er == OC_ENROLL_PENDING) {
+                fprintf(stderr, "openchimed: enrollment pending: reserve the code in the "
+                                "console; activation retries on next boot\n");
+            } else {
+                fprintf(stderr, "openchimed: enrollment activation failed (central unreachable?)\n");
             }
         }
     }
 
-    /* Which built-in sources are on (AUTH.md §8.8): OPENCHIME_AUTH_MODE is a list
-     * — `local`, `relay`, or `local,relay` — and `oidc` reads as `relay`. A name
-     * it does not know stops the boot: a typo must not quietly leave a workspace
-     * with no way in, or with one its operator did not mean. */
-    int want_local = 0, want_relay = 0;
-    {
-        const char *p = cfg->auth_mode;
-        while (*p) {
-            const char *e = strchr(p, ',');
-            if (!e) e = p + strlen(p);
-            const char *s = p;
-            while (s < e && (*s == ' ' || *s == '\t')) s++;
-            const char *t = e;
-            while (t > s && (t[-1] == ' ' || t[-1] == '\t')) t--;
-            size_t n = (size_t)(t - s);
-            if (n == 5 && strncmp(s, "local", 5) == 0) want_local = 1;
-            else if ((n == 5 && strncmp(s, "relay", 5) == 0) ||
-                     (n == 4 && strncmp(s, "oidc", 4) == 0)) want_relay = 1;
-            else if (n != 0) {
-                fprintf(stderr, "openchimed: OPENCHIME_AUTH_MODE: unknown source \"%.*s\"\n",
-                        (int)n, s);
-                oc_dbwriter_stop(db); return 1;
-            }
-            p = *e ? e + 1 : e;
-        }
-        if (!want_local && !want_relay) {
-            fprintf(stderr, "openchimed: OPENCHIME_AUTH_MODE names no source\n");
-            oc_dbwriter_stop(db); return 1;
-        }
-    }
+    /* Which built-in sources are on (AUTH.md §8.8): OPENCHIME_AUTH, parsed by
+     * the loader. */
+    int want_local = cfg->auth_local, want_relay = cfg->auth_relay;
     oc_dbwriter_set_local_enabled(db, want_local);
     oc_dbwriter_set_local_mfa(db, cfg->local_mfa);
     /* Passkeys only where a CA vouches for the name (AUTH.md §8.6): a
@@ -640,8 +596,7 @@ int main(int argc, char **argv) {
                  cfg->tls_src.names ? cfg->tls_src.names : "");
         oc_netloop_set_passkey_names(names);
     }
-    oc_dbwriter_set_session_policy(db, (uint64_t)cfg->session_days * 86400000ull,
-                                   (uint64_t)cfg->session_idle_days * 86400000ull);
+    oc_dbwriter_set_session_policy(db, OC_SESSION_TTL_MS, OC_SESSION_IDLE_MS);
 
     /* The factor key (AUTH.md §8.6), kept outside the database: without it a
      * stolen database gives away no second step. Made at first start; if it
@@ -662,48 +617,42 @@ int main(int argc, char **argv) {
         memset(fkey, 0, sizeof fkey);
     }
 
-    /* The relay source (AUTH.md §3): pin central's ES256 keys + issuer/audience.
-     * An enrolled box (CP-8) uses its daemon-generated audience automatically, and
-     * the relay is at the origin it enrolled with (§8.3). */
+    /* The relay source (AUTH.md §3): the control plane this box is enrolled
+     * with. Its issuer is the origin it enrolled at, its audience the
+     * enrollment's, and its keys the ones it publishes at /oidc/jwks, read at
+     * boot and daily (§3.3); a managed box may hold one pinned beneath them. */
     oc_relaykeys *relay_keys = NULL;
     if (want_relay) {
-        const char *iss = cfg->oidc.issuer;
-        const char *aud = enroll_audience ? enroll_audience : cfg->oidc.audience;
-        const char *pem = cfg->oidc.pubkey;   /* resolved in oc_config_load; owned by config */
-        if (!iss || !aud || !pem) {
-            fprintf(stderr, "openchimed: OIDC mode needs OPENCHIME_OIDC_ISSUER, "
-                            "OPENCHIME_OIDC_AUDIENCE, and OPENCHIME_OIDC_PUBKEY[_FILE]\n");
-            oc_dbwriter_stop(db); return 1;
-        }
         char origin[256] = "";
-        if (cfg->enroll.url) {
+        {
             const char *scheme = strstr(cfg->enroll.url, "://");
             const char *path = scheme ? strchr(scheme + 3, '/') : NULL;
             size_t n = path ? (size_t)(path - cfg->enroll.url) : strlen(cfg->enroll.url);
             if (scheme && n < sizeof origin) { memcpy(origin, cfg->enroll.url, n); origin[n] = '\0'; }
         }
-        if (oc_dbwriter_configure_oidc(db, iss, aud, pem, origin) != 0) {
+        const char *aud = enroll_audience;
+        if (!origin[0] || !aud) {
+            fprintf(stderr, "openchimed: OPENCHIME_AUTH=relay: this box has no enrollment to sign in through\n");
+            oc_dbwriter_stop(db); return 1;
+        }
+        if (oc_dbwriter_configure_oidc(db, origin, aud, cfg->oidc.pubkey, origin) != 0) {
             fprintf(stderr, "openchimed: OIDC configuration failed\n");
             oc_dbwriter_stop(db); return 1;
         }
         char why[256];
         if (oc_dbwriter_configure_join_rules(db, cfg->oidc.allow, why, sizeof why) != 0) {
-            fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW: %s\n", why);
+            fprintf(stderr, "openchimed: OPENCHIME_JOIN: %s\n", why);
             oc_dbwriter_stop(db); return 1;
         }
-        oc_dbwriter_set_email_link(db, cfg->oidc.email_link_any);
+        oc_dbwriter_set_email_link(db, 0);
         if (!cfg->oidc.allow || !cfg->oidc.allow[0])
-            fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW is empty: nobody new may join "
-                            "by OIDC except through an invite\n");
-        fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
-        /* Enrolled with central: its published keys too, so a rotation reaches
-         * this box without its operator (AUTH.md §3.3). */
-        if (origin[0]) {
-            char url[300];
-            snprintf(url, sizeof url, "%s/oidc/jwks", origin);
-            relay_keys = oc_relaykeys_start(url, db);
-            if (!relay_keys) fprintf(stderr, "openchimed: the relay's published keys will not be read\n");
-        }
+            fprintf(stderr, "openchimed: OPENCHIME_JOIN is unset: nobody new may join "
+                            "by signing in except through an invite\n");
+        fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", origin, aud);
+        char url[300];
+        snprintf(url, sizeof url, "%s/oidc/jwks", origin);
+        relay_keys = oc_relaykeys_start(url, db);
+        if (!relay_keys) fprintf(stderr, "openchimed: the relay's published keys will not be read\n");
     }
 
     /* Direct connections (AUTH.md §8.5): the operator's own providers, each a
@@ -714,7 +663,7 @@ int main(int argc, char **argv) {
         if (!want_relay) {
             char why[256];
             if (oc_dbwriter_configure_join_rules(db, cfg->oidc.allow, why, sizeof why) != 0) {
-                fprintf(stderr, "openchimed: OPENCHIME_OIDC_ALLOW: %s\n", why);
+                fprintf(stderr, "openchimed: OPENCHIME_JOIN: %s\n", why);
                 oc_dbwriter_stop(db); return 1;
             }
         }
@@ -742,7 +691,7 @@ int main(int argc, char **argv) {
     fed.active = enroll_active;
     /* A certificate through central needs a binding to ask with. */
     if (cfg->tls_src.source == OC_TLS_SRC_CENTRAL && !(fed.privkey && fed.audience)) {
-        fprintf(stderr, "openchimed: OPENCHIME_TLS_SOURCE=central needs an enrollment "
+        fprintf(stderr, "openchimed: OPENCHIME_TLS=central needs an enrollment "
                         "(OPENCHIME_ENROLL_URL); refusing to start without one\n");
         oc_dbwriter_stop(db); return 1;
     }
@@ -758,12 +707,12 @@ int main(int argc, char **argv) {
     /* Link unfurls (REQ-222, ARCH-105): always on, no switch. The worker
      * fetches previews off the hot path; its SSRF gate is what makes
      * user-supplied destinations safe to dial at all. */
-    oc_unfurler *unfurler = oc_unfurler_start(db, cfg->unfurl.allow_private);
+    oc_unfurler *unfurler = oc_unfurler_start(db, cfg->demo.private_unfurl);
     if (unfurler) oc_netloop_set_unfurler(unfurler);
     else fprintf(stderr, "openchimed: unfurl worker failed to start\n");
 
     /* First-run bootstrap (REQ-024, local mode only): if there is no owner yet
-     * and none was provisioned via OPENCHIME_BOOTSTRAP_USERS, mint a one-time owner
+     * and none was provisioned via OPENCHIME_DEMO_USERS, mint a one-time owner
      * setup token and print it once — the operator redeems it (REDEEM_INVITE)
      * to create the first owner, no pre-existing admin needed. */
     if (oc_dbwriter_auth_methods(db) & OC_AUTH_LOCAL) {
@@ -782,7 +731,7 @@ int main(int argc, char **argv) {
      * pin-breaking one. If none is stored, the first-run generation below
      * creates one and we persist it. */
     char *stored_cert = NULL, *stored_key = NULL;
-    /* The operator's own certificate (OPENCHIME_TLS_SOURCE=file) is theirs:
+    /* The operator's own certificate (OPENCHIME_TLS=file) is theirs:
      * neither overwritten from the database nor kept in it. */
     int own_files = cfg->tls_src.source == OC_TLS_SRC_FILE;
     int had_identity = !own_files && oc_dbwriter_load_identity(db, &stored_cert, &stored_key);
@@ -844,7 +793,7 @@ int main(int argc, char **argv) {
      * runs on it. A socket that cannot be bound leaves calls refused. */
     int audio_udp = -1;
     {
-        int uport = cfg->audio_port;   /* 0 = ephemeral */
+        int uport = cfg->proto_port;   /* the same number as TLS, on UDP (AUDIO.md §4) */
         const char *op = "socket";
         audio_udp = oc_listen_bind(SOCK_DGRAM, uport, &op);
         if (audio_udp >= 0) {

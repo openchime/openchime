@@ -26,7 +26,7 @@ int oc_stt_data_ready(char *err, size_t errcap) {
     char exe[512] = "";
     oc_tts_exe_dir(exe, sizeof exe);
     char dir[512];
-    if (!oc_data_dir_find("OPENCHIME_STT_DATA_DIR", oc_config_get()->stt.data_dir, OC_STT_DATA_SYSTEM_DIR,
+    if (!oc_data_dir_find(OC_STT_DATA_SYSTEM_DIR,
                           exe, "stt", dir, sizeof dir, err, errcap))
         return 0;
     if (oc_tts_data_verify(dir, OC_STT_MODEL_VERSION, OC_STT_DATA_FILES, err, errcap) != 0) return 0;

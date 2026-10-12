@@ -279,15 +279,11 @@ int run_slow_blob_tests(void) {
     CHECK(slow_s3_start(&g_s3) == 0);
     if (g_s3.port == 0) return failures;
 
-    /* Credentials select the S3 backend (ARCH-70); explicit http:// keeps the
-     * fake endpoint plaintext. */
-    char ep[64];
-    snprintf(ep, sizeof ep, "http://127.0.0.1:%d", g_s3.port);
-    setenv("OPENCHIME_S3_ENDPOINT", ep, 1);
-    setenv("OPENCHIME_S3_BUCKET", "slowbucket", 1);
-    setenv("OPENCHIME_S3_ACCESS_KEY", "AKIDEXAMPLE", 1);
-    setenv("OPENCHIME_S3_SECRET_KEY", "SECRETEXAMPLEKEY", 1);
-    setenv("OPENCHIME_S3_REGION", "us-east-1", 1);
+    /* OPENCHIME_S3 selects the S3 backend (ARCH-70); http+s3:// keeps the fake
+     * endpoint plaintext. */
+    char s3url[128];
+    snprintf(s3url, sizeof s3url, "http+s3://AKIDEXAMPLE:SECRETEXAMPLEKEY@127.0.0.1:%d/slowbucket", g_s3.port);
+    setenv("OPENCHIME_S3", s3url, 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -323,7 +319,7 @@ int run_slow_blob_tests(void) {
     /* --- storage pressure is not measured on S3 ------------------------------
      * The attachments are in S3, so the daemon samples no filesystem: the
      * owner's storage report carries no disk size and no pressure, whatever
-     * the local disk under OPENCHIME_BLOB_DIR holds -- which is what keeps a
+     * the local disk under the data directory holds -- which is what keeps a
      * low local disk from evicting out of S3 or refusing uploads (netloop.c). */
     oc_client_storage_status(alice);
     CHECK(SB_WAIT(alice, m->storage_have, 5000));
@@ -488,11 +484,7 @@ done:
     oc_tls_server_free(&srv);
     slow_s3_stop(&g_s3);
 
-    unsetenv("OPENCHIME_S3_ENDPOINT");
-    unsetenv("OPENCHIME_S3_BUCKET");
-    unsetenv("OPENCHIME_S3_ACCESS_KEY");
-    unsetenv("OPENCHIME_S3_SECRET_KEY");
-    unsetenv("OPENCHIME_S3_REGION");
+    unsetenv("OPENCHIME_S3");
     unlink("build/itest_slowblob.db");
     unlink("build/itest_slowblob.db-wal");
     unlink("build/itest_slowblob.db-shm");

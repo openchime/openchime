@@ -1,8 +1,8 @@
 /*
  * The relay's published keys (AUTH.md §3.3). A daemon enrolled with central
  * reads `<relay origin>/oidc/jwks` at boot and daily, over HTTPS verified with
- * the built-in roots, and trusts the ES256 keys there beside the ones pinned in
- * OPENCHIME_OIDC_PUBKEY -- which stay the floor whatever the fetch says. So a
+ * the built-in roots, and trusts the ES256 keys there beside any pinned one
+ * (OPENCHIME_MANAGED_RELAY_KEY) -- which stays the floor whatever the fetch says. So a
  * rotation that publishes the next key a day before signing with it reaches
  * every enrolled daemon by itself.
  */

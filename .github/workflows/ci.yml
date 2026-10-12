@@ -158,18 +158,15 @@ jobs:
       # backgrounded daemon does not outlive the step that launched it.
       - name: End-to-end (healthz, then the protocol vertical over TLS)
         env:
-          OPENCHIME_DB_PATH: ${{ runner.temp }}/itest/openchime.db
-          OPENCHIME_BLOB_DIR: ${{ runner.temp }}/itest/blobs
-          OPENCHIME_TLS_CERT: ${{ runner.temp }}/itest/cert.pem
-          OPENCHIME_TLS_KEY: ${{ runner.temp }}/itest/key.pem
+          OPENCHIME_DATA_DIR: ${{ runner.temp }}/itest
           OPENCHIME_HEALTH_PORT: '8080'
-          OPENCHIME_PROTO_PORT: '8443'
-          OPENCHIME_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
-          # The e2e client signs in by password, in a frame (AUTH.md §8.10).
-          OPENCHIME_TEST_PASSWORD_AUTH: '1'
+          OPENCHIME_PORT: '8443'
+          OPENCHIME_DEMO_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
+          # The e2e client signs in by password, in a frame (AUTH.md §8.10), as
+          # a demo build takes by default.
         run: |
           set -euo pipefail
-          mkdir -p "${{ runner.temp }}/itest/blobs"
+          mkdir -p "${{ runner.temp }}/itest"
           log="${{ runner.temp }}/daemon.log"
           ./openchimed >"$log" 2>&1 &
           dpid=$!

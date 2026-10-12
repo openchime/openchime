@@ -15,9 +15,8 @@ W=build/webtest; rm -rf "$W"; mkdir -p "$W/db" "$W/blobs"
 # The browser profiles are kept across runs: the compiled wasm is cached in them.
 mkdir -p build/webtest-profile
 PORT=18461; HPORT=18462; PAGE=18463
-env OPENCHIME_DB_PATH="$W/db/oc.db" OPENCHIME_TLS_CERT="$W/cert.pem" OPENCHIME_TLS_KEY="$W/key.pem" \
-    OPENCHIME_BLOB_DIR="$W/blobs" OPENCHIME_PROTO_PORT=$PORT OPENCHIME_HEALTH_PORT=$HPORT \
-    OPENCHIME_TEST_PASSWORD_AUTH=1 OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner" OPENCHIME_SUMMARY=off \
+env OPENCHIME_DATA_DIR="$W/data" OPENCHIME_PORT=$PORT OPENCHIME_HEALTH_PORT=$HPORT \
+    OPENCHIME_DEMO_USERS="alice:pw:owner" OPENCHIME_SUMMARY=off \
     ./openchimed > "$W/daemon.log" 2>&1 &
 D=$!
 python3 scripts/web/serve.py build/web $PAGE > "$W/webdev.log" 2>&1 &

@@ -47,9 +47,9 @@ typedef struct { char host[256]; int port; char domain[256]; char fingerprint[96
  * through untouched. */
 #define OC_SERVICE_SUFFIX "workspace.openchime.io"
 
-/* The suffix a frontend should hand to oc_resolve(): $OPENCHIME_SUFFIX when set
- * (the dev/self-host override), else OC_SERVICE_SUFFIX. Exists so every frontend
- * agrees on the default instead of each calling getenv() and getting NULL. */
+/* The suffix a frontend should hand to oc_resolve(): OC_SERVICE_SUFFIX, or in a
+ * demo build $OPENCHIME_TEST_SUFFIX when set (a test's own). Exists so every
+ * frontend agrees on the default instead of each calling getenv() and getting NULL. */
 const char *oc_default_suffix(void);
 
 /* Does the hosted suffix belong beside what has been typed so far? Only a bare

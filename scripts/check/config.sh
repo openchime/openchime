@@ -31,7 +31,7 @@ pattern_prefixes=$(echo "$rows" | grep '_N$' | sed 's/N$//')
 # tests/test_config.c names wrong settings on purpose (the unknown-name check).
 used=$(git ls-files -- daemon client shared tests scripts packaging docs README.md Dockerfile entrypoint.sh .github mk Makefile \
        | grep -vE '\.(png|ico|bin|ort|npz|wav|bmp)$|^tests/test_config\.c$' | xargs grep -ohE 'OPENCHIME_[A-Z0-9_]+' 2>/dev/null \
-       | grep -vE '_H$|^OPENCHIME_TEST_$|^OPENCHIME_S3_$|^OPENCHIME_$|_$' | sort -u)
+       | grep -vE '_H$|^OPENCHIME_TEST_$|^OPENCHIME_$|_$' | sort -u)
 missing=""
 for n in $used; do
     if echo "$rows" | grep -qx "$n"; then continue; fi
@@ -39,8 +39,7 @@ for n in $used; do
     for p in $pattern_prefixes; do case "$n" in "$p"[0-9]*) ok=1;; esac; done
     [ $ok = 1 ] || missing="$missing $n"
 done
-# The build's own, not settings.
-missing=$(echo "$missing" | tr ' ' '\n' | grep -vE '^$|^OPENCHIME_DATA_DIR$' | tr '\n' ' ')
+missing=$(echo "$missing" | tr ' ' '\n' | grep -vE '^$' | tr '\n' ' ')
 if [ -n "${missing// /}" ]; then say "named somewhere but not a setting in the registry:$missing"; fail=1; fi
 for n in $(echo "$rows" | grep -v '_N$'); do grep -q "\`$n\`" docs/CONFIG.md || { say "$n is a row but not in CONFIG.md"; fail=1; }; done
 
@@ -70,5 +69,6 @@ else
     if ! diff -q packaging/openchimed.env "$gen_env" >/dev/null; then say "packaging/openchimed.env is not what the daemon prints (scripts/check/config.sh --write)"; fail=1; fi
 fi
 rm -f "$gen_ref" "$cur_ref" "$gen_env"
-[ $fail = 0 ] && echo "config: one registry; $(echo "$rows" | wc -l) settings, the page and the env file match"
+n_rows=$("$BIN" --config-reference | sed '/^## No longer read/,$d' | grep -c '^| `OPENCHIME')
+[ $fail = 0 ] && echo "config: one registry; $n_rows rows, the page and the env file match"
 exit $fail

@@ -48,7 +48,7 @@ Each workspace is loaded and summarized as a real one would be (SUMMARIES.md
 for w in work/synth/ws*; do
   build/sumeval init $w/db.db && scripts/slack_to_db.py $w $w/db.db
   scripts/sumeval_set.py $w/db.db 609 $w/set.tsv
-  OPENCHIME_SUMMARY_MODEL=meta-llama/llama-3.3-70b-instruct build/sumeval batch $w/db.db https://openrouter.ai/api/v1 $w/set.tsv $w/out 1500 all
+  build/sumeval batch $w/db.db https://openrouter.ai/api/v1 $w/set.tsv $w/out 1500 all
 done
 scripts/sumtune_pairs.py work/pairs.jsonl work/synth/ws*/out
 ```

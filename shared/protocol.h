@@ -568,7 +568,7 @@ typedef enum {
     OC_ERR_AUTH_REQUIRED       = 2001,
     OC_ERR_AUTH_INVALID_TOKEN  = 2002,
     OC_ERR_AUTH_RATE_LIMITED   = 2003,
-    OC_ERR_USER_LIMIT          = 2004, /* workspace at its registered-user cap (OPENCHIME_MAX_USERS) */
+    OC_ERR_USER_LIMIT          = 2004, /* workspace at its registered-user cap (OPENCHIME_MANAGED_MAX_USERS) */
     OC_ERR_AUTH_SOURCE_UNAVAILABLE = 2006, /* AUTH_BEGIN named a source this deployment does not offer, or cannot reach */
     OC_ERR_AUTH_NOT_ALLOWED    = 2005, /* a valid identity that no join rule or invite admits (AUTH.md §8.4) */
     /* A device code's wait (AUTH.md §8.11), all non-fatal: not approved yet;
@@ -611,7 +611,7 @@ typedef enum {
     OC_ERR_CALL_UNAVAILABLE    = 3025, /* the audio relay is down and could not be restarted (REQ-150) */
     OC_ERR_SEGMENT_TOO_LONG    = 3026, /* a voice-input segment exceeds the cap (REQ-298) */
     OC_ERR_STT_UNAVAILABLE     = 3027, /* voice input is off, busy or recognition failed (REQ-300) */
-    OC_ERR_CALL_FULL           = 3028, /* the call is at OPENCHIME_CALL_MAX (REQ-305) */
+    OC_ERR_CALL_FULL           = 3028, /* the call is at the call cap (REQ-305) */
     OC_ERR_NOT_CALL_STARTER    = 3029, /* only the call's starter may end it for everyone (REQ-301) */
     OC_ERR_NOT_IN_CALL         = 3030, /* no such call, or the sender is not in it */
     OC_ERR_INVITE_UNREDEEMABLE = 3031, /* an invite bound to an address, where no sign-in source here could spend it */
@@ -735,7 +735,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_PRESENCE_AWAY    2u
 
 /* Audio calls (REQ-150-152, REQ-301-305): one call per conversation. The daemon
- * caps a call at OPENCHIME_CALL_MAX, clamped to this; it also bounds a frame's
+ * caps a call at OC_CALL_MAX, clamped to this; it also bounds a frame's
  * participant and invitee lists. */
 #define OC_MAX_CALL_PARTICIPANTS 32u
 #define OC_CALL_DEVICE_KEY_LEN   32u   /* an X25519 public key (ARCH-113) */
@@ -943,12 +943,12 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 /* Pushed after AUTH_OK: infra facts about this workspace, from the daemon's
  * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
  * workspace_name may be empty (client falls back to the host subdomain). */
-/* call_max is the most people in one call (OPENCHIME_CALL_MAX, REQ-305), so a
+/* call_max is the most people in one call (OC_CALL_MAX, REQ-305), so a
  * client starting one in a large channel knows when the starter has to pick. */
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
                  uint8_t call_max; } oc_workspace_info;
 /* Pushed after WORKSPACE_INFO, only where the deployment names the workspace's
- * canonical address (OPENCHIME_WORKSPACE_ADDRESS): a workspace moved to a new
+ * canonical address (OPENCHIME_MANAGED_ADDRESS): a workspace moved to a new
  * address still answers at the old one for a while, and a client that connected
  * by it re-files its stored workspace under the new one (CLIENT.md). */
 typedef struct { oc_slice address; } oc_workspace_address;

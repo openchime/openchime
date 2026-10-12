@@ -116,7 +116,7 @@ case "${1:-}" in
       # Named in its environment: the port is not on its command line.
       dpid=""
       for p in $(pgrep -x openchimed || true); do
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PROTO_PORT=$OC_TEST_PORT" && { dpid=$p; break; }
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "OPENCHIME_PORT=$OC_TEST_PORT" && { dpid=$p; break; }
       done
       # Only the daemon on THIS port is ours to restart: falling back to any
       # openchimed stopped whichever daemon another run happened to have up.
@@ -137,14 +137,11 @@ case "${1:-}" in
           done
         fi
         mkdir -p "$OC_TEST_DIR"
-        env OPENCHIME_DB_PATH="$OC_TEST_DIR/db" \
-            OPENCHIME_TLS_CERT="$OC_TEST_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_TEST_DIR/key.pem" \
-            OPENCHIME_BLOB_DIR="$OC_TEST_DIR/blobs" \
-            OPENCHIME_PROTO_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT=8080 \
-            OPENCHIME_TEST_PASSWORD_AUTH=1 \
+        env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
+            OPENCHIME_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT=8080 \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
-            OPENCHIME_BOOTSTRAP_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
-            OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
+            OPENCHIME_DEMO_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_MANAGED_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
         # Wait for the listener rather than sleeping a guess -- and long enough:
