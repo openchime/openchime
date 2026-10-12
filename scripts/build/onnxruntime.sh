@@ -129,7 +129,12 @@ echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static) 
     --minimal_build --include_ops_by_config "${OPS}" --enable_reduced_operator_type_support \
     --disable_ml_ops --disable_exceptions \
     --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF CMAKE_POSITION_INDEPENDENT_CODE=ON "${CROSS_ARGS[@]}"
-) > "${WORK}/build.log" 2>&1 || { tail -40 "${WORK}/build.log" >&2; echo "build_onnxruntime: build failed; full log ${WORK}/build.log" >&2; exit 1; }
+) > "${WORK}/build.log" 2>&1 || {
+  # The compiler's own words first: a parallel build's tail is make's summary,
+  # with the error that stopped it screens above.
+  grep -nE "error:|fatal error|Error [0-9]" "${WORK}/build.log" | grep -v Werror | tail -20 >&2
+  tail -20 "${WORK}/build.log" >&2
+  echo "build_onnxruntime: build failed; full log ${WORK}/build.log" >&2; exit 1; }
 
 OUT="${WORK}/out/MinSizeRel"
 rm -rf "${DEST}.new" && mkdir -p "${DEST}.new/lib" "${DEST}.new/include"
