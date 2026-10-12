@@ -446,7 +446,6 @@ enum {
     OC_CMD_UPDATE_SCHEDULED,
     OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
     OC_CMD_SET_EMAIL,        /* a local account's own address: body=address ("" clears) */
-    OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
     OC_CMD_MARK_ALL_READ,   /* MARK_ALL_READ: every membership, in one frame; no fields */
     OC_CMD_GET_CHANNEL_DESCRIPTION, /* ask for `channel_id`'s description (REQ-034) */
@@ -491,7 +490,6 @@ enum {
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
     OC_CMD_CHANNEL_INVITE,  /* add a user to a channel: channel_id + message_id = user id */
     OC_CMD_CHANNEL_KICK,    /* remove a user from a channel: same fields */
-    OC_CMD_REDEEM_INVITE,   /* pre-auth: body = token, body2 = "user:pass" */
     OC_CMD_FETCH,           /* download an attachment INTO MEMORY: message_id = attachment_id */
     OC_CMD_HISTORY,         /* page backwards: channel_id, message_id = before-id (0 = newest) */
     /* Post a video message (REQ-162): channel_id, message_id = thread root (0 = the

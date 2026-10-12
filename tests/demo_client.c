@@ -19,6 +19,7 @@
 #include "protocol.h"
 #include "framebuf.h"
 #include "tls.h"
+#include "testsignin.h"   /* the sign-in page: how a person, and so this client, signs in */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -55,7 +56,11 @@ static int dial(const char *host, int port) {
     return -1;
 }
 
+static const char *g_host = "127.0.0.1";
+static int         g_port;
+
 static int client_open(client *c, const char *host, int port) {
+    g_host = host; g_port = port;
     c->fd = dial(host, port);
     if (c->fd < 0) return -1;
     if (oc_tls_client_init(&c->cli, NULL) != 0) return -1;
@@ -109,10 +114,14 @@ static int do_handshake(client *c) {
 }
 
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *uid) {
-    uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
-    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
+    /* As a person signs in (AUTH.md §8.10): the daemon's page, then its token. */
+    char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    if (oc_test_signin(g_host, g_port, NULL, user, pass, tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) {
+        fprintf(stderr, "sign-in page: %s\n", why);
+        return -1;
+    }
+    uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver), { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0 || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;

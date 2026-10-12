@@ -17,6 +17,7 @@
 #include "tts_render.h"
 #include "stt_render.h"
 #include "check.h"
+#include "testsignin.h"   /* a person's sign-in, on the daemon's page */
 #include "sum_worker.h"
 #include "sqlite3.h"
 #include "signin.h"       /* a verifier and its challenge, as a client makes them */
@@ -130,7 +131,8 @@ static void stop_loop(struct loop_arg *a, pthread_t th) {
 }
 
 /* A connected + TLS-handshaked client. */
-typedef struct { int fd; oc_tls_client cli; oc_tls_conn conn; oc_framebuf fb; } client;
+/* `port` and `pin`: the daemon it was opened to, for the sign-in page (do_auth). */
+typedef struct { int fd; oc_tls_client cli; oc_tls_conn conn; oc_framebuf fb; int port; const uint8_t *pin; } client;
 
 static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     for (;;) {
@@ -188,6 +190,7 @@ static int client_open_with(client *c, int port, const uint8_t *pin,
 }
 
 static int client_open(client *c, int port, const uint8_t *pin) {
+    c->port = port; c->pin = pin;
     return client_open_with(c, port, pin, NULL, 0);
 }
 
@@ -335,11 +338,14 @@ static _Atomic uint32_t g_auth_stt_max_ms;
 
 static _Atomic int g_auth_summarize;   /* the last sign-in was told "summarize" (REQ-310) */
 static oc_alerts_summary g_auth_alerts;   /* what the last owner's or admin's sign-in was told */
+/* Sign `c` in as a person does (AUTH.md §8.10): the page, then the token on
+ * AUTH; the post-auth pushes drained, so the stream is positional after. */
 static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
-    uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
-    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
+    char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    if (oc_test_signin("127.0.0.1", c->port, c->pin, user, pass,
+                       tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) return -1;
+    uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver), { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0) return -1;
     if (write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
@@ -1431,14 +1437,12 @@ static void test_read_aloud_vertical(int port, const uint8_t *pin) {
         client cap;
         CHECK(client_open(&cap, port, pin) == 0);
         CHECK(do_handshake(&cap) == 0);
-        uint8_t cbuf[256];
-        oc_wbuf cw;
-        oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        CHECK(oc_encode_local_credential(&cw, oc_slice_str("bob"), oc_slice_str("pw-bob")) == OC_OK);
-        uint8_t buf[512];
+        char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+        CHECK(oc_test_signin("127.0.0.1", port, pin, "bob", "pw-bob", tok, sizeof tok, ver, sizeof ver, why, sizeof why) == 0);
+        uint8_t buf[8192];
         oc_wbuf w;
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_auth au = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
+        oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver), { NULL, 0 } };
         CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK);
         CHECK(write_all(&cap.conn, buf, w.len) == 0);
         oc_header hdr;
@@ -2122,9 +2126,12 @@ static void test_device_token_wire(int port, const uint8_t *pin) {
  * time is up, while a signed-in one is kept. */
 static void test_unauthed_closed(int port, const uint8_t *pin) {
     client a;
-    uint64_t uid = 0;
     CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
-    CHECK(do_auth(&a, "roy", "not-the-password", &uid) != 0);
+    {   /* a token the daemon's page never issued */
+        uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str("eyJ.not.issued"), oc_slice_str("v"), { NULL, 0 } };
+        CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    }
     CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     client_close(&a);
 
@@ -2142,8 +2149,9 @@ static void test_unauthed_closed(int port, const uint8_t *pin) {
 
 /* Revoking a user's sessions closes their other live connections, which are
  * authenticated in memory and would otherwise carry on (REQ-182): a password
- * change keeps only the device that made it, signing out everywhere keeps none,
- * and signing out this device leaves the others alone. */
+ * change on the page signs every device out (the page is no session, so none
+ * is the changer's), signing out everywhere keeps none, and signing out this
+ * device leaves the others alone. */
 static void test_revoke_other_devices(int port, const uint8_t *pin) {
     client a, b, c;
     CHECK(signed_in(&a, port, pin, "roy", "pw-roy") == 0);
@@ -2151,17 +2159,19 @@ static void test_revoke_other_devices(int port, const uint8_t *pin) {
     CHECK(signed_in(&c, port, pin, "roy", "pw-roy") == 0);
     int cur = 0;
     CHECK(session_count_of(&a, &cur) == 3 && cur == 1);   /* a fresh sign-in knows its own */
-    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_change_password cp = { oc_slice_str("pw-roy"), oc_slice_str("pw-roy2") };
-    CHECK(oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &cp) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+    char why[256];
+    CHECK(oc_test_change_password("127.0.0.1", port, pin, "roy", "pw-roy", "pw-roy2", why, sizeof why) == 0);
+    CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     CHECK(peer_closed(&b, PEER_CLOSES) == 1);
     CHECK(peer_closed(&c, PEER_CLOSES) == 1);
-    int mine = 0;
-    CHECK(session_count_of(&a, &mine) == 1 && mine == 1);   /* the changer's own, still working */
     client_close(&b); client_close(&c);
+    /* The old password is spent, the new one works. */
+    CHECK(oc_test_change_password("127.0.0.1", port, pin, "roy", "pw-roy", "pw-x", why, sizeof why) != 0);
+    CHECK(signed_in(&a, port, pin, "roy", "pw-roy2") == 0);
 
     /* Signing out this device leaves the user's others signed in. */
     client d, e;
+    uint8_t buf[256]; oc_wbuf w;
     CHECK(signed_in(&d, port, pin, "roy", "pw-roy2") == 0);
     CHECK(signed_in(&e, port, pin, "roy", "pw-roy2") == 0);
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -2574,11 +2584,9 @@ static void test_direct_signin(int port) {
     unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
 }
 
-/* The pages end to end, on a daemon of their own with the test knob OFF -- the
- * product as shipped: a password is taken only by a page, which ends with an ID
- * token the client presents on AUTH. */
+/* The pages end to end, on a daemon of their own: a password is taken only by
+ * a page, which ends with an ID token the client presents on AUTH. */
 static void test_web_signin(int port) {
-    setenv("OPENCHIME_DEMO_PASSWORD_FRAMES", "off", 1); oc_config_load(NULL, 0);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
@@ -2587,8 +2595,8 @@ static void test_web_signin(int port) {
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_web.db");
     if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
     CHECK(dbw2 != NULL);
-    if (!dbw2) { oc_tls_server_free(&srv2); goto restore; }
-    CHECK(!oc_dbwriter_password_frames(dbw2) && oc_dbwriter_local_browser(dbw2));
+    if (!dbw2) { oc_tls_server_free(&srv2); return; }
+    CHECK(oc_dbwriter_local_browser(dbw2));
     uint8_t setup[OC_INVITE_TOKEN_LEN];
     CHECK(oc_dbwriter_setup_invite(dbw2, setup) == 1);
     /* The members, made before the loop runs: the helper takes the writer's
@@ -2745,20 +2753,28 @@ static void test_web_signin(int port) {
     }
     CHECK(web_signin(port, pin, "mia", "pw-mia", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
 
-    /* Outside the knob, a password in a frame is refused: AUTH local,
-     * REDEEM_INVITE, and CHANGE_PASSWORD from a signed-in connection. */
+    /* A password in a frame is refused, whatever the build: AUTH with the
+     * local method ends the connection with AUTH_SOURCE_UNAVAILABLE, and the
+     * retired opcodes (REDEEM_INVITE 0x0047, CHANGE_PASSWORD 0x0049) are
+     * unknown before and after AUTH. */
     {
         client a;
         CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
-        uint64_t u = 0;
-        CHECK(do_auth(&a, "pat", "pw-new", &u) != 0);
+        uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        CHECK(oc_encode_local_credential(&cw, oc_slice_str("pat"), oc_slice_str("pw-new")) == OC_OK);
+        uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_auth au = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
+        CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
+        oc_header hdr; oc_rbuf p; oc_error er;
+        CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR &&
+              oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_AUTH_SOURCE_UNAVAILABLE);
+        CHECK(peer_closed(&a, PEER_CLOSES) == 1);
         client_close(&a);
         client b;
         CHECK(client_open(&b, port, pin) == 0 && do_handshake(&b) == 0);
-        uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_redeem_invite ri = { oc_slice_str(setup_hex), oc_slice_str("eve"), oc_slice_str("pw-eve") };
-        CHECK(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK && write_all(&b.conn, buf, w.len) == 0);
-        oc_header hdr; oc_rbuf p;
+        /* The frame by hand (PROTOCOL.md §2): length, version, the retired type, no payload. */
+        uint8_t raw[8] = { 0, 0, 0, 4, (uint8_t)(OC_PROTOCOL_VERSION >> 8), (uint8_t)OC_PROTOCOL_VERSION, 0x00, 0x47 };
+        CHECK(write_all(&b.conn, raw, sizeof raw) == 0);
         CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
         client_close(&b);
     }
@@ -3230,9 +3246,6 @@ static void test_web_signin(int port) {
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
-restore:
-    unsetenv("OPENCHIME_DEMO_PASSWORD_FRAMES");
-    oc_config_load(NULL, 0);
 }
 
 /* --- device codes (AUTH.md §8.11) -------------------------------------------- */
@@ -3286,13 +3299,10 @@ struct dev_daemon { oc_tls_server srv; uint8_t pin[OC_TLS_FINGERPRINT_LEN]; oc_d
                     struct loop_arg arg; pthread_t th; uint64_t dee; };
 static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
     memset(d, 0, sizeof *d);
-    setenv("OPENCHIME_DEMO_PASSWORD_FRAMES", "off", 1); oc_config_load(NULL, 0);
     if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
     unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
     d->dbw = oc_dbwriter_start("build/itest_dev.db");
     if (d->dbw) oc_dbwriter_set_pw_iterations(d->dbw, 2048);   /* fast PBKDF2 for tests */
-    unsetenv("OPENCHIME_DEMO_PASSWORD_FRAMES");
-    oc_config_load(NULL, 0);
     if (!d->dbw) return -1;
     d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
     oc_netloop_set_device_ttl_ms(ttl);
@@ -5353,21 +5363,27 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
               !er.fatal && er.message.len > 0);
     }
 
-    /* A fresh client redeems the invite: pre-auth account creation -> AUTH_OK. */
+    /* A newcomer redeems the invite on the sign-up page (AUTH.md §8.10): the
+     * account is made and the token it ends with signs them in -> AUTH_OK. */
     client nh;
     CHECK(client_open(&nh, port, pin) == 0);
     CHECK(do_handshake(&nh) == 0);
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_redeem_invite ri = { oc_slice_str(token), oc_slice_str("newhire"), oc_slice_str("nhpw") };
-    CHECK(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK);
-    CHECK(send_frame(&nh, buf, w.len) == 0);
+    {
+        char ntok[OC_TEST_TOKEN_CAP], nver[OC_TEST_VERIFIER_CAP], why[256];
+        CHECK(oc_test_signup("127.0.0.1", port, pin, token, "newhire", "nhpw",
+                             ntok, sizeof ntok, nver, sizeof nver, why, sizeof why) == 0);
+        uint8_t abuf[8192]; oc_wbuf aw; oc_wbuf_init(&aw, abuf, sizeof abuf);   /* room for the token */
+        oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(ntok), oc_slice_str(nver), { NULL, 0 } };
+        CHECK(oc_encode_auth(&aw, OC_PROTOCOL_VERSION, &au) == OC_OK);
+        CHECK(send_frame(&nh, abuf, aw.len) == 0);
+    }
     CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);
     oc_auth_ok ok; CHECK(oc_decode_auth_ok(&p, &ok) == OC_OK);
     uint64_t unh = ok.user_id;
     CHECK(unh != 0 && ok.role == OC_ROLE_MEMBER);
-    /* Redeeming an invite authenticates, so it carries the pause too (REQ-278):
-     * a brand new account is not paused, but the frame is unconditional — the
-     * client must never have to infer "no pause" from silence. */
+    /* Signing in carries the pause too (REQ-278): a brand new account is not
+     * paused, but the frame is unconditional: the client must never have to
+     * infer "no pause" from silence. */
     CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
     { oc_snooze sn0; CHECK(oc_decode_snooze(&p, &sn0) == OC_OK && sn0.until_ms == 0); }
     /* The owner, connected all along, is told of the new member unasked: a

@@ -498,8 +498,6 @@ int main(int argc, char **argv) {
      * serve any traffic (ARCH-27). Fatal if it can't. */
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
-    if (oc_dbwriter_password_frames(db))
-        fprintf(stderr, "openchimed: password frames are on: passwords are accepted in frames (demo build)\n");
 
     /* Registered-user cap (CP-7, hosted plan CP-4): 0/unset = unlimited
      * (self-hosted). Injected into managed-box config at provision time. */
@@ -713,8 +711,8 @@ int main(int argc, char **argv) {
 
     /* First-run bootstrap (REQ-024, local mode only): if there is no owner yet
      * and none was provisioned via OPENCHIME_DEMO_USERS, mint a one-time owner
-     * setup token and print it once — the operator redeems it (REDEEM_INVITE)
-     * to create the first owner, no pre-existing admin needed. */
+     * setup token and print it once: the operator redeems it on the sign-up
+     * page to create the first owner, no pre-existing admin needed. */
     if (oc_dbwriter_auth_methods(db) & OC_AUTH_LOCAL) {
         uint8_t stok[OC_INVITE_TOKEN_LEN];
         if (oc_dbwriter_setup_invite(db, stok)) {

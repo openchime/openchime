@@ -510,10 +510,11 @@ model; translate input to intents }, stop.
   its sidebar sort/filter/collapse through it and the Win32 client its
   preferences.
 
-  `INVITE_TO_CHANNEL`,
-  `REMOVE_FROM_CHANNEL` and `REDEEM_INVITE` are core entry points
-  (`oc_client_channel_invite` / `_channel_kick` / `_redeem_invite`) and the Win32
-  client surfaces all three.
+  `INVITE_TO_CHANNEL` and
+  `REMOVE_FROM_CHANNEL` are core entry points (`oc_client_channel_invite` /
+  `_channel_kick`), and redeeming a workspace invitation is the sign-up page
+  (`oc_client_start_signin` with the invitation); the Win32 client surfaces all
+  three.
 - **Windows (`client/gui/app/` over `client/gui/platform/win32/`):** the
   portable application (ARCH-80) for every surface (message transcript,
   sidebar, rails, **the composer**, every text field and every menu): an

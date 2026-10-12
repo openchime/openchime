@@ -2915,14 +2915,13 @@ static int run_connection(oc_net *n, int reconnecting,
             }
         }
 
-        /* Which way in. A stored session needs no source. A password goes to the
-         * local source. With no password given, the first browser source offered is
-         * the way: the daemon builds the URL, the frontend opens it, and this
-         * connection ends — nothing is held open while the person is in their
-         * browser (AUTH.md §8.1). */
-        int has_password = n->token && strchr(n->token, ':') != NULL;
-        int fresh = !(reconnecting && *have_sess) && !(n->invite && n->invite[0] && has_password);
-        if (fresh && !has_password && !n->oidc_token && n->device) {
+        /* Which way in. A stored session needs no source. Otherwise the first
+         * browser source offered is the way: the daemon builds the URL, the
+         * frontend opens it, and this connection ends: nothing is held open
+         * while the person is in their browser (AUTH.md §8.1). A password is
+         * never sent in a frame (§8.10). */
+        int fresh = !(reconnecting && *have_sess);
+        if (fresh && !n->oidc_token && n->device) {
             int local = 0;
             for (uint8_t i = 0; i < ch.n_sources; i++) if (ch.sources[i].kind == OC_SOURCE_LOCAL) local = 1;
             if (!local) {
@@ -2932,7 +2931,7 @@ static int run_connection(oc_net *n, int reconnecting,
             int dr = device_flow(n, &conn, fd, &fb, negotiated);
             if (dr != 0) { rc = dr; goto drop; }
             /* ...and on to AUTH below, with the token, on this connection. */
-        } else if (fresh && !has_password && !n->oidc_token) {
+        } else if (fresh && !n->oidc_token) {
             /* The source asked for; else the first browser source offered; else
              * local accounts, which sign in on the daemon's own pages (§8.10). */
             const oc_auth_source *src = NULL;
@@ -3023,13 +3022,12 @@ static int run_connection(oc_net *n, int reconnecting,
     }
 
     /* AUTH -> AUTH_OK. A reconnect re-auths silently with the stored session
-     * token (OC_AUTH_SESSION, ARCH-58); the first connect uses "user:password"
-     * (`n->token`). The AUTH_OK session token is captured so a later drop can
-     * reconnect without the password. */
+     * token (OC_AUTH_SESSION, ARCH-58); the first connect presents what the
+     * browser or the device code brought back. The AUTH_OK session token is
+     * captured so a later drop can reconnect silently. */
     {
         uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);   /* room for a token */
         oc_result er;
-        int sent_password = 0;
         if (n->oidc_token && !(reconnecting && *have_sess)) {
             /* What the browser brought back, with the verifier only this client
              * holds (AUTH.md §8.2). Both are spent here, whatever the answer. */
@@ -3045,27 +3043,7 @@ static int run_connection(oc_net *n, int reconnecting,
             oc_auth a = { OC_AUTH_SESSION, { NULL, 0 }, { sess, OC_SESSION_TOKEN_LEN }, { NULL, 0 }, { NULL, 0 } };
             er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
         } else {
-            const char *cred = n->token ? n->token : "";
-            const char *sep = strchr(cred, ':');
-            sent_password = 1;
-            oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
-                                : oc_slice_str(cred);
-            oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
-            if (n->invite && n->invite[0] && !n->invite_reset) {
-                /* Signup: creates the account AND authenticates, so the
-                 * reply below is the same AUTH_OK. Spent once — clearing it here
-                 * means a later reconnect re-auths with the session token rather
-                 * than replaying an invite the server has already consumed. */
-                oc_redeem_invite ri = { oc_slice_str(n->invite), user, pass };
-                er = oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri);
-                free(n->invite);
-                n->invite = NULL;
-            } else {
-                uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-                if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
-                oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
-                er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
-            }
+            goto drop;   /* nothing to present: the branches above started a sign-in */
         }
         if (er != OC_OK || (w.len && write_all(&conn, fd, buf, w.len, &n->stop) != 0)) goto drop;
         oc_header hdr; oc_rbuf p;
@@ -3076,11 +3054,7 @@ static int run_connection(oc_net *n, int reconnecting,
              * reconnect — either way there is nothing to silently retry. */
             oc_error er0; uint16_t code = 0;
             if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
-            /* A password in a frame, where the daemon takes one only on its own
-             * pages (AUTH.md §8.10): say where it goes instead. */
-            const char *why = sent_password && code == OC_ERR_AUTH_SOURCE_UNAVAILABLE
-                                ? "this workspace takes passwords on its sign-in page, in the browser"
-                                : auth_error_text(code, reconnecting);
+            const char *why = auth_error_text(code, reconnecting);
             push_err(n->to_ui, why);
             signin_answer(n, OC_LOOPBACK_REFUSED, why);   /* the browser hears it too */
             rc = RC_FATAL; goto drop;
@@ -3091,21 +3065,8 @@ static int run_connection(oc_net *n, int reconnecting,
         if (ok.session_token.len == OC_SESSION_TOKEN_LEN) {   /* fresh token (first auth) */
             memcpy(sess, ok.session_token.ptr, OC_SESSION_TOKEN_LEN);
             *have_sess = 1;
-            if (cs && cs->store) {   /* persist it so a relaunch reconnects silently */
-                /* With the account it belongs to, in the same write. A session
-                 * reconnect carries no credential, passes "", and keeps the
-                 * account already recorded. */
-                char user[128] = "";
-                const char *cred = n->token ? n->token : "";
-                const char *colon = strchr(cred, ':');
-                if (colon && colon > cred) {
-                    size_t un = (size_t)(colon - cred);
-                    if (un >= sizeof user) un = sizeof user - 1;
-                    memcpy(user, cred, un);
-                    user[un] = '\0';
-                }
-                oc_store_save_session(cs->store, cs->workspace, sess, ok.session_expiry, user);
-            }
+            if (cs && cs->store)   /* persist it so a relaunch reconnects silently */
+                oc_store_save_session(cs->store, cs->workspace, sess, ok.session_expiry, "");
         }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
@@ -3598,13 +3559,6 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_display_name(&w, OC_PROTOCOL_VERSION, &sn) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
-            if (c->type == OC_CMD_CHANGE_PASSWORD) {
-                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_change_password cp = { oc_slice_str(c->body ? c->body : ""),
-                                          oc_slice_str(c->body2 ? c->body2 : "") };
-                if (oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &cp) == OC_OK)
-                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
-            }
             if (c->type == OC_CMD_CHANNEL_INVITE || c->type == OC_CMD_CHANNEL_KICK) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_channel_member_op mo = { c->channel_id, c->message_id };
@@ -3931,48 +3885,6 @@ drop:
  * OC_EV_MESSAGE (folded + deduped by the reducer), plus an OC_EV_EDIT/_DELETE so
  * the "(edited)" marker / tombstone survives a relaunch, and seed the backfill
  * cursor. */
-/* Whose session is the stored token? A workspace holds ONE credential, so a
- * token found for this address belongs to whoever signed in last -- and signing
- * in AS SOMEBODY ELSE at the same address must not ride in on it. That is not a
- * corner case: it is two accounts on one machine, and the token silently winning
- * meant the second client came up as the first one's user, with the credential
- * it was given never consulted and nothing saying so.
- *
- * A caller that supplies no user (a silent reconnect, which carries no
- * credential) still gets the token: there is nobody else it could be. A caller
- * that names the account the token was stored for gets it too, which is what
- * keeps a password-carrying relaunch silent. Anything else authenticates with
- * what it was given. */
-/* Account names are compared without case: the daemon looks them up that way
- * (lower(display_name)), so "Alice" and "alice" are one account, and treating
- * them as two would send a password where a token would have done. */
-static int ascii_ieq(const char *a, const char *b) {
-    for (; *a && *b; a++, b++) {
-        int ca = (*a >= 'A' && *a <= 'Z') ? *a - 'A' + 'a' : *a;
-        int cb = (*b >= 'A' && *b <= 'Z') ? *b - 'A' + 'a' : *b;
-        if (ca != cb) return 0;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-static int session_is_ours(const conn_store *cs, const char *cred) {
-    const char *colon = cred ? strchr(cred, ':') : NULL;
-    if (!cred || !cred[0] || !colon || colon == cred) return 1;   /* no account named */
-    char want[128];
-    size_t n = (size_t)(colon - cred);
-    if (n >= sizeof want) n = sizeof want - 1;
-    memcpy(want, cred, n);
-    want[n] = '\0';
-    char have[128];
-    /* Unknown owner -- an entry from a client that stored tokens without them --
-     * means the password, once. Preferring the token there would leave every
-     * existing install with the bug until the day its user happened to sign in
-     * again, which is no fix at all. A mismatch costs a password round trip; it
-     * never costs the wrong identity. */
-    if (!oc_store_session_user(cs->store, cs->workspace, have, sizeof have)) return 0;
-    return ascii_ieq(have, want);
-}
-
 /* The net thread: run one connection after another, silently reconnecting with
  * the session token after an unexpected drop (REQ-100). The model is preserved
  * across reconnects (dedup on high-water), so a blip is invisible beyond a brief
@@ -4011,12 +3923,12 @@ static void *net_thread(void *arg) {
         if (cs.store) oc_store_adopt(opened, workspace, legacy);
         cs.have_pin = oc_store_load_pin(opened, workspace, cs.pin);
     }
-    if (cs.store) {
+    /* A sign-in the person has just made (the browser's token in hand) is the
+     * one to present: whatever session the store holds for this workspace is
+     * somebody's earlier one, and it is replaced by this sign-in's. */
+    if (cs.store && !n->oidc_token) {
         uint64_t now_ms = (uint64_t)time(NULL) * 1000;
-        /* Ownership first: a token that is not ours is not worth reading into a
-         * buffer we then have to remember not to use. */
-        if (session_is_ours(&cs, n->token) &&
-            oc_store_load_session(cs.store, workspace, sess, NULL, now_ms)) {
+        if (oc_store_load_session(cs.store, workspace, sess, NULL, now_ms)) {
             have_sess = 1;
             reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
         }
@@ -4107,13 +4019,9 @@ static void *net_thread(void *arg) {
             break;
         }
         if (rc == RC_FATAL) {
-            /* A session token (stored or reconnect) was rejected — drop it. If we
-             * still hold a password, fall back to it once; otherwise give up. */
+            /* A session token (stored or reconnect) was rejected: drop it and
+             * give up: signing in again is the person's to start. */
             if (reconnecting && cs.store) oc_store_clear_session(cs.store, workspace);
-            if (reconnecting && n->token && n->token[0]) {
-                have_sess = 0; reconnecting = 0; backoff_ms = 0;
-                continue;   /* retry immediately with the password */
-            }
             /* A session that was good and is not any more — expired, revoked, the
              * account removed — with no credential to try instead. Said as what it
              * is, so a frontend can open the sign-in instead of showing an error. */
@@ -4297,12 +4205,6 @@ void oc_net_set_call_media(oc_net *n, const oc_call_media *media, void *ctx) {
     if (n) oc_callsig_set_media(&n->calls, media, ctx);
 }
 
-void oc_net_set_invite(oc_net *n, const char *token) {
-    if (!n) return;
-    free(n->invite);
-    n->invite = (token && token[0]) ? strdup(token) : NULL;
-    n->invite_reset = 0;
-}
 
 void oc_net_cancel_signin(oc_net *n) { if (n) n->signin_cancel = 1; }
 

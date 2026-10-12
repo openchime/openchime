@@ -29,6 +29,7 @@
 #include "protocol.h"
 #include "tls.h"
 #include "check.h"
+#include "testsignin.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -211,6 +212,17 @@ struct sb_loop_arg {
     volatile sig_atomic_t stop;
 };
 
+/* A client signed in as a person is (AUTH.md §8.10): the page, then its token. */
+static oc_client *sb_start(int port, const char *user, const char *pass) {
+    char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    if (oc_test_signin("127.0.0.1", port, NULL, user, pass, tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) {
+        printf("    %s: the sign-in page refused: %s\n", user, why);
+        return NULL;
+    }
+    oc_signin_result res = { "local", ver, tok, NULL };
+    return oc_client_start_signin_result(NULL, "127.0.0.1", port, &res, NULL, NULL, 1, NULL);
+}
+
 static void *sb_loop_thread(void *p) {
     struct sb_loop_arg *a = p;
     char cfgerr[128];
@@ -307,8 +319,8 @@ int run_slow_blob_tests(void) {
     CHECK(pthread_create(&th, NULL, sb_loop_thread, &arg) == 0);
     sb_wait_port(arg.port);
 
-    oc_client *alice = oc_client_start("127.0.0.1", arg.port, "sb-alice:pw");
-    oc_client *bob   = oc_client_start("127.0.0.1", arg.port, "sb-bob:pw");
+    oc_client *alice = sb_start(arg.port, "sb-alice", "pw");
+    oc_client *bob   = sb_start(arg.port, "sb-bob", "pw");
     CHECK(alice && bob);
     if (!alice || !bob) goto done;
     CHECK(SB_WAIT(alice, m->authed, 8000));

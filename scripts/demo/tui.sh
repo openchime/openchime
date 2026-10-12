@@ -31,10 +31,10 @@ OPENCHIME_DEMO_USERS="alice:pw:owner,bob:pw:member" \
 D_PID=$!
 for _ in $(seq 1 40); do curl -sf "http://localhost:$HEALTH/healthz" >/dev/null 2>&1 && break; sleep 0.3; done
 
-say "Launch the TUI (auto-login as alice) in a tmux pane"
+say "Launch the TUI in a tmux pane (it offers the device-code sign-in: approve it as alice)"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 HOME="$WORK/home" tmux new-session -d -s "$SESSION" -x 140 -y 40 \
-  "cd '$ROOT' && HOME='$WORK/home' ./build/openchime-tui 127.0.0.1 $PROTO alice:pw"
+  "cd '$ROOT' && HOME='$WORK/home' ./build/openchime-tui 127.0.0.1 $PROTO"
 sleep 4
 tmux capture-pane -p -t "$SESSION" | grep -q "connected" || { echo "TUI did not connect"; tmux capture-pane -p -t "$SESSION"; exit 1; }
 

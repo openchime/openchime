@@ -18,8 +18,8 @@
  * session carries its own focused channel, scroll, and half-typed message, so
  * switching away and back doesn't lose work.
  *
- * Usage: openchime-tui [<workspace>] [user:pass]   (login box if omitted)
- *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
+ * Usage: openchime-tui [<workspace>]      (login box if omitted)
+ *        openchime-tui <host> <port>      (dev/local direct connect)
  *
  * Keys: everything is menus, dialogs, and screens — no commands to type. The
  *       composer only sends: Enter posts your message (or, inside a thread, posts
@@ -2453,8 +2453,7 @@ static int run_login(const char *initial_workspace, const char *initial_user,
     char err[320]; err[0] = '\0';
     for (;;) {
         if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
-        char cred[260] = "";   /* empty: the core signs in through the browser or a code */
-        if (!f.browser && !f.device && f.pass[0]) snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
+        const char *cred = "";   /* the core signs in through the browser or a code */
         /* Filed under the workspace as the person named it, not the address it
          * resolved to this time. */
         char key[288];
@@ -2486,7 +2485,6 @@ static int run_login(const char *initial_workspace, const char *initial_user,
         else if (why[0] && strcmp(why, "auth failed") != 0)
                                       snprintf(err, sizeof err, "%s", why);
         else                          snprintf(err, sizeof err, "sign-in failed");
-        f.pass[0] = '\0';   /* clear the password for the retry */
     }
 }
 
@@ -2571,9 +2569,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
-        fprintf(stderr, "usage: %s [<workspace>] [user:pass]\n"
-                        "       %s <host> <port> [user:pass]\n"
-                        "  With no workspace (or no credentials) a login box is shown.\n",
+        fprintf(stderr, "usage: %s [<workspace>]\n"
+                        "       %s <host> <port>\n"
+                        "  With no workspace a login box is shown; local accounts sign in\n"
+                        "  in the browser or with a device code (AUTH.md).\n",
                         argv[0], argv[0]);
         return 0;
     }
@@ -2596,10 +2595,10 @@ int main(int argc, char **argv) {
     g_secret = secret;
 
     /* Decide how to connect. Three shapes:
-     *   <host> <port> [cred]  — dev/local direct connect (argv[2] is a port);
-     *   <workspace> [cred]     — resolve by DNS (REQ-010), then connect;
-     *   (no credentials)      — show the login box (REQ-020).
-     * Connect directly when a credential is supplied or a session token is
+     *   <host> <port> : dev/local direct connect (argv[2] is a port);
+     *   <workspace>   : resolve by DNS (REQ-010), then connect;
+     *   (nothing)     : show the login box (REQ-020).
+     * Connect directly when a session token is
      * already stored; otherwise prompt. A resolution failure is reported
      * distinctly from connect/auth failure (REQ-011). */
     char host[256] = ""; int port = 0; const char *cred = NULL;
@@ -2611,12 +2610,10 @@ int main(int argc, char **argv) {
     if (argc >= 3 && all_digits(argv[2])) {          /* dev host:port */
         snprintf(host, sizeof host, "%s", argv[1]);
         port = atoi(argv[2]);
-        cred = argc > 3 ? argv[3] : NULL;
         oc_hostport(host, port, key0, sizeof key0);   /* an address IS its name here */
         direct = 1;
     } else if (argc >= 2 || cfg.workspace[0]) {       /* workspace mode (arg or config default) */
         const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
-        const char *cli_cred = argc >= 3 ? argv[2] : NULL;
         oc_endpoint ep;
         oc_resolve_status st = oc_resolve(inst, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
@@ -2630,8 +2627,7 @@ int main(int argc, char **argv) {
         snprintf(published_fp, sizeof published_fp, "%s", ep.fingerprint);
         if (oc_workspace_key(inst, oc_default_suffix(), key0, sizeof key0) != 0)
             oc_hostport(host, port, key0, sizeof key0);
-        if (cli_cred && cli_cred[0])                               { cred = cli_cred; direct = 1; }
-        else if (have_stored_token(store_path, key0, host, port, secret)) { cred = "";      direct = 1; }  /* silent reconnect */
+        if (have_stored_token(store_path, key0, host, port, secret)) { cred = ""; direct = 1; }  /* silent reconnect */
         else                                                       { prefill = inst; direct = 0; }  /* prompt */
     }                                                /* else: no args -> login box */
     if (!cred) cred = "";
@@ -2657,7 +2653,7 @@ int main(int argc, char **argv) {
          * workspaces on the same host would otherwise be indistinguishable
          * in the switcher. */
         snprintf(w->label, sizeof w->label, "%.255s", prefill[0] ? prefill : w->key);
-        /* `cred` is "user:pass" (or "" for a stored-token reconnect). */
+        /* `cred` is "" (a stored-token reconnect, or the browser). */
         const char *colon = strchr(cred, ':');
         if (colon && colon > cred) {
             size_t ul = (size_t)(colon - cred);
@@ -2713,13 +2709,12 @@ int main(int argc, char **argv) {
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
     enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD,
-           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW, PROMPT_INVITE };
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_INVITE };
     int await_invite = 0;   /* open the roster on the invitation once it is made */
     /* The invite prompt's explanation, which names the provider, and what was
      * wrong with the last answer ("" when nothing was). */
     char invite_note[128] = ""; const char *invite_note2 = ""; const char *invite_err = "";
     int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
-    char pw_old[128] = "";                 /* stashed between the two password prompts */
     tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
 
     /* Global action launcher (tuikit tk_palette, Ctrl-K / ':'). */
@@ -3121,15 +3116,6 @@ int main(int argc, char **argv) {
                                                    (uint16_t)a, (uint16_t)b, NULL, 0);
                     }
                 }
-                else if (k == PROMPT_PASSWD_OLD) {     /* step 1: stash, ask for the new one */
-                    snprintf(pw_old, sizeof pw_old, "%s", v);
-                    prompt_kind = PROMPT_PASSWD_NEW; prompt_title = "New password";
-                    tk_input_init(&prompt_input, 1, "");
-                }
-                else if (k == PROMPT_PASSWD_NEW) {     /* step 2: change it */
-                    if (*v && pw_old[0]) oc_client_change_password(cl, pw_old, v);
-                    pw_old[0] = '\0';
-                }
             }
             continue;
         }
@@ -3145,7 +3131,10 @@ int main(int argc, char **argv) {
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
                 else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, or 'off')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
-                else if (id == ACT_PASSWD)  { prompt_kind = PROMPT_PASSWD_OLD; prompt_title = "Current password"; tk_input_init(&prompt_input, 1, ""); pw_old[0] = '\0'; }
+                else if (id == ACT_PASSWD)  {   /* the workspace's own page (AUTH.md §8.10) */
+                    char url[1200];
+                    if (oc_client_open_page(cl, "account/password", NULL, url, sizeof url) == 0) open_in_browser(url);
+                }
                 else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                 else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
                 else if (id == ACT_SECURITY){   /* the workspace's own page (AUTH.md §8.6) */

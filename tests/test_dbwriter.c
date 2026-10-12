@@ -92,16 +92,80 @@ static uint64_t reg(oc_dbwriter *w, const char *user, const char *pass, uint8_t 
     return oc_dbwriter_register_local(w, user, pass, role, TEST_PW_ITERS);
 }
 
-/* Local auth over a conn; optionally captures the minted session token + role. */
-static uint64_t auth_local(oc_dbwriter *w, uint64_t conn_id, const char *user,
-                           const char *pass, uint8_t *token_out, uint8_t *role_out) {
+/* A local sign-in, as the pages make it (AUTH.md §8.10): the sign-in page's
+ * password check, which ends in an ID token, then that token on AUTH -- two
+ * jobs, as the daemon runs them. The challenge is over a fixed verifier: the
+ * writer binds the token to it and nothing here is secret. */
+#define TEST_VERIFIER  "test-verifier-test-verifier-test-verifier-0"
+/* b64url(SHA-256(TEST_VERIFIER)), computed once at first use. */
+static const char *test_challenge(void) {
+    static char ch[48];
+    if (!ch[0]) {
+        uint8_t h[32];
+        oc_sha256(TEST_VERIFIER, strlen(TEST_VERIFIER), h);
+        static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        size_t o = 0;
+        for (size_t i = 0; i < 32; i += 3) {
+            uint32_t v = (uint32_t)h[i] << 16;
+            if (i + 1 < 32) v |= (uint32_t)h[i + 1] << 8;
+            if (i + 2 < 32) v |= h[i + 2];
+            ch[o++] = A[(v >> 18) & 63]; ch[o++] = A[(v >> 12) & 63];
+            if (i + 1 < 32) ch[o++] = A[(v >> 6) & 63];
+            if (i + 2 < 32) ch[o++] = A[v & 63];
+        }
+        ch[o] = '\0';
+    }
+    return ch;
+}
+
+static void job_source(oc_job *j, const char *source) {
+    if (!source) return;
+    size_t n = strlen(source);
+    if (n >= sizeof j->source) n = sizeof j->source - 1;
+    memcpy(j->source, source, n);
+    j->source[n] = '\0';
+}
+
+/* The sign-in page's job for `user`: the token it ends in (heap, caller frees),
+ * or NULL with `code` the refusal. */
+static char *page_signin(oc_dbwriter *w, uint64_t conn_id, const char *user, const char *pass,
+                         const char *source, uint16_t *code) {
     uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
     oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
     j->method = OC_AUTH_LOCAL;
+    j->web = OC_WEB_SIGNIN;
+    snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge());
+    job_source(j, source);
     oc_job_set_token(j, cbuf, cw.len);
     oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);
+    char *tok = NULL;
+    if (r && r->type == OC_RES_WEB_OK && r->conn_id == conn_id && r->body) tok = strndup((const char *)r->body, r->body_len);
+    if (code) *code = r ? (r->type == OC_RES_WEB_OK ? 0 : r->err_code) : 0xFFFF;
+    oc_dbres_free(r);
+    return tok;
+}
+
+/* The token on AUTH, as the client presents it: the result, caller frees. */
+static oc_dbres *token_auth(oc_dbwriter *w, uint64_t conn_id, const char *tok, const char *source) {
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
+    j->method = OC_AUTH_OIDC;
+    snprintf(j->auth_source, sizeof j->auth_source, "%s", OC_SOURCE_ID_LOCAL);
+    job_source(j, source);
+    oc_job_set_token(j, (const uint8_t *)tok, strlen(tok));
+    oc_job_set_proof(j, (const uint8_t *)TEST_VERIFIER, strlen(TEST_VERIFIER));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Local auth over a conn; optionally captures the minted session token + role. */
+static uint64_t auth_local(oc_dbwriter *w, uint64_t conn_id, const char *user,
+                           const char *pass, uint8_t *token_out, uint8_t *role_out) {
+    char *tok = page_signin(w, conn_id, user, pass, NULL, NULL);
+    if (!tok) return 0;
+    oc_dbres *r = token_auth(w, conn_id, tok, NULL);
+    free(tok);
     uint64_t uid = 0;
     if (r && r->type == OC_RES_AUTH_OK && r->conn_id == conn_id) {
         uid = r->user_id;
@@ -116,20 +180,12 @@ static uint64_t auth_local(oc_dbwriter *w, uint64_t conn_id, const char *user,
 /* Local auth from `source` (NULL = none), returning the reason code (0 on OK). */
 static uint16_t auth_local_from(oc_dbwriter *w, uint64_t conn_id, const char *user,
                                 const char *pass, const char *source) {
-    uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-    oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
-    oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
-    j->method = OC_AUTH_LOCAL;
-    if (source) {
-        size_t n = strlen(source);
-        if (n >= sizeof j->source) n = sizeof j->source - 1;
-        memcpy(j->source, source, n);
-        j->source[n] = '\0';
-    }
-    oc_job_set_token(j, cbuf, cw.len);
-    oc_dbwriter_submit(w, j);
-    oc_dbres *r = wait_result(w);
-    uint16_t code = (r && r->type == OC_RES_AUTH_OK) ? 0 : (r ? r->err_code : 0xFFFF);
+    uint16_t code = 0;
+    char *tok = page_signin(w, conn_id, user, pass, source, &code);
+    if (!tok) return code;
+    oc_dbres *r = token_auth(w, conn_id, tok, source);
+    free(tok);
+    code = (r && r->type == OC_RES_AUTH_OK) ? 0 : (r ? r->err_code : 0xFFFF);
     oc_dbres_free(r);
     return code;
 }
@@ -873,11 +929,13 @@ static void test_oidc_auth(void) {
     {
         uint8_t tok[OC_INVITE_TOKEN_LEN]; memset(tok, 3, sizeof tok);
         oc_job *j = oc_job_new(OC_JOB_REDEEM, 26);
+        j->web = OC_WEB_SIGNUP;
+        snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge());
         oc_job_set_register(j, "newcomer", "pw", 0, 0);
         oc_job_set_token(j, tok, sizeof tok);
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
-        CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_REQUIRED);
+        CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_REQUIRED);
         oc_dbres_free(r);
     }
 
@@ -3353,12 +3411,27 @@ static oc_dbres *invite_user(oc_dbwriter *w, uint64_t actor, uint8_t role) {
     return wait_result(w);
 }
 
+/* Sign up on the page (AUTH.md §8.10) and go on signed in: the sign-up job
+ * makes the account and ends in a token, which is then presented on AUTH as
+ * the client does -- the AUTH_OK (role, session) is what comes back. A refusal
+ * is the sign-up's own AUTH_ERR. */
 static oc_dbres *redeem_invite(oc_dbwriter *w, const uint8_t *token, const char *user, const char *pass) {
     oc_job *j = oc_job_new(OC_JOB_REDEEM, 96);
+    j->web = OC_WEB_SIGNUP;
+    snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge());
     oc_job_set_register(j, user, pass, 0, TEST_PW_ITERS);   /* fast PBKDF2 for tests */
     oc_job_set_token(j, token, OC_INVITE_TOKEN_LEN);
     oc_dbwriter_submit(w, j);
-    return wait_result(w);
+    oc_dbres *r = wait_result(w);
+    /* A page's refusal is typed WEB_ERR; the callers read the reason as a
+     * sign-in's, which is what it is. */
+    if (r && r->type == OC_RES_WEB_ERR) r->type = OC_RES_AUTH_ERR;
+    if (!r || r->type != OC_RES_WEB_OK || !r->body) return r;
+    char *tok = strndup((const char *)r->body, r->body_len);
+    oc_dbres_free(r);
+    r = tok ? token_auth(w, 96, tok, NULL) : NULL;
+    free(tok);
+    return r;
 }
 
 static oc_dbres *list_users(oc_dbwriter *w, uint64_t actor) {
@@ -6739,11 +6812,14 @@ static oc_dbres *wait_result_ms(oc_dbwriter *w, int ms) {
     return NULL;
 }
 
+/* The sign-in page's password check for `user`, submitted and not waited for. */
 static void submit_local_auth(oc_dbwriter *w, uint64_t conn_id, const char *user, const char *pass) {
     uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
     oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
     j->method = OC_AUTH_LOCAL;
+    j->web = OC_WEB_SIGNIN;
+    snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge());
     oc_job_set_token(j, cbuf, cw.len);
     oc_dbwriter_submit(w, j);
 }
@@ -7148,11 +7224,16 @@ static void test_groups_mentions(void) {
     cleanup_db(path);
 }
 
-static void submit_change(oc_dbwriter *w, uint64_t conn, uint64_t uid, const char *oldpw, const char *newpw) {
-    oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, conn);
-    j->user_id = uid;
-    j->pf_old_pw = strdup(oldpw);
+/* The password page's job (AUTH.md §8.10): the current password checked as a
+ * sign-in's is, the new one stored, every session of the account revoked. */
+static void submit_change(oc_dbwriter *w, uint64_t conn, const char *user, const char *oldpw, const char *newpw) {
+    uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(oldpw));
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn);
+    j->method = OC_AUTH_LOCAL;
+    j->web = OC_WEB_PASSWORD;
     j->pf_new_pw = strdup(newpw);
+    oc_job_set_token(j, cbuf, cw.len);
     oc_dbwriter_submit(w, j);
 }
 
@@ -7170,30 +7251,23 @@ static void test_change_password(void) {
     uint64_t u = reg(w, "chg", "pw-one", OC_ROLE_MEMBER);
     CHECK(u != 0 && auth_local(w, 10, "chg", "pw-one", NULL, NULL) == u);
 
-    submit_change(w, 11, u, "pw-one", "pw-two");
+    submit_change(w, 11, "chg", "pw-one", "pw-two");
     oc_dbres *r = wait_result_ms(w, 60000);
-    CHECK(r && r->conn_id == 11 && r->type != OC_RES_PROFILE_ERR);
+    CHECK(r && r->conn_id == 11 && r->type == OC_RES_WEB_OK && r->revoked);
     oc_dbres_free(r);
     CHECK(auth_local(w, 12, "chg", "pw-two", NULL, NULL) == u);
     CHECK(auth_local(w, 13, "chg", "pw-one", NULL, NULL) == 0);
 
-    submit_change(w, 14, u, "not-it", "pw-three");
+    submit_change(w, 14, "chg", "not-it", "pw-three");
     r = wait_result_ms(w, 60000);
-    CHECK(r && r->conn_id == 14 && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    CHECK(r && r->conn_id == 14 && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
     oc_dbres_free(r);
     int queued = 0;
 
     /* A name with no account goes through the same slow check as a wrong
      * password, so the time to answer says nothing of which names exist. */
     oc_dbwriter_hold_auth(w, 1);
-    {
-        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        oc_encode_local_credential(&cw, oc_slice_str("nobody-here"), oc_slice_str("pw-one"));
-        oc_job *aj = oc_job_new(OC_JOB_AUTH, 30);
-        aj->method = OC_AUTH_LOCAL;
-        oc_job_set_token(aj, cbuf, cw.len);
-        oc_dbwriter_submit(w, aj);
-    }
+    submit_local_auth(w, 30, "nobody-here", "pw-one");
     queued = 0;
     for (int i = 0; i < 500 && !queued; i++) {
         queued = oc_dbwriter_auth_waiting(w) == 1;
@@ -7202,9 +7276,10 @@ static void test_change_password(void) {
     CHECK(queued);
     oc_dbwriter_hold_auth(w, 0);
     r = wait_result_ms(w, 60000);
-    CHECK(r && r->conn_id == 30 && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    CHECK(r && r->conn_id == 30 && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
     oc_dbres_free(r);
-    {   /* a wrong old password is seen, as an owner reads the log */
+    {   /* a wrong current password is seen, as an owner reads the log: the
+         * page's check is a sign-in's, and fails as one */
         uint64_t boss = reg(w, "chg-boss", "pw", OC_ROLE_OWNER);
         oc_job *qj = oc_job_new(OC_JOB_AUDIT_QUERY, 31);
         qj->user_id = boss; qj->audit_limit = 100;
@@ -7212,23 +7287,22 @@ static void test_change_password(void) {
         r = wait_result(w);
         int seen = 0;
         for (size_t i = 0; r && r->type == OC_RES_AUDIT_PAGE && i < r->n_audit; i++)
-            if (r->audit[i].action && !strcmp(r->audit[i].action, "password.change.failed") &&
-                r->audit[i].actor_id == u && !r->audit[i].outcome) seen = 1;
+            if (r->audit[i].action && !strcmp(r->audit[i].action, "auth.failed") && !r->audit[i].outcome) seen = 1;
         CHECK(seen);
         oc_dbres_free(r);
     }
 
-    /* And it counts with the sign-in limiter: wrong old passwords run out the
-     * account's tries, after which neither a change nor a sign-in is checked. */
+    /* And it counts with the sign-in limiter: wrong current passwords run out
+     * the account's tries, after which neither a change nor a sign-in is checked. */
     {
         uint64_t g = reg(w, "chg-guess", "pw-real", OC_ROLE_MEMBER);
         CHECK(g != 0);
         int refused = 0, limited = 0;
         for (int k = 0; k < 8; k++) {
-            submit_change(w, 40 + (uint64_t)k, g, "guess", "pw-new");
+            submit_change(w, 40 + (uint64_t)k, "chg-guess", "guess", "pw-new");
             r = wait_result_ms(w, 60000);
-            if (r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN) refused++;
-            if (r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_AUTH_RATE_LIMITED) limited++;
+            if (r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN) refused++;
+            else if (r && (r->type == OC_RES_AUTH_ERR || r->type == OC_RES_WEB_ERR) && r->err_code == OC_ERR_AUTH_RATE_LIMITED) limited++;
             oc_dbres_free(r);
         }
         CHECK(refused >= 1 && limited >= 1 && refused + limited == 8);
@@ -7237,7 +7311,7 @@ static void test_change_password(void) {
 
     /* Held on the pool, the change leaves the writer free. */
     oc_dbwriter_hold_auth(w, 1);
-    submit_change(w, 15, u, "pw-two", "pw-three");
+    submit_change(w, 15, "chg", "pw-two", "pw-three");
     queued = 0;
     for (int i = 0; i < 500 && !queued; i++) {
         queued = oc_dbwriter_auth_waiting(w) == 1;
@@ -7254,14 +7328,14 @@ static void test_change_password(void) {
     oc_dbres_free(r);
     oc_dbwriter_hold_auth(w, 0);
     r = wait_result_ms(w, 60000);
-    CHECK(r && r->conn_id == 15 && r->type != OC_RES_PROFILE_ERR);
+    CHECK(r && r->conn_id == 15 && r->type == OC_RES_WEB_OK);
     oc_dbres_free(r);
 
     /* Two changes from the same password, both checked before either is stored:
      * exactly one lands, and the password is the one it set. */
     oc_dbwriter_hold_auth(w, 1);
-    submit_change(w, 17, u, "pw-three", "pw-four");
-    submit_change(w, 18, u, "pw-three", "pw-five");
+    submit_change(w, 17, "chg", "pw-three", "pw-four");
+    submit_change(w, 18, "chg", "pw-three", "pw-five");
     queued = 0;
     for (int i = 0; i < 500 && !queued; i++) {
         queued = oc_dbwriter_auth_waiting(w) == 2;
@@ -7272,8 +7346,10 @@ static void test_change_password(void) {
     int won = 0, lost = 0; uint64_t winner = 0;
     for (int k = 0; k < 2; k++) {
         r = wait_result_ms(w, 60000);
-        if (r && r->type == OC_RES_PROFILE_ERR && r->err_code == OC_ERR_FORBIDDEN) lost++;
-        else if (r) { won++; winner = r->conn_id; }
+        /* The loser finds the credential changed under it: at the version check
+         * (INVALID_TOKEN, as a sign-in would be) or at the store (FORBIDDEN). */
+        if (r && r->type == OC_RES_WEB_ERR && (r->err_code == OC_ERR_FORBIDDEN || r->err_code == OC_ERR_AUTH_INVALID_TOKEN)) lost++;
+        else if (r && r->type == OC_RES_WEB_OK) { won++; winner = r->conn_id; }
         oc_dbres_free(r);
     }
     CHECK(won == 1 && lost == 1);
@@ -7317,7 +7393,7 @@ static void test_auth_pool(void) {
         if (!r) break;
         for (oc_dbres *x = r; x; x = x->next) {
             if (x->type == OC_RES_SEND_OK && x->conn_id == 200 && !t_send) t_send = pool_mono_us() - t0;
-            if (x->type == OC_RES_AUTH_OK && x->conn_id >= 100 && x->conn_id < 120) { auth_ok++; t_auth = pool_mono_us() - t0; }
+            if (x->type == OC_RES_WEB_OK && x->conn_id >= 100 && x->conn_id < 120) { auth_ok++; t_auth = pool_mono_us() - t0; }
         }
         oc_dbres_free(r);
     }
@@ -7358,7 +7434,7 @@ static void test_auth_pool(void) {
         oc_dbwriter_hold_auth(w, 0);
         oc_dbres *r = wait_result_ms(w, 60000);
         CHECK(r && r->conn_id == conn);
-        CHECK(r && r->type == (change ? OC_RES_AUTH_ERR : OC_RES_AUTH_OK));
+        CHECK(r && r->type == (change ? OC_RES_WEB_ERR : OC_RES_WEB_OK));
         oc_dbres_free(r);
     }
 
@@ -7439,23 +7515,20 @@ static void test_alerts(void) {
 
     /* Sign-in: an owner's carries the counts; a member's nothing. */
     uint8_t role = 0;
-    oc_job *aj;
     {
-        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        oc_encode_local_credential(&cw, oc_slice_str("olga"), oc_slice_str("pw-olga"));
-        aj = oc_job_new(OC_JOB_AUTH, 7); aj->method = OC_AUTH_LOCAL; oc_job_set_token(aj, cbuf, cw.len);
-        oc_dbwriter_submit(w, aj);
-        r = wait_result(w);
+        char *tok = page_signin(w, 7, "olga", "pw-olga", NULL, NULL);
+        CHECK(tok != NULL);
+        r = tok ? token_auth(w, 7, tok, NULL) : NULL;
+        free(tok);
         CHECK(r && r->type == OC_RES_AUTH_OK && r->alerts_admin && r->alerts_unacked == 1 && r->alerts_current == 1);
         oc_dbres_free(r);
     }
     CHECK(auth_local(w, 8, "mo", "pw-mo", NULL, &role) == member);
     {
-        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        oc_encode_local_credential(&cw, oc_slice_str("mo"), oc_slice_str("pw-mo"));
-        aj = oc_job_new(OC_JOB_AUTH, 9); aj->method = OC_AUTH_LOCAL; oc_job_set_token(aj, cbuf, cw.len);
-        oc_dbwriter_submit(w, aj);
-        r = wait_result(w);
+        char *tok = page_signin(w, 9, "mo", "pw-mo", NULL, NULL);
+        CHECK(tok != NULL);
+        r = tok ? token_auth(w, 9, tok, NULL) : NULL;
+        free(tok);
         CHECK(r && r->type == OC_RES_AUTH_OK && !r->alerts_admin && r->alerts_unacked == 0);
         oc_dbres_free(r);
     }

@@ -94,7 +94,9 @@ static void test_unknown_and_removed(void) {
     rc = load_with("OPENCHIME_SESSION_DAYS", "7", err, sizeof err);
     CHECK(rc != 0 && strstr(err, "constant"));
     rc = load_with("OPENCHIME_TEST_PASSWORD_AUTH", "1", err, sizeof err);
-    CHECK(rc != 0 && strstr(err, "OPENCHIME_DEMO_PASSWORD_FRAMES"));
+    CHECK(rc != 0 && strstr(err, "sign-in page"));
+    rc = load_with("OPENCHIME_DEMO_PASSWORD_FRAMES", "on", err, sizeof err);
+    CHECK(rc != 0 && strstr(err, "sign-in page"));
     rc = load_with("OPENCHIME_RECOVER_MB", "5", err, sizeof err);
     CHECK(rc != 0 && strstr(err, "no longer read"));
     /* An empty unknown name is not set, so it is not an error. */
@@ -250,13 +252,8 @@ static void test_constants(void) {
 }
 
 static void test_demo_switches(void) {
-    /* The test binary is a demo build: the switches are read, and password
-     * frames are on unless a test turns them off. */
+    /* The test binary is a demo build: the switches are read. */
     CHECK(oc_config_is_demo() == 1);
-    accepts("OPENCHIME_WORKSPACE_NAME", "x");
-    CHECK(oc_config_get()->demo.password_frames == 1);
-    accepts("OPENCHIME_DEMO_PASSWORD_FRAMES", "off");
-    CHECK(oc_config_get()->demo.password_frames == 0);
     accepts("OPENCHIME_DEMO_PRIVATE_UNFURL", "1");
     CHECK(oc_config_get()->demo.private_unfurl == 1);
     accepts("OPENCHIME_DEMO_FILE_PAGE", "2");
@@ -306,7 +303,7 @@ static void test_reload_and_registry(void) {
     }
     CHECK(operator_rows == 19);
     CHECK(managed_rows == 7);
-    CHECK(demo_rows == 9 + 11);     /* the daemon's nine, and the clients' */
+    CHECK(demo_rows == 8 + 12);     /* the daemon's eight, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
     /* No row is also a removed name. */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++)

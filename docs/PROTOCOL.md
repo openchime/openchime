@@ -346,7 +346,7 @@ A `method` discriminator selects the credential the payload carries (ARCH-59 for
 |--------------|------|----------------------------------------------------------------|
 | `method`     | u8   | `0x01` local, `0x02` oidc, `0x04` session.                     |
 | `source`     | str  | The `id` of the challenge entry being used; empty for `session`. |
-| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — an ES256 JWT: the central-issued one (AUTH.md §8.3), or with source `local` the daemon's own (AUTH.md §8.10); with an `oidc-<n>` source, the authorization code the provider sent back (AUTH.md §8.5); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — never sent in a frame (the method is refused; a local account signs in on the daemon's page and presents its token as **oidc** with source `local`); **oidc** — an ES256 JWT: the central-issued one (AUTH.md §8.3), or with source `local` the daemon's own (AUTH.md §8.10); with an `oidc-<n>` source, the authorization code the provider sent back (AUTH.md §8.5); **session** — the 32-byte session token from a prior `AUTH_OK`. |
 | `proof`      | str  | **oidc** — the verifier whose hash the client sent as `challenge` in `AUTH_BEGIN` (AUTH.md §8.2). Empty otherwise. |
 | `state`      | str  | **oidc** with an `oidc-<n>` source — the `state` the provider sent back, naming the sign-in `AUTH_BEGIN` began. Empty otherwise. Since version 22. |
 
@@ -362,9 +362,8 @@ raw *provider* token from the client. A direct connection's `state` matching no
 sign-in, or a verifier that is not its challenge's, is `AUTH_INVALID_TOKEN` and the
 code goes nowhere; a provider that cannot be reached is
 `AUTH_SOURCE_UNAVAILABLE`. A **local** credential, a password in the
-frame, is refused with `AUTH_SOURCE_UNAVAILABLE` unless the daemon runs with the
-demo build's switch `OPENCHIME_DEMO_PASSWORD_FRAMES` on: a local account signs in in the
-browser.
+frame, is refused with `AUTH_SOURCE_UNAVAILABLE` (fatal), in every build: a
+local account signs in in the browser (AUTH.md §8.10).
 
 ### 4.2a `AUTH_BEGIN` (client → server), msg_type `0x0015`, and `AUTH_REDIRECT` (server → client), msg_type `0x0016`
 
@@ -927,22 +926,13 @@ Either way the reply is
 | `role`       | u8    | The role the redeemed account will receive.                 |
 | `expires_at` | u64   | Ms since epoch UTC after which the token is dead.           |
 
-**`REDEEM_INVITE` (client → server), msg_type `0x0047`** — sent **before** `AUTH`
-(the invitee has no account yet), it creates the account and authenticates in one
-step. Refused (`AUTH_SOURCE_UNAVAILABLE`) unless the daemon is a demo build with
-`OPENCHIME_DEMO_PASSWORD_FRAMES` on: an invitation is redeemed on the sign-up page
-(AUTH.md §8.10).
-
-| Field      | Type  | Notes                                                        |
-|------------|-------|--------------------------------------------------------------|
-| `token`    | bytes | The invite token from `INVITE_CREATED`.                      |
-| `username` | str   | Desired username; must be unused.                            |
-| `password` | str   | The account password (PBKDF2-hashed server-side, AUTH.md §2).|
-
-On success the daemon consumes the token (single-use), creates the account with
-the invite's role, and replies with a normal **`AUTH_OK`** (§4.3) — the
-connection is now authenticated. Any failure (bad/expired/consumed token, taken
-username) is a fatal `ERROR AUTH_INVALID_TOKEN`, non-disclosing by design.
+**Redeeming an invitation** is not a frame: the invitee, who has no account
+yet, opens the daemon's sign-up page with the token (`/signin?invite=<hex>`,
+AUTH.md §8.10), which consumes it (single-use), creates the account with the
+invite's role and ends with the token the client presents on `AUTH`. A bad,
+expired or consumed token, or a taken username, shows the form again,
+non-disclosing by design. (`0x0047 REDEEM_INVITE` once carried this in a frame;
+the number is retired.)
 
 **`RESET_CREDENTIAL` (client → server), msg_type `0x001D`** `{ user_id: u64, clear_factors: u8 }`
 — an owner or admin makes a one-time link for a local account (AUTH.md §2). Who
@@ -970,8 +960,7 @@ author. The actor is acked with `USER_UPDATED` (`disabled=1`); the removed user'
 live connections receive the same notice and are then dropped.
 
 `SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
-(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL_ERROR`); a `REDEEM_INVITE` failure is fatal
-(the connection never authenticated).
+(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL_ERROR`).
 
 ### 5.9 Reactions (REQ-070, REQ-071)
 
@@ -1889,16 +1878,11 @@ join rule or invitation (AUTH.md §8.4). A provider's account keeps the address 
 provider gives, refreshed at each sign-in, and is refused (`FORBIDDEN`), as is
 something that is not one address. Answered with `PROFILE_INFO`.
 
-**`CHANGE_PASSWORD` (C → S), `0x0049`** `{ old_password: str, new_password: str }`
-— rotate your local password. The daemon verifies `old_password` (constant-time)
-against `local_credentials` and stores a fresh PBKDF2 salt+hash. A non-local
-(OIDC) account or a wrong `old_password` is `FORBIDDEN` (an `ERROR`, non-fatal),
-audited as `password.change.failed` and counted by the account's sign-in limiter,
-past which the change is `AUTH_RATE_LIMITED` unchecked;
-success answers with `PROFILE_UPDATED` (the name unchanged) as the ack, deletes the
-user's other sessions and closes their connections. `FORBIDDEN`
-too unless the daemon is a demo build with `OPENCHIME_DEMO_PASSWORD_FRAMES` on (CONFIG.md, "Demo builds only"): a
-password is changed on the password page (AUTH.md §8.10).
+**Changing a password** is not a frame: it is done on the daemon's own page
+(`/account/password`, AUTH.md §8.10), whose check of the current password is a
+sign-in's -- the same limiter, the same audit -- and which revokes every session
+of the account, so each device signs in again. (`0x0049 CHANGE_PASSWORD` once
+carried this in a frame; the number is retired.)
 
 **`PROFILE_UPDATED` (S → C), `0x004A`** `{ user_id: u64, display_name: str }` — a
 user's display name (after a rename; or the caller's unchanged name after a
@@ -2975,9 +2959,9 @@ this table cannot silently gain a shared value.
 | `0x0044` | `REMOVE_USER` | C → S | (REQ-033, tenant-level; owner/admin) |
 | `0x0045` | `USER_UPDATED` | S → C | ack/push for SET_ROLE + REMOVE_USER |
 | `0x0046` | `INVITE_CREATED` | S → C | the minted invite token |
-| `0x0047` | `REDEEM_INVITE` | C → S | pre-auth account creation |
+| `0x0047` | *(retired)* | — | was `REDEEM_INVITE`, a password in a frame; sign-up is a page (AUTH.md §8.10). Never reused. |
 | `0x0048` | `SET_DISPLAY_NAME` | C → S | change your own display name (REQ-020) |
-| `0x0049` | `CHANGE_PASSWORD` | C → S | change your own local password (verify old) |
+| `0x0049` | *(retired)* | — | was `CHANGE_PASSWORD`; the password page. Never reused. |
 | `0x004A` | `PROFILE_UPDATED` | S → C | a user's display name changed (also the self ack) |
 | `0x004B` | `LIST_INVITES` | C → S | outstanding invites (owner/admin) |
 | `0x004C` | `INVITE_LIST` | S → C | the list (token HASHES only, never tokens) |

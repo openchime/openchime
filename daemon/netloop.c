@@ -2411,6 +2411,16 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (hdr.msg_type == OC_MSG_AUTH) {
                 oc_auth a;
                 if (oc_decode_auth(&p, &a) != OC_OK) return -1;
+                /* A password is typed into the daemon's own pages, never sent in
+                 * a frame (AUTH.md §8.10): the local method has no frame form. */
+                if (a.method == OC_AUTH_LOCAL) {
+                    uint8_t ebuf[160]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+                    oc_error err = { OC_ERR_AUTH_SOURCE_UNAVAILABLE, 1, oc_slice_str("auth"),
+                                     oc_slice_str("a password is taken on the sign-in page, not in a frame") };
+                    oc_encode_error(&ew, c->version, &err);
+                    out_append(c, ebuf, ew.len);
+                    return -1;
+                }
                 int di = a.method == OC_AUTH_OIDC ? direct_index(a.source.ptr, a.source.len) : -1;
                 if (di >= 0) { handle_auth_direct(c, &a, di, dbw); continue; }
                 oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
@@ -2442,33 +2452,6 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 oc_auth_begin b;
                 if (oc_decode_auth_begin(&p, &b) != OC_OK) return -1;
                 handle_auth_begin(c, &b, dbw);
-                continue;
-            }
-            if (hdr.msg_type == OC_MSG_REDEEM_INVITE) {
-                /* Pre-auth account creation: redeem an invite, which both creates
-                 * the account and authenticates (reply is AUTH_OK). */
-                oc_redeem_invite ri;
-                if (oc_decode_redeem_invite(&p, &ri) != OC_OK) return -1;
-                oc_job *j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
-                if (!j) return -1;
-                char *u = strndup((const char *)ri.username.ptr, ri.username.len);
-                char *pw = strndup((const char *)ri.password.ptr, ri.password.len);
-                /* The client holds the hex form (see hex_encode above); accept
-                 * the raw bytes too, so a token captured before this change, or
-                 * pasted from the daemon's own bootstrap log, still redeems. */
-                uint8_t raw[OC_INVITE_TOKEN_LEN];
-                const uint8_t *tokp = ri.token.ptr;
-                size_t toklen = ri.token.len;
-                if (hex_decode((const char *)ri.token.ptr, ri.token.len,
-                               raw, sizeof raw) == (int)sizeof raw) {
-                    tokp = raw; toklen = sizeof raw;
-                }
-                int ok = u && pw &&
-                         oc_job_set_register(j, u, pw, 0, 0) == 0 &&
-                         oc_job_set_token(j, tokp, toklen) == 0;
-                free(u); free(pw);
-                if (!ok) return -1;
-                oc_dbwriter_submit(dbw, j);
                 continue;
             }
             /* A messaging frame before AUTH is a fatal protocol error. */
@@ -3549,19 +3532,6 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->pf_name = strndup((const char *)sn.name.ptr, nl);
             if (!j->pf_name) return -1;
-            oc_dbwriter_submit(dbw, j);
-            continue;
-        }
-        if (hdr.msg_type == OC_MSG_CHANGE_PASSWORD) {
-            oc_change_password cp;
-            if (oc_decode_change_password(&p, &cp) != OC_OK) return -1;
-            oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, c->conn_id);
-            if (!j) return -1;
-            j->user_id = c->user_id;
-            j->message_id = c->session_id;   /* the session that stays */
-            j->pf_old_pw = strndup((const char *)cp.old_password.ptr, cp.old_password.len);
-            j->pf_new_pw = strndup((const char *)cp.new_password.ptr, cp.new_password.len);
-            if (!j->pf_old_pw || !j->pf_new_pw) return -1;
             oc_dbwriter_submit(dbw, j);
             continue;
         }

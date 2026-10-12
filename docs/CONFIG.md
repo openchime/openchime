@@ -23,7 +23,7 @@ varies — session life, worker counts, queue depths, storage watermarks, rate
 limits, the call cap — is a constant in `daemon/config.h`, not a row. Seven
 more rows are the control plane's, written when it provisions a managed box
 ([MANAGED.md](./MANAGED.md)); set without its ticket they refuse the start.
-Nine are a demo build's test switches, which a production build refuses.
+Eight are a demo build's test switches, which a production build refuses.
 
 **The daemon is strict about its environment.** A value that does not parse,
 a value outside its range, a name it does not know (a typo, or a name it no
@@ -128,7 +128,6 @@ Read by a daemon or client built with `make DEMO=1` (TESTING.md). A production b
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_DEMO_PASSWORD_FRAMES` | `on` | The daemon takes a local password in a frame, as the test suites and the harness sign in (AUTH.md §8.10); `off` is the product as shipped. `on` or `off`. |
 | `OPENCHIME_DEMO_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
 | `OPENCHIME_DEMO_FILE_PAGE` | `200` | How many files one LIST_FILES page carries, so a test sees a second page. Integer 1..200. |
 | `OPENCHIME_DEMO_CALL_MAX` | `10` | The most people in one call, so a test can fill one. Integer 2..32. |
@@ -148,6 +147,7 @@ Read by a daemon or client built with `make DEMO=1` (TESTING.md). A production b
 | `OPENCHIME_TEST_VIDEO_CAP_MS` | *(unset)* | Clients: a shorter video message cap, in ms. |
 | `OPENCHIME_TEST_CALL_TIMERS` | *(unset)* | Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset. |
 | `OPENCHIME_TEST_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14). |
+| `OPENCHIME_TEST_SIGNIN` | *(unset)* | Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md). |
 
 ## No longer read
 
@@ -215,7 +215,8 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_STT_MAX_SECS` | a constant, 30: the model's limit |
 | `OPENCHIME_SUMMARY_URL` | OPENCHIME_SUMMARY=cloud:<url>,<model> |
 | `OPENCHIME_SUMMARY_MODEL` | OPENCHIME_SUMMARY=cloud:<url>,<model> |
-| `OPENCHIME_TEST_PASSWORD_AUTH` | renamed OPENCHIME_DEMO_PASSWORD_FRAMES, on by default in a demo build |
+| `OPENCHIME_TEST_PASSWORD_AUTH` | removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h) |
+| `OPENCHIME_DEMO_PASSWORD_FRAMES` | removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h) |
 | `OPENCHIME_BOOTSTRAP_USERS` | renamed OPENCHIME_DEMO_USERS |
 | `OPENCHIME_FILE_PAGE` | renamed OPENCHIME_DEMO_FILE_PAGE |
 | `OPENCHIME_UNFURL_ALLOW_PRIVATE` | renamed OPENCHIME_DEMO_PRIVATE_UNFURL |

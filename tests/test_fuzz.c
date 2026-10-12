@@ -72,7 +72,6 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_remove_user rmu; D(oc_decode_remove_user(&p, &rmu));
     oc_user_updated uu; D(oc_decode_user_updated(&p, &uu));
     oc_invite_created ic; D(oc_decode_invite_created(&p, &ic));
-    oc_redeem_invite ri; D(oc_decode_redeem_invite(&p, &ri));
     oc_backfill_done bd; D(oc_decode_backfill_done(&p, &bd));
     oc_error er; D(oc_decode_error(&p, &er));
     oc_open_dm odm; D(oc_decode_open_dm(&p, &odm));

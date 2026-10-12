@@ -60,7 +60,9 @@ const ctx = await chromium.launchPersistentContext(profile, {
 try { await ctx.clearCookies(); } catch (e) {}
 if (mic) await ctx.route((u) => u.pathname.endsWith('/mic.wav'), (route) => route.fulfill({ path: mic, contentType: 'audio/wav' }));
 const page = ctx.pages()[0] || await ctx.newPage();
-await page.addInitScript(() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} });
+// Once, on the first load: the sign-in leaves for the daemon's page and comes
+// back, and what the page keeps for the tab (its hook, the test switches) stays.
+await page.addInitScript(() => { try { if (!sessionStorage.getItem('oc.drive')) { localStorage.clear(); sessionStorage.clear(); sessionStorage.setItem('oc.drive', '1'); } } catch (e) {} });
 page.on('console', (m) => log('console: ' + m.text().slice(0, 300)));
 page.on('pageerror', (e) => log('pageerror: ' + e.message));
 await page.goto(url.toString());

@@ -28,7 +28,7 @@ for _ in $(seq 1 100); do grep -q "healthz listening" "$W/daemon.log" 2>/dev/nul
 # after a while and takes the client's own screenshot, which is left in
 # $W/gui.bmp for a person to look at.
 {
-    URL2="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&user=alice&pass=pw&wait=authed&shot=1"
+    URL2="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_TEST_SIGNIN%3Dalice%3Apw&wait=authed&shot=1"
     timeout 90 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
         --user-data-dir="build/webtest-profile/gui" --no-first-run --disable-background-networking \
@@ -61,7 +61,7 @@ PY
     # Media (WEB.md): a video message recorded from the synthetic camera and the
     # browser's (fake) microphone through Web Audio, stopped, and the file taken
     # -- the same recorder, codecs and muxer the desktop runs, in wasm.
-    URL3="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&user=alice&pass=pw&hook=1&env=OPENCHIME_TEST_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000"
+    URL3="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_TEST_SIGNIN%3Dalice%3Apw&hook=1&env=OPENCHIME_TEST_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000"
     timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
@@ -98,7 +98,7 @@ PY
     echo "  audio: ${audio:-not reported}"
     # The input method (plat_web.c): a composition played into the page's
     # hidden input ends in the composer, as a desktop IME's does.
-    URL4="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&user=alice&pass=pw&hook=1&ime=1"
+    URL4="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_TEST_SIGNIN%3Dalice%3Apw&hook=1&ime=1"
     timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
         --user-data-dir="build/webtest-profile/ime" --no-first-run --disable-background-networking \

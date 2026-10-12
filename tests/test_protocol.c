@@ -203,15 +203,15 @@ static void test_auth_frames(void) {
         CHECK(oc_decode_auth_continue(&p, &out) == OC_OK && out.step == OC_AUTH_STEP_TOTP);
     }
     {
-        /* AUTH — method-discriminated credential (here a local password). */
-        oc_auth in = { OC_AUTH_LOCAL, oc_slice_str("local"), oc_slice_str("alice:hunter2"),
+        /* AUTH: method-discriminated credential (here a page's token). */
+        oc_auth in = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str("eyJ.the.token"),
                        oc_slice_str("the-verifier"), oc_slice_str("the-state") };
         ROUNDTRIP(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH, h, p);
         oc_auth out;
         CHECK(oc_decode_auth(&p, &out) == OC_OK);
         CHECK(out.state.len == 9 && memcmp(out.state.ptr, "the-state", 9) == 0);   /* protocol 22 */
-        CHECK(out.method == OC_AUTH_LOCAL);
-        CHECK(slice_eq_str(out.credential, "alice:hunter2"));
+        CHECK(out.method == OC_AUTH_OIDC);
+        CHECK(slice_eq_str(out.credential, "eyJ.the.token"));
     }
     {
         /* AUTH_OK — carries the tenant role and a fresh 32-byte session token. */
@@ -1117,15 +1117,6 @@ static void test_admin_frames(void) {
         CHECK(out.token.len == OC_INVITE_TOKEN_LEN && out.token.ptr[0] == 3);
         CHECK(out.role == OC_ROLE_MEMBER && out.expires_at == 1751200500000ull);
     }
-    {
-        uint8_t tok[OC_INVITE_TOKEN_LEN]; memset(tok, 0x9A, sizeof tok);
-        oc_redeem_invite in = { { tok, OC_INVITE_TOKEN_LEN }, oc_slice_str("newbie"), oc_slice_str("hunter2") };
-        ROUNDTRIP(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REDEEM_INVITE, h, p);
-        oc_redeem_invite out;
-        CHECK(oc_decode_redeem_invite(&p, &out) == OC_OK);
-        CHECK(out.token.len == OC_INVITE_TOKEN_LEN && out.token.ptr[0] == 0x9A);
-        CHECK(slice_eq_str(out.username, "newbie") && slice_eq_str(out.password, "hunter2"));
-    }
 }
 
 static void test_search_frames(void) {
@@ -1450,14 +1441,6 @@ static void test_profile_frames(void) {
         oc_set_display_name out;
         CHECK(oc_decode_set_display_name(&p, &out) == OC_OK);
         CHECK(out.name.len == 6 && memcmp(out.name.ptr, "Dana Q", 6) == 0);
-    }
-    {
-        oc_change_password in = { oc_slice_str("old-secret"), oc_slice_str("new-secret") };
-        ROUNDTRIP(oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANGE_PASSWORD, h, p);
-        oc_change_password out;
-        CHECK(oc_decode_change_password(&p, &out) == OC_OK);
-        CHECK(out.old_password.len == 10 && memcmp(out.old_password.ptr, "old-secret", 10) == 0);
-        CHECK(out.new_password.len == 10 && memcmp(out.new_password.ptr, "new-secret", 10) == 0);
     }
     {
         oc_profile_updated in = { 42, oc_slice_str("Dana Q") };

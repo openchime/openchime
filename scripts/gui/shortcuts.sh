@@ -86,7 +86,9 @@ for _ in $(seq 1 40); do
 done
 ws_n()     { snap; grep -m1 '^workspaces=' "$D" | grep -o 'workspaces=[0-9]*' | cut -d= -f2; }
 ws_active(){ snap; grep -m1 '^workspaces=' "$D" | grep -o 'active=[0-9-]*' | cut -d= -f2; }
-"$PAIR" a wsadd "$HOST_ADDR:$SECOND_PORT" "alice:pw" >/dev/null
+"$PAIR" a wsadd "$HOST_ADDR:$SECOND_PORT" >/dev/null
+# The second workspace's card: Sign in, its certificate trusted, Sign in, the page.
+sign_in_card "$PAIR" a -- "/mnt/c/Windows/Temp/ocpair-$OC_TEST_PORT-a" alice pw || fail "alice's sign-in to the second workspace"
 two_ws() { [ "$(ws_n)" = 2 ]; }
 check "alice's client holds two workspaces" waitfor 20 two_ws
 on_second() { [ "$(ws_active)" = 1 ]; }

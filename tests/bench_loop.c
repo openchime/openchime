@@ -23,6 +23,7 @@
 #include "framebuf.h"
 #include "protocol.h"
 #include "tls.h"
+#include "testsignin.h"   /* the sign-in page, as a person signs in */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -169,11 +170,15 @@ static int bc_login(bclient *c, int i) {
     if (oc_encode_hello(&w, &h) != OC_OK || write_all(c, buf, w.len) != 0) return -1;
     if (read_until(c, OC_MSG_AUTH_CHALLENGE, &p, 30000) != 0) return -1;
     char user[16]; snprintf(user, sizeof user, "u%d", i);
-    uint8_t cred[128]; oc_wbuf cw; oc_wbuf_init(&cw, cred, sizeof cred);
-    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str("pw")) != OC_OK) return -1;
-    oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cred, cw.len }, { NULL, 0 }, { NULL, 0 } };
-    if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(c, buf, w.len) != 0) return -1;
+    /* As a person signs in (AUTH.md §8.10): the daemon's page, then its token. */
+    char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    if (oc_test_signin("127.0.0.1", g_port, NULL, user, "pw", tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) {
+        fprintf(stderr, "sign-in page: %s\n", why);
+        return -1;
+    }
+    uint8_t abuf[8192]; oc_wbuf aw; oc_wbuf_init(&aw, abuf, sizeof abuf);
+    oc_auth a = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver), { NULL, 0 } };
+    if (oc_encode_auth(&aw, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(c, abuf, aw.len) != 0) return -1;
     if (read_until(c, OC_MSG_AUTH_OK, &p, 60000) != 0) return -1;
     oc_auth_ok ok;
     if (oc_decode_auth_ok(&p, &ok) != OC_OK) return -1;

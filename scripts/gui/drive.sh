@@ -61,6 +61,7 @@ trust_dev_cert() {
     "$0" dump launch-trust >/dev/null 2>&1 || true
     S="$(cat "$LIN_DIR/launch-trust.txt" 2>/dev/null || true)"
     grep -q '^authed=1' <<<"$S" && return 0
+    [ -s "$LIN_DIR/signin_url.txt" ] && return 0     # trusted: the sign-in page is up next
     if grep -q '^confirm open=1 act=13' <<<"$S" &&
        line="$(grep '^a11yitem modal.button.trust and connect ' <<<"$S")"; then
       dpi="$(sed -n 's/.* dpi=\([0-9]*\).*/\1/p' <<<"$S" | head -1)"
@@ -77,8 +78,9 @@ case "${1:-}" in
     # The default workspace `launch` uses, for a script that names it itself.
     printf '%s:%s\n' "$(dev_host)" "$OC_TEST_PORT"; exit 0 ;;
   launch)
-  # A demo build (make DEMO=1): the fixture signs in by password in frames and
-  # bootstraps its users, which a production build refuses.
+  # A demo build (make DEMO=1): the fixture bootstraps its users, which a
+  # production build refuses; the client signs in on the daemon's page, the
+  # browser played by play_browser (scripts/gui/lib.sh) for `cred`'s person.
   if ! "$HERE/openchimed" --version | grep -q 'demo build'; then
     echo "$(basename "$0"): $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2
   fi
@@ -181,13 +183,18 @@ case "${1:-}" in
     # test switches cross too when set: OPENCHIME_TEST_AUDIO=synthetic,
     # OPENCHIME_TEST_MIC=<windows path to a WAV> for a microphone that speaks,
     # OPENCHIME_TEST_CAPTURE=synthetic|synthetic-camera|denied, and the rest.
+    rm -f "$LIN_DIR/signin_url.txt"
     WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_MIC_ECHO:OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_VIDEO_CAP_MS:OPENCHIME_TEST_SCREEN_GONE_MS" OPENCHIME_TEST_DIR="$WIN_DIR" \
-        setsid "$EXE" "$ws" "$cred" >/dev/null 2>&1 < /dev/null &
+        setsid "$EXE" "$ws" >/dev/null 2>&1 < /dev/null &
     disown; sleep 3
-    case "$ws" in
-      127.*|localhost|localhost:*|\[::1\]*) ;;
-      *) [ -n "$cred" ] && trust_dev_cert ;;
-    esac
+    # The person signs in: the card's Sign in, the certificate question where
+    # the daemon is not on loopback, Sign in again, and the page the harness
+    # types into (scripts/gui/lib.sh). A stored session needs none of it.
+    if [ -n "$cred" ] && ! { "$0" dump launch-pre >/dev/null 2>&1; grep -q '^authed=1' "$LIN_DIR/launch-pre.txt" 2>/dev/null; }; then
+      . "$HERE/scripts/gui/lib.sh"
+      "$0" restore >/dev/null 2>&1 || true      # a window never shown has no buttons to find
+      sign_in_card "$0" -- "$LIN_DIR" "${cred%%:*}" "${cred#*:}" || { echo "launch failed: the sign-in page" >&2; exit 1; }
+    fi
     echo "launched"; exit 0 ;;
   kill)
     # Graceful first, for the reason the launch path gives.

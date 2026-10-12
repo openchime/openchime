@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Screenshot feedback loop for the native Win32 GUI, driven from WSL.
 #
-#   scripts/gui/snap.sh launch [ws] [user:pass]   # start build/openchime.exe, then snap
+#   scripts/gui/snap.sh launch [ws]               # start build/openchime.exe, then snap
 #   scripts/gui/snap.sh                            # snap the running window
 #   scripts/gui/snap.sh kill                       # close the running client
 #
@@ -24,12 +24,12 @@ DEST="${GUI_SNAP_DEST:-/tmp/ocsnap.png}"
 cmd="${1:-snap}"
 case "$cmd" in
   launch)
-    ws="${2:-127.0.0.1:8443}"; cred="${3:-alice:pw}"
+    ws="${2:-}"
     [ -x "$EXE" ] || { echo "build first: make windows" >&2; exit 1; }
-    # WSL can exec the PE directly; detach so this script returns. Pass no creds
-    # to exercise the login dialog / cached-session path.
-    if [ -n "$cred" ]; then
-      setsid "$EXE" "$ws" "$cred" >/dev/null 2>&1 < /dev/null &
+    # WSL can exec the PE directly; detach so this script returns. With no
+    # workspace the login view shows; with one, its stored session or sign-in.
+    if [ -n "$ws" ]; then
+      setsid "$EXE" "$ws" >/dev/null 2>&1 < /dev/null &
     else
       setsid "$EXE" >/dev/null 2>&1 < /dev/null &
     fi
