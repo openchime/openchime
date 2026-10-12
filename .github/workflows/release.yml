@@ -358,7 +358,7 @@ jobs:
           path: |
             third_party/onnxruntime-1.30.0
             third_party/onnxruntime-1.30.0-aarch64
-            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc
+            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
             third_party/llamacpp-0.5.0
             third_party/llamacpp-0.5.0-aarch64
             build/kitten
@@ -421,7 +421,7 @@ jobs:
           path: |
             third_party/onnxruntime-1.30.0
             third_party/onnxruntime-1.30.0-aarch64
-            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc
+            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
             third_party/llamacpp-0.5.0
             third_party/llamacpp-0.5.0-aarch64
             build/kitten

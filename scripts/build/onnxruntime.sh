@@ -86,19 +86,23 @@ fi
 DEST="onnxruntime-${ORT_VERSION}${OC_ARCH:+-$OC_ARCH}"
 OPS="${ROOT}/daemon/ort.ops.config"
 STAMP="$(sha256sum "${OPS}" | cut -d" " -f1) ${CC:-cc} ${CXX:-c++}"
+# Current first, before anything a build would need: a restored archive is
+# used as it is, whether or not the host's protoc came back with it.
+if [ -f "${DEST}/lib/libonnxruntime.a" ] && [ "$(cat "${DEST}/.stamp" 2>/dev/null)" = "${STAMP}" ]; then
+  echo "build_onnxruntime: up to date: third_party/${DEST}/lib/libonnxruntime.a"
+  exit 0
+fi
 CROSS_ARGS=()
 if [ -n "${OC_ARCH:-}" ] && [ "${OC_ARCH}" != "$(uname -m)" ]; then
-  # A cross build runs the host's protoc: the one the host build made.
+  # A cross build runs the host's protoc: the one the host build made. `protoc`
+  # there is a symlink to the versioned binary beside it, so a cache of it must
+  # carry both (release.yml lists protoc*).
   HOST_PROTOC="$(pwd)/onnxruntime-${ORT_VERSION}-build/out/MinSizeRel/_deps/protobuf-build/protoc"
   [ -x "${HOST_PROTOC}" ] || { echo "build_onnxruntime: a cross build needs the host build's protoc at ${HOST_PROTOC}: build the host's ONNX Runtime first" >&2; exit 2; }
   TOOLCHAIN="$(pwd)/onnxruntime-${ORT_VERSION}-${OC_ARCH}.toolchain.cmake"
   printf 'set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR %s)\nset(CMAKE_C_COMPILER %s)\nset(CMAKE_CXX_COMPILER %s)\nset(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n' \
     "${OC_ARCH}" "${CC}" "${CXX}" > "${TOOLCHAIN}"
   CROSS_ARGS=(--path_to_protoc_exe "${HOST_PROTOC}" --cmake_extra_defines "CMAKE_TOOLCHAIN_FILE=${TOOLCHAIN}" onnxruntime_CROSS_COMPILING=ON)
-fi
-if [ -f "${DEST}/lib/libonnxruntime.a" ] && [ "$(cat "${DEST}/.stamp" 2>/dev/null)" = "${STAMP}" ]; then
-  echo "build_onnxruntime: up to date: third_party/${DEST}/lib/libonnxruntime.a"
-  exit 0
 fi
 
 WORK="onnxruntime-${ORT_VERSION}-build${OC_ARCH:+-$OC_ARCH}"
