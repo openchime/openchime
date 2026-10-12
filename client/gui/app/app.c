@@ -2289,6 +2289,7 @@ static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred);   
 static void signin_begin_known(oc_win *hwnd, const char *ws, const char *user); /* fwd */
 static void sw_book_load(void);      /* fwd */
 static void ws_forget(const char *ws);   /* fwd */
+static void ws_forget_begin(const char *ws);   /* fwd */
 
 static struct { char ws[256], label[80], user[80]; int current; } g_sw[16];
 static int   g_n_sw;
@@ -2392,6 +2393,11 @@ static int      g_si_browser;        /* the attempt in flight is a browser sign-
 static uint32_t g_si_opened_seq;     /* the model's signin_seq whose URL was opened */
 static rectf    g_si_browser_btn[8]; /* step 2: one per browser source, as g_si_src */
 static rectf    g_si_wait_cancel;    /* while waiting for the browser */
+static rectf    g_si_wait_copy;      /* ...and the link, for a browser that did not open */
+static int      g_si_open_failed;    /* the platform could not open the browser */
+static uint64_t g_si_copied_at;      /* when the link was last copied, for the card's note */
+static void signin_copy_link(void);
+static void draw_clipboard_icon(gfx *rt, rectf b, uint32_t c);   /* fwd */
 static void signin_start_browser(oc_win *hwnd, const char *source_id, const char *invite);
 static void signin_start_reset(oc_win *hwnd, const char *reset);
 
@@ -7550,6 +7556,13 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
      * claims the key when one of these four is actually up. */
     /* Shift+Esc is a shortcut of its own (marking everything read) and must reach
      * the table below; bare Esc dismisses what is open. */
+    /* Waiting on the browser: the fields are hidden, so Ctrl+C has nothing else
+     * to copy; it takes the sign-in link. */
+    if (!alt && mod_down(OCK_CONTROL) && (key == 'c' || key == 'C') &&
+        g_view == VIEW_SIGNIN && g_si_connecting && g_si_browser) {
+        signin_copy_link();
+        return 1;
+    }
     if (!alt && key == OCK_ESCAPE && !mod_down(OCK_SHIFT)) {
         /* Waiting on the browser: the fields are hidden, so nothing else hears Esc. */
         if (g_view == VIEW_SIGNIN && g_si_connecting && g_si_browser && g_si_client) {
@@ -10943,7 +10956,8 @@ static si_geom si_layout(float W, float H) {
 
     float head = 26 + 52 + 30 + 30;              /* mark + heading + subheading */
     int   nfields = (g_si_step == 1) ? 1 : 0;
-    float body = g_si_connecting ? (g_si_browser ? 120.0f : 76.0f)
+    /* Waiting on the browser: the message, the link, Copy, its note, Cancel. */
+    float body = g_si_connecting ? (g_si_browser ? 196.0f + (g_si_open_failed ? 34.0f : 0.0f) : 76.0f)
                : (float)nfields * 62.0f
                  + (g_si_step == 2 ? SI_NOTE_H : 0.0f)   /* where the password goes */
                  + (g_si_err[0] ? 34.0f : 0.0f)
@@ -11014,14 +11028,53 @@ static void draw_signin(gfx *rt, float W, float H) {
         const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
         int waiting = g_si_browser && sm && sm->signin_url[0];
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, waiting ? "Finish signing in in your browser\xE2\x80\xA6" : "Signing in\xE2\x80\xA6",
+        draw_text(rt, waiting ? (g_si_open_failed ? "Your browser did not open." : "Finish signing in in your browser\xE2\x80\xA6")
+                              : "Signing in\xE2\x80\xA6",
                   g_ui, rf(x0, y + 24, x0 + SI_W, y + 52), OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
         g_si_btn = g_si_remember_box = g_si_back = g_si_adv_link = rf(0, 0, 0, 0);
         memset(g_si_browser_btn, 0, sizeof g_si_browser_btn);
-        /* A wait that can last minutes needs a way out that is on the screen. */
+        g_si_wait_copy = rf(0, 0, 0, 0);
+        /* A wait that can last minutes needs a way out that is on the screen,
+         * and the link itself: a browser that did not open, or is not the one
+         * the person wants, is still a page they can reach by pasting. */
         if (g_si_browser) {
-            g_si_wait_cancel = rf(fx, y + 64, fx + fw, y + 86);
+            float cy = y + 64;
+            if (waiting) {
+                int copied = g_si_copied_at && now_ms() - g_si_copied_at < 2500;
+                g_meta->align = ST_ALIGN_CENTER;
+                if (g_si_open_failed)
+                    draw_text(rt, "Open the sign-in link in a browser yourself.", g_meta_w,
+                              rf(fx, cy - 6, fx + fw, cy + 30), OC_COL_MUTED), cy += 34;
+                /* The link itself, so what is copied is in view: its host and
+                 * path, the query (nonce, redirect) elided. */
+                {
+                    char shown[160]; const char *q = strchr(sm->signin_url, '?');
+                    size_t n = q ? (size_t)(q - sm->signin_url) : strlen(sm->signin_url);
+                    if (n > sizeof shown - 3) n = sizeof shown - 3;
+                    snprintf(shown, sizeof shown, "%.*s%s", (int)n, sm->signin_url, q ? "\xE2\x80\xA6" : "");
+                    draw_text(rt, shown, g_meta, rf(fx, cy, fx + fw, cy + 20), OC_COL_MUTED);
+                    cy += 26;
+                }
+                /* The button: a clipboard glyph and its label, centred together. */
+                g_si_wait_copy = rf(fx, cy, fx + fw, cy + 22);
+                {
+                    const char *label = "Copy sign-in link  (Ctrl+C)";
+                    float tw = text_width(label, g_meta), icon = 12.0f, gap = 7.0f;
+                    float x = fx + (fw - (icon + gap + tw)) / 2;
+                    draw_clipboard_icon(rt, rf(x, cy + 3, x + icon, cy + 19), OC_COL_ACCENT);
+                    g_meta->align = ST_ALIGN_LEFT;
+                    draw_text(rt, label, g_meta, rf(x + icon + gap, cy, fx + fw, cy + 22), OC_COL_ACCENT);
+                    g_meta->align = ST_ALIGN_CENTER;
+                }
+                cy += 24;
+                /* A moment's confirmation under the button; the button itself
+                 * does not change. */
+                if (copied) draw_text(rt, "Copied to the clipboard", g_meta, rf(fx, cy, fx + fw, cy + 20), OC_COL_MUTED);
+                cy += 26;
+                g_meta->align = ST_ALIGN_LEFT;
+            }
+            g_si_wait_cancel = rf(fx, cy, fx + fw, cy + 22);
             g_meta->align = ST_ALIGN_CENTER;
             draw_text(rt, "Cancel  (Esc)", g_meta, g_si_wait_cancel, OC_COL_ACCENT);
             g_meta->align = ST_ALIGN_LEFT;
@@ -11030,7 +11083,7 @@ static void draw_signin(gfx *rt, float W, float H) {
         }
         return;
     }
-    g_si_wait_cancel = rf(0, 0, 0, 0);
+    g_si_wait_cancel = g_si_wait_copy = rf(0, 0, 0, 0);
 
     /* Field chrome. The EDITs are placed on these same rects by layout_signin. */
     const char *labels[1] = { "Workspace" }; int nfields = g_si_step == 1 ? 1 : 0;
@@ -11782,6 +11835,25 @@ static int   main_is_conversation(void);    /* fwd — and it belongs to a conve
  * glyph, and they are shapes rather than letters in every toolbar too. */
 static void fmt_bar(gfx *rt, float x, float y, float w, float th, uint32_t c) {
     fill(rt, rf(x, y, x + w, y + th), c);
+}
+
+/* A clipboard: the board's outline, its clip on top, two lines of what is on
+ * it. Drawn in lines, as the formatting icons are, so it is crisp at every
+ * DPI and reads at twelve pixels. */
+static void draw_clipboard_icon(gfx *rt, rectf b, uint32_t c) {
+    float w = 1.4f, l = b.left + 0.5f, r = b.right - 0.5f, tp = b.top + 2.0f, bt = b.bottom - 0.5f;
+    gfx_line(rt, l, tp, l, bt, w, c, 1.0f);          /* board */
+    gfx_line(rt, r, tp, r, bt, w, c, 1.0f);
+    gfx_line(rt, l, bt, r, bt, w, c, 1.0f);
+    float cx = (l + r) / 2, clip = 2.5f;
+    gfx_line(rt, l, tp, cx - clip, tp, w, c, 1.0f);  /* top edge, around the clip */
+    gfx_line(rt, cx + clip, tp, r, tp, w, c, 1.0f);
+    gfx_line(rt, cx - clip, tp + 0.5f, cx - clip, b.top, w, c, 1.0f);   /* the clip */
+    gfx_line(rt, cx - clip, b.top, cx + clip, b.top, w, c, 1.0f);
+    gfx_line(rt, cx + clip, b.top, cx + clip, tp + 0.5f, w, c, 1.0f);
+    float y1 = tp + (bt - tp) * 0.42f, y2 = tp + (bt - tp) * 0.68f;  /* two lines of text */
+    gfx_line(rt, l + 2.5f, y1, r - 2.5f, y1, w, c, 1.0f);
+    gfx_line(rt, l + 2.5f, y2, r - 4.0f, y2, w, c, 1.0f);
 }
 
 static void draw_fmt_icon(gfx *rt, int which, rectf b, uint32_t c) {
@@ -12764,28 +12836,7 @@ static void confirm_run(oc_win *hwnd) {
     /* "" is what the original call passed and what the daemon expects for a toggle;
      * "1" would have been a plausible-looking change of behaviour smuggled in with
      * a refactor. */
-    case CONF_WS_FORGET: {
-        /* Re-resolve from the address, never from a remembered index. */
-        int slot = ws_find(g_confirm_ws);
-        int live = (slot >= 0 && g_wss[slot].client);
-        if (live && slot == g_ws_active) {
-            close_overlays();
-            oc_client_logout(g_client, OC_LOGOUT_THIS);
-            g_logging_out = 1;
-            g_forget_after_logout = 1;      /* delete the entry once it lands */
-        } else {
-            if (live) {                     /* a background one: stop it here */
-                dict_forget(g_wss[slot].client); ftray_forget(g_wss[slot].client);
-                oc_client_stop(g_wss[slot].client);
-                for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
-                g_n_wss--;
-                if (g_ws_active > slot) g_ws_active--;
-                g_n_notify_hw = 0;
-            }
-            ws_forget(g_confirm_ws);
-            sw_book_load();
-        }
-        break; }
+    case CONF_WS_FORGET: ws_forget_begin(g_confirm_ws); break;
     case CONF_DRAFT_DELETE: draft_delete(g_confirm_id, g_confirm_root); break;
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
@@ -24250,6 +24301,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
         if (g_si_connecting) {
             if (g_si_browser && pt_in(g_si_wait_cancel, x, y) && g_si_client)
                 oc_client_cancel_signin(g_si_client);   /* the poll sees the core's answer */
+            else if (g_si_browser && pt_in(g_si_wait_copy, x, y))
+                signin_copy_link();
             return 1;
         }
         if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
@@ -25829,6 +25882,33 @@ static void ws_clear_session(const char *ws) {
 
 /* Remove a workspace from this device entirely (REQ-012): credential, trusted fingerprint
  * and book entry in one delete, so "forget" leaves nothing behind. */
+/* Forget a workspace, as its dialog's OK does: the active one is signed out
+ * first (LOGOUT_THIS) and its entry deleted once that lands, so the running
+ * client cannot write its session back; a background one is stopped here and
+ * forgotten at once; one that is not running is forgotten at once. */
+static void ws_forget_begin(const char *ws) {
+    /* Re-resolve from the address, never from a remembered index. */
+    int slot = ws_find(ws);
+    int live = (slot >= 0 && g_wss[slot].client);
+    if (live && slot == g_ws_active) {
+        close_overlays();
+        oc_client_logout(g_client, OC_LOGOUT_THIS);
+        g_logging_out = 1;
+        g_forget_after_logout = 1;      /* delete the entry once it lands */
+        return;
+    }
+    if (live) {                     /* a background one: stop it here */
+        dict_forget(g_wss[slot].client); ftray_forget(g_wss[slot].client);
+        oc_client_stop(g_wss[slot].client);
+        for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
+        g_n_wss--;
+        if (g_ws_active > slot) g_ws_active--;
+        g_n_notify_hw = 0;
+    }
+    ws_forget(ws);
+    sw_book_load();
+}
+
 static void ws_forget(const char *ws) {
     const char *sp = store_path();
     oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
@@ -26223,6 +26303,7 @@ redraw:
 static void signin_start(oc_win *hwnd, const char *source_id, const char *invite, const char *reset);
 
 static void signin_start_browser(oc_win *hwnd, const char *source_id, const char *invite) {
+    g_si_open_failed = 0; g_si_copied_at = 0;
     signin_start(hwnd, source_id, invite, NULL);
 }
 
@@ -26318,7 +26399,20 @@ static void signin_open_url(const char *url) {
          * there, and the harness drives it in the sign-in page (WEB.md). */
         if (strcmp(oc_plat_name(), "web") != 0) return;
     }
-    oc_plat_open_signin(url);
+    /* A browser that does not open -- none installed, a locked-down desktop, a
+     * remote session -- leaves the person a link to copy (the card offers it
+     * either way) and is told so rather than left waiting. */
+    g_si_open_failed = !oc_plat_open_signin(url);
+    if (g_si_open_failed) invalidate();
+}
+
+/* The sign-in link to the clipboard, for a browser of the person's choosing. */
+static void signin_copy_link(void) {
+    const oc_model *sm = g_si_client ? oc_client_model(g_si_client) : NULL;
+    if (!sm || !sm->signin_url[0]) return;
+    SDL_SetClipboardText(sm->signin_url);
+    g_si_copied_at = now_ms();
+    invalidate();
 }
 
 /* Called each tick while an attempt is in flight. Mirrors the TUI's await_auth:
@@ -28720,10 +28814,12 @@ static void test_dump(const char *path) {
     fprintf(f, "host=\"%s\"\n", g_host);
     /* The sign-in card's controls, in scene units, for a harness to click. */
     fprintf(f, "signin step=%d connecting=%d browser=%d btn=%.0f,%.0f,%.0f,%.0f invite=%.0f,%.0f,%.0f,%.0f "
-               "reset=%.0f,%.0f,%.0f,%.0f\n",
+               "reset=%.0f,%.0f,%.0f,%.0f copy=%.0f,%.0f,%.0f,%.0f openfail=%d copied=%d\n",
             g_si_step, g_si_connecting, g_si_browser, g_si_btn.left, g_si_btn.top, g_si_btn.right, g_si_btn.bottom,
             g_si_invite_link.left, g_si_invite_link.top, g_si_invite_link.right, g_si_invite_link.bottom,
-            g_si_reset_link.left, g_si_reset_link.top, g_si_reset_link.right, g_si_reset_link.bottom);
+            g_si_reset_link.left, g_si_reset_link.top, g_si_reset_link.right, g_si_reset_link.bottom,
+            g_si_wait_copy.left, g_si_wait_copy.top, g_si_wait_copy.right, g_si_wait_copy.bottom,
+            g_si_open_failed, g_si_copied_at != 0);
     fprintf(f, "signinsub \"%s\"\n", g_si_step == 2 ? g_si_sub : "");
     fprintf(f, "profilemenu open=%d sub=%d\n",
             g_menu == MENU_PROFILE, g_sub_open != 0);
@@ -29038,7 +29134,11 @@ static void test_dump(const char *path) {
                     c->r.left, c->r.top, c->r.right, c->r.bottom, c->x.left, c->x.top, c->x.right, c->x.bottom);
         }
     }
-    fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
+    /* `forgetting`: a sign-out whose entry is deleted when it lands is still
+     * in flight (ws_forget_begin); a harness waits for 0 before it closes the
+     * client, or the entry outlives the forget. */
+    fprintf(f, "workspaces=%d active=%d elsewhere=%d forgetting=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere(),
+            g_logging_out || g_forget_after_logout);
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
         const oc_model *wm = g_wss[i].client ? oc_client_model(g_wss[i].client) : NULL;
@@ -29921,18 +30021,10 @@ static void test_poll(oc_win *hwnd) {
         else test_ack("err");
     } else if (!strcmp(verb, "wsforget")) {
         /* The removal itself, minus the confirmation dialog a harness cannot
-         * dismiss reliably. Same code path the button takes after OK. */
-        int slot = ws_find(arg);
-        if (slot >= 0 && g_wss[slot].client && slot != g_ws_active) {
-            dict_forget(g_wss[slot].client); ftray_forget(g_wss[slot].client);
-            oc_client_stop(g_wss[slot].client);
-            for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
-            g_n_wss--;
-            if (g_ws_active > slot) g_ws_active--;
-            g_n_notify_hw = 0;
-        }
-        ws_forget(arg);
-        sw_book_load();
+         * dismiss reliably: the code path the button takes after OK, which for
+         * the active workspace signs out first and forgets when that lands --
+         * a harness waits for authed=0 before it kills the client. */
+        ws_forget_begin(arg);
         test_ack("ok");
     } else if (!strcmp(verb, "wsbook")) {
         /* "<workspace> <user>" — a book entry with no sign-in behind it, so the
@@ -30636,6 +30728,8 @@ static void test_poll(oc_win *hwnd) {
         signin_set_advanced(hwnd, !g_si_advanced); test_ack("ok");
     } else if (!strcmp(verb, "sisubmit")) {
         signin_submit(hwnd); test_ack("ok");
+    } else if (!strcmp(verb, "sicopy")) {     /* the card's Copy sign-in link */
+        signin_copy_link(); test_ack("ok");
     } else if (!strcmp(verb, "siremember")) {
         g_si_remember = atoi(arg); test_ack("ok");
     } else {

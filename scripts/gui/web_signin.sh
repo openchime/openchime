@@ -186,6 +186,15 @@ rm -f "$LIN_DIR/signin_url.txt"
 real_dialog "$IX" "$IY" "$TOKEN" web-1-invite
 URL="$(await_url)" || fail "the client published no sign-up URL"
 case "$URL" in http://127.0.0.1:*/p/*/signin\?*invite=$TOKEN*) ;; *) fail "not a tunnel URL with the invitation: $URL" ;; esac
+# While it waits the card offers the link to copy (a browser that did not open):
+# the button is on the card, and pressing it puts the URL on the clipboard.
+S="$(state w1-wait)"
+grep -q '^signin .*browser=1 .*copy=[1-9]' <<<"$S" || fail "no Copy sign-in link while waiting: $(grep '^signin' <<<"$S")"
+drive sicopy
+CLIP="$(powershell.exe -NoProfile -Command 'Get-Clipboard -Raw' 2>/dev/null | tr -d '\r\n')"
+[ "$CLIP" = "$URL" ] || fail "the copied link is not the sign-in URL: ${CLIP:0:80}"
+grep -q '^signin .*copied=1' <<<"$(state w1-copied)" || fail "the card does not say the link was copied"
+echo "ok: the sign-in link copies from the card"
 R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
 OUTP="$(browser "$URL" signup "invite=$TOKEN&username=owen&password=pw-owen&confirm=pw-owen&redirect_uri=$(enc "$R")&nonce=$N")"
 grep -q 'You are signed in' <<<"$OUTP" || fail "sign-up did not reach the callback: $OUTP"
@@ -210,6 +219,12 @@ echo "ok: password changed on its page, the client back at sign-in"
 
 # 3. Forget the workspace -- its session and the trust -- and sign in again.
 drive wsforget "$WS"
+# Forgetting the active workspace signs it out first and deletes its entry
+# when that lands (the dump's forgetting=1 until then); killing the client
+# before then would leave the entry, session and trust.
+for _ in $(seq 1 50); do grep -q '^workspaces=.* forgetting=0' <<<"$(state wf)" && break; sleep 0.2; done
+S="$(state wf)"
+grep -q '^workspaces=.* forgetting=0' <<<"$S" && grep -q '^authed=0' <<<"$S" || fail "the workspace was not forgotten: $(grep -E '^workspaces|^authed' <<<"$S")"
 "$HERE/scripts/gui/drive.sh" kill >/dev/null 2>&1 || true
 rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
 WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
@@ -237,7 +252,7 @@ echo "ok: old password refused on the page, new one signed in"
 
 # 4. A reset, made as RESET_CREDENTIAL makes one (its hash kept, a day to run),
 #    entered on the sign-in card as the code the administrator sent.
-RESET="$(python3 - "$D/db" <<'PY'
+RESET="$(python3 - "$D/data/openchime.db" <<'PY'
 import hashlib, os, sqlite3, sys, time
 raw = os.urandom(32)
 db = sqlite3.connect(sys.argv[1], timeout=5)
@@ -251,6 +266,12 @@ PY
 )"
 [ ${#RESET} = 64 ] || fail "no reset made"
 drive wsforget "$WS"
+# Forgetting the active workspace signs it out first and deletes its entry
+# when that lands (the dump's forgetting=1 until then); killing the client
+# before then would leave the entry, session and trust.
+for _ in $(seq 1 50); do grep -q '^workspaces=.* forgetting=0' <<<"$(state wf)" && break; sleep 0.2; done
+S="$(state wf)"
+grep -q '^workspaces=.* forgetting=0' <<<"$S" && grep -q '^authed=0' <<<"$S" || fail "the workspace was not forgotten: $(grep -E '^workspaces|^authed' <<<"$S")"
 "$HERE/scripts/gui/drive.sh" kill >/dev/null 2>&1 || true
 rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
 WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
