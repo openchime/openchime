@@ -292,7 +292,7 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
              * (REQ-215/217) and kept the row so the conversation still reads.
              * Say so in place, dimmed and without an id: offering a download
              * that is guaranteed to fail would look like a broken client. */
-            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s \xe2\x80\x94 no longer available",
+            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (no longer available)",
                      a->filename[0] ? a->filename : "file");
             acol = TB_BLACK | TB_BOLD;
         } else if (a->media_kind == OC_MEDIA_VIDEO_MESSAGE) {

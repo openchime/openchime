@@ -2558,7 +2558,7 @@ static void toast_tick(const oc_model *m) {
                                            : "Signing in\u2026";
         uint64_t left = oc_model_reconnect_in(m, oc_model_now_ms());
         if (left > 0) {
-            snprintf(live, sizeof live, "Connection lost \u2014 reconnecting in %llus\u2026",
+            snprintf(live, sizeof live, "Connection lost: reconnecting in %llus\u2026",
                      (unsigned long long)((left + 999) / 1000));
             why = live;
         } else if (m->reconnect_at_ms) {
@@ -5041,7 +5041,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                  * a pencil. */
                 /* Against the fill this row actually has. A marker whose only
                  * job is to be noticed was 2.03:1 on a selected row under the
-                 * default scheme and 1.58:1 under Teal \u2014 worst pair in the app,
+                 * default scheme and 1.58:1 under Teal, the worst pair in the app,
                  * and on the row you are most likely to be looking at. */
                 draw_text(rt, "\u270E", g_meta,
                           rf(sx1 - UIS(34), ry, sx1 - UIS(10), ry + ROW_H),
@@ -6421,7 +6421,7 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
                   m->n_search, m->n_search == 1 ? "result" : "results", m->search_query,
                   /* gave the wire a cursor, so this stops apologising and the
                    * footer offers the next page instead. */
-                  m->search_truncated ? " \u2014 more below" : "");
+                  m->search_truncated ? ", more below" : "");
     draw_text(rt, count, g_meta, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
               m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
     body.top += 22;
@@ -6567,7 +6567,7 @@ static void draw_storage(gfx *rt, const oc_model *m, rectf reg, int embedded) {
     snprintf(both, sizeof both, "%llu file(s), %s", (unsigned long long)s->attach_count, v);
     draw_kv(rt, body, &y, "Attachments", both, OC_COL_TEXT);
     if (s->under_pressure)
-        draw_kv(rt, body, &y, "State", "under pressure \u2014 uploads may be refused", OC_COL_DANGER);
+        draw_kv(rt, body, &y, "State", "under pressure: uploads may be refused", OC_COL_DANGER);
 
     y += 10;
     draw_text(rt, "POLICY", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
@@ -6664,7 +6664,7 @@ static void draw_weblist(gfx *rt, const oc_model *m, rectf reg) {
     /* Rotate is the answer to a leaked token, because REVEAL IS IMPOSSIBLE: only the
      * SHA-256 is stored, so the token cannot be shown again. Saying that
      * here is the difference between a missing feature and an explained one. */
-    draw_text(rt, "A token is shown once. If one leaks, rotate it \u2014 it cannot be shown again.",
+    draw_text(rt, "A token is shown once. If one leaks, rotate it. It cannot be shown again.",
               g_meta, rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
     body.top += 28;
     ovl_use(OVL_WEB);
@@ -6973,7 +6973,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
         /* Same stacking rule as the level rows, for the same reason: the Edit
          * button reserved a flat strip on the right whatever the card's width,
          * so at 240 DPI the sentence explaining what keywords DO was cut to
-         * "None \u2014 messages con\u2026". Below the text, the sentence gets the card. */
+         * "None: messages con\u2026". Below the text, the sentence gets the card. */
         int estack = notify_edit_stacked(body);
         float er   = estack ? body.right - 20 : body.right - UIS(140);
         float dw   = er - (body.left + 20);
@@ -6987,7 +6987,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
          * a narrow card threw away. They wrap now, and the block's height is
          * measured from the wrap rather than fixed at one line. */
         const char *kwtext = kw[0] ? kw
-            : "None \u2014 messages containing a keyword notify you like a mention.";
+            : "None: messages containing a keyword notify you like a mention.";
         float kwh = text_height(kwtext, g_meta_w, dw);
         if (kwh < 20) kwh = 20;
         float kwblk = estack ? 18 + kwh + 34 : 18 + kwh + 6;
@@ -7013,7 +7013,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
             strncat(vips, nm, sizeof vips - strlen(vips) - 1);
         }
         const char *viptext = vips[0] ? vips
-            : "None \u2014 they reach you through a level and a pause, never a mute.";
+            : "None: they reach you through a level and a pause, never a mute.";
         float viph = text_height(viptext, g_meta_w, dw);
         if (viph < 20) viph = 20;
         float vipblk = estack ? 18 + viph + 34 : 18 + viph + 6;
@@ -8572,7 +8572,7 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
               rf(body.left + 24, y, swatch_left - 12, y + 22), OC_COL_TEXT);
     {
         char hint[96];
-        snprintf(hint, sizeof hint, "%s \u2014 the sidebar and the accent.",
+        snprintf(hint, sizeof hint, "%s: the sidebar and the accent.",
                  oc_theme_scheme_name(oc_theme_scheme()));
         draw_text(rt, hint, g_meta,
                   rf(body.left + 24, y + 20, swatch_left - 12, y + 40), OC_COL_FAINT);
@@ -15285,7 +15285,7 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
         y += 56;
     }
     if (!any)
-        draw_text(rt, "No conversations yet \u2014 use the compose button.", g_meta_w,
+        draw_text(rt, "No conversations yet. Use the compose button.", g_meta_w,
                   rf(x0 + 16, HEADER_H + 12, x1 - 16, HEADER_H + 60), OC_COL_FAINT);
 }
 
@@ -15371,7 +15371,7 @@ static void draw_dm_compose(gfx *rt, const oc_model *m, rectf reg) {
                  u->user_id == m->user_id ? " (you)" : "");
         draw_text(rt, nm, g_ui, rf(row.left + 56, y + 3, row.right - 20, y + 25), OC_COL_TEXT);
         draw_text(rt, u->user_id == m->user_id
-                      ? "Message yourself \u2014 notes, links, reminders"
+                      ? "Message yourself: notes, links, reminders"
                       : (dm_with(m, u->user_id) ? "Open the conversation" : "Start a conversation"),
                   g_meta, rf(row.left + 56, y + 23, row.right - 20, y + 41), OC_COL_FAINT);
 
@@ -15658,7 +15658,7 @@ static void draw_sessions(gfx *rt, const oc_model *m, rectf body) {
         char head[128];
         snprintf(head, sizeof head, "%s%s",
                  sr->device[0] ? sr->device : "Unnamed device",
-                 sr->current ? "   \u2014 this device" : "");
+                 sr->current ? "   (this device)" : "");
         draw_text(rt, head, sr->current ? g_ui_b : g_ui,
                   rf(body.left + 8, y + 4, body.right - 8, y + 26),
                   sr->current ? OC_COL_TEXT : OC_COL_MUTED);
@@ -17033,7 +17033,7 @@ static void newmsg_deliver(uint64_t cid, const char *body, uint64_t at) {
         char when[96], msg[176];
         oc_client_schedule(g_client, cid, 0, at, body);
         sch_describe(at, when, sizeof when);
-        snprintf(msg, sizeof msg, "Scheduled for %s \u2014 see Drafts, scheduled & sent.", when);
+        snprintf(msg, sizeof msg, "Scheduled for %s. See Drafts, scheduled & sent.", when);
         fb_confirm(msg);
     } else {
         oc_client_send(g_client, cid, body);
@@ -17066,7 +17066,7 @@ static void newmsg_send_at(oc_win *hwnd, uint64_t at) {
         const oc_model *cm = model();
         const oc_channel *cc = cm ? oc_model_channel((oc_model *)cm, g_tgt_chip[0].id) : NULL;
         if (cc && cc->archived) {
-            composer_hint("That channel is archived \u2014 it is read-only.", 1);
+            composer_hint("That channel is archived, so it is read-only.", 1);
             return;
         }
     }
@@ -17676,7 +17676,7 @@ static void draw_call_picker(gfx *rt, const oc_model *m, rectf body) {
     int ticked = 0;
     for (int i = 0; i < g_cpick_n; i++) ticked += g_cpick_on[i];
     char head[160];
-    snprintf(head, sizeof head, "%s \u2014 %d of %d ticked", g_cpick_invite ? "Invite to the call" : "Who to call",
+    snprintf(head, sizeof head, "%s: %d of %d ticked", g_cpick_invite ? "Invite to the call" : "Who to call",
              ticked, room > 0 ? room : 0);
     draw_text(rt, head, g_ui_b, rf(body.left + 24, body.top + 10, body.right - 24, body.top + 34), OC_COL_TEXT);
     float y = body.top + 44, rh = UIS(34);
@@ -21054,7 +21054,7 @@ static void sched_at(oc_win *hwnd, uint64_t at) {
     draft_flush(g_sel);
     char when[96], msg[160];
     sch_describe(at, when, sizeof when);
-    snprintf(msg, sizeof msg, "%s for %s \u2014 see Drafts, scheduled & sent.",
+    snprintf(msg, sizeof msg, "%s for %s. See Drafts, scheduled & sent.",
              reply ? "Reply scheduled" : "Scheduled", when);
     fb_confirm(msg);
     ed_changed(hwnd);
@@ -21084,7 +21084,7 @@ static void composer_send(void) {
         const oc_model *m = model();
         const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         if (c && c->archived) {
-            composer_hint("This channel is archived \u2014 it is read-only.", 1);
+            composer_hint("This channel is archived, so it is read-only.", 1);
             return;
         }
     }
@@ -21165,9 +21165,9 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
      * selected behind it — an answer to a question nobody asked (REQ-229). */
     if (g_view == VIEW_NEWMSG) { snprintf(out, cap, "Start a new message"); return; }
     const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-    if (g_edit_msg)            snprintf(out, cap, "Edit this message \u2014 Esc to cancel");
+    if (g_edit_msg)            snprintf(out, cap, "Edit this message. Esc to cancel");
     /* Say why, not just that it is disabled (REQ-035). */
-    else if (c && c->archived) snprintf(out, cap, "#%s is archived \u2014 read-only",
+    else if (c && c->archived) snprintf(out, cap, "#%s is archived, read-only",
                                         c->name ? c->name : "this channel");
     else if (m && m->thread_open) snprintf(out, cap, "Reply");
     else if (!c)               snprintf(out, cap, "Message");
@@ -21773,7 +21773,7 @@ static const char *dict_refusal_text(uint16_t code) {
     case OC_ERR_NOT_A_MEMBER:      return "You are not a member of this channel.";
     case OC_ERR_UNKNOWN_CHANNEL:   return "This conversation no longer exists.";
     case OC_ERR_CHANNEL_ARCHIVED:  return "This channel is archived: it is read-only.";
-    case OC_ERR_SEND_RATE_LIMITED: return "Sending too fast \u2014 that piece was not posted";
+    case OC_ERR_SEND_RATE_LIMITED: return "Sending too fast. That piece was not posted";
     default:                       return "What you said could not be recognized.";
     }
 }
@@ -21925,7 +21925,7 @@ static void profile_voice_picked(int field, int val) {
 static void profile_voice_play(int field) {
     if (field != 6 || !g_client) return;
     int val = atoi(g_form_f[field].value);
-    if (val <= 0) { fb_confirm("Pick a voice first \u2014 \u201cAutomatic\u201d is chosen by the server."); return; }
+    if (val <= 0) { fb_confirm("Pick a voice first. \u201cAutomatic\u201d is chosen by the server."); return; }
     const char *id = voice_id_at(model(), val);
     if (!id[0]) return;
     preview_drop();
@@ -23174,7 +23174,7 @@ static void show_msg_menu(oc_win *hwnd, const oc_model *m, uint64_t mid, float c
         snprintf(lbl, sizeof lbl, "Download %s", msg->attach[i].filename);
         /* A reclaimed blob cannot be downloaded (REQ-215), and a dead entry is worse
          * than none — the native menu greyed it; we omit it and say why. */
-        if (msg->attach[i].reclaimed) snprintf(lbl, sizeof lbl, "%s \u2014 no longer stored",
+        if (msg->attach[i].reclaimed) snprintf(lbl, sizeof lbl, "%s (no longer stored)",
                                                msg->attach[i].filename);
         mi_item(msg->attach[i].reclaimed ? 0 : 30 + i, lbl);
     }
@@ -23609,7 +23609,7 @@ static int permalink_follow(oc_win *hwnd, const char *text) {
      * accepted too: a link written before the port was included is still ours. */
     if (host[0] && self[0] && SDL_strcasecmp(host, self) != 0 && SDL_strcasecmp(host, g_host) != 0) {
         char msg[256];
-        snprintf(msg, sizeof msg, "That link is for %s \u2014 switch workspace first.", host);
+        snprintf(msg, sizeof msg, "That link is for %s. Switch workspace first.", host);
         fb_failed(msg);
         return 1;
     }
@@ -23803,7 +23803,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             /* An attachment needs a conversation to hang on, and this pane does
              * not have one until the send resolves it. Say so, rather than
              * opening a file dialog whose result has nowhere to go. */
-            composer_hint("Choose who this is for first \u2014 then you can attach a file.", 0);
+            composer_hint("Choose who this is for first. Then you can attach a file.", 0);
             return 1;
         }
         if (in_rect(g_nm_ed, x, y)) { g_nm_to_focus = 0; ed_focus(hwnd); ed_mouse_down(hwnd, (float)x, (float)y); return 1; }
@@ -24116,7 +24116,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             if (in_rect(g_invrows[i].r, x, y)) {
                 confirm_open(hwnd, CONF_INVITE_REVOKE, g_invrows[i].id, "Revoke invite?",
                              "Anyone holding this invite's token will no longer be able to "
-                             "use it. It cannot be un-revoked \u2014 mint a new one instead.",
+                             "use it. It cannot be un-revoked. Mint a new one instead.",
                              "Revoke");
                 return 1;
             }
@@ -24338,7 +24338,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
             int hex = n == 64;
             for (size_t i = 0; hex && i < n; i++) hex = isxdigit((unsigned char)code[i]) != 0;
             if (!hex) {
-                snprintf(g_si_err, sizeof g_si_err, "that isn't a reset code \u2014 it is 64 letters and digits");
+                snprintf(g_si_err, sizeof g_si_err, "that isn't a reset code: it is 64 letters and digits");
                 invalidate();
                 return 1;
             }
@@ -24732,8 +24732,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 /* The dangerous direction gets the danger wording. "You can change it
                  * back" is true and irrelevant: the history has been read by then. */
                 snprintf(t, sizeof t,
-                         "Make #%s public?\n\nEveryone in this workspace will be able to read it "
-                         "\u2014 INCLUDING EVERYTHING ALREADY SAID IN IT, from before it was "
+                         "Make #%s public?\n\nEveryone in this workspace will be able to read it, "
+                         "INCLUDING EVERYTHING ALREADY SAID IN IT, from before it was "
                          "public. Making it private again does not undo that.",
                          ac->name ? ac->name : "");
                 confirm_open(hwnd, CONF_CHANNEL_PUBLIC, g_sel, "Make public?", t, "Make public");
@@ -26643,7 +26643,7 @@ static void show_secret(oc_win *owner, const char *title, const char *what,
     oc_field f[1] = { { FF_TEXT, "", "", "" } };
     snprintf(f[0].value, sizeof f[0].value, "%s", token ? token : "");
     copy_to_clipboard(owner, token ? token : "");
-    snprintf(label, sizeof label, "%s \u2014 copied to your clipboard", what);
+    snprintf(label, sizeof label, "%s, copied to your clipboard", what);
     f[0].label = label;
     f[0].hint  = note;
     form_dialog(owner, title, f, 1);
@@ -26695,7 +26695,7 @@ static void show_reset(oc_win *owner, const oc_model *m) {
         snprintf(q, sizeof q, "t=%s", m->reset_token);
         if (oc_client_open_page(g_client, "account/reset", q, link, sizeof link) != 0) link[0] = '\0';
     }
-    oc_field f[1] = { { FF_MULTILINE, "Password reset \u2014 copied to your clipboard", "", "" } };
+    oc_field f[1] = { { FF_MULTILINE, "Password reset, copied to your clipboard", "", "" } };
     if (!oc_model_reset_text(m, g_cur_ws, link[0] ? link : NULL, f[0].value, sizeof f[0].value)) return;
     char crlf[2 * sizeof f[0].value]; size_t o = 0;
     for (const char *q = f[0].value; *q && o + 2 < sizeof crlf; q++) {
@@ -26704,7 +26704,7 @@ static void show_reset(oc_win *owner, const oc_model *m) {
     }
     crlf[o] = '\0';
     copy_to_clipboard(owner, crlf);
-    f[0].hint = "Send it to them. It works once, for a day, and is not shown again \u2014 reset them "
+    f[0].hint = "Send it to them. It works once, for a day, and is not shown again. Reset them "
                 "again if it is lost.";
     form_dialog(owner, "Password reset", f, 1);
 }
@@ -27219,7 +27219,7 @@ static void open_switcher(oc_win *hwnd) {
         else
             /* Remembered but not signed in — the state a sign-out now leaves
              * behind, and a click away from being live again. */
-            snprintf(lbl, sizeof lbl, "%s  \u2014 signed out", g_sw[i].label);
+            snprintf(lbl, sizeof lbl, "%s  (signed out)", g_sw[i].label);
         mi_item(100 + i, lbl);
     }
     if (g_n_sw == 0) mi_item(-1, "(no remembered workspaces)");
@@ -31094,7 +31094,7 @@ static int on_tick(oc_win *hwnd) {
                 open_new_message(hwnd);
                 ed_set(back);
                 ed_changed(hwnd);
-                fb_failed("That conversation could not be opened \u2014 your message is back here.");
+                fb_failed("That conversation could not be opened. Your message is back here.");
                 invalidate();
             }
             if (g_nm_pending) {
@@ -31285,7 +31285,7 @@ static int on_tick(oc_win *hwnd) {
                             snprintf(wsn, sizeof wsn, "%s", oc_model_workspace_name(wm));
                             if (source[0]) {
                                 char both[128];
-                                snprintf(both, sizeof both, "%s \u2014 %s", wsn, source);
+                                snprintf(both, sizeof both, "%s: %s", wsn, source);
                                 snprintf(source, sizeof source, "%s", both);
                             } else snprintf(source, sizeof source, "%s", wsn);
                         }
