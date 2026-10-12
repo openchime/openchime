@@ -58,7 +58,10 @@ fi
 
 scripts/build/onnxruntime.sh converter
 PRE="third_party/onnxruntime-1.30.0-prebuilt"
-${CC:-cc} -O2 -I"${PRE}/include" scripts/build/tts_convert.c -L"${PRE}/lib" -lonnxruntime \
+# The host's compiler, whatever CC a cross build exports: the converter runs
+# here, against the host's prebuilt ONNX Runtime, and the model it writes is
+# the same for every architecture.
+cc -O2 -I"${PRE}/include" scripts/build/tts_convert.c -L"${PRE}/lib" -lonnxruntime \
   -Wl,-rpath,"${ROOT}/${PRE}/lib" -o build/tts_convert
 build/tts_convert "${OUT}/kitten_tts_mini_v0_8.onnx" "${OUT}/kitten.ort.part" "${TARGET}"
 mv "${OUT}/kitten.ort.part" "${OUT}/kitten.ort"
