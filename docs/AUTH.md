@@ -873,6 +873,9 @@ same loopback and challenge checks as §8.1, is answered with a **path**:
 - **Through the client's loopback tunnel** otherwise — a self-signed daemon
   trusted by fingerprint, or one on loopback: `http://127.0.0.1:<port>/p/<secret>/signin…`.
   A loopback origin is one the browser treats as secure, so there is no warning.
+  Either way the client offers the link to copy while it waits, so a browser
+  that did not open, or is not the one wanted, is a paste away; the terminal
+  client shows its URL and a device code instead (§8.11).
   The tunnel carries only `/signin`, `/signin/verify`, `/signup`,
   `/account/password` and `/account/security`; only a
   request whose `Host` is the listener's own (DNS rebinding); and only to the

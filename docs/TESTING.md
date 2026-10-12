@@ -456,7 +456,8 @@ Remember me. Mutation proofs cover the verifier, `Origin`, direct-versus-tunnel 
 the tunnel's certificate and `Host` checks, the page's limiter and the subject.
 `scripts/gui/web_signin.sh` drives it on Windows: the Win32 client, with no
 credentials, against a self-signed daemon at the WSL address —
-certificate trusted, sign-up through the tunnel with the setup token, password
+certificate trusted, the sign-in link offered to copy while the browser is
+awaited and copied by the card's button, sign-up through the tunnel with the setup token, password
 changed on its page, and, the workspace forgotten, the old password refused and
 the new one signing in; then, forgotten again, the card checked to say nothing
 under a heading that already names the workspace, a reset's code entered on the

@@ -128,9 +128,13 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   through this client's own connection; and Change password opens the password
   page. The workspace book takes the
   account's name from the roster once it lists the signed-in user. While the browser is open the card says so, with
-  Cancel and Esc; under the automation hook the URL is written to
-  `signin_url.txt` in the test directory instead of being opened, so a harness
-  can play the browser.
+  **Copy sign-in link** (Ctrl+C) beside Cancel (Esc): the link the browser was
+  given, for one of the person's own choosing, and the way in where no browser
+  opened at all (none installed, a locked-down or remote desktop), which the
+  card says plainly when the platform's opener fails. Under the automation hook
+  the URL is written to `signin_url.txt` in the test directory instead of
+  being opened, so a harness can play the browser; its `sicopy` verb is the
+  link's button.
 - **`net.c` — the network thread.** A blocking-socket TLS connection (the client
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
