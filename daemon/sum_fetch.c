@@ -80,15 +80,27 @@ int oc_sum_model_ensure(const char *dir, const char *file, const char *url, cons
 }
 
 #if defined(__x86_64__)
-/* __builtin_cpu_supports takes only a literal: one per feature asked. The
- * model is built for x86-64-v3 there; on arm64 the baseline carries what it
- * needs, so there is nothing to ask. */
+#include <cpuid.h>
+/* By cpuid, not __builtin_cpu_supports: that builtin leans on libgcc's
+ * __cpu_model, which the release link (zig's clang over compiler-rt, glibc
+ * 2.34 stubs) does not carry, and the daemon failed to link. The model is
+ * built for x86-64-v3 there; on arm64 the baseline carries what it needs, so
+ * there is nothing to ask. The AVX family needs the OS to keep the upper
+ * halves of the registers too: OSXSAVE, and XCR0's two AVX-state bits. */
 static int cpu_supports(const char *f) {
-    __builtin_cpu_init();
-    if (!strcmp(f, "avx2")) return __builtin_cpu_supports("avx2");
-    if (!strcmp(f, "fma"))  return __builtin_cpu_supports("fma");
-    if (!strcmp(f, "f16c")) return __builtin_cpu_supports("f16c");
-    if (!strcmp(f, "bmi2")) return __builtin_cpu_supports("bmi2");
+    unsigned a, b, c, d, max = 0, c1 = 0, b7 = 0;
+    if (!__get_cpuid(0, &max, &b, &c, &d) || !__get_cpuid(1, &a, &b, &c1, &d)) return 0;
+    if (max >= 7) __get_cpuid_count(7, 0, &a, &b7, &c, &d);
+    int ymm = 0;
+    if ((c1 >> 27) & 1) {                       /* OSXSAVE: xgetbv may be asked */
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        ymm = (lo & 6) == 6;                    /* XMM and YMM state kept */
+    }
+    if (!strcmp(f, "avx2")) return ymm && ((b7 >> 5) & 1);
+    if (!strcmp(f, "fma"))  return ymm && ((c1 >> 12) & 1);
+    if (!strcmp(f, "f16c")) return ymm && ((c1 >> 29) & 1);
+    if (!strcmp(f, "bmi2")) return (b7 >> 8) & 1;
     return 0;
 }
 #endif

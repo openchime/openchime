@@ -332,6 +332,12 @@ static void test_cpu(void) {
     CHECK(oc_sum_cpu_ok(has_all, err, sizeof err) == 1);
 #if defined(__x86_64__)
     CHECK(oc_sum_cpu_ok(no_avx2, err, sizeof err) == 0 && strstr(err, "avx2"));
+    /* The daemon's own detection (cpuid, since the release link has no
+     * __cpu_model) agrees with the compiler's about this machine. */
+    __builtin_cpu_init();
+    int builtin = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+                  __builtin_cpu_supports("f16c") && __builtin_cpu_supports("bmi2");
+    CHECK(oc_sum_cpu_ok(NULL, err, sizeof err) == builtin);
 #endif
 }
 
