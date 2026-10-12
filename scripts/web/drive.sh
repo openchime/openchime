@@ -136,7 +136,7 @@ while [ ! -f "$DIR/ack" ] && [ "$t" -lt 800 ]; do sleep 0.02; t=$((t + 1)); done
 ack="$(cat "$DIR/ack" 2>/dev/null || echo TIMEOUT)"
 echo "ack: $ack"
 if [ "$ack" = TIMEOUT ]; then
-  echo "web_drive: no ack for '$1' after 16s — the client did not answer" >&2
+  echo "web_drive: no ack for '$1' after 16s: the client did not answer" >&2
   exit 1
 fi
 if { [ "$1" = "shot" ] || [ "$1" = "shotfull" ]; } && [ $# -eq 2 ]; then

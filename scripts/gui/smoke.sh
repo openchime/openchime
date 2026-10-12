@@ -48,7 +48,7 @@ export OC_TEST_WS="${OC_TEST_WS:-Smoke Fixture}"
 if [ "${OC_TEST_KEEP_DB:-0}" != "1" ]; then
   if ! kill_dev_daemon; then
     say "a daemon is still listening on :$OC_TEST_PORT and would keep running on a"
-    say "deleted directory — refusing to wipe underneath it. Stop it and re-run."
+    say "deleted directory: refusing to wipe underneath it. Stop it and re-run."
     exit 1
   fi
   rm -rf "$OC_TEST_DIR"
@@ -66,7 +66,7 @@ WAIT_MS="${OC_TEST_WAIT_MS:-6000}"
 # and this suite says so at the point it happens.
 drive() {
   if ! "$DRIVE" "$@" >/dev/null 2>&1; then
-    fail "the client did not answer '$*' — it is wedged or gone"
+    fail "the client did not answer '$*': it is wedged or gone"
     checks=$((checks + 1))
     return 1
   fi
@@ -105,7 +105,7 @@ expect() {                         # expect <dump> <key> <want> <label>
   checks=$((checks + 1))
   got=$(key_of "$dump" "$key")
   if [ "$got" = "$want" ]; then ok "$label ($key=$got)"
-  else fail "$label — expected $key=$want, got ${got:-<missing>}"; fi
+  else fail "$label: expected $key=$want, got ${got:-<missing>}"; fi
 }
 
 expect_eventually() {              # expect_eventually <key> <want> <label>
@@ -113,22 +113,22 @@ expect_eventually() {              # expect_eventually <key> <want> <label>
   checks=$((checks + 1))
   if wait_for "$key" "$want"; then ok "$label ($key=$want)"; return 0; fi
   got=$(key_of "$(snap)" "$key")
-  fail "$label — expected $key=$want, got ${got:-<missing>} after ${WAIT_MS}ms"
+  fail "$label: expected $key=$want, got ${got:-<missing>} after ${WAIT_MS}ms"
   return 1
 }
 
 expect_grep() {                    # expect_grep <regex> <label>
   checks=$((checks + 1))
   if wait_grep "$1"; then ok "$2"; return 0; fi
-  fail "$2 — no dump matched /$1/ within ${WAIT_MS}ms"
+  fail "$2: no dump matched /$1/ within ${WAIT_MS}ms"
   return 1
 }
 
 # --- 1. it starts, and it reaches a daemon ---------------------------------
 say "== it starts"
-"$DRIVE" launch >/dev/null 2>&1 || { say "launch failed — see scripts/gui/drive.sh launch"; exit 1; }
+"$DRIVE" launch >/dev/null 2>&1 || { say "launch failed: see scripts/gui/drive.sh launch"; exit 1; }
 if ! wait_grep 'authed=1 connected=1' 20000; then
-  say "   NOT AUTHED — the client started and never reached :$OC_TEST_PORT"
+  say "   NOT AUTHED: the client started and never reached :$OC_TEST_PORT"
   exit 1
 fi
 ok "the client launches, connects and authenticates"
@@ -140,7 +140,7 @@ fixture=$(snap | grep -o 'workspace name="[^"]*"' | cut -d'"' -f2)
 checks=$((checks + 1))
 case "$fixture" in
   "$OC_TEST_WS") ok "and it is the smoke fixture on :$OC_TEST_PORT, not somebody's workspace" ;;
-  *) fail "WRONG DAEMON — reached \"${fixture:-<none>}\", expected \"$OC_TEST_WS\""
+  *) fail "WRONG DAEMON: reached \"${fixture:-<none>}\", expected \"$OC_TEST_WS\""
      say "   Refusing to go on: every assertion below would be about the wrong data."
      exit 1 ;;
 esac
@@ -224,11 +224,11 @@ fi
 say "== it survives"
 checks=$((checks + 1))
 if "$DRIVE" dump smoke >/dev/null 2>&1; then ok "the client is still answering at the end of the run"
-else fail "the client stopped answering — it died during the run"; fi
+else fail "the client stopped answering: it died during the run"; fi
 
 [ "${1:-}" = "--kill" ] && "$DRIVE" kill >/dev/null 2>&1
 
 say ""
-say "(a boot check, not a feature suite — see the header)"
-if [ "$fails" -eq 0 ]; then say "gui_smoke: OK — $checks checks in $((SECONDS - START))s"; exit 0; fi
-say "gui_smoke: FAILED — $fails of $checks checks in $((SECONDS - START))s"; exit 1
+say "(a boot check, not a feature suite: see the header)"
+if [ "$fails" -eq 0 ]; then say "gui_smoke: OK: $checks checks in $((SECONDS - START))s"; exit 0; fi
+say "gui_smoke: FAILED: $fails of $checks checks in $((SECONDS - START))s"; exit 1

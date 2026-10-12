@@ -48,4 +48,4 @@ for entry in "${FILES[@]}"; do
   fi
 done
 touch "${OUT}/.done"
-echo "build_moonshine: done — build/moonshine ($(du -sh "${OUT}" | cut -f1))"
+echo "build_moonshine: done: build/moonshine ($(du -sh "${OUT}" | cut -f1))"

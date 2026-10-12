@@ -1320,28 +1320,28 @@ int oc_device_token_ok(const uint8_t *tok, size_t len) {
 
 const char *oc_error_text(uint16_t code) {
     switch (code) {
-    case OC_ERR_VERSION_TOO_OLD: return "this app is too old for the workspace — update it";
+    case OC_ERR_VERSION_TOO_OLD: return "this app is too old for the workspace: update it";
     case OC_ERR_VERSION_TOO_NEW: return "the workspace is older than this app";
     case OC_ERR_MALFORMED_FRAME: return "the workspace could not read a request";
     case OC_ERR_FRAME_TOO_LARGE: return "that was too large to send";
     case OC_ERR_UNEXPECTED_MSG_TYPE: return "the workspace did not expect that request";
-    case OC_ERR_VERSION_MISMATCH: return "the connection's version changed — reconnecting";
+    case OC_ERR_VERSION_MISMATCH: return "the connection's version changed: reconnecting";
     case OC_ERR_AUTH_REQUIRED: return "sign in first";
     case OC_ERR_AUTH_INVALID_TOKEN: return "the sign-in was not accepted";
-    case OC_ERR_AUTH_RATE_LIMITED: return "too many attempts — try again in a minute";
+    case OC_ERR_AUTH_RATE_LIMITED: return "too many attempts: try again in a minute";
     case OC_ERR_USER_LIMIT: return "this workspace is full";
     case OC_ERR_AUTH_NOT_ALLOWED: return "this account isn't allowed in this workspace";
     case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";
     case OC_ERR_AUTH_PENDING: return "waiting for the code to be approved";
     case OC_ERR_AUTH_SLOW_DOWN: return "waiting for the code to be approved";
-    case OC_ERR_AUTH_EXPIRED: return "the code expired — start again";
+    case OC_ERR_AUTH_EXPIRED: return "the code expired: start again";
     case OC_ERR_AUTH_DENIED: return "the sign-in was declined";
-    case OC_ERR_AUTH_SETUP_REQUIRED: return "this workspace requires two-step sign-in — set it up, then sign in";
-    case OC_ERR_AUTH_USE_PROVIDER: return "this address signs in here with Google or Microsoft — use that";
+    case OC_ERR_AUTH_SETUP_REQUIRED: return "this workspace requires two-step sign-in: set it up, then sign in";
+    case OC_ERR_AUTH_USE_PROVIDER: return "this address signs in here with Google or Microsoft: use that";
     case OC_ERR_BODY_TOO_LARGE: return "that message is too long";
     case OC_ERR_NOT_A_MEMBER: return "you are not in that channel";
     case OC_ERR_UNKNOWN_CHANNEL: return "that channel no longer exists";
-    case OC_ERR_SEND_RATE_LIMITED: return "slow down — too many messages at once";
+    case OC_ERR_SEND_RATE_LIMITED: return "slow down: too many messages at once";
     case OC_ERR_FORBIDDEN: return "you are not allowed to do that";
     case OC_ERR_LAST_OWNER: return "a workspace needs at least one owner";
     case OC_ERR_UNKNOWN_MESSAGE: return "that message no longer exists";
@@ -1352,7 +1352,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_STORAGE_FULL: return "upload refused: the server is low on storage";
     case OC_ERR_ATTACHMENT_GONE: return "attachment is no longer available (reclaimed by the server's storage policy)";
     case OC_ERR_INVALID_DEVICE_TOKEN: return "this device could not be registered for notifications";
-    case OC_ERR_TRANSFER_PROTOCOL: return "the file transfer failed — try again";
+    case OC_ERR_TRANSFER_PROTOCOL: return "the file transfer failed: try again";
     case OC_ERR_UNKNOWN_WEBHOOK: return "that webhook no longer exists";
     case OC_ERR_CHANNEL_EXISTS: return "a channel of that name already exists";
     case OC_ERR_TOO_MANY_PINS: return "this channel has as many pins as it can hold";
@@ -1368,12 +1368,12 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_CALL_FULL: return "the call is full";
     case OC_ERR_NOT_CALL_STARTER: return "only the person who started the call can end it for everyone";
     case OC_ERR_NOT_IN_CALL: return "you are not in that call";
-    case OC_ERR_INVITE_UNREDEEMABLE: return "this workspace signs nobody in by email address — invite with a token instead";
+    case OC_ERR_INVITE_UNREDEEMABLE: return "this workspace signs nobody in by email address: invite with a token instead";
     case OC_ERR_GROUP_HANDLE_TAKEN: return "something already answers to that @name";
     case OC_ERR_UNKNOWN_GROUP: return "that group no longer exists";
-    case OC_ERR_MEMBER_VIA_GROUP: return "they are in the channel through a group — change the group instead";
+    case OC_ERR_MEMBER_VIA_GROUP: return "they are in the channel through a group: change the group instead";
     case OC_ERR_INVALID_GROUP: return "that group's name or handle is not valid, or there are too many";
-    case OC_ERR_INTERNAL: return "the workspace had a problem — try again";
+    case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
     }
 }

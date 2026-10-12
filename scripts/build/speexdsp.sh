@@ -69,4 +69,4 @@ if [ ! -f "${DEST}/lib/libspeexdsp.a" ]; then
   )
 fi
 
-echo "build_speexdsp: done — third_party/${DEST}/lib/libspeexdsp.a, headers in third_party/${DEST}/include"
+echo "build_speexdsp: done: third_party/${DEST}/lib/libspeexdsp.a, headers in third_party/${DEST}/include"

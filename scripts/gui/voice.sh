@@ -245,7 +245,7 @@ fresh_fixture                                  # the next run starts with voice 
 [ "${1:-}" = "--kill" ] && "$DRIVE" kill >/dev/null 2>&1
 echo
 if [ "$fails" -eq 0 ]; then
-  say "gui_voice: OK — $checks checks in $((SECONDS - START))s"
+  say "gui_voice: OK: $checks checks in $((SECONDS - START))s"
 else
   say "gui_voice: $fails of $checks checks FAILED"
   exit 1

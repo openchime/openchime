@@ -2459,12 +2459,12 @@ static int url_is_openable(const char *u) {
 static const char *auth_error_text(uint16_t code, int reconnecting) {
     switch (code) {
     case OC_ERR_AUTH_NOT_ALLOWED:        return "this account isn't allowed in this workspace";
-    case OC_ERR_AUTH_USE_PROVIDER:       return "this address signs in here with Google or Microsoft — use that";
-    case OC_ERR_AUTH_RATE_LIMITED:       return "too many attempts — try again in a minute";
+    case OC_ERR_AUTH_USE_PROVIDER:       return "this address signs in here with Google or Microsoft: use that";
+    case OC_ERR_AUTH_RATE_LIMITED:       return "too many attempts: try again in a minute";
     case OC_ERR_USER_LIMIT:              return "this workspace is full";
     case OC_ERR_AUTH_SOURCE_UNAVAILABLE: return "this way of signing in isn't available right now";
     case OC_ERR_AUTH_REQUIRED:           return "this workspace doesn't sign in that way";
-    default: return reconnecting ? "session expired — please log in again" : "auth failed";
+    default: return reconnecting ? "session expired: please log in again" : "auth failed";
     }
 }
 
@@ -2503,7 +2503,7 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
         if (hdr.msg_type != OC_MSG_AUTH_DEVICE) {
             oc_error er0; uint16_t code = 0;
             if (hdr.msg_type == OC_MSG_ERROR && oc_decode_error(&p, &er0) == OC_OK) code = er0.code;
-            push_err(n->to_ui, code == OC_ERR_AUTH_RATE_LIMITED ? "too many sign-in codes waiting — try again later"
+            push_err(n->to_ui, code == OC_ERR_AUTH_RATE_LIMITED ? "too many sign-in codes waiting: try again later"
                                                                : auth_error_text(code, 0));
             return RC_FATAL;
         }
@@ -2573,7 +2573,7 @@ static int device_flow(oc_net *n, oc_tls_conn *conn, int fd, oc_framebuf *fb, ui
         if (code == OC_ERR_AUTH_SLOW_DOWN) { n->device_interval += 5; continue; }
         device_forget(n);
         push_err(n->to_ui, code == OC_ERR_AUTH_DENIED  ? "the sign-in was refused on the sign-in page" :
-                           code == OC_ERR_AUTH_EXPIRED ? "the sign-in code expired — start again" :
+                           code == OC_ERR_AUTH_EXPIRED ? "the sign-in code expired: start again" :
                                                          auth_error_text(code, 0));
         return RC_FATAL;
     }
@@ -3956,7 +3956,7 @@ static void *net_thread(void *arg) {
         if (served) reach_notified = 0;
         else if (rc == RC_CERT_UNPUBLISHED && !reach_notified) {
             push_err(n->to_ui, "this workspace publishes the certificate its server should "
-                               "present, and the server presented a different one — the "
+                               "present, and the server presented a different one: the "
                                "connection was refused");
             reach_notified = 1;
         }
@@ -3974,9 +3974,9 @@ static void *net_thread(void *arg) {
                 oc_queue_push(n->to_ui, e);
             }
             push_err(n->to_ui, rc == RC_CERT_CHANGED
-                ? "the server's certificate has changed since you trusted it — if you did not "
+                ? "the server's certificate has changed since you trusted it: if you did not "
                   "expect that, someone may be in the way; check its fingerprint before trusting it"
-                : "the server's certificate is not from an authority this computer trusts — check "
+                : "the server's certificate is not from an authority this computer trusts: check "
                   "its fingerprint with the workspace's administrator before trusting it");
             reach_notified = 1;
         }
@@ -4012,7 +4012,7 @@ static void *net_thread(void *arg) {
             if (lr == OC_LOOPBACK_OK) oc_query_get(query, "error", why, sizeof why);
             signin_forget(n);
             const char *said = lr == OC_LOOPBACK_CANCELLED ? "sign-in cancelled"
-                             : lr == OC_LOOPBACK_TIMEOUT   ? "sign-in timed out — try again"
+                             : lr == OC_LOOPBACK_TIMEOUT   ? "sign-in timed out: try again"
                              : why[0] ? why : "the browser sign-in did not finish";
             signin_answer(n, OC_LOOPBACK_REFUSED, said);
             push_err(n->to_ui, said);
@@ -4057,7 +4057,7 @@ static void *net_thread(void *arg) {
              * UI adds its own affordance (the TUI a Ctrl+R hint, the GUI its
              * "Retry now" button). A TUI chord leaking into the GUI banner is
              * what this used to do. */
-            snprintf(msg, sizeof msg, "Connection lost — reconnecting in %ds…",
+            snprintf(msg, sizeof msg, "Connection lost: reconnecting in %ds…",
                      (backoff_ms + 999) / 1000);
             push_err(n->to_ui, msg);
         }

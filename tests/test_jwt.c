@@ -40,7 +40,7 @@ static oc_jwt_result verify_payload(oc_issuer *is, const char *pems, const char 
 }
 
 int run_jwt_tests(void) {
-    printf("test_jwt: ES256 verify to the contract — key set by kid, required claims, "
+    printf("test_jwt: ES256 verify to the contract: key set by kid, required claims, "
            "lifetime, unescape, over-long refused, nonce, base64url\n");
 
     /* The test issuer's keypair, and a second (attacker) issuer. */

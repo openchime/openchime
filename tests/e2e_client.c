@@ -207,6 +207,6 @@ static int run(const char *host, int port) {
 int main(int argc, char **argv) {
     if (argc != 3) { fprintf(stderr, "usage: %s <host> <port>\n", argv[0]); return 2; }
     if (run(argv[1], atoi(argv[2])) != 0) return 1;
-    printf("e2e: OK — two clients, AUTH + SEND + BROADCAST against the daemon\n");
+    printf("e2e: OK: two clients, AUTH + SEND + BROADCAST against the daemon\n");
     return 0;
 }

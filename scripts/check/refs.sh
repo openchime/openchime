@@ -77,7 +77,7 @@ for f in $files; do
 done
 
 if [ "$fail" -ne 0 ]; then
-    echo "check_refs: files cite no issue numbers — say the thing, or cite REQ-N / ARCH-N." >&2
+    echo "check_refs: files cite no issue numbers: say the thing, or cite REQ-N / ARCH-N." >&2
     exit 1
 fi
 

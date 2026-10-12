@@ -716,7 +716,7 @@ int main(int argc, char **argv) {
     if (oc_dbwriter_auth_methods(db) & OC_AUTH_LOCAL) {
         uint8_t stok[OC_INVITE_TOKEN_LEN];
         if (oc_dbwriter_setup_invite(db, stok)) {
-            fprintf(stderr, "openchimed: no owner yet — first-run setup token "
+            fprintf(stderr, "openchimed: no owner yet: first-run setup token "
                             "(the invitation that creates the owner, on the sign-up page): ");
             for (size_t i = 0; i < OC_INVITE_TOKEN_LEN; i++) fprintf(stderr, "%02x", stok[i]);
             fprintf(stderr, "\n");

@@ -54,7 +54,7 @@ awk -v known="$KNOWN_SHARED" '
         code = sprintf("0x%04X", val)
         if (code in seen) {
             if (code in allowed)
-                printf "check_opcodes: known shared opcode %s (%s, %s) — a tracked defect\n",
+                printf "check_opcodes: known shared opcode %s (%s, %s): a tracked defect\n",
                        code, seen[code], name
             else {
                 printf "check_opcodes: DUPLICATE opcode %s used by %s and %s\n",
@@ -67,7 +67,7 @@ awk -v known="$KNOWN_SHARED" '
 
     END {
         if (n == 0) {
-            print "check_opcodes: no OC_MSG_* definitions found — wrong file?" > "/dev/stderr"
+            print "check_opcodes: no OC_MSG_* definitions found: wrong file?" > "/dev/stderr"
             exit 2
         }
         if (bad) {

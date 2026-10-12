@@ -28,7 +28,7 @@ fi
 cd "$(dirname "$0")/../.."
 DEST="third_party/llvm-mingw-${LLVM_MINGW_VERSION}"
 if [ -x "${DEST}/bin/x86_64-w64-mingw32-gcc" ]; then
-  echo "llvm_mingw.sh: up to date — ${DEST}"
+  echo "llvm_mingw.sh: up to date: ${DEST}"
   exit 0
 fi
 

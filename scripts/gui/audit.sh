@@ -136,14 +136,14 @@ for state in "${STATES[@]}"; do
     IFS=';' read -ra steps <<< "$verbs"
     for v in "${steps[@]}"; do
       if ! "$DRIVE" $v >/dev/null 2>&1; then
-        echo "  FAIL $tag/$id — the client did not answer '$v'"
+        echo "  FAIL $tag/$id: the client did not answer '$v'"
         ok=0; break
       fi
     done
     [ "$ok" = 1 ] || { fail=$((fail + 1)); continue; }
 
     if ! settle "$key" "$want"; then
-      echo "  FAIL $tag/$id — never reached $key=$want"
+      echo "  FAIL $tag/$id: never reached $key=$want"
       fail=$((fail + 1)); continue
     fi
 

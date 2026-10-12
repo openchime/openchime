@@ -52,7 +52,7 @@ done
 
 stamp="$(sha256sum "${OUT}/kitten_tts_mini_v0_8.onnx" | cut -d" " -f1) ${TARGET} $(sha256sum scripts/build/tts_convert.c | cut -d" " -f1)"
 if [ -f "${OUT}/kitten.ort" ] && [ "$(cat "${OUT}/.stamp" 2>/dev/null)" = "${stamp}" ]; then
-  echo "build_kitten: up to date — build/kitten/kitten.ort"
+  echo "build_kitten: up to date: build/kitten/kitten.ort"
   exit 0
 fi
 
@@ -64,4 +64,4 @@ build/tts_convert "${OUT}/kitten_tts_mini_v0_8.onnx" "${OUT}/kitten.ort.part" "$
 mv "${OUT}/kitten.ort.part" "${OUT}/kitten.ort"
 echo "${stamp}" > "${OUT}/.stamp"
 
-echo "build_kitten: done — build/kitten/kitten.ort ($(du -h "${OUT}/kitten.ort" | cut -f1)), voices.npz"
+echo "build_kitten: done: build/kitten/kitten.ort ($(du -h "${OUT}/kitten.ort" | cut -f1)), voices.npz"

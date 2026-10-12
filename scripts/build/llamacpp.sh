@@ -29,7 +29,7 @@ cd third_party
 # and CXX make exported, in a directory of its own beside the host's.
 DEST="llamacpp-${LLAMA_VERSION}${OC_ARCH:+-$OC_ARCH}"
 if [ -f "${DEST}/lib/libllamacpp.a" ]; then
-  echo "build_llamacpp: already built — third_party/${DEST}"
+  echo "build_llamacpp: already built: third_party/${DEST}"
   exit 0
 fi
 
@@ -86,4 +86,4 @@ cp "${SRC}/include/llama.h" "${SRC}/include/llama-cpp.h" "${DEST}/include/" 2>/d
 cp "${SRC}"/ggml/include/*.h "${DEST}/include/"
 cp "${SRC}/LICENSE" "${DEST}/LICENSE"
 rm -rf "${SRC}"
-echo "build_llamacpp: done — third_party/${DEST}"
+echo "build_llamacpp: done: third_party/${DEST}"

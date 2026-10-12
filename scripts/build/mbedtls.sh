@@ -81,4 +81,4 @@ if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
   make -C "${SRC}" -j"$(nproc)" lib ${CC:+CC="$CC"} ${AR:+AR="$AR"}
 fi
 
-echo "build_mbedtls: done — libs in third_party/${SRC}/library, headers in third_party/${SRC}/include"
+echo "build_mbedtls: done: libs in third_party/${SRC}/library, headers in third_party/${SRC}/include"
