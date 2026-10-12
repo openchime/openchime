@@ -146,9 +146,12 @@ reservation mid-job.
 `image` follows `packages`: it lays each architecture's release tarball onto a
 glibc base with **buildah** (`Dockerfile`, `packaging/image-context.sh`; no
 compile, no `RUN`, so the arm64 image is built on the x86 runner with
-`--arch arm64` and no emulation) and pushes a per-architecture image; a
-separate `image-manifest` job then publishes the `:VERSION` manifest list that
-indexes them. The per-architecture tags (`:VERSION-amd64`, `:VERSION-arm64`) are
+`--arch arm64` and no emulation), starts the amd64 one with **podman** (daemonless,
+reading buildah's store) and asks it `/healthz`, so a fault in the `Dockerfile`,
+the entrypoint or the binary on that base stops the release rather than reaching
+the registry (the arm64 image is build-only, as its binary is), and pushes a
+per-architecture image; a separate `image-manifest` job then publishes the
+`:VERSION` manifest list that indexes them. The per-architecture tags (`:VERSION-amd64`, `:VERSION-arm64`) are
 an implementation detail — nothing is documented as pullable until the manifest
 exists.
 
