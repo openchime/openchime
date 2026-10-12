@@ -422,6 +422,24 @@ jobs:
           # inside the binary; this is the one file it serves from beside itself.
           cp -r web "$DIST/web"
           packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
+      # Saved as soon as the build has run, whether or not the job goes on to
+      # pass: actions/cache saves only after a successful job, so every run
+      # that failed downstream of the engine build paid the twenty minutes
+      # again. The scripts leave a half-made archive or model in a .new
+      # directory, never under these paths, so what is saved is whole.
+      - name: Save the speech engine and models
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            third_party/onnxruntime-1.30.0
+            third_party/onnxruntime-1.30.0-aarch64
+            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc
+            third_party/llamacpp-0.5.0
+            third_party/llamacpp-0.5.0-aarch64
+            build/kitten
+            build/moonshine
+          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
       # No shipped daemon is a demo build: the marker a DEMO=1 build carries is
       # absent, for either architecture (nothing need run).
       - name: The daemon is not a demo build
