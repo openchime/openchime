@@ -102,3 +102,4 @@ web-test: $(WEB_DIR)/gfx-test.js $(WEB_DIR)/openchime.js
 	@$(MAKE) --no-print-directory WEB=1 $(BIN)
 	$(NODE) $(WEB_DIR)/gfx-test.js
 	scripts/web/test.sh
+	scripts/web/pages.sh
