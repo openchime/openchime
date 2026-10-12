@@ -35,8 +35,8 @@ on:
   # the push that lands on staging, whose run saves the caches every pull request
   # then restores (a cache is visible to a pull request from its base branch, not
   # from another feature branch). Not main: it reaches CI through release.yml's
-  # workflow_call, and running it standalone as well puts two runs in the same
-  # concurrency group, so one cancels the other.
+  # workflow_call, and nothing merges to main but a promotion of staging, which
+  # CI already ran.
   pull_request:
     branches: [staging]
     paths-ignore:
@@ -53,8 +53,13 @@ on:
   # deploys use.
   workflow_call:
 
+# Grouped by the calling workflow as well as the ref: when release.yml calls
+# this one, github.workflow is "release", so a push to staging (its own CI run)
+# no longer cancels the gate of a dry run rehearsing on staging, which it did
+# the first time one ran alongside a merge. Two runs of one workflow on one
+# ref still cancel the older, which is the point.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
