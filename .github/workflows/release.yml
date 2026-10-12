@@ -335,27 +335,14 @@ jobs:
           key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
 
       - name: Install build dependencies
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
+          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
+          # and retried, so a stall fails the step instead of holding the job.
           # rpm supplies rpmbuild, which used to come from the Rocky container;
           # nasm for libvpx's assembly; xz-utils for the toolchain tarballs.
-          sudo apt-get install -y -qq --no-install-recommends bzip2 rpm nasm xz-utils
+          scripts/build/apt.sh bzip2 rpm nasm xz-utils
 
       # Read-aloud's engine and model (ARCH-111), built by make with the same
       # toolchain and glibc target as the daemon: ONNX Runtime compiled from
@@ -629,25 +616,10 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/linux-${{ matrix.arch }}
       - name: Install buildah
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends buildah
+          scripts/build/apt.sh buildah
           buildah version
       # The build context is the extracted tarball plus the entrypoint: exactly
       # what an operator extracting the release would have.
@@ -709,26 +681,12 @@ jobs:
       VERSION: ${{ needs.version.outputs.number }}
       IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
     steps:
+      - uses: actions/checkout@v7   # for scripts/build/apt.sh
       - name: Install buildah
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends buildah
+          scripts/build/apt.sh buildah
       - name: Publish the manifest list
         run: |
           set -euo pipefail
@@ -759,18 +717,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install build dependencies
+        timeout-minutes: 20
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (see the packages
-          # job for the full reason).
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
+          set -euo pipefail
           # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
           # for the toolchain tarball.
-          sudo apt-get install -y -qq --no-install-recommends bzip2 nasm xz-utils
+          scripts/build/apt.sh bzip2 nasm xz-utils
       - name: Restore the toolchain
         uses: actions/cache@v6
         with:
@@ -1113,28 +1065,12 @@ jobs:
 
       - name: Install repository tooling
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
           # `rpm` is not optional and not implied: createrepo-c pulls librpm's
           # shared libraries but not the rpm binary, and an Ubuntu runner has
           # neither rpm nor rpmsign preinstalled. Without it the rpm repository
           # step fails at `rpm --addsign` with command-not-found -- in a job the
           # dry run skips, so it would only ever surface on a real release.
-          sudo apt-get install -y -qq apt-utils createrepo-c rclone gnupg rpm
+          scripts/build/apt.sh apt-utils createrepo-c rclone gnupg rpm
 
       - name: Import the signing key
         env:
@@ -1400,23 +1336,7 @@ jobs:
       - name: Move :latest to the released version
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends skopeo
+          scripts/build/apt.sh skopeo
           skopeo copy --all \
             --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
             --src-creds  "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
@@ -1471,6 +1391,7 @@ jobs:
       DIST_VERIFY_URL: https://staging.openchime.io/dist
       VERSION: ${{ needs.version.outputs.number }}
     steps:
+      - uses: actions/checkout@v7   # for scripts/build/apt.sh
       - name: Smoke the published apt repository
         # Skipped only when explicitly asked. The default stays a hard failure:
         # this step existing to fail while DIST_BASE_URL is unserved is a
@@ -1483,22 +1404,6 @@ jobs:
             -o /usr/share/keyrings/openchime-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_VERIFY_URL/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
           openchimed --version
 
@@ -1520,8 +1425,7 @@ jobs:
         if: ${{ !inputs.skip_repo_smoke }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends podman
+          command -v podman >/dev/null || scripts/build/apt.sh podman
           podman run --rm rockylinux:9 bash -euo pipefail -c "
             curl -fsSL '${DIST_VERIFY_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
             rpm --import /tmp/oc.asc
@@ -1549,10 +1453,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          command -v podman >/dev/null || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends podman
-          }
+          command -v podman >/dev/null || scripts/build/apt.sh podman
           export REGISTRY_AUTH_FILE="$RUNNER_TEMP/no-auth.json"
           echo '{}' > "$REGISTRY_AUTH_FILE"
           IMAGE="ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}"
