@@ -428,7 +428,8 @@ under the same name, on a box restarted with it: a full handshake, no session
 resumed, and back in with nobody asked, whatever it had pinned before.
 
 **Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, and
-it is also how every suite signs in: `tests/testsignin.h` plays the browser --
+it is also how every suite signs in, and a real browser is held to it too
+(`scripts/web/pages.sh`, below): `tests/testsignin.h` plays the browser --
 the form POSTed to the daemon's page over TLS, the token read off the 303 --
 and the client presents that token, so a suite's sign-in is a person's. The
 same helper is the `signin` command (`build/signin`) and links into the e2e,
@@ -705,6 +706,17 @@ the check signs in by password and bootstraps its user.
   hit-testing and line breaking through the API the views use. Last, a Japanese
   composition is played into the page's hidden input for the input method
   (`?ime=1`) and the composer must hold its result.
+- **`scripts/web/pages.sh`** — the daemon's sign-in pages from a real browser.
+  A headless Chromium (`scripts/web/pages.mjs`, Playwright) types into the
+  forms and submits them: the first owner signed up with the setup token, a
+  wrong password refused on the page, the right one signing in, the password
+  changed on its page, the old one refused and the new one signing in; each
+  sign-in's 303 lands on a loopback callback the script serves, as the
+  client's own listener is, and the token read off that address is presented
+  on `AUTH` by `build/signin present`. What the browser itself sends -- its
+  `Origin` under the pages' referrer policy, its handling of the redirect -- is
+  what this proves, and what no scripted post can. `make web-test` runs it
+  after `test.sh`.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, voice input, screen recording,
   uploads, files, the two call scripts and the search boxes, each on its own
