@@ -54,12 +54,14 @@ $(ORT_A): daemon/ort.ops.config $(TOOLCHAIN_DEPS)
 # first: built as the manifest host daemon (mk/daemon.mk) builds it, with the
 # host's compilers, so the two agree and it is made once. Without this a
 # release runner with no host build yet (a cold cache) stopped at the cross
-# build's first step.
+# build's first step. Both compilers are named: the cross build exports CC
+# and CXX (mk/toolchains.mk), and a host build that took only CC back mixed
+# the host's cc with the other architecture's c++, which failed in mlas.
 ifneq ($(ARCH_SUFFIX),)
 HOST_ORT_A := third_party/onnxruntime-1.30.0/lib/libonnxruntime.a
 $(ORT_A): $(HOST_ORT_A)
 $(HOST_ORT_A): daemon/ort.ops.config
-	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc OC_ARCH= $@
+	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= $@
 endif
 $(KITTEN) build/kitten/voices.npz: scripts/build/kitten.sh scripts/build/tts_convert.c
 	@echo "openchime: fetching the Kitten voice model (once)"

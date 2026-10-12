@@ -77,7 +77,7 @@ MANIFEST_BIN := $(BIN)
 else
 MANIFEST_BIN := build/manifest-host/openchimed
 $(MANIFEST_BIN): FORCE
-	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc OC_ARCH= openchimed
+	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= openchimed
 	@mkdir -p $(dir $@) && cp openchimed $@
 endif
 tts/manifest: $(MANIFEST_BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin
