@@ -22,7 +22,7 @@ OBJDUMP="${OBJDUMP:-${TOOLS:+$TOOLS/}x86_64-w64-mingw32-objdump}"
 ADDR2LINE="${ADDR2LINE:-${TOOLS:+$TOOLS/}x86_64-w64-mingw32-addr2line}"
 
 [ $# -ge 1 ] || { echo "usage: $0 <crash-report.txt | 0xRVA>" >&2; exit 2; }
-[ -f "$EXE" ] || { echo "no $EXE — set OC_CRASH_EXE" >&2; exit 2; }
+[ -f "$EXE" ] || { echo "no $EXE: set OC_CRASH_EXE" >&2; exit 2; }
 
 arg="$1"
 if [ -f "$arg" ]; then

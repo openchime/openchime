@@ -76,4 +76,4 @@ if [ ! -f "${DEST}/lib/libopus.a" ]; then
   )
 fi
 
-echo "build_opus: done — third_party/${DEST}/lib/libopus.a, headers in third_party/${DEST}/include"
+echo "build_opus: done: third_party/${DEST}/lib/libopus.a, headers in third_party/${DEST}/include"

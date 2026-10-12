@@ -83,4 +83,4 @@ EOF
   cmake --install "${DEST}/build" >/dev/null
 fi
 
-echo "build_sdl3_windows: done — lib in third_party/${DEST}/lib, headers in third_party/${DEST}/include"
+echo "build_sdl3_windows: done: lib in third_party/${DEST}/lib, headers in third_party/${DEST}/include"

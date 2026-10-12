@@ -87,4 +87,4 @@ if [ ! -f "${DEST}/lib/libvpx.a" ]; then
   )
 fi
 
-echo "build_libvpx: done — third_party/${DEST}/lib/libvpx.a, headers in third_party/${DEST}/include"
+echo "build_libvpx: done: third_party/${DEST}/lib/libvpx.a, headers in third_party/${DEST}/include"

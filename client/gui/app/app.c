@@ -6391,7 +6391,7 @@ static void draw_thread(gfx *rt, const oc_model *m, rectf reg) {
     fill(rt, rf(body.left, top, body.right, top + 1), OC_COL_BORDER);
     draw_text(rt, rc, g_meta, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
     rectf replies = rf(body.left, top + 24, body.right, body.bottom);
-    if (m->n_thread_msgs == 0) overlay_empty(rt, replies, "No replies yet — reply below.");
+    if (m->n_thread_msgs == 0) overlay_empty(rt, replies, "No replies yet: reply below.");
     else draw_msglist(rt, m, m->thread_msgs, m->n_thread_msgs, replies, MSGLIST_THREAD);
 }
 
@@ -6647,7 +6647,7 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
 static void draw_weblist(gfx *rt, const oc_model *m, rectf reg) {
     const oc_channel *c = oc_model_channel((oc_model *)m, m->weblist_channel);
     char title[160];
-    snprintf(title, sizeof title, "Webhooks — %s", (c && c->name) ? c->name : "channel");
+    snprintf(title, sizeof title, "Webhooks: %s", (c && c->name) ? c->name : "channel");
     rectf body = pane_header(rt, reg, title);
     g_n_webrows = 0;
     g_n_webacts = 0;
@@ -9107,7 +9107,7 @@ static void draw_transcript(gfx *rt, const oc_model *m, rectf reg) {
     }
     if (c->n_msgs == 0) {
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "No messages yet — say hello.", g_ui, reg, OC_COL_MUTED);
+        draw_text(rt, "No messages yet: say hello.", g_ui, reg, OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
         return;
     }
@@ -21719,7 +21719,7 @@ static const char *dict_refusal_text(uint16_t code) {
     case OC_ERR_STT_UNAVAILABLE:   return "Voice input is unavailable right now.";
     case OC_ERR_NOT_A_MEMBER:      return "You are not a member of this channel.";
     case OC_ERR_UNKNOWN_CHANNEL:   return "This conversation no longer exists.";
-    case OC_ERR_CHANNEL_ARCHIVED:  return "This channel is archived — it is read-only.";
+    case OC_ERR_CHANNEL_ARCHIVED:  return "This channel is archived: it is read-only.";
     case OC_ERR_SEND_RATE_LIMITED: return "Sending too fast \u2014 that piece was not posted";
     default:                       return "What you said could not be recognized.";
     }
@@ -26145,8 +26145,8 @@ static void signin_fail(oc_win *hwnd, const char *why) {
     /* The core reports a rejected credential as the terse "auth failed"; say what
      * the TUI says, since that is the wording a user can act on. */
     if (strstr(tmp, "auth failed"))
-        snprintf(tmp, sizeof tmp, g_si_browser ? "sign-in failed — try again"
-                                               : "sign-in failed — check your username and password");
+        snprintf(tmp, sizeof tmp, g_si_browser ? "sign-in failed: try again"
+                                               : "sign-in failed: check your username and password");
 
     if (g_si_client) { dict_forget(g_si_client); oc_client_stop(g_si_client); g_si_client = NULL; }
     g_si_connecting = 0; g_si_browser = 0;
@@ -26184,7 +26184,7 @@ static void signin_submit(oc_win *hwnd) {
         }
         if (st != OC_RESOLVE_OK) {
             snprintf(g_si_err, sizeof g_si_err,
-                     "'%s' not found — does not resolve in DNS", g_si_ws); goto redraw;
+                     "'%s' not found: does not resolve in DNS", g_si_ws); goto redraw;
         }
         snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
         g_si_port = ep.port;
@@ -26690,7 +26690,7 @@ static void switch_workspace(oc_win *hwnd, const char *ws, const char *cred) {
          * it words an unresolvable workspace already. */
         g_view = VIEW_SIGNIN;
         signin_begin(hwnd, ws, cred);
-        snprintf(g_si_err, sizeof g_si_err, "'%s' not found — does not resolve in DNS", ws);
+        snprintf(g_si_err, sizeof g_si_err, "'%s' not found: does not resolve in DNS", ws);
     }
     layout_signin(hwnd);
     layout_composer(hwnd);
@@ -28215,7 +28215,7 @@ static void show_channel_menu(oc_win *hwnd, const oc_model *m, uint64_t cid, flo
             const oc_group_view *vg = via ? oc_model_group(m, via) : NULL;
             if (vg) {
                 char why[72];
-                snprintf(why, sizeof why, "IN THROUGH @%.40s — MUTE INSTEAD", vg->handle);
+                snprintf(why, sizeof why, "IN THROUGH @%.40s: MUTE INSTEAD", vg->handle);
                 mi_section(why);
             } else {
                 mi_item_d(3, "Leave channel");
@@ -29628,7 +29628,7 @@ static void test_poll(oc_win *hwnd) {
          * of code guaranteed to be exercised for the first time at the worst
          * possible moment. Only reachable via the hook. */
         test_ack("ok");
-        crumb("crashtest — deliberate fault");
+        crumb("crashtest: deliberate fault");
         *(volatile int *)0 = 1;
     } else if (!strcmp(verb, "shot")) {
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
@@ -30695,7 +30695,7 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
             snprintf(body, sizeof body,
                      "%s %s not in #%s, so they were not notified.\n\n"
                      "Adding them to this private channel gives them its "
-                     "full history — everything already said here.",
+                     "full history: everything already said here.",
                      names, several ? "are" : "is", where);
         else
             /* Public: since REQ-288 they DO get the mention, in their
@@ -30705,8 +30705,8 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
              * is the thing they still do not have. */
             snprintf(body, sizeof body,
                      "%s %s not in #%s.\n\n"
-                     "The mention will reach %s — anyone here can read "
-                     "this channel — but %s will not see what comes next "
+                     "The mention will reach %s: anyone here can read "
+                     "this channel: but %s will not see what comes next "
                      "unless you add %s.",
                      names, several ? "are" : "is", where,
                      "them", "they", "them");
@@ -31226,10 +31226,10 @@ static int on_tick(oc_win *hwnd) {
                              * a different place from the channel it lives in,
                              * and a source that said only "#general" would send
                              * you looking down a scroll it is not in. */
-                            snprintf(source, sizeof source, "%s — thread", label);
+                            snprintf(source, sizeof source, "%s: thread", label);
                             if (!is_active) {
                                 char both[128];
-                                snprintf(both, sizeof both, "%s — %s",
+                                snprintf(both, sizeof both, "%s: %s",
                                          oc_model_workspace_name(wm), source);
                                 snprintf(source, sizeof source, "%s", both);
                             }

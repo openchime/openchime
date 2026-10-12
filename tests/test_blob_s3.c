@@ -266,7 +266,7 @@ static void round_trip(oc_blobstore *bs, fake_s3 *f, const char *key,
 }
 
 int run_blob_s3_tests(void) {
-    printf("test_blob_s3: fake S3 endpoint — streaming put/get round-trip, "
+    printf("test_blob_s3: fake S3 endpoint: streaming put/get round-trip, "
            "sizes, SigV4 header shape, delete, 404, config selection\n");
 
     fake_s3 *f = &g_fake;

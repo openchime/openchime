@@ -242,7 +242,7 @@ echo "ack: $ack"
 # the client never answered go silent, and it then reports itself as the NEXT
 # assertion failing — a defect blamed on whatever ran after the dropped command.
 if [ "$ack" = TIMEOUT ]; then
-  echo "gui_drive: no ack for '$1' after 10s — the client did not answer" >&2
+  echo "gui_drive: no ack for '$1' after 10s: the client did not answer" >&2
   exit 1
 fi
 

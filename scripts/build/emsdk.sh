@@ -14,7 +14,7 @@ EMSDK_VERSION="${EMSDK_VERSION:-6.0.8}"
 cd "$(dirname "$0")/../.."
 DEST="third_party/emsdk-${EMSDK_VERSION}"
 if [ -x "${DEST}/upstream/emscripten/emcc" ] && [ -x "${DEST}/node-bin/node" ]; then
-  echo "emsdk.sh: up to date — ${DEST}"
+  echo "emsdk.sh: up to date: ${DEST}"
   exit 0
 fi
 

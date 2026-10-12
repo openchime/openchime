@@ -74,7 +74,7 @@ if [ "${MODE}" = converter ]; then
     tar -xzf "${TARBALL}" -C "${DEST}" --strip-components=1
     rm -f "${TARBALL}"
   fi
-  echo "build_onnxruntime: done — third_party/${DEST}"
+  echo "build_onnxruntime: done: third_party/${DEST}"
   exit 0
 fi
 [ "${MODE}" = static ] || { echo "build_onnxruntime: mode is static or converter, not ${MODE}" >&2; exit 2; }
@@ -97,7 +97,7 @@ if [ -n "${OC_ARCH:-}" ] && [ "${OC_ARCH}" != "$(uname -m)" ]; then
   CROSS_ARGS=(--path_to_protoc_exe "${HOST_PROTOC}" --cmake_extra_defines "CMAKE_TOOLCHAIN_FILE=${TOOLCHAIN}" onnxruntime_CROSS_COMPILING=ON)
 fi
 if [ -f "${DEST}/lib/libonnxruntime.a" ] && [ "$(cat "${DEST}/.stamp" 2>/dev/null)" = "${STAMP}" ]; then
-  echo "build_onnxruntime: up to date — third_party/${DEST}/lib/libonnxruntime.a"
+  echo "build_onnxruntime: up to date: third_party/${DEST}/lib/libonnxruntime.a"
   exit 0
 fi
 
@@ -167,4 +167,4 @@ cp "${WORK}/src/LICENSE" "${WORK}/src/ThirdPartyNotices.txt" "${DEST}.new/"
 echo "${STAMP}" > "${DEST}.new/.stamp"
 rm -rf "${DEST}" && mv "${DEST}.new" "${DEST}"
 
-echo "build_onnxruntime: done — third_party/${DEST}/lib/libonnxruntime.a ($(du -h "${DEST}/lib/libonnxruntime.a" | cut -f1))"
+echo "build_onnxruntime: done: third_party/${DEST}/lib/libonnxruntime.a ($(du -h "${DEST}/lib/libonnxruntime.a" | cut -f1))"

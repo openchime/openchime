@@ -74,4 +74,4 @@ if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
   make -C "${SRC}" -j"$(nproc)" CC="${CC}" AR="${AR}" WINDOWS_BUILD=1 lib
 fi
 
-echo "build_mbedtls_windows: done — libs in third_party/${SRC}/library"
+echo "build_mbedtls_windows: done: libs in third_party/${SRC}/library"

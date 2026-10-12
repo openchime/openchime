@@ -25,7 +25,7 @@ fi
 cd "$(dirname "$0")/../.."
 DEST="third_party/zig-${ZIG_VERSION}"
 if [ -x "${DEST}/zig" ]; then
-  echo "zig.sh: up to date — ${DEST}/zig"
+  echo "zig.sh: up to date: ${DEST}/zig"
   exit 0
 fi
 

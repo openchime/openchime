@@ -37,7 +37,7 @@ fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); checks=$((checks + 1))
 ok()   { printf '  ok   %s\n' "$*"; checks=$((checks + 1)); }
 
 if ! kill_dev_daemon; then
-  say "a daemon is still listening on :$OC_TEST_PORT — refusing to wipe underneath it."
+  say "a daemon is still listening on :$OC_TEST_PORT: refusing to wipe underneath it."
   exit 1
 fi
 rm -rf "$OC_TEST_DIR"
@@ -72,7 +72,7 @@ signed_in() { [ "$(key_of "$d" authed)" = "1" ]; }
 if wait_for signed_in; then ok "signs in"; else fail "never signed in"; fi
 [ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" || fail "window is not visible"
 [ "$(key_of "$d" started)" = "1" ] && ok "exactly one client started" \
-  || fail "started $(key_of "$d" started) clients, not 1 — two net threads on one workspace"
+  || fail "started $(key_of "$d" started) clients, not 1: two net threads on one workspace"
 [ "$(key_of "$d" view)" != "$VIEW_SIGNIN" ] && ok "shows the workspace, not the sign-in view" \
   || fail "landed on the sign-in view"
 [ "$(key_of "$d" wsmgr)" = "0" ] && ok "does not also open the switcher" \
@@ -86,7 +86,7 @@ launch "nosuch.invalid" "alice:pw"
 on_signin() { [ "$(key_of "$d" view)" = "$VIEW_SIGNIN" ]; }
 if wait_for on_signin; then ok "lands on the sign-in view"; else fail "never reached the sign-in view (view=$(key_of "$d" view))"; fi
 [ "$(key_of "$d" visible)" = "1" ] && ok "window is visible" \
-  || fail "window is NOT visible — a live process showing nothing"
+  || fail "window is NOT visible: a live process showing nothing"
 [ "$(quoted_of "$d" si_ws)" = "nosuch.invalid" ] && ok "keeps the workspace it was given" \
   || fail "sign-in view shows workspace '$(quoted_of "$d" si_ws)'"
 case "$(quoted_of "$d" si_err)" in

@@ -214,7 +214,7 @@ fi   # a window: the Windows client's alone; a browser's picker is its own
 [ "${1:-}" = "--kill" ] && "$DRIVE" kill >/dev/null 2>&1
 echo
 if [ "$fails" -eq 0 ]; then
-  say "gui_screenrec: OK — $checks checks in $((SECONDS - START))s"
+  say "gui_screenrec: OK: $checks checks in $((SECONDS - START))s"
 else
   say "gui_screenrec: $fails of $checks checks FAILED"
   exit 1

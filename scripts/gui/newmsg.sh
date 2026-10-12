@@ -31,7 +31,7 @@ fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); checks=$((checks + 1))
 ok()   { printf '  ok   %s\n' "$*"; checks=$((checks + 1)); }
 
 if ! kill_dev_daemon; then
-  say "a daemon is still listening on :$OC_TEST_PORT — refusing to wipe underneath it."
+  say "a daemon is still listening on :$OC_TEST_PORT: refusing to wipe underneath it."
   exit 1
 fi
 rm -rf "$OC_TEST_DIR"
@@ -105,7 +105,7 @@ d="$(snap)"
 drive key shift+tab
 d="$(snap)"
 [ "$(nm_of "$d" focus)" = "to" ] && ok "Shift+Tab goes back to the recipients" \
-  || fail "Shift+Tab left focus on '$(nm_of "$d" focus)' — a keyboard trap"
+  || fail "Shift+Tab left focus on '$(nm_of "$d" focus)': a keyboard trap"
 
 # The keys that are NOT characters are the ones that used to leak: with the To:
 # field focused, Delete deleted from the message, Ctrl+A selected it and Ctrl+V
@@ -151,7 +151,7 @@ d="$(snap)"
 [ "$(nmq_of "$d" chips)" != "$before_chips" ] && ok "clicking a match adds it: $(nmq_of "$d" chips)" \
   || fail "clicking the match at $rx,$ry changed nothing (chips '$(nmq_of "$d" chips)')"
 [ "$(nm_of "$d" focus)" = "to" ] && ok "and the keys stay in the To: field" \
-  || fail "the click moved focus to '$(nm_of "$d" focus)' — it fell through to the composer"
+  || fail "the click moved focus to '$(nm_of "$d" focus)': it fell through to the composer"
 
 # --- 2. the To: field is a text field ------------------------------------------
 say "2. the To: field edits like a text field"
@@ -191,7 +191,7 @@ d="$(snap)"
 gen="$(printf '%s' "$d" | grep 'ch [0-9]* "general"' | head -1)"
 gmsgs="$(printf '%s' "$gen" | grep -o 'msgs=[0-9]*' | cut -d= -f2)"
 [ "$gmsgs" = "1" ] && ok "#general still holds only its own message" \
-  || fail "#general holds $gmsgs messages — the new message went to the wrong conversation"
+  || fail "#general holds $gmsgs messages: the new message went to the wrong conversation"
 case "$gen" in
   *'for bob only'*) fail "#general's newest message is the one addressed to bob" ;;
   *) ok "and its newest message is not the addressed one" ;;
@@ -229,7 +229,7 @@ drive channel general
 d="$(snap)"
 [ "$(key_of "$d" drafthere)" = "0" ] && ok "#general has no draft of the new message" \
   || fail "the unaddressed message was filed as #general's draft"
-[ "$(key_of "$d" draftn)" = "1" ] && ok "exactly one draft exists — the pane's own" \
+[ "$(key_of "$d" draftn)" = "1" ] && ok "exactly one draft exists: the pane's own" \
   || fail "$(key_of "$d" draftn) drafts exist, not 1"
 
 # --- 6. Backspace takes one recipient per press ---------------------------------

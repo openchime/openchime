@@ -579,7 +579,7 @@ static int        g_active = 0;       /* index into g_ws */
 /* The workspace label shown in the header (the active session's). */
 static const char *active_label(void) {
     return (g_nws && g_active < g_nws && g_ws[g_active].label[0])
-         ? g_ws[g_active].label : "—";
+         ? g_ws[g_active].label : "-";
 }
 
 static const char *active_address(void) {
@@ -674,7 +674,7 @@ static void draw_help(int W, int H) {
         { NULL, "Basics" },
         { "Enter",      "send the typed message" },
         { "Tab · Esc",  "move between the panes and the composer" },
-        { "Ctrl+K · :", "action menu — reach everything" },
+        { "Ctrl+K · :", "action menu: reach everything" },
         { "Ctrl+F",     "search messages" },
         { "Ctrl+W",     "switch workspace" },
         { "Ctrl+R",     "reconnect" },
@@ -1295,7 +1295,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
 static void draw_storage(const oc_model *m, int W, int H) {
     const tk_theme *th = tk_theme_active();
     if (!m->storage_have) {
-        const char *e = "No report yet — owner/admin only.";
+        const char *e = "No report yet: owner/admin only.";
         tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Storage  ·  Esc closes");
         tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
         tb_present();
@@ -1314,7 +1314,7 @@ static void draw_storage(const oc_model *m, int W, int H) {
          (unsigned long long)(s->avail_bytes / MBv), (unsigned long long)(s->total_bytes / MBv));
     SROW(th->fg, "Attachments  %llu file(s), %llu MB",
          (unsigned long long)s->attach_count, (unsigned long long)(s->attach_bytes / MBv));
-    if (s->under_pressure) SROW(TB_RED | TB_BOLD, "under pressure — reclaiming storage");
+    if (s->under_pressure) SROW(TB_RED | TB_BOLD, "under pressure: reclaiming storage");
     SROW(th->bg, "%s", "");
     SROW(th->accent2 | TB_BOLD, "%s", "Policy");
     if (s->max_age_days) SROW(th->fg, "  attachments expire after %llu day(s)", (unsigned long long)s->max_age_days);
@@ -2163,7 +2163,7 @@ static int form_probe(login_form *f, char *inl, size_t cap) {
     f->nsrc = 0; f->probed[0] = '\0';
     oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
     if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, cap, "invalid workspace '%s'", f->workspace); return 0; }
-    if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found — does not resolve in DNS", f->workspace); return 0; }
+    if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, cap, "'%s' not found: does not resolve in DNS", f->workspace); return 0; }
     if (st == OC_RESOLVE_BAD_METADATA) { snprintf(inl, cap, "'%s' publishes discovery metadata that is not valid", f->workspace); return 0; }
     /* The certificate is judged first (ARCH-10): one nobody vouches for is shown
      * to the person, and asked about again trusted if they say so. */
@@ -2617,7 +2617,7 @@ int main(int argc, char **argv) {
         oc_endpoint ep;
         oc_resolve_status st = oc_resolve(inst, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
-        if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found — it does not resolve in DNS\n", inst); return 3; }
+        if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found: it does not resolve in DNS\n", inst); return 3; }
         if (st == OC_RESOLVE_BAD_METADATA) { fprintf(stderr, "openchime: workspace '%s' publishes discovery metadata that is not valid\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;

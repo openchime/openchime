@@ -1173,10 +1173,10 @@ static void test_feedback(void) {
     CHECK(f.n == 0 && !oc_fb_update(&f, prog, OC_FB_CONFIRM, "x", t));
     /* Banners: the most severe shows; a repeat of the same state is not said again. */
     int said = g_fb_n_said;
-    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost — reconnecting in 3s…", "Retry now", 9);
+    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost: reconnecting in 3s…", "Retry now", 9);
     oc_fb_banner_set(&f, 2, OC_FB_INFO, "This channel is archived.", NULL, 0);
     CHECK(oc_fb_banner_top(&f) && oc_fb_banner_top(&f)->id == 1 && g_fb_n_said == said + 2 && g_fb_loud[said]);
-    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost — reconnecting in 2s…", "Retry now", 9);
+    oc_fb_banner_set(&f, 1, OC_FB_ERROR, "Connection lost: reconnecting in 2s…", "Retry now", 9);
     CHECK(g_fb_n_said == said + 2 && strstr(oc_fb_banner_top(&f)->text, "2s"));
     oc_fb_banner_clear(&f, 1);
     CHECK(oc_fb_banner_top(&f) && oc_fb_banner_top(&f)->id == 2);
