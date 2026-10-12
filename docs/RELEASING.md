@@ -25,9 +25,11 @@ push to `main` is a promotion, and `main` always names what was released. A
 deploy-key push starts workflows natively; no personal token is involved.
 
 `promote.yml` takes `dry_run`, which does everything except move `main`. A dry
-run of the release itself is `gh workflow run release.yml --ref main -f
-dry_run=true`. `release.yml` runs on `main` only, whether pushed or dispatched —
-its first job, `branch`, refuses anything else.
+run of the release itself is `gh workflow run release.yml --ref staging -f
+dry_run=true`: the rehearsal of the next promotion, on the commit that would be
+promoted. `release.yml` otherwise runs on `main` only, whether pushed or
+dispatched — its first job, `branch`, refuses anything else, and a dry run on
+any ref but `staging` or `main`.
 
 ## Shape
 

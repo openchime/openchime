@@ -65,7 +65,11 @@ permissions:
 
 jobs:
   # Only main is released. release-N is a fact about what main shipped, and the
-  # workflow used to publish from whatever ref it was dispatched on.
+  # workflow used to publish from whatever ref it was dispatched on. A DRY RUN
+  # is the exception, on staging only: it is the rehearsal of the next
+  # promotion, so it has to run on the commit that would be promoted, and it
+  # publishes and tags nothing by construction (every publishing step tests the
+  # flag).
   branch:
     name: running on main
     runs-on: ubuntu-24.04
@@ -74,11 +78,15 @@ jobs:
       - name: Refuse any other ref
         env:
           REF: ${{ github.ref }}
+          DRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
-          if [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::release runs on main only (this run is on $REF). A release starts with promote.yml on staging; a dry run is dispatched on main."
-            exit 1
+          if [ "$REF" = "refs/heads/main" ]; then exit 0; fi
+          if [ "$DRY" = "true" ] && [ "$REF" = "refs/heads/staging" ]; then
+            echo "dry run on staging: the next promotion's rehearsal; nothing is published or tagged"
+            exit 0
           fi
+          echo "::error::release runs on main only (this run is on $REF). A release starts with promote.yml on staging; a dry run is dispatched on staging or main."
+          exit 1
 
   # The same jobs a branch push runs. Reused, not re-implemented.
   test:
