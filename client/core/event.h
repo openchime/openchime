@@ -299,6 +299,7 @@ typedef struct {
     uint32_t        srvalert_current; /* OC_EV_SRVALERTS: how many still hold */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
+    uint16_t uses, used;   /* INVITE / INVITE_ROW: how many may redeem it (0 = no limit), how many have */
     uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
                               because a ms timestamp does not fit in `count`. */
     char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
@@ -548,6 +549,7 @@ typedef struct {
     uint64_t channel_id;
     uint64_t message_id;   /* REACT */
     uint8_t  op;           /* REACT: add/remove */
+    uint16_t uses;         /* INVITE_USER: how many may redeem it; 0 = no limit */
     uint64_t server_time;  /* SCHEDULE: when to send (ms) */
     char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
     char    *body2;        /* heap; SET_SETTING value, else NULL */

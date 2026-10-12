@@ -2594,9 +2594,10 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
 /* Mint an invite for `role`: random token to the caller, only its SHA-256 +
  * expiry stored. `created_by` is the issuing user (0 -> NULL, e.g. a first-run
  * setup token with no issuer). Returns 0 and fills token/expiry, or -1. */
-/* `hash_out` (may be NULL) receives the SHA-256 the row is keyed by. */
+/* `hash_out` (may be NULL) receives the SHA-256 the row is keyed by. `uses` is
+ * how many may redeem it (REQ-026): 1, N, or 0 for no limit until it expires. */
 static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const char *email,
-                           uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out,
+                           uint16_t uses, uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out,
                            uint8_t hash_out[OC_SHA256_LEN]) {
     uint8_t hash[OC_SHA256_LEN];
     if (oc_rand_bytes(token, OC_INVITE_TOKEN_LEN) != 0 ||
@@ -2605,8 +2606,8 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
     uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email) "
-        "VALUES(?,?,?,?,lower(?));",
+        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms,email,uses) "
+        "VALUES(?,?,?,?,lower(?),?);",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     if (created_by) sqlite3_bind_int64(st, 2, (sqlite3_int64)created_by);
@@ -2615,6 +2616,7 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
     sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
     if (email && email[0]) sqlite3_bind_text(st, 5, email, -1, SQLITE_STATIC);
     else                   sqlite3_bind_null(st, 5);
+    sqlite3_bind_int(st, 6, uses);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
@@ -2624,7 +2626,7 @@ static int mint_invite_for(sqlite3 *db, uint64_t created_by, uint8_t role, const
 
 static int mint_invite(sqlite3 *db, uint64_t created_by, uint8_t role,
                        uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
-    return mint_invite_for(db, created_by, role, NULL, token, expiry_out, NULL);
+    return mint_invite_for(db, created_by, role, NULL, 1, token, expiry_out, NULL);
 }
 
 /* The id an invitation is reported to central under (ARCH-85's invitation
@@ -2658,12 +2660,19 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     if (want != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
-
     /* An invite names an address or mints a bearer token, never both: bound to an
      * address it is spent by that address's verified sign-in (AUTH.md §8.4), and
      * the token that comes back is zeros — there is nothing to hand anybody. */
     const char *email = (j->email && j->email[0]) ? j->email : NULL;
     if (email && !oc_email_plausible(email)) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* How many may redeem it (REQ-026): 1 is an invitation to one person; N, or
+     * 0 for no limit, is a link to pass around. One address spends its invite
+     * once, whatever was asked. A link passed around makes members only:
+     * nobody mints admins by forwarding a message. */
+    uint16_t uses = email ? 1 : j->uses;
+    if (uses != 1 && want != OC_ROLE_MEMBER) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     /* Only a provider's verified sign-in spends an address-bound invite. Where no
@@ -2673,7 +2682,7 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INVITE_UNREDEEMABLE; return r;
     }
     uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN]; uint64_t expiry = 0;
-    if (mint_invite_for(db, j->user_id, want, email, token, &expiry, hash) != 0) {
+    if (mint_invite_for(db, j->user_id, want, email, uses, token, &expiry, hash) != 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     if (email) {
@@ -2691,6 +2700,7 @@ static oc_dbres *process_invite_user(oc_dbwriter *w, const oc_job *j) {
     memcpy(r->session_token, token, OC_INVITE_TOKEN_LEN);  /* carries the invite token */
     r->session_expiry = expiry;
     r->role = want;
+    r->invite_uses = uses;
     return r;
 }
 
@@ -2778,7 +2788,7 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     }
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT role, expires_at_ms, consumed_at_ms, created_by FROM invites "
+        "SELECT role, expires_at_ms, consumed_at_ms, created_by, uses, used FROM invites "
         "WHERE token_hash=? AND email IS NULL;",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
@@ -2788,12 +2798,15 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
      * owner bootstrap, not an ordinary invite; role alone can't tell them apart,
      * since an owner may also invite another owner at an ordinary role. */
     uint64_t created_by = 0;
+    int uses = 1, used = 0;
     if (sqlite3_step(st) == SQLITE_ROW) {
         role       = role_to_u8((const char *)sqlite3_column_text(st, 0));
         expiry     = (uint64_t)sqlite3_column_int64(st, 1);
         consumed   = sqlite3_column_type(st, 2) != SQLITE_NULL;
         created_by = sqlite3_column_type(st, 3) != SQLITE_NULL
                      ? (uint64_t)sqlite3_column_int64(st, 3) : 0;
+        uses       = sqlite3_column_int(st, 4);
+        used       = sqlite3_column_int(st, 5);
         found = 1;
     }
     sqlite3_finalize(st);
@@ -2832,10 +2845,13 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->iterations ? j->iterations : w->pw_iters);
     if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
 
-    /* Consume the invite (single-use); the single writer thread makes this atomic
-     * with the account creation above. */
-    sqlite3_prepare_v2(db, "UPDATE invites SET consumed_at_ms=? WHERE token_hash=?;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    /* Take one use; the last one consumes the invite (REQ-026). The single
+     * writer thread makes this atomic with the account creation above. */
+    int last = uses != 0 && used + 1 >= uses;
+    sqlite3_prepare_v2(db, "UPDATE invites SET used=used+1, consumed_at_ms=COALESCE(?,consumed_at_ms) "
+                           "WHERE token_hash=?;", -1, &st, NULL);
+    if (last) sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    else      sqlite3_bind_null(st, 1);
     sqlite3_bind_blob(st, 2, hash, sizeof hash, SQLITE_STATIC);
     sqlite3_step(st);
     sqlite3_finalize(st);
@@ -8398,7 +8414,7 @@ static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
      * revoke needs. */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0) FROM invites "
+        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0), uses, used FROM invites "
         " WHERE consumed_at_ms IS NULL AND expires_at_ms > ?1 "
         " ORDER BY expires_at_ms ASC LIMIT ?2;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
@@ -8413,6 +8429,8 @@ static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
                                                                  : OC_ROLE_MEMBER;
         arr[n].expires_at = (uint64_t)sqlite3_column_int64(st, 2);
         arr[n].created_by = (uint64_t)sqlite3_column_int64(st, 3);
+        arr[n].uses       = (uint16_t)sqlite3_column_int(st, 4);
+        arr[n].used       = (uint16_t)sqlite3_column_int(st, 5);
         arr[n].created_at = 0;      /* not stored; the table has no created_at_ms */
         n++;
     }

@@ -2244,6 +2244,7 @@ oc_result oc_encode_invite_user(oc_wbuf *w, uint16_t version, const oc_invite_us
     size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_USER);
     oc_w_u8(w, m->role);
     oc_w_str(w, m->email);
+    oc_w_u16(w, m->uses);
     return oc_frame_end(w, off);
 }
 
@@ -2298,6 +2299,7 @@ oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite
     oc_w_bytes(w, m->token);
     oc_w_u8(w, m->role);
     oc_w_u64(w, m->expires_at);
+    oc_w_u16(w, m->uses);
     return oc_frame_end(w, off);
 }
 
@@ -3363,6 +3365,7 @@ int oc_email_plausible(const char *s) {
 oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m) {
     m->role = oc_r_u8(p);
     m->email = oc_r_str(p);
+    m->uses = oc_r_u16(p);
     return r_done(p);
 }
 
@@ -3409,6 +3412,7 @@ oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m) {
     m->token = oc_r_bytes(p);
     m->role = oc_r_u8(p);
     m->expires_at = oc_r_u64(p);
+    m->uses = oc_r_u16(p);
     return r_done(p);
 }
 
@@ -3547,6 +3551,8 @@ oc_result oc_encode_invite_list(oc_wbuf *w, uint16_t version, const oc_invite_li
         oc_w_u64(w, m->entries[i].created_at);
         oc_w_u64(w, m->entries[i].expires_at);
         oc_w_u64(w, m->entries[i].created_by);
+        oc_w_u16(w, m->entries[i].uses);
+        oc_w_u16(w, m->entries[i].used);
     }
     return oc_frame_end(w, off);
 }
@@ -3562,6 +3568,8 @@ oc_result oc_decode_invite_list(oc_rbuf *p, oc_invite_entry *entries, uint16_t c
         e.created_at = oc_r_u64(p);
         e.expires_at = oc_r_u64(p);
         e.created_by = oc_r_u64(p);
+        e.uses       = oc_r_u16(p);
+        e.used       = oc_r_u16(p);
         if (i < cap) entries[i] = e;   /* drain the rest so the frame still validates */
     }
     return r_done(p);

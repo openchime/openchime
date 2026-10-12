@@ -5335,7 +5335,7 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
 
     /* Owner mints a member invite and receives the token. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_invite_user iu = { OC_ROLE_MEMBER, { NULL, 0 } };
+    oc_invite_user iu = { OC_ROLE_MEMBER, { NULL, 0 }, 1 };
     CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK);
     CHECK(send_frame(&owner, buf, w.len) == 0);
     CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_INVITE_CREATED);
@@ -5354,7 +5354,7 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
      * and the reason says what to do instead. */
     {
         oc_wbuf_init(&w, buf, sizeof buf);
-        oc_invite_user ie = { OC_ROLE_MEMBER, oc_slice_str("lee@partner.example") };
+        oc_invite_user ie = { OC_ROLE_MEMBER, oc_slice_str("lee@partner.example"), 1 };
         CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &ie) == OC_OK);
         CHECK(send_frame(&owner, buf, w.len) == 0);
         CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
@@ -5420,6 +5420,43 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
     for (uint16_t i = 0; i < n && i < 64; i++)
         if (ents[i].user_id == uo) { saw_owner = 1; CHECK(ents[i].role == OC_ROLE_OWNER); }
     CHECK(saw_owner == 1);
+
+    /* An invite two may use (REQ-026, a shareable link): the owner mints it
+     * and is told how many; two newcomers sign up on it, the third is refused
+     * on the page as any spent invite is; and a shared admin invite is refused
+     * outright. Neither newcomer connects, so the owner hears nothing. */
+    {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_invite_user is = { OC_ROLE_MEMBER, { NULL, 0 }, 2 };
+        CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &is) == OC_OK);
+        CHECK(send_frame(&owner, buf, w.len) == 0);
+        CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_INVITE_CREATED);
+        oc_invite_created sc; CHECK(oc_decode_invite_created(&p, &sc) == OC_OK && sc.uses == 2);
+        char stok[2 * OC_INVITE_TOKEN_LEN + 1];
+        memcpy(stok, sc.token.ptr, sc.token.len); stok[sc.token.len] = '\0';
+        char t1[OC_TEST_TOKEN_CAP], v1[OC_TEST_VERIFIER_CAP], why[256];
+        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-one", "pw1",
+                             t1, sizeof t1, v1, sizeof v1, why, sizeof why) == 0);
+        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-two", "pw2",
+                             t1, sizeof t1, v1, sizeof v1, why, sizeof why) == 0);
+        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-three", "pw3",
+                             t1, sizeof t1, v1, sizeof v1, why, sizeof why) != 0);
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_invite_user ia = { OC_ROLE_ADMIN, { NULL, 0 }, 0 };
+        CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &ia) == OC_OK);
+        CHECK(send_frame(&owner, buf, w.len) == 0);
+        /* The owner, connected all along, is told of each newcomer as they are
+         * made (a USER_LIST of one each); then the refusal. */
+        int rosters = 0, refused = 0;
+        for (int i = 0; i < 4 && !refused; i++) {
+            CHECK(read_frame(&owner, &hdr, &p) == 0);
+            if (hdr.msg_type == OC_MSG_USER_LIST) { rosters++; continue; }
+            CHECK(hdr.msg_type == OC_MSG_ERROR);
+            oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_FORBIDDEN && !er.fatal);
+            refused = 1;
+        }
+        CHECK(rosters == 2 && refused);
+    }
 
     /* Owner removes a connected member (bob); bob's connection is dropped. */
     client bob;

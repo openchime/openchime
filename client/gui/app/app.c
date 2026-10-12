@@ -14774,7 +14774,9 @@ static void draw_invites(gfx *rt, const oc_model *m, rectf body) {
         const char *role = iv->role >= OC_ROLE_OWNER ? "owner"
                          : iv->role >= OC_ROLE_ADMIN ? "admin" : "member";
         char head[160];
-        snprintf(head, sizeof head, "Invite as %s", role);
+        if (iv->uses == 1)      snprintf(head, sizeof head, "Invite as %s", role);
+        else if (iv->uses == 0) snprintf(head, sizeof head, "Invite link, no limit, %u used", (unsigned)iv->used);
+        else                    snprintf(head, sizeof head, "Invite link, %u of %u used", (unsigned)iv->used, (unsigned)iv->uses);
         draw_text(rt, head, g_ui, rf(body.left + 20, y + 2, body.right - 130, y + 22), OC_COL_TEXT);
 
         /* Expiry as a countdown, not a timestamp: "in 2 days" answers the question,
@@ -26340,14 +26342,14 @@ static void signin_start(oc_win *hwnd, const char *source_id, const char *invite
  * the daemon for the workspace `ws` (its own address), with nothing
  * remembered: begin the sign-in at once, no probe -- the daemon the page
  * came from names the way in (AUTH_BEGIN) and the page goes to it. */
-static void signin_served(oc_win *hwnd, const char *ws) {
+static void signin_served(oc_win *hwnd, const char *ws, const char *invite) {
     oc_endpoint ep;
     if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) return;
     snprintf(g_si_ws, sizeof g_si_ws, "%s", ws);
     snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
     g_si_port = ep.port;
     g_si_fp[0] = '\0';
-    signin_start_browser(hwnd, NULL, NULL);
+    signin_start_browser(hwnd, NULL, invite);
 }
 
 /* ...and back with the token: the sign-in resumes from what was stashed on
@@ -26652,8 +26654,17 @@ static void show_secret(oc_win *owner, const char *title, const char *what,
  * from, and already on the clipboard, as show_secret does for a bare token. The
  * clipboard gets CRLF line ends, which is what a Windows paste target expects. */
 static void show_invitation(oc_win *owner, const oc_model *m) {
-    oc_field f[1] = { { FF_MULTILINE, "Invitation \u2014 copied to your clipboard", "", "" } };
-    if (!oc_model_invitation_text(m, g_cur_ws, f[0].value, sizeof f[0].value)) return;
+    /* The daemon's own web client opened with the token (REQ-026): a link a
+     * browser anywhere can follow, so only where the pages open directly; one
+     * through this client's tunnel would work here alone. */
+    char link[1200] = "";
+    if (!m->invite_email[0] && oc_client_pages_direct(g_client)) {
+        char q[160];
+        snprintf(q, sizeof q, "invite=%s", m->invite_token);
+        if (oc_client_open_page(g_client, "app/", q, link, sizeof link) != 0) link[0] = '\0';
+    }
+    oc_field f[1] = { { FF_MULTILINE, "Invitation, copied to your clipboard", "", "" } };
+    if (!oc_model_invitation_text(m, g_cur_ws, link[0] ? link : NULL, f[0].value, sizeof f[0].value)) return;
     char crlf[2 * sizeof f[0].value]; size_t o = 0;
     for (const char *q = f[0].value; *q && o + 2 < sizeof crlf; q++) {
         if (*q == '\n') crlf[o++] = '\r';
@@ -26664,9 +26675,13 @@ static void show_invitation(oc_win *owner, const oc_model *m) {
     f[0].hint = m->invite_email[0]
         ? "Send it to the person you invited. Nothing else is needed: signing in as that "
           "address uses the invitation."
-        : "Send it to the person you invited. The token works once and is not shown again "
-          "\u2014 make a new invite if it is lost.";
-    form_dialog(owner, m->invite_email[0] ? "Invitation created" : "Invite created", f, 1);
+        : m->invite_uses == 1
+        ? "Send it to the person you invited. The token works once and is not shown again. "
+          "Make a new invite if it is lost."
+        : "Send it to the people you invited. It is not shown again. Admin > Invites shows "
+          "how many have used it, and revokes it.";
+    form_dialog(owner, m->invite_email[0] ? "Invitation created"
+                     : m->invite_uses == 1 ? "Invite created" : "Invite link created", f, 1);
 }
 
 /* A reset, to send its person: the workspace and the code they enter in their
@@ -26705,12 +26720,26 @@ static int g_await_invite;      /* show the minted invite token once it arrives 
 /* "Invite people": by address where the workspace signs people in through a
  * provider, by one-time token where it has password accounts, and either where
  * it has both -- a workspace refuses the kind it cannot redeem. */
+/* How many may use a token (REQ-026), as the form's choice: one person, as an
+ * invitation always was, or a link to pass around. A shared one makes members
+ * only, so an invitation as admin is not asked. */
+static const char INVITE_USES_OPTS[] =
+    "One person|Up to 5 people|Up to 25 people|Anyone with the link, until it expires";
+static const uint16_t INVITE_USES[] = { 1, 5, 25, 0 };
+
 static void invite_people(oc_win *hwnd, uint8_t role) {
     const oc_model *m = model();
     if (!g_client || !m) return;
     int by_addr = oc_model_offers_browser(m), by_token = oc_model_offers_local(m);
+    int ask_uses = by_token && role == OC_ROLE_MEMBER;
     if (!by_addr) {   /* passwords only: a token is the one kind of invite there is */
-        oc_client_invite(g_client, role, NULL);
+        uint16_t uses = 1;
+        if (ask_uses) {
+            oc_field f[1] = { { FF_SELECT, "Who can use it", INVITE_USES_OPTS, "0" } };
+            if (!form_dialog(hwnd, "Invite people", f, 1)) return;
+            uses = INVITE_USES[atoi(f[0].value) & 3];
+        }
+        oc_client_invite(g_client, role, NULL, uses);
         g_await_invite = 1;
         return;
     }
@@ -26719,13 +26748,14 @@ static void invite_people(oc_win *hwnd, uint8_t role) {
     snprintf(hint, sizeof hint,
              "The invitation is bound to this address, which must be able to sign in with %s.%s",
              prov[0] ? prov : "this workspace's sign-in provider",
-             by_token ? " Leave it empty to make a one-time invite token for a password "
+             by_token ? " Leave it empty to make an invite token for a password "
                         "account instead." : "");
-    oc_field f[1] = { { FF_TEXT, "Email address", hint, "" } };
+    oc_field f[2] = { { FF_TEXT, "Email address", hint, "" },
+                      { FF_SELECT, "Who can use a token", INVITE_USES_OPTS, "0" } };
     for (;;) {
         int seeded = g_form_seeded;
         if (!form_dialog(hwnd, role == OC_ROLE_ADMIN ? "Invite people as admin" : "Invite people",
-                         f, 1)) return;
+                         f, ask_uses ? 2 : 1)) return;
         {   /* checked as it will be sent: without the spaces a paste brings along */
             char *v = f[0].value, *b = v;
             while (*b == ' ' || *b == '\t') b++;
@@ -26745,7 +26775,7 @@ static void invite_people(oc_win *hwnd, uint8_t role) {
         f[0].hint = why;
         g_form_err_field = 0;
     }
-    oc_client_invite(g_client, role, f[0].value);
+    oc_client_invite(g_client, role, f[0].value, ask_uses ? INVITE_USES[atoi(f[1].value) & 3] : 1);
     g_await_invite = 1;
 }
 
@@ -32950,6 +32980,9 @@ int main(int argc, char *argv[]) {
      * client (WEB.md). With a result on the platform the sign-in resumes. */
     int served = argc >= 3 && strcmp(argv[1], "--signin") == 0;
     int resume = served && oc_plat_signin_result(rtoken, sizeof rtoken);
+    /* `--signin <ws> --invite <hex>`: the page was opened by an invitation
+     * link (REQ-026), and the sign-in begins with it on the sign-up form. */
+    const char *served_invite = served && argc >= 5 && strcmp(argv[3], "--invite") == 0 ? argv[4] : NULL;
     if (served) {
         snprintf(aws, sizeof aws, "%s", argv[2]);
         if (!resume) {
@@ -33049,7 +33082,7 @@ int main(int argc, char *argv[]) {
         }
     }
     if (resume) signin_resume(g_main, aws, rtoken);
-    else if (served && !direct) signin_served(g_main, aws);
+    else if (served && !direct) signin_served(g_main, aws, served_invite);
     oc_signin_wipe(rtoken, sizeof rtoken);
     invalidate();
     g_next_tick = now_ms() + TICK_MS;

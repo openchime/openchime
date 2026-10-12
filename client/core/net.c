@@ -1835,6 +1835,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (e) {
                 e->op = ic.role;
                 e->server_time = ic.expires_at;
+                e->uses = ic.uses;
                 e->body = malloc(ic.token.len + 1);
                 if (e->body) { memcpy(e->body, ic.token.ptr, ic.token.len); e->body[ic.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -2271,6 +2272,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op          = iv[i].role;
                 e->server_time = iv[i].expires_at;
                 e->user_id     = iv[i].created_by;
+                e->uses        = iv[i].uses;
+                e->used        = iv[i].used;
                 oc_queue_push(to_ui, e);
             }
             oc_ev *end = oc_ev_new(OC_EV_INVITE_END);
@@ -3576,7 +3579,7 @@ static int run_connection(oc_net *n, int reconnecting,
             if (c->type == OC_CMD_INVITE_USER) {
                 uint8_t buf[320]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 /* op = role; body = the address, or none for a bearer token */
-                oc_invite_user iu = { c->op, c->body ? oc_slice_str(c->body) : (oc_slice){ NULL, 0 } };
+                oc_invite_user iu = { c->op, c->body ? oc_slice_str(c->body) : (oc_slice){ NULL, 0 }, c->uses };
                 if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

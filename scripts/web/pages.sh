@@ -4,10 +4,12 @@
 # setup token, is refused a wrong password, signs in, changes the password on
 # its page and signs in with the new one; the token that last sign-in ends
 # with is then presented on AUTH by build/signin, which proves the page's
-# answer is one the daemon takes. What a browser sends -- its Origin under the
+# answer is one the daemon takes. Then an invitation link, opened cold in a
+# second browser, ends signed in to the web client (scripts/web/invite.mjs). What a browser sends -- its Origin under the
 # pages' referrer policy, its handling of the 303 -- is what is exercised,
 # which the suites' scripted posts cannot show. Needs ./openchimed (a demo
-# build), build/signin, node with playwright-core, and a Chromium (CHROME, else
+# build) with the web client beside it (make web), build/signin,
+# build/demo_client, node with playwright-core, and a Chromium (CHROME, else
 # Playwright's download).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -15,7 +17,9 @@ CHROME="${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/
 [ -x "${CHROME:-/nonexistent}" ] || { echo "pages: no Chromium (set CHROME)" >&2; exit 2; }
 [ -d node_modules/playwright-core ] || npm install --no-audit --no-fund --silent
 ./openchimed --version | grep -q 'demo build' || { echo "pages: ./openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
-[ -x build/signin ] || make build/signin >/dev/null || exit 2
+# Made here, not only when missing: one left from before a protocol bump would
+# be refused at HELLO and look like a page failure.
+make build/signin build/demo_client >/dev/null || exit 2
 W=build/webpages; rm -rf "$W"; mkdir -p "$W/data"
 PORT=18471; CBPORT=18473
 # The sign-in's callback: a loopback listener the browser can land on, as the
@@ -59,4 +63,14 @@ printf '%s\n' "$OUT" | grep -v '^token '
 TOKEN="$(printf '%s\n' "$OUT" | sed -n 's/^token //p' | tail -1)"
 WHO="$(./build/signin present 127.0.0.1 $PORT "$TOKEN" "$VERIFIER")" || { echo "  FAIL the browser's token is refused on AUTH"; exit 1; }
 echo "  ok   the browser's token signs in on AUTH (user $WHO)"
-echo "pages: OK: the sign-in pages from a real browser"
+# An invitation link (REQ-026): the owner mints an invite anyone may use, and a
+# second browser, which has never seen the workspace, opens the link cold and
+# ends signed in to the web client as a new member (scripts/web/invite.mjs).
+# The daemon serves the web client from web/ beside it (make web).
+[ -f web/openchime.wasm ] || { echo "pages: no web client beside the daemon (make web)" >&2; exit 2; }
+INVITE="$(./build/demo_client 127.0.0.1 $PORT owen pw-new invite 0 2>>"$W/pages.err")" || { echo "  FAIL minting the invitation link"; tail -3 "$W/pages.err"; exit 1; }
+OUT2="$(node scripts/web/invite.mjs "https://127.0.0.1:$PORT" "$INVITE" "$CHROME" 2>>"$W/pages.err")"
+rc=$?
+printf '%s\n' "$OUT2"
+[ $rc = 0 ] || { echo "pages: FAIL (see $W/pages.err)"; tail -5 "$W/pages.err"; exit 1; }
+echo "pages: OK: the sign-in pages and an invitation link from a real browser"

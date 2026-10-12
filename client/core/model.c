@@ -828,7 +828,17 @@ void oc_model_invite_asked(oc_model *m, const char *email) {
     m->invite_email[0] = '\0';
 }
 
-size_t oc_model_invitation_text(const oc_model *m, const char *address, char *out, size_t cap) {
+/* How many may use a token, as a sentence: the "It works once." of a single
+ * invitation, or the count a shared link is good for. */
+static const char *invite_uses_text(uint16_t uses, char *buf, size_t cap) {
+    if (uses == 1) return "It works once.";
+    if (uses == 0) return "Anyone with it can join until it expires.";
+    snprintf(buf, cap, "It works for up to %u people.", (unsigned)uses);
+    return buf;
+}
+
+size_t oc_model_invitation_text(const oc_model *m, const char *address, const char *link,
+                                char *out, size_t cap) {
     if (!out || cap == 0) return 0;
     out[0] = '\0';
     if (!m->invite_token[0]) return 0;
@@ -862,19 +872,43 @@ size_t oc_model_invitation_text(const oc_model *m, const char *address, char *ou
             m->invite_email,
             m->signin_provider[0] ? m->signin_provider : "this workspace's sign-in provider",
             expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
+    } else if (link && link[0]) {
+        /* The link first: it needs nothing installed. The token after, for a
+         * person who has the app and would rather sign in there. */
+        char uses[64];
+        n = snprintf(out, cap,
+            "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
+            "\n"
+            "Workspace: %s\n"
+            "Join: open this link in your browser and choose a username and password.\n"
+            "%s\n"
+            "In the OpenChime app instead: open the workspace, choose to create an account "
+            "with an invite, and enter this invite token.\n"
+            "Invite token: %s\n"
+            "%s\n"
+            "%s%s%s",
+            name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
+            m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
+            addr ? addr : "(the address you were given)",
+            link,
+            m->invite_token,
+            invite_uses_text(m->invite_uses, uses, sizeof uses),
+            expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
     } else {
+        char uses[64];
         n = snprintf(out, cap,
             "You are invited to join %s%s%s on OpenChime, as %s %s.\n"
             "\n"
             "Workspace: %s\n"
             "Sign in: open the workspace in the OpenChime app, choose to create an account "
             "with an invite, and enter this invite token with the username and password you "
-            "want. It works once.\n"
+            "want. %s\n"
             "Invite token: %s\n"
             "%s%s%s",
             name ? "the " : "", name ? name : "this workspace", name ? " workspace" : "",
             m->invite_role == OC_ROLE_MEMBER ? "a" : "an", role,
             addr ? addr : "(the address you were given)",
+            invite_uses_text(m->invite_uses, uses, sizeof uses),
             m->invite_token,
             expires[0] ? "Expires: " : "", expires, expires[0] ? "\n" : "");
     }
@@ -1989,6 +2023,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         iv->role       = e->op;
         iv->expires_at = e->server_time;
         iv->created_by = e->user_id;
+        iv->uses       = e->uses;
+        iv->used       = e->used;
         break;
     }
     case OC_EV_INVITE_END:
@@ -2523,6 +2559,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         snprintf(m->invite_token, sizeof m->invite_token, "%s", e->body ? e->body : "");
         m->invite_role = e->op;
         m->invite_expires = e->server_time;
+        m->invite_uses = e->uses;
         /* INVITE_CREATED answers the invite asked for last; one bound to an
          * address comes back with a token of zeros, which is nothing to share. */
         snprintf(m->invite_email, sizeof m->invite_email, "%s", m->invite_asked_email);

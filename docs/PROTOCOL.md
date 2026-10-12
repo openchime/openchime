@@ -206,7 +206,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 23** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 24** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -903,9 +903,12 @@ On success the actor is acked with **`USER_UPDATED` (server → client), msg_typ
 pushed to the affected user's live connections so their client updates its
 capabilities immediately.
 
-**`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8, email: str }` — owner/admin
-only (only an owner may invite at admin/owner role). With `email` empty it mints a
-single-use invite token for a **new** local account. With `email` set the invite
+**`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8, email: str, uses: u16 }` — owner/admin
+only (only an owner may invite at admin/owner role). With `email` empty it mints an
+invite token for a **new** local account; `uses` is how many may redeem it
+(REQ-026): `1` for one person, `N`, or `0` for no limit until it expires. More
+than one makes a link to pass around, which is member-role only: an admin or
+owner invite with `uses` other than `1` is refused with `FORBIDDEN`. With `email` set the invite
 is bound to that address instead (AUTH.md §8.4): it is spent by that address's
 first verified sign-in through a provider, no token can redeem it, and the
 `token` that comes back is 32 zero bytes. The `email` must have the shape of an
@@ -925,11 +928,14 @@ Either way the reply is
 | `token`      | bytes | The 32-byte invite token (only its SHA-256 is stored). The actor shares it out-of-band. |
 | `role`       | u8    | The role the redeemed account will receive.                 |
 | `expires_at` | u64   | Ms since epoch UTC after which the token is dead.           |
+| `uses`       | u16   | How many may redeem it: `1`, `N`, or `0` for no limit (REQ-026). An invite bound to an address is always `1`. |
 
 **Redeeming an invitation** is not a frame: the invitee, who has no account
 yet, opens the daemon's sign-up page with the token (`/signin?invite=<hex>`,
-AUTH.md §8.10), which consumes it (single-use), creates the account with the
-invite's role and ends with the token the client presents on `AUTH`. A bad,
+AUTH.md §8.10), which takes one of its uses (the last consumes it), creates the
+account with the invite's role and ends with the token the client presents on
+`AUTH`. The daemon's own web client opened with the token
+(`/app/?invite=<hex>`, WEB.md) is the same page reached from a link. A bad,
 expired or consumed token, or a taken username, shows the form again,
 non-disclosing by design. (`0x0047 REDEEM_INVITE` once carried this in a frame;
 the number is retired.)
@@ -2161,7 +2167,10 @@ client never offers an action that would fail.
 
 **`INVITE_LIST` (S → C), `0x004C`** — The outstanding invites, identified by a server-side id — never the token. (REQ-026)
 
-    count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64) }
+    count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64), uses (u16), used (u16) }
+
+`uses` is how many may redeem it (`0`: no limit) and `used` how many have (REQ-026);
+an invite leaves the list when its last use is taken.
 
 **`REVOKE_INVITE` (C → S), `0x004D`** — Revoke one outstanding invite by its id. (REQ-026)
 

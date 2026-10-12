@@ -115,6 +115,16 @@ Under the test harness a demo build types for the person:
 `?env=OPENCHIME_TEST_SIGNIN=user:password` has the page post the daemon's
 sign-in form itself and follow the redirect back (`plat_web.c`).
 
+**An invitation link.** `/app/?invite=<hex>` is the page opened with an
+invitation (REQ-026): the page starts the client as `openchime --signin
+<host:port> --invite <hex>`, the sign-in begins with the invitation, and the
+daemon's page opens on the sign-up form, so a person who was sent the link
+chooses a username and password in the browser and comes back here signed in
+as the new member, with nothing installed. The clients offer the link in the
+invitation text where the daemon's pages open directly
+(`oc_client_pages_direct`); `scripts/web/invite.mjs` proves it from a cold
+browser.
+
 **Media in the browser.** The same media, voice and call code the desktop
 links (`client/core/media`, `voice`, `call`: VP9 through libvpx, Opus,
 speexdsp's canceller and preprocessor, the MP4 muxer, the recorder, the player,

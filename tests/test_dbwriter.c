@@ -2358,7 +2358,9 @@ static void test_index_mentions(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;",
+    /* Back to before step 60; step 61's columns go too, so that it can run again. */
+    CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
+                           "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -3406,7 +3408,7 @@ static void test_channels(void) {
 
 static oc_dbres *invite_user(oc_dbwriter *w, uint64_t actor, uint8_t role) {
     oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 95);
-    j->user_id = actor; j->role = role;
+    j->user_id = actor; j->role = role; j->uses = 1;
     oc_dbwriter_submit(w, j);
     return wait_result(w);
 }
@@ -5036,6 +5038,95 @@ static void test_attachments(void) {
 /* Invite management (REQ-026) and webhook lifecycle. Both touch
  * tables whose columns already existed, so the risk is in the ops and their
  * authorisation — which is what this asserts. */
+/* An invite more than one person may redeem (REQ-026, a shareable link): two
+ * uses taken, the third refused; no limit; a shared one is member-role only;
+ * the list says how many have used it and how many may. */
+static void test_shared_invite(void) {
+    const char *path = "build/test_dbwriter_shared_invite.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    uint64_t owner = reg(w, "sh-owner", "pw", OC_ROLE_OWNER);
+    CHECK(owner);
+
+    /* Two may use it: the result says so, the list counts them, the third is
+     * refused as any spent invite is, and the row then leaves the list. */
+    uint8_t tok[OC_INVITE_TOKEN_LEN];
+    {
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 1);
+        j->user_id = owner; j->role = OC_ROLE_MEMBER; j->uses = 2;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_OK && r->invite_uses == 2);
+        if (r) memcpy(tok, r->session_token, OC_INVITE_TOKEN_LEN);
+        oc_dbres_free(r);
+    }
+    {
+        oc_dbres *r = redeem_invite(w, tok, "sh-one", "pw");
+        CHECK(r && r->type == OC_RES_AUTH_OK && r->role == OC_ROLE_MEMBER);
+        oc_dbres_free(r);
+        oc_job *j = oc_job_new(OC_JOB_LIST_INVITES, 2);
+        j->user_id = owner;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 1);
+        if (r && r->n_invites == 1) CHECK(r->invites[0].uses == 2 && r->invites[0].used == 1);
+        oc_dbres_free(r);
+        r = redeem_invite(w, tok, "sh-two", "pw");
+        CHECK(r && r->type == OC_RES_AUTH_OK);
+        oc_dbres_free(r);
+        r = redeem_invite(w, tok, "sh-three", "pw");
+        CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_LIST_INVITES, 3);
+        j->user_id = owner;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 0);
+        oc_dbres_free(r);
+    }
+    /* No limit: three in a row, and it is still outstanding. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 4);
+        j->user_id = owner; j->role = OC_ROLE_MEMBER; j->uses = 0;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_OK && r->invite_uses == 0);
+        if (r) memcpy(tok, r->session_token, OC_INVITE_TOKEN_LEN);
+        oc_dbres_free(r);
+        const char *names[3] = { "sh-a", "sh-b", "sh-c" };
+        for (int i = 0; i < 3; i++) {
+            r = redeem_invite(w, tok, names[i], "pw");
+            CHECK(r && r->type == OC_RES_AUTH_OK);
+            oc_dbres_free(r);
+        }
+        j = oc_job_new(OC_JOB_LIST_INVITES, 5);
+        j->user_id = owner;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 1);
+        if (r && r->n_invites == 1) CHECK(r->invites[0].uses == 0 && r->invites[0].used == 3);
+        oc_dbres_free(r);
+    }
+    /* A link passed around makes members only: a shared admin invite is refused
+     * even to an owner, where a one-person admin invite is not. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 6);
+        j->user_id = owner; j->role = OC_ROLE_ADMIN; j->uses = 2;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+        oc_dbres_free(r);
+        j = oc_job_new(OC_JOB_INVITE_USER, 7);
+        j->user_id = owner; j->role = OC_ROLE_ADMIN; j->uses = 1;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_OK && r->role == OC_ROLE_ADMIN && r->invite_uses == 1);
+        oc_dbres_free(r);
+    }
+    oc_dbwriter_stop(w);
+}
+
 static void test_invites_and_webhook_lifecycle(void) {
     const char *path = "build/test_dbwriter_invites.db";
     cleanup_db(path);
@@ -5049,7 +5140,7 @@ static void test_invites_and_webhook_lifecycle(void) {
     /* Mint two invites, then list them. */
     for (int i = 0; i < 2; i++) {
         oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 1);
-        j->user_id = owner; j->role = OC_ROLE_MEMBER;
+        j->user_id = owner; j->role = OC_ROLE_MEMBER; j->uses = 1;
         oc_dbwriter_submit(w, j);
         oc_dbres *r = wait_result(w);
         CHECK(r && r->type == OC_RES_INVITE_OK);
@@ -6645,7 +6736,7 @@ static void test_max_users(void) {
  * report needs: the address as stored and an id derived from the row. */
 static oc_dbres *invite_email(oc_dbwriter *w, uint64_t actor, const char *email) {
     oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 99);
-    j->user_id = actor; j->role = OC_ROLE_MEMBER;
+    j->user_id = actor; j->role = OC_ROLE_MEMBER; j->uses = 1;
     if (email) oc_job_set_email(j, email, strlen(email));
     oc_dbwriter_submit(w, j);
     return wait_result(w);
@@ -7953,6 +8044,7 @@ int run_dbwriter_tests(void) {
     test_attachments();
     test_webhooks();
     test_invites_and_webhook_lifecycle();
+    test_shared_invite();
     test_status_and_profile();
     test_custom_emoji();
     test_group_dm();

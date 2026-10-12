@@ -489,11 +489,13 @@ model; translate input to intents }, stop.
     sign in with the workspace's provider, by name where the workspace's browser
     sources say which (`oc_model_signin_provider`: a source id `google` is
     Google, `microsoft` Microsoft) — and, where it also has password accounts, a
-    blank address mints a one-time token instead; a workspace with password
-    accounts only mints the token without asking. Anything that is not an
-    address (`oc_email_plausible`) keeps the prompt open and says so. The
-    invitation text
-    (`oc_model_invitation_text`: the workspace, how to sign in, the expiry) is
+    blank address mints a one-time token instead, and a number is how many may
+    join by one shared link (`0` for no limit; REQ-026); a workspace with
+    password accounts only asks the same without the address. Anything that is
+    not an address or a number (`oc_email_plausible`) keeps the prompt open and
+    says so. The invitation text
+    (`oc_model_invitation_text`: the workspace, how to sign in, the expiry, and
+    the link to the daemon's web client where its pages open directly) is
     printed atop the roster, which opens on it.
   - **webhook management** — the channel menu's "Webhooks" overlays the focused
     channel's incoming webhooks; "Create webhook" mints one (the 32-byte token is
@@ -552,11 +554,15 @@ model; translate input to intents }, stop.
   as the TUI does — and refusing anything that is not an address at the field, in
   red, with the form asked again;
   where it also has password accounts the address
-  may be left empty for a one-time token, and where it has password accounts only
-  the token is minted without asking. The answer opens the invitation — the
-  workspace address as typed, how to sign in (the provider and the invited
-  address, or the token) and the expiry — in a selectable field, already on the
-  clipboard, as a one-time secret is shown. **Each
+  may be left empty for a token, and **Who can use it** says how many may:
+  one person, up to 5, up to 25, or anyone with the link until it expires
+  (REQ-026; a shared one is member-role only, so an invitation as admin is not
+  asked). Where it has password accounts only, that is the one question. The
+  answer opens the invitation — the workspace address as typed, how to sign in
+  (the provider and the invited address, or the link to the daemon's web client
+  where its pages open directly, and the token) and the expiry — in a
+  selectable field, already on the clipboard, as a one-time secret is shown.
+  Admin > Invites shows a shared one as "Invite link, 2 of 5 used". **Each
   destination has one door in the visible chrome**: an item is not repeated in a
   second menu a click away, and an icon does not open a menu something beside it
   already opens. Right of the rail sits the channel column (header with the

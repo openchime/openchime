@@ -412,6 +412,7 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
 }
 
 static const char *active_address(void);   /* the workspace as the person typed it */
+static const char *invite_link(void);      /* the last invite as a link, where one works anywhere */
 
 /* Build the rows for the roster overlay: each member with a presence dot,
  * colored by presence, plus a role tag. */
@@ -424,7 +425,7 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
      * the roster: the text to send the invited person, line by line. */
     if (m->invite_token[0]) {
         char text[1024];
-        if (oc_model_invitation_text(m, active_address(), text, sizeof text)) {
+        if (oc_model_invitation_text(m, active_address(), invite_link(), text, sizeof text)) {
             for (char *ln = text; ln && *ln; ) {
                 char *nl = strchr(ln, '\n');
                 if (nl) *nl = '\0';
@@ -586,6 +587,22 @@ static const char *active_address(void) {
     return (g_nws && g_active < g_nws) ? g_ws[g_active].label : "";
 }
 
+/* The last invite as the daemon's web client opened with it (REQ-026): a link
+ * a browser anywhere can follow, so only where the pages open directly; NULL
+ * where they open through this client's tunnel, which works here alone. */
+static const char *invite_link(void) {
+    static char link[1200];
+    link[0] = '\0';
+    if (!g_nws || g_active >= g_nws || !g_ws[g_active].cl) return NULL;
+    oc_client *cl = g_ws[g_active].cl;
+    const oc_model *m = oc_client_model(cl);
+    if (!m->invite_token[0] || m->invite_email[0] || !oc_client_pages_direct(cl)) return NULL;
+    char q[160];
+    snprintf(q, sizeof q, "invite=%s", m->invite_token);
+    if (oc_client_open_page(cl, "app/", q, link, sizeof link) != 0) return NULL;
+    return link;
+}
+
 /* The address as typed, without the spaces a paste brings along. */
 static void invite_trim(const char *v, char *out, size_t cap) {
     while (*v == ' ' || *v == '\t') v++;
@@ -596,20 +613,25 @@ static void invite_trim(const char *v, char *out, size_t cap) {
     out[n] = '\0';
 }
 
-/* "Invite a user": where the workspace signs people in through a provider, word
- * the prompt's two lines of explanation -- which provider, when the workspace
- * says, and whether a blank asks for a token -- and answer 1; where it has
- * password accounts only, ask for a token straight away and answer 0. */
+/* "Invite a user": the prompt's two lines of explanation. Where the workspace
+ * signs people in through a provider, an address -- which provider, when the
+ * workspace says -- and, where it also has password accounts, a blank for a
+ * one-time token or a number for a link that many may use (REQ-026); where it
+ * has password accounts only, the token or the number. Answers 1 to open the
+ * prompt. */
 static int invite_prompt(oc_client *cl, char *note, size_t cap, const char **note2) {
     const oc_model *im = oc_client_model(cl);
     if (!oc_model_offers_browser(im)) {
-        oc_client_invite_user(cl, OC_ROLE_MEMBER);
-        return 0;
+        snprintf(note, cap, "Leave it blank for a one-time invite token.");
+        *note2 = "Or a number: how many may join by one shared link (0 for no limit).";
+        return 1;
     }
     const char *prov = oc_model_signin_provider(im);
     snprintf(note, cap, "It must be able to sign in with %s.",
              prov[0] ? prov : "this workspace's provider");
-    *note2 = oc_model_offers_local(im) ? "Leave it blank for a one-time invite token instead." : "";
+    *note2 = oc_model_offers_local(im)
+             ? "Blank for a one-time invite token; a number for a shared link that many may use."
+             : "";
     return 1;
 }
 
@@ -3081,14 +3103,23 @@ int main(int argc, char **argv) {
                     const oc_model *im = oc_client_model(cl);
                     char addr[256];
                     invite_trim(v, addr, sizeof addr);
-                    if (!addr[0] && !oc_model_offers_local(im)) {
+                    int digits = addr[0] != '\0';
+                    for (const char *d = addr; *d; d++) if (*d < '0' || *d > '9') digits = 0;
+                    if ((!addr[0] || digits) && !oc_model_offers_local(im)) {
                         prompt_kind = PROMPT_INVITE;
                         invite_err = "An email address is needed to invite someone here.";
-                    } else if (addr[0] && !oc_email_plausible(addr)) {
+                    } else if (digits && strlen(addr) > 5) {
+                        prompt_kind = PROMPT_INVITE;
+                        invite_err = "That is too many people for one link.";
+                    } else if (addr[0] && !digits && !oc_email_plausible(addr)) {
                         prompt_kind = PROMPT_INVITE;
                         invite_err = "That does not look like an email address.";
                     } else {
-                        oc_client_invite(cl, OC_ROLE_MEMBER, addr);
+                        /* A number is how many may use one shared link (0 for no
+                         * limit); blank is a one-time token; else an address. */
+                        long n = digits ? atol(addr) : 1;
+                        oc_client_invite(cl, OC_ROLE_MEMBER, digits ? NULL : addr,
+                                         (uint16_t)(n > 65535 ? 65535 : n));
                         await_invite = 1;
                     }
                 }
@@ -3147,9 +3178,9 @@ int main(int argc, char **argv) {
                 else if (id == ACT_INVITE)  {
                     if (invite_prompt(cl, invite_note, sizeof invite_note, &invite_note2)) {
                         prompt_kind = PROMPT_INVITE;
-                        prompt_title = "Invite by email";
+                        prompt_title = oc_model_offers_browser(oc_client_model(cl)) ? "Invite by email" : "Invite people";
                         invite_err = "";
-                        tk_input_init(&prompt_input, 0, "name@example.com");
+                        tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
                     } else await_invite = 1;
                 }
                 else if (id == ACT_PROFILE) profile_open = 1;
@@ -3257,9 +3288,9 @@ int main(int argc, char **argv) {
                     else if (id == ACT_INVITE)  {
                         if (invite_prompt(cl, invite_note, sizeof invite_note, &invite_note2)) {
                             prompt_kind = PROMPT_INVITE;
-                            prompt_title = "Invite by email";
+                            prompt_title = oc_model_offers_browser(oc_client_model(cl)) ? "Invite by email" : "Invite people";
                             invite_err = "";
-                            tk_input_init(&prompt_input, 0, "name@example.com");
+                            tk_input_init(&prompt_input, 0, oc_model_offers_browser(oc_client_model(cl)) ? "name@example.com" : "");
                         } else await_invite = 1;
                     }
                     else if (id == ACT_PROFILE) profile_open = 1;

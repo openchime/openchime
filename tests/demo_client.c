@@ -165,6 +165,28 @@ static int cmd_token(client *c, const char *platform, const char *token) {
     return 0;
 }
 
+/* Mint a member invite that `uses` people may redeem (0: no limit) and print
+ * its token as hex: what scripts/web/pages.sh opens as an invitation link. */
+static int cmd_invite(client *c, unsigned uses) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_invite_user iu = { OC_ROLE_MEMBER, { NULL, 0 }, (uint16_t)uses };
+    if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) != OC_OK ||
+        write_all(&c->conn, buf, w.len) != 0) FAIL("send invite");
+    for (int i = 0; i < 32; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) FAIL("read after invite");
+        if (hdr.msg_type == OC_MSG_INVITE_CREATED) {
+            oc_invite_created ic;
+            if (oc_decode_invite_created(&p, &ic) != OC_OK) FAIL("decode invite");
+            printf("%.*s\n", (int)ic.token.len, (const char *)ic.token.ptr);
+            fprintf(stderr, "demo_client: invite for %u (0 = no limit)\n", ic.uses);
+            return 0;
+        }
+        if (hdr.msg_type == OC_MSG_ERROR) FAIL("invite refused");
+    }
+    FAIL("no INVITE_CREATED");
+}
+
 static int cmd_send(client *c, uint64_t channel_id, const char *text) {
     uint8_t idem[OC_IDEM_SIZE];
     for (size_t i = 0; i < sizeof idem; i++) idem[i] = (uint8_t)(text[i % (strlen(text) ? strlen(text) : 1)] ^ i);
@@ -259,9 +281,10 @@ int main(int argc, char **argv) {
             "       %s <host> <port> <user> <pass> send  <channel_id> <text...>\n"
             "       %s <host> <port> <user> <pass> reply <channel_id> <parent> <text...>\n"
             "       %s <host> <port> <user> <pass> summarize <channel_id> <start_ms> <end_ms>\n"
+            "       %s <host> <port> <user> <pass> invite [uses]   (a member invite; 0 = no limit)\n"
             "       %s <host> <port> --oidc <jwt>   whoami\n"
             "       %s <host> <port> --oidc <jwt>   send <channel_id> <text...>\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *host = argv[1]; int port = atoi(argv[2]);
@@ -284,6 +307,8 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "whoami") == 0) {
         printf("demo_client: authenticated as uid %llu\n", (unsigned long long)uid);
         rc = 0;
+    } else if (strcmp(cmd, "invite") == 0) {
+        rc = cmd_invite(&c, argc >= 7 ? (unsigned)atoi(argv[6]) : 1u);
     } else if (strcmp(cmd, "token") == 0 && argc >= 8) {
         rc = cmd_token(&c, argv[6], argv[7]);
     } else if (strcmp(cmd, "send") == 0 && argc >= 8) {

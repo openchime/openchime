@@ -1034,10 +1034,10 @@ void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role) {
 }
 
 void oc_client_invite_user(oc_client *c, uint8_t role) {
-    oc_client_invite(c, role, NULL);
+    oc_client_invite(c, role, NULL, 1);
 }
 
-void oc_client_invite(oc_client *c, uint8_t role, const char *email) {
+void oc_client_invite(oc_client *c, uint8_t role, const char *email, uint16_t uses) {
     if (!c) return;
     /* An address is sent as typed, trimmed of the spaces a paste brings along;
      * the daemon lower-cases and checks it. */
@@ -1054,6 +1054,7 @@ void oc_client_invite(oc_client *c, uint8_t role, const char *email) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_INVITE_USER);
     if (!cmd) return;
     cmd->op = role;
+    cmd->uses = uses;
     if (addr[0]) {
         cmd->body = strdup(addr);
         if (!cmd->body) { oc_cmd_free(cmd); return; }
