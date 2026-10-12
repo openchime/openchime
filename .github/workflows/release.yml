@@ -641,6 +641,29 @@ jobs:
             -f Dockerfile \
             -t "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
             image
+      # The image as it ships, started as the hosted model starts it (ARCH-76):
+      # podman is daemonless and reads buildah's store, so no Docker comes back
+      # (ARCH-36). /healthz answering proves the entrypoint, the data directory,
+      # the binary on this base and the data beside it hold together; before
+      # this a fault in any of them reached GHCR unchallenged, since nothing
+      # pulled or ran the image. The arm64 image is build-only here, as its
+      # binary is: the runner cannot run it without emulation.
+      - name: Start the image and ask it /healthz
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          podman run -d --name oc -p 127.0.0.1:18080:8080 \
+            -e OPENCHIME_WORKSPACE_NAME=Image "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null | grep -qx OK; then
+              echo "healthz: OK after ${i} s"; ok=1; break
+            fi
+            sleep 1
+          done
+          echo "--- the daemon's log"; podman logs oc 2>&1 | tail -30
+          podman rm -f oc >/dev/null
+          [ "$ok" = 1 ] || { echo "::error::the image did not answer /healthz within 60 s"; exit 1; }
       - name: Push the per-architecture image
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
