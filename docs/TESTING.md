@@ -715,8 +715,13 @@ the check signs in by password and bootstraps its user.
   client's own listener is, and the token read off that address is presented
   on `AUTH` by `build/signin present`. What the browser itself sends -- its
   `Origin` under the pages' referrer policy, its handling of the redirect -- is
-  what this proves, and what no scripted post can. `make web-test` runs it
-  after `test.sh`.
+  what this proves, and what no scripted post can. Then an invitation link
+  (REQ-026): the owner mints an invite anyone may use (`build/demo_client
+  ... invite 0`) and a second browser opens `/app/?invite=<hex>` cold
+  (`scripts/web/invite.mjs`), lands on the sign-up form, chooses a name and a
+  password and comes back signed in to the web client, which its own dump
+  says. Needs the web client beside the daemon (`make web`). `make web-test`
+  runs it after `test.sh`.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, voice input, screen recording,
   uploads, files, the two call scripts and the search boxes, each on its own

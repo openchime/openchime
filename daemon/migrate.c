@@ -1303,6 +1303,15 @@ static const char MIGRATION_0058[] =
  * its messages scanned once. */
 static const char MIGRATION_0060[] = "SELECT 1;";
 
+/* 0061: an invite that more than one person may redeem (REQ-026, a shareable
+ * link). `uses` is how many may: 1 as every invite was, N, or 0 for no limit;
+ * `used` counts the redemptions taken. `consumed_at_ms` is still set when the
+ * last use is taken, so the outstanding list and a revoke keep their meaning.
+ * Every existing row is a single-use invite, which the defaults say. */
+static const char MIGRATION_0061[] =
+    "ALTER TABLE invites ADD COLUMN uses INTEGER NOT NULL DEFAULT 1;"
+    "ALTER TABLE invites ADD COLUMN used INTEGER NOT NULL DEFAULT 0;";
+
 static const char MIGRATION_0059[] =
     /* A summary is its asker's, not their connection's (REQ-311, SUMMARIES.md
      * §5). The queue is made again -- its rows were only ever a run's -- with
@@ -1408,6 +1417,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 58, MIGRATION_0058 },
     { 59, MIGRATION_0059 },
     { 60, MIGRATION_0060 },
+    { 61, MIGRATION_0061 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

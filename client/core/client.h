@@ -362,11 +362,14 @@ void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role);
 void oc_client_invite_user(oc_client *c, uint8_t role);
 /* Invite someone: bound to `email` when it is given -- spent by that address's
  * first verified sign-in through the workspace's provider, no token to hand over
- * -- or, with NULL/"", a bearer token for a new local account. The answer is an
- * INVITE_CREATED; oc_model_invitation_text then words what to send the invited
- * person. Offer an address where oc_model_offers_browser holds and a token where
- * oc_model_offers_local does: a workspace refuses the other. */
-void oc_client_invite(oc_client *c, uint8_t role, const char *email);
+ * -- or, with NULL/"", a bearer token for a new local account. `uses` is how
+ * many may redeem a token (REQ-026): 1 for one person; N, or 0 for no limit
+ * until it expires, for a link to pass around, which the daemon makes
+ * member-role only. The answer is an INVITE_CREATED; oc_model_invitation_text
+ * then words what to send the invited person. Offer an address where
+ * oc_model_offers_browser holds and a token where oc_model_offers_local does:
+ * a workspace refuses the other. */
+void oc_client_invite(oc_client *c, uint8_t role, const char *email, uint16_t uses);
 void oc_client_remove_user(oc_client *c, uint64_t user_id);
 /* An owner's or admin's reset link for a local account (AUTH.md §2), with its
  * second step cleared too when `clear_step`; the model's reset_token is it. */

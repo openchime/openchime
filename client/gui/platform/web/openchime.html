@@ -59,10 +59,13 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
   // (or ?ws=, or ?host=&port=, for a page served from elsewhere), and the
   // client signs in on the daemon's pages and comes back here with the token
   // (?token=, which the client takes off the address).
+  // `/app/?invite=<hex>` is an invitation link (REQ-026): the client begins
+  // the sign-in with it, so the daemon's page opens on the sign-up form.
   const args = [];
   { let ws = q.get('ws') || q.get('host') || '';
     if (q.get('host') && q.get('port')) ws = q.get('host') + ':' + q.get('port');
-    args.push('--signin', ws || `${host}:${port}`); }
+    args.push('--signin', ws || `${host}:${port}`);
+    if (/^[0-9a-f]{64}$/.test(q.get('invite') || '')) args.push('--invite', q.get('invite')); }
   var Module = {
     arguments: args,
     // The test knobs the native harness sets in the environment (TESTING.md)

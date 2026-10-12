@@ -363,6 +363,7 @@ typedef struct oc_job {
     char          *username;  /* heap */
     char          *password;  /* heap */
     uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
+    uint16_t       uses;      /* INVITE_USER: how many may redeem it; 0 = no limit */
     uint32_t       iterations;/* PBKDF2 rounds (0 -> OC_PW_ITERATIONS default) */
 
     /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`.
@@ -1098,6 +1099,7 @@ typedef struct oc_dbres {
      * invitation mail report carries (ARCH-85). Empty/NULL for a bearer invite. */
     char            invite_id[33];
     char           *invite_email;   /* heap */
+    uint16_t        invite_uses;    /* INVITE_OK: how many may redeem it; 0 = no limit */
     uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
     oc_user_row    *ulist;          /* USER_LIST: heap array */
     size_t          n_ulist;

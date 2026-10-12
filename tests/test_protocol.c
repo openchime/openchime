@@ -1030,12 +1030,19 @@ static void test_admin_frames(void) {
         CHECK(out.user_id == 7 && out.role == OC_ROLE_ADMIN);
     }
     {
-        oc_invite_user in = { OC_ROLE_ADMIN, oc_slice_str("pat@acme.example") };
+        oc_invite_user in = { OC_ROLE_ADMIN, oc_slice_str("pat@acme.example"), 1 };
         ROUNDTRIP(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_USER, h, p);
         oc_invite_user out;
         CHECK(oc_decode_invite_user(&p, &out) == OC_OK);
         CHECK(out.role == OC_ROLE_ADMIN);
         CHECK(slice_eq_str(out.email, "pat@acme.example"));
+        CHECK(out.uses == 1);
+    }
+    {
+        /* A link to share: how many may use it travels, 0 for no limit. */
+        oc_invite_user shared = { OC_ROLE_MEMBER, { NULL, 0 }, 0 }, out;
+        ROUNDTRIP(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &shared), OC_MSG_INVITE_USER, h, p);
+        CHECK(oc_decode_invite_user(&p, &out) == OC_OK && out.uses == 0 && out.email.len == 0);
     }
     {
         /* What an invite can be bound to: the daemon refuses anything else, and
@@ -1110,12 +1117,24 @@ static void test_admin_frames(void) {
     {
         uint8_t tok[OC_INVITE_TOKEN_LEN];
         for (int i = 0; i < (int)OC_INVITE_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 3);
-        oc_invite_created in = { { tok, OC_INVITE_TOKEN_LEN }, OC_ROLE_MEMBER, 1751200500000ull };
+        oc_invite_created in = { { tok, OC_INVITE_TOKEN_LEN }, OC_ROLE_MEMBER, 1751200500000ull, 25 };
         ROUNDTRIP(oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_CREATED, h, p);
         oc_invite_created out;
         CHECK(oc_decode_invite_created(&p, &out) == OC_OK);
         CHECK(out.token.len == OC_INVITE_TOKEN_LEN && out.token.ptr[0] == 3);
-        CHECK(out.role == OC_ROLE_MEMBER && out.expires_at == 1751200500000ull);
+        CHECK(out.role == OC_ROLE_MEMBER && out.expires_at == 1751200500000ull && out.uses == 25);
+    }
+    {
+        /* INVITE_LIST entries carry how many may use each and how many have. */
+        oc_invite_entry in[2] = { { 7, OC_ROLE_MEMBER, 0, 1751200500000ull, 1, 1, 0 },
+                                  { 8, OC_ROLE_MEMBER, 0, 1751200600000ull, 1, 0, 3 } };
+        oc_invite_list l = { 2, in };
+        ROUNDTRIP(oc_encode_invite_list(&w, OC_PROTOCOL_VERSION, &l), OC_MSG_INVITE_LIST, h, p);
+        oc_invite_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_invite_list(&p, out, 2, &n) == OC_OK && n == 2);
+        CHECK(out[0].invite_id == 7 && out[0].uses == 1 && out[0].used == 0);
+        CHECK(out[1].invite_id == 8 && out[1].uses == 0 && out[1].used == 3 &&
+              out[1].expires_at == 1751200600000ull && out[1].created_by == 1);
     }
 }
 

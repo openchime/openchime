@@ -152,8 +152,12 @@
  * would need no bump; but every excerpt the daemon builds now says whether its
  * message is an action -- CHANNEL_LIST's preview_action, SEARCH_RESULTS,
  * ACTIVITY_ENTRY, THREAD_SUMMARY, PINNED_MSG, SAVED_MSG and FORWARD's
- * src_action -- and each is a byte appended to a layout. */
-#define OC_PROTOCOL_VERSION 23u
+ * src_action -- and each is a byte appended to a layout.
+ *
+ * 24: an invite more than one person may redeem (REQ-026, a shareable link).
+ * INVITE_USER carries `uses`, INVITE_CREATED `uses`, and each INVITE_LIST
+ * entry `uses` and `used`: fields appended to three layouts. */
+#define OC_PROTOCOL_VERSION 24u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -1550,7 +1554,9 @@ typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_li
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 /* `email` binds the invite to an address, consumed at that address's first
  * verified sign-in (AUTH.md §8.4); empty mints a bearer token for a local account. */
-typedef struct { uint8_t role; oc_slice email; } oc_invite_user;
+/* `uses`: how many may redeem it (REQ-026): 1 for one person, N, or 0 for no
+ * limit until it expires. More than one makes a member-role link to share. */
+typedef struct { uint8_t role; oc_slice email; uint16_t uses; } oc_invite_user;
 /* Whether `s` has the shape of an address an invite can be bound to: one "@",
  * a local part of 1-64 bytes with no spaces, controls or list separators, and a
  * domain of dot-separated labels (at least two, none empty). 254 bytes at most.
@@ -1575,12 +1581,12 @@ typedef struct { uint64_t session_id; } oc_revoke_session;
 typedef struct { oc_slice email; } oc_set_email;
 #define OC_MAX_EMAIL 254u
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
-typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
+typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; uint16_t uses; } oc_invite_created;
 /* An outstanding invite, identified by a server-side id rather than its
  * token: the token is not recoverable (only its hash is stored) and putting one on
  * the wire again would hand it to anyone who could read a list. */
 typedef struct { uint64_t invite_id; uint8_t role; uint64_t created_at; uint64_t expires_at;
-                 uint64_t created_by; } oc_invite_entry;
+                 uint64_t created_by; uint16_t uses, used; } oc_invite_entry;
 typedef struct { uint16_t count; const oc_invite_entry *entries; } oc_invite_list;
 typedef struct { uint64_t invite_id; } oc_revoke_invite;
 /* Self-service profile (REQ-020). */

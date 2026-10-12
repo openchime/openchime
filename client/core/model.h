@@ -307,7 +307,8 @@ typedef struct {
 
 /* One outstanding invite (REQ-026). No token: only its SHA-256 is stored
  * server-side, so there is nothing to carry. */
-typedef struct { uint64_t invite_id, expires_at, created_by; uint8_t role; } oc_invite_row;
+typedef struct { uint64_t invite_id, expires_at, created_by; uint8_t role;
+                 uint16_t uses, used; } oc_invite_row;   /* uses 0 = no limit */
 
 /* One saved item (REQ-231) — private to this user. */
 typedef struct {
@@ -589,6 +590,7 @@ typedef struct {
     char      invite_token[96];
     uint8_t   invite_role;
     uint64_t  invite_expires;
+    uint16_t  invite_uses;     /* how many may redeem it; 0 = no limit (REQ-026) */
     /* The address the last invite is bound to ("" for a bearer token), and the
      * one asked for but not answered yet: INVITE_CREATED does not repeat it. */
     char      invite_email[256];
@@ -1141,9 +1143,15 @@ void oc_model_invite_asked(oc_model *m, const char *email);
 /* The invitation to hand the invited person, for the last INVITE_CREATED: the
  * workspace's name and `address` (what people type to reach it), how to sign in
  * -- the provider and the invited address, or the token for a local account --
- * and when it expires. Plain text, lines ended by "\n". Returns the length
- * written (truncated to fit `cap`), 0 when there is no invite to describe. */
-size_t oc_model_invitation_text(const oc_model *m, const char *address, char *out, size_t cap);
+ * and when it expires. `link`, when given, is the daemon's own web client
+ * opened with the token (`https://<workspace>/app/?invite=<hex>`, WEB.md),
+ * which a browser anywhere can follow: the text offers it first and the token
+ * for the app after. Pass it only where the daemon's pages open directly
+ * (oc_client_pages_direct); a link through this client's tunnel works nowhere
+ * else. Plain text, lines ended by "\n". Returns the length written
+ * (truncated to fit `cap`), 0 when there is no invite to describe. */
+size_t oc_model_invitation_text(const oc_model *m, const char *address, const char *link,
+                                char *out, size_t cap);
 /* The reset to hand its person, for the last CREDENTIAL_RESET: the workspace's
  * name and `address`, the code to enter in the app's sign-in ("Have a reset
  * code?"), and `link` -- the page itself, where a browser can reach it from

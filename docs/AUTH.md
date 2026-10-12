@@ -75,7 +75,10 @@ authority.
   owners were all removed gets a token again.
 - **Adding users:** an owner/admin issues an **invite token**; the invitee
   creates the account — username and password — by presenting it on the sign-up
-  page (§8.10). Email delivery is never required.
+  page (§8.10). A token may be good for one person, for N, or for anyone until
+  it expires (REQ-026; the shared kinds make members only), and where the
+  daemon's pages open directly it is sent as a link to the daemon's own web
+  client (`/app/?invite=<hex>`, WEB.md). Email delivery is never required.
 - **Resetting a password:** an owner or admin makes a one-time link for a local
   account (`RESET_CREDENTIAL`; who may reset whom is who may remove whom) and
   sends it to its person, who sets a new password on `/account/reset`: by its

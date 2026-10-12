@@ -2670,6 +2670,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             j->role = iu.role;
+            j->uses = iu.uses;
             if (iu.email.len && oc_job_set_email(j, iu.email.ptr, iu.email.len) != 0) return -1;
             oc_dbwriter_submit(dbw, j);
             continue;
@@ -5871,7 +5872,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
         char tokhex[2 * OC_INVITE_TOKEN_LEN + 1];
         hex_encode(r->session_token, OC_INVITE_TOKEN_LEN, tokhex);
         oc_slice tok = { (const uint8_t *)tokhex, strlen(tokhex) };
-        oc_invite_created ic = { tok, r->role, r->session_expiry };
+        oc_invite_created ic = { tok, r->role, r->session_expiry, r->invite_uses };
         oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
         oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &ic);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
