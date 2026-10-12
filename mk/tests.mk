@@ -89,24 +89,31 @@ check-release-cc: $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBV
 # --- Tool binaries, built by path ---------------------------------------------
 # The e2e client CI's build job drives against a natively-run daemon (docs/
 # TESTING.md §3); links only the shared wire modules (no daemon internals).
-build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
-	    tests/e2e_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
+# Every tool signs in as a person does, through the daemon's pages (tests/testsignin.c).
+build/e2e_client: tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
+	    tests/e2e_client.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # Flexible black-box client for the local federated demo (register a device token /
 # send a message against a running daemon). Same shared-only linkage as e2e_client.
-build/demo_client: tests/demo_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
-	    tests/demo_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
+build/demo_client: tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
+	    tests/demo_client.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # Capacity benchmark load client (REQ-210/211); driven by scripts/bench.sh.
-build/bench_load: tests/bench_load.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O2 -Ishared -I$(MBEDTLS_INC) \
-	    tests/bench_load.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
+build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O2 -Ishared -Itests -I$(MBEDTLS_INC) \
+	    tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
 # Event-loop load harness: the daemon in-process, driven by loopback clients,
 # printing the net loop's turn percentiles beside client latency. Optimised like
 # the daemon, so the numbers are the daemon's; not part of `make test`.
-build/bench_loop: tests/bench_loop.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O) | build
-	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) \
-	    tests/bench_loop.c $(APP_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
+build/bench_loop: tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O) | build
+	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) -Itests \
+	    tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
+# The sign-in helper as a command, for the shell scripts: prints the token and
+# the verifier a client presents on AUTH (scripts/gui/lib.sh plays the browser
+# with it where a script holds no client of its own).
+build/signin: tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(wildcard shared/*.h tests/testsignin.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Ishared -Itests -I$(MBEDTLS_INC) \
+	    tests/testsignin_main.c tests/testsignin.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 # Manual S3 smoke test (tests/manual/s3_smoke.c) -- NOT part of `make test`.
 # Needs live S3 credentials in the environment; see the header of that file.
 build/s3_smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c daemon/config.c daemon/config_table.c daemon/proxyproto.c shared/url.c shared/tls.c third_party/ca-roots/ca_roots.c $(MBEDTLS_A) | build

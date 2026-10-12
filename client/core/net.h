@@ -69,10 +69,11 @@ int oc_net_pages_direct(oc_net *n);
  * thread. */
 int oc_net_open_page(oc_net *n, const char *page, const char *query, char *url, size_t cap);
 
-/* Start the network thread. `token` carries local credentials as
- * "username:password"; NULL or "" means a browser sign-in through the first such
- * source the workspace offers — OC_EV_AUTH_BROWSER then carries the URL for the
- * frontend to open, and the thread waits for the browser to come back. `store_path` (or NULL for in-memory only) is a local
+/* Start the network thread. `token` is NULL or "": a stored session reconnects
+ * silently, else a browser sign-in through the first such source the workspace
+ * offers: OC_EV_AUTH_BROWSER then carries the URL for the frontend to open,
+ * and the thread waits for the browser to come back. A password never reaches
+ * the core (AUTH.md §8.10). `store_path` (or NULL for in-memory only) is a local
  * SQLite store persisting the session token + trusted fingerprint, so a relaunch reconnects
  * silently. `secret` (borrowed; NULL = none) routes the session token into an OS
  * keyring instead of the SQLite file. Returns NULL on failure to spawn. */
@@ -148,12 +149,6 @@ oc_net *oc_net_start_device(const char *workspace_key, const char *host, int por
 
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
-/* Redeem an invite on the FIRST connect instead of authenticating (REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so
- * the reply is an ordinary AUTH_OK and everything after is unchanged. Call right
- * after oc_net_start; cleared once used, so a later reconnect re-auths normally
- * with the session token rather than replaying a spent invite. */
-void oc_net_set_invite(oc_net *n, const char *token);
-
 void oc_net_reconnect(oc_net *n);
 
 /* Stop waiting for the browser (the person pressed cancel). */

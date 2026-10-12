@@ -253,8 +253,8 @@ An owner/admin issues an invite; the invitee sets a password by presenting it.
 | `consumed_at_ms`| INTEGER | null until used; single-use.                          |
 
 The `invites` and `local_credentials` tables are exercised by the tenant-admin
-wire ops (PROTOCOL.md §5.8): `INVITE_USER` inserts an `invites` row and
-`REDEEM_INVITE` consumes it while creating the account.
+wire ops (PROTOCOL.md §5.8): `INVITE_USER` inserts an `invites` row and the
+sign-up page (AUTH.md §8.10) consumes it while creating the account.
 
 ---
 
@@ -1149,7 +1149,7 @@ an account whose string has no second bar gets its row at its next sign-in.
 `invites.email` (TEXT, NULL, lowercased). NULL is a bearer invite, redeemed for a
 local account. Set, the invite names who may join where a provider signs people
 in: it is spent by that address's first verified sign-in, which takes the role the
-invite names, and `REDEEM_INVITE` never matches it.
+invite names, and the sign-up page never matches it.
 
 ## 3ak. Migration 0046 — a channel's long-form description (REQ-034, ARCH-93)
 

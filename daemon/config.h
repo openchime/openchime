@@ -159,7 +159,6 @@ typedef struct {
     int file_page;                      /* the wire's maximum unless OPENCHIME_DEMO_FILE_PAGE */
     int max_conns_per_ip;               /* OC_MAX_CONNS_PER_IP unless OPENCHIME_DEMO_CONNS_PER_IP */
     struct {
-        int         password_frames;    /* OPENCHIME_DEMO_PASSWORD_FRAMES: a password in a frame; on in a demo build */
         int         private_unfurl;     /* OPENCHIME_DEMO_PRIVATE_UNFURL: the unfurl SSRF gate off */
         const char *users;              /* OPENCHIME_DEMO_USERS: accounts made at first start */
         const char *os_roots;           /* OPENCHIME_DEMO_OS_ROOTS: the CA bundle read instead of the OS's */

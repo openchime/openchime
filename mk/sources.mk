@@ -38,7 +38,7 @@ INC := -Ishared -Idaemon -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird
 APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES)
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
-TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c,$(wildcard tests/*.c))
+TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c tests/testsignin_main.c,$(wildcard tests/*.c))
 TEST_BIN := build/tests
 
 # --- Client app-core (ARCH-74) ------------------------------------------------

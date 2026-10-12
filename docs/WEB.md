@@ -111,8 +111,9 @@ way out (`client/core/signin_web.c`, the browser's `signin.c`), and starts the
 core with the result (`oc_client_start_signin_result`), whose first connection
 presents `AUTH{oidc}` as a desktop's does after its listener hears the
 redirect. A stored session reconnects on a reload without visiting the page.
-The password quick-launch (`?user=&pass=`) is the test harness's only, under
-`OPENCHIME_DEMO_PASSWORD_FRAMES`.
+Under the test harness a demo build types for the person:
+`?env=OPENCHIME_TEST_SIGNIN=user:password` has the page post the daemon's
+sign-in form itself and follow the redirect back (`plat_web.c`).
 
 **Media in the browser.** The same media, voice and call code the desktop
 links (`client/core/media`, `voice`, `call`: VP9 through libvpx, Opus,

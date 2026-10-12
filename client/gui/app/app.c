@@ -4,7 +4,7 @@
  * a slim left rail, a live channel sidebar, a scrollable message transcript,
  * and a working composer. Deep-blue accent on a dark neutral shell.
  *
- *   openchime.exe [<workspace> <user:pass>]   (defaults: 127.0.0.1:8443 alice:pw)
+ *   openchime.exe [<workspace>]   (the sign-in the workspace offers, or a stored session)
  *
  * The core owns the network thread + the view-model; this frontend is pure view
  * + input, ticked on a WM_TIMER (~30 ms, the GUI analogue of the TUI poll loop):
@@ -25954,7 +25954,7 @@ static int connect_start(const char *ws, const char *cred) {
 
     ws_register();
 
-    /* Remember this workspace (+ the username, parsed off "user:pass") so the next
+    /* Remember this workspace (and the username, where the credential names one) so the next
      * launch reconnects silently via the stored session token. */
     char user[128] = ""; const char *colon = strchr(cred, ':');
     if (colon && colon > cred) {
@@ -29778,10 +29778,17 @@ static void test_poll(oc_win *hwnd) {
         if (arg[0] && g_pal_edit) field_set(g_pal_edit, arg);
         test_ack("ok");
     } else if (!strcmp(verb, "wsadd")) {
-        /* "<workspace> <user:pass>" — connect an ADDITIONAL workspace. */
-        char ws[256] = "", cred[256] = "";
-        sscanf(arg, "%255s %255s", ws, cred);
-        if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+        /* "<workspace>": an ADDITIONAL workspace -- its stored session, else its
+         * sign-in card (the harness presses Sign in and plays the browser). */
+        char ws[256] = "";
+        sscanf(arg, "%255s", ws);
+        if (!ws[0]) test_ack("err");
+        else {
+            char key[288]; ws_key(ws, key, sizeof key);
+            if (have_stored_token(key)) switch_workspace(hwnd, ws, "");
+            else { ws_save_active(); close_overlays(); g_view = VIEW_SIGNIN; signin_begin(hwnd, ws, NULL); layout_signin(hwnd); invalidate(); }
+            test_ack("ok");
+        }
     } else if (!strcmp(verb, "shotfull")) {
         /* Kept as an alias: `shot` is now the composited capture, so there is
          * exactly one way to take a picture and it is the complete one. */
@@ -32825,7 +32832,8 @@ int main(int argc, char *argv[]) {
     oc_sidebar_opts_defaults(&g_sb);
 
     /* Credential resolution, uniform with the TUI:
-     *   1. Dev quick-launch `openchime <workspace> <user:pass>` -- connect directly.
+     *   1. `openchime <workspace>` -- connect directly: a stored session, else
+     *      the sign-in the workspace offers.
      *   2. A remembered workspace with a still-valid session token -- reconnect
      *      silently; the net thread reuses the stored token.
      *   3. Otherwise the in-window sign-in view, pre-filled from the book. */
@@ -32856,10 +32864,14 @@ int main(int argc, char *argv[]) {
             char key[288]; ws_key(aws, key, sizeof key);
             if (have_stored_token(key)) direct = 1;
         }
-    } else if (argc >= 3) {
+    } else if (argc >= 2) {
+        /* `openchime <workspace>`: its stored session reconnects silently;
+         * without one, the sign-in card for it, as a person's next step is to
+         * press Sign in. */
         snprintf(aws, sizeof aws, "%s", argv[1]);
-        snprintf(acred, sizeof acred, "%s", argv[2]);
-        direct = 1;
+        char key[288]; ws_key(aws, key, sizeof key);
+        if (have_stored_token(key)) direct = 1;
+        else snprintf(pre_ws, sizeof pre_ws, "%s", aws);
     } else {
         int have_last = pick_last_workspace(pre_ws, sizeof pre_ws, pre_user, sizeof pre_user);
         if (have_last && have_stored_token(pre_ws)) {

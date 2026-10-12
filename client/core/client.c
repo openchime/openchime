@@ -880,10 +880,6 @@ void oc_client_toggle_prefs(oc_client *c, int open) {
     if (open) oc_client_list_notify_prefs(c);   /* refresh on open */
 }
 
-void oc_client_redeem_invite(oc_client *c, const char *invite_token) {
-    if (c) oc_net_set_invite(c->net, invite_token);
-}
-
 void oc_client_set_client_type(oc_client *c, const char *client_type) {
     if (c) oc_net_set_client_type(c->net, client_type);
 }
@@ -1025,15 +1021,6 @@ void oc_client_set_email(oc_client *c, const char *email) {
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_EMAIL);
     if (!cmd) return;
     cmd->body = strdup(email);
-    oc_queue_push(&c->cmds, cmd);
-}
-
-void oc_client_change_password(oc_client *c, const char *old_pw, const char *new_pw) {
-    if (!c || !new_pw || !new_pw[0]) return;
-    oc_cmd *cmd = oc_cmd_new(OC_CMD_CHANGE_PASSWORD);
-    if (!cmd) return;
-    cmd->body  = strdup(old_pw ? old_pw : "");
-    cmd->body2 = strdup(new_pw);
     oc_queue_push(&c->cmds, cmd);
 }
 

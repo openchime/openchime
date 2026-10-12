@@ -140,8 +140,9 @@ jobs:
       # The daemon as the release builds it (every feature, the web client in),
       # the e2e client the step below drives, and the Linux terminal client.
       - name: Build the daemon, the e2e client and the terminal client
-        # DEMO=1: the end-to-end step below signs in by password in a frame and
-        # bootstraps its users, which only a demo build accepts (CONFIG.md).
+        # DEMO=1: the end-to-end step below bootstraps its users, which only a
+        # demo build accepts (CONFIG.md); it signs in as a person does, on the
+        # daemon's page (tests/testsignin.h).
         run: make DEMO=1 TTS=1 STT=1 SUM=1 WEB=1 && make build/e2e_client linux
       # Only the C runtime may be dynamic. ONNX Runtime, llama.cpp, their C++
       # runtime, mbedTLS, libopus and SQLite are all inside the binary, so anything else
@@ -162,8 +163,8 @@ jobs:
           OPENCHIME_HEALTH_PORT: '8080'
           OPENCHIME_PORT: '8443'
           OPENCHIME_DEMO_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
-          # The e2e client signs in by password, in a frame (AUTH.md §8.10), as
-          # a demo build takes by default.
+          # The e2e client signs in on the daemon's page, as a person does
+          # (AUTH.md §8.10, tests/testsignin.h).
         run: |
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/itest"

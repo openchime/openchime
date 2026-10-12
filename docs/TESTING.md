@@ -54,9 +54,9 @@ order" belongs in integration.
 
 - All unit and in-process integration suites compile into **one** binary,
   `build/tests`, run by `make test`, and that binary is a **demo build**
-  (`-DOC_DEMO`, like `make DEMO=1`): the suites sign in by password in frames
-  and set the test switches (CONFIG.md "Demo builds only"), which a production
-  build has no code for. There is deliberately no per-test binary:
+  (`-DOC_DEMO`, like `make DEMO=1`): the suites set the test switches (CONFIG.md
+  "Demo builds only"), which a production build has no code for; they sign in
+  as a person does, through the daemon's page (`tests/testsignin.h`). There is deliberately no per-test binary:
   the tests exercise public APIs, so each `tests/*.c` links the real module
   objects rather than `#include`-ing the `.c` under test.
 - The one exception is platform-backend code that cannot execute on the build
@@ -427,17 +427,23 @@ and a connected client across its daemon's certificate re-issued with a new key
 under the same name, on a box restarted with it: a full handshake, no session
 resumed, and back in with nobody asked, whatever it had pinned before.
 
-**Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, with
-the demo build's switch `OPENCHIME_DEMO_PASSWORD_FRAMES` off — the product as shipped; the
-other suites sign in by password with it on, a demo build's default.
+**Local sign-in in the browser** (AUTH.md §8.10) is proven at every layer, and
+it is also how every suite signs in: `tests/testsignin.h` plays the browser --
+the form POSTed to the daemon's page over TLS, the token read off the 303 --
+and the client presents that token, so a suite's sign-in is a person's. The
+same helper is the `signin` command (`build/signin`) and links into the e2e,
+demo and bench clients; the GUI harness presses the card's Sign in and plays
+the browser from the URL the client publishes under its hook (`sign_in_card`
+and `play_browser`, `scripts/gui/lib.sh`), and the web client, its own browser,
+types for the harness with `OPENCHIME_TEST_SIGNIN=user:password` (demo builds).
 `test_jwt`: a token the daemon's issuer mints verifies against its key, name and
 audience, and not with a byte changed, for another audience, from another key or
 past its time; a `sub` names a user only as `local|<id>`. `itest_netloop`
 (`test_web_signin`, a daemon of its own): the pages and their headers, escaping,
 the setup token signing up the owner, a sign-in's token presented on `AUTH`
 once and only with its verifier, a forged token, `Origin` and a non-loopback
-redirect refused, a password change, a removed member, the three frames refused,
-and the account limiter in front of the page. `test_signin`: the tunnel against a
+redirect refused, a password change, a removed member, `AUTH{local}` and the
+retired opcodes refused, and the account limiter in front of the page. `test_signin`: the tunnel against a
 fake daemon — the pages only, its own `Host` only, `Host`, `Origin` and a
 `Location` rewritten to the daemon's origin, a certificate other than the
 accepted one refused, and an answer slower than the budget for reaching the
@@ -445,12 +451,11 @@ daemon waited for — but not past the answer's own budget. `test_client_core` (
 both ways in — **directly**, at a daemon a test root vouches for, with a browser
 that verifies the root and the name; and **through the tunnel**, at a
 self-signed daemon on loopback — sign-up with the setup token, the password
-page, a wrong password leaving it waiting, cancel, a password typed into the
-client refused with where it goes, and a session kept by Remember me. Mutation
-proofs cover the knob, the verifier, `Origin`, direct-versus-tunnel both ways,
+page, a wrong password leaving it waiting, cancel, and a session kept by
+Remember me. Mutation proofs cover the verifier, `Origin`, direct-versus-tunnel both ways,
 the tunnel's certificate and `Host` checks, the page's limiter and the subject.
 `scripts/gui/web_signin.sh` drives it on Windows: the Win32 client, with no
-credentials, against a knob-free self-signed daemon at the WSL address —
+credentials, against a self-signed daemon at the WSL address —
 certificate trusted, sign-up through the tunnel with the setup token, password
 changed on its page, and, the workspace forgotten, the old password refused and
 the new one signing in; then, forgotten again, the card checked to say nothing
@@ -574,9 +579,9 @@ works. Nothing proves the shipped *image* works (§3.2).
   `last_error` as its code's words, not the server's text.
 - **Idempotency:** re-sending with the same token after a simulated drop yields
   the same `message_id` and no duplicate row (REQ-093).
-- **A password change by frame (`test_dbwriter` `test_change_password`):** a
-  wrong old password is audited and counts with the sign-in limiter, which then
-  stops both the change and a sign-in (REQ-191).
+- **A password change on the page (`test_dbwriter` `test_change_password`):** a
+  wrong current password is audited as a failed sign-in and counts with the
+  sign-in limiter, which then stops both the change and a sign-in (REQ-191).
 - **Owner by identity (`test_joinrules`, `test_dbwriter` `test_oidc_join_rules`):**
   `subject:` admits that exact `<issuer>|<subject>` as owner with no verified
   address, and no other subject, issuer or letter case.
@@ -1085,7 +1090,7 @@ the transcript. Requires `tmux`. To connect the TUI by hand instead:
 
 ```sh
 make linux
-build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direct connect
+build/openchime-tui 127.0.0.1 8443             # <host> <port>: a device-code sign-in, or the browser
 ```
 
 ### Notes / gotchas

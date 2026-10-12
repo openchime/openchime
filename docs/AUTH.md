@@ -60,8 +60,9 @@ authority.
   already linked and has no argon2. **No OpenChime client collects a password.**
   It is typed only into the daemon's own sign-in page, in the system browser, and
   reaches the daemon only inside TLS — directly, or through the client's loopback
-  tunnel (§8.10). It is never stored. A password in a frame is refused, but for a
-  demo build's switch (a production build has no such path).
+  tunnel (§8.10). It is never stored. A password in a frame is refused, in every
+  build: the protocol has no frame that carries one, and the test suites sign in
+  through the page as a person does (TESTING.md).
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
   created at first run from a one-time **setup token**. There is no config file
   and no configuration variable for it (ARCH-26): the daemon **mints** the token
@@ -420,9 +421,9 @@ After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 (`OPENCHIME_AUTH`: `local`, `relay`, or both). The client draws one control
 per source and replies with `AUTH`, whose `method` discriminator selects the path:
 
-- `local` — username + password in the frame. Refused (`AUTH_SOURCE_UNAVAILABLE`)
-  unless the daemon is a demo build with `OPENCHIME_DEMO_PASSWORD_FRAMES` on, its default (CONFIG.md, "Demo builds only");
-  local accounts sign in in the browser (§8.10).
+- `local` — the method's number is kept for the challenge's listing; an `AUTH`
+  with it is refused (`AUTH_SOURCE_UNAVAILABLE`, fatal): a password is never in
+  a frame, and local accounts sign in in the browser (§8.10).
 - `oidc` — a browser sign-in. `AUTH_BEGIN` gets the authorize URL from the daemon;
   `AUTH` then carries an ES256 JWT and the verifier (§8.2): the central-issued one
   (§3.3) for the relay, or, with source `local`, the daemon's own (§8.10).
@@ -621,9 +622,9 @@ Microsoft address is often absent or unverified, so a domain rule alone cannot s
 the domain — it admits that domain's people into the operator's *own* workspace,
 so a false claim harms nobody else.
 
-Bearer invite tokens (§2) remain for the local source only, and `REDEEM_INVITE` is
-refused where local accounts are not enabled: with a provider in charge, a bearer
-token would be the phishable credential the provider exists to remove.
+Bearer invite tokens (§2) remain for the local source only, and the sign-up page
+refuses one where local accounts are not enabled: with a provider in charge, a
+bearer token would be the phishable credential the provider exists to remove.
 
 **A person who signs in a second way is the same person.** An identity the
 workspace has not seen, whose provider verified its address, signs in as the
@@ -929,11 +930,13 @@ whose `Origin` is `https://` + its `Host`, and a sign-in's `redirect_uri` must b
 loopback and its `nonce` a challenge. A refusal shows the form again and never
 says which half of a credential was wrong.
 
-**Passwords in frames.** `AUTH{local}`, `REDEEM_INVITE` and `CHANGE_PASSWORD` are
-refused unless the daemon is a demo build with `OPENCHIME_DEMO_PASSWORD_FRAMES`
-on (its default; CONFIG.md), which it warns about at start; the test suites and
-the GUI scripts sign in that way, and the checks that prove the refusal set it
-`off`.
+**No password in a frame.** `AUTH{local}` is refused with
+`AUTH_SOURCE_UNAVAILABLE`, and the frames that once carried a password to sign
+up or change one (`0x0047`, `0x0049`) are retired, unknown to the daemon. The
+test suites and the GUI harness sign in as a person does: a helper plays the
+browser against the page (`tests/testsignin.h`; `play_browser` in
+`scripts/gui/lib.sh`; `OPENCHIME_TEST_SIGNIN` for the web client) and the client
+presents the token the page ends with (TESTING.md).
 
 **The terminal client** signs in to a local account with a device code (§8.11),
 which works where it has no browser of its own.

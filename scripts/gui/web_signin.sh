@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Local accounts sign in in the browser, on Windows, end to end (AUTH.md §8.10).
 #
-# A daemon WITHOUT the test knob -- as shipped: it takes a password only on its
-# own pages -- and the Win32 client started with no credentials. The client
+# The daemon as shipped -- it takes a password only on its own pages -- and
+# the Win32 client started with no credentials. The client
 # never shows a password field; it opens the daemon's pages through its loopback
 # tunnel: the daemon is reached at this machine's WSL address with its
 # self-signed certificate, which the person trusts in the client's question
@@ -145,7 +145,7 @@ for _ in $(seq 1 50); do
     exec 3<&- 3>&-; sleep 0.2
 done
 rm -rf "$D"; mkdir -p "$D/blobs"
-env OPENCHIME_DEMO_PASSWORD_FRAMES=off OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
+env OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
     OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Web Sign-in" \
     OPENCHIME_TTS=0 OPENCHIME_STT=0 \
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &
@@ -156,7 +156,6 @@ for _ in $(seq 1 150); do     # the speech models load first: seconds on a busy 
     [ -n "$TOKEN" ] && break; sleep 0.2
 done
 [ -n "$TOKEN" ] || fail "the daemon printed no setup token"
-grep -q 'password frames are on' "$D/daemon.log" && fail "the daemon has the test knob on"
 # The token is printed before the listener is up (the speech models load in
 # between), so wait for the port the client will ask, not for the log.
 for _ in $(seq 1 150); do

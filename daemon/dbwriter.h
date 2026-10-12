@@ -102,7 +102,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_CLIENT_SETTING = 41, OC_JOB_LIST_CLIENT_SETTINGS = 42,
        /* Self-service profile (REQ-020): rename yourself / rotate your local
         * password (verifies the old one). Both are writes. */
-       OC_JOB_SET_DISPLAY_NAME = 43, OC_JOB_CHANGE_PASSWORD = 44,
+       OC_JOB_SET_DISPLAY_NAME = 43, /* 44 was CHANGE_PASSWORD: passwords change on the page */
        /* Storage maintenance pass (ARCH-78): find what to reclaim. Read-mostly
         * but it tombstones rows, so it runs on the writer. */
        OC_JOB_STORAGE_MAINT = 45,
@@ -529,9 +529,8 @@ typedef struct oc_job {
     char          *cs_value;       /* heap */
 
     /* Self-service profile (REQ-020). SET_DISPLAY_NAME uses pf_name;
-     * CHANGE_PASSWORD uses pf_old_pw + pf_new_pw. */
+     * The password page uses pf_new_pw. */
     char          *pf_name;        /* heap */
-    char          *pf_old_pw;      /* heap */
     char          *pf_new_pw;      /* heap */
 
     /* UNFURL_STORE (REQ-222): the fetched preview for one URL of message_id.
@@ -1357,8 +1356,8 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
  * oc_dbwriter_configure_oidc. */
 void oc_dbwriter_set_relay_keys(oc_dbwriter *w, const char *fetched_pem);
 
-/* Local accounts on or off (on by default). Off, AUTH{local} and REDEEM_INVITE
- * are refused. */
+/* Local accounts on or off (on by default). Off, the pages refuse a password
+ * and an invitation. */
 void oc_dbwriter_set_local_enabled(oc_dbwriter *w, int on);
 
 /* Who may join through an OIDC source (OPENCHIME_JOIN, AUTH.md §8.4).
@@ -1396,10 +1395,6 @@ uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
 /* Local accounts sign in in the browser, on the daemon's pages (AUTH.md §8.10):
  * its issuer is ready. */
 int         oc_dbwriter_local_browser(oc_dbwriter *w);
-/* The demo switch OPENCHIME_DEMO_PASSWORD_FRAMES, read when the writer starts: a
- * password may still come in a frame -- AUTH local, REDEEM_INVITE,
- * CHANGE_PASSWORD. Off, only the pages take one. */
-int         oc_dbwriter_password_frames(oc_dbwriter *w);
 const char *oc_dbwriter_relay_origin(oc_dbwriter *w);
 const char *oc_dbwriter_oidc_audience(oc_dbwriter *w);
 

@@ -41,8 +41,9 @@ daemon_pid() {
 case "${1:-}" in
   devaddr) printf '127.0.0.1:%s\n' "$OC_TEST_PORT"; exit 0 ;;
   launch)
-  # A demo build (make DEMO=1): the fixture signs in by password in frames and
-  # bootstraps its users, which a production build refuses.
+  # A demo build (make DEMO=1): the fixture bootstraps its users, which a
+  # production build refuses; the client signs in on the daemon's page, the
+  # harness typing `cred` for the person (OPENCHIME_TEST_SIGNIN, plat_web.c).
   if ! "$HERE/openchimed" --version | grep -q 'demo build'; then
     echo "$(basename "$0"): $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2
   fi
@@ -92,7 +93,7 @@ case "${1:-}" in
     "$0" kill >/dev/null 2>&1 || true
     rm -f "$DIR"/cmd "$DIR"/ack "$DIR"/quit "$DIR"/drive.log
     host="${ws%:*}"; port="${ws##*:}"
-    url="https://${ws}/app/?host=${host}&port=${port}&user=${cred%%:*}&pass=${cred#*:}"
+    url="https://${ws}/app/?host=${host}&port=${port}&env=OPENCHIME_TEST_SIGNIN%3D$(python3 -c 'import sys,urllib.parse as u;print(u.quote(sys.argv[1],safe=""))' "$cred")"
     setsid node "$HERE/scripts/web/drive.mjs" "$DIR" "$url" "$(chromium)" > "$DIR/node.log" 2>&1 < /dev/null &
     echo $! > "$DIR/pid"; disown
     # Signed in before launch returns, as the Windows launch leaves a client that answers.

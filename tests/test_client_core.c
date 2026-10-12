@@ -7,6 +7,7 @@
  * the facade — with no UI. */
 
 #include "client.h"     /* the core facade under test */
+#include "testsignin.h" /* a person's sign-in, on the daemon's page */
 #include "model.h"
 #include "store.h"       /* to assert the persisted token/pin */
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
@@ -145,6 +146,27 @@ static void wait_port_ready(int port) {
 
 /* Tick the client and sleep briefly, up to ~5s, until `cond(model)` holds.
  * Returns 1 if the condition was met, 0 on timeout. */
+/* Start a client signed in as `cred` ("user:password") the way a person is:
+ * the password goes to the daemon's sign-in page (tests/signin.h) and the
+ * token it ends with is what the client presents (AUTH.md §8.10). NULL, with
+ * the reason printed, when the page refuses: a wrong password signs nothing in.
+ * `host` may be "::1"; the page is reached over IPv4 either way. */
+static oc_client *start_as(const char *workspace_key, const char *host, int port, const char *cred,
+                           const char *store_path, oc_secret *secret, int remember,
+                           const char *published_fingerprint) {
+    const char *colon = strchr(cred, ':');
+    if (!colon) return NULL;
+    char user[128], tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    snprintf(user, sizeof user, "%.*s", (int)(colon - cred), cred);
+    if (oc_test_signin("127.0.0.1", port, NULL, user, colon + 1, tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) {
+        printf("    %s: the sign-in page refused: %s\n", user, why);
+        return NULL;
+    }
+    oc_signin_result res = { "local", ver, tok, NULL };
+    return oc_client_start_signin_result(workspace_key, host, port, &res, store_path, secret, remember,
+                                         published_fingerprint);
+}
+
 #define WAIT_FOR(cl, cond)                                                      \
     ({                                                                         \
         int _ok = 0;                                                           \
@@ -3112,7 +3134,7 @@ static void test_calls_e2e(oc_client *a, oc_client *b, int port) {
     int v6 = host_has_ipv6();
     if (!v6) printf("  (no IPv6 loopback on this host: faye calls over IPv4)\n");
     int v6_before = __atomic_load_n(&g_tap.n_v6, __ATOMIC_ACQUIRE);
-    oc_client *c = oc_client_start(v6 ? "::1" : "127.0.0.1", port, "faye:pw-faye");
+    oc_client *c = start_as(NULL, v6 ? "::1" : "127.0.0.1", port, "faye:pw-faye", NULL, NULL, 1, NULL);
     CHECK(c != NULL);
     if (!c) { oc_call_engine_free(ea); oc_call_engine_free(eb); oc_call_engine_free(ec); return; }
     oc_client_set_call_media(c, oc_call_engine_media(), ec);
@@ -3416,7 +3438,7 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
     setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:800,tcp_probe:800", 1);
     oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
     unsetenv("OPENCHIME_TEST_CALL_TIMERS");
-    oc_client *c = oc_client_start("127.0.0.1", pport, "faye:pw-faye");
+    oc_client *c = start_as(NULL, "127.0.0.1", pport, "faye:pw-faye", NULL, NULL, 1, NULL);
     CHECK(c != NULL);
     if (!c) { oc_call_engine_free(ea); oc_call_engine_free(ec); proxy_stop(); return; }
     oc_client_set_call_media(a, oc_call_engine_media(), ea);
@@ -3661,7 +3683,7 @@ static void test_big_channel_list(int port) {
     CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
     wait_port_ready(arg.port);
 
-    oc_client *c = oc_client_start("127.0.0.1", arg.port, "hana:pw-hana");
+    oc_client *c = start_as(NULL, "127.0.0.1", arg.port, "hana:pw-hana", NULL, NULL, 1, NULL);
     CHECK(c != NULL);
     if (c) {
         /* Still connected, and every one of them there -- not 256, and not a
@@ -3768,7 +3790,7 @@ static void test_cert_trust(int port) {
 
     /* Self-signed, off loopback: shown, not talked to -- its fingerprint the
      * one the daemon has. */
-    oc_client *c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    oc_client *c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
     CHECK(c != NULL);
     if (!c) goto out;
     CHECK(WAIT_FOR(c, m->cert_seq > 0));
@@ -3787,7 +3809,7 @@ static void test_cert_trust(int port) {
     CHECK(oc_client_trust_cert(c, oc_client_model(c)->cert_fp) == 0);
     CHECK(WAIT_FOR(c, m->authed));
     oc_client_stop(c);
-    c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
     CHECK(c && WAIT_FOR(c, m->authed) && oc_client_model(c)->cert_seq == 0);   /* no question asked */
     if (c) oc_client_stop(c);
 
@@ -3796,7 +3818,7 @@ static void test_cert_trust(int port) {
     char chain[8192], key[2048];
     CHECK(testpki_leaf(&pki, "anything.test", 1, chain, sizeof chain, key, sizeof key) == 0);
     CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
-    c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
     CHECK(c && WAIT_FOR(c, m->cert_seq > 0) && oc_client_model(c)->cert_changed && !oc_client_model(c)->authed);
     if (c) oc_client_stop(c);
 
@@ -3804,10 +3826,10 @@ static void test_cert_trust(int port) {
      * as it is, and the person's old trust is forgotten. */
     CHECK(testpki_leaf(&pki, "trust.openchime.test", 0, chain, sizeof chain, key, sizeof key) == 0);
     CHECK(oc_tls_server_use(&srv, chain, strlen(chain), key, strlen(key)) == 0);
-    c = oc_client_start_named(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec);   /* key: the address */
+    c = start_as(lan, lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);   /* key: the address */
     CHECK(c && WAIT_FOR(c, m->cert_seq > 0) && !oc_client_model(c)->authed);        /* ...which it does not name */
     if (c) oc_client_stop(c);
-    c = oc_client_start_named("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec);
+    c = start_as("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
     CHECK(c && WAIT_FOR(c, m->authed) && oc_client_model(c)->cert_seq == 0);
     if (c) oc_client_stop(c);
     {
@@ -3818,7 +3840,7 @@ static void test_cert_trust(int port) {
             oc_store_save_pin(chk, "trust.openchime.test", real);            /* an old trust... */
             oc_store_close(chk);
         }
-        c = oc_client_start_named("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec);
+        c = start_as("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
         CHECK(c && WAIT_FOR(c, m->authed));
         if (c) oc_client_stop(c);
         chk = oc_store_open("ignored");
@@ -3840,7 +3862,7 @@ static void test_cert_trust(int port) {
             oc_store_save_pin(chk, "trust.openchime.test", real);            /* a stale trust */
             oc_store_close(chk);
         }
-        c = oc_client_start_named("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec);
+        c = start_as("trust.openchime.test", lan, arg.port, "iris:pw-iris", "ignored", &sec, 1, NULL);
         CHECK(c && WAIT_FOR(c, m->authed && m->connected));
         uint8_t before[OC_TLS_FINGERPRINT_LEN], after[OC_TLS_FINGERPRINT_LEN];
         CHECK(oc_tls_server_fingerprint(&srv, before) == 0);
@@ -3912,8 +3934,7 @@ static void test_published_fingerprint(int port) {
 
     /* The certificate the workspace published: in, and pinned. */
     {
-        oc_client *c = oc_client_start_verified("fp-right.openchime.test", "127.0.0.1", arg.port,
-                                                "iris:pw-iris", "ignored", NULL, 1, right);
+        oc_client *c = start_as("fp-right.openchime.test", "127.0.0.1", arg.port, "iris:pw-iris", "ignored", NULL, 1, right);
         CHECK(c != NULL);
         if (c) {
             CHECK(WAIT_FOR(c, m->authed));
@@ -3925,8 +3946,7 @@ static void test_published_fingerprint(int port) {
      * key, so there is no pin -- this is the first connection, the one only
      * the published fingerprint can check. */
     {
-        oc_client *c = oc_client_start_verified("fp-wrong.openchime.test", "127.0.0.1", arg.port,
-                                                "iris:pw-iris", "ignored", NULL, 1, wrong);
+        oc_client *c = start_as("fp-wrong.openchime.test", "127.0.0.1", arg.port, "iris:pw-iris", "ignored", NULL, 1, wrong);
         CHECK(c != NULL);
         if (c) {
             /* The refusal is what arrives; not signing in is then a fact, not
@@ -3941,8 +3961,7 @@ static void test_published_fingerprint(int port) {
     /* Text that is not a fingerprint is no fingerprint, not a pin half-read: the
      * connection proceeds on trust-on-first-use as it did before. */
     {
-        oc_client *c = oc_client_start_verified("fp-junk.openchime.test", "127.0.0.1", arg.port,
-                                                "iris:pw-iris", "ignored", NULL, 1, "not-a-fingerprint");
+        oc_client *c = start_as("fp-junk.openchime.test", "127.0.0.1", arg.port, "iris:pw-iris", "ignored", NULL, 1, "not-a-fingerprint");
         CHECK(c != NULL);
         if (c) {
             CHECK(WAIT_FOR(c, m->authed));
@@ -4067,17 +4086,14 @@ static int web_person(const char *url, const char *page, const char *fields) {
     return web_fetch(cb, "GET", NULL, NULL, resp, sizeof resp) == 200 ? 0 : -1;
 }
 
-/* A daemon for local sign-in in the browser, as shipped (the test knob off). */
+/* A daemon for local sign-in in the browser. */
 static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN]) {
-    setenv("OPENCHIME_DEMO_PASSWORD_FRAMES", "off", 1); oc_config_load(NULL, 0);
     char f[128];
     unlink(db);
     snprintf(f, sizeof f, "%s-wal", db); unlink(f);
     snprintf(f, sizeof f, "%s-shm", db); unlink(f);
     oc_dbwriter *dbw = oc_dbwriter_start(db);
     if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
-    unsetenv("OPENCHIME_DEMO_PASSWORD_FRAMES");
-    oc_config_load(NULL, 0);
     if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
     if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
         oc_dbwriter_stop(dbw); return NULL;
@@ -4097,7 +4113,7 @@ static void test_local_browser(int port) {
         CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
         uint8_t setup[OC_INVITE_TOKEN_LEN];
         oc_dbwriter *dbw = web_daemon("build/test_core_web1.db", setup);
-        CHECK(dbw != NULL && !oc_dbwriter_password_frames(dbw));
+        CHECK(dbw != NULL);
         if (!dbw) { oc_tls_server_free(&srv); return; }
         struct core_loop_arg arg;
         arg.port = port; arg.srv = &srv; arg.dbw = dbw; arg.stop = 0;
@@ -4178,11 +4194,6 @@ static void test_local_browser(int port) {
         CHECK(!oc_client_model(c)->authed);
         CHECK(web_person(url, "signin", "username=lia&password=pw-lia") == 0);
         CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
-        oc_client_stop(c);
-
-        /* A password typed into the client is refused, saying where it goes. */
-        c = oc_client_start("127.0.0.1", arg.port, "lia:pw-lia");
-        CHECK(c != NULL && WAIT_FOR(c, strstr(m->last_error, "sign-in page") != NULL) && !oc_client_model(c)->authed);
         oc_client_stop(c);
 
         /* Cancel. */
@@ -4590,14 +4601,6 @@ static void test_browser_signin(int port) {
         CHECK(oc_client_model(c)->signin_url[0] == '\0');
         oc_client_stop(c);
     }
-    /* A password offered to a workspace that takes none is refused in words too. */
-    {
-        oc_client *c = oc_client_start("127.0.0.1", arg.port, "dana:pw");
-        CHECK(c != NULL);
-        CHECK(WAIT_FOR(c, m->last_error[0] != '\0'));
-        CHECK(strcmp(oc_client_model(c)->last_error, "this workspace doesn't sign in that way") == 0);
-        oc_client_stop(c);
-    }
 
     __atomic_store_n(&arg.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
@@ -4863,8 +4866,8 @@ int run_client_core_tests(void) {
     CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
     wait_port_ready(arg.port);
 
-    oc_client *a = oc_client_start("127.0.0.1", arg.port, "dana:pw-dana");
-    oc_client *b = oc_client_start("127.0.0.1", arg.port, "erik:pw-erik");
+    oc_client *a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+    oc_client *b = start_as(NULL, "127.0.0.1", arg.port, "erik:pw-erik", NULL, NULL, 1, NULL);
     CHECK(a != NULL);
     CHECK(b != NULL);
 
@@ -5033,7 +5036,7 @@ int run_client_core_tests(void) {
          * second connection has read everything too, and when the first marks
          * the conversation unread, the second's badge comes back. */
         {
-            oc_client *b2 = oc_client_start("127.0.0.1", arg.port, "erik:pw-erik");
+            oc_client *b2 = start_as(NULL, "127.0.0.1", arg.port, "erik:pw-erik", NULL, NULL, 1, NULL);
             CHECK(b2 != NULL);
             if (b2) {
                 CHECK(WAIT_FOR(b2, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
@@ -5237,7 +5240,7 @@ int run_client_core_tests(void) {
          * oc_model_setting) and — because the daemon fans the sync to all of a
          * user's connections — reaches a second dana device `d`. Deleting a key
          * (empty value) drops it everywhere. */
-        oc_client *d = oc_client_start("127.0.0.1", arg.port, "dana:pw-dana");
+        oc_client *d = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
         CHECK(d);
         CHECK(WAIT_FOR(d, m->authed && m->user_id != 0));
         oc_client_list_settings(d);                 /* subscribe to the (empty) bucket */
@@ -5262,17 +5265,20 @@ int run_client_core_tests(void) {
         oc_client_set_display_name(a, "Dana Q");
         CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), "Dana Q") == 0));
         CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), "Dana Q") == 0));
-        oc_client_change_password(a, "pw-dana", "pw-dana-2");
-        CHECK(WAIT_FOR(a, strstr(m->status, "profile updated") != NULL));
-        /* Assert on error_seq, not on last_error's text. `last_error` is CLEARED
-         * on OC_EV_CONNECTED/AUTH_OK, so any reconnect between the rejection
-         * arriving and this check wipes the evidence — a race that made this the
-         * one intermittently-failing assertion in the suite. `error_seq` only
-         * ever increments, so it cannot be un-observed. */
-        uint32_t errs_before = oc_client_model(a)->error_seq;
-        oc_client_change_password(a, "wrong-old", "irrelevant");   /* rejected */
-        CHECK(WAIT_FOR(a, m->error_seq > errs_before));
-        oc_client_change_password(a, "pw-dana-2", "pw-dana");       /* restore password */
+        /* A password is changed on the daemon's page (AUTH.md §8.10), which
+         * signs every device out -- the page is no session -- so dana's client
+         * is started again after, as a person's would be. */
+        {
+            char why[256];
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "pw-dana", "pw-dana-2", why, sizeof why) == 0);
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "wrong-old", "irrelevant", why, sizeof why) != 0);
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "pw-dana-2", "pw-dana", why, sizeof why) == 0);
+            oc_client_stop(a);
+            a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+            CHECK(a != NULL);
+            if (!a) return failures;
+            CHECK(WAIT_FOR(a, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+        }
         oc_client_set_display_name(a, "dana");                      /* restore name */
         CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), "dana") == 0));
         CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), "dana") == 0));
@@ -5338,7 +5344,7 @@ int run_client_core_tests(void) {
         oc_client_send(a, 1, "second line for history");
         CHECK(WAIT_FOR(b, channel_has_body(m, 1, "second line for history")));
 
-        oc_client *c = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+        oc_client *c = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
         CHECK(c != NULL);
         if (c) {
             CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
@@ -5882,8 +5888,7 @@ int run_client_core_tests(void) {
             /* A session token persists only into a credential store, so this
              * round-trip needs one (the in-memory mock stands in for the OS). */
             oc_secret store_sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
-            oc_client *s1 = oc_client_start_secure("127.0.0.1", arg.port, "faye:pw-faye",
-                                                   sp, &store_sec);
+            oc_client *s1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", sp, &store_sec, 1, NULL);
             CHECK(s1 != NULL);
             if (s1) {
                 CHECK(WAIT_FOR(s1, m->authed && m->user_id != 0));
@@ -5899,11 +5904,10 @@ int run_client_core_tests(void) {
                 CHECK(oc_store_load_pin(chk, inst, pin) == 0);    /* loopback: accepted, not trusted */
                 oc_store_close(chk);
             }
-            /* Wrong password, but the stored token authenticates it anyway —
-             * for the SAME account, which is whose token it is. */
+            /* A relaunch with no credential rides in on the stored token, as
+             * faye. */
             uint64_t faye_id = 0;
-            oc_client *s2 = oc_client_start_secure("127.0.0.1", arg.port, "faye:WRONG-pw",
-                                                   sp, &store_sec);
+            oc_client *s2 = oc_client_start_secure("127.0.0.1", arg.port, "", sp, &store_sec);
             CHECK(s2 != NULL);
             if (s2) {
                 CHECK(WAIT_FOR(s2, m->authed && m->user_id != 0));
@@ -5911,28 +5915,10 @@ int run_client_core_tests(void) {
                 oc_client_stop(s2);
             }
 
-            /* ...and signing in as SOMEBODY ELSE at the same address is that
-             * somebody else. A workspace holds one credential, so faye's token
-             * is sitting right there; riding in on it would authenticate gil as
-             * faye, with the credential he gave never consulted — two accounts on
-             * one machine, and the second one is the first one.
-             *
-             * The book is written first, exactly as the Win32 client writes it in
-             * connect_start: the account it is ABOUT to try, before there is an
-             * answer. Without this line the test passes against a fix that reads
-             * the book instead of the token's own account — which is how the
-             * first attempt at this fix shipped and failed on the real client. */
-            {
-                oc_store *poison = oc_store_open(sp);
-                if (poison) {
-                    oc_store_set_secret(poison, &store_sec);
-                    oc_store_workspace_remember(poison, inst, inst, "gil",
-                                                (uint64_t)time(NULL) * 1000);
-                    oc_store_close(poison);
-                }
-            }
-            oc_client *s3 = oc_client_start_secure("127.0.0.1", arg.port, "gil:pw-gil",
-                                                   sp, &store_sec);
+            /* Somebody else signing in at the same address -- on the page, as
+             * a person does -- is that somebody else: the token presented wins
+             * over the token stored, and replaces it. */
+            oc_client *s3 = start_as(NULL, "127.0.0.1", arg.port, "gil:pw-gil", sp, &store_sec, 1, NULL);
             CHECK(s3 != NULL);
             if (s3) {
                 CHECK(WAIT_FOR(s3, m->authed && m->user_id != 0));
@@ -5941,10 +5927,8 @@ int run_client_core_tests(void) {
                 oc_client_stop(s3);
             }
 
-            /* The token now belongs to gil, so his relaunch is still silent: a
-             * wrong password rides in on it exactly as faye's did. */
-            oc_client *s4 = oc_client_start_secure("127.0.0.1", arg.port, "gil:WRONG-pw",
-                                                   sp, &store_sec);
+            /* The token now belongs to gil, so a silent relaunch is gil. */
+            oc_client *s4 = oc_client_start_secure("127.0.0.1", arg.port, "", sp, &store_sec);
             CHECK(s4 != NULL);
             if (s4) {
                 CHECK(WAIT_FOR(s4, m->authed && m->user_id != 0));
@@ -5952,40 +5936,13 @@ int run_client_core_tests(void) {
                 oc_client_stop(s4);
             }
 
-            /* An entry with a token but no recorded account — what an older
-             * client left behind — authenticates with the password. Proved by a
-             * WRONG password FAILING: "the right password works" would be true
-             * either way and proves nothing about which credential was used. */
-            {
-                oc_store *legacy = oc_store_open(sp);
-                if (legacy) {
-                    oc_store_set_secret(legacy, &store_sec);
-                    uint8_t tok[OC_SESSION_TOKEN_LEN];
-                    if (oc_store_load_session(legacy, inst, tok, NULL, 0)) {
-                        oc_store_clear_session(legacy, inst);           /* drops the account */
-                        oc_store_save_session(legacy, inst, tok, 0, ""); /* token, owner unknown */
-                    }
-                    char who[64];
-                    CHECK(oc_store_session_user(legacy, inst, who, sizeof who) == 0);
-                    oc_store_close(legacy);
-                }
-                oc_client *sl = oc_client_start_secure("127.0.0.1", arg.port, "gil:WRONG-pw",
-                                                       sp, &store_sec);
-                CHECK(sl != NULL);
-                if (sl) {
-                    /* Until it signs in or is refused -- the wrong password's
-                     * refusal is what arrives, and then it has not signed in. */
-                    const oc_model *ml = oc_client_model(sl);
-                    for (int i = 0; i < 500 && !ml->authed && !ml->last_error[0]; i++) { oc_client_tick(sl); usleep(10000); }
-                    CHECK(!ml->authed && ml->last_error[0] != '\0');
-                    oc_client_stop(sl);
-                }
-            }
+            /* A wrong password signs nobody in: the page refuses it and no
+             * client is started -- the stored token is not consulted for a
+             * sign-in somebody is making afresh. */
+            CHECK(start_as(NULL, "127.0.0.1", arg.port, "gil:WRONG-pw", sp, &store_sec, 1, NULL) == NULL);
 
-            /* And faye, whose token was replaced, authenticates with her
-             * password rather than as gil. */
-            oc_client *s5 = oc_client_start_secure("127.0.0.1", arg.port, "faye:pw-faye",
-                                                   sp, &store_sec);
+            /* And faye, signing in again on the page, is faye. */
+            oc_client *s5 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", sp, &store_sec, 1, NULL);
             CHECK(s5 != NULL);
             if (s5) {
                 CHECK(WAIT_FOR(s5, m->authed && m->user_id != 0));
@@ -6001,7 +5958,7 @@ int run_client_core_tests(void) {
          * so the session survives). The client silently re-authenticates with the
          * stored token — no password — its in-memory history is preserved, and it
          * can send again on the recovered session. */
-        oc_client *rc = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+        oc_client *rc = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
         CHECK(rc != NULL);
         if (rc) {
             CHECK(WAIT_FOR(rc, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
@@ -6033,7 +5990,7 @@ int run_client_core_tests(void) {
          * that makes a stateless client possible. Proven by posting while faye is
          * away and asserting a brand-new client (no store at all) receives it. */
         {
-            oc_client *c1 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+            oc_client *c1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
             CHECK(c1 != NULL);
             if (c1) {
                 CHECK(WAIT_FOR(c1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
@@ -6045,7 +6002,7 @@ int run_client_core_tests(void) {
                 oc_client_stop(c1);
             }
             /* Posted while faye has no client running at all. */
-            oc_client *other = oc_client_start("127.0.0.1", arg.port, "gil:pw-gil");
+            oc_client *other = start_as(NULL, "127.0.0.1", arg.port, "gil:pw-gil", NULL, NULL, 1, NULL);
             if (other) {
                 CHECK(WAIT_FOR(other, m->authed));
                 oc_client_send(other, 1, "arrived while away");
@@ -6053,7 +6010,7 @@ int run_client_core_tests(void) {
                 oc_client_stop(other);
             }
             /* A cold client: no store, no cursor, nothing remembered. */
-            oc_client *c2 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+            oc_client *c2 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
             CHECK(c2 != NULL);
             if (c2) {
                 CHECK(WAIT_FOR(c2, m->authed));
@@ -6073,8 +6030,8 @@ int run_client_core_tests(void) {
          * the outbox -- a stable state to read both counts in, rather than the
          * instant between a send and its acknowledgement. */
         {
-            oc_client *w1 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
-            oc_client *w2 = oc_client_start("127.0.0.1", arg.port, "gil:pw-gil");
+            oc_client *w1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
+            oc_client *w2 = start_as(NULL, "127.0.0.1", arg.port, "gil:pw-gil", NULL, NULL, 1, NULL);
             CHECK(w1 != NULL && w2 != NULL);
             if (w1 && w2) {
                 CHECK(WAIT_FOR(w1, m->authed));
@@ -6113,7 +6070,7 @@ int run_client_core_tests(void) {
          * comes back — within the life of the process, which is what REQ-102 asks
          * for ("queued locally, sent automatically on reconnect"). */
         {
-            oc_client *o1 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+            oc_client *o1 = start_as(NULL, "127.0.0.1", arg.port, "faye:pw-faye", NULL, NULL, 1, NULL);
             CHECK(o1 != NULL);
             if (o1) {
                 CHECK(WAIT_FOR(o1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));

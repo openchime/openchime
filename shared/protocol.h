@@ -530,9 +530,10 @@ typedef enum {
     OC_MSG_REMOVE_USER      = 0x0044, /* C->S (REQ-033, tenant-level; owner/admin) */
     OC_MSG_USER_UPDATED     = 0x0045, /* S->C, ack/push for SET_ROLE + REMOVE_USER */
     OC_MSG_INVITE_CREATED   = 0x0046, /* S->C, the minted invite token */
-    OC_MSG_REDEEM_INVITE    = 0x0047, /* C->S, pre-auth account creation */
+    /* 0x0047 was REDEEM_INVITE and 0x0049 CHANGE_PASSWORD: a password in a
+     * frame. Retired, never reused; accounts are made and passwords changed on
+     * the daemon's pages (AUTH.md §8.10). */
     OC_MSG_SET_DISPLAY_NAME = 0x0048, /* C->S, change your own display name (REQ-020) */
-    OC_MSG_CHANGE_PASSWORD  = 0x0049, /* C->S, change your own local password (verify old) */
     OC_MSG_PROFILE_UPDATED  = 0x004A, /* S->C, a user's display name changed (also the self ack) */
     /* Invite management (REQ-026). The `invites` table has always carried
      * role, expires_at_ms and consumed_at_ms — nothing could READ them, so a minted
@@ -786,7 +787,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_MAX_DISPLAY_NAME 48u /* display-name length cap (bytes), self-service rename */
 
 /* Account-creation invite token (AUTH.md §2); like a session token, only its
- * SHA-256 is stored. Presented in REDEEM_INVITE to set a password. */
+ * SHA-256 is stored. Presented on the sign-up page to set a password. */
 #define OC_INVITE_TOKEN_LEN 32u
 
 /* Emoji reaction op (REQ-070) and the emoji length cap (bytes; fits multi-
@@ -1582,10 +1583,8 @@ typedef struct { uint64_t invite_id; uint8_t role; uint64_t created_at; uint64_t
                  uint64_t created_by; } oc_invite_entry;
 typedef struct { uint16_t count; const oc_invite_entry *entries; } oc_invite_list;
 typedef struct { uint64_t invite_id; } oc_revoke_invite;
-typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
 /* Self-service profile (REQ-020). */
 typedef struct { oc_slice name; } oc_set_display_name;
-typedef struct { oc_slice old_password; oc_slice new_password; } oc_change_password;
 typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
 /* SEARCH carries the parsed FILTERS as fields and the leftover text as the FTS
  * query (REQ-081): `from:`/`in:`/`has:`/dates are predicates on columns, and
@@ -1896,9 +1895,7 @@ oc_result oc_encode_revoke_session(oc_wbuf *w, uint16_t version, const oc_revoke
 oc_result oc_encode_set_email(oc_wbuf *w, uint16_t version, const oc_set_email *m);
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
 oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
-oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
 oc_result oc_encode_set_display_name(oc_wbuf *w, uint16_t version, const oc_set_display_name *m);
-oc_result oc_encode_change_password(oc_wbuf *w, uint16_t version, const oc_change_password *m);
 oc_result oc_encode_profile_updated(oc_wbuf *w, uint16_t version, const oc_profile_updated *m);
 oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m);
 oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search_results *m);
@@ -2097,9 +2094,7 @@ oc_result oc_decode_revoke_session(oc_rbuf *p, oc_revoke_session *m);
 oc_result oc_decode_set_email(oc_rbuf *p, oc_set_email *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
-oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);
 oc_result oc_decode_set_display_name(oc_rbuf *p, oc_set_display_name *m);
-oc_result oc_decode_change_password(oc_rbuf *p, oc_change_password *m);
 oc_result oc_decode_profile_updated(oc_rbuf *p, oc_profile_updated *m);
 oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
 oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);

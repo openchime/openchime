@@ -16,6 +16,7 @@
 #include "protocol.h"
 #include "framebuf.h"
 #include "tls.h"
+#include "testsignin.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -132,11 +133,15 @@ static int do_handshake(client *c) {
     return 0;
 }
 
-static int do_auth(client *c, const char *user, const char *pass) {
-    uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
-    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
+static int do_auth(client *c, const char *host, int port, const char *user, const char *pass) {
+    /* As a person signs in (AUTH.md §8.10): the daemon's page, then its token. */
+    char tok[OC_TEST_TOKEN_CAP], ver[OC_TEST_VERIFIER_CAP], why[256];
+    if (oc_test_signin(host, port, NULL, user, pass, tok, sizeof tok, ver, sizeof ver, why, sizeof why) != 0) {
+        fprintf(stderr, "sign-in page: %s\n", why);
+        return -1;
+    }
+    uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(tok), oc_slice_str(ver), { NULL, 0 } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;
@@ -161,7 +166,7 @@ static void *run_worker(void *arg) {
     if (client_open(&c, W->host, W->port) != 0) return NULL;
     if (do_handshake(&c) != 0) { client_close(&c); return NULL; }
     char user[32]; snprintf(user, sizeof user, "bench%d", W->idx % W->nusers);
-    if (do_auth(&c, user, "benchpw") != 0) { client_close(&c); return NULL; }
+    if (do_auth(&c, W->host, W->port, user, "benchpw") != 0) { client_close(&c); return NULL; }
 
     W->connected = 1;
     pthread_mutex_lock(&g_mu); g_connected++; pthread_mutex_unlock(&g_mu);

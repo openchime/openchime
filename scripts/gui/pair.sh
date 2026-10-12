@@ -33,6 +33,10 @@ PIDS="$DEV/pids"
 WIN_A="C:\\Windows\\Temp\\ocpair-$PORT-a"; LIN_A="/mnt/c/Windows/Temp/ocpair-$PORT-a"
 WIN_B="C:\\Windows\\Temp\\ocpair-$PORT-b"; LIN_B="/mnt/c/Windows/Temp/ocpair-$PORT-b"
 
+# The browser, played for the person: scripts/gui/lib.sh's play_browser, which
+# this script does not otherwise source (lib.sh picks a driver, and this is one).
+eval "$(sed -n '/^sign_in_card() {/,/^}/p; /^play_browser() {/,/^}/p' "$HERE/scripts/gui/lib.sh")"
+
 drive() {  # drive <lin-dir> <win-dir> <cmd...>
   local dir="$1" wdir="$2"; shift 2
   # Same convenience scripts/gui/drive.sh has, for the same reason: a bare name is
@@ -119,8 +123,12 @@ up)
       OPENCHIME_TEST_DIR="$wdir" OPENCHIME_TEST_TONE="$tone" \
       OPENCHIME_TEST_AUDIO="${OPENCHIME_TEST_AUDIO:-}" OPENCHIME_TEST_MIC="${OPENCHIME_TEST_MIC:-}" \
       OPENCHIME_TEST_CAPTURE="${OPENCHIME_TEST_CAPTURE:-}" \
-      setsid "$EXE" "$host:$PORT" "$user:pw" >/dev/null 2>&1 &
+      setsid "$EXE" "$host:$PORT" >/dev/null 2>&1 &
     disown
+    # The person signs in: the card's Sign in, then the daemon's page
+    # (scripts/gui/lib.sh; the daemon is on loopback, so no certificate question).
+    sleep 2
+    sign_in_card drive "$ldir" "$wdir" -- "$ldir" "$user" pw || echo "warning: $user's sign-in" >&2
 
     # WAIT FOR THIS ONE TO AUTHENTICATE before starting the next. The token is
     # written to the keyring a second or two AFTER auth, and the next client's

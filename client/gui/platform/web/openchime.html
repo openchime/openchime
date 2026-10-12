@@ -32,6 +32,15 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
   // to /app/ without the query, and the harness still wants the hook there.
   if (q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }
   let hookKept = false; try { hookKept = sessionStorage.getItem('oc.hook') === '1'; } catch (e) {}
+  // The test switches (?env=, ?mic=) are kept for the tab the same way: the
+  // sign-in leaves for the daemon's page and comes back without the query.
+  let envs = q.getAll('env'), micUrl = q.get('mic');
+  try {
+    if (envs.length) sessionStorage.setItem('oc.env', JSON.stringify(envs));
+    else envs = JSON.parse(sessionStorage.getItem('oc.env') || '[]');
+    if (micUrl) sessionStorage.setItem('oc.mic', micUrl);
+    else micUrl = sessionStorage.getItem('oc.mic') || '';
+  } catch (e) {}
   const hookOn = q.get('hook') === '1' || hookKept || q.has('shot') || q.has('cmd');
   // The verb goes in, and the FRESH ack comes back: the old one is removed
   // first and the answer polled for, up to `wait` ms (a slow verb answers
@@ -46,16 +55,14 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
   });
   window.ocShot = async () => { await ocHook('shot /shot.bmp', 1500); const b = FS.readFile('/shot.bmp'); let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
   // The command line. Served by the daemon (WEB.md) the page is
-  // `openchime --signin <host:port>`: the workspace is the page's own origin,
-  // and the client signs in on the daemon's pages and comes back here with the
-  // token (?token=, which the client takes off the address). The dev
-  // quick-launch ?host=&port=&user=&pass= (or ?ws=) is the test harness's
-  // `openchime <workspace> <user:pass>` (OPENCHIME_TEST_PASSWORD_AUTH).
+  // `openchime --signin <host:port>`: the workspace is the page's own origin
+  // (or ?ws=, or ?host=&port=, for a page served from elsewhere), and the
+  // client signs in on the daemon's pages and comes back here with the token
+  // (?token=, which the client takes off the address).
   const args = [];
   { let ws = q.get('ws') || q.get('host') || '';
     if (q.get('host') && q.get('port')) ws = q.get('host') + ':' + q.get('port');
-    if (ws && q.get('user')) { args.push(ws); args.push((q.get('user') || '') + ':' + (q.get('pass') || '')); }
-    else args.push('--signin', ws || `${host}:${port}`); }
+    args.push('--signin', ws || `${host}:${port}`); }
   var Module = {
     arguments: args,
     // The test knobs the native harness sets in the environment (TESTING.md)
@@ -64,10 +71,10 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
     preRun: [() => {
       if (q.has('stats')) ENV.OC_WEB_STATS = '1';
       if (hookOn) { ENV.OPENCHIME_TEST_DIR = '/t'; try { FS.mkdir('/t'); } catch (e) {} }
-      for (const kv of q.getAll('env')) { const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1); }
-      if (q.get('mic')) {
+      for (const kv of envs) { const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1); }
+      if (micUrl) {
         addRunDependency('mic');
-        fetch(q.get('mic')).then((r) => r.arrayBuffer()).then((b) => { FS.writeFile('/mic.wav', new Uint8Array(b)); removeRunDependency('mic'); })
+        fetch(micUrl).then((r) => r.arrayBuffer()).then((b) => { FS.writeFile('/mic.wav', new Uint8Array(b)); removeRunDependency('mic'); })
           .catch((e) => { console.error('mic: ' + e); removeRunDependency('mic'); });
       }
     }],

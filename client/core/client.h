@@ -26,9 +26,11 @@ typedef struct {
 
 typedef struct oc_client oc_client;
 
-/* Start the core: spawn the network thread and connect to host:port. `cred`
- * carries local credentials as "username:password" for now. Returns NULL if the
- * thread could not be spawned. */
+/* Start the core: spawn the network thread and connect to host:port. `cred` is
+ * "": a stored session reconnects silently, else the first browser source the
+ * workspace offers signs the person in (AUTH.md §8.1). A password is never
+ * given to the core -- local accounts sign in on the daemon's own pages
+ * (§8.10). Returns NULL if the thread could not be spawned. */
 oc_client *oc_client_start(const char *host, int port, const char *cred);
 
 /* As oc_client_start, plus a local SQLite store at `store_path` (NULL = none)
@@ -133,10 +135,6 @@ void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_messag
 void oc_client_channel_invite(oc_client *c, uint64_t channel_id, uint64_t user_id);
 void oc_client_channel_kick(oc_client *c, uint64_t channel_id, uint64_t user_id);
 
-/* Signup (REQ-268): redeem an invite on this connection instead of
- * authenticating. Call immediately after a start_* with `cred` = "user:password"
- * — the pair the new account will have. */
-void oc_client_redeem_invite(oc_client *c, const char *invite_token);
 
 /* Mark `channel_id` read (clear its unread count). A frontend calls this for the
  * focused channel. */
@@ -350,13 +348,11 @@ void oc_client_audit_query(oc_client *c, uint64_t before_ms);
 void oc_client_toggle_audit(oc_client *c, int open);
 
 /* Self-service profile (REQ-020). Change your own display name (fans to every
- * roster) or rotate your local password (the server verifies `old_pw`). Each
- * folds a PROFILE_UPDATED into the model on success; a failure (e.g. wrong old
- * password) surfaces as a status/error line. */
+ * roster); a PROFILE_UPDATED folds into the model on success. A password is
+ * changed on the daemon's own page (oc_client_open_page, "account/password"). */
 void oc_client_set_display_name(oc_client *c, const char *name);
 /* A local account's own email address ("" clears it); answered with your profile. */
 void oc_client_set_email(oc_client *c, const char *email);
-void oc_client_change_password(oc_client *c, const char *old_pw, const char *new_pw);
 
 /* Admin / user management (REQ-030/033; owner/admin only, enforced server-side).
  * Set a user's tenant role (OC_ROLE_MEMBER/_ADMIN/_OWNER), mint a tenant invite

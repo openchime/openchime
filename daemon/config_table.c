@@ -85,7 +85,6 @@ const cfg_row OC_CFG[] = {
            cfg_parse_token_prefix, 0),
 
     /* --- Demo builds only -------------------------------------------------------- */
-    BOOL("OPENCHIME_DEMO_PASSWORD_FRAMES", CFG_DEMO, G_DEMO, "on", "The daemon takes a local password in a frame, as the test suites and the harness sign in (AUTH.md §8.10); `off` is the product as shipped.", demo.password_frames),
     STR("OPENCHIME_DEMO_USERS", CFG_DEMO, G_DEMO, NULL, "Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token.", F(demo.users), NULL, CFG_SECRET, 0),
     INT("OPENCHIME_DEMO_FILE_PAGE", CFG_DEMO, G_DEMO, "200", 1, (int64_t)OC_MAX_FILE_LIST, "How many files one LIST_FILES page carries, so a test sees a second page.", file_page),
     INT("OPENCHIME_DEMO_CALL_MAX", CFG_DEMO, G_DEMO, "10", 2, (int64_t)OC_MAX_CALL_PARTICIPANTS, "The most people in one call, so a test can fill one.", call_max),
@@ -105,6 +104,7 @@ const cfg_row OC_CFG[] = {
     CLIENT("OPENCHIME_TEST_VIDEO_CAP_MS", CFG_DEMO, G_DEMO, "Clients: a shorter video message cap, in ms."),
     CLIENT("OPENCHIME_TEST_CALL_TIMERS", CFG_DEMO, G_DEMO, "Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset."),
     CLIENT("OPENCHIME_TEST_SUFFIX", CFG_DEMO, G_DEMO, "Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14)."),
+    CLIENT("OPENCHIME_TEST_SIGNIN", CFG_DEMO, G_DEMO, "Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md)."),
 
     { NULL, CFG_STR, CFG_OPERATOR, NULL, NULL, NULL, 0, 0, NULL, 0, NULL, 0, 0 }
 };
@@ -172,7 +172,8 @@ const cfg_removed OC_CFG_REMOVED[] = {
     { "OPENCHIME_STT_MAX_SECS",      "a constant, 30: the model's limit" },
     { "OPENCHIME_SUMMARY_URL",       "OPENCHIME_SUMMARY=cloud:<url>,<model>" },
     { "OPENCHIME_SUMMARY_MODEL",     "OPENCHIME_SUMMARY=cloud:<url>,<model>" },
-    { "OPENCHIME_TEST_PASSWORD_AUTH",    "renamed OPENCHIME_DEMO_PASSWORD_FRAMES, on by default in a demo build" },
+    { "OPENCHIME_TEST_PASSWORD_AUTH",    "removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h)" },
+    { "OPENCHIME_DEMO_PASSWORD_FRAMES",  "removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h)" },
     { "OPENCHIME_BOOTSTRAP_USERS",       "renamed OPENCHIME_DEMO_USERS" },
     { "OPENCHIME_FILE_PAGE",             "renamed OPENCHIME_DEMO_FILE_PAGE" },
     { "OPENCHIME_UNFURL_ALLOW_PRIVATE",  "renamed OPENCHIME_DEMO_PRIVATE_UNFURL" },
