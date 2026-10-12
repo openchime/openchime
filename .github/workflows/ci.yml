@@ -70,29 +70,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install build deps
+        timeout-minutes: 20
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update
+          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
+          # and retried, so a stall fails the step instead of holding the job.
           # bzip2 for the vendored mbedTLS tarball that `make` builds via
           # scripts/build/mbedtls.sh; nasm for libvpx's assembly
           # (scripts/build/libvpx.sh); xz-utils for the toolchain tarballs. gdb
           # so that a test binary that crashes prints every thread's stack
           # (tests/main.c). cmake, curl, git and python3 are on the image.
-          sudo apt-get install -y --no-install-recommends bzip2 nasm gdb xz-utils
+          scripts/build/apt.sh bzip2 nasm gdb xz-utils
       # The toolchains make fetches pinned (mk/toolchains.mk): zig for the
       # release-compiler pass, Emscripten for the web client the daemon embeds.
       # Keyed by the scripts, which pin the versions and the checksums.
@@ -211,18 +198,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install build deps
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update
           # ffmpeg only for ffprobe, which the media suite runs over a recorded
           # file as an independent validator -- nothing links it. gdb so that a
           # crash prints every thread's stack (tests/main.c).
-          sudo apt-get install -y --no-install-recommends bzip2 nasm ffmpeg gdb
+          scripts/build/apt.sh bzip2 nasm ffmpeg gdb
       # The vendored native libraries: each script builds only what is missing,
       # so a hit skips the download and the build. Keyed by the scripts, which pin
       # the versions and checksums, and by the compiler that builds them.
@@ -247,27 +229,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install build deps
+        timeout-minutes: 20
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update
           # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
           # for the toolchain tarball. The compiler is not a package: make
           # fetches the pinned llvm-mingw (scripts/build/llvm_mingw.sh).
-          sudo apt-get install -y --no-install-recommends bzip2 nasm xz-utils
+          scripts/build/apt.sh bzip2 nasm xz-utils
       - name: Restore the toolchain
         uses: actions/cache@v6
         with:
