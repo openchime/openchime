@@ -160,7 +160,7 @@ To build the distributable packages from an already-built binary:
 
 ```sh
 packaging/build-deb.sh     <version> amd64 ./openchimed dist
-packaging/build-rpm.sh     <version>       ./openchimed dist   # needs rpmbuild
+packaging/build-rpm.sh     <version> amd64 ./openchimed dist   # needs rpmbuild
 packaging/build-tarball.sh <version> amd64 ./openchimed dist
 ```
 
