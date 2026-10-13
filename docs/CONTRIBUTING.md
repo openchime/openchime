@@ -95,8 +95,9 @@ and `packaging/openchimed.env` are regenerated from it
 (`scripts/check/config.sh --write`), `openchimed --check-config` reports it, and
 `make test` fails if a `getenv` appears outside the loader or a name appears
 anywhere the registry does not know. A client setting goes through
-`client/core/env.c` and a `CLIENT` row, so the name is known. A test switch is a
-`CFG_DEMO` row and `#ifdef OC_DEMO` code: it does not exist in a shipped build.
+`client/core/env.c` and a `CLIENT` row, so the name is known. A test input is a
+`CFG_DEV` row named `OPENCHIME_DEV_*`, read through `oc_env_dev` on a client: it
+does nothing unless `OPENCHIME_MODE=development` (CONFIG.md "Mode").
 
 ## CI
 

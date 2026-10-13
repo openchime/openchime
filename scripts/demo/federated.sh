@@ -20,6 +20,7 @@ set -euo pipefail
 
 CP="${1:-http://localhost:5176}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export OPENCHIME_MODE=development   # a box of your own (CONFIG.md "Mode")
 WORK="$(mktemp -d)"
 PROTO=18443; HEALTH=18080
 trap 'kill "${DPID:-0}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -27,11 +28,11 @@ trap 'kill "${DPID:-0}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "Building daemon + demo client"
-( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make build/demo_client >/dev/null )
+( cd "$ROOT" && make openchimed >/dev/null && make build/demo_client >/dev/null )
 
 daemon_env=(
   OPENCHIME_DATA_DIR="$WORK/data" OPENCHIME_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH"
-  OPENCHIME_DEMO_USERS="alice:pw:owner,bob:pw:member"
+  OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member"
   OPENCHIME_ENROLL_URL="$CP" OPENCHIME_PUSH_URL="$CP"
 )
 mkdir -p "$WORK/data"

@@ -38,7 +38,7 @@ $(WIN_MBEDLIBS) &: scripts/build/mbedtls_windows.sh $(MINGW_CC)
 # they carry WARN_CFLAGS explicitly. They must: the cross build is where the two
 # implicit float declarations hid, because nothing on the native side compiles
 # app.c at all.
-WIN_CFLAGS := -std=c99 $(WARN_CFLAGS) -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC $(DEMO_DEF)
+WIN_CFLAGS := -std=c99 $(WARN_CFLAGS) -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
 
 # --- The TUI ------------------------------------------------------------------
 # The termbox2 backend is tuikit/tk_term.c (Console API); the core seams
@@ -52,7 +52,7 @@ WIN_TUI_RES := build/openchime_tui_res.o
 $(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) $(MINGW_CC) | build
 	$(WINDRES) $(WINDRES_ARGS) $< -O coff -o $@
 $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
-                $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) $(DEMO_STAMP) | build
+                $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_INC) \
 	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static -o $@
@@ -107,7 +107,7 @@ $(WIN_GUI_RES): client/gui/platform/win32/res/openchime.rc client/gui/platform/w
 	$(WINDRES) -I client/gui/platform/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
                 $(wildcard client/gui/app/*.h client/gui/platform/*.h client/gui/platform/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) $(MEDIA_HDRS) $(VOICE_HDRS) $(CALL_HDRS) \
-                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) $(DEMO_STAMP) | build
+                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) $(WIN_MEDIA_A) | build
 	$(WINCC) $(WIN_CFLAGS) -std=c11 -Wno-unused-result -mwindows $(WIN_GUI_INC) $(WIN_MEDIA_INC) -Iclient/gui/platform/win32/res \
 	    $(GUI_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) $(WIN_MEDIA_A) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lcomdlg32 \

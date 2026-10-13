@@ -62,9 +62,9 @@ ifneq ($(filter 1,$(TTS) $(STT)),)
 ORT_LIBS := $(ORT_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(CC_STAMP) $(DEMO_STAMP) $(FEATURES) $(TOOLCHAIN_DEPS)
+$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(CC_STAMP) $(FEATURES) $(TOOLCHAIN_DEPS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(VERSION_DEF) $(DEMO_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
 
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever
@@ -83,7 +83,7 @@ MANIFEST_BIN := build/manifest-host/openchimed
 $(MANIFEST_BIN): FORCE
 	@mkdir -p $(dir $@)
 	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= \
-	    TTS=0 STT=0 SUM=0 WEB=0 DEMO=0 FEATURES=build/manifest-host/.features BIN=$@ $@
+	    TTS=0 STT=0 SUM=0 WEB=0 FEATURES=build/manifest-host/.features BIN=$@ $@
 endif
 tts/manifest: $(MANIFEST_BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin
 	mkdir -p tts/en-US

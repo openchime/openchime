@@ -8,6 +8,7 @@
 # Usage: scripts/bench.sh [idle_conn_counts...]   (default: 50 100 200)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+export OPENCHIME_MODE=development   # the fixture's users, no per-address cap (CONFIG.md "Mode")
 
 CONNS=("$@"); [ ${#CONNS[@]} -eq 0 ] && CONNS=(50 100 200)
 NUSERS=64          # distinct bootstrap users (auth is 600k-PBKDF2, so keep modest)
@@ -26,8 +27,7 @@ USERS=""; for i in $(seq 0 $((NUSERS-1))); do USERS+="bench$i:benchpw:member,"; 
 
 OPENCHIME_DATA_DIR="$WORK/data" \
 OPENCHIME_PORT="$PROTO_PORT" OPENCHIME_HEALTH_PORT="$HEALTH_PORT" \
-OPENCHIME_DEMO_CONNS_PER_IP=0 OPENCHIME_DEMO_USERS="$USERS" \
-OPENCHIME_DEMO_MAINT_MS="${OPENCHIME_DEMO_MAINT_MS:-}" \
+OPENCHIME_DEV_CONNS_PER_IP=0 OPENCHIME_DEV_USERS="$USERS" \
   ./openchimed > "$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 

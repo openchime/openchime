@@ -46,8 +46,8 @@ SHARE_WH=1728x1080; [ "$PLAT" = web ] && SHARE_WH=864x540
 export OC_TEST_PORT="${OC_TEST_PORT:-9620}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-calls}"
 export OC_TEST_HOST="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
-export OPENCHIME_TEST_AUDIO=synthetic
-export OPENCHIME_TEST_CAPTURE=synthetic   # the synthetic screen, for sharing
+export OPENCHIME_DEV_AUDIO=synthetic
+export OPENCHIME_DEV_CAPTURE=synthetic   # the synthetic screen, for sharing
 export OC_TEST_TONE_A=440 OC_TEST_TONE_B=660
 CH=1                                   # #general: both are members
 

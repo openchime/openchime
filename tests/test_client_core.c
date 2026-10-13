@@ -2383,14 +2383,14 @@ static void test_sni_name(void) {
         CHECK(sent == (T[i].want != NULL));
         CHECK(T[i].want ? strcmp(out, T[i].want) == 0 : out[0] == '\0');
     }
-    /* A bare name resolves under the hosted suffix; a demo build's OPENCHIME_TEST_SUFFIX wins. */
+    /* A bare name resolves under the hosted suffix; in development mode OPENCHIME_DEV_SUFFIX wins. */
     char d[256];
-    unsetenv("OPENCHIME_TEST_SUFFIX");
+    unsetenv("OPENCHIME_DEV_SUFFIX");
     CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0);
     CHECK(strcmp(d, "acme.workspace.openchime.io") == 0);
-    setenv("OPENCHIME_TEST_SUFFIX", "chat.example", 1);
+    setenv("OPENCHIME_DEV_SUFFIX", "chat.example", 1);
     CHECK(oc_resolve_domain("acme", oc_default_suffix(), d, sizeof d) == 0 && strcmp(d, "acme.chat.example") == 0);
-    unsetenv("OPENCHIME_TEST_SUFFIX");
+    unsetenv("OPENCHIME_DEV_SUFFIX");
 }
 
 struct moved_label { const char *workspace; char label[256]; };
@@ -2406,7 +2406,7 @@ static void moved_label_cb(void *ctx, const char *workspace, const char *label,
  * same address, or none, changes nothing. */
 static void test_workspace_move(void) {
     mock_reset();
-    unsetenv("OPENCHIME_TEST_SUFFIX");
+    unsetenv("OPENCHIME_DEV_SUFFIX");
     oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
     oc_store *s = oc_store_open("ignored");
     CHECK(s != NULL);
@@ -3005,7 +3005,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b), *mc = oc_client_model(c);
     uint64_t ua = ma->user_id, ub = mb->user_id;
     oc_call_stats st;
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
     view_watch wb = { .last = -1, .rising = 1 }, wa = { .last = -1, .rising = 1 }, wc = { .last = -1, .rising = 1 };
     int big0 = g_tap.big;
 
@@ -3079,7 +3079,7 @@ static void test_share_e2e(oc_client *a, oc_client *b, oc_client *c,
     oc_client_call_leave(c, 1);
     CHECK(CALL_WAIT(3000, !mc->in_call && ma->call.n_parts == 2));
     oc_frame_free(&wa.f); oc_frame_free(&wb.f); oc_frame_free(&wc.f);
-    unsetenv("OPENCHIME_TEST_CAPTURE");
+    unsetenv("OPENCHIME_DEV_CAPTURE");
 }
 
 /* The call engine's relay address: IPv4 first, IPv6 when that is all there is
@@ -3309,9 +3309,9 @@ static void test_calls_tcp(oc_client *a, oc_client *b) {
     oc_call_engine_opts ob = { NULL, NULL, 0, tone_source, tone_sink, &tb };
     /* The transport timers shortened (call_engine.c): falling back and coming
      * back are the same decisions at a fifth of the wait. */
-    setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,tcp_probe:800", 1);
+    setenv("OPENCHIME_DEV_CALL_TIMERS", "probe:200,udp_wait:600,tcp_probe:800", 1);
     oc_call_engine *ea = oc_call_engine_new(&oa), *eb = oc_call_engine_new(&ob);
-    unsetenv("OPENCHIME_TEST_CALL_TIMERS");
+    unsetenv("OPENCHIME_DEV_CALL_TIMERS");
     oc_client_set_call_media(a, oc_call_engine_media(), ea);
     oc_client_set_call_media(b, oc_call_engine_media(), eb);
     const oc_model *ma = oc_client_model(a), *mb = oc_client_model(b);
@@ -3450,9 +3450,9 @@ static void test_calls_rejoin(oc_client *a, oc_client *b, int port) {
     oc_call_engine_opts oa = { NULL, NULL, 0, tone_source, tone_sink, &ta };
     oc_call_engine_opts occ = { NULL, NULL, 0, tone_source, tone_sink, &tc };
     /* A lost path is reported after 0.8 s of quiet rather than twelve. */
-    setenv("OPENCHIME_TEST_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:800,tcp_probe:800", 1);
+    setenv("OPENCHIME_DEV_CALL_TIMERS", "probe:200,udp_wait:600,udp_lost:800,tcp_probe:800", 1);
     oc_call_engine *ea = oc_call_engine_new(&oa), *ec = oc_call_engine_new(&occ);
-    unsetenv("OPENCHIME_TEST_CALL_TIMERS");
+    unsetenv("OPENCHIME_DEV_CALL_TIMERS");
     oc_client *c = start_as(NULL, "127.0.0.1", pport, "faye:pw-faye", NULL, NULL, 1, NULL);
     CHECK(c != NULL);
     if (!c) { oc_call_engine_free(ea); oc_call_engine_free(ec); proxy_stop(); return; }
@@ -4798,7 +4798,7 @@ int run_client_core_tests(void) {
     /* Two files to a page, so the paging below is exercised with three uploads
      * rather than two hundred and one. Read once, by the config the loop thread
      * loads before the netloop runs. */
-    setenv("OPENCHIME_DEMO_FILE_PAGE", "2", 1);
+    setenv("OPENCHIME_DEV_FILE_PAGE", "2", 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -5837,7 +5837,7 @@ int run_client_core_tests(void) {
 
             /* The microphone has one owner: while dictation holds it, nothing
              * else can open it, and stopping gives it back. */
-            setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+            setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
             int derr = 0;
             oc_dictate *dict = oc_dictate_start(a, OC_STT_MODE_FREE, 1, 0, NULL, ma->stt_max_ms, &derr);
             CHECK(dict != NULL && derr == OC_DICTATE_OK);
@@ -5850,7 +5850,7 @@ int run_client_core_tests(void) {
             other = oc_audio_capture_open(NULL, 48000, 1, &aerr);
             CHECK(other != NULL);
             oc_audio_close(other);
-            unsetenv("OPENCHIME_TEST_AUDIO");
+            unsetenv("OPENCHIME_DEV_AUDIO");
         }
 
         test_call_relay_family();

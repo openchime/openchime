@@ -248,7 +248,7 @@ PROTOCOL.md §5.17 has the frames:
 **The TUI** renders no graphics (ARCH-75) and shows no calls, so no shares either.
 
 **Capture** is per platform — Windows Graphics Capture, with the synthetic screen
-for tests (`OPENCHIME_TEST_CAPTURE=synthetic`) — and **the codec is not**: frames
+for tests (`OPENCHIME_DEV_CAPTURE=synthetic`) — and **the codec is not**: frames
 cross into `client/core` and are encoded there, so the wire is the same everywhere.
 
 ## 9. Tests

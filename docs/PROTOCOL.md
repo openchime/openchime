@@ -1101,8 +1101,8 @@ discover who is in a private channel you were never invited to
 **`FILE_ENTRY` (`0x003E`)** newest-first, then **`FILES` (`0x003F`)**
 `{ channel_id, count: u32, more: u8 }`.
 
-A page holds at most 200 rows (the most the frame budget allows; a demo build's
-`OPENCHIME_DEMO_FILE_PAGE` may shorten it). `before_ms`/`before_id` are the **keyset cursor**: the
+A page holds at most 200 rows (the most the frame budget allows; in development
+mode `OPENCHIME_DEV_FILE_PAGE` may shorten it). `before_ms`/`before_id` are the **keyset cursor**: the
 `created_at` and `attachment_id` of the last row the client already has, and
 `0`/`0` for the first page. The daemon returns the rows strictly older than that
 pair — `(created_at_ms, id) < (before_ms, before_id)`, the row-value comparison
@@ -2112,7 +2112,7 @@ written in one client invisible in another.
 A draft may be **unaddressed** — `channel_id` absent with a `recipients` list
 beside it — because the New Message pane autosaves before a recipient is chosen
 (REQ-229). A scheduled message is held in its own table and fired by a daemon
-sweep on its own 15 s timer (a demo build's `OPENCHIME_DEMO_SCHED_MS` shortens it), delivered through the
+sweep on its own 15 s timer, delivered through the
 ordinary send path so mentions and notifications cannot diverge, with the
 **daemon minting the idempotency token at fire time** — the client's token
 belongs to the scheduling request.
@@ -2511,8 +2511,8 @@ A **participant** is a user on one connection, with a **slot** (0-255, the low
 byte of every SFrame KID it sends under) and its **device key** (an X25519
 public key). A connection is in at most one call, and a user in a call from one
 device: joining from a second moves them. The **epoch** starts at 1 and goes up
-by one on every join and every leave. The cap is ten (`OC_CALL_MAX`; a demo
-build's `OPENCHIME_DEMO_CALL_MAX` may lower it), announced on `WORKSPACE_INFO` as `call_max`.
+by one on every join and every leave. The cap is ten (`OC_CALL_MAX`; in
+development mode `OPENCHIME_DEV_CALL_MAX` may lower it), announced on `WORKSPACE_INFO` as `call_max`.
 
 **`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64, device_key: 32 bytes,
 codecs: u8, n: u16, n × { user_id: u64 } }` — start the conversation's call, or

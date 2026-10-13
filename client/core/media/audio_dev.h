@@ -6,15 +6,15 @@
  * Samples are signed 16-bit, interleaved. Captured samples are stamped from
  * oc_media_clock_us(), the clock video frames use.
  *
- * `OPENCHIME_TEST_AUDIO=synthetic` replaces the devices with a 440 Hz tone
+ * `OPENCHIME_DEV_AUDIO=synthetic` replaces the devices with a 440 Hz tone
  * source and a sink that consumes at real-time pace, so recording and playback
  * run in tests on a machine with no sound hardware. With it,
- * `OPENCHIME_TEST_MIC=<file.wav>` (16-bit PCM at the capture rate and channel
+ * `OPENCHIME_DEV_MIC=<file.wav>` (16-bit PCM at the capture rate and channel
  * count) is what the synthetic microphone hears instead of the tone: the file
  * once, then silence, so voice input can be driven with real speech.
- * `OPENCHIME_TEST_AUDIO=mic-denied` is the synthetic devices with every capture
+ * `OPENCHIME_DEV_AUDIO=mic-denied` is the synthetic devices with every capture
  * refused as OC_AUDIO_DENIED, as a microphone the operating system blocks is.
- * `OPENCHIME_TEST_TONE=<hz>` changes the synthetic microphone's tone. */
+ * `OPENCHIME_DEV_TONE=<hz>` changes the synthetic microphone's tone. */
 #ifndef OC_AUDIO_DEV_H
 #define OC_AUDIO_DEV_H
 
@@ -54,7 +54,7 @@ oc_audio_dev *oc_audio_playback_open(const char *id, int rate, int channels, int
  * default) is playing, captured as it goes out -- WASAPI loopback. Read like a
  * capture device. It is not the microphone and takes nothing from its one owner.
  * A stretch where nothing played reads as silence at the right times.
- * Synthetic: a 660 Hz tone over quieter ones; `OPENCHIME_TEST_MIC_ECHO=1` makes
+ * Synthetic: a 660 Hz tone over quieter ones; `OPENCHIME_DEV_MIC_ECHO=1` makes
  * the synthetic microphone hear it back 20 ms later at half strength, over its
  * own tone, and `=only` makes that echo all it hears. */
 oc_audio_dev *oc_audio_loopback_open(const char *output_id, int rate, int channels, int *err);

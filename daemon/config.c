@@ -34,14 +34,13 @@ static unsigned char g_src[MAX_SLOTS];
 static char  g_file_names[64][64];
 static int   g_n_file_names;
 
-/* A demo build carries this string and a production build does not, so the
- * release can tell them apart without running the binary (release.yml). */
-#ifdef OC_DEMO
-static const volatile char DEMO_MARKER[] = "OPENCHIME-DEMO-BUILD";
-int oc_config_is_demo(void) { return DEMO_MARKER[0] != 0; }
-#else
-int oc_config_is_demo(void) { return 0; }
-#endif
+const char *oc_mode_name(oc_mode m) {
+    switch (m) {
+        case OC_MODE_DEVELOPMENT: return "development";
+        case OC_MODE_DEMO:        return "demo";
+        default:                  return "normal";
+    }
+}
 
 const char *oc_deploy_mode_name(oc_deploy_mode m) {
     switch (m) {
@@ -510,11 +509,11 @@ static int validate(oc_config *c, char *err, size_t errcap) {
     snprintf(c->factor_key_file, sizeof c->factor_key_file, "%.*s/factor.key", (int)dl, c->data_dir);
 
     /* The storage policy: the design's numbers (storage.h), in the pass's
-     * units. A demo build may shorten the interval (the row writes it). */
+     * units. */
     {
         const uint64_t MB = 1024ull * 1024;
         oc_storage_policy *p = &c->storage;
-        if (!p->interval_ms) p->interval_ms = 5 * 60 * 1000;
+        p->interval_ms      = 5 * 60 * 1000;
         p->max_age_ms       = 0;                        /* attachments are kept */
         p->grace_ms         = 24ull * 60 * 60 * 1000;   /* nothing younger than a day is evicted */
         p->reserve_bytes    = 256 * MB;                 /* the database's (REQ-216) */
@@ -523,15 +522,15 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         p->evict_enabled    = 1;
         p->audit_max_age_ms = 365ull * 24 * 60 * 60 * 1000;   /* REQ-251 */
     }
-#ifndef OC_DEMO
-    /* A production build: the constants, whatever the zeroed demo rows hold. */
-    c->storage.interval_ms = 5 * 60 * 1000;
-    c->sched_tick_ms       = 15000;
-    c->file_page           = (int)OC_MAX_FILE_LIST;
-    c->call_max            = OC_CALL_MAX;
-    c->max_conns_per_ip    = OC_MAX_CONNS_PER_IP;
-    memset(&c->demo, 0, sizeof c->demo);
-#endif
+    c->sched_tick_ms = 15000;
+    if (c->mode != OC_MODE_DEVELOPMENT) {
+        /* Not development: the constants, whatever the development rows'
+         * defaults wrote (the rows themselves were refused if set). */
+        c->file_page        = (int)OC_MAX_FILE_LIST;
+        c->call_max         = OC_CALL_MAX;
+        c->max_conns_per_ip = OC_MAX_CONNS_PER_IP;
+        memset(&c->dev, 0, sizeof c->dev);
+    }
 
     /* Roots trusted beside the built-in ones: read and checked now, so a file
      * that does not parse stops the boot instead of failing each connection. */
@@ -539,7 +538,6 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         snprintf(err, errcap, "OPENCHIME_EXTRA_CA=%s: must be a readable file of PEM certificates", c->extra_ca);
         return -1;
     }
-    oc_tls_set_os_roots(c->demo.os_roots);
 
     /* The relay is the control plane this box is enrolled with (AUTH.md §3):
      * its issuer is that origin and its keys are the ones it publishes. */
@@ -573,14 +571,12 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         return -1;
     }
 
-#ifdef OC_DEMO
-    /* A demo build is for a box of one's own: it may call itself managed (the
+    /* Development is for a box of one's own: it may call itself managed (the
      * fixtures do, to exercise that mode), but it never enrols anywhere real. */
-    if (c->enroll.url && strncmp(c->enroll.url, "http://", 7) != 0) {
-        snprintf(err, errcap, "OPENCHIME_ENROLL_URL=%s: a demo build enrols with a loopback test service only", c->enroll.url);
+    if (c->mode == OC_MODE_DEVELOPMENT && c->enroll.url && strncmp(c->enroll.url, "http://", 7) != 0) {
+        snprintf(err, errcap, "OPENCHIME_ENROLL_URL=%s: development mode enrols with a loopback test service only", c->enroll.url);
         return -1;
     }
-#endif
     return 0;
 }
 
@@ -604,14 +600,15 @@ int oc_config_load(char *err, size_t errcap) {
             int is_default = 0;
             if (v && !*v) v = NULL;                 /* empty: unset */
             if (v) {
-                if (r->cls == CFG_DEMO && !oc_config_is_demo()) {
-                    snprintf(err, errcap, "%s is a demo build's setting and this is not a demo build (make DEMO=1)", name);
+                /* OPENCHIME_MODE is the first row, so c->mode is known here. */
+                if (r->cls == CFG_DEV && c->mode != OC_MODE_DEVELOPMENT) {
+                    snprintf(err, errcap, "%s is read in development mode only, and OPENCHIME_MODE is %s", name, oc_mode_name(c->mode));
                     return -1;
                 }
                 /* The control plane's rows come with its ticket; a self-hoster
-                 * setting one by hand is told so. A demo build, which stands
+                 * setting one by hand is told so. Development, which stands
                  * in for a managed box in the fixtures, takes them as given. */
-                if (r->cls == CFG_MANAGED && strcmp(name, "OPENCHIME_MANAGED_TICKET") != 0 && !oc_config_is_demo()) {
+                if (r->cls == CFG_MANAGED && strcmp(name, "OPENCHIME_MANAGED_TICKET") != 0 && c->mode != OC_MODE_DEVELOPMENT) {
                     const char *t = getenv("OPENCHIME_MANAGED_TICKET");
                     if (!t || !*t) {
                         snprintf(err, errcap, "%s is the control plane's, set at provision time with OPENCHIME_MANAGED_TICKET (MANAGED.md)", name);
@@ -703,7 +700,7 @@ void oc_config_report(void *out_) {
             }
             fprintf(out, "%-38s = %-40s (%s%s)\n", name, val,
                     src == SRC_FILE ? "file" : src == SRC_ENV ? "environment" : "default",
-                    r->cls == CFG_DEMO ? ", demo" : r->cls == CFG_MANAGED ? ", managed" : "");
+                    r->cls == CFG_DEV ? ", development" : r->cls == CFG_MANAGED ? ", managed" : "");
         }
     }
 }
@@ -752,8 +749,8 @@ void oc_config_print_reference(void *out_) {
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_OPERATOR);
     fprintf(out, "\n## Managed\n\nWritten by the control plane when it provisions a managed box (MANAGED.md), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.\n");
     for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_MANAGED);
-    fprintf(out, "\n## Demo builds only\n\nRead by a daemon or client built with `make DEMO=1` (TESTING.md). A production build refuses to start with any of them set; the code behind them is not in it.\n");
-    for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_DEMO);
+    fprintf(out, "\n## Development mode only\n\nRead by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.md): the tests, the harnesses and the scripts. In any other mode each refuses the daemon's start, and a client ignores it.\n");
+    for (int i = 0; i < n_seen; i++) print_group(out, seen[i], CFG_DEV);
     fprintf(out, "\n## No longer read\n\nA name that was a setting once. Set, it stops the daemon with the line below; the constants it names are in `daemon/config.h`.\n\n| Name | Instead |\n|---|---|\n");
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) fprintf(out, "| `%s` | %s |\n", x->name, x->instead);
 }

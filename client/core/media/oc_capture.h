@@ -61,14 +61,14 @@ int  oc_capture_list_screens(oc_capture_device *out, int cap);
  * frames still arrive at `fps` while nothing moves. */
 oc_capture *oc_capture_open_screen(const char *device_id, int max_w, int max_h, int fps, int *err);
 
-/* The backends. `OPENCHIME_TEST_CAPTURE=synthetic|denied` selects the synthetic
+/* The backends. `OPENCHIME_DEV_CAPTURE=synthetic|denied` selects the synthetic
  * ones; otherwise the platform's. `synthetic-camera` makes only the camera
  * synthetic, so a real screen can be recorded with a known picture in its box. */
 extern const oc_capture_backend oc_capture_synthetic;
 extern const oc_capture_backend oc_capture_denied;
 /* A synthetic screen: 2560×1600 of text-like stripes that change five times a
  * second, so fitting and the repeating of still frames are exercised.
- * `OPENCHIME_TEST_SCREEN_GONE_MS` makes it go away after that long. */
+ * `OPENCHIME_DEV_SCREEN_GONE_MS` makes it go away after that long. */
 extern const oc_capture_backend oc_capture_synthetic_screen;
 /* NULL where this platform's backend is not built yet. */
 const oc_capture_backend *oc_capture_platform(void);

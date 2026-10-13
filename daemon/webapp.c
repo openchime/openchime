@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "config.h"     /* the mode the page is told */
 #include "tts_data.h"   /* oc_data_dir_find: the same beside-the-binary lookup */
 
 /* The page and the loader, compiled in (scripts/build/embed_res.py, the Makefile's
@@ -21,6 +22,15 @@ extern const size_t        oc_webapp_js_len;
                   "Cross-Origin-Embedder-Policy: require-corp\r\n"
 #define NO_CACHE  "Cache-Control: no-cache\r\n"
 
+/* The page's mode (openchime.html): `normal` as compiled in, rewritten to
+ * `development` when the daemon is, so the harness's inputs work on a page
+ * from a development daemon and on no other. The page never takes its mode
+ * from its own address. */
+#define MODE_MARK     "/*OC_MODE*/'normal'"
+#define MODE_MARK_DEV "/*OC_MODE*/'development'"
+
+static char  *g_html;
+static size_t g_html_len;
 static char  *g_wasm;
 static size_t g_wasm_len;
 static oc_http_route g_routes[4];
@@ -64,8 +74,26 @@ int oc_webapp_load(const char *exe_dir, char *err, size_t errcap) {
         if (err && errcap) snprintf(err, errcap, "%s: cannot read", path);
         return 0;
     }
+    const void *html = oc_webapp_html;
+    size_t html_len = oc_webapp_html_len;
+    if (oc_config_get()->mode == OC_MODE_DEVELOPMENT) {
+        const char *page = (const char *)oc_webapp_html;
+        const char *at = strstr(page, MODE_MARK);
+        size_t ml = sizeof MODE_MARK - 1, dl = sizeof MODE_MARK_DEV - 1;
+        if (!at || !(g_html = malloc(oc_webapp_html_len - ml + dl))) {
+            if (err && errcap) snprintf(err, errcap, "the page cannot be told development mode");
+            free(g_wasm); g_wasm = NULL;
+            return 0;
+        }
+        size_t pre = (size_t)(at - page);
+        memcpy(g_html, page, pre);
+        memcpy(g_html + pre, MODE_MARK_DEV, dl);
+        memcpy(g_html + pre + dl, at + ml, oc_webapp_html_len - pre - ml);
+        g_html_len = oc_webapp_html_len - ml + dl;
+        html = g_html; html_len = g_html_len;
+    }
     g_n_routes = 0;
-    route(OC_WEBAPP_PATH,                  "text/html; charset=utf-8",       oc_webapp_html, oc_webapp_html_len);
+    route(OC_WEBAPP_PATH,                  "text/html; charset=utf-8",       html,           html_len);
     route(OC_WEBAPP_PATH "openchime.js",   "text/javascript; charset=utf-8", oc_webapp_js,   oc_webapp_js_len);
     route(OC_WEBAPP_PATH "openchime.wasm", "application/wasm",               g_wasm,         g_wasm_len);
     /* The front door: a browser at the workspace's address gets the client. */

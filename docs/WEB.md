@@ -111,8 +111,9 @@ way out (`client/core/signin_web.c`, the browser's `signin.c`), and starts the
 core with the result (`oc_client_start_signin_result`), whose first connection
 presents `AUTH{oidc}` as a desktop's does after its listener hears the
 redirect. A stored session reconnects on a reload without visiting the page.
-Under the test harness a demo build types for the person:
-`?env=OPENCHIME_TEST_SIGNIN=user:password` has the page post the daemon's
+Under the test harness, on a page from a development daemon, the client types
+for the person:
+`?env=OPENCHIME_DEV_SIGNIN=user:password` has the page post the daemon's
 sign-in form itself and follow the redirect back (`plat_web.c`).
 
 **An invitation link.** `/app/?invite=<hex>` is the page opened with an
@@ -226,7 +227,7 @@ the system's notification sounds, a crash dump, UDP for a call.
 ```
 make web                             # the client in build/web; the first run fetches Emscripten 6.0.8 (mk/toolchains.mk) and builds SDL3, mbedTLS and the codecs for wasm once
 make WEB=1                           # the daemon with the client compiled in and web/openchime.wasm beside it (remembered; `make full` does the same)
-make DEMO=1 web-test                 # gfx under Node, then the client in a headless Chromium (a demo build: the check signs in by password)
+make web-test                        # gfx under Node, then the client in a headless Chromium (development mode: the check signs in by password)
 python3 scripts/web/serve.py build/web  # the dev server: http://127.0.0.1:8765/openchime.html?host=…&port=…&user=…&pass=…
 ```
 

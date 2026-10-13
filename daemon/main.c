@@ -419,14 +419,13 @@ int main(int argc, char **argv) {
         }
         if (oc_config_load(cfgerr, sizeof cfgerr) != 0) { fprintf(stderr, "openchimed: config error: %s\n", cfgerr); return 1; }
         oc_config_report(stdout);
-        printf("openchimed: the configuration is complete; the daemon would start%s\n",
-               oc_config_is_demo() ? " (demo build)" : "");
+        printf("openchimed: the configuration is complete; the daemon would start in %s mode\n",
+               oc_mode_name(oc_config_get()->mode));
         return 0;
     }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
-            printf("openchimed %s (protocol %u)%s\n", OC_BUILD_ID,
-                   (unsigned)OC_PROTOCOL_VERSION, oc_config_is_demo() ? " (demo build)" : "");
+            printf("openchimed %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
             return 0;
         }
         fprintf(stderr, "openchimed: unknown argument '%s'\n", argv[i]);
@@ -439,10 +438,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
 
-    fprintf(stderr, "openchimed: build %s (protocol %u)%s\n", OC_BUILD_ID,
-            (unsigned)OC_PROTOCOL_VERSION, oc_config_is_demo() ? " (demo build)" : "");
-    if (oc_config_is_demo())
-        fprintf(stderr, "openchimed: DEMO BUILD: the test switches are compiled in; this binary is for a box of your own, never a deployment\n");
+    fprintf(stderr, "openchimed: build %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
 
     /* All daemon config is read once, here, into the process-global oc_config
      * (config.c). Subsystems read it via oc_config_get(); nothing else touches
@@ -453,6 +449,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     const oc_config *cfg = oc_config_get();
+    if (cfg->mode == OC_MODE_DEVELOPMENT)
+        fprintf(stderr, "openchimed: DEVELOPMENT MODE: the OPENCHIME_DEV_* inputs are read; for a box of your own, never a deployment\n");
+    else if (cfg->mode == OC_MODE_DEMO)
+        fprintf(stderr, "openchimed: demo mode: the public demo workspace\n");
 
 #ifdef OC_TTS
     /* Read-aloud's engine: the voice model built into this binary (ARCH-111).
@@ -519,7 +519,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "openchimed: #general created with its welcome\n");
 
     /* Optionally provision local accounts before serving (AUTH.md §2). */
-    bootstrap_users(db, cfg->demo.users);
+    bootstrap_users(db, cfg->dev.users);
 
     /* Federated enrollment (CP-8, AUTH.md §3.6). Gated on OPENCHIME_ENROLL_URL — the
      * operator opting this box into the control plane. On first boot: generate a
@@ -714,7 +714,7 @@ int main(int argc, char **argv) {
     /* Link unfurls (REQ-222, ARCH-105): always on, no switch. The worker
      * fetches previews off the hot path; its SSRF gate is what makes
      * user-supplied destinations safe to dial at all. */
-    oc_unfurler *unfurler = oc_unfurler_start(db, cfg->demo.private_unfurl);
+    oc_unfurler *unfurler = oc_unfurler_start(db, 0);
     if (unfurler) oc_netloop_set_unfurler(unfurler);
     else fprintf(stderr, "openchimed: unfurl worker failed to start\n");
 

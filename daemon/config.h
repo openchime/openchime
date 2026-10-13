@@ -13,9 +13,9 @@
  *
  * SMALL. An operator sees settings and feature flags: what to decide, with a
  * value where there is anything to configure. The control plane's rows
- * (CFG_MANAGED) are refused unless the box is started with its ticket, and a
- * demo build's switches (CFG_DEMO) are refused by a production build. What
- * nobody varies is a constant below, in code, not a row.
+ * (CFG_MANAGED) are refused unless the box is started with its ticket, and
+ * the development rows (CFG_DEV) are refused unless OPENCHIME_MODE is
+ * development. What nobody varies is a constant below, in code, not a row.
  *
  * STRICT. A value that does not parse, a value outside its range, a name the
  * registry does not know (a typo, a removed name) or a row that is not this
@@ -78,6 +78,14 @@ typedef struct {
 
 enum { OC_SUMMARY_OFF = 0, OC_SUMMARY_LOCAL = 1, OC_SUMMARY_CLOUD = 2 };
 
+/* What the box is for (OPENCHIME_MODE, CONFIG.md "Mode"): the one setting that
+ * says a box is not an ordinary deployment. Every build is the same binary. */
+typedef enum {
+    OC_MODE_NORMAL      = 0,  /* a deployment: the constants, no development rows */
+    OC_MODE_DEVELOPMENT = 1,  /* the tests and harnesses: the OPENCHIME_DEV_* rows are read */
+    OC_MODE_DEMO        = 2,  /* the public demo workspace */
+} oc_mode;
+
 /* Where the certificate the daemon presents comes from (TLS.md, "Certificates"). */
 typedef enum {
     OC_TLS_SRC_SELF    = 0,   /* its own self-signed certificate, made at first run */
@@ -94,6 +102,7 @@ typedef struct {
 
 typedef struct {
     /* Identity. */
+    oc_mode        mode;                /* OPENCHIME_MODE */
     oc_deploy_mode deployment_mode;     /* derived (above) */
     const char *workspace_name;         /* "" ⇒ a client derives one from the host */
     const char *workspace_address;      /* OPENCHIME_MANAGED_ADDRESS; "" ⇒ clients keep what they dialled */
@@ -118,8 +127,8 @@ typedef struct {
     const char *extra_ca;               /* PEM roots added to the built-in ones; NULL = none */
 
     oc_s3_config      s3;               /* endpoint NULL: local disk under data_dir/blobs */
-    oc_storage_policy storage;          /* the maintenance pass's constants (demo rows may shorten the interval) */
-    uint64_t          sched_tick_ms;    /* the scheduled-send sweep; 15 s unless a demo build is told otherwise */
+    oc_storage_policy storage;          /* the maintenance pass's constants */
+    uint64_t          sched_tick_ms;    /* the scheduled-send sweep: 15 s */
 
     /* Auth (OPENCHIME_AUTH): which sources are on. */
     int auth_local, auth_relay;
@@ -153,16 +162,14 @@ typedef struct {
      * cloud:<url>,<model>; OPENCHIME_SUMMARY_API_KEY is the hosted API's key. */
     struct { int mode; const char *url, *model, *api_key; } summary;
 
-    /* Demo builds only (OC_DEMO): the test switches. In a production build
-     * these are the production values and the variables refuse the start. */
-    int call_max;                       /* OC_CALL_MAX unless OPENCHIME_DEMO_CALL_MAX */
-    int file_page;                      /* the wire's maximum unless OPENCHIME_DEMO_FILE_PAGE */
-    int max_conns_per_ip;               /* OC_MAX_CONNS_PER_IP unless OPENCHIME_DEMO_CONNS_PER_IP */
+    /* Development mode only (OPENCHIME_DEV_*). In any other mode these are the
+     * constants and the variables refuse the start. */
+    int call_max;                       /* OC_CALL_MAX unless OPENCHIME_DEV_CALL_MAX */
+    int file_page;                      /* the wire's maximum unless OPENCHIME_DEV_FILE_PAGE */
+    int max_conns_per_ip;               /* OC_MAX_CONNS_PER_IP unless OPENCHIME_DEV_CONNS_PER_IP */
     struct {
-        int         private_unfurl;     /* OPENCHIME_DEMO_PRIVATE_UNFURL: the unfurl SSRF gate off */
-        const char *users;              /* OPENCHIME_DEMO_USERS: accounts made at first start */
-        const char *os_roots;           /* OPENCHIME_DEMO_OS_ROOTS: the CA bundle read instead of the OS's */
-    } demo;
+        const char *users;              /* OPENCHIME_DEV_USERS: accounts made at first start */
+    } dev;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.
@@ -179,9 +186,8 @@ const oc_config *oc_config_get(void);
 /* "standalone" | "federated" | "managed" -- for logs and the wire. */
 const char *oc_deploy_mode_name(oc_deploy_mode m);
 
-/* Whether this binary is a demo build (OC_DEMO): the test switches exist and
- * `--version` says so. */
-int oc_config_is_demo(void);
+/* "normal" | "development" | "demo" -- for logs and --check-config. */
+const char *oc_mode_name(oc_mode m);
 
 /* --- The command line's views of the registry (main.c) --------------------- */
 

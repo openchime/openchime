@@ -14,7 +14,7 @@
 #
 # OC_TEST_WHO=a|b names the client for a pair (its own page and channel);
 # OC_TEST_PORT, OC_TEST_DIR, OC_TEST_WS, OC_TEST_USERS as scripts/gui/drive.sh; the
-# OPENCHIME_TEST_* switches reach the page (scripts/web/drive.mjs). Needs node, the
+# OPENCHIME_DEV_* switches reach the page (scripts/web/drive.mjs). Needs node, the
 # playwright-core package (npm install, from package.json) and a Chromium:
 # CHROME names it, else Playwright's download is looked for.
 set -euo pipefail
@@ -41,12 +41,10 @@ daemon_pid() {
 case "${1:-}" in
   devaddr) printf '127.0.0.1:%s\n' "$OC_TEST_PORT"; exit 0 ;;
   launch)
-  # A demo build (make DEMO=1): the fixture bootstraps its users, which a
-  # production build refuses; the client signs in on the daemon's page, the
-  # harness typing `cred` for the person (OPENCHIME_TEST_SIGNIN, plat_web.c).
-  if ! "$HERE/openchimed" --version | grep -q 'demo build'; then
-    echo "$(basename "$0"): $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2
-  fi
+  # Development mode (CONFIG.md "Mode"): the fixture bootstraps its users,
+  # which no other mode reads; the client signs in on the daemon's page, the
+  # harness typing `cred` for the person (OPENCHIME_DEV_SIGNIN, plat_web.c).
+  export OPENCHIME_MODE=development
     ws="${2:-127.0.0.1:$OC_TEST_PORT}"; cred="${3:-alice:pw}"
     # Both halves built, as scripts/gui/drive.sh builds both: the daemon carries the client.
     if [ "${OC_TEST_NO_BUILD:-0}" != "1" ]; then
@@ -74,8 +72,8 @@ case "${1:-}" in
         env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
             OPENCHIME_PORT="$OC_TEST_PORT" OPENCHIME_HEALTH_PORT=0 \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
-            OPENCHIME_DEMO_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
-            OPENCHIME_DEMO_CALL_MAX="${OC_TEST_CALL_MAX:-10}" OPENCHIME_SUMMARY=off \
+            OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_DEV_CALL_MAX="${OC_TEST_CALL_MAX:-10}" OPENCHIME_SUMMARY=off \
             ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
             OPENCHIME_MANAGED_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
@@ -93,7 +91,7 @@ case "${1:-}" in
     "$0" kill >/dev/null 2>&1 || true
     rm -f "$DIR"/cmd "$DIR"/ack "$DIR"/quit "$DIR"/drive.log
     host="${ws%:*}"; port="${ws##*:}"
-    url="https://${ws}/app/?host=${host}&port=${port}&env=OPENCHIME_TEST_SIGNIN%3D$(python3 -c 'import sys,urllib.parse as u;print(u.quote(sys.argv[1],safe=""))' "$cred")"
+    url="https://${ws}/app/?host=${host}&port=${port}&env=OPENCHIME_DEV_SIGNIN%3D$(python3 -c 'import sys,urllib.parse as u;print(u.quote(sys.argv[1],safe=""))' "$cred")"
     setsid node "$HERE/scripts/web/drive.mjs" "$DIR" "$url" "$(chromium)" > "$DIR/node.log" 2>&1 < /dev/null &
     echo $! > "$DIR/pid"; disown
     # Signed in before launch returns, as the Windows launch leaves a client that answers.

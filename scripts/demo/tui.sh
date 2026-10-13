@@ -13,6 +13,7 @@ set -euo pipefail
 
 command -v tmux >/dev/null || { echo "tmux is required"; exit 2; }
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export OPENCHIME_MODE=development   # a box of your own (CONFIG.md "Mode")
 WORK="$(mktemp -d)"
 PROTO=18445; HEALTH=18082; SESSION=oc-tui-smoke
 D_PID=""
@@ -21,12 +22,12 @@ trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true; kill "$D_PID" 2>/dev/
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "Build daemon + TUI + demo_client"
-( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make linux >/dev/null && make build/demo_client >/dev/null )
+( cd "$ROOT" && make openchimed >/dev/null && make linux >/dev/null && make build/demo_client >/dev/null )
 
 say "Start a local daemon (bootstrap users alice/bob)"
 mkdir -p "$WORK/blobs"
 OPENCHIME_DATA_DIR="$WORK/data" OPENCHIME_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" \
-OPENCHIME_DEMO_USERS="alice:pw:owner,bob:pw:member" \
+OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" \
 "$ROOT/openchimed" >"$WORK/daemon.log" 2>&1 &
 D_PID=$!
 for _ in $(seq 1 40); do curl -sf "http://localhost:$HEALTH/healthz" >/dev/null 2>&1 && break; sleep 0.3; done

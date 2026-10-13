@@ -5,8 +5,8 @@
 #   scripts/gui/screenrec.sh --kill     # ... and shut it down afterwards
 #
 # Real Windows.Graphics.Capture on this machine, a known picture in the camera
-# box (OPENCHIME_TEST_CAPTURE=synthetic-camera: colour bars; the screens are
-# real), and known sound (OPENCHIME_TEST_AUDIO=synthetic: the microphone a
+# box (OPENCHIME_DEV_CAPTURE=synthetic-camera: colour bars; the screens are
+# real), and known sound (OPENCHIME_DEV_AUDIO=synthetic: the microphone a
 # 440 Hz tone, the computer's sound 660 Hz). It asserts that
 #
 #   - the screens and windows are listed, OpenChime's own among them;
@@ -69,9 +69,9 @@ uia_bar() { powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -
 # --- launch -------------------------------------------------------------------
 kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
 rm -rf "$OC_TEST_DIR"
-export OPENCHIME_TEST_CAPTURE=synthetic-camera
-export OPENCHIME_TEST_AUDIO=synthetic
-export OPENCHIME_TEST_VIDEO_CAP_MS=15000
+export OPENCHIME_DEV_CAPTURE=synthetic-camera
+export OPENCHIME_DEV_AUDIO=synthetic
+export OPENCHIME_DEV_VIDEO_CAP_MS=15000
 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
   [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }

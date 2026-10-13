@@ -15,7 +15,7 @@
 //
 //   node scripts/web/drive.mjs <dir> <url> [chromium-executable]
 //
-// The test switches a Windows script exports (OPENCHIME_TEST_AUDIO, _MIC,
+// The development inputs a Windows script exports (OPENCHIME_DEV_AUDIO, _MIC,
 // _MIC_ECHO, _CAPTURE, _TONE, _VIDEO_CAP_MS, _SCREEN_GONE_MS) reach the page
 // as ?env=; a _MIC WAV is routed to the page as /app/mic.wav. The browser
 // runs with Chromium's fake camera and microphone and answers its own
@@ -30,11 +30,11 @@ fs.mkdirSync(dir, { recursive: true });
 const log = (s) => fs.appendFileSync(path.join(dir, 'drive.log'), `${new Date().toISOString()} ${s}\n`);
 
 const url = new URL(baseUrl);
-const pass = ['OPENCHIME_TEST_AUDIO', 'OPENCHIME_TEST_MIC_ECHO', 'OPENCHIME_TEST_CAPTURE', 'OPENCHIME_TEST_TONE',
-              'OPENCHIME_TEST_VIDEO_CAP_MS', 'OPENCHIME_TEST_SCREEN_GONE_MS', 'OPENCHIME_TEST_MIC_LEAD_MS'];
+const pass = ['OPENCHIME_DEV_AUDIO', 'OPENCHIME_DEV_MIC_ECHO', 'OPENCHIME_DEV_CAPTURE', 'OPENCHIME_DEV_TONE',
+              'OPENCHIME_DEV_VIDEO_CAP_MS', 'OPENCHIME_DEV_SCREEN_GONE_MS', 'OPENCHIME_DEV_MIC_LEAD_MS'];
 for (const k of pass) if (process.env[k]) url.searchParams.append('env', `${k}=${process.env[k]}`);
-const mic = process.env.OPENCHIME_TEST_MIC;
-if (mic) { url.searchParams.append('env', 'OPENCHIME_TEST_MIC=/mic.wav'); url.searchParams.set('mic', 'mic.wav'); }
+const mic = process.env.OPENCHIME_DEV_MIC;
+if (mic) { url.searchParams.append('env', 'OPENCHIME_DEV_MIC=/mic.wav'); url.searchParams.set('mic', 'mic.wav'); }
 url.searchParams.set('hook', '1');
 
 // OC_TEST_DEBUG_PORT=<n>: Chromium's remote debugging on that port (a `b`
@@ -61,7 +61,7 @@ try { await ctx.clearCookies(); } catch (e) {}
 if (mic) await ctx.route((u) => u.pathname.endsWith('/mic.wav'), (route) => route.fulfill({ path: mic, contentType: 'audio/wav' }));
 const page = ctx.pages()[0] || await ctx.newPage();
 // Once, on the first load: the sign-in leaves for the daemon's page and comes
-// back, and what the page keeps for the tab (its hook, the test switches) stays.
+// back, and what the page keeps for the tab (its hook, the development inputs) stays.
 await page.addInitScript(() => { try { if (!sessionStorage.getItem('oc.drive')) { localStorage.clear(); sessionStorage.clear(); sessionStorage.setItem('oc.drive', '1'); } } catch (e) {} });
 page.on('console', (m) => log('console: ' + m.text().slice(0, 300)));
 page.on('pageerror', (e) => log('pageerror: ' + e.message));

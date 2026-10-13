@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drive the Win32 client through its in-app test hook (OPENCHIME_TEST_DIR) — a
+# Drive the Win32 client through its in-app test hook (OPENCHIME_DEV_DIR) — a
 # file command channel that works regardless of display state. Screenshots are
 # rendered by the app itself (Direct2D DC render target), so no screen-scraping.
 #
@@ -78,12 +78,10 @@ case "${1:-}" in
     # The default workspace `launch` uses, for a script that names it itself.
     printf '%s:%s\n' "$(dev_host)" "$OC_TEST_PORT"; exit 0 ;;
   launch)
-  # A demo build (make DEMO=1): the fixture bootstraps its users, which a
-  # production build refuses; the client signs in on the daemon's page, the
+  # Development mode (CONFIG.md "Mode"): the fixture bootstraps its users,
+  # which no other mode reads; the client signs in on the daemon's page, the
   # browser played by play_browser (scripts/gui/lib.sh) for `cred`'s person.
-  if ! "$HERE/openchimed" --version | grep -q 'demo build'; then
-    echo "$(basename "$0"): $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2
-  fi
+  export OPENCHIME_MODE=development
     # The default follows OC_TEST_PORT, so pointing a run at a second dev daemon
     # (a smoke run that must not touch the workspace you are using) does not also
     # require repeating the address on the command line.
@@ -142,7 +140,7 @@ case "${1:-}" in
         env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
             OPENCHIME_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT=8080 \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
-            OPENCHIME_DEMO_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
             OPENCHIME_MANAGED_MAX_USERS=100 \
             setsid "$HERE/openchimed" > "$OC_TEST_DIR/daemon.log" 2>&1 < /dev/null &
         disown
@@ -180,11 +178,11 @@ case "${1:-}" in
       EXE=/mnt/c/Temp/octest-bin/openchime.exe
     fi
     # WSLENV is required for the env var to cross into the Windows process. The
-    # test switches cross too when set: OPENCHIME_TEST_AUDIO=synthetic,
-    # OPENCHIME_TEST_MIC=<windows path to a WAV> for a microphone that speaks,
-    # OPENCHIME_TEST_CAPTURE=synthetic|synthetic-camera|denied, and the rest.
+    # development inputs cross too when set: OPENCHIME_DEV_AUDIO=synthetic,
+    # OPENCHIME_DEV_MIC=<windows path to a WAV> for a microphone that speaks,
+    # OPENCHIME_DEV_CAPTURE=synthetic|synthetic-camera|denied, and the rest.
     rm -f "$LIN_DIR/signin_url.txt"
-    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_MIC_ECHO:OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_VIDEO_CAP_MS:OPENCHIME_TEST_SCREEN_GONE_MS" OPENCHIME_TEST_DIR="$WIN_DIR" \
+    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_MODE:OPENCHIME_DEV_DIR:OPENCHIME_DEV_AUDIO:OPENCHIME_DEV_MIC:OPENCHIME_DEV_MIC_ECHO:OPENCHIME_DEV_CAPTURE:OPENCHIME_DEV_VIDEO_CAP_MS:OPENCHIME_DEV_SCREEN_GONE_MS" OPENCHIME_DEV_DIR="$WIN_DIR" \
         setsid "$EXE" "$ws" >/dev/null 2>&1 < /dev/null &
     disown; sleep 3
     # The person signs in: the card's Sign in, the certificate question where

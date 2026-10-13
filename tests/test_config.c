@@ -1,6 +1,6 @@
 /* The configuration loader (daemon/config.c) against the registry
  * (daemon/config_table.c): strict parsing, ranges, unknown and removed names,
- * the cross-row rules, the storage policy it derives, the demo switches, the
+ * the cross-row rules, the storage policy it derives, the mode and the development rows, the
  * EnvironmentFile, and the registry's own consistency (every default parses). */
 #include "config.h"
 #include "config_table.h"
@@ -51,8 +51,8 @@ static void test_numbers(void) {
     accepts("OPENCHIME_HEALTH_PORT", "0");
     CHECK(oc_config_get()->health_port == 0);
     refuses("OPENCHIME_HEALTH_PORT", "65536", "0..65535");
-    refuses("OPENCHIME_DEMO_CALL_MAX", "1", "2..32");
-    refuses("OPENCHIME_DEMO_FILE_PAGE", "0", "1..200");
+    refuses("OPENCHIME_DEV_CALL_MAX", "1", "2..32");
+    refuses("OPENCHIME_DEV_FILE_PAGE", "0", "1..200");
 }
 
 static void test_bools_and_enums(void) {
@@ -196,8 +196,8 @@ static void test_cross_rules(void) {
     refuses("OPENCHIME_TRUSTED_PROXIES", "not an address", "OPENCHIME_TRUSTED_PROXIES");
     accepts("OPENCHIME_TRUSTED_PROXIES", "127.0.0.0/8");
 
-    /* The managed rows (this binary is a demo build, which takes them without
-     * the ticket: the fixtures stand in for a managed box). */
+    /* The managed rows (the tests run in development mode, which takes them
+     * without the ticket: the fixtures stand in for a managed box). */
     refuses("OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX", "abc", "even number of hex");
     refuses("OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX", "zz", "hex");
     accepts("OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX", "0a0b");
@@ -251,30 +251,72 @@ static void test_constants(void) {
     CHECK(OC_MAX_VIDEO_SIZE < OC_MAX_ATTACHMENT_SIZE);
 }
 
-static void test_demo_switches(void) {
-    /* The test binary is a demo build: the switches are read. */
-    CHECK(oc_config_is_demo() == 1);
-    accepts("OPENCHIME_DEMO_PRIVATE_UNFURL", "1");
-    CHECK(oc_config_get()->demo.private_unfurl == 1);
-    accepts("OPENCHIME_DEMO_FILE_PAGE", "2");
+/* Load with `mode` as OPENCHIME_MODE and `name=value` set. */
+static int load_in_mode(const char *mode, const char *name, const char *value, char *err, size_t cap) {
+    setenv("OPENCHIME_MODE", mode, 1);
+    int rc = load_with(name, value, err, cap);
+    setenv("OPENCHIME_MODE", "development", 1);
+    return rc;
+}
+
+static void test_mode(void) {
+    char err[512];
+    /* The suites run in development mode: the development rows are read. */
+    CHECK(oc_config_load(err, sizeof err) == 0 && oc_config_get()->mode == OC_MODE_DEVELOPMENT);
+    accepts("OPENCHIME_DEV_FILE_PAGE", "2");
     CHECK(oc_config_get()->file_page == 2);
-    accepts("OPENCHIME_DEMO_CALL_MAX", "3");
+    accepts("OPENCHIME_DEV_CALL_MAX", "3");
     CHECK(oc_config_get()->call_max == 3);
-    accepts("OPENCHIME_DEMO_CONNS_PER_IP", "0");
+    accepts("OPENCHIME_DEV_CONNS_PER_IP", "0");
     CHECK(oc_config_get()->max_conns_per_ip == 0);
-    refuses("OPENCHIME_DEMO_MAINT_MS", "0", "1000..");           /* would busy-loop: refused, not floored */
-    accepts("OPENCHIME_DEMO_MAINT_MS", "1000");
-    CHECK(oc_config_get()->storage.interval_ms == 1000);
-    accepts("OPENCHIME_DEMO_SCHED_MS", "50");
-    CHECK(oc_config_get()->sched_tick_ms == 50);
-    accepts("OPENCHIME_DEMO_USERS", "alice:pw:owner");
-    CHECK(!strcmp(oc_config_get()->demo.users, "alice:pw:owner"));
-    /* The clients' switches are known names, not stored. */
-    accepts("OPENCHIME_TEST_AUDIO", "synthetic");
-    accepts("OPENCHIME_TEST_DIR", "/tmp/x");
-    accepts("OPENCHIME_TEST_SUFFIX", "chat.example");
-    /* A demo box enrols with a loopback test service only. */
+    accepts("OPENCHIME_DEV_USERS", "alice:pw:owner");
+    CHECK(!strcmp(oc_config_get()->dev.users, "alice:pw:owner"));
+    /* The clients' inputs are known names, not stored. */
+    accepts("OPENCHIME_DEV_AUDIO", "synthetic");
+    accepts("OPENCHIME_DEV_DIR", "/tmp/x");
+    accepts("OPENCHIME_DEV_SUFFIX", "chat.example");
+    /* Development enrols with a loopback test service only. */
     refuses("OPENCHIME_ENROLL_URL", "https://openchime.io", "loopback");
+
+    /* The values, and nothing else. */
+    refuses("OPENCHIME_MODE", "production", "normal");
+    refuses("OPENCHIME_MODE", "Development", "development");   /* case matters */
+    /* normal and demo: every development row refuses the start, naming itself
+     * and the mode; the constants hold, and the managed rows want the ticket. */
+    static const char *const modes[] = { "normal", "demo" };
+    static const char *const devs[][2] = {
+        { "OPENCHIME_DEV_USERS", "alice:pw:owner" }, { "OPENCHIME_DEV_FILE_PAGE", "2" },
+        { "OPENCHIME_DEV_CALL_MAX", "3" }, { "OPENCHIME_DEV_CONNS_PER_IP", "0" },
+        { "OPENCHIME_DEV_AUDIO", "synthetic" }, { "OPENCHIME_DEV_SIGNIN", "alice:pw" },
+    };
+    for (size_t m = 0; m < sizeof modes / sizeof *modes; m++) {
+        for (size_t i = 0; i < sizeof devs / sizeof *devs; i++) {
+            int rc = load_in_mode(modes[m], devs[i][0], devs[i][1], err, sizeof err);
+            CHECK(rc != 0 && strstr(err, devs[i][0]) && strstr(err, "development mode only") && strstr(err, modes[m]));
+            if (rc == 0) printf("    %s=%s was accepted in %s mode\n", devs[i][0], devs[i][1], modes[m]);
+        }
+        CHECK(load_in_mode(modes[m], "OPENCHIME_WORKSPACE_NAME", "x", err, sizeof err) == 0);
+        setenv("OPENCHIME_MODE", modes[m], 1);
+        CHECK(oc_config_load(err, sizeof err) == 0);
+        const oc_config *c = oc_config_get();
+        CHECK(c->mode == (m == 0 ? OC_MODE_NORMAL : OC_MODE_DEMO));
+        CHECK(c->call_max == OC_CALL_MAX && c->file_page == (int)OC_MAX_FILE_LIST && c->max_conns_per_ip == OC_MAX_CONNS_PER_IP);
+        CHECK(c->dev.users == NULL);
+        setenv("OPENCHIME_MODE", "development", 1);
+        CHECK(load_in_mode(modes[m], "OPENCHIME_MANAGED_MAX_USERS", "5", err, sizeof err) != 0 && strstr(err, "OPENCHIME_MANAGED_TICKET"));
+    }
+    /* Unset is normal. */
+    unsetenv("OPENCHIME_MODE");
+    CHECK(oc_config_load(err, sizeof err) == 0 && oc_config_get()->mode == OC_MODE_NORMAL);
+    CHECK(load_with("OPENCHIME_DEV_USERS", "alice:pw:owner", err, sizeof err) != 0 && strstr(err, "OPENCHIME_MODE is normal"));
+    setenv("OPENCHIME_MODE", "development", 1);
+
+    /* The names a demo build read are gone, each naming what replaced it. */
+    refuses("OPENCHIME_DEMO_USERS", "alice:pw:owner", "OPENCHIME_DEV_USERS");
+    refuses("OPENCHIME_DEMO_CONNS_PER_IP", "0", "OPENCHIME_DEV_CONNS_PER_IP");
+    refuses("OPENCHIME_DEMO_MAINT_MS", "1000", "five minutes");
+    refuses("OPENCHIME_TEST_AUDIO", "synthetic", "OPENCHIME_DEV_AUDIO");
+    CHECK(oc_config_load(err, sizeof err) == 0);
 }
 
 static void test_reload_and_registry(void) {
@@ -286,7 +328,7 @@ static void test_reload_and_registry(void) {
     CHECK(!strcmp(db1, oc_config_get()->db_path));
     /* Every row: a name, a group, a doc line; a class; a default that its own
      * kind accepts (a default that fails its parser is a bug in the table). */
-    int rows = 0, operator_rows = 0, managed_rows = 0, demo_rows = 0;
+    int rows = 0, operator_rows = 0, managed_rows = 0, dev_rows = 0;
     for (const cfg_row *r = OC_CFG; r->name; r++, rows++) {
         CHECK(r->group && r->doc && r->doc[0]);
         CHECK(strncmp(r->name, "OPENCHIME_", 10) == 0);
@@ -298,12 +340,12 @@ static void test_reload_and_registry(void) {
         if (r->flags & CFG_PATTERN) CHECK(strstr(r->name, "%d") && r->count > 0);
         /* The classes are in the names. */
         if (r->cls == CFG_MANAGED) { managed_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) == 0); }
-        else if (r->cls == CFG_DEMO) { demo_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEMO_", 15) || !strncmp(r->name, "OPENCHIME_TEST_", 15)); }
-        else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEMO_", 15)); }
+        else if (r->cls == CFG_DEV) { dev_rows++; CHECK(!strncmp(r->name, "OPENCHIME_DEV_", 14)); }
+        else { operator_rows++; CHECK(strncmp(r->name, "OPENCHIME_MANAGED_", 18) && strncmp(r->name, "OPENCHIME_DEV_", 14)); }
     }
-    CHECK(operator_rows == 19);
+    CHECK(operator_rows == 20);     /* OPENCHIME_MODE among them */
     CHECK(managed_rows == 7);
-    CHECK(demo_rows == 8 + 12);     /* the daemon's eight, and the clients' */
+    CHECK(dev_rows == 4 + 12);      /* the daemon's four, and the clients' */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++) CHECK(x->instead && x->instead[0]);
     /* No row is also a removed name. */
     for (const cfg_removed *x = OC_CFG_REMOVED; x->name; x++)
@@ -346,7 +388,7 @@ static void test_env_file(void) {
 
 int run_config_tests(void) {
     printf("test_config: strict numbers, bools and enums; unknown and removed names; the structured values; "
-           "the cross-row rules; the data directory; the constants; the demo switches; reload; the registry's "
+           "the cross-row rules; the data directory; the constants; the mode; reload; the registry's "
            "own consistency; the EnvironmentFile\n");
     char err[512];
     CHECK(oc_config_load(err, sizeof err) == 0);
@@ -357,7 +399,7 @@ int run_config_tests(void) {
     test_cross_rules();
     test_data_dir();
     test_constants();
-    test_demo_switches();
+    test_mode();
     test_reload_and_registry();
     test_env_file();
     return failures;

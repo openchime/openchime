@@ -47,7 +47,7 @@ typedef enum {
 typedef struct {
     const char *camera_id;   /* NULL or "" for the default */
     const char *mic_id;
-    uint32_t    cap_ms;      /* 0 for OC_RECORDER_CAP_MS; OPENCHIME_TEST_VIDEO_CAP_MS overrides */
+    uint32_t    cap_ms;      /* 0 for OC_RECORDER_CAP_MS; OPENCHIME_DEV_VIDEO_CAP_MS overrides */
     int         width, height, fps;   /* 0 for 1280×720 at 30; a screen fits inside the size */
     uint64_t    max_bytes;   /* 0 for OC_RECORDER_MAX_BYTES */
     /* A screen recording: a screen or window from oc_capture_list_screens, NULL

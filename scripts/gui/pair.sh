@@ -68,8 +68,8 @@ up)
     env OPENCHIME_DATA_DIR="$DEV/data" \
         OPENCHIME_PORT="$PORT" OPENCHIME_HEALTH_PORT=0 \
         OPENCHIME_WORKSPACE_NAME="Acme HQ" \
-        OPENCHIME_DEMO_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member}" \
-        OPENCHIME_DEMO_CALL_MAX="${OC_TEST_CALL_MAX:-10}" \
+        OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member}" \
+        OPENCHIME_DEV_CALL_MAX="${OC_TEST_CALL_MAX:-10}" \
         ${OC_TEST_ADVERTISE_PORT:+OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT="$OC_TEST_ADVERTISE_PORT"} \
         OPENCHIME_MANAGED_MAX_USERS=100 \
         setsid "$HERE/openchimed" > "$DEV/daemon.log" 2>&1 < /dev/null &
@@ -112,17 +112,17 @@ up)
       >/dev/null 2>&1 || true
 
     # The test audio switches go through to the client as they do in
-    # scripts/gui/drive.sh -- synthetic devices (and screens, OPENCHIME_TEST_CAPTURE), a
+    # scripts/gui/drive.sh -- synthetic devices (and screens, OPENCHIME_DEV_CAPTURE), a
     # spoken file, and each client's own
     # microphone tone (OC_TEST_TONE_A / _B), so a pair in a call can tell whom
     # it is hearing. Unset, they are forwarded as nothing and change nothing.
     tone=""
     [ "$who" = a ] && tone="${OC_TEST_TONE_A:-}"
     [ "$who" = b ] && tone="${OC_TEST_TONE_B:-}"
-    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR:OPENCHIME_TEST_AUDIO:OPENCHIME_TEST_MIC:OPENCHIME_TEST_TONE:OPENCHIME_TEST_CAPTURE" \
-      OPENCHIME_TEST_DIR="$wdir" OPENCHIME_TEST_TONE="$tone" \
-      OPENCHIME_TEST_AUDIO="${OPENCHIME_TEST_AUDIO:-}" OPENCHIME_TEST_MIC="${OPENCHIME_TEST_MIC:-}" \
-      OPENCHIME_TEST_CAPTURE="${OPENCHIME_TEST_CAPTURE:-}" \
+    WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_MODE:OPENCHIME_DEV_DIR:OPENCHIME_DEV_AUDIO:OPENCHIME_DEV_MIC:OPENCHIME_DEV_TONE:OPENCHIME_DEV_CAPTURE" \
+      OPENCHIME_DEV_DIR="$wdir" OPENCHIME_DEV_TONE="$tone" \
+      OPENCHIME_DEV_AUDIO="${OPENCHIME_DEV_AUDIO:-}" OPENCHIME_DEV_MIC="${OPENCHIME_DEV_MIC:-}" \
+      OPENCHIME_DEV_CAPTURE="${OPENCHIME_DEV_CAPTURE:-}" \
       setsid "$EXE" "$host:$PORT" >/dev/null 2>&1 &
     disown
     # The person signs in: the card's Sign in, then the daemon's page

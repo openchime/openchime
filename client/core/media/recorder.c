@@ -119,7 +119,7 @@ struct oc_recorder {
 };
 
 static uint32_t cap_from_env(uint32_t cap) {
-    const char *t = oc_env_demo("OPENCHIME_TEST_VIDEO_CAP_MS");
+    const char *t = oc_env_dev("OPENCHIME_DEV_VIDEO_CAP_MS");
     if (t) {
         long v = strtol(t, NULL, 10);
         if (v > 0 && v <= (long)OC_RECORDER_CAP_MS) return (uint32_t)v;

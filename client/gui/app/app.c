@@ -73,7 +73,7 @@
 
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
 #include "gfx.h"              /* portable primitives over the SDL renderer (ARCH-107) */
-#include "env.h"            /* the demo build's test switches */
+#include "env.h"            /* the development inputs */
 #include "sdltext.h"          /* portable text layout/hit-testing (ARCH-106) */
 
 /* The scene's rectangle vocabulary, kept in left/top/right/bottom because every
@@ -2574,7 +2574,7 @@ static void toast_tick(const oc_model *m) {
     }
 }
 
-/* Test/automation hook: when OPENCHIME_TEST_DIR is set, the app polls <dir>/cmd
+/* Test/automation hook: when OPENCHIME_DEV_DIR is set, the app polls <dir>/cmd
  * each tick and can render itself to a file — a display-independent way to drive
  * and screenshot the client from WSL/CI without screen-scraping. */
 static char g_test_dir[512];
@@ -28545,7 +28545,7 @@ static void test_dump(const char *path) {
         }
         fclose(f); return;
     }
-    fprintf(f, "build=%s\n", oc_env_is_demo() ? "demo" : "production");
+    fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
@@ -29737,7 +29737,7 @@ static void test_dump(const char *path) {
     fclose(f);
 }
 
-/* Poll <OPENCHIME_TEST_DIR>/cmd for one command per tick; write <dir>/ack. */
+/* Poll <OPENCHIME_DEV_DIR>/cmd for one command per tick; write <dir>/ack. */
 static void test_poll(oc_win *hwnd) {
     if (!g_test_dir[0]) return;
     char cmdpath[600]; snprintf(cmdpath, sizeof cmdpath, "%s\\cmd", g_test_dir);
@@ -30378,7 +30378,7 @@ static void test_poll(oc_win *hwnd) {
          * through the CRT, which never reaches a filter; `fastfail` bypasses
          * every handler by design and is the case only the memory-mapped ring
          * can report. Test hook only — reachable solely through
-         * OPENCHIME_TEST_DIR. */
+         * OPENCHIME_DEV_DIR. */
         crumb("die %s requested", arg);
         test_ack("ok");
         if      (!strcmp(arg, "av"))       { *(volatile int *)0 = 1; }
@@ -32941,9 +32941,9 @@ int main(int argc, char *argv[]) {
     /* Before anything else, so a crash during startup is reported too. */
     oc_plat_boot();
 
-    /* Automation hook (demo builds only): OPENCHIME_TEST_DIR enables the file
-     * command channel. A production client has no hook to enable. */
-    { const char *td = oc_env_demo("OPENCHIME_TEST_DIR");
+    /* Automation hook (development mode only): OPENCHIME_DEV_DIR enables the
+     * file command channel. Any other client has no hook to enable. */
+    { const char *td = oc_env_dev("OPENCHIME_DEV_DIR");
       if (td) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
 
     /* AFTER the test dir is known, because that is where a report belongs when

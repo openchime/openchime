@@ -16,7 +16,7 @@ cd "$(dirname "$0")/../.."
 CHROME="${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)}"
 [ -x "${CHROME:-/nonexistent}" ] || { echo "pages: no Chromium (set CHROME)" >&2; exit 2; }
 [ -d node_modules/playwright-core ] || npm install --no-audit --no-fund --silent
-./openchimed --version | grep -q 'demo build' || { echo "pages: ./openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
+export OPENCHIME_MODE=development   # the fixture's users (CONFIG.md "Mode")
 # Made here, not only when missing: one left from before a protocol bump would
 # be refused at HELLO and look like a page failure.
 make build/signin build/demo_client >/dev/null || exit 2

@@ -31,7 +31,7 @@ pattern_prefixes=$(echo "$rows" | grep '_N$' | sed 's/N$//')
 # tests/test_config.c names wrong settings on purpose (the unknown-name check).
 used=$(git ls-files -- daemon client shared tests scripts packaging docs README.md Dockerfile entrypoint.sh .github mk Makefile \
        | grep -vE '\.(png|ico|bin|ort|npz|wav|bmp)$|^tests/test_config\.c$' | xargs grep -ohE 'OPENCHIME_[A-Z0-9_]+' 2>/dev/null \
-       | grep -vE '_H$|^OPENCHIME_TEST_$|^OPENCHIME_$|_$' | sort -u)
+       | grep -vE '_H$|^OPENCHIME_DEV_$|^OPENCHIME_$|_$' | sort -u)
 missing=""
 for n in $used; do
     if echo "$rows" | grep -qx "$n"; then continue; fi

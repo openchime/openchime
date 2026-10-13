@@ -76,7 +76,7 @@ rm -rf "$SECOND_DIR"; mkdir -p "$SECOND_DIR"
 env OPENCHIME_DATA_DIR="$SECOND_DIR/data" \
     OPENCHIME_PORT="$SECOND_PORT" OPENCHIME_HEALTH_PORT=0 \
     OPENCHIME_WORKSPACE_NAME="Second Fixture" \
-    OPENCHIME_DEMO_USERS="alice:pw:owner" \
+    OPENCHIME_DEV_USERS="alice:pw:owner" \
     OPENCHIME_MANAGED_MAX_USERS=100 \
     setsid "$HERE/openchimed" > "$SECOND_DIR/daemon.log" 2>&1 < /dev/null &
 disown

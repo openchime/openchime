@@ -6,7 +6,8 @@
  *
  * A row earns its place by being something an operator must decide that the
  * daemon cannot derive. What the control plane writes is CFG_MANAGED; what
- * only a test varies is CFG_DEMO; everything else is a constant (config.h). */
+ * only a test varies is CFG_DEV, read in development mode alone; everything
+ * else is a constant (config.h). */
 #include "config_table.h"
 #include "protocol.h"   /* the wire's caps */
 
@@ -35,10 +36,12 @@ int cfg_parse_trusted_proxies(oc_config *c, const cfg_row *r, const char *name, 
 #define G_SET    "Settings"
 #define G_FLAG   "Features"
 #define G_MAN    "Managed"
-#define G_DEMO   "Demo"
+#define G_DEV    "Development"
 
 const cfg_row OC_CFG[] = {
     /* --- Settings: no feature behind them, a value an operator chooses -------- */
+    /* First: the mode decides whether the development rows below may be read. */
+    ENUM("OPENCHIME_MODE", CFG_OPERATOR, G_SET, "normal", "normal|development|demo", "What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace).", mode),
     STR("OPENCHIME_WORKSPACE_NAME", CFG_OPERATOR, G_SET, "", "The workspace's display name, shown to clients; unset, a client derives one from the host.", F(workspace_name), NULL, 0, 0),
     PATHR("OPENCHIME_DATA_DIR", CFG_OPERATOR, G_SET, "/data", "Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`.", F(data_dir), NULL, 0, 0),
     INT("OPENCHIME_PORT", CFG_OPERATOR, G_SET, "8443", 1, 65535, "The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54).", proto_port),
@@ -84,27 +87,23 @@ const cfg_row OC_CFG[] = {
            "Hex bytes (at most 16) that lead every relay token, so a front door can route by them.",
            cfg_parse_token_prefix, 0),
 
-    /* --- Demo builds only -------------------------------------------------------- */
-    STR("OPENCHIME_DEMO_USERS", CFG_DEMO, G_DEMO, NULL, "Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token.", F(demo.users), NULL, CFG_SECRET, 0),
-    INT("OPENCHIME_DEMO_FILE_PAGE", CFG_DEMO, G_DEMO, "200", 1, (int64_t)OC_MAX_FILE_LIST, "How many files one LIST_FILES page carries, so a test sees a second page.", file_page),
-    INT("OPENCHIME_DEMO_CALL_MAX", CFG_DEMO, G_DEMO, "10", 2, (int64_t)OC_MAX_CALL_PARTICIPANTS, "The most people in one call, so a test can fill one.", call_max),
-    INT("OPENCHIME_DEMO_CONNS_PER_IP", CFG_DEMO, G_DEMO, "1024", 0, 1000000, "Connections one address may hold; 0 is no cap, for a load test from one host.", max_conns_per_ip),
-    U64("OPENCHIME_DEMO_MAINT_MS", CFG_DEMO, G_DEMO, "300000", 1000, 86400000, "How often the maintenance pass runs.", storage.interval_ms),
-    U64("OPENCHIME_DEMO_SCHED_MS", CFG_DEMO, G_DEMO, "15000", 50, 3600000, "How often scheduled messages are swept.", sched_tick_ms),
-    BOOL("OPENCHIME_DEMO_PRIVATE_UNFURL", CFG_DEMO, G_DEMO, "off", "Turns the unfurl fetcher's SSRF gate off, so a test can fetch a loopback fixture.", demo.private_unfurl),
-    PATHR("OPENCHIME_DEMO_OS_ROOTS", CFG_DEMO, G_DEMO, NULL, "The CA bundle read instead of the operating system's, for a test with its own CA.", F(demo.os_roots), NULL, 0, 0),
-    CLIENT("OPENCHIME_TEST_DIR", CFG_DEMO, G_DEMO, "GUI: the directory of the automation hook's command channel and dumps (TESTING.md)."),
-    CLIENT("OPENCHIME_TEST_AUDIO", CFG_DEMO, G_DEMO, "Clients: `synthetic` audio devices, or `mic-denied`."),
-    CLIENT("OPENCHIME_TEST_MIC", CFG_DEMO, G_DEMO, "Clients: a WAV the synthetic microphone speaks."),
-    CLIENT("OPENCHIME_TEST_MIC_LEAD_MS", CFG_DEMO, G_DEMO, "Clients: silence before the WAV, in ms."),
-    CLIENT("OPENCHIME_TEST_TONE", CFG_DEMO, G_DEMO, "Clients: the synthetic microphone's tone in Hz (20 to 7000; 440 unset)."),
-    CLIENT("OPENCHIME_TEST_MIC_ECHO", CFG_DEMO, G_DEMO, "Clients: the speaker echoed into the microphone (`1`), or alone (`only`)."),
-    CLIENT("OPENCHIME_TEST_CAPTURE", CFG_DEMO, G_DEMO, "Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`."),
-    CLIENT("OPENCHIME_TEST_SCREEN_GONE_MS", CFG_DEMO, G_DEMO, "Clients: the synthetic screen ends after this many ms."),
-    CLIENT("OPENCHIME_TEST_VIDEO_CAP_MS", CFG_DEMO, G_DEMO, "Clients: a shorter video message cap, in ms."),
-    CLIENT("OPENCHIME_TEST_CALL_TIMERS", CFG_DEMO, G_DEMO, "Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset."),
-    CLIENT("OPENCHIME_TEST_SUFFIX", CFG_DEMO, G_DEMO, "Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14)."),
-    CLIENT("OPENCHIME_TEST_SIGNIN", CFG_DEMO, G_DEMO, "Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md)."),
+    /* --- Development mode only (OPENCHIME_MODE=development) ---------------------- */
+    STR("OPENCHIME_DEV_USERS", CFG_DEV, G_DEV, NULL, "Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token.", F(dev.users), NULL, CFG_SECRET, 0),
+    INT("OPENCHIME_DEV_FILE_PAGE", CFG_DEV, G_DEV, "200", 1, (int64_t)OC_MAX_FILE_LIST, "How many files one LIST_FILES page carries, so a test sees a second page.", file_page),
+    INT("OPENCHIME_DEV_CALL_MAX", CFG_DEV, G_DEV, "10", 2, (int64_t)OC_MAX_CALL_PARTICIPANTS, "The most people in one call, so a test can fill one.", call_max),
+    INT("OPENCHIME_DEV_CONNS_PER_IP", CFG_DEV, G_DEV, "1024", 0, 1000000, "Connections one address may hold; 0 is no cap, for a load test from one host.", max_conns_per_ip),
+    CLIENT("OPENCHIME_DEV_DIR", CFG_DEV, G_DEV, "GUI: the directory of the automation hook's command channel and dumps (TESTING.md)."),
+    CLIENT("OPENCHIME_DEV_AUDIO", CFG_DEV, G_DEV, "Clients: `synthetic` audio devices, or `mic-denied`."),
+    CLIENT("OPENCHIME_DEV_MIC", CFG_DEV, G_DEV, "Clients: a WAV the synthetic microphone speaks."),
+    CLIENT("OPENCHIME_DEV_MIC_LEAD_MS", CFG_DEV, G_DEV, "Clients: silence before the WAV, in ms."),
+    CLIENT("OPENCHIME_DEV_TONE", CFG_DEV, G_DEV, "Clients: the synthetic microphone's tone in Hz (20 to 7000; 440 unset)."),
+    CLIENT("OPENCHIME_DEV_MIC_ECHO", CFG_DEV, G_DEV, "Clients: the speaker echoed into the microphone (`1`), or alone (`only`)."),
+    CLIENT("OPENCHIME_DEV_CAPTURE", CFG_DEV, G_DEV, "Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`."),
+    CLIENT("OPENCHIME_DEV_SCREEN_GONE_MS", CFG_DEV, G_DEV, "Clients: the synthetic screen ends after this many ms."),
+    CLIENT("OPENCHIME_DEV_VIDEO_CAP_MS", CFG_DEV, G_DEV, "Clients: a shorter video message cap, in ms."),
+    CLIENT("OPENCHIME_DEV_CALL_TIMERS", CFG_DEV, G_DEV, "Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset."),
+    CLIENT("OPENCHIME_DEV_SUFFIX", CFG_DEV, G_DEV, "Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14)."),
+    CLIENT("OPENCHIME_DEV_SIGNIN", CFG_DEV, G_DEV, "Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md)."),
 
     { NULL, CFG_STR, CFG_OPERATOR, NULL, NULL, NULL, 0, 0, NULL, 0, NULL, 0, 0 }
 };
@@ -124,7 +123,7 @@ const cfg_removed OC_CFG_REMOVED[] = {
     { "OPENCHIME_AUDIO_PORT",        "the call relay's UDP port is OPENCHIME_PORT" },
     { "OPENCHIME_WORKSPACE_ADDRESS", "renamed OPENCHIME_MANAGED_ADDRESS (the control plane's)" },
     { "OPENCHIME_MAX_USERS",         "renamed OPENCHIME_MANAGED_MAX_USERS (the control plane's)" },
-    { "OPENCHIME_MAX_CONNS_PER_IP",  "a constant, 1024; a demo build reads OPENCHIME_DEMO_CONNS_PER_IP" },
+    { "OPENCHIME_MAX_CONNS_PER_IP",  "a constant, 1024; development mode reads OPENCHIME_DEV_CONNS_PER_IP" },
     { "OPENCHIME_XFER_WORKERS",      "a constant, 2" },
     { "OPENCHIME_SESSION_DAYS",      "a constant, 30" },
     { "OPENCHIME_SESSION_IDLE_DAYS", "a constant: no idle limit" },
@@ -154,14 +153,14 @@ const cfg_removed OC_CFG_REMOVED[] = {
     { "OPENCHIME_PRESSURE_MB",       "a constant, 512" },
     { "OPENCHIME_MAINT_BATCH",       "a constant, 64" },
     { "OPENCHIME_AUDIT_MAX_DAYS",    "a constant, 365" },
-    { "OPENCHIME_MAINT_INTERVAL_MS", "a constant, five minutes; a demo build reads OPENCHIME_DEMO_MAINT_MS" },
-    { "OPENCHIME_SCHED_TICK_MS",     "a constant, fifteen seconds; a demo build reads OPENCHIME_DEMO_SCHED_MS" },
+    { "OPENCHIME_MAINT_INTERVAL_MS", "a constant, five minutes" },
+    { "OPENCHIME_SCHED_TICK_MS",     "a constant, fifteen seconds" },
     { "OPENCHIME_ENROLL_CODE_FILE",  "the enrollment code is in the log" },
     { "OPENCHIME_ENROLL_WAIT_SECS",  "a constant: one attempt at first start, then each boot; a managed box waits two minutes for its claim" },
     { "OPENCHIME_ENROLL_TICKET",     "renamed OPENCHIME_MANAGED_TICKET" },
     { "OPENCHIME_AUDIO_ADVERTISE_PORT", "renamed OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT (the control plane's)" },
     { "OPENCHIME_AUDIO_TOKEN_PREFIX",   "renamed OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX (the control plane's)" },
-    { "OPENCHIME_CALL_MAX",          "a constant, 10; a demo build reads OPENCHIME_DEMO_CALL_MAX" },
+    { "OPENCHIME_CALL_MAX",          "a constant, 10; development mode reads OPENCHIME_DEV_CALL_MAX" },
     { "OPENCHIME_TTS_LANG",          "the binary carries one language" },
     { "OPENCHIME_TTS_QUEUE",         "a constant, 256" },
     { "OPENCHIME_TTS_IDLE_SECS",     "a constant, 300" },
@@ -174,11 +173,31 @@ const cfg_removed OC_CFG_REMOVED[] = {
     { "OPENCHIME_SUMMARY_MODEL",     "OPENCHIME_SUMMARY=cloud:<url>,<model>" },
     { "OPENCHIME_TEST_PASSWORD_AUTH",    "removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h)" },
     { "OPENCHIME_DEMO_PASSWORD_FRAMES",  "removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h)" },
-    { "OPENCHIME_BOOTSTRAP_USERS",       "renamed OPENCHIME_DEMO_USERS" },
-    { "OPENCHIME_FILE_PAGE",             "renamed OPENCHIME_DEMO_FILE_PAGE" },
-    { "OPENCHIME_UNFURL_ALLOW_PRIVATE",  "renamed OPENCHIME_DEMO_PRIVATE_UNFURL" },
-    { "OPENCHIME_TEST_OS_ROOTS",         "renamed OPENCHIME_DEMO_OS_ROOTS" },
-    { "OPENCHIME_SUFFIX",            "the service suffix is built in; a demo client reads OPENCHIME_TEST_SUFFIX" },
+    { "OPENCHIME_BOOTSTRAP_USERS",       "renamed OPENCHIME_DEV_USERS (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_FILE_PAGE",             "renamed OPENCHIME_DEV_FILE_PAGE (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_UNFURL_ALLOW_PRIVATE",  "nothing read it: the unfurl fetcher never reaches a private address" },
+    { "OPENCHIME_TEST_OS_ROOTS",         "nothing read it: the operating system's roots, with OPENCHIME_EXTRA_CA beside them" },
+    { "OPENCHIME_DEMO_USERS",            "renamed OPENCHIME_DEV_USERS (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_DEMO_FILE_PAGE",        "renamed OPENCHIME_DEV_FILE_PAGE (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_DEMO_CALL_MAX",         "renamed OPENCHIME_DEV_CALL_MAX (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_DEMO_CONNS_PER_IP",     "renamed OPENCHIME_DEV_CONNS_PER_IP (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_DEMO_MAINT_MS",         "nothing read it: the maintenance pass runs every five minutes" },
+    { "OPENCHIME_DEMO_SCHED_MS",         "nothing read it: scheduled messages are swept every fifteen seconds" },
+    { "OPENCHIME_DEMO_PRIVATE_UNFURL",   "nothing read it: the unfurl fetcher never reaches a private address" },
+    { "OPENCHIME_DEMO_OS_ROOTS",         "nothing read it: the operating system's roots, with OPENCHIME_EXTRA_CA beside them" },
+    { "OPENCHIME_TEST_DIR",              "renamed OPENCHIME_DEV_DIR (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_AUDIO",            "renamed OPENCHIME_DEV_AUDIO (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_MIC",              "renamed OPENCHIME_DEV_MIC (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_MIC_LEAD_MS",      "renamed OPENCHIME_DEV_MIC_LEAD_MS (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_TONE",             "renamed OPENCHIME_DEV_TONE (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_MIC_ECHO",         "renamed OPENCHIME_DEV_MIC_ECHO (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_CAPTURE",          "renamed OPENCHIME_DEV_CAPTURE (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_SCREEN_GONE_MS",   "renamed OPENCHIME_DEV_SCREEN_GONE_MS (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_VIDEO_CAP_MS",     "renamed OPENCHIME_DEV_VIDEO_CAP_MS (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_CALL_TIMERS",      "renamed OPENCHIME_DEV_CALL_TIMERS (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_SUFFIX",           "renamed OPENCHIME_DEV_SUFFIX (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_TEST_SIGNIN",           "renamed OPENCHIME_DEV_SIGNIN (OPENCHIME_MODE=development)" },
+    { "OPENCHIME_SUFFIX",            "the service suffix is built in; a client in development mode reads OPENCHIME_DEV_SUFFIX" },
     { "OPENCHIME_RECOVER_MB",        "nothing read it" },
     { "OPENCHIME_BLOB_BACKEND",      "OPENCHIME_S3 set is S3; unset is local disk" },
     { "OPENCHIME_STATE",             "the TUI keeps its state in the credential store (ARCH-88)" },

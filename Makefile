@@ -10,9 +10,8 @@
 #   make web-test     the browser client's checks, in a headless Chromium
 #   make clean        everything built, except the downloaded speech models
 #   make distclean    everything built, and the remembered configuration
-# With DEMO=1, a build with the test switches in it (the tests, the harness
-# and the demo scripts need one; a release never is one), remembered like the
-# features.
+# There is one build: what a box is for -- a deployment, the tests and
+# harnesses, the public demo -- is OPENCHIME_MODE when it runs (CONFIG.md).
 # With ARCH=aarch64, the daemon cross-built for arm64 into build/aarch64/; with
 # RELEASE=1, the host's as the release builds it (zig, glibc 2.34). Neither is
 # remembered.
@@ -95,21 +94,7 @@ WEB ?= 0
 HOST_ARCH := $(shell uname -m)
 ARCH    ?= $(HOST_ARCH)
 RELEASE ?= 0
-# DEMO=1 builds the daemon and the clients with the test switches in them
-# (-DOC_DEMO: OPENCHIME_TEST_*, the password-in-frame path, the fixture's
-# bootstrap users; CONFIG.md "Demo builds only"). The tests, the harness and
-# the demo scripts need it; a release never carries it, and `make` refuses the
-# pair. Remembered like the features.
-DEMO ?= 0
-ifeq ($(DEMO),1)
-ifneq ($(RELEASE)$(OC_BUILD_ID),0)
-$(error DEMO=1 is for a box of your own: a release (RELEASE=1, OC_BUILD_ID) is never a demo build)
-endif
-DEMO_DEF := -DOC_DEMO
-else
-DEMO_DEF :=
-endif
-FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB) DEMO=$(DEMO)
+FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB)
 $(FEATURES): FORCE | build
 	@printf '%s\n' $(FEATURES_NOW) | cmp -s - $@ || printf '%s\n' $(FEATURES_NOW) > $@
 
@@ -142,11 +127,6 @@ CC_STAMP := build$(BUILD_SUFFIX)/.cc
 $(CC_STAMP): FORCE | build
 	@mkdir -p $(dir $@)
 	@echo '$(CC)' | cmp -s - $@ || echo '$(CC)' > $@
-# The demo switch's stamp, a prerequisite of every compile: flipping DEMO
-# rebuilds the daemon, the clients and the wasm objects, and nothing else.
-DEMO_STAMP := build/.demo
-$(DEMO_STAMP): FORCE | build
-	@echo '$(DEMO)' | cmp -s - $@ || echo '$(DEMO)' > $@
 include mk/sources.mk
 include mk/vendor.mk
 include mk/daemon.mk
@@ -167,8 +147,8 @@ run: $(BIN) $(TUI_BIN)
 	@mkdir -p /tmp/openchime-dev
 	@echo "openchime dev daemon -> 127.0.0.1:8443  (users: alice/pw, bob/pw)"
 	@echo "connect: build/openchime-tui 127.0.0.1 8443 alice:pw"
-	@OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
-	 OPENCHIME_DEMO_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
+	@OPENCHIME_MODE=development OPENCHIME_DATA_DIR=/tmp/openchime-dev OPENCHIME_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
+	 OPENCHIME_DEV_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
 
 # Every client the tree builds, one per platform: macOS, iOS and Android join
 # this list when they exist.

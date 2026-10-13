@@ -560,7 +560,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("build/bench_data", 0700);
     setenv("OPENCHIME_DATA_DIR", "build/bench_data", 1);
-    setenv("OPENCHIME_DEMO_CONNS_PER_IP", "0", 1);
+    setenv("OPENCHIME_DEV_CONNS_PER_IP", "0", 1);
     char cfgerr[128];
     if (oc_config_load(cfgerr, sizeof cfgerr) != 0) { fprintf(stderr, "config: %s\n", cfgerr); return 1; }
 

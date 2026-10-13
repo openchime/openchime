@@ -386,6 +386,10 @@ static int run_parallel(int max_jobs) {
 
 int main(void) {
     crash_report_install();
+    /* The suites run in development mode (CONFIG.md "Mode"): the daemon's
+     * OPENCHIME_DEV_* rows and the clients' inputs are read. Not overwritten,
+     * so a run may try another mode. */
+    setenv("OPENCHIME_MODE", "development", 0);
     /* The suites sign in as a person does, through the daemon's page
      * (tests/testsignin.h, AUTH.md §8.10). */
     oc_config_load(NULL, 0);   /* the writer reads its configuration */
