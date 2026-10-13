@@ -9,17 +9,20 @@ WINDRES    ?= $(dir $(MINGW_CC))x86_64-w64-mingw32-windres
 WINOBJCOPY ?= $(dir $(MINGW_CC))x86_64-w64-mingw32-objcopy
 
 
-# Both .exe files carry a VERSIONINFO resource from client/shared/res. Only the
-# number is passed; the .rc builds the display string from it, for the reason
-# recorded there. OC_VERSION is a bare integer or empty, and VERSIONINFO has no
-# spelling for "dev", so an unset version stamps 0.
+# Both .exe files carry a VERSIONINFO resource from client/shared/res. Two
+# bare tokens cross the command line, for the reason recorded there: the
+# candidate build's run number (OC_BUILD_NUM, the one numeric field Windows
+# compares) and the build id (OC_BUILD_ID, shown as the product version).
+# Unset, they stamp 0 and "dev", matching the daemon.
 #
-# make tracks file times, not variables, so changing OC_VERSION on a tree that
-# already built leaves the old number in build/*_res.o. CI checks out clean and
-# never sees this; a local rebuild at a new version wants `make clean` first.
-OC_VERSION_NUM := $(if $(OC_VERSION),$(OC_VERSION),0)
+# make tracks file times, not variables, so changing them on a tree that
+# already built leaves the old values in build/*_res.o. CI checks out clean and
+# never sees this; a local rebuild at a new build id wants `make clean` first.
+OC_BUILD_NUM  ?=
+WIN_BUILD_NUM  := $(if $(OC_BUILD_NUM),$(OC_BUILD_NUM),0)
+WIN_BUILD_ID   := $(if $(OC_BUILD_ID),$(OC_BUILD_ID),dev)
 WIN_RES_SRC    := client/shared/res/version_info.rc
-WINDRES_ARGS   := -I client/shared/res --define OC_VERSION_NUM=$(OC_VERSION_NUM)
+WINDRES_ARGS   := -I client/shared/res --define OC_BUILD_NUM=$(WIN_BUILD_NUM) --define OC_BUILD_ID_TOKEN=$(WIN_BUILD_ID)
 MBEDTLS_WIN    := third_party/mbedtls-3.6.2-win
 WIN_MBEDLIBS   := $(MBEDTLS_WIN)/library/libmbedtls.a \
                   $(MBEDTLS_WIN)/library/libmbedx509.a \
@@ -50,7 +53,7 @@ $(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) $(MINGW_CC) | bui
 	$(WINDRES) $(WINDRES_ARGS) $< -O coff -o $@
 $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
                 $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) $(DEMO_STAMP) | build
-	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
+	$(WINCC) $(WIN_CFLAGS) $(VERSION_DEF) -Wno-unused-result $(WIN_INC) \
 	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lcrypt32 -lole32 -ladvapi32 -lshell32 -static -o $@
 

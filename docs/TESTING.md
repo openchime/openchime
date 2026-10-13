@@ -738,10 +738,11 @@ answer in frames, a ping's pong, and an unmasked frame ending the connection.
 ## 4. Continuous integration
 
 CI is GitHub Actions (`.github/workflows/ci.yml`). It runs on every **pull
-request into `staging`** and every **push to `staging`**, and `promote.yml` (on
-the staging commit being promoted) and `release.yml` (on `main`) run it through
-`workflow_call`, so a release is gated on exactly these jobs and a docs-only
-staging tip is still tested before it is released. Doc-only changes skip it
+request into `staging`** and every **push to `staging`**; `candidate.yml` waits
+for that push's run before it builds a candidate, and `promote.yml` (on the
+staging commit being promoted) runs it through `workflow_call`, so a release is
+gated on exactly these jobs and a docs-only staging tip is still tested before
+it is released (RELEASING.md). Doc-only changes skip it
 (`paths-ignore`). Nothing is checked twice: each suite runs once (§2.4), one
 clang compile is both the release-compiler and the second-compiler check, and
 what the release checks itself is not repeated.

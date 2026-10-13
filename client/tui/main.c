@@ -2580,13 +2580,13 @@ static int have_stored_token(const char *store_path, const char *key, const char
     return has;
 }
 
-#ifndef OC_VERSION
-#define OC_VERSION "dev"
+#ifndef OC_BUILD_ID
+#define OC_BUILD_ID "dev"   /* the short commit the candidate build compiled (docs/RELEASING.md) */
 #endif
 
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
-        printf("openchime-tui %s (protocol %u)%s\n", OC_VERSION, (unsigned)OC_PROTOCOL_VERSION,
+        printf("openchime-tui %s (protocol %u)%s\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION,
                oc_env_is_demo() ? " (demo build)" : "");
         return 0;
     }

@@ -57,7 +57,7 @@ WARN_CFLAGS := -Wall -Wextra -Werror
 CFLAGS ?= -std=c99 -D_GNU_SOURCE -O2
 # APPENDED, not folded into the ?= above, and that is the whole point. `CFLAGS ?=`
 # is one `make CFLAGS=...` away from being replaced wholesale -- and the release
-# workflow does pass variables on the command line (CC, OC_VERSION), so the one
+# workflow does pass variables on the command line (CC, OC_BUILD_ID), so the one
 # build that must not carry warnings is exactly the one best placed to drop the
 # flag that forbids them. `override` is what makes this hold: a plain `+=` still
 # loses to a command-line assignment, which is precisely the case being guarded.
@@ -102,8 +102,8 @@ RELEASE ?= 0
 # pair. Remembered like the features.
 DEMO ?= 0
 ifeq ($(DEMO),1)
-ifneq ($(RELEASE)$(OC_VERSION),0)
-$(error DEMO=1 is for a box of your own: a release (RELEASE=1, OC_VERSION) is never a demo build)
+ifneq ($(RELEASE)$(OC_BUILD_ID),0)
+$(error DEMO=1 is for a box of your own: a release (RELEASE=1, OC_BUILD_ID) is never a demo build)
 endif
 DEMO_DEF := -DOC_DEMO
 else
@@ -113,13 +113,15 @@ FEATURES_NOW := TTS=$(TTS) STT=$(STT) SUM=$(SUM) WEB=$(WEB) DEMO=$(DEMO)
 $(FEATURES): FORCE | build
 	@printf '%s\n' $(FEATURES_NOW) | cmp -s - $@ || printf '%s\n' $(FEATURES_NOW) > $@
 
-# Release identity (ARCH-20). The release workflow passes the release number it
-# is about to publish (OC_VERSION=7); a source build leaves it unset and the
-# daemon reports "dev". Only the daemon takes it -- the tests link the same
+# Build identity (ARCH-20). The candidate build passes the short commit it is
+# building (OC_BUILD_ID=74359c0), which is what `--version` and the startup
+# log say; a source build leaves it unset and reports "dev". A release number
+# is a label assigned to a build id afterwards (docs/RELEASING.md) and is
+# never compiled in. The daemon and the TUI take it; the tests link the same
 # objects and have no use for it.
-OC_VERSION ?=
-ifneq ($(OC_VERSION),)
-VERSION_DEF := -DOC_VERSION='"$(OC_VERSION)"'
+OC_BUILD_ID ?=
+ifneq ($(OC_BUILD_ID),)
+VERSION_DEF := -DOC_BUILD_ID='"$(OC_BUILD_ID)"'
 else
 VERSION_DEF :=
 endif

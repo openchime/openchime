@@ -270,12 +270,14 @@ static void on_serving(void *ctx) {
     else fprintf(stderr, "openchimed: could not start the enrollment claim\n");
 }
 
-/* Stamped by the build (-DOC_VERSION=...). A source build that sets nothing
- * reports "dev", which is the honest answer: only a release build carries a
- * release number, and an operator comparing a running process against an
- * installed package needs to be able to tell the two apart. */
-#ifndef OC_VERSION
-#define OC_VERSION "dev"
+/* Stamped by the build (-DOC_BUILD_ID=...): the short commit the candidate
+ * build compiled, which is the binary's identity (docs/RELEASING.md). A
+ * release number is a label assigned to a build afterwards and is not in the
+ * binary; the package that carries the binary says it. A source build that
+ * sets nothing reports "dev", which is the honest answer, and lets an operator
+ * tell a running process from an installed package. */
+#ifndef OC_BUILD_ID
+#define OC_BUILD_ID "dev"
 #endif
 
 /* --- summaries (REQ-310, ARCH-116) ---------------------------------------------
@@ -416,7 +418,7 @@ int main(int argc, char **argv) {
     }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
-            printf("openchimed %s (protocol %u)%s\n", OC_VERSION,
+            printf("openchimed %s (protocol %u)%s\n", OC_BUILD_ID,
                    (unsigned)OC_PROTOCOL_VERSION, oc_config_is_demo() ? " (demo build)" : "");
             return 0;
         }
@@ -430,7 +432,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
 
-    fprintf(stderr, "openchimed: version %s (protocol %u)%s\n", OC_VERSION,
+    fprintf(stderr, "openchimed: build %s (protocol %u)%s\n", OC_BUILD_ID,
             (unsigned)OC_PROTOCOL_VERSION, oc_config_is_demo() ? " (demo build)" : "");
     if (oc_config_is_demo())
         fprintf(stderr, "openchimed: DEMO BUILD: the test switches are compiled in; this binary is for a box of your own, never a deployment\n");

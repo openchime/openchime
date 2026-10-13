@@ -302,5 +302,5 @@ feature switches are remembered in `build/.features`).
 | `STT` | `0` | `1` builds voice input in; likewise `OPENCHIME_STT`. |
 | `SUM` | `0` | `1` builds llama.cpp in for `OPENCHIME_SUMMARY=local`; `cloud:…` works without it. |
 | `WEB` | `0` | `1` compiles the web client's loader into the daemon, which then serves it at `/app/`. |
-| `DEMO` | `0` | `1` builds the test switches in (the "Demo builds only" section): the tests, the GUI and web harness and the demo scripts need one; a release is never one, and `make` refuses `DEMO=1` with `RELEASE=1` or `OC_VERSION`. `--version` says `(demo build)`. |
-| `OC_VERSION` | *(unset: `dev`)* | The release number `--version` prints; the release workflow sets it (ARCH-20). |
+| `DEMO` | `0` | `1` builds the test switches in (the "Demo builds only" section): the tests, the GUI and web harness and the demo scripts need one; a release is never one, and `make` refuses `DEMO=1` with `RELEASE=1` or `OC_BUILD_ID`. `--version` says `(demo build)`. |
+| `OC_BUILD_ID` | *(unset: `dev`)* | The build id `--version` prints: the short commit the candidate build compiled (ARCH-20, RELEASING.md). A release number is assigned to a build afterwards and is not compiled in. |

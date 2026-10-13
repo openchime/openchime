@@ -1,43 +1,31 @@
-# Publish a release of the daemon (ARCH-20).
+# Publish a release of the daemon (ARCH-20, docs/RELEASING.md).
 #
-# Until this existed the project shipped nothing: CI built the daemon on every
-# push and threw it away, the Dockerfile was never built by CI, and the image the
-# control plane provisions onto customer boxes was produced by hand. Five
-# channels come out of one run, all carrying the same release number:
+# A release is a CANDIDATE given a number. candidate.yml builds everything from
+# each staging commit and stores it by its build id, the short commit; this
+# workflow runs on the promotion of that commit to main, fetches that
+# candidate, verifies its signed manifest, assigns the next release number,
+# packages the same binaries under it and publishes. No compiler runs here:
+# what was built and verified on staging is what ships, and a release takes
+# minutes. Five channels come out of one run, all carrying the same number:
 #
 #   apt      Debian/Ubuntu, GPG-signed repository in object storage
 #   dnf/yum  RHEL family, GPG-signed repository in object storage
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
-#   image    GHCR, for the hosted model (Fly)
+#   image    GHCR, for the hosted model (Fly): the candidate's image, re-tagged
 #   windows  the client, not the daemon: a signed installer attached to the
 #            GitHub release, and an MSIX for the Store
 #
-# ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm and the tarball, so all
-# three ship a byte-identical artifact rather than three builds that merely came
-# from one source tree. It is built with `zig cc` targeting glibc 2.34, the
-# oldest supported target -- because the runner's own glibc is too new: a binary
-# linked against 2.35+ will not start on RHEL 9, and one linked here against the
-# runner's libc failed outright on Debian bookworm during development.
-#
-# NOTHING IN THIS WORKFLOW USES DOCKER. The 2.34 floor was previously held by
-# building inside a rockylinux:9 container; zig ships glibc stubs for every
-# version and pins the floor on a bare runner instead. ONE LINUX HOST BUILDS
-# EVERYTHING: both architectures' daemons (arm64 cross-built with zig, build
-# only: nothing here runs it), the web client and the Windows clients come off
-# ubuntu-24.04 with toolchains make fetches pinned (mk/toolchains.mk); the
-# container image is the packaged binary laid onto a glibc base with buildah
-# (no compile inside it, so no emulation for arm64); only signing the Windows
-# installers needs a Windows machine. Keeping the pipeline daemon-free is a
-# standing constraint, not an accident -- see docs/RELEASING.md.
-#
-# The image carries the same binary as the packages, so the one-binary rule
-# holds for it too, read-aloud and voice input included.
+# ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm, the tarball and the
+# image, so all four ship a byte-identical artifact: the one the candidate's
+# manifest names. NOTHING IN THIS WORKFLOW USES DOCKER (skopeo re-tags, buildah
+# built); only signing the Windows installer needs a Windows machine.
 name: release
 
 # A release runs on the promotion: promote.yml fast-forwards main to a verified
 # staging commit with the deploy key, and that push is the trigger. main takes no
 # other updates (a ruleset), so every push to main is a promotion. The dispatch
-# stays for dry runs, and like the push it runs on main only (the `branch` job).
+# stays for dry runs, which rehearse the release against staging's own candidate
+# and publish nothing.
 #
 # `inputs.*` is EMPTY on a push, so every dry-run test below is written
 # `(github.event_name == 'workflow_dispatch' && inputs.dry_run)`: a push is never
@@ -48,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Build and verify everything, publish nothing, tag nothing'
+        description: 'Fetch the candidate, package and verify everything, publish nothing, tag nothing'
         type: boolean
         default: false
       skip_repo_smoke:
@@ -88,17 +76,10 @@ jobs:
           echo "::error::release runs on main only (this run is on $REF). A release starts with promote.yml on staging; a dry run is dispatched on staging or main."
           exit 1
 
-  # The same jobs a branch push runs. Reused, not re-implemented.
-  test:
-    name: gate on CI
-    needs: branch
-    uses: ./.github/workflows/ci.yml
-
-  # attribution-guard.yml has carried `workflow_call:` specifically so a release
-  # could gate on it, and nothing did -- this was the only release path in the
-  # estate that skipped it. contents: write is declared here because a called
-  # workflow cannot exceed its caller's permissions and this workflow defaults to
-  # read; scoped to this job so the rest stays read-only.
+  # CI is not run again here: the candidate exists only because ci.yml,
+  # attribution-guard and commit-policy passed on this commit on staging
+  # (candidate.yml's gate), and promote.yml gated on CI once more before
+  # moving main. The attribution guard is cheap and is kept as a last word.
   guard:
     name: attribution guard
     needs: branch
@@ -237,9 +218,90 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # The candidate for this commit, fetched from the staging bucket and
+  # verified: the manifest's signature, every file's sha256, the build id
+  # the binary itself reports, and the image the manifest names being in the
+  # registry. A commit with no candidate is refused here, before any number
+  # is reserved: the one way that happens is a promotion made before
+  # staging's candidate build finished, and the fix is to wait and promote
+  # again. The verified files go on as one artifact every later job reads.
+  candidate:
+    name: fetch the candidate
+    needs: [branch, preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      run_number: ${{ steps.id.outputs.run_number }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
+      DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+      DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+      DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tooling
+        timeout-minutes: 20
+        run: scripts/build/apt.sh rclone gnupg skopeo
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set; the candidate cannot be verified"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+      - name: Configure rclone for the staging bucket
+        run: |
+          set -euo pipefail
+          for v in DIST_S3_ENDPOINT DIST_S3_STAGING_ACCESS_KEY DIST_S3_STAGING_SECRET_KEY DIST_STAGING_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist-staging]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_STAGING_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_STAGING_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+          EOF
+      - name: Fetch and verify the candidate
+        id: id
+        run: |
+          set -euo pipefail
+          id="${GITHUB_SHA:0:7}"
+          scripts/release/candidate_fetch.sh "$id" candidate
+          run=$(python3 -c 'import json; print(json.load(open("candidate/manifest.json"))["run_number"])')
+          sha=$(python3 -c 'import json; print(json.load(open("candidate/manifest.json"))["sha"])')
+          [ "$sha" = "$GITHUB_SHA" ] || { echo "::error::the candidate is for ${sha}, not ${GITHUB_SHA}"; exit 1; }
+          echo "build_id=$id" >> "$GITHUB_OUTPUT"
+          echo "run_number=$run" >> "$GITHUB_OUTPUT"
+          # The binary says what it is: unpacked and asked, so the id in the
+          # manifest is the id the code carries, not merely the directory's name.
+          mkdir -p check && tar xzf "candidate/linux-amd64/openchimed-build-${id}-linux-amd64.tar.gz" -C check
+          got=$("check/openchimed-build-${id}-linux-amd64/openchimed" --version)
+          echo "$got"
+          printf '%s' "$got" | grep -q "^openchimed ${id} " || { echo "::error::the candidate's daemon reports '$got', not build ${id}"; exit 1; }
+          # And the image the release will re-tag exists, with the digest the
+          # manifest recorded.
+          want=$(python3 -c 'import json,sys; print(json.load(open("candidate/manifest.json"))["images"]["build-'"$id"'"])')
+          have="sha256:$(skopeo inspect --raw "docker://${IMAGE}:build-${id}" | sha256sum | cut -d' ' -f1)"
+          [ "$have" = "$want" ] || { echo "::error::${IMAGE}:build-${id} is ${have}, the manifest says ${want}"; exit 1; }
+          echo "image ${IMAGE}:build-${id} matches the manifest"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate
+          path: candidate
+          if-no-files-found: error
+
+  # The number is a label on the candidate's build id. Computed from the tags
+  # and reserved before anything is packaged, so that a failure between here
+  # and publishing burns a number rather than duplicating one.
   version:
     name: allocate the release number
-    needs: [test, guard, preflight]
+    needs: [guard, candidate]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -254,12 +316,9 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force --quiet
-          # Computed up front, unlike the control plane which tags after the
-          # fact: a package version is the artifact's identity and has to exist
-          # before anything is built.
           N=$(scripts/release/version.sh next)
           echo "number=$N" >> "$GITHUB_OUTPUT"
-          echo "this release is $N (previous: $(scripts/release/version.sh current))"
+          echo "this release is $N (previous: $(scripts/release/version.sh current)), build ${{ needs.candidate.outputs.build_id }}"
 
       # Reserve the number NOW, not after publishing.
       #
@@ -287,215 +346,60 @@ jobs:
           git push origin "release-${N}"
           echo "reserved release-${N}"
 
-  packages:
+  # The candidate's tree, packaged under the release number: the .deb, the
+  # .rpm and the tarball from the one binary, with the checks that the
+  # candidate build ran on its placeholder packages run again on the real
+  # ones. Seconds, not the hour a build took.
+  package:
     name: ${{ matrix.arch }} packages
-    needs: version
+    needs: [version, candidate]
     runs-on: ubuntu-24.04
-    # A cache miss compiles ONNX Runtime for read-aloud (below) before the daemon.
-    timeout-minutes: 120
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            make_arch: x86_64
-            bin: openchimed
-          # Cross-built with zig on the same x86 runner (make ARCH=aarch64).
-          # Build only: the binary is packaged and shipped, never run here;
-          # what runs below (the render, the install) runs for amd64 alone.
-          - arch: arm64
-            make_arch: aarch64
-            bin: build/aarch64/openchimed
+        arch: [amd64, arm64]
     env:
       VERSION: ${{ needs.version.outputs.number }}
-      MAKE_ARCH: ${{ matrix.make_arch }}
-      BIN: ${{ matrix.bin }}
-      # Every artifact this job produces lands under dist/<platform>/, which is
-      # also the artifact's name -- see the upload at the end of the job for why
-      # those two being the same string is what keeps the layout intact across
-      # the artifact round-trip.
+      BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+      OC_BUILD_ID: ${{ needs.candidate.outputs.build_id }}   # for the tarball's README
       PLATFORM: linux-${{ matrix.arch }}
       DIST: dist/linux-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7
-
-      # The toolchains make fetches pinned (mk/toolchains.mk): zig, whose
-      # bundled clang ships glibc stub libraries for every version back to 2.17
-      # and links against whichever one it is asked for, regardless of the
-      # host's own glibc -- so a 2.34 binary comes off a runner carrying 2.39
-      # with no container in the picture, and an arm64 one off an x86 runner;
-      # and Emscripten for the web client the daemon embeds. Keyed by the
-      # scripts, which pin the versions and the checksums.
-      - name: Restore the toolchains
-        uses: actions/cache@v6
+      - uses: actions/download-artifact@v8
         with:
-          path: |
-            third_party/zig-0.13.0
-            third_party/emsdk-6.0.8
-          key: toolchains-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/zig.sh', 'scripts/build/emsdk.sh') }}
-
-      - name: Install build dependencies
+          name: candidate
+          path: candidate
+      - name: Install packaging tools
         timeout-minutes: 20
+        run: scripts/build/apt.sh rpm
+      - name: Unpack the candidate's tree
         run: |
           set -euo pipefail
-          # scripts/build/apt.sh: the mirror rewritten, each apt-get bounded
-          # and retried, so a stall fails the step instead of holding the job.
-          # rpm supplies rpmbuild, which used to come from the Rocky container;
-          # nasm for libvpx's assembly; xz-utils for the toolchain tarballs.
-          scripts/build/apt.sh bzip2 rpm nasm xz-utils
-
-      # Read-aloud's engine and model (ARCH-111), built by make with the same
-      # toolchain and glibc target as the daemon: ONNX Runtime compiled from
-      # source as one minimal static archive, per architecture; the voice model
-      # converted; and voice input's recognizer files, fetched as published
-      # (ARCH-112). Functions of the files in the key, so a hit skips about 25
-      # minutes and a change rebuilds. The arm64 archive is cross-built with
-      # the host's protoc, so the amd64 build must exist first (the host's
-      # directory is in this cache too).
-      - name: Restore the speech engine and models
-        uses: actions/cache@v6
-        with:
-          path: |
-            third_party/onnxruntime-1.30.0
-            third_party/onnxruntime-1.30.0-aarch64
-            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
-            third_party/llamacpp-0.5.0
-            third_party/llamacpp-0.5.0-aarch64
-            build/kitten
-            build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
-
-      # One binary, built against the oldest glibc we support, then stripped
-      # once. Everything downstream consumes this exact file.
-      #
-      # The wrapper exists to keep one rule: the ONLY host header this build may
-      # see is sqlite3.h. Adding -I/usr/include instead would pull the runner's
-      # glibc 2.39 headers, which redirect strtol to __isoc23_strtol -- a 2.38
-      # symbol that does not exist in the 2.34 stubs, so the link fails. libc
-      # headers come from zig; the sqlite header is copied out on its own.
-      # The web client's libraries (docs/WEB.md): the daemon is never built
-      # without the client it serves -- the page and loader are compiled into it
-      # (daemon/webapp.h). Built once by their scripts and cached, keyed by the
-      # scripts and the pinned Emscripten.
-      - name: Restore the wasm libraries
-        uses: actions/cache@v6
-        with:
-          path: |
-            build/wasm/mbedtls
-            build/wasm/sdl3
-            build/wasm/libvpx
-            build/wasm/opus
-            build/wasm/speexdsp
-          key: wasm-emsdk6.0.8-${{ hashFiles('scripts/build/mbedtls_wasm.sh', 'scripts/build/sdl3_wasm.sh', 'scripts/build/media_wasm.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh') }}
-      # RELEASE=1 ARCH=...: zig's clang against glibc 2.34 for the architecture
-      # asked for, every vendored library cross-built the same way (OC_ARCH to
-      # the scripts), the binary stripped at the link. The ONLY host header this
-      # build sees is sqlite3.h, copied out on its own: the runner's glibc 2.39
-      # headers redirect strtol to __isoc23_strtol, a 2.38 symbol the 2.34 stubs
-      # do not have. An arm64 build writes its data manifests with the host's
-      # daemon, built from the same sources (mk/daemon.mk).
-      - name: Build the daemon (glibc 2.34)
+          mkdir -p "$DIST" tree
+          tar xzf "candidate/linux-${{ matrix.arch }}/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}.tar.gz" -C tree
+          cp -r "tree/openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}/." "$DIST/"
+          ls "$DIST"
+      - name: Build the packages
         run: |
           set -euo pipefail
-          mkdir -p "$DIST"
-          make RELEASE=1 ARCH="$MAKE_ARCH" TTS=1 STT=1 SUM=1 WEB=1 OC_VERSION="$VERSION"
-          cp "$BIN" "$DIST/openchimed"
-          # Read-aloud's and voice input's data travel beside the binary, where
-          # `make` assembled them and wrote their manifests; every package takes
-          # them from there.
-          cp -r tts "$DIST/tts"
-          cp -r stt "$DIST/stt"
-          # And the web client's wasm (docs/WEB.md): the page and loader are
-          # inside the binary; this is the one file it serves from beside itself.
-          cp -r web "$DIST/web"
-          packaging/build-rpm.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST" >/dev/null
-      # Saved as soon as the build has run, whether or not the job goes on to
-      # pass: actions/cache saves only after a successful job, so every run
-      # that failed downstream of the engine build paid the twenty minutes
-      # again. The scripts leave a half-made archive or model in a .new
-      # directory, never under these paths, so what is saved is whole.
-      - name: Save the speech engine and models
-        if: always()
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            third_party/onnxruntime-1.30.0
-            third_party/onnxruntime-1.30.0-aarch64
-            third_party/onnxruntime-1.30.0-build/out/MinSizeRel/_deps/protobuf-build/protoc*
-            third_party/llamacpp-0.5.0
-            third_party/llamacpp-0.5.0-aarch64
-            build/kitten
-            build/moonshine
-          key: tts-release-${{ matrix.arch }}-zig0.13.0-${{ hashFiles('scripts/build/onnxruntime.sh', 'scripts/build/llamacpp.sh', 'scripts/release/zig_cc.sh', 'daemon/ort.ops.config', 'scripts/build/kitten.sh', 'scripts/build/tts_convert.c', 'scripts/build/moonshine.sh') }}
-      # No shipped daemon is a demo build: the marker a DEMO=1 build carries is
-      # absent, for either architecture (nothing need run).
-      - name: The daemon is not a demo build
-        run: |
-          set -euo pipefail
-          if grep -q OPENCHIME-DEMO-BUILD "$DIST/openchimed"; then
-            echo "::error::$DIST/openchimed is a demo build"; exit 1; fi
-          echo "not a demo build"
-      # The host's binary runs here; the arm64 one is build-only.
-      - name: Speak and hear with the release binary
-        if: matrix.arch == 'amd64'
-        run: |
-          set -euo pipefail
-          "./$DIST/openchimed" --version
-          # Read-aloud works from what ships: a render from the stripped file,
-          # finding its voice data beside it and verifying it.
-          "./$DIST/openchimed" --tts-say expr-voice-2-f "This release speaks." /tmp/release-check.wav
-          # And voice input hears it, from the stt/ data beside the stripped file.
-          heard="$("./$DIST/openchimed" --stt-hear /tmp/release-check.wav)"
-          echo "heard: $heard"
-          printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'this release speaks' || {
-            echo "::error::the release binary did not hear what it said"; exit 1; }
-
-      # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
-      # is invisible in a passing build -- a binary needing 2.38 links and runs
-      # perfectly here, then fails to start on the distro it was built for. The
-      # container used to enforce it structurally; with the container gone this
-      # assertion is what enforces it, so it is not optional.
-      - name: Assert the glibc floor
-        run: |
-          set -euo pipefail
-          # readelf reads any ELF, whichever architecture the runner is.
-          max=$(readelf --dyn-syms --wide "$DIST/openchimed" \
-                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
-          echo "highest glibc symbol required: $max"
-          [ "$max" = "GLIBC_2.34" ] || {
-            echo "::error::binary requires $max, above the supported floor GLIBC_2.34"
-            exit 1
-          }
-
-      # The build-*.sh scripts take an output directory and default to a bare
-      # dist/. They are deliberately left knowing nothing about the per-platform
-      # layout: the release pipeline owns where artifacts go, so one caller
-      # decides it rather than three scripts agreeing by coincidence.
-      - name: Build the .deb and the tarball
-        # No MBEDTLS_DIR override any more. It used to point at a licence tree
-        # copied out of the build container, because mbedTLS was fetched and
-        # built on the container's throwaway copy of the source and its LICENSE
-        # never existed on the runner. The build now happens in this very tree,
-        # so licenses.sh finds third_party/mbedtls-3.6.2/LICENSE where it
-        # defaults to looking.
-        run: |
-          set -euo pipefail
+          packaging/build-rpm.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST" >/dev/null
           packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
           packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
           # Each package is named for ITS architecture: the publish job pools
           # both architectures' files under one prefix, and two named alike
-          # collide there, which a dry run (no publish) never saw.
+          # collide there.
           rpm_arch=$([ "${{ matrix.arch }}" = arm64 ] && echo aarch64 || echo x86_64)
           for want in "openchimed_${VERSION}_${{ matrix.arch }}.deb" \
                       "openchimed-${VERSION}-1.${rpm_arch}.rpm" \
                       "openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz"; do
             [ -f "$DIST/$want" ] || { echo "::error::$DIST has no $want"; ls "$DIST"; exit 1; }
           done
-
-      # Proves the three channels carry the same file. If this ever fails, the
-      # "one binary, packaged three ways" claim in the docs is false and should
-      # not be published.
-      - name: Verify all channels ship one identical binary
+      # Proves the three channels carry the same file, and that it is the one
+      # the candidate's manifest names: the sha256 of the binary in each
+      # package equals the sha256 of the binary the candidate build made.
+      - name: Verify all channels ship the candidate's binary
         run: |
           set -euo pipefail
           want=$(sha256sum "$DIST/openchimed" | cut -d' ' -f1)
@@ -506,86 +410,21 @@ jobs:
           for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
                    v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
             got=$(sha256sum "$f" | cut -d' ' -f1)
-            [ "$got" = "$want" ] || { echo "::error::$f differs from the built binary"; exit 1; }
+            [ "$got" = "$want" ] || { echo "::error::$f differs from the candidate's binary"; exit 1; }
           done
-          echo "all three channels ship $want"
-
-      # Install the real .deb and run what it put on disk. This is a weaker check
-      # than the clean-room install it replaces: the runner is not pristine, it
-      # is Ubuntu rather than Debian, and there is no equivalent for the .rpm at
-      # all, because nothing on an Ubuntu runner can install one. What survives
-      # is the single most valuable assertion of the three -- that the package
-      # unpacks, its dependencies resolve, and the binary it lays down executes.
-      #
-      # Dropping the container was a deliberate trade (see docs/RELEASING.md).
-      # The .rpm is now covered only by the identical-binary check above and by
-      # the repository smoke test in `publish`; a package that builds but fails
-      # to install on the RHEL family will not be caught before it is published.
+          echo "all three channels ship $want (build ${BUILD_ID})"
       - name: Install the package and run it
         if: matrix.arch == 'amd64'
         run: |
           set -euo pipefail
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
-          /usr/bin/openchimed --version
-          # The package put read-aloud's data where an installed daemon looks, and it
-          # verifies: a render by the installed binary, from the installed data.
-          /usr/bin/openchimed --tts-say expr-voice-2-f "The package speaks." /tmp/installed-check.wav
-          # And the recognizer's data, the same way.
-          heard="$(/usr/bin/openchimed --stt-hear /tmp/installed-check.wav)"
-          echo "heard: $heard"
-          printf '%s' "$heard" | tr 'A-Z' 'a-z' | grep -q 'the package speaks' || {
-            echo "::error::the installed daemon did not hear what it said"; exit 1; }
-
-      # The install above does not touch the unit file: both maintainer scripts
-      # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60
-      # lines of ProtectSystem, DynamicUser and RestrictAddressFamilies that CI
-      # produces need something to actually parse them.
-      #
-      # This used to need a container precisely because `docker run` has no
-      # /run/systemd/system. The runner is the opposite case -- it boots systemd
-      # for real -- so the check runs directly, against a newer systemd than the
-      # bookworm container offered.
-      #
-      # Not a real boot: that would need the service to start. `verify` resolves
-      # every directive against the installed systemd, which is the failure class
-      # that would otherwise ship unchecked.
-      - name: Validate the unit file
-        if: matrix.arch == 'amd64'
-        run: |
-          set -euo pipefail
-          # systemd-analyze exits 0 even for a directive it does not recognise, so
-          # its status is worthless here -- measured, not assumed. Grep the output.
-          #
-          # The pattern is "Unknown key", NOT "Unknown key name": systemd words it
-          # "Unknown key 'ProtectSystm' in section [Service], ignoring." A first
-          # draft matching "Unknown key name" passed a unit with a typo'd
-          # ProtectSystem, which is the exact bug this step exists to catch.
-          out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
-          printf "%s\n" "$out"
-          # Scope to OUR unit before matching. `verify` walks the dependency
-          # graph and reports on everything it loads, which in a pristine
-          # container was only openchimed.service -- and on a runner is also
-          # whatever systemd units that runner ships. Both of these are real
-          # output from ubuntu-22.04 and both matched the patterns below:
-          #   /lib/systemd/system/snapd.service:23: Unknown key name 'RestartMode'
-          #   netplan-ovs-cleanup.service: Failed to open ...: Permission denied
-          # Neither says anything about openchimed. Every message that does is
-          # prefixed either with the unit name or with its path and line number,
-          # so filtering on the name first is what keeps this check about us.
-          if printf "%s\n" "$out" | grep "openchimed" | grep -v "is not executable" \
-               | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
-            echo "::error::openchimed.service has a directive this systemd rejects"
-            exit 1
-          fi
-          echo "unit parses clean"
-
+          /usr/bin/openchimed --version | grep -q "^openchimed ${BUILD_ID} " || {
+            echo "::error::the installed daemon does not report build ${BUILD_ID}"; exit 1; }
       # The artifact is NAMED for the platform, and the publish job downloads
       # without merge-multiple. That combination is what rebuilds dist/<platform>/
       # on the other side: upload-artifact strips the common path prefix, so the
       # directory only survives the round-trip by being the artifact's name.
-      # The stripped binary is not uploaded -- it ships inside all three packages
-      # and the step above proves they are identical.
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PLATFORM }}
@@ -596,193 +435,19 @@ jobs:
             ${{ env.DIST }}/*.sha256
           if-no-files-found: error
 
-  # Built with buildah, not docker, from the packages job's tarball: the image
-  # is the released binary and its data laid onto a glibc base (Dockerfile),
-  # with no compile and no RUN step inside it, so an arm64 image comes off the
-  # x86 runner with `--arch arm64` and no emulation. The per-arch images and
-  # the manifest list that indexes them are two jobs; the per-arch tags are an
-  # implementation detail, nothing is documented as pullable until
-  # image-manifest publishes :VERSION.
-  image:
-    name: ${{ matrix.arch }} image
-    needs: [version, packages]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
-    env:
-      VERSION: ${{ needs.version.outputs.number }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: linux-${{ matrix.arch }}
-          path: dist/linux-${{ matrix.arch }}
-      - name: Install buildah
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          scripts/build/apt.sh buildah
-          buildah version
-      # The build context is the extracted tarball plus the entrypoint: exactly
-      # what an operator extracting the release would have.
-      - name: Build the image
-        run: |
-          set -euo pipefail
-          packaging/image-context.sh "dist/linux-${{ matrix.arch }}/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz" image
-          buildah build --arch "${{ matrix.arch }}" \
-            -f Dockerfile \
-            -t "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
-            image
-      # The image as it ships, started as the hosted model starts it (ARCH-76):
-      # podman is daemonless and reads buildah's store, so no Docker comes back
-      # (ARCH-36). /healthz answering proves the entrypoint, the data directory,
-      # the binary on this base and the data beside it hold together; before
-      # this a fault in any of them reached GHCR unchallenged, since nothing
-      # pulled or ran the image. The arm64 image is build-only here, as its
-      # binary is: the runner cannot run it without emulation.
-      - name: Start the image and ask it /healthz
-        if: matrix.arch == 'amd64'
-        run: |
-          set -euo pipefail
-          podman run -d --name oc -p 127.0.0.1:18080:8080 \
-            -e OPENCHIME_WORKSPACE_NAME=Image "${IMAGE}:${VERSION}-${{ matrix.arch }}"
-          ok=0
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:18080/healthz 2>/dev/null | grep -qx OK; then
-              echo "healthz: OK after ${i} s"; ok=1; break
-            fi
-            sleep 1
-          done
-          echo "--- the daemon's log"; podman logs oc 2>&1 | tail -30
-          podman rm -f oc >/dev/null
-          [ "$ok" = 1 ] || { echo "::error::the image did not answer /healthz within 60 s"; exit 1; }
-      - name: Push the per-architecture image
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: |
-          set -euo pipefail
-          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
-          buildah push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
 
-  # :VERSION only. `image` needs only `version`, so it runs alongside
-  # windows-package -- and if that fails, publish is skipped and nothing reaches
-  # apt, dnf or the releases page, yet :latest would already point at that build.
-  # Anyone pulling :latest would get a version that officially does not exist.
-  # :latest moves in `publish`.
-  image-manifest:
-    name: container image manifest
-    needs: [version, image]
-    # Nothing was pushed on a dry run, so there is nothing to index. The
-    # per-arch builds above still ran, which is the part worth proving.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    env:
-      VERSION: ${{ needs.version.outputs.number }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
-    steps:
-      - uses: actions/checkout@v7   # for scripts/build/apt.sh
-      - name: Install buildah
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          scripts/build/apt.sh buildah
-      - name: Publish the manifest list
-        run: |
-          set -euo pipefail
-          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
-          buildah manifest create "${IMAGE}:${VERSION}"
-          for a in amd64 arm64; do
-            buildah manifest add "${IMAGE}:${VERSION}" "docker://${IMAGE}:${VERSION}-${a}"
-          done
-          buildah manifest push --all "${IMAGE}:${VERSION}" "docker://${IMAGE}:${VERSION}"
-
-  # The Windows client (ARCH-80/81). It carries the same release number as the
-  # daemon even though it is a separate program, so a support question only ever
-  # needs one number.
-  #
-  # Split across two runners for one reason: the binaries cross-compile with
-  # On Linux, exactly as `make windows` does locally, with the pinned
-  # llvm-mingw make fetches (mk/toolchains.mk); Authenticode signing and MSIX
-  # packaging (makeappx.exe) exist only on Windows, so the next job does those.
-  # Compiling on windows-latest instead would mean maintaining a second,
-  # otherwise-unused toolchain for the same source.
-  windows-build:
-    name: windows binaries
-    needs: version
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      VERSION: ${{ needs.version.outputs.number }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install build dependencies
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          # bzip2 for the mbedTLS tarball, nasm for libvpx's assembly, xz-utils
-          # for the toolchain tarball.
-          scripts/build/apt.sh bzip2 nasm xz-utils
-      - name: Restore the toolchain
-        uses: actions/cache@v6
-        with:
-          path: third_party/llvm-mingw-20261006
-          key: toolchain-mingw-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh') }}
-      - name: Restore the vendored Windows libraries
-        uses: actions/cache@v6
-        with:
-          path: |
-            third_party/mbedtls-3.6.2-win
-            third_party/libvpx-1.17.0-win
-            third_party/opus-1.6.1-win
-            third_party/speexdsp-1.2.1-win
-            third_party/sdl3-3.4.14-win
-            third_party/mbedtls-3.6.2
-          key: vendor-win-${{ runner.os }}-24.04-${{ hashFiles('scripts/build/llvm_mingw.sh', 'scripts/build/mbedtls.sh', 'scripts/build/mbedtls_windows.sh', 'scripts/build/libvpx.sh', 'scripts/build/opus.sh', 'scripts/build/speexdsp.sh', 'scripts/build/sdl3_windows.sh') }}
-
-      - name: Build the GUI and the TUI
-        run: |
-          set -euo pipefail
-          make OC_VERSION="$VERSION" windows
-          # Both are statically linked, so nothing downstream has to chain a
-          # redistributable. If that ever stops being true the installer will
-          # still build and the app will fail to start on a clean machine, so
-          # it is asserted here rather than discovered there.
-          for f in build/openchime.exe build/openchime-tui.exe; do
-            file "$f" | grep -q 'PE32+' || { echo "::error::$f is not a PE32+ binary"; exit 1; }
-            # No shipped client is a demo build (the marker a DEMO=1 build carries).
-            if grep -q OPENCHIME-DEMO-BUILD "$f"; then echo "::error::$f is a demo build"; exit 1; fi
-          done
-
-      # Named for the toolchain, not the platform: these are the unpackaged
-      # compiler outputs handed to the next job, not a release artifact. The
-      # publish job collects dist/<platform>/ by matching `windows-*`, and this
-      # must not be caught by that.
-      - uses: actions/upload-artifact@v7
-        with:
-          name: mingw-binaries
-          path: |
-            build/openchime.exe
-            build/openchime-tui.exe
-            build/openchime.debug
-          if-no-files-found: error
-
-  windows-package:
+  # The Windows client, from the candidate's binaries: signed here, since only
+  # a real release signs and the installer embeds the signed files, then
+  # wrapped in the installer and the MSIX under the release number.
+  windows:
     name: windows installers
-    needs: [version, windows-build]
+    needs: [version, candidate]
     runs-on: windows-latest
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.version.outputs.number }}
+      BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+      BUILD_NUM: ${{ needs.candidate.outputs.run_number }}
       # Signing is gated on a real release AND on the credentials existing. A dry
       # run produces the same artifacts unsigned and never reads them, which is
       # what makes this job safe to run from a fork.
@@ -811,23 +476,29 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: mingw-binaries
-          path: build
+          name: candidate
+          path: candidate
+      - name: Take the candidate's binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Copy-Item candidate\windows-x64\openchime.exe, candidate\windows-x64\openchime-tui.exe, candidate\windows-x64\openchime.debug build\
+          Get-ChildItem build
 
-      # Both binaries carry a VERSIONINFO resource (client/shared/res). It is
-      # asserted rather than assumed because the failure is silent: a missing
-      # or misbuilt resource still produces a working .exe, and the installer
-      # wrapping it carries its own version, so nothing downstream notices that
-      # the shipped files report none. Before that resource existed this step
-      # read back empty for both.
+      # Both binaries carry a VERSIONINFO resource (client/shared/res): the
+      # file version is the candidate build's run number, the product version
+      # names the build id. Asserted rather than assumed because the failure
+      # is silent: a missing or misbuilt resource still produces a working
+      # .exe, and the installer wrapping it carries its own version.
       - name: Check the embedded version
         shell: pwsh
         run: |
-          $want = "1.0.$env:VERSION.0"
+          $want = "1.0.$env:BUILD_NUM.0"
           foreach ($f in 'build\openchime.exe','build\openchime-tui.exe') {
-            $got = (Get-Item $f).VersionInfo.FileVersion
-            if ($got -ne $want) { throw "$f reports FileVersion '$got', expected '$want'" }
-            Write-Host "$f $got"
+            $vi = (Get-Item $f).VersionInfo
+            if ($vi.FileVersion -ne $want) { throw "$f reports FileVersion '$($vi.FileVersion)', expected '$want'" }
+            if ($vi.ProductVersion -ne "build $env:BUILD_ID") { throw "$f reports ProductVersion '$($vi.ProductVersion)', expected 'build $env:BUILD_ID'" }
+            Write-Host "$f $($vi.FileVersion) $($vi.ProductVersion)"
           }
 
       # The SDK ships on the runner image but is not on PATH, and its versioned
@@ -961,7 +632,7 @@ jobs:
 
   publish:
     name: publish repositories
-    needs: [version, packages, image-manifest, windows-package]
+    needs: [version, candidate, package, windows]
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -975,6 +646,8 @@ jobs:
       published: ${{ steps.apt.outputs.published }}
     env:
       VERSION: ${{ needs.version.outputs.number }}
+      BUILD_ID: ${{ needs.candidate.outputs.build_id }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
       # Object storage is Tigris, provisioned through Fly (`fly storage create`)
       # and billed on the Fly account, so it is not a separate vendor
       # relationship. It speaks the S3 API; rclone is configured from these.
@@ -1326,7 +999,7 @@ jobs:
           # build. Build artifacts expire; a crash report does not.
           # The note tells the truth about the installer's signing status, because
           # the person who meets SmartScreen is the one who needs to know.
-          notes="Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached."
+          notes="Release ${VERSION} is build \`${BUILD_ID}\` (${GITHUB_SHA}), which is what \`openchimed --version\` and the Windows clients report. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached."
           if [ -z "${{ secrets.TRUSTED_SIGNING_ENDPOINT }}" ]; then
             unsigned="**The Windows installer in this release is not code-signed.** Windows SmartScreen will warn that the publisher is unrecognised; the download is still the artifact this workflow built, and its checksum is in the release assets."
             notes="${notes}"$'\n\n'"${unsigned}"
@@ -1337,27 +1010,32 @@ jobs:
             dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
             dist/windows-x64/openchime.debug
 
-      # Only now does :latest move. `skopeo copy` re-points the tag registry-side
-      # without pulling or rebuilding, preserving the manifest digest exactly --
-      # the property the control plane's promote step relies on. It replaces
-      # `docker buildx imagetools create`, which did the same job with a daemon.
-      # --all copies the whole manifest list, not just the host architecture.
-      - name: Move :latest to the released version
+      # The candidate's image becomes the release's: `skopeo copy` re-points
+      # tags registry-side without pulling or rebuilding, preserving the
+      # manifest digest exactly -- the property the control plane's promote
+      # step relies on. :N and the per-architecture tags first, :latest last,
+      # so nothing pulls :latest before :N exists. --all copies the whole
+      # manifest list, not just the host architecture.
+      - name: Tag the image as the release and move :latest
         run: |
           set -euo pipefail
           scripts/build/apt.sh skopeo
-          skopeo copy --all \
-            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            --src-creds  "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            "docker://ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}" \
-            "docker://ghcr.io/${{ github.repository_owner }}/openchime:latest"
-          echo "latest -> ${VERSION}"
+          creds="${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}"
+          for a in amd64 arm64; do
+            skopeo copy --dest-creds "$creds" --src-creds "$creds" \
+              "docker://${IMAGE}:build-${BUILD_ID}-${a}" "docker://${IMAGE}:${VERSION}-${a}"
+          done
+          skopeo copy --all --dest-creds "$creds" --src-creds "$creds" \
+            "docker://${IMAGE}:build-${BUILD_ID}" "docker://${IMAGE}:${VERSION}"
+          skopeo copy --all --dest-creds "$creds" --src-creds "$creds" \
+            "docker://${IMAGE}:${VERSION}" "docker://${IMAGE}:latest"
+          echo "${VERSION} and latest -> build-${BUILD_ID}"
 
       - name: Summary
         if: always()
         run: |
           {
-            echo "### Released \`${VERSION}\`"
+            echo "### Released \`${VERSION}\` (build \`${BUILD_ID}\`)"
             echo
             echo "| Channel | Where |"
             echo "|---|---|"
@@ -1529,3 +1207,4 @@ jobs:
         run: |
           git fetch --tags --force --quiet || true
           scripts/release/close_shipped_issues.sh "release-${N}"
+

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Resolve release numbers from the `release-N` tags (ARCH-20).
 #
-# The scheme is the sibling control plane's: a monotonically increasing integer,
-# tagged after the release succeeds. The one difference is *when* the number is
-# computed. openchime-saas tags after the fact, because its artifact is
-# identified by a commit sha; here the number IS the Debian package version, so
-# it has to exist before anything is built. The release workflow therefore asks
-# for `next` up front, builds and publishes with it, and tags only on success.
+# A monotonically increasing integer, assigned to one candidate build (which
+# is identified by its commit, the build id) when it is released: the number
+# IS the Debian package version, so the release asks for `next`, reserves it
+# as a tag, packages the candidate's binaries under it and publishes
+# (docs/RELEASING.md).
 #
 #   scripts/release/version.sh next     -> the number a new release would take
 #   scripts/release/version.sh current  -> the newest released number (0 if none)
