@@ -1413,7 +1413,9 @@ jobs:
             -o /usr/share/keyrings/openchime-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_VERIFY_URL/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
+          # Through apt.sh: the index fetched first (release 21's smoke ran
+          # install alone and found nothing), bounded and retried.
+          scripts/build/apt.sh openchimed
           openchimed --version
 
       # The dnf half, and it is not decoration. The apt check above proved one of
