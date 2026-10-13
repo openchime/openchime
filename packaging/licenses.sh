@@ -107,8 +107,10 @@ emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-ro
 emit "SQLite 3.53.4 -- Public Domain" "${root}/third_party/sqlite-3.53.4/LICENSE"
 
 if [ "$TTS" = 1 ] || [ "$STT" = 1 ]; then
-  emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0/LICENSE"
-  emit "ONNX Runtime 1.30.0 -- third-party notices" "${root}/third_party/onnxruntime-1.30.0/ThirdPartyNotices.txt"
+  # The architecture's own copy (OC_ARCH, as the build scripts take it): a
+  # cross build has no host archive to read from, and the texts are the same.
+  emit "ONNX Runtime 1.30.0 -- MIT License" "${root}/third_party/onnxruntime-1.30.0${OC_ARCH:+-$OC_ARCH}/LICENSE"
+  emit "ONNX Runtime 1.30.0 -- third-party notices" "${root}/third_party/onnxruntime-1.30.0${OC_ARCH:+-$OC_ARCH}/ThirdPartyNotices.txt"
 fi
 if [ "$TTS" = 1 ]; then
   emit "Kitten TTS mini 0.8 -- Apache License 2.0" "${root}/build/kitten/LICENSE"
@@ -120,5 +122,5 @@ fi
 # The summary model's engine (ARCH-116). The model itself is not in the package:
 # it is fetched on first use, with its own licence (Apache-2.0).
 if [ "$SUM" = 1 ]; then
-  emit "llama.cpp 0.5.0 (with ggml) -- MIT License" "${root}/third_party/llamacpp-0.5.0/LICENSE"
+  emit "llama.cpp 0.5.0 (with ggml) -- MIT License" "${root}/third_party/llamacpp-0.5.0${OC_ARCH:+-$OC_ARCH}/LICENSE"
 fi
