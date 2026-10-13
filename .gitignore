@@ -18,6 +18,8 @@ dist/
 !/third_party/picohttpparser/
 !/third_party/termbox2/
 !/third_party/utf8proc/
+!/third_party/argon2/
+!/third_party/pwlist/
 !/third_party/lucide/
 !/third_party/qrcodegen/
 !/third_party/miniaudio/

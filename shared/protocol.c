@@ -1373,6 +1373,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_UNKNOWN_GROUP: return "that group no longer exists";
     case OC_ERR_MEMBER_VIA_GROUP: return "they are in the channel through a group: change the group instead";
     case OC_ERR_INVALID_GROUP: return "that group's name or handle is not valid, or there are too many";
+    case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
     }

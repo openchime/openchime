@@ -101,9 +101,10 @@ struct oc_dbwriter {
     int             have_factor_key;         /* without it no step can be passed */
     int             local_mfa;               /* OC_MFA_*: when the second step is asked */
     int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
-    uint32_t        pw_iters;                /* PBKDF2 rounds for new keys and the unknown-name check */
+    uint32_t        pw_mem;                  /* Argon2id memory, KiB, for new keys and the unknown-name check */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed sign-ins per source IP, every source */
+    oc_ratelimit   *signup_rl;               /* accounts made per source IP, the sign-up page */
 
     /* Idempotency-map pruning (ARCH-44): drop sent_messages rows older than the
      * retention window, at most once per interval. Writer-thread state only. */
@@ -121,6 +122,10 @@ struct oc_dbwriter {
 #define OC_AUTH_SOURCE_MAX_FAILURES 20
 #define OC_AUTH_WINDOW_MS           60000u
 #define OC_AUTH_RL_CAPACITY         1024u
+/* Accounts made on the sign-up page per source in an hour (AUTH.md §2): a team
+ * behind one address joins freely, a script making accounts does not. */
+#define OC_SIGNUP_SOURCE_MAX        10
+#define OC_SIGNUP_WINDOW_MS         (60u * 60u * 1000u)
 /* A second step's own limiter (AUTH.md §8.6): five wrong codes per account in
  * five minutes, apart from the password's, so guessing a code is no faster
  * than guessing the password was. */
@@ -243,12 +248,12 @@ int oc_job_set_email(oc_job *j, const void *email, size_t len) {
 }
 
 int oc_job_set_register(oc_job *j, const char *username, const char *password,
-                        uint8_t role, uint32_t iterations) {
+                        uint8_t role, uint32_t mem_kib) {
     j->username = username ? strdup(username) : NULL;
     j->password = password ? strdup(password) : NULL;
     if ((username && !j->username) || (password && !j->password)) return -1;
     j->role = role;
-    j->iterations = iterations;
+    j->mem_kib = mem_kib;
     return 0;
 }
 
@@ -761,7 +766,7 @@ static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int 
     return count >= max_users;
 }
 
-/* Create a local account: `local:<username>` user + PBKDF2 credential (AUTH.md
+/* Create a local account: `local:<username>` user + Argon2id credential (AUTH.md
  * §2). Idempotent — INSERT OR IGNORE means re-running bootstrap never clobbers
  * an existing password. Returns the user id, or 0 on error. */
 /* The next credential version (migration 0047): taken inside the caller's
@@ -786,15 +791,15 @@ static __thread uint64_t g_joined_uid;
 
 static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
                                const char *password, size_t plen,
-                               uint8_t role, uint32_t iterations) {
+                               uint8_t role, uint32_t mem_kib) {
     char subject[256];
     size_t sublen = local_subject(subject, sizeof subject, username, ulen);
     if (sublen == 0 || plen == 0) return 0;
-    if (iterations == 0) iterations = OC_PW_ITERATIONS;
+    if (mem_kib == 0) mem_kib = OC_PW_MEM_KIB;
 
     uint8_t salt[OC_PW_SALT_LEN], hash[OC_PW_HASH_LEN];
     if (oc_rand_bytes(salt, sizeof salt) != 0) return 0;
-    if (oc_pw_derive(password, plen, salt, sizeof salt, iterations, hash) != 0) return 0;
+    if (oc_pw_derive(password, plen, salt, sizeof salt, mem_kib, hash) != 0) return 0;
 
     uint64_t now = dbw_now_ms();
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -818,11 +823,13 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
     if (uid == 0) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return 0; }
 
     sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO local_credentials(user_id,salt,iterations,hash,updated_at_ms,version) "
+        "INSERT OR IGNORE INTO local_credentials(user_id,salt,kdf,hash,updated_at_ms,version) "
         "VALUES(?,?,?,?,?,?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     sqlite3_bind_blob(st, 2, salt, sizeof salt, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 3, (sqlite3_int64)iterations);
+    char kdf[OC_PW_KDF_MAX];
+    oc_pw_kdf_format(mem_kib, kdf);
+    sqlite3_bind_text(st, 3, kdf, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 4, hash, sizeof hash, SQLITE_STATIC);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
     uint64_t version = next_credential_version(db);
@@ -845,14 +852,14 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
  * auth pool to check a password against. 1 found, 0 no such account (or no
  * password). */
 static int local_credential(sqlite3 *db, const char *username, size_t ulen, uint64_t *uid,
-                            uint8_t *salt, size_t salt_cap, size_t *slen, uint32_t *iters,
+                            uint8_t *salt, size_t salt_cap, size_t *slen, uint32_t *mem_kib,
                             uint8_t stored[OC_PW_HASH_LEN], uint64_t *version) {
     char subject[256];
     size_t sublen = local_subject(subject, sizeof subject, username, ulen);
     if (sublen == 0) return 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT u.id, c.salt, c.iterations, c.hash, c.version FROM users u "
+        "SELECT u.id, c.salt, c.kdf, c.hash, c.version FROM users u "
         "JOIN local_credentials c ON c.user_id = u.id WHERE u.subject = ?;", -1, &st, NULL);
     sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
     int found = 0;
@@ -861,11 +868,14 @@ static int local_credential(sqlite3 *db, const char *username, size_t ulen, uint
         int sl = sqlite3_column_bytes(st, 1);
         const void *hb = sqlite3_column_blob(st, 3);
         int hl = sqlite3_column_bytes(st, 3);
-        if (sb && hb && sl > 0 && (size_t)sl <= salt_cap && hl == (int)OC_PW_HASH_LEN) {
+        const char *kdf = (const char *)sqlite3_column_text(st, 2);
+        /* Settings this daemon does not make (a hash from before Argon2id, or
+         * other passes or lanes) are no credential: no password matches. */
+        if (sb && hb && sl > 0 && (size_t)sl <= salt_cap && hl == (int)OC_PW_HASH_LEN &&
+            oc_pw_kdf_parse(kdf, mem_kib) == 0) {
             *uid = (uint64_t)sqlite3_column_int64(st, 0);
             memcpy(salt, sb, (size_t)sl);
             *slen = (size_t)sl;
-            *iters = (uint32_t)sqlite3_column_int64(st, 2);
             memcpy(stored, hb, OC_PW_HASH_LEN);
             *version = (uint64_t)sqlite3_column_int64(st, 4);
             found = 1;
@@ -1365,7 +1375,7 @@ static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
     uint64_t uid = register_local(db,
         j->username ? j->username : "", j->username ? strlen(j->username) : 0,
         j->password ? j->password : "", j->password ? strlen(j->password) : 0,
-        j->role, j->iterations ? j->iterations : w->pw_iters);
+        j->role, j->mem_kib ? j->mem_kib : w->pw_mem);
     if (uid == 0) { r->type = OC_RES_REGISTER_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
     r->type = OC_RES_REGISTER_OK;
     r->user_id = uid;
@@ -1601,7 +1611,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
         }
         /* Throttle brute force per account and per source IP (REQ-191). Check
-         * before the expensive PBKDF2 so a flood can't also burn CPU. */
+         * before the expensive Argon2id so a flood can't also burn CPU. */
         char acct[OC_RL_KEYMAX];
         size_t al = user.len < sizeof acct - 1 ? user.len : sizeof acct - 1;
         memcpy(acct, user.ptr, al);
@@ -1680,7 +1690,7 @@ static oc_dbres *process_auth_job(oc_dbwriter *w, const oc_job *j) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
         }
         /* The per-source limiter stands in front of every source, and in front of
-         * the signature work as it stands in front of PBKDF2. Throttled attempts
+         * the signature work as it stands in front of Argon2id. Throttled attempts
          * are dropped silently and unaudited, for the reason given above. */
         if (j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms())) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
@@ -1873,7 +1883,7 @@ static oc_dbres *web_finish_as(oc_dbwriter *w, const oc_job *j, oc_dbres *r, uin
         r->pk_creds = passkeys_for(db, uid, j->wa_rp);   /* offered on its trusted name only */
         if (j->web == OC_WEB_PASSWORD && j->pw_derived) {
             r->step_pw = 1;
-            r->step_iters = j->pw_iters;
+            r->step_mem = j->pw_mem;
             memcpy(r->step_salt, j->pw_salt, sizeof r->step_salt);
             memcpy(r->step_hash, j->pw_hash, sizeof r->step_hash);
         }
@@ -2387,7 +2397,7 @@ static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
         if (chk && oc_rand_bytes(chk->new_salt, sizeof chk->new_salt) == 0) {
             chk->new_password = j->pf_new_pw;
             chk->new_pwlen = strlen(j->pf_new_pw);
-            chk->new_iters = w->pw_iters;
+            chk->new_mem = w->pw_mem;
             chk->owner = (oc_job *)j;
             ((oc_job *)j)->auth_stage = OC_AUTH_STAGE_READ;
             oc_authpool_submit(w->auth, chk);
@@ -2416,12 +2426,14 @@ static oc_dbres *process_reset_redeem(oc_dbwriter *w, const oc_job *j) {
     sqlite3_finalize(st);
     if (ok) {
         sqlite3_prepare_v2(db,
-            "INSERT INTO local_credentials(user_id, salt, iterations, hash, updated_at_ms, version) VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt, iterations=excluded.iterations, "
+            "INSERT INTO local_credentials(user_id, salt, kdf, hash, updated_at_ms, version) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt, kdf=excluded.kdf, "
             " hash=excluded.hash, updated_at_ms=excluded.updated_at_ms, version=excluded.version;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
         sqlite3_bind_blob (st, 2, j->pw_salt, OC_PW_SALT_LEN, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->pw_iters);
+        char kdf[OC_PW_KDF_MAX];
+        oc_pw_kdf_format(j->pw_mem, kdf);
+        sqlite3_bind_text (st, 3, kdf, -1, SQLITE_TRANSIENT);
         sqlite3_bind_blob (st, 4, j->pw_hash, OC_PW_HASH_LEN, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
         sqlite3_bind_int64(st, 6, (sqlite3_int64)version);
@@ -2747,11 +2759,17 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j);
 /* A sign-up from the pages is a guess at an invitation like any other, so its
  * source is limited as a sign-in's is; a refusal is the page's. */
 static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
-    if (j->web && j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms())) {
+    int limited = 0;
+    if (j->web && j->source[0] && oc_ratelimit_blocked(w->source_rl, src_key(j->source), dbw_now_ms()))
+        limited = OC_ERR_AUTH_RATE_LIMITED;
+    else if (j->web && j->source[0] && w->signup_rl &&
+             oc_ratelimit_blocked(w->signup_rl, src_key(j->source), dbw_now_ms()))
+        limited = OC_ERR_SIGNUP_LIMITED;
+    if (limited) {
         oc_dbres *r = calloc(1, sizeof *r);
         if (!r) return NULL;
         r->conn_id = j->conn_id;
-        r->type = OC_RES_WEB_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED;
+        r->type = OC_RES_WEB_ERR; r->err_code = limited;
         return r;
     }
     oc_dbres *r = process_redeem_job(w, j);
@@ -2759,6 +2777,8 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
         r->type = OC_RES_WEB_ERR;
         if (r->err_code == OC_ERR_AUTH_INVALID_TOKEN && j->source[0])
             oc_ratelimit_record(w->source_rl, src_key(j->source), dbw_now_ms());
+    } else if (r && j->web && j->source[0] && w->signup_rl && r->type != OC_RES_WEB_ERR) {
+        oc_ratelimit_record(w->signup_rl, src_key(j->source), dbw_now_ms());   /* an account made */
     }
     return r;
 }
@@ -2842,7 +2862,7 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
     }
 
-    uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->iterations ? j->iterations : w->pw_iters);
+    uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->mem_kib ? j->mem_kib : w->pw_mem);
     if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
 
     /* Take one use; the last one consumes the invite (REQ-026). The single
@@ -9112,10 +9132,12 @@ static int store_new_password(sqlite3 *db, const oc_job *j, uint64_t uid, uint64
     if (!version) return -1;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "UPDATE local_credentials SET salt=?, iterations=?, hash=?, updated_at_ms=?, version=? "
+        "UPDATE local_credentials SET salt=?, kdf=?, hash=?, updated_at_ms=?, version=? "
         "WHERE user_id=? AND version=?;", -1, &st, NULL);
     sqlite3_bind_blob (st, 1, j->pw_salt, OC_PW_SALT_LEN, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->pw_iters);
+    char kdf[OC_PW_KDF_MAX];
+    oc_pw_kdf_format(j->pw_mem, kdf);
+    sqlite3_bind_text (st, 2, kdf, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob (st, 3, j->pw_hash, OC_PW_HASH_LEN, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
     sqlite3_bind_int64(st, 5, (sqlite3_int64)version);
@@ -10482,7 +10504,7 @@ static void auth_checked(oc_auth_check *chk, void *ctx) {
     if (chk->derived) {   /* a password change: the new password's key */
         memcpy(j->pw_salt, chk->new_salt, OC_PW_SALT_LEN);
         memcpy(j->pw_hash, chk->new_hash, OC_PW_HASH_LEN);
-        j->pw_iters = chk->new_iters;
+        j->pw_mem = chk->new_mem;
         j->pw_derived = 1;
     }
     oc_e2e_wipe(chk, sizeof *chk);
@@ -10507,7 +10529,7 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
             chk->password = (const char *)pass.ptr;     /* in j->token, which outlives the check */
             chk->pwlen = pass.len;
             found = local_credential(rdb, (const char *)user.ptr, user.len, &uid, chk->salt, sizeof chk->salt,
-                                     &chk->slen, &chk->iters, chk->stored, &version);
+                                     &chk->slen, &chk->mem, chk->stored, &version);
         }
         /* A change from the password page: the new password's key too, as a
          * signed-in change gets it. */
@@ -10517,7 +10539,7 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
             if (found) {
                 chk->new_password = j->pf_new_pw;
                 chk->new_pwlen = strlen(j->pf_new_pw);
-                chk->new_iters = w->pw_iters;
+                chk->new_mem = w->pw_mem;
             }
         }
     }
@@ -10527,7 +10549,7 @@ static void auth_read_credential(oc_dbwriter *w, sqlite3 *rdb, oc_job *j) {
     if (!found && chk && chk->password &&
         oc_rand_bytes(chk->salt, OC_PW_SALT_LEN) == 0 && oc_rand_bytes(chk->stored, sizeof chk->stored) == 0) {
         chk->slen = OC_PW_SALT_LEN;
-        chk->iters = w->pw_iters;
+        chk->mem = w->pw_mem;
         chk->new_password = NULL;
         uid = 0;
         found = 1;
@@ -10661,10 +10683,10 @@ void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users) {
     w->max_users = max_users > 0 ? max_users : 0;
 }
 
-/* PBKDF2 rounds for keys the writer makes and the unknown-name check; tests
- * only, which hash at their own low count. Set before serving. */
-void oc_dbwriter_set_pw_iterations(oc_dbwriter *w, uint32_t iterations) {
-    w->pw_iters = iterations ? iterations : OC_PW_ITERATIONS;
+/* Argon2id memory (KiB) for keys the writer makes and the unknown-name check;
+ * tests only, which hash with little. Set before serving. */
+void oc_dbwriter_set_pw_mem(oc_dbwriter *w, uint32_t mem_kib) {
+    w->pw_mem = mem_kib ? mem_kib : OC_PW_MEM_KIB;
 }
 
 uint8_t oc_dbwriter_auth_methods(oc_dbwriter *w) { return w->auth_methods; }
@@ -10727,9 +10749,9 @@ void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
  * consumes one result from the queue, so it must not race a live consumer. */
 uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
                                     const char *password, uint8_t role,
-                                    uint32_t iterations) {
+                                    uint32_t mem_kib) {
     oc_job *j = oc_job_new(OC_JOB_REGISTER, 0);
-    if (!j || oc_job_set_register(j, username, password, role, iterations) != 0) {
+    if (!j || oc_job_set_register(j, username, password, role, mem_kib) != 0) {
         job_free(j);
         return 0;
     }
@@ -11032,10 +11054,11 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
     w->idem_retention_ms = OC_IDEM_RETENTION_MS;
     w->restore_window_ms = OC_RESTORE_WINDOW_MS;
-    w->pw_iters = OC_PW_ITERATIONS;
+    w->pw_mem = OC_PW_MEM_KIB;
     w->prune_interval_ms = OC_PRUNE_INTERVAL_MS;
     w->auth_rl   = oc_ratelimit_new(OC_AUTH_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->source_rl = oc_ratelimit_new(OC_AUTH_SOURCE_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
+    w->signup_rl = oc_ratelimit_new(OC_SIGNUP_SOURCE_MAX, OC_SIGNUP_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->step_rl   = oc_ratelimit_new(OC_STEP_MAX_FAILURES, OC_STEP_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->local_mfa = OC_MFA_OPTIONAL;
     if (!w->auth_rl || !w->source_rl || !w->step_rl) {
@@ -11158,6 +11181,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     oc_join_rules_free(w->join_rules);
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);
+    oc_ratelimit_free(w->signup_rl);
     oc_ratelimit_free(w->step_rl);
     oc_e2e_wipe(w->factor_key, sizeof w->factor_key);
     if (w->evfd >= 0) close(w->evfd);

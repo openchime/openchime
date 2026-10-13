@@ -2160,20 +2160,20 @@ static void test_revoke_other_devices(int port, const uint8_t *pin) {
     int cur = 0;
     CHECK(session_count_of(&a, &cur) == 3 && cur == 1);   /* a fresh sign-in knows its own */
     char why[256];
-    CHECK(oc_test_change_password("127.0.0.1", port, pin, "roy", "pw-roy", "pw-roy2", why, sizeof why) == 0);
+    CHECK(oc_test_change_password("127.0.0.1", port, pin, "roy", "pw-roy", "saffron-glacier-ember", why, sizeof why) == 0);
     CHECK(peer_closed(&a, PEER_CLOSES) == 1);
     CHECK(peer_closed(&b, PEER_CLOSES) == 1);
     CHECK(peer_closed(&c, PEER_CLOSES) == 1);
     client_close(&b); client_close(&c);
     /* The old password is spent, the new one works. */
     CHECK(oc_test_change_password("127.0.0.1", port, pin, "roy", "pw-roy", "pw-x", why, sizeof why) != 0);
-    CHECK(signed_in(&a, port, pin, "roy", "pw-roy2") == 0);
+    CHECK(signed_in(&a, port, pin, "roy", "saffron-glacier-ember") == 0);
 
     /* Signing out this device leaves the user's others signed in. */
     client d, e;
     uint8_t buf[256]; oc_wbuf w;
-    CHECK(signed_in(&d, port, pin, "roy", "pw-roy2") == 0);
-    CHECK(signed_in(&e, port, pin, "roy", "pw-roy2") == 0);
+    CHECK(signed_in(&d, port, pin, "roy", "saffron-glacier-ember") == 0);
+    CHECK(signed_in(&e, port, pin, "roy", "saffron-glacier-ember") == 0);
     oc_wbuf_init(&w, buf, sizeof buf);
     uint8_t none[OC_SESSION_TOKEN_LEN] = {0};
     oc_logout lo = { OC_LOGOUT_THIS, { none, sizeof none } };
@@ -2449,7 +2449,7 @@ static void test_direct_signin(int port) {
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0 && oc_tls_server_fingerprint(&srv, pin) == 0);
     unlink("build/itest_direct.db"); unlink("build/itest_direct.db-wal"); unlink("build/itest_direct.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_direct.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     char why[128];
     CHECK(oc_dbwriter_configure_join_rules(dbw, "domain:acme.example", why, sizeof why) == 0);
@@ -2593,7 +2593,7 @@ static void test_web_signin(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin) == 0);
     unlink("build/itest_web.db"); unlink("build/itest_web.db-wal"); unlink("build/itest_web.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_web.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     if (!dbw2) { oc_tls_server_free(&srv2); return; }
     CHECK(oc_dbwriter_local_browser(dbw2));
@@ -2654,12 +2654,29 @@ static void test_web_signin(int port) {
              ch, setup_hex);
     CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
     CHECK(strstr(resp, "name=\"confirm\"") != NULL && strstr(resp, setup_hex) != NULL);
+    /* The link carries the invitation, so the form keeps it out of sight; the
+     * rule for a password is said beside it, and the toggle's script is the
+     * page's own. */
+    CHECK(strstr(resp, "type=\"hidden\" name=\"invite\"") != NULL && strstr(resp, "id=\"invite\"") == NULL);
+    CHECK(strstr(resp, "At least 15 characters") != NULL && strstr(resp, "src=\"showpw.js\"") != NULL);
+    CHECK(strstr(resp, "\xE2\x80\x94") == NULL);
+    CHECK(web_call(port, pin, "GET", "/showpw.js", NULL, NULL, NULL, resp, sizeof resp) == 200 &&
+          strstr(resp, "showpw") != NULL);
+    /* A password that is short, common, or built on the name is refused, saying why. */
     snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
-             "&username=wes&password=pw-wes&confirm=pw-other", ch, setup_hex);
+             "&username=wes&password=pw-wes&confirm=pw-wes", ch, setup_hex);
+    CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "at least 15 characters") != NULL);
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
+             "&username=wes&password=1qaz2wsx3edc4rfv&confirm=1qaz2wsx3edc4rfv", ch, setup_hex);
+    CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
+    CHECK(strstr(resp, "too common") != NULL);
+    snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
+             "&username=wes&password=copper-lantern-meadow&confirm=pw-other", ch, setup_hex);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
     CHECK(strstr(resp, "don&#39;t match") != NULL);
     snprintf(body, sizeof body, "redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&invite=%s"
-             "&username=wes&password=pw-wes&confirm=pw-wes", ch, setup_hex);
+             "&username=wes&password=copper-lantern-meadow&confirm=copper-lantern-meadow", ch, setup_hex);
     CHECK(web_call(port, pin, "POST", "/signup", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
     CHECK(token_of(resp, tok, sizeof tok));
     uint64_t wes = 0;
@@ -2731,15 +2748,15 @@ static void test_web_signin(int port) {
     CHECK(web_call(port, pin, "GET", "/account/password", NULL, NULL, NULL, resp, sizeof resp) == 200);
     CHECK(strstr(resp, "autocomplete=\"new-password\"") != NULL);
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
-                   "username=pat&current=pw-bad&password=pw-new&confirm=pw-new", resp, sizeof resp) == 200);
+                   "username=pat&current=pw-bad&password=granite-harbor-violet&confirm=granite-harbor-violet", resp, sizeof resp) == 200);
     CHECK(strstr(resp, "current password isn&#39;t right") != NULL);
     CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
-                   "username=pat&current=pw-old&password=pw-new&confirm=pw-new", resp, sizeof resp) == 200);
+                   "username=pat&current=pw-old&password=granite-harbor-violet&confirm=granite-harbor-violet", resp, sizeof resp) == 200);
     CHECK(strstr(resp, "Password changed") != NULL);
     CHECK(peer_closed(&held, PEER_CLOSES) == 1);
     client_close(&held);
     CHECK(web_signin(port, pin, "pat", "pw-old", ch, tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
-    CHECK(web_signin(port, pin, "pat", "pw-new", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+    CHECK(web_signin(port, pin, "pat", "granite-harbor-violet", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
 
     /* A removed member is refused, whatever they type. */
     {
@@ -2761,7 +2778,7 @@ static void test_web_signin(int port) {
         client a;
         CHECK(client_open(&a, port, pin) == 0 && do_handshake(&a) == 0);
         uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        CHECK(oc_encode_local_credential(&cw, oc_slice_str("pat"), oc_slice_str("pw-new")) == OC_OK);
+        CHECK(oc_encode_local_credential(&cw, oc_slice_str("pat"), oc_slice_str("granite-harbor-violet")) == OC_OK);
         uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
         oc_auth au = { OC_AUTH_LOCAL, oc_slice_str("local"), { cbuf, cw.len }, { NULL, 0 }, { NULL, 0 } };
         CHECK(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &au) == OC_OK && write_all(&a.conn, buf, w.len) == 0);
@@ -2850,16 +2867,16 @@ static void test_web_signin(int port) {
         /* The password page asks for the step too, and changes nothing until it
          * is passed: the next step's code finishes it. */
         CHECK(web_call(port, pin, "POST", "/account/password", GOOD_ORIGIN, FORM,
-                       "username=sam&current=pw-sam&password=pw-sam2&confirm=pw-sam2", resp, sizeof resp) == 200);
+                       "username=sam&current=pw-sam&password=thunder-cobalt-orchard&confirm=thunder-cobalt-orchard", resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Two-step sign-in") != NULL && ticket_of(resp, ticket2, sizeof ticket2));
         CHECK(strstr(resp, "action=\"../signin/verify\"") != NULL);
-        CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+        CHECK(web_signin(port, pin, "sam", "thunder-cobalt-orchard", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
               !ticket_of(resp, ticket, sizeof ticket));                   /* not changed yet */
         snprintf(code, sizeof code, "%06u", oc_totp_code(secret, sizeof secret, step + 1));
         CHECK(web_verify(port, pin, ticket2, code, NULL, 0, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Password changed") != NULL);
         CHECK(web_verify(port, pin, stale, "FGHIJ67890", tok, sizeof tok, resp, sizeof resp) == 200 && !tok[0]);
-        CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
+        CHECK(web_signin(port, pin, "sam", "thunder-cobalt-orchard", ch, tok, sizeof tok, resp, sizeof resp) == 200 &&
               ticket_of(resp, ticket, sizeof ticket));
 
         /* Five wrong codes and the ticket is gone (the step that changed the
@@ -2962,7 +2979,7 @@ static void test_web_signin(int port) {
         CHECK(strstr(resp, "requires two-step sign-in") != NULL);
         oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OFF);
         CHECK(web_call(port, pin, "GET", "/account/security", NULL, NULL, NULL, resp, sizeof resp) == 404);
-        CHECK(web_signin(port, pin, "sam", "pw-sam2", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        CHECK(web_signin(port, pin, "sam", "thunder-cobalt-orchard", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         oc_dbwriter_set_local_mfa(dbw2, OC_MFA_OPTIONAL);
     }
 
@@ -3178,13 +3195,13 @@ static void test_web_signin(int port) {
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Set a new password") != NULL && strstr(resp, hex) != NULL);
         CHECK(web_call(port, pin, "GET", "/account/reset?t=short", NULL, NULL, NULL, resp, sizeof resp) == 400);
-        snprintf(body, sizeof body, "t=%s&password=pw-reset&confirm=pw-other", hex);
+        snprintf(body, sizeof body, "t=%s&password=ember-glacier-saffron&confirm=pw-other", hex);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "don&#39;t match") != NULL);
-        snprintf(body, sizeof body, "t=%s&password=pw-reset&confirm=pw-reset", hex);
+        snprintf(body, sizeof body, "t=%s&password=ember-glacier-saffron&confirm=ember-glacier-saffron", hex);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Password set") != NULL);
-        CHECK(web_signin(port, pin, "pat", "pw-reset", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        CHECK(web_signin(port, pin, "pat", "ember-glacier-saffron", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
         /* Spent: said of the reset, which was a link here and is a code typed on
          * the sign-in card elsewhere -- the words must be true of both. */
@@ -3221,7 +3238,7 @@ static void test_web_signin(int port) {
         snprintf(path, sizeof path, "/account/reset?t=%s&redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb", hex);
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 400);
         snprintf(body, sizeof body, "t=%s&redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s"
-                 "&password=pw-again&confirm=pw-again", hex, ch);
+                 "&password=orbit-pebble-canyon&confirm=orbit-pebble-canyon", hex, ch);
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 303);
         snprintf(loc, sizeof loc, "Location: ../signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&set=1\r\n",
                  ch);
@@ -3229,7 +3246,7 @@ static void test_web_signin(int port) {
         snprintf(path, sizeof path, "/signin?redirect_uri=http%%3A%%2F%%2F127.0.0.1%%3A5%%2Fcb&nonce=%s&set=1", ch);
         CHECK(web_call(port, pin, "GET", path, NULL, NULL, NULL, resp, sizeof resp) == 200);
         CHECK(strstr(resp, "Your new password is set") != NULL);
-        CHECK(web_signin(port, pin, "pat", "pw-again", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
+        CHECK(web_signin(port, pin, "pat", "orbit-pebble-canyon", ch, tok, sizeof tok, resp, sizeof resp) == 303 && tok[0]);
         /* The code again, as a client sends it: spent, and said so without
          * calling it a link. */
         CHECK(web_call(port, pin, "POST", "/account/reset", GOOD_ORIGIN, FORM, body, resp, sizeof resp) == 200);
@@ -3302,7 +3319,7 @@ static int dev_daemon_start(struct dev_daemon *d, int port, uint64_t ttl) {
     if (oc_tls_server_init(&d->srv, NULL, NULL) != 0 || oc_tls_server_fingerprint(&d->srv, d->pin) != 0) return -1;
     unlink("build/itest_dev.db"); unlink("build/itest_dev.db-wal"); unlink("build/itest_dev.db-shm");
     d->dbw = oc_dbwriter_start("build/itest_dev.db");
-    if (d->dbw) oc_dbwriter_set_pw_iterations(d->dbw, 2048);   /* fast PBKDF2 for tests */
+    if (d->dbw) oc_dbwriter_set_pw_mem(d->dbw, 2048);   /* a cheap Argon2id for tests */
     if (!d->dbw) return -1;
     d->dee = oc_dbwriter_register_local(d->dbw, "dee", "pw-dee", OC_ROLE_MEMBER, 2048);
     oc_netloop_set_device_ttl_ms(ttl);
@@ -3466,7 +3483,7 @@ static void test_voice_input_absent(int port, int by_env) {
     unlink("build/itest_stt_off.db-wal");
     unlink("build/itest_stt_off.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_stt_off.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
     struct loop_arg arg2;
@@ -3601,7 +3618,7 @@ static void test_summaries(int port) {
     unlink("build/itest_sum.db-wal");
     unlink("build/itest_sum.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_sum.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER, 2048) != 0);
     g_sum_dbw = dbw2;
@@ -5144,7 +5161,7 @@ static void test_call_routed(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_routed.db"); unlink("build/itest_routed.db-wal"); unlink("build/itest_routed.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_routed.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     CHECK(oc_dbwriter_register_local(dbw2, "alice", "pw-alice", OC_ROLE_OWNER,  2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw2, "bob",   "pw-bob",   OC_ROLE_MEMBER, 2048) != 0);
@@ -5370,7 +5387,7 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
     CHECK(do_handshake(&nh) == 0);
     {
         char ntok[OC_TEST_TOKEN_CAP], nver[OC_TEST_VERIFIER_CAP], why[256];
-        CHECK(oc_test_signup("127.0.0.1", port, pin, token, "newhire", "nhpw",
+        CHECK(oc_test_signup("127.0.0.1", port, pin, token, "newhire", "willow-quartz-ferry",
                              ntok, sizeof ntok, nver, sizeof nver, why, sizeof why) == 0);
         uint8_t abuf[8192]; oc_wbuf aw; oc_wbuf_init(&aw, abuf, sizeof abuf);   /* room for the token */
         oc_auth au = { OC_AUTH_OIDC, oc_slice_str("local"), oc_slice_str(ntok), oc_slice_str(nver), { NULL, 0 } };
@@ -5435,11 +5452,11 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
         char stok[2 * OC_INVITE_TOKEN_LEN + 1];
         memcpy(stok, sc.token.ptr, sc.token.len); stok[sc.token.len] = '\0';
         char t1[OC_TEST_TOKEN_CAP], v1[OC_TEST_VERIFIER_CAP], why[256];
-        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-one", "pw1",
+        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-one", "pebble-canyon-orbit",
                              t1, sizeof t1, v1, sizeof v1, why, sizeof why) == 0);
-        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-two", "pw2",
+        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-two", "marble-tundra-signal",
                              t1, sizeof t1, v1, sizeof v1, why, sizeof why) == 0);
-        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-three", "pw3",
+        CHECK(oc_test_signup("127.0.0.1", port, pin, stok, "shared-three", "silver-meadow-tangent",
                              t1, sizeof t1, v1, sizeof v1, why, sizeof why) != 0);
         oc_wbuf_init(&w, buf, sizeof buf);
         oc_invite_user ia = { OC_ROLE_ADMIN, { NULL, 0 }, 0 };
@@ -5456,6 +5473,32 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
             refused = 1;
         }
         CHECK(rosters == 2 && refused);
+
+        /* Accounts made from one address are limited to ten an hour (AUTH.md
+         * §2): on an invite anyone may use, the sign-ups from here stop at the
+         * tenth this hour, refused 429 with the page saying why. */
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_invite_user iu = { OC_ROLE_MEMBER, { NULL, 0 }, 0 };
+        CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK);
+        CHECK(send_frame(&owner, buf, w.len) == 0);
+        CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_INVITE_CREATED);
+        oc_invite_created uc; CHECK(oc_decode_invite_created(&p, &uc) == OC_OK);
+        char utok[2 * OC_INVITE_TOKEN_LEN + 1];
+        memcpy(utok, uc.token.ptr, uc.token.len); utok[uc.token.len] = '\0';
+        int made = 0, stopped = 0;
+        for (int i = 0; i < 12 && !stopped; i++) {
+            char who[32]; snprintf(who, sizeof who, "many-%d", i);
+            why[0] = '\0';
+            if (oc_test_signup("127.0.0.1", port, pin, utok, who, "violet-harbor-granite",
+                               t1, sizeof t1, v1, sizeof v1, why, sizeof why) == 0) { made++; continue; }
+            stopped = strstr(why, "HTTP 429") != NULL;   /* the page's "Too many accounts…" */
+            if (!stopped) printf("    sign-up %d refused: %s\n", i, why);
+        }
+        CHECK(stopped && made >= 1 && made <= 10);
+        for (int i = 0; i < 12; i++) {   /* the owner heard of each; nothing else waits */
+            if (made-- <= 0) break;
+            CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_USER_LIST);
+        }
     }
 
     /* Owner removes a connected member (bob); bob's connection is dropped. */
@@ -6440,7 +6483,7 @@ static void test_http_stack(int port, int hport) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_http.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
 
     /* The web client the daemon serves (webapp.h): the page and the loader
@@ -6494,6 +6537,7 @@ static void test_http_stack(int port, int hport) {
           strstr(resp, "text/html") && strstr(resp, "An OpenChime workspace is running here."));
     CHECK(plain_exchange(hport, "GET /app/ HTTP/1.1\r\n\r\n", resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace is running here."));
+    CHECK(strstr(resp, "&mdash;") == NULL && strstr(resp, "to sign in") != NULL);   /* and, with a web client beside the daemon, where it is */
     CHECK(plain_exchange(hport, "POST /anything/else HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi",
                          resp, sizeof resp) > 0);
     CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0 && strstr(resp, "An OpenChime workspace"));
@@ -6710,7 +6754,7 @@ static void test_auth_begin(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_begin.db"); unlink("build/itest_begin.db-wal"); unlink("build/itest_begin.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_begin.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     /* Any P-256 public key will do: nothing here presents a token. */
     static const char PEM[] =
@@ -6803,7 +6847,7 @@ static void test_proxy_header(int port) {
     CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
     unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
     oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_proxy.db");
-    if (dbw2) oc_dbwriter_set_pw_iterations(dbw2, 2048);   /* fast PBKDF2 for tests */
+    if (dbw2) oc_dbwriter_set_pw_mem(dbw2, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw2 != NULL);
     struct loop_arg arg2;
     arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
@@ -6877,7 +6921,7 @@ int run_netloop_tests(void) {
     unlink("build/itest_netloop.db-wal");
     unlink("build/itest_netloop.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_netloop.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
 
     /* Provision the accounts the clients log in as, before the loop serves

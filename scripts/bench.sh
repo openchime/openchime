@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../.."
 export OPENCHIME_MODE=development   # the fixture's users, no per-address cap (CONFIG.md "Mode")
 
 CONNS=("$@"); [ ${#CONNS[@]} -eq 0 ] && CONNS=(50 100 200)
-NUSERS=64          # distinct bootstrap users (auth is 600k-PBKDF2, so keep modest)
+NUSERS=64          # distinct bootstrap users (auth is a 19 MiB Argon2id, so keep modest)
 LAT_N=32           # concurrent senders for the latency measurement
 PROTO_PORT=18443; HEALTH_PORT=18080
 
@@ -31,7 +31,7 @@ OPENCHIME_DEV_CONNS_PER_IP=0 OPENCHIME_DEV_USERS="$USERS" \
   ./openchimed > "$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
-echo "Bootstrapping $NUSERS users (600k-iteration PBKDF2 each) + starting listener..."
+echo "Bootstrapping $NUSERS users (a 19 MiB Argon2id each) + starting listener..."
 for _ in $(seq 1 400); do
   grep -q "netloop: listening" "$WORK/daemon.log" 2>/dev/null && break
   kill -0 "$DAEMON_PID" 2>/dev/null || { echo "daemon exited early:"; cat "$WORK/daemon.log"; exit 1; }
@@ -44,7 +44,7 @@ printf '\nBaseline daemon RSS: %.1f MB\n\n' "$(awk -v k=$BASE 'BEGIN{print k/102
 printf '%s\n' "--------------------------------------------------------"
 printf '%-12s %-12s %-14s %-16s\n' "requested" "connected" "peak_rss_mb" "kb_per_conn"
 for N in "${CONNS[@]}"; do
-  # Auth is a 600k-iteration PBKDF2 serialized on the writer (~2 logins/s here),
+  # Auth is a 19 MiB Argon2id on the two-thread auth pool (~2 logins/s here),
   # so the ramp is N/2 seconds, not N/5.
   HOLD=$(( N / 2 + 10 ))
   OUT="$WORK/idle_$N.txt"
@@ -65,7 +65,7 @@ echo "Message round-trip latency ($LAT_N concurrent senders, isolated channels):
 # Print the WHOLE line, including connections_ok= and sends=. Stripping the
 # prefix hid a degenerate run: failed connections report rtt 0.00, which reads
 # like a fantastic result instead of a broken measurement.
-# 20s, not 6: auth is a 600k-iteration PBKDF2 on the single writer (~6-7
+# 20s, not 6: auth is a 19 MiB Argon2id on the auth pool (~6-7
 # logins/s, BENCHMARK.md), so a burst of $LAT_N simultaneous logins queues for
 # several seconds. A 6s window let most connections time out before they ever
 # authenticated, and the run then reported rtt 0.00 from the handful that made

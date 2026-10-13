@@ -25,6 +25,7 @@
 #include "framebuf.h"
 #include "http.h"
 #include "webpages.h"
+#include "pwpolicy.h"
 #include "webapp.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
 #include "jwt.h"         /* oc_base64url_encode: a passkey's challenge; oc_jwt_nonce_matches */
@@ -43,6 +44,7 @@
 #include <mbedtls/sha256.h>
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -4118,6 +4120,7 @@ static const oc_http_route TLS_ROUTES[] = {
     { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
     { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
     { "GET",  "/codes.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
+    { "GET",  "/showpw.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
     { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
     { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
     { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
@@ -4150,8 +4153,8 @@ static const char LANDING_BODY[] =
     "<main>\n"
     "<h1>OpenChime</h1>\n"
     "<p>An OpenChime workspace is running here.</p>\n"
-    "<p>This address speaks the OpenChime protocol, not the web &mdash; "
-    "open it in an OpenChime client to sign in.</p>\n"
+    "<p>This address speaks the OpenChime protocol. Open it in an OpenChime client "
+    "to sign in%s</p>\n"
     "<p><a href=\"https://github.com/openchime/openchime\">openchime</a></p>\n"
     "</main>\n"
     "</body>\n"
@@ -4166,10 +4169,33 @@ static const oc_http_route HEALTH_ROUTES[] = {
      * from the same box in development; a deployment fronts both with TLS. */
     { "GET", WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL },
 };
-static const oc_http_route HEALTH_LANDING = {
-    NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8",
-    LANDING_BODY, sizeof LANDING_BODY - 1, NULL
+/* LANDING_BODY with its one variable part: where the web client is, when this
+ * daemon serves one (webapp.h) -- on the TLS port, at the workspace's address
+ * when it has one, else at this host's -- or nothing. */
+static char g_landing[sizeof LANDING_BODY + 640];
+static oc_http_route g_health_landing = {
+    NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8", NULL, 0, NULL
 };
+static void landing_init(void) {
+    char app[600] = ".";
+    if (oc_webapp_loaded()) {
+        const oc_config *cfg = oc_config_get();
+        const char *addr = cfg->workspace_address && cfg->workspace_address[0] ? cfg->workspace_address : NULL;
+        int ok = 1;
+        for (const char *a = addr; a && *a; a++)
+            if (!(isalnum((unsigned char)*a) || *a == '.' || *a == '-')) ok = 0;
+        if (addr && ok && cfg->proto_port == 443)
+            snprintf(app, sizeof app, ", or use the web client: <a href=\"https://%s/app/\">https://%s/app/</a>.", addr, addr);
+        else if (addr && ok)
+            snprintf(app, sizeof app, ", or use the web client: <a href=\"https://%s:%d/app/\">https://%s:%d/app/</a>.",
+                     addr, cfg->proto_port, addr, cfg->proto_port);
+        else
+            snprintf(app, sizeof app, ", or use the web client at <code>/app/</code> on port %d over HTTPS.", cfg->proto_port);
+    }
+    int n = snprintf(g_landing, sizeof g_landing, LANDING_BODY, app);
+    g_health_landing.body = g_landing;
+    g_health_landing.body_len = n > 0 && (size_t)n < sizeof g_landing ? (size_t)n : 0;
+}
 
 /* The sites as served: the fixed routes above, then the web client's when its
  * wasm is beside the binary (webapp.h) -- on the TLS port only, where the
@@ -4185,7 +4211,8 @@ static void sites_init(void) {
     for (size_t i = 0; i < na && i < 8; i++) g_tls_routes[nt + i] = app[i];
     g_tls_site.routes = g_tls_routes; g_tls_site.n = nt + (na < 8 ? na : 8); g_tls_site.fallback = NULL;
     g_health_site.routes = HEALTH_ROUTES; g_health_site.n = sizeof HEALTH_ROUTES / sizeof HEALTH_ROUTES[0];
-    g_health_site.fallback = &HEALTH_LANDING;
+    landing_init();
+    g_health_site.fallback = &g_health_landing;
 }
 
 /* Dispatch one webhook post, routed here by the I/O thread (POST under
@@ -4264,7 +4291,8 @@ static void web_page(conn *c, int status, const oc_page *pg) {
     size_t len = 0;
     char *html = oc_page_render(pg, &len);
     if (!html) { http_reply(c, 500, "text/plain", "error\n", 6); return; }
-    int scripts = pg->pk_mode != 0 || (pg->kind == OC_PAGE_SECURITY && pg->sec == OC_SEC_CODES);
+    int scripts = pg->pk_mode != 0 || (pg->kind == OC_PAGE_SECURITY && pg->sec == OC_SEC_CODES) ||
+                  oc_page_has_password(pg);
     web_reply_ex(c, status, html, len, pg->redirect_uri, NULL, scripts);
     free(html);
 }
@@ -4338,11 +4366,12 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     else if (plen == 17 && memcmp(req->path, "/account/security", 17) == 0) kind = OC_PAGE_SECURITY;
     else if (plen == 14 && memcmp(req->path, "/account/reset", 14) == 0) kind = OC_PAGE_RESET;
     else if ((plen == 12 && memcmp(req->path, "/webauthn.js", 12) == 0) ||
-             (plen == 9 && memcmp(req->path, "/codes.js", 9) == 0)) {
-        /* A page's script: static, the passkey's or the recovery codes' copy
-         * button (AUTH.md §8.6). */
+             (plen == 9 && memcmp(req->path, "/codes.js", 9) == 0) ||
+             (plen == 10 && memcmp(req->path, "/showpw.js", 10) == 0)) {
+        /* A page's script: static, the passkey's, the recovery codes' copy
+         * button (AUTH.md §8.6) or the show-password toggle. */
         size_t jl;
-        const char *js = plen == 9 ? oc_codes_js(&jl) : oc_webauthn_js(&jl);
+        const char *js = plen == 9 ? oc_codes_js(&jl) : plen == 10 ? oc_showpw_js(&jl) : oc_webauthn_js(&jl);
         char hdr[512];
         size_t hn = oc_http_head_ex(hdr, sizeof hdr, 200, "text/javascript; charset=utf-8", jl,
                                     "X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n");
@@ -4426,17 +4455,32 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     }
     /* A sign-in link carrying an invitation opens the sign-up form. */
     if (!post && kind == OC_PAGE_SIGNIN && w->invite[0]) kind = w->kind = OC_PAGE_SIGNUP;
+    const char *wsname = oc_config_get()->workspace_name;
     oc_page pg = { .kind = kind, .redirect_uri = w->redirect_uri, .nonce = w->nonce,
-                   .username = w->username, .invite = w->invite, .message = "", .done = w->done };
+                   .username = w->username, .invite = w->invite, .message = "", .done = w->done,
+                   .workspace = wsname };
     if (!post) { web_page(c, 200, &pg); free(w); return -1; }
 
     int rc = -1;
     oc_job *j = NULL;
+    char norm[OC_PW_NORM_MAX];
     if (kind == OC_PAGE_SIGNUP || kind == OC_PAGE_PASSWORD) {
-        const char *np = pass;
+        const char *np = pass, *why = NULL;
         if (strcmp(np, confirm) != 0) { pg.message = "The two passwords don't match."; goto show; }
         if (!np[0]) { pg.message = "Choose a password."; goto show; }
+        /* What a new password must be (pwpolicy.h); what is hashed is its
+         * normalized form. */
+        if (oc_pw_acceptable(np, w->username, wsname, norm, sizeof norm, &why) != 0) { pg.message = why; goto show; }
+        if (strlen(norm) >= sizeof pass) { pg.message = "Use at most 128 characters."; goto show; }
+        memcpy(pass, norm, strlen(norm) + 1);
     }
+    /* A password presented to sign in is normalized the same way; one that
+     * cannot be simply fails to match. */
+    if (kind == OC_PAGE_SIGNIN && oc_pw_normalize(pass, norm, sizeof norm) == 0 && strlen(norm) < sizeof pass)
+        memcpy(pass, norm, strlen(norm) + 1);
+    if (kind == OC_PAGE_PASSWORD && oc_pw_normalize(current, norm, sizeof norm) == 0 && strlen(norm) < sizeof current)
+        memcpy(current, norm, strlen(norm) + 1);
+    oc_e2e_wipe(norm, sizeof norm);
     if (kind == OC_PAGE_SIGNUP) {
         uint8_t raw[OC_INVITE_TOKEN_LEN];
         if (hex_decode(w->invite, strlen(w->invite), raw, sizeof raw) != (int)sizeof raw) {
@@ -4526,6 +4570,11 @@ static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     /* Approve: the sign-in the other pages make (AUTH.md §8.10), its token bound
      * to the terminal's challenge rather than a callback's. */
     uint8_t cbuf[1200]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    {   /* normalized as every sign-in is (pwpolicy.h) */
+        char norm[OC_PW_NORM_MAX];
+        if (oc_pw_normalize(pass, norm, sizeof norm) == 0 && strlen(norm) < sizeof pass) memcpy(pass, norm, strlen(norm) + 1);
+        oc_e2e_wipe(norm, sizeof norm);
+    }
     if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) {
         pg.message = "The username or password is too long.";
         web_page(c, 200, &pg);
@@ -4603,7 +4652,7 @@ static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw) {
     snprintf(j->web_nonce, sizeof j->web_nonce, "%s", t.nonce);
     if (t.pw) {
         j->pw_derived = 1;
-        j->pw_iters = t.pw_iters;
+        j->pw_mem = t.pw_mem;
         memcpy(j->pw_salt, t.pw_salt, sizeof j->pw_salt);
         memcpy(j->pw_hash, t.pw_hash, sizeof j->pw_hash);
     }
@@ -4737,6 +4786,14 @@ static int on_reset_page(conn *c, int post, const char *q, oc_dbwriter *dbw) {
     if (!post) { web_page(c, 200, &pg); goto out; }
     if (strcmp(pass, confirm) != 0) { pg.message = "The two passwords don't match."; web_page(c, 200, &pg); goto out; }
     if (!pass[0]) { pg.message = "Choose a password."; web_page(c, 200, &pg); goto out; }
+    {
+        char norm[OC_PW_NORM_MAX]; const char *why = NULL;
+        int ok = oc_pw_acceptable(pass, NULL, oc_config_get()->workspace_name, norm, sizeof norm, &why) == 0 &&
+                 strlen(norm) < sizeof pass;
+        if (ok) memcpy(pass, norm, strlen(norm) + 1);
+        oc_e2e_wipe(norm, sizeof norm);
+        if (!ok) { pg.message = why ? why : "Use at most 128 characters."; web_page(c, 200, &pg); goto out; }
+    }
     web_req *w = calloc(1, sizeof *w);
     oc_job *j = w ? oc_job_new(OC_JOB_RESET_REDEEM, c->conn_id) : NULL;
     if (!j || oc_job_set_token(j, t, strlen(t)) != 0 || !(j->pf_new_pw = strdup(pass))) {
@@ -4931,7 +4988,7 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         snprintf(t.user_code, sizeof t.user_code, "%s", w->user_code);
         if (r->step_pw) {
             t.pw = 1;
-            t.pw_iters = r->step_iters;
+            t.pw_mem = r->step_mem;
             memcpy(t.pw_salt, r->step_salt, sizeof t.pw_salt);
             memcpy(t.pw_hash, r->step_hash, sizeof t.pw_hash);
         }
@@ -5032,6 +5089,8 @@ static void web_result(int ep, conn **conns, const oc_dbres *r) {
         switch (r->err_code) {
         case OC_ERR_AUTH_RATE_LIMITED: status = 429; pg.message = "Too many attempts. Wait a minute and try again."; break;
         case OC_ERR_USER_LIMIT:        pg.message = "This workspace is full."; break;
+        case OC_ERR_SIGNUP_LIMITED:
+            status = 429; pg.message = "Too many accounts were made from your address. Try again in an hour."; break;
         case OC_ERR_AUTH_SETUP_REQUIRED:
             pg.message = "This workspace requires two-step sign-in. Set it up on the Two-step sign-in page "
                          "(below), then sign in.";

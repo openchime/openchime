@@ -345,7 +345,7 @@ typedef struct oc_job {
     uint64_t       auth_version;            /* CHECKED: which version of it */
     /* A password change, CHECKED: the new password's key, derived on the pool. */
     int            pw_derived;
-    uint32_t       pw_iters;
+    uint32_t       pw_mem;
     uint8_t        pw_salt[16];             /* OC_PW_SALT_LEN */
     uint8_t        pw_hash[32];             /* OC_PW_HASH_LEN */
     char          *email;     /* heap; INVITE_USER: the address the invite is bound to */
@@ -364,7 +364,7 @@ typedef struct oc_job {
     char          *password;  /* heap */
     uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
     uint16_t       uses;      /* INVITE_USER: how many may redeem it; 0 = no limit */
-    uint32_t       iterations;/* PBKDF2 rounds (0 -> OC_PW_ITERATIONS default) */
+    uint32_t       mem_kib;/* Argon2id memory, KiB (0 -> the writer's, OC_PW_MEM_KIB) */
 
     /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`.
      * Also carries the target for channel INVITE/REMOVE. */
@@ -966,7 +966,7 @@ typedef struct oc_dbres {
     /* WEB_STEP2, and SECURITY's passkey screens: the account's passkeys on the
      * job's relying party, base64url, comma-separated (heap, or NULL). */
     char          *pk_creds;
-    uint32_t       step_iters;
+    uint32_t       step_mem;
     uint8_t        step_salt[16], step_hash[32];
     /* LOGOUT_OK, WEB_OK, PROFILE_UPDATED: the user's sessions were revoked, so
      * every connection of `user_id` closes but `conn_id`'s (REQ-182). */
@@ -1346,9 +1346,9 @@ int  oc_dbwriter_eventfd(oc_dbwriter *w);
  * once before serving. */
 void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
 
-/* PBKDF2 rounds for new password keys, a register job given 0, and the check
- * an unknown name gets; 0 = OC_PW_ITERATIONS. Tests only. Call before serving. */
-void oc_dbwriter_set_pw_iterations(oc_dbwriter *w, uint32_t iterations);
+/* Argon2id memory (KiB) for new password keys, a register job given 0, and the
+ * check an unknown name gets; 0 = OC_PW_MEM_KIB. Tests only. Call before serving. */
+void oc_dbwriter_set_pw_mem(oc_dbwriter *w, uint32_t mem_kib);
 
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
@@ -1414,16 +1414,16 @@ int     oc_job_set_token(oc_job *j, const void *tok, size_t len);
 int     oc_job_set_proof(oc_job *j, const void *proof, size_t len);
 int     oc_job_set_email(oc_job *j, const void *email, size_t len);
 int     oc_job_set_body(oc_job *j, const void *body, size_t len);
-/* Fill a REGISTER job (copies strings). iterations 0 -> OC_PW_ITERATIONS. */
+/* Fill a REGISTER job (copies strings). mem_kib 0 -> the writer's Argon2id memory. */
 int     oc_job_set_register(oc_job *j, const char *username, const char *password,
-                            uint8_t role, uint32_t iterations);
+                            uint8_t role, uint32_t mem_kib);
 
 /* Synchronously ensure a local account exists (bootstrap the first owner, or a
  * fixed set of accounts for tests). Runs a REGISTER job through the writer and
  * blocks for its result; returns the user id, or 0 on failure. */
 uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
                                     const char *password, uint8_t role,
-                                    uint32_t iterations);
+                                    uint32_t mem_kib);
 
 /* The auth pool's hold and its count of waiting checks (authpool.h): a test's
  * knob, for putting a password change between a sign-in's fetch of the

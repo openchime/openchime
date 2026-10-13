@@ -41,7 +41,7 @@ or broken is not a document — it is the
 | [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry is generated from the codec and is the authority on which opcodes are taken. |
 | [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting every migration and why each table is shaped the way it is. |
 | [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, native-child rules, and the paint ledger the audit reads. |
-| [AUTH.md](docs/AUTH.md) | The two authentication modes — local PBKDF2 accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
+| [AUTH.md](docs/AUTH.md) | The two authentication modes — local Argon2id accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
 | [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
 | [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
 | [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, how to bring the federated stack up by hand, and the GUI's two harnesses — the boot check and the visual audit that checks a render against itself rather than against a second binary. |
@@ -63,7 +63,7 @@ wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
 network loop + a single DB-writer thread, refined by ARCH-66 into a third
 read-only query thread), TLS termination with self-signed TOFU certs (ARCH-10,
 mbedTLS), and schema migrations applied on boot (ARCH-27) — it runs the whole
-messaging path end to end: **two-mode authentication** (local PBKDF2 accounts or
+messaging path end to end: **two-mode authentication** (local Argon2id accounts or
 an OIDC token re-issued by the central relay, converging on a daemon-issued
 session, [docs/AUTH.md](docs/AUTH.md)), roles and full tenant administration,
 public/private channels and DMs, edit/delete, reactions, threads, FTS5 search,

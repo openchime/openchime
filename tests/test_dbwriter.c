@@ -48,8 +48,8 @@ static oc_dbres *wait_result(oc_dbwriter *w) {
  * own database keeps what it wrote. */
 static const char *TEMPLATE_DB = "build/test_dbwriter_template.db";
 
-/* Low PBKDF2 rounds keep the tests fast; the production default is 600k. */
-#define TEST_PW_ITERS 2048
+/* Little Argon2id memory keeps the tests fast; production uses 19 MiB. */
+#define TEST_PW_MEM 2048
 
 static int make_template(void) {
     static int made;
@@ -73,7 +73,7 @@ static oc_dbwriter *start_db(const char *path) {
         if (out) fclose(out);
     }
     oc_dbwriter *w = oc_dbwriter_start(path);
-    if (w) oc_dbwriter_set_pw_iterations(w, TEST_PW_ITERS);   /* fast PBKDF2 for tests */
+    if (w) oc_dbwriter_set_pw_mem(w, TEST_PW_MEM);   /* a cheap Argon2id for tests */
     return w;
 }
 
@@ -89,7 +89,7 @@ static void cleanup_db(const char *path) {
 }
 
 static uint64_t reg(oc_dbwriter *w, const char *user, const char *pass, uint8_t role) {
-    return oc_dbwriter_register_local(w, user, pass, role, TEST_PW_ITERS);
+    return oc_dbwriter_register_local(w, user, pass, role, TEST_PW_MEM);
 }
 
 /* A local sign-in, as the pages make it (AUTH.md §8.10): the sign-in page's
@@ -2358,9 +2358,12 @@ static void test_index_mentions(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    /* Back to before step 60; step 61's columns go too, so that it can run again. */
+    /* Back to before step 60; the columns of steps 61 and 62 go too, so that
+     * they can run again. */
     CHECK(sqlite3_exec(db, "DELETE FROM mentions; DELETE FROM schema_version WHERE version >= 60;"
-                           "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;",
+                           "ALTER TABLE invites DROP COLUMN used; ALTER TABLE invites DROP COLUMN uses;"
+                           "ALTER TABLE local_credentials DROP COLUMN kdf;"
+                           "ALTER TABLE local_credentials ADD COLUMN iterations INTEGER NOT NULL DEFAULT 0;",
                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
@@ -3421,7 +3424,7 @@ static oc_dbres *redeem_invite(oc_dbwriter *w, const uint8_t *token, const char 
     oc_job *j = oc_job_new(OC_JOB_REDEEM, 96);
     j->web = OC_WEB_SIGNUP;
     snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge());
-    oc_job_set_register(j, user, pass, 0, TEST_PW_ITERS);   /* fast PBKDF2 for tests */
+    oc_job_set_register(j, user, pass, 0, TEST_PW_MEM);   /* a cheap Argon2id for tests */
     oc_job_set_token(j, token, OC_INVITE_TOKEN_LEN);
     oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);

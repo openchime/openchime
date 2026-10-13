@@ -21,16 +21,17 @@ SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/ref
 TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
-TEST_ALL_SRC := $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
-                $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
+# Sorted: the daemon and the text layout both carry utf8proc, compiled once.
+TEST_ALL_SRC := $(sort $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
+                $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC))
 TEST_DEPS := $(TEST_ALL_SRC) $(VOICE_HDRS) $(CALL_HDRS) $(HDRS) $(MEDIA_HDRS) \
              $(wildcard tests/*.h client/core/*.h sdltext/*.h ttskit/*.h daemon/tts_*.h daemon/stt_*.h client/gui/app/theme.h) \
-             $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(CC_STAMP)
+             $(MBEDTLS_A) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP)
 test: $(TEST_BIN)
 	@$(SOURCE_CHECKS)
 	OC_TEST_JOBS="$${OC_TEST_JOBS:-$(TEST_JOBS)}" ./$(TEST_BIN)
 $(TEST_BIN): $(TEST_DEPS) | build
-	$(CC) $(CFLAGS) -O0 -g $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O0 -g $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -lresolv -lpthread -lm -o $@
 
 # --- CI's split (docs/TESTING.md §2.4) ----------------------------------------
 # The suites whose code runs threads -- the loop and its I/O threads, the
@@ -63,7 +64,7 @@ test-ci-threads: ci-only $(TSAN_BIN)
 	OC_TEST_ONLY="$${OC_TEST_ONLY:-$(TSAN_SUITES)}" \
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" setarch $$(uname -m) -R ./$(TSAN_BIN)
 $(TSAN_BIN): $(TEST_DEPS) | build
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread $(TEST_INC) $(TEST_ALL_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(MEDIA_LIBS) -fsanitize=thread -lresolv -lpthread -lm -o $@
 
 # --- The release's compiler (CI) ----------------------------------------------
 # The daemon's sources through the RELEASE's compiler, with the release's flags,
@@ -78,7 +79,7 @@ $(TSAN_BIN): $(TEST_DEPS) | build
 RELEASE_CC ?= $(ZIG) cc -target x86_64-linux-gnu.2.34
 RELEASE_CC_TEST_SRC := $(TEST_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) \
                        $(SDLTEXT_COMMON) $(THEME_SRC) $(TTSKIT_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)
-check-release-cc: $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(WEBAPP_RES)
+check-release-cc: $(ZIG) $(MBEDTLS_A) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(LIBVPX_A) $(OPUS_A) $(SPEEXDSP_A) $(WEBAPP_RES) $(PWLIST_RES)
 	@for f in $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC); do \
 	  $(RELEASE_CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -c -o /dev/null $$f || exit 1; \
 	done
@@ -105,9 +106,9 @@ build/bench_load: tests/bench_load.c tests/testsignin.c $(SHARED_SRC) $(wildcard
 # Event-loop load harness: the daemon in-process, driven by loopback clients,
 # printing the net loop's turn percentiles beside client latency. Optimised like
 # the daemon, so the numbers are the daemon's; not part of `make test`.
-build/bench_loop: tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O) | build
+build/bench_loop: tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(HDRS) $(MBEDTLS_A) $(SQLITE_O) $(ARGON2_O) | build
 	$(CC) $(CFLAGS) $(INC) $(SQLITE_INC) -Itests \
-	    tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(SQLITE_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
+	    tests/bench_loop.c tests/testsignin.c $(APP_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) -ldl -lpthread -lm -o $@
 # The sign-in helper as a command, for the shell scripts: prints the token and
 # the verifier a client presents on AUTH, and presents one (`present`) for a
 # script that played the browser itself (scripts/web/pages.sh).

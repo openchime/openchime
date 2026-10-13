@@ -903,7 +903,7 @@ static void test_requeue_at_start(void) {
     const char *path = "/tmp/oc_test_summary_requeue.db";
     drop_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
-    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
+    if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
     CHECK(w != NULL);
     if (!w) return;
     oc_dbwriter_stop(w);
@@ -916,7 +916,7 @@ static void test_requeue_at_start(void) {
         "VALUES (10, 1, 1, 0, 100, 0, '{}', 5);", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
     w = oc_dbwriter_start(path);
-    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
+    if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
     CHECK(w != NULL);
     if (w) oc_dbwriter_stop(w);
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
@@ -933,7 +933,7 @@ static void test_notice_prune(void) {
     const char *path = "/tmp/oc_test_summary_prune.db";
     drop_db(path);
     oc_dbwriter *w = oc_dbwriter_start(path);
-    if (w) oc_dbwriter_set_pw_iterations(w, 2048);   /* fast PBKDF2 for tests */
+    if (w) oc_dbwriter_set_pw_mem(w, 2048);   /* a cheap Argon2id for tests */
     CHECK(w != NULL);
     if (!w) return;
     sqlite3 *db = NULL;

@@ -9,12 +9,13 @@ SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c shared/mention.c 
               shared/searchq.c shared/notify.c shared/url.c shared/richtext.c shared/speakable.c shared/action.c \
               shared/oc_mp4.c shared/e2e_hpke.c shared/e2e_sframe.c \
               third_party/ca-roots/ca_roots.c
-DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c
+DAEMON_SRC := daemon/main.c daemon/config.c daemon/config_table.c daemon/pwpolicy.c third_party/utf8proc/utf8proc.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c daemon/joinrules.c daemon/proxyproto.c daemon/listen.c daemon/ratelimit.c daemon/roles.c daemon/blobstore.c daemon/blob_s3.c daemon/xferpool.c daemon/storage.c daemon/sigv4.c daemon/http.c third_party/picohttpparser/picohttpparser.c daemon/relay.c daemon/ioloop.c daemon/enroll.c daemon/push.c daemon/invite_mail.c daemon/unfurl.c daemon/voice_pick.c daemon/idmap.c daemon/srccount.c daemon/authpool.c daemon/https_client.c daemon/acme.c daemon/certs.c daemon/localissuer.c daemon/webpages.c daemon/webapp.c daemon/devicecodes.c daemon/json.c daemon/idtoken.c daemon/oidcrp.c daemon/relaykeys.c daemon/totp.c daemon/webstep.c daemon/cbor.c daemon/webauthn.c third_party/qrcodegen/qrcodegen.c daemon/sum_core.c daemon/sum_store.c daemon/sum_worker.c daemon/sum_load.c daemon/sum_fetch.c daemon/sum_cloud.c daemon/tts_data.c
 # The web client's page and loader, compiled into the daemon as resources
 # (daemon/webapp.h). The page always; the loader when WEB=1 (mk/web.mk), so a
 # daemon built without Emscripten still links, and says it has no client.
 WEBAPP_RES := build/gen/webapp_res.c
-SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES)
+PWLIST_RES := build/gen/pw_common.c
+SRC        := $(SHARED_SRC) $(DAEMON_SRC) $(WEBAPP_RES) $(PWLIST_RES)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
 # Vendored, pinned mbedTLS (scripts/build/mbedtls.sh) -- one version across local
@@ -30,12 +31,16 @@ MBEDTLS_LIBS := $(MBEDTLS_DIR)/library/libmbedtls.a \
 SQLITE_DIR := third_party/sqlite-3.53.4
 SQLITE_INC := -I$(SQLITE_DIR)
 SQLITE_O   := build$(BUILD_SUFFIX)/sqlite3.o
+# Password hashing (AUTH.md §2): the Argon2 reference implementation,
+# vendored (third_party/argon2, CC0 or Apache-2.0), one object of its own.
+ARGON2_DIR := third_party/argon2
+ARGON2_O   := build$(BUILD_SUFFIX)/argon2.o
 
-INC := -Ishared -Idaemon -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird_party/qrcodegen -I$(MBEDTLS_INC)
+INC := -Ishared -Idaemon -I$(ARGON2_DIR) -Ithird_party/utf8proc -Ithird_party/jsmn -Ithird_party/picohttpparser -Ithird_party/qrcodegen -I$(MBEDTLS_INC)
 
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
-APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES)
+APP_SRC  := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC)) $(WEBAPP_RES) $(PWLIST_RES)
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
 TEST_SRC := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c tests/bench_loop.c tests/testsignin_main.c,$(wildcard tests/*.c))

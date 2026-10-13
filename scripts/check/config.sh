@@ -34,7 +34,7 @@ used=$(git ls-files -- daemon client shared tests scripts packaging docs README.
        | grep -vE '_H$|^OPENCHIME_DEV_$|^OPENCHIME_$|_$' | sort -u)
 missing=""
 for n in $used; do
-    if echo "$rows" | grep -qx "$n"; then continue; fi
+    if grep -qx "$n" <<<"$rows"; then continue; fi
     ok=0
     for p in $pattern_prefixes; do case "$n" in "$p"[0-9]*) ok=1;; esac; done
     [ $ok = 1 ] || missing="$missing $n"

@@ -6,8 +6,8 @@
 # binary. The texts are read from the actual trees the build used rather than
 # copied into this script, so they cannot drift from what was linked.
 #
-# Only what the DAEMON links is listed. termbox2 and utf8proc are TUI-only and
-# lucide is client artwork; none is in openchimed, and claiming otherwise would
+# Only what the DAEMON links is listed. termbox2 is TUI-only and lucide is
+# client artwork; utf8proc is in both, the daemon normalizing passwords with it; none is in openchimed, and claiming otherwise would
 # be its own kind of wrong. Read-aloud (ARCH-111) is built into the daemon by
 # default, and with it ONNX Runtime, the Kitten voice model and data derived from
 # CMUdict; voice input (ARCH-112) likewise, with ONNX Runtime and Moonshine. A
@@ -64,7 +64,12 @@ openchimed links the components below. Each is used under the licence reproduced
 in full here, as those licences require.
 
   Mbed TLS 3.6.2   Apache-2.0   TLS transport, TOFU certificate handling,
-                                SHA-256/PBKDF2, ES256 verification
+                                SHA-256, ES256 verification
+  Argon2           CC0-1.0 or   password hashing (the reference
+    20190702       Apache-2.0   implementation)
+  utf8proc         MIT          Unicode normalization of passwords
+  SecLists         MIT          the common passwords refused, embedded
+                                as data
   jsmn             MIT          JSON tokenizer (OIDC and webhook payloads)
   picohttpparser   MIT          HTTP request parser (webhooks, /healthz)
   Mozilla CA roots MPL-2.0      the root certificates outbound HTTPS verifies
@@ -101,6 +106,9 @@ fi
 emit "openchimed -- GNU Affero General Public License v3.0 or later" "${root}/LICENSE"
 
 emit "Mbed TLS 3.6.2 -- Apache License 2.0" "${MBEDTLS_DIR}/LICENSE"
+emit "Argon2 (reference implementation) -- CC0 1.0 or Apache License 2.0" "${root}/third_party/argon2/LICENSE"
+emit "utf8proc -- MIT License, with the Unicode data licence" "${root}/third_party/utf8proc/LICENSE.md"
+emit "SecLists (the common-password list) -- MIT License" "${root}/third_party/pwlist/LICENSE"
 emit "jsmn -- MIT License" "${root}/third_party/jsmn/LICENSE"
 emit "picohttpparser -- MIT License" "${root}/third_party/picohttpparser/LICENSE"
 emit "Mozilla CA roots -- Mozilla Public License 2.0" "${root}/third_party/ca-roots/LICENSE"

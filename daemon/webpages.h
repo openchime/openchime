@@ -1,8 +1,9 @@
 /*
  * The daemon's own sign-in pages (AUTH.md §8.10): sign in, sign up with an
  * invitation, change a password. Only the HTML is here -- escaped, self-contained,
- * no scripts, no external fetches, no cookies -- and the headers every page
- * carries; the event loop does the requests and the writer the checks.
+ * no external fetches, no cookies, and only the daemon's own small scripts (a
+ * show-password toggle, the passkey, the copy button) -- and the headers every
+ * page carries; the event loop does the requests and the writer the checks.
  *
  * Every URL a page uses is RELATIVE, so the same pages work whether the browser
  * reached them directly (https://<workspace>/signin) or through a client's
@@ -33,6 +34,7 @@ typedef struct {
     const char  *nonce;          /* SIGNIN/SIGNUP: the client's PKCE challenge */
     const char  *username;       /* prefilled, or "" */
     const char  *invite;         /* SIGNUP: the invitation, prefilled, or "" */
+    const char  *workspace;      /* SIGNIN/SIGNUP: the workspace's name, or NULL/"" */
     const char  *message;        /* why the form is back, or "" */
     int          done;           /* PASSWORD: it was changed. DEVICE: approved.
                                   * SIGNIN: a new password was just set */
@@ -96,5 +98,14 @@ const char *oc_codes_js_integrity(void);
 /* `in`/`n` with &, <, >, " and ' escaped, appended at `*o` in `out`. -1 if it
  * does not fit. */
 int oc_html_escape(char *out, size_t cap, size_t *o, const char *in, size_t n);
+
+/* The show-password toggle's script, served at /showpw.js, and its SRI value:
+ * on the pages with a password field, it reveals a checkbox that shows what
+ * was typed. */
+const char *oc_showpw_js(size_t *len);
+const char *oc_showpw_js_integrity(void);
+
+/* Whether a page carries a password field, and so the toggle and its script. */
+int oc_page_has_password(const oc_page *pp);
 
 #endif /* OPENCHIME_WEBPAGES_H */

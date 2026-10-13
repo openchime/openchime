@@ -26,7 +26,7 @@ typedef struct oc_auth_check {
     size_t        pwlen;
     uint8_t       salt[64];
     size_t        slen;
-    uint32_t      iters;
+    uint32_t      mem;      /* the stored hash's Argon2id memory, KiB */
     uint8_t       stored[OC_PW_HASH_LEN];
     /* A password change: the new password (borrowed), and the salt and count to
      * derive it with. NULL for a sign-in. A check with no `password` derives
@@ -34,7 +34,7 @@ typedef struct oc_auth_check {
     const char   *new_password;
     size_t        new_pwlen;
     uint8_t       new_salt[OC_PW_SALT_LEN];
-    uint32_t      new_iters;
+    uint32_t      new_mem;
     int           ok;                     /* out: 1 matched, 0 did not, -1 never checked (stopping) */
     int           derived;                /* out: the new password's key is in new_hash */
     uint8_t       new_hash[OC_PW_HASH_LEN];

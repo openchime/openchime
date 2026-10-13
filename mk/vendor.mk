@@ -25,6 +25,13 @@ $(SQLITE_O): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h $(CC_STAMP) $(TOOLC
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out $(WARN_CFLAGS),$(CFLAGS)) -w $(SQLITE_DEFS) -c $< -o $@
 
+# Argon2, as released, in one unit (argon2_all.c) with its own flags: the
+# release compares an unsigned length with a zero minimum (-Wtype-limits), and
+# the daemon hashes with one lane, so no threads.
+$(ARGON2_O): $(wildcard $(ARGON2_DIR)/*.c $(ARGON2_DIR)/*.h $(ARGON2_DIR)/blake2/*) $(CC_STAMP) $(TOOLCHAIN_DEPS) | build
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Wno-type-limits -DARGON2_NO_THREADS -I$(ARGON2_DIR) -c $(ARGON2_DIR)/argon2_all.c -o $@
+
 # --- mbedTLS and the media codecs, natively ------------------------------------
 $(MBEDTLS_A): $(TOOLCHAIN_DEPS)
 	@echo "openchime: building mbedTLS (about a minute, once)"
@@ -70,3 +77,8 @@ $(LLAMA_A): scripts/build/llamacpp.sh $(TOOLCHAIN_DEPS)
 	@echo "openchime: building llama.cpp for summaries (a few minutes, once; make SUM=0 skips it)"
 	scripts/build/llamacpp.sh
 	@touch -c $@   # the script leaves a current build alone
+
+# The common-password list (third_party/pwlist), compiled in (daemon/pwpolicy.c).
+$(PWLIST_RES): third_party/pwlist/common.txt scripts/build/pw_common.py
+	@mkdir -p $(dir $@)
+	python3 scripts/build/pw_common.py $@ third_party/pwlist/common.txt

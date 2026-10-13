@@ -41,9 +41,19 @@ const submitStays = async () => { await page.click('button[type="submit"]'); awa
 // 1. Sign up with the setup token: the first owner, made on the page.
 await page.goto(`${origin}/signin?redirect_uri=${redirect}&nonce=${challenge}&invite=${setup}`);
 check(await page.locator('form[action="signup"]').count() === 1, 'the invitation opens the sign-up form');
+check(await page.locator('input[name="invite"][type="hidden"]').count() === 1, 'the link carries the invitation out of sight');
+check((await page.textContent('form')).includes('At least 15 characters'), 'the rule is said beside the field');
 await page.fill('input[name="username"]', 'owen');
 await page.fill('input[name="password"]', 'pw-owen');
 await page.fill('input[name="confirm"]', 'pw-owen');
+await submitStays();
+check((await msg()).includes('at least 15 characters'), 'a short password is refused, saying why');
+await page.fill('input[name="password"]', 'lantern-orchard-copper');
+await page.fill('input[name="confirm"]', 'lantern-orchard-copper');
+check(await page.isVisible('#showpw'), 'the show-password toggle is offered');
+await page.check('#showpw');
+check(await page.getAttribute('input[name="password"]', 'type') === 'text', 'ticked, it shows the password');
+await page.uncheck('#showpw');
 await submitToCallback();
 check(tokenOf().length > 20, 'sign-up ends at the callback with a token');
 
@@ -53,16 +63,16 @@ await page.fill('input[name="username"]', 'owen');
 await page.fill('input[name="password"]', 'not-it');
 await submitStays();
 check((await msg()).includes("isn't right"), 'a wrong password shows the form again, saying so');
-await page.fill('input[name="password"]', 'pw-owen');
+await page.fill('input[name="password"]', 'lantern-orchard-copper');
 await submitToCallback();
 check(tokenOf().length > 20, 'the right password ends at the callback with a token');
 
 // 3. The password page: the current password checked, the new one stored.
 await page.goto(`${origin}/account/password`);
 await page.fill('input[name="username"]', 'owen');
-await page.fill('input[name="current"]', 'pw-owen');
-await page.fill('input[name="password"]', 'pw-new');
-await page.fill('input[name="confirm"]', 'pw-new');
+await page.fill('input[name="current"]', 'lantern-orchard-copper');
+await page.fill('input[name="password"]', 'granite-harbor-violet');
+await page.fill('input[name="confirm"]', 'granite-harbor-violet');
 await page.click('button[type="submit"]');
 await page.waitForSelector('h1', { timeout: 30000 });
 check((await page.locator('h1').first().textContent()) === 'Password changed', 'the password page changes it');
@@ -70,10 +80,10 @@ check((await page.locator('h1').first().textContent()) === 'Password changed', '
 // 4. The old password is spent and the new one signs in; that token is the script's to present.
 await page.goto(`${origin}/signin?redirect_uri=${redirect}&nonce=${challenge}`);
 await page.fill('input[name="username"]', 'owen');
-await page.fill('input[name="password"]', 'pw-owen');
+await page.fill('input[name="password"]', 'lantern-orchard-copper');
 await submitStays();
 check((await msg()).includes("isn't right"), 'the old password is refused');
-await page.fill('input[name="password"]', 'pw-new');
+await page.fill('input[name="password"]', 'granite-harbor-violet');
 await submitToCallback();
 const token = tokenOf();
 check(token.length > 20, 'the new password signs in');

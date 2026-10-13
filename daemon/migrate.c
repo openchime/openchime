@@ -1312,6 +1312,15 @@ static const char MIGRATION_0061[] =
     "ALTER TABLE invites ADD COLUMN uses INTEGER NOT NULL DEFAULT 1;"
     "ALTER TABLE invites ADD COLUMN used INTEGER NOT NULL DEFAULT 0;";
 
+/* 0062: passwords are Argon2id (AUTH.md §2). Each hash is stored beside its
+ * settings (`kdf`, "argon2id$v=19$m=…,t=…,p=…") instead of a PBKDF2 count.
+ * There are no deployments to carry over: a PBKDF2 credential is deleted, and
+ * its account sets a password again by a reset link (RESET_CREDENTIAL). */
+static const char MIGRATION_0062[] =
+    "DELETE FROM local_credentials;"
+    "ALTER TABLE local_credentials ADD COLUMN kdf TEXT NOT NULL DEFAULT '';"
+    "ALTER TABLE local_credentials DROP COLUMN iterations;";
+
 static const char MIGRATION_0059[] =
     /* A summary is its asker's, not their connection's (REQ-311, SUMMARIES.md
      * §5). The queue is made again -- its rows were only ever a run's -- with
@@ -1418,6 +1427,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 59, MIGRATION_0059 },
     { 60, MIGRATION_0060 },
     { 61, MIGRATION_0061 },
+    { 62, MIGRATION_0062 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

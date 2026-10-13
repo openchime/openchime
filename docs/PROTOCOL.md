@@ -2891,6 +2891,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3033` | `UNKNOWN_GROUP`       | groups     | no    | No such group. |
 | `3034` | `MEMBER_VIA_GROUP`    | groups     | no    | `LEAVE_CHANNEL` or `REMOVE_FROM_CHANNEL` for someone in the channel only through a group (§5.16k). |
 | `3035` | `INVALID_GROUP`       | groups     | no    | A handle, name or description out of bounds, or a group, a workspace or a channel at its cap (§5.16k). |
+| `3036` | `SIGNUP_LIMITED`      | auth       | no    | Ten accounts were made from this address in the last hour; the sign-up page says so (AUTH.md §2). Not sent as a frame. |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which

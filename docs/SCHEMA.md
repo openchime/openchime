@@ -230,13 +230,13 @@ Reconnect hashes the presented token and looks it up here; logout/revoke deletes
 the row(s) (REQ-182).
 
 ### `local_credentials`  — local-mode passwords (ARCH-59)
-Only local users have a row. PBKDF2-HMAC-SHA256; never a plaintext password.
+Only local users have a row. Argon2id (AUTH.md §2); never a plaintext password.
 
 | column        | type    | notes                                                   |
 |---------------|---------|---------------------------------------------------------|
 | `user_id`     | INTEGER | primary key, → `users(id)`.                             |
 | `salt`        | BLOB    | per-user random salt.                                   |
-| `iterations`  | INTEGER | PBKDF2 iteration count (recorded so it can be raised).  |
+| `kdf`         | TEXT    | the hash's settings, `argon2id$v=19$m=19456,t=2,p=1` (migration 0062): another daemon's or an unknown one matches no password. |
 | `hash`        | BLOB    | the derived key.                                        |
 | `updated_at_ms`| INTEGER |                                                        |
 | `version`     | INTEGER | `NOT NULL DEFAULT 0` — from `credential_version_seq`, new on every write (migration 0047). |
@@ -1565,6 +1565,20 @@ given live to the connection watching it is seen at once (`seen_at_ms`). Unseen,
 it is told on every sign-in; seen, it is deleted a day later
 (`SUM_NOTICE_KEEP_MS`, by the storage sweep). The involved Activity feed lists a
 person's notices as kind 4.
+
+## 3ay. Migration 0062 — Argon2id credentials (AUTH.md §2)
+
+```sql
+DELETE FROM local_credentials;
+ALTER TABLE local_credentials ADD COLUMN kdf TEXT NOT NULL DEFAULT '';
+ALTER TABLE local_credentials DROP COLUMN iterations;
+```
+
+Passwords are hashed with Argon2id, and each row carries its settings in `kdf`
+in place of a PBKDF2 count, so the memory, passes and lanes can be raised
+later without a format change. The PBKDF2 rows are deleted rather than carried:
+there were no deployments to keep. An account that had one sets a password
+again by a reset link (`RESET_CREDENTIAL`).
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

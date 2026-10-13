@@ -37,8 +37,8 @@ check(new URL(page.url()).searchParams.get('invite') === invite, 'with the invit
 
 // 2. The newcomer chooses a name and a password and is sent back to the web client.
 await page.fill('input[name="username"]', 'linked');
-await page.fill('input[name="password"]', 'pw-linked');
-await page.fill('input[name="confirm"]', 'pw-linked');
+await page.fill('input[name="password"]', 'pebble-canyon-orbit');
+await page.fill('input[name="confirm"]', 'pebble-canyon-orbit');
 await page.click('button[type="submit"]');
 await until('the web client', async () => new URL(page.url()).pathname === '/app/', 30000);
 check(!page.url().includes('invite='), 'the browser comes back to the web client');

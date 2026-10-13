@@ -161,9 +161,9 @@ where one exists.
   JWKS itself; through a **direct connection**, the provider's own
   ID token, which the daemon has obtained as the relying party and validated
   against that provider's published keys; with **local** accounts a
-  username+password checked against the stored PBKDF2 hash (ARCH-59).
+  username+password checked against the stored Argon2id hash (ARCH-59).
 - **REQ-024.** In local mode the daemon has managed accounts itself: passwords
-  hashed with PBKDF2-HMAC-SHA256 and never stored in the clear, the first owner
+  hashed with Argon2id and never stored in the clear, the first owner
   bootstrapped from a one-time setup token, further users created by invite
   token, and repeated failed attempts rate-limited (ARCH-59). No OpenChime
   client has collected a password: signing in, signing up with an invitation and

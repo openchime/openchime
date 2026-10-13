@@ -35,14 +35,14 @@ static void *pool_loop(void *arg) {
 
         uint8_t derived[OC_PW_HASH_LEN];
         if (c->password)
-            c->ok = oc_pw_derive(c->password, c->pwlen, c->salt, c->slen, c->iters, derived) == 0 &&
+            c->ok = oc_pw_derive(c->password, c->pwlen, c->salt, c->slen, c->mem, derived) == 0 &&
                     oc_ct_eq(derived, c->stored, OC_PW_HASH_LEN);
         else
             c->ok = c->new_password != NULL;   /* derive-only */
         oc_e2e_wipe(derived, sizeof derived);
         c->derived = c->ok == 1 && c->new_password &&
                      oc_pw_derive(c->new_password, c->new_pwlen, c->new_salt, sizeof c->new_salt,
-                                  c->new_iters, c->new_hash) == 0;
+                                  c->new_mem, c->new_hash) == 0;
         p->done(c, p->ctx);
     }
     return NULL;
