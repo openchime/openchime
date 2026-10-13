@@ -230,12 +230,14 @@ jobs:
         include:
           - arch: amd64
             make_arch: x86_64
+            oc_arch: ""
             bin: openchimed
           # Cross-built with zig on the same x86 runner (make ARCH=aarch64).
           # Build only: the binary is packaged and shipped, never run here;
           # what runs below (the render, the install) runs for amd64 alone.
           - arch: arm64
             make_arch: aarch64
+            oc_arch: aarch64
             bin: build/aarch64/openchimed
     env:
       BUILD_ID: ${{ needs.id.outputs.build_id }}
@@ -246,6 +248,10 @@ jobs:
       # binary under the number it assigns (release.yml).
       VERSION: "0"
       MAKE_ARCH: ${{ matrix.make_arch }}
+      # What the vendored-library scripts call the architecture, for the
+      # licence file assembled outside make (packaging/licenses.sh): the
+      # arm64 runner has only its own copies of the vendored texts.
+      OC_ARCH: ${{ matrix.oc_arch }}
       BIN: ${{ matrix.bin }}
       # Every artifact this job produces lands under dist/<platform>/, which is
       # also the artifact's name -- see the upload at the end of the job for why
