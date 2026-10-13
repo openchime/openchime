@@ -3663,7 +3663,7 @@ static void test_big_channel_list(int port) {
     unlink("build/test_core_biglist.db"); unlink("build/test_core_biglist.db-wal");
     unlink("build/test_core_biglist.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_biglist.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return; }
     uint64_t uid = oc_dbwriter_register_local(dbw, "hana", "pw-hana", OC_ROLE_OWNER, 2048);
@@ -3785,7 +3785,7 @@ static void test_cert_trust(int port) {
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
     unlink("build/test_core_trust.db"); unlink("build/test_core_trust.db-wal"); unlink("build/test_core_trust.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_trust.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return; }
     CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
@@ -3926,7 +3926,7 @@ static void test_published_fingerprint(int port) {
     unlink("build/test_core_fp.db"); unlink("build/test_core_fp.db-wal");
     unlink("build/test_core_fp.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_fp.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return; }
     CHECK(oc_dbwriter_register_local(dbw, "iris", "pw-iris", OC_ROLE_OWNER, 2048) != 0);
@@ -4108,7 +4108,7 @@ static oc_dbwriter *web_daemon(const char *db, uint8_t setup[OC_INVITE_TOKEN_LEN
     snprintf(f, sizeof f, "%s-wal", db); unlink(f);
     snprintf(f, sizeof f, "%s-shm", db); unlink(f);
     oc_dbwriter *dbw = oc_dbwriter_start(db);
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     if (dbw && setup && oc_dbwriter_setup_invite(dbw, setup) != 1) { oc_dbwriter_stop(dbw); return NULL; }
     if (dbw && !oc_dbwriter_register_local(dbw, "lia", "pw-lia", OC_ROLE_MEMBER, 2048)) {
         oc_dbwriter_stop(dbw); return NULL;
@@ -4161,9 +4161,9 @@ static void test_local_browser(int port) {
             CHECK(web_fetch(post, "POST", "Origin: https://evil.example\r\nContent-Type: application/x-www-form-urlencoded\r\n",
                             "username=lia&password=pw-lia", resp, sizeof resp) == 403);
         }
-        CHECK(web_person(url, "signup", "invite=&username=owen&password=pw-owen&confirm=pw-owen") == 200);
+        CHECK(web_person(url, "signup", "invite=&username=owen&password=lantern-orchard-copper&confirm=lantern-orchard-copper") == 200);
         char f2[256];
-        snprintf(f2, sizeof f2, "invite=%s&username=owen&password=pw-owen&confirm=pw-owen", setup_hex);
+        snprintf(f2, sizeof f2, "invite=%s&username=owen&password=lantern-orchard-copper&confirm=lantern-orchard-copper", setup_hex);
         CHECK(web_person(url, "signup", f2) == 0);
         CHECK(WAIT_FOR(c, m->authed && m->user_id != 0));
         /* The password page, opened on its own through a tunnel of its own. */
@@ -4424,7 +4424,7 @@ static void test_browser_signin(int port) {
     unlink("build/test_core_browser.db"); unlink("build/test_core_browser.db-wal");
     unlink("build/test_core_browser.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/test_core_browser.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     oc_issuer is;
     CHECK(oc_issuer_init(&is, "oc-core-browser") == 0);
@@ -4807,7 +4807,7 @@ int run_client_core_tests(void) {
     unlink("build/itest_core.db-wal");
     unlink("build/itest_core.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_core.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return failures; }
 
@@ -5285,11 +5285,11 @@ int run_client_core_tests(void) {
          * is started again after, as a person's would be. */
         {
             char why[256];
-            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "pw-dana", "pw-dana-2", why, sizeof why) == 0);
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "pw-dana", "harbor-violet-granite", why, sizeof why) == 0);
             CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "wrong-old", "irrelevant", why, sizeof why) != 0);
-            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "pw-dana-2", "pw-dana", why, sizeof why) == 0);
+            CHECK(oc_test_change_password("127.0.0.1", arg.port, NULL, "dana", "harbor-violet-granite", "meadow-cobalt-thunder", why, sizeof why) == 0);
             oc_client_stop(a);
-            a = start_as(NULL, "127.0.0.1", arg.port, "dana:pw-dana", NULL, NULL, 1, NULL);
+            a = start_as(NULL, "127.0.0.1", arg.port, "dana:meadow-cobalt-thunder", NULL, NULL, 1, NULL);
             CHECK(a != NULL);
             if (!a) return failures;
             CHECK(WAIT_FOR(a, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));

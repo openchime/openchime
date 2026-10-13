@@ -1,4 +1,5 @@
 #include "webpages.h"
+#include "pwpolicy.h"
 
 #include "qrcodegen.h"
 
@@ -91,6 +92,8 @@ static const char STYLE[] =
     "background:#1264a3;border:0;border-radius:8px;cursor:pointer}\n"
     ".msg{margin:1rem 0 0;padding:.6rem .75rem;border-radius:8px;background:#fdecea;color:#b3261e}\n"
     ".alt{margin-top:1.25rem;font-size:.92rem}\n"
+    ".hint{margin:.35rem 0 0;font-size:.88rem}\n"
+    ".show{display:flex;align-items:center;gap:.4rem;margin-top:.8rem;font-weight:400}.show input{width:auto;margin:0}\n"
     "a{color:#1264a3}\n"
     "pre,code{font:15px/1.6 ui-monospace,Consolas,monospace}\n"
     ".qr{display:block;margin:1rem auto}\n"
@@ -220,6 +223,52 @@ const char *oc_codes_js_integrity(void) {
     return sri;
 }
 
+/* The show-password toggle: hidden without script, it shows every password
+ * field of the form it sits in while ticked; it fetches nothing. */
+static const char SHOWPW_JS[] =
+    "(function(){\n"
+    "var b=document.getElementById('showpw');\n"
+    "if(!b)return;\n"
+    "b.parentNode.hidden=false;\n"
+    "b.addEventListener('change',function(){var f=b.form.querySelectorAll('input.pw');"
+    "for(var i=0;i<f.length;i++)f[i].type=b.checked?'text':'password';});\n"
+    "})();\n";
+
+const char *oc_showpw_js(size_t *len) { *len = sizeof SHOWPW_JS - 1; return SHOWPW_JS; }
+
+const char *oc_showpw_js_integrity(void) {
+    static char sri[64];
+    if (!sri[0]) integrity(SHOWPW_JS, sizeof SHOWPW_JS - 1, sri);
+    return sri;
+}
+
+int oc_page_has_password(const oc_page *pp) {
+    return pp->kind == OC_PAGE_SIGNIN || pp->kind == OC_PAGE_SIGNUP ||
+           ((pp->kind == OC_PAGE_PASSWORD || pp->kind == OC_PAGE_RESET) && !pp->done);
+}
+
+/* A password field: `field` with the class the toggle finds. */
+static void pw_field(pg *p, const char *id, const char *label, const char *ac, int focus) {
+    raw(p, "<label for=\""); raw(p, id); raw(p, "\">"); esc(p, label); raw(p, "</label>\n");
+    raw(p, "<input id=\""); raw(p, id); raw(p, "\" name=\""); raw(p, id); raw(p, "\" type=\"password\" class=\"pw\"");
+    raw(p, " autocomplete=\""); raw(p, ac); raw(p, "\" required");
+    if (focus) raw(p, " autofocus");
+    raw(p, ">\n");
+}
+
+/* What a new password must be, under its field (pwpolicy.h). */
+static void pw_rule(pg *p) {
+    raw(p, "<p class=\"hint\">"); esc(p, OC_PW_RULE_TEXT); raw(p, "</p>\n");
+}
+
+/* The toggle and its script, last in the form. `depth` is how far the page sits
+ * below the root, so the script's path works under the tunnel's prefix too. */
+static void pw_toggle(pg *p, int depth) {
+    raw(p, "<label class=\"show\" hidden><input type=\"checkbox\" id=\"showpw\"> Show password</label>\n");
+    raw(p, depth ? "<script src=\"../showpw.js\" integrity=\"" : "<script src=\"showpw.js\" integrity=\"");
+    raw(p, oc_showpw_js_integrity()); raw(p, "\"></script>\n");
+}
+
 /* The passkey button and the fields its answer fills, in the form it posts. */
 static void passkey_button(pg *p, const oc_page *pp) {
     raw(p, "<input type=\"hidden\" name=\"pk_cd\" value=\"\">\n");
@@ -255,15 +304,18 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
     const char *user = pp->username ? pp->username : "";
     switch (pp->kind) {
     case OC_PAGE_SIGNIN:
-        open_page(&p, "Sign in \xE2\x80\x94 OpenChime");
-        raw(&p, "<h1>Sign in</h1>\n<p>to your OpenChime workspace</p>\n");
+        open_page(&p, "Sign in \xC2\xB7 OpenChime");
+        raw(&p, "<h1>Sign in</h1>\n<p>to ");
+        if (pp->workspace && pp->workspace[0]) esc(&p, pp->workspace); else raw(&p, "your OpenChime workspace");
+        raw(&p, "</p>\n");
         if (pp->done) raw(&p, "<p>Your new password is set. Sign in with it.</p>\n");
         message(&p, pp->message);
         raw(&p, "<form method=\"post\" action=\"signin\">\n");
         hidden(&p, "redirect_uri", pp->redirect_uri);
         hidden(&p, "nonce", pp->nonce);
         field(&p, "username", "Username", "text", "username", user, !user[0]);
-        field(&p, "password", "Password", "password", "current-password", "", user[0] != 0);
+        pw_field(&p, "password", "Password", "current-password", user[0] != 0);
+        pw_toggle(&p, 0);
         raw(&p, "<button type=\"submit\">Sign in</button>\n</form>\n");
         raw(&p, "<p class=\"alt\">Have an invitation? <a href=\"signup?");
         carry(&p, pp);
@@ -272,23 +324,31 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 "<a href=\"account/security\">Two-step sign-in</a></p>\n");
         break;
     case OC_PAGE_SIGNUP:
-        open_page(&p, "Create an account \xE2\x80\x94 OpenChime");
-        raw(&p, "<h1>Create an account</h1>\n<p>with the invitation you were given</p>\n");
+        open_page(&p, "Create an account \xC2\xB7 OpenChime");
+        raw(&p, "<h1>Create an account</h1>\n<p>");
+        if (pp->workspace && pp->workspace[0]) { raw(&p, "to join "); esc(&p, pp->workspace); }
+        else raw(&p, "with the invitation you were given");
+        raw(&p, "</p>\n");
         message(&p, pp->message);
         raw(&p, "<form method=\"post\" action=\"signup\">\n");
         hidden(&p, "redirect_uri", pp->redirect_uri);
         hidden(&p, "nonce", pp->nonce);
-        field(&p, "invite", "Invitation", "text", "off", pp->invite, !(pp->invite && pp->invite[0]));
+        /* The link carries the invitation: nothing for the person to see or
+         * change. Without one, the person pastes it. */
+        if (pp->invite && pp->invite[0]) hidden(&p, "invite", pp->invite);
+        else field(&p, "invite", "Invitation", "text", "off", "", 1);
         field(&p, "username", "Username", "text", "username", user, pp->invite && pp->invite[0]);
-        field(&p, "password", "Password", "password", "new-password", "", 0);
-        field(&p, "confirm", "Password again", "password", "new-password", "", 0);
+        pw_field(&p, "password", "Password", "new-password", 0);
+        pw_rule(&p);
+        pw_field(&p, "confirm", "Password again", "new-password", 0);
+        pw_toggle(&p, 0);
         raw(&p, "<button type=\"submit\">Create account</button>\n</form>\n");
         raw(&p, "<p class=\"alt\">Have an account? <a href=\"signin?");
         carry(&p, pp);
         raw(&p, "\">Sign in</a></p>\n");
         break;
     case OC_PAGE_DEVICE:
-        open_page(&p, "Sign in a device \xE2\x80\x94 OpenChime");
+        open_page(&p, "Sign in a device \xC2\xB7 OpenChime");
         if (pp->done) {
             raw(&p, "<h1>Signed in</h1>\n<p>Go back to your terminal: it is signing in now. "
                     "You can close this tab.</p>\n");
@@ -331,7 +391,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
                 "That wasn't me</button>\n</form>\n");
         break;
     case OC_PAGE_STEP:
-        open_page(&p, "Two-step sign-in \xE2\x80\x94 OpenChime");
+        open_page(&p, "Two-step sign-in \xC2\xB7 OpenChime");
         raw(&p, "<h1>Two-step sign-in</h1>\n<p>Enter the code your authenticator app shows, "
                 "or one of your recovery codes.</p>\n");
         message(&p, pp->message);
@@ -346,7 +406,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         if (pp->pk_mode == 1) passkey_script(&p);
         break;
     case OC_PAGE_SECURITY:
-        open_page(&p, "Two-step sign-in \xE2\x80\x94 OpenChime");
+        open_page(&p, "Two-step sign-in \xC2\xB7 OpenChime");
         raw(&p, "<h1>Two-step sign-in</h1>\n");
         switch (pp->sec) {
         case OC_SEC_SIGNIN:
@@ -421,7 +481,7 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         }
         break;
     case OC_PAGE_RESET:
-        open_page(&p, "Set a new password \xE2\x80\x94 OpenChime");
+        open_page(&p, "Set a new password \xC2\xB7 OpenChime");
         if (pp->done) {
             raw(&p, "<h1>Password set</h1>\n<p>Sign in with your new password. You can close this tab.</p>\n");
             break;
@@ -435,12 +495,14 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
             hidden(&p, "redirect_uri", pp->redirect_uri);
             hidden(&p, "nonce", pp->nonce);
         }
-        field(&p, "password", "New password", "password", "new-password", "", 1);
-        field(&p, "confirm", "New password again", "password", "new-password", "", 0);
+        pw_field(&p, "password", "New password", "new-password", 1);
+        pw_rule(&p);
+        pw_field(&p, "confirm", "New password again", "new-password", 0);
+        pw_toggle(&p, 1);
         raw(&p, "<button type=\"submit\">Set password</button>\n</form>\n");
         break;
     case OC_PAGE_PASSWORD:
-        open_page(&p, "Change your password \xE2\x80\x94 OpenChime");
+        open_page(&p, "Change your password \xC2\xB7 OpenChime");
         if (pp->done) {
             raw(&p, "<h1>Password changed</h1>\n<p>Sign in with your new password from now on. "
                     "You can close this tab.</p>\n");
@@ -450,9 +512,11 @@ char *oc_page_render(const oc_page *pp, size_t *len) {
         message(&p, pp->message);
         raw(&p, "<form method=\"post\" action=\"password\">\n");
         field(&p, "username", "Username", "text", "username", user, !user[0]);
-        field(&p, "current", "Current password", "password", "current-password", "", user[0] != 0);
-        field(&p, "password", "New password", "password", "new-password", "", 0);
-        field(&p, "confirm", "New password again", "password", "new-password", "", 0);
+        pw_field(&p, "current", "Current password", "current-password", user[0] != 0);
+        pw_field(&p, "password", "New password", "new-password", 0);
+        pw_rule(&p);
+        pw_field(&p, "confirm", "New password again", "new-password", 0);
+        pw_toggle(&p, 1);
         raw(&p, "<button type=\"submit\">Change password</button>\n</form>\n");
         break;
     }

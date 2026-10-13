@@ -196,7 +196,7 @@ CLIP="$(powershell.exe -NoProfile -Command 'Get-Clipboard -Raw' 2>/dev/null | tr
 grep -q '^signin .*copied=1' <<<"$(state w1-copied)" || fail "the card does not say the link was copied"
 echo "ok: the sign-in link copies from the card"
 R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
-OUTP="$(browser "$URL" signup "invite=$TOKEN&username=owen&password=pw-owen&confirm=pw-owen&redirect_uri=$(enc "$R")&nonce=$N")"
+OUTP="$(browser "$URL" signup "invite=$TOKEN&username=owen&password=lantern-orchard-copper&confirm=lantern-orchard-copper&redirect_uri=$(enc "$R")&nonce=$N")"
 grep -q 'You are signed in' <<<"$OUTP" || fail "sign-up did not reach the callback: $OUTP"
 for _ in $(seq 1 50); do S="$(state w2)"; grep -q '^authed=1' <<<"$S" && break; sleep 0.2; done
 grep -q '^authed=1' <<<"$S" || fail "not signed in after sign-up"
@@ -208,7 +208,7 @@ rm -f "$LIN_DIR/signin_url.txt"
 drive menu 31
 URL="$(await_url)" || fail "no password page URL"
 case "$URL" in http://127.0.0.1:*/p/*/account/password*) ;; *) fail "not a tunnel password URL: $URL" ;; esac
-OUTP="$(browser "$URL" password "username=owen&current=pw-owen&password=pw-new&confirm=pw-new")"
+OUTP="$(browser "$URL" password "username=owen&current=lantern-orchard-copper&password=granite-harbor-violet&confirm=granite-harbor-violet")"
 grep -q 'Password changed' <<<"$OUTP" || fail "the password was not changed: $OUTP"
 # The change signs every device out, this one too: the client goes to the
 # sign-in card and says why.
@@ -242,9 +242,9 @@ URL="$(await_url)" || fail "no sign-in URL"
 case "$URL" in http://127.0.0.1:*/p/*/signin\?*) ;; *) fail "not a tunnel sign-in URL: $URL" ;; esac
 drive shotfull web-3-waiting
 R="$(qget "$URL" redirect_uri)"; N="$(qget "$URL" nonce)"
-OUTP="$(browser "$URL" signin "username=owen&password=pw-owen&redirect_uri=$(enc "$R")&nonce=$N")"
+OUTP="$(browser "$URL" signin "username=owen&password=lantern-orchard-copper&redirect_uri=$(enc "$R")&nonce=$N")"
 grep -q 'isn&#39;t right' <<<"$OUTP" || fail "the old password was not refused: $OUTP"
-OUTP="$(browser "$URL" signin "username=owen&password=pw-new&redirect_uri=$(enc "$R")&nonce=$N")"
+OUTP="$(browser "$URL" signin "username=owen&password=granite-harbor-violet&redirect_uri=$(enc "$R")&nonce=$N")"
 grep -q 'You are signed in' <<<"$OUTP" || fail "the new password did not sign in: $OUTP"
 for _ in $(seq 1 50); do S="$(state w3)"; grep -q '^authed=1' <<<"$S" && break; sleep 0.2; done
 grep -q '^authed=1' <<<"$S" || fail "not signed in with the new password"

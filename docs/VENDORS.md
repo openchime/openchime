@@ -32,8 +32,10 @@ CI builds share byte-identical sources with zero transitive dependencies
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
-| **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
+| **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width); NFKC normalization of passwords | tuikit (→ TUI); the daemon (AUTH.md §2) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **qrcodegen** | v1.8.0 | QR codes: the device-code sign-in's URL, for a phone's camera (AUTH.md §8.11); a second step's setup key, for an authenticator app (AUTH.md §8.6) | tuikit `tk_qr` (→ TUI); the daemon's setup page | https://github.com/nayuki/QR-Code-generator | MIT |
+| **Argon2** | 20190702 (the reference implementation) | Password hashing, Argon2id (AUTH.md §2): `argon2.c`, `core.c`, `encoding.c`, `ref.c`, `thread.c`, `blake2/`, as released, compiled as one unit (`argon2_all.c`) with its own flags | Daemon | https://github.com/P-H-C/phc-winner-argon2 | CC0-1.0 or Apache-2.0 |
+| **Common passwords** | SecLists, `xato-net-10-million-passwords-1000000.txt` | The passwords of 15 characters or more a new one may not be, lowercased (`third_party/pwlist/common.txt`, compiled in by `scripts/build/pw_common.py`) | Daemon | https://github.com/danielmiessler/SecLists | MIT |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
@@ -77,8 +79,8 @@ texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
 `packaging/licenses.sh` reads them out of the trees the build actually used, so
 the notice cannot drift from what was linked, and it **fails the build** if a
 licence file is missing rather than shipping a binary without one. termbox2,
-utf8proc, qrcodegen and lucide are deliberately absent from that file: they are TUI and
-client components, and none is linked into the daemon.
+qrcodegen and lucide are deliberately absent from that file: they are TUI and
+client components. utf8proc is in it: the daemon normalizes passwords with it.
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
 (terminal layer + width handling), which the TUI builds on. `client/tui/main.c`
@@ -98,7 +100,7 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`utf8proc/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/` and `lucide/`
+`utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/` and `lucide/`
 (see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
@@ -121,7 +123,7 @@ has moved (`scripts/check/toolchains.sh`).
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
-| **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256/PBKDF2, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
+| **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), certificate verification, ACME's JWS, CSRs and challenge certificates, SHA-256, ES256 verify; calls' end-to-end encryption — X25519, HKDF, AES-GCM, CTR-DRBG for HPKE and SFrame (ARCH-113) | Daemon + client (`shared/tls.c`, `shared/e2e_*.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
 | **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 | **libvpx** | 1.17.0 | VP9 encode and decode | Client media library — video messages (ARCH-110) and screenshare (ARCH-87) | https://chromium.googlesource.com/webm/libvpx | BSD-3-Clause (with a separate patent grant) |
 | **libopus** | 1.6.1 | Opus encode and decode | Client media library — video messages (ARCH-110) and the audio client (ARCH-73) | https://opus-codec.org | BSD-3-Clause |
@@ -346,7 +348,8 @@ paths ship; nothing is fetched at runtime.
 
 | License | Packages | Notes |
 |---------|----------|-------|
-| **MIT** | termbox2, utf8proc, qrcodegen, jsmn | Vendored, committed |
+| **MIT** | termbox2, utf8proc, qrcodegen, jsmn, SecLists' common passwords | Vendored, committed |
+| **CC0-1.0 or Apache-2.0** | Argon2 (reference) | Vendored, committed |
 | **MIT** | ONNX Runtime, Moonshine Tiny Streaming | Fetched at build; ONNX Runtime static-linked and Moonshine shipped as data, **daemon only** (ARCH-111/112) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |

@@ -68,7 +68,7 @@ echo "  ok   the browser's token signs in on AUTH (user $WHO)"
 # ends signed in to the web client as a new member (scripts/web/invite.mjs).
 # The daemon serves the web client from web/ beside it (make web).
 [ -f web/openchime.wasm ] || { echo "pages: no web client beside the daemon (make web)" >&2; exit 2; }
-INVITE="$(./build/demo_client 127.0.0.1 $PORT owen pw-new invite 0 2>>"$W/pages.err")" || { echo "  FAIL minting the invitation link"; tail -3 "$W/pages.err"; exit 1; }
+INVITE="$(./build/demo_client 127.0.0.1 $PORT owen granite-harbor-violet invite 0 2>>"$W/pages.err")" || { echo "  FAIL minting the invitation link"; tail -3 "$W/pages.err"; exit 1; }
 OUT2="$(node scripts/web/invite.mjs "https://127.0.0.1:$PORT" "$INVITE" "$CHROME" 2>>"$W/pages.err")"
 rc=$?
 printf '%s\n' "$OUT2"

@@ -36,12 +36,14 @@ GPL-3.0: modify and distribute a client, and the source travels with it.
 
 | Component | Licence | Used by |
 |---|---|---|
-| Mbed TLS 3.6.2 | Apache-2.0 | TLS, SHA-256/PBKDF2, ES256 |
+| Mbed TLS 3.6.2 | Apache-2.0 | TLS, SHA-256, ES256 |
+| Argon2 (reference, 20190702) | CC0-1.0 or Apache-2.0 | password hashing |
+| SecLists' common passwords | MIT | the passwords a new one may not be, as data |
 | SDL3 | zlib | GUI windowing, input, 2D renderer |
 | jsmn | MIT | JSON tokenizer |
 | Mozilla CA roots | MPL-2.0 | the roots outbound HTTPS verifies against, as data |
 | termbox2 | MIT | TUI terminal layer |
-| utf8proc | MIT-like | Unicode handling |
+| utf8proc | MIT-like | Unicode handling; password normalization in the daemon |
 | lucide | ISC | icons |
 | SQLite | public domain | linked dynamically (`-lsqlite3`) |
 

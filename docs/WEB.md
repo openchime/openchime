@@ -119,7 +119,8 @@ sign-in form itself and follow the redirect back (`plat_web.c`).
 **An invitation link.** `/app/?invite=<hex>` is the page opened with an
 invitation (REQ-026): the page starts the client as `openchime --signin
 <host:port> --invite <hex>`, the sign-in begins with the invitation, and the
-daemon's page opens on the sign-up form, so a person who was sent the link
+daemon's page opens on the sign-up form, naming the workspace and carrying the
+invitation out of sight, so a person who was sent the link
 chooses a username and password in the browser and comes back here signed in
 as the new member, with nothing installed. The clients offer the link in the
 invitation text where the daemon's pages open directly

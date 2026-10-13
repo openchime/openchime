@@ -3,11 +3,12 @@
 
 #include "auth.h"
 
-#include <mbedtls/pkcs5.h>
+#include "argon2.h"
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
 
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -35,14 +36,25 @@ int oc_sha256(const void *in, size_t n, uint8_t out[OC_SHA256_LEN]) {
 
 int oc_pw_derive(const char *password, size_t pwlen,
                  const uint8_t *salt, size_t saltlen,
-                 uint32_t iterations, uint8_t out[OC_PW_HASH_LEN]) {
-    int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(
-        MBEDTLS_MD_SHA256,
-        (const unsigned char *)password, pwlen,
-        salt, saltlen,
-        iterations,
-        OC_PW_HASH_LEN, out);
-    return rc == 0 ? 0 : -1;
+                 uint32_t mem_kib, uint8_t out[OC_PW_HASH_LEN]) {
+    if (mem_kib < 8 * OC_PW_LANES) return -1;
+    return argon2id_hash_raw(OC_PW_PASSES, mem_kib, OC_PW_LANES, password, pwlen,
+                             salt, saltlen, out, OC_PW_HASH_LEN) == ARGON2_OK ? 0 : -1;
+}
+
+void oc_pw_kdf_format(uint32_t mem_kib, char out[OC_PW_KDF_MAX]) {
+    snprintf(out, OC_PW_KDF_MAX, "argon2id$v=19$m=%u,t=%u,p=%u",
+             (unsigned)mem_kib, (unsigned)OC_PW_PASSES, (unsigned)OC_PW_LANES);
+}
+
+int oc_pw_kdf_parse(const char *kdf, uint32_t *mem_kib) {
+    unsigned m = 0, t = 0, p = 0;
+    int n = 0;
+    if (!kdf || sscanf(kdf, "argon2id$v=19$m=%u,t=%u,p=%u%n", &m, &t, &p, &n) != 3 || kdf[n] != '\0')
+        return -1;
+    if (t != OC_PW_PASSES || p != OC_PW_LANES || m < 8 * OC_PW_LANES) return -1;
+    *mem_kib = m;
+    return 0;
 }
 
 int oc_ct_eq(const void *a, const void *b, size_t n) {

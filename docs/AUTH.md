@@ -52,17 +52,31 @@ advertised to the client in-protocol via `AUTH_CHALLENGE` (§5).
 For deployments that run no identity provider. The daemon is the identity
 authority.
 
-- **Credentials:** username + password. Passwords are hashed with
-  **PBKDF2-HMAC-SHA256** (via mbedTLS `mbedtls_pkcs5_pbkdf2_hmac`) using a
-  per-user random salt and a high iteration count (~600k, OWASP-tier). Only the
-  derived hash + salt + iteration count are stored (`local_credentials` table).
-  PBKDF2 was chosen over argon2/bcrypt to add **no new dependency** — mbedTLS is
-  already linked and has no argon2. **No OpenChime client collects a password.**
+- **Credentials:** username + password. Passwords are hashed with **Argon2id**
+  (the reference implementation, vendored in `third_party/argon2`) at OWASP's
+  floor: 19 MiB of memory, two passes, one lane, a per-user random salt. Only
+  the derived hash, the salt and the settings it was made with
+  (`argon2id$v=19$m=19456,t=2,p=1`) are stored (`local_credentials`, migration
+  0062), so the settings can be raised without a format change; a hash with
+  settings this daemon does not make matches no password. **No OpenChime client
+  collects a password.**
   It is typed only into the daemon's own sign-in page, in the system browser, and
   reaches the daemon only inside TLS — directly, or through the client's loopback
   tunnel (§8.10). It is never stored. A password in a frame is refused, in every
   build: the protocol has no frame that carries one, and the test suites sign in
   through the page as a person does (TESTING.md).
+- **What a password must be** (NIST SP 800-63B rev 4, `daemon/pwpolicy.c`):
+  15 to 128 characters, counted after Unicode NFKC normalization; not one of
+  the common passwords of that length in SecLists' list of a million
+  (`third_party/pwlist`, compiled in, compared without regard to case), not one
+  character repeated, and not containing the username or the workspace's name
+  (when four characters or more) or "openchime". Nothing else: spaces and every
+  printable character are allowed, there are no composition rules, and a
+  password never expires. The page says the rule beside the field, and why a
+  password was refused. Every password, set or presented, is normalized the
+  same way before it is hashed, so the same characters typed on any keyboard
+  match. The pages allow pasting and a password manager's fill, and offer a
+  "Show password" toggle (a script of the daemon's own, `/showpw.js`).
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
   created at first run from a one-time **setup token**. There is no config file
   and no configuration variable for it (ARCH-26): the daemon **mints** the token
@@ -100,14 +114,17 @@ authority.
   time; only the daemon can enforce it since only it holds the users table.
 - **Brute-force protection (REQ-191):** the daemon rate-limits failed local-auth
   attempts per account **and** per source IP (`daemon/ratelimit.c`, fixed-window
-  counters checked before PBKDF2 so a flood can't burn CPU), answering excess
+  counters checked before the hash so a flood can't burn CPU), answering excess
   attempts with `ERROR AUTH_RATE_LIMITED`. The per-source cap is higher than
   per-account, so many users behind one NAT are tolerated while an account-spray
   from a single IP is still stopped; a successful login clears the account
   counter but not the source counter. The sign-in and password pages (§8.10)
   go through the same limiters, by the address the request came from — the
   browser's, or the client's through its tunnel — and a sign-up with an
-  invitation that is not valid counts against its source.
+  invitation that is not valid counts against its source. Accounts made on the
+  sign-up page are limited to ten an hour per source (`SIGNUP_LIMITED`, the
+  page answering 429), so a team behind one address joins freely and a script
+  making accounts on a shared invitation does not.
 - **Where the derivation runs:** not on the database writer. The writer checks
   the limiters, a reader fetches the stored credential and its version, a
   two-thread auth pool derives and compares, and the writer finishes the

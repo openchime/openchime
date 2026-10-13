@@ -45,8 +45,8 @@ static oc_auth_check *mk(int i, const char *pw) {
     oc_auth_check *c = calloc(1, sizeof *c);
     memset(c->salt, 0x11, 16);
     c->slen = 16;
-    c->iters = 1000;
-    oc_pw_derive("right", 5, c->salt, c->slen, c->iters, c->stored);
+    c->mem = 1000;
+    oc_pw_derive("right", 5, c->salt, c->slen, c->mem, c->stored);
     c->password = pw;
     c->pwlen = strlen(pw);
     c->owner = (void *)(intptr_t)i;
@@ -69,10 +69,10 @@ int run_authpool_tests(void) {
     /* A change: the new password's key, derived only after the old one matched. */
     oc_auth_check *chg = mk(0, "right");
     chg->new_password = "fresh"; chg->new_pwlen = 5;
-    memset(chg->new_salt, 0x22, sizeof chg->new_salt); chg->new_iters = 1000;
+    memset(chg->new_salt, 0x22, sizeof chg->new_salt); chg->new_mem = 1000;
     oc_auth_check *nochg = mk(1, "wrong");
     nochg->new_password = "fresh"; nochg->new_pwlen = 5;
-    memset(nochg->new_salt, 0x22, sizeof nochg->new_salt); nochg->new_iters = 1000;
+    memset(nochg->new_salt, 0x22, sizeof nochg->new_salt); nochg->new_mem = 1000;
     int before = returned();
     oc_authpool_submit(p, chg);
     oc_authpool_submit(p, nochg);

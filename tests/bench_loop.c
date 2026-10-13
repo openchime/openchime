@@ -12,9 +12,9 @@
  * Usage: bench_loop [scenario ...]   scenarios: chat fanout storm backfill call call-tcp
  *                                     (none named: all of them, in that order)
  *
- * Sign-in uses a cheap password hash (the accounts are made with 2048 PBKDF2
- * iterations, as the tests make theirs), because the hash runs on the writer
- * thread, not the loop; at the production 600k a storm would measure the writer. */
+ * Sign-in uses a cheap password hash (the accounts are made with 2 MiB of
+ * Argon2id memory, as the tests make theirs), because the hash runs on the auth
+ * pool, not the loop; at the production 19 MiB a storm would measure the pool. */
 
 #include "netloop.h"
 #include "audio.h"
@@ -578,7 +578,7 @@ int main(int argc, char **argv) {
     const char *db = "build/bench_loop.db";
     unlink(db); unlink("build/bench_loop.db-wal"); unlink("build/bench_loop.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start(db);
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     if (!dbw) { fprintf(stderr, "db start failed\n"); return 1; }
     for (int i = 0; i < N_USERS; i++) {
         char user[16]; snprintf(user, sizeof user, "u%d", i);

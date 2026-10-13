@@ -29,7 +29,7 @@ typedef struct {
     char     redirect_uri[512], nonce[48];   /* a sign-in's */
     char     user_code[16];                  /* a device approval's */
     int      pw;                             /* a password change's new key */
-    uint32_t pw_iters;
+    uint32_t pw_mem;
     uint8_t  pw_salt[16], pw_hash[32];
     /* A passkey (AUTH.md §8.6), on the trusted name the page was reached at: its
      * relying party and origin, the ceremony's challenge (base64url), and the

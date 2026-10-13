@@ -68,10 +68,10 @@ static int client_open(client *c, const char *host, int port) {
     c->fd = dial(host, port);
     if (c->fd < 0) return -1;
     /* Bound every blocking read so a worker can never hang the run (auth does a
-     * 600k-iteration PBKDF2 on the daemon's single writer, so AUTH_OK can lag
+     * 19 MiB Argon2id on the daemon's auth pool, so AUTH_OK can lag
      * under a connection burst). recv() blocks up to this, so no busy-spin. */
-    /* Generous, because AUTH is deliberately expensive: a 600k-iteration PBKDF2
-     * on the single writer thread, serialized across all connections. At ~2
+    /* Generous, because AUTH is deliberately expensive: a 19 MiB Argon2id
+     * on the two-thread auth pool, serialized across all connections. At ~2
      * logins/s a burst of N clients takes N/2 seconds to drain, and a 10s
      * timeout silently capped usable concurrency at ~20 — every connection past
      * that gave up mid-auth and was counted as a failure, which then skewed the

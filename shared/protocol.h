@@ -624,6 +624,7 @@ typedef enum {
     OC_ERR_UNKNOWN_GROUP       = 3033, /* no such group */
     OC_ERR_MEMBER_VIA_GROUP    = 3034, /* in the channel through a group: leaving or removing them alone cannot (REQ-309) */
     OC_ERR_INVALID_GROUP       = 3035, /* a handle, name or description out of bounds, or a group or channel at its cap */
+    OC_ERR_SIGNUP_LIMITED      = 3036, /* too many accounts made from one address in the hour (the sign-up page) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not

@@ -366,8 +366,10 @@ listen use port ranges no other suite uses (`itest_netloop` from 15000,
 listens takes a port from the kernel (bind port 0) or a range of its own.
 
 Password hashing in the tests is at test strength: every test writer is given
-2,048 PBKDF2 rounds (`oc_dbwriter_set_pw_iterations`), including the check an
-unknown name gets and a new password's key, where production uses 600,000.
+2 MiB of Argon2id memory (`oc_dbwriter_set_pw_mem`), including the check an
+unknown name gets and a new password's key, where production uses 19 MiB.
+Passwords a test sets on the pages must pass the policy (AUTH.md §2): fifteen
+characters or more, not common, not built on the username.
 
 There are two test commands: `make test`, every suite plainly, the one to run
 locally; and `make test-ci`, CI's, which refuses unless `CI` is set (as GitHub
@@ -819,7 +821,7 @@ scripts/bench.sh                 # default: idle memory at 50, 100, 200 conns + 
 scripts/bench.sh 50 100 200 400  # custom connection counts
 ```
 
-It bootstraps a set of local accounts (auth is a 600k-iteration PBKDF2, so it
+It bootstraps a set of local accounts (auth is a 19 MiB Argon2id, so it
 keeps the count modest), starts a throwaway daemon, and prints a table of
 connections vs. peak RSS vs. round-trip latency, tearing everything down after.
 
@@ -871,21 +873,18 @@ Scaling further needs no architecture change (REQ-210): raise
 ### The one bottleneck: connection setup
 
 Steady-state connection *count* is cheap; connection *establishment* is not. Each
-login runs a **600k-iteration PBKDF2-HMAC-SHA256** password verification
-(OWASP-tier, `OC_PW_ITERATIONS` in `daemon/auth.h`), and — like all mutations —
-it runs on the **single DB-writer thread** (ARCH-5). That serializes logins at
-**~2 per second** (≈500 ms each), the figure the results table and the
-harness-limitations section below both carry.
+login runs an **Argon2id** password verification at OWASP's floor (19 MiB, two
+passes, one lane: `OC_PW_MEM_KIB` and its neighbours in `daemon/auth.h`), about
+70 ms on a development machine, on the **two-thread auth pool** (ARCH-5): about
+25 logins a second.
 
 This is a deliberate security cost paid once per login, not a memory or
 steady-state limit: a box holding thousands of connections is fine, but a
 **thundering-herd reconnect** (e.g. every client re-authenticating at once after
-a daemon restart) drains at ~2/sec — ~25 minutes for 3,000 clients. If that ever
-matters at scale, the fix is to parallelize the PBKDF2 across a small worker pool
-off the single writer (the auth verification is CPU-bound and independent per
-login), not to add RAM. It is a modest cost at the low-hundreds target scale
-(50 logins ≈ 25 seconds), and session-token reconnect (ARCH-58) skips PBKDF2
-entirely, which is what a real reconnect storm uses.
+a daemon restart) drains at about 25 a second, two minutes for 3,000 clients.
+It is a modest cost at the low-hundreds target scale, and session-token
+reconnect (ARCH-58) skips the hash entirely, which is what a real reconnect
+storm uses.
 
 ### Caveats
 
@@ -1014,10 +1013,9 @@ The loop's own turn is the figure to compare.
 
 ### Harness conventions worth knowing
 
-- `bench_load`'s read timeout is 180 s, so the PBKDF2 auth ramp
-  (a few logins/sec, ≈500 ms each) is never the limit — a burst of N clients takes
-  N/2 seconds to drain, and a short timeout would count slow-but-fine clients
-  as connection failures.
+- `bench_load`'s read timeout is 180 s, so the Argon2id auth ramp
+  (about 25 logins a second) is never the limit, and a short timeout would count
+  slow-but-fine clients as connection failures.
 - `scripts/bench.sh` prints the whole result line, `connections_ok=` included —
   a failed connection reports `rtt 0.00`, so hiding the count makes a degenerate
   run read like an outstanding result.
@@ -1025,11 +1023,11 @@ The loop's own turn is the figure to compare.
   connections that actually established.
 
 **The real constraint** is that password sign-in is bounded by design (REQ-191
-wants PBKDF2 expensive): at ≈500 ms a derivation on the two-thread auth pool
-(ARCH-5), about four a second. The pool keeps a burst of them off the writer, so
+wants the hash expensive): at about 70 ms an Argon2id on the two-thread auth
+pool (ARCH-5), about 25 a second. The pool keeps a burst of them off the writer, so
 everyone else's sends go on meanwhile, but a server restart with a few hundred
 clients signing in by password would still take a minute or two; session-token
-reconnect (ARCH-58), which skips PBKDF2 entirely, is what makes a restart
+reconnect (ARCH-58), which skips the hash entirely, is what makes a restart
 tolerable in practice. Worth remembering before quoting a connection-count
 capacity number: the daemon *holds* thousands of connections, but *establishes*
 password sign-ins at a few per second.

@@ -306,7 +306,7 @@ int run_slow_blob_tests(void) {
     unlink("build/itest_slowblob.db-wal");
     unlink("build/itest_slowblob.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_slowblob.db");
-    if (dbw) oc_dbwriter_set_pw_iterations(dbw, 2048);   /* fast PBKDF2 for tests */
+    if (dbw) oc_dbwriter_set_pw_mem(dbw, 2048);   /* a cheap Argon2id for tests */
     CHECK(dbw != NULL);
     if (!dbw) { slow_s3_stop(&g_s3); return failures; }
     CHECK(oc_dbwriter_register_local(dbw, "sb-alice", "pw", OC_ROLE_OWNER, 2048) != 0);
