@@ -317,7 +317,7 @@ static oc_dbres *backfill(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64
     return wait_result(w);
 }
 
-static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid);
+static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid, int advances);
 
 static void test_backfill(void) {
     const char *path = "build/test_dbwriter3.db";
@@ -373,7 +373,7 @@ static void test_backfill(void) {
      * keeps no local history (ARCH-88) ended up showing an empty channel on
      * every launch. The read cursor places the unread divider; it does not
      * decide which messages exist. */
-    client_ack(w, u, OC_DEFAULT_CHANNEL, last);
+    client_ack(w, u, OC_DEFAULT_CHANNEL, last, 1);
     r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
     CHECK(r && r->n_replay == BF_TAIL);
     CHECK(r->replay[BF_TAIL - 1].message_id == last);
@@ -4540,18 +4540,21 @@ static void test_idem_pruning(void) {
 /* Server-side delivery accounting (REQ-090): CLIENT_ACK advances a per-(user,
  * channel) cursor, and a cursorless (count=0) backfill resumes each member
  * channel from that cursor. */
-static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid) {
+static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid, int advances) {
     oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, 1);
     j->user_id = uid; j->channel_id = channel; j->message_id = mid;
     oc_dbwriter_submit(w, j);
-    /* A real advance now yields a READ_CURSOR result (REQ-090 seen-by); drain it
-     * so it doesn't bleed into the next helper's result. A non-advancing ack
-     * yields nothing, so the poll is bounded and simply times out. */
-    for (int i = 0; i < 50; i++) {
-        oc_dbres *r = oc_dbwriter_next_result(w);
-        if (r) { oc_dbres_free(r); return; }
-        usleep(2000);
-    }
+    /* A real advance answers with a READ_CURSOR (REQ-090 seen-by), which is
+     * taken here so it cannot bleed into the next helper's answer; a stale ack
+     * answers nothing, and the writer's queue is FIFO, so the caller's next
+     * write lands after it either way. The caller says which: a timer here
+     * (100 ms) let the advance's answer arrive late under ThreadSanitizer and
+     * be read as the next step's. A read job cannot stand in as a barrier:
+     * reads go to reader threads (ARCH-66), not through the writer's queue. */
+    if (!advances) return;
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_READ_CURSOR && r->channel_id == channel && r->message_id == mid);
+    oc_dbres_free(r);
 }
 
 static oc_dbres *backfill0(oc_dbwriter *w, uint64_t uid) {
@@ -4584,7 +4587,7 @@ static void test_delivery_cursor(void) {
 
     /* bob acks m2; a synchronous send afterwards flushes the writer past the
      * ack (FIFO), so the reader sees the committed cursor. */
-    client_ack(w, bob, OC_DEFAULT_CHANNEL, m2);
+    client_ack(w, bob, OC_DEFAULT_CHANNEL, m2, 1);
     memset(idem, 4, sizeof idem); uint64_t m4 = send_msg(w, alice, idem, "four");
     CHECK(m4 > m3);
 
@@ -4600,7 +4603,7 @@ static void test_delivery_cursor(void) {
 
     /* The cursor itself still advances only forward — acking an older id does
      * not rewind it — which is what read-receipts depend on. */
-    client_ack(w, bob, OC_DEFAULT_CHANNEL, m1);
+    client_ack(w, bob, OC_DEFAULT_CHANNEL, m1, 0);   /* behind m2: no advance */
     memset(idem, 5, sizeof idem); uint64_t m5 = send_msg(w, alice, idem, "five");
     r = backfill0(w, bob);
     CHECK(r && r->n_replay == 5 && r->replay[4].message_id == m5);
@@ -4672,7 +4675,7 @@ static void test_mark_all_read(void) {
         CHECK(sqlite3_step(st) == SQLITE_ROW);
         uint64_t newest_c2 = (uint64_t)sqlite3_column_int64(st, 0);
         sqlite3_finalize(st); sqlite3_close(raw);
-        client_ack(w, bob, c2, newest_c2);
+        client_ack(w, bob, c2, newest_c2, 1);
     }
 
     /* One job, answered with one result per channel that moved: the default
