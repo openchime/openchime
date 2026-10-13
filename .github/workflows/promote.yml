@@ -70,6 +70,39 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The candidate this commit's push built on staging (candidate.yml) has
+      # to exist before main moves: a release takes exactly that candidate and
+      # refuses without one, so refusing here keeps main from moving to a
+      # commit that cannot ship. The one way to arrive here without it is a
+      # promotion started before the candidate build finished; wait, then
+      # promote again.
+      - name: The candidate for this commit exists
+        timeout-minutes: 10
+        env:
+          DIST_S3_ENDPOINT:           ${{ vars.DIST_S3_ENDPOINT }}
+          DIST_S3_STAGING_ACCESS_KEY: ${{ secrets.DIST_S3_STAGING_ACCESS_KEY }}
+          DIST_S3_STAGING_SECRET_KEY: ${{ secrets.DIST_S3_STAGING_SECRET_KEY }}
+          DIST_STAGING_BUCKET:        ${{ vars.DIST_STAGING_BUCKET }}
+        run: |
+          set -euo pipefail
+          scripts/build/apt.sh rclone
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dist-staging]
+          type = s3
+          provider = Other
+          access_key_id = ${DIST_S3_STAGING_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_STAGING_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
+          EOF
+          id="${GITHUB_SHA:0:7}"
+          if rclone lsf "dist-staging:${DIST_STAGING_BUCKET}/candidates/${id}/manifest.json" 2>/dev/null | grep -q .; then
+            echo "candidate ${id} is stored"
+          else
+            echo "::error::no candidate for ${id}: candidate.yml has not stored one for this staging commit. Wait for its run (gh run list --workflow candidate.yml), then promote again."
+            exit 1
+          fi
       - name: Fast-forward main to the verified commit
         env:
           KEY: ${{ secrets.RELEASE_SSH_KEY }}

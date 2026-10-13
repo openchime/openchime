@@ -291,7 +291,7 @@ is the upstream's own stability contract for a base OS.
   the `:latest` tag, daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
   build, not to test, not locally, not in CI. This is a standing constraint;
-  see ARCH-36 and the header of `.github/workflows/release.yml`.
+  see ARCH-36 and the header of `.github/workflows/candidate.yml`.
 
 ## 6. Windows cross-compile artifacts
 

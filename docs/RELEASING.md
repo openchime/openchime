@@ -1,7 +1,59 @@
 # Releasing
 
-How `release.yml` publishes a version, and the things about it that are not
-obvious from reading the file.
+How a staging commit becomes a **candidate** (`candidate.yml`) and a candidate
+becomes a **release** (`release.yml`), and the things about both that are not
+obvious from reading the files.
+
+## Build id and release number
+
+A build is identified by its **build id**: the short commit it was built from
+(`74359c0`). The candidate build compiles it into the daemon and both Windows
+clients (`make OC_BUILD_ID=...`), and it is what `openchimed --version`, the
+startup log, `openchime-tui --version` and the Windows file properties
+(ProductVersion `build 74359c0`) report. Nothing about a release number is in
+a binary.
+
+A **release number** is a label assigned to one build id when it is released:
+`release-23` is build `74359c0`. It appears only where a public monotonic
+version is required: the deb and rpm version fields and filenames, the tarball
+and installer filenames, the installer's and the MSIX's version, the image tags
+`:23` and `:latest`, the `release-23` tag and the GitHub release, whose notes
+name the build id. The tag on the commit is the map from one to the other.
+
+Windows wants a numeric, growing file version. A commit is neither, so the
+file version is `1.0.<run>.0`, the run number of the candidate build that made
+the files, recorded in the candidate's manifest; the release's installer check
+reads it from there.
+
+## Candidates: built on staging, stored by build id
+
+Every push to `staging` runs `candidate.yml`, which waits for the push's CI,
+attribution-guard and commit-policy runs to pass and then builds everything a
+release ships, exactly as a release used to build it: both daemons with their
+data (zig against glibc 2.34, the arm64 one cross-built), the images (buildah,
+started with podman and asked `/healthz`), the Windows clients (llvm-mingw).
+The packaging scripts run under a placeholder version so a package that cannot
+be built, installed or made identical across channels stops the candidate; the
+packages themselves are not kept.
+
+What is kept, under `candidates/<build-id>/` in the staging bucket
+(`DIST_STAGING_BUCKET`, via the `dist-staging` rclone remote):
+
+    linux-amd64/openchimed-build-<id>-linux-amd64.tar.gz   the binary, tts/, stt/, web/
+    linux-arm64/openchimed-build-<id>-linux-arm64.tar.gz
+    windows-x64/openchime.exe, openchime-tui.exe, openchime.debug
+    manifest.json, manifest.json.asc
+
+The manifest (`scripts/release/candidate_manifest.sh`) names the build id, the
+full commit, the run number and id, every file's sha256 and size, and the
+digests of the images the candidate pushed to GHCR as `:build-<id>-amd64`,
+`:build-<id>-arm64` and the manifest list `:build-<id>`. It is signed with the
+archive signing key. The same files go up as a workflow artifact,
+`candidate-<id>`, for anyone who wants to look. Candidates older than thirty
+days that no `release-*` tag names are pruned.
+
+One candidate per commit. `make RELEASE=1 ARCH=aarch64 ... OC_BUILD_ID=<id>`
+is the same command a developer runs, so a candidate is reproducible by hand.
 
 ## Starting a release
 
@@ -14,8 +66,10 @@ and `promote.yml` does, in order:
 1. refuses unless it was started on `staging`;
 2. runs the full CI suite on that exact staging commit;
 3. confirms the attribution guard and commit policy passed on the push that put
-   the commit on `staging`, that `staging` has not moved on since, and that
-   `main` is its ancestor;
+   the commit on `staging`, that `staging` has not moved on since, that
+   `main` is its ancestor, and that **a candidate for the commit is stored**
+   (the one way there is none is a promotion started before the candidate
+   build finished: wait for it, then promote again);
 4. fast-forwards `main` to it with the repository's deploy key (`RELEASE_SSH_KEY`
    in the `release` environment).
 
@@ -26,22 +80,39 @@ deploy-key push starts workflows natively; no personal token is involved.
 
 `promote.yml` takes `dry_run`, which does everything except move `main`. A dry
 run of the release itself is `gh workflow run release.yml --ref staging -f
-dry_run=true`: the rehearsal of the next promotion, on the commit that would be
-promoted. `release.yml` otherwise runs on `main` only, whether pushed or
-dispatched — its first job, `branch`, refuses anything else, and a dry run on
-any ref but `staging` or `main`.
+dry_run=true`: it fetches staging's own candidate for that commit, packages it
+under the next number and publishes nothing. `release.yml` otherwise runs on
+`main` only, whether pushed or dispatched — its first job, `branch`, refuses
+anything else, and a dry run on any ref but `staging` or `main`.
 
 ## Shape
 
-    branch ─▶ guard ─────┐
-          ├─▶ test ──────┼─▶ version ─┬─▶ packages (amd64, arm64) ─▶ image ─▶ image-manifest ─┐
-          └─▶ preflight ─┘            └─▶ windows-build ─▶ windows-package ─────────────────────┴─▶ publish ─┬─▶ smoke
-                                                                                              ├─▶ close-issues
-                                                                                              └─▶ unreserve (on failure)
+`candidate.yml`, on every push to staging:
 
-`test` is `ci.yml` reused, not re-implemented: a release that ran a weaker suite
-than CI would be worse than no gate, because it would look like one. `guard` is
-the attribution guard, gated via `workflow_call`.
+    branch ─▶ id ──────┬─▶ packages (amd64, arm64) ─▶ image ─▶ image-manifest ─┐
+          ├─▶ gate ────┤                                                       ├─▶ store ─▶ prune
+          └─▶ preflight└─▶ windows-build ─▶ windows-package ───────────────────┘
+
+`release.yml`, on the promotion:
+
+    branch ─▶ guard ─────┐
+          └─▶ preflight ─┴─▶ candidate ─▶ version ─┬─▶ package (amd64, arm64) ─┬─▶ publish ─┬─▶ smoke
+                                                  └─▶ windows ────────────────┘            ├─▶ close-issues
+                                                                                           └─▶ unreserve (on failure)
+
+`candidate` fetches `candidates/<id>/` for `main`'s new head, verifies the
+manifest's signature and every file against it, unpacks the amd64 daemon and
+asks it `--version` (the id in the manifest is the id the code carries), and
+checks the image `:build-<id>` is in the registry with the digest the manifest
+recorded. `version` reserves the number. `package` runs the packaging scripts
+under it and proves the deb, the rpm and the tarball carry the candidate's
+binary. `windows` signs the candidate's exes and wraps them in the installer
+and the MSIX. `publish` writes the repositories, re-tags the image, creates the
+GitHub release and moves `:latest`. No compiler runs; a release takes minutes.
+
+`guard` is the attribution guard, gated via `workflow_call`. CI is not run
+again on main: the candidate exists only because CI passed on the commit on
+staging, and `promote.yml` gated on it once more before moving `main`.
 
 `close-issues` closes the issues the release shipped: every commit on `main`
 names its issue in the subject, and `scripts/release/close_shipped_issues.sh` reads the
@@ -97,13 +168,14 @@ surface is a real release, after the CI gate, both package builds, the image
 and the Windows binaries have all run.
 
 It gates **`version`**, not merely `publish`, and that is the point: the release
-number is reserved before anything is built and only returned when nothing was
+number is reserved before anything is packaged and only returned when nothing was
 published, so a run that cannot possibly publish would otherwise burn a number
 for nothing.
 
-A **dry run reports and continues** rather than failing. Its job is to prove the
-build, and failing it would stop anyone verifying one on a fork with no secrets —
-but surfacing the gap in a dry run is exactly what was impossible before.
+A **dry run reports and continues** rather than failing, and so does the
+candidate build: their job is to prove the build, and failing it would stop
+anyone verifying one on a fork with no secrets — but surfacing the gap is
+exactly what was impossible before.
 
 Authenticode signing is checked separately because it is optional (see *Windows
 signing is optional* below). The state worth naming is a **partial** trio: `SIGN`
@@ -113,14 +185,13 @@ ships unsigned. Preflight warns on that specifically.
 ## The release number is reserved, not assigned at the end
 
 `version` allocates N from the tags and **pushes `release-N` immediately**,
-before anything is built.
+once the candidate is verified and before anything is packaged.
 
-This is the opposite of the control plane, which tags after deploying, and the
-asymmetry is deliberate. Here the number is baked into `.deb` and `.rpm`
-filenames and into the apt/dnf indexes: if the tag push were last and it failed,
-release N would already be live and untagged, and the next run would compute N
-again, build different content and publish it under the same version. Two `.deb`s
-sharing a version is the one thing apt cannot recover from.
+The number goes into `.deb` and `.rpm` filenames and into the apt/dnf indexes:
+if the tag push were last and it failed, release N would already be live and
+untagged, and the next run would compute N again, package different content and
+publish it under the same version. Two `.deb`s sharing a version is the one
+thing apt cannot recover from.
 
 Reserving inverts the failure: the worst case is a **burnt number**, which costs
 nothing. The terminal `unreserve` job deletes the tag when `publish` did not
@@ -141,19 +212,17 @@ stops with nothing published. The tagging step near the end still **asserts**
 the tag rather than creating it; if that ever fires, something deleted the
 reservation mid-job.
 
-## `:latest` moves last
+## The image is the candidate's, re-tagged; `:latest` moves last
 
-`image` follows `packages`: it lays each architecture's release tarball onto a
-glibc base with **buildah** (`Dockerfile`, `packaging/image-context.sh`; no
-compile, no `RUN`, so the arm64 image is built on the x86 runner with
-`--arch arm64` and no emulation), starts the amd64 one with **podman** (daemonless,
-reading buildah's store) and asks it `/healthz`, so a fault in the `Dockerfile`,
-the entrypoint or the binary on that base stops the release rather than reaching
-the registry (the arm64 image is build-only, as its binary is), and pushes a
-per-architecture image; a separate `image-manifest` job then publishes the
-`:VERSION` manifest list that indexes them. The per-architecture tags (`:VERSION-amd64`, `:VERSION-arm64`) are
-an implementation detail — nothing is documented as pullable until the manifest
-exists.
+The candidate build's `image` job lays each architecture's tree onto a glibc
+base with **buildah** (`Dockerfile`, `packaging/image-context.sh`; no compile,
+no `RUN`, so the arm64 image is built on the x86 runner with `--arch arm64` and
+no emulation), starts the amd64 one with **podman** (daemonless, reading
+buildah's store) and asks it `/healthz`, so a fault in the `Dockerfile`, the
+entrypoint or the binary on that base stops the candidate rather than reaching
+the registry (the arm64 image is build-only, as its binary is), and pushes
+`:build-<id>-<arch>`; `image-manifest` pushes the manifest list `:build-<id>`.
+Nothing is documented as pullable under those tags.
 
 Everything Linux-hosted runs on one image, `ubuntu-24.04`, with every compiler
 fetched pinned by make (VENDORS.md §2, "Toolchains"). The arm64 daemon is
@@ -162,14 +231,13 @@ the render, the hearing check and the package install run for amd64; arm64 ships
 the same sources through the same compiler, asserted for its glibc floor and
 packaged, but not run.
 
-`:VERSION` **only**. If `:latest` moved there and a later job failed, `publish`
-would be skipped and `:latest` would point at a version with no packages, no tag
-and no release — anyone pulling `:latest` would be on a build that officially
-does not exist.
-
-`publish` moves it at the end with `skopeo copy --all`, which re-points the tag
-registry-side without pulling, preserving the digest. `--all` copies the whole
-manifest list rather than just the runner's architecture.
+The release re-tags with `skopeo copy`, which re-points tags registry-side
+without pulling or rebuilding, preserving the digest: `:build-<id>-<arch>`
+becomes `:N-<arch>`, the manifest list becomes `:N`, and only then `:N`
+becomes `:latest`. If `:latest` moved earlier and a later step failed,
+`:latest` would point at a version with no packages, no tag and no release.
+`--all` copies the whole manifest list rather than just the runner's
+architecture.
 
 ## The apt/dnf pool guard
 
@@ -295,14 +363,13 @@ containers (ARCH-36):
 - **The `.deb`** is installed on the runner itself and the binary is executed —
   Ubuntu rather than Debian, and a runner that is not pristine, but it proves
   the package unpacks, its dependencies resolve, and what it lays down runs.
-- **The `.rpm` is never installed by anything.** Nothing on a hosted runner can
-  install one. Between the identical-binary check and the apt repository smoke
-  test, the *binary* and the *signing and object layout* are both covered — but
-  nothing exercises `dnf`, so an rpm that builds and signs correctly yet fails to
-  install on the RHEL family will not be caught before it is published.
-- **The published-repository smoke test has no dnf half** for the same reason.
-  The apt half runs on the runner and shares the signing key and object layout
-  with the rpm repository, so faults in those still surface there.
+  The candidate build does it with the placeholder package; the release does
+  it again with the real one and asserts the installed daemon reports the
+  build id.
+- **The `.rpm` is installed only by the published-repository smoke test**, in
+  a `rockylinux:9` container with `dnf`, after publishing. Before that, the
+  identical-binary check covers its contents and the apt half of the smoke
+  covers the signing key and object layout the two repositories share.
 
 ## Windows signing is optional
 
@@ -316,7 +383,7 @@ credential.
 
 The second half is load-bearing: gating on a real release alone would invoke
 `Azure/artifact-signing-action` against an empty endpoint whenever credentials
-are absent. That fails `windows-package`, and `publish` needs it — so with no
+are absent. That fails `windows`, and `publish` needs it — so with no
 certificate a release would publish **nothing at all**: not the Windows
 installer, which cannot be signed, but also not apt, dnf, the image or the
 GitHub release, none of which needs a certificate.
@@ -375,12 +442,15 @@ Windows clients, and `make test`'s `scripts/check/release_lint.sh` keeps
 
 ## Dry runs
 
-`dry_run: true` builds and verifies everything and publishes nothing. It skips
-the version reservation, the per-architecture image push and `image-manifest`,
-Authenticode signing, `publish` (apt, dnf, the GitHub release and `:latest`),
-`smoke`, `unreserve` and `close-issues`. Note what that means for
-testing — a dry run **cannot** exercise any of those, because they are the parts
-it skips. The first real release is the first test of them.
+The candidate build is the rehearsal of the build: every staging push proves
+the daemons, the images and the Windows clients build, install, start and
+report their build id, and leaves the result stored. A release dry run
+(`release.yml` dispatched on staging with `dry_run: true`) rehearses the other
+half against that candidate: it fetches and verifies it, computes the next
+number without reserving it, packages both architectures under it, builds the
+installer unsigned, and skips `publish` (apt, dnf, the GitHub release, the
+re-tagging and `:latest`), `smoke`, `unreserve` and `close-issues`. Those are
+exercised only by a real release.
 
 A push is never a dry run: `inputs.*` is empty on a push, so every dry-run
 condition tests `github.event_name == 'workflow_dispatch' && inputs.dry_run`

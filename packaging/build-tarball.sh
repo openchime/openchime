@@ -99,8 +99,13 @@ fi
 INSTALL
 chmod 0755 "$dir/install.sh"
 
+# The build id the binary carries, for the README: OC_BUILD_ID when the caller
+# knows it (the release does; a cross-built binary cannot be asked), else the
+# binary's own answer.
+build="${OC_BUILD_ID:-$("$BINARY" --version 2>/dev/null | awk '{print $2}')}"
+[ -n "$build" ] || build=unknown
 cat > "$dir/README" <<EOF
-OpenChime daemon ${VERSION} (linux-${ARCH})
+OpenChime daemon release ${VERSION} (linux-${ARCH}), build ${build}
 
   sudo ./install.sh
 
@@ -123,9 +128,8 @@ EOF
 
 mkdir -p "$OUTDIR"
 out="${OUTDIR}/${name}.tar.gz"
-# Deterministic: fixed owner, sorted order, and a fixed mtime taken from the
-# release number rather than "now", so rebuilding the same release produces the
-# same bytes.
+# Deterministic: fixed owner, sorted order, and a fixed mtime rather than
+# "now", so packaging the same build again produces the same bytes.
 tar --sort=name --owner=root:0 --group=root:0 --mtime="@0" \
     -czf "$out" -C "$stage" "$name"
 

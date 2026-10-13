@@ -12,35 +12,43 @@
  * which was true of both binaries until this file existed, even though the
  * installer wrapping them carried one (packaging/windows/openchime.iss).
  *
- * The Makefile passes OC_VERSION_NUM to windres as bare digits, from the same
- * OC_VERSION that scripts/release/version.sh allocates and the daemon reports. A
- * source build leaves it unset and gets 0, matching the daemon's "dev".
+ * The Makefile passes two bare tokens to windres: OC_BUILD_NUM, the candidate
+ * build's run number, and OC_BUILD_ID_TOKEN, the short commit the daemon
+ * reports as its build id (docs/RELEASING.md). A source build leaves them
+ * unset and gets 0 and "dev", matching the daemon.
  *
- * Only the number crosses the command line, and the display string is built
- * here. That is deliberate: windres hands its arguments to the preprocessor
- * through a second shell, so a --define carrying quotes loses them on the way
- * and the string literal arrives as bare tokens. Digits have no such problem.
+ * Only bare tokens cross the command line, and the strings are built here.
+ * That is deliberate: windres hands its arguments to the preprocessor through
+ * a second shell, so a --define carrying quotes loses them on the way and the
+ * string literal arrives as bare tokens. A number, or a commit's hex, has no
+ * such problem; both are stringified below.
  *
- * Why 1.0.<release>.0: scripts/release/version.sh hands out a bare integer, and Windows wants
- * four fields. Third field, so the number increases monotonically -- the only
- * property Windows actually enforces. Same placement as the MSIX manifest and
- * the Inno script, so all three agree.
+ * Why 1.0.<run>.0: Windows wants four numeric fields and compares them, so the
+ * one thing a build has that only grows is the run number of the candidate
+ * build that made it. A release number is assigned afterwards and lives in
+ * the installer and the MSIX manifest, not in the file. The build id is the
+ * ProductVersion string, which is free text, so Properties > Details names
+ * the commit a bug report should quote.
  */
 #include <windows.h>
 
-#ifndef OC_VERSION_NUM
-#define OC_VERSION_NUM 0
+#ifndef OC_BUILD_NUM
+#define OC_BUILD_NUM 0
+#endif
+#ifndef OC_BUILD_ID_TOKEN
+#define OC_BUILD_ID_TOKEN dev
 #endif
 
 /* Two levels, because # does not expand its argument: the outer macro expands
-   OC_VERSION_NUM and the inner one stringifies the result. */
+   the token and the inner one stringifies the result. */
 #define OC_RES_STR_(x) #x
 #define OC_RES_STR(x)  OC_RES_STR_(x)
-#define OC_VERSION_STR "1.0." OC_RES_STR(OC_VERSION_NUM) ".0"
+#define OC_FILE_VERSION_STR "1.0." OC_RES_STR(OC_BUILD_NUM) ".0"
+#define OC_BUILD_ID_STR     "build " OC_RES_STR(OC_BUILD_ID_TOKEN)
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION    1,0,OC_VERSION_NUM,0
-PRODUCTVERSION 1,0,OC_VERSION_NUM,0
+FILEVERSION    1,0,OC_BUILD_NUM,0
+PRODUCTVERSION 1,0,OC_BUILD_NUM,0
 FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
 FILEFLAGS      0
 FILEOS         VOS_NT_WINDOWS32
@@ -55,11 +63,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "OpenChime"
             VALUE "FileDescription",  OC_RES_DESC
-            VALUE "FileVersion",      OC_VERSION_STR
+            VALUE "FileVersion",      OC_FILE_VERSION_STR
             VALUE "InternalName",     OC_RES_ORIG
             VALUE "OriginalFilename", OC_RES_ORIG
             VALUE "ProductName",      "OpenChime"
-            VALUE "ProductVersion",   OC_VERSION_STR
+            VALUE "ProductVersion",   OC_BUILD_ID_STR
             /* No LegalCopyright: the licence is an open decision and this is
                not the place to assert one. Add it when the tree gets a
                LICENSE file. */

@@ -56,7 +56,7 @@ or broken is not a document — it is the
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
-| [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and the GitHub release — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
+| [RELEASING.md](docs/RELEASING.md) | How a staging commit becomes a candidate and a candidate becomes a release on apt, dnf, GHCR and the GitHub release — build ids and release numbers, the pool guard that stops an index delisting prior releases, and the archive signing key's properties. |
 
 The daemon is the **chat core**. On the foundations — the
 wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
@@ -80,7 +80,7 @@ participants' devices ([docs/CALLS.md](docs/CALLS.md), [docs/AUDIO.md](docs/AUDI
 
 ## Install the daemon
 
-Four channels, one release number (ARCH-20). Packages are signed; the daemon
+Four channels, one binary, one build id (ARCH-20): `openchimed --version` names the commit it was built from, and the release number is the label the packages carry. Packages are signed; the daemon
 runs under systemd as a transient user with its state in `/var/lib/openchime`.
 
 **Debian / Ubuntu** — bookworm or 22.04 and newer:
@@ -150,7 +150,7 @@ on (`TTS`, `STT`, `SUM`, `WEB`) are remembered in `build/.features`, so a later
 `make distclean` forgets them. `make ARCH=aarch64` cross-builds the daemon for
 arm64 into `build/aarch64/` (build only), and `make RELEASE=1` builds the host's
 as the release does, with zig against glibc 2.34.
-`make OC_VERSION=<n>` stamps a release number into `openchimed --version`;
+`make OC_BUILD_ID=<commit>` stamps the build id into `openchimed --version`;
 an unstamped build reports `dev`. `make DEMO=1` builds the test switches in,
 which the GUI and web harness and the demo scripts need; a release never
 carries them, and `--version` says `(demo build)` when they are there

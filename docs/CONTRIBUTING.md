@@ -101,7 +101,7 @@ anywhere the registry does not know. A client setting goes through
 ## CI
 
 `ci.yml` runs on every pull request into `staging` and every push to `staging`,
-and is the gate `promote.yml` and `release.yml` call. It checks nothing twice:
+and is the gate `promote.yml` calls and `candidate.yml` waits for. It checks nothing twice:
 each test suite runs once, one clang compile serves as both the release-compiler
 and the second-compiler check, and what the release checks itself is left to the
 release. Every vendored library is cached by the script that builds it, and

@@ -12,16 +12,20 @@
 ; cost is that a machine-wide deployment is not possible from this installer;
 ; that case is the MSIX, or a future MSI.
 ;
-; Built by .github/workflows/release.yml, which passes the release number:
+; Built by .github/workflows/release.yml, which passes the release number it
+; assigned to the candidate's binaries (the binaries themselves carry the
+; build id, client/shared/res/version_info.rc):
 ;   ISCC.exe /DVersion=7 /Odist packaging/windows/openchime.iss
 
 #ifndef Version
   #define Version "0"
 #endif
 
-; The four-part form Windows expects in file version metadata. scripts/release/version.sh
-; hands out a bare integer, so it lands in the third field: 1.0.<release>.0
-; increases monotonically, which is the only property Windows requires.
+; The four-part form Windows expects in version metadata. The release number
+; is a bare integer, so it lands in the third field: 1.0.<release>.0 increases
+; monotonically, which is the only property Windows requires. This is the
+; installer's own version; the files inside carry the candidate build's run
+; number in the same field.
 #define FileVersion "1.0." + Version + ".0"
 
 [Setup]
