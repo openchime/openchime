@@ -79,7 +79,7 @@ void oc_capture_close(oc_capture *c);
 
 A backend is an `oc_capture_backend` — the same six operations — and the front
 functions forward to the one in use: the synthetic source when
-`OPENCHIME_TEST_CAPTURE` asks for it, otherwise `oc_capture_platform()`, which is
+`OPENCHIME_DEV_CAPTURE` asks for it, otherwise `oc_capture_platform()`, which is
 NULL on a platform with no backend.
 
 Errors are typed so the UI can say the right thing: `OC_CAP_DENIED` (the operating
@@ -136,11 +136,11 @@ window is minimised or covered is not drawn, and every screen-capture API return
 black or refuses (measured: Windows.Graphics.Capture one black frame, DXGI
 duplication `E_ACCESSDENIED`, GDI black). A window is captured either way.
 
-**The synthetic sources** are selected with `OPENCHIME_TEST_CAPTURE=synthetic` (or
+**The synthetic sources** are selected with `OPENCHIME_DEV_CAPTURE=synthetic` (or
 `denied`, which fails with `OC_CAP_DENIED`); `synthetic-camera` makes only the
 camera synthetic, so a real screen can be recorded with a known picture in its box.
 They are how every automated test and the GUI harness record without a camera.
-`OPENCHIME_TEST_SCREEN_GONE_MS` makes the synthetic screen go away after that long.
+`OPENCHIME_DEV_SCREEN_GONE_MS` makes the synthetic screen go away after that long.
 
 ### 3.3 Microphone and speaker
 
@@ -173,7 +173,7 @@ minutes of video is at most 155 MB.
 - **The byte budget.** The recorder also stops when the samples reach 155 MiB, so a
   take cannot outgrow the daemon's default video cap and fail at upload.
 - **The cap.** The recorder stops when the recorded duration reaches the cap. Tests
-  shorten it with `OPENCHIME_TEST_VIDEO_CAP_MS`.
+  shorten it with `OPENCHIME_DEV_VIDEO_CAP_MS`.
 - **Poster.** The first keyframe at or after 1 s is decoded back and written as JPEG
   (stb_image_write). A recording shorter than 1 s uses its first keyframe.
 - **A screen.** The screen is the capture the size comes from. The camera, when
@@ -356,7 +356,7 @@ player is the one place bytes reach a file, and only one the user chose.
 - **Seek.** To the keyframe at or before the target. Opus restarts 80 ms early and
   discards up to the matching sample, so sound resumes converged.
 - **Output.** I420 converted to BGRA for the UI; PCM into the playback ring. Tests
-  use `OPENCHIME_TEST_AUDIO=synthetic`, a sink that consumes at real-time pace.
+  use `OPENCHIME_DEV_AUDIO=synthetic`, a sink that consumes at real-time pace.
 
 ## 9. The Win32 client
 

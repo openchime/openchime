@@ -5,8 +5,8 @@
 #   scripts/gui/voice.sh --kill     # ... and shut it down afterwards
 #
 # A real daemon recognizing real speech: read-aloud renders a sentence, and the
-# client's synthetic microphone (OPENCHIME_TEST_AUDIO=synthetic with
-# OPENCHIME_TEST_MIC) speaks it, so every step from capture to the composer or
+# client's synthetic microphone (OPENCHIME_DEV_AUDIO=synthetic with
+# OPENCHIME_DEV_MIC) speaks it, so every step from capture to the composer or
 # the channel is the shipped code. It asserts that
 #
 #   - push to talk, by the held key, by UI Automation and by the mouse, puts the
@@ -127,9 +127,9 @@ HOLD=$(clip_secs)
 
 # --- launch against a daemon with voice input on --------------------------
 fresh_fixture
-export OPENCHIME_TEST_AUDIO=synthetic
-if [ "$PLAT" = web ]; then export OPENCHIME_TEST_MIC="$LIN_DIR/voice-mic.wav"
-else export OPENCHIME_TEST_MIC="$WIN_DIR\\voice-mic.wav"; fi
+export OPENCHIME_DEV_AUDIO=synthetic
+if [ "$PLAT" = web ]; then export OPENCHIME_DEV_MIC="$LIN_DIR/voice-mic.wav"
+else export OPENCHIME_DEV_MIC="$WIN_DIR\\voice-mic.wav"; fi
 "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
   [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }
@@ -214,7 +214,7 @@ drive vm close
 # --- a microphone the operating system blocks ---------------------------------
 say "== the microphone blocked"
 fresh_fixture
-OPENCHIME_TEST_AUDIO=mic-denied "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
+OPENCHIME_DEV_AUDIO=mic-denied "$DRIVE" launch >/dev/null 2>&1 || { say "launch failed"; exit 1; }
 t=0; until snap | grep 'authed=1 connected=1' >/dev/null; do
   [ "$t" -ge 200 ] && { say "the client never authenticated on :$OC_TEST_PORT"; exit 1; }
   sleep 0.1; t=$((t + 1))

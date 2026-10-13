@@ -929,8 +929,7 @@ author, and it may never exist at all. A "pending" flag would make every history
 search, backfill, unread and mention query responsible for excluding it, and the
 first one that forgot would leak unsent text into somebody else's transcript.
 
-The partial `idx_sched_due` is what the ~15 s firing sweep reads
-(`OPENCHIME_DEMO_SCHED_MS` shortens it in a demo build); `state` carries the outcome, and `fail_reason` is
+The partial `idx_sched_due` is what the ~15 s firing sweep reads; `state` carries the outcome, and `fail_reason` is
 shown to the author, because a message promised and not sent is the one case
 where silence is indefensible.
 

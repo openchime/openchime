@@ -1196,7 +1196,7 @@ static void test_transport_config(void) {
         setenv(names[i], "http://127.0.0.1:9/api", 1);
         CHECK(oc_config_load(err, sizeof err) == 0);
         setenv(names[i], "https://push.example.com/api", 1);
-        /* https is the transport; a demo build (this binary) additionally
+        /* https is the transport; development mode (the tests') additionally
          * refuses to ENROL anywhere but loopback, so for that name the https
          * form is refused with that reason, not the transport's. */
         if (i == 0) CHECK(oc_config_load(err, sizeof err) == 0);

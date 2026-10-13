@@ -9,7 +9,7 @@
 # Makefile's typed targets are the ones its header names; the configuration
 # registry is the one source of every OPENCHIME_* name, CONFIG.md's reference
 # and the packaged environment file (config.sh); and nothing that ships is a
-# demo build (release_lint.sh).
+# box in development mode (release_lint.sh).
 SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/refs.sh && scripts/check/make_targets.sh && scripts/check/config.sh && scripts/check/release_lint.sh
 
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
@@ -19,7 +19,7 @@ SOURCE_CHECKS := scripts/check/opcodes.sh shared/protocol.h && scripts/check/ref
 # always carries read-aloud's and voice input's test paths (stub engines) and
 # never needs ONNX Runtime, llama.cpp or Emscripten, whatever the switches say.
 TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
-TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT -DOC_DEMO \
+TEST_INC  := $(INC) $(SQLITE_INC) $(CORE_INC) $(MEDIA_INC) $(VOICE_INC) $(CALL_INC) $(TTSKIT_INC) -DOC_TTS -DOC_STT \
              -Itests -Iclient/gui/app -Iclient/gui/platform -Iclient/shared -Ituikit -Ithird_party/qrcodegen
 TEST_ALL_SRC := $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MEDIA_SRC) $(VOICE_SRC) $(CALL_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) \
                 $(TTSKIT_SRC) $(TTS_TEST_SRC) $(STT_TEST_SRC) $(QR_TEST_SRC) $(OSN_TEST_SRC)

@@ -8,6 +8,7 @@
 #   scripts/web/pair.sh up | a <cmd...> | b <cmd...> | down
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export OPENCHIME_MODE=development   # the fixtures (CONFIG.md "Mode")
 PORT="${OC_TEST_PORT:-9600}"
 HOST="${OC_TEST_HOST:-127.0.0.1}"
 DEV="${OC_TEST_DIR:-/tmp/openchime-pair}"
@@ -23,8 +24,8 @@ up)
   mkdir -p "$DEV"
   # The daemon once (the first launch starts it), then the pages; a tone of
   # its own for each client's synthetic microphone, as scripts/gui/pair.sh gives them.
-  OC_TEST_WHO=a OPENCHIME_TEST_TONE="${OC_TEST_TONE_A:-}" "$DRIVE" launch "$HOST:$PORT" alice:pw >/dev/null
-  OC_TEST_WHO=b OPENCHIME_TEST_TONE="${OC_TEST_TONE_B:-}" OC_TEST_NO_DAEMON=1 OC_TEST_NO_BUILD=1 "$DRIVE" launch "$HOST:$PORT" bob:pw >/dev/null
+  OC_TEST_WHO=a OPENCHIME_DEV_TONE="${OC_TEST_TONE_A:-}" "$DRIVE" launch "$HOST:$PORT" alice:pw >/dev/null
+  OC_TEST_WHO=b OPENCHIME_DEV_TONE="${OC_TEST_TONE_B:-}" OC_TEST_NO_DAEMON=1 OC_TEST_NO_BUILD=1 "$DRIVE" launch "$HOST:$PORT" bob:pw >/dev/null
   for who in a b; do
     ok=0
     for _ in $(seq 1 60); do

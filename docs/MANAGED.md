@@ -37,8 +37,8 @@ the relay's issuer), `OPENCHIME_AUTH=relay`, `OPENCHIME_JOIN` (an `owner:` or
   (`OC_CLAIM_WAIT_SECS`) while central cannot be reached; a refused ticket is
   not retried.
 
-## A demo build
+## Development mode
 
-A demo build (`make DEMO=1`) accepts the managed rows without the ticket, so
+Development mode (`OPENCHIME_MODE=development`) accepts the managed rows without the ticket, so
 the fixtures can stand in for a managed box (a user cap in the menu, a relay
 port nothing answers on); it still never enrols anywhere but loopback.

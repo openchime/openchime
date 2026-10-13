@@ -7619,9 +7619,7 @@ static void backfill_accept(int ep, conn **conns, oc_dbres *r) {
  *
  * Raised again immediately whenever one fires, so a backlog drains at queue
  * speed rather than one per tick — the flag is set by the result path below. */
-/* Overridable for tests, exactly as OPENCHIME_DEMO_MAINT_MS is: a suite
- * that has to wait fifteen real seconds to see a scheduled message fire is one
- * nobody runs. Floored so a bad value cannot busy-loop the writer. */
+/* The sweep's interval, from the configuration (config.c: fifteen seconds). */
 static __thread uint64_t g_sched_tick_ms;   /* from the configuration, when the loop starts */
 static uint64_t sched_tick_ms(void) { return g_sched_tick_ms; }
 
@@ -8210,8 +8208,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     }
     g_device_rl = oc_ratelimit_new(OC_DEVICE_LOOKUPS_MAX, OC_DEVICE_LOOKUPS_WINDOW, 1024);
 
-    /* Per-source-IP concurrent-connection cap (config.h; a demo build may
-     * change it, 0 disabling it). Blunts a connection-exhaustion flood from one
+    /* Per-source-IP concurrent-connection cap (config.h; development mode
+     * may change it, 0 disabling it). Blunts a connection-exhaustion flood from one
      * host while staying generous enough for a large office behind one NAT.
      * The global cap is OC_NETLOOP_MAX_FD. */
     int max_per_ip = oc_config_get()->max_conns_per_ip;

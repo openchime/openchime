@@ -37,7 +37,7 @@
 #include <string.h>
 
 const char *oc_default_suffix(void) {
-    const char *env = oc_env_demo("OPENCHIME_TEST_SUFFIX");
+    const char *env = oc_env_dev("OPENCHIME_DEV_SUFFIX");
     return env ? env : OC_SERVICE_SUFFIX;
 }
 

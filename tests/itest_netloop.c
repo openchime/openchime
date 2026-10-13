@@ -6320,7 +6320,7 @@ static void test_concurrent_load(int port, const uint8_t *pin) {
     for (int i = 0; i < N; i++) CHECK(args[i].ok == 1);
 }
 
-/* The per-address cap (OPENCHIME_DEMO_CONNS_PER_IP, 2 here) on the TLS port, run
+/* The per-address cap (OPENCHIME_DEV_CONNS_PER_IP, 2 here) on the TLS port, run
  * in test_http_stack's loop: two in and the third refused at accept, a close
  * giving its place back, and IPv6 counted by its /64 apart from 127.0.0.1. */
 static void throttle_checks(int port, const uint8_t *pin2) {
@@ -6433,7 +6433,7 @@ static size_t plain_exchange(int port, const char *req, char *buf, size_t cap) {
  *   - the health port counts against the same per-address cap as the TLS port;
  *   - and it is the loop's: once the loop stops, nothing answers it. */
 static void test_http_stack(int port, int hport) {
-    setenv("OPENCHIME_DEMO_CONNS_PER_IP", "2", 1);
+    setenv("OPENCHIME_DEV_CONNS_PER_IP", "2", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
@@ -6675,7 +6675,7 @@ static void test_http_stack(int port, int hport) {
     }
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
-    unsetenv("OPENCHIME_DEMO_CONNS_PER_IP");
+    unsetenv("OPENCHIME_DEV_CONNS_PER_IP");
     unlink("build/itest_http.db"); unlink("build/itest_http.db-wal"); unlink("build/itest_http.db-shm");
 }
 
@@ -6796,7 +6796,7 @@ static void test_auth_begin(int port) {
  * own loop, with loopback as the trusted forwarder and a per-address cap of two. */
 static void test_proxy_header(int port) {
     setenv("OPENCHIME_TRUSTED_PROXIES", "127.0.0.0/8", 1);
-    setenv("OPENCHIME_DEMO_CONNS_PER_IP", "2", 1);
+    setenv("OPENCHIME_DEV_CONNS_PER_IP", "2", 1);
     oc_tls_server srv2;
     CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
     uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
@@ -6840,7 +6840,7 @@ static void test_proxy_header(int port) {
     oc_dbwriter_stop(dbw2);
     oc_tls_server_free(&srv2);
     unsetenv("OPENCHIME_TRUSTED_PROXIES");
-    unsetenv("OPENCHIME_DEMO_CONNS_PER_IP");
+    unsetenv("OPENCHIME_DEV_CONNS_PER_IP");
     unlink("build/itest_proxy.db"); unlink("build/itest_proxy.db-wal"); unlink("build/itest_proxy.db-shm");
 }
 
@@ -6852,7 +6852,7 @@ int run_netloop_tests(void) {
     mkdir("build/itest_data", 0700);
     setenv("OPENCHIME_DATA_DIR", "build/itest_data", 1);
     /* A small call cap, so the call test can fill one (REQ-305). */
-    setenv("OPENCHIME_DEMO_CALL_MAX", "3", 1);
+    setenv("OPENCHIME_DEV_CALL_MAX", "3", 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -6965,7 +6965,7 @@ int run_netloop_tests(void) {
     }
 
     stop_loop(&arg, th);
-    unsetenv("OPENCHIME_DEMO_CALL_MAX");
+    unsetenv("OPENCHIME_DEV_CALL_MAX");
 
     if (failures == 0) {
         test_voice_input_absent(arg.port + 124, 1);

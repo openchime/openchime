@@ -167,7 +167,7 @@ done
 # --- the client, with no credentials -----------------------------------------
 "$HERE/scripts/gui/drive.sh" kill >/dev/null 2>&1 || true
 rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack" "$LIN_DIR/signin_url.txt"
-WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
+WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_MODE:OPENCHIME_DEV_DIR" OPENCHIME_DEV_DIR="$WIN_DIR" \
     setsid "$EXE" >/dev/null 2>&1 < /dev/null &
 disown
 await_shown
@@ -227,7 +227,7 @@ S="$(state wf)"
 grep -q '^workspaces=.* forgetting=0' <<<"$S" && grep -q '^authed=0' <<<"$S" || fail "the workspace was not forgotten: $(grep -E '^workspaces|^authed' <<<"$S")"
 "$HERE/scripts/gui/drive.sh" kill >/dev/null 2>&1 || true
 rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
-WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
+WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_MODE:OPENCHIME_DEV_DIR" OPENCHIME_DEV_DIR="$WIN_DIR" \
     setsid "$EXE" >/dev/null 2>&1 < /dev/null &
 disown
 await_shown
@@ -274,7 +274,7 @@ S="$(state wf)"
 grep -q '^workspaces=.* forgetting=0' <<<"$S" && grep -q '^authed=0' <<<"$S" || fail "the workspace was not forgotten: $(grep -E '^workspaces|^authed' <<<"$S")"
 "$HERE/scripts/gui/drive.sh" kill >/dev/null 2>&1 || true
 rm -f "$LIN_DIR/cmd" "$LIN_DIR/ack"
-WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \
+WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_MODE:OPENCHIME_DEV_DIR" OPENCHIME_DEV_DIR="$WIN_DIR" \
     setsid "$EXE" >/dev/null 2>&1 < /dev/null &
 disown
 await_shown

@@ -6,14 +6,31 @@
 A static server with the two headers a page needs to run WebAssembly threads
 (cross-origin isolation, for SharedArrayBuffer), which python's own server
 does not send. Development only; a deployment serves the files from the
-daemon's origin.
+daemon's origin. The page is served in development mode, as a development
+daemon serves it (daemon/webapp.c), so the harness's inputs work.
 """
 import http.server
 import os
 import sys
 
 
+MODE_MARK = b"/*OC_MODE*/'normal'"
+MODE_MARK_DEV = b"/*OC_MODE*/'development'"
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        path = self.translate_path(self.path)
+        if not path.endswith(".html") or not os.path.isfile(path):
+            return super().do_GET()
+        with open(path, "rb") as f:
+            body = f.read().replace(MODE_MARK, MODE_MARK_DEV, 1)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def end_headers(self):
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")

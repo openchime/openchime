@@ -162,11 +162,11 @@ struct oc_audio_dev {
     int64_t       syn_start_us;
     uint64_t      syn_frames;
     /* Synthetic capture: what the microphone "hears" instead of the tone, when
-     * OPENCHIME_TEST_MIC names a WAV (played once, then silence). */
+     * OPENCHIME_DEV_MIC names a WAV (played once, then silence). */
     int16_t      *syn_clip;
     size_t        syn_clip_n;
     /* Synthetic capture: the tone is silent for this many frames from open
-     * (OPENCHIME_TEST_MIC_LEAD_MS), while an echo is still heard. */
+     * (OPENCHIME_DEV_MIC_LEAD_MS), while an echo is still heard. */
     uint64_t      syn_lead;
     int           loopback;           /* capture of what the output device plays */
     int           ref_slot;           /* playback: its far-end reference slot, or -1 */
@@ -189,22 +189,22 @@ static void take_flush(oc_audio_dev *d) {
 }
 
 static int use_synthetic(void) {
-    const char *t = oc_env_demo("OPENCHIME_TEST_AUDIO");
+    const char *t = oc_env_dev("OPENCHIME_DEV_AUDIO");
     return t && (strcmp(t, "synthetic") == 0 || strcmp(t, "mic-denied") == 0);
 }
 
-/* `OPENCHIME_TEST_AUDIO=mic-denied`: the synthetic devices, with the microphone
+/* `OPENCHIME_DEV_AUDIO=mic-denied`: the synthetic devices, with the microphone
  * refused as the operating system refuses one it blocks. */
 static int mic_denied(void) {
-    const char *t = oc_env_demo("OPENCHIME_TEST_AUDIO");
+    const char *t = oc_env_dev("OPENCHIME_DEV_AUDIO");
     return t && strcmp(t, "mic-denied") == 0;
 }
 
-/* OPENCHIME_TEST_MIC: a 16-bit PCM WAV at `rate` with `channels`, for the
+/* OPENCHIME_DEV_MIC: a 16-bit PCM WAV at `rate` with `channels`, for the
  * synthetic microphone to speak -- so voice input is testable end to end on a
  * machine with no microphone. NULL (and the tone) when unset or unusable. */
 static int16_t *load_test_clip(int rate, int channels, size_t *n_out) {
-    const char *path = oc_env_demo("OPENCHIME_TEST_MIC");
+    const char *path = oc_env_dev("OPENCHIME_DEV_MIC");
     if (!path) return NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -333,7 +333,7 @@ static oc_audio_dev *open_dev(int capture, int loopback, const char *id, int rat
         d->synthetic = 1;
         if (capture && !loopback) d->syn_clip = load_test_clip(rate, channels, &d->syn_clip_n);
         if (capture && !loopback) {
-            const char *lead = oc_env_demo("OPENCHIME_TEST_MIC_LEAD_MS");
+            const char *lead = oc_env_dev("OPENCHIME_DEV_MIC_LEAD_MS");
             int ms = lead ? atoi(lead) : 0;
             if (ms > 0) d->syn_lead = (uint64_t)ms * (uint64_t)rate / 1000;
         }
@@ -362,7 +362,7 @@ oc_audio_dev *oc_audio_loopback_open(const char *output_id, int rate, int channe
 
 /* The synthetic computer sound: a 660 Hz tone over a spread of quieter ones, a
  * continuous function of the media clock alone -- so a synthetic microphone can
- * hear it back as an echo (OPENCHIME_TEST_MIC_ECHO) exactly as a room would,
+ * hear it back as an echo (OPENCHIME_DEV_MIC_ECHO) exactly as a room would,
  * whenever either opened. Continuous matters: a signal computed per sample index
  * shifts by whole samples as two clocks' grids slide past each other, which a
  * canceller sees as a room that keeps changing. */
@@ -373,18 +373,18 @@ static double syn_loop_value(double t_s) {
     return v;
 }
 
-/* The synthetic microphone's tone: 440 Hz, or OPENCHIME_TEST_TONE's. Two clients
+/* The synthetic microphone's tone: 440 Hz, or OPENCHIME_DEV_TONE's. Two clients
  * on one machine in a call each speak their own, so either can tell which of
  * them it is hearing. */
 static double mic_tone_hz(void) {
-    const char *t = oc_env_demo("OPENCHIME_TEST_TONE");
+    const char *t = oc_env_dev("OPENCHIME_DEV_TONE");
     double hz = t ? atof(t) : 0.0;
     return hz > 20.0 && hz < 7000.0 ? hz : 440.0;
 }
 
 /* 0 none; 1 the echo over the microphone's own tone; 2 the echo alone. */
 static int mic_echo(void) {
-    const char *t = oc_env_demo("OPENCHIME_TEST_MIC_ECHO");
+    const char *t = oc_env_dev("OPENCHIME_DEV_MIC_ECHO");
     if (!t || strcmp(t, "0") == 0) return 0;
     return strcmp(t, "only") == 0 ? 2 : 1;
 }

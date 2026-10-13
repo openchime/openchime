@@ -17,13 +17,11 @@ PLAT="${OC_TEST_PLATFORM:-}"
 if [ -z "$PLAT" ]; then
   if [ -n "${OC_TEST_DRIVE:-}${OC_TEST_PAIR:-}" ]; then PLAT=web; else PLAT=win32; fi
 fi
-# The daemon these scripts start must be a demo build (make DEMO=1): the
-# fixtures bootstrap their users (OPENCHIME_DEMO_USERS), which a production
-# build refuses; they sign in as a person does, on the daemon's pages.
-if [ -x "$HERE/openchimed" ] && ! "$HERE/openchimed" --version | grep -q 'demo build'; then
-  echo "lib.sh: $HERE/openchimed is not a demo build; the harness needs one: make DEMO=1" >&2
-  exit 2
-fi
+# The daemon and the clients these scripts start run in development mode
+# (CONFIG.md "Mode"): the fixtures bootstrap their users (OPENCHIME_DEV_USERS)
+# and the clients read their inputs (OPENCHIME_DEV_*), which no other mode
+# does; they sign in as a person does, on the daemon's pages.
+export OPENCHIME_MODE=development
 case "$PLAT" in
   win32) DRIVE="$HERE/scripts/gui/drive.sh"; PAIR="$HERE/scripts/gui/pair.sh" ;;
   web)   DRIVE="$HERE/scripts/web/drive.sh"; PAIR="$HERE/scripts/web/pair.sh" ;;
@@ -39,7 +37,7 @@ PAIR="${OC_TEST_PAIR:-$PAIR}"
 # signin_url.txt instead of opening a tab, and PowerShell on Windows -- where
 # the client's loopback is -- fetches the page and posts the form, following
 # the redirect back to the client's callback. The web client is its own
-# browser (OPENCHIME_TEST_SIGNIN, scripts/web/drive.sh) and needs none of this.
+# browser (OPENCHIME_DEV_SIGNIN, scripts/web/drive.sh) and needs none of this.
 #   play_browser <lin-dir> <user> <password>   # waits for the URL, signs in
 #   sign_in_card <drive...> -- <lin-dir> <user> <password>
 #       drives the card as the person would: Sign in (step 1 resolves and

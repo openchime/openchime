@@ -16,19 +16,20 @@ roots, a direct connection's secret).
 where there is anything to configure (`OPENCHIME_TLS=acme:chat.example.com`,
 `OPENCHIME_S3=s3://…`, `OPENCHIME_SUMMARY=cloud:<url>,<model>`), and
 **settings**, values with no feature behind them (the name, the data
-directory, the ports, who may join). Nineteen in all. Every path is under one
+directory, the ports, who may join, the mode). Twenty in all. Every path is under one
 `OPENCHIME_DATA_DIR` at a fixed name, the deployment model is derived from
 what the box was started with rather than declared, and everything nobody
 varies — session life, worker counts, queue depths, storage watermarks, rate
 limits, the call cap — is a constant in `daemon/config.h`, not a row. Seven
 more rows are the control plane's, written when it provisions a managed box
 ([MANAGED.md](./MANAGED.md)); set without its ticket they refuse the start.
-Eight are a demo build's test switches, which a production build refuses.
+Four more, and twelve the clients read, are development inputs, which only
+development mode reads ("Mode", below).
 
 **The daemon is strict about its environment.** A value that does not parse,
 a value outside its range, a name it does not know (a typo, or a name it no
-longer reads), a managed row without the ticket and, in a production build, a
-demo build's switch each stop the daemon before it opens anything, with one
+longer reads), a managed row without the ticket and, outside development
+mode, a development input each stop the daemon before it opens anything, with one
 line naming the variable, the value and what is accepted. An empty value is
 unset. There is no lenient mode:
 `openchimed --check-config --env-file /etc/openchime/openchimed.env` runs the
@@ -66,6 +67,32 @@ data and the web client are not configuration: they are found at
 with one says what replaced it, or the constant it became, and stops (the
 table at the end lists them).
 
+## Mode
+
+`OPENCHIME_MODE` says what a box is for, and it is the only thing that does:
+there is one build, and the same binary is a deployment, a test fixture or
+the public demo by this setting alone. The daemon and every client read it.
+
+| Mode | For | What it changes |
+|---|---|---|
+| `normal` (the default) | every deployment, self-hosted or managed | Nothing: the constants hold, and a development input refuses the daemon's start (a client ignores one). |
+| `development` | the tests, CI, the GUI and web harnesses, the scripts, a box of your own | The development inputs below are read: fixture accounts, a smaller call or file page, no per-address connection cap, and the clients' synthetic devices, test hook and sign-in typing. Enrolment and certificates through central reach a loopback test service only; the managed rows are taken without the ticket, so a fixture can stand in for a managed box. The startup log says so in capitals. |
+| `demo` | the public demo workspace | A development input refuses the start, as in `normal`. The demo's own rules are separate work. |
+
+Nothing that ships sets `development`: `make test` checks that no release
+path (the workflows, the Dockerfile, `packaging/`) names it or a development
+input (`scripts/check/release_lint.sh`). The test code behind the inputs is
+in every binary and does nothing outside development mode.
+
+**The web client takes its mode from the daemon that serves it.** A browser
+has no environment, so the page builds one, and its own address is not a
+source the mode may come from: a link must not be able to turn the harness on
+in a visitor's browser. The daemon writes its mode into the page it serves at
+`/app/`; only a page from a development daemon (or from
+`scripts/web/serve.py`, which serves one the same way) honours `?env=`,
+`?hook=`, `?cmd=`, `?shot=` and `?mic=`, and `?env=` never sets
+`OPENCHIME_MODE`.
+
 ---
 
 <!-- config-reference -->
@@ -79,6 +106,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `OPENCHIME_MODE` | `normal` | What the box is for: `normal` (a deployment), `development` (the tests and harnesses; the only mode that reads the Development rows) or `demo` (the public demo workspace). One of `normal`, `development`, `demo`. |
 | `OPENCHIME_WORKSPACE_NAME` | *(empty)* | The workspace's display name, shown to clients; unset, a client derives one from the host. |
 | `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`. |
 | `OPENCHIME_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54). Integer 1..65535. |
@@ -120,34 +148,30 @@ Written by the control plane when it provisions a managed box (MANAGED.md), with
 | `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` | `0` | The UDP port clients are told, where a front door maps it (AUDIO.md §4); 0 is the bound one. Integer 0..65535. |
 | `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX` | *(unset)* | Hex bytes (at most 16) that lead every relay token, so a front door can route by them. |
 
-## Demo builds only
+## Development mode only
 
-Read by a daemon or client built with `make DEMO=1` (TESTING.md). A production build refuses to start with any of them set; the code behind them is not in it.
+Read by the daemon or a client only when `OPENCHIME_MODE=development` (TESTING.md): the tests, the harnesses and the scripts. In any other mode each refuses the daemon's start, and a client ignores it.
 
-### Demo
+### Development
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_DEMO_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
-| `OPENCHIME_DEMO_FILE_PAGE` | `200` | How many files one LIST_FILES page carries, so a test sees a second page. Integer 1..200. |
-| `OPENCHIME_DEMO_CALL_MAX` | `10` | The most people in one call, so a test can fill one. Integer 2..32. |
-| `OPENCHIME_DEMO_CONNS_PER_IP` | `1024` | Connections one address may hold; 0 is no cap, for a load test from one host. Integer 0..1000000. |
-| `OPENCHIME_DEMO_MAINT_MS` | `300000` | How often the maintenance pass runs. Integer 1000..86400000. |
-| `OPENCHIME_DEMO_SCHED_MS` | `15000` | How often scheduled messages are swept. Integer 50..3600000. |
-| `OPENCHIME_DEMO_PRIVATE_UNFURL` | `off` | Turns the unfurl fetcher's SSRF gate off, so a test can fetch a loopback fixture. `on` or `off`. |
-| `OPENCHIME_DEMO_OS_ROOTS` | *(unset)* | The CA bundle read instead of the operating system's, for a test with its own CA. |
-| `OPENCHIME_TEST_DIR` | *(unset)* | GUI: the directory of the automation hook's command channel and dumps (TESTING.md). |
-| `OPENCHIME_TEST_AUDIO` | *(unset)* | Clients: `synthetic` audio devices, or `mic-denied`. |
-| `OPENCHIME_TEST_MIC` | *(unset)* | Clients: a WAV the synthetic microphone speaks. |
-| `OPENCHIME_TEST_MIC_LEAD_MS` | *(unset)* | Clients: silence before the WAV, in ms. |
-| `OPENCHIME_TEST_TONE` | *(unset)* | Clients: the synthetic microphone's tone in Hz (20 to 7000; 440 unset). |
-| `OPENCHIME_TEST_MIC_ECHO` | *(unset)* | Clients: the speaker echoed into the microphone (`1`), or alone (`only`). |
-| `OPENCHIME_TEST_CAPTURE` | *(unset)* | Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`. |
-| `OPENCHIME_TEST_SCREEN_GONE_MS` | *(unset)* | Clients: the synthetic screen ends after this many ms. |
-| `OPENCHIME_TEST_VIDEO_CAP_MS` | *(unset)* | Clients: a shorter video message cap, in ms. |
-| `OPENCHIME_TEST_CALL_TIMERS` | *(unset)* | Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset. |
-| `OPENCHIME_TEST_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14). |
-| `OPENCHIME_TEST_SIGNIN` | *(unset)* | Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md). |
+| `OPENCHIME_DEV_USERS` | *(unset)* | Accounts made at first start, `name:password:role,…`, for a fixture; a real deployment's first owner comes from the setup token. |
+| `OPENCHIME_DEV_FILE_PAGE` | `200` | How many files one LIST_FILES page carries, so a test sees a second page. Integer 1..200. |
+| `OPENCHIME_DEV_CALL_MAX` | `10` | The most people in one call, so a test can fill one. Integer 2..32. |
+| `OPENCHIME_DEV_CONNS_PER_IP` | `1024` | Connections one address may hold; 0 is no cap, for a load test from one host. Integer 0..1000000. |
+| `OPENCHIME_DEV_DIR` | *(unset)* | GUI: the directory of the automation hook's command channel and dumps (TESTING.md). |
+| `OPENCHIME_DEV_AUDIO` | *(unset)* | Clients: `synthetic` audio devices, or `mic-denied`. |
+| `OPENCHIME_DEV_MIC` | *(unset)* | Clients: a WAV the synthetic microphone speaks. |
+| `OPENCHIME_DEV_MIC_LEAD_MS` | *(unset)* | Clients: silence before the WAV, in ms. |
+| `OPENCHIME_DEV_TONE` | *(unset)* | Clients: the synthetic microphone's tone in Hz (20 to 7000; 440 unset). |
+| `OPENCHIME_DEV_MIC_ECHO` | *(unset)* | Clients: the speaker echoed into the microphone (`1`), or alone (`only`). |
+| `OPENCHIME_DEV_CAPTURE` | *(unset)* | Clients: `synthetic` camera and screen, `synthetic-camera`, or `denied`. |
+| `OPENCHIME_DEV_SCREEN_GONE_MS` | *(unset)* | Clients: the synthetic screen ends after this many ms. |
+| `OPENCHIME_DEV_VIDEO_CAP_MS` | *(unset)* | Clients: a shorter video message cap, in ms. |
+| `OPENCHIME_DEV_CALL_TIMERS` | *(unset)* | Clients: `probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>`, any subset. |
+| `OPENCHIME_DEV_SUFFIX` | *(unset)* | Clients: the DNS suffix appended to a bare workspace name instead of the service's (ARCH-14). |
+| `OPENCHIME_DEV_SIGNIN` | *(unset)* | Web client: `user:password` the harness types into the daemon's sign-in page for the person (TESTING.md). |
 
 ## No longer read
 
@@ -167,7 +191,7 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_AUDIO_PORT` | the call relay's UDP port is OPENCHIME_PORT |
 | `OPENCHIME_WORKSPACE_ADDRESS` | renamed OPENCHIME_MANAGED_ADDRESS (the control plane's) |
 | `OPENCHIME_MAX_USERS` | renamed OPENCHIME_MANAGED_MAX_USERS (the control plane's) |
-| `OPENCHIME_MAX_CONNS_PER_IP` | a constant, 1024; a demo build reads OPENCHIME_DEMO_CONNS_PER_IP |
+| `OPENCHIME_MAX_CONNS_PER_IP` | a constant, 1024; development mode reads OPENCHIME_DEV_CONNS_PER_IP |
 | `OPENCHIME_XFER_WORKERS` | a constant, 2 |
 | `OPENCHIME_SESSION_DAYS` | a constant, 30 |
 | `OPENCHIME_SESSION_IDLE_DAYS` | a constant: no idle limit |
@@ -197,14 +221,14 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_PRESSURE_MB` | a constant, 512 |
 | `OPENCHIME_MAINT_BATCH` | a constant, 64 |
 | `OPENCHIME_AUDIT_MAX_DAYS` | a constant, 365 |
-| `OPENCHIME_MAINT_INTERVAL_MS` | a constant, five minutes; a demo build reads OPENCHIME_DEMO_MAINT_MS |
-| `OPENCHIME_SCHED_TICK_MS` | a constant, fifteen seconds; a demo build reads OPENCHIME_DEMO_SCHED_MS |
+| `OPENCHIME_MAINT_INTERVAL_MS` | a constant, five minutes |
+| `OPENCHIME_SCHED_TICK_MS` | a constant, fifteen seconds |
 | `OPENCHIME_ENROLL_CODE_FILE` | the enrollment code is in the log |
 | `OPENCHIME_ENROLL_WAIT_SECS` | a constant: one attempt at first start, then each boot; a managed box waits two minutes for its claim |
 | `OPENCHIME_ENROLL_TICKET` | renamed OPENCHIME_MANAGED_TICKET |
 | `OPENCHIME_AUDIO_ADVERTISE_PORT` | renamed OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT (the control plane's) |
 | `OPENCHIME_AUDIO_TOKEN_PREFIX` | renamed OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX (the control plane's) |
-| `OPENCHIME_CALL_MAX` | a constant, 10; a demo build reads OPENCHIME_DEMO_CALL_MAX |
+| `OPENCHIME_CALL_MAX` | a constant, 10; development mode reads OPENCHIME_DEV_CALL_MAX |
 | `OPENCHIME_TTS_LANG` | the binary carries one language |
 | `OPENCHIME_TTS_QUEUE` | a constant, 256 |
 | `OPENCHIME_TTS_IDLE_SECS` | a constant, 300 |
@@ -217,11 +241,31 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_SUMMARY_MODEL` | OPENCHIME_SUMMARY=cloud:<url>,<model> |
 | `OPENCHIME_TEST_PASSWORD_AUTH` | removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h) |
 | `OPENCHIME_DEMO_PASSWORD_FRAMES` | removed: a password is taken only on the sign-in page; tests sign in through it (tests/testsignin.h) |
-| `OPENCHIME_BOOTSTRAP_USERS` | renamed OPENCHIME_DEMO_USERS |
-| `OPENCHIME_FILE_PAGE` | renamed OPENCHIME_DEMO_FILE_PAGE |
-| `OPENCHIME_UNFURL_ALLOW_PRIVATE` | renamed OPENCHIME_DEMO_PRIVATE_UNFURL |
-| `OPENCHIME_TEST_OS_ROOTS` | renamed OPENCHIME_DEMO_OS_ROOTS |
-| `OPENCHIME_SUFFIX` | the service suffix is built in; a demo client reads OPENCHIME_TEST_SUFFIX |
+| `OPENCHIME_BOOTSTRAP_USERS` | renamed OPENCHIME_DEV_USERS (OPENCHIME_MODE=development) |
+| `OPENCHIME_FILE_PAGE` | renamed OPENCHIME_DEV_FILE_PAGE (OPENCHIME_MODE=development) |
+| `OPENCHIME_UNFURL_ALLOW_PRIVATE` | nothing read it: the unfurl fetcher never reaches a private address |
+| `OPENCHIME_TEST_OS_ROOTS` | nothing read it: the operating system's roots, with OPENCHIME_EXTRA_CA beside them |
+| `OPENCHIME_DEMO_USERS` | renamed OPENCHIME_DEV_USERS (OPENCHIME_MODE=development) |
+| `OPENCHIME_DEMO_FILE_PAGE` | renamed OPENCHIME_DEV_FILE_PAGE (OPENCHIME_MODE=development) |
+| `OPENCHIME_DEMO_CALL_MAX` | renamed OPENCHIME_DEV_CALL_MAX (OPENCHIME_MODE=development) |
+| `OPENCHIME_DEMO_CONNS_PER_IP` | renamed OPENCHIME_DEV_CONNS_PER_IP (OPENCHIME_MODE=development) |
+| `OPENCHIME_DEMO_MAINT_MS` | nothing read it: the maintenance pass runs every five minutes |
+| `OPENCHIME_DEMO_SCHED_MS` | nothing read it: scheduled messages are swept every fifteen seconds |
+| `OPENCHIME_DEMO_PRIVATE_UNFURL` | nothing read it: the unfurl fetcher never reaches a private address |
+| `OPENCHIME_DEMO_OS_ROOTS` | nothing read it: the operating system's roots, with OPENCHIME_EXTRA_CA beside them |
+| `OPENCHIME_TEST_DIR` | renamed OPENCHIME_DEV_DIR (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_AUDIO` | renamed OPENCHIME_DEV_AUDIO (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_MIC` | renamed OPENCHIME_DEV_MIC (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_MIC_LEAD_MS` | renamed OPENCHIME_DEV_MIC_LEAD_MS (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_TONE` | renamed OPENCHIME_DEV_TONE (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_MIC_ECHO` | renamed OPENCHIME_DEV_MIC_ECHO (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_CAPTURE` | renamed OPENCHIME_DEV_CAPTURE (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_SCREEN_GONE_MS` | renamed OPENCHIME_DEV_SCREEN_GONE_MS (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_VIDEO_CAP_MS` | renamed OPENCHIME_DEV_VIDEO_CAP_MS (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_CALL_TIMERS` | renamed OPENCHIME_DEV_CALL_TIMERS (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_SUFFIX` | renamed OPENCHIME_DEV_SUFFIX (OPENCHIME_MODE=development) |
+| `OPENCHIME_TEST_SIGNIN` | renamed OPENCHIME_DEV_SIGNIN (OPENCHIME_MODE=development) |
+| `OPENCHIME_SUFFIX` | the service suffix is built in; a client in development mode reads OPENCHIME_DEV_SUFFIX |
 | `OPENCHIME_RECOVER_MB` | nothing read it |
 | `OPENCHIME_BLOB_BACKEND` | OPENCHIME_S3 set is S3; unset is local disk |
 | `OPENCHIME_STATE` | the TUI keeps its state in the credential store (ARCH-88) |
@@ -283,7 +327,7 @@ accepts, and any other stops it with exit status 2.
 | Argument | What it does |
 |---|---|
 | `--version`, `-V` | Prints the version and protocol version, then exits. |
-| `--check-config [--env-file PATH]` | Loads the configuration from the environment, with PATH's `NAME=value` lines applied over it (systemd's `EnvironmentFile` grammar), prints every setting's effective value and source, and exits 0 only when the daemon would start. |
+| `--check-config [--env-file PATH]` | Loads the configuration from the environment, with PATH's `NAME=value` lines applied over it (systemd's `EnvironmentFile` grammar), prints every setting's effective value and source and the mode it would start in, and exits 0 only when the daemon would start. |
 | `--config-reference` | Prints the settings reference above, as markdown, from the registry. |
 | `--config-env` | Prints the packaged environment file (`packaging/openchimed.env`), from the registry. |
 | `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to an MP4 at OUT with the built-in model, then exits. Only in a build with read-aloud. |
@@ -302,5 +346,4 @@ feature switches are remembered in `build/.features`).
 | `STT` | `0` | `1` builds voice input in; likewise `OPENCHIME_STT`. |
 | `SUM` | `0` | `1` builds llama.cpp in for `OPENCHIME_SUMMARY=local`; `cloud:…` works without it. |
 | `WEB` | `0` | `1` compiles the web client's loader into the daemon, which then serves it at `/app/`. |
-| `DEMO` | `0` | `1` builds the test switches in (the "Demo builds only" section): the tests, the GUI and web harness and the demo scripts need one; a release is never one, and `make` refuses `DEMO=1` with `RELEASE=1` or `OC_BUILD_ID`. `--version` says `(demo build)`. |
 | `OC_BUILD_ID` | *(unset: `dev`)* | The build id `--version` prints: the short commit the candidate build compiled (ARCH-20, RELEASING.md). A release number is assigned to a build afterwards and is not compiled in. |

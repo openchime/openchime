@@ -1073,14 +1073,14 @@ static void m_stop(void *ctx) {
 
 /* --- the frontend's calls ------------------------------------------------------- */
 
-/* The transport timers, shortened for a test: OPENCHIME_TEST_CALL_TIMERS is
+/* The transport timers, shortened for a test: OPENCHIME_DEV_CALL_TIMERS is
  * "probe:<ms>,udp_wait:<ms>,udp_lost:<ms>,tcp_probe:<ms>", any subset, read once when an
  * engine is made. Unset, the defaults above; a test of falling back to the
  * connection and back then takes a second rather than fifteen. */
 static void call_timers(oc_call_engine *e) {
     e->probe_ms = PROBE_MS; e->udp_wait_ms = UDP_WAIT_MS; e->udp_lost_ms = UDP_LOST_MS;
     e->tcp_probe_ms = TCP_PROBE_MS;
-    const char *v = oc_env_demo("OPENCHIME_TEST_CALL_TIMERS");
+    const char *v = oc_env_dev("OPENCHIME_DEV_CALL_TIMERS");
     for (const char *p = v; p && *p; ) {
         int *dst = !strncmp(p, "probe:", 6) ? &e->probe_ms :
                    !strncmp(p, "udp_wait:", 9) ? &e->udp_wait_ms :

@@ -20,28 +20,36 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
   // the sign-in view opens. The core dials host:port; Emscripten turns that into
   // one WebSocket at ws(s)://host:port/ws, the daemon's transport.
   const q = new URLSearchParams(location.search);
+  // The mode (CONFIG.md "Mode"): `normal` as built, rewritten by the daemon
+  // that serves this page when it runs in development mode (daemon/webapp.c),
+  // and by scripts/web/serve.py. Never read from the address: only on a page
+  // from a development daemon do the harness's inputs below (?hook=, ?shot=,
+  // ?cmd=, ?env=, ?mic=) do anything, so a link cannot turn them on.
+  const mode = /*OC_MODE*/'normal';
+  const dev = mode === 'development';
   const host = q.get('host') || location.hostname;
   const port = q.get('port') || location.port || (location.protocol === 'https:' ? '443' : '80');
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const status = document.getElementById('status');
-  // The test hook (OPENCHIME_TEST_DIR, TESTING.md), on the page's filesystem,
+  // The test hook (OPENCHIME_DEV_DIR, TESTING.md), on the page's filesystem,
   // when the page is opened with ?hook=1: ocHook('verb args') answers the ack,
   // and ?shot=<ms> logs the client's own screenshot as SHOT:<base64 BMP> after
   // that many milliseconds -- what scripts/web/test.sh reads.
   // ?hook=1 is kept for the tab: the sign-in leaves the page and comes back
   // to /app/ without the query, and the harness still wants the hook there.
-  if (q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }
-  let hookKept = false; try { hookKept = sessionStorage.getItem('oc.hook') === '1'; } catch (e) {}
-  // The test switches (?env=, ?mic=) are kept for the tab the same way: the
+  if (dev && q.get('hook') === '1') { try { sessionStorage.setItem('oc.hook', '1'); } catch (e) {} }
+  let hookKept = false; try { hookKept = dev && sessionStorage.getItem('oc.hook') === '1'; } catch (e) {}
+  // The development inputs (?env=, ?mic=) are kept for the tab the same way: the
   // sign-in leaves for the daemon's page and comes back without the query.
-  let envs = q.getAll('env'), micUrl = q.get('mic');
-  try {
+  // OPENCHIME_MODE itself is the page's, never an ?env=.
+  let envs = dev ? q.getAll('env').filter((kv) => !kv.startsWith('OPENCHIME_MODE=')) : [], micUrl = dev ? q.get('mic') : '';
+  if (dev) try {
     if (envs.length) sessionStorage.setItem('oc.env', JSON.stringify(envs));
     else envs = JSON.parse(sessionStorage.getItem('oc.env') || '[]');
     if (micUrl) sessionStorage.setItem('oc.mic', micUrl);
     else micUrl = sessionStorage.getItem('oc.mic') || '';
   } catch (e) {}
-  const hookOn = q.get('hook') === '1' || hookKept || q.has('shot') || q.has('cmd');
+  const hookOn = dev && (q.get('hook') === '1' || hookKept || q.has('shot') || q.has('cmd'));
   // The verb goes in, and the FRESH ack comes back: the old one is removed
   // first and the answer polled for, up to `wait` ms (a slow verb answers
   // late; a stale ack would be the previous verb's).
@@ -70,10 +78,11 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
     arguments: args,
     // The test knobs the native harness sets in the environment (TESTING.md)
     // are the page's ?env=NAME=value (repeatable); ?mic=<url> puts a WAV on the
-    // page's filesystem at /mic.wav for OPENCHIME_TEST_MIC.
+    // page's filesystem at /mic.wav for OPENCHIME_DEV_MIC.
     preRun: [() => {
+      ENV.OPENCHIME_MODE = mode;
       if (q.has('stats')) ENV.OC_WEB_STATS = '1';
-      if (hookOn) { ENV.OPENCHIME_TEST_DIR = '/t'; try { FS.mkdir('/t'); } catch (e) {} }
+      if (hookOn) { ENV.OPENCHIME_DEV_DIR = '/t'; try { FS.mkdir('/t'); } catch (e) {} }
       for (const kv of envs) { const i = kv.indexOf('='); if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1); }
       if (micUrl) {
         addRunDependency('mic');
@@ -92,11 +101,11 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
       if (q.get('open')) setTimeout(() => Module.ccall('oc_web_handoff', null, ['string', 'string'], ['url', q.get('open')]), 4000);
     },
   };
-  if (q.has('cmd')) setTimeout(async () => console.log('ACK:' + (await ocHook(q.get('cmd')))), parseInt(q.get('at') || '6000', 10));
+  if (hookOn && q.has('cmd')) setTimeout(async () => console.log('ACK:' + (await ocHook(q.get('cmd')))), parseInt(q.get('at') || '6000', 10));
   // ?ime=1: once signed in, a composition is played into the hidden input the
   // platform keeps for the input method (plat_web.c) -- what a Japanese IME
   // sends -- and the composer's text is logged as IME: for the web test.
-  if (q.get('ime') === '1') (async () => {
+  if (hookOn && q.get('ime') === '1') (async () => {
     const t0 = Date.now(); let line = '';
     while (Date.now() - t0 < 60000) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -122,7 +131,7 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
   // ?script=verb@ms|verb@ms…: each verb at its time after the client is signed
   // in, its ACK logged; then, after the last, DUMP: of the model -- the web
   // test's way of recording a video message end to end.
-  if (q.has('script')) (async () => {
+  if (hookOn && q.has('script')) (async () => {
     const t0 = Date.now(); let line = '';
     while (Date.now() - t0 < 60000) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -139,10 +148,10 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
     await ocHook('dump /dump.txt', 1500);
     try { console.log('DUMPALL:' + btoa(unescape(encodeURIComponent(FS.readFile('/dump.txt', { encoding: 'utf8' }))))); } catch (e) { console.log('DUMP-ERR:' + e); }
   })();
-  if (q.has('dumpat')) setTimeout(async () => { await ocHook('dump /dump.txt', 1200); try { console.log('DUMP:' + FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]); } catch (e) { console.log('DUMP-ERR:' + e); } }, parseInt(q.get('dumpat'), 10));
+  if (hookOn && q.has('dumpat')) setTimeout(async () => { await ocHook('dump /dump.txt', 1200); try { console.log('DUMP:' + FS.readFile('/dump.txt', { encoding: 'utf8' }).split('\n')[0]); } catch (e) { console.log('DUMP-ERR:' + e); } }, parseInt(q.get('dumpat'), 10));
   // ?wait=authed&shot=1: poll the model until it is signed in (or 60 s pass),
   // log that line as DUMP:, then the screenshot -- the test's whole exchange.
-  if (q.get('wait') === 'authed') (async () => {
+  if (hookOn && q.get('wait') === 'authed') (async () => {
     const t0 = Date.now(); let line = '';
     while (Date.now() - t0 < 60000) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -152,7 +161,7 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
     console.log('DUMP:' + line);
     if (q.has('shot')) { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }
   })();
-  else if (q.has('shot')) setTimeout(async () => { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }, parseInt(q.get('shot'), 10));
+  else if (hookOn && q.has('shot')) setTimeout(async () => { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }, parseInt(q.get('shot'), 10));
 }
 </script>
 <script src="openchime.js"></script>

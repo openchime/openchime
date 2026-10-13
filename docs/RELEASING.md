@@ -435,10 +435,11 @@ it misread. The packages run `openchimed --check-config --env-file
 refuse; an operator runs the same before restarting. The release notes of the
 first release carrying this say so.
 
-No shipped binary is a demo build: the release asserts the marker a `DEMO=1`
-build carries is absent from the daemon of each architecture and from the
-Windows clients, and `make test`'s `scripts/check/release_lint.sh` keeps
-`DEMO=1` out of the release workflow, the Dockerfile and `packaging/`.
+Nothing that ships runs in development mode. There is one build, and the
+tests run the binary that ships; what keeps a deployment ordinary is
+`OPENCHIME_MODE`, which defaults to `normal` (CONFIG.md "Mode"). `make test`'s
+`scripts/check/release_lint.sh` keeps `OPENCHIME_MODE=development` and every
+development input out of the workflows, the Dockerfile and `packaging/`.
 
 ## Dry runs
 

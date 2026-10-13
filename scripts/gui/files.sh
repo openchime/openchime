@@ -25,7 +25,7 @@ cpath() { if [ "$PLAT" = web ]; then printf '%s/%s' "$LIN_DIR" "$1"; else printf
 export OC_TEST_PORT="${OC_TEST_PORT:-9590}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-files}"
 export OC_TEST_WS="${OC_TEST_WS:-Files Fixture}"
-export OPENCHIME_DEMO_FILE_PAGE=2     # gui_drive passes the daemon its environment
+export OPENCHIME_DEV_FILE_PAGE=2     # gui_drive passes the daemon its environment
 
 kill_dev_daemon || { say "a daemon still holds :$OC_TEST_PORT; stop it and re-run"; exit 1; }
 rm -rf "$OC_TEST_DIR"

@@ -32,9 +32,8 @@ await() {   # a regex the screen must come to show
 }
 
 # --- the daemon, as shipped ---------------------------------------------------
-"$HERE/openchimed" --version | grep -q 'demo build' || { echo "tui_device: $HERE/openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
-env OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
-    OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Device Code" OPENCHIME_DEMO_USERS="dee:pw-dee:owner" \
+env OPENCHIME_MODE=development OPENCHIME_DATA_DIR="$D/data" OPENCHIME_PORT="$PORT" \
+    OPENCHIME_HEALTH_PORT=0 OPENCHIME_WORKSPACE_NAME="Device Code" OPENCHIME_DEV_USERS="dee:pw-dee:owner" \
     setsid "$HERE/openchimed" > "$D/daemon.log" 2>&1 < /dev/null &
 disown
 for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && { exec 3<&- 3>&-; break; }; sleep 0.2; done

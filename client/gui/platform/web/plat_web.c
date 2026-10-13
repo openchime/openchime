@@ -26,7 +26,7 @@
 #include <string.h>
 
 #include "platform.h"
-#include "env.h"        /* oc_env_demo: the harness's switches, demo builds only */
+#include "env.h"        /* oc_env_dev: the harness's inputs, development mode only */
 #include "st_canvas.h"
 
 static uint32_t g_evtype;
@@ -75,13 +75,13 @@ void *oc_plat_ring_map(const char *path, size_t size) { (void)path; (void)size; 
 void  oc_plat_ring_unmap(void *p, size_t size) { (void)p; (void)size; }
 int   oc_plat_handoff(const char *kind, const char *payload) { (void)kind; (void)payload; return 0; }
 /* The page goes to the daemon's sign-in page itself; it comes back to /app/
- * with the token (oc_plat_signin_result). A demo build with
- * OPENCHIME_TEST_SIGNIN=user:password set (TESTING.md) is its own harness: it
+ * with the token (oc_plat_signin_result). In development mode, with
+ * OPENCHIME_DEV_SIGNIN=user:password set (TESTING.md) is its own harness: it
  * posts the page's form as the person would type it -- same origin, so the
  * browser sends the Origin the page requires -- and follows the page's 303
  * back here with the token. The product path, with the typing done. */
 int   oc_plat_open_signin(const char *url) {
-    const char *typed = oc_env_demo("OPENCHIME_TEST_SIGNIN");
+    const char *typed = oc_env_dev("OPENCHIME_DEV_SIGNIN");
     if (typed && strchr(typed, ':')) {
         EM_ASM({
             var url = UTF8ToString($0);

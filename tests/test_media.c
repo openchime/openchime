@@ -136,7 +136,7 @@ static void test_mp4_audio_only(void) {
 /* A read-aloud rendering plays: an audio-only file has no picture, so the player
  * runs on the audio clock alone and ends where the audio does (ARCH-111). */
 static void test_player_audio_only(void) {
-    setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+    setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
     oc_opusenc *enc = oc_opusenc_open();
     CHECK(enc != NULL);
     if (!enc) return;
@@ -185,7 +185,7 @@ static void test_player_audio_only(void) {
         oc_player_close(p);
     }
     free(file);
-    unsetenv("OPENCHIME_TEST_AUDIO");
+    unsetenv("OPENCHIME_DEV_AUDIO");
 }
 
 static uint32_t rng_state = 12345;
@@ -264,7 +264,7 @@ static double psnr_y(const oc_frame *a, const oc_frame *b) {
 }
 
 static void test_vp9_roundtrip(void) {
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
     int err;
     oc_capture *cam = oc_capture_open(NULL, 1280, 720, 30, &err);
     CHECK(cam != NULL && err == OC_CAP_OK);
@@ -395,9 +395,9 @@ static int ffprobe_ok(const uint8_t *mp4, size_t len, uint32_t duration_ms) {
 static oc_rec_result g_rec;          /* shared with the player tests */
 
 static void test_recorder(void) {
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
-    setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "2500", 1);   /* past the 2 s keyframe: the poster and the slow decoder need it */
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
+    setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "2500", 1);   /* past the 2 s keyframe: the poster and the slow decoder need it */
     oc_recorder_opts o = { .width = 640, .height = 360, .fps = 30 };
     int err;
     oc_recorder *r = oc_recorder_open(&o, &err);
@@ -451,7 +451,7 @@ static void test_recorder(void) {
     CHECK(ffprobe_ok(g_rec.video, g_rec.video_len, g_rec.duration_ms));
 
     /* Stopping early. */
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "300000", 1);
+    setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "300000", 1);
     r = oc_recorder_open(&o, &err);
     CHECK(r != NULL);
     if (r) {
@@ -490,18 +490,18 @@ static void test_recorder(void) {
     if (r) { oc_recorder_start(r); msleep(50); oc_recorder_close(r); }
 
     /* The OS blocks the camera. */
-    setenv("OPENCHIME_TEST_CAPTURE", "denied", 1);
+    setenv("OPENCHIME_DEV_CAPTURE", "denied", 1);
     r = oc_recorder_open(&o, &err);
     CHECK(r == NULL && err == OC_REC_CAMERA_DENIED);
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
-    unsetenv("OPENCHIME_TEST_VIDEO_CAP_MS");
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    unsetenv("OPENCHIME_DEV_VIDEO_CAP_MS");
 }
 
 /* ---- player ------------------------------------------------------------------------- */
 
 static void test_player(void) {
     if (!g_rec.video) return;
-    setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+    setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
     oc_player *p = oc_player_open(g_rec.video, g_rec.video_len);
     CHECK(p != NULL);
     if (!p) return;
@@ -669,7 +669,7 @@ static void check_frame_rate(const char *what, const int64_t *pts_us, int n,
 /* The screen front end: the synthetic screen changes five times a second, and
  * frames still come at the frame rate, all one size, fitted inside the maximum. */
 static void test_screen_source(void) {
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
     oc_capture_device d[4];
     CHECK(oc_capture_list_screens(d, 4) == 2);
     CHECK(d[0].kind == OC_SOURCE_SCREEN && d[1].kind == OC_SOURCE_WINDOW);
@@ -765,16 +765,16 @@ static double tone_amp(const int16_t *x, size_t n, double hz) {
 }
 
 static void test_screen_recording(void) {
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
-    setenv("OPENCHIME_TEST_AUDIO", "synthetic", 1);
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    setenv("OPENCHIME_DEV_AUDIO", "synthetic", 1);
     /* The microphone hears the computer's sound back, 20 ms late at half strength:
      * a room, on a machine with speakers. */
-    setenv("OPENCHIME_TEST_MIC_ECHO", "1", 1);
+    setenv("OPENCHIME_DEV_MIC_ECHO", "1", 1);
     /* ...and the narrator draws breath before speaking, as a person does: a
      * second from when the microphone opens, so the recording, which starts a
      * frame or so later, opens on the computer's sound alone. See below. */
-    setenv("OPENCHIME_TEST_MIC_LEAD_MS", "500", 1);
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "2000", 1);
+    setenv("OPENCHIME_DEV_MIC_LEAD_MS", "500", 1);
+    setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "2000", 1);
 
     /* One recording, the camera in the top-left corner -- not the default, so a
      * recorder that ignored the choice would put it in the wrong place. Where
@@ -875,13 +875,13 @@ static void test_screen_recording(void) {
         oc_rec_result_free(&res);
     }
     /* The recording above plays the computer's sound back into the microphone
-     * too (OPENCHIME_TEST_MIC_ECHO), and asserts the computer's sound comes out
+     * too (OPENCHIME_DEV_MIC_ECHO), and asserts the computer's sound comes out
      * once, while the narrator talks over it: the echo-only case is the easier
      * one, and an uncancelled echo (~1.26 times the level) fails that check
      * already. */
-    unsetenv("OPENCHIME_TEST_MIC_LEAD_MS");
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "1200", 1);   /* the last second is what is heard */
-    unsetenv("OPENCHIME_TEST_MIC_ECHO");
+    unsetenv("OPENCHIME_DEV_MIC_LEAD_MS");
+    setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "1200", 1);   /* the last second is what is heard */
+    unsetenv("OPENCHIME_DEV_MIC_ECHO");
 
     /* A window, no camera, no computer sound: no box anywhere, the microphone only. */
     {
@@ -922,8 +922,8 @@ static void test_screen_recording(void) {
     }
 
     /* The window closes mid-recording: what came before it is kept. */
-    setenv("OPENCHIME_TEST_VIDEO_CAP_MS", "300000", 1);
-    setenv("OPENCHIME_TEST_SCREEN_GONE_MS", "500", 1);
+    setenv("OPENCHIME_DEV_VIDEO_CAP_MS", "300000", 1);
+    setenv("OPENCHIME_DEV_SCREEN_GONE_MS", "500", 1);
     {
         oc_recorder_opts o = { .height = 720, .fps = 30, .screen_id = "window:synthetic" };
         int err;
@@ -944,7 +944,7 @@ static void test_screen_recording(void) {
         }
     }
     /* Gone before anything was captured: refused as that. */
-    setenv("OPENCHIME_TEST_SCREEN_GONE_MS", "0", 1);
+    setenv("OPENCHIME_DEV_SCREEN_GONE_MS", "0", 1);
     {
         oc_recorder_opts o = { .height = 720, .screen_id = "window:synthetic" };
         int err;
@@ -952,9 +952,9 @@ static void test_screen_recording(void) {
         CHECK(r == NULL && err == OC_REC_SCREEN_GONE);
         if (r) oc_recorder_close(r);
     }
-    unsetenv("OPENCHIME_TEST_SCREEN_GONE_MS");
+    unsetenv("OPENCHIME_DEV_SCREEN_GONE_MS");
     /* The system refuses the capture. */
-    setenv("OPENCHIME_TEST_CAPTURE", "denied", 1);
+    setenv("OPENCHIME_DEV_CAPTURE", "denied", 1);
     {
         oc_recorder_opts o = { .height = 720, .screen_id = "screen:synthetic" };
         int err;
@@ -962,8 +962,8 @@ static void test_screen_recording(void) {
         CHECK(r == NULL && err == OC_REC_SCREEN_DENIED);
         if (r) oc_recorder_close(r);
     }
-    setenv("OPENCHIME_TEST_CAPTURE", "synthetic", 1);
-    unsetenv("OPENCHIME_TEST_VIDEO_CAP_MS");
+    setenv("OPENCHIME_DEV_CAPTURE", "synthetic", 1);
+    unsetenv("OPENCHIME_DEV_VIDEO_CAP_MS");
 }
 
 int run_media_tests(void) {
@@ -980,7 +980,7 @@ int run_media_tests(void) {
     test_screen_recording();
     test_player();
     oc_rec_result_free(&g_rec);
-    unsetenv("OPENCHIME_TEST_CAPTURE");
-    unsetenv("OPENCHIME_TEST_AUDIO");
+    unsetenv("OPENCHIME_DEV_CAPTURE");
+    unsetenv("OPENCHIME_DEV_AUDIO");
     return failures;
 }

@@ -22,7 +22,7 @@ typedef enum {
 typedef enum {
     CFG_OPERATOR, /* a setting or feature flag an operator decides: the reference's first part */
     CFG_MANAGED,  /* the control plane's, written at provision time; refused without its ticket */
-    CFG_DEMO,     /* a demo build's test switch; refused by a production build */
+    CFG_DEV,      /* a development input; refused unless OPENCHIME_MODE=development */
 } cfg_class;
 
 enum {

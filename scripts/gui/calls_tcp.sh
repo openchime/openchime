@@ -20,7 +20,7 @@ export OC_TEST_PORT="${OC_TEST_PORT:-9630}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-calls-tcp}"
 export OC_TEST_HOST="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 export OC_TEST_ADVERTISE_PORT=9   # discard: nothing answers there
-export OPENCHIME_TEST_AUDIO=synthetic
+export OPENCHIME_DEV_AUDIO=synthetic
 export OC_TEST_TONE_A=440 OC_TEST_TONE_B=660
 CH=1
 

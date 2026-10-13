@@ -10,13 +10,13 @@ cd "$(dirname "$0")/../.."
 CHROME="${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)}"
 [ -x "${CHROME:-/nonexistent}" ] || { echo "webtest: no Chromium (set CHROME)" >&2; exit 2; }
 [ -f build/web/openchime.js ] || { echo "webtest: build/web is not built (make web)" >&2; exit 2; }
-./openchimed --version | grep -q 'demo build' || { echo "webtest: ./openchimed is not a demo build (make DEMO=1)" >&2; exit 2; }
+export OPENCHIME_MODE=development   # the fixture's users (CONFIG.md "Mode")
 W=build/webtest; rm -rf "$W"; mkdir -p "$W/db" "$W/blobs"
 # The browser profiles are kept across runs: the compiled wasm is cached in them.
 mkdir -p build/webtest-profile
 PORT=18461; HPORT=18462; PAGE=18463
 env OPENCHIME_DATA_DIR="$W/data" OPENCHIME_PORT=$PORT OPENCHIME_HEALTH_PORT=$HPORT \
-    OPENCHIME_DEMO_USERS="alice:pw:owner" OPENCHIME_SUMMARY=off \
+    OPENCHIME_DEV_USERS="alice:pw:owner" OPENCHIME_SUMMARY=off \
     ./openchimed > "$W/daemon.log" 2>&1 &
 D=$!
 python3 scripts/web/serve.py build/web $PAGE > "$W/webdev.log" 2>&1 &
@@ -28,7 +28,7 @@ for _ in $(seq 1 100); do grep -q "healthz listening" "$W/daemon.log" 2>/dev/nul
 # after a while and takes the client's own screenshot, which is left in
 # $W/gui.bmp for a person to look at.
 {
-    URL2="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_TEST_SIGNIN%3Dalice%3Apw&wait=authed&shot=1"
+    URL2="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw&wait=authed&shot=1"
     timeout 90 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
         --user-data-dir="build/webtest-profile/gui" --no-first-run --disable-background-networking \
@@ -61,7 +61,7 @@ PY
     # Media (WEB.md): a video message recorded from the synthetic camera and the
     # browser's (fake) microphone through Web Audio, stopped, and the file taken
     # -- the same recorder, codecs and muxer the desktop runs, in wasm.
-    URL3="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_TEST_SIGNIN%3Dalice%3Apw&hook=1&env=OPENCHIME_TEST_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000"
+    URL3="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000"
     timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
@@ -98,7 +98,7 @@ PY
     echo "  audio: ${audio:-not reported}"
     # The input method (plat_web.c): a composition played into the page's
     # hidden input ends in the composer, as a desktop IME's does.
-    URL4="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_TEST_SIGNIN%3Dalice%3Apw&hook=1&ime=1"
+    URL4="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw&hook=1&ime=1"
     timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
         --user-data-dir="build/webtest-profile/ime" --no-first-run --disable-background-networking \

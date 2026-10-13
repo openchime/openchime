@@ -22,6 +22,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export OPENCHIME_MODE=development   # a box of your own (CONFIG.md "Mode")
 SAAS="$ROOT/../openchime-saas"
 WORK="$(mktemp -d)"
 CP=http://localhost:5176
@@ -52,7 +53,7 @@ CP_PID=$!
 for _ in $(seq 1 60); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$CP/healthz" 2>/dev/null)" = "200" ] && break; sleep 1; done
 
 say "Start a daemon in relay mode, enrolled with central (its keys come from $CP/oidc/jwks)"
-( cd "$ROOT" && make DEMO=1 openchimed >/dev/null && make build/demo_client >/dev/null )
+( cd "$ROOT" && make openchimed >/dev/null && make build/demo_client >/dev/null )
 mkdir -p "$WORK/data"
 OPENCHIME_DATA_DIR="$WORK/data" OPENCHIME_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" \
 OPENCHIME_AUTH=relay OPENCHIME_ENROLL_URL="$CP" \

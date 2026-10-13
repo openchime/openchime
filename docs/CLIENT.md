@@ -830,8 +830,8 @@ none, which is exactly the case the prompt exists for.
 
 **Workspace resolution (REQ-010/011,** `client/core/resolve.c`**).** A
 user-typed workspace — a full domain (`chat.acme.com`) or a bare
-name (`acme`, which gets the service suffix — or a demo build's
-`$OPENCHIME_TEST_SUFFIX` — appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
+name (`acme`, which gets the service suffix — or, in development mode,
+`$OPENCHIME_DEV_SUFFIX` — appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
 the domain's A record at 443. A resolution failure is a distinct status, so the
 TUI tells "workspace not found" apart from "could not reach the server" (connect)
 and "auth failed" (login). The TUI accepts `<workspace>` (resolved) or a raw
@@ -863,7 +863,7 @@ on black so any terminal's colours read the same) where the terminal has room,
 the daemon's fingerprint where the browser will warn about its certificate, and
 the time left; it also opens the page where there is a desktop to open it on,
 and Esc cancels. A `host port user:pw` command line still signs in by password,
-against a daemon with the demo build's switch. The dialog resolves the workspace on submit
+against a daemon in development mode. The dialog resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
 reason and refocuses the password to retry. *Remember me* gates whether the
 session token persists (the store) or stays session-only. A returning user with a

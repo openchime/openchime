@@ -53,9 +53,9 @@ order" belongs in integration.
 ### 2.1 Convention
 
 - All unit and in-process integration suites compile into **one** binary,
-  `build/tests`, run by `make test`, and that binary is a **demo build**
-  (`-DOC_DEMO`, like `make DEMO=1`): the suites set the test switches (CONFIG.md
-  "Demo builds only"), which a production build has no code for; they sign in
+  `build/tests`, run by `make test`, and that binary runs in **development
+  mode** (it sets `OPENCHIME_MODE=development` for itself, CONFIG.md "Mode"):
+  the suites set the development inputs, which no other mode reads; they sign in
   as a person does, through the daemon's page (`tests/testsignin.h`). There is deliberately no per-test binary:
   the tests exercise public APIs, so each `tests/*.c` links the real module
   objects rather than `#include`-ing the `.c` under test.
@@ -303,10 +303,9 @@ Unit tests must be reproducible and independent of wall-clock or environment:
   source**: `dbw_now_ms` calls `clock_gettime` directly with no override seam, so
   determinism here comes from asserting relative facts rather than from
   scripting time. What *is* injectable is the interval a periodic job runs at
-  (`oc_dbwriter_set_idem_retention`, `OPENCHIME_DEMO_MAINT_MS`,
-  `OPENCHIME_DEMO_SCHED_MS`, `oc_netloop_set_relay_silence_ms`,
-  `oc_netloop_set_presence_rate_ms`, `OPENCHIME_TEST_CALL_TIMERS`,
-  `OPENCHIME_TEST_VIDEO_CAP_MS`), which is what lets a suite compress a clock it
+  (`oc_dbwriter_set_idem_retention`, `oc_netloop_set_relay_silence_ms`,
+  `oc_netloop_set_presence_rate_ms`, `OPENCHIME_DEV_CALL_TIMERS`,
+  `OPENCHIME_DEV_VIDEO_CAP_MS`), which is what lets a suite compress a clock it
   cannot fake.
 - **A check that something does NOT happen never waits out a timeout to say
   so.** It waits for something that must come *after* the thing it rules out,
@@ -436,7 +435,7 @@ same helper is the `signin` command (`build/signin`) and links into the e2e,
 demo and bench clients; the GUI harness presses the card's Sign in and plays
 the browser from the URL the client publishes under its hook (`sign_in_card`
 and `play_browser`, `scripts/gui/lib.sh`), and the web client, its own browser,
-types for the harness with `OPENCHIME_TEST_SIGNIN=user:password` (demo builds).
+types for the harness with `OPENCHIME_DEV_SIGNIN=user:password` (development mode).
 `test_jwt`: a token the daemon's issuer mints verifies against its key, name and
 audience, and not with a byte changed, for another audience, from another key or
 past its time; a `sub` names a user only as `local|<id>`. `itest_netloop`
@@ -681,8 +680,9 @@ works. Nothing proves the shipped *image* works (§3.2).
 
 The browser build (WEB.md) is checked where a Chromium is present (a
 developer's box today; a CI job once the runner has one; make fetches
-Emscripten itself). The daemon it starts must be a demo build (`make DEMO=1`):
-the check signs in by password and bootstraps its user.
+Emscripten itself). The daemon it starts, and the page `scripts/web/serve.py`
+serves, run in development mode: the check signs in by password and
+bootstraps its user.
 `make web-test` runs the first two:
 
 - **The gfx pixel test** — `client/gui/gfx/gfx_test_win.c` compiled to wasm
@@ -1199,7 +1199,7 @@ verb to the page's hook, takes a `dump` or `shot` back out of the page's
 filesystem into that directory, and copies an `attach`ed file onto the page
 first so the verb names a path the client can read. The browser runs with
 Chromium's fake camera and microphone, its own permission prompts answered,
-its screen picker choosing the screen; `OPENCHIME_TEST_AUDIO`, `_MIC`,
+its screen picker choosing the screen; `OPENCHIME_DEV_AUDIO`, `_MIC`,
 `_CAPTURE`, `_TONE` and the other switches reach the page as `?env=`, and a
 `_MIC` WAV is served to it. Needs `node`, the `playwright-core` package
 (`package.json`; `launch` installs it) and a Chromium (`CHROME`, else
@@ -1229,9 +1229,9 @@ mismatched pair is the thing under test, such as the version-reject path.
 `scripts/gui/lib.sh` (the feature scripts), `scripts/gui/drive.sh` and
 `scripts/web/drive.sh` (one client) and the two `pair.sh` (two clients); an older
 prefix in the environment (`OC_DEV_`, `OC_PAIR_`, `OC_GUI_`, `OC_DRIVE_`,
-`OC_WEB_`) is refused by name. The daemon they start must be a demo build
-(`make DEMO=1`, CONFIG.md "Demo builds only"); the scripts check `--version`
-first and say so otherwise.
+`OC_WEB_`) is refused by name. The daemon and the clients they start run in
+development mode (`scripts/gui/lib.sh` exports `OPENCHIME_MODE=development`,
+CONFIG.md "Mode"), and any build will do.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -1265,10 +1265,10 @@ finds nothing there does not try again. Only the daemon on `OC_TEST_PORT` — fo
 by its environment — is restarted.
 
 **Video messages drive on a synthetic camera.** Launch with
-`WSLENV=OPENCHIME_TEST_CAPTURE:OPENCHIME_TEST_AUDIO OPENCHIME_TEST_CAPTURE=synthetic
-OPENCHIME_TEST_AUDIO=synthetic scripts/gui/drive.sh launch` (add
-`OPENCHIME_TEST_VIDEO_CAP_MS` to shorten the five-minute cap, or
-`OPENCHIME_TEST_CAPTURE=denied` for the blocked-camera path). The `vm` verb opens,
+`WSLENV=OPENCHIME_DEV_CAPTURE:OPENCHIME_DEV_AUDIO OPENCHIME_DEV_CAPTURE=synthetic
+OPENCHIME_DEV_AUDIO=synthetic scripts/gui/drive.sh launch` (add
+`OPENCHIME_DEV_VIDEO_CAP_MS` to shorten the five-minute cap, or
+`OPENCHIME_DEV_CAPTURE=denied` for the blocked-camera path). The `vm` verb opens,
 records, stops, sends, plays and closes by name, and `dump` reports the overlay on
 its `vm=` line. The synthetic source never opens a real camera, so a run cannot
 turn on the camera of the machine it happens to be on.
@@ -1374,7 +1374,7 @@ the target picker, or the composer's key routing.
 
 `scripts/gui/smoke.sh` answers one question —
 **does the client boot and run** — in about ten seconds across fourteen checks.
-It drives the client through the test hook (`OPENCHIME_TEST_DIR`) and stands up
+It drives the client through the test hook (`OPENCHIME_DEV_DIR`) and stands up
 its own fixture daemon on its own port. It is the pre-push gate; it is not a
 feature suite and does not aspire to be one.
 
@@ -1416,8 +1416,8 @@ check can erase the evidence a wait is polling for.
 
 `scripts/gui/screenrec.sh` records with real Windows.Graphics.Capture against its
 own fixture daemon (port 9530), with a known picture in the camera box
-(`OPENCHIME_TEST_CAPTURE=synthetic-camera`) and known sound
-(`OPENCHIME_TEST_AUDIO=synthetic`: the microphone 440 Hz, the computer 660 Hz). It
+(`OPENCHIME_DEV_CAPTURE=synthetic-camera`) and known sound
+(`OPENCHIME_DEV_AUDIO=synthetic`: the microphone 440 Hz, the computer 660 Hz). It
 asserts the screens and windows listed, the box in the chosen corner of the preview
 (colour bars at the rectangle the dump's `vmsrc` line and `oc_inset_rect` put it),
 the card stepping aside for the recording bar, the bar kept out of the capture and
@@ -1507,7 +1507,7 @@ Not in CI, for the smoke's reason.
 ## Reading the files harness
 
 `scripts/gui/files.sh` pages the Win32 files view (REQ-143) against its own
-fixture daemon (port 9590) with `OPENCHIME_DEMO_FILE_PAGE=2`, so three uploads are
+fixture daemon (port 9590) with `OPENCHIME_DEV_FILE_PAGE=2`, so three uploads are
 enough to see paging a real daemon would only show past two hundred files. It
 asserts that the first page holds its two rows and says more remain; that "Load
 more" is published to assistive technology; that pressing it APPENDS the next
@@ -1599,14 +1599,14 @@ file on disk for everything after it to read.
 
 `scripts/gui/calls.sh` runs two Win32 clients in a call over `scripts/gui/pair.sh`
 against its own fixture daemon (port 9620): alice's synthetic microphone at
-440 Hz, bob's at 660 Hz (`OPENCHIME_TEST_TONE`). The clients reach the daemon at
+440 Hz, bob's at 660 Hz (`OPENCHIME_DEV_TONE`). The clients reach the daemon at
 the WSL machine's own address rather than 127.0.0.1, because WSL forwards only TCP
 there and a call's audio is UDP. It asserts the start and bob's invitation (his
 Calls section and a notification), both in the call hearing each other with
 every packet decrypting once the keys are in, noise suppression taking a steady
 hum out, bob muted and seen muted, push to talk, a per-person volume, only the
 starter ending, the missed-call line, and screen sharing — alice shares the
-synthetic screen (`OPENCHIME_TEST_CAPTURE=synthetic`), bob's view shows it with
+synthetic screen (`OPENCHIME_DEV_CAPTURE=synthetic`), bob's view shows it with
 readable, rising frame numbers, full screen and Esc, actual size, the
 accessibility names, bob taking over and stopping. It reads the dump's `call` line — `in=
 parts= epoch= sent= keepalives= tx_epoch= self= slot=` — its `call.peer` lines —
@@ -1676,12 +1676,12 @@ the EDIT given a fixed height again.
 
 `scripts/gui/voice.sh` drives voice input in the Win32 client end to end against
 its own fixture daemon (port 9510), with real recognition: read-aloud renders a
-sentence, and `OPENCHIME_TEST_AUDIO=synthetic` with `OPENCHIME_TEST_MIC=<wav>`
+sentence, and `OPENCHIME_DEV_AUDIO=synthetic` with `OPENCHIME_DEV_MIC=<wav>`
 makes the client's microphone speak it. It asserts push to talk by the held key,
 by UI Automation and by the mouse (words in the composer, nothing sent), free talk
 (the words posted, the composer untouched), that leaving the conversation and
 opening the video recorder end a session, that a blocked microphone
-(`OPENCHIME_TEST_AUDIO=mic-denied`) is reported, and that with `OPENCHIME_STT=0`
+(`OPENCHIME_DEV_AUDIO=mic-denied`) is reported, and that with `OPENCHIME_STT=0`
 there are no controls at all. It reads the dump's `dictate` line — `avail=
 offered= on= mode= hold= sent= answered= words= err=` and the button rects — and
 its `toast[n]` lines. Not in CI, for the smoke's reason. Run it when a change
@@ -1712,7 +1712,7 @@ it drew.
 **The paint ledger** (`gfx_ledger_dump`, verb `ledger <path>`) is one row per
 primitive, in draw order, with the rect, the clip in force, the colour and a
 tag — see the note in `client/gui/gfx/gfx.h`. It is allocated only when
-`OPENCHIME_TEST_DIR` is set. From it, `scripts/gui/audit/oracles.py` asks questions
+`OPENCHIME_DEV_DIR` is set. From it, `scripts/gui/audit/oracles.py` asks questions
 a single frame can answer:
 
 - a string whose raster runs past its clip is **truncated**, and nothing on

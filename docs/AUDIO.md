@@ -215,12 +215,12 @@ callback to its media thread with a lock-free single-producer ring. The callback
 never allocates, locks or does I/O; captured samples are stamped from the media
 clock video frames use; playback reports the samples the device has consumed,
 which is the clock a player — or a call's jitter buffer — runs on. Video messages
-record at 48 kHz mono; calls open it at 16 kHz. `OPENCHIME_TEST_AUDIO=synthetic`
+record at 48 kHz mono; calls open it at 16 kHz. `OPENCHIME_DEV_AUDIO=synthetic`
 swaps the devices for a tone source and a real-time sink, so both run in
-`make test` on a machine with no sound hardware; with it, `OPENCHIME_TEST_MIC=<wav>`
-makes the synthetic microphone speak a recording, and `OPENCHIME_TEST_AUDIO=mic-denied`
+`make test` on a machine with no sound hardware; with it, `OPENCHIME_DEV_MIC=<wav>`
+makes the synthetic microphone speak a recording, and `OPENCHIME_DEV_AUDIO=mic-denied`
 refuses the microphone as the operating system refuses a blocked one — which is how
-`scripts/gui/voice.sh` drives voice input — and `OPENCHIME_TEST_TONE` changes the
+`scripts/gui/voice.sh` drives voice input — and `OPENCHIME_DEV_TONE` changes the
 synthetic microphone's tone, which is how `scripts/gui/calls.sh` tells two clients
 apart.
 

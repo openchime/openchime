@@ -51,7 +51,7 @@
 #include "store.h"      /* peek a stored session token (skip the login box) */
 #include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
-#include "env.h"        /* the demo build's switches, and whether this is one */
+#include "env.h"        /* the development inputs */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 #include "net.h"        /* oc_net_probe: how a workspace signs people in */
 
@@ -2586,8 +2586,7 @@ static int have_stored_token(const char *store_path, const char *key, const char
 
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
-        printf("openchime-tui %s (protocol %u)%s\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION,
-               oc_env_is_demo() ? " (demo build)" : "");
+        printf("openchime-tui %s (protocol %u)\n", OC_BUILD_ID, (unsigned)OC_PROTOCOL_VERSION);
         return 0;
     }
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
