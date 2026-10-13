@@ -66,7 +66,14 @@ install -D -m 0600 "$root/packaging/openchimed.env"            "$stage/etc/openc
 # Attribution for the linked third-party components. Debian looks for this exact
 # path, and a binary package without it is one that should not be published.
 install -D -m 0644 /dev/null "$stage/usr/share/doc/openchimed/copyright"
-"$root/packaging/licenses.sh" "$MBEDTLS_DIR" > "$stage/usr/share/doc/openchimed/copyright"
+# The licence file (packaging/licenses.sh) is assembled from the vendored
+# sources, which exist only where the build ran. A candidate's tree carries it
+# assembled, beside the binary, so the release can package without them.
+copyright_into() {
+  if [ -f "$(dirname "$BINARY")/copyright" ]; then cp "$(dirname "$BINARY")/copyright" "$1"
+  else "$root/packaging/licenses.sh" "$MBEDTLS_DIR" > "$1"; fi
+}
+copyright_into "$stage/usr/share/doc/openchimed/copyright"
 
 for s in postinst prerm postrm; do
   install -D -m 0755 "$root/packaging/debian/$s" "$stage/DEBIAN/$s"

@@ -528,6 +528,10 @@ jobs:
           name="openchimed-build-${BUILD_ID}-linux-${{ matrix.arch }}"
           mkdir -p "tree/$name"
           cp -r "$DIST/openchimed" "$DIST/tts" "$DIST/stt" "$DIST/web" "tree/$name/"
+          # The licence file, assembled here where the vendored texts are
+          # (packaging/licenses.sh); the release packages from this tree on a
+          # runner that has none.
+          packaging/licenses.sh third_party/mbedtls-3.6.2 > "tree/$name/copyright"
           mkdir -p "candidate/$PLATFORM"
           tar -C tree --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
             -czf "candidate/$PLATFORM/$name.tar.gz" "$name"

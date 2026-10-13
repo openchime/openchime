@@ -53,7 +53,14 @@ if [ -f "$(dirname "$BINARY")/web/openchime.wasm" ]; then
 fi
 install -m 0644 "$root/packaging/debian/openchimed.service"    "$stage/openchimed.service"
 install -m 0600 "$root/packaging/openchimed.env"               "$stage/openchimed.env"
-"$root/packaging/licenses.sh" "$MBEDTLS_DIR"                 > "$stage/copyright"
+# The licence file (packaging/licenses.sh) is assembled from the vendored
+# sources, which exist only where the build ran. A candidate's tree carries it
+# assembled, beside the binary, so the release can package without them.
+copyright_into() {
+  if [ -f "$(dirname "$BINARY")/copyright" ]; then cp "$(dirname "$BINARY")/copyright" "$1"
+  else "$root/packaging/licenses.sh" "$MBEDTLS_DIR" > "$1"; fi
+}
+copyright_into "$stage/copyright"
 chmod 0644 "$stage/copyright"
 
 topdir="$(mktemp -d)"
