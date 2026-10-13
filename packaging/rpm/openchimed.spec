@@ -40,7 +40,9 @@ Summary:        OpenChime chat daemon
 # Mozilla's CA roots (MPL-2.0).
 License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT AND BSD-2-Clause AND MPL-2.0
 URL:            https://openchime.io
-BuildArch:      %{_target_cpu}
+# No BuildArch: that tag is for noarch packages, and set to the target it made
+# rpmbuild refuse a cross target ("No compatible architectures found for
+# build"). The package's architecture is the --target build-rpm.sh passes.
 
 %description
 The OpenChime server: a single-binary chat daemon holding one tenant's messages
