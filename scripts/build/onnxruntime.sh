@@ -77,7 +77,16 @@ if [ "${MODE}" = converter ]; then
   echo "build_onnxruntime: done: third_party/${DEST}"
   exit 0
 fi
-[ "${MODE}" = static ] || { echo "build_onnxruntime: mode is static or converter, not ${MODE}" >&2; exit 2; }
+# --- the host's protoc, for a cross build -----------------------------------
+# The same configure as the static build below, in the host's build directory,
+# but only the protoc target is compiled: protobuf and the abseil it needs. A
+# later host build of the archive continues in the same directory.
+if [ "${MODE}" = protoc ]; then
+  [ -z "${OC_ARCH:-}" ] || { echo "build_onnxruntime: protoc is built for the host (OC_ARCH set)" >&2; exit 2; }
+  MODE=static; PROTOC_ONLY=1
+fi
+PROTOC_ONLY="${PROTOC_ONLY:-0}"
+[ "${MODE}" = static ] || { echo "build_onnxruntime: mode is static, converter or protoc, not ${MODE}" >&2; exit 2; }
 
 # --- the minimal static library -----------------------------------------------
 # OC_ARCH (make ARCH=aarch64): a build for another architecture with the CC
@@ -88,7 +97,7 @@ OPS="${ROOT}/daemon/ort.ops.config"
 STAMP="$(sha256sum "${OPS}" | cut -d" " -f1) ${CC:-cc} ${CXX:-c++}"
 # Current first, before anything a build would need: a restored archive is
 # used as it is, whether or not the host's protoc came back with it.
-if [ -f "${DEST}/lib/libonnxruntime.a" ] && [ "$(cat "${DEST}/.stamp" 2>/dev/null)" = "${STAMP}" ]; then
+if [ "${PROTOC_ONLY}" = 0 ] && [ -f "${DEST}/lib/libonnxruntime.a" ] && [ "$(cat "${DEST}/.stamp" 2>/dev/null)" = "${STAMP}" ]; then
   echo "build_onnxruntime: up to date: third_party/${DEST}/lib/libonnxruntime.a"
   exit 0
 fi
@@ -98,7 +107,14 @@ if [ -n "${OC_ARCH:-}" ] && [ "${OC_ARCH}" != "$(uname -m)" ]; then
   # there is a symlink to the versioned binary beside it, so a cache of it must
   # carry both (release.yml lists protoc*).
   HOST_PROTOC="$(pwd)/onnxruntime-${ORT_VERSION}-build/out/MinSizeRel/_deps/protobuf-build/protoc"
-  [ -x "${HOST_PROTOC}" ] || { echo "build_onnxruntime: a cross build needs the host build's protoc at ${HOST_PROTOC}: build the host's ONNX Runtime first" >&2; exit 2; }
+  if [ ! -x "${HOST_PROTOC}" ]; then
+    # Built here and now, as the host's: protoc alone, with the host's own
+    # compilers, from the sources the host build would use. Minutes, where
+    # the host's whole archive is twenty, and all the arm64 build needs of it.
+    echo "build_onnxruntime: a cross build runs the host's protoc; building it"
+    (cd "${ROOT}" && env -u OC_ARCH -u CC -u CXX scripts/build/onnxruntime.sh protoc)
+    [ -x "${HOST_PROTOC}" ] || { echo "build_onnxruntime: no protoc at ${HOST_PROTOC} after building it" >&2; exit 2; }
+  fi
   TOOLCHAIN="$(pwd)/onnxruntime-${ORT_VERSION}-${OC_ARCH}.toolchain.cmake"
   printf 'set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR %s)\nset(CMAKE_C_COMPILER %s)\nset(CMAKE_CXX_COMPILER %s)\nset(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n' \
     "${OC_ARCH}" "${CC}" "${CXX}" > "${TOOLCHAIN}"
@@ -123,11 +139,17 @@ if [ -z "${ORT_JOBS:-}" ]; then
   [ "${ORT_JOBS}" -le "$(nproc)" ] || ORT_JOBS="$(nproc)"
 fi
 
-echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static) with ${ORT_JOBS} jobs"
+TARGET_ARGS=()
+if [ "${PROTOC_ONLY}" = 1 ]; then
+  TARGET_ARGS=(--target protoc)
+  echo "build_onnxruntime: building protoc (host) with ${ORT_JOBS} jobs"
+else
+  echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static) with ${ORT_JOBS} jobs"
+fi
 (
   cd "${WORK}/src"
   PYTHONPATH="$(cd ../py && pwd)" python3 tools/ci_build/build.py \
-    --build_dir "$(cd .. && pwd)/out" --config MinSizeRel --update --build --parallel "${ORT_JOBS}" \
+    --build_dir "$(cd .. && pwd)/out" --config MinSizeRel --update --build --parallel "${ORT_JOBS}" "${TARGET_ARGS[@]}" \
     --skip_tests --skip_pip_install --skip_submodule_sync --compile_no_warning_as_error \
     --cmake_generator "Unix Makefiles" \
     --minimal_build --include_ops_by_config "${OPS}" --enable_reduced_operator_type_support \
@@ -141,6 +163,11 @@ echo "build_onnxruntime: building ONNX Runtime ${ORT_VERSION} (minimal, static) 
   echo "build_onnxruntime: build failed; full log ${WORK}/build.log" >&2; exit 1; }
 
 OUT="${WORK}/out/MinSizeRel"
+if [ "${PROTOC_ONLY}" = 1 ]; then
+  [ -x "${OUT}/_deps/protobuf-build/protoc" ] || { echo "build_onnxruntime: the protoc build left no ${OUT}/_deps/protobuf-build/protoc" >&2; exit 1; }
+  echo "build_onnxruntime: done: ${WORK}/out/MinSizeRel/_deps/protobuf-build/protoc"
+  exit 0
+fi
 rm -rf "${DEST}.new" && mkdir -p "${DEST}.new/lib" "${DEST}.new/include"
 # Every archive the session needs, merged: ORT's own, the ONNX schema, protobuf-lite
 # with its UTF-8 checker, cpuinfo, abseil and, on arm64, KleidiAI. protoc and full

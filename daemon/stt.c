@@ -14,11 +14,6 @@
 #include <string.h>
 #include <time.h>
 
-const char *const OC_STT_DATA_FILES[] = {
-    "frontend.model.ort", "frontend.weights.ort", "encoder.ort", "adapter.ort",
-    "cross_kv.ort", "decoder_kv.ort", "tokenizer.bin", "streaming_config.json", NULL,
-};
-
 /* The directory oc_stt_data_ready chose and checked. Set once at startup. */
 static char g_data_dir[512];
 
@@ -32,16 +27,6 @@ int oc_stt_data_ready(char *err, size_t errcap) {
     if (oc_tts_data_verify(dir, OC_STT_MODEL_VERSION, OC_STT_DATA_FILES, err, errcap) != 0) return 0;
     snprintf(g_data_dir, sizeof g_data_dir, "%s", dir);
     return 1;
-}
-
-int oc_stt_manifest(const char *dir) {
-    char err[256] = "";
-    if (oc_tts_data_write_manifest(dir, OC_STT_MODEL_VERSION, OC_STT_DATA_FILES, err, sizeof err) != 0) {
-        fprintf(stderr, "openchimed: %s\n", err);
-        return 1;
-    }
-    fprintf(stderr, "openchimed: wrote %s/%s for %s\n", dir, OC_TTS_DATA_MANIFEST, OC_STT_MODEL_VERSION);
-    return 0;
 }
 
 /* ---- the engine ------------------------------------------------------------------ */

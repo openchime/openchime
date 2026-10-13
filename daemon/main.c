@@ -29,12 +29,15 @@
 #include "totp.h"
 #include "tts_data.h"   /* the beside-the-binary data lookup: speech data and the web client's wasm */
 #include "webapp.h"
-#ifdef OC_TTS
+/* The engines' headers come in whether or not the engines do: the data
+ * manifests below name each model's version, and a daemon built with
+ * neither engine writes them for the arm64 build, which cannot run here. */
 #include "tts.h"
+#include "stt.h"
+#ifdef OC_TTS
 #include "tts_render.h"
 #endif
 #ifdef OC_STT
-#include "stt.h"
 #include "stt_render.h"
 #endif
 
@@ -383,17 +386,21 @@ int main(int argc, char **argv) {
      * renders one text with the voice model built into this binary. */
     if (argc == 5 && strcmp(argv[1], "--tts-say") == 0)
         return oc_tts_say(argv[2], argv[3], argv[4]);
-    if (argc == 3 && strcmp(argv[1], "--tts-manifest") == 0)
-        return oc_tts_manifest(argv[2]);
 #endif
 #ifdef OC_STT
     /* Voice input's check (stt.h): recognize one recording with the model in
      * this binary. */
     if (argc == 3 && strcmp(argv[1], "--stt-hear") == 0)
         return oc_stt_hear(argv[2]);
-    if (argc == 3 && strcmp(argv[1], "--stt-manifest") == 0)
-        return oc_stt_manifest(argv[2]);
 #endif
+    /* The data manifests (tts_data.h): the version each engine is compiled
+     * for over the files beside the binary. Written by whichever build runs
+     * on the packaging machine, engines or not, since the version is a
+     * constant of the sources and the hashes are of the data. */
+    if (argc == 3 && strcmp(argv[1], "--tts-manifest") == 0)
+        return oc_tts_data_write_manifest_cli(argv[2], OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES);
+    if (argc == 3 && strcmp(argv[1], "--stt-manifest") == 0)
+        return oc_tts_data_write_manifest_cli(argv[2], OC_STT_MODEL_VERSION, OC_STT_DATA_FILES);
     /* The registry's views (config.h): the reference CONFIG.md carries, the
      * packaged environment file, and a check of this environment -- or of a
      * file, applied over it -- through the same loader the daemon starts with. */

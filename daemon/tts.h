@@ -31,10 +31,9 @@ extern const char *const OC_TTS_DATA_FILES[];
  * 0 with a reason, and read-aloud should be treated as absent. */
 int oc_tts_data_ready(char *err, size_t errcap);
 
-/* `openchimed --tts-manifest DIR`: hash the data files in DIR and write the
- * manifest this build will accept -- the daemon writes it, so the version it
+/* `openchimed --tts-manifest DIR` (main.c, tts_data.h): hash the data files in
+ * DIR and write the manifest this build will accept -- the daemon writes it, so the version it
  * names is exactly the version compiled in. Returns a process exit status. */
-int oc_tts_manifest(const char *dir);
 
 /* `openchimed --tts-say VOICE TEXT OUT`: render TEXT with the model in this binary
  * through the same path the daemon's renders take, writing the audio-only MP4 (or,

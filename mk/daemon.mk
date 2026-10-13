@@ -69,16 +69,21 @@ $(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS)
 # The data directories, and their manifests written by the daemon just built --
 # so the version they name is exactly the version compiled in. Rebuilt whenever
 # the daemon is, which is whenever that version could have changed. A
-# cross-built daemon cannot run here, so the HOST's daemon, built from the same
-# sources with the same features, writes them: the data and the manifest are
-# the same for every architecture.
+# cross-built daemon cannot run here, so a HOST daemon from the same sources
+# writes them. It is built with NO features: the manifest names each model's
+# version, a constant of the sources, over hashes of the data, and neither
+# needs an engine linked in -- so the arm64 build no longer compiles the host's
+# ONNX Runtime and llama.cpp for a binary that only writes two files. Its own
+# features file and binary path, so a developer's remembered features and host
+# daemon are left as they were.
 ifeq ($(ARCH_SUFFIX),)
 MANIFEST_BIN := $(BIN)
 else
 MANIFEST_BIN := build/manifest-host/openchimed
 $(MANIFEST_BIN): FORCE
-	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= openchimed
-	@mkdir -p $(dir $@) && cp openchimed $@
+	@mkdir -p $(dir $@)
+	@$(MAKE) --no-print-directory ARCH=$(HOST_ARCH) RELEASE=0 CC=cc CXX=c++ OC_ARCH= \
+	    TTS=0 STT=0 SUM=0 WEB=0 DEMO=0 FEATURES=build/manifest-host/.features BIN=$@ $@
 endif
 tts/manifest: $(MANIFEST_BIN) $(KITTEN) build/kitten/voices.npz ttskit/data/en-US/lexicon.bin ttskit/data/en-US/guesses.bin
 	mkdir -p tts/en-US

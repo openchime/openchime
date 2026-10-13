@@ -30,9 +30,8 @@ extern const char *const OC_STT_DATA_FILES[];
  * expects. 1 on success; 0 with a reason, and voice input should be absent. */
 int oc_stt_data_ready(char *err, size_t errcap);
 
-/* `openchimed --stt-manifest DIR`: hash the data files in DIR and write the
+/* `openchimed --stt-manifest DIR` (main.c, tts_data.h): hash the data files in DIR and write the
  * manifest this build accepts. Returns a process exit status. */
-int oc_stt_manifest(const char *dir);
 
 /* `openchimed --stt-hear IN.wav`: recognize a 16-bit mono WAV (any rate; it is
  * resampled to 16 kHz) with the model in this binary, printing the text on
