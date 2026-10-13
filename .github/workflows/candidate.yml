@@ -287,8 +287,9 @@ jobs:
       # converted; and voice input's recognizer files, fetched as published
       # (ARCH-112). Functions of the files in the key, so a hit skips about 25
       # minutes and a change rebuilds. The arm64 archive is cross-built with
-      # the host's protoc, so the amd64 build must exist first (the host's
-      # directory is in this cache too).
+      # the host's protoc, which the script builds on its own, protoc alone,
+      # when the cache has none (it is in this cache too); the arm64 runner
+      # never builds the host's archive.
       - name: Restore the speech engine and models
         uses: actions/cache@v6
         with:

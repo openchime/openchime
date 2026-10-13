@@ -1,5 +1,7 @@
 /* Where read-aloud's data lives, and whether it matches (tts_data.h). */
 #include "tts_data.h"
+#include "tts.h"   /* the engines' file lists, defined here so a build without the
+#include "stt.h"      engines (the manifest writer for a cross build) still has them */
 
 #include <mbedtls/sha256.h>
 
@@ -175,3 +177,24 @@ void oc_tts_map_close(oc_tts_map *m) {
     m->p = NULL;
     m->n = 0;
 }
+
+int oc_tts_data_write_manifest_cli(const char *dir, const char *version, const char *const *files) {
+    char err[256] = "";
+    if (oc_tts_data_write_manifest(dir, version, files, err, sizeof err) != 0) {
+        fprintf(stderr, "openchimed: %s\n", err);
+        return 1;
+    }
+    fprintf(stderr, "openchimed: wrote %s/%s for %s\n", dir, OC_TTS_DATA_MANIFEST, version);
+    return 0;
+}
+
+/* What each engine's data directory holds, in the order the manifest lists
+ * them (tts.h, stt.h). Here, not beside each engine: the manifest is written
+ * by a daemon that may carry neither (mk/daemon.mk). */
+const char *const OC_TTS_DATA_FILES[] = {
+    "kitten.ort", "voices.npz", OC_TTS_LANG "/lexicon.bin", OC_TTS_LANG "/guesses.bin", NULL,
+};
+const char *const OC_STT_DATA_FILES[] = {
+    "frontend.model.ort", "frontend.weights.ort", "encoder.ort", "adapter.ort",
+    "cross_kv.ort", "decoder_kv.ort", "tokenizer.bin", "streaming_config.json", NULL,
+};

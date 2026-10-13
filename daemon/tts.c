@@ -23,10 +23,6 @@ typedef struct {
     oc_tts_map ort, voices, lexicon, guesses;   /* consumed in place: they outlive both */
 } kitten_engine;
 
-const char *const OC_TTS_DATA_FILES[] = {
-    "kitten.ort", "voices.npz", OC_TTS_LANG "/lexicon.bin", OC_TTS_LANG "/guesses.bin", NULL,
-};
-
 /* The data directory oc_tts_data_ready chose and checked; the engine opens from
  * it. Set once at startup, before the render worker exists. */
 static char g_data_dir[512];
@@ -41,16 +37,6 @@ int oc_tts_data_ready(char *err, size_t errcap) {
     if (oc_tts_data_verify(dir, OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES, err, errcap) != 0) return 0;
     snprintf(g_data_dir, sizeof g_data_dir, "%s", dir);
     return 1;
-}
-
-int oc_tts_manifest(const char *dir) {
-    char err[256] = "";
-    if (oc_tts_data_write_manifest(dir, OC_TTS_MODEL_VERSION, OC_TTS_DATA_FILES, err, sizeof err) != 0) {
-        fprintf(stderr, "openchimed: %s\n", err);
-        return 1;
-    }
-    fprintf(stderr, "openchimed: wrote %s/%s for %s\n", dir, OC_TTS_DATA_MANIFEST, OC_TTS_MODEL_VERSION);
-    return 0;
 }
 
 static int map_data(const char *name, oc_tts_map *m, char *err, size_t errcap) {

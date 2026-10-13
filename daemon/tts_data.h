@@ -41,6 +41,9 @@ int oc_tts_data_verify(const char *dir, const char *version, const char *const *
 /* Write `dir`'s manifest for `version` over `files`, hashing each. 0 or -1. */
 int oc_tts_data_write_manifest(const char *dir, const char *version, const char *const *files,
                                char *err, size_t errcap);
+/* The same from the command line (`openchimed --tts-manifest <dir>`, the
+ * packaging step): says what it wrote or why not on stderr; the exit code. */
+int oc_tts_data_write_manifest_cli(const char *dir, const char *version, const char *const *files);
 
 /* A file mapped read-only, as the engine consumes it in place. */
 typedef struct { const unsigned char *p; size_t n; } oc_tts_map;
