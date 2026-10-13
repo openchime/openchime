@@ -20,6 +20,14 @@ set -euo pipefail
 [ "$#" -gt 0 ] || { echo "usage: apt.sh <package>..." >&2; exit 2; }
 sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
   /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+# The runner image's sources do not name the mirror: they point at a mirror
+# LIST (`URIs: mirror+file:/etc/apt/apt-mirrors.txt`), whose first entry is
+# the Azure mirror, so the rewrite above changed nothing and release 21's
+# publish job was still fetching from azure. The list is rewritten too.
+if [ -f /etc/apt/apt-mirrors.txt ] && grep -q azure /etc/apt/apt-mirrors.txt; then
+  printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://security.ubuntu.com/ubuntu/\tpriority:2\n' \
+    | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+fi
 printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\nAcquire::ForceIPv4 "true";\nDpkg::Lock::Timeout "120";\n' \
   | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
 for try in 1 2 3; do

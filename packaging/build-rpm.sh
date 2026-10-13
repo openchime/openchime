@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 # Assemble openchimed-<version>-1.<arch>.rpm from an already-built binary.
 #
-# Must run somewhere with rpmbuild -- in the release that is the same
-# rockylinux:9 container that produced the binary, which also gives the package
-# the right %{_target_cpu} and the RHEL-family dependency names.
+# Runs on the release runner with rpmbuild, for BOTH architectures: the
+# arm64 binary is cross-built on the x86 runner (release.yml), so the
+# package's architecture is told, not taken from the machine. Left to
+# rpmbuild's default it was the host's, and release 21's arm64 package came
+# out as openchimed-21-1.x86_64.rpm, colliding with the real one in the pool.
 #
-#   build-rpm.sh <version> <binary> [outdir]
+#   build-rpm.sh <version> <arch> <binary> [outdir]      arch: amd64|arm64
 set -euo pipefail
 
-VERSION="${1:?usage: build-rpm.sh <version> <binary> [outdir]}"
-BINARY="${2:?missing path to the built openchimed}"
-OUTDIR="${3:-dist}"
+VERSION="${1:?usage: build-rpm.sh <version> <arch> <binary> [outdir]}"
+ARCH="${2:?missing arch (amd64|arm64)}"
+BINARY="${3:?missing path to the built openchimed}"
+OUTDIR="${4:-dist}"
+case "$ARCH" in
+  amd64) target=x86_64 ;;
+  arm64) target=aarch64 ;;
+  *) echo "build-rpm.sh: unsupported arch $ARCH" >&2; exit 1 ;;
+esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MBEDTLS_DIR="${MBEDTLS_DIR:-${root}/third_party/mbedtls-3.6.2}"
@@ -52,7 +60,7 @@ topdir="$(mktemp -d)"
 trap 'rm -rf "$stage" "$topdir"' EXIT
 mkdir -p "$topdir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-rpmbuild -bb \
+rpmbuild -bb --target "${target}" \
   --define "_topdir ${topdir}" \
   --define "_version ${VERSION}" \
   --define "_bindir_src ${stage}" \
@@ -65,6 +73,10 @@ rpmbuild -bb \
 mkdir -p "$OUTDIR"
 built="$(find "$topdir/RPMS" -name '*.rpm' -type f | head -1)"
 [ -n "$built" ] || { echo "build-rpm.sh: rpmbuild produced no package" >&2; exit 1; }
+case "$(basename "$built")" in
+  *".${target}.rpm") ;;
+  *) echo "build-rpm.sh: rpmbuild named the package $(basename "$built"), not .${target}.rpm" >&2; exit 1 ;;
+esac
 cp "$built" "$OUTDIR/"
 
 echo "${OUTDIR}/$(basename "$built")"

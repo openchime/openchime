@@ -408,7 +408,7 @@ jobs:
           # And the web client's wasm (docs/WEB.md): the page and loader are
           # inside the binary; this is the one file it serves from beside itself.
           cp -r web "$DIST/web"
-          packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
+          packaging/build-rpm.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST" >/dev/null
       # Saved as soon as the build has run, whether or not the job goes on to
       # pass: actions/cache saves only after a successful job, so every run
       # that failed downstream of the engine build paid the twenty minutes
@@ -482,6 +482,15 @@ jobs:
           set -euo pipefail
           packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
           packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          # Each package is named for ITS architecture: the publish job pools
+          # both architectures' files under one prefix, and two named alike
+          # collide there, which a dry run (no publish) never saw.
+          rpm_arch=$([ "${{ matrix.arch }}" = arm64 ] && echo aarch64 || echo x86_64)
+          for want in "openchimed_${VERSION}_${{ matrix.arch }}.deb" \
+                      "openchimed-${VERSION}-1.${rpm_arch}.rpm" \
+                      "openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz"; do
+            [ -f "$DIST/$want" ] || { echo "::error::$DIST has no $want"; ls "$DIST"; exit 1; }
+          done
 
       # Proves the three channels carry the same file. If this ever fails, the
       # "one binary, packaged three ways" claim in the docs is false and should
