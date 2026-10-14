@@ -206,7 +206,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 24** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 25** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -444,6 +444,7 @@ a bare host address. Clients that don't recognize the frame ignore it.
 | `max_users`       | u32  | Registered-user cap; `0` = unlimited.                       |
 | `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
 | `call_max`        | u8   | The most people in one call, ten (`OC_CALL_MAX`, REQ-305) — so a client starting one in a large channel knows when the starter must pick (§5.17). |
+| `mode`            | u8   | `OPENCHIME_MODE`: `0` normal, `1` development, `2` demo. A client in a public demo (`2`) says so for as long as it is open (AUTH.md §8.12). Appended in version 25. |
 
 ### 4.3b `WORKSPACE_ADDRESS` (server → client), msg_type `0x001C`
 
@@ -2892,6 +2893,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3034` | `MEMBER_VIA_GROUP`    | groups     | no    | `LEAVE_CHANNEL` or `REMOVE_FROM_CHANNEL` for someone in the channel only through a group (§5.16k). |
 | `3035` | `INVALID_GROUP`       | groups     | no    | A handle, name or description out of bounds, or a group, a workspace or a channel at its cap (§5.16k). |
 | `3036` | `SIGNUP_LIMITED`      | auth       | no    | Ten accounts were made from this address in the last hour; the sign-up page says so (AUTH.md §2). Not sent as a frame. |
+| `3037` | `DEMO_LIMIT`          | demo       | no    | A public demo's daily limit was reached (AUTH.md §8.12); `message` says which, in a sentence for the person. Sent as `ERROR`, or as a transfer's error for an upload. |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which

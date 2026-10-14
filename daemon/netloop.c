@@ -26,6 +26,7 @@
 #include "http.h"
 #include "webpages.h"
 #include "pwpolicy.h"
+#include "demolimits.h"
 #include "webapp.h"   /* the sign-in pages (AUTH.md §8.10) */
 #include "devicecodes.h" /* a terminal signs in with a code (AUTH.md §8.11) */
 #include "jwt.h"         /* oc_base64url_encode: a passkey's challenge; oc_jwt_nonce_matches */
@@ -187,7 +188,7 @@ typedef struct {
 /* A page's post, kept while the writer checks it: what the answer needs. */
 typedef struct web_req {
     oc_page_kind kind;
-    char redirect_uri[512], nonce[48], username[128], invite[80];
+    char redirect_uri[512], nonce[48], username[128], invite[1024];   /* a token's hex, or a demo invite (AUTH.md §8.12) */
     char user_code[16];          /* DEVICE: the code being approved */
     char step[OC_STEP_TICKET_LEN + 1];   /* a second step's: the ticket it is for */
     char rp[256], origin[300];           /* reached on a passkey's trusted name: which */
@@ -1507,6 +1508,14 @@ static void call_send_roster(int ep, conn **conns, const call_t *c, uint64_t exc
     }
 }
 
+/* A demo workspace's daily limits (demolimits.h): NULL in any other mode. */
+static oc_dl *g_demo_limits;
+
+/* Whether `user` may do one more `k` today; always, outside a demo. */
+static int demo_ok(oc_dl_kind k, uint64_t user) {
+    return !g_demo_limits || oc_dl_take(g_demo_limits, k, user, now_ms());
+}
+
 /* A call is over (REQ-301): tell its audience, drop every participant from the
  * relay, and -- when nobody but its starter ever joined and somebody was asked
  * -- leave the missed-call line in the conversation (REQ-304). The slot is freed
@@ -1585,6 +1594,11 @@ static void call_expire_detached(int ep, conn **conns) {
     uint64_t t = now_ms(), grace = call_grace_ms();
     for (int i = 0; i < OC_MAX_CALLS; i++) {
         call_t *c = &g_calls[i];
+        /* A demo's calls last at most twenty minutes (demolimits.h). */
+        if (g_demo_limits && c->channel_id && c->started_at && t - c->started_at >= OC_DEMO_CALL_MAX_MS) {
+            call_finish(ep, conns, c);
+            continue;
+        }
         for (int k = c->channel_id ? c->n - 1 : -1; k >= 0 && c->channel_id; k--)
             if (c->parts[k].detached_ms && t - c->parts[k].detached_ms >= grace)
                 call_drop(ep, conns, c, k);   /* swaps the last, already seen, into k */
@@ -1616,7 +1630,8 @@ static void send_call_error(int ep, conn *c, uint16_t code, const char *msg) {
  * their notification settings allow it, treated as a mention (ARCH-103). The
  * desktop's toast comes from CALL_STATE, decided by the client that shows it. */
 static void call_push_invites(const call_t *c, const uint64_t *uids, int n, uint64_t inviter) {
-    for (int i = 0; i < n; i++) oc_push_notify_call(cur_push(), c->channel_id, inviter, uids[i]);
+    for (int i = 0; i < n; i++)
+        if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify_call(cur_push(), c->channel_id, inviter, uids[i]);
 }
 
 /* Add the invitees in `uids` -- already known to be able to read the
@@ -2119,6 +2134,15 @@ static int reject_rate(conn *c, uint64_t id, const char *why) {
     return out_append(c, tmp, w.len);
 }
 
+/* A demo's refusal: an ERROR saying which limit, with `ctx` (an idempotency
+ * key, or nothing) for the client to match it to what it asked. */
+static int demo_refuse(conn *c, const uint8_t *ctx, size_t ctx_len, oc_dl_kind k) {
+    uint8_t tmp[320]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_error e = { OC_ERR_DEMO_LIMIT, 0, { ctx, ctx_len }, oc_slice_str(oc_dl_why(k)) };
+    if (oc_encode_error(&w, OC_PROTOCOL_VERSION, &e) != OC_OK) return -1;
+    return out_append(c, tmp, w.len);
+}
+
 static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
     oc_slice ctx = { idem, OC_IDEM_LEN };
@@ -2469,6 +2493,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_send s = {0};
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
             if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
+            if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
+                if (demo_refuse(c, s.idem, OC_IDEM_LEN, OC_DL_MESSAGE) != 0) return -1;
+                continue;
+            }
             oc_job *j = oc_job_new(OC_JOB_SEND, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -2509,6 +2537,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!sum_offered()) {
                 send_summary(ep, conns, c, sm.req_id, OC_SUM_UNAVAILABLE, sm.channel_id, 0, 0, 0, "",
                              "Summaries are not turned on.");
+                continue;
+            }
+            if (!demo_ok(OC_DL_SUMMARY, c->user_id)) {
+                send_summary(ep, conns, c, sm.req_id, OC_SUM_UNAVAILABLE, sm.channel_id, 0, 0, 0, "",
+                             oc_dl_why(OC_DL_SUMMARY));
                 continue;
             }
             oc_job *j = oc_job_new(OC_JOB_SUMMARY_LOOKUP, c->conn_id);
@@ -2668,6 +2701,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_INVITE_USER) {
             oc_invite_user iu;
             if (oc_decode_invite_user(&p, &iu) != OC_OK) return -1;
+            if (!demo_ok(OC_DL_INVITE, c->user_id)) {
+                if (demo_refuse(c, NULL, 0, OC_DL_INVITE) != 0) return -1;
+                continue;
+            }
             oc_job *j = oc_job_new(OC_JOB_INVITE_USER, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -2853,6 +2890,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
             if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
+            if (!demo_ok(OC_DL_MESSAGE, c->user_id)) {
+                if (demo_refuse(c, sr.idem, OC_IDEM_LEN, OC_DL_MESSAGE) != 0) return -1;
+                continue;
+            }
             oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -3553,6 +3594,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (hdr.msg_type == OC_MSG_CALL_JOIN) {
                 oc_call_join cj;
                 if (oc_decode_call_join(&p, &cj, uids, OC_MAX_CALL_INVITES) != OC_OK) return -1;
+                if (!demo_ok(OC_DL_CALL, c->user_id)) {
+                    if (demo_refuse(c, NULL, 0, OC_DL_CALL) != 0) return -1;
+                    continue;
+                }
                 if (!(j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id))) return -1;
                 j->call_op = OC_CALL_OP_JOIN;
                 j->channel_id = cj.channel_id;
@@ -3718,6 +3763,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             }
             if (ub.total_size > g_max_attach) {
                 if (send_transfer_error(c, 0, OC_ERR_ATTACHMENT_TOO_LARGE) != 0) return -1;
+                continue;
+            }
+            /* A demo's files are small and few (demolimits.h). */
+            if (g_demo_limits && (ub.total_size > OC_DEMO_MAX_UPLOAD || !demo_ok(OC_DL_UPLOAD, c->user_id))) {
+                if (send_transfer_error(c, 0, OC_ERR_DEMO_LIMIT) != 0) return -1;
                 continue;
             }
             /* Admission control (REQ-216): refuse at declaration, before a byte
@@ -4313,6 +4363,20 @@ static int field_get(const char *q, const char *key, char *out, size_t cap) {
     return r < 0 ? -1 : 0;
 }
 
+/* Whether `s` has the shape of a compact JWS: three base64url segments, the
+ * last a signature, short enough to be an invite (AUTH.md §8.12). Its meaning
+ * is the writer's to check. */
+static int is_compact_jws(const char *s) {
+    size_t n = strlen(s), dots = 0;
+    if (n < 40 || n > 1000) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        if (ch == '.') { if (i == 0 || i + 1 == n || s[i - 1] == '.') return 0; dots++; }
+        else if (!isalnum((unsigned char)ch) && ch != '-' && ch != '_') return 0;
+    }
+    return dots == 2;
+}
+
 static int on_device_page(conn *c, int post, const char *q, oc_dbwriter *dbw);   /* fwd */
 static int on_step_page(conn *c, const char *q, oc_dbwriter *dbw);               /* fwd */
 
@@ -4483,12 +4547,18 @@ static int on_web_page(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
     oc_e2e_wipe(norm, sizeof norm);
     if (kind == OC_PAGE_SIGNUP) {
         uint8_t raw[OC_INVITE_TOKEN_LEN];
+        /* A demo workspace also takes the control plane's signed invite
+         * (AUTH.md §8.12): three base64url segments, which the writer checks. */
+        int demo = 0;
         if (hex_decode(w->invite, strlen(w->invite), raw, sizeof raw) != (int)sizeof raw) {
-            pg.message = "That invitation isn't valid."; goto show;
+            demo = oc_config_get()->mode == OC_MODE_DEMO && is_compact_jws(w->invite);
+            if (!demo) { pg.message = "That invitation isn't valid."; goto show; }
         }
         j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
         if (!j || oc_job_set_register(j, w->username, pass, 0, 0) != 0 ||
-            oc_job_set_token(j, raw, sizeof raw) != 0) goto fail;
+            (demo ? oc_job_set_token(j, w->invite, strlen(w->invite)) : oc_job_set_token(j, raw, sizeof raw)) != 0)
+            goto fail;
+        j->demo_invite = (uint8_t)demo;
         j->web = OC_WEB_SIGNUP;
     } else {
         const char *pw = kind == OC_PAGE_PASSWORD ? current : pass;
@@ -5426,7 +5496,10 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
             oc_workspace_info wi = { (uint8_t)cfg->deployment_mode,
                                      (uint32_t)(cfg->max_users > 0 ? cfg->max_users : 0),
                                      oc_slice_str(cfg->workspace_name ? cfg->workspace_name : ""),
-                                     (uint8_t)cfg->call_max };
+                                     (uint8_t)cfg->call_max,
+                                     (uint8_t)(cfg->mode == OC_MODE_DEMO ? OC_WS_MODE_DEMO
+                                               : cfg->mode == OC_MODE_DEVELOPMENT ? OC_WS_MODE_DEVELOPMENT
+                                               : OC_WS_MODE_NORMAL) };
             oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
@@ -5662,7 +5735,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 fanout_members(ep, conns, r->members, r->n_members, 0, g_enc, flen);
             }
             fanout_actions(ep, conns, r);   /* REQ-058 */
-            oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id, 0);
+            if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
              * result later, or never. */
@@ -5923,7 +5996,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
     case OC_RES_INVITE_OK: {
         /* The invite is committed; its mail is reported whether or not the
          * inviter is still connected, and never holds up the reply. */
-        if (r->invite_email && r->invite_id[0])
+        if (r->invite_email && r->invite_id[0] && demo_ok(OC_DL_MAIL, 0))
             oc_invite_mail_report(__atomic_load_n(&g_invite_mail, __ATOMIC_ACQUIRE),
                                   r->invite_id, r->invite_email, r->session_expiry / 1000u);
         conn *c = find_by_id(conns, r->conn_id);
@@ -6296,7 +6369,7 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
              * thread's PARTICIPANTS and not merely whoever the channel level
              * would have caught. Fire-and-forget beside the send path's own
              * call, and a no-op when push is unconfigured. */
-            oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id,
+            if (demo_ok(OC_DL_PUSH, 0)) oc_push_notify(cur_push(), r->channel_id, r->author_id, r->message_id,
                            r->parent_id);
             /* A reply's URLs unfurl like any other body's (REQ-222). */
             unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
@@ -8343,6 +8416,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     if (!indexed) NETLOOP_FAIL("allocating the connection indexes");
     /* The I/O threads (ARCH-22): every accepted socket is theirs from here. */
     sites_init();
+    /* A demo workspace counts its day (demolimits.h). */
+    if (oc_config_get()->mode == OC_MODE_DEMO && !g_demo_limits) g_demo_limits = oc_dl_new();
     g_io = indexed ? oc_ioloop_start(OC_IO_THREADS, tls, trusted, &g_tls_site, &g_health_site) : NULL;
     int iofd = -1;
     if (indexed && !g_io) { NETLOOP_FAIL("starting the I/O threads"); indexed = 0; }

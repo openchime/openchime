@@ -380,6 +380,7 @@ typedef struct {
     uint64_t user_id;                 /* our own id, from AUTH_OK */
     /* Workspace facts from WORKSPACE_INFO (infra config the daemon serves). */
     uint8_t  deployment_mode;         /* 0 standalone · 1 federated · 2 managed */
+    uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
 

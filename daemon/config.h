@@ -49,6 +49,7 @@ typedef enum {
 /* --- The constants that were once settings -----------------------------------
  * Each is here because nothing in any deployment varies it: the number is the
  * design, and a row would only be a way to get it wrong. */
+#define OC_DEMO_SESSION_TTL_MS (24ull * 60 * 60 * 1000)   /* a demo's sessions: a day */
 #define OC_SESSION_TTL_MS      (30ull * 24 * 60 * 60 * 1000)   /* a session lives 30 days (REQ-181) */
 #define OC_SESSION_IDLE_MS     0ull                            /* and may go unused as long as it lives */
 #define OC_XFER_WORKERS        2       /* threads moving attachment bytes (ARCH-69); each holds a TLS session */

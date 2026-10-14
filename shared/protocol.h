@@ -156,8 +156,12 @@
  *
  * 24: an invite more than one person may redeem (REQ-026, a shareable link).
  * INVITE_USER carries `uses`, INVITE_CREATED `uses`, and each INVITE_LIST
- * entry `uses` and `used`: fields appended to three layouts. */
-#define OC_PROTOCOL_VERSION 24u
+ * entry `uses` and `used`: fields appended to three layouts.
+ *
+ * 25: WORKSPACE_INFO carries the workspace's `mode` (OPENCHIME_MODE: normal,
+ * development, demo), so a client can say it is in a public demo (AUTH.md
+ * §8.12). A byte appended to a layout. */
+#define OC_PROTOCOL_VERSION 25u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -625,6 +629,7 @@ typedef enum {
     OC_ERR_MEMBER_VIA_GROUP    = 3034, /* in the channel through a group: leaving or removing them alone cannot (REQ-309) */
     OC_ERR_INVALID_GROUP       = 3035, /* a handle, name or description out of bounds, or a group or channel at its cap */
     OC_ERR_SIGNUP_LIMITED      = 3036, /* too many accounts made from one address in the hour (the sign-up page) */
+    OC_ERR_DEMO_LIMIT          = 3037, /* a public demo's daily limit (AUTH.md §8.12); the message says which */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 /* What a reason code means, in words a person reads: the client shows this, not
@@ -950,9 +955,14 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
  * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
  * workspace_name may be empty (client falls back to the host subdomain). */
 /* call_max is the most people in one call (OC_CALL_MAX, REQ-305), so a
- * client starting one in a large channel knows when the starter has to pick. */
+ * client starting one in a large channel knows when the starter has to pick.
+ * mode is OPENCHIME_MODE: 0 normal, 1 development, 2 demo -- a public demo,
+ * which a client says it is in (AUTH.md §8.12). */
+#define OC_WS_MODE_NORMAL      0
+#define OC_WS_MODE_DEVELOPMENT 1
+#define OC_WS_MODE_DEMO        2
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name;
-                 uint8_t call_max; } oc_workspace_info;
+                 uint8_t call_max; uint8_t mode; } oc_workspace_info;
 /* Pushed after WORKSPACE_INFO, only where the deployment names the workspace's
  * canonical address (OPENCHIME_MANAGED_ADDRESS): a workspace moved to a new
  * address still answers at the old one for a while, and a client that connected

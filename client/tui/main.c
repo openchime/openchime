@@ -1035,8 +1035,9 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     uint8_t pr = oc_model_presence_of(m, m->user_id);
     const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : pr == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
     char hdr[256];
-    snprintf(hdr, sizeof hdr, " OpenChime · %.120s · %.48s %s · %s",
-             active_label(), me[0] ? me : "…", dot, conn);
+    snprintf(hdr, sizeof hdr, " OpenChime · %.120s%s · %.48s %s · %s",
+             active_label(), m->workspace_mode == OC_WS_MODE_DEMO ? " (public demo, erased nightly)" : "",
+             me[0] ? me : "…", dot, conn);
     tk_fill(0, 0, W, th->header_bg);
     tk_text(0, 0, W, hdr, th->fg | TB_BOLD, th->header_bg);
     /* Unread here, and — so a background workspace isn't invisible — a count of

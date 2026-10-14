@@ -647,6 +647,8 @@ void oc_dbres_free(oc_dbres *r) {
 #define OC_SESSION_TTL_MS (30ull * 24 * 60 * 60 * 1000)
 /* The session policy (REQ-181), set before serving and read on the writer. */
 static uint64_t g_session_ttl_ms = OC_SESSION_TTL_MS;
+/* A demo workspace (oc_dbwriter_set_demo), read on the writer only. */
+static int g_dbw_demo;
 static uint64_t g_session_idle_ms;   /* 0: never refused for being idle */
 
 /* Invite-token lifetime (AUTH.md §2): the invitee must redeem within this window. */
@@ -2799,19 +2801,8 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     if (!j->web) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_SOURCE_UNAVAILABLE; return r;
     }
-    if (j->token_len != OC_INVITE_TOKEN_LEN) {
-        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
-    }
     uint8_t hash[OC_SHA256_LEN];
-    if (oc_sha256((const uint8_t *)j->token, j->token_len, hash) != 0) {
-        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
-    }
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "SELECT role, expires_at_ms, consumed_at_ms, created_by, uses, used FROM invites "
-        "WHERE token_hash=? AND email IS NULL;",
-        -1, &st, NULL);
-    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     uint8_t role = OC_ROLE_MEMBER; uint64_t expiry = 0; int consumed = 1, found = 0;
     /* NULL created_by is the first-run setup token (REQ-024, mint_invite's own
      * created_by==0 -> NULL convention) — the signal that this redemption is an
@@ -2819,6 +2810,44 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
      * since an owner may also invite another owner at an ordinary role. */
     uint64_t created_by = 0;
     int uses = 1, used = 0;
+    /* A demo workspace's visitor (AUTH.md §8.12): the control plane's signed
+     * word, under its published keys, for this workspace, for a member, once.
+     * Its id is kept as a spent invite (the hash of "demo-invite:<jti>", which
+     * no 32-byte token can match), so a restart does not make it new again. */
+    oc_jwt_invite di = { 0 };
+    if (j->demo_invite) {
+        if (!g_dbw_demo || !w->oidc_issuer || !w->oidc_audience) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        pthread_mutex_lock(&w->keys_mu);
+        oc_jwt_result vr = w->oidc_keyset_pem
+            ? oc_jwt_verify_demo_invite(j->token, j->token_len, w->oidc_keyset_pem, strlen(w->oidc_keyset_pem) + 1,
+                                        w->oidc_issuer, w->oidc_audience, dbw_now_ms() / 1000u, &di)
+            : OC_JWT_E_KEY;
+        pthread_mutex_unlock(&w->keys_mu);
+        char key[OC_JWT_MAX_SHORT + 16];
+        snprintf(key, sizeof key, "demo-invite:%s", di.jti);
+        if (vr != OC_JWT_OK || oc_sha256(key, strlen(key), hash) != 0) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        sqlite3_prepare_v2(db, "SELECT 1 FROM invites WHERE token_hash=?;", -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        int spent = sqlite3_step(st) == SQLITE_ROW;
+        sqlite3_finalize(st);
+        if (spent) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
+        role = OC_ROLE_MEMBER; created_by = UINT64_MAX;   /* nobody here invited them */
+    } else {
+    if (j->token_len != OC_INVITE_TOKEN_LEN) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    if (oc_sha256((const uint8_t *)j->token, j->token_len, hash) != 0) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    sqlite3_prepare_v2(db,
+        "SELECT role, expires_at_ms, consumed_at_ms, created_by, uses, used FROM invites "
+        "WHERE token_hash=? AND email IS NULL;",
+        -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     if (sqlite3_step(st) == SQLITE_ROW) {
         role       = role_to_u8((const char *)sqlite3_column_text(st, 0));
         expiry     = (uint64_t)sqlite3_column_int64(st, 1);
@@ -2832,6 +2861,7 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     sqlite3_finalize(st);
     if (!found || consumed || (expiry != 0 && dbw_now_ms() >= expiry)) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
     }
     /* A setup token makes an owner only for a workspace with none who can sign
      * in: one printed before the first owner signed up makes no second. */
@@ -2865,6 +2895,18 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->mem_kib ? j->mem_kib : w->pw_mem);
     if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
 
+    if (j->demo_invite) {
+        /* Spent at once, as a consumed member invite of one use. */
+        sqlite3_prepare_v2(db, "INSERT INTO invites(token_hash, created_by, role, expires_at_ms, consumed_at_ms, uses, used) "
+                               "VALUES(?, NULL, 'member', ?, ?, 1, 1);", -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)(di.exp * 1000u));
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        audit_log(db, OC_AUDIT_ACCOUNT, "user.demo_join", 0, NULL, uid, user, 1, "via=browser");
+        return web_finish(w, j, r, uid);
+    }
     /* Take one use; the last one consumes the invite (REQ-026). The single
      * writer thread makes this atomic with the account creation above. */
     int last = uses != 0 && used + 1 >= uses;
@@ -2883,6 +2925,91 @@ static oc_dbres *process_redeem_job(oc_dbwriter *w, const oc_job *j) {
     if (created_by) audit_actor(db, OC_AUDIT_ACCOUNT, "invite.redeem", uid, 0, NULL, 1, "via=browser");
     else            audit_log(db, OC_AUDIT_ACCOUNT, "user.bootstrap", 0, NULL, uid, user, 1, "via=browser");
     return web_finish(w, j, r, uid);
+}
+
+/* A demo workspace's sample content (AUTH.md §8.12), written once, at its
+ * first start: what the demo is, in #general, and two more channels with a
+ * little in each, by "OpenChime Demo" -- an account nobody signs in as (no
+ * credential, removed), so nobody can edit its messages, and only a moderator
+ * delete them. A workspace that has it already is left alone. */
+static oc_dbres *process_seed_demo(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_OK;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE subject='demo:openchime';", -1, &st, NULL);
+    int have = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    if (have) return r;
+
+    const char *ws = j->ch_name && j->ch_name[0] ? j->ch_name : "this workspace";
+    int wl = utf8_prefix_len(ws, 64);
+    uint64_t now = dbw_now_ms();
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db, "INSERT INTO users(subject, display_name, role, created_at_ms, disabled) "
+                           "VALUES('demo:openchime', 'OpenChime Demo', 'member', ?, 1);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    uint64_t author = (uint64_t)sqlite3_last_insert_rowid(db);
+
+    static const struct { const char *name, *topic, *descr; } CH[] = {
+        { "general", "The public demo of OpenChime. Everything here is erased every night.",
+          "This is a public demo: everyone who signs up can read and post here. It is reset every night "
+          "at midnight UTC, and some things have daily limits so the demo stays usable for everyone." },
+        { "random", "Anything at all.", "Say hello, try a reaction, start a thread." },
+        { "feedback", "Tell us what you think.", "What worked, what didn't, what you would want. We read it." },
+    };
+    uint64_t cid[3] = { OC_DEFAULT_CHANNEL, 0, 0 };
+    for (int i = 0; ok && i < 3; i++) {
+        if (i == 0)
+            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channels(id,kind,name,is_public,created_at_ms) "
+                                   "VALUES(1,'channel','general',1,?);", -1, &st, NULL);
+        else
+            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO channels(kind,name,is_public,created_at_ms) "
+                                   "VALUES('channel',?,1,?);", -1, &st, NULL);
+        if (i == 0) sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+        else { sqlite3_bind_text(st, 1, CH[i].name, -1, SQLITE_STATIC); sqlite3_bind_int64(st, 2, (sqlite3_int64)now); }
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+        sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE kind='channel' AND name=?;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, CH[i].name, -1, SQLITE_STATIC);
+        if (ok && sqlite3_step(st) == SQLITE_ROW) cid[i] = (uint64_t)sqlite3_column_int64(st, 0);
+        else ok = 0;
+        sqlite3_finalize(st);
+        sqlite3_prepare_v2(db, "UPDATE channels SET topic=?, description=? WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, CH[i].topic, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, CH[i].descr, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)cid[i]);
+        if (ok) ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    char welcome[512];
+    snprintf(welcome, sizeof welcome,
+             "Welcome to %.*s, the public demo of OpenChime. Post, react, start a thread, share a file "
+             "or start a call: everything works, within a few daily limits. Anyone who signs up sees what "
+             "you write here, and it is all erased every night.", wl, ws);
+    const struct { int ch; const char *body; } MSG[] = {
+        { 0, welcome },
+        { 0, "Try the read-aloud and voice input from the composer, and the summary of a channel from its menu." },
+        { 0, "Please be kind: this is a shared space, and the people here are trying it out like you." },
+        { 1, "This is #random. Anything goes, within reason." },
+        { 2, "What did you like, and what was missing? Say so here." },
+    };
+    for (size_t i = 0; ok && i < sizeof MSG / sizeof *MSG; i++) {
+        sqlite3_prepare_v2(db, "INSERT INTO messages(channel_id, author_id, body, created_at_ms) VALUES(?,?,?,?);",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cid[MSG[i].ch]);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)author);
+        sqlite3_bind_text(st, 3, MSG[i].body, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)(now - (sizeof MSG / sizeof *MSG - i) * 60000u));
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+    if (!ok) return r;                    /* channel_id 0: not written */
+    r->channel_id = OC_DEFAULT_CHANNEL;   /* written now */
+    return r;
 }
 
 /* Load the persisted TLS identity (ARCH-66b); result cert_pem/key_pem are NULL
@@ -4808,6 +4935,11 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
     user_role(db, j->user_id, &role);
     size_t vlen = j->ch_name ? strlen(j->ch_name) : 0;
 
+    /* A demo's channels say what the demo is: their text is a moderator's. */
+    if (g_dbw_demo && (j->chup_op == OC_CHUP_TOPIC || j->chup_op == OC_CHUP_DESCRIPTION) &&
+        !oc_role_can_moderate(role)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
     if (j->chup_op == OC_CHUP_TOPIC) {
         if (vlen > OC_MAX_TOPIC) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
@@ -10039,6 +10171,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_LOAD_ENROLLMENT)  return process_load_enrollment(w->db, j);
     if (j->type == OC_JOB_STORE_ENROLLMENT) return process_store_enrollment(w->db, j);
     if (j->type == OC_JOB_WELCOME_GENERAL)  return process_welcome_general(w->db, j);
+    if (j->type == OC_JOB_SEED_DEMO)        return process_seed_demo(w->db, j);
     if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
     if (j->type == OC_JOB_ATTACH_MEDIA_SET) return process_attach_media_set(w->db, j);
@@ -10997,6 +11130,26 @@ void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem,
 int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name) {
     if (deployment_mode != OC_DEPLOY_MANAGED) return 0;   /* self-hosted: #general as ever */
     oc_job *j = oc_job_new(OC_JOB_WELCOME_GENERAL, 0);
+    if (!j) return 0;
+    j->ch_name = strdup(workspace_name ? workspace_name : "");
+    if (!j->ch_name) { job_free(j); return 0; }
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int wrote = r->type == OC_RES_OK && r->channel_id == OC_DEFAULT_CHANNEL;
+            oc_dbres_free(r);
+            return wrote;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+void oc_dbwriter_set_demo(oc_dbwriter *w, int on) { (void)w; g_dbw_demo = on != 0; }
+
+int oc_dbwriter_seed_demo(oc_dbwriter *w, const char *workspace_name) {
+    oc_job *j = oc_job_new(OC_JOB_SEED_DEMO, 0);
     if (!j) return 0;
     j->ch_name = strdup(workspace_name ? workspace_name : "");
     if (!j->ch_name) { job_free(j); return 0; }

@@ -37,6 +37,15 @@ the relay's issuer), `OPENCHIME_AUTH=relay`, `OPENCHIME_JOIN` (an `owner:` or
   (`OC_CLAIM_WAIT_SECS`) while central cannot be reached; a refused ticket is
   not retried.
 
+## A demo workspace
+
+The public demo in each environment (AUTH.md §8.12) is a managed box like any
+other, provisioned with `OPENCHIME_MODE=demo` and `OPENCHIME_AUTH=local,relay`:
+visitors make local accounts with the control plane's signed invite, checked
+against the relay's published keys, and the operator signs in through the
+relay as its owner. The control plane rebuilds it every night, from the image,
+on a new volume.
+
 ## Development mode
 
 Development mode (`OPENCHIME_MODE=development`) accepts the managed rows without the ticket, so

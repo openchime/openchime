@@ -229,16 +229,16 @@ static void test_auth_frames(void) {
     }
     {
         /* WORKSPACE_INFO — deployment mode + user cap + (optional) name. */
-        oc_workspace_info in = { 2 /* managed */, 500, oc_slice_str("Acme HQ"), 10 };
+        oc_workspace_info in = { 2 /* managed */, 500, oc_slice_str("Acme HQ"), 10, OC_WS_MODE_DEMO };
         ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
         oc_workspace_info out;
         CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
-        CHECK(out.deployment_mode == 2 && out.max_users == 500 && out.call_max == 10);
+        CHECK(out.deployment_mode == 2 && out.max_users == 500 && out.call_max == 10 && out.mode == OC_WS_MODE_DEMO);
         CHECK(slice_eq_str(out.workspace_name, "Acme HQ"));
     }
     {
         /* WORKSPACE_INFO — empty name (client derives from the host subdomain). */
-        oc_workspace_info in = { 0, 0, oc_slice_str(""), 0 };
+        oc_workspace_info in = { 0, 0, oc_slice_str(""), 0, 0 };
         ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
         oc_workspace_info out;
         CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);

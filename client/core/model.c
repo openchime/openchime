@@ -1659,6 +1659,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->deployment_mode = e->status;
         m->max_users = e->count;
         m->call_max = e->op;
+        m->workspace_mode = e->ws_mode;
         snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
         break;
     case OC_EV_CHANNEL: {

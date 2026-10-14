@@ -39,6 +39,49 @@ static oc_jwt_result verify_payload(oc_issuer *is, const char *pems, const char 
     return oc_jwt_verify(token, tlen, pems, strlen(pems) + 1, ISS, AUD, NOW, c);
 }
 
+/* A demo invitation (AUTH.md §8.12): the control plane's signed word for one
+ * member account, told from a sign-in token by its typ and its claims. */
+static void test_demo_invite(oc_issuer *is, const char *pem) {
+    size_t pl = strlen(pem) + 1;
+    char kid[OC_JWT_THUMBPRINT_LEN + 1];
+    CHECK(oc_jwt_key_thumbprint(pem, pl, kid) == 0);
+    char hdr[200], bad_hdr[200], pay[512], tok[2048];
+    snprintf(hdr, sizeof hdr, "{\"alg\":\"ES256\",\"typ\":\"" OC_JWT_DEMO_INVITE_TYP "\",\"kid\":\"%s\"}", kid);
+    #define DEMO_PAY(iat, exp, role, aud) snprintf(pay, sizeof pay, \
+        "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu,\"jti\":\"inv-1\",\"role\":\"%s\"}", \
+        ISS, aud, (unsigned long long)(iat), (unsigned long long)(exp), role)
+    oc_jwt_invite inv;
+    DEMO_PAY(NOW - 5, NOW + 895, "member", AUD);
+    size_t n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_OK);
+    CHECK(strcmp(inv.jti, "inv-1") == 0 && strcmp(inv.role, "member") == 0 && inv.exp == NOW + 895);
+    /* It is not a sign-in token. */
+    oc_jwt_claims c;
+    CHECK(oc_jwt_verify(tok, n, pem, pl, ISS, AUD, NOW, &c) != OC_JWT_OK);
+    /* Fifteen minutes at most; a member only; this workspace; not yet expired. */
+    DEMO_PAY(NOW - 5, NOW + 1000, "member", AUD);
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    DEMO_PAY(NOW - 5, NOW + 600, "admin", AUD);
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    DEMO_PAY(NOW - 5, NOW + 600, "member", "other.example");
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    DEMO_PAY(NOW - 900, NOW - 100, "member", AUD);
+    n = oc_issuer_mint(is, hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_EXPIRED);
+    /* The right claims under another typ, or none, are no invitation. */
+    DEMO_PAY(NOW - 5, NOW + 600, "member", AUD);
+    snprintf(bad_hdr, sizeof bad_hdr, "{\"alg\":\"ES256\",\"typ\":\"JWT\",\"kid\":\"%s\"}", kid);
+    n = oc_issuer_mint(is, bad_hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    snprintf(bad_hdr, sizeof bad_hdr, "{\"alg\":\"ES256\",\"kid\":\"%s\"}", kid);
+    n = oc_issuer_mint(is, bad_hdr, pay, tok);
+    CHECK(oc_jwt_verify_demo_invite(tok, n, pem, pl, ISS, AUD, NOW, &inv) == OC_JWT_E_CLAIMS);
+    #undef DEMO_PAY
+}
+
 int run_jwt_tests(void) {
     printf("test_jwt: ES256 verify to the contract: key set by kid, required claims, "
            "lifetime, unescape, over-long refused, nonce, base64url\n");
@@ -286,6 +329,7 @@ int run_jwt_tests(void) {
         free(k); free(name);
     }
 
+    test_demo_invite(&iss, pem);
     oc_issuer_free(&iss);
     oc_issuer_free(&other);
     return failures;

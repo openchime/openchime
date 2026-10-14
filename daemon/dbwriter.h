@@ -275,7 +275,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SUMMARY_DETACH = 138,
        OC_JOB_SUMMARY_CANCEL = 139,
        OC_JOB_SUMMARY_OPEN = 140,
-       OC_JOB_SUMMARY_SEEN = 141 };
+       OC_JOB_SUMMARY_SEEN = 141,
+       /* A demo workspace's first start (AUTH.md §8.12): its sample channels
+        * and messages, by an author nobody signs in as. Write, setup-time. */
+       OC_JOB_SEED_DEMO = 142 };
 /* OC_JOB_SECURITY's scopes (AUTH.md §8.6). */
 #define OC_SEC_CONFIRM_TOTP 1   /* a new secret's first code: on, with recovery codes */
 #define OC_SEC_TURN_OFF     2   /* a code: the step off, passkeys and codes gone */
@@ -334,6 +337,7 @@ typedef struct oc_job {
      * token it ends with is bound to. An AUTH job signs in or changes a password;
      * a REDEEM job signs up. */
     uint8_t        web;
+    uint8_t        demo_invite;   /* REDEEM: `token` is a control plane's signed demo invite */
     char           web_nonce[48];
     /* A password sign-in's path (AUTH.md §2): the writer checks the limiter, a
      * reader fetches the credential and its version, the auth pool checks the
@@ -1493,6 +1497,14 @@ void oc_dbwriter_note_enrollment_active(oc_dbwriter *w, const char *privkey_pem,
  * exists is left as it is, so this runs on every boot. Returns 1 when it wrote
  * the welcome, 0 otherwise. Setup-time only. */
 int oc_dbwriter_welcome_general(oc_dbwriter *w, int deployment_mode, const char *workspace_name);
+
+/* A demo workspace (OPENCHIME_MODE=demo, AUTH.md §8.12): sign-up takes the
+ * control plane's signed invite as well as a token; channel topics and
+ * descriptions are a moderator's; and its first start seeds sample channels
+ * and messages. Call before serving. */
+void oc_dbwriter_set_demo(oc_dbwriter *w, int on);
+/* The seed, once: 1 when it was written now, 0 when it was there already. */
+int oc_dbwriter_seed_demo(oc_dbwriter *w, const char *workspace_name);
 
 /* Register a push device token (ARCH-85): submits + blocks for the ack; returns 1
  * on success, 0 on a bad platform/empty token. */

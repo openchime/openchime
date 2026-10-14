@@ -73,7 +73,11 @@ canvas{display:block;width:100vw;height:100vh;outline:none}
   { let ws = q.get('ws') || q.get('host') || '';
     if (q.get('host') && q.get('port')) ws = q.get('host') + ':' + q.get('port');
     args.push('--signin', ws || `${host}:${port}`);
-    if (/^[0-9a-f]{64}$/.test(q.get('invite') || '')) args.push('--invite', q.get('invite')); }
+    // An invitation: a token's hex, or a demo workspace's signed invite
+    // (three base64url segments, AUTH.md §8.12), which the daemon checks.
+    const inv = q.get('invite') || '';
+    if (/^[0-9a-f]{64}$/.test(inv) || (inv.length <= 1000 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(inv)))
+      args.push('--invite', inv); }
   var Module = {
     arguments: args,
     // The test knobs the native harness sets in the environment (TESTING.md)

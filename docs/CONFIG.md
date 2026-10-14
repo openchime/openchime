@@ -77,7 +77,7 @@ the public demo by this setting alone. The daemon and every client read it.
 |---|---|---|
 | `normal` (the default) | every deployment, self-hosted or managed | Nothing: the constants hold, and a development input refuses the daemon's start (a client ignores one). |
 | `development` | the tests, CI, the GUI and web harnesses, the scripts, a box of your own | The development inputs below are read: fixture accounts, a smaller call or file page, no per-address connection cap, and the clients' synthetic devices, test hook and sign-in typing. Enrolment and certificates through central reach a loopback test service only; the managed rows are taken without the ticket, so a fixture can stand in for a managed box. The startup log says so in capitals. |
-| `demo` | the public demo workspace | A development input refuses the start, as in `normal`. The demo's own rules are separate work. |
+| `demo` | the public demo workspace | A development input refuses the start, as in `normal`. Needs `OPENCHIME_AUTH=local,relay`. Visitors sign up with the control plane's signed invite; daily limits per person and per workspace; one-day sessions; sample content at first start; every client says it is a public demo (AUTH.md §8.12). |
 
 Nothing that ships sets `development`: `make test` checks that no release
 path (the workflows, the Dockerfile, `packaging/`) names it or a development
