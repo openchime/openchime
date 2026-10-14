@@ -12959,7 +12959,10 @@ enum { MODAL_SM = 0, MODAL_LG };
 
 typedef struct { const char *label; uint8_t kind; int cmd; } oc_mbtn;
 /* The open modal's button that cannot be pressed yet (grey, takes nothing), or -1. */
-static int g_modal_off_cmd = -1;
+/* The button a modal holds switched off, or MODAL_NO_OFF. Not -1: that is
+ * MODAL_OK, which a "none" of -1 switched off in every form. */
+#define MODAL_NO_OFF (-1000)
+static int g_modal_off_cmd = MODAL_NO_OFF;
 typedef struct {
     const char *title;
     const char *subtitle;                  /* optional; NULL or "" for none */
@@ -14192,7 +14195,7 @@ static float status_want_h(void) {
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
     memset(&sp, 0, sizeof sp);
-    g_modal_off_cmd = -1;
+    g_modal_off_cmd = MODAL_NO_OFF;
     if (g_sr_open) {
         /* Summarize is a COMMAND, as Schedule is, and grey until both days are
          * picked: there is nothing to summarize before that. */
