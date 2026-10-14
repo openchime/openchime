@@ -1184,6 +1184,12 @@ static uint64_t g_geom_dirty_at;  /* geometry changed; save once it settles */
  * drags — a programmatic move never sends it, and the geometry would then be
  * whatever it was at the last drag. */
 static int geom_capture(oc_win *hwnd) {
+#ifdef __EMSCRIPTEN__
+    /* The browser's window is the page's, not one to remember: a desktop
+     * placement restored from the shared settings must not come from it. */
+    (void)hwnd;
+    return 0;
+#endif
     if (!hwnd || !hwnd->sdl) return 0;
     SDL_WindowFlags fl = SDL_GetWindowFlags(hwnd->sdl);
     if (fl & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) return 0;   /* never persist minimised */
@@ -31534,11 +31540,15 @@ static int on_tick(oc_win *hwnd) {
                      * default placement is visible, and an invisible window reads
                      * as an app that did not start. */
                     SDL_Rect saved = { g_win_x, g_win_y, g_win_w, g_win_h };
+#ifdef __EMSCRIPTEN__
+                    (void)saved;   /* the page is the window: nothing to place */
+#else
                     if (g_win_x != -1 && SDL_GetDisplayForRect(&saved)) {
                         SDL_SetWindowPosition(hwnd->sdl, g_win_x, g_win_y);
                         SDL_SetWindowSize(hwnd->sdl, g_win_w, g_win_h);
                         if (g_win_max) SDL_MaximizeWindow(hwnd->sdl);
                     }
+#endif
                     show_and_focus(hwnd);   /* see show_and_focus: shown late = not activated */
                 }
                 layout_composer(hwnd);
@@ -33050,8 +33060,17 @@ int main(int argc, char *argv[]) {
     /* Created hidden: when auto-connecting it is held back until the settings
      * bucket arrives so it opens where it was left rather than snapping there a
      * second later; shown immediately when there is nothing to wait for. */
+#ifdef __EMSCRIPTEN__
+    /* In the browser the window is the page: SDL sizes the canvas to the
+     * browser window at the screen's pixel ratio and follows its resizes
+     * (fill-document). A fixed size would be stretched, or, on a high-density
+     * screen, drawn at 1120x820 with the page showing beyond it. */
+    const SDL_WindowFlags win_mode = SDL_WINDOW_FILL_DOCUMENT;
+#else
+    const SDL_WindowFlags win_mode = SDL_WINDOW_RESIZABLE;
+#endif
     g_main->sdl = SDL_CreateWindow("OpenChime", 1120, 820,
-                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                   win_mode | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_main->sdl) return 1;
     g_win = g_main->sdl;
     if (!gfx_stack_init()) return 1;

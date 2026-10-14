@@ -4,9 +4,12 @@
 <meta charset="utf-8">
 <title>OpenChime</title>
 <style>
-html,body{margin:0;height:100%;background:#fff;overflow:hidden}
-canvas{display:block;width:100vw;height:100vh;outline:none}
-#status{position:fixed;left:12px;bottom:8px;font:12px system-ui,sans-serif;color:#6b7280;background:#fff8;padding:4px 8px;border-radius:6px}
+/* The canvas is sized by SDL to the browser window (fill-document); a size
+   here would take that over. The background is the client's own, so nothing
+   white shows while it loads or around it. */
+html,body{margin:0;height:100%;background:#162238;overflow:hidden}
+canvas{display:block;outline:none}
+#status{position:fixed;left:12px;bottom:8px;font:12px system-ui,sans-serif;color:#a6b0c3;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px}
 </style>
 </head>
 <body>
