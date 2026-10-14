@@ -26356,7 +26356,10 @@ static void signin_served(oc_win *hwnd, const char *ws, const char *invite) {
     snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
     g_si_port = ep.port;
     g_si_fp[0] = '\0';
-    signin_start_browser(hwnd, NULL, invite);
+    /* An invitation makes a local account, so it goes to the local source's
+     * pages even where the daemon also offers another (a demo workspace's
+     * relay, AUTH.md §8.12); without one, the daemon names the way in. */
+    signin_start_browser(hwnd, invite && invite[0] ? OC_SOURCE_ID_LOCAL : NULL, invite);
 }
 
 /* ...and back with the token: the sign-in resumes from what was stashed on
