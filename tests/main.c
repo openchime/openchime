@@ -16,6 +16,7 @@ int run_framebuf_tests(void);
 int run_migrate_tests(void);
 int run_auth_tests(void);
 int run_jwt_tests(void);
+int run_demolimits_tests(void);
 int run_joinrules_tests(void);
 int run_idtoken_tests(void);
 int run_relaykeys_tests(void);
@@ -229,6 +230,7 @@ static const struct suite { const char *name; int (*fn)(void); } SUITES[] = {
     S(run_migrate_tests),
     S(run_auth_tests),
     S(run_jwt_tests),
+    S(run_demolimits_tests),
     S(run_joinrules_tests),
     S(run_idtoken_tests),
     S(run_relaykeys_tests),

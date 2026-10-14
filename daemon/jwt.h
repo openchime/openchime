@@ -71,6 +71,30 @@ oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
                             const char *want_iss, const char *want_aud,
                             uint64_t now_secs, oc_jwt_claims *out);
 
+/* A demo invitation (AUTH.md §8.12): the control plane's signed word that one
+ * visitor may make one member account on a demo workspace. Header typ
+ * OC_JWT_DEMO_INVITE_TYP, so it can never pass as a sign-in token (which has
+ * sub and nonce, and lives five minutes) nor a sign-in token as one. */
+#define OC_JWT_DEMO_INVITE_TYP      "oc-demo-invite+jwt"
+#define OC_JWT_DEMO_INVITE_MAX_SECS 900u   /* exp - iat ceiling: fifteen minutes */
+
+typedef struct {
+    char     iss[OC_JWT_MAX_FIELD];
+    char     aud[OC_JWT_MAX_FIELD];
+    char     jti[OC_JWT_MAX_SHORT];    /* single-use id; the caller keeps the set */
+    char     role[16];                 /* "member": the only role one may give */
+    uint64_t exp, iat;
+} oc_jwt_invite;
+
+/* Verify a demo invitation as oc_jwt_verify does a sign-in token -- ES256, the
+ * pinned keys by `kid`, iss and aud -- but requiring the demo typ, iss, aud,
+ * jti, role "member", iat and exp, exp in the future and a life of at most
+ * OC_JWT_DEMO_INVITE_MAX_SECS. */
+oc_jwt_result oc_jwt_verify_demo_invite(const char *token, size_t tlen,
+                                        const char *pubkeys_pem, size_t pem_len,
+                                        const char *want_iss, const char *want_aud,
+                                        uint64_t now_secs, oc_jwt_invite *out);
+
 /* RFC 7638 thumbprint of one PEM EC P-256 public key, as unpadded base64url
  * into `out` (OC_JWT_THUMBPRINT_LEN + 1 bytes). `pem_len` includes the NUL.
  * Returns 0, or -1 if the key is not an EC P-256 public key. */

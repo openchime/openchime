@@ -91,7 +91,7 @@ enum {
                             * replaced one trusted before */
     OC_EV_SIGNED_OUT,      /* the session was refused and there is nothing to fall back on:
                             * the person has to sign in again, and the thread has stopped */
-    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name */
+    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name, ws_mode */
     OC_EV_MESSAGE,         /* a BROADCAST: channel/author/message_id/time + body */
     OC_EV_CHANNEL,         /* a CHANNEL_LIST entry / CHANNEL_INFO: channel_id + name(body)
                               + status, plus topic (author_name) and archived (REQ-034/035) */
@@ -309,6 +309,7 @@ typedef struct {
                               Derived server-side (ARCH-104) because the client
                               holds a thread's replies only while it is open. */
     uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
+    uint8_t  ws_mode;      /* WORKSPACE_INFO: OC_WS_MODE_* (a public demo, AUTH.md §8.12) */
     uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
     char    *preview;      /* heap; CHANNEL: newest message text (REQ-050 sidebar) */
     uint64_t preview_author;

@@ -11,6 +11,7 @@
 #include "notify.h"   /* the badge asks the same rule a toast does */
 #include "protocol.h"
 #include "issuer.h"
+#include "jwt.h"
 #include "check.h"
 #include <time.h>
 #include "mention.h"
@@ -8018,6 +8019,93 @@ static void test_actions(void) {
     cleanup_db(path);
 }
 
+/* A demo workspace (AUTH.md §8.12): a visitor makes a member account with the
+ * control plane's signed invite, once; the seed is written once; and channel
+ * text is a moderator's. */
+static int demo_count(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void test_demo_mode(void) {
+    const char *path = "build/test_dbwriter_demo.db";
+    cleanup_db(path);
+    oc_dbwriter *w = start_db(path);
+    CHECK(w != NULL);
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-demo") == 0);
+    const char *ISS = "https://staging.openchime.example", *AUD = "ws_demo";
+    CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem, "") == 0);
+    char kid[OC_JWT_THUMBPRINT_LEN + 1];
+    CHECK(oc_jwt_key_thumbprint(is.pem, strlen(is.pem) + 1, kid) == 0);
+    char hdr[200], pay[512], tok[2048];
+    snprintf(hdr, sizeof hdr, "{\"alg\":\"ES256\",\"typ\":\"" OC_JWT_DEMO_INVITE_TYP "\",\"kid\":\"%s\"}", kid);
+    unsigned long long now = (unsigned long long)time(NULL);
+    snprintf(pay, sizeof pay, "{\"iss\":\"%s\",\"aud\":\"%s\",\"iat\":%llu,\"exp\":%llu,\"jti\":\"d-1\",\"role\":\"member\"}",
+             ISS, AUD, now - 5, now + 895);
+    size_t n = oc_issuer_mint(&is, hdr, pay, tok);
+
+    #define DEMO_REDEEM(cid, user, out) do { \
+        oc_job *j = oc_job_new(OC_JOB_REDEEM, cid); \
+        j->web = OC_WEB_SIGNUP; j->demo_invite = 1; \
+        snprintf(j->web_nonce, sizeof j->web_nonce, "%s", test_challenge()); \
+        oc_job_set_register(j, user, "granite-harbor-violet", 0, TEST_PW_MEM); \
+        oc_job_set_token(j, tok, n); \
+        oc_dbwriter_submit(w, j); \
+        out = wait_result(w); } while (0)
+    oc_dbres *r;
+    /* Outside demo mode the writer takes no signed invite. */
+    DEMO_REDEEM(40, "visitor", r);
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    oc_dbwriter_set_demo(w, 1);
+    DEMO_REDEEM(41, "visitor", r);
+    CHECK(r && r->type == OC_RES_WEB_OK);
+    oc_dbres_free(r);
+    DEMO_REDEEM(42, "visitor-two", r);   /* once only, the same invite */
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    tok[n - 3] ^= 1;                     /* a signature that does not verify */
+    DEMO_REDEEM(43, "visitor-three", r);
+    CHECK(r && r->type == OC_RES_WEB_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    #undef DEMO_REDEEM
+
+    /* The seed: once, its channels and messages, by an author nobody signs in as. */
+    CHECK(oc_dbwriter_seed_demo(w, "Demo") == 1);
+    CHECK(oc_dbwriter_seed_demo(w, "Demo") == 0);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM channels WHERE name IN ('general','random','feedback');") == 3);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM messages m JOIN users u ON u.id=m.author_id "
+                          "WHERE u.subject='demo:openchime' AND u.disabled=1;") == 5);
+    CHECK(demo_count(db, "SELECT COUNT(*) FROM users WHERE subject='local:visitor' AND role='member';") == 1);
+    sqlite3_int64 visitor = 0;
+    {
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject='local:visitor';", -1, &st, NULL);
+        if (sqlite3_step(st) == SQLITE_ROW) visitor = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    /* A member may not reword a demo's channel. */
+    oc_job *j = oc_job_new(OC_JOB_UPDATE_CHANNEL, 44);
+    j->user_id = (uint64_t)visitor; j->channel_id = OC_DEFAULT_CHANNEL; j->chup_op = OC_CHUP_TOPIC;
+    j->ch_name = strdup("mine now");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    oc_dbwriter_set_demo(w, 0);
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity, catch-up, channel description, invites by address, a managed workspace welcome in general\n");
     test_auth_pool();
@@ -8030,6 +8118,7 @@ int run_dbwriter_tests(void) {
     test_welcome_general();
     test_auth_and_send();
     test_oidc_auth();
+    test_demo_mode();
     test_oidc_join_rules();
     test_direct_identities();
     test_relay_published_keys();

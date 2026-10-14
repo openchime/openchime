@@ -515,6 +515,13 @@ int main(int argc, char **argv) {
     /* A managed workspace's first boot opens with a welcome in #general: its
      * topic and description, nothing authored. Before the accounts below, which
      * would otherwise create the channel bare; a later boot finds it made. */
+    /* A demo workspace (AUTH.md §8.12): its rules, and at first start its
+     * sample content -- before the welcome, so #general says what the demo is. */
+    if (cfg->mode == OC_MODE_DEMO) {
+        oc_dbwriter_set_demo(db, 1);
+        if (oc_dbwriter_seed_demo(db, cfg->workspace_name))
+            fprintf(stderr, "openchimed: demo mode: the sample channels and messages written\n");
+    }
     if (oc_dbwriter_welcome_general(db, (int)cfg->deployment_mode, cfg->workspace_name))
         fprintf(stderr, "openchimed: #general created with its welcome\n");
 
@@ -603,7 +610,10 @@ int main(int argc, char **argv) {
                  cfg->tls_src.names ? cfg->tls_src.names : "");
         oc_netloop_set_passkey_names(names);
     }
-    oc_dbwriter_set_session_policy(db, OC_SESSION_TTL_MS, OC_SESSION_IDLE_MS);
+    /* A demo's visitors sign in for a day (AUTH.md §8.12); everyone else for
+     * the constant's thirty. */
+    oc_dbwriter_set_session_policy(db, cfg->mode == OC_MODE_DEMO ? OC_DEMO_SESSION_TTL_MS : OC_SESSION_TTL_MS,
+                                   OC_SESSION_IDLE_MS);
 
     /* The factor key (AUTH.md §8.6), kept outside the database: without it a
      * stolen database gives away no second step. Made at first start; if it

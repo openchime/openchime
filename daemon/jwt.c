@@ -372,13 +372,12 @@ int oc_jwt_nonce_matches(const char *nonce, const uint8_t *verifier, size_t veri
 
 #define OC_JWT_LEEWAY_SECS 60u   /* small clock-skew tolerance */
 
-oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
-                            const char *pubkeys_pem, size_t pem_len,
-                            const char *want_iss, const char *want_aud,
-                            uint64_t now_secs, oc_jwt_claims *out) {
-    if (!token || !out || !pubkeys_pem || pem_len == 0) return OC_JWT_E_INTERNAL;
-    memset(out, 0, sizeof *out);
-
+/* The signature half of both verifiers: split the compact JWS, pin ES256, pick
+ * the pinned key the `kid` names, verify, and only then parse the payload into
+ * `doc` (its strings point into `pay`). The header's typ must be `want_typ`,
+ * or absent or "JWT" when that is NULL. */
+static oc_jwt_result jws_verify(const char *token, size_t tlen, const char *pubkeys_pem,
+                                const char *want_typ, jdoc *doc, uint8_t *pay, size_t paycap) {
     /* Split "header.payload.signature". */
     const char *dot1 = memchr(token, '.', tlen);
     if (!dot1) return OC_JWT_E_FORMAT;
@@ -391,17 +390,21 @@ oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
     size_t sig_b64_len = tlen - (size_t)(sig_b64 - token);
     size_t signing_len = (size_t)(dot2 - token);   /* "header.payload" */
 
-    jdoc doc;
+    jdoc hd;
 
     /* Header: pin alg == ES256, and read which pinned key signed it. */
     uint8_t hdr[512];
     long hn = oc_base64url_decode(token, h_len, hdr, sizeof hdr);
     if (hn < 0) return OC_JWT_E_FORMAT;
     char alg[16], kid[OC_JWT_MAX_SHORT];
-    if (!jdoc_parse(&doc, (const char *)hdr, (size_t)hn)) return OC_JWT_E_FORMAT;
-    if (jdoc_str(&doc, "alg", alg, sizeof alg) != 1) return OC_JWT_E_FORMAT;
+    if (!jdoc_parse(&hd, (const char *)hdr, (size_t)hn)) return OC_JWT_E_FORMAT;
+    if (jdoc_str(&hd, "alg", alg, sizeof alg) != 1) return OC_JWT_E_FORMAT;
     if (strcmp(alg, "ES256") != 0) return OC_JWT_E_ALG;
-    if (jdoc_str(&doc, "kid", kid, sizeof kid) != 1) return OC_JWT_E_KEY;
+    if (jdoc_str(&hd, "kid", kid, sizeof kid) != 1) return OC_JWT_E_KEY;
+    /* The type keeps one kind of token from passing as another. */
+    char typ[32] = "";
+    if (jdoc_str(&hd, "typ", typ, sizeof typ) < 0) return OC_JWT_E_FORMAT;
+    if (want_typ ? strcmp(typ, want_typ) != 0 : (typ[0] && strcmp(typ, "JWT") != 0)) return OC_JWT_E_CLAIMS;
 
     /* Signature: 64 raw bytes -> DER. */
     uint8_t sig[80];
@@ -416,7 +419,6 @@ oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
     if (mbedtls_sha256((const unsigned char *)token, signing_len, hash, 0) != 0)
         return OC_JWT_E_INTERNAL;
 
-    (void)pem_len;   /* the set is NUL-terminated; the length is the contract's */
     mbedtls_pk_context pk;
     if (pick_key(pubkeys_pem, kid, &pk) != 0) return OC_JWT_E_KEY;
     int bad = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof hash, der, der_len);
@@ -424,10 +426,22 @@ oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
     if (bad != 0) return OC_JWT_E_SIGNATURE;
 
     /* Payload: read only after the signature is trusted. */
-    uint8_t pay[8192];
-    long pn = oc_base64url_decode(dot1 + 1, p_len, pay, sizeof pay);
+    long pn = oc_base64url_decode(dot1 + 1, p_len, pay, paycap);
     if (pn < 0) return OC_JWT_E_FORMAT;
-    if (!jdoc_parse(&doc, (const char *)pay, (size_t)pn)) return OC_JWT_E_FORMAT;
+    if (!jdoc_parse(doc, (const char *)pay, (size_t)pn)) return OC_JWT_E_FORMAT;
+    return OC_JWT_OK;
+}
+
+oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
+                            const char *pubkeys_pem, size_t pem_len,
+                            const char *want_iss, const char *want_aud,
+                            uint64_t now_secs, oc_jwt_claims *out) {
+    if (!token || !out || !pubkeys_pem || pem_len == 0) return OC_JWT_E_INTERNAL;
+    memset(out, 0, sizeof *out);
+    jdoc doc;
+    uint8_t pay[8192];
+    oc_jwt_result vr = jws_verify(token, tlen, pubkeys_pem, NULL, &doc, pay, sizeof pay);
+    if (vr != OC_JWT_OK) return vr;
 
     /* Required strings must be present; every string must fit and unescape. */
     if (jdoc_str(&doc, "iss",   out->iss,   sizeof out->iss)   != 1) return OC_JWT_E_CLAIMS;
@@ -454,5 +468,29 @@ oc_jwt_result oc_jwt_verify(const char *token, size_t tlen,
     if (out->iat > now_secs + OC_JWT_LEEWAY_SECS) return OC_JWT_E_EXPIRED;
     if (out->nbf > now_secs + OC_JWT_LEEWAY_SECS) return OC_JWT_E_EXPIRED;
 
+    return OC_JWT_OK;
+}
+
+oc_jwt_result oc_jwt_verify_demo_invite(const char *token, size_t tlen,
+                                        const char *pubkeys_pem, size_t pem_len,
+                                        const char *want_iss, const char *want_aud,
+                                        uint64_t now_secs, oc_jwt_invite *out) {
+    if (!token || !out || !pubkeys_pem || pem_len == 0 || !want_iss || !want_aud) return OC_JWT_E_INTERNAL;
+    memset(out, 0, sizeof *out);
+    jdoc doc;
+    uint8_t pay[2048];
+    oc_jwt_result vr = jws_verify(token, tlen, pubkeys_pem, OC_JWT_DEMO_INVITE_TYP, &doc, pay, sizeof pay);
+    if (vr != OC_JWT_OK) return vr;
+    if (jdoc_str(&doc, "iss",  out->iss,  sizeof out->iss)  != 1) return OC_JWT_E_CLAIMS;
+    if (jdoc_str(&doc, "aud",  out->aud,  sizeof out->aud)  != 1) return OC_JWT_E_CLAIMS;
+    if (jdoc_str(&doc, "jti",  out->jti,  sizeof out->jti)  != 1) return OC_JWT_E_CLAIMS;
+    if (jdoc_str(&doc, "role", out->role, sizeof out->role) != 1) return OC_JWT_E_CLAIMS;
+    if (!out->jti[0] || strcmp(out->role, "member") != 0) return OC_JWT_E_CLAIMS;
+    if (jdoc_u64(&doc, "exp", &out->exp) != 1) return OC_JWT_E_CLAIMS;
+    if (jdoc_u64(&doc, "iat", &out->iat) != 1) return OC_JWT_E_CLAIMS;
+    if (strcmp(out->iss, want_iss) != 0 || strcmp(out->aud, want_aud) != 0) return OC_JWT_E_CLAIMS;
+    if (out->exp < out->iat || out->exp - out->iat > OC_JWT_DEMO_INVITE_MAX_SECS) return OC_JWT_E_CLAIMS;
+    if (now_secs > out->exp + OC_JWT_LEEWAY_SECS) return OC_JWT_E_EXPIRED;
+    if (out->iat > now_secs + OC_JWT_LEEWAY_SECS) return OC_JWT_E_EXPIRED;
     return OC_JWT_OK;
 }

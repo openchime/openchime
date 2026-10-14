@@ -1003,3 +1003,41 @@ minute). A code is found only while pending; the page never says whose it is.
 **Phishing.** A device code can be sent to someone to approve for an attacker,
 so the page says where the request came from and when, tells the person to go on
 only if it was them, and offers a refusal the terminal is told about.
+
+### 8.12 A demo workspace
+
+A workspace started with `OPENCHIME_MODE=demo` (CONFIG.md "Mode") is the public
+demo: open to anyone, through the control plane, with everything working but
+bounded. It needs `OPENCHIME_AUTH=local,relay`: visitors make local accounts,
+and the relay's keys are what vouch for them.
+
+- **Getting in.** The control plane's `/demo` page (its PROVISIONING.md) mints
+  an invite and sends the browser to `https://<demo>/app/?invite=<invite>`. The
+  invite is a JWS signed with the relay's keys (`/oidc/jwks`, §3.3), header
+  `typ` `oc-demo-invite+jwt`, claims `iss` (the control plane's origin), `aud`
+  (the workspace's audience), `iat`, `exp` (fifteen minutes at most), `jti`
+  and `role` `member`. The web client passes it to the sign-up page like any
+  invitation, and only in demo mode does the page take one: the writer checks
+  the signature, the type, the issuer and audience, the life and the role
+  (`oc_jwt_verify_demo_invite`), and that its `jti` was never used -- kept as a
+  spent invite, so a restart does not forget it. A sign-in token is no invite
+  and an invite no sign-in token: the type and the claims differ.
+- **What a visitor is.** A member. Members cannot manage people, so the admin
+  screens are shown through the owner's account, which is the operator's.
+- **Daily limits** (`daemon/demolimits.c`), per person and per workspace, in a
+  UTC day: messages (200, 5,000), files shared (20, 500; 10 MB each), calls
+  joined (30, 500; each ends after 20 minutes), invitations (10, 50),
+  summaries (5, 100), and for the workspace alone push notifications (5,000)
+  and invitations mailed (20). Past one, the thing is refused with `ERROR
+  DEMO_LIMIT` (3037) and a sentence saying which limit -- a refusal is the
+  product too -- or, for push and mail, quietly not sent. The counts are held
+  in memory; a restart forgets the day.
+- **Sessions** last a day rather than thirty.
+- **Sample content.** At first start the workspace seeds #general, #random
+  and #feedback with their topics, descriptions and a few messages, by
+  "OpenChime Demo", an account nobody signs in as: nobody can edit them, and
+  only a moderator delete them. A channel's topic and description are a
+  moderator's in a demo, so a visitor cannot reword them.
+- **Saying so.** `WORKSPACE_INFO` carries the mode (PROTOCOL.md §4.3a); every
+  client shows that this is a public demo, read by everyone and erased every
+  night, for as long as it is open.

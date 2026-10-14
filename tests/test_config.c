@@ -289,7 +289,11 @@ static void test_mode(void) {
         { "OPENCHIME_DEV_CALL_MAX", "3" }, { "OPENCHIME_DEV_CONNS_PER_IP", "0" },
         { "OPENCHIME_DEV_AUDIO", "synthetic" }, { "OPENCHIME_DEV_SIGNIN", "alice:pw" },
     };
+    /* A demo admits visitors with the control plane's invite to local accounts:
+     * it needs both sources, and is refused without. */
+    CHECK(load_in_mode("demo", "OPENCHIME_WORKSPACE_NAME", "x", err, sizeof err) != 0 && strstr(err, "local,relay"));
     for (size_t m = 0; m < sizeof modes / sizeof *modes; m++) {
+        if (m == 1) { setenv("OPENCHIME_AUTH", "local,relay", 1); setenv("OPENCHIME_ENROLL_URL", "https://cp.example/api/machine/enroll", 1); }
         for (size_t i = 0; i < sizeof devs / sizeof *devs; i++) {
             int rc = load_in_mode(modes[m], devs[i][0], devs[i][1], err, sizeof err);
             CHECK(rc != 0 && strstr(err, devs[i][0]) && strstr(err, "development mode only") && strstr(err, modes[m]));
@@ -304,6 +308,7 @@ static void test_mode(void) {
         CHECK(c->dev.users == NULL);
         setenv("OPENCHIME_MODE", "development", 1);
         CHECK(load_in_mode(modes[m], "OPENCHIME_MANAGED_MAX_USERS", "5", err, sizeof err) != 0 && strstr(err, "OPENCHIME_MANAGED_TICKET"));
+        if (m == 1) { unsetenv("OPENCHIME_AUTH"); unsetenv("OPENCHIME_ENROLL_URL"); }
     }
     /* Unset is normal. */
     unsetenv("OPENCHIME_MODE");

@@ -334,6 +334,7 @@ oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_worksp
     oc_w_u32(w, m->max_users);
     oc_w_str(w, m->workspace_name);        /* u16 length + bytes */
     oc_w_u8(w, m->call_max);
+    oc_w_u8(w, m->mode);
     return oc_frame_end(w, off);
 }
 
@@ -1373,6 +1374,7 @@ const char *oc_error_text(uint16_t code) {
     case OC_ERR_UNKNOWN_GROUP: return "that group no longer exists";
     case OC_ERR_MEMBER_VIA_GROUP: return "they are in the channel through a group: change the group instead";
     case OC_ERR_INVALID_GROUP: return "that group's name or handle is not valid, or there are too many";
+    case OC_ERR_DEMO_LIMIT: return "this is a public demo, and that is limited for the day";
     case OC_ERR_SIGNUP_LIMITED: return "too many accounts were made from this address; try again in an hour";
     case OC_ERR_INTERNAL: return "the workspace had a problem: try again";
     default: return NULL;
@@ -2485,6 +2487,7 @@ oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m) {
     m->max_users = oc_r_u32(p);
     m->workspace_name = oc_r_str(p);
     m->call_max = oc_r_u8(p);
+    m->mode = oc_r_u8(p);
     return r_done(p);
 }
 

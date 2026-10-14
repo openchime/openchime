@@ -571,6 +571,13 @@ static int validate(oc_config *c, char *err, size_t errcap) {
         return -1;
     }
 
+    /* A demo admits visitors by the control plane's signed invite, checked
+     * against the relay's keys, to local accounts (AUTH.md §8.12). */
+    if (c->mode == OC_MODE_DEMO && !(c->auth_local && c->auth_relay)) {
+        snprintf(err, errcap, "OPENCHIME_MODE=demo: a demo's visitors make local accounts with the control plane's "
+                              "invite, so it needs OPENCHIME_AUTH=local,relay");
+        return -1;
+    }
     /* Development is for a box of one's own: it may call itself managed (the
      * fixtures do, to exercise that mode), but it never enrols anywhere real. */
     if (c->mode == OC_MODE_DEVELOPMENT && c->enroll.url && strncmp(c->enroll.url, "http://", 7) != 0) {

@@ -2452,7 +2452,7 @@ static int g_pref_toastpos = TOASTPOS_BOTTOM_CENTRE;
 /* What a toast's one action does (oc_fb_toast.action_id). */
 enum { FBA_NONE = 0, FBA_UNDO_DRAFT, FBA_RETRY, FBA_UNDO_DELETE };
 /* Banner states this client can be in (oc_fb_banner.id). */
-enum { FBB_CONNECTION = 1 };
+enum { FBB_CONNECTION = 1, FBB_DEMO };
 #define TOAST_GAP      UIS(10.0f)
 #define BANNER_H       UIS(34.0f)
 /* Hit-boxes, captured during paint: the card, its close and its action. */
@@ -2572,6 +2572,13 @@ static void toast_tick(const oc_model *m) {
     } else {
         oc_fb_banner_clear(&g_fb, FBB_CONNECTION);
     }
+    /* A public demo says so, all the time it is open (AUTH.md §8.12). */
+    if (m && m->authed && m->workspace_mode == OC_WS_MODE_DEMO)
+        oc_fb_banner_set(&g_fb, FBB_DEMO, OC_FB_INFO,
+                         "This is a public demo: everyone here can read what you post, and it is all erased every night.",
+                         NULL, 0);
+    else
+        oc_fb_banner_clear(&g_fb, FBB_DEMO);
 }
 
 /* Test/automation hook: when OPENCHIME_DEV_DIR is set, the app polls <dir>/cmd
