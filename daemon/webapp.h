@@ -8,7 +8,14 @@
  * /usr/share/openchime/web when installed), read once at startup. The two
  * are built and released together, so there is nothing to configure and no
  * version to mismatch. Without the wasm beside it the routes are absent and
- * the landing page stands as before. */
+ * the landing page stands as before.
+ *
+ * Sent small, and once: the loader is compiled in gzipped too, and the build
+ * writes `openchime.wasm.gz` beside the wasm, each sent with Content-Encoding to
+ * a browser that takes gzip (the daemon compresses nothing itself). Every
+ * route has an ETag, a hash of what it serves, so a browser revalidating its
+ * copy (`Cache-Control: no-cache`) is answered 304 and downloads nothing, and
+ * a new daemon -- a new client -- is never mistaken for the old one. */
 #ifndef OC_WEBAPP_H
 #define OC_WEBAPP_H
 
@@ -26,6 +33,9 @@ int oc_webapp_built(void);
  * filled when not (which is not an error for the daemon: it runs without a
  * web client), as it is when the client was not built in at all. */
 int oc_webapp_load(const char *exe_dir, char *err, size_t errcap);
+/* Whether `gz` is a gzip member whose trailer says it holds exactly `body`
+ * (its CRC-32 and length): a copy left from an older build is not served. */
+int oc_webapp_gzip_matches(const void *gz, size_t gz_len, const void *body, size_t body_len);
 int oc_webapp_loaded(void);
 
 /* The routes that serve it, to append to a site's: the page, the loader and

@@ -18453,6 +18453,7 @@ static void paint(oc_win *hwnd) {
     layout_natives(hwnd);
     a11y_publish_scene(m);   /* describe what was just drawn (ARCH-99) */
     gfx_end(rt);
+    oc_plat_frame_shown();
 }
 
 /* ---- the composer: our own editor (ARCH-98) ------------------------

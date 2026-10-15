@@ -98,6 +98,53 @@ same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (wasm threads
 need the isolation) and the loader and wasm under it. Nothing is configured:
 without the wasm beside it the daemon says so once and the landing page stands.
 
+**Loading.** What a browser downloads, and what it shows while it does.
+
+- *Small.* The client links at `-O2` (`mk/web.mk`): Emscripten's post-link
+  optimiser runs, and the loader leaves out its debugging assertions. A link
+  with no level is `-O0`, which skips both and gave a wasm twice the size.
+  The daemon sends nothing compressed of its own: `make web` writes
+  `openchime.wasm.gz` beside the wasm (`gzip -9 -n`, the same bytes every build)
+  and the loader is compiled in gzipped as well (`embed_res.py`'s `gzip:`). Each
+  goes with `Content-Encoding: gzip` to a browser that takes it. A gzip copy
+  whose trailer (CRC-32 and length) is not of the wasm beside it is passed
+  over, with a line saying so, so one left from another build cannot send
+  the wrong client. The page itself is about 16 KB and goes as it is.
+- *Once.* Every route under `/app/` has an ETag, a hash of what it serves (the
+  gzip copy's ends `-gz`), and keeps `Cache-Control: no-cache`: a browser
+  revalidates on every load, a daemon serving the same client answers `304`
+  and nothing is downloaded again, and a new daemon -- a new client -- is never
+  mistaken for the one before.
+- *Said.* The page shows a load screen over the canvas (`openchime.html`): the
+  download as a bar and a byte count ("Downloading 1.2 of 5.3 MB"), the page
+  fetching the wasm itself in `Module.instantiateWasm` so it can count, and
+  compiling it as it streams. The total is the daemon's `X-OC-Size`, the
+  decoded size, since with gzip `Content-Length` is the compressed one. Then
+  Compiling, Starting and Opening, and the screen comes down when the client
+  has drawn its first frame (`oc_plat_frame_shown`), not on a timer. A page not
+  cross-origin isolated, a loader or wasm that does not arrive, a download that
+  stops for 30 seconds, or a client that aborts says which, with **Try again**.
+  The bar is a `progressbar` with its value, and the stage is a polite live
+  region.
+
+Measured on the build that brought these in (a Chromium on the same host as
+the daemon, its certificate trusted; median of five cold loads):
+
+| | before | after |
+|---|---|---|
+| wasm, as sent | 11.2 MB | 1.9 MB (5.6 MB decoded) |
+| loader, as sent | 558 KB | 68 KB |
+| a second load, over the wire | all of it again | about 1 KB (every route `304`) |
+| the runtime up, cold | 1.76 s | 0.52 s |
+
+The pthread pool stays at 16 workers (`-sPTHREAD_POOL_SIZE`), each loading the
+loader and the module before `main` runs. Four took the cold first frame (the
+load screen down) from 1.4 s to 1.2 s here. It stays because in a browser a thread can only start on a
+worker already running or once the page's thread yields: a thread the page's
+thread creates and then waits for, as the device list's is (`app.c`), would
+otherwise never start, and a call (five threads) with a recording (three) open
+needs most of the pool.
+
 **Sign-in in a browser.** The page starts the client as `openchime --signin
 <host:port>`, its own origin, and nothing is typed into it: the client asks
 the daemon the way in (`AUTH_BEGIN`, AUTH.md §8.1) naming its own origin at

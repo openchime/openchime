@@ -65,6 +65,9 @@ int   oc_plat_open_signin(const char *url);
 int   oc_plat_signin_result(char *out, size_t cap);
 /* Last thing before exit. */
 void  oc_plat_quit(void);
+/* A frame of the main window was presented. The page takes its load screen
+ * down on the first (WEB.md, "Loading"); a desktop has nothing to do. */
+void  oc_plat_frame_shown(void);
 const char *oc_plat_name(void);
 /* Where the person allows the microphone when the platform blocks it, for
  * the message that says so ("Windows privacy settings", "the browser's site

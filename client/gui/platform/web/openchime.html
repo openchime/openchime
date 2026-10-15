@@ -9,12 +9,28 @@
    white shows while it loads or around it. */
 html,body{margin:0;height:100%;background:#162238;overflow:hidden}
 canvas{display:block;outline:none}
-#status{position:fixed;left:12px;bottom:8px;font:12px system-ui,sans-serif;color:#a6b0c3;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px}
+/* The load screen: over the canvas until the client draws its first frame. */
+#load{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;background:#162238;color:#e6ebf4;font:14px system-ui,sans-serif}
+#load .mark{font-size:24px;font-weight:600;letter-spacing:.2px}
+#load .track{width:min(320px,70vw);height:6px;border-radius:3px;background:#24324d;overflow:hidden}
+#load .fill{height:100%;width:0;background:#3b82f6;border-radius:3px;transition:width .15s linear}
+#load .fill.busy{width:30%;animation:oc-busy 1.2s ease-in-out infinite}
+@keyframes oc-busy{from{transform:translateX(-100%)}to{transform:translateX(340%)}}
+#load .stage{color:#a6b0c3;min-height:1.4em;text-align:center;max-width:min(480px,86vw)}
+#load.failed .fill{background:#ef4444;width:100%;animation:none}
+#load button{font:inherit;color:#fff;background:#3b82f6;border:0;border-radius:6px;padding:7px 16px;cursor:pointer}
+@media (prefers-reduced-motion:reduce){#load .fill{transition:none}#load .fill.busy{animation:none;width:100%;opacity:.5}}
 </style>
 </head>
 <body>
 <canvas id="canvas" tabindex="0"></canvas>
-<div id="status">loading…</div>
+<div id="load">
+  <div class="mark">OpenChime</div>
+  <div class="track" role="progressbar" aria-label="Loading OpenChime" aria-valuemin="0" aria-valuemax="100"><div class="fill busy"></div></div>
+  <div class="stage" aria-live="polite">Loading…</div>
+  <button type="button" hidden>Try again</button>
+</div>
 <script>
 { // A block: this script's names stay its own. The loader is a classic
   // script in the same global scope, and with its worker and worklet
@@ -33,7 +49,37 @@ canvas{display:block;outline:none}
   const host = q.get('host') || location.hostname;
   const port = q.get('port') || location.port || (location.protocol === 'https:' ? '443' : '80');
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const status = document.getElementById('status');
+  // The load screen (WEB.md, "Loading"): what the page is doing until the
+  // client draws its first frame -- the download by bytes, then each stage by
+  // name -- or, when it cannot go on, why, with a way to try again. It never
+  // sits at one word with nothing moving.
+  const load = document.getElementById('load');
+  const track = load.querySelector('.track'), fill = load.querySelector('.fill');
+  const stageEl = load.querySelector('.stage'), retry = load.querySelector('button');
+  let failed = false, downloading = false, lastByte = 0;
+  const stage = (text, frac) => {
+    if (failed || !load.isConnected) return;
+    if (stageEl.textContent !== text) stageEl.textContent = text;
+    if (frac == null) { fill.classList.add('busy'); fill.style.width = ''; track.removeAttribute('aria-valuenow'); }
+    else {
+      const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+      fill.classList.remove('busy'); fill.style.width = pct + '%'; track.setAttribute('aria-valuenow', String(pct));
+    }
+  };
+  const fail = (why) => {
+    if (failed || !load.isConnected) return;
+    failed = true; downloading = false;
+    load.classList.add('failed'); track.removeAttribute('aria-valuenow');
+    stageEl.textContent = why; retry.hidden = false; retry.focus();
+  };
+  retry.addEventListener('click', () => location.reload());
+  window.ocLoaded = () => { if (!failed) load.remove(); };
+  const mb = (n) => (n / 1048576).toFixed(1);
+  // A download that stops arriving says so rather than waiting forever.
+  setInterval(() => { if (downloading && Date.now() - lastByte > 30000) fail('The download stopped. Check the connection and try again.'); }, 2000);
+  // A script error before the first frame is a start that failed (fail() does
+  // nothing once the screen is down).
+  window.addEventListener('error', (ev) => fail('OpenChime could not start: ' + (ev.message || 'a script failed')));
   // The test hook (OPENCHIME_DEV_DIR, TESTING.md), on the page's filesystem,
   // when the page is opened with ?hook=1: ocHook('verb args') answers the ack,
   // and ?shot=<ms> logs the client's own screenshot as SHOT:<base64 BMP> after
@@ -98,11 +144,41 @@ canvas{display:block;outline:none}
       }
     }],
     canvas: document.getElementById('canvas'),
+    // The wasm is fetched here rather than by the loader, so its bytes can be
+    // counted as they arrive; it still compiles while it streams. The size is
+    // the daemon's X-OC-Size (with gzip, Content-Length is the compressed
+    // size), else Content-Length, else unknown and the bar just moves.
+    instantiateWasm: (imports, done) => {
+      (async () => {
+        stage('Downloading…');
+        const r = await fetch('openchime.wasm', { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('the server answered ' + r.status);
+        const total = Number(r.headers.get('X-OC-Size')) ||
+                      (r.headers.get('Content-Encoding') ? 0 : Number(r.headers.get('Content-Length'))) || 0;
+        let got = 0;
+        downloading = true; lastByte = Date.now();
+        const counted = r.body.pipeThrough(new TransformStream({
+          transform(chunk, c) {
+            got += chunk.byteLength; lastByte = Date.now();
+            if (total) stage(`Downloading ${mb(Math.min(got, total))} of ${mb(total)} MB`, got / total);
+            else stage(`Downloading ${mb(got)} MB`);
+            c.enqueue(chunk);
+          },
+          flush() { downloading = false; stage('Compiling…'); },
+        }));
+        const res = new Response(counted, { headers: { 'Content-Type': 'application/wasm' } });
+        const out = await WebAssembly.instantiateStreaming(res, imports);
+        stage('Starting…');
+        done(out.instance, out.module);
+      })().catch((e) => fail('OpenChime could not be downloaded: ' + (e && e.message ? e.message : e)));
+      return {};
+    },
+    onAbort: (what) => fail('OpenChime stopped: ' + what),
     websocket: { url: q.get('ws') || `${scheme}://${host}:${port}/ws`, subprotocol: 'binary' },
     print: (t) => console.log(t),
     printErr: (t) => console.error(t),
     onRuntimeInitialized: () => {
-      status.textContent = 'OpenChime on the web'; setTimeout(() => status.remove(), 6000);
+      stage('Opening…');
       // ?open=openchime://... : a permalink for the running client, as a second
       // launch hands one over on a desktop.
       if (q.get('open')) setTimeout(() => Module.ccall('oc_web_handoff', null, ['string', 'string'], ['url', q.get('open')]), 4000);
@@ -171,6 +247,21 @@ canvas{display:block;outline:none}
   else if (hookOn && q.has('shot')) setTimeout(async () => { try { console.log('SHOT:' + (await ocShot())); } catch (e) { console.log('SHOT-ERR:' + e); } }, parseInt(q.get('shot'), 10));
 }
 </script>
-<script src="openchime.js"></script>
+<script>
+// Threads need the page cross-origin isolated (the daemon's headers say so);
+// without it the loader cannot start, so say that instead of loading it.
+if (!window.crossOriginIsolated) {
+  document.querySelector('#load .stage').textContent =
+    'This page was not served with the isolation OpenChime needs (Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy). Open it from the workspace\'s own address.';
+  document.getElementById('load').classList.add('failed');
+} else {
+  const s = document.createElement('script');
+  s.src = 'openchime.js';
+  s.onerror = () => { const l = document.getElementById('load'); if (!l) return;
+    l.classList.add('failed'); l.querySelector('.stage').textContent = 'OpenChime could not be downloaded. Check the connection and try again.';
+    const b = l.querySelector('button'); b.hidden = false; };
+  document.body.appendChild(s);
+}
+</script>
 </body>
 </html>

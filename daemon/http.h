@@ -34,6 +34,10 @@ typedef struct {
     int         upgrade_ws;
     const char *ws_key;   size_t ws_key_len;
     const char *ws_proto; size_t ws_proto_len;
+    /* What a static route's answer depends on (oc_http_static_choose): whether
+     * any Accept-Encoding takes gzip, and the first If-None-Match. */
+    int         accept_gzip;
+    const char *inm;      size_t inm_len;
     size_t      head_len;                    /* request line + headers + blank line */
     size_t      content_length;              /* declared; 0 when absent */
 } oc_http_req;
@@ -78,6 +82,14 @@ typedef struct {
     const char  *body;
     size_t       body_len;
     const char  *extra;       /* OC_HTTP_STATIC: headers added to the answer ("A: b\r\n"), or NULL */
+    /* OC_HTTP_STATIC, optional. The same body gzipped, sent with
+     * Content-Encoding to a request that takes it (NULL: none); and the
+     * body's ETag, quoted, with the gzip copy's beside it, so a browser that
+     * already holds what it would get is answered 304 (NULL: no ETag). */
+    const char  *gz_body;
+    size_t       gz_len;
+    const char  *etag;
+    const char  *etag_gz;
 } oc_http_route;
 
 /* What one listener serves: its routes, in order, and what a path none of them
@@ -98,12 +110,31 @@ const oc_http_route *oc_http_route_find(const oc_http_site *site, const oc_http_
 /* Write a response head -- status line, Content-Type, Content-Length and
  * `Connection: close` -- into `out`. Returns its length, or 0 if `cap` is too
  * small. OC_HTTP_HEAD_MAX always suffices for a Content-Type under 64 bytes. */
-#define OC_HTTP_HEAD_MAX 512u
+#define OC_HTTP_HEAD_MAX 1024u
 size_t oc_http_head(char *out, size_t cap, int status, const char *ctype, size_t body_len);
 /* The same with `extra` -- whole header lines, each ending "\r\n", or NULL --
  * after Content-Type: a Location, the pages' security headers. */
 size_t oc_http_head_ex(char *out, size_t cap, int status, const char *ctype, size_t body_len,
                        const char *extra);
+
+/* A static route's answer to a request: 304 when the request already holds the
+ * representation it would be sent (If-None-Match names its ETag), the gzip copy
+ * when the route has one and the request takes gzip, otherwise the body. */
+typedef struct {
+    int         status;               /* 200 or 304 */
+    const char *body; size_t len;     /* what follows the head; nothing on a 304 */
+    int         gzip;                 /* the body is the gzip copy */
+    const char *etag;                 /* the representation's ETag, or NULL */
+} oc_http_static_pick;
+void oc_http_static_choose(const oc_http_route *rt, const oc_http_req *req, oc_http_static_pick *out);
+/* Its head: the route's Content-Type and `extra`, then the ETag, the
+ * Content-Encoding and `Vary: Accept-Encoding` as they apply. A 304 carries no
+ * Content-Type or Content-Length. Returns the length, or 0 when `cap` is short. */
+size_t oc_http_static_head(char *out, size_t cap, const oc_http_route *rt, const oc_http_static_pick *p);
+/* Does an Accept-Encoding value take gzip (by name or `*`, at a q above 0)? */
+int oc_http_accepts_gzip(const char *v, size_t n);
+/* Does an If-None-Match value name `etag` (or say `*`)? Weak forms match. */
+int oc_http_etag_listed(const char *v, size_t n, const char *etag);
 
 /* The small fixed page an error status is answered with (text/plain). */
 const char *oc_http_error_body(int status, size_t *len);

@@ -144,11 +144,11 @@ static void test_head_fields(void) {
 
 static void test_router(void) {
     static const oc_http_route R[] = {
-        { "POST", "/webhook/", 1, OC_HTTP_LOOP,   64, NULL, NULL, 0, NULL },
-        { "GET",  "/page",     0, OC_HTTP_STATIC, 0, "text/plain", "p", 1, NULL },
-        { NULL,   "/any",      0, OC_HTTP_STATIC, 0, "text/plain", "a", 1, NULL },
+        { "POST", "/webhook/", 1, OC_HTTP_LOOP,   64, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+        { "GET",  "/page",     0, OC_HTTP_STATIC, 0, "text/plain", "p", 1, NULL, NULL, 0, NULL, NULL },
+        { NULL,   "/any",      0, OC_HTTP_STATIC, 0, "text/plain", "a", 1, NULL, NULL, 0, NULL, NULL },
     };
-    static const oc_http_route FB = { NULL, "/", 1, OC_HTTP_STATIC, 0, "text/html", "f", 1, NULL };
+    static const oc_http_route FB = { NULL, "/", 1, OC_HTTP_STATIC, 0, "text/html", "f", 1, NULL, NULL, 0, NULL, NULL };
     oc_http_site site = { R, 3, NULL }, site_fb = { R, 3, &FB };
     oc_http_req req;
     int st = 0;
@@ -185,9 +185,64 @@ static void test_writer(void) {
     }
 }
 
+/* A static route with a gzip copy and ETags (the web client's, webapp.h):
+ * gzip only to a request that takes it, 304 to one that already holds the
+ * representation it would get, and the head saying which. */
+static void test_static_answers(void) {
+    CHECK(oc_http_accepts_gzip("gzip", 4));
+    CHECK(oc_http_accepts_gzip("deflate, gzip, br", 17));
+    CHECK(oc_http_accepts_gzip("GZip;q=0.5", 10));
+    CHECK(oc_http_accepts_gzip("*", 1));
+    CHECK(!oc_http_accepts_gzip("gzip;q=0", 8));
+    CHECK(!oc_http_accepts_gzip("gzip; q=0.000, br", 17));
+    CHECK(!oc_http_accepts_gzip("br, identity", 12));
+    CHECK(!oc_http_accepts_gzip("gzipx", 5));                       /* whole names */
+    CHECK(!oc_http_accepts_gzip("*;q=0", 5));
+    CHECK(!oc_http_accepts_gzip("", 0));
+    CHECK(oc_http_accepts_gzip("*, gzip;q=0.1", 13));
+
+    CHECK(oc_http_etag_listed("\"a\"", 3, "\"a\""));
+    CHECK(oc_http_etag_listed("\"x\", W/\"a\"", 10, "\"a\""));     /* weak forms match */
+    CHECK(oc_http_etag_listed("*", 1, "\"a\""));
+    CHECK(!oc_http_etag_listed("\"ab\"", 4, "\"a\""));
+    CHECK(!oc_http_etag_listed("\"a-gz\"", 6, "\"a\""));           /* another representation */
+
+    static const oc_http_route R = { "GET", "/w", 0, OC_HTTP_STATIC, 0, "application/wasm", "BODY", 4,
+                                     "X-A: 1\r\n", "GZ", 2, "\"e\"", "\"e-gz\"" };
+    oc_http_req req;
+    oc_http_static_pick p;
+    char head[OC_HTTP_HEAD_MAX];
+#define PICK(line) (oc_http_parse_head(line, strlen(line), &req) == 1 ? (oc_http_static_choose(&R, &req, &p), 1) : 0)
+    CHECK(PICK("GET /w HTTP/1.1\r\n\r\n") && p.status == 200 && !p.gzip && p.len == 4 && !strcmp(p.etag, "\"e\""));
+    CHECK(oc_http_static_head(head, sizeof head, &R, &p) > 0 && strstr(head, "X-A: 1\r\n") &&
+          strstr(head, "ETag: \"e\"\r\n") && strstr(head, "Vary: Accept-Encoding\r\n") &&
+          !strstr(head, "Content-Encoding") && strstr(head, "Content-Length: 4\r\n"));
+    CHECK(PICK("GET /w HTTP/1.1\r\nAccept-Encoding: gzip, br\r\n\r\n") && p.status == 200 && p.gzip &&
+          p.len == 2 && memcmp(p.body, "GZ", 2) == 0);
+    CHECK(oc_http_static_head(head, sizeof head, &R, &p) > 0 && strstr(head, "Content-Encoding: gzip\r\n") &&
+          strstr(head, "ETag: \"e-gz\"\r\n") && strstr(head, "Content-Length: 2\r\n"));
+    /* Revalidation: the representation held is the one that would be sent. */
+    CHECK(PICK("GET /w HTTP/1.1\r\nAccept-Encoding: gzip\r\nIf-None-Match: \"e-gz\"\r\n\r\n") &&
+          p.status == 304 && p.len == 0);
+    CHECK(oc_http_static_head(head, sizeof head, &R, &p) > 0 && !strncmp(head, "HTTP/1.1 304 Not Modified\r\n", 27) &&
+          strstr(head, "ETag: \"e-gz\"\r\n") && !strstr(head, "Content-Length") && !strstr(head, "Content-Type"));
+    CHECK(PICK("GET /w HTTP/1.1\r\nIf-None-Match: \"e-gz\"\r\n\r\n") && p.status == 200 && !p.gzip);
+    CHECK(PICK("GET /w HTTP/1.1\r\nIf-None-Match: \"old\"\r\n\r\n") && p.status == 200);
+    /* A route with neither (every other static route) answers as it always has. */
+    static const oc_http_route PLAIN = { NULL, "/p", 0, OC_HTTP_STATIC, 0, "text/plain", "ok", 2,
+                                         NULL, NULL, 0, NULL, NULL };
+    const char *rp = "GET /p HTTP/1.1\r\nAccept-Encoding: gzip\r\nIf-None-Match: *\r\n\r\n";
+    CHECK(oc_http_parse_head(rp, strlen(rp), &req) == 1);
+    oc_http_static_choose(&PLAIN, &req, &p);
+    CHECK(p.status == 200 && !p.gzip && p.etag == NULL && p.len == 2);
+    CHECK(oc_http_static_head(head, sizeof head, &PLAIN, &p) > 0 && !strstr(head, "ETag") && !strstr(head, "Vary"));
+#undef PICK
+}
+
 int run_http_tests(void) {
     printf("test_http: request line, headers, body framing, partial input, size limits,\n");
-    printf("           refusals, JSON/plain webhook text, the router, the response writer\n");
+    printf("           refusals, JSON/plain webhook text, the router, the response writer,\n");
+    printf("           a static route's gzip copy and ETag\n");
     test_parse_json();
     test_parse_plain();
     test_incomplete();
@@ -199,5 +254,6 @@ int run_http_tests(void) {
     test_head_fields();
     test_router();
     test_writer();
+    test_static_answers();
     return failures;
 }

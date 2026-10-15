@@ -52,6 +52,14 @@ int oc_http_parse_head(const char *buf, size_t len, oc_http_req *req) {
             if (h[i].value_len == 9 && ci_eq(h[i].value, 9, "websocket")) req->upgrade_ws = 1;
             continue;
         }
+        if (ci_eq(h[i].name, h[i].name_len, "accept-encoding")) {
+            if (oc_http_accepts_gzip(h[i].value, h[i].value_len)) req->accept_gzip = 1;
+            continue;
+        }
+        if (ci_eq(h[i].name, h[i].name_len, "if-none-match")) {
+            if (!req->inm) { req->inm = h[i].value; req->inm_len = h[i].value_len; }
+            continue;
+        }
         if (ci_eq(h[i].name, h[i].name_len, "sec-websocket-key")) {
             req->ws_key = h[i].value; req->ws_key_len = h[i].value_len;
             continue;
@@ -186,6 +194,80 @@ size_t oc_http_head_ex(char *out, size_t cap, int status, const char *ctype, siz
         "Content-Length: %zu\r\n"
         "Connection: close\r\n\r\n",
         status, reason(status), ctype, extra ? extra : "", body_len);
+    return (n < 0 || (size_t)n >= cap) ? 0 : (size_t)n;
+}
+
+/* One comma-separated element of a header list, its surrounding blanks
+ * trimmed: [*s, *s + *n). Advances *pos past it; 0 when there are no more. */
+static int list_next(const char *v, size_t n, size_t *pos, const char **s, size_t *len) {
+    size_t i = *pos;
+    while (i < n && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) i++;
+    if (i >= n) return 0;
+    size_t b = i;
+    while (i < n && v[i] != ',') i++;
+    size_t e = i;
+    while (e > b && (v[e - 1] == ' ' || v[e - 1] == '\t')) e--;
+    *s = v + b; *len = e - b; *pos = i;
+    return 1;
+}
+
+int oc_http_accepts_gzip(const char *v, size_t n) {
+    const char *s; size_t len, pos = 0;
+    int star = 0;
+    while (list_next(v, n, &pos, &s, &len)) {
+        size_t k = 0;
+        while (k < len && s[k] != ';' && s[k] != ' ' && s[k] != '\t') k++;
+        /* "q=0" (or 0.0, 0.00...) refuses; any other weight takes it. */
+        int refused = 0;
+        for (size_t j = k; j + 1 < len; j++)
+            if ((s[j] == 'q' || s[j] == 'Q') && s[j + 1] == '=') {
+                size_t d = j + 2;
+                refused = d < len && s[d] == '0';
+                for (d++; refused && d < len && s[d] != ';' && s[d] != ' '; d++)
+                    if (s[d] != '.' && s[d] != '0') refused = 0;
+                break;
+            }
+        if (ci_eq(s, k, "gzip") || ci_eq(s, k, "x-gzip")) return !refused;
+        if (k == 1 && s[0] == '*') star = !refused;
+    }
+    return star;
+}
+
+int oc_http_etag_listed(const char *v, size_t n, const char *etag) {
+    if (!v || !etag) return 0;
+    size_t el = strlen(etag);
+    const char *s; size_t len, pos = 0;
+    while (list_next(v, n, &pos, &s, &len)) {
+        if (len == 1 && s[0] == '*') return 1;
+        if (len > 2 && s[0] == 'W' && s[1] == '/') { s += 2; len -= 2; }
+        if (len == el && memcmp(s, etag, el) == 0) return 1;
+    }
+    return 0;
+}
+
+void oc_http_static_choose(const oc_http_route *rt, const oc_http_req *req, oc_http_static_pick *out) {
+    int gz = rt->gz_body && rt->gz_len && req->accept_gzip;
+    out->gzip = gz;
+    out->etag = gz ? rt->etag_gz : rt->etag;
+    if (out->etag && req->inm && oc_http_etag_listed(req->inm, req->inm_len, out->etag)) {
+        out->status = 304; out->body = ""; out->len = 0;
+        return;
+    }
+    out->status = 200;
+    out->body = gz ? rt->gz_body : rt->body;
+    out->len  = gz ? rt->gz_len  : rt->body_len;
+}
+
+size_t oc_http_static_head(char *out, size_t cap, const oc_http_route *rt, const oc_http_static_pick *p) {
+    char more[512];
+    int m = snprintf(more, sizeof more, "%s%s%s%s%s%s",
+                     rt->extra ? rt->extra : "",
+                     p->etag ? "ETag: " : "", p->etag ? p->etag : "", p->etag ? "\r\n" : "",
+                     p->gzip ? "Content-Encoding: gzip\r\n" : "",
+                     rt->gz_body ? "Vary: Accept-Encoding\r\n" : "");
+    if (m < 0 || (size_t)m >= sizeof more) return 0;
+    if (p->status != 304) return oc_http_head_ex(out, cap, p->status, rt->ctype, p->len, more);
+    int n = snprintf(out, cap, "HTTP/1.1 304 Not Modified\r\n%sConnection: close\r\n\r\n", more);
     return (n < 0 || (size_t)n >= cap) ? 0 : (size_t)n;
 }
 

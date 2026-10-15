@@ -722,7 +722,14 @@ bootstraps its user.
   ... invite 0`) and a second browser opens `/app/?invite=<hex>` cold
   (`scripts/web/invite.mjs`), lands on the sign-up form, chooses a name and a
   password and comes back signed in to the web client, which its own dump
-  says. Needs the web client beside the daemon (`make web`). `make web-test`
+  says. Last, the client's load (`scripts/web/load.mjs`, WEB.md "Loading"),
+  cold and then warm in one browser that trusts the daemon's certificate by
+  its key (a browser caches nothing from one it was told to overlook): the load
+  screen counts the download in bytes against its size, shows Downloading,
+  Starting and Opening in that order and comes down once the client has
+  drawn; the wasm and the loader arrive gzipped; and the second load brings
+  the page, the loader and the wasm under 2 KB each, every one a `304`. Needs
+  the web client beside the daemon (`make web`) and `openssl`. `make web-test`
   runs it after `test.sh`.
 - **`scripts/gui/run.sh --web all`** — the Windows feature scripts against the browser
   ("Driving the web client" below): the smoke, voice input, screen recording,

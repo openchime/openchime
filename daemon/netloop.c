@@ -4157,24 +4157,24 @@ static void http_reply(conn *c, int status, const char *ctype, const char *body,
  * handled on the I/O thread (ioloop.c). */
 #define WS_PATH "/ws"
 static const oc_http_route TLS_ROUTES[] = {
-    { "GET",  WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL },
-    { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0, NULL },
-    { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
-    { "POST", "/signin/verify", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
-    { "GET",  "/signup", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
-    { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
-    { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
-    { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "GET",  "/codes.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "GET",  "/showpw.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
-    { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL },
-    { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL },
+    { "GET",  WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", WEBHOOK_PREFIX, 1, OC_HTTP_LOOP, OC_MAX_BODY_SIZE, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/signin", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/signin", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/signin/verify", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/signup", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/signup", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/account/password", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/account/password", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/account/security", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/account/security", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/account/reset", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/webauthn.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/codes.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/showpw.js", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/account/reset", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "GET",  "/device", 0, OC_HTTP_LOOP, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
+    { "POST", "/device", 0, OC_HTTP_LOOP, WEB_MAX_BODY, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
 };
 
 /* A workspace address is a perfectly natural thing to paste into a browser, so
@@ -4215,17 +4215,17 @@ static const char LANDING_BODY[] =
  * ignored, up to a small limit. */
 #define HEALTH_MAX_BODY 4096u
 static const oc_http_route HEALTH_ROUTES[] = {
-    { NULL, "/healthz", 0, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/plain", "OK", 2, NULL },
+    { NULL, "/healthz", 0, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/plain", "OK", 2, NULL, NULL, 0, NULL, NULL },
     /* The protocol in WebSocket frames, in the clear, for a browser page served
      * from the same box in development; a deployment fronts both with TLS. */
-    { "GET", WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL },
+    { "GET", WS_PATH, 0, OC_HTTP_WS, 0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL },
 };
 /* LANDING_BODY with its one variable part: where the web client is, when this
  * daemon serves one (webapp.h) -- on the TLS port, at the workspace's address
  * when it has one, else at this host's -- or nothing. */
 static char g_landing[sizeof LANDING_BODY + 640];
 static oc_http_route g_health_landing = {
-    NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8", NULL, 0, NULL
+    NULL, "/", 1, OC_HTTP_STATIC, HEALTH_MAX_BODY, "text/html; charset=utf-8", NULL, 0, NULL, NULL, 0, NULL, NULL
 };
 static void landing_init(void) {
     char app[600] = ".";

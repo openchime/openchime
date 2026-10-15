@@ -77,13 +77,16 @@ $(WEB_DIR)/openchime.js: $(WEB_GUI_OBJS) $(WEB_CORE_OBJS) client/gui/platform/we
 	    -pthread -sPTHREAD_POOL_SIZE=16 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=128MB -sSTACK_SIZE=1MB -sASYNCIFY -sASYNCIFY_STACK_SIZE=65536 \
 	    -sAUDIO_WORKLET -sWASM_WORKERS -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE='$$emscriptenGetAudioObject' \
 	    -sENVIRONMENT=web,worker -sWEBSOCKET_SUBPROTOCOL=binary -sEXIT_RUNTIME=0 -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,UTF16ToString,stringToNewUTF8,stringToUTF8,FS,ENV \
-	    -sFORCE_FILESYSTEM -Wno-pthreads-mem-growth -Wno-limited-postlink-optimizations $(WEB_LDEXTRA) -o $@
+	    -sFORCE_FILESYSTEM -Wno-pthreads-mem-growth -Wno-limited-postlink-optimizations -O2 $(WEB_LDEXTRA) -o $@
 	cp client/gui/platform/web/openchime.html $(WEB_DIR)/openchime.html
 	# The daemon serves the wasm from web/ beside its binary (daemon/webapp.h),
 	# as it finds its voice data: placed there for a developer's daemon, and
-	# copied into the packages the same way by the release.
+	# copied into the packages the same way by the release. Its gzip copy
+	# goes beside it (-n: no name or time, the same bytes every build), which
+	# the daemon sends to a browser that takes gzip.
 	mkdir -p web
 	cp $(WEB_DIR)/openchime.wasm web/
+	gzip -9 -n -c web/openchime.wasm > web/openchime.wasm.gz
 web: $(WEB_DIR)/openchime.js
 
 # The page and the loader as C arrays for the daemon (daemon/webapp.h). The
@@ -97,7 +100,8 @@ WEBAPP_JS :=
 endif
 $(WEBAPP_RES): client/gui/platform/web/openchime.html $(WEBAPP_JS) scripts/build/embed_res.py $(FEATURES)
 	mkdir -p build/gen
-	python3 scripts/build/embed_res.py $@ oc_webapp_html=client/gui/platform/web/openchime.html oc_webapp_js=$(WEBAPP_JS)
+	python3 scripts/build/embed_res.py $@ oc_webapp_html=client/gui/platform/web/openchime.html oc_webapp_js=$(WEBAPP_JS) \
+	    oc_webapp_js_gz=$(if $(WEBAPP_JS),gzip:$(WEBAPP_JS))
 
 # The client's checks: the gfx pixel test under Node, then the client signing
 # in, drawing, recording and composing in a headless Chromium
