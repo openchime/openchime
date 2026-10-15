@@ -344,6 +344,12 @@ oc_result oc_encode_workspace_address(oc_wbuf *w, uint16_t version, const oc_wor
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_server_build(oc_wbuf *w, uint16_t version, const oc_server_build *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SERVER_BUILD);
+    oc_w_str(w, m->build);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LOGOUT);
     oc_w_u8(w, m->scope);
@@ -2493,6 +2499,11 @@ oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m) {
 
 oc_result oc_decode_workspace_address(oc_rbuf *p, oc_workspace_address *m) {
     m->address = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_server_build(oc_rbuf *p, oc_server_build *m) {
+    m->build = oc_r_str(p);
     return r_done(p);
 }
 

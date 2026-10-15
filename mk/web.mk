@@ -56,6 +56,10 @@ WEB_GUI_INC := -Ishared -Iclient/core -Iclient/core/media -Iclient/core/voice -I
                -Ibuild/wasm/libvpx/include -Ibuild/wasm/opus/include -Ibuild/wasm/speexdsp/include -Ithird_party/libfvad/include
 WEB_GUI_CFLAGS := -std=gnu11 -D_GNU_SOURCE -O2 $(WARN_CFLAGS) -pthread -Wno-typedef-redefinition
 WEB_GUI_OBJS := $(patsubst %.c,build/wasm/gui/%.o,$(WEB_GUI_SRC))
+# The application says its build (About OpenChime): compiled with the id, and
+# again when the id changes.
+build/wasm/gui/client/gui/app/app.o: WEB_GUI_CFLAGS += $(VERSION_DEF)
+build/wasm/gui/client/gui/app/app.o: $(BUILD_ID_STAMP)
 # The browser has no loopback listener for a sign-in's return: the core's
 # signin.c is replaced by signin_web.c, the same API over the page (WEB.md).
 WEB_CORE_SRC  := $(filter-out client/core/signin.c,$(CORE_SRC)) client/core/signin_web.c

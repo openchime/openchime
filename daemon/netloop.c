@@ -7,6 +7,7 @@
 #include "audio.h"
 #include "auth.h"
 #include "blobstore.h"
+#include "build_id.h"   /* OC_BUILD_ID: SERVER_BUILD */
 #include "config.h"
 #include "push.h"
 #include "invite_mail.h"
@@ -5513,6 +5514,15 @@ static void deliver_result(int ep, conn **conns, oc_dbwriter *dbw, oc_dbres *r) 
                 send_bytes(ep, conns, fd, g_enc, w.len);
                 if (!conns[fd]) break;
             }
+
+            /* Which build this is, for the client's About: a person reporting a
+             * problem reads both builds off one screen. Signed in only, so an
+             * address alone does not learn what to probe for. */
+            oc_wbuf_init(&w, g_enc, OC_MAX_FRAME_SIZE);
+            oc_server_build sb = { oc_slice_str(OC_BUILD_ID) };
+            oc_encode_server_build(&w, OC_PROTOCOL_VERSION, &sb);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;
         }
 
         /* What this daemon offers, by name (REQ-295). Always sent, and sent

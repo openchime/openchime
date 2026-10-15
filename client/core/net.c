@@ -1020,6 +1020,15 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, wi.workspace_name.ptr, wi.workspace_name.len); e->body[wi.workspace_name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_SERVER_BUILD) {
+            oc_server_build sb;
+            if (oc_decode_server_build(&p, &sb) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_SERVER_BUILD);
+            if (e) {
+                e->body = malloc(sb.build.len + 1);
+                if (e->body) { memcpy(e->body, sb.build.ptr, sb.build.len); e->body[sb.build.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_WORKSPACE_ADDRESS) {
             /* The workspace's address now: one that moved still answers at the old
              * one for a while. File it under the new one, and dial that next time. */

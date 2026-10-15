@@ -60,6 +60,7 @@
 #include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
+#include "build_id.h"         /* OC_BUILD_ID: About OpenChime */
 #include "theme.h"
 #include "osnotify.h"    /* OS notifications, per platform (REQ-138) */
 #include "feedback.h"    /* in-app toasts and banners (REQ-263) */
@@ -1911,6 +1912,7 @@ static struct {
 
 /* Copy fingerprint, and View certificate: the question's two footer actions. */
 enum { CERT_CMD_COPY = 2700, CERT_CMD_VIEW = 2701 };
+enum { ABOUT_CMD_COPY = 2702 };
 static float cert_q_body(gfx *rt, rectf body);   /* fwd */
 
 static char     g_confirm_body[640];
@@ -1992,6 +1994,9 @@ enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
 
 /* Notification-prefs review + the shortcut sheet. */
 static int g_notify_open, g_keys_open;
+/* About OpenChime: which build this client is and which the daemon is, to read
+ * off one screen and copy into a report. */
+static int g_about_open;
 /* The status dialog (bespoke modal body, not the generic form): its emoji is
  * PICKED, its text suggested, its clear-after chip prefilled from the live
  * expiry. g_status_emoji and g_status_edit are declared beside the picker,
@@ -3442,6 +3447,7 @@ static void close_overlays(void) {
     profile_close();
     g_notify_open = 0;
     g_keys_open = 0;
+    g_about_open = 0;
     g_wsmgr_open = 0;
     if (!mm) return;
     if (mm->thread_open)    oc_client_close_thread(g_client);
@@ -7658,6 +7664,45 @@ static void draw_keys(gfx *rt, rectf reg) {
     ovl_end(rt, body);
 }
 
+/* About OpenChime: the client's build, the daemon's, and the protocol between
+ * them -- what a person reporting a problem is asked for first. A build is the
+ * short commit it was compiled from (build_id.h); a release number is a label
+ * on a build and is in no binary, so the build is what is shown. */
+static const char *about_server(const oc_model *m) {
+    if (!m || !m->authed) return "not connected";
+    return m->server_build[0] ? m->server_build : "not reported (an older daemon)";
+}
+
+enum { ABOUT_ROWS = 3 };   /* client, server, protocol: the card is sized to them */
+
+/* The one line Copy puts on the clipboard, and the test hook's ack. */
+static void about_text(const oc_model *m, char *out, size_t cap) {
+    snprintf(out, cap, "OpenChime client %s (%s), server %s, protocol %u",
+             OC_BUILD_ID, oc_plat_name(), about_server(m), (unsigned)OC_PROTOCOL_VERSION);
+}
+
+static void draw_about_app(gfx *rt, rectf reg) {
+    const oc_model *m = model();
+    char client[64], proto[16];
+    snprintf(client, sizeof client, "%s (%s)", OC_BUILD_ID,
+             strcmp(oc_plat_name(), "web") == 0 ? "web" : "Windows");
+    snprintf(proto, sizeof proto, "%u", (unsigned)OC_PROTOCOL_VERSION);
+    const struct { const char *k, *v; } ROWS[ABOUT_ROWS] = {
+        { "Client",   client },
+        { "Server",   about_server(m) },
+        { "Protocol", proto },
+    };
+    /* The value column starts past the widest label, at whatever the text size. */
+    float kw = 0;
+    for (int i = 0; i < ABOUT_ROWS; i++) { float t = text_width(ROWS[i].k, g_ui_b); if (t > kw) kw = t; }
+    float rowh = UIS(32), y = reg.top + 8, vx = reg.left + 24 + kw + UIS(24);
+    for (int i = 0; i < ABOUT_ROWS; i++) {
+        draw_text(rt, ROWS[i].k, g_ui_b, rf(reg.left + 24, y, vx, y + rowh), OC_COL_TEXT);
+        draw_text(rt, ROWS[i].v, g_ui,   rf(vx, y, reg.right - 24, y + rowh), OC_COL_MUTED);
+        y += rowh;
+    }
+}
+
 
 /* A channel's pinned messages (REQ-230). Each row is the message itself, so the
  * list is readable without jumping — and clicking still jumps, because a pin is
@@ -9486,6 +9531,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Preferences",             70 },
     { "Notifications",           71 },
     { "Keyboard shortcuts",      72 },
+    { "About OpenChime",         89 },
     { "Mark all as read",        73 },
     { "Edit profile",            53 },
     { "Change password",         31 },
@@ -12779,7 +12825,7 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
  * They used to replace the transcript, which made "change a setting" cost you
  * your place in the conversation. */
 static int modal_open(void) {
-    return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
+    return g_prefs_open || g_keys_open || g_about_open || g_wsmgr_open || g_notify_open ||
            g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
            g_status_open || g_sch_open || g_sr_open;
 }
@@ -13573,6 +13619,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     gfx_clip_push(rt, gr(clip));
     if (g_prefs_open)       draw_prefs(rt, body);
     else if (g_keys_open)   draw_keys(rt, body);
+    else if (g_about_open)  draw_about_app(rt, body);
     else if (g_wsmgr_open)  draw_wsmgr(rt, body);
     else if (g_notify_open) draw_notify_prefs(rt, m, body);
     else if (g_browse_open) draw_browse(rt, m, body);
@@ -14326,6 +14373,14 @@ static const oc_modal_spec *modal_current(void) {
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 1;
+    } else if (g_about_open) {
+        sp.title = "About OpenChime";
+        sp.size = MODAL_SM;
+        sp.want_h = (MODAL_TITLE_H + ABOUT_ROWS * UIS(32.0f) + UIS(16.0f) + MODAL_FOOT_H + UIS(16.0f))
+                    / g_text_scale;
+        sp.buttons[0] = (oc_mbtn){ "Copy",  MB_NORMAL,  ABOUT_CMD_COPY };
+        sp.buttons[1] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
     } else if (g_keys_open) {
         sp.title = "Keyboard shortcuts";
         sp.size = MODAL_LG;
@@ -14419,7 +14474,7 @@ static void modal_finish(int save) {
     if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(g_main); }
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
-    g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
+    g_prefs_open = g_keys_open = g_about_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_confirm_open = g_sessions_open = g_status_open = g_sch_open = g_sr_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
     if (g_view == VIEW_SIGNIN) layout_signin(g_main);   /* its fields, back */
@@ -26876,6 +26931,7 @@ static void open_ws_menu(oc_win *hwnd) {
     mi_item(71, "Notifications");
     mi_item(73, "Mark all as read");
     mi_item(72, "Keyboard shortcuts");
+    mi_item(89, "About OpenChime");
     if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log");
                  mi_item(87, "Groups"); }
     mi_sep();
@@ -28203,6 +28259,13 @@ static void menu_dispatch(oc_win *hwnd, int cmd) {
         break; }
     case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
     case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
+    case 89: modal_enter(hwnd, &g_about_open); break;
+    case ABOUT_CMD_COPY: {
+        char t[256];
+        about_text(model(), t, sizeof t);
+        copy_to_clipboard(hwnd, t);
+        fb_confirm("Copied");
+        break; }
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
     /* Adding a workspace must not sign you out of the one you are in — which is
@@ -28567,8 +28630,9 @@ static void test_dump(const char *path) {
     fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
-    fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
-            oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m));
+    fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u server_build=\"%s\"\n",
+            oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m),
+            oc_model_server_build(m));
     /* The roster, by name. A harness that names people ("group-DM bob,carol",
      * "@al completes to alice") cannot otherwise tell "the feature is broken"
      * from "this daemon has never heard of bob" — and it once reported the
@@ -29034,7 +29098,7 @@ static void test_dump(const char *path) {
             g_modal_close_btn.left, g_modal_close_btn.top,
             g_modal_close_btn.right, g_modal_close_btn.bottom, g_n_modal_btns);
     fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
-            g_prefs_open ? "prefs" : g_keys_open ? "keys" :
+            g_prefs_open ? "prefs" : g_keys_open ? "keys" : g_about_open ? "about" :
             g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
             g_browse_open ? "browse" : g_confirm_open ? "confirm" :
             g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
@@ -30139,6 +30203,11 @@ static void test_poll(oc_win *hwnd) {
         oc_client_list_notify_prefs(g_client); test_ack("ok");
     } else if (!strcmp(verb, "keys")) {
         modal_enter(hwnd, &g_keys_open); test_ack("ok");
+    } else if (!strcmp(verb, "about")) {
+        /* About OpenChime; the ack is the text Copy puts on the clipboard. */
+        char t[256];
+        about_text(model(), t, sizeof t);
+        modal_enter(hwnd, &g_about_open); test_ack(t);
     } else if (!strcmp(verb, "menu")) {
         /* Drive a workspace/new-menu command directly. Modal forms block this
          * poll loop until dismissed, so the ack lands after the dialog closes. */

@@ -48,6 +48,7 @@ prefs-messages	view home;prefs 1	modal	prefs
 prefs-notifications	view home;prefs 2	modal	prefs
 prefs-system	view home;prefs 3	modal	prefs
 shortcuts	view home;keys	modal	keys
+about	view home;about	modal	about
 # --- overlays and floating surfaces ----------------------------------------
 palette	view home;palette	view	0
 search	view home;channel general;search render	view	0

@@ -12,6 +12,7 @@
  */
 
 #include "audio.h"
+#include "build_id.h"   /* OC_BUILD_ID */
 #include "certs.h"
 #include "config.h"
 #include "sum_fetch.h"
@@ -272,16 +273,6 @@ static void on_serving(void *ctx) {
     if (pthread_create(&f->claim, NULL, claim_thread, f) == 0) f->claiming = 1;
     else fprintf(stderr, "openchimed: could not start the enrollment claim\n");
 }
-
-/* Stamped by the build (-DOC_BUILD_ID=...): the short commit the candidate
- * build compiled, which is the binary's identity (docs/RELEASING.md). A
- * release number is a label assigned to a build afterwards and is not in the
- * binary; the package that carries the binary says it. A source build that
- * sets nothing reports "dev", which is the honest answer, and lets an operator
- * tell a running process from an installed package. */
-#ifndef OC_BUILD_ID
-#define OC_BUILD_ID "dev"
-#endif
 
 /* --- summaries (REQ-310, ARCH-116) ---------------------------------------------
  * Brought up on a thread of their own, after the daemon is serving: the first

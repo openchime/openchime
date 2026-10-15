@@ -1249,6 +1249,21 @@ is the product of the first two, so nothing downstream has to know there are two
 inputs; anything that caches a font size of its own (the form fields' HFONT among
 them) is rebuilt by `scale_apply`.
 
+## About OpenChime: both builds on one screen
+
+The workspace menu's **About OpenChime** (and the palette's) is a small dialog
+with three rows: the client's build id and platform (`dev (web)`,
+`74359c0 (Windows)`), the daemon's build id, and the protocol version. The
+daemon's comes from `SERVER_BUILD` at sign-in (PROTOCOL.md §4.3c), held in the
+model as `server_build`; it reads "not connected" when signed out and "not
+reported (an older daemon)" from a daemon that predates the frame. A build is
+the short commit it was compiled from (`shared/build_id.h`, RELEASING.md); a
+release number is a label on a build and is not in either binary, so the build
+is what is shown. **Copy** puts the whole as one line on the clipboard --
+`OpenChime client 74359c0 (win32), server 74359c0, protocol 25` -- for pasting
+into a report; the harness's `about` verb opens the dialog and answers that
+line, which `make web-test` checks.
+
 ## What the window says, and where (REQ-263)
 
 Each kind of message has one surface, decided by what it is

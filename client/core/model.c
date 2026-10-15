@@ -465,6 +465,7 @@ const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
 uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
 uint32_t    oc_model_max_users(const oc_model *m)       { return m->max_users; }
 const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_name; }
+const char *oc_model_server_build(const oc_model *m)    { return m->server_build; }
 
 /* ---- read-aloud (ARCH-111) ---------------------------------------------- */
 
@@ -1661,6 +1662,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->call_max = e->op;
         m->workspace_mode = e->ws_mode;
         snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
+        /* SERVER_BUILD follows on this connection; a daemon too old to send it
+         * leaves the field empty rather than showing the last daemon's build. */
+        m->server_build[0] = '\0';
+        break;
+    case OC_EV_SERVER_BUILD:
+        snprintf(m->server_build, sizeof m->server_build, "%s", e->body ? e->body : "");
         break;
     case OC_EV_CHANNEL: {
         oc_channel *c = channel_ensure(m, e->channel_id);
