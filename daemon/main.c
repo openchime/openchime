@@ -276,9 +276,9 @@ static void on_serving(void *ctx) {
 
 /* --- summaries (REQ-310, ARCH-116) ---------------------------------------------
  * Brought up on a thread of their own, after the daemon is serving: the first
- * start fetches the model (half a gigabyte), and every start checks the CPU can
- * run it and loads it before anyone is told summaries exist. Anything that fails
- * leaves summaries off, with a line saying why. */
+ * start with summaries on fetches the model (about 1.3 GB), and every start
+ * checks the CPU can run it and loads it before anyone is told summaries exist.
+ * Anything that fails leaves summaries off, with a line saying why. */
 typedef struct {
     pthread_t      thread;
     int            started;

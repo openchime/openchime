@@ -94,7 +94,7 @@ migrations — `role`/`avatar_key` (0002), `disabled` (0003), and the DND window
 | column          | type    | notes                                            |
 |-----------------|---------|--------------------------------------------------|
 | `id`            | INTEGER | primary key (tenant-local user id).              |
-| `subject`       | TEXT    | unique; the OIDC `issuer\|subject` pair.         |
+| `subject`       | TEXT    | unique; `local:<username>` or `oidc:<issuer>\|<sub>`. |
 | `email`         | TEXT    | from the token; display/convenience.             |
 | `display_name`  | TEXT    | optional.                                        |
 | `created_at_ms` | INTEGER | first seen.                                      |
@@ -178,13 +178,6 @@ Adds the tables the real auth design ([AUTH.md](./AUTH.md), ARCH-55–60) needs,
 and extends `users`. Appended as `MIGRATION_0002` + a `{ 2, ... }` entry in
 `OC_MIGRATIONS` — the runner is unchanged (§1). `users` gains columns via
 `ALTER TABLE ADD COLUMN` (SQLite-supported; existing rows default).
-
-### `users` — read path (REQ-289)
-`title`, `timezone`, `status_emoji` and `status_text` travel on `USER_LIST`
-as well as `PROFILE_INFO` — `PROFILE_INFO` is sent only to the
-user who edited them, so the roster is the one place every client learns
-everyone else's. Expired status reads as absent
-here too, applying `build_profile`'s rule in the second place that needs it.
 
 ### `users` (added columns)
 `subject` remains the unique identity key, namespaced by source
@@ -325,6 +318,11 @@ Server-side delivery accounting (REQ-090); see the server-robustness notes in
 REQ-090. A `delivery_cursors` row per `(user, channel)` advanced by
 `CLIENT_ACK` so a cursorless backfill can resume where the user left off.
 
+### `delivery_cursors`
+- `(user_id, channel_id)` (PK) — one row per user per channel.
+- `message_id` (INTEGER) — the highest cumulatively acked message id.
+- `updated_at_ms` (INTEGER) — when it last advanced.
+
 ---
 
 ## 3f. Migration 0008 — server identity
@@ -452,6 +450,17 @@ Server-authoritative notification settings, synced across a user's devices.
   (`SET_TZ_OFFSET`, sent straight after `AUTH_OK` so no frontend has to
   remember to), and it also rides `SET_SCHEDULE` — so travel and
   daylight-saving turnover correct themselves at the next connect.
+- `dnd_until_ms` (INTEGER, migration 0033) — a **pause** (REQ-278): the absolute
+  instant it ends, `0` for none. A different type from the window above, not a
+  longer version of it — the window is periodic by construction, this is one
+  moment, and neither can express the other, which is why "do not disturb until
+  5pm" was unbuildable with the window alone.
+
+  **Enforced on read**, the pattern migration 0027 proved for status expiry: a
+  stamp that has passed reads as absent everywhere (the push worker, the auth
+  result, the prefs snapshot), so a client that is not running to clear its own
+  state costs nothing and there is no sweep to keep correct. Ending a pause early
+  writes `0` — the same op with 0 minutes, not a second one.
 
 ### `notify_schedule` (migration 0034)
 - `(user_id, weekday)` (PK), `enabled`, `start_min`, `end_min` — used by
@@ -460,12 +469,12 @@ Server-authoritative notification settings, synced across a user's devices.
   too rather than an omission.
 
 ### `thread_follows`, `thread_reads` (migration 0036)
-- `thread_follows (user_id, root_id)` + `channel_id`, `state` — **overrides only**
+- `thread_follows (user_id, root_id)` + `channel_id`, `state`, `updated_ms` — **overrides only**
   (REQ-062, ARCH-104). Participation is derived from `messages.parent_id`: you are
   in a thread if you wrote its root or a reply. `state` 1 is an explicit follow of
   one you did not write in, `state` 0 an explicit unfollow of one you did — and
   the unfollow outranks participation, which is what "turn off replies" means.
-- `thread_reads (user_id, root_id, last_read_reply_id)` — a per-thread cursor,
+- `thread_reads (user_id, root_id)` + `last_read_reply_id`, `updated_ms` — a per-thread cursor,
   advancing only. It cannot be derived from `delivery_cursors`: that advances when
   the CHANNEL is read, and thread replies are deliberately not in the main scroll
   (REQ-060), so the channel cursor sweeps past replies nobody has seen.
@@ -481,17 +490,6 @@ Server-authoritative notification settings, synced across a user's devices.
 - A keyword hit is written into **`mentions`** with `kind = 4`, so the push
   query, the activity feed and the reader's highlight all keep working with no
   further change.
-- `dnd_until_ms` (INTEGER, migration 0033) — a **pause** (REQ-278): the absolute
-  instant it ends, `0` for none. A different type from the window above, not a
-  longer version of it — the window is periodic by construction, this is one
-  moment, and neither can express the other, which is why "do not disturb until
-  5pm" was unbuildable with the window alone.
-
-  **Enforced on read**, the pattern migration 0027 proved for status expiry: a
-  stamp that has passed reads as absent everywhere (the push worker, the auth
-  result, the prefs snapshot), so a client that is not running to clear its own
-  state costs nothing and there is no sweep to keep correct. Ending a pause early
-  writes `0` — the same op with 0 minutes, not a second one.
 
 ---
 
@@ -620,7 +618,7 @@ the oldest channel survives, with the others' messages and membership removed.
 
 ---
 
-## 3p. Migration 0020 — a channel name is unique (REQ-040)
+## 3p. Migration 0020 — a channel name is unique (REQ-036)
 
 Adds a **partial unique index** on `lower(name)` `WHERE kind='channel'`, so two
 `#test` channels cannot coexist and `#Test` cannot shadow `#test`. DMs are
@@ -827,6 +825,12 @@ The avatar is an **attachment id**, not a blob column: the attachment store
 already handles upload, the size cap, dedup by hash and reclamation (REQ-215,
 ARCH-78), and a second image path would reimplement all of it. Reclamation
 excludes avatars, which building them exposed.
+
+*The roster carries them too* (REQ-289). `title`, `timezone`, `status_emoji` and
+`status_text` travel on `USER_LIST` as well as `PROFILE_INFO` — `PROFILE_INFO`
+is sent only to the user who edited them, so the roster is the one place every
+client learns everyone else's. Expired status reads as absent there too,
+applying `build_profile`'s rule in the second place that needs it.
 
 ## 3x. Migration 0028 — the global notification default (REQ-134)
 

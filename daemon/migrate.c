@@ -215,9 +215,10 @@ static const char MIGRATION_0011[] =
     "ALTER TABLE messages ADD COLUMN author_name TEXT;";
 
 /* 0012: notification preferences (REQ-130/131). Per-channel notification level
- * (0=all, 1=mentions, 2=none) — an absent row means the default (all). Plus a
- * per-user do-not-disturb window as columns on `users`: a daily [start,end)
- * range in minutes-of-day (UTC; the client converts from local), wrapping past
+ * (0=all, 1=mentions, 2=none) — an absent row means the default (all; 0028
+ * made that users.notify_default). Plus a per-user do-not-disturb window as
+ * columns on `users`: a daily [start,end) range in minutes-of-day (UTC here;
+ * 0034 made it local, read against users.tz_offset_min), wrapping past
  * midnight when start > end. These are the server-authoritative settings that
  * clients honor and the future push gateway (REQ-132/133) will consult; DND
  * suppresses push, not in-app unread (REQ-131). */
@@ -338,8 +339,9 @@ static const char MIGRATION_0018[] =
  *
  * The backfill uses MIN/MAX rather than group_concat because SQLite does not
  * guarantee group_concat's ordering, and this key must be byte-identical to the
- * one the daemon computes. DMs have one or two participants (group DMs are
- * REQ-056, unbuilt), so MIN/MAX covers every case.
+ * one the daemon computes. At the time DMs had one or two participants, so
+ * MIN/MAX covered every case; group DMs (REQ-056, up to OC_MAX_GROUP_DM others)
+ * came later and the daemon writes their longer sorted key itself.
  *
  * Pre-existing violations are DELETED, not merged: this ships before any release
  * (the operator decision on record), and merging conversations is a judgement no
@@ -443,7 +445,7 @@ static const char MIGRATION_0022[] =
      * will be per-user and private when it is built.
      *
      * pinned_by is kept for attribution ("pinned by alice") and is nullable so
-     * that removing a user (REQ-025) does not have to delete the channel's
+     * that removing a user (REQ-033) does not have to delete the channel's
      * pins — the pin outlives whoever placed it, because it belongs to the
      * channel.
      *

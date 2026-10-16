@@ -346,9 +346,10 @@ Three things about the check are measured, not assumed:
 3. **The output must be scoped to our unit before it is matched.** `verify` walks
    the dependency graph and reports on everything it loads. In the container that
    was only `openchimed.service`; on the runner it is also the runner's own
-   units, and `ubuntu-22.04` ships two that trip the patterns above —
-   `snapd.service` has an `Unknown key name 'RestartMode'`, and
-   `netplan-ovs-cleanup.service` gives `Failed to open ...: Permission denied`.
+   units. The job runs on `ubuntu-24.04` now; when this was measured, on
+   `ubuntu-22.04`, two of that image's units tripped the patterns above —
+   `snapd.service` had an `Unknown key name 'RestartMode'`, and
+   `netplan-ovs-cleanup.service` gave `Failed to open ...: Permission denied`.
    Grepping for `openchimed`
    first is what makes the check about us; every message that concerns a unit is
    prefixed with its name or its path and line.

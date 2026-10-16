@@ -28,7 +28,7 @@ OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 WIN_DIR='C:\Windows\Temp\octest'
 
-export OC_TEST_PORT="${OC_TEST_PORT:-9510}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9680}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-voice}"
 export OC_TEST_WS="${OC_TEST_WS:-Voice Fixture}"
 

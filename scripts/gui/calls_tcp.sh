@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 fails=0
 
-export OC_TEST_PORT="${OC_TEST_PORT:-9630}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9670}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-calls-tcp}"
 export OC_TEST_HOST="${OC_TEST_HOST:-$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)}"
 export OC_TEST_ADVERTISE_PORT=9   # discard: nothing answers there

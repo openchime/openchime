@@ -169,7 +169,9 @@ message is about 5 seconds, 15 KB. A thousand rendered messages is about 15 MB.
 
 ## 6. The wire
 
-Protocol version 16; full layouts in PROTOCOL.md §5.14b.
+Introduced in protocol version 13 (`TTS_INFO`, `AUDIO_*`, the voice on profile frames); voice
+languages came in 14, `CAPABILITIES` in 15 and `VOICE_PREVIEW_GET` in 16 (`shared/protocol.h`).
+Full layouts in PROTOCOL.md §5.14b.
 
 - **`CAPABILITIES` (S→C, `0x00E1`)** after authentication: the features this daemon offers, by
   name. `tts` is present exactly when read-aloud is running — built in, turned on, and its data
@@ -210,7 +212,7 @@ Protocol version 16; full layouts in PROTOCOL.md §5.14b.
 | `make test` — ttskit | pronunciation, the data files, the guesser against its reference (TTSKIT.md §9) |
 | `make test` — speakable | code blocks, links, mentions, markdown, emoji, quotes, not-renderable |
 | `make test` — render worker | with a stub synthesizer: queue order, a full queue, eventfd wake-up, idle release; Kitten's token ids against its own tokenizer |
-| `make test` — daemon | cache hit and miss, in-flight de-duplication, handle stability and edit → new handle, reclaim first with no tombstone, the rate limit, protocol v13 round trips, a two-client vertical |
+| `make test` — daemon | cache hit and miss, in-flight de-duplication, handle stability and edit → new handle, reclaim first with no tombstone, the rate limit, round trips of the read-aloud frames at the current protocol version, a two-client vertical |
 | `make test` — client core | an audio-only MP4 round trip; the listen queue in order, skipping not-renderable |
 | Build job | the real daemon: links statically (only the C runtime dynamic); the release binary renders a sentence (`--tts-say`) that voice input hears back (`--stt-hear`); manual listening on model changes |
-| Win32 harness | Listen plays a channel in order with voice changes; pause, skip, stop; absent with read-aloud off |
+| Win32 harness | no scripted Listen run. The harness's `voicepreview` verb asks for a voice's audition and reports how long it took (`preview wait_ms=`), and `scripts/gui/voice.sh` has the real daemon render a sentence (`--tts-say`) that the client's synthetic microphone then speaks |

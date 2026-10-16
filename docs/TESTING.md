@@ -845,7 +845,7 @@ Representative figures (they vary a few KB/ms run to run):
 | 100 idle connections | ~10–12 MB total |
 | 200 idle connections | ~15–18 MB total |
 | Message round-trip (persist + `SEND_ACK`), 32 concurrent senders | **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** |
-| Connection *setup* throughput | **~2 logins/sec** (see bottleneck below) |
+| Connection *setup* throughput | **~25–110 logins/sec**, by machine — not measured by the script: two auth threads at 18–70 ms an Argon2id (see bottleneck below) |
 
 The per-connection cost is dominated by the mbedTLS session buffers plus the
 per-connection frame reassembler and output buffer — flat and predictable, with
@@ -883,14 +883,15 @@ Scaling further needs no architecture change (REQ-210): raise
 
 Steady-state connection *count* is cheap; connection *establishment* is not. Each
 login runs an **Argon2id** password verification at OWASP's floor (19 MiB, two
-passes, one lane: `OC_PW_MEM_KIB` and its neighbours in `daemon/auth.h`), about
-70 ms on a development machine, on the **two-thread auth pool** (ARCH-5): about
-25 logins a second.
+passes, one lane: `OC_PW_MEM_KIB` and its neighbours in `daemon/auth.h`), 18 ms
+on a 12-core development machine and about 70 ms on a small box, on the
+**two-thread auth pool** (ARCH-5): about 110 logins a second at the one end, 25
+at the other.
 
 This is a deliberate security cost paid once per login, not a memory or
 steady-state limit: a box holding thousands of connections is fine, but a
 **thundering-herd reconnect** (e.g. every client re-authenticating at once after
-a daemon restart) drains at about 25 a second, two minutes for 3,000 clients.
+a daemon restart) drains at 25 to 110 a second: on a small box, two minutes for 3,000 clients.
 It is a modest cost at the low-hundreds target scale, and session-token
 reconnect (ARCH-58) skips the hash entirely, which is what a real reconnect
 storm uses.
@@ -1562,7 +1563,7 @@ a failure — is proven in `test_client_core.c`, and cancelling in
 ## Reading the members harness
 
 `scripts/gui/members.sh` scrolls the members pane (REQ-031) against its own
-fixture daemon (port 9600) bootstrapped with sixty people — `OC_TEST_USERS`, all of
+fixture daemon (port 9690) bootstrapped with sixty people — `OC_TEST_USERS`, all of
 whom land in `#general` on registration — so the roster is three times what the
 pane holds. It asserts that only what fits is drawn and the pane says the rest is
 below it; that the wheel reaches **every** member, counted as the distinct people
@@ -1636,7 +1637,7 @@ and `callevents`. The `call` verb drives it: `call start|join|open|leave|end|dec
 `call volume <uid> <percent>`, `call share <device id or name>|pick|stop|full|actual`.
 Not in CI, for the smoke's reason.
 
-`scripts/gui/calls_tcp.sh` is the same pair (port 9630) with UDP that goes
+`scripts/gui/calls_tcp.sh` is the same pair (port 9670) with UDP that goes
 nowhere: the daemon advertises the relay at a port nothing answers on
 (`OC_TEST_ADVERTISE_PORT`, which `scripts/gui/pair.sh` passes as
 `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT`). It asserts that each client finds within
@@ -1693,7 +1694,7 @@ the EDIT given a fixed height again.
 ## Reading the voice harness
 
 `scripts/gui/voice.sh` drives voice input in the Win32 client end to end against
-its own fixture daemon (port 9510), with real recognition: read-aloud renders a
+its own fixture daemon (port 9680), with real recognition: read-aloud renders a
 sentence, and `OPENCHIME_DEV_AUDIO=synthetic` with `OPENCHIME_DEV_MIC=<wav>`
 makes the client's microphone speak it. It asserts push to talk by the held key,
 by UI Automation and by the mouse (words in the composer, nothing sent), free talk

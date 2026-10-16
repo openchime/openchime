@@ -367,9 +367,9 @@ static int hold_part(build *b, oc_sum_part *p, int cap, const oc_sum_lines *l, u
     return 0;
 }
 
-/* The summary a reader is shown, of `l` (messages, or notes and the messages
- * they cite) over a span of `input_words` words: the stored body (heap), or
- * NULL with b->err set. */
+/* The summary a reader is shown, of `l` (messages, or the notes alone when the
+ * span is too big for one prompt) over a span of `input_words` words: the
+ * stored body (heap), or NULL with b->err set. */
 static char *write_summary(build *b, const char *intro, const oc_sum_lines *l, size_t input_words,
                            uint32_t *tokens, uint32_t *cpu) {
     oc_sum_caps c;

@@ -1379,9 +1379,9 @@ where one exists.
   the daemon **what was said**: the client has cut speech at pauses and sent each
   segment over the existing connection, and the daemon has recognized it itself, with
   a model installed beside it (ARCH-112) — posting it in free talk, returning it to
-  the speaker's connection only in push to talk. A segment has been capped — at 30
-  seconds unless the operator sets otherwise — and its audio discarded once
-  recognized and written nowhere.
+  the speaker's connection only in push to talk. A segment has been capped at 30
+  seconds, the recognizer's own limit, and its audio discarded once recognized
+  and written nowhere.
 - **REQ-299.** The microphone has been **open only on the user's say,
   visibly, and to one use at a time**: from press to release in push to talk, from
   on to off in free talk, marked as live throughout, never shared with a recording or

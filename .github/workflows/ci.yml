@@ -2,8 +2,8 @@ name: ci
 
 # Runs on every pull request into staging and every push to staging -- the
 # checks staging's branch protection requires before a merge -- and is called by
-# promote.yml and release.yml as their gate. Three jobs, on three machines at
-# once, and nothing checked twice:
+# promote.yml as its gate (release.yml does not run it again). Three jobs, on
+# three machines at once, and nothing checked twice:
 #   - build:       the daemon built and started for real (health check plus the
 #                  protocol vertical over TLS), static linking, every Linux
 #                  translation unit through the release's clang (the second
@@ -180,7 +180,9 @@ jobs:
       - name: Everything compiles with the release's compiler
         run: make check-release-cc
       # The suites that run no threads; the others run under the sanitizer in
-      # its own job. its recipe runs the opcode and issue-reference checks first.
+      # its own job. Its recipe runs the five source checks first (mk/tests.mk's
+      # SOURCE_CHECKS: opcodes, issue references, make targets, the configuration
+      # registry, release lint).
       - name: Run the suites the sanitizer does not
         run: make test-ci PART=plain
 

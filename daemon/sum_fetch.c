@@ -17,7 +17,7 @@ void oc_sum_model_dir(const char *db_path, char *out, size_t cap) {
 }
 
 /* The marker beside the model says which file was checked: its SHA-256 and
- * size. Hashing half a gigabyte at every start is not needed to know it is the
+ * size. Hashing 1.3 GB at every start is not needed to know it is the
  * file that was checked; the size and the marker together are. */
 static int marker_ok(const char *marker, const char *path, const char *sha) {
     FILE *f = fopen(marker, "r");

@@ -44,8 +44,8 @@ printf '\nBaseline daemon RSS: %.1f MB\n\n' "$(awk -v k=$BASE 'BEGIN{print k/102
 printf '%s\n' "--------------------------------------------------------"
 printf '%-12s %-12s %-14s %-16s\n' "requested" "connected" "peak_rss_mb" "kb_per_conn"
 for N in "${CONNS[@]}"; do
-  # Auth is a 19 MiB Argon2id on the two-thread auth pool (~2 logins/s here),
-  # so the ramp is N/2 seconds, not N/5.
+  # Auth is a 19 MiB Argon2id on the two-thread auth pool (25-110 logins/s by
+  # machine, docs/TESTING.md §5); N/2 seconds is room for the slowest.
   HOLD=$(( N / 2 + 10 ))
   OUT="$WORK/idle_$N.txt"
   ( timeout $((HOLD+120)) ./build/bench_load 127.0.0.1 "$PROTO_PORT" "$N" "$HOLD" 0 "$NUSERS" >"$OUT" 2>&1 ) &
@@ -65,9 +65,9 @@ echo "Message round-trip latency ($LAT_N concurrent senders, isolated channels):
 # Print the WHOLE line, including connections_ok= and sends=. Stripping the
 # prefix hid a degenerate run: failed connections report rtt 0.00, which reads
 # like a fantastic result instead of a broken measurement.
-# 20s, not 6: auth is a 19 MiB Argon2id on the auth pool (~6-7
-# logins/s, BENCHMARK.md), so a burst of $LAT_N simultaneous logins queues for
-# several seconds. A 6s window let most connections time out before they ever
+# 20s, not 6: auth is a 19 MiB Argon2id on the two-thread auth pool (25-110
+# logins/s by machine, docs/TESTING.md §5), so a burst of $LAT_N simultaneous
+# logins queues for several seconds on a small box. A 6s window let most connections time out before they ever
 # authenticated, and the run then reported rtt 0.00 from the handful that made
 # it -- a broken measurement that looked like a great one.
 ./build/bench_load 127.0.0.1 "$PROTO_PORT" "$LAT_N" 20 8 "$NUSERS" | sed 's/^/  /'

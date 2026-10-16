@@ -6852,8 +6852,8 @@ static oc_dbres *process_mark_all_read(sqlite3 *db, const oc_job *j) {
 
 /* Replay messages newer than each cursor, for channels the user belongs to,
  * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). A request with no
- * cursors (count=0) resumes every member channel from the server's stored
- * delivery cursor (REQ-090) — 0 for a fresh client, else its last ack. */
+ * cursors (count=0) sends every member channel its newest page, as a cursor of
+ * 0 would; a non-empty list covers only the channels it names. */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -6869,9 +6869,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
     if (!arr) return r;
 
-    /* Effective cursors: the client's explicit list, or — when it sent none —
-     * every member channel resumed from the stored delivery cursor (REQ-090):
-     * 0 for a fresh client, else its last ack. */
+    /* Effective cursors: the client's explicit list (channels left out of it
+     * are skipped), or — when it sent none — every member channel with a
+     * cursor of 0, which the loop below turns into its newest page. */
     const oc_bf_cursor *curs = j->cursors;
     size_t ncurs = j->n_cursors;
     oc_bf_cursor *derived = NULL;
