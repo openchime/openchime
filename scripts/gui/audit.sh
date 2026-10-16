@@ -78,8 +78,15 @@ settle() {   # settle <key> <want>
   local key="$1" want="$2" t=0 got
   while [ "$t" -lt 4000 ]; do
     drive dump settle
-    got=$(grep -o "\b$key=[^ ]*" "$LIN_DIR/settle.txt" 2>/dev/null | head -1 | cut -d= -f2)
-    [ "$got" = "$want" ] && return 0
+    # The key as a line of its own first (`view=1`): the same name is a field
+    # of other lines too (the call line's `view=`), and the first of those is
+    # not the scene's.
+    got=$( { grep -o "^$key=[^ ]*" "$LIN_DIR/settle.txt"; grep -o "\b$key=[^ ]*" "$LIN_DIR/settle.txt"; } 2>/dev/null | head -1 | cut -d= -f2)
+    # `!value`: anything but it -- a dialog is settled when some modal is up.
+    case "$want" in
+      !*) [ -n "$got" ] && [ "$got" != "${want#!}" ] && return 0 ;;
+      *)  [ "$got" = "$want" ] && return 0 ;;
+    esac
     sleep 0.05; t=$((t + 50))
   done
   return 1
@@ -131,7 +138,11 @@ for state in "${STATES[@]}"; do
     # Every scene starts from the same place. Without this a modal left open by
     # the previous row becomes part of the next one's scene, and the finding is
     # filed against the wrong surface.
-    drive key esc; drive view home
+    drive key esc
+    # A dialog the last scene left open unwinds its own loop only after the Esc
+    # is answered; the next scene's dialog would be refused until it has.
+    settle modal none || drive key esc
+    drive view home
     ok=1
     IFS=';' read -ra steps <<< "$verbs"
     for v in "${steps[@]}"; do

@@ -52,7 +52,9 @@ sign_in_card() {
   for i in $(seq 1 200); do
     "${drv[@]}" dump sign_in_card >/dev/null 2>&1 || true
     S="$(cat "$ldir/sign_in_card.txt" 2>/dev/null || true)"
-    grep -q '^authed=1' <<<"$S" && return 0
+    # Signed in, and not merely in another workspace with this one's card over
+    # it (a stored session elsewhere is authed=1 too).
+    grep -q '^authed=1' <<<"$S" && ! grep -qE 'si_overlay=1|^view=100 ' <<<"$S" && return 0
     step="$(sed -n 's/^signin step=\([0-9]*\).*/\1/p' <<<"$S" | head -1)"
     cn="$(sed -n 's/^signin .*connecting=\([0-9]*\).*/\1/p' <<<"$S" | head -1)"
     br="$(sed -n 's/^signin .*browser=\([0-9]*\).*/\1/p' <<<"$S" | head -1)"
