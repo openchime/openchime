@@ -1027,7 +1027,7 @@ static void test_central(void) {
 
 int run_acme_tests(void) {
     printf("test_acme: ACME TLS-ALPN-01 against a fake CA, the listener's certificate choice, renewal and swap, certificates through central\n");
-    srand((unsigned)time(NULL));
+    srand(4561);
     /* Every run starts from nothing, so the suite runs again in one process
      * (OC_TEST_REPEAT): the fake CA's state and stop flag, the listener's,
      * and what the last run kept. */

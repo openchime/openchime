@@ -7,11 +7,11 @@
 #   scripts/gui/run.sh --web smoke calls            # two scripts, in the browser
 #   scripts/gui/run.sh all                          # every script, on Windows
 #
-# Each script starts its own fixture daemon and prints its "<name>: OK — N
-# checks" line; this prints the tally. Local only: the daemon is Linux's and
-# the clients need a desktop or a Chromium (TESTING.md says why not CI). On
-# the web, the scripts whose checks are the Windows platform's alone are
-# skipped by name rather than failed.
+# Each script starts its own fixture daemon and prints a "gui_<name>: ..." result
+# line ("N/M passed", "OK: N checks", "all passed", or its failures); this
+# counts exit codes. Local only: the daemon is Linux's and the clients need a
+# desktop or a Chromium (TESTING.md says why not CI). On the web, the scripts
+# whose checks are the Windows platform's alone are skipped by name.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ALL="smoke startup composer drafts links keymenu members newmsg shortcuts reactions groups files uploads voice screenrec search_boxes calls calls_tcp balloon"

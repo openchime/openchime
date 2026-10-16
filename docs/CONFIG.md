@@ -57,7 +57,8 @@ the daemon creates and migrates), `blobs/` (attachments on local disk, unless
 `OPENCHIME_S3`), `cert.pem` and `key.pem` (the certificate presented, written
 by the daemon or, with `OPENCHIME_TLS=file`, yours), `factor.key` (the key
 local accounts' second-step secrets are sealed under: back it up with the
-database) and `summary/` (the local summary model, fetched on first use). The
+database) and `summary/` (the local summary model, fetched at the first start with
+`OPENCHIME_SUMMARY=local`). The
 daemon makes the directory if it is absent (not its parents), and everything
 inside it. The speech features'
 data and the web client are not configuration: they are found at

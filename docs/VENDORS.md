@@ -227,8 +227,10 @@ dependency, built the same way:
   headers. It needs CMake 3.14+ and a C++17 compiler, and takes a few minutes. The
   daemon links it with the same static C++ runtime as ONNX Runtime. `make full` (or
   `make SUM=1`) builds it in; a plain `make` leaves it out.
-- **The model is never shipped**: the daemon fetches it on first use from a pinned
-  address and checks a pinned SHA-256 (SUMMARIES.md §6). It is Qwen3.5 2B
+- **The model is never shipped**: the daemon fetches it at the first start with
+  summaries on, from its Hugging Face address, and checks a pinned SHA-256
+  (SUMMARIES.md §6). The address names a branch (`resolve/main`), not a revision,
+  so only the hash is pinned: a changed file upstream is refused, not taken. It is Qwen3.5 2B
   (Apache-2.0), 4-bit GGUF.
 
 llama.cpp's MIT notice travels with every package through `packaging/licenses.sh`.

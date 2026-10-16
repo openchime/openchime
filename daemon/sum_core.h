@@ -8,7 +8,7 @@
  *     level is smaller by its structure, not by the model's choice;
  *   - the summary a reader is shown: the shape of the standard (SUMMARIES.md
  *     §1), sized to the span, written from messages when they fit one prompt,
- *     else from the notes and the messages they cite.
+ *     else from the notes alone.
  * The model writes inside a grammar that bounds how many lines of each part
  * there are and how long each line is; code checks what it wrote (citations,
  * numbers, people, repeats) and holds each part and the whole to its cap.

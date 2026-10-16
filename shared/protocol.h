@@ -192,7 +192,7 @@
 /* Attachment transfer (REQ-140, ARCH-69). A chunk's data must leave room for the
  * frame header + the chunk's fixed fields under OC_MAX_FRAME_SIZE. */
 #define OC_ATTACH_CHUNK_SIZE   65024u /* 63.5 KiB data per UPLOAD/DOWNLOAD chunk  */
-#define OC_MAX_ATTACHMENT_SIZE (200ull * 1024 * 1024) /* 200 MiB default cap      */
+#define OC_MAX_ATTACHMENT_SIZE (200ull * 1024 * 1024) /* 200 MiB cap, fixed       */
 
 /* --- Message types (PROTOCOL.md §9) ------------------------------------- */
 
@@ -917,7 +917,10 @@ typedef struct {
 #define OC_MEDIA_MAX_WIDTH        1920u
 #define OC_MEDIA_MAX_HEIGHT       1080u
 #define OC_MEDIA_MAX_POSTER_SIZE  (1024u * 1024u)
-#define OC_MAX_VIDEO_MESSAGE_SIZE (160ull * 1024 * 1024) /* default byte cap: five minutes at 1080p */
+/* A video message's byte cap, five minutes at 1080p: what the recorder sizes a
+ * take to, and the daemon's initial value only -- at startup it enforces
+ * OC_MAX_VIDEO_SIZE (daemon/config.h), the same 160 MiB. */
+#define OC_MAX_VIDEO_MESSAGE_SIZE (160ull * 1024 * 1024)
 
 typedef struct { uint64_t attachment_id; uint8_t media_kind; uint32_t duration_ms;
                  uint16_t width, height; uint64_t poster_id; } oc_attach_media_set;

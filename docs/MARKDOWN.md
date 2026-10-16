@@ -74,11 +74,13 @@ Rendering is never allowed to lose characters the author typed.
 - **In `shared/` because the daemon reads messages aloud** (ARCH-111). Turning a
   body into speakable text (`shared/speakable.c`) has to skip code blocks and drop
   delimiters by exactly the rules a reader sees applied, so the daemon links the
-  same parser the frontends do.
-- **One parser, both frontends.** The TUI and the GUI call the same function and
-  receive the same spans, for the reason ARCH-89 gives for the mention scanner:
-  two implementations of "is this bold" will drift, and nobody can tell which is
-  right from either side alone.
+  same parser the GUI does.
+- **One parser, one renderer.** The GUI — Windows and the web alike — calls it
+  and receives the spans, and the daemon's speakable text uses the same function,
+  for the reason ARCH-89 gives for the mention scanner: two implementations of
+  "is this bold" will drift, and nobody can tell which is right from either side
+  alone. The TUI does not call it (nothing in `client/tui/` includes
+  `richtext.h`); it shows a body as written, markers included.
 
 The parser returns **spans over the original bytes** — `{start, len, style}` —
 never a rewritten string. The body a client renders is byte-identical to the body
@@ -180,9 +182,10 @@ and an underline is indistinguishable from a link in most renderings.
 - **No link *titles*, reference-style links, or images.** Titles and references
   exist to make long-form prose readable and neither survives a chat transcript;
   an image is an attachment.
-- **The TUI renders the same structure without proportional styling** (REQ-220):
-  bold and italic become terminal attributes, code blocks are shown in band. It
-  is not exempt from formatting the way it is exempt from images (ARCH-75).
+- **The TUI shows the source, not the formatting.** It does not parse the body:
+  bold, italic, code and links appear with their delimiters, as typed. That stays
+  readable because the delimiters are the ones people already type in plain
+  text, and the stored body is the same either way.
 
 ## 6. Rendering
 
@@ -240,9 +243,9 @@ business:
   Hovering one shows its real address in a tip beside the pointer, and a click
   opens a confirmation — "This link goes to *host*", the full address, and Open
   link — rather than the browser.
-- **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
-  since a terminal has no proportional styling to lean on. Markup shown as
-  source stays legible, which the dialect guarantees.
+- **TUI** — no rendering: the body is drawn as written, delimiters and all,
+  since the TUI never calls the parser. Markup shown as source stays legible,
+  which the dialect guarantees.
 
 **The composer shows formatting as you type**, which is only affordable because
 the parser is client-side and runs over a ≤4000-unit buffer — the same pass that

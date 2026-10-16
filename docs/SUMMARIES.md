@@ -51,7 +51,8 @@ bottom line first, a handful of topics, and actions and open questions
 labelled — as most chat users asked for in Microsoft's study of chat
 summaries — set the rest.
 
-In the TUI and the Windows client (CLIENT.md §2–3), a summary is asked for from
+In the TUI and the GUI — the Windows client and the same client in the browser
+(CLIENT.md §2–3) — a summary is asked for from
 the Summarize button in the conversation's header (the same five spans from the
 conversation's menu and the launcher), laid out as Slack's: what it covers --
 the dates, how many messages, who posted -- the overview, each topic with who
@@ -381,8 +382,9 @@ formats, and the grammar would not let it start anyway.
 
 **The model** (`daemon/sum_fetch.h`). Qwen3.5 2B, 4-bit (`Q4_K_M`), Apache-2.0:
 about 1.3 GB on disk. On the first start with summaries on, the daemon fetches it
-from its pinned address into `summary/` beside the database, checks it against
-the pinned SHA-256, and writes a marker; later starts check the marker and the
+from its Hugging Face address into `summary/` beside the database, checks it against
+the pinned SHA-256 (the address names a branch, `resolve/main`, not a revision, so
+the hash is what pins the file), and writes a marker; later starts check the marker and the
 size, then load the model. Any failure leaves summaries off with a line in the
 log saying why.
 

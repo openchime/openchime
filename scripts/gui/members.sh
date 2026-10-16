@@ -26,7 +26,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$HERE/scripts/gui/lib.sh"
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 
-export OC_TEST_PORT="${OC_TEST_PORT:-9600}"
+export OC_TEST_PORT="${OC_TEST_PORT:-9690}"
 export OC_TEST_DIR="${OC_TEST_DIR:-/tmp/oc-members}"
 export OC_TEST_WS="${OC_TEST_WS:-Members Fixture}"
 # alice plus fifty-nine others, all of whom land in #general on registration.

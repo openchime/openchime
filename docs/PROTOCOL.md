@@ -13,16 +13,16 @@ reconnect backfill and the error frame — plus presence and
 typing (§5.13, REQ-120/121), attachments (§5.14), incoming webhooks (§5.15),
 notification preferences (§5.16), synced client settings (§5.16a), self-service
 profile (§5.16b), call signaling and screen sharing (§5.17, REQ-150–152, REQ-161), and push device
-tokens.
+tokens (§5.18).
 
-**§9 is the complete list; §5's prose is not.** The registry is generated from
+**§9 is the complete list; §5's prose is not.** The registry is kept in step with
 `shared/protocol.h` and carries all 225 message types. The narrative sections
 below specify the payload layouts for the families they name, and a number of
 later families — drafts, scheduled send, the notification schedule and pause,
 keywords, custom emoji, group DMs, invite and session management, webhook
 enable/rotate, cross-channel threads, unresolved-mention notices, and the
 per-channel file census — are listed in §9 with their opcodes and directions but
-are specified in §§5.16d–5.16j.
+are specified in §§5.16d–5.16m.
 
 **Code.** The frames in this document are realized in
 `shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
@@ -606,7 +606,8 @@ its unread badge again.
 **`GET_CHANNEL_DESCRIPTION` (C → S), `0x008C`** `{ channel_id: u64 }` and
 **`CHANNEL_DESCRIPTION` (S → C), `0x008D`** `{ channel_id: u64, description:
 str }` — a channel's long-form description (REQ-034, ARCH-93). It is set with
-`UPDATE_CHANNEL` op `OC_CHUP_DESCRIPTION` (6), by any member, up to
+`UPDATE_CHANNEL` op `OC_CHUP_DESCRIPTION` (6), by any member (on a public demo,
+an owner or admin; §5.7a), up to
 `OC_MAX_DESCRIPTION` (1,000) bytes, with `""` clearing it — and it is **not**
 carried on `CHANNEL_INFO` or `CHANNEL_LIST`, because the list is one frame for
 every channel and text this long on each entry would stop it fitting.
@@ -829,13 +830,19 @@ exists is never rewritten, and a self-hosted daemon creates it bare.
 One frame for every verb because they all mutate one row and all fan out the same
 state — the op *is* the difference.
 
-**Authority** splits on blast radius: **any member may set the topic** (already
-visible to the channel, corrected in seconds); **owner/admin only** for rename,
-archive, unarchive and a change of visibility, which change what people *not* looking at the channel see.
+**Authority** splits on blast radius: **any member may set the topic or the
+description** (already visible to the channel, corrected in seconds); **owner/admin
+only** for rename, archive, unarchive and a change of visibility, which change what
+people *not* looking at the channel see. On a public demo (AUTH.md §8.12) the topic
+and the description are an owner's or admin's too — a demo's channels say what the
+demo is — and a member's attempt is `FORBIDDEN`.
 
 On success the daemon replies **`CHANNEL_INFO`** to the actor and **fans the same
 frame to every other member** — a rename or archive changes what everyone's
-sidebar should say. `CHANNEL_INFO` therefore carries `topic` and `archived`:
+sidebar should say. `CHANNEL_INFO` therefore carries `topic` and `archived`.
+Op `6` is the exception: it sends **`CHANNEL_DESCRIPTION`** (§5.4), not
+`CHANNEL_INFO`, to the actor and every other member — the description does not
+ride the channel-state frame, so a sidebar has nothing to redraw.
 
 `CHANNEL_LIST` entries also carry a **`preview`** (the newest top-level message,
 truncated to 120 bytes, tombstones skipped) and its **`preview_author`**. A client
@@ -983,7 +990,7 @@ author. The actor is acked with `USER_UPDATED` (`disabled=1`); the removed user'
 live connections receive the same notice and are then dropped.
 
 `SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
-(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL_ERROR`).
+(`FORBIDDEN`, `LAST_OWNER`, `INVITE_UNREDEEMABLE`, `INTERNAL`).
 
 ### 5.9 Reactions (REQ-070, REQ-071)
 
@@ -1169,37 +1176,6 @@ message body and its first attachment's name, like a pin — a saved message is
 usually far outside loaded history — and, last, an `action` byte (REQ-058,
 §5.16l): `1` when the message is an action, its body then being the action text. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
-
-### Drafts (REQ-223, ARCH-101)
-
-**`SET_DRAFT` (client → server), msg_type `0x00C0`**
-`{ channel_id: u64, thread_root: u64, recipients: str, body: str }`. Upserts the
-draft for that conversation; **an empty body deletes it**, which is the same
-frame rather than a second op. A draft may be **unaddressed** (REQ-229):
-`channel_id` 0 with a comma-separated `recipients` id list beside it. An
-addressed draft requires membership of the channel — a draft is user content
-*about* a conversation, and storing one for a channel you cannot see would
-report its existence back to you on every other device. Bodies over
-`OC_DRAFT_BODY_MAX` (16 KB) are **truncated, not refused**: no composer can type
-one that long, so a frame that size is a bug or a probe, and losing its tail
-beats losing the draft.
-
-**`DRAFT` (`0x00C2`)** `{ id, channel_id, thread_root, updated_ms, recipients,
-body }` is sent to the writer's **other** connections as a device sync — never
-back to the connection that wrote it, which already has the text and would
-otherwise be at risk of overwriting a composer still being typed in. A delete
-arrives as the same frame with an empty body. The surrogate `id` is what
-distinguishes unaddressed drafts from each other — they all share `channel_id`
-0, so the conversation key cannot tell them apart.
-
-**`LIST_DRAFTS` (`0x00C1`)** (no body) streams **`DRAFT` (`0x00C2`)** newest
-first, then **`DRAFTS` (`0x00C3`)** `{ count: u16 }`, capped at 256. Entries for
-channels you have since left are omitted but **not deleted**: leaving is
-reversible, so the draft waits for you rather than being discarded.
-
-*One frame for two jobs.* `DRAFT` is both the streamed list entry and the sync
-push, exactly as `CLIENT_SETTINGS` doubles as snapshot and push — the client
-folds it the same way whatever prompted it, instead of two frames that can drift.
 
 **`LIST_ACTIVITY` (`0x0067`)** `{ filter: u8 }` streams **`ACTIVITY_ENTRY`
 (`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
@@ -1613,47 +1589,6 @@ The media row then rides every attachment entry — `BROADCAST`, `THREAD_REPLY`,
 backfill, history and `LIST_THREAD` — and `FILE_ENTRY` (§5.9b). Search matches any
 video attachment with `has:video` (§5.11).
 
-### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
-
-An incoming webhook lets an uncontrolled third party post a message into one
-channel over HTTP, with no user session. There are two surfaces: the
-**binary-protocol frames** a client uses to mint a token, and the **HTTP
-endpoint** the third party posts to.
-
-**`CREATE_WEBHOOK` (C → S), `0x0059`** `{ channel_id: u64, label: str }` — an
-authenticated member of `channel_id` mints a webhook (same post access as
-sending). `label` is a human note. Fails (`ERROR`) with `UNKNOWN_CHANNEL` /
-`NOT_A_MEMBER` if the caller can't post there.
-
-**`WEBHOOK_INFO` (S → C), `0x005A`** `{ webhook_id: u64, channel_id: u64, token:
-bytes }` — the minted **32-byte token, shown once**. Only its SHA-256 is stored
-(ARCH-71); the client hex-encodes the token into the POST URL and cannot recover
-it later.
-
-**Management.** `LIST_WEBHOOKS` (C → S, `0x005B`) `{ channel_id: u64 }` → a
-`WEBHOOK_LIST` (S → C, `0x005C`) of `{ webhook_id, channel_id, label, disabled }`
-for a channel the caller can read — **never the token**. `DELETE_WEBHOOK` (C → S,
-`0x005D`) `{ webhook_id: u64 }`, allowed to any member of the webhook's channel,
-removes it and replies `WEBHOOK_DELETED` (S → C, `0x005E`) `{ webhook_id: u64 }`
-(or `ERROR UNKNOWN_WEBHOOK` / `NOT_A_MEMBER`); the token then stops resolving.
-
-**HTTP endpoint — `POST /webhook/<hex-token>`.** Reached over the same TLS proto
-port, demultiplexed by ALPN (ARCH-54): a connection that does **not** negotiate
-`oc/1` is served by the HTTP/1.1 handler. The body is either
-`application/json {"text": "..."}` or a raw `text/plain` message, capped at
-`MAX_BODY_SIZE`. The daemon hex-decodes the token, looks it up by hash, and posts
-the text as a message **authored by the webhook's creator**, carrying the
-webhook's **label as a display-name override** (the `author_name` field on
-`BROADCAST`, so the post shows as e.g. "GitHub CI") — delivered to the channel's
-members as an ordinary `BROADCAST` (§5.3) and included in backfill.
-Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty or bad
-body, or a malformed request); `403` (the channel is archived and therefore
-read-only, REQ-035); `404` (unknown or disabled token); `405` (non-POST); `408`
-(the request did not arrive whole within 10 seconds); `413` (a declared
-`Content-Length` over `MAX_BODY_SIZE`, refused as soon as the headers are read,
-before the body is); `429` (per-token rate limit, 60/min).
-
-
 ### 5.14b Read-aloud (REQ-291–295, ARCH-111)
 
 Speech is **not** an attachment: nothing was uploaded, and the daemon makes the
@@ -1670,9 +1605,10 @@ would fail (REQ-295). `tts` is present exactly when read-aloud is running — bu
 in, turned on, and its voice data found and verified against its manifest. `stt`
 is present exactly when voice input (§5.14c) is running, on the same terms for the
 recognizer's data. `calls` is present when the audio relay is up to carry calls
-(§5.17). `summarize` is present when summaries are on and their model loaded at
-startup (§5.16m); a daemon that brings them up after a client signed in tells it
-at its next sign-in.
+(§5.17). `summarize` is present when summaries are on (§5.16m), including while
+their model is still coming up — a request sent then waits in the queue until it
+is ready; a daemon whose model did not come up answers whatever waited
+UNAVAILABLE and leaves the name out of every later sign-in.
 Names rather than bit positions, so there is no ceiling and nothing to misnumber; a
 client ignores a name it does not know. At most 16 names: a longer list is a
 malformed frame.
@@ -1772,14 +1708,58 @@ recognition failed; `NOT_A_MEMBER`, `UNKNOWN_CHANNEL`, `CHANNEL_ARCHIVED` and
 `SEND_RATE_LIMITED` in free talk, as for `SEND`; and `TRANSFER_PROTOCOL` for a chunk
 out of order, a total that does not match, or an `STT_BEGIN` mid-segment.
 
+### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
+
+An incoming webhook lets an uncontrolled third party post a message into one
+channel over HTTP, with no user session. There are two surfaces: the
+**binary-protocol frames** a client uses to mint a token, and the **HTTP
+endpoint** the third party posts to.
+
+**`CREATE_WEBHOOK` (C → S), `0x0059`** `{ channel_id: u64, label: str }` — an
+authenticated member of `channel_id` mints a webhook (same post access as
+sending). `label` is a human note. Fails (`ERROR`) with `UNKNOWN_CHANNEL` /
+`NOT_A_MEMBER` if the caller can't post there.
+
+**`WEBHOOK_INFO` (S → C), `0x005A`** `{ webhook_id: u64, channel_id: u64, token:
+bytes }` — the minted **32-byte token, shown once**. Only its SHA-256 is stored
+(ARCH-71); the client hex-encodes the token into the POST URL and cannot recover
+it later.
+
+**Management.** `LIST_WEBHOOKS` (C → S, `0x005B`) `{ channel_id: u64 }` → a
+`WEBHOOK_LIST` (S → C, `0x005C`) of `{ webhook_id, channel_id, label, disabled }`
+for a channel the caller can read — **never the token**. `DELETE_WEBHOOK` (C → S,
+`0x005D`) `{ webhook_id: u64 }`, allowed to any member of the webhook's channel,
+removes it and replies `WEBHOOK_DELETED` (S → C, `0x005E`) `{ webhook_id: u64 }`
+(or `ERROR UNKNOWN_WEBHOOK` / `NOT_A_MEMBER`); the token then stops resolving.
+
+**HTTP endpoint — `POST /webhook/<hex-token>`.** Reached over the same TLS proto
+port, demultiplexed by ALPN (ARCH-54): a connection that does **not** negotiate
+`oc/1` is served by the HTTP/1.1 handler. The body is either
+`application/json {"text": "..."}` or a raw `text/plain` message, capped at
+`MAX_BODY_SIZE`. The daemon hex-decodes the token, looks it up by hash, and posts
+the text as a message **authored by the webhook's creator**, carrying the
+webhook's **label as a display-name override** (the `author_name` field on
+`BROADCAST`, so the post shows as e.g. "GitHub CI") — delivered to the channel's
+members as an ordinary `BROADCAST` (§5.3) and included in backfill.
+Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty or bad
+body, or a malformed request); `403` (the channel is archived and therefore
+read-only, REQ-035); `404` (unknown or disabled token); `405` (non-POST); `408`
+(the request did not arrive whole within 10 seconds); `413` (a declared
+`Content-Length` over `MAX_BODY_SIZE`, refused as soon as the headers are read,
+before the body is); `429` (per-token rate limit, 60/min).
+
 ---
 
 ### 5.16 Notification preferences (REQ-130, REQ-131)
 
 A user's notification settings are **server-authoritative and synced across their
-devices**. Two settings: a per-channel **level** (REQ-130) and a **do-not-disturb
-window** (REQ-131). They are the config that clients honor and that the push emitter
-(REQ-132/133, ARCH-85) consults; DND suppresses *push*, not in-app unread (REQ-131).
+devices**. `NOTIFY_PREFS` carries the per-channel **level** (REQ-130), beside the
+user's default and per-channel mute; *when* notifications are allowed travels on
+frames of its own — the recurring **schedule** (`SET_SCHEDULE`/`SCHEDULE`,
+REQ-136), which replaced REQ-131's single do-not-disturb window in version 6, and
+the manual **pause** (`SET_SNOOZE`/`SNOOZE`, REQ-278) (§5.16d). They are the config
+that clients honor and that the push emitter (REQ-132/133, ARCH-85) consults;
+quiet hours and a pause suppress *push*, not in-app unread (REQ-131).
 
 **`SET_NOTIFY_PREF` (C → S), `0x0090`** `{ channel_id: u64, level: u8 }` — set the
 level for a channel the caller can read: `0` all, `1` mentions-only, `2` none. An
@@ -1802,7 +1782,9 @@ count × { channel_id: u64, level: u8, muted: u8 } }` — the snapshot. It is se
 device updates the others.
 
 **`SET_SNOOZE` (C → S), `0x00CA`** `{ minutes: u32 }` — **pause** notifications
-for that many minutes from now; `0` ends the pause. Slack's `dnd.setSnooze` takes
+for that many minutes from now; `0` ends the pause. More than a week (10,080
+minutes) is cut to a week, so a bad client cannot silence somebody for a decade
+by arithmetic. Slack's `dnd.setSnooze` takes
 minutes for the same reason ours does: every preset the client offers is a
 duration, and only the client knows the timezone that turns "until tomorrow" into
 an instant. The daemon resolves it once and stores the absolute end.
@@ -1926,12 +1908,13 @@ rather than answered with zeros.
 
 **`STORAGE_STATUS` (S → C), `0x0098`** — current usage, free space, the active
 retention/eviction policy, and cumulative reclamation counts **by reason** (orphan
-/ aged out / evicted under pressure, migration 0015). Fields are fixed-width, so a
-later revision may append without a version bump.
+/ aged out / evicted under pressure, migration 0015).
 
-**`AUDIT_QUERY` (C → S), `0x0099`** — pages the audit log (REQ-251). `before_ms`
-pages **backwards from a timestamp** rather than by offset, so a page boundary
-stays stable as new entries arrive; `0` asks for the newest page.
+**`AUDIT_QUERY` (C → S), `0x0099`** `{ before_ms: u64, limit: u16 }` — pages the
+audit log (REQ-251). `before_ms` pages **backwards from a timestamp** rather than
+by offset, so a page boundary stays stable as new entries arrive; `0` asks for the
+newest page. `limit` is the page size: `0` means 50, and more than
+`OC_AUDIT_PAGE_MAX` (200) is cut to 200.
 
 **`AUDIT_PAGE` (S → C), `0x009A`** — a page of entries, newest first: time,
 family (admin / account / security / moderation), action, actor, target, outcome,
@@ -2038,8 +2021,10 @@ rather than edited, which keeps the ops idempotent and the caps enforceable:
 
     n_terms (u8), n_terms × term (str), n_people (u8), n_people × user_id (u64)
 
-Both lists cap at 64 (`OC_MAX_KEYWORDS`, `OC_MAX_PRIORITY`) and a term at 64
-bytes; the encoder truncates to the cap rather than failing. A keyword hit is
+Both lists cap at 64 (`OC_MAX_KEYWORDS`, `OC_MAX_PRIORITY`): the encoder sends
+at most 64 and the daemon keeps the first 64, truncating rather than failing. The
+daemon cuts each term to 63 bytes (`OC_KEYWORD_MAX` less its terminator) and
+stores it lowercased; an empty term is dropped. A keyword hit is
 **written into `mentions` with its own kind**, so the push query, the activity
 feed and the reader's highlight all keep working unchanged — and it is matched by
 `shared/mention.c`, never by SQL, so a client highlights exactly what the server
@@ -2128,9 +2113,32 @@ written in one client invisible in another.
 
     count (u16)
 
-A draft may be **unaddressed** — `channel_id` absent with a `recipients` list
+`SET_DRAFT` upserts the draft for its conversation (`channel_id`,
+`thread_root`), and an empty body deletes it — the same frame rather than a second op. A draft may be
+**unaddressed** — `channel_id` 0 with a comma-separated `recipients` id list
 beside it — because the New Message pane autosaves before a recipient is chosen
-(REQ-229). A scheduled message is held in its own table and fired by a daemon
+(REQ-229). An addressed draft requires membership of the channel — a draft is
+user content *about* a conversation, and storing one for a channel you cannot see
+would report its existence back to you on every other device. Bodies over
+`OC_DRAFT_BODY_MAX` (16 KB) are **truncated, not refused**: no composer can type
+one that long, so a frame that size is a bug or a probe, and losing its tail
+beats losing the draft.
+
+`DRAFT` is sent to the writer's **other** connections as a device sync — never
+back to the connection that wrote it, which already has the text and would
+otherwise be at risk of overwriting a composer still being typed in. A delete
+arrives as the same frame with an empty body. The surrogate `id` is what
+distinguishes unaddressed drafts from each other — they all share `channel_id`
+0, so the conversation key cannot tell them apart. `LIST_DRAFTS` streams newest
+first, capped at 256 (`OC_MAX_DRAFTS`). Entries for channels you have since left
+are omitted but **not deleted**: leaving is reversible, so the draft waits for
+you rather than being discarded.
+
+*One frame for two jobs.* `DRAFT` is both the streamed list entry and the sync
+push, exactly as `CLIENT_SETTINGS` doubles as snapshot and push — the client
+folds it the same way whatever prompted it, instead of two frames that can drift.
+
+A scheduled message is held in its own table and fired by a daemon
 sweep on its own 15 s timer, delivered through the
 ordinary send path so mentions and notifications cannot diverge, with the
 **daemon minting the idempotency token at fire time** — the client's token
@@ -2225,87 +2233,6 @@ session and revoke it (REQ-182). Rotating a webhook mints a new token and return
 it once, on the same terms as creation: only the SHA-256 is stored, so a token
 cannot be re-shown.
 
-### 5.16k User groups (REQ-307-309, ARCH-114)
-
-A **group** is a named set of people with an `@handle`. Owners and admins manage
-groups; everyone signed in sees them, since a composer offers them and a profile
-lists them. A handle uses the mention scanner's characters (`[A-Za-z0-9._-]`), is
-1–48 long, does not start with a digit or `.`, `-` or `_`, and is compared without
-case. It shares one namespace with display names and the broadcast words: a group
-cannot take `here`, `channel`, `everyone` or anyone's display name, and a person
-cannot rename themselves to a group's handle (`GROUP_HANDLE_TAKEN`). A group holds
-people only, at most 1024; a workspace holds at most 256 groups.
-
-**`LIST_GROUPS` (C → S), `0x00E8`** — Ask for every group. The answer is one `GROUP_INFO` per group, then `GROUPS_END`. A group the answer does not name no longer exists. A client need not ask at sign-in: the daemon follows a session's first `USER_LIST` with the same answer, unasked.
-
-    (empty)
-
-**`CREATE_GROUP` (C → S), `0x00E9`** — Owner/admin. Answered, and announced to everyone, with the new group's `GROUP_INFO`.
-
-    handle (str), name (str), description (str)
-
-**`UPDATE_GROUP` (C → S), `0x00EA`** — Owner/admin: a group's handle, name and description, whole.
-
-    group_id (u64), handle (str), name (str), description (str)
-
-**`DELETE_GROUP` (C → S), `0x00EB`** — Owner/admin. The group leaves every channel it was in, and takes with it the membership it gave. Announced to everyone as `GROUP_DELETED`.
-
-    group_id (u64)
-
-**`GROUP_ADD_MEMBERS` (C → S), `0x00EC`** / **`GROUP_REMOVE_MEMBERS` (C → S), `0x00ED`** — Owner/admin: people in or out, at most 256 per frame. Each person added gains every channel the group is in. Each person removed loses those channels they are in only through it. An id that is nobody, or somebody removed from the workspace, is ignored.
-
-    group_id (u64), count (u16), then count x { user_id (u64) }
-
-**`GROUP_INFO` (S → C), `0x00EE`** — One group, whole. It is a list entry, and it is pushed to everyone signed in on any change.
-
-    group_id (u64), handle (str), name (str), description (str), created_by (u64), count (u16), then count x { user_id (u64) }
-
-**`GROUP_DELETED` (S → C), `0x00EF`** — Pushed to everyone signed in.
-
-    group_id (u64)
-
-**`GROUPS_END` (S → C), `0x00F0`** — Terminator of a `LIST_GROUPS` answer.
-
-    count (u16)
-
-**`CHANNEL_ADD_GROUP` (C → S), `0x00F1`** / **`CHANNEL_REMOVE_GROUP` (C → S), `0x00F2`** — Any member of the channel (not a DM), as with inviting a person. At most 32 groups per channel. The group's members are in the channel through it: added to the group later, they are in; taken out, they are out, unless they were also added directly. Answered like `INVITE_TO_CHANNEL`: the channel's `CHANNEL_INFO` to the actor, then its `CHANNEL_GROUPS`.
-
-    channel_id (u64), group_id (u64)
-
-**`CHANNEL_GROUPS` (S → C), `0x00F3`** — The groups a channel has.
-- Sent right after every `CHANNEL_INFO` of a channel (not a DM), to the same people, none included.
-- Sent after the channel list, for each channel.
-- Sent to every member when the channel's groups change.
-
-**`CHANNEL_VIA_GROUP` (S → C), `0x00F4`** — Sent right after the `MEMBERS` terminator of every `LIST_MEMBERS` answer. It names the channel's members who are in it **only** through a group, which are the ones leave and remove refuse.
-
-    channel_id (u64), count (u16), then count x { user_id (u64) }
-
-**`MENTION_UNRESOLVED_MORE` (S → C), `0x00F5`** — To the sender only, right after `MENTION_UNRESOLVED`, when a message could not reach more people than that notice lists (a group larger than its eight names). It gives the total.
-
-    channel_id (u64), message_id (u64), total (u16)
-
-    channel_id (u64), count (u16), then count x { group_id (u64) }
-
-**Who gains or loses a channel by any of these** is told as an invitee and a
-leaver are:
-- A person who gained a channel gets its `CHANNEL_INFO` (joined 1) and its `CHANNEL_GROUPS`.
-- A person who lost one gets its `CHANNEL_INFO` with joined 0. So does someone removed with `REMOVE_FROM_CHANNEL`.
-
-**Leaving and removing.** Leave and remove clear someone's direct membership,
-and a group the channel has keeps them in. Someone in a channel **only** through a
-group cannot leave it, and cannot be removed from it alone. `LEAVE_CHANNEL` and
-`REMOVE_FROM_CHANNEL` are refused with `MEMBER_VIA_GROUP`. They leave when they
-leave the group, or when the group leaves the channel.
-
-**`@handle` in a message** reaches every member of the group who can read the
-channel, each under their own notification level, schedule and pause, as a
-personal mention does. Members who cannot read it are listed to the sender in
-`MENTION_UNRESOLVED` (§5.16g), up to its eight names, followed by
-`MENTION_UNRESOLVED_MORE` with the total when there are more. A handle wins a clash
-with a person's name. Only an identity provider's name at first sign-in can make
-one.
-
 ### 5.16i Threads across channels
 
 Delivers REQ-062 (ARCH-104). Participation is **derived** — you are in a thread
@@ -2384,6 +2311,87 @@ class the reaction and pin replays exist to prevent. An **edit drops the
 message's stored unfurls** and re-fetches from the new body, so a removed URL's
 preview cannot be replayed. Always on — there is no switch. Adding the frame
 needed no protocol-version bump; a peer that does not know it never expects it.
+
+### 5.16k User groups (REQ-307-309, ARCH-114)
+
+A **group** is a named set of people with an `@handle`. Owners and admins manage
+groups; everyone signed in sees them, since a composer offers them and a profile
+lists them. A handle uses the mention scanner's characters (`[A-Za-z0-9._-]`), is
+1–48 long, does not start with a digit or `.`, `-` or `_`, and is compared without
+case. It shares one namespace with display names and the broadcast words: a group
+cannot take `here`, `channel`, `everyone` or anyone's display name, and a person
+cannot rename themselves to a group's handle (`GROUP_HANDLE_TAKEN`). A group holds
+people only, at most 1024; a workspace holds at most 256 groups.
+
+**`LIST_GROUPS` (C → S), `0x00E8`** — Ask for every group. The answer is one `GROUP_INFO` per group, then `GROUPS_END`. A group the answer does not name no longer exists. A client need not ask at sign-in: the daemon follows a session's first `USER_LIST` with the same answer, unasked.
+
+    (empty)
+
+**`CREATE_GROUP` (C → S), `0x00E9`** — Owner/admin. Answered, and announced to everyone, with the new group's `GROUP_INFO`.
+
+    handle (str), name (str), description (str)
+
+**`UPDATE_GROUP` (C → S), `0x00EA`** — Owner/admin: a group's handle, name and description, whole.
+
+    group_id (u64), handle (str), name (str), description (str)
+
+**`DELETE_GROUP` (C → S), `0x00EB`** — Owner/admin. The group leaves every channel it was in, and takes with it the membership it gave. Announced to everyone as `GROUP_DELETED`.
+
+    group_id (u64)
+
+**`GROUP_ADD_MEMBERS` (C → S), `0x00EC`** / **`GROUP_REMOVE_MEMBERS` (C → S), `0x00ED`** — Owner/admin: people in or out, at most 256 per frame. Each person added gains every channel the group is in. Each person removed loses those channels they are in only through it. An id that is nobody, or somebody removed from the workspace, is ignored.
+
+    group_id (u64), count (u16), then count x { user_id (u64) }
+
+**`GROUP_INFO` (S → C), `0x00EE`** — One group, whole. It is a list entry, and it is pushed to everyone signed in on any change.
+
+    group_id (u64), handle (str), name (str), description (str), created_by (u64), count (u16), then count x { user_id (u64) }
+
+**`GROUP_DELETED` (S → C), `0x00EF`** — Pushed to everyone signed in.
+
+    group_id (u64)
+
+**`GROUPS_END` (S → C), `0x00F0`** — Terminator of a `LIST_GROUPS` answer.
+
+    count (u16)
+
+**`CHANNEL_ADD_GROUP` (C → S), `0x00F1`** / **`CHANNEL_REMOVE_GROUP` (C → S), `0x00F2`** — Any member of the channel (not a DM), as with inviting a person. At most 32 groups per channel. The group's members are in the channel through it: added to the group later, they are in; taken out, they are out, unless they were also added directly. Answered like `INVITE_TO_CHANNEL`: the channel's `CHANNEL_INFO` to the actor, then its `CHANNEL_GROUPS`.
+
+    channel_id (u64), group_id (u64)
+
+**`CHANNEL_GROUPS` (S → C), `0x00F3`** — The groups a channel has.
+- Sent right after every `CHANNEL_INFO` of a channel (not a DM), to the same people, none included.
+- Sent after the channel list, for each channel.
+- Sent to every member when the channel's groups change.
+
+    channel_id (u64), count (u16), then count x { group_id (u64) }
+
+**`CHANNEL_VIA_GROUP` (S → C), `0x00F4`** — Sent right after the `MEMBERS` terminator of every `LIST_MEMBERS` answer. It names the channel's members who are in it **only** through a group, which are the ones leave and remove refuse.
+
+    channel_id (u64), count (u16), then count x { user_id (u64) }
+
+**`MENTION_UNRESOLVED_MORE` (S → C), `0x00F5`** — To the sender only, right after `MENTION_UNRESOLVED`, when a message could not reach more people than that notice lists (a group larger than its eight names). It gives the total.
+
+    channel_id (u64), message_id (u64), total (u16)
+
+**Who gains or loses a channel by any of these** is told as an invitee and a
+leaver are:
+- A person who gained a channel gets its `CHANNEL_INFO` (joined 1) and its `CHANNEL_GROUPS`.
+- A person who lost one gets its `CHANNEL_INFO` with joined 0. So does someone removed with `REMOVE_FROM_CHANNEL`.
+
+**Leaving and removing.** Leave and remove clear someone's direct membership,
+and a group the channel has keeps them in. Someone in a channel **only** through a
+group cannot leave it, and cannot be removed from it alone. `LEAVE_CHANNEL` and
+`REMOVE_FROM_CHANNEL` are refused with `MEMBER_VIA_GROUP`. They leave when they
+leave the group, or when the group leaves the channel.
+
+**`@handle` in a message** reaches every member of the group who can read the
+channel, each under their own notification level, schedule and pause, as a
+personal mention does. Members who cannot read it are listed to the sender in
+`MENTION_UNRESOLVED` (§5.16g), up to its eight names, followed by
+`MENTION_UNRESOLVED_MORE` with the total when there are more. A handle wins a clash
+with a person's name. Only an identity provider's name at first sign-in can make
+one.
 
 ### 5.16l Actions (REQ-058, ARCH-115)
 
@@ -2545,7 +2553,10 @@ call leaves it first; one in this call is taken out and put back, with a fresh
 token and slot — how a client whose address changed is relayed again. A relay
 that has exited and could not be restarted refuses the join with
 `ERROR CALL_UNAVAILABLE` (3025); so is a start when the daemon holds as many
-calls as it can.
+calls as it can. On a public demo (AUTH.md §8.12) a join past the day's call
+limit is refused with `ERROR DEMO_LIMIT` (3037), and a call ends for everyone —
+`CALL_STATE` with `ended` set — twenty minutes after it started
+(`OC_DEMO_CALL_MAX_MS`, `daemon/demolimits.h`).
 
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
 u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
@@ -2678,7 +2689,7 @@ Fragments, NACKs, keyframe requests and rate reports travel **inside the
 encryption** as typed packets (CALLS.md §5.4); the relay's framing does not
 change. [CALLS.md](./CALLS.md) §6 is the design.
 
-### Push device tokens (REQ-132/133, ARCH-85)
+### 5.18 Push device tokens (REQ-132/133, ARCH-85)
 
 **`REGISTER_DEVICE_TOKEN` (C → S), `0x00B0`** `{ platform: u8, token: str }` —
 register the caller's mobile push token (`platform` 0 = APNs, 1 = FCM). Upserts on
@@ -2865,11 +2876,11 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | A frame not valid in the current state: a non-`HELLO` first frame (sent as `REJECT`, since no version is negotiated yet) or a post-auth type this version does not define (sent as `ERROR`). A `SEND` before `AUTH_OK` gets the more specific `AUTH_REQUIRED` instead. |
 | `1006` | `VERSION_MISMATCH`    | post-hello | yes   | A post-handshake frame carried a `version` other than the negotiated one. Distinct from `1001`/`1002`, which answer a `HELLO` and precede a session: this says the peer agreed and then sent something else. The `ERROR` itself is stamped with the negotiated version, so it is readable by the peer being disconnected. |
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
-| `2002` | `AUTH_INVALID_TOKEN`  | auth       | yes   | JWT failed signature/audience/expiry validation (REQ-023).     |
-| `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
+| `2002` | `AUTH_INVALID_TOKEN`  | auth       | on `AUTH` | JWT failed signature/audience/expiry validation (REQ-023).     |
+| `2003` | `AUTH_RATE_LIMITED`   | auth       | on `AUTH` | Too many auth attempts for this tenant (REQ-191).              |
 | `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MANAGED_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
 | `2005` | `AUTH_NOT_ALLOWED`    | auth       | yes   | A valid identity that no join rule or invite admits (AUTH.md §8.4). An identity the workspace already knows still signs in. |
-| `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | no    | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach; or a password came in a frame, where the daemon takes one only on its pages (AUTH.md §8.10). |
+| `2006` | `AUTH_SOURCE_UNAVAILABLE` | auth   | on `AUTH` | `AUTH_BEGIN` named a source this deployment does not offer, or one it cannot reach; or a password came in a frame, where the daemon takes one only on its pages (AUTH.md §8.10). |
 | `2007` | `AUTH_PENDING` | auth   | no    | A device code not approved yet (§4.2c). |
 | `2008` | `AUTH_SLOW_DOWN` | auth   | no    | A device-code poll sooner than the interval; the interval grows by five seconds. |
 | `2009` | `AUTH_EXPIRED` | auth   | no    | A device code that ran out, was collected, or never was. |
@@ -2913,10 +2924,13 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3035` | `INVALID_GROUP`       | groups     | no    | A handle, name or description out of bounds, or a group, a workspace or a channel at its cap (§5.16k). |
 | `3036` | `SIGNUP_LIMITED`      | auth       | no    | Ten accounts were made from this address in the last hour; the sign-up page says so (AUTH.md §2). Not sent as a frame. |
 | `3037` | `DEMO_LIMIT`          | demo       | no    | A public demo's daily limit was reached (AUTH.md §8.12); `message` says which, in a sentence for the person. Sent as `ERROR`, or as a transfer's error for an upload. |
-| `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
+| `9001` | `INTERNAL`            | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
 `HELLO`) are delivered via `REJECT`, which carries the same `code`; the other codes are delivered via `ERROR`.
+A code marked **on `AUTH`** is fatal as the answer to `AUTH` — another try is on
+a new connection — and non-fatal as the answer to `AUTH_BEGIN` or the device-code
+frames (§4.2a, §4.2c).
 
 ---
 

@@ -274,11 +274,13 @@ out of scope for this doc.)
 
 **The issuer above is illustrative, not normative.** It is a string the daemon
 compares with `strcmp` and never dereferences — there is no discovery document,
-because the keys are read from the relay's origin (§3.4). Any
-value both sides agree on works, and an implementer should not read the example
-as a URL that has to resolve, or as requiring a particular subdomain.
+because the keys are read from the relay's origin (§3.4). The daemon expects
+the origin of the address it enrolled at (`OPENCHIME_ENROLL_URL`), and an
+implementer should not read the example as a URL that has to resolve, or as
+requiring a particular subdomain.
 
-The daemon validates it by **pinning both the keys and the algorithm**
+The daemon validates it by **fixing the algorithm and trusting only the relay's
+keys**
 (`daemon/jwt.c`):
 
 - it requires `alg = ES256` and rejects anything else — this closes JWT's classic
@@ -289,7 +291,7 @@ The daemon validates it by **pinning both the keys and the algorithm**
   thumbprint, which it computes for each key it holds — and refuses a token whose
   `kid` is absent or names none of them (§8.3). The keys it holds are the ones
   the relay publishes (§3.4) and, on a managed box, one pinned beneath them;
-- it checks `iss` (central) and `aud` (== this workspace's configured opaque id —
+- it checks `iss` (central's origin) and `aud` (== this workspace's enrolled opaque id —
   not its hostname — so a token minted for one workspace cannot be replayed at
   another);
 - it requires `sub`, `nonce`, `jti`, `iat` and `exp`, refuses a token that is
@@ -316,7 +318,7 @@ targets the high-frequency message path, not the auth bootstrap.)
   §8.7). A self-hoster enabling relay-OIDC enrolls their workspace with central
   once, after which central will mint tokens for that audience.
 - **An enrolled box follows a rotation by itself.** It reads
-  `<relay origin>/oidc/jwks` at boot and daily — every minute while it gets no
+  `<enroll origin>/oidc/jwks` at boot and daily (`daemon/relaykeys.c`) — every minute while it gets no
   good answer — over HTTPS verified with the built-in roots, and trusts the ES256
   P-256 signing keys there, beside a managed box's pinned one
   (`OPENCHIME_MANAGED_RELAY_KEY`). Each answer replaces the last;
@@ -359,7 +361,7 @@ The central service + relay are a **separate system** — a web service, not the
 daemon. Its contract with the daemon is narrow:
 
 - run the Authorization-Code-+-PKCE flow against the configured providers;
-- mint ES256 JWTs (§3.3) signed by a key it publishes at `/oidc/jwks`,
+- mint ES256 JWTs (§3.3) signed by one of the keys it publishes at `/oidc/jwks`,
   audience-scoped to the requesting workspace;
 - maintain the workspace registry (which `audience` ids are valid), binding each
   workspace's opaque id at enrollment (§3.3) and minting a token only for a
@@ -368,7 +370,7 @@ daemon. Its contract with the daemon is narrow:
 
 The daemon's OIDC path is tested with a **test issuer**:
 generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
-configure the daemon with the test public key — the same faking approach as the
+hand the daemon the test public key as one of the relay's — the same faking approach as the
 existing TLS/netloop integration tests.
 
 **The daemon's enrollment client (ARCH-84).** How a federated box *obtains* its
@@ -701,7 +703,8 @@ retried every minute, and until it answers its source returns
 **The exchange.**
 1. `AUTH_BEGIN{oidc-n, redirect_uri, challenge}` makes a **pending sign-in**:
    a random `state`, the daemon's own PKCE verifier, a random `nonce`, the client's
-   challenge and its `redirect_uri`, for ten minutes, at most sixteen per source.
+   challenge and its `redirect_uri`, for ten minutes, at most sixteen per client address (an IPv6 client's /64) and
+   256 in all, beyond which `AUTH_BEGIN` is answered `AUTH_RATE_LIMITED`.
    `AUTH_REDIRECT` carries the provider's authorize URL — `response_type=code`,
    `scope=openid email profile`, S256 from the daemon's verifier. With
    `redirect=localhost` the loopback address is written as `localhost`, for a
@@ -946,7 +949,9 @@ daemon's own (§8.6), no cookies and no state kept between requests, with
 `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
 frame-ancestors 'none'; base-uri 'none'; form-action 'self' <the callback's
 origin>` (browsers hold a form's redirect to `form-action`; a page that runs a
-script adds `script-src 'self'`),
+script adds `script-src 'self'`; for a callback at the IPv6 loopback, `[::1]`,
+which a policy's host grammar cannot name, `form-action` is left out altogether
+and the page still posts only to itself),
 `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
 `Cache-Control: no-store` and `Referrer-Policy: same-origin` — no other site is
 told a page's URL, and the page's own posts carry its origin (under

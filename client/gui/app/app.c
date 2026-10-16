@@ -1,16 +1,15 @@
 /*
- * OpenChime Win32 GUI client (ARCH-80/82) — pure C, over the shared app-core
- * (client/core, ARCH-74). A native window drawn with Direct2D + DirectWrite:
+ * OpenChime GUI client (ARCH-80/82) — pure C, over the shared app-core
+ * (client/core, ARCH-74). An SDL3 window drawn through oc_gfx + sdltext:
  * a slim left rail, a live channel sidebar, a scrollable message transcript,
  * and a working composer. Deep-blue accent on a dark neutral shell.
  *
  *   openchime.exe [<workspace>]   (the sign-in the workspace offers, or a stored session)
  *
  * The core owns the network thread + the view-model; this frontend is pure view
- * + input, ticked on a WM_TIMER (~30 ms, the GUI analogue of the TUI poll loop):
- * tick -> read oc_client_model() -> D2D-draw -> dispatch intents, all on the UI
- * thread. No product logic lives here (the core owns it). Native controls (a
- * RichEdit composer, menus, dialogs) and the members pane land in later phases.
+ * + input, ticked from the event loop every TICK_MS (~30 ms, the GUI analogue
+ * of the TUI poll loop): tick -> read oc_client_model() -> draw -> dispatch
+ * intents, all on the UI thread. No product logic lives here (the core owns it).
  */
 
 /* ---- the platform seam (ARCH-80; client/gui/platform/platform.h) ----------
@@ -289,14 +288,14 @@ static uint32_t g_app_evtype;      /* the app's own posts to itself: the trust q
 enum { APP_EV_TRUST_RESUME = 1 };
 
 
-/* Layout metrics (device pixels; per-monitor DPI is a later phase). */
+/* Layout metrics (DIPs; see DPI below). */
 /* ---- DPI ------------------------------------------------------------------
  * Every layout constant and hit-box below is in DIPs (1/96"), not device pixels.
- * Direct2D and DirectWrite already work that way, so telling the render target
- * the window's DPI scales the entire drawn UI for free. Two boundaries do NOT
+ * oc_gfx and sdltext work that way, so handing them the window's scale
+ * (scene_scale_apply) scales the entire drawn UI for free. Two boundaries do NOT
  * scale themselves and must be converted by hand:
  *
- *   native children  positioned with MoveWindow, which takes device pixels
+ *   window rects     window positions and the text input area take device pixels
  *   mouse messages   delivered in device pixels
  *
  * Without any of this the process is DPI-unaware and Windows bitmap-stretches
@@ -322,8 +321,8 @@ static unsigned g_dpi = 96;    /* 96 x the window's display scale (SDL), as DIPs
  * and every use site expands against it. */
 /* 1.0 until the first scale_apply, and the initialiser is load-bearing: every
  * metric below expands against this, so a zero here makes every row, header and
- * avatar zero-sized at the first paint — degenerate geometry that faults inside
- * d2d1.dll rather than drawing nothing. */
+ * avatar zero-sized at the first paint — degenerate geometry handed to the
+ * renderer rather than nothing drawn. */
 static float g_text_scale = 1.0f;
 #define UIS(x) ((x) * g_text_scale)
 
@@ -643,9 +642,9 @@ static void draw_avatar_presence(gfx *rt, rectf tile,
  * select for a list you scan. Both carry their options in `hint` as "a|b|c" and
  * both write the chosen INDEX into `value`, so a caller reads them the same way. */
 /* FF_MULTILINE is FF_TEXT for PROSE: several lines, where Enter is a new line
- * rather than "submit" (Ctrl+Enter submits instead). Still a native EDIT, for the
- * same reason every text field here is one -- caret, selection, IME and undo stay
- * the platform's problem. */
+ * rather than "submit" (Ctrl+Enter submits instead). A drawn `field` like every
+ * other text field here (field_init with `multi` set), so it wraps and scrolls
+ * in the box the form gives it. */
 enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE, FF_SELECT, FF_MULTILINE };
 
 typedef struct {
@@ -668,13 +667,12 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n);
 /* The form is drawn on the modal frame like every other sheet, so its
  * state has to be visible to the painter, the click router and layout_natives —
  * hence globals rather than locals inside form_dialog. At most one form is open:
- * it runs a nested message loop, so a second one cannot start underneath it.
+ * it runs a nested event loop (pump), so a second one cannot start underneath it.
  *
- * The text fields are still native EDITs. They are children of the MAIN window
- * now, positioned by layout_natives from rects the painter recorded, which is the
- * same arrangement the sign-in card already uses successfully — the platform keeps
- * caret, selection, IME and clipboard, and we stop shipping a grey GDI popup with
- * a different font, different colours and a Windows 95 title bar. */
+ * The text fields are drawn `field`s (field_init in form_dialog), like the
+ * sign-in card's. The painter records the rect each one goes in and
+ * layout_natives shows it there, so the form wears the app's own font and
+ * colours rather than a grey GDI popup with a Windows 95 title bar. */
 /* Seven since Edit profile gained the voice a person is read aloud in
  * (REQ-292): the identity screen owns every field that is one screen's worth of
  * a person, and the voice is one of them. */
@@ -684,8 +682,8 @@ static int        g_form_open;                       /* a form is on the frame *
  * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
  * unassertable. Diagnosis only. */
 static char       g_form_last[320];
-/* The form fields' font: the UI token at the UI family, so a native EDIT sitting on
- * our card is not the one control in the app wearing the stock shell font (ARCH-97
+/* The form fields' font: the UI token at the UI family, so a field on our card
+ * is not the one control in the app wearing the stock shell font (ARCH-97
  * — the platform owns the family, we own the scale). Rebuilt whenever the scale
  * changes, which is why form_font() is a function and not a one-shot global. */
 static int        g_form_done, g_form_result;         /* the nested loop's exit */
@@ -711,12 +709,12 @@ static void (*g_form_on_pick)(int field, int val);
  * picker needs one -- you choose a voice by hearing it, and hearing it is a
  * request to the daemon that takes a moment and can fail. The field owns the
  * label and the busy state so the button can say which it is in. */
-/* WHICH FIELD HAS THE KEYBOARD, when it is not a native EDIT. Windows' dialog
- * manager tabs between child windows, and this form's checks, chips and selects
- * are drawn rather than child windows -- so Tab walked straight past the time
- * zone and the read-aloud voice, and the only way to either was the mouse. This
- * is the ring that includes them: -1 when a native field has focus, otherwise
- * the drawn field's index (or its action button). */
+/* WHICH FIELD HAS THE KEYBOARD, when it is not a text field. A text field holds
+ * the keyboard through g_focus; this form's checks, chips and selects are not
+ * fields -- so Tab once walked straight past the time zone and the read-aloud
+ * voice, and the only way to either was the mouse. This is the ring that
+ * includes them: -1 when a text field has focus, otherwise the check, choice or
+ * select's index (or its action button). */
 static int         g_form_focus = -1;
 static int         g_form_focus_btn;          /* the focused stop is the action button */
 static int         g_form_action_field = -1;
@@ -983,10 +981,11 @@ static char       g_host[256];
 static int        g_port;
 static char       g_cur_ws[256];        /* the workspace string we connected with */
 
-/* The rendering stack (ARCH-80): an SDL window whose oc_win *this file subclasses
- * (so WM_GETOBJECT, the tray, IME and every input path keep their Win32
- * handling), an SDL renderer drawn through oc_gfx, and an sdltext context on
- * the DirectWrite backend. There is no render-target-owned state to lose —
+/* The rendering stack (ARCH-80): an SDL window the platform layer attaches to
+ * (oc_plat_window_attach; on Win32 it subclasses the window so WM_GETOBJECT,
+ * the tray and the handoff keep their Win32 handling), an SDL renderer drawn
+ * through oc_gfx, and an sdltext context on the platform's text backend
+ * (oc_plat_text_create: DirectWrite on Windows, the canvas in a browser). There is no render-target-owned state to lose —
  * per-range color is data — so the brush globals are gone. */
 static SDL_Window   *g_win;
 static SDL_Renderer *g_ren;
@@ -1082,7 +1081,7 @@ static char g_link_down[1024];
  * open on RELEASE over the one the press landed on. */
 static uint64_t g_chan_hover, g_chan_down;
 
-/* Custom transcript scrollbar (drawn over the D2D surface). Geometry is captured
+/* Custom transcript scrollbar (drawn over the scene). Geometry is captured
  * each paint so the mouse handlers can hit-test and drag the thumb. */
 static rectf g_sbar_thumb;    /* thumb hit-box (empty when not scrollable) */
 static float    g_sbar_track_top;   /* track origin + travel range, for drag mapping */
@@ -1094,8 +1093,6 @@ static uint8_t  g_post_auth;        /* one-shot post-auth roster/channel refresh
 static uint64_t g_backfilled[512];  /* channels we've already asked history for */
 static int      g_n_backfilled;
 
-/* The composer is a native RichEdit child (IME / selection / clipboard / undo);
- * we subclass it to make Enter send and Shift+Enter insert a newline. */
 /* The composer is OURS now (ARCH-98): no RichEdit, no child window. The
  * declarations sit up here because the shell — drafts, the send button, the
  * autocomplete, the picker, F6 — talks to it from above its definition. */
@@ -1118,7 +1115,7 @@ static float ed_line_h(void);             /* fwd — the field's REAL line heigh
 static void ed_mode_changed(void);        /* fwd — the editor preference flips */
 static uint32_t    g_last_typing;
 
-/* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
+/* Sidebar row hit-boxes, captured during paint for on_lbutton_down. */
 /* Sidebar rows come from the shared core helper (oc_model_sidebar), so the GUI
  * and the TUI group, filter and sort identically. A row is either a section
  * header or a conversation. */
@@ -1173,17 +1170,18 @@ static int g_prefs_pending;        /* fold the synced values in once they land *
  * does mean it is stored per workspace rather than per machine. Acceptable: the
  * alternative is not remembering it at all.
  *
- * Stored in DEVICE pixels, since that is what SetWindowPos takes; a move to a
- * differently-scaled monitor is handled by WM_DPICHANGED afterwards. */
+ * Stored in the units SDL_SetWindowPosition / SDL_SetWindowSize take; a move
+ * to a differently-scaled monitor arrives afterwards as
+ * SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED (dpi_set). */
 static int g_win_x = -1, g_win_y, g_win_w, g_win_h, g_win_max;
 static int g_geom_applied;         /* only restore once per run */
 static uint64_t g_geom_deadline;  /* show anyway if the bucket never lands */
 static uint64_t g_geom_dirty_at;  /* geometry changed; save once it settles */
 
 /* Read the window's placement into the globals. Returns 1 if it changed.
- * Separate from saving because WM_EXITSIZEMOVE only fires for INTERACTIVE
- * drags — a programmatic move never sends it, and the geometry would then be
- * whatever it was at the last drag. */
+ * Separate from saving because it runs on every move and resize event
+ * (SDL_EVENT_WINDOW_MOVED, on_size), mid-drag included; the save waits for
+ * the placement to settle (g_geom_dirty_at, on the tick). */
 static int geom_capture(oc_win *hwnd) {
 #ifdef __EMSCRIPTEN__
     /* The browser's window is the page's, not one to remember: a desktop
@@ -1342,7 +1340,7 @@ static int  g_pref_close = CLOSE_QUITS;
 static int  g_pref_min_tray;        /* minimise hides too, off by default */
 static int  g_close_to_tray_told;
 static int  g_hidden_to_tray;      /* observable by the harness; see test_dump */
-/* Set only by app_quit. WM_CLOSE hides unless this says the close was ASKED
+/* Set only by app_quit. A close request hides unless this says the close was ASKED
  * for -- one message, two meanings, and the flag is which. */
 static int  g_quitting;
 
@@ -1636,20 +1634,21 @@ static void taskbar_flash(oc_win *hwnd) {
 
 /* ---- inline image thumbnails -------------------------------------
  * Attachments rendered as text lines only. The bytes are fetched INTO MEMORY
- * (oc_client_fetch_attachment) and decoded with WIC — no temp file, because a
- * client stores nothing locally (ARCH-88) and a scratch file for rendering is
- * exactly the cache that decision removed.
+ * (oc_client_fetch_attachment) and decoded by the platform
+ * (oc_plat_image_decode) — no temp file, because a client stores nothing
+ * locally (ARCH-88) and a scratch file for rendering is exactly the cache that
+ * decision removed.
  *
- * The decoded bitmaps belong to the render target, so the cache is dropped
- * whenever the RT is recreated. */
+ * The textures belong to the renderer; thumb_get re-uploads one a device reset
+ * dropped, and the whole cache is dropped on a theme change and at exit. */
 #define THUMB_H UIS(160.0f)
 #define THUMB_W UIS(260.0f)
 enum { THUMB_CACHE = 32 };
-/* Dimensions are captured at decode time from WIC with explicit out-params
- * (the by-value GetSize ABI hazard is recorded in git history). `px` is the
- * decoded PBGRA image, kept alongside the texture so it can be re-uploaded if
- * the renderer's device resets — same shape the D2D cache had, one target
- * dance lighter: an SDL texture draws into every render pass, screenshots
+/* Dimensions are captured at decode time from oc_plat_image_decode's
+ * out-params (the by-value GetSize ABI hazard is recorded in git history).
+ * `px` is the decoded PBGRA image, kept alongside the texture so it can be
+ * re-uploaded if the renderer's device resets — same shape the D2D cache had,
+ * one target dance lighter: an SDL texture draws into every render pass, screenshots
  * included, so the per-shot bitmap machinery is gone. */
 static struct { uint64_t id; gfx_tex *tex; unsigned w, h; uint8_t *px; unsigned stride; } g_thumbs[THUMB_CACHE];
 static int      g_n_thumbs;
@@ -1721,9 +1720,9 @@ static struct { rectf r; int attach_ix; uint64_t mid; } g_thumb_dl[32];
 static int      g_n_thumb_dl;
 static uint64_t g_thumb_deadline;
 
-/* Only what WIC will actually decode, and only from the server's declared mime —
- * guessing from the filename would mean fetching whatever someone chose to call
- * a .png. */
+/* Only what the platform decoder will actually decode, and only from the
+ * server's declared mime — guessing from the filename would mean fetching
+ * whatever someone chose to call a .png. */
 static int mime_is_image(const char *mime) {
     return mime && (strcmp(mime, "image/png") == 0 || strcmp(mime, "image/jpeg") == 0 ||
                     strcmp(mime, "image/gif") == 0 || strcmp(mime, "image/bmp") == 0 ||
@@ -1771,9 +1770,9 @@ static uint64_t avatar_of(const oc_model *m, uint64_t uid) {
 /* Draw a user's avatar in `box`: their photo when we have the bytes, the coloured
  * initial otherwise.
  *
- * The image is CIRCLE-CLIPPED by filling an ellipse with a bitmap brush rather than
- * pushing a layer: a layer costs a render-target flush per avatar, and a transcript
- * can hold dozens. The brush transform scales the shorter edge to the box and
+ * The image is CIRCLE-CLIPPED by drawing the texture in the shape itself
+ * (gfx_tex_draw_shaped) rather than pushing a clip per avatar, and a transcript
+ * can hold dozens. The mapping rect scales the shorter edge to the box and
  * centres the overflow, so a non-square photo is cropped rather than squashed.
  *
  * It shares the thumbnail cache and its single-fetch-in-flight rule, so avatars and
@@ -1816,7 +1815,7 @@ static uint64_t g_unread_chan;
 static rectf g_unread_jump;      /* "N new" affordance in the header */
 static int g_unread_count;
 
-/* Transcript text selection (DirectWrite hit-testing over the custom surface).
+/* Transcript text selection (sdltext hit-testing over the custom surface).
  * Anchor/focus are (message id, UTF-16 offset); order is resolved at draw time. */
 static uint64_t g_sel_a_mid, g_sel_f_mid;
 static uint32_t g_sel_a_pos, g_sel_f_pos;
@@ -2134,7 +2133,7 @@ static field   *g_srch;                 /* search-overlay query box */
 
 /* Composer autocomplete. The candidate list is rebuilt from the text up
  * to the caret on every change; the popover renders above the composer and the
- * RichEdit subclass steals the navigation keys while it is open. */
+ * composer's key handling takes the navigation keys while it is open. */
 /* Emoji picker. One panel serves two callers: with g_pick_mid == 0 it
  * inserts into the composer, otherwise it reacts to that message — the same
  * catalogue either way, so the reaction set is no longer six hardcoded glyphs. */
@@ -2175,7 +2174,7 @@ static float    g_srch_max;             /* its maximum, computed at paint */
 static rectf g_srch_box;          /* the query field's chrome, for layout_search */
 static char     g_find_filter[64];      /* current filter text (lowercased) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
-/* The pointer, in DIPs, updated from WM_MOUSEMOVE. The file tracked a dozen
+/* The pointer, in DIPs, updated from on_mouse_move. The file tracked a dozen
  * derived hover states (g_nav_hover, g_hover_mid, …) but never the position
  * itself, so shared chrome — the modal frame's buttons — had nothing to ask. */
 static int g_mouse_x = -1, g_mouse_y = -1;
@@ -2194,7 +2193,7 @@ static int g_n_more;
 static struct { float top, bot; int act; } g_moreflyrows[8];
 static int g_n_moreflyrows;
 
-/* ---- custom D2D dropdown menus (workspace / profile / new / switcher) -------
+/* ---- custom drawn dropdown menus (workspace / profile / new / switcher) -----
  * One reusable floating menu. This is now EVERY menu in the client — the
  * four native context popups are gone, so the claim this comment used to make
  * is finally true. An opener fills
@@ -2353,8 +2352,8 @@ static int         g_send_hover = 0;
  * retry, and could not be returned to after sign-out. The behaviour mirrors the
  * TUI's proven run_login() loop (client/tui/main.c) so the two clients agree on
  * wording and on what happens after a failure — but the TUI can block in
- * await_auth() and a Win32 UI thread cannot, so the wait is a state machine
- * driven from the WM_TIMER tick instead. */
+ * await_auth() and the GUI's UI thread cannot, so the wait is a state machine
+ * driven from the tick (on_tick) instead. */
 #define SI_W        380.0f        /* card width */
 #define SI_TIMEOUT  20000         /* ms before we stop waiting for auth */
 static int   g_si_step = 1;       /* 1 = workspace, 2 = credentials */
@@ -2831,7 +2830,7 @@ static void stroke_round(gfx *rt, rectf r, float rad,
 
 /* ---- the text engine ------------------------------------------------------
  * Every string the chrome draws goes through here: an st_layout shaped by
- * DirectWrite, rasterized once, kept as a texture keyed by what produced it,
+ * sdltext, rasterized once, kept as a texture keyed by what produced it,
  * and re-blitted for free on the frames between changes. The cache is what
  * turns the raster path's ~0.3 ms per layout into ~zero per frame; a full
  * invalidation (theme, zoom, DPI) just bumps the generation. */
@@ -2912,7 +2911,7 @@ static txt_ent *txt_get(const char *s, fmtw *fm, float w, uint32_t rgb) {
 
 /* Blit a cached raster into `r` honouring the wrapper's paragraph alignment.
  * The texture is drawn at its natural DIP size — never scaled — so glyphs stay
- * exactly as DirectWrite rasterized them. */
+ * exactly as sdltext rasterized them. */
 /* Where the LAYOUT BOX's top sits inside `r` for this format's para mode.
  * Shared by the blit below and draw_text_hl, so highlight fills and glyphs
  * cannot disagree about the origin again. */
@@ -3028,7 +3027,7 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm, const char *s
             if (want > have) cut = want - have;
         }
         /* HORIZONTALLY only where nothing trims. A format that does not wrap is
-         * given DirectWrite's ellipsis (mk_fmt_s), so running out of room ends in
+         * given sdltext's ellipsis (mk_fmt_s), so running out of room ends in
          * a "…" -- legible, deliberate, and a question of layout style rather
          * than a defect. A WRAPPING format has no trimming to fall back on, so a
          * word longer than its column is cut mid-glyph and nothing says so. */
@@ -3076,8 +3075,8 @@ static int custom_emoji_id(const char *s, char *name, size_t cap) {
     return 1;
 }
 
-/* Colour emoji render through the same engine — the DirectWrite backend
- * rasters COLR layers when the layout asks for them. */
+/* Colour emoji render through the same engine — the sdltext backend
+ * (DirectWrite on Windows) rasters colour glyph layers when the layout asks for them. */
 static int draw_custom_emoji(gfx *rt, const char *s, rectf r);  /* fwd */
 
 static void rel_time(uint64_t ms, char *out, size_t cap);   /* fwd */
@@ -3192,11 +3191,11 @@ static void draw_lucide(gfx *rt, int id, rectf box, uint32_t rgb) {
 
 /* ---- search boxes ------------------------------------------------------------
  * Six of them -- find a conversation, search messages, files, people, Jump to
- * and emoji -- and each is a native EDIT over chrome drawn here. They are one
+ * and emoji -- and each is a drawn field inside chrome drawn here. They are one
  * control: the same height, the same glyph in the same place, and the same text,
  * the UI face at the UI size (form_font()), so none is smaller or stranger than
- * the text around it. The box follows the text scale; the EDIT is exactly the
- * font's line height and sits centred in it (search_edit_place()). */
+ * the text around it. The box follows the text scale; the field's text goes in
+ * search_text_box() of it. */
 #define SEARCH_BOX_H UIS(30.0f)
 /* Where a search box's text goes, inside the chrome search_box_draw() drew:
  * after the glyph, up to the right inset. */
@@ -3212,7 +3211,7 @@ static void search_box_draw(gfx *rt, rectf box, uint32_t fill) {
                 OC_COL_MUTED);
 }
 
-/* ---- Direct2D / DirectWrite setup ---------------------------------------- */
+/* ---- text formats (sdltext) and the rendering stack ---------------------- */
 
 static fmtw *mk_fmt_s(const char *family, float size, int wt,
                       int ta, int pa, int wrap, int italic,
@@ -3263,7 +3262,7 @@ static fmtw *mk_fmt(const char *family, float size, int wt,
 /* ---- typography (ARCH-97) ------------------------------------------------- */
 
 /* The user's text-size preference (REQ-269), NOT system DPI and NOT window zoom
- * — ARCH-97 keeps the three separate on purpose. A DirectWrite format's size is
+ * — ARCH-97 keeps the three separate on purpose. An sdltext format's size is
  * immutable, so changing this means rebuilding all of them. */
 
 /* ARCH-97 keeps three multipliers apart, and this is where two of them live: the
@@ -3364,7 +3363,8 @@ static void emoji_fonts_build(void) {
 }
 
 /* Bring up the rendering stack against the SDL window: renderer, gfx, the
- * sdltext context (DirectWrite backend, sink in capture mode), formats. */
+ * sdltext context (the platform's backend via oc_plat_text_create, sink in
+ * capture mode), formats. */
 static int gfx_stack_init(void) {
     g_ren = SDL_CreateRenderer(g_win, NULL);
     if (!g_ren) return 0;
@@ -3477,7 +3477,7 @@ static int  modal_open(void);          /* fwd — pointer_blocked() asks */
  * the pointer under a menu, the emoji picker, the palette, a flyout, the time
  * dropdown, the lightbox or a modal — rows lighting up around an open menu was
  * the visible symptom. window_is_covered() is the whole-window subset of this;
- * it lives later in the file and gates native children rather than hover. */
+ * it lives later in the file and gates the drawn fields rather than hover. */
 static int pointer_blocked(void) {
     return g_menu != MENU_NONE || g_pick_open || g_pal_open || g_more_open ||
            g_tp_open || g_lightbox || VM_UP() || modal_open() || g_view == VIEW_SIGNIN;
@@ -4778,8 +4778,8 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
     }
 
     /* "Find a conversation" box — a rounded container with a search glyph; the
-     * native EDIT child (g_find) sits inside and live-filters the list. */
-    /* The container and the native EDIT inside it are derived from the same
+     * drawn field (g_find) sits inside and live-filters the list. */
+    /* The container and the field inside it are derived from the same
      * numbers (find_box()), because two hand-kept copies is how the white box
      * ended up floating half out of its own border at large text. */
     search_box_draw(rt, find_box(), OC_COL_INPUT);
@@ -5164,7 +5164,7 @@ static size_t body_lead(const oc_msg *msg) {
 }
 
 /* Is there any text to show? An attachment-only message has none — body_text()
- * hands back a single space so DirectWrite always has something to measure, and
+ * hands back a single space so sdltext always has something to measure, and
  * both the height calculation and the draw pass then advanced by a full line for
  * it, leaving an empty row between the author name and the file. The layout is
  * still built (selection and hit-testing want a span); it is just neither drawn
@@ -5174,8 +5174,8 @@ static int msg_has_body(const oc_msg *msg) {
     return msg->deleted || (msg->body && msg->body[0]);
 }
 
-/* A DirectWrite layout for a message body wrapped to `cw`; *wlen (optional) gets
- * the UTF-16 length — the unit HitTest positions are expressed in. */
+/* An sdltext layout for a message body wrapped to `cw`; *wlen (optional) gets
+ * the UTF-16 length — the unit hit-test positions are expressed in. */
 /* A CUSTOM emoji (REQ-072) is a `:shortcode:`, not a codepoint, so anything that
  * draws "an emoji" has to be able to draw an image instead. Returns 0 when `s` is
  * not a custom shortcode, so callers fall through to their normal glyph path.
@@ -5230,7 +5230,7 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
 }
 
 /* ---- rich text (REQ-220, ARCH-100) ----------------------------------------
- * Formatting is DirectWrite ranges over the unchanged body — the mechanism the
+ * Formatting is sdltext ranges over the unchanged body — the mechanism the
  * @mention highlighting already uses — so it composes with mentions and custom
  * emoji instead of fighting them, and the layout keeps indexing the bytes the
  * daemon stored. Selection, copy, hit-testing and the mention offsets all
@@ -5244,8 +5244,8 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
  * WYSIWYG note above ed_hidden_build(), which is where the answer lives. The two
  * surfaces now render a body identically, which is the property worth having.
  *
- * Removing one takes a transparent brush AND a 0.1 DIP font size, because the
- * layout covers the raw body: a transparent asterisk keeps its width and every
+ * Removing one collapses the run (st_range_hide) rather than only making it
+ * transparent, because the layout covers the raw body: a transparent asterisk keeps its width and every
  * bold word ends up fenced by two gaps that read as typos (checked by looking —
  * they are obvious). Shrinking the run to nothing takes the width with it, and
  * costs nothing else: line height comes from the rest of the line, and copy
@@ -5852,7 +5852,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
         /* The thread's row, as Slack draws it: a thread mark, the count in the
          * link colour, and on hover the row lights and says what a click does.
          * A click opens the thread (on_click); so does a double-click on the
-         * message itself (WM_LBUTTONDBLCLK). */
+         * message itself (on_dblclk). */
         char line[64];
         snprintf(line, sizeof line, "%u %s", msg->reply_count, msg->reply_count == 1 ? "reply" : "replies");
         rectf row = rf(tx - UIS(6.0f), by + UIS(2.0f), x0 + content_w + AVA + 12, by + REPLY_ROW_H - UIS(2.0f));
@@ -6425,8 +6425,8 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
     g_n_searchrows = 0;
 
     /* The query box lives IN the overlay, so refining a search never
-     * closes and reopens it. The native EDIT is placed over this chrome by
-     * layout_search(). */
+     * closes and reopens it. The field is drawn inside this chrome here, and
+     * layout_search() decides whether it is shown. */
     g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 10 + SEARCH_BOX_H);
     search_box_draw(rt, g_srch_box, OC_COL_INPUT);
     if (g_srch) field_draw(rt, g_srch, search_text_box(g_srch_box), OC_COL_TEXT);
@@ -6978,8 +6978,8 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
      * window, whose DIP extent shrinks in inverse proportion to DPI — so at 240
      * DPI a default-sized window leaves ~310 DIP of body and everything from the
      * weekday rows down was simply drawn outside the clip. It was never a
-     * scaling bug: the layout math is DIP and DPI-independent (D2D applies the
-     * DPI through the render target). The card just had no way to reach content
+     * scaling bug: the layout math is DIP and DPI-independent (gfx and sdltext
+     * apply the DPI as the scene scale). The card just had no way to reach content
      * taller than the window, which is the exact problem ovl_begin() already
      * solved for every other list overlay. */
     float top = ovl_begin(rt, reg, g_notify_content_h);
@@ -7203,7 +7203,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
 }
 
 static void layout_composer(oc_win *hwnd);   /* fwd */
-static void layout_natives(oc_win *hwnd);    /* fwd — owns every native child */
+static void layout_natives(oc_win *hwnd);    /* fwd — owns every field's visibility */
 static void scale_apply(oc_win *hwnd);        /* fwd — text size / zoom (ARCH-97) */
 static void dpi_set(oc_win *hwnd, unsigned dpi);  /* fwd */
 static void layout_search(oc_win *hwnd);     /* fwd */
@@ -7294,7 +7294,7 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
     invalidate();
 }
 
-/* ---- shortcuts: one table, dispatched from the message loop ----------------
+/* ---- shortcuts: one table, dispatched from on_event -----------------------
  *
  * Named SHORTCUTS, not ACCEL: windows.h already defines an ACCEL struct for
  * accelerator tables.
@@ -7311,10 +7311,10 @@ static void nav_conversation(oc_win *hwnd, int delta, int unread_only) {
  * box, search box, palette box, picker and sign-in fields were the same black
  * hole, each having had to re-implement any chord it wanted to let through.
  *
- * So dispatch happens in the message loop, before the message reaches any window.
+ * So dispatch happens in on_event, before the key reaches any field or handler.
  * Focus stops being part of the question. Rows with ACC_NONE are documentation for
  * behaviour that is inherently focus-specific — Enter sends only in the composer,
- * Esc means something different in each surface — and those stay in their procs.
+ * Esc means something different in each surface — and those stay in their handlers.
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
@@ -7455,8 +7455,9 @@ static void accel_run(oc_win *hwnd, int action) {
     }
 }
 
-/* Called from the message loop for every keystroke. Returns 1 when it claimed
- * the key, so it is neither translated nor dispatched. */
+/* Called from on_event for every key press and release. Returns 1 when it
+ * claimed the key, so no field or handler sees it and the text SDL sends for
+ * the same press is dropped (g_claimed_text). */
 /* ---- who is holding a modifier ---------------------------------------------
  * Normally the real keyboard. While the harness is delivering a SYNTHETIC chord
  * this holds the modifier set it means, and the handlers read that instead.
@@ -7507,7 +7508,7 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
     if (VM_UP() && !alt && vm_key(hwnd, key)) { invalidate(); return 1; }
     /* A modal owns the window: shortcuts that open other surfaces behind it would
      * leave two things claiming the screen. Esc and Enter reach it through
-     * modal_key in the window proc. */
+     * modal_key, from on_event and on_key_down. */
     if (modal_open()) return 0;
     /* An OPEN MENU owns the keyboard, as a menu does: the arrows move through it,
      * Enter chooses, Right opens a flyout and Left closes one. Without this the
@@ -7568,9 +7569,9 @@ static int accel_dispatch(oc_win *hwnd, int key, int up, int alt, int rep) {
         return 1;
     }
     /* Esc dismisses a transient overlay FIRST, whatever has focus. The
-     * menu/flyout/lightbox/palette Esc handling lives in the main window's proc,
-     * which the composer's focus makes unreachable — the same trap as the chords
-     * above. Everything else about Esc is focus-specific (cancel an edit, close the
+     * menu/flyout/lightbox/palette Esc handling lives in on_key_down, which a
+     * focused field never reaches (on_event hands it the key) — the same trap as
+     * the chords above. Everything else about Esc is focus-specific (cancel an edit, close the
      * picker, drop a selection) and stays in the control that owns it, so this only
      * claims the key when one of these four is actually up. */
     /* Shift+Esc is a shortcut of its own (marking everything read) and must reach
@@ -8200,8 +8201,8 @@ static float draw_file_filters(gfx *rt, rectf body, int full) {
     float y = body.top + 8;
 
     if (full) {
-        /* Name search: a rounded container with the glyph, the native EDIT
-         * placed over it by layout_files_find(). */
+        /* Name search: a rounded container with the glyph, the field drawn
+         * inside it; layout_files_find() decides whether it is shown. */
         g_file_search_box = rf(body.left + 20, y, body.right - 20, y + SEARCH_BOX_H);
         search_box_draw(rt, g_file_search_box, OC_COL_INPUT);
         if (g_ffind) field_draw(rt, g_ffind, search_text_box(g_file_search_box), OC_COL_TEXT);
@@ -10998,10 +10999,8 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
     }
 }
 
-/* The composer region behind the RichEdit child (which paints its own box),
- * plus an attach (+) button to the left of the input. */
 /* Card geometry, derived once so draw_signin() and layout_signin() cannot drift
- * (they must agree on the field rects to the pixel — the EDITs sit on top of the
+ * (they must agree on the field rects to the pixel — the fields sit on top of the
  * chrome the painter draws). Height grows with the error row and the step, so an
  * error can never overlap the button below it. */
 #define SI_NOTE_H 48.0f
@@ -11034,9 +11033,8 @@ static si_geom si_layout(float W, float H) {
 }
 
 /* One centred sign-in card, both steps. Field *chrome* is drawn here; the text
- * itself lives in native EDIT children positioned over it by layout_signin(),
- * so we get IME, selection, clipboard and password masking for free rather than
- * hand-rolling a text editor (the same trade the composer and find box make). */
+ * is drawn fields (g_si_e_*) over it, which layout_signin() shows or hides --
+ * the same arrangement as the composer and find box. */
 static void draw_signin(gfx *rt, float W, float H) {
     si_geom g = si_layout(W, H);
     float cx = W / 2, x0 = g.x0, y0 = g.y0;
@@ -11144,7 +11142,7 @@ static void draw_signin(gfx *rt, float W, float H) {
     }
     g_si_wait_cancel = g_si_wait_copy = rf(0, 0, 0, 0);
 
-    /* Field chrome. The EDITs are placed on these same rects by layout_signin. */
+    /* Field chrome. The fields are drawn on these same rects. */
     const char *labels[1] = { "Workspace" }; int nfields = g_si_step == 1 ? 1 : 0;
     g_si_suffix_shown = 0;
     if (g_si_step == 2) {
@@ -11196,7 +11194,7 @@ static void draw_signin(gfx *rt, float W, float H) {
 
     if (g_si_step == 2) {
         /* Remember me — a drawn checkbox, matching the rest of the shell rather
-         * than dropping a native BUTTON into an otherwise D2D card. */
+         * than dropping a native BUTTON into an otherwise drawn card. */
         g_si_remember_box = rf(fx, y + 2, fx + 16, y + 18);
         fill_round(rt, g_si_remember_box, OC_R_CONTROL, g_si_remember ? OC_COL_ACCENT : OC_COL_INPUT);
         stroke_round(rt, g_si_remember_box, OC_R_CONTROL,
@@ -13077,8 +13075,8 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
     fill_round(rt, card, OC_R_OVERLAY, OC_COL_BASE);
     stroke_round(rt, card, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
 
-    /* Title bar. The close button is a D2D hit-box, not a native child: a child
-     * would composite above the card and punch through it. */
+    /* Title bar. The close button is a drawn hit-box, like everything else on
+     * the card. */
     /* Title then subtitle, STACKED by the title's own height rather than by a
      * constant 30: at large text the two were drawn on top of each other, since
      * the title grew and the subtitle's offset did not. */
@@ -13252,19 +13250,18 @@ static int text_lines(const char *s, fmtw *fmt, float w) {
     return m.lines;
 }
 
-/* The lines each multi-line field's EDIT wrapped its opening value into, counted
- * by the EDIT itself once it had its width (form_dialog); 0 until then. Taken
+/* The lines each multi-line field wrapped its opening value into, counted by
+ * field_line_count once it had its width (form_dialog); 0 until then. Taken
  * once, so the box does not change height under someone typing in it. */
 static int g_form_lines[FORM_MAX_FIELDS];
 
-/* `w` is the row's width. The count is the EDIT's own where it has one; before
- * the EDIT is placed it is estimated in the UI face the EDIT is given
- * (form_font) at the width it will have -- the box FORM_BOX_INSET in from each
- * side, the EDIT 9 in from that (layout_natives) -- with a line to spare, since
- * two engines wrap a long word differently. */
+/* `w` is the row's width. The count is the field's own where it has one; before
+ * the field is placed it is estimated in the UI face at the width it will have
+ * -- the box FORM_BOX_INSET in from each side, the text 9 in from that -- with a
+ * line to spare, since the estimate and the field may wrap a long word
+ * differently. */
 static float form_multi_h(const oc_field *f, float w) {
-    /* The EDIT's own line pitch where its font exists; the five-line floor is
-     * the box this field always had. */
+    /* The UI line pitch; the five-line floor is the box this field always had. */
     float lh = UIS(22.0f);
     float floor_h = UIS(22.0f) * (float)FORM_MULTI_MIN + UIS(8.0f);
     int lines = FORM_MULTI_MIN;
@@ -13429,7 +13426,7 @@ static void draw_form(gfx *rt, rectf body) {
                            body.right - FORM_BOX_INSET, y + 22 + bh);
             fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
             /* The focused field gets the accent ring, so tabbing is visible: the
-             * EDIT itself draws no border of ours. */
+             * field itself draws no border. */
             int focused = (g_form_edit[i] && g_focus == g_form_edit[i]);
             /* ONE weight for both states; only the COLOUR says which has focus.
              * A 1.0px stroke on a rounded rect antialiases to something so faint
@@ -13614,7 +13611,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
      * returns and the caller draws afterwards. */
     /* NEVER an inverted rect. At a large scale in a small window the scaled title
      * band and footer can exceed the card, leaving body.bottom above body.top —
-     * and D2D faults INSIDE d2d1.dll on an inverted clip rather than refusing it.
+     * and D2D faulted INSIDE d2d1.dll on an inverted clip rather than refusing it.
      * That crash took the client down mid-suite and surfaced as a dozen unrelated
      * failures. */
     rectf clip = rf(body.left, body.top,
@@ -14154,7 +14151,7 @@ static void draw_sumrange(gfx *rt, rectf body) {
     float gap = SR_MONTH_GAP, mw = 7 * SCH_CELL_W;
     float x0 = body.left + ((body.right - body.left) - (2 * mw + gap)) / 2;
     if (x0 < body.left) x0 = body.left;
-    /* A label and a field over each month; the EDIT sits right of the icon. */
+    /* A label and a field over each month; the text sits right of the icon. */
     static const char *const LABEL[2] = { "Start date", "End date" };
     for (int k = 0; k < 2; k++) {
         float fx = x0 + k * (mw + gap);
@@ -14534,7 +14531,8 @@ static int modal_frame_click(oc_win *hwnd, int x, int y) {
 
 /* Esc cancels, Enter fires the primary. Both in one place so no modal has to
  * remember, and so the two agree about what dismissal means. */
-/* Does field `i` take the keyboard as a drawn field (rather than as an EDIT)? */
+/* Does field `i` take the keyboard through g_form_focus (a check, choice or
+ * select) rather than as a text field through g_focus? */
 static int form_field_is_drawn(int i) {
     if (i < 0 || i >= g_form_n) return 0;
     int k = g_form_f[i].kind;
@@ -14542,12 +14540,12 @@ static int form_field_is_drawn(int i) {
 }
 
 /* Tab and Shift+Tab across every stop in the form: each field, plus the action
- * button beside one of them. Native fields hand focus to their EDIT; drawn ones
- * hold it here, which is what makes them reachable at all. */
+ * button beside one of them. Text fields take focus through focus_set; checks,
+ * choices and selects hold it here, which is what makes them reachable at all. */
 static void form_focus_step(oc_win *owner, int dir) {
     (void)owner;
     if (!g_form_open || g_form_n <= 0) return;
-    /* Where we are now: a focused EDIT, or a drawn stop. */
+    /* Where we are now: a focused text field, or a check/choice/select stop. */
     int at = g_form_focus;
     if (at < 0) {
         field *f = g_focus;
@@ -14649,13 +14647,14 @@ static int modal_key(oc_win *hwnd, int vk) {
     return 0;
 }
 
-/* EVERY native child's visibility, decided in one place.
+/* EVERY drawn field's visibility, decided in one place.
  *
- * A native child window composites **above** the Direct2D output. There is no
- * z-order to lose and no way to draw over one — so a child left visible while
- * the thing it belongs to is not drawn appears as a bare control floating over
- * whatever IS drawn. That is not a cosmetic class of bug: it looks like
- * corruption.
+ * A shown field takes clicks and keys and draws its caret wherever it was last
+ * placed. These were native child windows once, which composited above
+ * everything drawn -- so a child left visible while the thing it belonged to
+ * was not drawn appeared as a bare control floating over whatever WAS drawn.
+ * A field left shown is the same bug in a quieter form: an input that answers
+ * where nothing is drawn.
  *
  * Deciding it per-control, at each control's own site, is what made this recur.
  * The find box leaked three times as the second column gained new tenants
@@ -14674,7 +14673,7 @@ static int modal_key(oc_win *hwnd, int vk) {
  *
  * and all but the last two also yield to `window_is_covered()`. A new view or a
  * new overlay has to be named in one of those predicates; it cannot silently
- * inherit somebody else's children. */
+ * inherit somebody else's fields. */
 static void layout_files_find(oc_win *hwnd);   /* fwd */
 static void layout_dir_find(oc_win *hwnd);     /* fwd */
 
@@ -14715,15 +14714,14 @@ static void layout_natives(oc_win *hwnd) {
 
 /* ---- paint --------------------------------------------------------------- */
 
-/* Draw the whole UI into `rt` (window RT for painting, or a DC RT for test
- * shots). Caller wraps this in BeginDraw/EndDraw; brushes must belong to `rt`. */
+/* Draw the whole UI through `rt` (the window's gfx, for painting and for test
+ * shots alike). Caller wraps this in gfx_begin/gfx_end. */
 /* Views that show the channel sidebar + transcript + composer.
  *
  * Deliberately 0 during sign-in even when the shell is drawn behind the
- * card (g_si_overlay): this gates the native children — composer, find box —
- * and a native child composites above Direct2D, so leaving them shown would
- * punch them straight through the sign-in card. `shell_visible` is the drawing
- * question; this is the input/child-window question. */
+ * card (g_si_overlay): this gates the composer and the find box, and leaving
+ * them live would take input meant for the sign-in card. `shell_visible` is the
+ * drawing question; this is the input question. */
 /* Activity joins Home and DMs: its list is the second column and the middle one
  * stays the conversation (ARCH-94), so clicking an item shows you the thread
  * from that point rather than replacing the transcript with a page. */
@@ -14745,9 +14743,9 @@ static int g_dm_compose;              /* the "start a conversation" picker is up
  * main_is_conversation(). sidebar_kind()'s comment above says why that is worse
  * than it looks — an expression repeated is a rule waiting to be applied in one
  * place and not another — and it duly was: the search box asked none of them,
- * so leaving search open and walking to DMs floated a native EDIT over the
- * third person in the picker. Anything that depends on what the middle
- * column HOLDS asks here. */
+ * so leaving search open and walking to DMs floated the search box (a native
+ * EDIT then) over the third person in the picker. Anything that depends on
+ * what the middle column HOLDS asks here. */
 static int dm_index_view(void) {
     const oc_model *m = model();
     const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
@@ -14758,9 +14756,9 @@ static int dm_index_view(void) {
  *
  * These were the same question until that column started hosting lists other
  * than the channel sidebar, and conflating them caused the same bug three times:
- * the native "Find a conversation" EDIT is a child window, so it composites
- * ABOVE the Direct2D output and shows up as a bare rectangle over whatever is
- * really there. It was patched per-view twice (`!= VIEW_DMS`, and before that
+ * the "Find a conversation" box (a native EDIT then) composited ABOVE the
+ * drawn output and showed up as a bare rectangle over whatever was really
+ * there. It was patched per-view twice (`!= VIEW_DMS`, and before that
  * the workspace menu) and would have needed a third for Activity.
  *
  * So anything that depends on the column's CONTENT asks this, and a new tenant
@@ -15883,7 +15881,8 @@ static int tf_insert(tfield *t, const char *u8, int n) {
     return 1;
 }
 
-/* One WM_CHAR. Surrogate pairs arrive as two messages and are joined here —
+/* One typed UTF-16 unit (SDL text input, split by to_w). Surrogate pairs arrive
+ * as two units and are joined here —
  * converting each half on its own dropped every astral character silently. */
 static int tf_char(tfield *t, oc_wch ch) {
     if (ch < 0x20 || ch == 0x7F) return 0;        /* control keys are not text */
@@ -17234,9 +17233,10 @@ static void draw_empty_state(gfx *rt, rectf body, int icon,
         rectf b = rf((body.left + body.right) / 2 - w / 2, cy + 92,
                            (body.left + body.right) / 2 + w / 2, cy + 128);
         fill_round(rt, b, OC_R_CONTROL, OC_COL_ACCENT);
-        /* Centred by DirectWrite in BOTH axes rather than by a hand-picked top
-         * inset: the inset was right for one text size and dropped the label
-         * onto the button's bottom edge at every other. */
+        /* Centred by the format (centre align, PARA_MID) in BOTH axes rather
+         * than by a hand-picked top inset: the inset was right for one text
+         * size and dropped the label onto the button's bottom edge at every
+         * other. */
         /* Save/restore, never a literal: g_ui is BUILT PARA_MID, and the old
          * restore-to-TOP left every later g_ui draw mis-seated until the next
          * fonts_build — a whole-app alignment bug from one button. */
@@ -17339,10 +17339,10 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
                                    "Everyone in this workspace.");
     g_n_listrows = 0;
     /* The search field's CHROME — the rounded container and the glyph — with the
-     * native EDIT placed inside it by layout_dir_find, exactly as the Files
-     * search is built. Reserving the space without painting the box left an
-     * unframed EDIT on a white pane: reported visible by the harness and
-     * invisible to a person, which is the worst of both. */
+     * field drawn inside it, exactly as the Files search is built. Reserving the
+     * space without painting the box once left an unframed field on a white
+     * pane: reported visible by the harness and invisible to a person, which is
+     * the worst of both. */
     g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 8 + SEARCH_BOX_H);
     search_box_draw(rt, g_dir_search_box, OC_COL_INPUT);
     if (g_dir_edit) field_draw(rt, g_dir_edit, search_text_box(g_dir_search_box), OC_COL_TEXT);
@@ -18321,11 +18321,10 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
                 draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
             }
         }
-        /* main_is_conversation(), not just the DM index: the RichEdit already
-         * hid itself under the Files/Pins/About tabs and search, but the box,
-         * its buttons and the send arrow were still PAINTED there — an input
-         * you cannot type into, which is what hiding the child was meant to
-         * prevent. One predicate now decides both. */
+        /* main_is_conversation(), not just the DM index: the editor (a RichEdit
+         * then) hid itself under the Files/Pins/About tabs and search, but the
+         * box, its buttons and the send arrow were still PAINTED there — an
+         * input you cannot type into. One predicate now decides both. */
         if (main_is_conversation()) draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
         if (!picker_floats())
@@ -18480,7 +18479,7 @@ static void paint(oc_win *hwnd) {
  *     the field, all of which need a layout we own.
  *   - a surface the harness can drive and a screenshot can see.
  *
- * There is no child window: the text is part of the Direct2D scene and the MAIN
+ * There is no child window: the text is part of the drawn scene and the MAIN
  * window owns the keyboard while `g_ed_focus` is set. That is what makes the
  * caret, the selection and the composition string ours to draw — and it is why
  * every native-child rule in layout_natives no longer applies to the composer.
@@ -19424,14 +19423,13 @@ static int ed_lines(float w) {
 /* ---- the system caret (REQ-269, ARCH-99) ----------------------------------
  * A self-drawn text field still has to tell Windows where the caret is. The
  * system caret is what screen readers and magnifiers track, and what a
- * `WM_GETOBJECT`-less app has never had here. `g_caret_owned` is our own record
- * of having created one, because `CreateCaret` replaces the thread's caret
- * silently and destroying one we do not own would take it from a native child. */
+ * `WM_GETOBJECT`-less app has never had here. ed_caret_sync tells the platform
+ * through oc_plat_text_input_area; `g_caret_owned` and `g_caret_at` are our own
+ * record of having done so and where, so an unchanged caret is not re-sent. */
 /* g_caret_placed (declared above, with the paint pass that clears it): a caret
- * nobody placed this frame belongs to a field that is no longer on screen — and
- * it does NOT go away by itself, because our CreateCaret adopts the thread's
- * caret, so if a native EDIT had shown one, ours blinks wherever it was last
- * put. That is the bar left sitting at the bottom of the Drafts pane. */
+ * nobody placed this frame belongs to a field that is no longer on screen, and
+ * ed_caret_kill forgets it -- otherwise it would stay wherever it was last put.
+ * That is the bar once left sitting at the bottom of the Drafts pane. */
 static int    g_caret_owned;
 static ipoint g_caret_at = { -32768, -32768 };
 
@@ -19783,7 +19781,7 @@ static int ed_key(oc_win *hwnd, int vk) {
         moved = 1; break;
     case OCK_UP: case OCK_DOWN: {
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
-         * "the line above" is a question only DirectWrite can answer. */
+         * "the line above" is a question only the sdltext layout can answer. */
         st_layout *tl = ed_layout(g_ed_box.right - g_ed_box.left);
         if (!tl) break;
         st_rect cr = st_hit_pos(tl, ed_b(g_ed_caret), false);
@@ -19865,8 +19863,8 @@ static int ed_key(oc_win *hwnd, int vk) {
     case 'Z': if (ctrl) { if (shift) ed_redo(); else ed_undo(); changed = 1; break; } return 0;
     case 'Y': if (ctrl) { ed_redo(); changed = 1; break; } return 0;
     default:
-        /* Everything else — including the app's chords, which the message loop has
-         * already had its go at — is not ours. */
+        /* Everything else — including the app's chords, which on_event has
+         * already offered to accel_dispatch — is not ours. */
         return 0;
     }
 
@@ -19902,7 +19900,7 @@ static int ed_mouse_down(oc_win *hwnd, float x, float y) {
     ed_focus(hwnd);
     /* A click in the body is the whole answer to which field has the keys. The
      * New message pane's own click handler says so too, but it never runs: this
-     * is called first (WM_LBUTTONDOWN) and consumes the click, which left the
+     * is called first (on_lbutton_down) and consumes the click, which left the
      * caret in the body while every character went on to the To: query. */
     g_nm_to_focus = 0;
     ed_intent_clear();
@@ -21024,7 +21022,7 @@ modal_items:
 
 
 /* ---- composer autocomplete ---------------------------------------
- * Everything works in UTF-16 for the RichEdit and UTF-8 for the core: the text
+ * Everything works in UTF-16 for the editor and UTF-8 for the core: the text
  * up to the caret is converted once for oc_complete(), while the replacement
  * range is found by scanning the UTF-16 buffer back to the token's whitespace
  * boundary. Keeping the two independent avoids converting offsets between the
@@ -21180,7 +21178,7 @@ static void composer_send(void) {
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (b) {
         to_u8(w, b, blen);
-        /* Drop a trailing newline the RichEdit may append; skip empty/whitespace. */
+        /* Drop a trailing newline; skip empty/whitespace. */
         int nonspace = 0;
         for (char *p = b; *p; p++) if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') { nonspace = 1; break; }
         if (files) {
@@ -21259,18 +21257,18 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
 }
 
 
-/* Subclass proc: Enter sends, Shift+Enter inserts a newline. While the
- * autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
+/* The composer's keys (ed_key): Enter sends, Shift+Enter inserts a newline.
+ * While the autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
  * accepting a candidate rather than sending is what makes the popover feel like
  * part of the composer instead of a thing floating over it. */
 static void nav_conversation(oc_win *hwnd, int delta, int unread_only);   /* fwd */
 
 
-/* Recompute the composer's height from what is actually in it. EM_GETLINECOUNT
- * counts WRAPPED lines on a multiline control, so a long single paragraph grows
- * the box too — which is the case that made the old fixed height worst. Returns
- * 1 when the height changed, so the caller can re-lay-out rather than doing it
- * on every keystroke. */
+/* Recompute the composer's height from what is actually in it. ed_lines
+ * counts WRAPPED lines, so a long single paragraph grows the box too — which
+ * is the case that made the old fixed height worst. Returns 1 when the height
+ * changed, so the caller can re-lay-out rather than doing it on every
+ * keystroke. */
 static int composer_remeasure(void) {
     float want = COMPOSER_H;
     {
@@ -21304,7 +21302,6 @@ static int composer_refit(oc_win *hwnd) {
     return moved;
 }
 
-/* Position the RichEdit over the composer region for the current window size. */
 static void layout_find(oc_win *hwnd);   /* fwd */
 
 /* Is the MIDDLE column currently a conversation you could type into?
@@ -21343,8 +21340,8 @@ static int main_is_conversation(void) {
     return !dm_index_view();
 }
 
-/* Does something own the whole window right now? A native child underneath it
- * must be hidden, because there is no z-order to lose — see layout_natives. */
+/* Does something own the whole window right now? A field underneath it must be
+ * hidden, so it cannot take input meant for the cover — see layout_natives. */
 static int window_is_covered(void) {
     return modal_open() || g_pal_open || g_lightbox || VM_UP() || g_menu || g_more_open ||
            g_view == VIEW_SIGNIN;
@@ -21410,13 +21407,11 @@ static void layout_composer(oc_win *hwnd) {
     g_ed_box = field;
 }
 
-/* Position the "Find a conversation" EDIT inside its sidebar box (transcript
- * views only). */
 /* Where the sidebar's filter box is, in DIP. The painter draws its container
- * here and layout_find places the EDIT inside it — one source, so they cannot
- * disagree at a scale nobody tested. */
+ * here and the field inside it — one source, so they cannot disagree at a scale
+ * nobody tested. */
 /* The find box gives up its right end to the Unreads toggle, and both derive
- * from here so the chip and the native EDIT inside the box cannot overlap. */
+ * from here so the chip and the field inside the box cannot overlap. */
 #define UNREAD_CHIP_W UIS(70)
 static rectf find_box(void) {
     return rf(RAIL_W + UIS(10), HEADER_H + UIS(6),
@@ -21451,10 +21446,9 @@ static void find_changed(field *f) {
     snprintf(g_find_filter, sizeof g_find_filter, "%s", b);
 }
 
-/* The Files view's "Search files" box. Native child number seven, and written
- * with the last six in mind: it is gated on its OWN view rather than on any
- * predicate that happens to be true there today, and it reports itself in the
- * test dump, because `shot` renders Direct2D only and cannot see it.
+/* The Files view's "Search files" box. It is gated on its OWN view rather than
+ * on any predicate that happens to be true there today, and it reports itself
+ * in the test dump.
  *
  * g_file_search_box is measured during paint, so this runs from the paint path
  * (layout_natives) as well as on resize. */
@@ -21466,10 +21460,9 @@ static void layout_files_find(oc_win *hwnd) {
     field_show(g_ffind, want);
 }
 
-/* The People pane's search box. Native child number EIGHT, and written to the
- * same rules as the seventh: gated on its own view, never on a predicate that
- * happens to be true there, and reported in the dump because `shot` renders
- * Direct2D only and cannot see a native child. */
+/* The People pane's search box, written to the same rules as the Files one:
+ * gated on its own view, never on a predicate that happens to be true there,
+ * and reported in the dump. */
 static void dir_changed(field *f) {
     snprintf(g_dir_filter, sizeof g_dir_filter, "%s", f->buf);
     g_ovl_scroll = 0;          /* a new query starts at the top */
@@ -21485,20 +21478,20 @@ static void layout_dir_find(oc_win *hwnd) {
 
 static void ffind_changed(field *f) { snprintf(g_file_q, sizeof g_file_q, "%s", f->buf); }
 
-/* Place the search-overlay query EDIT over the chrome draw_search() painted.
+/* Show or hide the search-overlay query field draw_search() draws.
  * g_srch_box is only valid after a paint, so this runs from the paint path as
- * well as from WM_SIZE. */
+ * well as on resize. */
 static void layout_search(oc_win *hwnd) {
     const oc_model *m = model();
     if (!g_srch) return;
     /* `covered` matters here too: the search box is a middle-column overlay, and
-     * a modal drawn over it would otherwise have this control punched through
+     * a modal drawn over it would otherwise leave this field taking input under
      * its card.
      *
      * And `transcript_shell()`, for the same reason as the natives take above.
      * This box was gated on `search_open` ALONE, which is a MODEL flag and so
      * outlives the view that owns the surface: leaving search open and going to
-     * DMs left a native EDIT floating over the "New direct message" list,
+     * DMs left the box (a native EDIT then) floating over the "New direct message" list,
      * covering the third person in it. That the other two boxes were safe is not
      * an accident — each is gated on its own view (`VIEW_FILES`, `SBK_CHANNELS`)
      * — and layout_find's comment claiming search "is already gated on its own
@@ -22026,10 +22019,11 @@ static void vm_player_close(void) {
  *
  * While a screen records, the card steps aside so the screen can be used, and
  * this small always-on-top window stands in for it: what is happening, the time,
- * and Stop and Discard. Real Win32 controls, so a screen reader finds them
- * without help. Windows that can keep a window out of a capture keep this one
- * out (WDA_EXCLUDEFROMCAPTURE, Windows 10 2004 and later); elsewhere it appears
- * in the recording, which the docs say (REQ-166). */
+ * and Stop and Discard, drawn with the app's own primitives (bar_paint) in a
+ * window of its own (bar_open). Windows that can keep a window out of a capture
+ * keep this one out (oc_plat_window_capture_exclude: WDA_EXCLUDEFROMCAPTURE,
+ * Windows 10 2004 and later); elsewhere it appears in the recording, which the
+ * docs say (REQ-166). */
 static char g_recbar_line[96];
 static int  g_recbar_stop_on = 1;
 
@@ -22947,8 +22941,8 @@ static void draw_lightbox(gfx *rt, float W, float H) {
     g_meta->align = ST_ALIGN_LEFT;
 }
 
-/* Decode `len` bytes with WIC and cache the pixels + texture under `id`. WIC
- * works from an IStream, so the buffer is wrapped rather than copied to disk. */
+/* Decode `len` bytes through the platform (oc_plat_image_decode) and cache the
+ * pixels + texture under `id`, from memory rather than via a file on disk. */
 static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
     if (!g_gfx || !data || !len) return;
     int iw = 0, ih = 0;
@@ -23033,9 +23027,8 @@ static int srch_key(field *f, int key, int ctrl, int shift) {
     return 0;
 }
 
-/* Place the sign-in EDITs over the field chrome draw_signin() paints. The two
- * must agree on geometry, so both derive it from the same card maths — keep the
- * pad/step offsets here in step with that function. */
+/* Show or hide the sign-in fields drawn over the chrome draw_signin() paints
+ * (layout_signin, below). */
 /* The hosted suffix beside the workspace field: not in advanced mode, and only
  * beside what it would be added to (oc_workspace_takes_suffix). */
 static void si_get(field *e, char *out, size_t cap);   /* fwd */
@@ -23068,15 +23061,14 @@ static int si_key(field *f, int key, int ctrl, int shift) {
 static void si_ws_changed(field *f) { (void)f; layout_signin(g_main); }
 
 
-/* Re-skin the native children after a theme change. The D2D chrome repaints itself
- * from oc_theme[] every frame; an EDIT caches its background brush. The composer
- * used to be here too, when it was a RichEdit with its own background and character
- * format — it is drawn from oc_theme[] like everything else now. */
+/* What re-skinned the native children after a theme change. Nothing is left to
+ * do: every field and the composer are drawn from oc_theme[] each frame, so this
+ * is empty. */
 static void theme_restyle_children(void) { }
 
-/* Force a scale factor. Shared by WM_DPICHANGED's path, the `dpi` test verb and
- * the Advanced pane's override, because the render target, the brushes and every
- * cached thumbnail all carry the old DPI and forgetting one of them leaves the
+/* Force a scale factor. Shared by SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, the
+ * `dpi` test verb and the Advanced pane's override, because the text rasters and
+ * every laid-out field carry the old DPI and forgetting one of them leaves the
  * window drawing at two scales at once. */
 static void dpi_set(oc_win *hwnd, unsigned dpi) {
     if (dpi < 48 || dpi > 480) return;
@@ -23089,10 +23081,9 @@ static void dpi_set(oc_win *hwnd, unsigned dpi) {
     invalidate();
 }
 
-/* Every text-size or zoom change goes through here. A DirectWrite format's size is
- * immutable, so a scale change means rebuilding the whole table, restyling the
- * native children that carry their own font, and relaying out — three steps that
- * were each forgettable at each call site. */
+/* Every text-size or zoom change goes through here. An sdltext format's size is
+ * immutable, so a scale change means rebuilding the whole table and relaying
+ * out — steps that were each forgettable at each call site. */
 static void scale_apply(oc_win *hwnd) {
     g_text_scale = textsize_mult();
     fonts_build();      /* g_body's uniform line spacing scales inside it */
@@ -24273,8 +24264,8 @@ static int on_click(oc_win *hwnd, int x, int y) {
                 invalidate();
                 return 1;
             }
-        /* Clicking a field's box focuses it — the EDIT itself is only as tall as
-         * its text, and the visible target is the rounded box behind it. */
+        /* Clicking a field's box focuses it — the visible target is the rounded
+         * box the field is drawn in. */
         for (int i = 0; i < g_form_n; i++)
             if (g_form_edit[i] && in_rect(g_form_erect[i], x, y)) {
                 focus_set(g_form_edit[i]);
@@ -25161,7 +25152,7 @@ static int on_click(oc_win *hwnd, int x, int y) {
     return 0;
 }
 
-/* ---- transcript text selection (DirectWrite hit-testing) ----------------- */
+/* ---- transcript text selection (sdltext hit-testing) --------------------- */
 
 /* Both axes. Every caller that means "the message under the pointer" wants this
  * one — see the note on oc_msgrow. */
@@ -26155,7 +26146,7 @@ static void boot_other_workspaces(const char *skip) {
 
 /* ---- sign-in flow -------------------------------------------------- */
 
-/* Read a native EDIT's text as UTF-8. */
+/* Read a sign-in field's text as UTF-8. */
 static void si_get(field *e, char *out, size_t cap) {
     snprintf(out, cap, "%s", e ? e->buf : "");
 }
@@ -26582,13 +26573,13 @@ static void signin_poll(oc_win *hwnd) {
  * It used to be a native GDI popup — its own window class, its own message loop,
  * STATIC labels, BUTTONs, a WS_CAPTION title bar and the stock shell font. The
  * reasoning was that the platform's focus, tab order and IME handling were worth
- * more than matching the palette. Half of that holds: the TEXT FIELDS are still
- * native EDITs and always will be. The chrome around them was never worth it —
- * sixteen call sites meant sixteen grey Windows-95 boxes in the middle of a themed
- * app, none of them dismissible the way every other sheet is, none of them
- * screenshot-comparable, none of them reachable by the harness.
+ * more than matching the palette. None of it held: sixteen call sites meant
+ * sixteen grey Windows-95 boxes in the middle of a themed app, none of them
+ * dismissible the way every other sheet is, none of them screenshot-comparable,
+ * none of them reachable by the harness.
  *
- * So the frame is ours and the fields are the platform's.
+ * So the frame is ours, and so are the fields: every one is drawn (field_init
+ * in form_dialog for text, the painter for checks, choices and selects).
  *
  * oc_field / FF_* are declared near the top of the file so earlier code can build
  * forms; form_dialog() itself lives here. */
@@ -26596,19 +26587,18 @@ static void signin_poll(oc_win *hwnd) {
 
 /* Returns 1 on OK with every field's `value` updated, 0 on Cancel.
  *
- * Synchronous, by a nested message loop, because all sixteen callers read the
- * answer on the next line — `if (form_dialog(...)) oc_client_set_topic(...)`.
+ * Synchronous, by a nested turn of the event loop (pump), because all sixteen
+ * callers read the answer on the next line —
+ * `if (form_dialog(...)) oc_client_set_topic(...)`.
  * Turning that into a callback per site was the alternative and it buys nothing:
  * the loop is the same one the old GDI popup ran, and it already ran from inside
  * on_click, so re-entrancy here is not new. What IS new is that the sheet is the
  * app's own modal frame, so Esc, Enter, ✕, the scrim, the footer and the snapshot
  * rule all come from the same place as every other modal. */
-/* Esc and Enter belong to the FRAME, but a single-line EDIT eats both, and the
- * key never reaches the message loop when it is sent straight to the focused
- * child — which is what a real keystroke does once the caret is in a field, and
- * what the harness's `key` verb does deliberately. So the field itself answers
- * them, the same way the composer's proc does. This was found by the smoke: Esc
- * and Enter were dead in the one modal where you are always typing. */
+/* Esc and Enter belong to the FRAME, but the focused text field gets the key
+ * first. So each form field's `key` hook (this function) answers them, the way
+ * the composer's key handling does. This was found by the smoke: Esc and Enter
+ * were dead in the one modal where you are always typing. */
 /* In a multi-line field Enter is a NEW LINE -- the thing prose needs -- so
  * submitting moves to Ctrl+Enter there, as it does in every editor that has
  * both. Esc still cancels from anywhere. */
@@ -26621,7 +26611,7 @@ static int form_key(field *f, int key, int ctrl, int shift) {
 }
 
 /* Seeded by the harness's `formnext` verb: the NEXT form dialog answers with
- * these values instead of running its nested message loop.
+ * these values instead of running its nested event loop.
  *
  * It exists because a modal form blocks the command poll loop — so every feature
  * reached through one (the keyword list, the schedule, the pause's custom time)
@@ -26675,9 +26665,10 @@ static int form_dialog(oc_win *owner, const char *title, oc_field *f, int n) {
     memset(g_form_lines, 0, sizeof g_form_lines);
     modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
     layout_natives(owner);
-    /* A multi-line field is as tall as its value's lines, and only the EDIT,
-     * placed at its width, can say how many it wraps them into: count them, then
-     * paint and place once more at that height. */
+    /* A multi-line field is as tall as its value's lines, and only the field,
+     * placed at its width, can say how many it wraps them into
+     * (field_line_count): count them, then paint and place once more at that
+     * height. */
     {
         int counted = 0;
         for (int i = 0; i < n; i++)
@@ -28574,12 +28565,9 @@ static int write_bmp(const char *path, int w, int h, const void *bgra) {
     fclose(f); return 1;
 }
 
-/* Render the whole UI to a BMP via a Direct2D DC render target — independent of
- * the display being awake/unlocked (the whole point). The RichEdit composer is a
- * native child and won't appear; everything D2D-drawn does. */
-/* Renders the scene into a DC target for the harness. Thumbnails are suppressed
- * for the duration: their bitmaps belong to the window's target and drawing one
- * here would fail the whole frame. */
+/* Render the whole UI to a BMP for the harness: the scene drawn through the
+ * window's renderer and read back (gfx_readback). Thumbnail FETCHES are held
+ * off for the duration; thumbnails already decoded still draw. */
 /* ---- composited snapshots ------------------------------------------------ */
 
 /* One image of the whole window: the scene rendered and read back. Every
@@ -29118,8 +29106,8 @@ static void test_dump(const char *path) {
             g_browse_open ? "browse" : g_confirm_open ? "confirm" :
             g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
-    /* The form's shape and its values, so a driven form is checkable: its EDITs
-     * are native children and a screenshot of one proves only that it is there. */
+    /* The form's shape and its values, so a driven form is checkable: a
+     * screenshot of a field proves only that it is there. */
     fprintf(f, "paneclose=%.0f,%.0f,%.0f,%.0f\n", g_pane_close.left, g_pane_close.top,
             g_pane_close.right, g_pane_close.bottom);
     fprintf(f, "form=%d nfields=%d title=\"%s\" last=%s\n",
@@ -29136,7 +29124,7 @@ static void test_dump(const char *path) {
     for (int i = 0; i < g_form_n && g_form_f; i++) {
         char cur[256]; snprintf(cur, sizeof cur, "%s", g_form_f[i].value);
         if (g_form_edit[i]) snprintf(cur, sizeof cur, "%s", g_form_edit[i]->buf);
-        /* A SELECT has no native EDIT, so `cur` is empty for one and the rect
+        /* A SELECT has no text field, so `cur` is empty for one and the rect
          * that matters is its own box: report both, or the harness cannot tell a
          * select that is not drawn from one whose value it cannot read. */
         rectf fr = (g_form_f[i].kind == FF_SELECT) ? g_form_sel_box[i] : g_form_erect[i];
@@ -29145,7 +29133,7 @@ static void test_dump(const char *path) {
         fprintf(f, "  formfield %d kind=%d edit=%d r=%.0f,%.0f,%.0f,%.0f value=\"%s\"\n",
                 i, g_form_f[i].kind, g_form_edit[i] ? 1 : 0,
                 fr.left, fr.top, fr.right, fr.bottom, cur);
-        /* A multi-line field's lines, as the EDIT itself wraps them, against how
+        /* A multi-line field's lines, as the field itself wraps them, against how
          * many its box shows: "all of it is visible" is lines <= shown. */
         if (g_form_f[i].kind == FF_MULTILINE && g_form_edit[i]) {
             float lh = g_meta_w && g_meta_w->f ? st_line_height(g_st, g_meta_w->f) : UIS(18.0f);
@@ -29274,9 +29262,9 @@ static void test_dump(const char *path) {
         fprintf(f, "  ws[%d] %s client=%p authed=%d unread=%d\n", i, g_wss[i].ws,
                 (void *)g_wss[i].client, wm ? wm->authed : 0, u);
     }
-    /* Native children are invisible to `shot` (that renders Direct2D only), so
-     * they are reported here instead — otherwise the one class of bug the
-     * harness cannot see is the one that reaches the user. */
+    /* The fields' visibility is reported here as well as drawn in `shot`, so a
+     * field shown in the wrong place, or not at all, is readable without
+     * comparing an image. */
     fprintf(f, "sisuffix shown=%d\n", g_si_suffix_shown);
     fprintf(f, "natives re=%d find=%d ffind=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
             (g_ed_box.right > g_ed_box.left), g_find && g_find->visible,
@@ -29311,8 +29299,7 @@ static void test_dump(const char *path) {
     }
     /* Hit-box geometry, because a hit test that silently matches nothing looks
      * exactly like a hit test that is never called. */
-    /* The composer cue is painted by the native RichEdit, so `shot` cannot see
-     * it either — same reason as the natives line above. */
+    /* The composer cue, as text, so it is assertable without reading pixels. */
     { char cue[160]; composer_cue(m, cue, sizeof cue);
       fprintf(f, "composer_cue=\"%s\"\n", cue); }
     /* The formatting toolbar's hit-boxes, so the smoke can CLICK the
@@ -29609,9 +29596,8 @@ static void test_dump(const char *path) {
                     m->sched_days[i].weekday, m->sched_days[i].enabled,
                     m->sched_days[i].start_min, m->sched_days[i].end_min);
     }
-    /* People (REQ-289): how many the filter shows and whether its native search
-     * box is up — `shot` cannot see a native child, which is the lesson the Files
-     * box left behind. */
+    /* People (REQ-289): how many the filter shows and whether its search box is
+     * up — reported, as the Files box is, so it is assertable from the dump. */
     {
         int nvis = 0;
         char low[80]; snprintf(low, sizeof low, "%s", g_dir_filter);
@@ -29862,13 +29848,13 @@ static void test_poll(oc_win *hwnd) {
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "ledger")) {
         /* The frame the window last painted, as a list of primitives. Repaint
-         * first and let the message loop run it, so the dump describes the
-         * scene as it stands NOW rather than whatever was on screen when the
-         * previous verb happened to leave it — the trap `shot` documents.
+         * first (paint_now), so the dump describes the scene as it stands NOW
+         * rather than whatever was on screen when the previous verb happened to
+         * leave it — the trap `shot` documents.
          *
-         * The ledger belongs to the WINDOW's target. test_shot renders into its
-         * own, which is the right thing for a picture and the wrong thing here:
-         * a capture's ledger would describe the capture. */
+         * The ledger records whatever g_gfx last drew, and test_shot draws
+         * through the same gfx: repainting here also keeps a capture's frame
+         * from being the one described. */
         paint_now();
         test_ack(gfx_ledger_dump(g_gfx, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "send")) {
@@ -29892,17 +29878,17 @@ static void test_poll(oc_win *hwnd) {
         synth_mouse(hwnd, !strcmp(verb, "mousedown") ? 0 : 2, x, y);
         test_ack("ok");
     } else if (!strcmp(verb, "click")) {
-        /* A REAL WM_LBUTTONDOWN/UP pair, not a direct on_click: the composer is a
-         * self-drawn field now and its caret placement lives in the button
-         * handler, so a verb that jumped straight to on_click could not click into
+        /* A REAL button down/up pair through on_event, not a direct on_click:
+         * the composer is a self-drawn field now and its caret placement
+         * lives in the button handler, so a verb that jumped straight to on_click could not click into
          * the one control users click into most. */
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
         synth_mouse(hwnd, 0, x, y);
         synth_mouse(hwnd, 2, x, y);
         test_ack("ok");
     } else if (!strcmp(verb, "dblclick") || !strcmp(verb, "tripleclick")) {
-        /* A real WM_LBUTTONDBLCLK, which is what the system sends only because
-         * the class asks for it (CS_DBLCLKS) — driving two `click`s instead
+        /* A real double-click: the second button-down carries clicks=2, as SDL
+         * reports the second press of a pair — driving two `click`s instead
          * would test the thing that was already happening and passing. The
          * triple sends the following down/up too, in one go, so the assertion
          * does not depend on the harness beating 500u. */
@@ -29947,8 +29933,9 @@ static void test_poll(oc_win *hwnd) {
         SDL_MinimizeWindow(hwnd->sdl);
         test_ack("ok");
     } else if (!strcmp(verb, "close")) {
-        /* WM_CLOSE through the real path, so what the harness drives is what a
-         * click on the title bar's X does. `close quit` is the deliberate exit. */
+        /* A close request through the real path, so what the harness drives
+         * is what a click on the title bar's X does. `close quit` is the
+         * deliberate exit. */
         if (!strcmp(arg, "quit")) app_quit(hwnd);
         else on_close_request(hwnd);
         test_ack("ok");
@@ -29975,7 +29962,7 @@ static void test_poll(oc_win *hwnd) {
             test_ack("ok");
         }
     } else if (!strcmp(verb, "typekeys")) {
-        /* Through the REAL character path (WM_CHAR -> ed_char), one keystroke
+        /* Through the REAL character path (text input -> ed_char), one keystroke
          * at a time — unlike `type`, which SETS the buffer. The rich-mode
          * typing rules (pending styles, continuation across spaces, whitespace
          * stepping outside a closer) live in ed_char, so only this verb can
@@ -29986,8 +29973,8 @@ static void test_poll(oc_win *hwnd) {
             test_ack("ok");
         }
     } else if (!strcmp(verb, "dirfind")) {
-        /* Drive the People pane's search box (REQ-289). Through the control, so
-         * the EN_CHANGE path the user's typing takes is the one under test — the
+        /* Drive the People pane's search box (REQ-289). Through the field, so
+         * the change hook the user's typing fires is the one under test — the
          * palette verb sets its box the same way. */
         if (g_dir_edit) { field_set(g_dir_edit, arg); test_ack("ok"); }
         else test_ack("err");
@@ -30022,16 +30009,17 @@ static void test_poll(oc_win *hwnd) {
          * exactly one way to take a picture and it is the complete one. */
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "wheel")) {
-        /* A real WM_MOUSEWHEEL at a point, in SCREEN coordinates as the message
-         * carries them. The `scroll` verb only moves the transcript's own offset, so
-         * every other scrollable region — the sidebar, the overlay panes, and now
-         * Files and Later — had no way to be tested at all. */
+        /* A real wheel step at a point (window DIPs; 120 = one notch) into
+         * on_wheel, as the mouse's own reaches it. The `scroll` verb only
+         * moves the transcript's own offset, so every other scrollable region
+         * — the sidebar, the overlay panes, and now Files and Later — had no
+         * way to be tested at all. */
         int x = 0, y = 0, d = 0;
         sscanf(arg, "%d %d %d", &x, &y, &d);
         synth_wheel(hwnd, x, y, d);
         test_ack("ok");
     } else if (!strcmp(verb, "chars")) {
-        /* Real WM_CHARs, one per character. `type` SETS the text; this
+        /* Real typed characters, one per character. `type` SETS the text; this
          * TYPES it, which is the path that exercises insertion, the caret, the
          * typing indicator and the autocomplete — the code a user actually runs. */
         oc_wch w[512]; int n = to_w(arg, w, 512);
@@ -30106,13 +30094,13 @@ static void test_poll(oc_win *hwnd) {
         } else test_ack("err");
         invalidate();
     } else if (!strcmp(verb, "key") || !strcmp(verb, "keyup")) {
-        /* A raw virtual key through the real WM_KEYDOWN path, so Esc/Enter/Tab
+        /* A raw key through the path a real key takes (synth_key), so Esc/Enter/Tab
          * behaviour is drivable at all — without this, every keyboard rule in the
          * app was verifiable only by hand. Names for the ones used most, so a test
          * reads `key esc` rather than `key 27`. */
         /* `key ctrl+k`, `key alt+shift+up`, `key esc`, `key 27`. Modifiers matter:
-         * the app's shortcuts are dispatched from the message loop and read
-         * GetKeyState, so a chord cannot be tested by posting a bare key — and
+         * the app's shortcuts are dispatched from the loop and read mod_down,
+         * so a chord cannot be tested by sending a bare key — and
          * until this existed, no chord in the app was testable at all. */
         unsigned want = 0;
         const char *k = arg;
@@ -30123,9 +30111,9 @@ static void test_poll(oc_win *hwnd) {
             break;
         }
         int vk = oc_key_from_name(k);
-        /* Modifiers are read with GetKeyState, so they have to be really held:
-         * SetKeyboardState makes them so for this thread without moving the user's
-         * physical keyboard. */
+        /* Modifiers are read with mod_down, which answers from g_synth_mods
+         * while it is set: the chord is held for this one key, without touching
+         * the OS's key state or the user's physical keyboard. */
         g_synth_mods = (int)want;
         /* `keyup` lets the key go: the release a held key (the talk key) waits for. */
         int up = !strcmp(verb, "keyup");
@@ -30133,7 +30121,7 @@ static void test_poll(oc_win *hwnd) {
         g_synth_mods = -1;
         test_ack("ok");
     } else if (!strcmp(verb, "move")) {
-        /* A real WM_MOUSEMOVE, so hover goes through the same path the mouse
+        /* A real mouse-motion event, so hover goes through the same path the mouse
          * does rather than a test-only shortcut that could drift from it. */
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
         synth_mouse(hwnd, 1, x, y);
@@ -30143,7 +30131,8 @@ static void test_poll(oc_win *hwnd) {
         nav_conversation(hwnd, d, u); test_ack("ok");
     } else if (!strcmp(verb, "dpi")) {
         /* Force a scale factor so the layout can be checked without a scaled
-         * display attached. Same path WM_DPICHANGED takes. */
+         * display attached. Same path SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED
+         * takes. */
         int d = atoi(arg);
         if (d >= 48 && d <= 480) { dpi_set(hwnd, (unsigned)d); test_ack("ok"); }
         else test_ack("err");
@@ -30260,7 +30249,7 @@ static void test_poll(oc_win *hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "clickform")) {
         /* `clickform x y` -- `click`, acked FIRST: for a click that opens a real
-         * form, whose nested message loop would hold an ack sent afterwards until
+         * form, whose nested event loop would hold an ack sent afterwards until
          * the dialog closed. The commands that follow run inside that loop, so a
          * harness fills the open dialog (`formtype`) and answers it (`key enter`)
          * as a person does -- where `formnext` answers it without ever opening it,
@@ -30284,7 +30273,7 @@ static void test_poll(oc_win *hwnd) {
         }
     } else if (!strcmp(verb, "form")) {
         /* Drive the generic form. The ack goes FIRST, because the form runs
-         * a nested message loop: acking afterwards would make the harness wait for a
+         * a nested event loop: acking afterwards would make the harness wait for a
          * dialog it has not been told about yet, which is the trap the `menu` verb
          * documents above. The OUTCOME lands in the dump instead. */
         test_ack("ok");
@@ -30857,7 +30846,7 @@ static void test_poll(oc_win *hwnd) {
         test_ack(a);
     } else if (!strcmp(verb, "dump")) {
         test_dump(arg); test_ack("ok");
-    /* Sign-in drivers. Setting the EDIT text directly is deterministic, where
+    /* Sign-in drivers. Setting the field's text directly is deterministic, where
      * synthesised keystrokes depend on the window being foreground — which it
      * is not when the harness drives it from WSL. */
     } else if (!strcmp(verb, "siws") || !strcmp(verb, "siuser") || !strcmp(verb, "sipass")) {
@@ -30879,8 +30868,8 @@ static void test_poll(oc_win *hwnd) {
     invalidate();
 }
 
-/* The pointer, spoken through SDL (its subclass owns WM_SETCURSOR for the
- * client area): 0 arrow, 1 I-beam, 2 hand. Cursors are created once and set
+/* The pointer, spoken through SDL (SDL owns the cursor over the client
+ * area): 0 arrow, 1 I-beam, 2 hand. Cursors are created once and set
  * only on change — SDL_SetCursor per mouse move would be free anyway, but the
  * intent reads better as an edge. */
 static void cursor_want(int kind) {
@@ -30963,9 +30952,8 @@ static void unresolved_notice(oc_win *hwnd, const oc_model *m, int update) {
     }
 }
 
-/* Every drawn field, made once with the window. Their placeholders are what
- * the native boxes' cue banners said; their keys and change hooks are what
- * the subclass procedures did. */
+/* Every drawn field, made once with the window: its placeholder, its keys and
+ * its change hook. */
 static void fields_create(void) {
     static field find, ffind, dir, srch, pal, pick, si[3];
     field_init(&find, "Find a conversation", 0, 0);
@@ -31230,9 +31218,10 @@ static int on_tick(oc_win *hwnd) {
                     invalidate();
                 }
             }
-            /* Persist a settled move. WM_EXITSIZEMOVE covers a drag, but not a
-             * programmatic move, and nothing covers being killed — a debounce
-             * means the placement survives without waiting for a clean exit. */
+            /* Persist a settled move. Every move and resize event marks the
+             * geometry dirty, mid-drag included, and nothing covers being
+             * killed — a debounce means the placement survives without
+             * waiting for a clean exit. */
             if (g_geom_dirty_at && g_geom_applied &&
                 now_ms() - g_geom_dirty_at > 1200) {
                 g_geom_dirty_at = 0;
@@ -31351,7 +31340,7 @@ static int on_tick(oc_win *hwnd) {
                      * keyword hit as it counts an @-mention (REQ-135).
                      *
                      * It scans EVERY message this tick brought, not just the
-                     * newest in the channel. This loop runs on a timer, so a
+                     * newest in the channel. This loop runs on the tick, so a
                      * batch landing between two ticks arrives together:
                      * sampling only the last row meant a mention went silent
                      * whenever an ordinary message happened to follow it, and
@@ -32133,9 +32122,8 @@ static int on_mouse_move(oc_win *hwnd, int mx, int my) {
          * that should clear it. link_under() answers 0 off the transcript, which
          * is the clearing case and has to be reached to happen.
          *
-         * WM_SETCURSOR reads the result. It arrives BEFORE this message for the
-         * same position, so the cursor is also set here: without that it lags one
-         * move behind on the way onto a link. */
+         * The cursor is set here from the result (cursor_want), on the same
+         * move: nothing else asks for it later. */
         {
             char u[sizeof g_link_hover];
             int had = g_link_hover[0] != 0 || g_chan_hover != 0;
@@ -32330,10 +32318,9 @@ static int on_lbutton_up(oc_win *hwnd, int mx, int my) {
         }
         g_link_down[0] = 0; g_chan_down = 0;
         return 0;
-    /* No WM_SETCURSOR arm: SDL's window proc answers it for the client area
-     * with the SDL cursor (and does not chain), so the app's cursor choice is
-     * pushed through SDL_SetCursor from the hover machine instead —
-     * cursor_apply(), called from WM_MOUSEMOVE. */
+    /* No cursor handling here: SDL owns the pointer over the client area, so
+     * the app's cursor choice is pushed through SDL_SetCursor from the hover
+     * machine instead — cursor_want(), called from on_mouse_move. */
 }
 
 static int on_key_down(oc_win *hwnd, int wp) {
@@ -32368,13 +32355,13 @@ static int on_key_down(oc_win *hwnd, int wp) {
         if (wp == OCK_ESCAPE && g_has_sel) { g_has_sel = 0; invalidate(); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
-         * field owns every other key while it has focus. The main window
-         * really does have Win32 focus now — the field is not a child — so this is
-         * where its keys arrive. */
+         * field owns every other key while it has focus. The field is not a
+         * child window — the main window's key events are its keys — so this
+         * is where they arrive. */
         if (ed_key(hwnd, wp)) return 0;
-        /* Ctrl+/, Ctrl+F, Ctrl+K, Alt+arrows and F6 are handled in the message
-         * loop (SHORTCUTS / accel_dispatch), not here: a shortcut in this proc only
-         * fires when the main window has focus, which is now always. */
+        /* Ctrl+/, Ctrl+F, Ctrl+K, Alt+arrows and F6 are handled in on_event
+         * (SHORTCUTS / accel_dispatch), not here: a shortcut here would only
+         * fire when no field has focus. */
         return 0;
 }
 
@@ -32617,8 +32604,8 @@ static int on_a11y_invoke(oc_win *hwnd, uint64_t tok) {
 }
 
 static int on_focus_gained(oc_win *hwnd) {
-        /* Coming back from a native child (the find box, the palette, a form
-         * field) means the field is typeable again. */
+        /* The window has the keyboard again, so the composer is typeable
+         * again. */
         if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
         invalidate();
         return 0;

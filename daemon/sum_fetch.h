@@ -1,13 +1,14 @@
 /*
- * OpenChime — the local summary model, fetched on first use (REQ-310, ARCH-116,
- * docs/SUMMARIES.md §6).
+ * OpenChime — the local summary model, fetched at the first start with summaries
+ * on (REQ-310, ARCH-116, docs/SUMMARIES.md §6).
  *
  * The model is data, not code, and is never shipped in a package: when an
- * operator turns summaries on, the daemon fetches the one model it was built
- * for, from a pinned address, checks the file against a pinned SHA-256, and
- * keeps it beside the database. Later starts find it there. A file that is
- * missing, partial or altered is fetched again; one that cannot be fetched
- * leaves summaries off.
+ * operator turns summaries on, the daemon's next start fetches the one model it
+ * was built for, from the URL below, checks the file against a pinned SHA-256,
+ * and keeps it beside the database. The URL names a branch (`resolve/main`),
+ * not a revision, so only the hash pins what is accepted. Later starts find it
+ * there. A file that is missing, partial or altered is fetched again; one that
+ * cannot be fetched leaves summaries off.
  */
 #ifndef OC_SUM_FETCH_H
 #define OC_SUM_FETCH_H
@@ -28,7 +29,7 @@
 #endif
 
 /* Make sure the model is in `dir` (created if need be): its path into `out`.
- * `url` and `sha256_hex` are normally the pinned ones above (a test passes its
+ * `url` and `sha256_hex` are normally the ones above (a test passes its
  * own). `stop`, once set, abandons a fetch. 0, or -1 with a reason. Blocks for
  * as long as a fetch takes. */
 int oc_sum_model_ensure(const char *dir, const char *file, const char *url, const char *sha256_hex,
