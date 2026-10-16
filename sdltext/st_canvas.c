@@ -54,6 +54,13 @@ EM_JS(float, stc_width, (const char *font, const char *text), {
     ctx.font = UTF8ToString(font);
     return ctx.measureText(UTF8ToString(text)).width;
 });
+/* How far a run's ink reaches above and below its baseline, in CSS px. */
+EM_JS(void, stc_ink, (const char *font, const char *text, float *asc, float *desc), {
+    var ctx = Module.stc.ctx;
+    ctx.font = UTF8ToString(font);
+    var m = ctx.measureText(UTF8ToString(text));
+    HEAPF32[asc >> 2] = m.actualBoundingBoxAscent || 0; HEAPF32[desc >> 2] = m.actualBoundingBoxDescent || 0;
+});
 /* The font's ascent and descent in CSS px, from a representative measure. */
 EM_JS(void, stc_font_metrics, (const char *font, float *asc, float *desc), {
     var ctx = Module.stc.ctx;
@@ -179,13 +186,13 @@ struct st_layout {
     float      w, h;
     int        trimmed;      /* ellipsis applied: the last item draws with "…" */
     /* the last raster, kept while nothing about the layout changes */
-    unsigned char *px; int pw, ph; float px_scale, px_alpha; uint32_t px_rgb; float px_pad;
+    unsigned char *px; int pw, ph, ph0; float px_scale, px_alpha; uint32_t px_rgb; float px_pad, px_top;
 };
 
 static char *st_dup(const char *s, size_t n) { char *d = malloc(n + 1); if (d) { memcpy(d, s, n); d[n] = 0; } return d; }
 
 static void font_string(char *out, size_t cap, const char *family, float px, int weight, int italic) {
-    const char *fallback = ", 'Segoe UI', system-ui, -apple-system, Roboto, 'Helvetica Neue', Arial, 'Noto Color Emoji', 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif";
+    const char *fallback = ", 'Segoe UI', 'Segoe UI Symbol', system-ui, -apple-system, Roboto, 'Helvetica Neue', Arial, 'Noto Color Emoji', 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif";
     snprintf(out, cap, "%s%d %.2fpx \"%s\"%s", italic ? "italic " : "", weight > 0 ? weight : 400, px, family && family[0] ? family : "system-ui", fallback);
 }
 
@@ -669,16 +676,78 @@ void st_draw(st_ctx *c, st_layout *l, float x, float y, uint32_t rgb, float alph
      * past the content's own width. */
     float span = l->w;
     if (l->max_w > 0 && (l->align != ST_ALIGN_LEFT || l->trimmed) && l->max_w > span) span = l->max_w;
+    /* A trimmed line is as wide as the box it was cut to, not the text it was
+     * cut from: a caller centring the raster otherwise sets its start left of
+     * the box, and the box clips the first letters off ("tart typing..."). */
+    if (l->trimmed && l->max_w > 0) span = l->max_w;
     float wdip = span + 2.0f, hdip = l->h + 2.0f;
     int pw = (int)ceilf(wdip * s) + 2, ph = (int)ceilf(hdip * s) + 2;
     if (pw <= 0 || ph <= 0 || pw > 8192 || ph > 8192) return;
     const float pad = 1.0f;
-    if (l->px && l->pw == pw && l->ph == ph && l->px_scale == s && l->px_rgb == rgb && l->px_alpha == alpha) {
-        c->sink.blit(c->sink.user, l->px, pw * 4, pw, ph, x - pad, y - pad);
+    if (l->px && l->pw == pw && l->ph0 == ph && l->px_scale == s && l->px_rgb == rgb && l->px_alpha == alpha) {
+        c->sink.blit(c->sink.user, l->px, pw * 4, pw, l->ph, x - pad, y - pad - l->px_top);
         return;
     }
     g_n_rasters++;
+    /* The raster holds the INK, which can reach past the line box: a font
+     * whose own ascent is less than its glyphs' (Segoe UI Emoji, as a browser
+     * on Linux reads it) lost the tops of its emoji to the raster's edge. The
+     * layout keeps the box; only the picture grows, and the blit moves up by
+     * what it grew above. */
+    int ph0 = ph;
+    float ink_top = 0, ink_bot = 0;
+    for (int i = 0; i < l->nitems; i++) {
+        const st_item *it = &l->items[i];
+        if (it->newline || it->hide || it->box >= 0) continue;
+        const st_lineinfo *ln = &l->lines[it->line];
+        if (l->max_h > 0 && ln->y >= l->max_h) break;
+        char font[192];
+        font_string(font, sizeof font, it->family, it->size * s, it->weight, it->italic);
+        char *piece = st_dup(l->text + it->off, (size_t)it->len);
+        if (!piece) continue;
+        float ia = 0, id = 0;
+        stc_ink(font, piece, &ia, &id);
+        free(piece);
+        float over_top = ia / s - (ln->y + ln->base), over_bot = (ln->y + ln->base + id / s) - l->h;
+        if (over_top > ink_top) ink_top = ceilf(over_top);
+        if (over_bot > ink_bot) ink_bot = ceilf(over_bot);
+    }
+    if (ink_top > 0 || ink_bot > 0) {
+        ph = (int)ceilf((hdip + ink_top + ink_bot) * s) + 2;
+        if (ph > 8192) return;
+    }
     stc_begin(pw, ph);
+    /* Where a trimmed line ends, found before anything is drawn: the last item
+     * and cluster that leave room for the sign. The item that overflows may
+     * have no room for even one cluster, and then the sign belongs after the
+     * item before it, not past the edge. No white space before the sign, as
+     * DirectWrite leaves none. Nothing at all fits: the line's first cluster
+     * stays, clipped, with no sign, as DirectWrite never trims a line to
+     * nothing (a lone emoji in a narrow swatch). */
+    int trim_i = -1, trim_cut = 0, lone = 0;
+    if (l->trimmed) {
+        int first = -1;
+        for (int i = 0; i < l->nitems; i++) {
+            const st_item *it = &l->items[i];
+            if (it->newline || it->hide || it->box >= 0 || it->line != 0) continue;
+            if (first < 0) first = i;
+            char f2[192];
+            font_string(f2, sizeof f2, it->family, it->size * s, it->weight, it->italic);
+            float ell = stc_width(f2, "\xE2\x80\xA6") / s;
+            int cut = it->un;
+            while (cut > 0 && it->x + (l->adv[it->u0 + cut] - l->adv[it->u0]) + ell > l->max_w)
+                cut = st__cluster_prev(l->cb, l->map.wlen, it->u0 + cut - 1) - it->u0;
+            int whole = cut == it->un;
+            while (cut > 0 && (unsigned char)l->text[st__w2b(&l->map, it->u0 + cut) - 1] <= ' ')
+                cut = st__cluster_prev(l->cb, l->map.wlen, it->u0 + cut - 1) - it->u0;
+            if (cut > 0) { trim_i = i; trim_cut = cut; }
+            if (!whole) break;
+        }
+        if (trim_i < 0 && first >= 0) {
+            trim_i = first; lone = 1;
+            trim_cut = st__cluster_next(l->cb, l->map.wlen, l->items[first].u0) - l->items[first].u0;
+        }
+    }
     for (int i = 0; i < l->nitems; i++) {
         const st_item *it = &l->items[i];
         if (it->newline || it->hide || it->box >= 0) continue;
@@ -688,20 +757,29 @@ void st_draw(st_ctx *c, st_layout *l, float x, float y, uint32_t rgb, float alph
         font_string(font, sizeof font, it->family, it->size * s, it->weight, it->italic);
         uint32_t col = it->has_color ? it->rgb : rgb;
         float a = it->has_color ? it->alpha * alpha : alpha;
-        float px = (it->x + pad) * s, py = (ln->y + ln->base + pad) * s;
+        float px = (it->x + pad) * s, py = (ln->y + ln->base + pad + ink_top) * s;
         char *piece = st_dup(l->text + it->off, (size_t)it->len);
         if (!piece) continue;
-        if (l->trimmed && it->line == 0 && it->x + it->w > l->max_w) {
-            /* cut this item to fit with an ellipsis after it */
-            float ell = stc_width(font, "\xE2\x80\xA6") / s;
-            int cut = it->un;
-            while (cut > 0 && it->x + (l->adv[it->u0 + cut] - l->adv[it->u0]) + ell > l->max_w)
-                cut = st__cluster_prev(l->cb, l->map.wlen, it->u0 + cut - 1) - it->u0;
-            if (cut < 0) cut = 0;
-            int cb = st__w2b(&l->map, it->u0 + cut) - it->off;
-            if (cb < 0) cb = 0;
-            char *cutp = malloc((size_t)cb + 4);
-            if (cutp) { memcpy(cutp, piece, (size_t)cb); memcpy(cutp + cb, "\xE2\x80\xA6", 4); free(piece); piece = cutp; }
+        if (i == trim_i) {
+            /* The cut as it will be drawn, measured whole: the advances it was
+             * found by are summed in pieces, and the run can draw wider. */
+            int cut = trim_cut;
+            char *cutp = NULL;
+            for (;;) {
+                int cb = st__w2b(&l->map, it->u0 + cut) - it->off;
+                if (cb < 0) cb = 0;
+                free(cutp);
+                cutp = malloc((size_t)cb + 4);
+                if (!cutp) break;
+                memcpy(cutp, piece, (size_t)cb); memcpy(cutp + cb, lone ? "" : "\xE2\x80\xA6", lone ? 1 : 4);
+                if (lone || it->x + stc_width(font, cutp) / s <= l->max_w) break;
+                int prev = st__cluster_prev(l->cb, l->map.wlen, it->u0 + cut - 1) - it->u0;
+                while (prev > 0 && (unsigned char)l->text[st__w2b(&l->map, it->u0 + prev) - 1] <= ' ')
+                    prev = st__cluster_prev(l->cb, l->map.wlen, it->u0 + prev - 1) - it->u0;
+                if (prev <= 0) break;
+                cut = prev;
+            }
+            if (cutp) { free(piece); piece = cutp; }
             stc_text(px, py, font, (int)col, a, piece, it->level & 1);
             free(piece);
             break;
@@ -714,7 +792,7 @@ void st_draw(st_ctx *c, st_layout *l, float x, float y, uint32_t rgb, float alph
     unsigned char *px = malloc((size_t)pw * (size_t)ph * 4);
     if (!px) return;
     stc_end(pw, ph, px);
-    c->sink.blit(c->sink.user, px, pw * 4, pw, ph, x - pad, y - pad);
+    c->sink.blit(c->sink.user, px, pw * 4, pw, ph, x - pad, y - pad - ink_top);
     free(l->px);
-    l->px = px; l->pw = pw; l->ph = ph; l->px_scale = s; l->px_rgb = rgb; l->px_alpha = alpha; l->px_pad = pad;
+    l->px = px; l->pw = pw; l->ph = ph; l->ph0 = ph0; l->px_scale = s; l->px_rgb = rgb; l->px_alpha = alpha; l->px_pad = pad; l->px_top = ink_top;
 }
