@@ -4,7 +4,7 @@
 model reads. It is the front half of read-aloud (ARCH-111, [READ-ALOUD.md](./READ-ALOUD.md)):
 the daemon cleans a message, hands the words to ttskit, and feeds ttskit's phonemes to the
 voice model. It has no dependencies, no copyleft anywhere in it or its data, and reads its
-data where it lies — a memory-mapped file, or the copy embedded in `openchimed` — rather
+data where it lies — a memory-mapped file, or bytes the caller has already mapped — rather
 than loading it.
 
 This document covers the whole chain: why ttskit exists (§1), where it sits (§2), how text
@@ -169,9 +169,9 @@ and 256 on the same 3,009 at eighteen times; 32 takes about 1.7 ms a word.
 
 ## 6. The data files
 
-Both files live in `ttskit/data/en-US/` and are committed — a directory per language, so adding one is adding a directory rather than renaming files. `openchimed` embeds them in its
-executable and opens them with `tts_load_mem`; `tts_load` maps them from a directory
-instead (the tests and `tts_pack`). Either way nothing is copied: a lookup is a binary
+Both files live in `ttskit/data/en-US/` and are committed — a directory per language, so adding one is adding a directory rather than renaming files. `openchimed` maps the copies in its
+read-aloud data directory and opens them with `tts_load_mem`; `tts_load` maps them from a directory
+itself (the tests and `tts_pack`). Either way nothing is copied: a lookup is a binary
 search over a sorted table and reads only the pages it passes through; the kernel pages
 them in on demand, shares them between processes and can drop them under pressure.
 Nothing is parsed at load and no copy of the dictionary or the model is made on the heap —

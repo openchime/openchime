@@ -16,7 +16,7 @@ profile (§5.16b), call signaling and screen sharing (§5.17, REQ-150–152, REQ
 tokens.
 
 **§9 is the complete list; §5's prose is not.** The registry is generated from
-`shared/protocol.h` and carries all 179 message types. The narrative sections
+`shared/protocol.h` and carries all 225 message types. The narrative sections
 below specify the payload layouts for the families they name, and a number of
 later families — drafts, scheduled send, the notification schedule and pause,
 keywords, custom emoji, group DMs, invite and session management, webhook
@@ -109,8 +109,10 @@ during the TLS handshake:
 
 Both sides exist. A connection that negotiates `oc/1` reaches the binary
 protocol; one that does not is read by the daemon's HTTP/1.1 stack (ARCH-32),
-which serves `POST /webhook/<token>` (§5.15) and nothing else on this port: any
-other path is `404`, and the webhook path under another method `405`.
+which serves `POST /webhook/<token>` (§5.15), the WebSocket upgrade `GET /ws`
+(§1.2), the daemon's own sign-in pages (AUTH.md §8.10/§8.11) and, when its wasm
+is beside the binary, the web client under `/app/` (WEB.md): any other path is
+`404`, and a served path under another method `405`.
 `/healthz` and the landing page are on the separate plaintext health port
 (ARCH-25), served by the same stack. Either port takes **one request per
 connection**, answered with `Connection: close`; a request not whole within 10
@@ -451,8 +453,8 @@ a bare host address. Clients that don't recognize the frame ignore it.
 Pushed right after `WORKSPACE_INFO`, and only where the deployment names the
 workspace's canonical address (`OPENCHIME_MANAGED_ADDRESS`). A hosted workspace
 that moved to a new address still answers at its former one for a while; a client
-that connected by it files the workspace under the new one (CLIENT.md, "The
-workspace key") and dials that next time. A new frame, so no version bump.
+that connected by it files the workspace under the new one (CLIENT.md
+§5) and dials that next time. A new frame, so no version bump.
 
 | Field     | Type | Notes                                             |
 |-----------|------|---------------------------------------------------|
@@ -502,7 +504,7 @@ continue); with `scope=1`, every other connection of the user's too.
 | `src_message`        | u64    | Forward source message (REQ-057), `0` when the message forwards nothing.  |
 | *(optional tail)*    | u16 + u64[] | Attachment ids to link (REQ-140), written only when present.        |
 
-**Forwarding (REQ-057, ARCH-108).** The client sends only the two source ids.
+**Forwarding (REQ-057, ARCH-117).** The client sends only the two source ids.
 The daemon resolves the source author, a truncated excerpt and the attachment
 count from the row it already holds, and announces them on a `FORWARD` frame —
 so a client cannot claim someone said something they did not. The two fields sit
@@ -603,7 +605,7 @@ its unread badge again.
 
 **`GET_CHANNEL_DESCRIPTION` (C → S), `0x008C`** `{ channel_id: u64 }` and
 **`CHANNEL_DESCRIPTION` (S → C), `0x008D`** `{ channel_id: u64, description:
-lstr }` — a channel's long-form description (REQ-034, ARCH-93). It is set with
+str }` — a channel's long-form description (REQ-034, ARCH-93). It is set with
 `UPDATE_CHANNEL` op `OC_CHUP_DESCRIPTION` (6), by any member, up to
 `OC_MAX_DESCRIPTION` (1,000) bytes, with `""` clearing it — and it is **not**
 carried on `CHANNEL_INFO` or `CHANNEL_LIST`, because the list is one frame for
@@ -821,15 +823,15 @@ exists is never rewritten, and a self-hosted daemon creates it bare.
 | Field        | Type | Notes                                                    |
 |--------------|------|----------------------------------------------------------|
 | `channel_id` | u64  | The channel to change.                                   |
-| `op`         | u8   | `0` set-topic · `1` rename · `2` archive · `3` unarchive. |
-| `value`      | str  | The new topic (≤250 bytes, empty clears it) or name (≤64). Ignored for archive/unarchive. |
+| `op`         | u8   | `0` set-topic · `1` rename · `2` archive · `3` unarchive · `4` make private · `5` make public · `6` set description (§5.4). |
+| `value`      | str  | The new topic (≤250 bytes, empty clears it), name (≤64) or description (≤1,000). Ignored for archive/unarchive and private/public. |
 
-One frame for four verbs because they all mutate one row and all fan out the same
+One frame for every verb because they all mutate one row and all fan out the same
 state — the op *is* the difference.
 
 **Authority** splits on blast radius: **any member may set the topic** (already
 visible to the channel, corrected in seconds); **owner/admin only** for rename,
-archive and unarchive, which change what people *not* looking at the channel see.
+archive, unarchive and a change of visibility, which change what people *not* looking at the channel see.
 
 On success the daemon replies **`CHANNEL_INFO`** to the actor and **fans the same
 frame to every other member** — a rename or archive changes what everyone's
@@ -1309,6 +1311,7 @@ newest activity first, and closes with **`THREADS` (`0x00D3`)** `{ count: u32 }`
 | `unread`        | u32  | Replies by others past my per-thread cursor.           |
 | `following`     | u8   | Resolved, not stored: participation counts (ARCH-104). |
 | `preview`       | str  | The root's first bytes.                                |
+| `action`        | u8   | `1` when the root is an action and `preview` is its text (REQ-058). |
 
 **`SET_THREAD_FOLLOW` (client → server), `0x00D4`** `{ root_id: u64,
 channel_id: u64, on: u8 }` and **`MARK_THREAD_READ` (client → server), `0x00D5`**
@@ -1555,8 +1558,8 @@ be empty when it carries attachments.
    mime: str, total_size: u64, sha256: bytes }` — sent once before the bytes.
 3. **`DOWNLOAD_CHUNK` (S → C), `0x0088`** `{ attachment_id: u64, seq: u32, data:
    bytes }` — sequential chunks. Backpressure is implicit: the worker pauses
-   reading from storage when this connection's output buffer nears the 1 MiB cap
-   and resumes on `EPOLLOUT` drain, so a slow reader never grows daemon memory
+   reading from storage when this connection's pending output reaches 256 KiB,
+   well under the 1 MiB cap, and resumes on `EPOLLOUT` drain, so a slow reader never grows daemon memory
    (the same discipline as message fan-out).
 4. **`DOWNLOAD_END` (S → C), `0x0089`** `{ attachment_id: u64 }` — all bytes
    sent; the client verifies the reassembled size (and optionally `sha256`).
@@ -1660,7 +1663,7 @@ already has.
 
 **`CAPABILITIES` (S → C), `0x00E1`** `{ count: u8, count × name: str }` — the
 features this daemon offers, by name, sent once to every client just after
-`WORKSPACE_INFO` and before the frames that describe any feature. A name present
+`SERVER_BUILD` (§4.3c) and before the frames that describe any feature. A name present
 means the feature is available on this connection; absent means a client shows
 nothing of it, which is the correct result rather than offering something that
 would fail (REQ-295). `tts` is present exactly when read-aloud is running — built
@@ -1834,8 +1837,8 @@ when the user travels or when daylight saving turns over, neither of which
 involves editing quiet hours. Carrying it only on `SET_SCHEDULE` meant it was
 captured at the last edit and then trusted indefinitely, so this is its own frame
 — refreshing the offset must not require, or rewrite, a schedule. The daemon
-clamps it to −720…+840, the range real offsets occupy. There is no reply: nothing
-about the session changes, and the value matters later, to the push decision.
+clamps it to −720…+840, the range real offsets occupy. It is answered with the
+`SCHEDULE` the offset belongs to (above).
 
 **`SET_KEYWORDS` (C → S), `0x00CE`** `{ count: u8, count × str }` and
 **`SET_PRIORITY` (C → S), `0x00CF`** `{ count: u8, count × u64 }` — replace my
@@ -1906,8 +1909,7 @@ of the account, so each device signs in again. (`0x0049 CHANGE_PASSWORD` once
 carried this in a frame; the number is retired.)
 
 **`PROFILE_UPDATED` (S → C), `0x004A`** `{ user_id: u64, display_name: str }` — a
-user's display name (after a rename; or the caller's unchanged name after a
-password change). **Fanned to every authed connection** so all rosters update in
+user's display name, after a rename. **Fanned to every authed connection** so all rosters update in
 place; the originator reads its own as the operation's success ack.
 
 ---
@@ -1944,7 +1946,7 @@ it, and a member's request is refused with `ERROR FORBIDDEN`.
 
 **`ALERTS_SUMMARY` (S → C), `0x00F6`** `{ unacked: u32, current: u32 }` — how
 many entries nobody has acknowledged, and how many still hold. Sent to an owner
-or admin as the last frame of the sign-in sequence (after `SNOOZE`), and to every
+or admin in the sign-in sequence, right after `SNOOZE`, and to every
 owner and admin connected whenever an entry is raised, cleared or acknowledged.
 
 **`ALERTS_LIST` (C → S), `0x00F7`** — empty payload. Asks for the entries.
@@ -1968,8 +1970,10 @@ acknowledged when it is raised again, until it stops and comes back.
 Everything a user says about *when* they are notified, beyond §5.16's per-channel
 level. Opcode `0x0091` is **retired and never reused** (§5.16, ARCH-103).
 
-Each of these answers with a full `NOTIFY_PREFS` (`0x0093`) to **all** of the
-user's connections, followed by `SNOOZE`, `SCHEDULE` and `ALERT_PREFS`. That
+`SET_NOTIFY_DEFAULT` and `SET_MUTE` answer with a full `NOTIFY_PREFS` (`0x0093`)
+to **all** of the user's connections, followed by `SNOOZE`, `SCHEDULE` and
+`ALERT_PREFS`; the others answer, to all of them too, with the one frame they
+changed (`SNOOZE`; `SCHEDULE`; `ALERT_PREFS`). That
 four-frame trailer follows every `NOTIFY_PREFS`, not only a `LIST` request, so a
 client always folds a complete picture rather than a delta.
 
@@ -2414,7 +2418,7 @@ an action.
 
 ### 5.16m Summaries (REQ-310–313, ARCH-116)
 
-Only when the daemon sent the **`summarize`** capability (§4.2): summaries are
+Only when the daemon sent the **`summarize`** capability (`CAPABILITIES`, §5.14b): summaries are
 off unless the operator turns them on. It is sent while the model is still
 coming up, too — a request then waits in the queue until it is ready — and a
 daemon whose model did not come up stops sending it, answering whatever waited
@@ -2441,8 +2445,8 @@ overview; topics, each a title, who was in it, how many messages it rests on,
 what happened and details; what needs attention; titles of further topics —
 every part citing message ids; who posted in the span and how many messages it
 holds; and the cited messages as plain text — and `start_ms`/`end_ms` the span
-it covers. Its size is fixed by the standard (SUMMARIES.md §1), whatever the
-span.
+it covers. Its size is set by the standard (SUMMARIES.md §1), from the span it
+covers.
 1 **unavailable** (summaries are off, or too many are being made), 2
 **forbidden** (the person cannot read the conversation), 3 **failed**; `body` is
 then a sentence saying why. A summary not yet made is made before the answer,
@@ -2527,7 +2531,7 @@ byte of every SFrame KID it sends under) and its **device key** (an X25519
 public key). A connection is in at most one call, and a user in a call from one
 device: joining from a second moves them. The **epoch** starts at 1 and goes up
 by one on every join and every leave. The cap is ten (`OC_CALL_MAX`; in
-development mode `OPENCHIME_DEV_CALL_MAX` may lower it), announced on `WORKSPACE_INFO` as `call_max`.
+development mode `OPENCHIME_DEV_CALL_MAX` sets it, 2 to 32), announced on `WORKSPACE_INFO` as `call_max`.
 
 **`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64, device_key: 32 bytes,
 codecs: u8, n: u16, n × { user_id: u64 } }` — start the conversation's call, or
@@ -2540,7 +2544,8 @@ cap is refused with `ERROR CALL_FULL` (3028). A connection already in another
 call leaves it first; one in this call is taken out and put back, with a fresh
 token and slot — how a client whose address changed is relayed again. A relay
 that has exited and could not be restarted refuses the join with
-`ERROR CALL_UNAVAILABLE` (3025).
+`ERROR CALL_UNAVAILABLE` (3025); so is a start when the daemon holds as many
+calls as it can.
 
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
 u64, udp_port: u16, token: bytes, slot: u8, epoch: u32, starter: u64,
@@ -2552,8 +2557,8 @@ u64, slot: u8, device_key: 32 bytes, codecs: u8, flags: u8 }` — `flags` bit 0
 it stands. The token is opaque to the client and 16 to 32 bytes long: 16 random
 bytes behind the daemon's `OPENCHIME_MANAGED_AUDIO_TOKEN_PREFIX`, if one is set, and
 `udp_port` is `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` where that is set (AUDIO.md §4).
-The client then speaks UDP directly to the relay, over IPv4, at the host it
-connected to: `token ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
+The client then speaks UDP directly to the relay at the host it connected to,
+over IPv4 when the host has an IPv4 address and over IPv6 when that is all it has: `token ‖ seq(u16) ‖ payload` to it, `sender_user_id(u64) ‖ seq(u16) ‖
 payload` from it (`daemon/audio.h`). Every non-empty payload is an SFrame
 ciphertext (CALLS.md §5.4); an empty one is a keep-alive.
 
@@ -2671,7 +2676,7 @@ hold clients on different platforms, so the codec is a **wire contract** —
 `codecs` above, one mandatory codec (VP9), a new bit for a successor.
 Fragments, NACKs, keyframe requests and rate reports travel **inside the
 encryption** as typed packets (CALLS.md §5.4); the relay's framing does not
-change. [VIDEO.md](./VIDEO.md) is the design.
+change. [CALLS.md](./CALLS.md) §6 is the design.
 
 ### Push device tokens (REQ-132/133, ARCH-85)
 
@@ -2685,8 +2690,8 @@ nothing (REQ-041). Answered with `DEVICE_TOKEN_ACK`.
 registration of a token (logout / token rotation). Answered with `DEVICE_TOKEN_ACK`.
 
 **`DEVICE_TOKEN_ACK` (S → C), `0x00B2`** `{ ok: u8, code: u16 }` — `ok=1` on success;
-on failure `code` is the reason (`OC_ERR_INVALID_DEVICE_TOKEN` for an empty token or
-unknown platform). A committed SEND then drives contentless APNs/FCM delivery to
+on failure `code` is the reason (`OC_ERR_INVALID_DEVICE_TOKEN` for a token no device
+issues (§8.2) or an unknown platform). A committed SEND then drives contentless APNs/FCM delivery to
 registered tokens via the emitter (ARCH-85), gated by each recipient's level + DND.
 
 ---
@@ -2713,8 +2718,8 @@ a lower id in another, and a single global cursor would skip it.
 channel's NEWEST page** — its last N top-level messages — not its oldest. A
 client that keeps nothing locally (ARCH-88) wants the bottom of the transcript,
 which is where it will be scrolled to; older history is paged in by scrolling
-back. For a channel the client omits entirely, and for `count = 0`, the same
-rule applies to every channel the user belongs to.
+back. For `count = 0`, the same rule applies to every channel the user belongs
+to; a channel left out of a non-empty list is not replayed.
 
 The server does **not** resume a zero cursor from the user's stored delivery
 cursor (§5.4). That cursor is where they last read *to*, so a caught-up user
@@ -2729,7 +2734,7 @@ only what it missed, with no duplicate replay.
 The server replays a channel the caller may **read** — public, or one they are a
 member of — which is the same rule §5.7 applies to reading generally (REQ-031).
 A cursorless request is the narrower case: with no cursors the server derives the
-caller's *member* channels and resumes each from its stored read cursor.
+caller's *member* channels and sends each its newest page.
 
 ### 6.2 Replay and `BACKFILL_DONE` (server → client), msg_type `0x0031`
 
@@ -2844,7 +2849,7 @@ A request-scoped or connection-scoped error. The handshake stage uses `REJECT`
 |-----------|------|----------------------------------------------------------------------|
 | `code`    | u16  | Reason code from §8.2.                                                |
 | `fatal`   | u8   | `1` if the server is closing the connection after this frame; `0` if the connection continues and only the triggering request failed. |
-| `context` | bytes| Optional correlation data. For a failed `SEND`, this is the 16-byte `idempotency_token`; otherwise empty (`n = 0`). |
+| `context` | bytes| Optional correlation data. For a failed `SEND`, this is the 16-byte `idempotency_token`; for other requests, the id the section names (a message, attachment or segment id, big-endian); otherwise empty (`n = 0`) or a short label. |
 | `message` | str  | Human-readable detail, for logs/display.                             |
 
 ### 8.2 Reason code table (REQ-111)
@@ -2910,15 +2915,15 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3037` | `DEMO_LIMIT`          | demo       | no    | A public demo's daily limit was reached (AUTH.md §8.12); `message` says which, in a sentence for the person. Sent as `ERROR`, or as a transfer's error for an upload. |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
-Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
-carries the same `code`; the other codes are delivered via `ERROR`.
+Handshake-stage codes (`1001`/`1002`, and `1003`/`1005` for a bad or missing
+`HELLO`) are delivered via `REJECT`, which carries the same `code`; the other codes are delivered via `ERROR`.
 
 ---
 
 ## 9. Message type registry
 
-**Generated from `shared/protocol.h`** — every `OC_MSG_*` the codec defines, in
-opcode order, 165 of them. The sections above specify the payload layouts; this
+**Kept by hand in step with `shared/protocol.h`** — every `OC_MSG_*` the codec
+defines, in opcode order, 225 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
 **Every opcode carries exactly one message type.** `scripts/check/opcodes.sh`
@@ -3146,6 +3151,7 @@ this table cannot silently gain a shared value.
 | `0x00FC` | `ACTION` | S → C | whether a message is an action (REQ-058); after every live message frame, and replayed |
 | `0x00FD` | `SUMMARIZE` | C → S | summarize a channel or DM over a span (REQ-310) |
 | `0x00FE` | `SUMMARY` | S → C | the answer to one `SUMMARIZE`: the summary as JSON, or why not |
+| `0x00FF` | `ERROR` | S → C | §8.1 |
 | `0x0100` | `SUMMARY_QUEUED` | S → C | where one `SUMMARIZE` is in the queue: how many are ahead of it |
 | `0x0101` | `SUMMARY_DETACH` | C → S | stop watching a request: told as a notice when made |
 | `0x0102` | `SUMMARY_CANCEL` | C → S | cancel a request |

@@ -37,6 +37,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **Argon2** | 20190702 (the reference implementation) | Password hashing, Argon2id (AUTH.md §2): `argon2.c`, `core.c`, `encoding.c`, `ref.c`, `thread.c`, `blake2/`, as released, compiled as one unit (`argon2_all.c`) with its own flags | Daemon | https://github.com/P-H-C/phc-winner-argon2 | CC0-1.0 or Apache-2.0 |
 | **Common passwords** | SecLists, `xato-net-10-million-passwords-1000000.txt` | The passwords of 15 characters or more a new one may not be, lowercased (`third_party/pwlist/common.txt`, compiled in by `scripts/build/pw_common.py`) | Daemon | https://github.com/danielmiessler/SecLists | MIT |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
+| **picohttpparser** | commit-pinned | HTTP/1.1 request line and header parsing for the daemon's one HTTP stack (ARCH-32) | Daemon (`daemon/http.c`) | https://github.com/h2o/picohttpparser | MIT (or the Perl licence; we use it under MIT) |
 | **miniaudio** | 0.11.25 | Audio device I/O — capture and playback over WASAPI, CoreAudio, ALSA/PulseAudio/PipeWire, AAudio, Web Audio | Client media library (`client/core/media/audio_dev.c`): video messages and the audio client (AUDIO.md §3.2) | https://github.com/mackron/miniaudio | Public Domain (Unlicense) **or** MIT-0, at our choice |
 | **stb_image_write**, **stb_image** | commit-pinned | JPEG encode of a video message's poster; image decode | Client media library (`client/core/media/recorder.c`) | https://github.com/nothings/stb | Public Domain **or** MIT, at our choice |
 | **libfvad** | commit `532ab666` (2024-02-07; upstream has no release tags) | Voice-activity detection: where an utterance ends (the WebRTC detector as a standalone C library) | Voice input in the Win32 client (`client/core/voice/fvad_unit.c`, ARCH-112); never the daemon | https://github.com/dpirch/libfvad | BSD-3-Clause |
@@ -73,7 +74,8 @@ daemon provably does not use.
 
 **Attribution when shipping binaries.** Building from source never triggered the
 vendored licences' notice requirements; distributing packages does. `openchimed`
-links **mbedTLS** (Apache-2.0) and **jsmn** (MIT), and every channel ships both
+links **mbedTLS** (Apache-2.0), **Argon2**, **jsmn**, **picohttpparser**,
+utf8proc, SecLists' list, SQLite and the CA roots, and every channel ships their
 texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
 `/usr/share/licenses/openchimed/copyright` on RHEL, `COPYRIGHT` in the tarball.
 `packaging/licenses.sh` reads them out of the trees the build actually used, so
@@ -100,14 +102,15 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it), and the
 its header). miniaudio's implementation is compiled in exactly one translation
 unit, `audio_dev.c`, with only device I/O enabled. `.gitignore` ignores
 `third_party/*` and whitelists the committed paths: `jsmn/`, `termbox2/`,
-`utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/` and `lucide/`
+`picohttpparser/`, `utf8proc/`, `argon2/`, `pwlist/`, `qrcodegen/`, `miniaudio/`, `stb/`, `sqlite-3.53.4/`, `libfvad/`, `ca-roots/` and `lucide/`
 (see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
 ## 2. Fetched at build time — `scripts/build/*.sh` (gitignored output)
 
 **Toolchains** come this way too (`mk/toolchains.mk`): make fetches each on
-first use, pinned by version and SHA-256 in its script, into `third_party/`,
+first use, pinned by version and SHA-256 in its script (Emscripten by its emsdk
+tag, whose own table pins the sum of everything it installs), into `third_party/`,
 and puts it first on `PATH` for every recipe and vendor script, so nothing
 depends on what a machine or a runner image happens to have installed.
 `make full` needs only cc, make, cmake, python3, git, curl and xz beyond them.
@@ -130,7 +133,7 @@ has moved (`scripts/check/toolchains.sh`).
 | **ONNX Runtime** | 1.30.0 | Neural network inference for the read-aloud voice model and the voice-input recognizer, built from source **minimal and static** (only the models' operators and types, `.ort` format only, no exceptions) | Daemon (read-aloud ARCH-111, voice input ARCH-112) | https://github.com/microsoft/onnxruntime | MIT (its compiled-in components — abseil, flatbuffers, protobuf-lite, ONNX, cpuinfo, Eigen — are permissive and listed in its ThirdPartyNotices) |
 | **llama.cpp** (with ggml) | 0.5.0 | Running the summary model, built from source **CPU only and static** (no OpenMP, no tools, no network code) | Daemon (summaries ARCH-116) | https://github.com/ggml-org/llama.cpp | MIT |
 | **Kitten TTS mini** | 0.8 | The read-aloud voice model: `kitten_tts_mini_v0_8.onnx` and `voices.npz`, converted to `.ort` and **shipped beside the daemon** as data | Daemon (read-aloud, ARCH-111) | https://huggingface.co/KittenML/kitten-tts-mini-0.8 | Apache-2.0 |
-| **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: eight files — the frontend, encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
+| **Moonshine Tiny Streaming (English)** | CDN directory `quantized_26_08_21` | The voice-input recognizer: nine files — the frontend (model and weights), encoder, adapter, cross-attention and decoder graphs as int8 `.ort`, `tokenizer.bin`, `streaming_config.json` and the licence, about 45 MB — **shipped beside the daemon** as data in `stt/` | Daemon (voice input, ARCH-112) | https://github.com/moonshine-ai/moonshine | MIT (English models; the legacy non-streaming models for other languages are under a non-commercial licence and are not used) |
 | **speexdsp** | 1.2.1 | The acoustic echo canceller (`speex_echo_state`), behind the processor seam (AUDIO.md §3.3) | Client media library (`client/core/media/processor.c`) — voice input (ARCH-112) and the audio client; never the daemon | https://www.speex.org | BSD-3-Clause |
 | **Phonetisaurus** (+ OpenFst, MITLM in its wheel) | 0.3.0 | Trains ttskit's guesser. **Build tool for maintainers only**: never linked, never shipped, not needed to build OpenChime | `scripts/build/ttskit_data.sh` | https://github.com/AdolfVonKleist/Phonetisaurus | BSD-3-Clause (OpenFst Apache-2.0, MITLM MIT) |
 | **CMUdict** | commit `74790861` | Source of ttskit's pronunciation data, which is generated from it and **committed** (`ttskit/data/en-US/`, with its notice beside it) | Daemon (read-aloud) | https://github.com/cmusphinx/cmudict | BSD-style (two clauses) |
@@ -235,15 +238,21 @@ llama.cpp's MIT notice travels with every package through `packaging/licenses.sh
 built static and floating point into `third_party/speexdsp-1.2.1[-win]/`
 (gitignored). The daemon links none of it.
 
+**The web client** (`make web`) builds its own copies with Emscripten into
+`build/wasm/` (gitignored): `scripts/build/mbedtls_wasm.sh` from the fetched
+mbedTLS tree, `scripts/build/sdl3_wasm.sh` from the same pinned, SHA-256-verified
+SDL3 release, and `scripts/build/media_wasm.sh` for libvpx, libopus and speexdsp
+from the sources their native scripts fetch and verify.
+
 ## 3. System / OS packages (linked at build)
 
-Provided by the host toolchain (local dev / CI) or the Alpine base of the
+Provided by the host toolchain (local dev / CI) or the Debian base of the
 published container image; their versions track the OS, not this repo.
 
 | Package | Purpose | Used by | Link | Source | License |
 |---------|---------|---------|------|--------|---------|
 | **glibc `resolv`** (`libresolv`) | DNS **SRV** lookup for workspace resolution (REQ-010) | TUI only (Linux) | `-lresolv` | glibc | LGPL-2.1 (glibc) |
-| **pthreads** | Threads (net thread, queues, dbwriter) | Daemon + client | `-lpthread` | glibc / musl | LGPL-2.1 / MIT |
+| **pthreads** | Threads (net thread, queues, dbwriter) | Daemon + client | `-lpthread` | glibc | LGPL-2.1 |
 | **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
 | **GLib** *(optional)* | Pulled in transitively by libsecret | TUI (only when libsecret present) | via libsecret | https://gitlab.gnome.org/GNOME/glib | LGPL-2.1 |
 
@@ -254,7 +263,8 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 
 - **Local build headers:** `libsecret-1-dev` for the keyring backend. SQLite needs
   none — it is compiled from the committed amalgamation.
-- **CI installs:** `bzip2`, `nasm` and `xz-utils`; every compiler is fetched by
+- **CI installs:** `bzip2`, `nasm` and `xz-utils` (and `gdb`, and `ffmpeg` for
+  `ffprobe`, neither linked); every compiler is fetched by
   make (the toolchains above). The Windows TUI and GUI (`make windows`) need
   neither libsecret nor libresolv: the mingw build reaches DNS through
   `DnsQuery` and the credential store through Credential Manager.
@@ -273,8 +283,9 @@ packages, and the arm64 image is built on the x86 runner with no emulation. It
 adds no packages: the daemon links everything it needs, CA roots included.
 
 The project runs no containers for development or testing (ARCH-36), so this
-table holds exactly one row. The sole image reference in the repo is the
-`FROM debian:bookworm-slim` in `Dockerfile` — a tag rather than a digest, which
+table holds exactly one row. The sole image the repo builds on is the
+`FROM debian:bookworm-slim` in `Dockerfile` (the only other image named is
+`rockylinux:9`, which the release's dnf smoke runs under podman) — a tag rather than a digest, which
 is the upstream's own stability contract for a base OS.
 
 ## 5. Build & dev tooling (not linked into the product)
@@ -289,8 +300,9 @@ is the upstream's own stability contract for a base OS.
 - **zig, Emscripten, llvm-mingw** — fetched by make, pinned (§2, "Toolchains").
   zig is the release's compiler and CI's second compiler; a plain `make` of the
   host's daemon uses the system cc.
-- **buildah / skopeo** — **release only**. Build and push the OCI image and move
-  the `:latest` tag, daemonlessly.
+- **buildah / podman / skopeo** — **candidate and release only**. Build, start and
+  push the OCI image (the candidate), re-tag it and move the `:latest` tag (the
+  release), daemonlessly.
 - **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
   build, not to test, not locally, not in CI. This is a standing constraint;
   see ARCH-36 and the header of `.github/workflows/candidate.yml`.
@@ -348,12 +360,12 @@ paths ship; nothing is fetched at runtime.
 
 | License | Packages | Notes |
 |---------|----------|-------|
-| **MIT** | termbox2, utf8proc, qrcodegen, jsmn, SecLists' common passwords | Vendored, committed |
+| **MIT** | termbox2, utf8proc, qrcodegen, jsmn, picohttpparser, SecLists' common passwords | Vendored, committed |
 | **CC0-1.0 or Apache-2.0** | Argon2 (reference) | Vendored, committed |
 | **MIT** | ONNX Runtime, Moonshine Tiny Streaming | Fetched at build; ONNX Runtime static-linked and Moonshine shipped as data, **daemon only** (ARCH-111/112) |
 | **MIT-0 / Public Domain** | miniaudio | Vendored, committed; client only |
 | **MIT / Public Domain** | stb_image_write, stb_image | Vendored, committed; client only |
-| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 26 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
+| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 41 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9), libopus | Fetched at build and static-linked: both into the Win32 client (ARCH-110), and libopus into the daemon to encode read-aloud renders (ARCH-111). Permissive, within this repo's posture (mbedTLS is already Apache-2.0, not MIT) |
 | **BSD-3-Clause** | speexdsp, libfvad | Voice input in the Win32 client (ARCH-112): speexdsp fetched and static-linked, libfvad vendored and compiled in; **client only** |

@@ -146,7 +146,7 @@ struct oc_call_engine {
     atomic_int  path_lost;   /* UDP worked, then went quiet for udp_lost_ms */
     int64_t     started_ms, udp_heard_ms, last_probe_ms;
 
-    /* Screen sharing (REQ-161, VIDEO.md). share_mu guards all of it and is taken
+    /* Screen sharing (REQ-161, CALLS.md §6). share_mu guards all of it and is taken
      * before mu, never after. */
     oc_mutex_t  share_mu;
     uint64_t    sharer;            /* who the daemon says is sharing, 0 nobody */

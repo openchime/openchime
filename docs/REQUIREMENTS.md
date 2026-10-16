@@ -321,7 +321,7 @@ where one exists.
 - **REQ-040.** No query path in the daemon has been able to return data
   belonging to a different tenant, because each tenant has run as a
   separate daemon process against a separate SQLite database file with no
-  shared connection or shared query surface (ARCH-4, ARCH-7). Isolation has
+  shared connection or shared query surface (ARCH-4). Isolation has
   therefore been a property of the deployment topology, not of a
   tenant-ID filter inside shared queries.
 - **REQ-041.** **A tenant's messages have been stored only by that tenant's own
@@ -438,7 +438,7 @@ where one exists.
   channel or DM they can post to, carrying a reference to the original — its
   author and a quoted excerpt — rather than copying the text opaquely, so a
   forwarded message has stayed attributable to its source.
-  The reference is **structured, not prose** (ARCH-108): the client sends the two
+  The reference is **structured, not prose** (ARCH-117): the client sends the two
   source ids on `SEND` and the daemon resolves the author, the excerpt and the
   attachment count from the row it holds, so a client cannot claim someone said
   something they did not, and the recipient renders a card it recognises rather
@@ -1245,7 +1245,7 @@ where one exists.
 
 ### 6.3 Video — camera video excluded; screenshare and video messages admitted
 
-*Design: [VIDEO.md](./VIDEO.md) (screenshare), [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md)
+*Design: [CALLS.md](./CALLS.md) §6 (screenshare), [VIDEO-MESSAGES.md](./VIDEO-MESSAGES.md)
 (video messages).*
 
 - **REQ-160.** *(Excluded by decision)* **Camera video** calling, and video streaming or playback beyond
@@ -1275,7 +1275,7 @@ where one exists.
   share, the computer's sound, drawing on a share, simultaneous sharers, and
   camera video have all been out of scope of a call (REQ-160); a *recorded*
   screen is a video message (REQ-162). A **text-only frontend has been
-  permanently exempt** (ARCH-75 — the TUI renders no graphics). [VIDEO.md](./VIDEO.md)
+  permanently exempt** (ARCH-75 — the TUI renders no graphics). [CALLS.md](./CALLS.md) §6
   is the design.
 - **REQ-162.** A user has been able to **record a video message and
   post it** into a channel, a DM or a thread, with the composer's text as its

@@ -1,4 +1,4 @@
-/* Screen sharing's packet logic (REQ-161, ARCH-86/87, docs/VIDEO.md §4-§6): what
+/* Screen sharing's packet logic (REQ-161, ARCH-86/87, docs/CALLS.md §6.4-§6.6): what
  * the call engine does with a share's frames between the encoder and SFrame, and
  * between SFrame and the decoder. No sockets, no threads, no codec -- the engine
  * owns those -- so every rule here can be driven by a test with a simulated

@@ -1,4 +1,4 @@
-/* Tests for screen sharing's packet logic (REQ-161, docs/VIDEO.md §4-§6), with no
+/* Tests for screen sharing's packet logic (REQ-161, docs/CALLS.md §6.4-§6.6), with no
  * network or device: a sharer and a viewer joined by a simulated network that
  * loses, delays, reorders and duplicates. Fragmenting and reassembling; NACKs
  * recovering lost fragments and whole lost frames; a PLI bringing a keyframe when

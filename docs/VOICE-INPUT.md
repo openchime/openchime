@@ -8,7 +8,7 @@ Voice input produces **text messages**, nothing else. No audio is stored, attach
 posted; a spoken message is an ordinary message — search, mentions, edit and delete
 all work. It is not a clip (REQ-273) and not a call (REQ-150).
 
-The client is the Win32 GUI; the TUI has no voice input.
+The client is the Win32 GUI and the web client (WEB.md); the TUI has no voice input.
 
 ---
 
@@ -172,4 +172,4 @@ stays for clients that cannot carry a model.
 | `make test` — daemon | the `STT_*` frames; the capability and cap; order, cap, rate, a chunk out of order, a failed recognition; off, and no engine as with missing data; free talk posts through the send path, idempotently, refused for an archived channel or a non-member, and never after its speaker has left; mention normalisation |
 | `make test` — client core | free talk arrives as `BROADCAST`s in order with no client `SEND`; push to talk's words wait for the composer they were spoken into, and nothing is sent; one microphone owner |
 | Build job and release | read-aloud renders a sentence and `openchimed --stt-hear` must hear its words — built, stripped, and installed from the `.deb` |
-| Win32 harness | `scripts/gui/voice.sh`: a synthetic microphone speaking a recorded sentence (`OPENCHIME_DEV_MIC`) — push to talk by key, mouse and UI Automation puts the words in the composer unsent; free talk posts them; leaving the conversation and opening the recorder end the session; absent with voice input off |
+| Win32 harness | `scripts/gui/voice.sh`: a synthetic microphone speaking a recorded sentence (`OPENCHIME_DEV_MIC`) — push to talk by key, mouse and UI Automation puts the words in the composer unsent; free talk posts them; leaving the conversation and opening the recorder end the session; a microphone the OS blocks is reported as that; absent with voice input off |

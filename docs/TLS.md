@@ -6,7 +6,7 @@ runs entirely inside this TLS session ([PROTOCOL.md](./PROTOCOL.md) §1).
 
 ## Library: vendored mbedTLS (ARCH-51)
 
-TLS is mbedTLS (Apache-2.0), pinned at **3.6 (LTS)** and built from source by
+TLS is mbedTLS (Apache-2.0), pinned at **3.6.2** (the 3.6 LTS line) and built from source by
 `scripts/build/mbedtls.sh` into `third_party/` (gitignored). It was chosen over
 OpenSSL and LibreSSL for fit with this project's constraints:
 

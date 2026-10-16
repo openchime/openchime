@@ -41,7 +41,7 @@ packages themselves are not kept.
 What is kept, under `candidates/<build-id>/` in the staging bucket
 (`DIST_STAGING_BUCKET`, via the `dist-staging` rclone remote):
 
-    linux-amd64/openchimed-build-<id>-linux-amd64.tar.gz   the binary, tts/, stt/, web/
+    linux-amd64/openchimed-build-<id>-linux-amd64.tar.gz   the binary, tts/, stt/, web/, copyright
     linux-arm64/openchimed-build-<id>-linux-arm64.tar.gz
     windows-x64/openchime.exe, openchime-tui.exe, openchime.debug
     manifest.json, manifest.json.asc
@@ -97,8 +97,8 @@ anything else, and a dry run on any ref but `staging` or `main`.
 
 `release.yml`, on the promotion:
 
-    branch ─▶ guard ─────┐
-          └─▶ preflight ─┴─▶ candidate ─▶ version ─┬─▶ package (amd64, arm64) ─┬─▶ publish ─┬─▶ smoke
+    branch ─▶ guard ──────────────────┐
+          └─▶ preflight ─▶ candidate ─┴─▶ version ─┬─▶ package (amd64, arm64) ─┬─▶ publish ─┬─▶ smoke
                                                   └─▶ windows ────────────────┘            ├─▶ close-issues
                                                                                            └─▶ unreserve (on failure)
 
@@ -327,11 +327,11 @@ Properties worth knowing before touching it:
 
 ## The unit file is validated, because nothing else validates it
 
-`openchimed.service` is 60 lines of `ProtectSystem`, `DynamicUser` and
+`openchimed.service` is 70 lines of `ProtectSystem`, `DynamicUser` and
 `RestrictAddressFamilies` that nothing at install time parses strictly: both
 maintainer scripts gate the enable path on `[ -d /run/systemd/system ]`.
 
-The release runs `systemd-analyze verify` against it, directly on the runner —
+The candidate build runs `systemd-analyze verify` against it, directly on the runner —
 which boots systemd for real, so no container is needed to have something that
 parses the unit.
 
@@ -416,15 +416,15 @@ list of roots added and removed.
 | name | kind | required for |
 |---|---|---|
 | `DIST_S3_ACCESS_KEY` / `DIST_S3_SECRET_KEY` | secret | apt + dnf publish (production's bucket) |
-| `DIST_S3_STAGING_ACCESS_KEY` / `DIST_S3_STAGING_SECRET_KEY` | secret | apt + dnf publish (staging's bucket) |
-| `REPO_SIGNING_KEY` | secret | signing the indexes and packages |
+| `DIST_S3_STAGING_ACCESS_KEY` / `DIST_S3_STAGING_SECRET_KEY` | secret | apt + dnf publish (staging's bucket); storing, checking and fetching candidates |
+| `REPO_SIGNING_KEY` | secret | signing the indexes and packages, and the candidate manifest |
 | `RELEASE_SSH_KEY` | secret, `release` environment | `promote.yml`'s fast-forward of `main`; the private half of the repository's write deploy key, the ruleset's one bypass actor |
 | `TRUSTED_SIGNING_ACCOUNT` / `_ENDPOINT` / `_PROFILE` | secret | Authenticode; **optional** |
 | `AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | secret | Authenticode signing auth; **optional** |
 | `DIST_S3_ENDPOINT` / `DIST_BUCKET` / `DIST_STAGING_BUCKET` | variable | rclone configuration |
 
 `GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image. It is passed
-to `buildah login` and `skopeo --creds`.
+to `buildah login` and `skopeo`'s `--src-creds` and `--dest-creds`.
 
 ## Upgrading changes what the environment may say
 

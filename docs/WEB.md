@@ -1,7 +1,7 @@
 # The web client
 
 How the graphical client comes to run in a browser (ARCH-74, CLIENT.md §3
-"Web"), what of it exists, and what is left, in the order it is built. The
+"Web") and what of it exists. The
 end state is the one portable GUI (ARCH-80) compiled to WebAssembly with
 Emscripten, served by the daemon from its own origin, carrying the protocol
 inside WebSocket frames. The application is the same sources as the Windows
@@ -33,8 +33,8 @@ the native build (`scripts/build/mbedtls_wasm.sh`). Three places in the core
 have an Emscripten branch and no more: the connection's setup (`net.c`), SRV
 lookup (`resolve.c`, a browser has no resolver), and `poll` (`sock.h`,
 Emscripten's reports and never waits, so a timeout is a loop of short sleeps
-on the network thread). The credential store is in memory for now
-(`client/gui/platform/web/secret_mem.c`).
+on the network thread). The credential store is memory with `localStorage`
+behind it (`client/gui/platform/web/secret_mem.c`).
 
 **The drawing layer in a browser.** SDL3 builds for wasm from the same release
 the Windows client uses (`scripts/build/sdl3_wasm.sh`), and `oc_gfx` compiles
@@ -47,8 +47,8 @@ over the browser's platform directory (`client/gui/platform/web/`). The
 window, its events, timers, cursors and clipboard text are SDL3 on both; what
 only a platform can do is the contract in `client/gui/platform/platform.h`,
 and the browser's implementation (`plat_web.c`) answers "not available" for
-what a page cannot do yet (a tray, a file picker, a crash dump, a second
-process to hand a URL to) and does what it can (the badge is the tab's
+what a page cannot do (a tray, a crash dump, a second process to hand a URL
+to) and does what it can (the badge is the tab's
 title). The application's loop yields to the browser between turns (Asyncify).
 Text is the canvas backend of sdltext (`sdltext/st_canvas.c`): the browser
 measures and rasterizes runs, the backend lays out lines, styles ranges,
@@ -236,15 +236,7 @@ desktop IME. `make web-test` plays a Japanese composition into it.
 Rough edges: fonts are the browser's, so layouts are near-identical to
 Windows, not pixel-identical, and the harness compares state, not pixels. the picker and the clipboard need a
 user gesture, as the browser requires, so the harness drives uploads through
-the tray and the test hook instead; there is no IME beyond what SDL's
-Emscripten port passes through; a crash leaves nothing but the console.
-
-## What is left, in order
-
-1. **`make web-test` and `scripts/gui/run.sh --web all` in CI.** CI builds the client (the
-   daemon needs it) but runs the browser tests locally only; a runner with a
-   Chromium joins them.
-
+the tray and the test hook instead; a crash leaves nothing but the console.
 
 What a page cannot have, and the application lives without: a tray, the
 taskbar's flash and progress, the platform's certificate viewer, autostart,
@@ -276,16 +268,16 @@ the system's notification sounds, a crash dump, UDP for a call.
 make web                             # the client in build/web; the first run fetches Emscripten 6.0.8 (mk/toolchains.mk) and builds SDL3, mbedTLS and the codecs for wasm once
 make WEB=1                           # the daemon with the client compiled in and web/openchime.wasm beside it (remembered; `make full` does the same)
 make web-test                        # gfx under Node, then the client in a headless Chromium (development mode: the check signs in by password)
-python3 scripts/web/serve.py build/web  # the dev server: http://127.0.0.1:8765/openchime.html?host=…&port=…&user=…&pass=…
+python3 scripts/web/serve.py build/web  # the dev server: http://127.0.0.1:8765/openchime.html?host=…&port=…
 ```
 
 A daemon started from this directory serves the client at `https://<its
 address>:<TLS port>/` (self-signed in development, so the browser asks once).
 
-The two wasm libraries are built once into `build/wasm/` and never touch the
+The wasm libraries are built once into `build/wasm/` and never touch the
 native trees in `third_party/`. The page takes the workspace in its query
-(`host`, `port`, `user`, `pass`, which become the application's command line;
-without them the sign-in view opens) and, with `hook=1`, the client's test
-hook on the page's filesystem (`ocHook('verb')`, `ocShot()`), which is what
-the test drives. `make web-test` needs a Chromium: Playwright's download is
+(`host` and `port`, or `ws`, for a page served from elsewhere than the
+daemon; they become the application's `--signin`) and, on a page in
+development mode, with `hook=1`, the client's test hook on the page's
+filesystem (`ocHook('verb')`, `ocShot()`), which is what the test drives. `make web-test` needs a Chromium: Playwright's download is
 found under `~/.cache/ms-playwright`, or name one in `CHROME`.

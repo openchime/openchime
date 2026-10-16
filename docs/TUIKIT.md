@@ -23,6 +23,9 @@ structs and drives them from its own event loop.
 - `tk_style` — bordered boxes: `tk_panel` (titled, focus-aware border) and `tk_box` (border +
   cleared interior, the frame under a modal). There is deliberately no full Lip Gloss-style struct (padding/align/
   attrs) — helpers grow here as widgets need them.
+- `tk_qr` — a QR code as terminal text: `tk_qr_render` gives the rows, two modules to a cell
+  in half blocks, with a quiet zone (the device code's URL, AUTH.md §8.11). Pure, no terminal;
+  the encoding is `third_party/qrcodegen`.
 
 **Theme / color**
 - `tk_theme` — semantic 256-color tokens (`bg`, `surface`, `fg`, `muted`, `faint`, `accent`,
@@ -82,7 +85,8 @@ supplies a function that formats item *i* into a styled string. This is the rule
 
 ## Dependencies & boundaries
 
-- `tuikit` depends **only** on `third_party/termbox2` and `third_party/utf8proc`.
+- `tuikit` depends **only** on `third_party/termbox2`, `third_party/utf8proc` and
+  `third_party/qrcodegen` (for `tk_qr`).
 - It must **never** include `client/core`, `oc_model`, `oc_client`, or any OpenChime header.
 - Chat-specific code stays in the app (`client/tui/`): the message/roster/search row builders
   (reimplemented as `tk_list`/`tk_viewport` delegates), the panel `layout`, `ws_session`,
@@ -93,9 +97,10 @@ supplies a function that formats item *i* into a styled string. This is the rule
 ## Build
 
 Compiled into the TUI targets (repo style — one gcc invocation, no separate archive step):
-`TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c))` + `-Ituikit`, added to both
+`TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c)) $(QRCODEGEN)` +
+`TUIKIT_INC` (`-Ituikit -Ithird_party/qrcodegen`), added to both
 `linux` and `windows` (`demo.c` is filtered out — it carries its own `main()`).
-`tk_term` owns the Windows console backend. `termbox2.h`/`utf8proc` stay
+`tk_term` owns the Windows console backend. `termbox2.h`/`utf8proc`/`qrcodegen` stay
 vendored in `third_party/`. `libtuikit.a` (an `ar` archive of `tuikit/*.o`) is a documented
 option for reuse elsewhere, not required.
 

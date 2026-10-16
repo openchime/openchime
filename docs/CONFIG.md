@@ -8,7 +8,7 @@ process environment, read once at startup into a single `oc_config` singleton
 (`daemon/config.c`) from one registry (`daemon/config_table.c`), which is also
 where the reference below, the packaged environment file and
 `openchimed --check-config` come from. The files the loader opens are the ones
-the data directory holds and the PEM files the environment names (any extra CA
+the data directory holds and the files the environment names (any extra CA
 roots, a direct connection's secret).
 
 **The surface is small, on purpose.** An operator sees two kinds of row:
@@ -22,7 +22,7 @@ what the box was started with rather than declared, and everything nobody
 varies — session life, worker counts, queue depths, storage watermarks, rate
 limits, the call cap — is a constant in `daemon/config.h`, not a row. Seven
 more rows are the control plane's, written when it provisions a managed box
-([MANAGED.md](./MANAGED.md)); set without its ticket they refuse the start.
+("A managed box", below); set without its ticket they refuse the start.
 Four more, and twelve the clients read, are development inputs, which only
 development mode reads ("Mode", below).
 
@@ -111,7 +111,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 | `OPENCHIME_DATA_DIR` | `/data` | Where the daemon keeps everything: `openchime.db`, `blobs/`, `cert.pem`, `key.pem`, `factor.key`, `summary/`. The packages set `/var/lib/openchime`. |
 | `OPENCHIME_PORT` | `8443` | The TLS port the protocol, the web client and the sign-in pages are served on, and the UDP port calls use (443 for a real deployment, ARCH-54). Integer 1..65535. |
 | `OPENCHIME_HEALTH_PORT` | `8080` | The plaintext port for `/healthz` and the landing page (ARCH-25); 0 opens none. Integer 0..65535. |
-| `OPENCHIME_JOIN` | *(unset)* | Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §3). Unset: only by invitation. |
+| `OPENCHIME_JOIN` | *(unset)* | Who may join by signing in through a provider: `domain:`, `tenant:`, `subject:` and `owner:` rules, comma-separated (AUTH.md §8.4). Unset: only by invitation. |
 | `OPENCHIME_OIDC_CONNECT_<n>` | *(unset)* | A direct connection to your own provider, 1 to 4 (SSO.md): `label=…;issuer=https://…;client_id=…;secret_file=…;subject=sub|oid;redirect=127.0.0.1|localhost`. |
 | `OPENCHIME_EXTRA_CA` | *(unset)* | PEM roots trusted beside the built-in ones for every outbound connection (push, enrollment, unfurls, S3): a service behind a private CA. |
 | `OPENCHIME_TRUSTED_PROXIES` | *(unset)* | Addresses or CIDRs whose PROXY protocol v2 header is believed, comma-separated; the connection's address is then the one the proxy saw. |
@@ -134,7 +134,7 @@ Everything an operator may set. A value that does not parse, is out of its range
 
 ## Managed
 
-Written by the control plane when it provisions a managed box (MANAGED.md), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.
+Written by the control plane when it provisions a managed box ("A managed box", below), with `OPENCHIME_MANAGED_TICKET`; set without the ticket, each refuses the start.
 
 ### Managed
 
@@ -142,7 +142,7 @@ Written by the control plane when it provisions a managed box (MANAGED.md), with
 |---|---|---|
 | `OPENCHIME_MANAGED_TICKET` | *(unset)* | The one-time claim ticket; with it the box is managed and the other rows here may be set. |
 | `OPENCHIME_MANAGED_AUDIENCE` | *(unset)* | The audience central minted for this workspace; the relay's tokens carry it. |
-| `OPENCHIME_MANAGED_RELAY_KEY` | *(unset)* | A relay public key, PEM, pinned beneath the keys the relay publishes (AUTH.md §3.3). |
+| `OPENCHIME_MANAGED_RELAY_KEY` | *(unset)* | A relay public key, PEM, pinned beneath the keys the relay publishes (AUTH.md §8.3). |
 | `OPENCHIME_MANAGED_MAX_USERS` | `0` | The most registered users (CP-7); 0 is unlimited. Integer 0..1000000. |
 | `OPENCHIME_MANAGED_ADDRESS` | *(empty)* | The workspace's canonical address, when it moved and still answers at the old one; clients re-file it under this. |
 | `OPENCHIME_MANAGED_AUDIO_ADVERTISE_PORT` | `0` | The UDP port clients are told, where a front door maps it (AUDIO.md §4); 0 is the bound one. Integer 0..65535. |
@@ -271,6 +271,56 @@ A name that was a setting once. Set, it stops the daemon with the line below; th
 | `OPENCHIME_STATE` | the TUI keeps its state in the credential store (ARCH-88) |
 <!-- /config-reference -->
 
+## A managed box
+
+The `OPENCHIME_MANAGED_*` rows above are what the control plane writes into a
+daemon's environment when it provisions a managed workspace (ARCH-76, model 3).
+An operator never sets them; a daemon started with one of them and no ticket
+refuses to start, naming this section. What the rows carry, beyond the table:
+
+- **`OPENCHIME_MANAGED_TICKET`** is the one-time claim ticket (AUTH.md §8.7).
+  Its presence is what makes the box managed, and it needs
+  `OPENCHIME_ENROLL_URL` and `OPENCHIME_MANAGED_AUDIENCE` beside it.
+- **`OPENCHIME_MANAGED_AUDIENCE`** is adopted: the daemon generates its own key
+  and claims the binding. A database holding a different audience stops the
+  boot rather than becoming two workspaces.
+- **`OPENCHIME_MANAGED_RELAY_KEY`** is optional; the keys the relay publishes at
+  `<enroll origin>/oidc/jwks` alone are the ordinary case.
+- **`OPENCHIME_MANAGED_ADDRESS`** is how a moved workspace is re-filed by clients
+  (PROTOCOL.md §4.3b); during the move, the certificate through central is
+  asked for both names (AUTH.md §8.9).
+
+With them, the control plane sets the operator rows a managed box needs as any
+deployment would: `OPENCHIME_ENROLL_URL` (central's own origin, which is also
+the relay's issuer), `OPENCHIME_AUTH=relay`, `OPENCHIME_JOIN` (an `owner:` or
+`subject:` rule from the owner's console sign-in, AUTH.md §8.4),
+`OPENCHIME_PUSH_URL`, `OPENCHIME_INVITE_MAIL=on`, `OPENCHIME_WORKSPACE_NAME`,
+`OPENCHIME_DATA_DIR`, `OPENCHIME_PORT` and `OPENCHIME_HEALTH_PORT`.
+
+**What is derived.**
+
+- **The deployment model** is `managed` when the ticket is set, `federated`
+  when only `OPENCHIME_ENROLL_URL` is, else `standalone`; nothing declares it.
+- **The relay** needs no issuer, key file or audience of its own: the issuer
+  is the enroll URL's origin, the keys are fetched from it, and the audience is
+  the enrollment's — which on a managed box is the one above.
+- **The certificate** comes through central (`OPENCHIME_TLS=central`) unless
+  told otherwise.
+- **The claim** is made once the daemon serves and retried for two minutes
+  (`OC_CLAIM_WAIT_SECS`) while central cannot be reached; a refused ticket is
+  not retried.
+
+**A demo workspace.** The public demo in each environment (AUTH.md §8.12) is a
+managed box like any other, provisioned with `OPENCHIME_MODE=demo` and
+`OPENCHIME_AUTH=local,relay`: visitors make local accounts with the control
+plane's signed invite, checked against the relay's published keys, and the
+operator signs in through the relay as its owner. The control plane rebuilds it
+every night, from the image, on a new volume.
+
+**Development mode** accepts the managed rows without the ticket, so the
+fixtures can stand in for a managed box (a user cap in the menu, a relay port
+nothing answers on); it still never enrols anywhere but loopback.
+
 ## Link unfurls (REQ-222, ARCH-105)
 
 Always on — there is deliberately **no on/off variable**. Every fetch passes an
@@ -316,8 +366,8 @@ Fixed in code (`daemon/dbwriter.c`); nothing in the environment changes them.
 |---|---|---|
 | `journal_mode` | `WAL` | Readers run beside the single writer without blocking it (ARCH-2/66). |
 | `foreign_keys` | `ON` | The schema's references and cascades are enforced. |
-| `query_only` (read connection) | `1` | Queries go through a second connection that cannot write (ARCH-66). |
-| `busy_timeout` (read connection) | 5000 ms | How long a read waits on a lock before failing. |
+| `query_only` (read connections) | `1` | Queries go through three further connections that cannot write (ARCH-66). |
+| `busy_timeout` (read connections) | 5000 ms | How long a read waits on a lock before failing. |
 
 ## Command line
 
@@ -331,9 +381,9 @@ accepts, and any other stops it with exit status 2.
 | `--config-reference` | Prints the settings reference above, as markdown, from the registry. |
 | `--config-env` | Prints the packaged environment file (`packaging/openchimed.env`), from the registry. |
 | `--tts-say VOICE TEXT OUT` | Renders TEXT in VOICE to an MP4 at OUT with the built-in model, then exits. Only in a build with read-aloud. |
-| `--tts-manifest DIR` | Writes the manifest for the read-aloud data in DIR, then exits. Only in a build with read-aloud. |
+| `--tts-manifest DIR` | Writes the manifest for the read-aloud data in DIR, then exits. In every build, with read-aloud or not. |
 | `--stt-hear IN.wav` | Prints the text recognized in a 16-bit mono WAV, then exits. Only in a build with voice input. |
-| `--stt-manifest DIR` | Writes the manifest for the recognizer data in DIR, then exits. Only in a build with voice input. |
+| `--stt-manifest DIR` | Writes the manifest for the recognizer data in DIR, then exits. In every build, with voice input or not. |
 
 ## Build switches
 

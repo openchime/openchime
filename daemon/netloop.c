@@ -1326,7 +1326,7 @@ static void relay_gone(void *ctx, const uint8_t *token, size_t len) {
  * Media never costs a connection: with more than OC_MEDIA_SOFT already waiting
  * to be written it is dropped, and the loss is recovered as UDP loss is -- by
  * the audio's FEC and concealment, and a screen share's resend and keyframe
- * requests (AUDIO.md §4, VIDEO.md §5). */
+ * requests (AUDIO.md §4, CALLS.md §6.5). */
 #define OC_MEDIA_SOFT (256u * 1024u)
 static void relay_tcp_send(void *ctx, uint64_t conn_id, uint64_t sender, uint16_t seq,
                            const uint8_t *ct, size_t len) {
