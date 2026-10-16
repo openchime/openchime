@@ -13309,6 +13309,10 @@ static float form_rowh(const oc_field *f, float w) {
         }
         return UIS(24.0f) + (float)rows * UIS(34.0f) + UIS(2.0f);
     }
+    /* A select's `hint` is its options, not a line under it: measured as one,
+     * the time zone list wrapped to a row two hundred pixels tall and pushed
+     * the read-aloud voice off the bottom of Edit profile. */
+    if (f->kind == FF_SELECT) return UIS(54.0f);
     /* A hint wraps, and its row grows by the lines it takes: one cut to a
      * single line lost the half of a sentence that said what to do. */
     float hint = (f->hint && f->hint[0]) ? form_hint_h(f->hint, w) : 0;
