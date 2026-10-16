@@ -47,10 +47,15 @@ const profile = path.join(process.env.XDG_CACHE_HOME || path.join(process.env.HO
 fs.mkdirSync(profile, { recursive: true });
 // A browser that died leaves its lock behind; nothing else holds this profile.
 for (const f of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) { try { fs.unlinkSync(path.join(profile, f)); } catch (e) {} }
+// The browser window is the client's window (fill-document, CLIENT.md), so its
+// size is the viewport's: OC_TEST_VIEWPORT=<w>x<h>, at OC_TEST_DPR device
+// pixels per CSS pixel -- what `size` and `dpi` set on Windows.
+const [vw, vh] = (process.env.OC_TEST_VIEWPORT || '1280x800').split('x').map((n) => parseInt(n, 10));
+const dpr = parseFloat(process.env.OC_TEST_DPR || '1') || 1;
 const ctx = await chromium.launchPersistentContext(profile, {
   headless: true,
   executablePath: exe || undefined,
-  ignoreHTTPSErrors: true, viewport: { width: 1280, height: 800 },
+  ignoreHTTPSErrors: true, viewport: { width: vw, height: vh }, deviceScaleFactor: dpr,
   permissions: ['camera', 'microphone', 'clipboard-read', 'clipboard-write', 'notifications'],
   args: [...dbg, '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-certificate-errors',
          '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
@@ -119,9 +124,9 @@ async function serve(line) {
   const sp = line.indexOf(' ');
   const verb = sp < 0 ? line : line.slice(0, sp), arg = sp < 0 ? '' : line.slice(sp + 1);
   let cmd = line, after = null;
-  if ((verb === 'dump' || verb === 'shot' || verb === 'shotfull') && arg && !arg.includes('/') && !arg.includes('\\')) {
+  if ((verb === 'dump' || verb === 'shot' || verb === 'shotfull' || verb === 'ledger') && arg && !arg.includes('/') && !arg.includes('\\')) {
     // A bare name: the file comes out of the page as <dir>/<name>.<ext>.
-    const ext = verb === 'dump' ? 'txt' : 'bmp', onPage = `/out/${arg}.${ext}`;
+    const ext = verb === 'dump' ? 'txt' : verb === 'ledger' ? 'tsv' : 'bmp', onPage = `/out/${arg}.${ext}`;
     cmd = `${verb} ${onPage}`;
     await page.evaluate(() => { try { FS.mkdir('/out'); } catch (e) {} });
     after = async () => {

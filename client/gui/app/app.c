@@ -15987,7 +15987,9 @@ static void tf_draw(gfx *rt, const tfield *t, fmtw *fmt, rectf box, float x0,
     if (focused && ((now_ms() - g_tgt_blink) / 530) % 2 == 0) {
         memcpy(tmp, t->buf, (size_t)t->caret); tmp[t->caret] = 0;
         float wc = text_width(tmp, fmt);
+        gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
         fill(rt, rf(x0 + wc, box.top + UIS(7), x0 + wc + 1.0f, box.bottom - UIS(7)), OC_COL_TEXT);
+        gfx_tag(rt, NULL);
     }
 }
 
@@ -16354,7 +16356,9 @@ static void field_draw(gfx *rt, field *f, rectf box, uint32_t ink) {
     if (focused && l && ((now_ms() - f->blink) / 530) % 2 == 0) {
         st_rect cr = fld_caret_rect(f, l, f->caret);
         float cx = ox + cr.x + (f->comp_len ? text_width(f->comp, fm) : 0);
+        gfx_tag(rt, "transient:caret");   /* a phase, not a rendering (the composer's caret) */
         fill(rt, rf(cx, oy + cr.y + 1, cx + 1.0f, oy + cr.y + cr.h - 1), OC_COL_TEXT);
+        gfx_tag(rt, NULL);
         /* Where an IME should put its candidates (and what a magnifier follows). */
         SDL_Rect area = { PX(cx), PX(oy + cr.y), 1, PX(cr.h) };
         oc_plat_text_input_area(g_win, &area);
@@ -28635,6 +28639,12 @@ static void test_dump(const char *path) {
     fprintf(f, "mode=%s\n", oc_env_is_dev() ? "development" : "normal");
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
+    /* Whether the DM picker is open (`dmcompose 0|1`), so a harness waits for
+     * the state it asked for rather than the view, which both share. */
+    fprintf(f, "dm_compose=%d\n", g_dm_compose);
+    /* The open conversation's member list has arrived: until it has, the panel
+     * says "Loading…", and a picture taken then is of the wait. */
+    fprintf(f, "chanmem_ready=%d\n", m->chanmem_channel == g_sel && !m->chanmem_loading);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u server_build=\"%s\"\n",
             oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m),
             oc_model_server_build(m));
@@ -30213,6 +30223,12 @@ static void test_poll(oc_win *hwnd) {
         char t[256];
         about_text(model(), t, sizeof t);
         modal_enter(hwnd, &g_about_open); test_ack(t);
+    } else if (!strcmp(verb, "open")) {
+        /* `open <cmd>` -- `menu`, acked FIRST, as `clickform` is: a command that
+         * opens a dialog runs its nested loop inside the dispatch, and the verbs
+         * that follow (dump, ledger, shot, formtype, key) are answered there. */
+        test_ack("ok");
+        menu_dispatch(hwnd, atoi(arg));
     } else if (!strcmp(verb, "menu")) {
         /* Drive a workspace/new-menu command directly. Modal forms block this
          * poll loop until dismissed, so the ack lands after the dialog closes. */
@@ -30654,7 +30670,9 @@ static void test_poll(oc_win *hwnd) {
          * A verb rather than a click at a measured coordinate: the button moves
          * with the sidebar, and a test that misses it would pass by asserting
          * about the view it failed to leave. */
-        g_dm_compose = !g_dm_compose;
+        /* "1" or "0" sets it, as a run that starts from a client already in
+         * either state needs; nothing toggles, as the button does. */
+        g_dm_compose = arg[0] == '1' ? 1 : arg[0] == '0' ? 0 : !g_dm_compose;
         layout_composer(hwnd);
         invalidate();
         test_ack("ok");

@@ -2,6 +2,9 @@
 #
 # id <TAB> verbs (semicolon-separated) <TAB> settle key <TAB> settled value
 #
+# A settled value of `!value` is anything but it: a dialog's scene is settled
+# when some modal is up, whichever kind it names itself.
+#
 # THE SETTLE COLUMN IS NOT OPTIONAL. A verb acks when its handler RAN, not when
 # the frame that shows its effect has been painted, and several of these views
 # ask the daemon for their content and paint "Loading..." until it answers. An
@@ -17,7 +20,7 @@
 #
 # --- the ten views ---------------------------------------------------------
 home	view home;channel general	view	0
-dms	view dms	view	1
+dms	view dms;dmcompose 0	dm_compose	0
 activity	view activity	view	2
 files	view files	view	3
 later	view later	view	4
@@ -49,6 +52,21 @@ prefs-notifications	view home;prefs 2	modal	prefs
 prefs-system	view home;prefs 3	modal	prefs
 shortcuts	view home;keys	modal	keys
 about	view home;about	modal	about
+# --- dialogs: every one a command opens, by `open <cmd>` (acked before the
+# dialog's own loop runs, so the capture verbs are answered inside it). Change
+# password (31) and two-step sign-in (32) open the daemon's own pages, which are
+# not the client's to draw, and are left to the feature scripts. -------------
+dlg-create-channel	view home;open 1	modal	!none
+dlg-new-dm	view home;open 6	modal	!none
+dlg-new-group	view home;open 83	view	6
+dlg-edit-profile	view home;open 53	modal	!none
+dlg-change-email	view home;open 33	modal	!none
+dlg-sessions	view home;open 54	modal	sessions
+dlg-schedule	view home;open 50	modal	notify
+dlg-pause-until	view home;open 64	modal	!none
+dlg-invite-member	view home;open 40	modal	!none
+dlg-manage-groups	view home;open 87	view	7
+dlg-add-workspace	view home;open 80	view	100
 # --- overlays and floating surfaces ----------------------------------------
 palette	view home;palette	view	0
 search	view home;channel general;search render	view	0
@@ -60,11 +78,11 @@ profile	view home;channel general;profile 2	view	0
 # opens one never checks them.
 menu-tray	view home;traymenu	menu	1
 emoji-picker	view home;channel general;emoji 1	pick	1
-dm-compose	view dms;dmcompose	view	1
+dm-compose	view dms;dmcompose 1	dm_compose	1
 # --- conversations that are not channels -----------------------------------
 # A group DM has no name and a stack of faces rather than one, so it exercises
 # the composite that a named channel row never reaches.
-dm-index	view dms	view	1
+dm-index	view dms;dmcompose 0	dm_compose	0
 # --- tabs on a conversation ------------------------------------------------
 tab-files	view home;channel general;tab 1	view	0
 tab-pins	view home;channel general;tab 2	view	0

@@ -55,8 +55,9 @@ case "${1:-}" in
     if [ "${OC_TEST_NO_DAEMON:-0}" != "1" ]; then
       dpid="$(daemon_pid || true)"; stale=1
       if [ -n "$dpid" ] && (exec 3<>/dev/tcp/127.0.0.1/$OC_TEST_PORT) 2>/dev/null; then
-        started=$(stat -c %Y "/proc/$dpid" 2>/dev/null || echo 0)
-        built=$(stat -c %Y "$HERE/openchimed" 2>/dev/null || echo 0)
+        age=$(ps -o etimes= -p "$dpid" 2>/dev/null | tr -d ' '); started=$(( $(date +%s) - ${age:-1000000000} ))   # /proc/<pid>'s own time is its first lookup, not its start
+        built=$(stat -c %Y "$HERE/openchimed" "$HERE/web/openchime.wasm" 2>/dev/null | sort -n | tail -1)   # the wasm too: read once, at start
+        built=${built:-0}
         [ "$started" -ge "$built" ] && stale=0
       fi
       if [ "$stale" = 1 ]; then

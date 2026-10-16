@@ -122,8 +122,9 @@ case "${1:-}" in
       # openchimed stopped whichever daemon another run happened to have up.
       stale=1
       if [ "$listening" = "1" ] && [ -n "$dpid" ]; then
-        started=$(stat -c %Y "/proc/$dpid" 2>/dev/null || echo 0)
-        built=$(stat -c %Y "$HERE/openchimed" 2>/dev/null || echo 0)
+        age=$(ps -o etimes= -p "$dpid" 2>/dev/null | tr -d ' '); started=$(( $(date +%s) - ${age:-1000000000} ))   # /proc/<pid>'s own time is its first lookup, not its start
+        built=$(stat -c %Y "$HERE/openchimed" "$HERE/web/openchime.wasm" 2>/dev/null | sort -n | tail -1)   # the wasm too: read once, at start
+        built=${built:-0}
         [ "$started" -ge "$built" ] && stale=0
       fi
       if [ "$stale" = "1" ]; then
@@ -138,7 +139,7 @@ case "${1:-}" in
         fi
         mkdir -p "$OC_TEST_DIR"
         env OPENCHIME_DATA_DIR="$OC_TEST_DIR/data" \
-            OPENCHIME_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT=8080 \
+            OPENCHIME_PORT="${OC_TEST_PORT}" OPENCHIME_HEALTH_PORT="${OC_TEST_HEALTH_PORT:-8080}" \
             OPENCHIME_WORKSPACE_NAME="${OC_TEST_WS:-Acme HQ}" \
             OPENCHIME_DEV_USERS="${OC_TEST_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
             OPENCHIME_MANAGED_MAX_USERS=100 \
@@ -188,7 +189,10 @@ case "${1:-}" in
     # The person signs in: the card's Sign in, the certificate question where
     # the daemon is not on loopback, Sign in again, and the page the harness
     # types into (scripts/gui/lib.sh). A stored session needs none of it.
-    if [ -n "$cred" ] && ! { "$0" dump launch-pre >/dev/null 2>&1; grep -q '^authed=1' "$LIN_DIR/launch-pre.txt" 2>/dev/null; }; then
+    if [ -n "$cred" ] && ! { "$0" dump launch-pre >/dev/null 2>&1; grep -q '^authed=1' "$LIN_DIR/launch-pre.txt" 2>/dev/null &&
+        ! grep -q 'si_overlay=1' "$LIN_DIR/launch-pre.txt" 2>/dev/null; }; then
+      # (A stored session for another workspace is authed too, with the card
+      # for this one over it: that is still a sign-in.)
       . "$HERE/scripts/gui/lib.sh"
       "$0" restore >/dev/null 2>&1 || true      # a window never shown has no buttons to find
       sign_in_card "$0" -- "$LIN_DIR" "${cred%%:*}" "${cred#*:}" || { echo "launch failed: the sign-in page" >&2; exit 1; }

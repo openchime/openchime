@@ -1865,6 +1865,60 @@ the frame showing its effect has been painted, and several of these views paint
 "Loading…" until the daemon answers; sleeping a fixed time instead
 captures a view mid-load, which reads as a layout defect.
 
+## Web parity: the two clients against each other
+
+`scripts/gui/parity.sh` shows the web client is the Win32 client. It walks the
+audit's scene list (`scripts/gui/audit/scenes.tsv`) on both, against one
+fixture, at one size, theme, scale and text size, and compares what each
+painted. `--quick` runs light, 96 dpi, text size 1; without it the run adds
+dark, 144 dpi and text size 3. `--scene <id>` runs one scene; `--keep` leaves
+both clients up.
+
+The two clients are one application, so a scene's two paint ledgers should
+hold the same primitives at the same places. `scripts/gui/audit/parity.py`
+aligns them and reports what is drawn on one side only, what moved or resized
+by more than a pixel, and what changed colour. Text widths are listed but do
+not fail a scene: DirectWrite and the browser's canvas measure the same string
+a pixel or two apart. A ledger cannot see what a raster holds (a glyph from
+another font, a sign clipped off), so the report ends with the scenes ranked by
+how many pixels differ to the eye, and `<out>/<state>.<scene>.side.png` holds
+Win32, web and their difference side by side.
+
+How a run is kept honest:
+
+- **Its own daemon.** Port 8453 (`OC_TEST_PORT`), data in `/tmp/oc-parity-dev`
+  (`OC_TEST_DIR`), wiped at the start, health port off
+  (`OC_TEST_HEALTH_PORT=0`). A scene that changes the workspace (the emoji
+  picker reacts) otherwise changes the next run.
+- **The fixture sender is rebuilt every run.** A `build/demo_client` from
+  before a protocol change fails its handshake, and a fixture with no messages
+  compares two empty screens. A send that fails stops the run.
+- **Both clients restart for each state,** so one pass does not inherit the
+  last pass's open tab or picker.
+- **The pointer is parked** on the rail's empty stretch on both clients before
+  each capture: the Win32 window is on a real desktop, and a mouse resting over
+  it draws a hover the browser never has.
+- **Each scene waits for its dump key, then for the conversation's members**
+  (`chanmem_ready=1`), so no picture is of "Loading…". A key with a leading `!`
+  waits for anything but that value (`modal !none`: some dialog is up).
+- **The browser gets this machine's Windows fonts** through a fontconfig made
+  for the run (`OC_TEST_FONTS`, default `/mnt/c/Windows/Fonts`). The headless
+  Chromium is a Linux one with no Segoe UI, and its fallback is about 16%
+  wider. Nothing is installed.
+
+The web driver takes `OC_TEST_VIEWPORT=<w>x<h>` and `OC_TEST_DPR=<ratio>`, the
+CSS size and device pixel ratio the page runs at; the run uses 1024x768 and
+dpi/96. Both drivers take `open <cmd>`, which dispatches a menu command id as
+its menu item does, for dialogs no verb reaches.
+
+Known differences that remain, and why:
+
+- A control sized by its label (the member count chip, a Preferences button)
+  is one or two pixels wider on the web, the two text engines' measurement.
+- Active sessions lists the other client's session where the first lists its
+  own, because each is "this device".
+- A colour emoji draws about a pixel larger on the web.
+
 ## `clipped=`: text that does not fit its own box
 
 `chromefit` compares published rectangles, so a label whose box is the right size
