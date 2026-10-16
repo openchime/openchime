@@ -291,6 +291,7 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
         if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE &&
             hdr->msg_type != OC_MSG_TYPING_UPDATE &&
             hdr->msg_type != OC_MSG_WORKSPACE_INFO &&
+            hdr->msg_type != OC_MSG_SERVER_BUILD &&
             hdr->msg_type != OC_MSG_CAPABILITIES &&
             hdr->msg_type != OC_MSG_TTS_INFO &&
             hdr->msg_type != OC_MSG_STT_INFO &&
@@ -357,6 +358,12 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
      * presence snapshot). Consume it here so both read_frame and the raw
      * presence/typing test start from a clean stream. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
+    /* Then which build the daemon is (About in a client): always, and never empty. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_SERVER_BUILD) return -1;
+    {
+        oc_server_build sb;
+        if (oc_decode_server_build(&p, &sb) != OC_OK || sb.build.len == 0) return -1;
+    }
     /* Then what this daemon offers (REQ-295), told to every client at auth. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_CAPABILITIES) return -1;
     {

@@ -383,6 +383,7 @@ typedef struct {
     uint8_t  workspace_mode;          /* OC_WS_MODE_*: a public demo says so (AUTH.md §8.12) */
     uint32_t max_users;               /* 0 = unlimited */
     char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
+    char     server_build[48];        /* the daemon's build id (SERVER_BUILD); "" from a daemon that does not say */
 
     /* Read-aloud (REQ-291-295, ARCH-111), from TTS_INFO after auth and replaced
      * on every reconnect. Without it a frontend shows nothing of the feature. */
@@ -1166,6 +1167,9 @@ uint8_t     oc_model_deployment_mode(const oc_model *m);
 const char *oc_model_deployment_name(const oc_model *m);
 const char *oc_model_workspace_name(const oc_model *m);
 uint32_t    oc_model_max_users(const oc_model *m);
+/* The daemon's build id (SERVER_BUILD), "" until it says -- a daemon older than
+ * the frame never does. */
+const char *oc_model_server_build(const oc_model *m);
 
 /* Read-aloud (TTS_INFO, ARCH-111). `available` 0 means this daemon does not speak
  * messages and a frontend shows nothing of the feature (REQ-295). The voices are

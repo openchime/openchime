@@ -54,6 +54,7 @@
 #include "env.h"        /* the development inputs */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 #include "net.h"        /* oc_net_probe: how a workspace signs people in */
+#include "build_id.h"   /* OC_BUILD_ID: --version */
 
 #include <ctype.h>
 #include <locale.h>
@@ -2580,10 +2581,6 @@ static int have_stored_token(const char *store_path, const char *key, const char
     oc_store_close(s);
     return has;
 }
-
-#ifndef OC_BUILD_ID
-#define OC_BUILD_ID "dev"   /* the short commit the candidate build compiled (docs/RELEASING.md) */
-#endif
 
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {

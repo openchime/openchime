@@ -7,11 +7,13 @@ obvious from reading the files.
 ## Build id and release number
 
 A build is identified by its **build id**: the short commit it was built from
-(`74359c0`). The candidate build compiles it into the daemon and both Windows
-clients (`make OC_BUILD_ID=...`), and it is what `openchimed --version`, the
-startup log, `openchime-tui --version` and the Windows file properties
-(ProductVersion `build 74359c0`) report. Nothing about a release number is in
-a binary.
+(`74359c0`). The candidate build compiles it into the daemon, the web client
+the daemon serves, and both Windows clients (`make OC_BUILD_ID=...`, through
+`shared/build_id.h`), and it is what `openchimed --version`, the startup log,
+`openchime-tui --version`, the Windows file properties (ProductVersion
+`build 74359c0`) and the GUI's About OpenChime report. About shows the daemon's
+too, which the daemon sends each client at sign-in (PROTOCOL.md `SERVER_BUILD`).
+Nothing about a release number is in a binary.
 
 A **release number** is a label assigned to one build id when it is released:
 `release-23` is build `74359c0`. It appears only where a public monotonic

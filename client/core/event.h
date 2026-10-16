@@ -269,6 +269,8 @@ enum {
      * new key, in `body`, and the next connection dials it. A frontend showing the
      * workspace by its old key relabels it. */
     OC_EV_WORKSPACE_MOVED,
+    /* SERVER_BUILD: the daemon's build id, in `body`. */
+    OC_EV_SERVER_BUILD,
     /* SUMMARY (REQ-310): the answer to one SUMMARIZE, named by `req_id`.
      * `status` is OC_SUM_*; `body` the summary as JSON when OK, otherwise a
      * sentence saying why. `channel_id`, `span_start`/`span_end` and

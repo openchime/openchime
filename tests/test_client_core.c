@@ -411,6 +411,31 @@ static void test_capabilities(void) {
     oc_model_free(&m);
 }
 
+/* The daemon's build (SERVER_BUILD) for About: kept as said, and cleared by the
+ * WORKSPACE_INFO it follows, so a daemon too old to send it shows none rather
+ * than the build of the daemon before it. */
+static void ev_body(oc_model *m, int type, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = type;
+    e.body = body ? strdup(body) : NULL;
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+static void test_server_build(void) {
+    oc_model m; oc_model_init(&m);
+    CHECK(strcmp(oc_model_server_build(&m), "") == 0);      /* nothing said yet */
+    ev_body(&m, OC_EV_WORKSPACE_INFO, "Acme");
+    ev_body(&m, OC_EV_SERVER_BUILD, "74359c0");
+    CHECK(strcmp(oc_model_server_build(&m), "74359c0") == 0);
+    ev_body(&m, OC_EV_WORKSPACE_INFO, "Acme");              /* the next connection */
+    CHECK(strcmp(oc_model_server_build(&m), "") == 0);
+    ev_body(&m, OC_EV_SERVER_BUILD, NULL);
+    CHECK(strcmp(oc_model_server_build(&m), "") == 0);
+    oc_model_free(&m);
+}
+
 /* Invitations in the model (REQ-033): which kind a workspace can redeem, from
  * its sign-in sources, and the text an INVITE_CREATED becomes -- by address, or
  * with the token -- with the workspace, how to sign in and the expiry. */
@@ -4769,6 +4794,7 @@ int run_client_core_tests(void) {
     test_thread_notices();
     test_unread_counts_what_notifies();
     test_capabilities();
+    test_server_build();
     test_invitation_text();
     test_reset_text();
     test_addressable_targets();

@@ -102,14 +102,20 @@ $(FEATURES): FORCE | build
 # building (OC_BUILD_ID=74359c0), which is what `--version` and the startup
 # log say; a source build leaves it unset and reports "dev". A release number
 # is a label assigned to a build id afterwards (docs/RELEASING.md) and is
-# never compiled in. The daemon and the TUI take it; the tests link the same
-# objects and have no use for it.
+# never compiled in. The daemon, the TUI and both GUI clients take it, through
+# shared/build_id.h; the tests link the same objects and have no use for it.
 OC_BUILD_ID ?=
 ifneq ($(OC_BUILD_ID),)
 VERSION_DEF := -DOC_BUILD_ID='"$(OC_BUILD_ID)"'
 else
 VERSION_DEF :=
 endif
+# The build id as a file, rewritten only when it changes, so every binary that
+# compiles it in is rebuilt when the id is not the one it was compiled with
+# (and the web client's one object that says it, About OpenChime).
+BUILD_ID_STAMP := build/.build_id
+$(BUILD_ID_STAMP): FORCE | build
+	@printf '%s\n' '$(OC_BUILD_ID)' | cmp -s - $@ || printf '%s\n' '$(OC_BUILD_ID)' > $@
 
 FORCE:
 build:

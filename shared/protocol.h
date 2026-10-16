@@ -531,6 +531,10 @@ typedef enum {
     OC_MSG_SUMMARY_READY        = 0x0103, /* S->C, a notice */
     OC_MSG_SUMMARY_OPEN         = 0x0104, /* C->S { req_id, notice_id } */
     OC_MSG_SUMMARY_DISMISS      = 0x0105, /* C->S { notice_id } */
+    /* The daemon's build id, so a client can say which build it is talking to
+     * (a person reporting a problem reads both off one screen). After
+     * WORKSPACE_INFO, signed in only: an address does not learn a build. */
+    OC_MSG_SERVER_BUILD         = 0x0106, /* S->C { build } */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -968,6 +972,9 @@ typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace
  * address still answers at the old one for a while, and a client that connected
  * by it re-files its stored workspace under the new one (CLIENT.md). */
 typedef struct { oc_slice address; } oc_workspace_address;
+/* Pushed after WORKSPACE_INFO: the daemon's build id (shared/build_id.h), the
+ * short commit it was built from or "dev". */
+typedef struct { oc_slice build; } oc_server_build;
 /* src_channel/src_message are the forward source (REQ-057), zero when the
  * message is not a forward. The client asserts nothing but the two ids: the
  * daemon resolves the author, the excerpt and the attachment count from the
@@ -1662,6 +1669,7 @@ oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
 oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_workspace_info *m);
 oc_result oc_encode_workspace_address(oc_wbuf *w, uint16_t version, const oc_workspace_address *m);
+oc_result oc_encode_server_build(oc_wbuf *w, uint16_t version, const oc_server_build *m);
 oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m);
 oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
 oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m);
@@ -1945,6 +1953,7 @@ oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);
 oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m);
 oc_result oc_decode_workspace_address(oc_rbuf *p, oc_workspace_address *m);
+oc_result oc_decode_server_build(oc_rbuf *p, oc_server_build *m);
 oc_result oc_decode_logout(oc_rbuf *p, oc_logout *m);
 oc_result oc_decode_send(oc_rbuf *p, oc_send *m);
 oc_result oc_decode_send_ack(oc_rbuf *p, oc_send_ack *m);

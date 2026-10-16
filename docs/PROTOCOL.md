@@ -458,6 +458,20 @@ workspace key") and dials that next time. A new frame, so no version bump.
 |-----------|------|---------------------------------------------------|
 | `address` | str  | The workspace's address now, e.g. `acme.workspace.openchime.io`. |
 
+### 4.3c `SERVER_BUILD` (server → client), msg_type `0x0106`
+
+Pushed after `WORKSPACE_INFO` (and `WORKSPACE_ADDRESS`, when that is sent), on
+every sign-in. The daemon's build id (docs/RELEASING.md): the short commit it
+was built from, or `dev` from a source build. A client shows it beside its own
+in About OpenChime (CLIENT.md), so a person reporting a problem reads both builds
+off one screen. Sent only once signed in, so an address alone does not learn
+which build to probe. A new frame, so no version bump; a client talking to a
+daemon too old to send it says the daemon did not report one.
+
+| Field   | Type | Notes                                      |
+|---------|------|--------------------------------------------|
+| `build` | str  | The daemon's build id, e.g. `74359c0`.     |
+
 ### 4.4 `LOGOUT` (client → server), msg_type `0x0013`
 
 Revokes daemon-issued sessions (REQ-182) — the local revocation a stateless
@@ -3138,6 +3152,7 @@ this table cannot silently gain a shared value.
 | `0x0103` | `SUMMARY_READY` | S → C | a summary made while its asker was not watching (a notice) |
 | `0x0104` | `SUMMARY_OPEN` | C → S | a notice's summary, as it was made |
 | `0x0105` | `SUMMARY_DISMISS` | C → S | a notice seen, unopened |
+| `0x0106` | `SERVER_BUILD` | S → C | after `WORKSPACE_INFO`: the daemon's build id |
 
 ## 10. Connection state machine
 

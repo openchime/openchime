@@ -62,7 +62,7 @@ ifneq ($(filter 1,$(TTS) $(STT)),)
 ORT_LIBS := $(ORT_A) $(TTS_CXXLIB) -lm -Wl,--gc-sections -Wl,-z,noexecstack
 endif
 
-$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES) $(TOOLCHAIN_DEPS)
+$(BIN): $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(MBEDTLS_A) $(HDRS) $(TTS_DEPS) $(STT_DEPS) $(SUM_DEPS) $(SQLITE_O) $(ARGON2_O) $(CC_STAMP) $(FEATURES) $(BUILD_ID_STAMP) $(TOOLCHAIN_DEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) $(SQLITE_INC) $(TTS_FLAGS) $(STT_FLAGS) $(SUM_FLAGS) -o $@ $(SRC) $(TTS_SRC) $(STT_SRC) $(SUM_SRC) $(SQLITE_O) $(ARGON2_O) $(MBEDTLS_LIBS) $(TTS_LIBS) $(SUM_LIBS) $(ORT_LIBS) $(SUM_CXX) $(LDFLAGS)
 

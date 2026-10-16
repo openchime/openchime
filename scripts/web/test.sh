@@ -61,7 +61,7 @@ PY
     # Media (WEB.md): a video message recorded from the synthetic camera and the
     # browser's (fake) microphone through Web Audio, stopped, and the file taken
     # -- the same recorder, codecs and muxer the desktop runs, in wasm.
-    URL3="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000"
+    URL3="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw&hook=1&env=OPENCHIME_DEV_CAPTURE%3Dsynthetic&script=sttest@0|vm%20open@1000|vm%20record@18000|vm%20stop@23000|dump%20/t/d.txt@33000|about@34000"
     timeout 120 "$CHROME" --headless=new --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
         --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required \
         --hide-scrollbars --window-size=1280,800 --enable-logging=stderr --v=0 \
@@ -96,6 +96,9 @@ PY
     # The audio ran on the worklet (audio_web.c): the fallback would say "scriptprocessor".
     audio=$(grep -oE 'oc-web: audio [a-z]+' "$W/chrome-media.log" | head -1)
     echo "  audio: ${audio:-not reported}"
+    # About OpenChime: both builds on one line, the daemon's told by SERVER_BUILD.
+    about=$(grep -oE '"ACK about: [^"]*' "$W/chrome-media.log" | head -1 | cut -c13-)
+    echo "  about: ${about:-no answer}"
     # The input method (plat_web.c): a composition played into the page's
     # hidden input ends in the composer, as a desktop IME's does.
     URL4="http://127.0.0.1:$PAGE/openchime.html?host=127.0.0.1&port=$HPORT&env=OPENCHIME_DEV_SIGNIN%3Dalice%3Apw&hook=1&ime=1"
@@ -115,7 +118,7 @@ PY
     echo "  ime: ${ime:-no answer}"
     # Two units composing (comp=2) and, committed, two characters in the box.
     imeok=0; echo "$composing" | grep -q 'comp=2' && echo "$ime" | grep -q 'len=2 ' && echo "$ime" | grep -q '日本' && imeok=1
-    if [ $mok = 1 ] && echo "$taken" | grep -q ': ok' && echo "$vm" | grep -qE 'take_bytes=[1-9]' && [ "$audio" = "oc-web: audio worklet" ] && [ $imeok = 1 ] && echo "$sttest" | grep -q '^ok '; then
+    if [ $mok = 1 ] && echo "$taken" | grep -q ': ok' && echo "$vm" | grep -qE 'take_bytes=[1-9]' && [ "$audio" = "oc-web: audio worklet" ] && [ $imeok = 1 ] && echo "$sttest" | grep -q '^ok ' && echo "$about" | grep -qE '^OpenChime client [^ ]+ \(web\), server [0-9a-z]+, protocol [0-9]+$'; then
         echo "webtest: PASS -- the client signed in, drew itself and recorded a video message in the browser"; exit 0
     fi
     echo "webtest: FAIL (media) -- see $W/chrome-media.log" >&2

@@ -254,6 +254,14 @@ static void test_auth_frames(void) {
         CHECK(slice_eq_str(out.address, "acme-new.workspace.openchime.io"));
     }
     {
+        /* SERVER_BUILD — the daemon's build id. */
+        oc_server_build in = { oc_slice_str("74359c0") };
+        ROUNDTRIP(oc_encode_server_build(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SERVER_BUILD, h, p);
+        oc_server_build out;
+        CHECK(oc_decode_server_build(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.build, "74359c0"));
+    }
+    {
         /* LOGOUT — scope + the session token to revoke. */
         uint8_t token[OC_SESSION_TOKEN_LEN];
         memset(token, 0x3C, sizeof token);
